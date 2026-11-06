@@ -112,6 +112,19 @@ const (
 	AnnoFirstSeenOperatorWorkqueue   = "passiontech.dev/first-seen-operator-workqueue"
 	AnnoFirstSeenLinkerdEndpointSync = "passiontech.dev/first-seen-linkerd-endpoint-sync"
 	AnnoFirstSeenArgoCDAppStuck      = "passiontech.dev/first-seen-argocd-app-stuck"
+	// AnnoLastLinkerdOpaquePatch is linkerd-protocol-detection-stall's
+	// durable stamp on the owning Deployment/StatefulSet — a GitOps
+	// (Flux/ArgoCD) managed workload whose pod template keeps losing
+	// opaque-ports to force/selfHeal must not trigger a 30m
+	// patch-vs-revert fight (6h cooldown).
+	AnnoLastLinkerdOpaquePatch = "passiontech.dev/last-linkerd-opaque-patch"
+	// AnnoLastKargoRefresh is kargo-promotion-health's persisted
+	// cooldown for its warehouse-refresh merge-patches.
+	AnnoLastKargoRefresh = "passiontech.dev/last-kargo-refresh"
+	// AnnoAllowEmptySecretKey opts an ExternalSecret out of the
+	// externalsecret-nudge empty/whitespace-key audit (some Secrets
+	// legitimately carry empty values).
+	AnnoAllowEmptySecretKey = "passiontech.dev/allow-empty-secret-key"
 	// AnnoRolledConfigHash is the EXTERNAL contract: fluentbit-roller
 	// stamps it on the fluent-bit Secret so other tooling sees which
 	// fluent.io/config-hash was last rolled out. Value must never
@@ -157,6 +170,10 @@ const (
 	AnnoFluxRequestedAt = "reconcile.fluxcd.io/requestedAt"
 	AnnoFluxResetAt     = "reconcile.fluxcd.io/resetAt"
 	AnnoFluxForceAt     = "reconcile.fluxcd.io/forceAt"
+	// AnnoKargoRefresh is kargo's own refresh-request annotation —
+	// kargo-promotion-health stamps it on a Warehouse to nudge a
+	// credential/artifact refresh. Value must never change.
+	AnnoKargoRefresh = "kargo.akuity.io/refresh"
 )
 
 // The third external key — weave.works/kured-node-lock, the reboot

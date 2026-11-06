@@ -62,6 +62,8 @@ const (
 	scyllaReasonDegraded     = "degraded_condition"
 	scyllaReasonMemberDesync = "member_service_desync"
 	scyllaReasonGossipStall  = "gossip_or_raft_stall"
+	// W12-ST3 — the tombstone-avalanche / overload stall reason.
+	scyllaReasonTombstoneStall = "tombstone_overload_stall"
 )
 
 // scyllaClusterGVR is the ScyllaCluster CR the W9-ST1 auditor reads —
@@ -72,7 +74,7 @@ var (
 	// W9-ST1 — the ScyllaDB unhealthy signal: 1 while the
 	// ScyllaCluster/member shows a sustained unhealthy signature.
 	// reason is degraded_condition | member_service_desync |
-	// gossip_or_raft_stall.
+	// gossip_or_raft_stall | tombstone_overload_stall (W12-ST3).
 	scyllaClusterUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_scylla_unhealthy",
 		Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
@@ -104,6 +106,25 @@ var scyllaGossipPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`replace_address_first_boot`),
 	regexp.MustCompile(`group0.*timed out`),
 	regexp.MustCompile(`raft_group0`),
+}
+
+// scyllaTombstonePatterns are the W12-ST3 log signatures of a
+// tombstone avalanche / overload stall — the failure shape where a
+// member stays Running but its reads time out scanning thousands of
+// tombstones or one shard's reactor wedges on a hot partition:
+//
+//   - "Read N live cells and M tombstones" — the tombstone-scan
+//     warning a partition avalanche produces on every query path;
+//   - tombstone_warn/failure_threshold — Scylla's own scanner
+//     guardrails firing;
+//   - "Reactor stalled for N ms" — a shard's event loop wedged
+//     (hot partition, bad_alloc pressure);
+//   - bad_alloc — a shard hit its memory ceiling mid-read.
+var scyllaTombstonePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`Read \d+ live cells and \d+ tombstones`),
+	regexp.MustCompile(`tombstone_(warn|failure)_threshold`),
+	regexp.MustCompile(`Reactor stalled for \d+ ms`),
+	regexp.MustCompile(`bad_alloc`),
 }
 
 // unstructuredCondStatus returns a dynamic-client object's named
@@ -147,23 +168,37 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 	return false
 }
 
-// scyllaGossipLogHit fetches the last scyllaGossipTailLines of the
-// pod's "scylla" container and reports whether any line matches a
-// gossip/raft stall signature. Bounded to 8s / scyllaGossipLogMaxBytes
+// scyllaStallLogHit fetches the last scyllaGossipTailLines of the
+// pod's "scylla" container and returns the reason label of the first
+// matching stall signature — scyllaReasonGossipStall for the gossip/
+// raft patterns, scyllaReasonTombstoneStall for the W12-ST3
+// tombstone/overload set. Bounded to 8s / scyllaGossipLogMaxBytes
 // (same posture as the coredns watchdog's log probe); a stream/read
 // failure is inconclusive — PodLogTail returns it as an error so the
 // caller logs it rather than reading "no match" as "healthy".
-func (p *scyllaHealthCheck) scyllaGossipLogHit(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	return probefw.PodLogTail(ctx, p.CS, pod, scyllaContainerName,
+func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.Pod) (string, error) {
+	var reason string
+	hit, err := probefw.PodLogTail(ctx, p.CS, pod, scyllaContainerName,
 		scyllaGossipTailLines, scyllaGossipLogMaxBytes, 8*time.Second,
 		func(line string) bool {
 			for _, re := range scyllaGossipPatterns {
 				if re.MatchString(line) {
+					reason = scyllaReasonGossipStall
+					return true
+				}
+			}
+			for _, re := range scyllaTombstonePatterns {
+				if re.MatchString(line) {
+					reason = scyllaReasonTombstoneStall
 					return true
 				}
 			}
 			return false
 		})
+	if err != nil || !hit {
+		return "", err
+	}
+	return reason, nil
 }
 
 // checkScyllaHealth audits the ScyllaDB operand stack on the three
@@ -177,10 +212,12 @@ func (p *scyllaHealthCheck) scyllaGossipLogHit(ctx context.Context, pod *corev1.
 //	   (scylla.scylladb.com/pod-name=<pod>) whose EndpointSlice does
 //	   not carry the live pod's status.podIP — or carries no endpoint
 //	   at all while the pod is Running — for >=10m;
-//	c) gossip_or_raft_stall — an unready/restarting member pod
+//	c) gossip_or_raft_stall | tombstone_overload_stall — an
+//	   unready/restarting member pod
 //	   (scylla.scylladb.com/cluster=<name>) whose scylla log tail
 //	   matches the ghost-gossip / replace_address_first_boot /
-//	   group0-raft-timeout signatures for >=10m.
+//	   group0-raft-timeout signatures — or, W12-ST3, the tombstone-
+//	   avalanche / reactor-stall signatures — for >=10m.
 //
 // Every signature must persist its window before
 // node_automation_scylla_unhealthy{reason}=1 fires; a resolved tuple
@@ -307,14 +344,14 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// (c) gossip_or_raft_stall — troubled member pods whose scylla
-	// log tail carries a stall signature.
+	// (c) gossip_or_raft_stall / tombstone_overload_stall — troubled
+	// member pods whose scylla log tail carries a stall signature.
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Labels[scyllaClusterLabel] == "" || !scyllaPodTroubled(pod) {
 			continue
 		}
-		hit, err := p.scyllaGossipLogHit(ctx, pod)
+		reason, err := p.scyllaStallLogHit(ctx, pod)
 		if err != nil {
 			// Inconclusive, not clean — a broken pod-log path must
 			// not silently read as "no stall".
@@ -322,13 +359,13 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 				"pod", pod.Namespace+"/"+pod.Name, "error", err)
 			continue
 		}
-		if !hit {
+		if reason == "" {
 			continue
 		}
-		pending["gossip/"+pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)] =
+		pending["stall/"+pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)+"/"+reason] =
 			scyllaFinding{
 				ns: pod.Namespace, cluster: pod.Labels[scyllaClusterLabel],
-				reason: scyllaReasonGossipStall,
+				reason: reason,
 			}
 	}
 

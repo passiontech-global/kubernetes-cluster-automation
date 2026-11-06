@@ -5,15 +5,18 @@
 package datastore
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -250,6 +253,160 @@ func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
 
 	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("downscaled statefulset must pass: %+v", res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-SC2 — multi-master split brain + cross-DC site skew
+// ---------------------------------------------------------------------------
+
+// endpointSliceWithZones builds an EndpointSlice bound to svc whose
+// endpoints carry the given zone values ("" = unset).
+func endpointSliceWithZones(ns, svc string, zones ...string) *discoveryv1.EndpointSlice {
+	s := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: svc + "-zzz",
+			Labels: map[string]string{discoveryv1.LabelServiceName: svc},
+		},
+	}
+	for i, z := range zones {
+		ep := discoveryv1.Endpoint{
+			Addresses:  []string{fmt.Sprintf("10.0.0.%d", i+1)},
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		}
+		if z != "" {
+			ep.Zone = ptr.To(z)
+		}
+		s.Endpoints = append(s.Endpoints, ep)
+	}
+	return s
+}
+
+// zoneNode builds a Ready worker node carrying the topology zone.
+func zoneNode(name, zone string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{corev1.LabelTopologyZone: zone}},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+	}
+}
+
+// A master-role Service carrying 2 Ready endpoints is a live
+// split-brain — but only after two consecutive sweeps (a relabeling
+// flap settles inside one).
+func TestMasterlessMultipleMastersSplitBrain(t *testing.T) {
+	statefulServiceMultipleMastersGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	t.Cleanup(func() {
+		statefulServiceMultipleMastersGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	})
+	sts := shSTS("db", "dragonfly", 2,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	cs := fake.NewSimpleClientset(sts, svc,
+		endpointSliceWithZones("db", "dragonfly-master", "", ""))
+	p := testProberDyn(cs, probetest.OpDyn())
+
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("first multi-master sighting must pass: %+v", res)
+	}
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("multi-master for 2 sweeps did not fail the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_stateful_service_multiple_masters",
+		map[string]string{"namespace": "db", "service": "dragonfly-master",
+			"statefulset": "dragonfly"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("multiple_masters gauge = %v, want 1", m)
+	}
+}
+
+// Trigger A: the master's Ready endpoint lives in lanit while the
+// STS still serves a Ready replica in datahub — reads/writes pay
+// the inter-DC RTT.
+func TestMasterlessSiteSkewTriggerA(t *testing.T) {
+	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly", "lanit")
+	t.Cleanup(func() {
+		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly", "lanit")
+	})
+	sts := shSTS("db", "dragonfly", 2,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	// The master endpoint lives in lanit; a replica stays Ready in
+	// datahub — the asymmetric pinning the skew detector exists for.
+	replica := probetest.ReadyPodWithIP("db", "dragonfly-1", "10.0.0.9",
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	replica.Spec.NodeName = "dh-worker"
+	cs := fake.NewSimpleClientset(sts, svc, replica,
+		zoneNode("dh-worker", "datahub"),
+		zoneNode("ln-worker", "lanit"),
+		endpointSliceWithZones("db", "dragonfly-master", "lanit"))
+	p := testProberDyn(cs, probetest.OpDyn())
+
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("master pinned to lanit with datahub replicas must fail")
+	}
+	m := probetest.FindMetric(t, "node_automation_stateful_master_site_skew",
+		map[string]string{"namespace": "db", "service": "dragonfly-master",
+			"statefulset": "dragonfly", "zone": "lanit"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("site_skew gauge = %v, want 1", m)
+	}
+}
+
+// Trigger B: every stateful master in the cluster pinned to lanit
+// (100% >= 80%) is a cluster-level skew event — each pinned master
+// gets the gauge even without a same-STS datahub replica.
+func TestMasterlessSiteSkewPinRatio(t *testing.T) {
+	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m1", "sts-a", "lanit")
+	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m2", "sts-b", "lanit")
+	t.Cleanup(func() {
+		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m1", "sts-a", "lanit")
+		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m2", "sts-b", "lanit")
+	})
+	stsA := shSTS("db", "sts-a", 2, map[string]string{"app": "a"})
+	stsB := shSTS("db", "sts-b", 2, map[string]string{"app": "b"})
+	svcA := shMasterSvc("db", "m1", map[string]string{"app": "a", "role": "master"})
+	svcB := shMasterSvc("db", "m2", map[string]string{"app": "b", "role": "master"})
+	cs := fake.NewSimpleClientset(stsA, stsB, svcA, svcB,
+		zoneNode("dh-worker", "datahub"),
+		zoneNode("ln-worker", "lanit"),
+		endpointSliceWithZones("db", "m1", "lanit"),
+		endpointSliceWithZones("db", "m2", "lanit"))
+	p := testProberDyn(cs, probetest.OpDyn())
+
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("100% masters pinned to lanit must fail")
+	}
+	for _, lv := range []map[string]string{
+		{"namespace": "db", "service": "m1", "statefulset": "sts-a", "zone": "lanit"},
+		{"namespace": "db", "service": "m2", "statefulset": "sts-b", "zone": "lanit"},
+	} {
+		m := probetest.FindMetric(t,
+			"node_automation_stateful_master_site_skew", lv)
+		if m == nil || m.GetGauge().GetValue() != 1 {
+			t.Fatalf("site_skew gauge missing for %v", lv)
+		}
+	}
+}
+
+// A single-zone cluster (only lanit workers) can never skew — the
+// signature is meaningless without a live main site.
+func TestMasterlessSiteSkewSingleZoneSkips(t *testing.T) {
+	sts := shSTS("db", "sts-a", 2, map[string]string{"app": "a"})
+	svc := shMasterSvc("db", "m1", map[string]string{"app": "a", "role": "master"})
+	cs := fake.NewSimpleClientset(sts, svc,
+		zoneNode("ln-worker", "lanit"),
+		endpointSliceWithZones("db", "m1", "lanit"))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("single-zone cluster must pass: %+v", res)
 	}
 }
 

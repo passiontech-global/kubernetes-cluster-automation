@@ -1,12 +1,18 @@
 // scheduler_watchdog_test.go — coverage for the
-// scheduler-watchdog check (W8-CP3).
+// scheduler-watchdog check (W8-CP3 + W12-SC1).
 package watchdogs
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
@@ -35,5 +41,94 @@ func TestCheckSchedulerFrozenHealthy(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("PodScheduled=False verdict pod misread as frozen: %+v", res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-SC1 — PriorityClass preemption cascade
+// ---------------------------------------------------------------------------
+
+// preemptedEvent builds a recent reason=Preempted event — the
+// scheduler's domino-eviction signal. The timestamp rides
+// LastTimestamp (the recurring-event clock kube.EventTime prefers).
+func preemptedEvent(ns, name string, age time.Duration) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+		},
+		Reason:        "Preempted",
+		LastTimestamp: metav1.NewTime(time.Now().Add(-age)),
+	}
+}
+
+// More than schedulerPreemptionMax Preempted events inside the
+// window is a domino cascade — FAIL + storm gauge, even on an
+// otherwise healthy cluster.
+func TestCheckSchedulerPreemptionStorm(t *testing.T) {
+	objs := []runtime.Object{probetest.ReadyWorkerNode("w1", "", 0, false)}
+	for i := 0; i < schedulerPreemptionMax+1; i++ {
+		objs = append(objs,
+			preemptedEvent("apps", fmt.Sprintf("ev-%d", i), time.Minute))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("preemption storm must fail: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_scheduler_preemption_storm",
+		map[string]string{})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("preemption_storm=%v, want 1", m)
+	}
+}
+
+// At-or-under the ceiling, stale events, and non-Preempted noise all
+// stay quiet — ordinary placement churn must never read as a storm.
+func TestCheckSchedulerPreemptionChurnQuiet(t *testing.T) {
+	objs := []runtime.Object{probetest.ReadyWorkerNode("w1", "", 0, false)}
+	for i := 0; i < schedulerPreemptionMax; i++ {
+		objs = append(objs,
+			preemptedEvent("apps", fmt.Sprintf("fresh-%d", i), time.Minute))
+	}
+	for i := 0; i < 5; i++ {
+		// Outside the 5m window — a stale cascade tail is not a
+		// live storm.
+		objs = append(objs,
+			preemptedEvent("apps", fmt.Sprintf("stale-%d", i), 30*time.Minute))
+		// Same age, wrong reason — Scheduled chatter never counts.
+		e := preemptedEvent("apps", fmt.Sprintf("sched-%d", i), time.Minute)
+		e.Reason = "Scheduled"
+		objs = append(objs, e)
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("under-ceiling churn must pass: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_scheduler_preemption_storm",
+		map[string]string{})
+	if m == nil || m.GetGauge().GetValue() != 0 {
+		t.Fatalf("preemption_storm=%v, want 0", m)
+	}
+}
+
+// An events-list failure is a tolerated sub-failure — the check
+// reports Infra but the frozen signal still judges on its own
+// evidence (and an inconclusive storm is never a clean pass).
+func TestCheckSchedulerPreemptionListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	cs.PrependReactor("list", "events",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	if res.Infra == nil {
+		t.Fatalf("events list failure must surface as Infra: %+v", res)
 	}
 }

@@ -1,3 +1,8 @@
+// flux_helmrelease_retries.go — the flux-helmrelease-retries check
+// (W10-CP4): HelmReleases parked Ready=False past the stuck window
+// with a retries-exhausted failure get the reconcile annotation
+// triple stamped (requestedAt/forceAt/resetAt) so helm-controller
+// runs the release again.
 package gitops
 
 import (
@@ -58,10 +63,13 @@ const (
 	// fluxHRHealCooldown bounds reconcile-annotation patches to one
 	// per HelmRelease per 30m.
 	fluxHRHealCooldown = 30 * time.Minute
-	// The stamped pair is kube.AnnoFluxRequestedAt /
-	// kube.AnnoFluxForceAt — requestedAt asks for a reconcile,
-	// forceAt skips the artifact-cache freshness check (same pair
-	// the flux CLI `reconcile --with-source` writes).
+	// The stamped triple is kube.AnnoFluxRequestedAt /
+	// kube.AnnoFluxForceAt / kube.AnnoFluxResetAt — requestedAt asks
+	// for a reconcile, forceAt skips the artifact-cache freshness
+	// check (same pair the flux CLI `reconcile --with-source`
+	// writes), and resetAt clears the exhausted retry counter —
+	// helm-controller >= v0.37.0 ignores requestedAt/forceAt on a
+	// RetriesExceeded/Stalled HR without it (W12 P0-3).
 )
 
 // helmReleaseRetryGVRs are the HelmRelease API versions the check
@@ -230,6 +238,11 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 	patch, err := kube.MergePatchAnnos(map[string]any{
 		kube.AnnoFluxRequestedAt: token,
 		kube.AnnoFluxForceAt:     token,
+		// resetAt clears RetriesExceeded/Stalled on
+		// helm-controller >= v0.37.0 — the requestedAt/forceAt
+		// pair alone is deduped away once the retry counter is
+		// spent (same triple helmrelease-unlocker stamps).
+		kube.AnnoFluxResetAt: token,
 	})
 	if err != nil {
 		metrics.IncError(p.Name)

@@ -3,6 +3,12 @@
 // linkerd-injected namespaces for EndpointSlice desync, deletes
 // provably-stale controller-owned slices, and bounces the oldest
 // linkerd-destination pod past the persistence window.
+//
+// W12-NM1b rides the same sweep for the Cilium socket-LB vs Linkerd
+// compatibility audit: pod-netns bpf-lb-sock rewrites connect()
+// before linkerd-init's iptables rules can steer into the proxy,
+// silently killing SO_ORIGINAL_DST/mTLS — reported on
+// node_automation_cilium_linkerd_socklb_conflict.
 package nethealth
 
 import (
@@ -82,6 +88,11 @@ const (
 	// slices the desync heal deletes, since that controller is what
 	// recreates them with corrected contents.
 	linkerdSliceManagedByESC = "endpointslice-controller.k8s.io"
+
+	// W12-NM1b — ciliumConfigNS/ciliumConfigName locate the Cilium
+	// ConfigMap the socket-LB audit reads.
+	ciliumConfigNS   = "kube-system"
+	ciliumConfigName = "cilium-config"
 )
 
 var (
@@ -94,11 +105,24 @@ var (
 		Name: "node_automation_linkerd_endpoint_desync",
 		Help: "1 while the Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
 	}, []string{"namespace", "service"})
+
+	// W12-NM1b — the socket-LB conflict signal: 1 while Cilium runs
+	// pod-netns bpf-lb-sock alongside Linkerd without either
+	// compatibility knob (cni-exclusive=false keeps linkerd-init's
+	// iptables redirect authoritative; bpf-lb-sock-hostns-only=true
+	// confines socket-LB to the host netns for the node-local-dns
+	// LRPs). A plain gauge — the conflict is cluster-wide, not
+	// per-object.
+	ciliumLinkerdSockLBConflictGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_automation_cilium_linkerd_socklb_conflict",
+		Help: "1 while Cilium pod-netns socket-LB is enabled alongside Linkerd without cni-exclusive=false or bpf-lb-sock-hostns-only=true.",
+	})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		linkerdEndpointDesyncGauge)
+		linkerdEndpointDesyncGauge,
+		ciliumLinkerdSockLBConflictGauge)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +266,16 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}
 	injected := map[string]bool{}
+	// linkerdInstalled feeds the W12-NM1b socket-LB audit — the
+	// Cilium config only conflicts while the mesh itself is
+	// deployed on this cluster.
+	linkerdInstalled := false
 	for i := range nsList.Items {
 		if nsList.Items[i].Labels[linkerdInjectLabel] == "enabled" {
 			injected[nsList.Items[i].Name] = true
+		}
+		if nsList.Items[i].Name == probefw.LinkerdNS {
+			linkerdInstalled = true
 		}
 	}
 
@@ -386,7 +417,20 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	var rep probefw.SweepReport
+
+	// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit:
+	// when Cilium's bpf-lb-sock rewrites connect() inside the pod
+	// netns, packets reach linkerd-proxy already resolved to a
+	// backend IP — the proxy never sees the Service identity, so
+	// mTLS and L7 balancing silently turn off (the classic
+	// Buoyant/Isovalent interop trap). The two safe shapes are
+	// cni-exclusive="false" (Cilium respects linkerd-init's iptables
+	// rules) or bpf-lb-sock-hostns-only="true" (socket-LB stays in
+	// the host netns — enough for the node-local-dns LRPs).
+	p.auditCiliumLinkerdSockLB(ctx, log, linkerdInstalled, &rep)
+
 	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
+	var emitted []string
 	for k, svc := range desynced {
 		// The window gates the stale-EndpointSlice delete plus the
 		// linkerd-destination bounce — an operator restart must not
@@ -401,6 +445,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 		rep.Emit(linkerdEndpointDesyncGauge, k,
 			[]string{svc.Namespace, svc.Name}, k)
+		emitted = append(emitted, k)
 	}
 	rep.Close(&p.linkerdDesyncEmitted,
 		linkerdEndpointDesyncGauge.DeleteLabelValues)
@@ -408,8 +453,10 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.
 	// The 1h cooldown is per desynced SERVICE — two services stuck on
-	// the same root cause share one bounce.
-	for _, k := range rep.Findings() {
+	// the same root cause share one bounce. Iterates `emitted`, not
+	// rep.Findings(): the socket-LB audit (W12-NM1b) also reports
+	// findings into rep and must not trigger a desync heal.
+	for _, k := range emitted {
 		p.healLinkerdDestination(ctx, log, k, now, staleSlices[k])
 	}
 
@@ -531,4 +578,63 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	if healed {
 		p.linkerdDesyncHealed.Stamp(svcKey, now)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit
+// ---------------------------------------------------------------------------
+
+// ciliumSockLBConflictsWithLinkerd reports whether the cilium-config
+// data runs pod-netns Socket-LB in a shape that bypasses linkerd's
+// iptables redirect: bpf-lb-sock="true" with NEITHER compatibility
+// knob set. cni-exclusive="false" keeps linkerd-init's rules
+// authoritative (Cilium shares the CNI chain instead of owning it);
+// bpf-lb-sock-hostns-only="true" confines socket-LB to the host
+// netns — the node-local-dns LRPs keep working while pod traffic
+// still flows through linkerd-proxy.
+func ciliumSockLBConflictsWithLinkerd(data map[string]string) bool {
+	if data["bpf-lb-sock"] != "true" {
+		return false
+	}
+	return data["cni-exclusive"] != "false" &&
+		data["bpf-lb-sock-hostns-only"] != "true"
+}
+
+// auditCiliumLinkerdSockLB runs the W12-NM1b runtime half of the
+// static socket-LB gate: with Linkerd installed AND Cilium's
+// ConfigMap present, pod-netns bpf-lb-sock without a compatibility
+// knob silently bypasses linkerd-proxy (SO_ORIGINAL_DST never sees
+// the original ClusterIP). No mesh → no conflict; no cilium-config →
+// no Cilium, so no socket-LB to conflict with. A ConfigMap read
+// failure is tolerated (WARN + InfraErr) — "can't tell" must not
+// read as resolved, so the gauge keeps its last value.
+func (p *linkerdEndpointSyncCheck) auditCiliumLinkerdSockLB(
+	ctx context.Context, log logr.Logger, linkerdInstalled bool,
+	rep *probefw.SweepReport) {
+
+	if !linkerdInstalled {
+		ciliumLinkerdSockLBConflictGauge.Set(0)
+		return
+	}
+	cm, err := p.CS.CoreV1().ConfigMaps(ciliumConfigNS).
+		Get(ctx, ciliumConfigName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		ciliumLinkerdSockLBConflictGauge.Set(0)
+		return
+	case err != nil:
+		log.Info("WARN: cilium-config get failed — socket-LB audit inconclusive",
+			"error", err)
+		rep.InfraErr(fmt.Errorf("get configmap %s/%s: %w",
+			ciliumConfigNS, ciliumConfigName, err))
+		return
+	}
+	if !ciliumSockLBConflictsWithLinkerd(cm.Data) {
+		ciliumLinkerdSockLBConflictGauge.Set(0)
+		return
+	}
+	ciliumLinkerdSockLBConflictGauge.Set(1)
+	rep.Find(ciliumConfigNS + "/" + ciliumConfigName +
+		": bpf-lb-sock=true without cni-exclusive=false or " +
+		"bpf-lb-sock-hostns-only=true — pod-netns socket-LB bypasses linkerd-proxy")
 }

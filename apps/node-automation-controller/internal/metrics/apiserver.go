@@ -24,6 +24,15 @@ var apiBackendQuarantined = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the backend IP is quarantined out of default/Endpoints and EndpointSlice kubernetes.",
 }, []string{"backend"})
 
+// apiBackendJWKSKIDSkew marks (1) a backend whose /openid/v1/jwks kid
+// set disagrees with the healthy-backend majority for the streak
+// threshold — sa.pub/sa.key rotation skew surfaces as random 401s
+// across the HAProxy pool (W12-CP4b).
+var apiBackendJWKSKIDSkew = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_apiserver_jwks_kid_skew",
+	Help: "1 while the backend's JWKS kid set mismatches the control-plane majority (SA signer-key skew).",
+}, []string{"backend"})
+
 // ---------------------------------------------------------------------------
 // Self-healing / gray-failure defense metrics (Quick-Wins + C1-C6).
 // Exported so the module packages under internal/<domain>/ drive the
@@ -44,6 +53,15 @@ var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.Counte
 	Name: "node_automation_webhook_circuit_breaker_trips_total",
 	Help: "Circuit-breaker trips per webhook config.",
 }, []string{"kind", "name"})
+
+// WebhookMissingCriticalNSExclusion marks (1) live admission sub-webhooks
+// with failurePolicy=Fail whose namespaceSelector still matches any of the
+// critical self-healing namespaces (kube-system, node-ops, medik8s) — catches
+// Helm/operator-installed webhooks invisible to static check-webhook-guard.sh (W12-CP-B).
+var WebhookMissingCriticalNSExclusion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_missing_critical_ns_exclusion",
+	Help: "1 while the fail-closed sub-webhook's namespaceSelector matches kube-system, node-ops, or medik8s.",
+}, []string{"kind", "name", "webhook"})
 
 // ---------------------------------------------------------------------------
 // Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
@@ -92,8 +110,9 @@ var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 // follows declaration order.
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		apiBackendRVGap, apiBackendQuarantined,
+		apiBackendRVGap, apiBackendQuarantined, apiBackendJWKSKIDSkew,
 		WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
+		WebhookMissingCriticalNSExclusion,
 		APIServiceUnavailable,
 		UnmeshedPods, UnmeshedPodsRecreatedTotal,
 		APIServiceUnblockHealsTotal)
@@ -112,10 +131,21 @@ func ObserveAPIBackend(ip string, rvGap float64, quarantined bool) {
 	apiBackendQuarantined.WithLabelValues(ip).Set(v)
 }
 
+// ObserveAPIBackendJWKSSkew records this cycle's JWKS kid-set
+// majority verdict for backend `ip` (W12-CP4b).
+func ObserveAPIBackendJWKSSkew(ip string, skewed bool) {
+	v := 0.0
+	if skewed {
+		v = 1
+	}
+	apiBackendJWKSKIDSkew.WithLabelValues(ip).Set(v)
+}
+
 // ForgetAPIBackend prunes the per-backend series when an IP leaves the
 // controller set (controller decommissioned) so /metrics does not leak
 // stale label values.
 func ForgetAPIBackend(ip string) {
 	apiBackendRVGap.DeleteLabelValues(ip)
 	apiBackendQuarantined.DeleteLabelValues(ip)
+	apiBackendJWKSKIDSkew.DeleteLabelValues(ip)
 }

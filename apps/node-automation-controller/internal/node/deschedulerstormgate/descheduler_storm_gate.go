@@ -12,7 +12,13 @@
 //	b) no node may hold a True condition from stormConds (NPD
 //	   watchdog-state-monitor latches, network-problem-detector
 //	   K8sExporter, kubelet pressure);
-//	c) no node may carry a stormTaints key (set by reaper/evictor).
+//	c) no node may carry a stormTaints key (set by reaper/evictor);
+//	d) W12-SC1 — no PriorityClass preemption cascade: more than
+//	   stormPreemptionMax reason=Preempted events inside
+//	   stormPreemptionWindow is a domino eviction storm (a
+//	   high-priority pod preempts victims that preempt their own
+//	   victims) — the descheduler's evictions would add another
+//	   wave on top.
 //
 // Storm -> scale to 0, clear -> back to 1. The verdict + evidence is
 // recorded in annotation passiontech.dev/storm-gate-decision for
@@ -71,13 +77,21 @@ import (
 const (
 	stormGateHoldAnno     = kube.AnnoStormGateHold
 	stormGateDecisionAnno = kube.AnnoStormGateDecision
+
+	// W12-SC1 — preemption-cascade knobs, matched to
+	// scheduler-watchdog's: an ordinary scheduler emits a handful
+	// of Preempted events during placement churn; more than the
+	// ceiling inside the window is a domino cascade.
+	stormPreemptionWindow = 5 * time.Minute
+	stormPreemptionMax    = 15
 )
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
 // NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
 // node-host-agent overlay conditions; KernelHungTasks,
 // KernelSlabLeak, KernelResourceExhaustion, CgroupDyingLeak,
-// MemoryPSIThrashing, ClockUnsynchronized, JournaldWedged,
+// MemoryPSIThrashing, ClockUnsynchronized, ClockSkewDetected
+// (W12-1.4 — chrony still synced but >2s offset), JournaldWedged,
 // SystemdSessionLeak, ConntrackExhausted, InodePressure,
 // KubeletPLEGUnhealthy, ControlPlaneFrozen, CalicoFelixDown,
 // CiliumIPAMExhausted and the remaining Cilium* latches are the
@@ -91,13 +105,13 @@ var stormConds = []corev1.NodeConditionType{
 	"DiskPressure", "NetworkUnavailable", "FilesystemReadOnly",
 	"NebulaIsolated", "NebulaDegraded", "NebulaPMTUBlackhole",
 	"KernelHungTasks", "KernelSlabLeak", "ClockUnsynchronized",
-	"CalicoFelixDown", "CiliumIPAMExhausted",
+	"ClockSkewDetected", "CalicoFelixDown", "CiliumIPAMExhausted",
 	"InodePressure", "MemoryPSIThrashing", "CgroupDyingLeak",
 	"KernelResourceExhaustion", "KubeletPLEGUnhealthy",
 	"SystemdSessionLeak", "CiliumAgentDown", "CiliumInitStuck",
 	"CiliumEnvoyDown", "CiliumWGStale", "CiliumLRPDegraded",
 	"CiliumMTUDrift", "ConntrackExhausted", "JournaldWedged",
-	"ControlPlaneFrozen",
+	"ControlPlaneFrozen", "DiskSlowIO",
 }
 
 // stormTaints mirrors STORM_TAINTS.
@@ -227,10 +241,29 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		return ctrl.Result{}, err
 	}
 
+	// W12-SC1 storm signal (d): a PriorityClass preemption cascade
+	// — a domino wave of reason=Preempted events — gates the
+	// descheduler so its own evictions do not amplify the storm.
+	// The read happens AFTER the deployment-exists skip so a
+	// cluster without descheduler never pays for (or fails on)
+	// the events scan; a list error aborts the reconcile — never a
+	// "clear" verdict on blind data.
+	var preempted []string
+	preemptedCount, err := kube.CountRecentEvents(ctx, r.cs,
+		kube.PreemptedEventReason, stormPreemptionWindow, now)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("list preempted events: %w", err)
+	}
+	if preemptedCount > stormPreemptionMax {
+		preempted = append(preempted, fmt.Sprintf(
+			"%d Preempted events in %s (>%d)",
+			preemptedCount, stormPreemptionWindow, stormPreemptionMax))
+	}
+
 	want := int32(1)
 	verdict := "clear"
 	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 ||
-		len(cordoned) > 0 || len(maintenance) > 0 {
+		len(cordoned) > 0 || len(maintenance) > 0 || len(preempted) > 0 {
 		want, verdict = 0, "storm"
 	}
 
@@ -246,18 +279,19 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		cur = *deploy.Spec.Replicas
 		curStr = strconv.Itoa(int(cur))
 	}
-	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s]",
+	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s]",
 		r.now.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
 		strings.Join(notReady, "\n"), strings.Join(bad, "\n"),
 		strings.Join(tainted, "\n"), strings.Join(cordoned, "\n"),
-		strings.Join(maintenance, "\n"))
+		strings.Join(maintenance, "\n"), strings.Join(preempted, "\n"))
 
 	switch {
 	case cur != want:
 		log.Info("storm-gate: scaling replicas",
 			"verdict", verdict, "from", curStr, "to", want,
 			"notReady", notReady, "bad", bad, "tainted", tainted,
-			"cordoned", cordoned, "maintenance", maintenance)
+			"cordoned", cordoned, "maintenance", maintenance,
+			"preempted", preempted)
 		// One merge patch carries spec.replicas AND the decision
 		// annotation — two back-to-back merge patches on the same
 		// Deployment would pay two API writes for one logical act.

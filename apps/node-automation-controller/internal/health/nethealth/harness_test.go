@@ -31,6 +31,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewLinkerdH2StreamGuardCheck,
 		NewCloudflaredTunnelHealthCheck,
 		NewLiqoTunnelHealthCheck,
+		NewKonnectivityTunnelHealthCheck,
 		NewGatewayRouteHealthCheck,
 	)
 	// The production sweep resolves the CILIUM_* knobs into

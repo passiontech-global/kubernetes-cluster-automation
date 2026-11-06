@@ -172,8 +172,8 @@ func TestCheckNodeHangStaleStampCleanup(t *testing.T) {
 // inside the fuse the NTP daemon gets its resync window.
 func TestCheckNodeHangClockSkewCordon(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		probetest.ReadyWorkerNode("w-skew", nodeClockSkewCond, 15*time.Minute, false),
-		probetest.ReadyWorkerNode("w-skew-fresh", nodeClockSkewCond, 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-skew", "ClockUnsynchronized", 15*time.Minute, false),
+		probetest.ReadyWorkerNode("w-skew-fresh", "ClockUnsynchronized", 5*time.Minute, false),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
@@ -187,6 +187,28 @@ func TestCheckNodeHangClockSkewCordon(t *testing.T) {
 	fresh, _ := cs.CoreV1().Nodes().Get(ctx, "w-skew-fresh", metav1.GetOptions{})
 	if fresh.Spec.Unschedulable {
 		t.Fatal("fresh ClockUnsynchronized cordoned inside the NTP resync window")
+	}
+}
+
+// W12-1.4 — ClockSkewDetected (chrony synced but >2s offset) rides
+// the same 10m clock fuse as ClockUnsynchronized.
+func TestCheckNodeHangClockSkewDetectedCordon(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-skew2", "ClockSkewDetected", 15*time.Minute, false),
+		probetest.ReadyWorkerNode("w-skew2-fresh", "ClockSkewDetected", 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("sustained ClockSkewDetected did not fail the check")
+	}
+	old, _ := cs.CoreV1().Nodes().Get(ctx, "w-skew2", metav1.GetOptions{})
+	if !old.Spec.Unschedulable ||
+		old.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+		t.Fatal("sustained ClockSkewDetected not cordoned+stamped")
+	}
+	fresh, _ := cs.CoreV1().Nodes().Get(ctx, "w-skew2-fresh", metav1.GetOptions{})
+	if fresh.Spec.Unschedulable {
+		t.Fatal("fresh ClockSkewDetected cordoned inside the resync window")
 	}
 }
 

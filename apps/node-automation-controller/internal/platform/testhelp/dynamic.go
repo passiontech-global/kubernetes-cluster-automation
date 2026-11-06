@@ -129,15 +129,20 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	// shipwright.io itself serves the v1beta1 Build/BuildRun APIs and
 	// has no v1alpha1 shipwrightbuilds resource.
 	{Group: "tekton.dev", Version: "v1", Kind: "PipelineRun"},
+	{Group: "tekton.dev", Version: "v1", Kind: "TaskRun"},
 	{Group: "shipwright.io", Version: "v1beta1", Kind: "Build"},
 	{Group: "shipwright.io", Version: "v1beta1", Kind: "BuildRun"},
 	{Group: "operator.shipwright.io", Version: "v1alpha1", Kind: "ShipwrightBuild"},
 
-	// the remaining watched operators (clusterhealthprobes).
+	// the remaining watched operators (clusterhealthprobes) + the
+	// wave-12 scans (kargo promotion health, argo analysisrun zombie
+	// guard, percona quorum).
 	{Group: "rabbitmq.com", Version: "v1beta1", Kind: "RabbitmqCluster"},
 	{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"},
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Stage"},
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Warehouse"},
+	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Promotion"},
+	{Group: "argoproj.io", Version: "v1alpha1", Kind: "AnalysisRun"},
 	{Group: "scylla.scylladb.com", Version: "v1", Kind: "ScyllaCluster"},
 	{Group: "dragonflydb.io", Version: "v1alpha1", Kind: "Dragonfly"},
 
@@ -145,11 +150,15 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	// sweep module's dyn client reads (kube.AutopilotPlanGVR).
 	{Group: "autopilot.k0sproject.io", Version: "v1beta2", Kind: "Plan"},
 
-	// gateway-api (clusterhealthprobes' cilium gateway signature).
+	// gateway-api (clusterhealthprobes' cilium gateway signature) +
+	// the reference-grant census gateway-route-health lists under
+	// both served versions.
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GatewayClass"},
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"},
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"},
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GRPCRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"},
+	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Kind: "ReferenceGrant"},
 }
 
 // buildDynScheme assembles the scheme NewDynamicClient and DynScheme

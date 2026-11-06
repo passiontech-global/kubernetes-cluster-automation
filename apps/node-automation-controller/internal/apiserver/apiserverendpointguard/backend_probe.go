@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
@@ -26,24 +27,28 @@ import (
 )
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
-// RV, the watch-cache list RV, or the transport/HTTP error.
+// RV, the watch-cache list RV, the sorted JWKS kid set, or the
+// transport/HTTP error.
 type apiProbeResult struct {
-	liveRV  int64
-	cacheRV int64
-	err     error
+	liveRV   int64
+	cacheRV  int64
+	jwksKIDs string // sorted,space-joined keys[].kid; "" when unfetchable
+	err      error
 }
 
 // backendProbeState carries the consecutive-cycle streaks a single
 // backend must accumulate before the guard acts — wedges are never a
 // one-sample verdict (same convention as kubeletReaperProbes).
 type backendProbeState struct {
-	gapStreak    int // consecutive cycles with live_rv-cache_rv >= threshold
-	frozenStreak int // consecutive cycles cache_rv flat while live_rv grew
-	okStreak     int // consecutive healthy cycles (recovery latch)
-	errStreak    int // consecutive probe transport/5xx failures
-	lastLiveRV   int64
-	lastCacheRV  int64
-	haveLast     bool
+	gapStreak     int // consecutive cycles with live_rv-cache_rv >= threshold
+	frozenStreak  int // consecutive cycles cache_rv flat while live_rv grew
+	okStreak      int // consecutive healthy cycles (recovery latch)
+	errStreak     int // consecutive probe transport/5xx failures
+	kidSkewStreak int // consecutive cycles jwksKIDs != healthy majority
+	lastLiveRV    int64
+	lastCacheRV   int64
+	lastKIDs      string // last fetched JWKS kid set ("" = unfetchable)
+	haveLast      bool
 }
 
 // probe measures live_rv and cache_rv of one apiserver backend.
@@ -65,7 +70,11 @@ func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeR
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("cache rv: %w", err)}
 	}
-	return apiProbeResult{liveRV: liveRV, cacheRV: cacheRV}
+	// W12-CP4b: the JWKS kid set is best-effort — a fetch failure
+	// yields "" and simply skips that backend in the skew census
+	// (inconclusive, never a wedge signal by itself).
+	kids, _ := fetchJWKSKIDs(ctx, client, ip)
+	return apiProbeResult{liveRV: liveRV, cacheRV: cacheRV, jwksKIDs: kids}
 }
 
 // probeClient returns the single probe http.Client (transport() +
@@ -155,6 +164,44 @@ func fetchListRV(ctx context.Context, client *http.Client, ip, path string) (int
 	return strconv.ParseInt(body.Metadata.ResourceVersion, 10, 64)
 }
 
+// fetchJWKSKIDs GETs /openid/v1/jwks on one backend and returns its
+// keys[].kid set sorted and space-joined — identical sets compare
+// equal as strings (W12-CP4b sa.pub/sa.key rotation-skew audit).
+func fetchJWKSKIDs(ctx context.Context, client *http.Client, ip string) (string, error) {
+	url := "https://" + net.JoinHostPort(ip, endpointGuardPort) + "/openid/v1/jwks"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		Keys []struct {
+			KID string `json:"kid"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	kids := make([]string, 0, len(body.Keys))
+	for _, k := range body.Keys {
+		if k.KID != "" {
+			kids = append(kids, k.KID)
+		}
+	}
+	slices.Sort(kids)
+	return strings.Join(kids, " "), nil
+}
+
 // ---------------------------------------------------------------------------
 // Per-cycle verdicts — fold each backend's probe result into the
 // streaks above, then turn the streaks into this cycle's
@@ -219,6 +266,7 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 				st.frozenStreak = 0
 			}
 			st.lastLiveRV, st.lastCacheRV, st.haveLast = res.liveRV, res.cacheRV, true
+			st.lastKIDs = res.jwksKIDs
 			o.wedged = st.gapStreak >= endpointGuardGapCycles ||
 				st.frozenStreak >= endpointGuardFrozenCyc
 			o.healthy = gap < endpointGuardRVGap && st.frozenStreak < endpointGuardFrozenCyc
@@ -230,6 +278,46 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 			metrics.ObserveAPIBackend(ip, float64(gap), quarantinedIPs[ip])
 		}
 		results[ip] = o
+	}
+
+	// ---- JWKS kid-set skew census (W12-CP4b) -------------------------
+	// Majority vote across backends that returned a kid set: the most
+	// common set wins, a dissenting backend accumulates
+	// kidSkewStreak — >=3 cycles means its sa.pub/sa.key pair is out
+	// of rotation step (random 401s through the LB pool). Empty sets
+	// (unfetchable JWKS) neither vote nor accuse.
+	kidVotes := map[string]int{}
+	for _, ip := range allIPs {
+		if st := g.backends[ip]; st != nil && st.lastKIDs != "" {
+			kidVotes[st.lastKIDs]++
+		}
+	}
+	majorityKIDs, majorityN := "", 0
+	for k, n := range kidVotes {
+		if n > majorityN || (n == majorityN && k < majorityKIDs) {
+			majorityKIDs, majorityN = k, n
+		}
+	}
+	for _, ip := range allIPs {
+		st := g.backends[ip]
+		if st == nil {
+			continue
+		}
+		// Skew needs >=2 voters (a one-backend cluster can't
+		// disagree) and a dissenting non-empty set.
+		skew := len(kidVotes) > 0 && majorityN >= 2 &&
+			st.lastKIDs != "" && st.lastKIDs != majorityKIDs
+		if skew {
+			st.kidSkewStreak++
+		} else {
+			st.kidSkewStreak = 0
+		}
+		flagged := st.kidSkewStreak >= endpointGuardKidSkewCycles
+		metrics.ObserveAPIBackendJWKSSkew(ip, flagged)
+		if flagged {
+			log.Error(fmt.Errorf("JWKS kid set skew"), "backend serves a different ServiceAccount signer kid set than the control-plane majority — random 401s through the LB pool (sa.pub/sa.key rotation skew)",
+				"ip", ip, "cycles", st.kidSkewStreak)
+		}
 	}
 
 	// Prune state + metric series for IPs that left the controller set.

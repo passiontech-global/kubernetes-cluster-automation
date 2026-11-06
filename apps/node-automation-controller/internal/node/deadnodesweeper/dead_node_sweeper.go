@@ -314,9 +314,19 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bo
 	return false, nil
 }
 
-// hasRemediationCR reports whether any medik8s remediation object is
-// named after the node (CR name == node name in both CRDs). A missing
-// CRD is "no evidence", not an error — other list failures are real.
+// remediationNodeNameAnno is the annotation medik8s NHC (>= v0.6)
+// stamps on remediation CRs it names "<nodeName>-<templateName>"
+// (escalatingRemediations / multi-template setups) — the CR name no
+// longer equals the node name, so the annotation carries the
+// fencing target (W12 P0-7).
+const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
+
+// hasRemediationCR reports whether any medik8s remediation object
+// targets the node: CR name == node name (the 1:1 shape both CRDs
+// historically use), the remediation.medik8s.io/node-name
+// annotation, or a "<nodeName>-" name prefix (the template-suffixed
+// shape NHC v0.6+ emits). A missing CRD is "no evidence", not an
+// error — other list failures are real.
 func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string) (bool, error) {
 	// A missing dynamic client is a wiring bug, not "no fencing
 	// evidence" — unverifiable fails closed like every other check
@@ -337,7 +347,9 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 			return false, fmt.Errorf("list %s: %w", gvr.Resource, err)
 		}
 		for i := range items {
-			if items[i].GetName() == nodeName {
+			if items[i].GetName() == nodeName ||
+				items[i].GetAnnotations()[remediationNodeNameAnno] == nodeName ||
+				strings.HasPrefix(items[i].GetName(), nodeName+"-") {
 				return true, nil
 			}
 		}

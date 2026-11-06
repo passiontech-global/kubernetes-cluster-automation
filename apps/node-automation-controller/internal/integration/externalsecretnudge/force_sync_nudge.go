@@ -6,14 +6,20 @@
 // persisted stamps esNudgeStamp reads back — durable across restarts,
 // so no in-RAM ledger is needed.
 // Also carries the W9-GO1 storm census: a mass-failure storm
-// suppresses every stamp and feeds the connect auto-heal.
+// suppresses every stamp and feeds the connect auto-heal — and the
+// W12-GO3 hygiene pair: the empty/whitespace-key audit on Ready=True
+// ExternalSecrets, plus the empty-skeleton Secret delete that runs
+// right before each delivered stamp.
 package externalsecretnudge
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strconv"
 	"time"
+
+	"github.com/go-logr/logr"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -84,6 +90,11 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	// a ClusterSecretStore down >=15m is itself a trigger.
 	n.maybeHealConnect(ctx, storm, now)
 
+	// W12-GO3 — the empty-key audit runs on every census too: it reads
+	// Ready=True ESs only, so a storm (or a total store outage) must
+	// not blind it — the early returns below come after it.
+	n.auditEmptySecretKeys(ctx, list)
+
 	if storm {
 		log.Info("sweep done", "nudged", 0, "storm", true)
 		return nil
@@ -124,6 +135,10 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
 			continue
 		}
+		// W12-GO3 — clear the empty skeleton BEFORE stamping: ESO can
+		// leave a len(Data)==0 target Secret behind after a failed
+		// sync, and the forced reconcile recreates it populated.
+		n.deleteEmptySkeletonSecret(ctx, es)
 		patch, err := kube.MergePatchAnnos(map[string]any{
 			esForceSyncAnno: strconv.FormatInt(now.Unix(), 10),
 			// Same moment in RFC3339 — the persisted cooldown
@@ -174,4 +189,164 @@ func esNudgeStamp(es *unstructured.Unstructured) (time.Time, bool) {
 		}
 	}
 	return latest, found
+}
+
+// ---------------------------------------------------------------------------
+// W12-GO3 — empty/whitespace-key audit + empty-skeleton Secret reaper
+// ---------------------------------------------------------------------------
+
+// auditEmptySecretKeys flags every empty credential ESO reports as
+// synced: an ExternalSecret can sit Ready=True while a key it wrote is
+// "" or whitespace-only — a 1Password item saved with an empty field,
+// or a remoteRef property typo pulling a blank value. For every
+// Ready=True ES (minus the passiontech.dev/allow-empty-secret-key
+// opt-out) the target Secret is read once: each spec.data[].secretKey
+// missing from the Secret AND each key present but
+// bytes.TrimSpace-empty emits
+// node_automation_externalsecret_empty_key{namespace,name,key}=1 via
+// the emptyKeyEmitted ledger, so a key that later syncs populated gets
+// its series deleted instead of pinning stale.
+func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
+	list *unstructured.UnstructuredList) {
+	if n.cs == nil {
+		return // no typed client wired — cannot read target Secrets
+	}
+	log := logf.FromContext(ctx)
+	for i := range list.Items {
+		es := &list.Items[i]
+		c, _ := kube.ConditionOf(es.Object, "Ready")
+		if c.Status != "True" {
+			continue // only a "successfully synced" ES can lie about content
+		}
+		if es.GetAnnotations()[kube.AnnoAllowEmptySecretKey] == "true" {
+			continue // operator opted out — empty values are legitimate here
+		}
+		ns, name := es.GetNamespace(), es.GetName()
+		target := esTargetSecretName(es)
+		secret, err := n.cs.CoreV1().Secrets(ns).Get(ctx, target, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			continue // no Secret yet — nothing to audit, not an error
+		case err != nil:
+			// Unverifiable is not "clean": re-emit this ES's last-sweep
+			// keys so a transient read flap doesn't drop a live alert.
+			metrics.IncError(n.queue)
+			log.Error(err, "target secret read failed — keeping last verdict",
+				"es", ns+"/"+name, "secret", target)
+			for k, lv := range n.emptyKeyEmitted.Last() {
+				if k.ns == ns && k.name == name {
+					n.emptyKeyEmitted.Emit(k, lv...)
+				}
+			}
+			continue
+		}
+		for k := range esDeclaredKeys(es) {
+			if _, present := secret.Data[k]; !present {
+				n.flagEmptyKey(log, es, k, "declared key missing from target secret")
+			}
+		}
+		for k, v := range secret.Data {
+			if len(bytes.TrimSpace(v)) == 0 {
+				n.flagEmptyKey(log, es, k, "key is empty/whitespace-only")
+			}
+		}
+	}
+	n.emptyKeyEmitted.Prune(metrics.ExternalSecretEmptyKey.DeleteLabelValues)
+}
+
+// flagEmptyKey emits one empty-key series through the ledger — Set
+// folds the gauge write and the emit bookkeeping into one call.
+func (n *externalSecretNudge) flagEmptyKey(log logr.Logger,
+	es *unstructured.Unstructured, key, why string) {
+	ns, name := es.GetNamespace(), es.GetName()
+	n.emptyKeyEmitted.Set(metrics.ExternalSecretEmptyKey, 1,
+		esEmptyKey{ns: ns, name: name, key: key}, ns, name, key)
+	log.Info("ALERT: ExternalSecret synced an empty secret key — "+
+		"Ready=True but the credential is blank",
+		"es", ns+"/"+name, "key", key, "why", why)
+}
+
+// esTargetSecretName resolves the Secret the ES writes:
+// spec.target.name when set, else the ES's own name (the ESO
+// default).
+func esTargetSecretName(es *unstructured.Unstructured) string {
+	if target, ok := kube.NestedString(
+		es.Object, "spec", "target", "name"); ok && target != "" {
+		return target
+	}
+	return es.GetName()
+}
+
+// esDeclaredKeys returns the target Secret key names spec.data[]
+// declares — the keys ESO is expected to have written; a declared key
+// absent from the Secret is as poisonous as an empty one.
+func esDeclaredKeys(es *unstructured.Unstructured) map[string]bool {
+	keys := map[string]bool{}
+	entries, _ := kube.NestedSlice(es.Object, "spec", "data")
+	for _, e := range entries {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, ok := kube.NestedString(m, "secretKey"); ok && k != "" {
+			keys[k] = true
+		}
+	}
+	return keys
+}
+
+// deleteEmptySkeletonSecret removes the zero-byte skeleton ESO leaves
+// behind when a sync fails after creating the target Secret: a Secret
+// provably owned by THIS ExternalSecret carrying len(Data)==0 never
+// gets filled by a reconcile that errors before the write — deleting
+// it lets the force-synced reconcile recreate the Secret wholesale.
+// Skeleton GC is exempt from the maintenance mutex like every orphan
+// cleanup (the mutex defers heal churn, not GC). Failures are
+// tolerated: the skeleton survives for the next stamp cycle and the
+// force-sync itself is still worth stamping.
+func (n *externalSecretNudge) deleteEmptySkeletonSecret(ctx context.Context,
+	es *unstructured.Unstructured) {
+	if n.cs == nil {
+		return
+	}
+	log := logf.FromContext(ctx)
+	ns, name := es.GetNamespace(), es.GetName()
+	target := esTargetSecretName(es)
+	secret, err := n.cs.CoreV1().Secrets(ns).Get(ctx, target, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return // no skeleton at all — the common path
+	case err != nil:
+		metrics.IncError(n.queue)
+		log.Error(err, "target secret read failed — skeleton kept (fail closed)",
+			"es", ns+"/"+name, "secret", target)
+		return
+	}
+	if len(secret.Data) != 0 {
+		return // carries data — not the empty-skeleton failure shape
+	}
+	// Only a Secret provably owned by THIS ExternalSecret may go: a
+	// same-named hand-made or differently-owned Secret (UID differs —
+	// the ES was recreated) is never ours to delete.
+	owned := false
+	for _, or := range secret.OwnerReferences {
+		if or.Kind == "ExternalSecret" && or.Name == name &&
+			or.UID == es.GetUID() {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return
+	}
+	if err := n.cs.CoreV1().Secrets(ns).Delete(ctx, target,
+		kube.UIDDeleteOptions(secret.UID, metav1.DeletePropagationBackground)); err != nil {
+		metrics.IncError(n.queue)
+		log.Error(err, "empty skeleton secret delete failed",
+			"es", ns+"/"+name, "secret", target)
+		return
+	}
+	log.Info("DELETE secret: empty skeleton owned by failing ExternalSecret — "+
+		"force-sync will recreate it populated",
+		"es", ns+"/"+name, "secret", target)
 }

@@ -23,6 +23,13 @@
 // passiontech.dev/last-es-nudge) is younger than an hour is already
 // poked, so a flapping store cannot stampede the API even across
 // controller restarts.
+//
+// W12-GO3 rides the same sweep: a Ready=True ES whose target Secret
+// carries a missing/empty/whitespace-only key is flagged on
+// node_automation_externalsecret_empty_key (ESO happily reports
+// SecretSynced while the app reads an empty credential), and a
+// Ready=False ES whose ESO-owned target Secret is a len(Data)==0
+// skeleton has it deleted right before the force-sync stamp.
 package externalsecretnudge
 
 import (
@@ -79,6 +86,13 @@ var (
 	externalSecretGVRs     = kube.ExternalSecretGVRs
 )
 
+// esEmptyKey identifies one emitted ExternalSecretEmptyKey series —
+// the namespace/ES-name/secret-key triple needed to delete it again
+// once the key syncs populated (or the ES is annotated/gone).
+type esEmptyKey struct {
+	ns, name, key string
+}
+
 type externalSecretNudge struct {
 	cs  kubernetes.Interface // connect-pod heal target lists + deletes
 	dyn dynamic.Interface
@@ -109,6 +123,11 @@ type externalSecretNudge struct {
 	// sweep's heal preambles — one evaluation per Verdict TTL
 	// instead of three API reads per target.
 	verdict kube.Verdict
+	// emptyKeyEmitted: the ns/ES/key triples the W12-GO3 empty-key
+	// audit flagged on the previous sweep — a key that synced
+	// populated (or an ES that vanished) gets its series deleted so
+	// /metrics never leaks a stale "empty" series.
+	emptyKeyEmitted state.GaugeLedger[esEmptyKey]
 }
 
 // Setup registers the 10-minute sweep — or nothing when the cluster

@@ -1,0 +1,184 @@
+// konnectivity_tunnel_health_test.go — coverage for the
+// konnectivity-tunnel-health check (W12-CP3): the half-open deficit
+// persisting past the window heals the agent, an all-agents-down
+// shape never heals (server-side outage), and the no-CP /
+// no-Prometheus postures pass clean.
+package nethealth
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+)
+
+// konnCPNode builds a Ready control-plane node — the expectedCPCount
+// census member.
+func konnCPNode(name string) *corev1.Node {
+	n := probetest.ReadyWorkerNode(name, "", 0, false)
+	n.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+	return n
+}
+
+// konnAgentPod builds a Running konnectivity-agent member pod —
+// name-prefix matched like the DaemonSet's own pod names.
+func konnAgentPod(name, node string) *corev1.Pod {
+	pod := probetest.PodWithPhase("kube-system", name,
+		corev1.PodRunning, true, time.Hour)
+	pod.Spec.NodeName = node
+	return pod
+}
+
+// konnPromServer answers only the open_server_connections query —
+// every other series reads empty.
+func konnPromServer(t *testing.T,
+	byPod map[string]float64) *httptest.Server {
+	t.Helper()
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if !strings.Contains(query, "open_server_connections") {
+			return nil
+		}
+		var out []probetest.PromTestSample
+		for pod, v := range byPod {
+			out = append(out, probetest.PromTestSample{
+				Labels: map[string]string{
+					"namespace": "kube-system", "pod": pod},
+				Value: v})
+		}
+		return out
+	})
+	return srv
+}
+
+// konnProber wires the prom endpoint + client into the test prober —
+// the seam the production PromQuery reads per call.
+func konnProber(cs *fake.Clientset, srv *httptest.Server) *probetest.Prober {
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	return p
+}
+
+// A half-open agent persists the deficit past the 10m window while a
+// sibling holds the full count: the gauge fires and the wedged agent
+// is deleted so it re-dials every konnectivity-server.
+func TestKonnectivityHalfOpenHealsPastWindow(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 1, // expected 2 — half-open
+		"konnectivity-agent-b": 2,
+	})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	if res := check.Run(ctx); !res.Pass {
+		t.Fatalf("first sight is inside the window — must pass: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res := check.Run(ctx)
+	if res.Pass {
+		t.Fatal("half-open tunnel past the window must FAIL")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "konnectivity-agent-a", metav1.GetOptions{}); err == nil {
+		t.Fatal("half-open agent must be deleted while a sibling is fully connected")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "konnectivity-agent-b", metav1.GetOptions{}); err != nil {
+		t.Fatalf("fully-connected sibling must survive: %v", err)
+	}
+	m := probetest.FindMetric(t, "node_automation_konnectivity_agent_half_open",
+		map[string]string{"pod": "konnectivity-agent-a", "node": "w1"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("half-open gauge must emit {pod,node}")
+	}
+}
+
+// EVERY agent below the expected count is a server-side outage, not
+// a per-pod wedge — the gauge fires (alerting is the contract) but
+// no pod is deleted: bouncing agents during a konnectivity-server
+// outage only prolongs it.
+func TestKonnectivityAllHalfOpenNeverHeals(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 0,
+		"konnectivity-agent-b": 1,
+	})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	_ = check.Run(ctx)
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res := check.Run(ctx)
+	if res.Pass {
+		t.Fatal("all-agents half-open must still FAIL the check")
+	}
+	for _, name := range []string{"konnectivity-agent-a", "konnectivity-agent-b"} {
+		if _, err := cs.CoreV1().Pods("kube-system").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("no healthy peer — %s must not be deleted: %v", name, err)
+		}
+	}
+}
+
+// Every agent at the full connection count is healthy — the
+// early-exit never even lists pods.
+func TestKonnectivityFullyConnectedPasses(t *testing.T) {
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 2, "konnectivity-agent-b": 2})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+	}...)
+	p := konnProber(cs, srv)
+	if res := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p).
+		Run(ctx); !res.Pass {
+		t.Fatalf("fully-connected agents must pass: %+v", res)
+	}
+}
+
+// Zero Ready control-plane nodes: the expected count is unprovable
+// (and the cluster has bigger problems) — pass without ever querying
+// Prometheus or listing pods.
+func TestKonnectivityNoReadyControlPlanePasses(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset(
+		konnAgentPod("konnectivity-agent-a", "w1")))
+	if res := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p).
+		Run(ctx); !res.Pass {
+		t.Fatalf("no ready CP must pass: %+v", res)
+	}
+}
+
+// No resolvable Prometheus endpoint: the only evidence source is
+// offline — the check has nothing to evaluate and passes.
+func TestKonnectivityNoPrometheusPasses(t *testing.T) {
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+	}...)
+	p := testProber(cs) // HTTPContent.URL points at a dead address
+	if res := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p).
+		Run(ctx); !res.Pass {
+		t.Fatalf("no prometheus endpoint must pass: %+v", res)
+	}
+}

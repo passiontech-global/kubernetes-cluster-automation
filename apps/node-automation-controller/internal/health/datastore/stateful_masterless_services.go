@@ -62,6 +62,17 @@ type statefulMasterlessCheck struct {
 	drHealed       state.CooldownSet
 	drPodHealed    state.CooldownSet
 	drOpHealAt     time.Time
+	// W12-SC2 watchdog state:
+	//   - multiMasterStreak: "ns/svc/sts" → consecutive sweeps the
+	//     master-role Service showed >1 Ready endpoints — a
+	//     split-brain must hold two sweeps to outlive a relabeling
+	//     flap.
+	//   - multiMasterEmitted / siteSkewEmitted: the emitted-gauge
+	//     ledgers for the W12-SC2 tuples — a split-brain or skew
+	//     that resolves loses its series via DeleteLabelValues.
+	multiMasterStreak  state.StreakLedger
+	multiMasterEmitted state.GaugeLedger[string]
+	siteSkewEmitted    state.GaugeLedger[string]
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-target heal preambles share — one evaluation per
 	// Verdict TTL instead of three API reads per masterless service.
@@ -115,6 +126,22 @@ const (
 	// dragonflyPodHealAnno persists the last ordinal-0 pod delete on
 	// the STS — the restart-proof half of the cooldown.
 	dragonflyPodHealAnno = kube.AnnoLastDragonflyPodHeal
+
+	// W12-SC2 — split-brain: a master-role Service carrying >1
+	// Ready endpoint must hold this many consecutive sweeps — an
+	// operator relabeling flap settles inside one.
+	statefulMultiMasterMinStreak = 2
+	// W12-SC2 — primary-site skew: the two DC zones this cluster
+	// spans. After maintenance on the main site every stateful
+	// master can stay pinned to the standby site — reads/writes
+	// then pay the inter-DC tunnel RTT forever.
+	statefulMainSiteZone    = "datahub"
+	statefulStandbySiteZone = "lanit"
+	// statefulSiteSkewMaxPinned: at or above this share of all
+	// evaluated stateful masters pinned to the standby zone the
+	// pinning is a cluster-level skew event, not one operator's
+	// election outcome.
+	statefulSiteSkewMaxPinned = 0.8
 )
 
 var (
@@ -124,11 +151,31 @@ var (
 		Name: "node_automation_stateful_service_zero_endpoints",
 		Help: "1 while the master-role Service of a ready StatefulSet reports 0 Ready endpoints.",
 	}, []string{"namespace", "service", "statefulset"})
+
+	// W12-SC2 — the split-brain signal: 1 while a master-role
+	// Service routes to more than one Ready pod for two consecutive
+	// sweeps (two pods answering the master role at once).
+	statefulServiceMultipleMastersGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_stateful_service_multiple_masters",
+		Help: "1 while a master-role Service reports >1 Ready endpoints for >=2 consecutive sweeps — a multi-master split brain.",
+	}, []string{"namespace", "service", "statefulset"})
+
+	// W12-SC2 — the cross-DC pinning signal: 1 while a stateful
+	// master's Ready endpoint lives in the standby zone (lanit)
+	// while the STS also serves Ready replicas in the main zone
+	// (datahub) — or while >=80% of all stateful masters are pinned
+	// to the standby zone.
+	statefulMasterSiteSkewGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_stateful_master_site_skew",
+		Help: "1 while a stateful master's Ready endpoint is pinned to the standby topology zone while the main zone serves Ready replicas (or >=80% of all stateful masters are standby-pinned).",
+	}, []string{"namespace", "service", "statefulset", "zone"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		statefulServiceZeroEndpointsGauge)
+		statefulServiceZeroEndpointsGauge,
+		statefulServiceMultipleMastersGauge,
+		statefulMasterSiteSkewGauge)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,8 +292,10 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// Ready-endpoint census per ns/service — same source as the
 	// webhook guard (paged, service-name label binding, nil ready
 	// counts as ready). A list error skips the whole check: "0
-	// ready" is indistinguishable from "no data".
-	ready := map[string]int{}
+	// ready" is indistinguishable from "no data". W12-SC2 keeps the
+	// endpoint detail (zone/node/targetRef) so the split-brain and
+	// site-skew signatures can place each endpoint.
+	ready := map[string][]readyEndpoint{}
 	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
 		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
@@ -258,9 +307,20 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 				}
 				key := s.Namespace + "/" + svc
 				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
-						ready[key]++
+					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+						continue
 					}
+					e := readyEndpoint{}
+					if ep.Zone != nil {
+						e.zone = *ep.Zone
+					}
+					if ep.NodeName != nil {
+						e.node = *ep.NodeName
+					}
+					if ref := ep.TargetRef; ref != nil && ref.Kind == "Pod" {
+						e.podKey = ref.Namespace + "/" + ref.Name
+					}
+					ready[key] = append(ready[key], e)
 				}
 			}
 			return nil
@@ -268,6 +328,46 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
 	}
+
+	// W12-SC2 reads: node topology zones (the skew gate + the
+	// nodeName resolution path) and the pod census (targetRef
+	// fallback + STS replica zones). Same full-truth posture —
+	// either list failing skips the skew eval entirely, never a
+	// false pin.
+	nodeZone := map[string]string{}
+	zoneWorkers := map[string]bool{} // zones with >=1 Ready schedulable worker
+	podNode := map[string]string{}   // "ns/name" -> nodeName
+	var podItems []corev1.Pod
+	nodes, nerr := kube.ListNodes(ctx, p.CS)
+	pods, perr := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.Pods(p.CS, metav1.NamespaceAll))
+	skewEval := nerr == nil && perr == nil
+	if !skewEval {
+		// Tolerated: the skew signatures go dark this sweep, the
+		// masterless/multimaster ones are unaffected.
+		log.Info("WARN: node/pod census failed — site-skew evaluation skipped",
+			"nodeErr", fmt.Sprint(nerr), "podErr", fmt.Sprint(perr))
+	} else {
+		for i := range nodes {
+			nodeZone[nodes[i].Name] = nodes[i].Labels[corev1.LabelTopologyZone]
+			if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
+				!kube.IsControlPlane(&nodes[i]) {
+				if z := nodeZone[nodes[i].Name]; z != "" {
+					zoneWorkers[z] = true
+				}
+			}
+		}
+		podItems = pods
+		for i := range pods {
+			podNode[pods[i].Namespace+"/"+pods[i].Name] = pods[i].Spec.NodeName
+		}
+	}
+	// The skew signatures only mean something on a multi-zone
+	// cluster where BOTH sites have live workers — a single-zone
+	// cluster or a dead site can't skew.
+	multiZone := zoneWorkers[statefulMainSiteZone] &&
+		zoneWorkers[statefulStandbySiteZone]
 
 	// Candidates: a ready STS paired with a master-role Service
 	// routing to its pods.
@@ -300,11 +400,17 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	seen := map[string]bool{}   // tuples observed at 0 ready this sweep
-	var rep probefw.SweepReport // tuples past the gauge window
-	var due []masterlessDue     // past the heal window
+	seen := map[string]bool{}      // tuples observed at 0 ready this sweep
+	evaluated := map[string]bool{} // candidate keys evaluated this sweep — the streak's keep set
+	var rep probefw.SweepReport    // tuples past the gauge window
+	var multiRep, skewRep probefw.SweepReport
+	var due []masterlessDue // past the heal window
+	totalMasters := 0
+	lanitPinned := map[string][]string{} // candidate key -> lv, for standby-pinned masters
+	emittedSkew := map[string]bool{}     // keys already flagged this sweep (dedup A vs B triggers)
 	for _, c := range candidates {
 		key := c.ns + "/" + c.svc + "/" + c.sts.Name
+		evaluated[key] = true
 		sts := c.sts
 		patch := func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx,
@@ -312,7 +418,59 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 				metav1.PatchOptions{})
 			return err
 		}
-		if ready[c.ns+"/"+c.svc] > 0 {
+		eps := ready[c.ns+"/"+c.svc]
+		// W12-SC2(i) — multi-master split brain: >1 Ready endpoint
+		// on the master role two sweeps running. A relabeling flap
+		// settles inside one sweep; two pods answering the role at
+		// once is an election split.
+		if len(eps) > 1 {
+			if p.multiMasterStreak.Hit(key) >= statefulMultiMasterMinStreak {
+				multiRep.Flag(statefulServiceMultipleMastersGauge, key,
+					[]string{c.ns, c.svc, c.sts.Name})
+				rep.Find(key + "(multiple_masters)")
+			}
+		} else {
+			p.multiMasterStreak.Reset(key)
+		}
+		// W12-SC2(ii) — cross-DC pin accounting: only meaningful on
+		// a multi-zone cluster with a live master to place.
+		if multiZone && len(eps) >= 1 {
+			totalMasters++
+			zones := map[string]bool{}
+			resolved := 0
+			for _, e := range eps {
+				z := endpointZone(e, podNode, nodeZone)
+				if z == "" {
+					continue
+				}
+				resolved++
+				zones[z] = true
+			}
+			if zones[statefulStandbySiteZone] {
+				// Trigger A: the master lives in the standby zone
+				// while the STS still serves Ready replicas in the
+				// main zone — reads/writes pay the inter-DC RTT.
+				if p.stsReadyInZone(c.sts, podItems, podNode, nodeZone,
+					statefulMainSiteZone) {
+					skewRep.Flag(statefulMasterSiteSkewGauge,
+						key+"/"+statefulStandbySiteZone,
+						[]string{c.ns, c.svc, c.sts.Name,
+							statefulStandbySiteZone})
+					rep.Find(key + "(site_skew " + statefulStandbySiteZone +
+						" while datahub replicas ready)")
+					emittedSkew[key] = true
+				}
+			}
+			// "Pinned to lanit" = every resolved endpoint lives in
+			// the standby zone (an unresolved endpoint can't
+			// disprove the pin).
+			if resolved > 0 && zones[statefulStandbySiteZone] &&
+				!zones[statefulMainSiteZone] {
+				lanitPinned[key] = []string{c.ns, c.svc, c.sts.Name,
+					statefulStandbySiteZone}
+			}
+		}
+		if len(eps) > 0 {
 			// Master reachable — the signature resolved on a live
 			// object: drop the persisted stamp so a recurrence
 			// re-arms the full window (a stale stamp would
@@ -352,8 +510,28 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
+	// W12-SC2(ii) trigger B — the pin is cluster-wide when >=80% of
+	// evaluated stateful masters live in the standby zone (every
+	// resolved endpoint lanit, none datahub). Flag every pinned
+	// master not already caught by trigger A.
+	if multiZone && totalMasters > 0 &&
+		float64(len(lanitPinned))/float64(totalMasters) >= statefulSiteSkewMaxPinned {
+		for key, lv := range lanitPinned {
+			if emittedSkew[key] {
+				continue
+			}
+			skewRep.Flag(statefulMasterSiteSkewGauge,
+				key+"/"+statefulStandbySiteZone, lv)
+			rep.Find(fmt.Sprintf("%s(site_skew >=%d%% masters pinned to %s)",
+				key, int(statefulSiteSkewMaxPinned*100), statefulStandbySiteZone))
+		}
+	}
+
 	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
+	p.multiMasterStreak.Prune(func(k string) bool { return evaluated[k] })
 	rep.Close(&p.stsZeroEmitted, statefulServiceZeroEndpointsGauge.DeleteLabelValues)
+	multiRep.Close(&p.multiMasterEmitted, statefulServiceMultipleMastersGauge.DeleteLabelValues)
+	skewRep.Close(&p.siteSkewEmitted, statefulMasterSiteSkewGauge.DeleteLabelValues)
 
 	// Dragonfly auto-heal — a masterless dragonfly past the heal
 	// window bounces the operator leader to force re-election (step
@@ -385,6 +563,64 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	return rep.Verdict(fmt.Sprintf(
 		"master-role services at 0 ready endpoints >=%s: ",
 		masterlessZeroMinAge), ", ")
+}
+
+// ---------------------------------------------------------------------------
+// W12-SC2 — split-brain + cross-DC pin helpers.
+// ---------------------------------------------------------------------------
+
+// readyEndpoint is the slice-endpoint detail the W12-SC2 signatures
+// place: the endpoint's own zone hint, its nodeName, and the
+// targetRef pod key the nodeName fallback resolves through.
+type readyEndpoint struct {
+	zone   string
+	node   string
+	podKey string // "ns/name" of the targetRef Pod
+}
+
+// endpointZone resolves the topology zone a Ready endpoint lives in:
+// the slice's own zone field first (the endpointslice controller
+// copies the node's zone label — custom producers may not fill it),
+// then the endpoint's nodeName through the node census, then the
+// targetRef pod's spec.nodeName — the fallback chain the spec calls
+// for. "" means unresolvable: an unresolvable endpoint can neither
+// confirm nor disprove a pin.
+func endpointZone(e readyEndpoint, podNode, nodeZone map[string]string) string {
+	if e.zone != "" {
+		return e.zone
+	}
+	if e.node != "" {
+		return nodeZone[e.node]
+	}
+	if e.podKey != "" {
+		return nodeZone[podNode[e.podKey]]
+	}
+	return ""
+}
+
+// stsReadyInZone reports whether the StatefulSet has at least one
+// Ready pod on a node labeled with the given topology zone — the
+// "the STS still serves the main site" half of trigger A.
+func (p *statefulMasterlessCheck) stsReadyInZone(sts *appsv1.StatefulSet,
+	pods []corev1.Pod, podNode, nodeZone map[string]string, zone string) bool {
+
+	sel, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+	if err != nil {
+		return false
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Namespace != sts.Namespace ||
+			!sel.Matches(labels.Set(pod.Labels)) ||
+			pod.DeletionTimestamp != nil ||
+			!kube.PodReadyCond(pod) {
+			continue
+		}
+		if nodeZone[podNode[pod.Namespace+"/"+pod.Name]] == zone {
+			return true
+		}
+	}
+	return false
 }
 
 // podMasterRole reports whether the pod carries a master/primary/

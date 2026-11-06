@@ -21,6 +21,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -453,6 +454,15 @@ func TestAuditStuckPVCReferencedKept(t *testing.T) {
 // status ("True"/"False"/"" for none), completedAgo backs
 // status.completionTime (0 omits it).
 func fjjBuildRun(ns, name, succeeded string, completedAgo time.Duration) *unstructured.Unstructured {
+	return fjjRun(kube.GVRShipwrightBuildRun, "BuildRun", ns, name, succeeded, completedAgo)
+}
+
+// fjjRun builds one run object (PipelineRun/TaskRun/BuildRun) in the
+// knative-style condition shape all three controllers write —
+// succeeded is the Succeeded condition status ("True"/"False"/"" for
+// none), completedAgo backs status.completionTime (0 omits it).
+func fjjRun(gvr schema.GroupVersionResource, kind, ns, name, succeeded string,
+	completedAgo time.Duration) *unstructured.Unstructured {
 	status := map[string]any{}
 	if completedAgo > 0 {
 		status["completionTime"] = time.Now().Add(-completedAgo).UTC().Format(time.RFC3339)
@@ -464,7 +474,7 @@ func fjjBuildRun(ns, name, succeeded string, completedAgo time.Duration) *unstru
 		}}
 	}
 	return testutil.Unstructured(
-		buildRunGVR.GroupVersion().WithKind("BuildRun"), ns, name,
+		gvr.GroupVersion().WithKind(kind), ns, name,
 		map[string]any{"status": status})
 }
 
@@ -472,17 +482,23 @@ func fjjDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewDynamicClient(objs...)
 }
 
-func fjjBuildRunExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name string) bool {
+func fjjRunExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient,
+	gvr schema.GroupVersionResource, ns, name string) bool {
 	t.Helper()
-	_, err := dyn.Resource(buildRunGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	_, err := dyn.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
 		return true
 	}
 	if apierrors.IsNotFound(err) {
 		return false
 	}
-	t.Fatalf("get buildrun %s/%s: %v", ns, name, err)
+	t.Fatalf("get %s %s/%s: %v", gvr.Resource, ns, name, err)
 	return false
+}
+
+func fjjBuildRunExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name string) bool {
+	t.Helper()
+	return fjjRunExists(t, dyn, kube.GVRShipwrightBuildRun, ns, name)
 }
 
 // Completed BuildRuns older than 24h are reaped; fresh completions,
@@ -496,12 +512,17 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 		fjjBuildRun("cicd", "running", "", 0),                  // keep — not completed
 		fjjBuildRun("cicd", "no-cond", "", 48*time.Hour),       // keep — no condition
 		fjjBuildRun("other", "old-ok", "True", 48*time.Hour),   // delete — all namespaces
+		// Registers tekton.dev/v1 TaskRun in the fake (the
+		// testhelp GVK table covers PipelineRun only) — the
+		// table sweep lists every kind, and a non-terminal
+		// taskrun doubles as a keep-witness.
+		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-live", "", 0),
 	)
 	j := &failedJobsJanitor{
 		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
-	if err := j.sweepBuildRuns(ctx); err != nil {
+	if err := j.sweepCompletedRuns(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"old-ok", "old-fail"} {
@@ -519,6 +540,69 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 	}
 }
 
+// W12-GO2 — Tekton PipelineRuns and TaskRuns share the same 24h
+// retention horizon: terminal past-TTL objects are reaped while
+// running/fresh/unresolved ones stay.
+func TestFailedJobsJanitorTektonRunTTL(t *testing.T) {
+	dyn := fjjDynFake(
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-old-ok", "True", 30*time.Hour), // delete
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-fresh", "True", 2*time.Hour),   // keep — inside TTL
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-running", "", 0),               // keep — not terminal
+		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-old-fail", "False", 48*time.Hour),      // delete
+		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-running", "", 0),                       // keep — not terminal
+	)
+	j := &failedJobsJanitor{
+		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepCompletedRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fjjRunExists(t, dyn, kube.GVRTektonPipelineRun, "cicd", "pr-old-ok") {
+		t.Fatal("completed PipelineRun older than TTL must be deleted")
+	}
+	if fjjRunExists(t, dyn, kube.GVRTektonTaskRun, "cicd", "tr-old-fail") {
+		t.Fatal("failed TaskRun older than TTL must be deleted")
+	}
+	for _, c := range []struct {
+		gvr  schema.GroupVersionResource
+		name string
+	}{
+		{kube.GVRTektonPipelineRun, "pr-fresh"},
+		{kube.GVRTektonPipelineRun, "pr-running"},
+		{kube.GVRTektonTaskRun, "tr-running"},
+	} {
+		if !fjjRunExists(t, dyn, c.gvr, "cicd", c.name) {
+			t.Fatalf("%s %s must survive", c.gvr.Resource, c.name)
+		}
+	}
+}
+
+// A terminal condition without a completionTime is still reaped —
+// the condition's lastTransitionTime is the finish stamp (older
+// controllers resolved runs without stamping completionTime).
+func TestFailedJobsJanitorRunTerminalFallbackTimestamp(t *testing.T) {
+	obj := fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-no-ct", "True", 0)
+	if err := unstructured.SetNestedSlice(obj.Object, []any{map[string]any{
+		"type":               "Succeeded",
+		"status":             "False",
+		"lastTransitionTime": time.Now().Add(-30 * time.Hour).UTC().Format(time.RFC3339),
+	}}, "status", "conditions"); err != nil {
+		t.Fatal(err)
+	}
+	dyn := fjjDynFake(obj)
+	j := &failedJobsJanitor{
+		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepCompletedRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fjjRunExists(t, dyn, kube.GVRTektonTaskRun, "cicd", "tr-no-ct") {
+		t.Fatal("terminal TaskRun aged by lastTransitionTime must be deleted")
+	}
+}
+
 // No Shipwright CRD → the sweep is a quiet no-op, not an error.
 func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 	j := &failedJobsJanitor{
@@ -526,7 +610,7 @@ func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
 	// dyn nil — the sweep must no-op without a dynamic client.
-	if err := j.sweepBuildRuns(ctx); err != nil {
+	if err := j.sweepCompletedRuns(ctx); err != nil {
 		t.Fatalf("nil dyn must no-op: %v", err)
 	}
 	// A dyn fake without the BuildRun GVR registered panics on List —
@@ -538,7 +622,267 @@ func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 				schema.GroupResource{Group: "shipwright.io", Resource: "buildruns"}, "x")
 		})
 	j.dyn = dyn
-	if err := j.sweepBuildRuns(ctx); err != nil {
+	if err := j.sweepCompletedRunKind(ctx, kube.GVRShipwrightBuildRun, "buildrun"); err != nil {
 		t.Fatalf("absent Shipwright CRD must be a quiet no-op: %v", err)
+	}
+	// Absent Tekton (both GVRs 404) must not break the table sweep —
+	// Shipwright objects still get reaped. A throwaway TaskRun seed is
+	// required only to register the type in the fake (the testhelp GVK
+	// table covers PipelineRun only); the list reactor still 404s.
+	dyn2 := fjjDynFake(
+		fjjBuildRun("cicd", "old-ok", "True", 25*time.Hour),
+		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-live", "", 0))
+	for _, res := range []string{"pipelineruns", "taskruns"} {
+		res := res
+		dyn2.PrependReactor("list", res,
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewNotFound(
+					schema.GroupResource{Group: "tekton.dev", Resource: res}, "x")
+			})
+	}
+	j.dyn = dyn2
+	if err := j.sweepCompletedRuns(ctx); err != nil {
+		t.Fatalf("absent Tekton CRDs must be a quiet no-op: %v", err)
+	}
+	if fjjBuildRunExists(t, dyn2, "cicd", "old-ok") {
+		t.Fatal("completed BuildRun must still be reaped when Tekton is absent")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-GO2 — orphaned run-workspace PVC reaper
+// ---------------------------------------------------------------------------
+
+// fjjWorkspacePVC builds a PVC age old carrying the given
+// ownerReferences and labels.
+func fjjWorkspacePVC(ns, name string, age time.Duration,
+	refs []metav1.OwnerReference, labels map[string]string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Namespace:         ns,
+		Name:              name,
+		CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+		OwnerReferences:   refs,
+		Labels:            labels,
+	}}
+}
+
+// fjjPVCOwner is the ownerRef literal a run-owned workspace PVC
+// carries.
+func fjjPVCOwner(apiVersion, kind, name string) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		APIVersion: apiVersion, Kind: kind, Name: name, UID: types.UID("owner-" + name)}
+}
+
+// fjjPodClaiming builds a pod in phase that mounts claimName.
+func fjjPodClaiming(ns, name, claimName string, phase corev1.PodPhase) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "ws",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claimName}}}}},
+		Status: corev1.PodStatus{Phase: phase},
+	}
+}
+
+func fjjPVCExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().PersistentVolumeClaims(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	t.Fatalf("get pvc %s/%s: %v", ns, name, err)
+	return false
+}
+
+// The orphan matrix: a workspace claim older than 6h is deleted when
+// every run ref is gone-or-terminal and no non-terminal pod mounts
+// it; live owners, mounting pods, fresh claims, terminating claims
+// and claimless PVCs all stay.
+func TestOrphanWorkspacePVCReaper(t *testing.T) {
+	dyn := fjjDynFake(
+		// pr-live is non-terminal (no condition) — its PVC stays.
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-live", "", 0),
+		// pr-done is terminal but still inside the run TTL — the
+		// workspace is already dead weight and goes now.
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-done", "True", 30*time.Minute),
+	)
+	// Already terminating → skipped, not re-deleted.
+	terminating := fjjWorkspacePVC("cicd", "pvc-terminating", 8*time.Hour,
+		[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil)
+	terminating.Finalizers = []string{"kubernetes.io/pvc-protection"}
+	termAt := metav1.NewTime(time.Now())
+	terminating.DeletionTimestamp = &termAt
+	cs := fake.NewSimpleClientset(
+		// Owner gone from the API server → delete.
+		fjjWorkspacePVC("cicd", "pvc-owner-gone", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil),
+		// Owner exists but terminal → delete.
+		fjjWorkspacePVC("cicd", "pvc-owner-terminal", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-done")}, nil),
+		// Owner live and non-terminal → keep.
+		fjjWorkspacePVC("cicd", "pvc-owner-live", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-live")}, nil),
+		// tekton.dev/pipelineRun label only (no ownerRef) → delete.
+		fjjWorkspacePVC("cicd", "pvc-label-orphan", 8*time.Hour,
+			nil, map[string]string{"tekton.dev/pipelineRun": "pr-gone"}),
+		// shipwright.io/buildRun label only → delete.
+		fjjWorkspacePVC("cicd", "pvc-shipwright-orphan", 8*time.Hour,
+			nil, map[string]string{"shipwright.io/buildRun": "br-gone"}),
+		// Gone Job owner → delete.
+		fjjWorkspacePVC("cicd", "pvc-job-orphan", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("batch/v1", "Job", "job-gone")}, nil),
+		// Live incomplete Job owner → keep.
+		fjjWorkspacePVC("cicd", "pvc-job-live", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("batch/v1", "Job", "job-live")}, nil),
+		// Still mounted by a Running pod → keep.
+		fjjWorkspacePVC("cicd", "pvc-mounted", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil),
+		// Mounted only by a terminal pod → delete (volumes released).
+		fjjWorkspacePVC("cicd", "pvc-terminal-pod", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil),
+		// Too young → keep.
+		fjjWorkspacePVC("cicd", "pvc-young", 2*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil),
+		// No run refs at all → keep.
+		fjjWorkspacePVC("cicd", "pvc-plain", 8*time.Hour, nil, nil),
+		terminating,
+		// The live Job for pvc-job-live.
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "cicd", Name: "job-live"}},
+		// Pods: one Running mounting pvc-mounted, one Failed mounting
+		// pvc-terminal-pod.
+		fjjPodClaiming("cicd", "runner", "pvc-mounted", corev1.PodRunning),
+		fjjPodClaiming("cicd", "done-pod", "pvc-terminal-pod", corev1.PodFailed),
+	)
+	j := &failedJobsJanitor{
+		cs: cs, dyn: dyn, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"pvc-owner-gone", "pvc-owner-terminal", "pvc-label-orphan",
+		"pvc-shipwright-orphan", "pvc-job-orphan", "pvc-terminal-pod"} {
+		if fjjPVCExists(t, cs, "cicd", name) {
+			t.Fatalf("orphan workspace pvc %s must be deleted", name)
+		}
+	}
+	for _, name := range []string{
+		"pvc-owner-live", "pvc-job-live", "pvc-mounted",
+		"pvc-young", "pvc-plain", "pvc-terminating"} {
+		if !fjjPVCExists(t, cs, "cicd", name) {
+			t.Fatalf("pvc %s must survive", name)
+		}
+	}
+}
+
+// Orphan deletes carry the UID precondition — a same-named claim
+// recreated since the list must not inherit the delete.
+func TestOrphanWorkspacePVCUIDPrecondition(t *testing.T) {
+	pvc := fjjWorkspacePVC("cicd", "pvc-orphan", 8*time.Hour,
+		[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil)
+	pvc.UID = "uid-pvc-orphan"
+	cs := fake.NewSimpleClientset(pvc)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "persistentvolumeclaims",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil
+		})
+	j := &failedJobsJanitor{
+		cs: cs, dyn: fjjDynFake(), now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotUID == nil || *gotUID != pvc.UID {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
+	}
+}
+
+// A ref lookup that errors (not NotFound) fails closed: the claim is
+// kept, the run still nils out, the failure is IncError'd once.
+func TestOrphanWorkspacePVCFailClosedOnRefGetError(t *testing.T) {
+	pvc := fjjWorkspacePVC("cicd", "pvc-orphan", 8*time.Hour,
+		[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-maybe")}, nil)
+	cs := fake.NewSimpleClientset(pvc)
+	dyn := fjjDynFake()
+	dyn.PrependReactor("get", "pipelineruns",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	j := &failedJobsJanitor{
+		cs: cs, dyn: dyn, now: time.Now, queue: "failed-jobs-janitor",
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+		t.Fatalf("unverifiable ref must not error the sweep: %v", err)
+	}
+	if !fjjPVCExists(t, cs, "cicd", "pvc-orphan") {
+		t.Fatal("pvc deleted although its owner could not be verified")
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 1 {
+		t.Fatalf("unverifiable ref did not IncError once, delta %v", got)
+	}
+}
+
+// Without a dynamic client, CRD-owned claims cannot be verified and
+// stay — but Job-owned orphans still reap through the typed client.
+func TestOrphanWorkspacePVCNilDyn(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		fjjWorkspacePVC("cicd", "pvc-crd-owned", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil),
+		fjjWorkspacePVC("cicd", "pvc-job-owned", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("batch/v1", "Job", "job-gone")}, nil),
+	)
+	j := &failedJobsJanitor{
+		cs: cs, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !fjjPVCExists(t, cs, "cicd", "pvc-crd-owned") {
+		t.Fatal("CRD-owned pvc deleted without a dyn client to verify the owner")
+	}
+	if fjjPVCExists(t, cs, "cicd", "pvc-job-owned") {
+		t.Fatal("Job-owned orphan pvc must reap without a dyn client")
+	}
+}
+
+// The reaper rides the same hourly run() — an orphan PVC owned by a
+// just-reaped PipelineRun reads "owner gone" inside one pass.
+func TestOrphanWorkspacePVCReapedAfterRunTTL(t *testing.T) {
+	dyn := fjjDynFake(
+		fjjRun(kube.GVRTektonPipelineRun, "PipelineRun", "cicd", "pr-old", "True", 30*time.Hour),
+		// Registers tekton.dev/v1 TaskRun in the fake — the table
+		// sweep lists every kind.
+		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-live", "", 0))
+	cs := fake.NewSimpleClientset(
+		fjjWorkspacePVC("cicd", "pvc-workspace", 8*time.Hour,
+			[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-old")}, nil),
+	)
+	j := &failedJobsJanitor{
+		cs: cs, dyn: dyn, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fjjRunExists(t, dyn, kube.GVRTektonPipelineRun, "cicd", "pr-old") {
+		t.Fatal("past-TTL PipelineRun must be reaped")
+	}
+	if fjjPVCExists(t, cs, "cicd", "pvc-workspace") {
+		t.Fatal("workspace pvc of the reaped run must be deleted in the same pass")
 	}
 }

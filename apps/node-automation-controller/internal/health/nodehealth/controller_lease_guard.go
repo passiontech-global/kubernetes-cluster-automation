@@ -72,7 +72,9 @@ type controllerLeaseGuardCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	emitted state.GaugeLedger[string]
+	// thrashEmitted is the W12-SC2 twin for the thrashing tuples.
+	emitted       state.GaugeLedger[string]
+	thrashEmitted state.GaugeLedger[string]
 
 	// ksmLogProbe is the pod log-tail seam — tests inject a
 	// fixture; the zero value runs the real bounded GetLogs tail
@@ -102,6 +104,12 @@ const (
 	// or split-braining, not electing normally.
 	leaseFlapMinTransitions = int32(5)
 	leaseFlapWindow         = 15 * time.Minute
+
+	// W12-SC2 — thrashing: the tighter early-warning under the flap
+	// threshold. >=4 transitions inside 10m is election churn the
+	// 15m window hasn't proven yet.
+	leaseThrashMinTransitions = int32(4)
+	leaseThrashWindow         = 10 * time.Minute
 
 	// Expired-lease window: a client-go elector renews every ~2s
 	// inside a ~15s leaseDuration, so a renewTime stale past 10m
@@ -138,11 +146,20 @@ var (
 		Name: "node_automation_controller_lease_unhealthy",
 		Help: "1 while a control-plane Lease flaps or sits expired with running pods, or a kube-state-metrics pod is wedged.",
 	}, []string{"namespace", "lease", "reason"})
+
+	// W12-SC2 — the thrashing early-warning: 1 while a lease's
+	// leaseTransitions counter jumped >=4 inside 10m — election
+	// churn below the flap threshold.
+	controllerLeaseThrashingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_controller_lease_thrashing",
+		Help: "1 while a control-plane Lease's leaseTransitions jumped >=4 within 10m — election churn below the flap threshold.",
+	}, []string{"namespace", "lease"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		controllerLeaseUnhealthyGauge)
+		controllerLeaseUnhealthyGauge,
+		controllerLeaseThrashingGauge)
 }
 
 // checkControllerLeaseGuard sweeps the watched namespaces' Leases for
@@ -154,7 +171,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	var rep probefw.SweepReport
+	var rep, thrashRep probefw.SweepReport
 
 	// podsCache memoizes the per-namespace pod list the
 	// expired-lease heuristic needs — fetched lazily, only for
@@ -187,7 +204,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			List(ctx, metav1.ListOptions{})
 		if err != nil {
 			rep.InfraErr(fmt.Errorf("list leases in %s: %w", ns, err))
-			p.carryNamespace(&rep, liveLeases, ns)
+			p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
 			continue
 		}
 		for i := range leases.Items {
@@ -198,13 +215,21 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 				p.emitUnhealthy(&rep, ns, lease.Name, leaseReasonFlapping)
 				rep.Find(key + "(" + leaseReasonFlapping + ")")
 			}
+			// W12-SC2 — the tighter early-warning under the flap
+			// threshold: >=4 transitions inside 10m is election
+			// churn the 15m window hasn't proven yet.
+			if p.leaseThrashing(key, now) {
+				thrashRep.Flag(controllerLeaseThrashingGauge, key,
+					[]string{ns, lease.Name})
+				rep.Find(key + "(thrashing)")
+			}
 			if !leaseStaleWindow(lease, now) {
 				continue
 			}
 			pods, err := podsInNS(ns)
 			if err != nil {
 				rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
-				p.carryNamespace(&rep, liveLeases, ns)
+				p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
 				continue
 			}
 			targets := controllerRunningPods(lease, pods)
@@ -224,6 +249,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	rep.InfraErr(p.checkKSMWedged(ctx, log, now, &rep))
 
+	thrashRep.Close(&p.thrashEmitted, controllerLeaseThrashingGauge.DeleteLabelValues)
 	return rep.Result(&p.emitted, controllerLeaseUnhealthyGauge.DeleteLabelValues,
 		"controller leases unhealthy: ", ", ")
 }
@@ -267,6 +293,30 @@ func (p *controllerLeaseGuardCheck) leaseFlapping(key string,
 		return false
 	}
 	return transitions-samples[0].transitions >= leaseFlapMinTransitions
+}
+
+// leaseThrashing reports whether the lease's transitions counter
+// climbed >= leaseThrashMinTransitions inside leaseThrashWindow —
+// the tighter early-warning under leaseFlapping. It reuses the flap
+// ledger's samples (leaseFlapping already appended this sweep's
+// sample and trimmed to the flap window); the in-window oldest
+// sample is the baseline. Fewer than two in-window samples can't
+// prove a jump — first sightings read clean.
+func (p *controllerLeaseGuardCheck) leaseThrashing(key string, now time.Time) bool {
+	samples := p.transitions[key]
+	cutoff := now.Add(-leaseThrashWindow)
+	var first *leaseTransitionSample
+	for i := range samples {
+		if !samples[i].at.Before(cutoff) {
+			first = &samples[i]
+			break
+		}
+	}
+	if first == nil {
+		return false
+	}
+	return samples[len(samples)-1].transitions-first.transitions >=
+		leaseThrashMinTransitions
 }
 
 // pruneTransitions drops flap history for leases that vanished — an
@@ -385,11 +435,16 @@ func (p *controllerLeaseGuardCheck) emitUnhealthy(
 // "not evaluated" must not read as "resolved", or one API flap would
 // prune live series and re-arm every persistence window.
 func (p *controllerLeaseGuardCheck) carryNamespace(
-	rep *probefw.SweepReport, liveLeases map[string]bool, ns string) {
+	rep, thrashRep *probefw.SweepReport, liveLeases map[string]bool, ns string) {
 
 	for k, lv := range p.emitted.Last() {
 		if strings.HasPrefix(k, ns+"/") {
 			rep.Carry(k, lv)
+		}
+	}
+	for k, lv := range p.thrashEmitted.Last() {
+		if strings.HasPrefix(k, ns+"/") {
+			thrashRep.Carry(k, lv)
 		}
 	}
 	for k := range p.transitions {

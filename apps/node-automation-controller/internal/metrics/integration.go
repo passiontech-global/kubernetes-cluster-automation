@@ -154,6 +154,16 @@ var ExternalSecretStormSuppressed = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help: "1 while the ExternalSecret storm guard suppresses force-sync stamps.",
 })
 
+// ExternalSecretEmptyKey marks (1) each key in a Ready=True
+// ExternalSecret's target Secret that synced missing, empty or
+// whitespace-only — ESO reports SecretSynced while the app reads a
+// blank credential (W12-GO3). Labels: ES namespace + ES name + the
+// offending secret key.
+var ExternalSecretEmptyKey = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_externalsecret_empty_key",
+	Help: "1 while the named key of the ExternalSecret's target Secret is missing/empty/whitespace-only.",
+}, []string{"namespace", "name", "key"})
+
 // VeleroBackupStuck marks (1) each velero.io Backup wedged
 // InProgress or Deleting for over 6h (W10-ST6). Labels: namespace +
 // backup name.
@@ -194,7 +204,7 @@ func init() {
 		ReplicatedSecretDrift,
 		VeleroBSLUnavailable,
 		HelmSecretsPrunedTotal, DBBackupUnhealthy,
-		ExternalSecretStormSuppressed,
+		ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
 		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
 		VeleroWedgedObjectsCleanedTotal)
 }

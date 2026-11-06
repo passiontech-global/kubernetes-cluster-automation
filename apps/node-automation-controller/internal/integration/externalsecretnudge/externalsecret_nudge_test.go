@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -716,5 +717,204 @@ func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
 		"onepassword-connect-aaa", metav1.GetOptions{}); err != nil {
 		t.Fatalf("transient observation must not delete the pod, get err=%v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-GO3 — empty/whitespace-key audit + empty-skeleton Secret reaper
+// ---------------------------------------------------------------------------
+
+// esDataKeys declares spec.data[] entries pulling each key — the
+// "expected to exist in the target Secret" list the audit checks.
+func esDataKeys(es *unstructured.Unstructured, keys ...string) {
+	data := make([]any, 0, len(keys))
+	for _, k := range keys {
+		data = append(data, map[string]any{
+			"secretKey": k,
+			"remoteRef": map[string]any{"key": k},
+		})
+	}
+	_ = unstructured.SetNestedSlice(es.Object, data, "spec", "data")
+}
+
+// esTarget points spec.target.name at a differently-named Secret —
+// the non-default target shape.
+func esTarget(es *unstructured.Unstructured, name string) {
+	_ = unstructured.SetNestedMap(es.Object,
+		map[string]any{"name": name}, "spec", "target")
+}
+
+// esSecret builds the target Secret fixture — data nil leaves a
+// zero-key skeleton.
+func esSecret(ns, name string, data map[string][]byte, owner *metav1.OwnerReference) *corev1.Secret {
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Data:       data,
+	}
+	if owner != nil {
+		s.OwnerReferences = []metav1.OwnerReference{*owner}
+	}
+	return s
+}
+
+// A Ready=True ES whose target Secret carries empty/whitespace keys —
+// or lacks a key spec.data[] declares — emits one series per offender;
+// a populated key is silent, and a vanished target is just skipped.
+func TestExternalSecretEmptyKeyAudit(t *testing.T) {
+	es := esObj("apps", "es-ok", "True", time.Hour)
+	esDataKeys(es, "username", "password", "missing-key")
+	secret := esSecret("apps", "es-ok", map[string][]byte{
+		"username": []byte("admin"),
+		"password": []byte(""),
+		"token":    []byte("  \n\t"),
+	}, nil)
+	dyn := newDynFake(es)
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: kfake.NewSimpleClientset(secret), dyn: dyn,
+		storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"password", "token", "missing-key"} {
+		if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-ok", key) {
+			t.Fatalf("missing empty-key series for %q", key)
+		}
+	}
+	if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-ok", "username") {
+		t.Fatal("populated key flagged as empty")
+	}
+}
+
+// A key that syncs populated on the next sweep gets its series pruned
+// — the ledger never leaks a stale "empty" series.
+func TestExternalSecretEmptyKeyPrunesResolved(t *testing.T) {
+	es := esObj("apps", "es-ok", "True", time.Hour)
+	secret := esSecret("apps", "es-ok", map[string][]byte{
+		"password": []byte(""),
+	}, nil)
+	cs := kfake.NewSimpleClientset(secret)
+	dyn := newDynFake(es)
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-ok", "password") {
+		t.Fatal("empty key not flagged")
+	}
+	// ESO fills the value — the series must disappear, not pin.
+	secret.Data["password"] = []byte("s3cret")
+	if _, err := cs.CoreV1().Secrets("apps").Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-ok", "password") {
+		t.Fatal("resolved key still carries an empty-key series")
+	}
+}
+
+// The opt-out annotation silences the audit for Secrets that
+// legitimately carry empty values; spec.target.name redirects the
+// lookup away from the ES's own name.
+func TestExternalSecretEmptyKeyOptOutAndTargetName(t *testing.T) {
+	opted := esObj("apps", "es-opted", "True", time.Hour)
+	opted.SetAnnotations(map[string]string{kube.AnnoAllowEmptySecretKey: "true"})
+	renamed := esObj("apps", "es-renamed", "True", time.Hour)
+	esTarget(renamed, "real-secret")
+	dyn := newDynFake(opted, renamed)
+	cs := kfake.NewSimpleClientset(
+		esSecret("apps", "es-opted", map[string][]byte{"k": []byte("")}, nil),
+		esSecret("apps", "real-secret", map[string][]byte{"k": []byte("")}, nil),
+	)
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-opted", "k") {
+		t.Fatal("opt-out ES flagged for an empty key")
+	}
+	if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-renamed", "k") {
+		t.Fatal("spec.target.name lookup missed the renamed Secret")
+	}
+}
+
+// The empty skeleton an ESO-owned Secret can be left as after a failed
+// sync is deleted (UID precondition) right before the force-sync stamp
+// lands — the forced reconcile recreates it populated.
+func TestExternalSecretSkeletonSecretDeleted(t *testing.T) {
+	es := esObj("apps", "es-stuck", "False", time.Hour)
+	es.SetUID("es-uid-1")
+	skeleton := esSecret("apps", "es-stuck", nil, &metav1.OwnerReference{
+		APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret",
+		Name: "es-stuck", UID: "es-uid-1",
+	})
+	dyn := newDynFake(es)
+	cs := kfake.NewSimpleClientset(skeleton)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "secrets",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil
+		})
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
+		"es-stuck", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("empty skeleton must be deleted, get err=%v", err)
+	}
+	if gotUID == nil || *gotUID != skeleton.UID {
+		t.Fatalf("skeleton delete missing the UID precondition: %v", gotUID)
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0],
+		"apps", "es-stuck", esForceSyncAnno); got == "" {
+		t.Fatal("force-sync not stamped after the skeleton delete")
+	}
+}
+
+// A Secret that is NOT provably owned by the failing ES is never
+// deleted — no ownerRef, a UID mismatch, or real data all keep it.
+func TestExternalSecretSkeletonSecretKept(t *testing.T) {
+	noOwner := esObj("apps", "es-noowner", "False", time.Hour)
+	noOwner.SetUID("es-uid-2")
+	mismatched := esObj("apps", "es-mismatch", "False", time.Hour)
+	mismatched.SetUID("es-uid-3")
+	withData := esObj("apps", "es-data", "False", time.Hour)
+	withData.SetUID("es-uid-4")
+	dyn := newDynFake(noOwner, mismatched, withData)
+	cs := kfake.NewSimpleClientset(
+		// Same name, no ownerReferences — could be hand-made: keep.
+		esSecret("apps", "es-noowner", nil, nil),
+		// Owned by an ExternalSecret of the same name but a different
+		// UID — belongs to a deleted ES instance: keep.
+		esSecret("apps", "es-mismatch", nil, &metav1.OwnerReference{
+			APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret",
+			Name: "es-mismatch", UID: "stale-uid",
+		}),
+		// Provably owned but carries data — not the skeleton shape.
+		esSecret("apps", "es-data", map[string][]byte{"k": []byte("v")},
+			&metav1.OwnerReference{
+				APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret",
+				Name: "es-data", UID: "es-uid-4",
+			}),
+	)
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"es-noowner", "es-mismatch", "es-data"} {
+		if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
+			name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("secret %s must survive, get err=%v", name, err)
+		}
 	}
 }

@@ -28,16 +28,29 @@
 // watch re-reconciles on every node add/remove. minReplicas<=0
 // disables the pin (the Deployment keeps its own .spec.replicas) so
 // a cluster can re-enable the standalone CPA without being fought.
+//
+// Corefile negative-cache guard (W12-NM4b): the kube-system/coredns
+// ConfigMap is k0s-managed and drifts back to a bare `cache 30`,
+// which negative-caches NXDOMAIN for the full SOA TTL — a Job pod
+// that outraces endpointslice-controller at deploy time eats a
+// 30s-cached NXDOMAIN and dies on backoffLimit. The reconciler
+// rewrites a denial-less cache directive to `cache 30 { success
+// 9984 30; denial 9984 5 }`, capping negative caching at 5s while
+// keeping the 30s positive cache.
 package corednspatcher
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -150,9 +163,12 @@ func configFromEnv() corednsPatcherConfig {
 
 // Reconcile delegates to the shared pinned-Deployment skeleton —
 // this module only supplies the kube-system/coredns identity, the
-// drift check and the patch body.
+// drift check and the patch body — then reconciles the Corefile's
+// negative-cache cap on the same requeue cadence (the ConfigMap is
+// not watched; the 15m requeue plus every Deployment reconcile is
+// fresh enough for a drift k0s only re-applies on stack changes).
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	return pinnedworkload.DeploymentSpec{
+	res, err := pinnedworkload.DeploymentSpec{
 		CS:        r.cs,
 		Namespace: "kube-system",
 		Name:      "coredns",
@@ -169,6 +185,13 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 			return corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
 		},
 	}.Reconcile(ctx)
+	if err != nil {
+		return res, err
+	}
+	if err := r.reconcileCorefile(ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+	return res, nil
 }
 
 // corednsMinDomainsWanted gates minDomains onto DoNotSchedule only —
@@ -315,4 +338,150 @@ func corednsPatchBody(zoneWhen string, minDomains int, wantReplicas int32) ([]by
 		spec["replicas"] = wantReplicas
 	}
 	return json.Marshal(map[string]any{"spec": spec})
+}
+
+// ---------------------------------------------------------------------------
+// Corefile negative-cache reconcile (W12-NM4b)
+// ---------------------------------------------------------------------------
+
+const (
+	corednsConfigNS   = "kube-system"
+	corednsConfigName = "coredns"
+	corednsCorefile   = "Corefile"
+	// corefileDenialDirective is the injected negative-cache cap —
+	// 9984 entries at 5s TTL (a bare `cache 30` negative-caches
+	// NXDOMAIN for the full SOA TTL and kills fresh-deploy Jobs).
+	corefileDenialDirective = "denial 9984 5"
+	corefileSuccessLine     = "success 9984 30"
+)
+
+// reconcileCorefile reads kube-system/coredns's Corefile and merge-
+// patches it when a cache directive lacks a denial cap (see the
+// header note). A missing ConfigMap/Corefile is tolerated — the k0s
+// stack applier owns the object and re-creates it; a patch or get
+// failure surfaces so the reconcile retries on the apiserver's
+// backoff instead of silently leaving a 30s NXDOMAIN cache live.
+func (r *corednsPatcher) reconcileCorefile(ctx context.Context) error {
+	cm, err := r.cs.CoreV1().ConfigMaps(corednsConfigNS).
+		Get(ctx, corednsConfigName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("get configmap %s/%s: %w",
+			corednsConfigNS, corednsConfigName, err)
+	}
+	corefile := cm.Data[corednsCorefile]
+	if corefile == "" {
+		return nil
+	}
+	rewritten, changed := corefileDenialCap(corefile)
+	if !changed {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"data": map[string]any{corednsCorefile: rewritten},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal coredns corefile patch: %w", err)
+	}
+	if _, err := r.cs.CoreV1().ConfigMaps(corednsConfigNS).Patch(ctx,
+		corednsConfigName, types.MergePatchType, payload,
+		metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("patch configmap %s/%s: %w",
+			corednsConfigNS, corednsConfigName, err)
+	}
+	logf.FromContext(ctx).Info("PATCH: Corefile cache directive gains a 5s denial cap " +
+		"(NXDOMAIN no longer negative-caches for the full SOA TTL)")
+	return nil
+}
+
+// corefileDenialCap rewrites every cache directive in the Corefile
+// that carries no denial directive. Bare `cache 30` (optionally with
+// zone args) expands to the success+denial block; an already-braced
+// `cache 30 { ... }` block keeps its contents and only gains the
+// denial line it lacks. A block that already declares denial is
+// untouched — idempotent by construction. Returns (rewritten, changed).
+//
+// The parser is a line scan, not a Corefile grammar: `cache` is the
+// only directive the rewrite touches, brace depth tracks the block
+// it opens, and comment lines (#…) can never satisfy or break the
+// denial check.
+func corefileDenialCap(corefile string) (string, bool) {
+	lines := strings.Split(corefile, "\n")
+	changed := false
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 || fields[0] != "cache" {
+			continue
+		}
+		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
+		open := strings.Index(trimmed, "{")
+		switch {
+		case open < 0:
+			// Bare form: `cache 30 [zones...]` → replace with the
+			// braced success+denial block, keeping the args and the
+			// line's own indentation.
+			lines[i] = indent + trimmed + " {\n" +
+				indent + "    " + corefileSuccessLine + "\n" +
+				indent + "    " + corefileDenialDirective + "\n" +
+				indent + "}"
+			changed = true
+		case strings.LastIndex(trimmed, "}") > open:
+			// Inline single-line block `cache 30 { denial 9984 5 }`:
+			// a denial inside already satisfies; without one, inject
+			// before the closing brace.
+			inner := trimmed[open+1 : strings.LastIndex(trimmed, "}")]
+			if !corefileBlockHasDenial(inner) {
+				last := strings.LastIndex(lines[i], "}")
+				lines[i] = lines[i][:last] + " " + corefileDenialDirective + " }"
+				changed = true
+			}
+		default:
+			// Braced multi-line block: find the matching close and
+			// inject denial before it when absent.
+			depth := strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+			hasDenial := false
+			closeIdx := -1
+			for j := i + 1; j < len(lines) && depth > 0; j++ {
+				t := strings.TrimSpace(lines[j])
+				depth += strings.Count(t, "{") - strings.Count(t, "}")
+				if t != "" && !strings.HasPrefix(t, "#") &&
+					strings.Fields(t)[0] == "denial" {
+					hasDenial = true
+				}
+				if depth == 0 {
+					closeIdx = j
+				}
+			}
+			if !hasDenial && closeIdx >= 0 {
+				lines[closeIdx] = indent + "    " + corefileDenialDirective +
+					"\n" + lines[closeIdx]
+				changed = true
+				i = closeIdx // skip past the handled block
+			} else if closeIdx >= 0 {
+				i = closeIdx
+			}
+		}
+	}
+	if !changed {
+		return corefile, false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// corefileBlockHasDenial reports whether an inline cache block body
+// already declares a denial directive. Separators inside the braces
+// are optional (`{ success 9984 30  denial 9984 5 }` is what our own
+// injector emits on a separator-less input), so the scan is for a
+// bare `denial` token anywhere in the body — a zone arg such as
+// `denial.example.com` lands as a single field and cannot collide.
+func corefileBlockHasDenial(inner string) bool {
+	for _, f := range strings.Fields(inner) {
+		if f == "denial" {
+			return true
+		}
+	}
+	return false
 }

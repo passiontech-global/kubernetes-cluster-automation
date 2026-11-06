@@ -75,6 +75,67 @@ func isRabbitMQPod(pod *corev1.Pod) bool {
 		pod.Labels["app.kubernetes.io/component"] == "rabbitmq"
 }
 
+// rabbitClusterKey is the per-RabbitmqCluster census key —
+// "<ns>/<app.kubernetes.io/name>", the label the cluster operator
+// stamps with the owning CR's name. "" when the label is absent:
+// those pods fall back to controller-owner grouping (ReadyByOwner)
+// so two clusters sharing a namespace still never pool their Ready
+// members (W12 P0-2a).
+func rabbitClusterKey(pod *corev1.Pod) string {
+	if name := pod.Labels["app.kubernetes.io/name"]; name != "" {
+		return pod.Namespace + "/" + name
+	}
+	return ""
+}
+
+// rabbitHealableReasons is the whitelist of findings that justify a
+// member-pod delete — each clears on a fresh start. NOT
+// disk_watermark_alarm (W12 P0-2c): a pod delete cannot free the
+// PVC, and the restart replays the quorum-queue WAL onto a
+// still-full disk; a future unknown reason defaults to alert-only
+// too.
+var rabbitHealableReasons = map[string]bool{
+	"mnesia_partition":       true,
+	"stuck_unready":          true,
+	"fd_limit_alarm":         true,
+	"memory_watermark_alarm": true,
+}
+
+// rabbitHealableFindings reports whether the pod's finding set
+// holds at least one delete-worthy reason.
+func rabbitHealableFindings(reasons map[string]bool) bool {
+	for r := range reasons {
+		if rabbitHealableReasons[r] {
+			return true
+		}
+	}
+	return false
+}
+
+// rabbitReadySiblings counts the Ready members of pod's OWN
+// RabbitmqCluster excluding the pod itself. The self-discount is
+// the gray-failure guard: a member under a Prometheus alarm keeps
+// reporting Ready, and counting it would let a 3-node cluster at
+// 2/3 Ready approve a delete that drops it to 1/3 — Raft quorum
+// loss (W12 P0-2b). An unlabeled pod resolves through its
+// controller owner; unlabeled AND unowned reads 0 — no provable
+// siblings, fail closed.
+func rabbitReadySiblings(readyByCluster map[string]int,
+	readyByOwner map[types.UID]int, pod *corev1.Pod) int {
+	var ready int
+	if key := rabbitClusterKey(pod); key != "" {
+		ready = readyByCluster[key]
+	} else if ref := metav1.GetControllerOf(pod); ref != nil {
+		ready = readyByOwner[ref.UID]
+	}
+	// The target may itself still report Ready under an alarm —
+	// discount self so the guard requires GENUINELY other members.
+	if ready > 0 && probefw.PodRunningReady(pod) {
+		ready--
+	}
+	return ready
+}
+
 // checkRabbitMQQuorumHealth watches RabbitMQ quorum/partition
 // health two ways: Prometheus alarms (fd-limit / memory / disk
 // watermarks, erlang dist node_state != connected) and the
@@ -102,7 +163,8 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	rabbitByName := map[string]*corev1.Pod{}
 	rabbitByPodName := map[string]*corev1.Pod{}
-	rabbitByNS := map[string][]*corev1.Pod{}
+	var memberPods []*corev1.Pod
+	var unlabeledPods []corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !isRabbitMQPod(pod) ||
@@ -111,7 +173,10 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		rabbitByName[pod.Namespace+"/"+pod.Name] = pod
 		rabbitByPodName[pod.Name] = pod // ns fallback for series w/o namespace label
-		rabbitByNS[pod.Namespace] = append(rabbitByNS[pod.Namespace], pod)
+		memberPods = append(memberPods, pod)
+		if rabbitClusterKey(pod) == "" {
+			unlabeledPods = append(unlabeledPods, *pod)
+		}
 	}
 
 	// Prometheus alarm/partition signals.
@@ -153,45 +218,50 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// Ready-sibling census per namespace — the quorum precondition
-	// for every heal below (>=2 OTHER replicas Ready).
-	readyByNS := map[string]int{}
-	for ns, members := range rabbitByNS {
-		for _, pod := range members {
-			if probefw.PodRunningReady(pod) {
-				readyByNS[ns]++
-			}
+	// Ready-sibling census per RabbitmqCluster — the quorum
+	// precondition for every heal below (>=2 OTHER members Ready).
+	// Grouping by namespace would pool the Ready members of two
+	// clusters sharing one namespace into a single tally and "prove"
+	// quorum that does not exist (W12 P0-2a). The primary grouping
+	// is the operator's app.kubernetes.io/name label; pods missing
+	// it fall back to controller-owner grouping via ReadyByOwner,
+	// and an unlabeled AND unowned pod cannot prove siblings at all
+	// (0 — fail closed).
+	readyByCluster := map[string]int{}
+	for _, pod := range memberPods {
+		if key := rabbitClusterKey(pod); key != "" &&
+			probefw.PodRunningReady(pod) {
+			readyByCluster[key]++
 		}
 	}
+	readyByOwner := probefw.ReadyByOwner(unlabeledPods)
 
 	// Stuck-unready pod signature — independent of Prometheus.
 	seenKeep := map[string]bool{}
-	for ns, members := range rabbitByNS {
-		for _, pod := range members {
-			if pod.DeletionTimestamp != nil ||
-				pod.Status.Phase == corev1.PodSucceeded ||
-				pod.Status.Phase == corev1.PodFailed {
-				continue
-			}
-			since, unready := probefw.PodUnreadySince(pod)
-			if !unready {
-				continue
-			}
-			key := ns + "/" + pod.Name
-			if now.Sub(since) < rabbitUnreadyMinAge {
-				continue
-			}
-			if findings[key] == nil {
-				findings[key] = map[string]bool{}
-			}
-			findings[key]["stuck_unready"] = true
-			// Heal only when quorum survives: >=2 OTHER replicas
-			// Ready — the unready pod itself is never Ready, so the
-			// running-ready count already excludes it.
-			if readyByNS[ns] >= 2 {
-				p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
-					key, pod, rabbitQuorumHealCool, now)
-			}
+	for _, pod := range memberPods {
+		if pod.DeletionTimestamp != nil ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		since, unready := probefw.PodUnreadySince(pod)
+		if !unready {
+			continue
+		}
+		key := pod.Namespace + "/" + pod.Name
+		if now.Sub(since) < rabbitUnreadyMinAge {
+			continue
+		}
+		if findings[key] == nil {
+			findings[key] = map[string]bool{}
+		}
+		findings[key]["stuck_unready"] = true
+		// Heal only when quorum survives: >=2 OTHER members of the
+		// SAME cluster Ready — the unready pod itself is never
+		// Ready, so the sibling count already excludes it.
+		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
+			p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
+				key, pod, rabbitQuorumHealCool, now)
 		}
 	}
 
@@ -221,7 +291,20 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 			}) {
 			continue
 		}
-		if readyByNS[pod.Namespace] >= 2 {
+		// disk_watermark_alarm is deliberately non-healable (W12
+		// P0-2c): deleting the pod cannot free its PVC, and the
+		// restart replays the quorum-queue WAL onto a still-full
+		// disk. The finding still FAILs the check and emits the
+		// gauge below — it just never deletes.
+		if !rabbitHealableFindings(findings[key]) {
+			continue
+		}
+		// >=2 OTHER members of the same cluster Ready — the
+		// alarmed pod may itself still report Ready (the
+		// gray-failure shape), and counting it would let a 3-node
+		// cluster at 2/3 Ready approve a delete that drops it to
+		// 1/3 — Raft quorum loss (W12 P0-2b).
+		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
 			p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
 				key, pod, rabbitQuorumHealCool, now)
 		}

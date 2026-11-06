@@ -1563,3 +1563,54 @@ func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {
 			ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
+
+// W12-CP4b: a backend whose JWKS kid set dissents from the healthy
+// majority for 3 consecutive cycles is flagged (gauge+log) — the
+// sa.pub/sa.key rotation skew surfaces as random 401s through the LB.
+func TestEndpointGuardJWKSKIDSkew(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient()
+	probes := probeTable{
+		"10.0.0.1": {liveRV: 1000, cacheRV: 1000, jwksKIDs: "k1 k2"},
+		"10.0.0.2": {liveRV: 1000, cacheRV: 1000, jwksKIDs: "k1 k2"},
+		"10.0.0.3": {liveRV: 1000, cacheRV: 1000, jwksKIDs: "k3"}, // skewed
+	}
+	g := newEndpointGuard(cs, dyn, probes)
+	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	for cyc := 0; cyc < endpointGuardKidSkewCycles; cyc++ {
+		g.evaluateBackends(ctx, ips, ips, map[string]bool{})
+	}
+	if got := g.backends["10.0.0.3"].kidSkewStreak; got != endpointGuardKidSkewCycles {
+		t.Fatalf("skewed backend kidSkewStreak = %d, want %d", got, endpointGuardKidSkewCycles)
+	}
+	if got := g.backends["10.0.0.1"].kidSkewStreak; got != 0 {
+		t.Fatalf("majority backend kidSkewStreak = %d, want 0", got)
+	}
+	// Recovery: the odd backend rejoins the majority — streak resets.
+	probes["10.0.0.3"] = &apiProbeResult{liveRV: 1000, cacheRV: 1000, jwksKIDs: "k1 k2"}
+	g.evaluateBackends(ctx, ips, ips, map[string]bool{})
+	if got := g.backends["10.0.0.3"].kidSkewStreak; got != 0 {
+		t.Fatalf("recovered backend kidSkewStreak = %d, want 0", got)
+	}
+}
+
+// A lone dissent voter can't skew itself: empty/missing JWKS sets
+// abstain, and a 2-backend tie never flags a minority.
+func TestEndpointGuardJWKSTieNeverFlags(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient()
+	probes := probeTable{
+		"10.0.0.1": {liveRV: 1000, cacheRV: 1000, jwksKIDs: "k1"},
+		"10.0.0.2": {liveRV: 1000, cacheRV: 1000, jwksKIDs: "k2"},
+	}
+	g := newEndpointGuard(cs, dyn, probes)
+	ips := []string{"10.0.0.1", "10.0.0.2"}
+	for cyc := 0; cyc < endpointGuardKidSkewCycles+1; cyc++ {
+		g.evaluateBackends(ctx, ips, ips, map[string]bool{})
+	}
+	for _, ip := range ips {
+		if got := g.backends[ip].kidSkewStreak; got != 0 {
+			t.Fatalf("tied backend %s kidSkewStreak = %d, want 0", ip, got)
+		}
+	}
+}
