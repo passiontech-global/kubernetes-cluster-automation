@@ -70,9 +70,12 @@ jobs:
           # only when no "<app>/vX.Y.Z" tag exists yet (git --sort=-v:refname
           # compares full refnames, so "v0.2.0" would otherwise sort
           # ahead of "node-automation-controller/v0.5.0").
-          last_tag=$(git tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
+          # versionsort.suffix=- orders prerelease suffixes BEFORE the
+          # bare version (v0.1.0-rc.1 < v0.1.0) — without it an rc tag
+          # sorts HIGHER than the stable release and wins "latest".
+          last_tag=$(git -c versionsort.suffix=- tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
           if [ -z "$last_tag" ] && [ "${{ inputs.legacy_v_tags }}" = "true" ]; then
-            last_tag=$(git tag -l "v[0-9]*" --sort=-v:refname | head -1)
+            last_tag=$(git -c versionsort.suffix=- tag -l "v[0-9]*" --sort=-v:refname | head -1)
           fi
           if [ -z "$last_tag" ]; then
             last_tag="$APP/v0.0.0"
@@ -172,6 +175,8 @@ jobs:
           REL_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          args=(--title "$APP $REL_VERSION" --notes-file notes.md)
+          args=(--title "$APP $REL_VERSION" --notes-file notes.md --target "$GITHUB_SHA")
           [ "$REL_PRERELEASE" != "true" ] || args+=(--prerelease)
-          gh release create "$REL_TAG" "apps/$APP/dist/"* notes.md "${args[@]}"
+          # Positional args are uploaded release ASSETS — notes.md is
+          # already passed via --notes-file and must not ship as one.
+          gh release create "$REL_TAG" "apps/$APP/dist/"* "${args[@]}"

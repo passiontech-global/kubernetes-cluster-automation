@@ -15,6 +15,28 @@ project:
   description: 'GitHub org webhook fan-out to Concourse resource check webhooks (push/release/tag-create -> git, pull_request -> github-pr).'
 
 tasks:
+  # test/vet/lint are defined globally in .moon/tasks/all.yml — the inputs
+  # below MERGE with the global list. hostkit is compiled into this module
+  # via the go.mod `replace ../../libs/hostkit`, so its sources must
+  # invalidate every cache that depends on compiled code (and let
+  # `moon ci` treat a touched hostkit file as affecting these tasks).
+  test:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+
+  vet:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+
+  lint:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      # golangci-lint resolves its config by walking up to the repo root.
+      - '/.golangci.yml'
+
   build:
     script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/webhook-dispatcher ./cmd/dispatcher'
     toolchains: 'system'
@@ -26,6 +48,9 @@ tasks:
       - 'cmd/**/*.go'
       - 'internal/**/*.go'
       - 'go.mod'
+      - 'go.sum'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
     outputs:
       - 'bin/webhook-dispatcher'
 
@@ -36,6 +61,9 @@ tasks:
       - 'cmd/**/*.go'
       - 'internal/**/*.go'
       - 'go.mod'
+      - 'go.sum'
       - '.ko.yaml'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
     options:
       cache: false

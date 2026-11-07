@@ -15,6 +15,39 @@ project:
   description: 'Per-node agent (DaemonSet) for the kubernetes-node-automation stack.'
 
 tasks:
+  # test/vet/lint are defined globally in .moon/tasks/all.yml — the inputs
+  # below MERGE with the global list. hostkit is compiled into this module
+  # via the go.mod `replace ../../libs/hostkit`, so its sources must
+  # invalidate every cache that depends on compiled code (and let
+  # `moon ci` treat a touched hostkit file as affecting these tasks).
+  #
+  # Two non-Go trees also feed the compiled packages:
+  #   internal/subsystem/hostconfig/templates/** — go:embed'ed by
+  #     hostconfig/cycle.go (compiled into the binary + exercised by
+  #     hostconfig tests)
+  #   internal/subsystem/hubsync/testdata/** — fixtures read by the
+  #     hubsync tests (testdata/vars, testdata/nebula-certs)
+  test:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      - 'internal/subsystem/hostconfig/templates/**'
+      - 'internal/subsystem/hubsync/testdata/**'
+
+  vet:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      - 'internal/subsystem/hostconfig/templates/**'
+
+  lint:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      - 'internal/subsystem/hostconfig/templates/**'
+      # golangci-lint resolves its config by walking up to the repo root.
+      - '/.golangci.yml'
+
   build:
     script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-host-agent ./cmd/agent'
     toolchains: 'system'
@@ -26,6 +59,10 @@ tasks:
       - 'cmd/**/*.go'
       - 'internal/**/*.go'
       - 'go.mod'
+      - 'go.sum'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      - 'internal/subsystem/hostconfig/templates/**'
     outputs:
       - 'bin/node-host-agent'
 
@@ -79,6 +116,7 @@ tasks:
       - '/.dockerignore'
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - 'internal/subsystem/hostconfig/templates/**'
     options:
       # script is a multi-line shell snippet — must run via shell.
       shell: true

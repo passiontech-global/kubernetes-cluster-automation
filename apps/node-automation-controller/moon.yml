@@ -15,6 +15,31 @@ project:
   description: 'controller-runtime operator replacing the shell-operator Deployment + bash hooks for node lifecycle automation.'
 
 tasks:
+  # test/vet/lint are defined globally in .moon/tasks/all.yml — the inputs
+  # below MERGE with the global list. hostkit is compiled into this module
+  # via the go.mod `replace ../../libs/hostkit`, so its sources must
+  # invalidate every cache that depends on compiled code (and let
+  # `moon ci` treat a touched hostkit file as affecting these tasks).
+  test:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      # internal/envdoc TestEnvDocCoversSource reads docs/env.md — without
+      # this input a docs-only PR never re-runs this test on CI.
+      - 'docs/env.md'
+
+  vet:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+
+  lint:
+    inputs:
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      # golangci-lint resolves its config by walking up to the repo root.
+      - '/.golangci.yml'
+
   build:
     script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-automation-controller ./cmd/manager'
     toolchains: 'system'
@@ -27,6 +52,8 @@ tasks:
       - 'internal/**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
     outputs:
       - 'bin/node-automation-controller'
 
@@ -39,5 +66,7 @@ tasks:
       - 'go.mod'
       - 'go.sum'
       - '.ko.yaml'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
     options:
       cache: false

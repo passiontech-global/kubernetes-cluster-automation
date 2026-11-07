@@ -13,3 +13,8 @@
 **/changelog.md
 **/*.test
 **/coverage.out
+# Gitignored build outputs that must not leak into the build context
+# (a stale apps/node-host-agent/agent is ~47MB). These sit beside the
+# **/bin/ dirs already excluded above.
+apps/node-host-agent/agent
+apps/node-automation-controller/manager
