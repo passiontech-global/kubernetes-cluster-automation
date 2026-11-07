@@ -1,5 +1,5 @@
 // workload_scale_flapping.go — the workload-scale-flapping check
-// (W13-SC1 / Gap #5): counts ScalingReplicaSet events per
+// (scale-flap): counts ScalingReplicaSet events per
 // Deployment/StatefulSet over the last hour and flags any workload
 // whose scale direction reversed >=6 times — the runtime signature
 // of a three-way tug-of-war between Flux GitOps (static
@@ -27,7 +27,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// workloadScaleFlappingCheck is the W13-SC1 scale tug-of-war
+// workloadScaleFlappingCheck is the scale-flap scale tug-of-war
 // detector.
 type workloadScaleFlappingCheck struct {
 	*probefw.Deps
@@ -37,7 +37,7 @@ type workloadScaleFlappingCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewWorkloadScaleFlappingCheck builds the W13-SC1 check — the
+// NewWorkloadScaleFlappingCheck builds the scale-flap check — the
 // emitted ledger is zero-value usable.
 func NewWorkloadScaleFlappingCheck(d *probefw.Deps) probefw.Check {
 	return &workloadScaleFlappingCheck{Deps: d}
@@ -45,7 +45,7 @@ func NewWorkloadScaleFlappingCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	// CheckNameWorkloadScaleFlapping is the check's kuberhealthy_check
-	// label value — W13-SC1; not a ported HealthCheck but reports
+	// label value — scale-flap; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNameWorkloadScaleFlapping = "workload-scale-flapping"
@@ -76,10 +76,10 @@ const (
 )
 
 var (
-	// W13-SC1 — workload scale tug-of-war.
+	// scale-flap — workload scale tug-of-war.
 	workloadScaleFlappingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_workload_scale_flapping",
-		Help: "1 while the workload's scale direction flipped >=6 times in the last hour (GitOps/downscaler/autoscaler tug-of-war) — W13-SC1.",
+		Help: "1 while the workload's scale direction flipped >=6 times in the last hour (GitOps/downscaler/autoscaler tug-of-war) — scale-flap.",
 	}, []string{"namespace", "kind", "name"})
 )
 

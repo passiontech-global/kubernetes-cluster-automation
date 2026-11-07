@@ -778,12 +778,12 @@ func TestVeleroAuditorEverestCRDAbsent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W13-ST2 — BackupRepository health audit
+// backup-health — BackupRepository health audit
 // ---------------------------------------------------------------------------
 
 // veleroRepo builds a BackupRepository — status.phase plus an
 // optional lastMaintenanceTime (zero value omits the field) drive
-// the W13-ST2 health verdicts.
+// the backup-health health verdicts.
 func veleroRepo(ns, name, phase string, lastMaint time.Time) *unstructured.Unstructured {
 	status := map[string]any{"phase": phase}
 	if !lastMaint.IsZero() {

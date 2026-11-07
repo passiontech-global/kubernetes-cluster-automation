@@ -1,5 +1,5 @@
 // linkerd_outlier_guard_test.go — coverage for the
-// linkerd-outlier-guard check (W13-NM2): the 4-condition cohort
+// linkerd-outlier-guard check (linkerd-outlier): the 4-condition cohort
 // math (MinRPS, same-revision, outlier err, sibling median) and the
 // six evict gates (persistence+age, Ready sibling, controller
 // cooldown, PDB, maintenance mutex+budget, kill switch).

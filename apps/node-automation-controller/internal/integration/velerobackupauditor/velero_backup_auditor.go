@@ -18,7 +18,7 @@
 // Clusters without Velero have no CRDs — the Schedule List 404s and
 // the sweep no-ops quietly (same contract as externalsecret-nudge).
 //
-// W13-ST2 adds the BackupRepository audit: a repo whose status.phase
+// backup-health adds the BackupRepository audit: a repo whose status.phase
 // is not Ready cannot be opened by restic/kopia, and a
 // status.lastMaintenanceTime older than 7 days means the scheduled
 // prune/repack maintenance loop stopped — either way the next
@@ -73,7 +73,7 @@ var (
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
 	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
-	// W13-ST2 — backuprepositories.velero.io: the restic/kopia repo
+	// backup-health — backuprepositories.velero.io: the restic/kopia repo
 	// each BSL's snapshots land in; its phase and maintenance clock
 	// say whether a restore can actually read them.
 	veleroRepoGVR = kube.GVVeleroBackupRepository
@@ -99,7 +99,7 @@ var veleroStuckPhases = map[string]string{
 
 const veleroStuckMaxAge = 6 * time.Hour
 
-// veleroRepoMaintenanceMaxAge is the W13-ST2 repo-maintenance bound:
+// veleroRepoMaintenanceMaxAge is the backup-health repo-maintenance bound:
 // velero runs restic/kopia repository maintenance (prune + repack)
 // on a regular cycle — default hourly, never sparser than daily — so
 // a lastMaintenanceTime older than 7 days means the maintenance loop
@@ -158,7 +158,7 @@ type backupKey struct{ namespace, schedule, reason string }
 type everestKey struct{ namespace, cluster, reason string }
 
 // repoKey identifies one VeleroRepoUnhealthy series — the label
-// triple (namespace, BackupRepository name, reason) of the W13-ST2
+// triple (namespace, BackupRepository name, reason) of the backup-health
 // repo audit.
 type repoKey struct{ namespace, name, reason string }
 
@@ -185,7 +185,7 @@ type veleroBackupAuditor struct {
 	// seenBSL: series ledger for VeleroBSLUnavailable — an
 	// Available-again or deleted BSL gets DeleteLabelValues.
 	seenBSL state.GaugeLedger[pausedKey]
-	// seenRepo: series ledger for VeleroRepoUnhealthy (W13-ST2) — a
+	// seenRepo: series ledger for VeleroRepoUnhealthy (backup-health) — a
 	// repo that goes Ready again or gets a fresh maintenance stamp
 	// loses its series.
 	seenRepo state.GaugeLedger[repoKey]
@@ -345,7 +345,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
 
-	// W13-ST2 — BackupRepository health: the restic/kopia repo every
+	// backup-health — BackupRepository health: the restic/kopia repo every
 	// snapshot lands in. A repo whose phase is not Ready cannot be
 	// opened at all, and a lastMaintenanceTime older than 7d means
 	// the scheduled maintenance (prune/repack) stopped — both leave

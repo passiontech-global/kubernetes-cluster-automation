@@ -1,5 +1,5 @@
 // imagepull_secret_auditor.go — the imagepull-secret-auditor check
-// (W13-SC1): audits the kubernetes.io/dockerconfigjson Secrets that
+// (pullsecret-audit): audits the kubernetes.io/dockerconfigjson Secrets that
 // imagePullSecrets actually reference — on Pods, ServiceAccounts and
 // Deployment/StatefulSet/DaemonSet pod templates — and flags ones
 // that are missing, malformed, the wrong type, or carrying an
@@ -29,7 +29,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// imagePullSecretAuditorCheck is the W13-SC1 pull-secret hygiene
+// imagePullSecretAuditorCheck is the pullsecret-audit pull-secret hygiene
 // auditor.
 type imagePullSecretAuditorCheck struct {
 	*probefw.Deps
@@ -39,7 +39,7 @@ type imagePullSecretAuditorCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewImagePullSecretAuditorCheck builds the W13-SC1 check — the
+// NewImagePullSecretAuditorCheck builds the pullsecret-audit check — the
 // emitted ledger is zero-value usable.
 func NewImagePullSecretAuditorCheck(d *probefw.Deps) probefw.Check {
 	return &imagePullSecretAuditorCheck{Deps: d}
@@ -47,7 +47,7 @@ func NewImagePullSecretAuditorCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	// CheckNameImagePullSecretAuditor is the check's
-	// kuberhealthy_check label value — W13-SC1; not a ported
+	// kuberhealthy_check label value — pullsecret-audit; not a ported
 	// HealthCheck but reports under its own check name so the
 	// generic FAIL alerting path covers it.
 	CheckNameImagePullSecretAuditor = "imagepull-secret-auditor"
@@ -58,10 +58,10 @@ const (
 )
 
 var (
-	// W13-SC1 — pull-secret hygiene.
+	// pullsecret-audit — pull-secret hygiene.
 	imagePullSecretUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_imagepull_secret_unhealthy",
-		Help: "1 while an imagePullSecrets-referenced Secret is missing, malformed, wrong-typed, or carries a JWT expiring <7d — W13-SC1.",
+		Help: "1 while an imagePullSecrets-referenced Secret is missing, malformed, wrong-typed, or carries a JWT expiring <7d — pullsecret-audit.",
 	}, []string{"namespace", "secret", "reason"})
 )
 
@@ -142,7 +142,7 @@ func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 // which already includes ServiceAccount-injected entries), the
 // ServiceAccounts themselves, and the pod templates of
 // Deployments/StatefulSets/DaemonSets. The workload templates matter
-// for the W13-SC1 scenario specifically: a downscaler-parked
+// for the pullsecret-audit scenario specifically: a downscaler-parked
 // replicas:0 Deployment has no pods, but its stale secret still
 // waits to bite the next scale-up.
 func (p *imagePullSecretAuditorCheck) collectPullSecretRefs(ctx context.Context) (map[pullSecretRef]bool, error) {

@@ -108,7 +108,7 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"endpointslice-zone-starvation",
 		"linkerd-outlier-guard",
 		"node-condition-sweeper",
-		// The three gated W13 gitops rows close out the roster —
+		// The three gated gitops rows close out the roster —
 		// they landed after the always-on sequence when checks first
 		// became registry rows, so they stay last.
 		"flux-kustomization-health",

@@ -191,7 +191,7 @@ var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.Counte
 
 // VeleroRepoUnhealthy marks (1) each velero.io BackupRepository
 // reporting a status.phase other than Ready, or a
-// status.lastMaintenanceTime older than 7 days (W13-ST2) — the
+// status.lastMaintenanceTime older than 7 days (backup-health) — the
 // restic/kopia maintenance loop stopped, so restores degrade or the
 // repo cannot be opened at all. reason is phase_not_ready or
 // maintenance_stale. Labels: namespace + name + reason.

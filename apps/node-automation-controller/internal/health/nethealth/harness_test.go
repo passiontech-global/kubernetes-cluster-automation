@@ -44,7 +44,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
 		NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
 	}
-	// Same stamp for the W13-NM2 evict kill-switch —
+	// Same stamp for the linkerd-outlier evict kill-switch —
 	// nethealth.LinkerdConfigFromEnv resolves it at Setup; tests
 	// that want the gate off set the field to false directly.
 	p.Cfg.Linkerd.OutlierEvictEnabled = LinkerdOutlierEvictEnabledDefault

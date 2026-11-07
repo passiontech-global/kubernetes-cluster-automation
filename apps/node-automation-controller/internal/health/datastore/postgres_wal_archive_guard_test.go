@@ -174,10 +174,10 @@ func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W13-ST3 — CloudNativePG cluster health
+// cnpg-health — CloudNativePG cluster health
 // ---------------------------------------------------------------------------
 
-// cnpgClusterHealth builds a CNPG Cluster CR carrying the W13-ST3
+// cnpgClusterHealth builds a CNPG Cluster CR carrying the cnpg-health
 // status fields — phase, the declared/ready instance counts and an
 // optional phaseTimestamp (age<0 omits it, forcing the first-seen
 // ledger path).

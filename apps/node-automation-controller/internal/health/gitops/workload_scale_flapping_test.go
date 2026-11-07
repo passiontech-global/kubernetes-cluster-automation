@@ -1,4 +1,4 @@
-// workload_scale_flapping_test.go — the W13-SC1 scale tug-of-war
+// workload_scale_flapping_test.go — the scale-flap scale tug-of-war
 // detector driven through the fake clientset.
 package gitops
 
@@ -16,7 +16,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W13-SC1 — workload scale flapping
+// scale-flap — workload scale flapping
 // ---------------------------------------------------------------------------
 
 // scaleEvent builds a ScalingReplicaSet event on a workload — up

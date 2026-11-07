@@ -1,4 +1,4 @@
-// flux_kustomization_health_test.go — the W13-GO1 Flux Kustomization
+// flux_kustomization_health_test.go — the flux-stuck Flux Kustomization
 // stuck detector + reconcile nudger driven through the fake clientset
 // + fake dynamic client.
 package gitops
@@ -17,7 +17,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W13-GO1 — flux Kustomization stuck detector + requestedAt nudge
+// flux-stuck — flux Kustomization stuck detector + requestedAt nudge
 // ---------------------------------------------------------------------------
 
 // shKust builds a Kustomization carrying a Ready condition at `since`.

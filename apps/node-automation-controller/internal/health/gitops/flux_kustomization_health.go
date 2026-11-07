@@ -1,5 +1,5 @@
 // flux_kustomization_health.go — the flux-kustomization-health check
-// (W13-GO1): Flux Kustomizations parked Ready=False for >=15m emit
+// (flux-stuck): Flux Kustomizations parked Ready=False for >=15m emit
 // the stuck gauge; when every spec.dependsOn is Ready=True and the
 // failure is ArtifactFailed/SourceNotReady — or HealthCheckFailed
 // while the applied workloads are actually Ready — the check stamps
@@ -36,7 +36,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// fluxKustomizationHealthCheck is the W13-GO1 Flux Kustomization
+// fluxKustomizationHealthCheck is the flux-stuck Flux Kustomization
 // stuck detector + reconcile nudger.
 type fluxKustomizationHealthCheck struct {
 	*probefw.Deps
@@ -51,7 +51,7 @@ type fluxKustomizationHealthCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewFluxKustomizationHealthCheck builds the W13-GO1 check — its
+// NewFluxKustomizationHealthCheck builds the flux-stuck check — its
 // state is the cooldown/gauge ledgers (zero value usable); the
 // maintenance verdict rides the shared Deps memo.
 func NewFluxKustomizationHealthCheck(d *probefw.Deps) probefw.Check {
@@ -60,7 +60,7 @@ func NewFluxKustomizationHealthCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	// CheckNameFluxKustomizationHealth is the check's
-	// kuberhealthy_check label value — W13-GO1; not a ported
+	// kuberhealthy_check label value — flux-stuck; not a ported
 	// HealthCheck but reports under its own check name so the
 	// generic FAIL alerting path covers it.
 	CheckNameFluxKustomizationHealth = "flux-kustomization-health"
@@ -89,10 +89,10 @@ var fluxKustNudgeReasons = map[string]bool{
 }
 
 var (
-	// W13-GO1 — Flux Kustomization stuck.
+	// flux-stuck — Flux Kustomization stuck.
 	fluxKustomizationStuckGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_flux_kustomization_stuck",
-		Help: "1 while the Flux Kustomization reports Ready=False for >=15m — W13-GO1.",
+		Help: "1 while the Flux Kustomization reports Ready=False for >=15m — flux-stuck.",
 	}, []string{"namespace", "name", "reason"})
 )
 

@@ -199,7 +199,7 @@ type CiliumConfig struct {
 }
 
 // DatastoreConfig — the datastore checks' persistence windows:
-// postgres-wal-archive-guard's W13-ST3 CloudNativePG signatures and
+// postgres-wal-archive-guard's cnpg-health CloudNativePG signatures and
 // the pvc-resize-stall-guard's stall window.
 type DatastoreConfig struct {
 	CNPGUnhealthyMinAge  time.Duration // HEALTH_CNPG_UNHEALTHY_MIN_AGE
@@ -207,7 +207,7 @@ type DatastoreConfig struct {
 }
 
 // LinkerdConfig — the linkerd nethealth knobs:
-// linkerd-outlier-guard's evict kill-switch (W13-NM2). The env name
+// linkerd-outlier-guard's evict kill-switch (linkerd-outlier). The env name
 // carries no HEALTH_ prefix — it is an ops lever on the flags
 // ConfigMap like the other sub-feature gates.
 type LinkerdConfig struct {

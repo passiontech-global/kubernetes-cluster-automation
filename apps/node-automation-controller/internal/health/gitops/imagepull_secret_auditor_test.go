@@ -1,4 +1,4 @@
-// imagepull_secret_auditor_test.go — the W13-SC1 pull-secret hygiene
+// imagepull_secret_auditor_test.go — the pullsecret-audit pull-secret hygiene
 // auditor driven through the fake clientset.
 package gitops
 
@@ -18,7 +18,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W13-SC1 — imagepull secret auditor
+// pullsecret-audit — imagepull secret auditor
 // ---------------------------------------------------------------------------
 
 // pullPod builds a pod whose spec.imagePullSecrets refs names.
