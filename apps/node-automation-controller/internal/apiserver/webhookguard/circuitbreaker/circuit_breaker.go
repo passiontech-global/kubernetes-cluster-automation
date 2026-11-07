@@ -163,6 +163,9 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	g := snap.G
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()
+	// bounceAt keys on backend Service names that die with the
+	// Service — bound the map so stale stamps cannot accumulate.
+	b.bounceAt.PruneExpired(now, BounceCooldown)
 
 	ready, err := snap.ReadyCounts()
 	if err != nil {
@@ -182,15 +185,27 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	var failed []string
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, g.Queue, guardstate.KindMutating,
-			cfg.Name, cfg.Annotations[guardstate.CircuitBrokenAnno],
-			mutHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
+		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
+			guardstate.KindMutating, cfg.Name,
+			cfg.Annotations[guardstate.CircuitBrokenAnno],
+			mutHookViews(cfg.Webhooks), ready, now, seen)
 		if payload == nil {
+			// Nothing to write — the still-broken re-asserts read
+			// verified live state (the annotation already lists
+			// them, the policy is already Ignore), so the series
+			// emits without a landed patch.
+			circuitMetrics(&b.brokenEmitted, guardstate.KindMutating,
+				cfg.Name, nil, nil, stillBroken)
 			continue
 		}
 		patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
 		if err != nil {
+			// The post-patch annotation state is unverifiable —
+			// carry the config's last-emitted tuples forward so
+			// the sweep-end prune does not flap a still-broken
+			// series off (the annotation may well still list it).
+			b.carryBrokenForward(guardstate.KindMutating, cfg.Name)
 			log.Error(err, "circuit breaker patch failed",
 				"kind", guardstate.KindMutating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
@@ -200,26 +215,32 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		// the unmeshed audit's injector-health read must see the
 		// new failurePolicy/annotation state, not the stale list.
 		snap.SetMWC(patched)
-		circuitMetrics(&b.brokenEmitted, guardstate.KindMutating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, guardstate.KindMutating,
+			cfg.Name, trips, recovered, stillBroken)
 	}
 	for i := range vwcs.Items {
 		cfg := &vwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, g.Queue, guardstate.KindValidating,
-			cfg.Name, cfg.Annotations[guardstate.CircuitBrokenAnno],
-			valHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
+		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
+			guardstate.KindValidating, cfg.Name,
+			cfg.Annotations[guardstate.CircuitBrokenAnno],
+			valHookViews(cfg.Webhooks), ready, now, seen)
 		if payload == nil {
+			circuitMetrics(&b.brokenEmitted, guardstate.KindValidating,
+				cfg.Name, nil, nil, stillBroken)
 			continue
 		}
 		patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
 		if err != nil {
+			b.carryBrokenForward(guardstate.KindValidating, cfg.Name)
 			log.Error(err, "circuit breaker patch failed",
 				"kind", guardstate.KindValidating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
 		snap.SetVWC(patched)
-		circuitMetrics(&b.brokenEmitted, guardstate.KindValidating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, guardstate.KindValidating,
+			cfg.Name, trips, recovered, stillBroken)
 	}
 
 	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
@@ -304,15 +325,17 @@ func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 // ...} — the webhooks list is patchMergeKey=name + patchStrategy=merge
 // (+listType=map), so only the touched element's failurePolicy is
 // rewritten and a concurrent writer's sibling entries survive instead
-// of being reverted by a whole-array reserialize. emitted is the
-// sweep's WebhookCircuitBroken series ledger — tuples re-asserted at
-// =1 are Emitted into it so the caller's Prune deletes whatever was
-// not re-seen. Returns nil payload when nothing changed;
-// trips/recovered are the names whose metric updates the caller must
-// apply only after the patch lands.
+// of being reverted by a whole-array reserialize. Returns nil
+// payload when nothing changed; trips, recovered and stillBroken are
+// the names whose metric/ledger updates the caller must apply only
+// after the patch lands (stillBroken is also returned on the
+// nil-payload path — nothing needs writing, but the
+// annotation-verified series still re-asserts). Emitting any of
+// them earlier would let a failed patch pin or drop a series the
+// annotation no longer justifies.
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
-	seen map[string]bool, emitted *state.GaugeLedger[string]) ([]byte, []string, []string) {
+	seen map[string]bool) (payload []byte, trips, recovered, stillBroken []string) {
 
 	broken := guardstate.ParseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
@@ -329,7 +352,6 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 			"name": h.name, "failurePolicy": string(fp)})
 	}
 	changed := false
-	var trips, recovered []string
 
 	for _, h := range hooks {
 		present[h.name] = true
@@ -376,12 +398,16 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 				"service", svcRefString(h.svc))
 		case isBroken:
 			// Still dead — the annotation is the SSOT, so re-assert
-			// Ignore if the policy was flipped back externally.
+			// Ignore if the policy was flipped back externally. The
+			// series re-asserts post-patch via stillBroken: a failed
+			// patch leaves the annotation unverifiable, so marking
+			// it emitted here would let the prune keep (or drop)
+			// the wrong set.
 			if h.fp == nil || *h.fp != admissionv1.Ignore {
 				flip(h, admissionv1.Ignore)
 				changed = true
 			}
-			emitted.Set(metrics.WebhookCircuitBroken, 1, key, kind, cfgName, h.name)
+			stillBroken = append(stillBroken, h.name)
 		case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.fp):
 			seen[key] = true
 			first, tracked := b.deadSince.Observe(key, now)
@@ -437,7 +463,7 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		}
 	}
 	if !changed {
-		return nil, nil, nil
+		return nil, nil, nil, stillBroken
 	}
 
 	anno := map[string]any{guardstate.CircuitBrokenAnno: nil} // merge-patch null deletes the key
@@ -462,9 +488,24 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		// metered so the dropped work is still counted.
 		metrics.IncError(queue)
 		log.Error(err, "marshal circuit breaker patch", "config", cfgName)
-		return nil, nil, nil
+		return nil, nil, nil, stillBroken
 	}
-	return payload, trips, recovered
+	return payload, trips, recovered, stillBroken
+}
+
+// carryBrokenForward re-asserts last sweep's WebhookCircuitBroken
+// tuples for one config after its patch failed — the same
+// carry-forward the CRD conversion sweep runs on an unverifiable
+// read: a failed patch leaves the annotation (and the truth the
+// series reports) at its last confirmed state, so the sweep-end
+// prune must not flap a still-broken series off.
+func (b *Breaker) carryBrokenForward(kind, cfgName string) {
+	prefix := kind + "/" + cfgName + "/"
+	for k, lv := range b.brokenEmitted.Last() {
+		if strings.HasPrefix(k, prefix) {
+			b.brokenEmitted.Emit(k, lv...)
+		}
+	}
 }
 
 // svcRefString renders a webhook's Service reference for log lines.
@@ -502,6 +543,9 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 	g := snap.G
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()
+	// The shared bounce ledger is stamped below for hung conversion
+	// backends too — same once-per-sweep bound as Sweep.
+	b.bounceAt.PruneExpired(now, BounceCooldown)
 
 	carryForward := func() {
 		for k, lv := range b.crdUnhealthyEmitted.Last() {

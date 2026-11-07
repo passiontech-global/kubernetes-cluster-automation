@@ -451,10 +451,17 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 // a zero series.
 func (k *KineDB) probeTopChurn(ctx context.Context, pg, user, pass string,
 	note func(string)) {
+	if k.cfg.ReadOnly {
+		// The watermark files are the DAEMON's sampling window — a
+		// read-only probe (check-kine-db) must not rebase it. The
+		// sample itself feeds only the guard textfile, which the
+		// CLI does not render, so there is nothing to report here.
+		return
+	}
 	dir := k.cfg.GuardStateDir
 	prevHead, _ := readIntFile(filepath.Join(dir, churnFileHead))
 	prevTS, _ := readIntFile(filepath.Join(dir, churnFileTS))
-	now := k.cfg.nowFn().Unix()
+	now := k.cfg.Clock.Now().Unix()
 	if prevTS == 0 {
 		// First sighting — seed the watermark only. A missing
 		// watermark treated as head=0 would group-by the WHOLE
@@ -487,7 +494,9 @@ func (k *KineDB) probeTopChurn(ctx context.Context, pg, user, pass string,
 			top = append(top, churnEntry{resource: f[0], revs: n})
 		}
 	}
+	k.churnMu.Lock()
 	k.churnTop = top
+	k.churnMu.Unlock()
 	// Advance the watermark — a churn-free window still moves it
 	// so the next window measures fresh ground.
 	writeIntFile(filepath.Join(dir, churnFileHead), resHead(k, ctx, pg, user, pass))
@@ -636,7 +645,7 @@ func (k *KineDB) emitProbe(res *probeResult) {
 	p.Gauge("node_agent_kine_pg_idle_in_tx_terminated_total",
 		"Stuck kine sessions terminated by the session reaper",
 		float64(k.m.idleTermTotal))
-	ts := float64(k.cfg.nowFn().Unix())
+	ts := float64(k.cfg.Clock.Now().Unix())
 	p.Gauge("kine_db_probe_last_run_timestamp_seconds",
 		"Last probe run", ts)
 	k.m.probeLastRun.Set(ts)

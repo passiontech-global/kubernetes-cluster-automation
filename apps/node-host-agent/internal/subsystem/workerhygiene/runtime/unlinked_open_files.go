@@ -100,11 +100,11 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// The fd walk is IO on the disk that is already full — at most
 	// once per BloatScanInterval while over the watermark; the last
 	// exported series values persist meanwhile.
-	if c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
+	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
 		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	total, count, holderBytes, holderPids := c.sweep(e)
 	c.d.UnlinkedOpenFileBytes = total
 	c.d.UnlinkedOpenFileCount = int64(count)

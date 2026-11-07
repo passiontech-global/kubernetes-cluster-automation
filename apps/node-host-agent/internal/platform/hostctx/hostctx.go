@@ -14,6 +14,7 @@ package hostctx
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Deps is the shared watchdog/host context — one value per process,
@@ -67,6 +68,12 @@ type Deps struct {
 	// main) — the pods-filter key, the topology.Load registry key,
 	// and the NodeCondition target.
 	NodeName string
+	// Clock is the shared settable clock — ONE timex.Cell spliced
+	// into every subsystem Config, so a test stubbing the cell once
+	// (deps.Clock.Set) is observed by every subsystem's hoststate
+	// store and clock reads. Nil → each subsystem's applyDefaults
+	// arms its own NewCell(nil); DepsFromEnv always fills it.
+	Clock *timex.Cell
 }
 
 // PathJoin is the nil-safe form of the HostPath join: nil HostPath →

@@ -1,4 +1,4 @@
-// groups_test.go — shared converge fixtures (scriptedRunner,
+// groups_test.go — shared converge fixtures (newScripted,
 // writeVarsDir, loadCyc, host-root helpers) plus cross-group and
 // orchestration coverage: CycleWithErrors accounting, applyNftUnit
 // staging, run budgets, and the sh* charset gates.
@@ -6,7 +6,6 @@ package hostconfig
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,45 +14,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
-// scriptedRunner answers canned output per command prefix and records
-// every invocation.
-type scriptedRunner struct {
-	calls []string
-	res   map[string]string // substring match -> stdout
-	errs  map[string]bool   // substring match -> error
-}
-
-func (s *scriptedRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	c := name + " " + strings.Join(args, " ")
-	s.calls = append(s.calls, c)
-	for k := range s.errs {
-		if strings.Contains(c, k) {
-			return "", fmt.Errorf("scripted failure for %q", c)
-		}
+// newScripted loads the shared FakeRunner from the res/errs maps the
+// suites used to hand the private scriptedRunner: res maps a command
+// substring to stdout, errs marks substrings that fail (a fail key
+// wins over a res key however long either is — the old errs-first
+// lookup, now FakeRunner's fail-rules-beat-replies rule).
+func newScripted(res map[string]string, errs map[string]bool) *testutil.FakeRunner {
+	f := testutil.NewFakeRunner()
+	for k, v := range res {
+		f.On(k, v)
 	}
-	best := ""
-	bestLen := -1
-	for k, v := range s.res {
-		if strings.Contains(c, k) && len(k) > bestLen {
-			best, bestLen = v, len(k)
-		}
+	for k := range errs {
+		f.FailOn(k, nil)
 	}
-	return best, nil
-}
-
-func (s *scriptedRunner) callsMatching(sub string) []string {
-	var out []string
-	for _, c := range s.calls {
-		if strings.Contains(c, sub) {
-			out = append(out, c)
-		}
-	}
-	return out
+	return f
 }
 
 func writeVarsDir(t *testing.T, cluster string) string {
@@ -164,22 +145,19 @@ func hostExists(r *Reconciler, path string) bool {
 // cleanCycleFixture returns a Reconciler + runner whose groups all
 // self-gate or succeed under a tempdir HostRoot, so CycleWithErrors
 // reports 0 and lastOK is stamped.
-func cleanCycleFixture(t *testing.T) (*Reconciler, *scriptedRunner) {
+func cleanCycleFixture(t *testing.T) (*Reconciler, *testutil.FakeRunner) {
 	t.Helper()
 	vars := writeVarsDir(t, "interdc_nebula_enabled: false\n")
-	sr := &scriptedRunner{
-		res: map[string]string{
-			"/usr/local/bin/coredns -version":               "CoreDNS-1.14.7",
-			"dig @127.0.0.1":                                "10.0.1.10",
-			"dpkg-query -W -f=${db:Status-Status} fail2ban": "installed",
-			"sshd -T": "passwordauthentication no",
-		},
-		errs: map[string]bool{},
-	}
+	sr := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version":               "CoreDNS-1.14.7",
+		"dig @127.0.0.1":                                "10.0.1.10",
+		"dpkg-query -W -f=${db:Status-Status} fail2ban": "installed",
+		"sshd -T": "passwordauthentication no",
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		DownloadDir: t.TempDir(), Runner: sr,
-		NowFn: func() time.Time { return time.Unix(1_700_000_000, 0) }}, nil)
+		Clock: timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,13 +169,13 @@ func TestCycleWithErrorsCleanCycleStampsLastOK(t *testing.T) {
 	if got := r.CycleWithErrors(context.Background()); got != 0 {
 		t.Fatalf("clean cycle returned %d errors", got)
 	}
-	if got := testutil.ToFloat64(r.lastOK); got != 1_700_000_000 {
-		t.Fatalf("lastOK = %v, want NowFn unix", got)
+	if got := promtestutil.ToFloat64(r.lastOK); got != 1_700_000_000 {
+		t.Fatalf("lastOK = %v, want Clock unix", got)
 	}
 }
 
 func TestCycleWithErrorsTopologyLoadFailure(t *testing.T) {
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: t.TempDir(), // missing interdc_nodes.yaml/cluster.yaml
 		Runner:  sr}, nil)
@@ -213,7 +191,7 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 	r, sr := cleanCycleFixture(t)
 	// daemon-reload runs when the nodelocaldns nft+unit change —
 	// failing it is a command error attributed to that group only.
-	sr.errs["systemctl daemon-reload"] = true
+	sr.FailOn("systemctl daemon-reload", nil)
 	got := r.CycleWithErrors(context.Background())
 	// EXACT count — one noteErr per daemonReload invocation:
 	// nodelocaldns nft apply + host-internal-ports nft apply
@@ -225,21 +203,21 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 		t.Fatalf("cycle returned %d errors, want exactly 3 "+
 			"(daemon-reload x nodelocaldns/host-ports-guard/nodeip_cpu)", got)
 	}
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("nodelocaldns", "error")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("nodelocaldns", "error")); got != 1 {
 		t.Fatalf("cycles{nodelocaldns,error} = %v want 1", got)
 	}
 	// Errors attribute per group: a clean group still reads "ok".
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("base", "ok")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("base", "ok")); got != 1 {
 		t.Fatalf("cycles{base,ok} = %v want 1 (error mis-attributed)", got)
 	}
-	if got := testutil.ToFloat64(r.lastOK); got != 0 {
+	if got := promtestutil.ToFloat64(r.lastOK); got != 0 {
 		t.Fatalf("lastOK stamped on a failed cycle: %v", got)
 	}
 }
 
 func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -248,7 +226,7 @@ func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	c := loadCyc(t, r, vars, "node-b")
 
 	c.group("g-ok", func() {})
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-ok", "ok")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("g-ok", "ok")); got != 1 {
 		t.Fatalf("cycles{g-ok,ok} = %v want 1", got)
 	}
 	if c.errs != 0 {
@@ -256,7 +234,7 @@ func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	}
 
 	c.group("g-err", func() { c.err("boom") })
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-err", "error")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("g-err", "error")); got != 1 {
 		t.Fatalf("cycles{g-err,error} = %v want 1", got)
 	}
 	if c.errs != 1 {
@@ -264,7 +242,7 @@ func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	}
 
 	c.group("g-panic", func() { panic("test panic") })
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-panic", "panic")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("g-panic", "panic")); got != 1 {
 		t.Fatalf("cycles{g-panic,panic} = %v want 1", got)
 	}
 	if c.errs != 2 {
@@ -272,14 +250,14 @@ func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	}
 	// later groups still run after a panic.
 	c.group("g-after", func() {})
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-after", "ok")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("g-after", "ok")); got != 1 {
 		t.Fatalf("cycles{g-after,ok} = %v want 1", got)
 	}
 }
 
 func TestGroupWriteFailureCountedViaHelper(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	hr := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: hr,
 		VarsDir: vars, Runner: sr}, nil)
@@ -296,17 +274,17 @@ func TestGroupWriteFailureCountedViaHelper(t *testing.T) {
 			t.Error("writeManaged unexpectedly succeeded")
 		}
 	})
-	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-write", "error")); got != 1 {
+	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("g-write", "error")); got != 1 {
 		t.Fatalf("cycles{g-write,error} = %v want 1", got)
 	}
 }
 
 // ---------- journald integrity (A5, groupBase) ----------
 
-func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cyc, *Reconciler, *scriptedRunner) {
+func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cyc, *Reconciler, *testutil.FakeRunner) {
 	t.Helper()
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: res, errs: errs}
+	sr := newScripted(res, errs)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -320,9 +298,9 @@ func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cy
 // nft -c'd at a CANDIDATE path and never reach the deploy file.
 func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
+	sr := newScripted(nil, map[string]bool{
 		"nft -c -f": true,
-	}}
+	})
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -342,9 +320,9 @@ func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 		t.Fatal("rejected candidate left behind")
 	}
 	// validation ran on the candidate, not the deploy path
-	if len(sr.callsMatching("nft -c -f /etc/guard.nft.candidate")) == 0 {
+	if len(sr.CallsMatching("nft -c -f /etc/guard.nft.candidate")) == 0 {
 		t.Fatalf("nft -c did not target the candidate: %v",
-			sr.callsMatching("nft -c"))
+			sr.CallsMatching("nft -c"))
 	}
 }
 
@@ -352,7 +330,7 @@ func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 // promoted through writeManaged and the staging file swept.
 func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -366,7 +344,7 @@ func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
 	if hostExists(r, "/etc/guard.nft.candidate") {
 		t.Fatal("candidate lingered after promotion")
 	}
-	if len(sr.callsMatching("systemctl restart guard.service")) == 0 {
+	if len(sr.CallsMatching("systemctl restart guard.service")) == 0 {
 		t.Fatal("changed ruleset did not restart the unit")
 	}
 }
@@ -394,39 +372,15 @@ func TestDownloadSweepsTmpOnShaMismatch(t *testing.T) {
 
 // ---------- runLong timeout routing ----------
 
-// budgetProbe answers canned output like scriptedRunner but records
-// the deadline each command ran under — asserts the run vs runLong
-// routing of slow host ops.
-type budgetProbe struct {
-	res map[string]string
-	dls map[string]time.Duration
-}
-
-func (b *budgetProbe) Run(ctx context.Context, name string, args ...string) (string, error) {
-	c := name + " " + strings.Join(args, " ")
-	if b.dls == nil {
-		b.dls = map[string]time.Duration{}
-	}
-	if dl, ok := ctx.Deadline(); ok {
-		b.dls[c] = time.Until(dl)
-	}
-	best, bestLen := "", -1
-	for k, v := range b.res {
-		if strings.Contains(c, k) && len(k) > bestLen {
-			best, bestLen = v, len(k)
-		}
-	}
-	return best, nil
-}
-
 // TestSlowOpsUseLongBudget — the package/vacuum commands run under
 // CmdTimeoutLong (~10m); plain probes stay on CmdTimeout (~120s).
+// FakeRunner's per-call deadline record (DeadlineFor) is the probe.
 func TestSlowOpsUseLongBudget(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	bp := &budgetProbe{res: map[string]string{
+	bp := newScripted(map[string]string{
 		"journalctl -n 5": "File corruption detected at /var/log/journal/x/system.journal:0 (of 20971520 bytes, 0%)",
 		"sshd -T":         "passwordauthentication no",
-	}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: bp}, nil)
 	if err != nil {
@@ -437,7 +391,7 @@ func TestSlowOpsUseLongBudget(t *testing.T) {
 	c.groupBase()
 	c.groupSecurity()
 	budget := func(call string) time.Duration {
-		d, ok := bp.dls[call]
+		d, ok := bp.DeadlineFor(call)
 		if !ok {
 			t.Fatalf("%q never ran", call)
 		}
@@ -461,7 +415,7 @@ func TestSlowOpsUseLongBudget(t *testing.T) {
 // path a leftover .candidate from a crashed converge is still swept.
 func TestApplyNftUnitSweepsStaleCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -474,7 +428,7 @@ func TestApplyNftUnitSweepsStaleCandidate(t *testing.T) {
 	if hostExists(r, "/etc/guard.nft.candidate") {
 		t.Fatal("stale candidate not swept on the unchanged path")
 	}
-	if len(sr.callsMatching("nft -c")) > 0 {
+	if len(sr.CallsMatching("nft -c")) > 0 {
 		t.Fatal("unchanged ruleset re-validated — staging must be skipped")
 	}
 }

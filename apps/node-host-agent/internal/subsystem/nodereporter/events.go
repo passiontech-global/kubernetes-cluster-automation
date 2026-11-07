@@ -337,7 +337,7 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 		return
 	}
 	msg, ts := splitLogLine(line)
-	if replay && (ts.IsZero() || r.cfg.nowFn().Sub(ts) > r.cfg.LogLookback) {
+	if replay && (ts.IsZero() || r.cfg.Clock.Now().Sub(ts) > r.cfg.LogLookback) {
 		return
 	}
 	for _, rule := range logRules {
@@ -364,7 +364,7 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 // apiserver degradation) would spam unbounded Events.
 func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 	events := r.cfg.Client.EventsV1().Events(r.cfg.EventNamespace)
-	now := r.cfg.nowFn()
+	now := r.cfg.Clock.Now()
 	// Truncate BEFORE keying: two >1KiB notes sharing the first
 	// maxEventNote bytes store an identical Note, so they must share
 	// one dedup entry — keying on the untruncated note would create
@@ -442,7 +442,7 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 // hard-capped: a flood of distinct reason+message pairs evicts the
 // least-recently-observed entries first.
 func (r *Reporter) pruneEmitted() {
-	now := r.cfg.nowFn()
+	now := r.cfg.Clock.Now()
 	for k, e := range r.emittedEvts {
 		if now.Sub(e.at) > r.cfg.EventDedupTTL {
 			delete(r.emittedEvts, k)

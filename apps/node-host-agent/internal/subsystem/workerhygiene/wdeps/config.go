@@ -13,8 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -49,14 +48,26 @@ const (
 // PodsDir, SysClassNet, NebulaIface, HostResolvConf) — same
 // precedent as CtrTaskRoot.
 type Config struct {
-	NodeName          string        // this node (spec.nodeName)
-	Interval          time.Duration // check cadence
-	WatchdogStateDir  string        // state-*/last-*/consecutive-* files
-	WatchdogLogFile   string        // appended watchdog log (NPD filelog)
-	ProcRoot          string        // host /proc
-	CtrTaskRoot       string        // containerd runtime-v2 task dirs
-	SandboxCtlRoot    string        // sandbox-controller shim dirs
-	K0sWorkerUnitFile string        // presence gates all checks
+	// Base is the shared watchdog-subsystem block — cadence, the
+	// watchdog state dir (state-*/last-*/consecutive-* files) +
+	// appended watchdog log (NPD filelog), ProcRoot, the systemd
+	// client driving host restarts/probes (nsenter-wrapped inside
+	// the container; nil → all systemd-dependent checks degrade to
+	// the "cannot determine → keep" branch, log-only), the parsed
+	// node-watchdog.conf (the runner's per-module WD_SIG_<NAME>=off
+	// kill switch plus, through APIBackendIPs, the watch-wedge
+	// check's upstream-stale gate) and its per-cycle reloader
+	// (subframe.FromDeps). The live clock seam stays
+	// Seams.Host.Clock — the field checks and tests re-stub — and
+	// ApplyDefaults arms THAT cell when unset, so the store is
+	// built with the explicit-clock subframe.StoreAt form, never
+	// the promoted Base.Store (Base.Clock may be nil or a
+	// different cell than the armed seams one).
+	subframe.Base
+	NodeName          string // this node (spec.nodeName)
+	CtrTaskRoot       string // containerd runtime-v2 task dirs
+	SandboxCtlRoot    string // sandbox-controller shim dirs
+	K0sWorkerUnitFile string // presence gates all checks
 	// Promoted wiring paths/ifaces — read by ≥2 domain packages
 	// (ctr + kubelet read CtrSocket, ctr + runtime read K0sDataDir,
 	// kubelet + runtime read PodsDir, cilium + guards + runtime read
@@ -69,19 +80,6 @@ type Config struct {
 	NebulaIface    string // overlay iface MTU baseline (neb1 = 1300)
 	HostResolvConf string // host resolv.conf (dns drift baseline)
 	Client         kubernetes.Interface
-	// Systemd drives host restarts/probes (nsenter-wrapped inside the
-	// container). nil → all systemd-dependent checks degrade to the
-	// "cannot determine → keep" branch (log-only).
-	Systemd *systemd.Client
-	// Watchdog is the parsed node-watchdog.conf — feeds the runner's
-	// per-module kill switch (WD_SIG_<NAME>=off) and, through
-	// APIBackendIPs, the upstream-stale gate of the watch-wedge
-	// check. nil → every check runs (pre-conf behaviour).
-	Watchdog *watchdogconf.Config
-	// WatchdogSrc, when set, re-reads the conf every Cycle so
-	// hostconfig rewrites (WD_SIG_*, API_BACKENDS) apply live —
-	// APIBackends below is then refreshed from the file each cycle.
-	WatchdogSrc *watchdogconf.Reloader
 	// APIBackends are the "ip[:port]" apiserver endpoints module 06
 	// gates on — wired from watchdogconf.APIBackendIPs() by main
 	// (kept current by WatchdogSrc when set).

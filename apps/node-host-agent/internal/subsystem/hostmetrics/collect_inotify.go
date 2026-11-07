@@ -171,7 +171,7 @@ func (c *Collector) sweepInotify() (inst, watch uint64, top []inotifyConsumer) {
 // inotifySnapshot returns the cached sweep, re-walking the procfs
 // at most once per InotifyScanInterval.
 func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
-	if inst, watch, top, ok := c.ino.get(c.cfg.nowFn(),
+	if inst, watch, top, ok := c.ino.get(c.cfg.Clock.Now(),
 		c.cfg.InotifyScanInterval); ok {
 		return inst, watch, top
 	}
@@ -181,7 +181,7 @@ func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
 	// blocked for the whole walk. Two scrapes may then sweep in
 	// parallel; the later store wins, harmless for a cache.
 	inst, watch, top := c.sweepInotify()
-	c.ino.put(c.cfg.nowFn(), inst, watch, top)
+	c.ino.put(c.cfg.Clock.Now(), inst, watch, top)
 	return inst, watch, top
 }
 

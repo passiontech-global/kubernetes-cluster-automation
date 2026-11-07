@@ -40,3 +40,37 @@ func TestNewClock(t *testing.T) {
 		t.Fatalf("NewClock(nil).Now() = %v", got)
 	}
 }
+
+func TestCellSetObservedAfterSharing(t *testing.T) {
+	// The contract the hoststate.New call sites rely on: a method
+	// value captured BEFORE Set still observes the new clock —
+	// the whole point of sharing a *Cell over closing over a
+	// config field.
+	c := NewCell(nil)
+	nowFn := c.Now // binds the pointer, not the installed Clock
+
+	fixed := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	c.Set(func() time.Time { return fixed })
+	if got := nowFn(); !got.Equal(fixed) {
+		t.Fatalf("post-Set Now() = %v, want %v", got, fixed)
+	}
+	// Set(nil) resets to system time.
+	c.Set(nil)
+	before := time.Now()
+	if got := nowFn(); got.Before(before) || got.After(time.Now()) {
+		t.Fatalf("post-Set(nil) Now() = %v", got)
+	}
+}
+
+func TestCellNilReceiverReadsSystemTime(t *testing.T) {
+	var c *Cell
+	before := time.Now()
+	got := c.Now()
+	if got.Before(before) || got.After(time.Now()) {
+		t.Fatalf("nil *Cell.Now() = %v", got)
+	}
+	// A never-Set Cell (not via NewCell) reads the same way.
+	if got := (&Cell{}).Now(); got.Before(before) {
+		t.Fatalf("unset Cell.Now() = %v", got)
+	}
+}

@@ -85,6 +85,10 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", snap.err)
 	}
 	now := g.now.Now()
+	// unblocked keys on APIService names that die with the resource —
+	// bound the map so decommissioned backends' stamps cannot
+	// accumulate forever.
+	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
 
 	// Candidate pass — cheap unstructured reads only; the namespace
 	// scan below is skipped entirely when nothing qualifies.
@@ -160,12 +164,16 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 			metrics.IncError(g.queue)
 			continue
 		}
-		u.unblocked.Stamp(c.svc.GetName(), now)
-		healed++
+		// Stamp the cooldown only on a delivered heal — a pass that
+		// deleted nothing (backing Service selectorless, pods already
+		// terminating, NotFound races) must not open the suppression
+		// window or one empty run would defer the real heal 15m.
 		if deleted > 0 {
+			u.unblocked.Stamp(c.svc.GetName(), now)
 			metrics.APIServiceUnblockHealsTotal.
 				WithLabelValues(svcNs, "backing_pods_deleted").Inc()
 		}
+		healed++
 		log.Info("ACTION: unblocked dead APIService wedging namespace termination",
 			"apiservice", c.svc.GetName(), "group", c.group,
 			"service", svcNs+"/"+svcName,

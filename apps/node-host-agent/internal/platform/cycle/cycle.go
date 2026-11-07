@@ -30,6 +30,31 @@ func Every(name string, interval time.Duration, fn func(context.Context)) *Runne
 	return &Runner{name: name, interval: interval, fn: fn}
 }
 
+// EverySafe is Every with per-tick panic recovery — the safeCycle
+// shape kinedb hand-rolled: a panicking fn is recovered and logged,
+// then the loop keeps ticking instead of the goroutine unwinding
+// past the ticker. Prefer plain Every when a defect SHOULD unwind
+// Run to the supervisor's recover + restart backoff.
+//
+// onPanic, when non-nil, runs inside the recover so the caller can
+// count the panic in its own metrics (kinedb's
+// cycles{loop,"panic"}); nil means the log line alone suffices.
+func EverySafe(name string, interval time.Duration,
+	fn func(context.Context), onPanic func(name string, recovered any)) *Runner {
+	return &Runner{name: name, interval: interval, fn: func(ctx context.Context) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger().Error(name+" tick panicked — cycle "+
+					"skipped, loop keeps ticking", "panic", r)
+				if onPanic != nil {
+					onPanic(name, r)
+				}
+			}
+		}()
+		fn(ctx)
+	}}
+}
+
 // Name identifies the runner for logging.
 func (r *Runner) Name() string { return r.name }
 

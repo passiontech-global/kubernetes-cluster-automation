@@ -38,7 +38,7 @@ var kubeletJournalRules = []logRule{
 // error leaves the cursor untouched — the same window is retried
 // next cycle.
 func (r *Reporter) fetchJournal(ctx context.Context, cursor *int64, args ...string) ([]journalwatch.Entry, error) {
-	return journalwatch.Fetch(ctx, r.cfg.journalFetch, r.cfg.nowFn(),
+	return journalwatch.Fetch(ctx, r.cfg.journalFetch, r.cfg.Clock.Now(),
 		r.cfg.LogLookback, cursor, args...)
 }
 

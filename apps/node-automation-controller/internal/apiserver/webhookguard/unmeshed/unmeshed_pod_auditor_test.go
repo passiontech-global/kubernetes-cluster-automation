@@ -38,7 +38,7 @@ import (
 func upNamespace(name, inject string) *corev1.Namespace {
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	if inject != "" {
-		ns.Annotations = map[string]string{linkerdInjectKey: inject}
+		ns.Annotations = map[string]string{kube.LinkerdInjectKey: inject}
 	}
 	return ns
 }
@@ -148,14 +148,14 @@ func TestUnmeshedAuditSkips(t *testing.T) {
 		Kind: "Job", Name: "j", Controller: ptr.To(true)}}
 
 	optedOut := upPod("meshed", "opted-out")
-	optedOut.Annotations = map[string]string{linkerdInjectKey: "disabled"}
+	optedOut.Annotations = map[string]string{kube.LinkerdInjectKey: "disabled"}
 
 	meshed := upPod("meshed", "meshed")
 	meshed.Spec.Containers = append(meshed.Spec.Containers,
-		corev1.Container{Name: linkerdProxyContainer})
+		corev1.Container{Name: kube.LinkerdProxyContainer})
 
 	initMeshed := upPod("meshed", "init-meshed")
-	initMeshed.Spec.InitContainers = []corev1.Container{{Name: linkerdProxyContainer}}
+	initMeshed.Spec.InitContainers = []corev1.Container{{Name: kube.LinkerdProxyContainer}}
 
 	cs := fake.NewSimpleClientset(
 		upNamespace("kube-system", ""),
@@ -174,9 +174,9 @@ func TestUnmeshedAuditSkips(t *testing.T) {
 // pod-level inject=disabled opts out inside an enabled namespace.
 func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
 	podEnabled := upPod("plain", "pod-enabled")
-	podEnabled.Annotations = map[string]string{linkerdInjectKey: "enabled"}
+	podEnabled.Annotations = map[string]string{kube.LinkerdInjectKey: "enabled"}
 	nsEnabledPodDisabled := upPod("meshed", "ns-enabled-pod-disabled")
-	nsEnabledPodDisabled.Annotations = map[string]string{linkerdInjectKey: "disabled"}
+	nsEnabledPodDisabled.Annotations = map[string]string{kube.LinkerdInjectKey: "disabled"}
 
 	metrics.UnmeshedPods.DeleteLabelValues("plain", "pod-enabled")
 	t.Cleanup(func() {

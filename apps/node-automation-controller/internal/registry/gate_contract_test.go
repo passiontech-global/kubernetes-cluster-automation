@@ -32,6 +32,15 @@ import (
 func TestDisabledGateContract(t *testing.T) {
 	for _, m := range Modules {
 		t.Run(m.Name, func(t *testing.T) {
+			// CheckReg rows carry no Setup to drive — their gated
+			// behavior is "never collected into Deps.CheckRegs",
+			// asserted by TestSetupModulesCheckRegGate.
+			if m.Setup == nil {
+				if m.CheckReg == nil {
+					t.Fatal("module row has neither Setup nor CheckReg")
+				}
+				return
+			}
 			mgr := testutil.NewStubManager()
 			d := testDeps(mgr)
 			d.Name = m.Name

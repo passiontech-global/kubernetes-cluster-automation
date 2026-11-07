@@ -113,6 +113,13 @@ func Str(a, b string) string {
 	return b
 }
 
+// IsSet reports whether key is present and non-empty — the
+// env-presence check layered config fallbacks (env → conf file →
+// compiled default) use to know whether the env layer spoke. It
+// answers "did the env say anything", not "is the value valid" —
+// parse-level fallback stays with the consuming getter.
+func IsSet(key string) bool { return os.Getenv(key) != "" }
+
 // IntOr is env → conf → def for int knobs (conf ints are raw counts;
 // <=0 = unset). A set-but-non-numeric env yields def, not confVal.
 func IntOr(key string, confVal, def int) int {

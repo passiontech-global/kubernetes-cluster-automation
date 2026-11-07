@@ -77,7 +77,7 @@ func jfixture(t *testing.T) *jenv {
 		e.kills = append(e.kills, killRecord{pid, sig})
 		return nil
 	}
-	j.cfg.nowFn = func() time.Time { return e.now }
+	j.cfg.Clock.Set(func() time.Time { return e.now })
 	e.j = j
 	return e
 }

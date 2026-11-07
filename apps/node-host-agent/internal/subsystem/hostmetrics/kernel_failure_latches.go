@@ -1,112 +1,80 @@
-// kernel_failure_latches.go — shared kernel deep-failure latch
-// contract: the cross-domain constants, the host-command seam and
-// the state-dir latch helpers the domain files (kmsg.go, pidfd.go,
-// clockskew.go, fsreadonly.go) share. The latch ticker itself
-// (refreshLatches) stays in latches.go and calls into the domain
-// updaters.
+// kernel_failure_latches.go — the parent half of the Wave-10
+// kernel deep-failure contract.
+//
+// The engine itself — the /dev/kmsg drain, the pid/fd
+// resource-pressure, clock-skew, fs-readonly-evidence and
+// steal/entropy latch updaters plus their shared statePath /
+// ensureStateLatch helpers — lives in the kernelfail subpackage:
+// those checks produce state-* latches, evidence markers and
+// node-exporter textfile gauges, never a prometheus series, so the
+// split keeps the scrape-time Collector free of file-contract
+// machinery. The contract overview moved with the code — see
+// kernelfail's package doc.
+//
+// What stays here is the seam surface the engine's Deps closes
+// over: the runHostCmd and kmsgDevicePaths package vars the
+// hostmetrics test suite stubs in package (fixtureSeams pins them
+// to the fixture root — the closures below read the var per call,
+// so a post-New re-stub still lands exactly like the pre-split
+// direct reads did).
 package hostmetrics
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
-
-// ===========================================================================
-// Kernel deep-failure modes (W10-KR1/KR2/KR5, W10-ST1)
-//
-// The domain files extend the latch ticker with this contract:
-//
-//   - W10-KR1 checkKernelDmesg (kmsg.go): /dev/kmsg drain (dmesg -T
-//     fallback) classifying filesystem/block errors, nf_conntrack
-//     table-full drops and host-level OOM kills into stateDir
-//     evidence markers. workerhygiene consumes the OOM markers for
-//     the SystemOOMVictim node event; kmsg.go owns the latches +
-//     counters.
-//   - W10-KR2 updatePidFDPressure (pidfd.go): pid/thread/fd
-//     utilization ratios → state-pid-fd-pressure
-//     (KernelResourceExhaustion) + the node_agent_*_utilization_ratio
-//     textfile gauges (the W10 metric channel — same convention the
-//     controllerhygiene textfile channel uses; a new prometheus desc
-//     would mean a domainTable row in domains.go, the textfile
-//     channel needs no registry change).
-//   - W10-KR5 checkClockSkew (clockskew.go): chronyc tracking
-//     (adjtimex offset fallback) → state-clock-skew
-//     (ClockSkewDetected) + a rate-limited `chronyc makestep`.
-//   - W10-ST1 updateFSReadonlyEvidence (fsreadonly.go): ro
-//     ext4/xfs/btrfs mounts under the PVC provisioner roots parsed
-//     out of /proc/<pid>/mounts → state-fs-readonly
-//     (FilesystemReadOnly) ahead of statfs.
-//   - cpu-steal-guard + kernel-entropy-check
-//     (collect_steal_entropy.go): /proc/stat steal-column delta →
-//     state-cpu-steal-pressure (CPUStealPressure) + the
-//     node_agent_cpu_steal_ratio / node_agent_kernel_entropy_avail_bits
-//     textfile gauges.
-//
-// Every new latch ensureStateLatch installs also lands a
-// "STATE-ENTER: <name> (<evidence>)" line in the shared watchdog
-// log via the Store — nodereporter's events.go tails that file and
-// maps the line onto a Kubernetes Event.
-// ===========================================================================
-
-// --- shared kernel-failure helpers ---
-
-// kmsgFsErrorFile is the cross-domain evidence marker: kmsg.go's
-// noteKernelFsError writes it and fsreadonly.go's
-// updateFSReadonlyEvidence consumes it. Marker/state file names live
-// inside WatchdogStateDir — shared with workerhygiene (the
-// SystemOOMVictim consumer) by convention.
-const kmsgFsErrorFile = "kmsg-fs-error"
 
 // runHostCmd executes a host binary for the Wave-10 probes that have
 // no Config seam (chronyc, dmesg) — a package var so tests stub it.
 // The 30s cap matches the nethealth runHostCmd convention; the exec
 // itself is hostexec.RunCombined — capped output + WaitDelay, no
-// second timeout stacked underneath.
+// second timeout stacked underneath. Reached by the engine through
+// Deps.RunHostCmd's late-bound closure.
 var runHostCmd = func(ctx context.Context, argv ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	return hostexec.RunCombined(cctx, argv...)
 }
 
-func (l *Latches) statePath(name string) string {
-	return filepath.Join(l.c.cfg.WatchdogStateDir, name)
+// kmsgDevicePaths returns the /dev/kmsg candidates — a package var
+// so tests point it at a fixture instead of the real device (the
+// DaemonSet bind-mounts host /dev/kmsg; <HostRoot>/dev/kmsg covers
+// standalone layouts where only the host tree is mounted). Reached
+// by the engine through Deps.KmsgDevicePaths's late-bound closure.
+var kmsgDevicePaths = func(hostRoot string) []string {
+	return kmsg.DevicePaths("/dev/kmsg", hostRoot)
 }
 
-// ensureStateLatch installs a state latch when absent (epoch
-// content, written through the Store's atomic WriteEpochFile —
-// concurrent ticker/scrape writers share no fixed .tmp-<name>
-// staging file) and logs the transition once; BUG-H6's refresh
-// loop owns the mtime while held.
-func (l *Latches) ensureStateLatch(path, name, evidence string) {
-	if _, err := os.Stat(path); err == nil {
-		return
+// kernelFailDeps assembles the engine's dependency surface off the
+// Collector — the exported Config fields verbatim, the shared
+// hoststate.Store and clock cell, and the three seams as late-bound
+// closures so both packages' test stubs keep working (Adjtimex is
+// the one Config knob private to this package; cfg.adjtimexFn
+// re-stubs after New still land through the closure).
+func (c *Collector) kernelFailDeps() kernelfail.Deps {
+	return kernelfail.Deps{
+		StateDir:         c.cfg.WatchdogStateDir,
+		ProcRoot:         c.cfg.ProcRoot,
+		HostRoot:         c.cfg.HostRoot,
+		ConntrackMaxFile: c.cfg.ConntrackMaxFile,
+		FileNRFile:       c.cfg.FileNRFile,
+		OpenEBSLocalDir:  c.cfg.OpenEBSLocalDir,
+		Store:            c.state,
+		Clock:            c.cfg.Clock,
+		Adjtimex: func(tx *unix.Timex) (int, error) {
+			return c.cfg.adjtimexFn(tx)
+		},
+		RunHostCmd: func(ctx context.Context, argv ...string) (string, error) {
+			return runHostCmd(ctx, argv...)
+		},
+		KmsgDevicePaths: func(hostRoot string) []string {
+			return kmsgDevicePaths(hostRoot)
+		},
 	}
-	if !l.c.state.WriteEpochFile(path, l.c.cfg.nowFn().Unix()) {
-		return
-	}
-	logger().Warn("hostmetrics: "+name+" latch set — "+evidence,
-		"path", path)
-	// A NEW latch also lands a STATE-ENTER line in the shared
-	// watchdog log — nodereporter's events.go tails that file and
-	// maps "STATE-ENTER: <name>" onto a Kubernetes Event. The name
-	// argument here is the display form ("state-<latch>"); the log
-	// line carries the bare latch suffix the event regexes anchor
-	// on. The line goes through the Store's AppendLog — NOT a bare
-	// logger() call — because the file half is the contract, not
-	// the slog mirror.
-	l.c.state.AppendLog(fmt.Sprintf("STATE-ENTER: %s (%s)",
-		strings.TrimPrefix(name, hoststate.LatchFilePrefix), evidence))
 }
-
-// --- small shared helpers (uniquely named per file rules) ---
-//
-// The last-* rate budgets (conntrackBumpBudgetFile,
-// clockStepBudgetFile) go through l.c.state — the shared hoststate
-// rateOK/rateSpend parity (atomic spend, same file format).

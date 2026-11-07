@@ -41,10 +41,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -88,6 +90,11 @@ type cfTunnelConnectorTarget struct {
 
 type cfTunnelProxyWatchdog struct {
 	cs kubernetes.Interface
+	// dyn feeds the maintenance mutex's autopilot-Plan signal — the
+	// cloudflared pod deletes defer while a drain or k0s upgrade is
+	// in flight. Nil (literal test fixtures) leaves the gate
+	// unarmed — the standard unarmed-seam convention.
+	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and the registration log
 	// come from one place.
@@ -100,6 +107,9 @@ type cfTunnelProxyWatchdog struct {
 	// pod-name cooldown never suppressed the re-heal — the replacement
 	// was deleted every sweep until the wedge cleared.
 	lastHeal state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation so the
+	// sweep pays one evaluation per TTL window.
+	verdict kube.Verdict
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
 }
@@ -111,7 +121,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg watchdogConfig) error {
 		logf.Log.WithName(d.Name).Info("registered",
 			"namespace", cfg.namespace, "interval", cfg.interval)
-		w := &cfTunnelProxyWatchdog{cs: d.CS, queue: d.Name, namespace: cfg.namespace}
+		w := &cfTunnelProxyWatchdog{cs: d.CS, dyn: d.Dyn, queue: d.Name, namespace: cfg.namespace}
 		return shared.AddPeriodic(d.Mgr, w.queue, cfg.interval, w.run)
 	})
 }
@@ -286,6 +296,25 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// but die with their Deployments — bound the map so decommissioned
 	// workloads' stamps cannot accumulate forever.
 	w.lastHeal.PruneExpired(now, cfTunnelHealCooldown)
+	// Maintenance mutex + global heal budget — the deletes below kill
+	// LIVE pods, so they defer while a cordon/drain/kured reboot or a
+	// k0s upgrade is in flight, and "cannot verify" fails closed.
+	// heal.AllowedV runs with a nil heals ledger: this module's
+	// pacing is the per-controller lastHeal cooldown checked per pod
+	// inside healConnectorTarget — only the mutex and budget gates
+	// apply here, shared via w.verdict so the sweep pays one
+	// evaluation.
+	if w.dyn != nil {
+		proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
+			w.cs, w.dyn, nil, "cloudflared-wedges", 0, now)
+		if unverifiable {
+			metrics.IncError(w.queue)
+			return 0, nil
+		}
+		if !proceed {
+			return 0, nil
+		}
+	}
 	healed := 0
 	for _, tgt := range w.connectorTargets() {
 		n, err := w.healConnectorTarget(ctx, tgt, now)
@@ -399,14 +428,19 @@ func (w *cfTunnelProxyWatchdog) healOnCooldown(p *corev1.Pod, now time.Time) boo
 // fresh pod, and killing the replacement would undo the heal.
 func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
 	p *corev1.Pod, reason string) error {
-	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
-		p.Namespace, reason).Inc()
 	err := w.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 		kube.UIDDeleteOptions(p.UID, ""))
 	if apierrors.IsNotFound(err) {
-		return nil
+		return nil // already gone — not a delete we delivered
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// Count only delivered deletes — incrementing before the call
+	// recorded every API failure as a heal that never happened.
+	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
+		p.Namespace, reason).Inc()
+	return nil
 }
 
 // podLogWedged fetches the tail of the pod's log and matches the

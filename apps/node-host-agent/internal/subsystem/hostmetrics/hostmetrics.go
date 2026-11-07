@@ -112,6 +112,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
 
 // Defaults — paths are the host mounts the DaemonSet provides.
@@ -151,9 +152,9 @@ type Collector struct {
 	// STATE-ENTER log lines go through it so the on-disk format stays
 	// the lib.sh parity every subsystem shares. LogFile is the shared
 	// watchdog log — nodereporter tails it, so a latch-entry line
-	// only counts if it lands there. Now is a closure over
-	// c.cfg.nowFn — tests re-stub the clock after New() and the
-	// store must observe the new one.
+	// only counts if it lands there. Now is c.cfg.Clock.Now — the
+	// method value binds the shared timex.Cell, so a post-New
+	// Clock.Set lands here.
 	state *hoststate.Store
 
 	// Hoisted out of the scrape path in New(): drift regexes are
@@ -167,22 +168,21 @@ type Collector struct {
 	// mutex (the domains are independent, so the old single mu
 	// split into one lock per domain). Field docs live on the
 	// domain types.
-	seen  latchSeenBook     // collect_watchdog.go — emit-0 bookkeeping
-	k0s   k0sDriftCache     // collect_k0sdrift.go — mtime+size config cache
-	cpu   cpuDeliveredProbe // collect_psi_cpu.go — busy-loop probe
-	steal stealDelta        // collect_steal_entropy.go — jiffie baseline
-	fs    fsProbeState      // collect_fs.go — hung-mount probes
-	ino   inotifyCache      // collect_inotify.go — fdinfo sweep cache
-	lpv   localpvCache      // collect_localpv.go — du walk cache
-	ebpf  ebpfCache         // collect_ebpf.go — prog/map id sweep cache
-	// kscan is the W10-KR1 kernel-log drain state — the kmsg tail
-	// session (fd) + cross-line OOM pairing. Owned by the
-	// Collector directly: the Latches wrapper is recreated per
-	// call, so a keyed side-map would pin the session (and its
-	// /dev/kmsg fd) for the process lifetime — Latches.Run closes
-	// it on exit. Only the latch ticker touches it, so it needs
-	// no mutex.
-	kscan kernelScanState
+	seen latchSeenBook     // collect_watchdog.go — emit-0 bookkeeping
+	k0s  k0sDriftCache     // collect_k0sdrift.go — mtime+size config cache
+	cpu  cpuDeliveredProbe // collect_psi_cpu.go — busy-loop probe
+	fs   fsProbeState      // collect_fs.go — hung-mount probes
+	ino  inotifyCache      // collect_inotify.go — fdinfo sweep cache
+	lpv  localpvCache      // collect_localpv.go — du walk cache
+	ebpf ebpfCache         // collect_ebpf.go — prog/map id sweep cache
+	// kf is the W10 kernel deep-failure engine (kernelfail
+	// subpackage) — the kmsg tail session + the steal jiffie
+	// baseline live inside it. Owned by the Collector directly:
+	// the Latches wrapper is recreated per call, so a keyed
+	// side-map would pin the session (and its /dev/kmsg fd) for
+	// the process lifetime — Latches.Run closes it on exit. Only
+	// the latch ticker touches it.
+	kf *kernelfail.Runner
 }
 
 // New returns the Collector. Call Register to add it to the agent's
@@ -194,8 +194,7 @@ func New(cfg Config) *Collector {
 	c.seen.m = map[string]time.Time{}
 	c.fs.inflight = map[string]time.Time{}
 	c.fs.stalledLogged = map[string]bool{}
-	c.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return c.cfg.nowFn() }, logger)
+	c.state = cfg.Store(logger)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical
@@ -210,6 +209,9 @@ func New(cfg Config) *Collector {
 	for _, k := range cfg.ExpectedKCMArgs {
 		c.expectedKCM[k] = true
 	}
+	// Built last — the Deps close over cfg + the Store, so both
+	// must be resolved first.
+	c.kf = kernelfail.New(c.kernelFailDeps())
 	return c
 }
 

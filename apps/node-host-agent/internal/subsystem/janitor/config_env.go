@@ -3,6 +3,7 @@ package janitor
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -25,9 +26,7 @@ type EnvDeps struct {
 // EnvDeps.WatchdogStateDir, .WatchdogLogFile and .Systemd.
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogLogFile:  d.WatchdogLogFile,
-		Systemd:          d.Systemd,
+		Base: subframe.FromDeps(d.Deps),
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

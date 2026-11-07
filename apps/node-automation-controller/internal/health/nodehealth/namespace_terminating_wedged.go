@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -176,6 +177,13 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 		for _, r := range rl.APIResources {
 			if !r.Namespaced || strings.Contains(r.Name, "/") {
 				continue // cluster-scoped or subresource
+			}
+			// The sweep lists objects and merge-patches their
+			// finalizers — a resource that cannot do BOTH (e.g.
+			// watch-only aggregated APIs) can only error per item.
+			if !slices.Contains(r.Verbs, "list") ||
+				!slices.Contains(r.Verbs, "patch") {
+				continue
 			}
 			gvr := schema.GroupVersionResource{
 				Group: gv.Group, Version: gv.Version, Resource: r.Name}

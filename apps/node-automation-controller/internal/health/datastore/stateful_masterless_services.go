@@ -77,10 +77,6 @@ type statefulMasterlessCheck struct {
 	multiMasterStreak  state.StreakLedger
 	multiMasterEmitted state.GaugeLedger[string]
 	siteSkewEmitted    state.GaugeLedger[string]
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-target heal preambles share — one evaluation per
-	// Verdict TTL instead of three API reads per masterless service.
-	verdict kube.Verdict
 }
 
 // newStatefulMasterlessCheck builds the W6.2 check — the ledgers

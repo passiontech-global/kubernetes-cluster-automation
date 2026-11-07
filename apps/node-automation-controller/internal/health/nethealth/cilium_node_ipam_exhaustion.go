@@ -22,7 +22,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -36,10 +35,6 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	// stale value (zero value usable; the serial sweep needs no
 	// lock).
 	emitted state.GaugeLedger[string]
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-node reap preambles share — one evaluation per Verdict TTL
-	// instead of three API reads per exhausted node.
-	verdict kube.Verdict
 }
 
 // newCiliumNodeIPAMExhaustionCheck builds the W10-NM6 check — its
@@ -108,7 +103,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 	log := logf.FromContext(ctx)
 	now := p.Now()
 	// The CILIUM_NODE_IPAM_MIN_FREE_RATIO knob resolves once at
-	// sweep Setup (probefw.CiliumConfigFromEnv — >1 keeps working as
+	// sweep Setup (CiliumConfigFromEnv — >1 keeps working as
 	// the documented "disable this check" escape).
 	minFree := p.Cfg.Cilium.NodeIPAMMinFreeRatio
 
@@ -218,8 +213,8 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	log logr.Logger, node string, now time.Time) {
 
 	ck := probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node)
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.Heals, ck, ciliumIPAMNodeCool, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, ciliumIPAMNodeCool, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

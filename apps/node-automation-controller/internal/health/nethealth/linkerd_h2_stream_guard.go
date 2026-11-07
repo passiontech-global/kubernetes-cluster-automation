@@ -175,7 +175,7 @@ func init() {
 func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 	pod *corev1.Pod) (storm, identity bool, err error) {
 
-	_, err = probefw.PodLogTail(ctx, p.CS, pod, linkerdProxyContainer,
+	_, err = probefw.PodLogTail(ctx, p.CS, pod, kube.LinkerdProxyContainer,
 		linkerdH2TailLines, linkerdH2LogMaxByte, linkerdH2LogTimeout,
 		func(line string) bool {
 			l := strings.ToLower(line)
@@ -232,7 +232,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		if pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
 			now.Sub(pod.CreationTimestamp.Time) < linkerdH2PodMinAge ||
-			!kube.PodSpecHasContainer(&pod.Spec, linkerdProxyContainer) {
+			!kube.PodSpecHasContainer(&pod.Spec, kube.LinkerdProxyContainer) {
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
@@ -306,7 +306,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 					"pod", key)
 			} else {
 				p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-					key, pod, linkerdH2HealCool, now)
+					kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
 			}
 		}
 		if identity {
@@ -329,7 +329,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 					"pod", key)
 			} else {
 				p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-					key, pod, linkerdH2HealCool, now)
+					kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
 			}
 		}
 	}
@@ -412,7 +412,7 @@ func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
 // lockout starts.
 func linkerdProxyOOMKilled(pod *corev1.Pod) bool {
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name != linkerdProxyContainer {
+		if cs.Name != kube.LinkerdProxyContainer {
 			continue
 		}
 		t := cs.LastTerminationState.Terminated
@@ -597,7 +597,7 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 				"pod", podKey)
 		default:
 			p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-				podKey, pod, linkerdH2HealCool, now)
+				kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
 		}
 	}
 	p.balancerSeen.Prune(func(k string) bool { return keep[k] })

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 )
 
 // ---------- T6 watchdog (+ T15 systemd watchdog) ----------
@@ -123,7 +123,7 @@ func (c *cyc) groupWatchdog() {
 	_ = r.ensureDir("/var/lib/node-watchdog", 0o755)
 	if !r.fileExists("/var/lib/node-watchdog/installed") {
 		_, _ = r.writeManaged("/var/lib/node-watchdog/installed",
-			[]byte(strconv.FormatInt(c.r.cfg.NowFn().Unix(), 10)), 0o644)
+			[]byte(strconv.FormatInt(c.r.cfg.Clock.Now().Unix(), 10)), 0o644)
 	}
 	c.controllerTuning()
 }

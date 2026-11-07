@@ -41,10 +41,6 @@ import (
 type fluxKustomizationHealthCheck struct {
 	*probefw.Deps
 
-	// verdict memoizes the maintenance-mutex evaluation every nudge
-	// gate in the sweep shares — one verdict per TTL instead of three
-	// API reads per stuck Kustomization.
-	verdict kube.Verdict
 	// reconcileHealed is the in-RAM half of the 30m per-Kustomization
 	// nudge cooldown — the durable half is the requestedAt stamp the
 	// patch leaves behind (heal.PersistedCooledDown reads the wider
@@ -57,7 +53,7 @@ type fluxKustomizationHealthCheck struct {
 
 // NewFluxKustomizationHealthCheck builds the W13-GO1 check — its
 // state is the cooldown/gauge ledgers (zero value usable); the
-// maintenance verdict is zero-value ready.
+// maintenance verdict rides the shared Deps memo.
 func NewFluxKustomizationHealthCheck(d *probefw.Deps) probefw.Check {
 	return &fluxKustomizationHealthCheck{Deps: d}
 }
@@ -123,15 +119,20 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	var rep probefw.SweepReport
 	kusts, err := p.Dyn.Resource(fluxKustomizationGVR).List(ctx, metav1.ListOptions{})
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		return probefw.Result{Pass: true} // CRD absent — Flux not installed
+		// CRD absent — Flux not installed. The sweep IS complete
+		// (nothing can exist), so the emitted ledger still closes
+		// out: tuples flagged while the CRD existed are dead series
+		// now and must be DeleteLabelValues'd, not leaked.
+		return rep.Result(&p.emitted, fluxKustomizationStuckGauge.DeleteLabelValues,
+			"flux kustomizations stuck: ", ", ")
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list kustomizations: %w", err)}
 	}
 
-	var rep probefw.SweepReport
 	for i := range kusts.Items {
 		kust := &kusts.Items[i]
 		if suspended, _ := kube.NestedBool(
@@ -174,6 +175,10 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Context,
 	log logr.Logger, kust *unstructured.Unstructured, reason string, now time.Time) {
 
+	// reconcileHealed keys on Kustomization names that die with the
+	// object — bound the map so decommissioned names' stamps cannot
+	// accumulate.
+	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
 	key := kust.GetNamespace() + "/" + kust.GetName()
 	if !p.fluxKustDepsReady(ctx, kust) {
 		return
@@ -188,8 +193,7 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now) {
 		return
 	}
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, nil, ck, 0, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log, nil, ck, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

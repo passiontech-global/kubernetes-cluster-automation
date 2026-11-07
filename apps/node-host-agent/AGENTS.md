@@ -29,23 +29,27 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   call sites reference `envnames.EnvX`, never the literal.
 - `libs/hostkit` (repo root, separate Go module wired via replace +
   go.work) — shared leaf libraries that used to live here:
-  `envx` (env knobs/Mode/Knob tables) and `logx` (named slog loggers).
+  `envx` (env knobs/Mode/Knob tables), `logx` (named slog loggers),
+  `timex` (settable clock seam), and `jinja` (the mini-Jinja2
+  evaluator + ordered-map/YAML values behind vars-file resolution).
 - `internal/platform/*` — leaf libraries: cycle (period loop),
   checks (check-group dispatch),
   hoststate (`state-*`/`last-*` latch files), hostexec, hostutil,
   systemd, watchdogconf, probee, procfs, journalwatch, promfile,
-  kmsg, pagecache, topology, jinja, sshclient.
+  kmsg, pagecache, sshclient.
 - `internal/subsystem/*` — the 12 periodic subsystems (sweeper,
   concoursecache, apiprober, hostmetrics, workerhygiene, nethealth,
   janitor, nodereporter, controllerhygiene, hostconfig, hubsync,
   kinedb). Convention: `Config` struct + `EnvDeps` (non-env inputs) +
   `ConfigFromEnv(EnvDeps) Config` + `New(cfg, reg)`.
 - `internal/domain/*` — importable domain libraries shared by
-  subsystems and ops (etcdmaint, eventpurge): the `Run(ctx, Config,
-  ...)`-style logic behind a one-shot op that a periodic subsystem
-  also drives. Domain pkgs sit above platform (they may use
-  hostexec/hostkit) and below subsystem/ops — they must not import
-  either.
+  subsystems and ops (etcdmaint, eventpurge, topology): the
+  `Run(ctx, Config, ...)`-style logic behind a one-shot op that a
+  periodic subsystem also drives (topology is the inter-DC
+  vars-files → derived-topology pass consumed by hostconfig,
+  hubsync, workerhygiene, and ops/nebulasign). Domain pkgs sit
+  above platform (they may use hostexec/hostkit) and below
+  subsystem/ops — they must not import either.
 - `internal/ops/*` — one-shot subcommand packages: thin
   `Cmd(ctx, args) int` wrappers (exit 0 clean / 1 runtime / 2 usage)
   over internal/domain libs (evpurge -> domain/eventpurge,

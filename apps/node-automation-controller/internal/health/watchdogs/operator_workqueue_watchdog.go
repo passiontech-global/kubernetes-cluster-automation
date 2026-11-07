@@ -57,10 +57,6 @@ type operatorWorkqueueCheck struct {
 	opFirstSeen state.FirstSeenLedger
 	opFrozen    state.GaugeLedger[string]
 	opHealed    state.CooldownSet
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-operator heal preambles share — one evaluation per
-	// Verdict TTL instead of three API reads per stuck operator.
-	verdict kube.Verdict
 
 	// gwClassCtlr caches GatewayClass name → spec.controllerName for
 	// ~a minute so the gateway-API ownership filter doesn't LIST the

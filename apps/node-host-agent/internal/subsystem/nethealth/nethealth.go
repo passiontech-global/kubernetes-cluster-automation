@@ -62,7 +62,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -120,29 +120,23 @@ var defaultNebulaDirectTCPPorts = []int{22, 6443, 8132, 9443, 39901}
 // empty config (every check idles on defaults like the shell did on
 // nodes without a conf file).
 type Config struct {
-	Interval           time.Duration // check cadence
-	WatchdogStateDir   string        // state-*/egress-*/dnsfb-* files
-	WatchdogLogFile    string        // appended watchdog log (NPD filelog)
-	HostResolvConf     string        // host resolv.conf (DNS probe source)
-	HostsFile          string        // host /etc/hosts (managed block)
-	ProcNetUDP         string        // host /proc/1/net/udp (socket check)
-	ProcNetUDP6        string        // host /proc/1/net/udp6
-	UptimeFile         string        // host /proc/uptime (20/21 gate)
-	ConntrackCountFile string        // nf_conntrack_count (entries used)
-	ConntrackMaxFile   string        // nf_conntrack_max (table size)
+	// Base is the shared watchdog-subsystem block — the cadence,
+	// state dir/log, host root, systemd client, watchdog conf +
+	// reloader and clock splice (subframe.FromDeps).
+	subframe.Base
+	HostResolvConf     string // host resolv.conf (DNS probe source)
+	HostsFile          string // host /etc/hosts (managed block)
+	ProcNetUDP         string // host /proc/1/net/udp (socket check)
+	ProcNetUDP6        string // host /proc/1/net/udp6
+	UptimeFile         string // host /proc/uptime (20/21 gate)
+	ConntrackCountFile string // nf_conntrack_count (entries used)
+	ConntrackMaxFile   string // nf_conntrack_max (table size)
 	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
 	// per-CPU insert_failed/drop counters the W12-KR3 spike
 	// detector reads (module absent → no file → detector idles).
 	ConntrackStatFile string
-	HostRoot          string // "/" = already on host (no nsenter)
-	Watchdog          *watchdogconf.Config
-	// WatchdogSrc, when set, re-reads the conf file every Cycle so
-	// hostconfig rewrites (OVERLAY_*, DNS_FALLBACK_MAP, WD_SIG_*
-	// kill switches) apply live instead of only at agent start.
-	WatchdogSrc  *watchdogconf.Reloader
-	Systemd      *systemd.Client // nil → systemd checks degrade keep-only
-	ConsecNeeded int
-	MinRestart   time.Duration
+	ConsecNeeded      int
+	MinRestart        time.Duration
 	// NebulaDirectTCPPorts is the nebula_direct_tcp_ports list the
 	// pref-1499 route guard enforces — TCP dport on these ports
 	// bypasses the overlay (direct underlay). Nil → the default
@@ -150,7 +144,6 @@ type Config struct {
 	NebulaDirectTCPPorts []int
 
 	// Seams — nil gets production defaults.
-	nowFn timex.Clock
 	// runHostCmd executes a host binary (ip, ping): hostexec NSNet —
 	// nsenter -t 1 -n -- <argv> when HostRoot != "/", plain exec on
 	// the host itself. Netns only — the binaries are shipped in the
@@ -246,8 +239,8 @@ func (c *Config) applyDefaults() {
 	if c.NebulaDirectTCPPorts == nil {
 		c.NebulaDirectTCPPorts = defaultNebulaDirectTCPPorts
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 	// Both host-exec defaults share one platform/hostexec Runner —
 	// the single nsenter seam: NSNet for binaries shipped in the
@@ -394,27 +387,17 @@ func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 		dnsfails:  map[string]int{},
 		egressCtr: map[string]int{},
 	}
-	// The Now closure must read n.cfg.nowFn at call time — tests
-	// re-stub the clock after New() and the store has to observe it
-	// (hoststate.Store.Now contract; controllerhygiene parity).
-	n.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return n.cfg.nowFn() }, logger)
-	n.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_nethealth_cycles_total",
-		Help: "Net-health check cycles by check and result " +
+	// The store binds the shared timex.Cell — a post-New
+	// cfg.Clock.Set is observed by it (hoststate.Store.Now
+	// contract; controllerhygiene parity).
+	n.state = cfg.Store(logger)
+	n.cycles, n.actions = subframe.Counters("nethealth",
+		"Net-health check cycles by check and result "+
 			"(ok|abort|gated|disabled|uptime_gate|open_error|restore_error).",
-	}, []string{"check", "result"})
-	n.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_nethealth_actions_total",
-		Help: "Net-health remediation actions by check and action " +
-			"(pin|unpin|restart|rule_add|rule_del|kill|restored).",
-	}, []string{"check", "action"})
-	if reg != nil {
-		for _, c := range []prometheus.Collector{n.cycles, n.actions} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register nethealth metrics: %w", err)
-			}
-		}
+		"Net-health remediation actions by check and action "+
+			"(pin|unpin|restart|rule_add|rule_del|kill|restored).")
+	if err := subframe.RegisterAll(reg, n.cycles, n.actions); err != nil {
+		return nil, fmt.Errorf("register nethealth metrics: %w", err)
 	}
 	n.initChecks()
 	return n, nil
@@ -488,19 +471,13 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	// Deferred so even an early-returned cycle proves the loop is
 	// alive (BUG-H1 — Store.StampLastRun no-ops on an empty dir).
 	defer n.state.StampLastRun()
-	if n.cfg.WatchdogSrc != nil {
-		// cfg.Watchdog is owned by the Cycle goroutine alone: only
-		// in-cycle checks read the field, and only when WatchdogSrc
-		// is wired does it move. Off-Cycle goroutines (routeGuard,
-		// mtuProbeLoop) NEVER read it — watchdogConf() routes them
-		// through the mutexed reloader instead (workerhygiene's
-		// feederWatchdogConf parity).
-		n.cfg.Watchdog = n.cfg.WatchdogSrc.Get()
-	}
-	wd := n.cfg.Watchdog
-	sigOn := func(name string) bool {
-		return wd == nil || wd.SignalEnabled(name)
-	}
+	// cfg.Watchdog is owned by the Cycle goroutine alone: only
+	// in-cycle checks read the field, and only when WatchdogSrc
+	// is wired does BeginCycle move it. Off-Cycle goroutines
+	// (routeGuard, mtuProbeLoop) NEVER read it — watchdogConf()
+	// routes them through the mutexed reloader instead
+	// (workerhygiene's feederWatchdogConf parity).
+	_, sigOn := n.cfg.BeginCycle()
 	checks.Dispatch(ctx, sigOn, n.cycles, n.groups)
 }
 

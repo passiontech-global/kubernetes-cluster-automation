@@ -59,7 +59,7 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// The task map is only worth building once a Terminating pod
 	// exists — with none, the whole loop below is a no-op.
 	var tasks map[string][]wdeps.CtrTask
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	wedged := 0
 	ndel := 0
 	for i := range e.Pods {

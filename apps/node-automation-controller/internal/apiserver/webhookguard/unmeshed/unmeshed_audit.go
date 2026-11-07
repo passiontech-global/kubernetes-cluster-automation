@@ -33,20 +33,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
+// The linkerd identifiers (inject annotation key, injected sidecar
+// container name, injector sub-webhook name) live in platform/kube —
+// the nethealth checks and the zombie-sidecar reaper match the same
+// identity.
 const (
-	// linkerdInjectKey is the label/annotation both linkerd and this
-	// auditor read on Namespaces and Pods: enabled opts in, disabled
-	// opts out.
-	linkerdInjectKey = "linkerd.io/inject"
-	// linkerdProxyContainer is the sidecar name injection adds — a
-	// pod carrying it in containers OR initContainers counts as
-	// meshed.
-	linkerdProxyContainer = "linkerd-proxy"
-	// linkerdInjectorWebhook is the injector's full sub-webhook name
-	// inside the MutatingWebhookConfiguration — matched exactly so a
-	// similarly-named webhook (e.g. "acme-linkerd-proxy-injector.example.com")
-	// can never impersonate the health signal.
-	linkerdInjectorWebhook = "linkerd-proxy-injector.linkerd.io"
 	// unmeshedMinPodAge: a pod must be this old before deletion —
 	// younger pods may simply be mid-admission/mid-start.
 	unmeshedMinPodAge = 2 * time.Minute
@@ -309,12 +300,12 @@ func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
 // container or initContainer — the injection signature.
 func podHasSidecar(p *corev1.Pod) bool {
 	for _, c := range p.Spec.Containers {
-		if c.Name == linkerdProxyContainer {
+		if c.Name == kube.LinkerdProxyContainer {
 			return true
 		}
 	}
 	for _, c := range p.Spec.InitContainers {
-		if c.Name == linkerdProxyContainer {
+		if c.Name == kube.LinkerdProxyContainer {
 			return true
 		}
 	}
@@ -328,7 +319,7 @@ func podHasSidecar(p *corev1.Pod) bool {
 // no directive anywhere returns "".
 func injectDirective(labels, annotations map[string]string) string {
 	for _, m := range []map[string]string{annotations, labels} {
-		switch m[linkerdInjectKey] {
+		switch m[kube.LinkerdInjectKey] {
 		case "disabled":
 			return "disabled"
 		case "enabled":
@@ -360,7 +351,7 @@ func (a *Auditor) linkerdInjectorHealthy(snap *guardstate.Snapshot) (bool, error
 		cfg := &mwcs.Items[i]
 		broken := guardstate.ParseCircuitAnnotation(cfg.Annotations[guardstate.CircuitBrokenAnno])
 		for _, w := range cfg.Webhooks {
-			if w.Name != linkerdInjectorWebhook {
+			if w.Name != kube.LinkerdInjectorWebhook {
 				continue // exact match — a lookalike name is not the injector
 			}
 			found = true

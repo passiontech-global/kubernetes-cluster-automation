@@ -79,8 +79,8 @@ type Host struct {
 	// KillFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
 	KillFn func(pid int, sig syscall.Signal) error
-	// NowFn supplies the current time — seam for tests.
-	NowFn timex.Clock
+	// Clock supplies the current time — the shared timex.Cell seam.
+	Clock *timex.Cell
 	// JournalFn returns the k0sworker journal window — the runner's
 	// shared -10min snapshot (05/06). nil → Systemd.Journal.
 	JournalFn func(ctx context.Context) (string, error)
@@ -256,8 +256,8 @@ func (s *Host) applyDefaults(c *Config) {
 			return syscall.Kill(pid, sig)
 		}
 	}
-	if s.NowFn == nil {
-		s.NowFn = timex.SystemClock
+	if s.Clock == nil {
+		s.Clock = timex.NewCell(nil)
 	}
 	if s.JournalFn == nil {
 		sd := c.Systemd

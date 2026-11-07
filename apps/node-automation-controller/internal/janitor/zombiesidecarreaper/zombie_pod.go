@@ -10,6 +10,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -24,8 +26,8 @@ const (
 // Job pod Running — linkerd is the offender this module was built
 // for, istio shares the shape.
 var zombieSidecarNames = map[string]bool{
-	"linkerd-proxy": true,
-	"istio-proxy":   true,
+	kube.LinkerdProxyContainer: true,
+	"istio-proxy":              true,
 }
 
 // zombiePod returns the name of the still-Running mesh sidecar when

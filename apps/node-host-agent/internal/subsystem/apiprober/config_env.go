@@ -1,10 +1,9 @@
 package apiprober
 
 import (
-	"os"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -105,8 +104,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 		CAFile:            pi.caFile,
 		// Same env/dir hostmetrics uses — one shared watchdog
 		// state dir mount for the whole pod.
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogSrc:      d.WatchdogSrc,
+		Base: subframe.FromDeps(d.Deps),
 	}
 	// The env surface beyond the guard.conf chain, one row per knob
 	// in declaration order.
@@ -131,16 +129,16 @@ func ConfigFromEnv(d EnvDeps) Config {
 	// (env > guard.conf > default; the overlay used to shadow env
 	// outright). Same "empty == unset" semantics as the envx knobs.
 	cfg.envSet = guardEnvSet{
-		socket:     os.Getenv(envnames.EnvApiproberSocket) != "",
-		backend:    os.Getenv(envnames.EnvApiproberBackend) != "",
-		companions: os.Getenv(envnames.EnvApiproberCompanionBackends) != "",
-		mode:       os.Getenv(envnames.EnvApiproberMode) != "",
-		tokenFile:  os.Getenv(envnames.EnvApiproberTokenFile) != "",
-		caFile:     os.Getenv(envnames.EnvApiproberCaFile) != "",
-		gapMin:     os.Getenv(envnames.EnvApiproberGapMin) != "",
-		failCycles: os.Getenv(envnames.EnvApiproberFailCycles) != "",
-		frozen:     os.Getenv(envnames.EnvApiproberFrozenCycles) != "",
-		recoverC:   os.Getenv(envnames.EnvApiproberRecoverCycles) != "",
+		socket:     envx.IsSet(envnames.EnvApiproberSocket),
+		backend:    envx.IsSet(envnames.EnvApiproberBackend),
+		companions: envx.IsSet(envnames.EnvApiproberCompanionBackends),
+		mode:       envx.IsSet(envnames.EnvApiproberMode),
+		tokenFile:  envx.IsSet(envnames.EnvApiproberTokenFile),
+		caFile:     envx.IsSet(envnames.EnvApiproberCaFile),
+		gapMin:     envx.IsSet(envnames.EnvApiproberGapMin),
+		failCycles: envx.IsSet(envnames.EnvApiproberFailCycles),
+		frozen:     envx.IsSet(envnames.EnvApiproberFrozenCycles),
+		recoverC:   envx.IsSet(envnames.EnvApiproberRecoverCycles),
 	}
 	return cfg
 }

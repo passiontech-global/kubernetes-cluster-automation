@@ -57,7 +57,7 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 	d.State.AppendLog(fmt.Sprintf(
 		"POD-TEARDOWN-FORCE-DELETE: force-delete pod %s/%s (uid %.8s) - Terminating %ds, zero live tasks",
 		p.Namespace, p.Name, string(p.UID),
-		int64(d.Cfg.Seams.Host.NowFn().Sub(p.DeletionTimestamp.Time).Seconds())))
+		int64(d.Cfg.Seams.Host.Clock.Now().Sub(p.DeletionTimestamp.Time).Seconds())))
 	return d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 		metav1.DeleteOptions{
 			GracePeriodSeconds: ptr.To[int64](0),

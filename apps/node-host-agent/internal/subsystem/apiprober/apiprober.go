@@ -72,7 +72,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 )
 
 // Mode values — the shell script's dry-run default is preserved.
@@ -125,6 +125,18 @@ type StaticBackend struct {
 
 // Config carries the prober's knobs — all test-injectable.
 type Config struct {
+	// Base is the shared watchdog-subsystem block — the probe
+	// cadence, WatchdogStateDir (the apibe-*/state-apiserver-
+	// backend-stale-* compat files land there) and WatchdogSrc
+	// (re-reads node-watchdog.conf every cycle and merges its
+	// API_BACKENDS into the static set — hostconfig rewrites the
+	// conf mid-run, so a backend joining/leaving the list must
+	// apply next cycle, not next agent restart) splice
+	// (subframe.FromDeps). The rest of the block (clock, host root,
+	// systemd, watchdog log) is carried but unused — the prober
+	// writes its own apibe-* files directly, not through a
+	// hoststate store.
+	subframe.Base
 	SocketPath  string // HAProxy admin unix socket
 	BackendName string // HAProxy backend holding the apiservers
 	// CompanionBackends are extra HAProxy backends that receive the
@@ -134,11 +146,6 @@ type Config struct {
 	// StaticBackends are API_BACKENDS-style name=ip:port entries
 	// merged into the probe set (see package doc).
 	StaticBackends []StaticBackend
-	// WatchdogSrc, when set, re-reads node-watchdog.conf every cycle
-	// and merges its API_BACKENDS into the static set — hostconfig
-	// rewrites the conf mid-run, so a backend joining/leaving the
-	// list must apply next cycle, not next agent restart.
-	WatchdogSrc *watchdogconf.Reloader
 	// GuardSrc, when set, re-reads api-backend-guard.conf every
 	// cycle and overlays the keys it carries onto the
 	// startup-resolved knobs (SocketPath/BackendName/
@@ -165,7 +172,6 @@ type Config struct {
 	// means "nothing env-protected", so hand-built Configs keep
 	// the old conf-wins-everything behavior.
 	envSet        guardEnvSet
-	Interval      time.Duration // probe cycle
 	Mode          string        // dry-run | enforce
 	GapMin        int64         // rv-gap wedge threshold
 	FailCycles    int           // consecutive gap>GapMin OR query-fail → drain
@@ -178,9 +184,9 @@ type Config struct {
 	InsecureTLS   bool          // skip backend cert verification (mirrors curl -sk)
 	LivePath      string        // consistent-read URL path+query
 	CachePath     string        // cached-read URL path+query
-	// WatchdogStateDir, when non-empty and present on disk, receives
-	// the apibe-gap-*/state-apiserver-backend-stale-* compat files.
-	WatchdogStateDir string
+	// Base.WatchdogStateDir, when non-empty and present on disk,
+	// receives the apibe-gap-*/state-apiserver-backend-stale-*
+	// compat files.
 
 	// HTTPClient, when set, is used for all API queries and overrides
 	// TokenFile/CAFile/InsecureTLS — the test seam (httptest clients).
@@ -339,15 +345,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 		Help: "Duration of the last probe cycle.",
 	})
 
-	if reg != nil {
-		for _, c := range []prometheus.Collector{
-			p.rvGap, p.enabled, p.probeFailures, p.actions, p.cycles,
-			p.backendCount, p.duration,
-		} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register apiprober metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		p.rvGap, p.enabled, p.probeFailures, p.actions, p.cycles,
+		p.backendCount, p.duration); err != nil {
+		return nil, fmt.Errorf("register apiprober metrics: %w", err)
 	}
 	return p, nil
 }

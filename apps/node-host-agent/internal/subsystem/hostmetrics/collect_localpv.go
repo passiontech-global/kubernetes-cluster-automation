@@ -64,11 +64,11 @@ var descLocalPVDirBytes = prometheus.NewDesc(
 // local-path volumes here" must stay distinguishable from "zero
 // bytes").
 func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
-	cached, fresh := c.lpv.snapshot(c.cfg.nowFn(), c.cfg.LocalPVScanInterval)
+	cached, fresh := c.lpv.snapshot(c.cfg.Clock.Now(), c.cfg.LocalPVScanInterval)
 	bytes := cached
 	if !fresh {
 		if walked := c.walkLocalPVDirs(); walked != nil {
-			c.lpv.store(c.cfg.nowFn(), walked)
+			c.lpv.store(c.cfg.Clock.Now(), walked)
 			bytes = walked
 		}
 		// A failed walk (root unreadable) keeps serving the last

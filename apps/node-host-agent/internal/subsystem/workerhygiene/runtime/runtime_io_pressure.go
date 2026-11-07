@@ -174,7 +174,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "abort").Inc()
 		return
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	cur := parseDiskstats(data)
 	util, await, maxAwait := 0.0, 0.0, 0.0
 	if c.lastDisk != nil {

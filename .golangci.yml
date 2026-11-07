@@ -42,8 +42,9 @@ linters:
       #     contract is const declarations only — it must never
       #     import another package in the module.
       #   - internal/platform/** is the leaf layer (hoststate,
-      #     systemd, ...; envx/logx moved out to libs/hostkit): it
-      #     must never import the layers above it.
+      #     systemd, ...; envx/logx/jinja moved out to libs/hostkit,
+      #     topology to internal/domain): it must never import the
+      #     layers above it.
       #   - internal/domain/** holds the importable domain libs
       #     shared by subsystems and ops (etcdmaint, eventpurge):
       #     it may use platform/hostkit but must not import
@@ -57,8 +58,9 @@ linters:
       #     itself. The reverse direction stays allowed — ops
       #     wrappers may import domain libs and subsystems (e.g.
       #     ops/kinecheckdb wraps subsystem/kinedb).
-      #   - libs/hostkit is the shared stdlib-only leaf module: it
-      #     must never import back into an app module.
+      #   - libs/hostkit is the shared leaf module (stdlib-only
+      #     except jinja's go.yaml.in/yaml/v3 dep): it must never
+      #     import back into an app module.
       # Deliberately NOT denied: ops -> domain and ops -> subsystem
       # imports (the one-directional half of the old subsystem<->ops
       # convention), and cmd/agent may import anything.
@@ -116,7 +118,7 @@ linters:
             - "**/libs/hostkit/**"
           deny:
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps"
-              desc: "libs/hostkit is a shared stdlib-only leaf module; it must not import any app module"
+              desc: "libs/hostkit is a shared leaf module; it must not import any app module"
         # node-automation-controller layering (see
         # apps/node-automation-controller/AGENTS.md). Same
         # absolute-path `files` empirics as above; scoping again comes

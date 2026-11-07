@@ -41,8 +41,10 @@ func moduleGateEnvs() []string {
 // a dup would merge two modules' error accounting), every row must
 // carry a known Group (a typo'd group string would silently shrink a
 // `-modules @group` expansion — the constants are unexported so only
-// this file can mint one) and every row must carry a Setup — a nil
-// one would nil-call at boot.
+// this file can mint one) and every row must carry a Setup or a
+// CheckReg — a row with neither would be dead weight at boot. The
+// exactly-one-of-the-two shape is asserted in
+// checkreg_contract_test.go.
 func TestModuleRegistry(t *testing.T) {
 	seen := map[string]bool{}
 	for _, m := range Modules {
@@ -59,8 +61,8 @@ func TestModuleRegistry(t *testing.T) {
 		default:
 			t.Fatalf("module %q has unknown Group %q", m.Name, m.Group)
 		}
-		if m.Setup == nil {
-			t.Fatalf("module %q has nil Setup", m.Name)
+		if m.Setup == nil && m.CheckReg == nil {
+			t.Fatalf("module %q has neither Setup nor CheckReg", m.Name)
 		}
 	}
 }
@@ -240,8 +242,10 @@ func TestParseModulesFlag(t *testing.T) {
 	}
 }
 
-// Every module registers exactly one runnable on the manager — 32 in
-// the registry — except the gate-skippers, which SetupModules hands
+// Every runnable module registers exactly one runnable on the
+// manager — 32 runnable rows in the 35-row registry (the three
+// health CheckReg rows contribute checks to the sweep roster, not
+// runnables) — except the gate-skippers, which SetupModules hands
 // Deps.Disabled and which then skip mgr.Add entirely. Modules whose
 // flag only gates the tick body (csr-watcher approve mode,
 // helmrelease-unlocker stall-unwedge,
@@ -275,7 +279,8 @@ func TestSetupModules(t *testing.T) {
 		if err := SetupModules(testDeps(m), Modules); err != nil {
 			t.Fatalf("SetupModules: %v", err)
 		}
-		// 32 modules minus the 18 gate-skippers = 14 runnables.
+		// 32 runnable rows minus the 18 gate-skippers = 14 runnables
+		// (the 3 CheckReg rows register nothing regardless).
 		if len(m.Added) != 14 {
 			t.Fatalf("registered %d runnables, want 14", len(m.Added))
 		}

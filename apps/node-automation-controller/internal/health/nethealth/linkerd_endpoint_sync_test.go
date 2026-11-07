@@ -523,7 +523,7 @@ func clusterIPService(ns, name string, selector map[string]string) *corev1.Servi
 func linkerdInjectedNamespace(name string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name:   name,
-		Labels: map[string]string{linkerdInjectLabel: "enabled"},
+		Labels: map[string]string{kube.LinkerdInjectKey: "enabled"},
 	}}
 }
 

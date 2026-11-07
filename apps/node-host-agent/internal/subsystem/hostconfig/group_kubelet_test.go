@@ -12,7 +12,7 @@ import (
 
 func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -62,13 +62,13 @@ func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 		t.Fatalf("bad registry-mirror toml:\n%s", t91)
 	}
 	// ansible header contract: agent NEVER restarts k0s/containerd.
-	for _, c2 := range sr.calls {
+	for _, c2 := range sr.Calls() {
 		if strings.Contains(c2, "restart") &&
 			(strings.Contains(c2, "k0sworker") || strings.Contains(c2, "k0scontroller") || strings.Contains(c2, "containerd")) {
 			t.Fatalf("unexpected restart call: %s", c2)
 		}
 	}
-	if len(sr.callsMatching("systemctl daemon-reload")) == 0 {
+	if len(sr.CallsMatching("systemctl daemon-reload")) == 0 {
 		t.Fatal("daemon-reload not invoked after unit change")
 	}
 }
@@ -78,7 +78,7 @@ func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 // styles.
 func TestGroupPullsQuotedExtraArgs(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -112,7 +112,7 @@ func TestGroupPullsQuotedExtraArgs(t *testing.T) {
 // mangled unit.
 func TestGroupPullsRefusesUnsafeQPS(t *testing.T) {
 	vars := writeVarsDir(t, "kubelet_registry_qps: \"2;rm -rf /\"\n")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -136,7 +136,7 @@ func TestGroupPullsRefusesUnsafeQPS(t *testing.T) {
 // than merge flags into a value systemd tokenizes differently.
 func TestGroupPullsUnterminatedExtraArgsQuote(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

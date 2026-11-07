@@ -40,6 +40,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -123,8 +124,8 @@ type Config struct {
 	// statfsFn reads filesystem stats for the pressure check — seam
 	// for tests; nil → syscall.Statfs.
 	statfsFn func(path string, st *syscall.Statfs_t) error
-	// nowFn supplies the current time — seam for tests; nil → time.Now.
-	nowFn timex.Clock
+	// Clock supplies the current time — the shared timex.Cell seam; nil → system time.
+	Clock *timex.Cell
 }
 
 func (c *Config) applyDefaults() {
@@ -186,8 +187,8 @@ func (c *Config) applyDefaults() {
 	if c.statfsFn == nil {
 		c.statfsFn = syscall.Statfs
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 }
 
@@ -219,12 +220,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Pruner, error) {
 		Name: "node_host_agent_concourse_cache_bytes_freed_total",
 		Help: "Bytes freed by the shared-cache pruner (file sizes/du).",
 	})
-	if reg != nil {
-		for _, c := range []prometheus.Collector{p.cycles, p.filesDeleted, p.bytesFreed} {
-			if err := reg.Register(c); err != nil {
-				return nil, err
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		p.cycles, p.filesDeleted, p.bytesFreed); err != nil {
+		return nil, err
 	}
 	return p, nil
 }

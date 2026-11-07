@@ -82,12 +82,11 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	}
 	// Maintenance mutex — "cannot verify" fails closed like every
 	// other caller: an unverifiable drain state defers the heal.
-	// heal.AllowedV runs with a nil ledger — the cooldown above is
+	// HealAllowed runs with a nil ledger — the cooldown above is
 	// the wider-of-both PersistedCooledDown, not a single key, so
-	// only its mutex gate applies — shared via the check's verdict
+	// only its mutex gate applies — shared via the Deps-wide verdict
 	// so a sweep of stuck operators pays one evaluation.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, nil, op.name, 0, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log, nil, op.name, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

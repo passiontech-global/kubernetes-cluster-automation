@@ -306,7 +306,7 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "abort").Inc()
 		return
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	missing := 0
 	for i := range e.Pods {
 		p := &e.Pods[i]

@@ -19,8 +19,8 @@ import (
 // cycles{result}.
 func (s *Sweeper) Sweep(ctx context.Context) {
 	log := logger()
-	start := s.cfg.nowFn()
-	defer func() { s.duration.Set(s.cfg.nowFn().Sub(start).Seconds()) }()
+	start := s.cfg.Clock.Now()
+	defer func() { s.duration.Set(s.cfg.Clock.Now().Sub(start).Seconds()) }()
 
 	fi, err := os.Stat(s.cfg.BaseDir)
 	if err != nil || !fi.IsDir() {
@@ -113,7 +113,7 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 			s.skips.WithLabelValues(skipStatError).Inc()
 			continue
 		}
-		if s.cfg.nowFn().Sub(info.ModTime()) <= s.cfg.MinAge {
+		if s.cfg.Clock.Now().Sub(info.ModTime()) <= s.cfg.MinAge {
 			log.Info("SKIP: younger than min age", "dir", name,
 				"minAge", s.cfg.MinAge.String())
 			s.skips.WithLabelValues(skipTooYoung).Inc()

@@ -8,13 +8,13 @@ package hostconverge
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // HostRoot/RunnerFactory wire the production standalone contract
@@ -31,22 +31,18 @@ var (
 // failure, 2 usage error — same contract as the other ops
 // subcommands).
 func Cmd(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("converge-once", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs := opsx.FlagSet("converge-once")
 	varsDir := fs.String("vars-dir",
-		getenv(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
+		envx.String(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
 		"vars dir holding defaults.yaml/cluster.yaml/interdc_nodes.yaml")
 	nodeName := fs.String("node-name",
-		getenv(envnames.EnvNodeName, getenv("NODE_NAME", "")),
+		envx.String(envnames.EnvNodeName, envx.String("NODE_NAME", "")),
 		"registry node name (default: OS hostname)")
 	certsDir := fs.String("nebula-certs-dir",
-		getenv(envnames.EnvNebulaCertsDir, "/etc/node-host-agent/nebula-certs"),
+		envx.String(envnames.EnvNebulaCertsDir, "/etc/node-host-agent/nebula-certs"),
 		"nebula cert dir (hubsync pushes to /etc/node-host-agent/nebula-certs)")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0 // -h/--help is a clean exit, not a usage error
-		}
-		return 2
+	if code, ok := opsx.Parse(fs, args); !ok {
+		return code
 	}
 	return converge(ctx, *varsDir, *nodeName, *certsDir)
 }
@@ -68,7 +64,7 @@ func converge(ctx context.Context, varsDir, nodeName, certsDir string) int {
 	}, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "converge-once:", err)
-		return 1
+		return opsx.ExitRuntime
 	}
 	logger().Info("converge-once starting",
 		"node", nn, "varsDir", varsDir, "certsDir", certsDir)
@@ -79,16 +75,7 @@ func converge(ctx context.Context, varsDir, nodeName, certsDir string) int {
 	if errs := hc.CycleWithErrors(ctx); errs > 0 {
 		logger().Error("converge-once finished with errors",
 			"node", nn, "errors", errs)
-		return 1
+		return opsx.ExitRuntime
 	}
-	return 0
-}
-
-// getenv mirrors cmd/agent's env-or-default helper — the flag
-// defaults keep reading the same NODE_HOST_AGENT_* envs.
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
+	return opsx.ExitOK
 }

@@ -152,7 +152,7 @@ func pemDaysLeft(data []byte, now int64) (float64, bool) {
 // cert gauge). The path label strips the HostRoot mount prefix so
 // pods and standalone hosts emit identical series.
 func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
-	now := c.cfg.nowFn().Unix()
+	now := c.cfg.Clock.Now().Unix()
 	for _, src := range c.cfg.PKICertPaths {
 		for _, f := range pkiCertFiles(src) {
 			data, err := os.ReadFile(f)

@@ -14,7 +14,6 @@ package k0sdrift
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +21,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
 )
 
@@ -29,8 +29,7 @@ import (
 // dispatch, returning the process exit code (0 clean, 1 drift,
 // 2 usage error — same contract as the other ops subcommands).
 func Cmd(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("check-k0s-drift", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs := opsx.FlagSet("check-k0s-drift")
 	config := fs.String("config", "/etc/k0s/k0s.yaml", "k0s config to scan")
 	expected := fs.String("expected-keys", "",
 		"comma-separated expected controllerManager.extraArgs keys "+
@@ -41,11 +40,8 @@ func Cmd(ctx context.Context, args []string) int {
 	unit := fs.String("unit-file", "/etc/systemd/system/k0scontroller.service",
 		"k0s controller gate — the check only runs when this unit file "+
 			"exists (point at /dev/null to force on a non-controller)")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0 // -h/--help is a clean exit, not a usage error
-		}
-		return 2
+	if code, ok := opsx.Parse(fs, args); !ok {
+		return code
 	}
 	// Provided-vs-absent matters: --expected-keys= (explicit empty)
 	// means "no expected keys" while a missing flag means "use the
@@ -77,18 +73,18 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 	// is an upfront cancellation gate.
 	if err := ctx.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "check-k0s-drift:", err)
-		return 1
+		return opsx.ExitRuntime
 	}
 	scan := hostmetrics.ScanK0sDrift(cfg)
 	cfg = scan.Config // print the normalized (defaults-applied) paths
 	if scan.NotController {
 		_, _ = fmt.Fprintf(out, "check-k0s-drift: %s absent — "+
 			"not a k0s controller, skip\n", cfg.UnitFile)
-		return 0
+		return opsx.ExitOK
 	}
 	if len(scan.Findings) == 0 {
 		_, _ = fmt.Fprintln(out, "check-k0s-drift: OK (no drift)")
-		return 0
+		return opsx.ExitOK
 	}
 
 	// Aggregate the way the script did: one line listing every extra
@@ -130,7 +126,7 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 				"(removed upstream -> component will crashloop after upgrade)\n",
 			cfg.ConfigFile, flag)
 	}
-	return 1
+	return opsx.ExitRuntime
 }
 
 // splitCSV splits a comma-separated flag value, trimming spaces and

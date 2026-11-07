@@ -6,4 +6,4 @@ stack: 'backend'
 
 project:
   title: 'hostkit'
-  description: 'Shared stdlib-only host-agent toolkit: envx (env knobs/Mode/Knob tables) and logx (named slog loggers).'
+  description: 'Shared host-agent toolkit (stdlib + yaml3 only): envx (env knobs/Mode/Knob tables), logx (named slog loggers), timex (settable clock), and jinja (mini-Jinja2 evaluator).'

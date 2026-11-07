@@ -35,10 +35,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -96,6 +98,11 @@ var partitionCondTypes = []corev1.NodeConditionType{
 
 type partitionEvictor struct {
 	cs kubernetes.Interface
+	// dyn feeds the maintenance mutex's autopilot-Plan signal — the
+	// pod evictions defer while a drain or k0s upgrade is in
+	// flight. Nil (literal test fixtures) leaves the gate unarmed —
+	// the same unarmed-seam convention as nodeReader/namespaces.
+	dyn dynamic.Interface
 	// nodeReader backs ListNodesCached — the informer-backed node
 	// census; the taint/untaint writes still confirm on the direct
 	// clientset. Nil (test fixtures) falls back to ListNodes.
@@ -104,6 +111,9 @@ type partitionEvictor struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// verdict memoizes the maintenance-mutex evaluation so the
+	// sweep pays one evaluation per TTL window.
+	verdict kube.Verdict
 	// now is the wall-clock seam so tests can age a partition
 	// condition past partitionMinAge without sleeping. nil reads as
 	// system time — the standard unarmed-seam convention.
@@ -121,6 +131,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg evictorConfig) error {
 		e := &partitionEvictor{
 			cs:         d.CS,
+			dyn:        d.Dyn,
 			nodeReader: d.Mgr.GetClient(),
 			queue:      d.Name,
 			now:        shared.SystemClock,
@@ -362,6 +373,27 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		metrics.IncError(e.queue)
 		log.Error(err, "pvc list failed — pod eviction skipped this run")
 		return nil
+	}
+
+	// Maintenance mutex + global heal budget — evictions kill LIVE
+	// pods, so they defer while a cordon/drain/kured reboot or a k0s
+	// upgrade is in flight (the taints above still fence the flagged
+	// nodes — fencing is not destructive). heal.AllowedV runs with a
+	// nil heals ledger: this module's pacing is partitionEvictCap,
+	// not a CooldownSet — its mutex and budget gates are what apply,
+	// shared via e.verdict so the sweep pays one evaluation.
+	// Unverifiable fails closed and IncErrors the queue like every
+	// other tolerated sub-failure.
+	if e.dyn != nil {
+		proceed, unverifiable := heal.AllowedV(ctx, log, &e.verdict,
+			e.cs, e.dyn, nil, "partition-evictor", 0, now)
+		if unverifiable {
+			metrics.IncError(e.queue)
+			return nil
+		}
+		if !proceed {
+			return nil
+		}
 	}
 
 	evicted := 0

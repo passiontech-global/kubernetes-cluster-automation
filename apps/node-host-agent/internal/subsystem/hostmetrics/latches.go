@@ -17,7 +17,10 @@
 // Collector: the latch updaters share the collector's cfg + probe
 // seams (probeFS, psiAvg60, nebulaCertDaysLeft, the hoststate
 // Store), so the split keeps the same package — Latches reaches
-// them via l.c.
+// them via l.c. The Wave-10 kernel deep-failure block (kmsg drain,
+// pid/fd pressure, steal/entropy, clock skew, fs-readonly evidence)
+// delegates to l.c.kf — the kernelfail subpackage engine, which
+// produces latch/marker files rather than scrape series.
 package hostmetrics
 
 import (
@@ -35,8 +38,9 @@ import (
 
 // Latches is the agent.Subsystem half of hostmetrics — the
 // scrape-independent latch-maintenance ticker. The Collector keeps
-// the prometheus.Collector role; the split is in-package because the
-// latch updaters share its cfg and probe seams via l.c.
+// the prometheus.Collector role; the scrape-shared latch updaters
+// share its cfg and probe seams via l.c, and the W10 kernel
+// deep-failure checks delegate to l.c.kf (the kernelfail engine).
 type Latches struct{ c *Collector }
 
 // Latches returns the subsystem half of this Collector — the
@@ -53,9 +57,10 @@ func (l *Latches) Collector() *Collector { return l.c }
 func (l *Latches) Name() string { return "hostmetrics" }
 
 // Run drives the latch-maintenance ticker until ctx is cancelled;
-// the /dev/kmsg session it lazily opened is released on exit.
+// the /dev/kmsg session the engine lazily opened is released on
+// exit.
 func (l *Latches) Run(ctx context.Context) {
-	defer l.closeKernelScan()
+	defer l.c.kf.Close()
 	cycle.Every("hostmetrics", l.c.cfg.LatchInterval,
 		func(context.Context) { l.refreshLatches() }).Run(ctx)
 }
@@ -88,28 +93,15 @@ func (l *Latches) refreshLatches() {
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)
 	}
-	// W10-KR1: kernel dmesg/kmsg deep-error scan — filesystem/block
-	// errors, conntrack table-full drops, host-level OOM kills.
-	// Writes evidence markers (kmsg-fs-error, kmsg-conntrack-drops,
-	// kmsg-host-oom-*) that the latches below and workerhygiene's
-	// SystemOOMVictim emitter consume. Ticker-only: a scrape-side
-	// drain would steal records from this loop.
-	l.checkKernelDmesg()
-	// W10-KR2: pid/thread/fd utilization → state-pid-fd-pressure
-	// plus the node_agent_*_utilization_ratio textfile gauges.
-	l.updatePidFDPressure()
-	// cpu-steal-guard + kernel-entropy-check: /proc/stat steal
-	// delta → state-cpu-steal-pressure plus the
-	// node_agent_cpu_steal_ratio / node_agent_kernel_entropy_avail_bits
-	// textfile gauges.
-	l.updateStealEntropy()
-	// W10-KR5: chronyc/adjtimex clock-skew probe → state-clock-skew
-	// + rate-limited chronyc makestep.
-	l.checkClockSkew()
-	// W10-ST1+KR1: the state-fs-readonly evidence latch — a fresh
-	// kernel fs error OR an ro ext4/xfs/btrfs mount under a PVC
-	// dir, ahead of statfs ever reporting ST_RDONLY.
-	l.updateFSReadonlyEvidence()
+	// W10-KR1/KR2/KR5 + W10-ST1 + cpu-steal-guard: the kernel
+	// deep-failure block — the kmsg drain (evidence markers
+	// kmsg-fs-error, kmsg-conntrack-drops, kmsg-host-oom-* the
+	// fs-readonly latch and workerhygiene's SystemOOMVictim /
+	// vm.compact_memory consumers read), pid/fd pressure,
+	// steal/entropy, clock skew and fs-readonly evidence, in that
+	// fixed order. Lives in the kernelfail subpackage; ticker-only
+	// — a scrape-side drain would steal records from this loop.
+	c.kf.Refresh()
 	// BUG-H6: while a latch stays held keep its mtime fresh so the
 	// janitor's LatchMaxAge reap can't retire an active signal.
 	for _, name := range []string{
@@ -131,7 +123,7 @@ func (l *Latches) refreshLatches() {
 	} {
 		p := c.state.Path(name)
 		if _, err := os.Stat(p); err == nil {
-			now := c.cfg.nowFn()
+			now := c.cfg.Clock.Now()
 			if cerr := os.Chtimes(p, now, now); cerr != nil {
 				logger().Debug("hostmetrics: latch touch failed",
 					"path", p, "error", cerr)

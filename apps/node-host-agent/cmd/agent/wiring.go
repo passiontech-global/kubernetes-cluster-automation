@@ -152,7 +152,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return std(w, sweeper.EnvDeps{Client: cs},
+				return std(w, sweeper.EnvDeps{Deps: w.Deps, Client: cs},
 					sweeper.ConfigFromEnv, sweeper.New)
 			},
 		},

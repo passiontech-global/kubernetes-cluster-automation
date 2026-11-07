@@ -19,6 +19,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const pvcUUID = "pvc-12345678-90ab-cdef-1234-567890abcdef"
@@ -38,7 +39,7 @@ func fixture(t *testing.T, client *fake.Clientset) (*Sweeper, string, string) {
 		MaxDelete:  10,
 		MountsFile: mountsFile,
 		Client:     client,
-		nowFn:      time.Now,
+		Clock:      timex.NewCell(time.Now),
 		statfsFn:   func(string) (uint64, error) { return 0, errors.New("no fs in test") },
 	}, prometheus.NewRegistry())
 	if err != nil {
@@ -425,8 +426,8 @@ func TestApplyDefaults(t *testing.T) {
 		s.cfg.RequestTimeout != defaultRequestTimeout {
 		t.Fatalf("defaults not applied: %+v", s.cfg)
 	}
-	if s.cfg.statfsFn == nil || s.cfg.nowFn == nil {
-		t.Fatal("statfsFn/nowFn seams not defaulted")
+	if s.cfg.statfsFn == nil || s.cfg.Clock == nil {
+		t.Fatal("statfsFn/Clock seams not defaulted")
 	}
 }
 

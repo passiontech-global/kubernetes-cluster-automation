@@ -29,7 +29,7 @@ func holdLease(s *Syncer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.held = true
-	s.leaseExpiresAt = s.cfg.NowFn().Add(time.Hour)
+	s.leaseExpiresAt = s.cfg.Clock.Now().Add(time.Hour)
 }
 
 // testConfig returns a Config pointed at the fixture dirs plus a

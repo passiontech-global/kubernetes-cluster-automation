@@ -177,7 +177,7 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 	if sc.certOK && sc.certDays < nebulaCertWarnDays {
 		present[hoststate.LatchNebulaCertExpiring] = true
 	}
-	for _, name := range c.seen.update(present, sc.certOK, c.cfg.nowFn()) {
+	for _, name := range c.seen.update(present, sc.certOK, c.cfg.Clock.Now()) {
 		v := 0.0
 		if present[name] {
 			v = 1

@@ -6,10 +6,10 @@ package concourseinit
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 )
 
 // Cmd is the init-rm subcommand: the flags map onto Config's path
@@ -18,8 +18,7 @@ import (
 // the agent as the runc wrapper even when argv[0] resolves
 // elsewhere).
 func Cmd(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("concourse-worker-init", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs := opsx.FlagSet("concourse-worker-init")
 	workDir := fs.String("work-dir", "",
 		"concourse work dir to soft-reset (default "+DefaultWorkDir+")")
 	runcDir := fs.String("runc-dir", "",
@@ -31,11 +30,8 @@ func Cmd(ctx context.Context, args []string) int {
 	wrapperSource := fs.String("wrapper-source", "",
 		"binary installed as <runc-dir>/runc — the multi-call agent "+
 			"(default: os.Executable)")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0 // -h/--help is a clean exit, not a usage error
-		}
-		return 2
+	if code, ok := opsx.Parse(fs, args); !ok {
+		return code
 	}
 	if err := WorkerInit(ctx, Config{
 		WorkDir:       *workDir,
@@ -44,7 +40,7 @@ func Cmd(ctx context.Context, args []string) int {
 		WrapperSource: *wrapperSource,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "concourse-worker-init:", err)
-		return 1
+		return opsx.ExitRuntime
 	}
-	return 0
+	return opsx.ExitOK
 }

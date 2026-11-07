@@ -69,7 +69,7 @@ type Fixture struct {
 
 	Live   map[int]bool // pids KillFn(0) reports alive
 	Kills  []KillRecord
-	Now    time.Time  // Cfg.Seams.Host.NowFn reads this — advance to age budgets
+	Now    time.Time  // Cfg.Seams.Host.Clock reads this — advance to age budgets
 	SDCmds [][]string // systemd fake argv log
 	// SDHook, when set, runs inside sdRun before the reply lookup —
 	// tests advance the fake clock here to simulate a slow host call
@@ -246,7 +246,7 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		f.Kills = append(f.Kills, KillRecord{pid, sig})
 		return nil
 	}
-	d.Cfg.Seams.Host.NowFn = func() time.Time { return f.Now }
+	d.Cfg.Seams.Host.Clock.Set(func() time.Time { return f.Now })
 	d.Cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
 	d.Cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
 	d.Cfg.Seams.Probe.ProbeHTTP = func(_ context.Context, url string, _ time.Duration) error {

@@ -3,8 +3,8 @@
 // age that bounds "still renewing" and the freeze persistence
 // window a stalled reconcile must exceed before the gauge fires.
 // Resolved once at sweep Setup —
-// clusterhealthprobes.healthProbeConfigFromEnv delegates the
-// watchdog knobs here and keeps only the sweep-level timeouts
+// clusterhealthprobes.healthProbeConfigFromEnv assigns the returned
+// KCMConfig into cfg.KCM and keeps only the sweep-level timeouts
 // itself.
 package watchdogs
 
@@ -15,10 +15,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// KCMConfigFromEnv fills c.KCM — the kcm-workqueue-watchdog knobs —
-// from the HEALTH_* env vars.
-func KCMConfigFromEnv(c *probefw.Config) {
-	c.KCM = probefw.KCMConfig{
+// KCMConfigFromEnv resolves the kcm-workqueue-watchdog knobs — the
+// HEALTH_* env vars backing cfg.KCM — as the sub-struct the caller
+// assigns.
+func KCMConfigFromEnv() probefw.KCMConfig {
+	return probefw.KCMConfig{
 		// KCM leader-election defaults are LeaseDuration 15s,
 		// RenewDeadline 10s, RetryPeriod ~2s, so a live holder's
 		// renewTime is never more than a few seconds old. 30s —

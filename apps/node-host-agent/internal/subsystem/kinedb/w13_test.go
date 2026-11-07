@@ -63,11 +63,28 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 		{Substr: "rm -f", Out: ""},
 	}
 	k, fr, dir := fixture(t, rules)
-	k.cfg.BackupDir = filepath.Join(dir, "backups")
+	bdir := filepath.Join(dir, "backups")
+	k.cfg.BackupDir = bdir
 	// Stub the free-space probe: the real statfs of the test fs is
 	// environment-dependent (a tmpfs under memory pressure can dip
 	// below the 30% gate and flake the pipeline assertions).
 	k.cfg.statfsFn = func(string) (float64, error) { return 0.9, nil }
+	// cp publishes via <dest>.tmp -> rename; the fake exec produces
+	// no bytes, so lay down the file a real cp would have written
+	// (dest is kine-<testNow>.dump — the fixture clock is fixed).
+	if err := os.MkdirAll(bdir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	tmpDump := filepath.Join(bdir, "kine-1700000000.dump.tmp")
+	if err := os.WriteFile(tmpDump, []byte("PGDMP fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A stale partial from a crashed earlier run — pruneDumps must
+	// sweep it even though it never matches the *.dump glob.
+	staleTmp := filepath.Join(bdir, "kine-1690000000.dump.tmp")
+	if err := os.WriteFile(staleTmp, []byte("PGD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	res := &guardResult{}
 	var notes []string
 	note := func(s string) { notes = append(notes, s) }
@@ -78,8 +95,20 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 		!strings.Contains(j, "cp pg:") {
 		t.Fatalf("backup pipeline not run:\n%s", j)
 	}
+	if !strings.Contains(j, ".dump.tmp") {
+		t.Fatalf("cp did not target the .tmp staging name:\n%s", j)
+	}
 	if !res.backupSeen || !res.backupValid || res.backupAge != 0 {
 		t.Fatalf("res=%+v want seen/valid/age=0", res)
+	}
+	if _, err := os.Stat(filepath.Join(bdir, "kine-1700000000.dump")); err != nil {
+		t.Fatalf("published dump missing after rename: %v", err)
+	}
+	if _, err := os.Stat(tmpDump); !os.IsNotExist(err) {
+		t.Fatal(".tmp staging file left behind after publish")
+	}
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		t.Fatal("stale .tmp partial not swept by pruneDumps")
 	}
 }
 

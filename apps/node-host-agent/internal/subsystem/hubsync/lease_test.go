@@ -10,13 +10,14 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 func newTestSyncer(cs *fake.Clientset, now func() time.Time) *Syncer {
 	cfg := Config{
 		Client:   cs,
 		Identity: "pod-a",
-		NowFn:    now,
+		Clock:    timex.NewCell(now),
 		// Dialer left nil is not allowed by New (it would read the
 		// real key path) — inject the fake.
 		Dialer: newFakeDialer(),

@@ -76,7 +76,7 @@ func (p *Pruner) pruneAgeBucket(ctx context.Context, sc, bucket string, maxAge t
 // than maxAge (-type f -mtime +N -delete). Errors are skipped like
 // the script's `|| true`; ctx cancellation stops the walk.
 func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge time.Duration, log *slog.Logger) {
-	now := p.cfg.nowFn()
+	now := p.cfg.Clock.Now()
 	var n, failed int
 	var bytes int64
 	var lastErr error
@@ -210,7 +210,7 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 	if !isDir(dir) {
 		return
 	}
-	now := p.cfg.nowFn()
+	now := p.cfg.Clock.Now()
 
 	// First-level <cksum> dirs older than the dir cap (-mtime +7 on
 	// the dir itself — content mtimes do not count).

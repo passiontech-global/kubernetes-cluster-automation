@@ -57,6 +57,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -141,8 +142,8 @@ type Config struct {
 	// counting spawn calls across Run re-entries.
 	SpawnFn func(ctx context.Context, name string, fn func(context.Context)) (stop func())
 
-	// NowFn supplies wall time — seam for tests.
-	NowFn timex.Clock
+	// Clock supplies wall time — the shared timex.Cell seam.
+	Clock *timex.Cell
 	// Log overrides the default slog logger — seam for tests.
 	Log *slog.Logger
 }
@@ -208,8 +209,8 @@ func (c *Config) applyDefaults() {
 	if c.TargetTimeout <= 0 {
 		c.TargetTimeout = defaultTargetTimeout
 	}
-	if c.NowFn == nil {
-		c.NowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 	if c.Log == nil {
 		c.Log = logger()
@@ -308,7 +309,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 		name:     cfg.LeaseName,
 		identity: cfg.Identity,
 		duration: cfg.LeaseDuration,
-		now:      cfg.NowFn,
+		now:      cfg.Clock.Now,
 	}
 
 	s.lastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -324,12 +325,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 		Help: "Converge cycles per target by result (ok|error|parse_error|parse_note|secret_error|unresolved).",
 	}, []string{"target", "result"})
 
-	if reg != nil {
-		for _, c := range []prometheus.Collector{s.lastSuccess, s.targetUp, s.cycles} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register hubsync metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		s.lastSuccess, s.targetUp, s.cycles); err != nil {
+		return nil, fmt.Errorf("register hubsync metrics: %w", err)
 	}
 	return s, nil
 }
@@ -434,7 +432,7 @@ func (s *Syncer) leaseLoop(ctx context.Context) {
 func (s *Syncer) leaseHeld() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.held && s.cfg.NowFn().Before(s.leaseExpiresAt)
+	return s.held && s.cfg.Clock.Now().Before(s.leaseExpiresAt)
 }
 
 // freshHold reports whether the lease is held but no cycle ran yet

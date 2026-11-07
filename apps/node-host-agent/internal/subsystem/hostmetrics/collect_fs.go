@@ -102,10 +102,10 @@ func (s *fsProbeState) noteStall(mount string, stalled bool) (wasLogged bool) {
 // must not manufacture a hung-mount alert. ok=true only when statfs
 // completed without error.
 func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
-	start, fresh := c.fs.probeStart(mount, c.cfg.nowFn())
+	start, fresh := c.fs.probeStart(mount, c.cfg.Clock.Now())
 	if !fresh {
 		return unix.Statfs_t{},
-			c.cfg.nowFn().Sub(start) >= c.cfg.fsProbeTimeout, false
+			c.cfg.Clock.Now().Sub(start) >= c.cfg.fsProbeTimeout, false
 	}
 
 	res := make(chan fsResult, 1)

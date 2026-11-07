@@ -117,8 +117,12 @@ func main() {
 	defer stop()
 
 	srv := &http.Server{
-		Addr:              envx.String("LISTEN_ADDR", ":8080"),
-		Handler:           mux,
+		Addr:    envx.String("LISTEN_ADDR", ":8080"),
+		Handler: mux,
+		// ReadTimeout covers the whole request incl. the body (bounded
+		// by MaxBytesReader at 8 MiB) — without it a slow-drip client
+		// outlives ReadHeaderTimeout and holds the conn forever.
+		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		// WriteTimeout must cover the handler's 30s index-fetch budget
 		// (fan-out itself is async — the response is a fast 202).

@@ -3,6 +3,7 @@ package hostconfig
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -35,9 +36,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		runner = DirectRunner{}
 	}
 	cfg := Config{
+		Base:     subframe.FromDeps(d.Deps),
 		NodeName: d.NodeName,
 		Hostname: d.Hostname,
-		HostRoot: d.HostRoot,
 		VarsDir:  d.VarsDir,
 		Runner:   runner,
 	}

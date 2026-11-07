@@ -7,9 +7,10 @@ package wdeps
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -44,18 +45,17 @@ func ConfigFromEnv(d EnvDeps) Config {
 	// identity fallback needed here.
 	hostPath := d.PathJoin
 	cfg := Config{
-		NodeName:         d.NodeName,
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogLogFile:  d.WatchdogLogFile,
+		Base:     subframe.FromDeps(d.Deps),
+		NodeName: d.NodeName,
 		Journal: JournalConfig{
 			Dirs:             d.JournalDirs,
 			UnreadableNeeded: d.JournalUnreadableNeeded,
 		},
-		Systemd:     d.Systemd,
-		Watchdog:    d.Watchdog,
-		WatchdogSrc: d.WatchdogSrc,
-		Client:      d.Client,
+		Client: d.Client,
 	}
+	// The shared timex.Cell lives in the Host seams group — nil
+	// d.Clock leaves it unset so ApplyDefaults arms its own cell.
+	cfg.Seams.Host.Clock = d.Clock
 	// The env surface, one row per knob — the rows live beside
 	// their domain's type in config_<domain>.go; the assembly
 	// order below is the pre-split table's exact order (shared

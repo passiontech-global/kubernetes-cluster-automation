@@ -30,7 +30,7 @@ func TestUnpinRemovesBothMarkerStyles(t *testing.T) {
 // count) rather than rewrite the file to only the managed block.
 func TestBlockInHostsReadFail(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -57,7 +57,7 @@ func TestBlockInHostsReadFail(t *testing.T) {
 // the unreadable case: create it containing just the managed block.
 func TestBlockInHostsCreatesWhenMissing(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

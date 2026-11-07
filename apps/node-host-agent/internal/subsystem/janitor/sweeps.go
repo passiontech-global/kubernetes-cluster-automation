@@ -100,7 +100,7 @@ func (j *Janitor) sweepLatches() {
 			j.cfg.WatchdogStateDir, err))
 		return
 	}
-	now := j.cfg.nowFn()
+	now := j.cfg.Clock.Now()
 	for _, e := range entries {
 		key, ok := strings.CutPrefix(e.Name(), hoststate.LatchFilePrefix)
 		if !ok {

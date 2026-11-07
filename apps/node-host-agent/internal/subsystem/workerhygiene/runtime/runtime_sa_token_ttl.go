@@ -98,7 +98,7 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	for i := range e.Pods {
 		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	minTTL := -1.0
 	for _, ent := range podDirs {
 		if !ent.IsDir() {
@@ -137,12 +137,12 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 // stall emits the SATokenRotationStalled event and stamps the
 // resync annotation — the annotation's own timestamp dedupes
-// nudges (a landed resync already refreshed it).
+// nudges (a landed resync already refreshed it), and the event
+// rides the SAME dedupe: event names embed UnixNano, so emitting
+// ahead of the gate would spam a new Warning event every cycle.
 func (c *SATokenTTLCheck) stall(ctx context.Context, pod *corev1.Pod,
 	tokenFile string, ttl int64) {
-	now := c.d.Cfg.Seams.Host.NowFn()
-	// Event first — it reports regardless of the nudge dedupe.
-	c.emitEvent(ctx, pod, ttl)
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	if c.d.Cfg.Client == nil {
 		return
 	}
@@ -160,6 +160,8 @@ func (c *SATokenTTLCheck) stall(ctx context.Context, pod *corev1.Pod,
 			return // nudged recently — let the in-flight resync land
 		}
 	}
+	// Past the cooldown — report once per nudge window.
+	c.emitEvent(ctx, pod, ttl)
 	// Patch ONLY the annotation — merge-patch keeps every other
 	// field untouched; the kubelet volumeManager sees the pod
 	// update and re-syncs the projected volume.
@@ -186,7 +188,7 @@ func (c *SATokenTTLCheck) emitEvent(ctx context.Context, pod *corev1.Pod,
 	if c.d.Cfg.Client == nil {
 		return
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),

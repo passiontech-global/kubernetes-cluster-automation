@@ -1,7 +1,7 @@
-// run.go — the loop lifecycle (Run spawns probe/compact-guard/maint
-// tickers) plus the runtime helpers every cycle body shares: exec
-// budgets, container discovery, psql plumbing, textfile emission and
-// the small parse/state-file utilities.
+// run.go — the loop lifecycle (Run drives probe/compact-guard/maint
+// through cycle.RunAll) plus the runtime helpers every cycle body
+// shares: exec budgets, container discovery, psql plumbing, textfile
+// emission and the small parse/state-file utilities.
 package kinedb
 
 import (
@@ -12,9 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
@@ -22,47 +21,21 @@ import (
 // Run starts the three loops (probe, compact guard, maintenance) and
 // blocks until ctx is cancelled.
 func (k *KineDB) Run(ctx context.Context) {
-	var wg sync.WaitGroup
-	for _, l := range []struct {
-		name  string
-		every time.Duration
-		fn    func(context.Context)
-	}{
-		{"probe", k.cfg.ProbeInterval, func(ctx context.Context) { k.probeCycle(ctx) }},
-		{"compact-guard", k.cfg.GuardInterval, func(ctx context.Context) { k.guardCycle(ctx) }},
-		{"maint", k.cfg.MaintInterval, func(ctx context.Context) { k.maintCycle(ctx) }},
-	} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			k.loop(ctx, l.name, l.every, l.fn)
-		}()
+	// countPanic is the metric half of the old safeCycle — the
+	// recover half moved into cycle.EverySafe, so a panicking round
+	// counts cycles{loop,"panic"} and skips to the next interval
+	// instead of unwinding the loop's goroutine.
+	countPanic := func(loop string, _ any) {
+		k.m.cycles.WithLabelValues(loop, "panic").Inc()
 	}
-	wg.Wait()
-}
-
-func (k *KineDB) loop(ctx context.Context, name string, every time.Duration, fn func(context.Context)) {
-	k.safeCycle(ctx, name, fn)
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			k.safeCycle(ctx, name, fn)
-		}
-	}
-}
-
-func (k *KineDB) safeCycle(ctx context.Context, name string, fn func(context.Context)) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger().Error("kinedb cycle panicked", "loop", name, "panic", r)
-			k.m.cycles.WithLabelValues(name, "panic").Inc()
-		}
-	}()
-	fn(ctx)
+	cycle.RunAll(ctx,
+		cycle.EverySafe("probe", k.cfg.ProbeInterval,
+			func(ctx context.Context) { k.probeCycle(ctx) }, countPanic),
+		cycle.EverySafe("compact-guard", k.cfg.GuardInterval,
+			func(ctx context.Context) { k.guardCycle(ctx) }, countPanic),
+		cycle.EverySafe("maint", k.cfg.MaintInterval,
+			func(ctx context.Context) { k.maintCycle(ctx) }, countPanic),
+	)
 }
 
 // --- command + container helpers ---

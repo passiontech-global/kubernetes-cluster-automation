@@ -307,8 +307,22 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 	// Quorum-safe bounce: a wedged member may still report Ready
 	// (the gray-failure shape), so the sibling count self-discounts
 	// — >=2 OTHER Ready members of the SAME StatefulSet or the
-	// delete could drop the cluster under Raft quorum.
-	for key, rs := range podReasons {
+	// delete could drop the cluster under Raft quorum. At most ONE
+	// member is bounced per cycle even when several qualify — a
+	// fleet-wide wedge must heal one member at a time so a bad
+	// verdict can never halve the cluster in a single pass. The
+	// key sort makes WHICH member goes first deterministic — map
+	// order would bounce a random one, and the ledger stamp going
+	// from missing/stale to `now` is how a DELIVERED delete reads
+	// (DeletePodHeal swallows cooldown/mutex/delete failures).
+	healed := false
+	bounceKeys := make([]string, 0, len(podReasons))
+	for key := range podReasons {
+		bounceKeys = append(bounceKeys, key)
+	}
+	sort.Strings(bounceKeys)
+	for _, key := range bounceKeys {
+		rs := podReasons[key]
 		pod := memberByName[key]
 		healable := false
 		for r := range rs {
@@ -317,7 +331,7 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 				break
 			}
 		}
-		if !healable {
+		if !healable || healed {
 			continue
 		}
 		other := readyBySTS[natsSTSKey(pod)]
@@ -330,8 +344,13 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 				"pod", key, "otherReady", other)
 			continue
 		}
+		hk := probefw.SelfHealKey(CheckNameNatsJetstreamHealth, key)
+		before, _ := p.Heals.Last(hk)
 		p.DeletePodHeal(ctx, log, CheckNameNatsJetstreamHealth,
 			key, pod, natsHealCool, now)
+		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
+			healed = true
+		}
 	}
 
 	return rep.Result(&p.emitted, natsJetstreamUnhealthyGauge.DeleteLabelValues,

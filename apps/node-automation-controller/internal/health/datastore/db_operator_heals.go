@@ -96,8 +96,8 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, operator string, now time.Time) {
 	const dbOperatorHealCooldown = 30 * time.Minute
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.Heals, operator, dbOperatorHealCooldown, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, operator, dbOperatorHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

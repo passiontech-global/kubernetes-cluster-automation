@@ -12,6 +12,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
+// persistCounterName deliberately stays a literal (not
+// UnreadableCounter): it pins the on-disk filename contract, so a
+// contract-breaking rename of the exported const trips these tests.
 const persistCounterName = "consecutive-journal-unreadable"
 
 // TestCounterResumeAcrossRestart: an agent restart mid-episode must

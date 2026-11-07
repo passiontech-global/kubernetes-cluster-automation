@@ -21,13 +21,12 @@
 package watchdogconf
 
 import (
-	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
-	"sync"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/fileconf"
 )
 
 // DNSEntry is one DNS_FALLBACK_MAP element "name[:port]=ip1,ip2,..." —
@@ -251,17 +250,10 @@ func num(v string, def float64) float64 {
 // Load parses the conf at path. A missing file returns an empty
 // Config and nil error — the watchdog's documented behaviour
 // ("node has no conf file -> every module self-skips to defaults").
+// The file contract is the shared fileconf.Load — identical to the
+// reloader's per-Get read.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Missing file = all-defaults config (shell parity:
-			// modules ran on defaults without a conf).
-			return Parse(nil)
-		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	return Parse(data)
+	return fileconf.Load(path, Parse)
 }
 
 // Parse parses conf content — separated from Load so tests and the
@@ -437,11 +429,17 @@ func (c *Config) APIBackendIPs() []string {
 // (hard-error) file keeps the last good one — the shell `source`
 // semantics were "read fresh each run, defaults on absent". Get is
 // safe for concurrent use.
+//
+// The reload skeleton (mutex, keep-last-good, failure warn) is the
+// shared platform/fileconf.Reloader — embedded so Path stays the
+// exported, Get-time-read field callers already use. This flavour
+// keeps watchdogconf's legacy warn-on-EVERY-failed-Get (no
+// edge-latch: consumers cycle once per watchdog period and the file
+// is hostconfig-managed, so a persistently unreadable conf must stay
+// loud) and lets an empty Path open ENOENT → parse as an absent file
+// → all-defaults config.
 type Reloader struct {
-	Path string
-
-	mu  sync.Mutex
-	cfg *Config
+	*fileconf.Reloader[*Config]
 }
 
 // NewReloader seeds the reloader with initial (nil → empty baseline)
@@ -450,21 +448,15 @@ func NewReloader(path string, initial *Config) *Reloader {
 	if initial == nil {
 		initial, _ = Parse(nil)
 	}
-	return &Reloader{Path: path, cfg: initial}
+	return &Reloader{fileconf.New(path, Parse, initial, fileconf.Options{
+		Log:          logger(),
+		WarnMsg:      "watchdogconf: reload failed — keeping last good config",
+		WarnEveryGet: true,
+	})}
 }
 
 // Get returns the freshest parse of Path, falling back to the last
 // good config on read/parse errors. The returned *Config is SHARED
 // across callers and retained by the reloader — consumers must not
 // mutate it.
-func (r *Reloader) Get() *Config {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, err := Load(r.Path); err != nil {
-		logger().Warn("watchdogconf: reload failed — keeping last good config",
-			"path", r.Path, "error", err)
-	} else if c != nil {
-		r.cfg = c
-	}
-	return r.cfg
-}
+func (r *Reloader) Get() *Config { return r.Reloader.Get() }

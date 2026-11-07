@@ -10,20 +10,23 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // ---------- swap sizing ----------
 
-// swapRunner wraps scriptedRunner and materializes the swapfile under
-// HostRoot on fallocate/dd — the real nsenter runner creates it on
-// the host where hostconfig then sees it through the HostRoot mount.
+// swapRunner wraps the shared FakeRunner and materializes the
+// swapfile under HostRoot on fallocate/dd — the real nsenter runner
+// creates it on the host where hostconfig then sees it through the
+// HostRoot mount.
 type swapRunner struct {
-	*scriptedRunner
+	*testutil.FakeRunner
 	hostRoot string
 }
 
 func (s *swapRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := s.scriptedRunner.Run(ctx, name, args...)
+	out, err := s.FakeRunner.Run(ctx, name, args...)
 	if err != nil {
 		return out, err
 	}
@@ -45,12 +48,12 @@ func (s *swapRunner) Run(ctx context.Context, name string, args ...string) (stri
 	return out, err
 }
 
-func newSwapHost(t *testing.T, vars, node string, sr *scriptedRunner) *Reconciler {
+func newSwapHost(t *testing.T, vars, node string, sr *testutil.FakeRunner) *Reconciler {
 	t.Helper()
 	hr := t.TempDir()
 	r, err := New(Config{NodeName: node, HostRoot: hr,
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		Runner: &swapRunner{scriptedRunner: sr, hostRoot: hr}}, nil)
+		Runner: &swapRunner{FakeRunner: sr, hostRoot: hr}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +62,7 @@ func newSwapHost(t *testing.T, vars, node string, sr *scriptedRunner) *Reconcile
 
 func TestSwapControllerDefault12G(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r := newSwapHost(t, vars, "node-a", sr)
 	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
 		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
@@ -67,11 +70,11 @@ func TestSwapControllerDefault12G(t *testing.T) {
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupSwap()
 
-	if len(sr.callsMatching("fallocate -l 12288M /swapfile-kine")) == 0 {
-		t.Fatalf("12G fallocate missing: %v", sr.callsMatching("fallocate"))
+	if len(sr.CallsMatching("fallocate -l 12288M /swapfile-kine")) == 0 {
+		t.Fatalf("12G fallocate missing: %v", sr.CallsMatching("fallocate"))
 	}
-	if len(sr.callsMatching("mkswap /swapfile-kine")) == 0 ||
-		len(sr.callsMatching("swapon /swapfile-kine")) == 0 {
+	if len(sr.CallsMatching("mkswap /swapfile-kine")) == 0 ||
+		len(sr.CallsMatching("swapon /swapfile-kine")) == 0 {
 		t.Fatal("mkswap/swapon not invoked")
 	}
 	fstab := hostRead(t, r, "/etc/fstab")
@@ -96,7 +99,7 @@ func TestSwapKineDBHost2G(t *testing.T) {
   - name: other-vm
     ip: 10.9.9.10
 `)
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r := newSwapHost(t, vars, "db-vm-1", sr)
 	hostWrite(t, r, "/etc/fstab", "")
 	c := loadCyc(t, r, vars, "db-vm-1")
@@ -104,11 +107,11 @@ func TestSwapKineDBHost2G(t *testing.T) {
 	// ansible db include passed NO swap_path → the task default
 	// /swapfile (NOT the controller's /swapfile-kine — that created
 	// a second 2G file + orphaned fstab line on the real db-vm).
-	if len(sr.callsMatching("fallocate -l 2048M /swapfile")) == 0 {
-		t.Fatalf("2G fallocate missing: %v", sr.callsMatching("fallocate"))
+	if len(sr.CallsMatching("fallocate -l 2048M /swapfile")) == 0 {
+		t.Fatalf("2G fallocate missing: %v", sr.CallsMatching("fallocate"))
 	}
-	if len(sr.callsMatching("swapfile-kine")) > 0 {
-		t.Fatalf("db VM must not touch /swapfile-kine: %v", sr.callsMatching("swapfile-kine"))
+	if len(sr.CallsMatching("swapfile-kine")) > 0 {
+		t.Fatalf("db VM must not touch /swapfile-kine: %v", sr.CallsMatching("swapfile-kine"))
 	}
 	fstab := hostRead(t, r, "/etc/fstab")
 	if !strings.Contains(fstab, "/swapfile none swap sw 0 0") {
@@ -120,18 +123,18 @@ func TestSwapKineDBHost2G(t *testing.T) {
 	}
 
 	// non-matching host name -> no swap at all
-	sr2 := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr2 := newScripted(nil, nil)
 	r2 := newSwapHost(t, vars, "other-vm", sr2)
 	c2 := loadCyc(t, r2, vars, "other-vm")
 	c2.groupSwap()
-	if len(sr2.callsMatching("fallocate")) > 0 || len(sr2.callsMatching("swapon ")) > 0 {
-		t.Fatalf("swap touched on non-kine_db host: %v", sr2.calls)
+	if len(sr2.CallsMatching("fallocate")) > 0 || len(sr2.CallsMatching("swapon ")) > 0 {
+		t.Fatalf("swap touched on non-kine_db host: %v", sr2.Calls())
 	}
 }
 
 func TestSwapSwappinessVarOverride(t *testing.T) {
 	vars := writeVarsDir(t, "swap_swappiness: \"30\"\n")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r := newSwapHost(t, vars, "node-a", sr)
 	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
 		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
@@ -146,13 +149,13 @@ func TestSwapSwappinessVarOverride(t *testing.T) {
 
 func TestSwapNoOpOnPlainWorker(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r := newSwapHost(t, vars, "node-b", sr)
 	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
 		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupSwap()
-	for _, call := range sr.calls {
+	for _, call := range sr.Calls() {
 		if strings.Contains(call, "fallocate") || strings.Contains(call, "swapon") ||
 			strings.Contains(call, "mkswap") {
 			t.Fatalf("swap touched on plain worker: %s", call)
@@ -165,7 +168,7 @@ func TestSwapNoOpOnPlainWorker(t *testing.T) {
 
 func TestSwapSkipsRecreateWhenRightSize(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r := newSwapHost(t, vars, "node-a", sr)
 	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
 		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
@@ -181,10 +184,10 @@ func TestSwapSkipsRecreateWhenRightSize(t *testing.T) {
 	_ = f.Close()
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupSwap()
-	if len(sr.callsMatching("fallocate")) > 0 {
+	if len(sr.CallsMatching("fallocate")) > 0 {
 		t.Fatal("right-size swapfile must not be recreated")
 	}
-	if len(sr.callsMatching("swapon /swapfile-kine")) == 0 {
+	if len(sr.CallsMatching("swapon /swapfile-kine")) == 0 {
 		t.Fatal("swapon still expected on inactive file")
 	}
 }
@@ -195,9 +198,9 @@ func TestSwapSwaponProbeFailureSkipsCycle(t *testing.T) {
 	// ACTIVE swapfile — removing it pulls the kernel's swap target
 	// out from under it. The whole cycle must be skipped on a
 	// failed probe, not just the remove branch.
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
+	sr := newScripted(nil, map[string]bool{
 		"swapon --show=NAME": true,
-	}}
+	})
 	r := newSwapHost(t, vars, "node-a", sr)
 	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
 		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
@@ -222,8 +225,8 @@ func TestSwapSwaponProbeFailureSkipsCycle(t *testing.T) {
 	}
 	// the ONLY host command issued is the probe itself — nothing
 	// (create/chmod/mkswap/fstab/swapon/sysctl) may proceed.
-	if len(sr.calls) != 1 || !strings.Contains(sr.calls[0], "swapon --show") {
-		t.Fatalf("swap converge proceeded past the failed probe: %v", sr.calls)
+	if sr.Count() != 1 || !strings.Contains(sr.Nth(0), "swapon --show") {
+		t.Fatalf("swap converge proceeded past the failed probe: %v", sr.Calls())
 	}
 	if hostExists(r, "/etc/sysctl.d/99-kine-swap.conf") {
 		t.Fatal("swappiness drop-in written despite skipped cycle")
@@ -257,9 +260,9 @@ func TestSwapActiveMatchExactLine(t *testing.T) {
 
 	// /swapfile probed while only /swapfile-kine is active: NOT active
 	// — the wrong-size file is recreated and swapon is issued.
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"swapon --show=NAME": "/swapfile-kine\n",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r := newSwapHost(t, vars, "db-vm-1", sr)
 	hostWrite(t, r, "/etc/fstab", "")
 	seed(r, "/swapfile", 1024) // wrong size vs db default 2048
@@ -269,15 +272,15 @@ func TestSwapActiveMatchExactLine(t *testing.T) {
 	if err != nil || fi.Size() != 2048*1048576 {
 		t.Fatalf("/swapfile must be recreated at 2G — substring match marked it active: fi=%v err=%v", fi, err)
 	}
-	if len(sr.callsMatching("swapon /swapfile")) == 0 {
-		t.Fatalf("swapon /swapfile expected on inactive file: %v", sr.calls)
+	if len(sr.CallsMatching("swapon /swapfile")) == 0 {
+		t.Fatalf("swapon /swapfile expected on inactive file: %v", sr.Calls())
 	}
 
 	// /swapfile-kine listed exactly: ACTIVE — never removed, never
 	// re-swapon'd (controller wants 12G; the live 2G file stays).
-	sr2 := &scriptedRunner{res: map[string]string{
+	sr2 := newScripted(map[string]string{
 		"swapon --show=NAME": "/swapfile\n/swapfile-kine\n",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r2 := newSwapHost(t, vars, "node-a", sr2)
 	hostWrite(t, r2, "/etc/systemd/system/k0scontroller.service",
 		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
@@ -289,7 +292,7 @@ func TestSwapActiveMatchExactLine(t *testing.T) {
 	if err != nil || fi.Size() != 2048*1048576 {
 		t.Fatal("active /swapfile-kine was removed/resized")
 	}
-	if len(sr2.callsMatching("swapon /swapfile-kine")) > 0 {
+	if len(sr2.CallsMatching("swapon /swapfile-kine")) > 0 {
 		t.Fatal("swapon issued for already-active /swapfile-kine")
 	}
 }

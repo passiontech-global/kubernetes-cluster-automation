@@ -4,6 +4,7 @@ package hostmetrics
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -24,12 +25,17 @@ func TestCollectEBPFCounts(t *testing.T) {
 			"5": "pos:\t0\nmap_id:\t7\nmap_id:\t9\nprog_id:\t66\n",
 		}},
 	} {
+		pid, _ := strconv.Atoi(fx.pid)
 		dir := filepath.Join(cfg.ProcRoot, fx.pid, "fdinfo")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		for fd, body := range fx.fdinfo {
 			testutil.WriteFile(t, filepath.Join(dir, fd), body)
+			// The /fd symlink gates the fdinfo read — only
+			// anon_inode:bpf-* targets pass the pre-filter.
+			n, _ := strconv.Atoi(fd)
+			mkFdLink(t, cfg.ProcRoot, pid, n, "anon_inode:bpf-prog")
 		}
 	}
 	cfg.BpffsDir = filepath.Join(t.TempDir(), "no-bpffs") // absent → skipped
@@ -74,11 +80,12 @@ func TestEBPFScanCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	testutil.WriteFile(t, filepath.Join(dir, "3"), "prog_id:\t99\n")
+	mkFdLink(t, cfg.ProcRoot, 10, 3, "anon_inode:bpf-map")
 	progs, _, _ := c.ebpfSnapshot()
 	if progs != 0 {
 		t.Fatalf("cache missed: progs=%d want 0", progs)
 	}
-	c.ebpf.at = c.cfg.nowFn().Add(-2 * defaultEBPFScanInterval)
+	c.ebpf.at = c.cfg.Clock.Now().Add(-2 * defaultEBPFScanInterval)
 	progs, _, _ = c.ebpfSnapshot()
 	if progs != 1 {
 		t.Fatalf("post-expiry progs=%d want 1", progs)

@@ -107,7 +107,7 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n.cfg.nowFn = func() time.Time { return e.now }
+	n.cfg.Clock.Set(func() time.Time { return e.now })
 	n.cfg.runHostCmd = e.host.Run
 	n.cfg.runMountCmd = e.host.Run
 	n.cfg.dnsProbe = func(_ context.Context, ns, name string) (string, error) {

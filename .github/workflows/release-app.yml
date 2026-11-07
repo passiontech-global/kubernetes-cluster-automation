@@ -101,14 +101,25 @@ jobs:
             # echoes the same version; force a patch bump so the
             # release tag never collides.
             if [ "$rel_version" = "$last_ver" ]; then
-              IFS=. read -r major minor patch <<<"${last_ver#v}"
-              # A prerelease last tag ("v0.1.0-rc.1") leaves a suffix
-              # on the last component ("0-rc.1") — strip it (and the
-              # build-metadata '+' form) or the arithmetic crashes.
-              major="${major%%[-+]*}"
-              minor="${minor%%[-+]*}"
-              patch="${patch%%[-+]*}"
-              rel_version="v$major.$minor.$((patch + 1))"
+              case "$last_ver" in
+                *-*)
+                  # Last tag is a prerelease ("v0.1.0-rc.1") — this
+                  # release IS its base version: strip the "-rc.N"
+                  # suffix (a prerelease sorts before its release,
+                  # so the base tag cannot exist yet). Bumping patch
+                  # here would skip v0.1.0 entirely.
+                  rel_version="${last_ver%%-*}"
+                  ;;
+                *)
+                  IFS=. read -r major minor patch <<<"${last_ver#v}"
+                  # Strip a build-metadata '+' suffix from the last
+                  # component ("0+meta") or the arithmetic crashes.
+                  major="${major%%+*}"
+                  minor="${minor%%+*}"
+                  patch="${patch%%+*}"
+                  rel_version="v$major.$minor.$((patch + 1))"
+                  ;;
+              esac
             fi
           fi
           rel_tag="$APP/$rel_version"

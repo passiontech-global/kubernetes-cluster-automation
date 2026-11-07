@@ -63,7 +63,7 @@ etcdctl_tgz_file: "etcd-v3.7.3-linux-amd64.tar.gz"
 
 func TestEtcdctlSkipsNonController(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -72,8 +72,8 @@ func TestEtcdctlSkipsNonController(t *testing.T) {
 	// no k0scontroller.service + no pki — a worker/infra host.
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupEtcdctl()
-	if len(sr.callsMatching("etcdctl")) > 0 {
-		t.Fatalf("etcdctl probed on a non-controller: %v", sr.callsMatching("etcdctl"))
+	if len(sr.CallsMatching("etcdctl")) > 0 {
+		t.Fatalf("etcdctl probed on a non-controller: %v", sr.CallsMatching("etcdctl"))
 	}
 	if hostExists(r, "/var/lib/k0s/bin/etcdctl") {
 		t.Fatal("etcdctl installed on a non-controller")
@@ -82,7 +82,7 @@ func TestEtcdctlSkipsNonController(t *testing.T) {
 
 func TestEtcdctlSkipsKineHost(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -93,16 +93,14 @@ func TestEtcdctlSkipsKineHost(t *testing.T) {
 	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service", "[Unit]\n")
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupEtcdctl()
-	if len(sr.callsMatching("etcdctl")) > 0 || hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+	if len(sr.CallsMatching("etcdctl")) > 0 || hostExists(r, "/var/lib/k0s/bin/etcdctl") {
 		t.Fatal("etcdctl installed on a kine host (no embedded etcd pki)")
 	}
 }
 
 func TestEtcdctlVersionMatchSkipsDownload(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
-	sr := &scriptedRunner{
-		res: map[string]string{"/var/lib/k0s/bin/etcdctl version": "etcdctl version: 3.7.3"},
-	}
+	sr := newScripted(map[string]string{"/var/lib/k0s/bin/etcdctl version": "etcdctl version: 3.7.3"}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -119,7 +117,7 @@ func TestEtcdctlVersionMatchSkipsDownload(t *testing.T) {
 func TestEtcdctlMissingPinsFailsClosed(t *testing.T) {
 	// defaults.yaml carries no etcdctl_* vars — fail closed like kine.
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
@@ -141,7 +139,7 @@ func TestEtcdctlMissingPinsFailsClosed(t *testing.T) {
 func TestEtcdctlInstallsFromStagedTgz(t *testing.T) {
 	arc, sum := mkTgz(t, "etcdctl", "fake-etcdctl-binary")
 	vars := writeVarsDir(t, etcdctlPins(sum))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
@@ -167,7 +165,7 @@ func TestEtcdctlInstallsFromStagedTgz(t *testing.T) {
 func TestEtcdctlStagedShaMismatchRefuses(t *testing.T) {
 	arc, _ := mkTgz(t, "etcdctl", "fake-etcdctl-binary")
 	vars := writeVarsDir(t, etcdctlPins("00000000"))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
@@ -189,7 +187,7 @@ func TestEtcdctlStagedShaMismatchRefuses(t *testing.T) {
 
 func TestKineServiceOffByDefault(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -205,7 +203,7 @@ func TestKineServiceOffByDefault(t *testing.T) {
 			t.Fatalf("%s written while node not in kine_service_hosts", p)
 		}
 	}
-	for _, call := range sr.calls {
+	for _, call := range sr.Calls() {
 		if strings.Contains(call, "kine") {
 			t.Fatalf("kine touched on unlisted host: %s", call)
 		}
@@ -224,7 +222,7 @@ kine_bin_url: "%s/kine"
 kine_bin_sha256: "%x"
 kine_endpoint: "postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=disable"
 `, srv.URL, sum))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -271,15 +269,15 @@ kine_endpoint: "postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=di
 			t.Fatalf("kine.service missing %q:\n%s", want, unit)
 		}
 	}
-	if len(sr.callsMatching("systemctl daemon-reload")) == 0 {
+	if len(sr.CallsMatching("systemctl daemon-reload")) == 0 {
 		t.Fatal("daemon-reload not run after unit write")
 	}
-	if len(sr.callsMatching("systemctl enable kine.service")) == 0 ||
-		len(sr.callsMatching("systemctl start kine.service")) == 0 {
+	if len(sr.CallsMatching("systemctl enable kine.service")) == 0 ||
+		len(sr.CallsMatching("systemctl start kine.service")) == 0 {
 		t.Fatal("kine.service not enabled+started")
 	}
 	// first converge changes binary/env/unit -> restart to activate.
-	if len(sr.callsMatching("systemctl restart kine.service")) == 0 {
+	if len(sr.CallsMatching("systemctl restart kine.service")) == 0 {
 		t.Fatal("kine.service not restarted after input changes")
 	}
 }
@@ -288,7 +286,7 @@ func TestKineServiceSkipsWithoutBinaryPins(t *testing.T) {
 	vars := writeVarsDir(t, `kine_service_hosts: [node-a]
 kine_endpoint: "postgres://x"
 `)
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -299,7 +297,7 @@ kine_endpoint: "postgres://x"
 	if hostExists(r, "/etc/systemd/system/kine.service") {
 		t.Fatal("unit written while the kine binary is unpinned/unverifiable")
 	}
-	if len(sr.callsMatching("systemctl enable kine.service")) > 0 {
+	if len(sr.CallsMatching("systemctl enable kine.service")) > 0 {
 		t.Fatal("kine.service enabled without a verified binary")
 	}
 }
@@ -314,7 +312,7 @@ kine_bin_url: "https://example/kine"
 kine_bin_sha256: "deadbeef"
 kine_endpoint: ""
 `)
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -325,8 +323,8 @@ kine_endpoint: ""
 	if hostExists(r, "/etc/systemd/system/kine.service") || hostExists(r, "/etc/kine/kine.env") {
 		t.Fatal("unit/env rendered with empty kine_endpoint")
 	}
-	if len(sr.callsMatching("systemctl enable kine.service")) > 0 ||
-		len(sr.callsMatching("systemctl start kine.service")) > 0 {
+	if len(sr.CallsMatching("systemctl enable kine.service")) > 0 ||
+		len(sr.CallsMatching("systemctl start kine.service")) > 0 {
 		t.Fatal("kine.service enabled/started with empty kine_endpoint")
 	}
 }
@@ -339,7 +337,7 @@ kine_bin_url: "http://127.0.0.1:1/never-used"
 kine_bin_sha256: "%x"
 kine_endpoint: "postgres://x"
 `, sum))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

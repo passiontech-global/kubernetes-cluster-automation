@@ -75,7 +75,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			!spegelPodRe.MatchString(p.Name) ||
 			p.DeletionTimestamp != nil ||
 			p.Status.Phase != corev1.PodRunning ||
-			c.d.Cfg.Seams.Host.NowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
+			c.d.Cfg.Seams.Host.Clock.Now().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
 			continue
 		}
 		sp = p
@@ -522,7 +522,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// raced the CNI ADD is not an orphan no matter what the
 		// inode check says.
 		if fi, err := os.Stat(path); err != nil ||
-			c.d.Cfg.Seams.Host.NowFn().Sub(fi.ModTime()) < cniNetnsMinAge {
+			c.d.Cfg.Seams.Host.Clock.Now().Sub(fi.ModTime()) < cniNetnsMinAge {
 			continue
 		}
 		// W12-KR2: the containerd task map is the stronger liveness

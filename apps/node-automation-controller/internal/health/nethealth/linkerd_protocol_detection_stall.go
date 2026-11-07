@@ -53,10 +53,6 @@ type linkerdProtocolDetectionStallCheck struct {
 	// kept apart from emitted because each GaugeLedger binds ONE
 	// vec's DeleteLabelValues at reconcile time.
 	driftEmitted state.GaugeLedger[string]
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-pod heal preambles share — one evaluation per Verdict TTL
-	// instead of three API reads per violating pod.
-	verdict kube.Verdict
 }
 
 // newLinkerdProtocolDetectionStallCheck builds the W10-NM3 check —
@@ -69,8 +65,10 @@ func NewLinkerdProtocolDetectionStallCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameLinkerdOpaqueStall = "linkerd-protocol-detection-stall"
 
-	// W10-NM3 — linkerd-protocol-detection-stall knobs.
-	linkerdProxyContainer   = "linkerd-proxy"
+	// W10-NM3 — linkerd-protocol-detection-stall knobs. The injected
+	// sidecar container name lives in platform/kube
+	// (kube.LinkerdProxyContainer) — the apiserver webhook guard
+	// matches the same container.
 	linkerdOpaquePortsAnno  = "config.linkerd.io/opaque-ports"
 	linkerdSkipInboundAnno  = "config.linkerd.io/skip-inbound-ports"
 	linkerdSkipOutboundAnno = "config.linkerd.io/skip-outbound-ports"
@@ -255,7 +253,7 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		if !kube.PodSpecHasContainer(&pod.Spec, linkerdProxyContainer) {
+		if !kube.PodSpecHasContainer(&pod.Spec, kube.LinkerdProxyContainer) {
 			continue
 		}
 		missing := missingBinaryPorts(pod)
@@ -285,8 +283,8 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	rep *probefw.SweepReport, driftNow map[string][]string) {
 
 	ck := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, pod.Namespace+"/"+pod.Name)
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.Heals, ck, linkerdOpaqueHealCool, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, linkerdOpaqueHealCool, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

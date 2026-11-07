@@ -11,7 +11,7 @@ import (
 
 func TestFail2BanIgnoreIPDerived(t *testing.T) {
 	vars := writeVarsDir(t, "fail2ban_ignoreip_extra: \"192.168.0.0/16\"\n")
-	sr := &scriptedRunner{}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -29,10 +29,10 @@ func TestFail2BanIgnoreIPDerived(t *testing.T) {
 
 func TestSecurityFileContents(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"dpkg-query -W -f=${db:Status-Status} fail2ban": "installed",
 		"sshd -T": "passwordauthentication no",
-	}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

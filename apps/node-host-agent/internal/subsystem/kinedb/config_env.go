@@ -24,6 +24,7 @@ type EnvDeps struct {
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
 		TextfileDir: d.TextfileDir,
+		Clock:       d.Clock,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
