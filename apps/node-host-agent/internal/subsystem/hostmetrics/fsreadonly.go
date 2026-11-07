@@ -167,13 +167,8 @@ func (l *Latches) updateFSReadonlyEvidence() {
 	case evidence != "" && lerr != nil:
 		l.ensureStateLatch(p, hoststate.LatchFilePrefix+hoststate.LatchFSReadonly, evidence)
 	case evidence == "" && lerr == nil:
-		if rerr := os.Remove(p); rerr != nil {
-			logger().Warn("hostmetrics: fs-readonly latch remove failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: fs-readonly latch cleared — "+
-				"no fresh kernel fs errors, no ro PVC mounts",
-				"path", p)
-		}
+		// STATE-EXIT: the file is the contract half; the log line
+		// is what nodereporter's filelog tails for the transition.
+		l.c.state.Exit(hoststate.LatchFSReadonly, nil)
 	}
 }

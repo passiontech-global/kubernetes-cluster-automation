@@ -119,12 +119,24 @@ TasksMax=infinity
 			"error", hostsErr)
 	}
 	hn := c.r.cfg.NodeName
-	re := regexp.MustCompile(`(?m)^\s*127\.0\.1\.1\s.*$`)
+	// The separator must be a non-newline whitespace — bare `\s`
+	// could eat the newline after a value-less `127.0.1.1` line and
+	// let the match swallow the NEXT line on replace.
+	re := regexp.MustCompile(`(?m)^\s*127\.0\.1\.1[ \t].*$`)
 	line := "127.0.1.1 " + hn
-	if re.Match(hosts) {
-		if !re.MatchString(string(hosts)) || !strings.Contains(string(hosts), line) {
-			nh := re.ReplaceAll(hosts, []byte(line))
-			if string(nh) != string(hosts) {
+	if m := re.Find(hosts); m != nil {
+		// The pin must carry THIS hostname as a whole field — a
+		// substring Contains matched "127.0.1.1 worker-10" when hn
+		// was "worker-1" and left the wrong pin live.
+		pinned := false
+		for _, f := range strings.Fields(string(m))[1:] {
+			if f == hn {
+				pinned = true
+				break
+			}
+		}
+		if !pinned {
+			if nh := re.ReplaceAll(hosts, []byte(line)); string(nh) != string(hosts) {
 				_, _ = r.writeManaged("/etc/hosts", nh, 0o644)
 			}
 		}

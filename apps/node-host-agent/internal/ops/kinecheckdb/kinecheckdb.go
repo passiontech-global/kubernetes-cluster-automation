@@ -46,5 +46,9 @@ func Cmd(ctx context.Context, args []string) int {
 		EnvFile:  *envFile,
 		WireAddr: *wireAddr,
 		Runtime:  *runtime,
+		// check-kine-db is diagnostics-only — RunCheckCLI forces
+		// this regardless; declared here so the CLI contract is
+		// visible at the call site.
+		ReadOnly: true,
 	}, os.Stdout)
 }

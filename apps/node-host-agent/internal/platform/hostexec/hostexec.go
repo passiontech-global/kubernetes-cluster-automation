@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -327,10 +328,22 @@ func runCombined(ctx context.Context, env []string, argv []string) (string, erro
 // returns BOTH streams on the error path so partial output survives.
 // Same WaitDelay contract as the Config runners.
 func Run(ctx context.Context, argv []string, stdin string) (stdout, stderr string, err error) {
+	return RunEnv(ctx, nil, argv, stdin)
+}
+
+// RunEnv is Run with extra child environment variables layered over
+// the inherited environment — the way a secret (PGPASSWORD) reaches
+// `docker exec -e PGPASSWORD` without ever appearing on the child's
+// argv, where /proc/<pid>/cmdline would expose it to every process
+// on the host.
+func RunEnv(ctx context.Context, env []string, argv []string, stdin string) (stdout, stderr string, err error) {
 	if len(argv) == 0 {
 		return "", "", errEmptyArgv
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if env != nil {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

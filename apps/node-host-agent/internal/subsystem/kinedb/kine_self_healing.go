@@ -60,15 +60,34 @@ const (
 // nothing: the IN list covers both the real backend database and
 // stacks that did create a dedicated kine database. Best-effort: a
 // failed query only notes, never fails the probe.
+// stuckSessionPredicate is the reaper's pg_stat_activity WHERE
+// clause — shared by the terminate query and the read-only COUNT
+// so the two paths can never disagree on what "stuck" means.
+const stuckSessionPredicate = "WHERE datname IN ('postgres', 'kine') " +
+	"AND ((state = 'idle in transaction' " +
+	"AND state_change < now() - interval '5 minutes') OR " +
+	"(state = 'active' AND query_start < now() - interval '10 minutes' " +
+	"AND query NOT ILIKE '%VACUUM%' AND query NOT ILIKE '%REINDEX%' " +
+	"AND query NOT ILIKE '%pg_repack%'))"
+
 func (k *KineDB) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	note func(string)) {
+	if k.cfg.ReadOnly {
+		// COUNT what the reaper WOULD kill — diagnostics only.
+		out, err := k.psqlQuery(ctx, pg, user, pass,
+			"SELECT COUNT(pid) FROM pg_stat_activity "+stuckSessionPredicate)
+		if err != nil {
+			note(fmt.Sprintf("reap-sessions-fail: %v", err))
+			return
+		}
+		if n := strings.TrimSpace(firstLine(out)); n != "0" {
+			note(fmt.Sprintf("read-only: %s stuck kine session(s) would be reaped", n))
+		}
+		return
+	}
 	out, err := k.psqlQuery(ctx, pg, user, pass,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
-			"WHERE datname IN ('postgres', 'kine') AND ((state = 'idle in transaction' "+
-			"AND state_change < now() - interval '5 minutes') OR "+
-			"(state = 'active' AND query_start < now() - interval '10 minutes' "+
-			"AND query NOT ILIKE '%VACUUM%' AND query NOT ILIKE '%REINDEX%' "+
-			"AND query NOT ILIKE '%pg_repack%'))")
+			stuckSessionPredicate)
 	if err != nil {
 		note(fmt.Sprintf("reap-sessions-fail: %v", err))
 		return
@@ -141,21 +160,14 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// restart can't help.
 	authWedge := res.checks[checkE2EAuth] == 0 &&
 		res.checks[checkBackendEnv] == 1
-	fails := 0
-	if authWedge {
-		prev, _ := readIntFile(failPath)
-		fails = int(prev) + 1
-		writeIntFile(failPath, int64(fails))
-	} else {
-		writeIntFile(failPath, 0)
-	}
 
-	// W12-CP1: server-pool starvation streak. The backend-env gate
-	// is required like the auth wedge's — a broken postgres can
-	// legitimately starve the queue and RECONNECT cannot fix it. The
-	// active-query count is only asked for once the SHOW POOLS
-	// pre-conditions hold (a failed read is inconclusive → resets
-	// the streak, never evidence).
+	// W12-CP1: server-pool starvation evaluation. The backend-env
+	// gate is required like the auth wedge's — a broken postgres
+	// can legitimately starve the queue and RECONNECT cannot fix
+	// it. The active-query count is only asked for once the SHOW
+	// POOLS pre-conditions hold (a failed read is inconclusive →
+	// resets the streak, never evidence). Evaluated before the
+	// state files below so the ReadOnly path reports it too.
 	starved := false
 	if res.poolSeen && res.checks[checkBackendEnv] == 1 &&
 		res.pool.serverConns > 0 &&
@@ -164,6 +176,33 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 		if n, ok := k.activeBackendQueries(ctx, pg, user, pass, note); ok {
 			starved = n < res.pool.serverConns
 		}
+	}
+
+	if k.cfg.ReadOnly {
+		// Diagnostics only — the streak files, the 15m budget
+		// spend, RECONNECT and the container restart all stay
+		// untouched.
+		switch {
+		case saturated:
+			note(fmt.Sprintf("read-only: pgbouncer saturated cl_waiting=%d>%d — restart suppressed",
+				res.pool.clWaiting, k.cfg.WaitMax))
+		case starved:
+			note(fmt.Sprintf("read-only: pgbouncer server-pool starvation (maxwait=%ds cl_waiting=%d sv_active=%d sv=%d) — RECONNECT suppressed",
+				res.pool.maxWaitSec, res.pool.clWaiting, res.pool.svActive,
+				res.pool.serverConns))
+		case authWedge:
+			note("read-only: pgbouncer auth wedge (e2e_auth fail, backend_env ok) — restart suppressed")
+		}
+		return
+	}
+
+	fails := 0
+	if authWedge {
+		prev, _ := readIntFile(failPath)
+		fails = int(prev) + 1
+		writeIntFile(failPath, int64(fails))
+	} else {
+		writeIntFile(failPath, 0)
 	}
 	starvePath := filepath.Join(dir, pgbStarveFile)
 	streaks := 0
@@ -211,8 +250,8 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// restart` would kill. Saturation/auth wedges skip it: a queue
 	// past WaitMax or a broken auth path wants the full bounce.
 	if starveFire && !saturated && fails < fires {
-		if _, err := k.exec(ctx, []string{k.cfg.Runtime, "exec",
-			"-e", "PGPASSWORD=" + pass, pg,
+		if _, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+			"-e", "PGPASSWORD", pg,
 			"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
 			"-U", user, "-d", pgbAdminDB, "-Aqc", "RECONNECT"}, ""); err == nil {
 			k.m.cycles.WithLabelValues("probe", "pgb_reconnect").Inc()

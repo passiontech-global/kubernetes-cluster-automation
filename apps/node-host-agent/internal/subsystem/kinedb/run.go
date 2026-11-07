@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -68,16 +69,24 @@ func (k *KineDB) safeCycle(ctx context.Context, name string, fn func(context.Con
 
 // exec runs argv under the short command budget.
 func (k *KineDB) exec(ctx context.Context, argv []string, stdin string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, k.cfg.CmdTimeout)
-	defer cancel()
-	return k.cfg.run(cctx, argv, stdin)
+	return k.execEnv(ctx, nil, argv, stdin)
 }
 
-// execLong runs argv under the maintenance budget.
-func (k *KineDB) execLong(ctx context.Context, argv []string, stdin string) (string, error) {
+// execEnv is exec with extra child environment — the only channel a
+// secret may take: it rides the child's env, never argv.
+func (k *KineDB) execEnv(ctx context.Context, env, argv []string, stdin string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, k.cfg.CmdTimeout)
+	defer cancel()
+	return k.cfg.run(cctx, env, argv, stdin)
+}
+
+// execLongEnv runs argv under the maintenance budget with extra
+// child environment (see execEnv — the only channel a secret may
+// take).
+func (k *KineDB) execLongEnv(ctx context.Context, env, argv []string, stdin string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, k.cfg.LongCmdTimeout)
 	defer cancel()
-	return k.cfg.run(cctx, argv, stdin)
+	return k.cfg.run(cctx, env, argv, stdin)
 }
 
 // discoverContainer returns preferred when it exists, else the first
@@ -175,29 +184,38 @@ func envValue(data, key string) string {
 	return ""
 }
 
-// psqlArgs builds `RT exec [-i] -e PGPASSWORD=.. <pg> psql -h 127.0.0.1
+// psqlArgs builds `RT exec [-i] -e PGPASSWORD <pg> psql -h 127.0.0.1
 // -U <user> -d postgres <extra...>` — every backend query goes through
-// the container like the bash originals.
-func (k *KineDB) psqlArgs(pg, user, pass string, interactive bool, extra ...string) []string {
+// the container like the bash originals. The password is NOT on argv:
+// `-e PGPASSWORD` forwards the var from the docker/podman client's
+// own environment (psqlPassEnv on the child), keeping it off
+// /proc/<pid>/cmdline where any host process could read it.
+func (k *KineDB) psqlArgs(pg, user string, interactive bool, extra ...string) []string {
 	argv := []string{k.cfg.Runtime, "exec"}
 	if interactive {
 		argv = append(argv, "-i")
 	}
-	argv = append(argv, "-e", "PGPASSWORD="+pass, pg,
+	argv = append(argv, "-e", "PGPASSWORD", pg,
 		"psql", "-h", "127.0.0.1", "-U", user, "-d", "postgres")
 	return append(argv, extra...)
 }
 
+// psqlPassEnv is the env half of the password hand-off — paired with
+// the bare `-e PGPASSWORD` in psqlArgs/the exec call sites.
+func psqlPassEnv(pass string) []string {
+	return []string{"PGPASSWORD=" + pass}
+}
+
 // psqlQuery runs one statement with -tAc (unaligned, tuples only).
 func (k *KineDB) psqlQuery(ctx context.Context, pg, user, pass, sql string) (string, error) {
-	return k.exec(ctx, k.psqlArgs(pg, user, pass, false, "-tAc", sql), "")
+	return k.execEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false, "-tAc", sql), "")
 }
 
 // psqlScript runs a multi-statement script in ONE psql session via
 // stdin — required for the session-scoped advisory lock to cover the
 // chunk loop + vacuum.
 func (k *KineDB) psqlScript(ctx context.Context, pg, user, pass, script string) (string, error) {
-	return k.execLong(ctx, k.psqlArgs(pg, user, pass, true,
+	return k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, true,
 		"-v", "ON_ERROR_STOP=1", "-f", "-"), script)
 }
 
@@ -284,12 +302,11 @@ func writeIntFile(path string, v int64) {
 		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 		return
 	}
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(v, 10)+"\n"), 0o644); err != nil {
-		logger().Warn("kinedb state file write failed", "file", path, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	// hostutil's random-suffix tmp + fsync + rename — probe and
+	// guard loops can reach the same file from different goroutines,
+	// so a fixed .tmp-<name> staging path could clobber mid-write.
+	if err := hostutil.WriteFileAtomicBytes(path,
+		[]byte(strconv.FormatInt(v, 10)+"\n")); err != nil {
 		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 	}
 }

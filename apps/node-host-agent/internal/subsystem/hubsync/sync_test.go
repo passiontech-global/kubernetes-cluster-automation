@@ -1014,10 +1014,11 @@ func TestRemoteSHA256Directory(t *testing.T) {
 	}
 }
 
-// TestPutAtomicKeyMaterialChmodEarly: secret material must not sit
-// world-readable in the staging tmp under the remote umask — the
-// 0600 lands right after the upload, before the final-mode chmod
-// and the mv.
+// TestPutAtomicKeyMaterialChmodEarly: secret material must never
+// sit world-readable on the target — the staging tmp is pre-created
+// at 0600 via `install -m 600 /dev/null` BEFORE the upload (`cat >`
+// under the remote umask would otherwise leave a 0644 window), then
+// ONE chmod to the final mode and the mv.
 func TestPutAtomicKeyMaterialChmodEarly(t *testing.T) {
 	c := newFakeConn()
 	if err := putAtomic(context.Background(), c, "/etc/x/host.key",
@@ -1025,12 +1026,23 @@ func TestPutAtomicKeyMaterialChmodEarly(t *testing.T) {
 		t.Fatalf("putAtomic: %v", err)
 	}
 	assertOpOrder(t, c.opsLog(),
+		"run:install -m 600 /dev/null '/etc/x/.host.key.tmp'",
 		"write:/etc/x/.host.key.tmp",
-		"run:chmod 0600 '/etc/x/.host.key.tmp'",
 		"run:chmod 0644 '/etc/x/.host.key.tmp'",
 		"run:mv '/etc/x/.host.key.tmp' '/etc/x/host.key'")
+	// Exactly one chmod — the 0600-then-final-mode double chmod is
+	// collapsed.
+	var chmods int
+	for _, o := range c.opsLog() {
+		if strings.Contains(o, "chmod") {
+			chmods++
+		}
+	}
+	if chmods != 1 {
+		t.Fatalf("chmod ops = %d want 1: %v", chmods, c.opsLog())
+	}
 
-	// A non-secret file gets no early chmod.
+	// A non-secret file gets no install pre-create.
 	c2 := newFakeConn()
 	if err := putAtomic(context.Background(), c2, "/etc/x/plain.yaml",
 		strings.NewReader("y"), "0644"); err != nil {
@@ -1040,4 +1052,7 @@ func TestPutAtomicKeyMaterialChmodEarly(t *testing.T) {
 		"write:/etc/x/.plain.yaml.tmp",
 		"run:chmod 0644 '/etc/x/.plain.yaml.tmp'",
 		"run:mv '/etc/x/.plain.yaml.tmp' '/etc/x/plain.yaml'")
+	if strings.Contains(strings.Join(c2.opsLog(), "\n"), "install") {
+		t.Fatalf("non-secret upload ran install: %v", c2.opsLog())
+	}
 }

@@ -323,11 +323,6 @@ func (r *Reporter) Cycle(ctx context.Context) {
 			r.heartbeatInit = true
 		}
 	}
-	if err := r.syncConditions(ctx); err != nil {
-		logger().Error("nodereporter: condition sync failed",
-			"node", r.cfg.NodeName, "error", err)
-		ok = false
-	}
 	if err := r.syncLogEvents(ctx); err != nil {
 		logger().Error("nodereporter: event sync failed",
 			"node", r.cfg.NodeName, "error", err)
@@ -351,8 +346,13 @@ func (r *Reporter) Cycle(ctx context.Context) {
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
-	if err := r.syncNPDConditions(ctx); err != nil {
-		logger().Error("nodereporter: npd condition sync failed",
+	// One Node GET + at most one merged status PATCH per cycle —
+	// syncConditions covers the watchdog latch conditions AND the
+	// two NPD monitor conditions (the former split issued a
+	// GET+PATCH each). It runs last so it ships whatever state the
+	// monitors computed this cycle.
+	if err := r.syncConditions(ctx); err != nil {
+		logger().Error("nodereporter: condition sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}

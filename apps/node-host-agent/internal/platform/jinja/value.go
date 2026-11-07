@@ -3,6 +3,7 @@ package jinja
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -398,7 +399,17 @@ func binOp(op string, l, r any) (any, error) {
 			if rf == 0 {
 				return nil, errors.New("modulo by zero")
 			}
-			return float64(int64(lf) % int64(rf)), nil
+			// math.Mod, NOT int64(lf) % int64(rf): operands reaching
+			// this branch aren't int-representable (a float-string
+			// like "0.5"), and truncating a sub-1 divisor to
+			// int64(rf)==0 was an integer divide-by-zero PANIC.
+			// Python's % takes the DIVISOR's sign (floored modulo),
+			// so shift an fmod result whose sign disagrees with rf.
+			m := math.Mod(lf, rf)
+			if m != 0 && (m < 0) != (rf < 0) {
+				m += rf
+			}
+			return m, nil
 		}
 	case "==":
 		return deepEq(l, r), nil

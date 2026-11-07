@@ -22,8 +22,8 @@ package hostmetrics
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -52,8 +52,10 @@ func (l *Latches) Collector() *Collector { return l.c }
 // Name identifies the subsystem for the agent loop.
 func (l *Latches) Name() string { return "hostmetrics" }
 
-// Run drives the latch-maintenance ticker until ctx is cancelled.
+// Run drives the latch-maintenance ticker until ctx is cancelled;
+// the /dev/kmsg session it lazily opened is released on exit.
 func (l *Latches) Run(ctx context.Context) {
+	defer l.closeKernelScan()
 	cycle.Every("hostmetrics", l.c.cfg.LatchInterval,
 		func(context.Context) { l.refreshLatches() }).Run(ctx)
 }
@@ -177,33 +179,16 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 
 // updateKernelKeysLatch drives state-kernel-keys-pressure (W8-KR3):
 // set above 0.80 of the enforced quota — a full keyring fails
-// keyctl_join/add_key silently for new sessions.
+// keyctl_join/add_key silently for new sessions. Enter/Exit carry
+// the STATE-ENTER/STATE-EXIT lines nodereporter's KernelKeysPressure
+// event rule consumes.
 func (l *Latches) updateKernelKeysLatch(ratio float64) {
-	p := l.c.state.Path(hoststate.LatchKernelKeysPressure)
-	_, err := os.Stat(p)
-	switch {
-	case ratio > kernelKeysPressureRatio && err != nil:
-		content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + "\n"
-		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			logger().Warn("hostmetrics: kernel-keys-pressure latch write failed",
-				"path", p, "error", werr)
-		} else if rerr := os.Rename(tmp, p); rerr != nil {
-			logger().Warn("hostmetrics: kernel-keys-pressure latch install failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Warn("hostmetrics: kernel-keys-pressure latch set",
-				"ratio", ratio, "threshold", kernelKeysPressureRatio, "path", p)
-		}
-	case ratio <= kernelKeysPressureRatio && err == nil:
-		if rerr := os.Remove(p); rerr != nil {
-			logger().Warn("hostmetrics: kernel-keys-pressure latch remove failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: kernel-keys-pressure latch cleared",
-				"ratio", ratio, "path", p)
-		}
+	if ratio > kernelKeysPressureRatio {
+		l.c.state.Enter(hoststate.LatchKernelKeysPressure,
+			fmt.Sprintf("ratio=%.3f > %.2f", ratio, kernelKeysPressureRatio))
+		return
 	}
+	l.c.state.Exit(hoststate.LatchKernelKeysPressure, nil)
 }
 
 var descKernelKeys = prometheus.NewDesc(

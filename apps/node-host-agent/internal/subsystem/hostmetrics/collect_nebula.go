@@ -8,6 +8,7 @@ package hostmetrics
 import (
 	"bufio"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 const (
@@ -96,45 +98,25 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 // enter/exit transition. A steady-state scrape therefore writes
 // nothing to disk.
 func (c *Collector) updateCertLatch(days int64, ok bool) {
-	dir := c.cfg.WatchdogStateDir
-	latch := c.state.Path(hoststate.LatchNebulaCertExpiring)
+	daysPath := filepath.Join(c.cfg.WatchdogStateDir, "nebula-cert-days-left")
 	if !ok {
-		_ = os.Remove(latch)
-		_ = os.Remove(filepath.Join(dir, "nebula-cert-days-left"))
+		c.state.Exit(hoststate.LatchNebulaCertExpiring, nil)
+		_ = os.Remove(daysPath)
 		return
 	}
-	daysPath := filepath.Join(dir, "nebula-cert-days-left")
 	daysContent := strconv.FormatInt(days, 10) + "\n"
 	if cur, err := os.ReadFile(daysPath); err != nil || string(cur) != daysContent {
-		tmp := filepath.Join(dir, ".tmp-"+filepath.Base(daysPath))
-		if err := os.WriteFile(tmp, []byte(daysContent), 0o644); err == nil {
-			_ = os.Rename(tmp, daysPath)
+		if err := hostutil.WriteFileAtomic(daysPath, daysContent); err != nil {
+			logger().Debug("hostmetrics: nebula-cert-days-left write failed",
+				"path", daysPath, "error", err)
 		}
 	}
-	_, statErr := os.Stat(latch)
 	switch {
-	case days < nebulaCertWarnDays && statErr != nil:
-		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
-		tmp := filepath.Join(dir, ".tmp-"+filepath.Base(latch))
-		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			logger().Warn("hostmetrics: nebula-cert-expiring latch write failed",
-				"path", latch, "error", werr)
-		} else if rerr := os.Rename(tmp, latch); rerr != nil {
-			logger().Warn("hostmetrics: nebula-cert-expiring latch install failed",
-				"path", latch, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: nebula-cert-expiring latch set",
-				"daysLeft", days,
-				"warnDays", nebulaCertWarnDays, "path", latch)
-		}
-	case days >= nebulaCertWarnDays && statErr == nil:
-		if rerr := os.Remove(latch); rerr != nil {
-			logger().Warn("hostmetrics: nebula-cert-expiring latch remove failed",
-				"path", latch, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: nebula-cert-expiring latch cleared",
-				"daysLeft", days, "path", latch)
-		}
+	case days < nebulaCertWarnDays:
+		c.state.Enter(hoststate.LatchNebulaCertExpiring,
+			fmt.Sprintf("daysLeft=%d < warnDays=%d", days, nebulaCertWarnDays))
+	default:
+		c.state.Exit(hoststate.LatchNebulaCertExpiring, nil)
 	}
 }
 

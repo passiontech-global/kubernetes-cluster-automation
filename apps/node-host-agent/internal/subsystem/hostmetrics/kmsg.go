@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
@@ -60,23 +59,26 @@ var kmsgDevicePaths = func(hostRoot string) []string {
 // this file keeps the plumbing they dispatch into.
 
 // kernelScanState is the per-Collector scanner state — the kmsg
-// tail session plus the cross-line OOM pairing. NetHealth-style
-// keyed state because the Latches wrapper is recreated per call —
-// the Collector underneath is the stable identity.
+// tail session plus the cross-line OOM pairing. It lives as a
+// Collector field (hostmetrics.go's kscan): the Latches wrapper is
+// recreated per call, so a keyed side-map would never release the
+// session — the old sync.Map leaked both the entry and the
+// /dev/kmsg fd for the process lifetime.
 type kernelScanState struct {
 	sess       *kmsgSession // nil until the session is (re)built
 	oomPending *oomKillCtx  // constraint line awaiting its kill line
 }
 
-var kernelScanStates sync.Map // *Collector → *kernelScanState
-
 func (l *Latches) kernelScan() *kernelScanState {
-	if v, ok := kernelScanStates.Load(l.c); ok {
-		return v.(*kernelScanState)
-	}
-	st := &kernelScanState{}
-	actual, _ := kernelScanStates.LoadOrStore(l.c, st)
-	return actual.(*kernelScanState)
+	return &l.c.kscan
+}
+
+// closeKernelScan releases the /dev/kmsg fd the session holds —
+// Latches.Run defers it so subsystem shutdown doesn't leak the
+// descriptor. Only the ticker goroutine owns the scan, so this
+// needs no lock.
+func (l *Latches) closeKernelScan() {
+	l.closeKMSSession(l.kernelScan())
 }
 
 // kmsgSession is the consumer half of the /dev/kmsg tail: the
@@ -377,7 +379,7 @@ func (l *Latches) noteHostOOMKill(msg string, st *kernelScanState) {
 	now := l.c.cfg.nowFn()
 	p := l.statePath(kmsgOOMVictimFile)
 	content := strconv.FormatInt(now.Unix(), 10) + " " + comm + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Warn("hostmetrics: host-oom victim marker write failed",
 			"path", p, "error", err)
 	}
@@ -395,7 +397,7 @@ func (l *Latches) noteKernelFsError(msg string) {
 	p := l.statePath(kmsgFsErrorFile)
 	content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + " " +
 		detail + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Warn("hostmetrics: kmsg fs-error marker write failed",
 			"path", p, "error", err)
 	}

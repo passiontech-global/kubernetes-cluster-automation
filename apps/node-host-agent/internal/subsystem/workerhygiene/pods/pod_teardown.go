@@ -129,7 +129,11 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 						"pod-teardown-wedged suppressed-overloaded stuck=%d", wedged))
 				}
 			} else {
-				c.d.State.Enter(hoststate.LatchPodTeardownWedged, fmt.Sprintf("stuck=%d", wedged))
+				// EnterFrom: ctr-tasks shares this latch for
+				// unkillable orphan shims — our exit below must
+				// release only OUR hold, never theirs.
+				c.d.State.EnterFrom(hoststate.LatchPodTeardownWedged,
+					wdeps.CheckTeardown, fmt.Sprintf("stuck=%d", wedged))
 			}
 		} else {
 			c.d.State.AppendLog(fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d (check %d/%d)",
@@ -137,7 +141,8 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	default:
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchPodTeardownWedged, nil)
+		c.d.State.ExitFrom(hoststate.LatchPodTeardownWedged,
+			wdeps.CheckTeardown, nil)
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckTeardown, "ok").Inc()
 }

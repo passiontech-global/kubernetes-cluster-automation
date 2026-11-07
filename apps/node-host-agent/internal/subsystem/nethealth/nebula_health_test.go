@@ -294,6 +294,9 @@ func TestNebulaUnderlayPeersParsesStaticHostMap(t *testing.T) {
 
 func TestNebulaClockLatchRestartsTimesyncd(t *testing.T) {
 	e := nebulaEnv(t, nil)
+	// timesyncd must be enabled/active for the latch restart —
+	// a dormant unit (chrony host) is never woken.
+	e.sd.On("is-enabled systemd-timesyncd.service", "enabled\n")
 	e.sd.On("restart systemd-timesyncd.service", "")
 	testutil.WriteFile(t, e.procudp,
 		"  sl  local_address rem_address   st\n") // socket unbound → nebula fails
@@ -324,5 +327,29 @@ func TestNebulaNoClockLatchNoTimesyncdRestart(t *testing.T) {
 	e.n.Cycle(context.Background())
 	if e.sd.Ran("restart systemd-timesyncd") {
 		t.Fatal("timesyncd restarted without a clock latch")
+	}
+}
+
+// A clock latch while nebula is unhealthy must not restart a
+// DORMANT timesyncd — on chrony hosts the unit ships installed but
+// disabled/inactive and a restart would put a second NTP daemon on
+// the box fighting chrony over adjtimex.
+func TestTimesyncdLatchRestartGatedOnLiveUnit(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.state.Enter("clock-unsync", "test")
+	ctx := context.Background()
+
+	// Default sd Miss = "no unit" — neither enabled nor active:
+	// the latch alone must not restart timesyncd (nor spend budget).
+	e.n.restartTimesyncdOnClockLatch(ctx)
+	if e.sd.Ran("restart systemd-timesyncd.service") {
+		t.Fatal("dormant timesyncd restarted on chrony-style host")
+	}
+
+	// Enabled (the node's real daemon, possibly crashed) → restart.
+	e.sd.On("is-enabled systemd-timesyncd.service", "enabled\n")
+	e.n.restartTimesyncdOnClockLatch(ctx)
+	if !e.sd.Ran("restart systemd-timesyncd.service") {
+		t.Fatal("enabled timesyncd not restarted under clock latch")
 	}
 }

@@ -84,9 +84,19 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// SIGKILLed every sweep — cold-restarting every foreign container
 	// and saturating the node (NodeOverloaded incident 2026-11).
 	nShim := 0
+	// shimEscalated records whether phase B escalated any orphan
+	// shim into the shared pod-teardown-wedged latch this round —
+	// a completed scan with no escalation releases our owner hold
+	// (shim reaped or recovered since the last cycle). killCapHit
+	// marks an incomplete scan: the kill budget cut the pid walk
+	// short, so unexamined shims may still be wedged and the hold
+	// must be kept (inconclusive, never a flap).
+	shimEscalated := false
+	killCapHit := false
 	pids := e.PidsOnce()
 	for _, pid := range pids {
 		if nShim >= c.d.Cfg.Ctr.MaxShimKill {
+			killCapHit = true
 			break
 		}
 		argv := c.d.Proc.Cmdline(pid)
@@ -121,11 +131,17 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// orphan into the pod-teardown-wedged latch so the
 		// node-level NHC→SNR remediation path sees the wedge
 		// (kubelet/containerd teardown is dead by definition).
+		// EnterFrom, not Enter: pod-teardown shares this latch and
+		// must not clear OUR hold when its own pod scan finds
+		// nothing wedged — multi-owner semantics keep the file
+		// latched while ANY producer still sees the wedge.
 		if state, _, ok := c.d.ProcStatStatePPID(pid); ok &&
 			(state == "D" || state == "Z") {
-			c.d.State.Enter(hoststate.LatchPodTeardownWedged, fmt.Sprintf(
-				"unkillable-orphan-shim pid=%d id=%.12s state=%s",
-				pid, sid, state))
+			shimEscalated = true
+			c.d.State.EnterFrom(hoststate.LatchPodTeardownWedged,
+				wdeps.CheckCtrTasks, fmt.Sprintf(
+					"unkillable-orphan-shim pid=%d id=%.12s state=%s",
+					pid, sid, state))
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ctr-tasks orphan shim pid=%d id=%.12s state=%s — SIGKILL cannot clear it, escalated to pod-teardown-wedged",
 				pid, sid, state))
@@ -238,6 +254,13 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		nClean++
 		c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "rm_dir").Inc()
+	}
+	// Full scan with no D/Z orphan shim left → release our hold on
+	// the shared latch (pod-teardown's own hold, if any, is
+	// untouched). A capped or escalated scan keeps it.
+	if !shimEscalated && !killCapHit {
+		c.d.State.ExitFrom(hoststate.LatchPodTeardownWedged,
+			wdeps.CheckCtrTasks, nil)
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "ok").Inc()
 }

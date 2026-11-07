@@ -102,7 +102,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 	k.reapInvalidIndexes(ctx, pg, user, pass, res, note)
 
 	// (a) REINDEX CONCURRENTLY — always, cheap on a small table.
-	if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+	if _, err := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 		"-qc", "REINDEX TABLE CONCURRENTLY "+sqlIdent(k.cfg.Table)), ""); err == nil {
 		res.okReindex = true
 	} else {
@@ -160,7 +160,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		logger().Warn("kinedb: pg_repack skipped — insufficient disk headroom, VACUUM only",
 			"free", free, "heap", res.heapBytes, "wal", wal)
 		res.repackState = "skipped-headroom"
-		if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+		if _, err := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 			"-qc", "VACUUM (ANALYZE) "+sqlIdent(k.cfg.Table)), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
@@ -180,7 +180,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 			"repack-needed-no-binary (heap=%dB dead=%d%%)", res.heapBytes, res.deadPct))
 		return
 	}
-	if _, err := k.exec(ctx, k.psqlArgs(pg, user, pass, false,
+	if _, err := k.execEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 		"-qc", "CREATE EXTENSION IF NOT EXISTS pg_repack"), ""); err != nil {
 		// pg_repack cannot run without the extension — attempting
 		// it anyway fails identically and doubles the error noise.
@@ -189,8 +189,8 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("repack-ext-fail: %v", err))
 		return
 	}
-	if _, err := k.execLong(ctx, []string{k.cfg.Runtime, "exec",
-		"-e", "PGPASSWORD=" + pass, pg, repackBin,
+	if _, err := k.execLongEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+		"-e", "PGPASSWORD", pg, repackBin,
 		"-h", "127.0.0.1", "-U", user, "-d", "postgres",
 		"-t", "public." + k.cfg.Table,
 		"--no-superuser-check", "--no-order"}, ""); err == nil {
@@ -239,7 +239,7 @@ func (k *KineDB) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 			logger().Warn("kinedb: invalid index on kine table kept (not a reindex orphan)",
 				"index", base)
 		default:
-			if _, derr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+			if _, derr := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 				"-qc", "DROP INDEX CONCURRENTLY IF EXISTS "+
 					sqlIdent(base)), ""); derr != nil {
 				note(fmt.Sprintf("drop-index-%s-fail: %v", base, derr))

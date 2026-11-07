@@ -688,3 +688,52 @@ func TestDecodeYAMLTrailingSeparator(t *testing.T) {
 		t.Fatalf("aliased value = %T want *OMap", use)
 	}
 }
+
+// The float-% branch truncated operands through int64 — a sub-1 or
+// non-int-representable divisor (a float-string like "0.5") became
+// int64(rf)==0 → integer divide-by-zero PANIC. math.Mod is the
+// float modulo; the result takes the divisor's sign like python.
+func TestFloatModuloNoPanic(t *testing.T) {
+	cases := map[string]string{
+		`{{ "5.5" % "0.5" }}`: "0",
+		`{{ 5 % "0.5" }}`:     "0",
+		`{{ "5.5" % "2" }}`:   "1.5",
+		`{{ "-5.5" % "2" }}`:  "0.5", // floored (divisor's sign)
+		`{{ "5.5" % "-2" }}`:  "-0.5",
+		`{{ 5.5 % 2.0 }}`:     "1", // int path still governs
+		`{{ "10" % "0.25" }}`: "0",
+	}
+	for tpl, want := range cases {
+		got, err := Render(tpl, nil, nil)
+		if err != nil {
+			t.Fatalf("render %q: %v", tpl, err)
+		}
+		if got != want {
+			t.Fatalf("render %q = %q want %q", tpl, got, want)
+		}
+	}
+	// A real zero divisor still errors.
+	if _, err := Render(`{{ "5.5" % "0" }}`, nil, nil); err == nil {
+		t.Fatal("x % \"0\" succeeded — want modulo-by-zero error")
+	}
+}
+
+// indent with a negative width fed strings.Repeat a negative count —
+// a panic. Python's ' ' * -n is ” so the value renders unindented.
+func TestIndentNegativeWidth(t *testing.T) {
+	got, err := Render("{{ 'a\\nb' | indent(-3) }}", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "a\nb" {
+		t.Fatalf("indent(-3) = %q want unindented", got)
+	}
+	// Positive widths still pad.
+	got, err = Render("{{ 'a\\nb' | indent(2) }}", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "  a\n  b" {
+		t.Fatalf("indent(2) = %q", got)
+	}
+}

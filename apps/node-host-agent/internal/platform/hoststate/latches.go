@@ -123,6 +123,13 @@ type LatchDef struct {
 	Name   string // the <name> half of state-<name>
 	Owner  string // owning subsystem
 	Prefix bool   // parameterized family — suffix minted per target
+	// Owners lists every producer id that may hold the latch
+	// simultaneously through Store.EnterFrom/Store.ExitFrom —
+	// non-nil only for shared latches. hoststate is the leaf both
+	// producers import, so the declared ids are the contract the
+	// calls must match (store.go's ExitFrom seeds a synthetic hold
+	// set from this list for owner-less legacy files).
+	Owners []string
 }
 
 // LatchDefs is every state-<name> latch an enabled check can
@@ -154,8 +161,12 @@ type LatchDef struct {
 //	hostmetrics: node-overloaded (PSI hysteresis), filesystem-readonly,
 //	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3)
 var LatchDefs = []LatchDef{
-	// workerhygiene
-	{Name: LatchPodTeardownWedged, Owner: "workerhygiene"},
+	// workerhygiene — pod-teardown-wedged is the shared latch:
+	// pods.PodTeardownCheck holds it for stuck Terminating pods,
+	// ctr.CtrTasksCheck for unkillable D/Z orphan shims. The
+	// ids match wdeps.CheckTeardown/wdeps.CheckCtrTasks.
+	{Name: LatchPodTeardownWedged, Owner: "workerhygiene",
+		Owners: []string{"pod-teardown", "ctr-tasks"}},
 	{Name: LatchKonnectivityIPMismatch, Owner: "workerhygiene"},
 	{Name: LatchDNSResolvStale, Owner: "workerhygiene"},
 	{Name: LatchKubeletRuntimeStall, Owner: "workerhygiene"},
@@ -227,6 +238,17 @@ var LatchDefs = []LatchDef{
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},
+}
+
+// SharedOwners returns the declared multi-owner producer ids for a
+// latch — nil for every single-producer latch.
+func SharedOwners(name string) []string {
+	for _, d := range LatchDefs {
+		if d.Name == name {
+			return d.Owners
+		}
+	}
+	return nil
 }
 
 // KnownLatchName reports whether a state-<?> suffix is in the

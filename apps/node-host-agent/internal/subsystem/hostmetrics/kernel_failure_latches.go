@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -80,24 +79,16 @@ func (l *Latches) statePath(name string) string {
 	return filepath.Join(l.c.cfg.WatchdogStateDir, name)
 }
 
-// ensureStateLatch installs a state latch when absent (epoch content,
-// atomic tmp+rename — the updateKernelKeysLatch pattern) and logs
-// the transition once; BUG-H6's refresh loop owns the mtime while
-// held.
+// ensureStateLatch installs a state latch when absent (epoch
+// content, written through the Store's atomic WriteEpochFile —
+// concurrent ticker/scrape writers share no fixed .tmp-<name>
+// staging file) and logs the transition once; BUG-H6's refresh
+// loop owns the mtime while held.
 func (l *Latches) ensureStateLatch(path, name, evidence string) {
 	if _, err := os.Stat(path); err == nil {
 		return
 	}
-	content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + "\n"
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		logger().Warn("hostmetrics: "+name+" latch write failed",
-			"path", path, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		logger().Warn("hostmetrics: "+name+" latch install failed",
-			"path", path, "error", err)
+	if !l.c.state.WriteEpochFile(path, l.c.cfg.nowFn().Unix()) {
 		return
 	}
 	logger().Warn("hostmetrics: "+name+" latch set — "+evidence,

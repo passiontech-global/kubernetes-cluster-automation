@@ -24,6 +24,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // logRule is one temporary filelog rule — reason → K8s Event reason +
@@ -39,6 +42,20 @@ import (
 type logRule struct {
 	reason string
 	re     *regexp.Regexp
+}
+
+// stateEnterRe builds the "STATE-ENTER: <latch>" match pattern for
+// one or more hoststate latch names. Every latch→event rule derives
+// its token from the hoststate registry constants — a renamed latch
+// can never silently drift the filelog contract (the
+// filesystem-readonly vs fs-readonly split is exactly the drift this
+// prevents: both registered tokens feed the one event reason).
+func stateEnterRe(latches ...string) *regexp.Regexp {
+	alts := make([]string, 0, len(latches))
+	for _, l := range latches {
+		alts = append(alts, regexp.QuoteMeta(l))
+	}
+	return regexp.MustCompile(`STATE-ENTER: (?:` + strings.Join(alts, "|") + `)`)
 }
 
 // logRules is the watchdog-filelog-monitor.json rules array, in order.
@@ -54,7 +71,7 @@ var logRules = []logRule{
 	{"TincEgressRecovered", regexp.MustCompile(`ACTION: egress [0-9.]+ -> direct underlay`)},
 	{"TincEgressHeal", regexp.MustCompile(`ACTION: heal egress`)},
 	{"NebulaRestarted", regexp.MustCompile(`ACTION: restarting nebula@`)},
-	{"NebulaIsolatedEnter", regexp.MustCompile(`STATE-ENTER: nebula-isolated`)},
+	{"NebulaIsolatedEnter", stateEnterRe(hoststate.LatchNebulaIsolated)},
 	{"NebulaDataplaneDegraded", regexp.MustCompile(`nebula-dataplane-degraded`)},
 	{"NebulaSlowPath", regexp.MustCompile(`nebula-dataplane-slowpath`)},
 	{"NebulaSiteEdge", regexp.MustCompile(`nebula-siteedge-degraded`)},
@@ -66,9 +83,15 @@ var logRules = []logRule{
 	{"DnsResolvStale", regexp.MustCompile(`dns-resolv-stale`)},
 	{"StuckPodForceDeleted", regexp.MustCompile(`force-delete pod `)},
 	{"PodTeardownWedged", regexp.MustCompile(`pod-teardown-wedged`)},
-	{"ClockUnsynchronized", regexp.MustCompile(`STATE-ENTER: clock-unsync|ACTION: restarting (systemd-timesyncd|chrony|chronyd)\.service`)},
-	{"ConntrackPressure", regexp.MustCompile(`STATE-ENTER: conntrack-pressure|nf_conntrack.*table full`)},
-	{"CiliumIPAMExhausted", regexp.MustCompile(`STATE-ENTER: cilium-ipam-exhausted|no more IPs available`)},
+	{"ClockUnsynchronized", regexp.MustCompile(
+		stateEnterRe(hoststate.LatchClockUnsync).String() +
+			`|ACTION: restarting (systemd-timesyncd|chrony|chronyd)\.service`)},
+	{"ConntrackPressure", regexp.MustCompile(
+		stateEnterRe(hoststate.LatchConntrackPressure).String() +
+			`|nf_conntrack.*table full`)},
+	{"CiliumIPAMExhausted", regexp.MustCompile(
+		stateEnterRe(hoststate.LatchCiliumIPAMExhausted).String() +
+			`|no more IPs available`)},
 	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
 	{"ZombieProcessStorm", regexp.MustCompile(`ACTION:? *zombie-storm:`)},
 	{"CiliumMTUExceedsOverlay", regexp.MustCompile(`ACTION:? *cilium-mtu-drift:`)},
@@ -82,7 +105,7 @@ var logRules = []logRule{
 	// journalwatch blindness latch — STATE-ENTER only (one event per
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).
-	{"JournaldUnreadable", regexp.MustCompile(`STATE-ENTER: journal-unreadable`)},
+	{"JournaldUnreadable", stateEnterRe(hoststate.LatchJournalUnreadable)},
 	// W7-H1: workerhygiene's d-state-storm latch-entry line —
 	// "ACTION d-state-storm: count=N runtime=M wchan=...".
 	{"KernelHungTasks", regexp.MustCompile(`ACTION:? *d-state-storm:`)},
@@ -92,15 +115,15 @@ var logRules = []logRule{
 	// older rule (nebula-isolated → NebulaIsolatedEnter,
 	// conntrack-pressure → ConntrackPressure, cilium-ipam-exhausted
 	// → CiliumIPAMExhausted) are intentionally not duplicated.
-	{"NebulaDegraded", regexp.MustCompile(`STATE-ENTER: nebula-degraded`)},
-	{"CiliumEnvoyDown", regexp.MustCompile(`STATE-ENTER: cilium-envoy-down`)},
-	{"CiliumBPFMapPressure", regexp.MustCompile(`STATE-ENTER: cilium-bpf-map-pressure`)},
-	{"SpegelMirrorDegraded", regexp.MustCompile(`STATE-ENTER: spegel-mirror-degraded`)},
-	{"CalicoVethLeak", regexp.MustCompile(`STATE-ENTER: calico-veth-leak`)},
-	{"CalicoFelixDown", regexp.MustCompile(`STATE-ENTER: calico-felix-down`)},
-	{"Fail2banDown", regexp.MustCompile(`STATE-ENTER: fail2ban-down`)},
-	{"KernelKeysPressure", regexp.MustCompile(`STATE-ENTER: kernel-keys-pressure`)},
-	{"ControlPlaneCertReloadStale", regexp.MustCompile(`STATE-ENTER: cp-cert-reload-stale`)},
+	{"NebulaDegraded", stateEnterRe(hoststate.LatchNebulaDegraded)},
+	{"CiliumEnvoyDown", stateEnterRe(hoststate.LatchCiliumEnvoyDown)},
+	{"CiliumBPFMapPressure", stateEnterRe(hoststate.LatchCiliumBPFMapPressure)},
+	{"SpegelMirrorDegraded", stateEnterRe(hoststate.LatchSpegelMirrorDegraded)},
+	{"CalicoVethLeak", stateEnterRe(hoststate.LatchCalicoVethLeak)},
+	{"CalicoFelixDown", stateEnterRe(hoststate.LatchCalicoFelixDown)},
+	{"Fail2banDown", stateEnterRe(hoststate.LatchFail2banDown)},
+	{"KernelKeysPressure", stateEnterRe(hoststate.LatchKernelKeysPressure)},
+	{"ControlPlaneCertReloadStale", stateEnterRe(hoststate.LatchCPCertReloadStale)},
 	// W2: workerhygiene's psi-memory-thrash latch-entry line —
 	// "ACTION psi-memory-thrash: avg60=... free=...".
 	{"NodeMemoryPSIThrashing", regexp.MustCompile(`ACTION:? *psi-memory-thrash:`)},
@@ -108,22 +131,31 @@ var logRules = []logRule{
 	// workerhygiene's W9-KR3 slab-leak guard + nethealth's W9-NM1
 	// DF PMTU probe — one Event per STATE-ENTER (clock-unsync is
 	// already covered by the ClockUnsynchronized rule above).
-	{"KernelSlabLeak", regexp.MustCompile(`STATE-ENTER: kernel-slab-leak`)},
-	{"NebulaPMTUBlackhole", regexp.MustCompile(`STATE-ENTER: nebula-pmtu-blackhole`)},
+	{"KernelSlabLeak", stateEnterRe(hoststate.LatchKernelSlabLeak)},
+	{"NebulaPMTUBlackhole", stateEnterRe(hoststate.LatchNebulaPMTUBlackhole)},
 	// --- latch→event surface: kernel/host deep-failure + hygiene ---
 	// One Event per STATE-ENTER for the remaining registered latches.
 	// containerd-corrupt and fs-readonly feed shared conditions via
 	// altStateKeys in conditions.go (KubeletRuntimeStall and
 	// FilesystemReadOnly respectively); the rest own their condition
 	// type 1:1.
-	{"ContainerdCorrupt", regexp.MustCompile(`STATE-ENTER: containerd-corrupt`)},
-	{"FilesystemReadOnly", regexp.MustCompile(`STATE-ENTER: fs-readonly`)},
-	{"KernelResourceExhaustion", regexp.MustCompile(`STATE-ENTER: pid-fd-pressure`)},
-	{"ClockSkewDetected", regexp.MustCompile(`STATE-ENTER: clock-skew`)},
-	{"KubeconfigCertExpiring", regexp.MustCompile(`STATE-ENTER: kubeconfig-cert-expiring`)},
-	{"CPUStealPressure", regexp.MustCompile(`STATE-ENTER: cpu-steal-pressure`)},
-	{"CgroupDyingLeak", regexp.MustCompile(`STATE-ENTER: cgroup-dying-leak`)},
-	{"SystemdSessionBloat", regexp.MustCompile(`STATE-ENTER: systemd-session-bloat`)},
+	{"ContainerdCorrupt", stateEnterRe(hoststate.LatchContainerdCorrupt)},
+	// FilesystemReadOnly is fed by TWO latches: the W5.3 statfs
+	// latch (filesystem-readonly) and the W10 evidence latch
+	// (fs-readonly) — both registered tokens map to the one reason.
+	{"FilesystemReadOnly", stateEnterRe(
+		hoststate.LatchFSReadonly, hoststate.LatchFilesystemReadonly)},
+	{"KernelResourceExhaustion", stateEnterRe(hoststate.LatchPIDFDPressure)},
+	{"ClockSkewDetected", stateEnterRe(hoststate.LatchClockSkew)},
+	{"KubeconfigCertExpiring", stateEnterRe(hoststate.LatchKubeconfigCertExpiring)},
+	{"CPUStealPressure", stateEnterRe(hoststate.LatchCPUStealPressure)},
+	{"CgroupDyingLeak", stateEnterRe(hoststate.LatchCgroupDyingLeak)},
+	{"SystemdSessionBloat", stateEnterRe(hoststate.LatchSystemdSessionBloat)},
+	// W11/W12 latches that had conditions (conditions.go) but no
+	// filelog rule — kubelet-pleg-unhealthy and disk-slow-io
+	// previously entered without ever emitting an Event.
+	{"KubeletPLEGUnhealthy", stateEnterRe(hoststate.LatchKubeletPLEGUnhealthy)},
+	{"DiskSlowIO", stateEnterRe(hoststate.LatchDiskSlowIO)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

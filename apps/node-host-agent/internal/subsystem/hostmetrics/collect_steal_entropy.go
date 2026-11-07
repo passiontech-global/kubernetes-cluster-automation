@@ -186,15 +186,8 @@ func (l *Latches) updateStealEntropy() {
 		if n := l.c.state.Incr(cpuStealLowCountFile); n < cpuStealExitTicks {
 			return
 		}
-		if _, err := os.Stat(latchPath); err == nil {
-			if rerr := os.Remove(latchPath); rerr != nil {
-				logger().Warn("hostmetrics: cpu-steal-pressure latch "+
-					"remove failed", "path", latchPath, "error", rerr)
-			} else {
-				logger().Info("hostmetrics: cpu-steal-pressure latch "+
-					"cleared", "steal_ratio", ratio, "path", latchPath)
-			}
-		}
+		// Exit self-gates on the file existing and logs STATE-EXIT.
+		l.c.state.Exit(hoststate.LatchCPUStealPressure, nil)
 		// The exit streak is consumed — a later re-entry must
 		// build its own 2-tick release, not inherit this count.
 		l.c.state.ResetCounter(cpuStealLowCountFile)

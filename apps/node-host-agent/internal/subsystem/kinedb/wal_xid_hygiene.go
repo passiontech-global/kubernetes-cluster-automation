@@ -240,6 +240,9 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 	h.preparedSeen = true // a successful empty read = no orphans
 	for _, gid := range parseGIDs(out) {
 		h.preparedXacts++
+		if k.cfg.ReadOnly {
+			continue // diagnostics only — no ROLLBACK PREPARED
+		}
 		if _, rerr := k.psqlQuery(ctx, pg, user, pass,
 			"ROLLBACK PREPARED "+sqlQuote(gid)); rerr != nil {
 			note(fmt.Sprintf("rollback-prepared-%s-fail: %v", gid, rerr))
@@ -249,6 +252,10 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 		preparedXactRolledBackTotal.Add(1)
 		logger().Warn("kinedb: rolled back orphaned prepared transaction",
 			"gid", gid)
+	}
+	if k.cfg.ReadOnly && h.preparedXacts > 0 {
+		note(fmt.Sprintf("read-only: %d orphaned prepared xact(s) left in place",
+			h.preparedXacts))
 	}
 }
 
@@ -311,8 +318,20 @@ func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 	// so the guard survives an agent restart. A pg_stat reset (DB
 	// restart) reads as a negative delta and simply re-baselines.
 	prevPath := filepath.Join(k.cfg.GuardStateDir, seqTupReadFile)
-	prev, _ := readIntFile(prevPath)
+	prev, perr := readIntFile(prevPath)
+	if k.cfg.ReadOnly {
+		// Diagnostics only — never the baseline write, the
+		// ANALYZE, or the last-kine-analyze budget spend.
+		return
+	}
 	writeIntFile(prevPath, tupRead)
+	if perr != nil {
+		// First observation (or an unreadable baseline): the
+		// lifetime seq_tup_read is NOT a delta — seed prev with the
+		// current value and skip, or the first probe after every
+		// agent restart fires a bogus ANALYZE.
+		return
+	}
 	delta := tupRead - prev
 	if delta <= seqTupReadDeltaMax {
 		return
@@ -326,7 +345,7 @@ func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 		note("kine-analyze cooldown (<30m)")
 		return
 	}
-	if _, aerr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+	if _, aerr := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 		"-qc", "ANALYZE "+sqlIdent(k.cfg.Table)), ""); aerr != nil {
 		note(fmt.Sprintf("kine-analyze-fail: %v", aerr))
 		return
@@ -355,6 +374,11 @@ func parseGIDs(out string) []string {
 // absent rather than fabricating a zero), and the lifetime rollback
 // counter every round like idleTermTotal.
 func (k *KineDB) emitXactTextfile(h *hygieneResult) {
+	if k.cfg.ReadOnly {
+		// A zeroed in-process counter would overwrite the daemon's
+		// series — read-only mode never writes textfiles.
+		return
+	}
 	var p promfile.Builder
 	mxidHelp := "MAX(age(datminmxid)) across databases — distance " +
 		"to MultiXact wraparound pressure."
@@ -426,6 +450,11 @@ func (k *KineDB) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 	h.deadTup, h.deadSeen = dead, true
 	h.deadRatio = float64(dead) / float64(max(live, 1))
 	if h.deadRatio <= deadTupleRatioMax || dead <= deadTupleMinCount {
+		return
+	}
+	if k.cfg.ReadOnly {
+		note(fmt.Sprintf("read-only: dead-tuple VACUUM (ANALYZE) suppressed (dead=%d ratio=%.2f)",
+			dead, h.deadRatio))
 		return
 	}
 	if k.deadTupleVacuum(ctx, pg, user, pass, note) {
@@ -566,6 +595,11 @@ func (k *KineDB) hygieneWAL(ctx context.Context, pg, user, pass string,
 			// Past the critical threshold the slot is an orphan
 			// pinning the disk to PANIC — drop it and let the
 			// consumer resync from scratch if it ever returns.
+			if k.cfg.ReadOnly {
+				note(fmt.Sprintf("read-only: inactive slot %s pins %dB WAL (>%dGiB) — drop suppressed",
+					s.name, s.retained, slotRetainedDrop>>30))
+				continue
+			}
 			note(fmt.Sprintf("inactive slot %s pins %dB WAL (>%dGiB) — dropping",
 				s.name, s.retained, slotRetainedDrop>>30))
 			if _, derr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
@@ -649,7 +683,7 @@ func (k *KineDB) xidFreezeCheck(ctx context.Context, pg, user, pass string,
 	note(fmt.Sprintf("xid-age=%d>%d — VACUUM (FREEZE, ANALYZE)", age, xidFreezeAge))
 	logger().Warn("kinedb: XID age past freeze threshold — VACUUM (FREEZE, ANALYZE)",
 		"xid_age", age, "threshold", xidFreezeAge)
-	if _, verr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+	if _, verr := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
 		"-qc", "VACUUM (FREEZE, ANALYZE) "+sqlIdent(k.cfg.Table)), ""); verr != nil {
 		res.okFreeze = false
 		res.freezeState = "fail"

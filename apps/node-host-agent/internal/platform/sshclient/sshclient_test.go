@@ -84,6 +84,52 @@ func TestBoundOpNilLog(t *testing.T) {
 	}
 }
 
+// TestBoundOpCtxUsesCtxDeadline: the whole-op bound mirrors the
+// caller's ctx budget (hubsync's per-target timeout), not the dial
+// timeout — a blackholed session body must fail AT the op budget.
+func TestBoundOpCtxUsesCtxDeadline(t *testing.T) {
+	nc := &dlConn{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	want := time.Now().Add(3 * time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), want)
+	defer cancel()
+	clear := BoundOpCtx(ctx, log, nc, time.Second)
+	if len(nc.dls) != 1 || !nc.dls[0].Equal(want) {
+		t.Fatalf("deadline = %v, want the ctx deadline %v", nc.dls, want)
+	}
+	clear()
+	if len(nc.dls) != 2 || !nc.dls[1].IsZero() {
+		t.Fatalf("deadline not cleared: %v", nc.dls)
+	}
+}
+
+// TestBoundOpCtxFallbackTimeout: a deadline-less ctx falls back to
+// now+timeout — the op still can't hang forever on a dead transport.
+func TestBoundOpCtxFallbackTimeout(t *testing.T) {
+	nc := &dlConn{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	before := time.Now().Add(time.Minute)
+	clear := BoundOpCtx(context.Background(), log, nc, time.Minute)
+	after := time.Now().Add(time.Minute)
+	if len(nc.dls) != 1 || nc.dls[0].Before(before) || nc.dls[0].After(after) {
+		t.Fatalf("deadline = %v, want ~now+1m", nc.dls)
+	}
+	clear()
+}
+
+// TestBoundOpCtxUnsupportedIsLoud: same rejected-SetDeadline
+// contract as BoundOp — an unbounded body must warn.
+func TestBoundOpCtxUnsupportedIsLoud(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	nc := &dlConn{err: errors.New("deadline not supported")}
+	clear := BoundOpCtx(context.Background(), log, nc, time.Minute)
+	clear()
+	if !strings.Contains(buf.String(), "unbounded") {
+		t.Fatalf("rejected SetDeadline not warned:\n%s", buf.String())
+	}
+}
+
 // TestLinkDeadlineConn: behind a bastion Net is the chanConn
 // (SetDeadline always errors) while every muxed channel rides the
 // jump's real TCP conn — the per-op bound must land on JumpNet.

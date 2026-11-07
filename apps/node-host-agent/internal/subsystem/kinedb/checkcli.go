@@ -22,9 +22,14 @@ import (
 // prints one "  OK   <name>" / "  FAIL <name>" line per check in the
 // bash script's format, then the ALL OK / CO CHECK FAIL verdict.
 // Returns the process exit code: 0 when every check succeeded, else 1.
-// Note: pgHygiene writes the kine-db-xact.prom textfile on every run
-// (shared with the periodic path — no separate CLI-only emit path).
+// The CLI is strictly read-only: Config.ReadOnly is forced so it
+// prints diagnostics without touching the daemon's state files, the
+// kine-db-xact.prom textfile, sessions, DDL, or containers (the
+// pre-fix CLI ran the live remediation path — it could zero the
+// xact textfile, consume the last-seq-tup-read delta, terminate
+// sessions, VACUUM, roll back prepared xacts and restart pgbouncer).
 func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
+	cfg.ReadOnly = true
 	k, err := New(cfg, nil)
 	if err != nil {
 		_, _ = fmt.Fprintln(out, "check-kine-db: init:", err)

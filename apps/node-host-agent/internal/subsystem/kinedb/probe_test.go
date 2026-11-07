@@ -156,8 +156,11 @@ func TestProbeCycleAllOK(t *testing.T) {
 	// e2e goes through the pooler from inside the postgres container
 	// — in-container port 5432 on the podman network (6432 is only
 	// the published host port).
-	if !strings.Contains(j, "exec -e PGPASSWORD=secret kine-postgres psql -h kine-pgbouncer -p 5432") {
+	if !strings.Contains(j, "exec -e PGPASSWORD kine-postgres psql -h kine-pgbouncer -p 5432") {
 		t.Fatalf("e2e argv missing pooler path:\n%s", j)
+	}
+	if strings.Contains(j, "PGPASSWORD=secret") {
+		t.Fatalf("password leaked onto argv:\n%s", j)
 	}
 	// The pgbouncer log scan uses the bash's 301s window (5m plus
 	// the boundary second).

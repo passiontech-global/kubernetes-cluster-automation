@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -196,10 +195,10 @@ func (c *cyc) writeResolvConf(isHub bool, pub1 string) {
 	r, ctx, t := c.r, c.ctx, c.t
 	extra, _ := r.run(ctx, "sh", "-c",
 		`grep -E '^(search|domain|options)' /etc/resolv.conf | grep -vFx 'options timeout:2 attempts:2' || true`)
-	dst := r.hp("/etc/resolv.conf")
-	if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		_ = os.Remove(dst)
-	}
+	// The resolved-managed symlink needs no pre-remove: writeManaged's
+	// tmp+os.Rename replaces the LINK itself atomically (rename(2)
+	// never follows the final component), while a remove-then-write
+	// left /etc/resolv.conf absent — a DNS outage window every cycle.
 	var rc strings.Builder
 	if isHub {
 		fmt.Fprintf(&rc, `# Managed by hub_converge.yaml - local coredns first,

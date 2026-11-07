@@ -6,8 +6,8 @@
 package hostmetrics
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -71,36 +71,17 @@ func (c *Collector) psiAvg60() (float64, bool) {
 // updateOverloadLatch drives state-node-overloaded with hysteresis:
 // >=psiOverloadedOn enters, <psiOverloadedOff exits, between the
 // thresholds the current state persists. Written only on transition —
-// the file content is when the condition STARTED.
+// the file content is when the condition STARTED. Enter/Exit carry
+// the STATE-ENTER/STATE-EXIT lines nodereporter's NodeOverloaded
+// event rule consumes.
 func (c *Collector) updateOverloadLatch(avg60 float64) {
-	p := c.state.Path(hoststate.LatchNodeOverloaded)
-	_, err := os.Stat(p)
 	switch {
-	case avg60 >= psiOverloadedOn && err != nil:
-		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
-		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			logger().Warn("hostmetrics: node-overloaded latch write failed",
-				"path", p, "error", werr)
-		} else if rerr := os.Rename(tmp, p); rerr != nil {
-			logger().Warn("hostmetrics: node-overloaded latch install failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: node-overloaded latch set — "+
-				"PSI cpu some avg60 above threshold",
-				"avg60", avg60,
-				"enterThreshold", psiOverloadedOn, "path", p)
-		}
-	case avg60 < psiOverloadedOff && err == nil:
-		if rerr := os.Remove(p); rerr != nil {
-			logger().Warn("hostmetrics: node-overloaded latch remove failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: node-overloaded latch cleared — "+
-				"PSI cpu some avg60 back below threshold",
-				"avg60", avg60,
-				"exitThreshold", psiOverloadedOff, "path", p)
-		}
+	case avg60 >= psiOverloadedOn:
+		c.state.Enter(hoststate.LatchNodeOverloaded,
+			fmt.Sprintf("psi cpu some avg60=%.1f >= %.1f",
+				avg60, psiOverloadedOn))
+	case avg60 < psiOverloadedOff:
+		c.state.Exit(hoststate.LatchNodeOverloaded, nil)
 	}
 }
 

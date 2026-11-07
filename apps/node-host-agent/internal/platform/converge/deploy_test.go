@@ -19,19 +19,23 @@ import (
 // the joined path off the fs itself) while recording writes,
 // removes, and check runs for assertions.
 type fakeFileOps struct {
-	host     Host
-	writes   []string // host paths passed to WriteManaged
-	removes  []string // host paths passed to RemoveManaged
-	runs     [][]string
-	writeErr error // returned by every WriteManaged
-	runOut   string
-	runErr   error
+	host      Host
+	writes    []string // host paths passed to WriteManaged
+	removes   []string // host paths passed to RemoveManaged
+	runs      [][]string
+	writeErr  error            // returned by every WriteManaged
+	writeErrs map[string]error // per-path write error (wins over writeErr)
+	runOut    string
+	runErr    error
 }
 
 func (f *fakeFileOps) Join(p string) string { return f.host.Join(p) }
 
 func (f *fakeFileOps) WriteManaged(p string, c []byte, m os.FileMode) (bool, error) {
 	f.writes = append(f.writes, p)
+	if err, ok := f.writeErrs[p]; ok {
+		return false, err
+	}
 	if f.writeErr != nil {
 		return false, f.writeErr
 	}
@@ -160,6 +164,31 @@ func TestDeployStagingFailureWrapsErrManagedWrite(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("a staging failure must not report changed")
+	}
+}
+
+// A failed PROMOTE (staging write fine, live-path write fails) must
+// surface ErrManagedWrite — it used to be swallowed into a nil
+// return, so checkedDeploy read ok=true and unmask/enabled/restarted
+// api-local-lb/haproxy/nftables onto a stale or missing config.
+func TestDeployPromoteFailurePropagates(t *testing.T) {
+	o := newFakeFileOps(t)
+	o.writeErrs = map[string]error{"/etc/f": errors.New("disk full")}
+
+	changed, err := Deploy(context.Background(), o, "/etc/f", []byte("v"), 0o644)
+	if !errors.Is(err, ErrManagedWrite) {
+		t.Fatalf("err = %v, want ErrManagedWrite-wrapped", err)
+	}
+	if changed {
+		t.Fatal("a failed promote must not report changed")
+	}
+	// The candidate is swept on a promote failure too, and the live
+	// path was never reached.
+	if o.host.FileExists("/etc/f.candidate") {
+		t.Fatal("candidate not swept after promote failure")
+	}
+	if o.host.FileExists("/etc/f") {
+		t.Fatal("failed promote must not reach the live path")
 	}
 }
 

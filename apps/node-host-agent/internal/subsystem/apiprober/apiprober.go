@@ -156,7 +156,15 @@ type Config struct {
 	// /etc/api-backend-guard.conf) when GuardSrc is nil; set an
 	// explicit GuardSrc to point elsewhere or at a path that never
 	// exists to disable the overlay.
-	GuardSrc      *GuardReloader
+	GuardSrc *GuardReloader
+	// envSet records which conf-overlappable knobs env explicitly
+	// carried at ConfigFromEnv time — the documented precedence is
+	// env > guard.conf > default, so refreshGuard's live conf
+	// overlay must not shadow an env-provided field (it used to
+	// shadow it outright — precedence inversion). The zero value
+	// means "nothing env-protected", so hand-built Configs keep
+	// the old conf-wins-everything behavior.
+	envSet        guardEnvSet
 	Interval      time.Duration // probe cycle
 	Mode          string        // dry-run | enforce
 	GapMin        int64         // rv-gap wedge threshold
@@ -395,6 +403,14 @@ func caClient(caFile string) (*http.Client, string, error) {
 	return &http.Client{Transport: baseTransport(tlsCfg)}, key, nil
 }
 
+// guardEnvSet marks the conf-overlappable knobs env explicitly set
+// — refreshGuard consults it per field (env > guard.conf > default).
+type guardEnvSet struct {
+	socket, backend, companions          bool
+	mode, tokenFile, caFile              bool
+	gapMin, failCycles, frozen, recoverC bool
+}
+
 // guardEff is the per-cycle effective view of the knobs
 // api-backend-guard.conf may carry (see Config.GuardSrc) — the
 // startup-resolved Config value overlaid by the live conf.
@@ -420,21 +436,43 @@ type guardEff struct {
 // fallback → every probe qfailed → enforce-mode drain ~60s in).
 //
 // Overlay rule: a key the conf carries wins over the startup Config
-// value (the conf is the managed contract — hostconfig owns it);
-// keys absent from the conf fall through to Config. A garbage MODE
-// degrades to the non-enforce (dry-run) paths — fail-safe.
+// value (the conf is the managed contract — hostconfig owns it)
+// UNLESS env set that field — the documented chain is env >
+// guard.conf > default, so ConfigFromEnv records which knobs env
+// carried in cfg.envSet and those are never shadowed; keys absent
+// from the conf fall through to Config. A garbage MODE degrades to
+// the non-enforce (dry-run) paths — fail-safe.
 func (p *Prober) refreshGuard() {
 	var g GuardDefaults
 	if p.cfg.GuardSrc != nil {
 		g = p.cfg.GuardSrc.Get()
 	}
 	e := &p.eff
-	e.socket = firstNonEmpty(g.SocketPath, p.cfg.SocketPath)
-	e.backend = firstNonEmpty(g.BackendName, p.cfg.BackendName)
-	e.mode = firstNonEmpty(g.Mode, p.cfg.Mode)
-	e.tokenFile = firstNonEmpty(g.TokenFile, p.cfg.TokenFile)
-	e.caFile = firstNonEmpty(g.CAFile, p.cfg.CAFile)
-	if len(g.CompanionBackends) > 0 {
+	s := p.cfg.envSet
+	// env > guard.conf > default: a knob env explicitly set keeps
+	// cfg's value — the live conf overlay only reaches fields env
+	// left unset (cfg then holds the startup conf/default value,
+	// which a later conf edit may still override).
+	str := func(set bool, cfgVal, confVal string) string {
+		if set || confVal == "" {
+			return cfgVal
+		}
+		return confVal
+	}
+	num := func(set bool, cfgVal, confVal int64) int64 {
+		if set || confVal <= 0 {
+			return cfgVal
+		}
+		return confVal
+	}
+	e.socket = str(s.socket, p.cfg.SocketPath, g.SocketPath)
+	e.backend = str(s.backend, p.cfg.BackendName, g.BackendName)
+	e.mode = str(s.mode, p.cfg.Mode, g.Mode)
+	e.tokenFile = str(s.tokenFile, p.cfg.TokenFile, g.TokenFile)
+	e.caFile = str(s.caFile, p.cfg.CAFile, g.CAFile)
+	if s.companions {
+		e.companions = p.cfg.CompanionBackends
+	} else if len(g.CompanionBackends) > 0 {
 		e.companions = g.CompanionBackends
 	} else {
 		e.companions = p.cfg.CompanionBackends
@@ -445,22 +483,10 @@ func (p *Prober) refreshGuard() {
 	e.statics = dedupStatic(append(
 		append([]StaticBackend{}, g.StaticBackends...),
 		p.cfg.StaticBackends...))
-	e.gapMin = p.cfg.GapMin
-	if g.GapMin > 0 {
-		e.gapMin = g.GapMin
-	}
-	e.failCycles = p.cfg.FailCycles
-	if g.FailCycles > 0 {
-		e.failCycles = g.FailCycles
-	}
-	e.frozen = p.cfg.FrozenCycles
-	if g.FrozenCycles > 0 {
-		e.frozen = g.FrozenCycles
-	}
-	e.recoverC = p.cfg.RecoverCycles
-	if g.RecoverCycles > 0 {
-		e.recoverC = g.RecoverCycles
-	}
+	e.gapMin = num(s.gapMin, p.cfg.GapMin, g.GapMin)
+	e.failCycles = int(num(s.failCycles, int64(p.cfg.FailCycles), int64(g.FailCycles)))
+	e.frozen = int(num(s.frozen, int64(p.cfg.FrozenCycles), int64(g.FrozenCycles)))
+	e.recoverC = int(num(s.recoverC, int64(p.cfg.RecoverCycles), int64(g.RecoverCycles)))
 	p.refreshClient()
 }
 

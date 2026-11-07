@@ -553,6 +553,16 @@ func (n *NetHealth) restartTimesyncdOnClockLatch(ctx context.Context) {
 	if n.cfg.Systemd == nil {
 		return
 	}
+	// Never wake a dormant timesyncd: its unit file ships installed
+	// on every Debian/Ubuntu host, so on a chrony node restart
+	// would put a SECOND clock-discipline daemon on the box and the
+	// two fight over adjtimex (restartNTPDaemon's pick logic
+	// enforces the same installed ≠ in use rule). Enabled counts —
+	// an enabled-but-crashed unit is the node's real daemon.
+	if !n.cfg.Systemd.IsEnabled(ctx, "systemd-timesyncd.service") &&
+		!n.cfg.Systemd.IsActive(ctx, "systemd-timesyncd.service") {
+		return
+	}
 	if !n.state.RateTrySpend("last-ntp-restart", nebulaNTPRestartInterval) {
 		return
 	}

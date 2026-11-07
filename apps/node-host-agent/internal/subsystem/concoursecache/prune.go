@@ -179,10 +179,11 @@ func (p *Pruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, l
 			break
 		}
 		dsz := int64(perDir[filepath.Base(d.path)])
-		if writable {
-			makeWritable(d.path)
+		err := os.RemoveAll(d.path)
+		if writable && err != nil {
+			err = removeTree(d.path)
 		}
-		if err := os.RemoveAll(d.path); err == nil {
+		if err == nil {
 			p.bytesFreed.Add(float64(dsz))
 		} else {
 			log.Warn(bucket+": rm -rf failed — cap accounting may overshoot",
@@ -226,8 +227,7 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 				continue
 			}
 			dpath := filepath.Join(dir, e.Name())
-			makeWritable(dpath)
-			if err := os.RemoveAll(dpath); err == nil {
+			if err := removeTree(dpath); err == nil {
 				log.Info("node-deps: aged cksum dir removed", "dir", e.Name())
 			} else {
 				log.Warn("node-deps: cksum dir removal failed",
@@ -300,8 +300,7 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 				continue
 			}
 			dpath := filepath.Join(dir, e.Name())
-			makeWritable(dpath)
-			if err := os.RemoveAll(dpath); err == nil {
+			if err := removeTree(dpath); err == nil {
 				log.Info("node-deps: stale staging dir removed", "dir", e.Name())
 			} else {
 				log.Warn("node-deps: staging dir removal failed",

@@ -174,6 +174,14 @@ type Collector struct {
 	fs    fsProbeState      // collect_fs.go — hung-mount probes
 	ino   inotifyCache      // collect_inotify.go — fdinfo sweep cache
 	lpv   localpvCache      // collect_localpv.go — du walk cache
+	// kscan is the W10-KR1 kernel-log drain state — the kmsg tail
+	// session (fd) + cross-line OOM pairing. Owned by the
+	// Collector directly: the Latches wrapper is recreated per
+	// call, so a keyed side-map would pin the session (and its
+	// /dev/kmsg fd) for the process lifetime — Latches.Run closes
+	// it on exit. Only the latch ticker touches it, so it needs
+	// no mutex.
+	kscan kernelScanState
 }
 
 // New returns the Collector. Call Register to add it to the agent's
