@@ -93,12 +93,17 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			if c == nil || !condZombie(c, now) {
 				continue
 			}
+			hbAge := "never stamped"
+			if !c.LastHeartbeatTime.IsZero() {
+				hbAge = fmt.Sprintf("frozen %s",
+					now.Sub(c.LastHeartbeatTime.Time).Round(time.Second))
+			}
 			stale = append(stale, corev1.NodeCondition{
 				Type:    c.Type,
 				Status:  corev1.ConditionFalse,
 				Reason:  "StaleConditionCleared",
-				Message: fmt.Sprintf("heartbeat frozen %s — owning reporter presumed dead; cleared by %s",
-					now.Sub(c.LastHeartbeatTime.Time).Round(time.Second), CheckNameNodeCondSweeper),
+				Message: fmt.Sprintf("heartbeat %s — owning reporter presumed dead; cleared by %s",
+					hbAge, CheckNameNodeCondSweeper),
 				LastHeartbeatTime:  metav1.NewTime(now),
 				LastTransitionTime: metav1.NewTime(now),
 			})
