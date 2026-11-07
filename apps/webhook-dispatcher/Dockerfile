@@ -7,13 +7,21 @@
 # go.mod `replace ../../libs/hostkit` target resolves inside the
 # context at /src/libs/hostkit.
 FROM golang:1.27 AS build
-ARG VERSION=dev
 WORKDIR /src
+# Dep manifests first so `go mod download` is a cacheable layer that only
+# busts when go.mod/go.sum (or the hostkit replace target's go.mod) change —
+# not on every source edit. libs/hostkit is go.mod-replaced, so `go mod
+# download` only needs its go.mod, not its sources.
+COPY libs/hostkit/go.* libs/hostkit/
+COPY apps/webhook-dispatcher/go.mod apps/webhook-dispatcher/go.sum apps/webhook-dispatcher/
+WORKDIR /src/apps/webhook-dispatcher
+RUN go mod download
+# Full source only after deps are cached. ARG VERSION sits just above
+# `go build` so bumping it invalidates the link layer, not the downloads.
 COPY libs/hostkit/ libs/hostkit/
 COPY apps/webhook-dispatcher/ apps/webhook-dispatcher/
-WORKDIR /src/apps/webhook-dispatcher
-RUN go mod download && \
-    CGO_ENABLED=0 go build -trimpath \
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/webhook-dispatcher ./cmd/dispatcher
 

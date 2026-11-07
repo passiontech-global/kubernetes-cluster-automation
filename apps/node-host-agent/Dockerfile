@@ -11,13 +11,21 @@
 # context at /src/libs/hostkit. No go.work is copied, so the build
 # runs in plain module mode (the release path).
 FROM golang:1.27 AS build
-ARG VERSION=dev
 WORKDIR /src
+# Dep manifests first so `go mod download` is a cacheable layer that only
+# busts when go.mod/go.sum (or the hostkit replace target's go.mod) change —
+# not on every source edit. libs/hostkit is go.mod-replaced, so `go mod
+# download` only needs its go.mod, not its sources.
+COPY libs/hostkit/go.* libs/hostkit/
+COPY apps/node-host-agent/go.mod apps/node-host-agent/go.sum apps/node-host-agent/
+WORKDIR /src/apps/node-host-agent
+RUN go mod download
+# Full source only after deps are cached. ARG VERSION sits just above
+# `go build` so bumping it invalidates the link layer, not the downloads.
 COPY libs/hostkit/ libs/hostkit/
 COPY apps/node-host-agent/ apps/node-host-agent/
-WORKDIR /src/apps/node-host-agent
-RUN go mod download && \
-    CGO_ENABLED=0 go build -trimpath \
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-host-agent ./cmd/agent
 

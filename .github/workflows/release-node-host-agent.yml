@@ -77,7 +77,9 @@ jobs:
           # ahead). The git lookup stays only as a fallback.
           tag="${{ needs.release.outputs.rel_tag }}"
           if [ -z "$tag" ]; then
-            tag="$(git tag -l 'node-host-agent/v[0-9]*' --sort=-v:refname | head -1)"
+            # versionsort.suffix=- keeps v0.1.0 ranked above v0.1.0-rc.*
+            # (default sort would crown the prerelease "latest").
+            tag="$(git -c versionsort.suffix=- tag -l 'node-host-agent/v[0-9]*' --sort=-v:refname | head -1)"
           fi
           test -n "$tag"
           echo "REL_TAG=$tag" >>"$GITHUB_ENV"
