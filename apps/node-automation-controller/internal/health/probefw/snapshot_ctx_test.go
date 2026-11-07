@@ -174,3 +174,65 @@ func TestInvalidatePodsKeepsOtherCensuses(t *testing.T) {
 		t.Fatalf("lists nodes=%d after InvalidateSweep, want 2", nodeLists)
 	}
 }
+
+// The placement joins memoize on the snapshot like the censuses —
+// NodeZones/PodNodes each carry their own (items, err, loaded)
+// triple derived from the shared node/pod LISTs — and
+// InvalidatePods drops the pod-derived join alongside the pod
+// census while the node join survives untouched.
+func TestPlacementJoinsMemoizeAndInvalidate(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web-1"},
+			Spec:       corev1.PodSpec{NodeName: "w1"}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name:   "w1",
+			Labels: map[string]string{corev1.LabelTopologyZone: "z1"}}})
+	var podLists, nodeLists int
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			podLists++
+			return false, nil, nil
+		})
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			nodeLists++
+			return false, nil, nil
+		})
+	d := &Deps{CS: cs}
+	sweepCtx := WithSweepSnapshot(context.Background())
+
+	zones, err := d.NodeZones(sweepCtx)
+	if err != nil || zones["w1"] != "z1" {
+		t.Fatalf("NodeZones = %v, %v — want w1→z1", zones, err)
+	}
+	podNodes, err := d.PodNodes(sweepCtx)
+	if err != nil || podNodes["apps/web-1"] != "w1" {
+		t.Fatalf("PodNodes = %v, %v — want apps/web-1→w1", podNodes, err)
+	}
+	// Repeat reads serve the memoized joins — no fresh LISTs.
+	if _, err := d.NodeZones(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PodNodes(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 1 || nodeLists != 1 {
+		t.Fatalf("lists pods=%d nodes=%d, want 1 each "+
+			"(joins must build on the memoized censuses)",
+			podLists, nodeLists)
+	}
+	// A pod delete stales the pod census AND the join derived from
+	// it; the node join rides the still-valid node census.
+	d.InvalidatePods(sweepCtx)
+	if _, err := d.PodNodes(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.NodeZones(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 2 || nodeLists != 1 {
+		t.Fatalf("lists pods=%d nodes=%d after InvalidatePods, "+
+			"want pods=2 nodes=1", podLists, nodeLists)
+	}
+}

@@ -98,6 +98,19 @@ type sweepSnapshot struct {
 	namespaces    []corev1.Namespace
 	namespacesErr error
 	namespacesSet bool
+
+	// nodeZones/podNodes are the memoized placement JOINS derived
+	// from the pods/nodes censuses — several checks need the maps,
+	// not the raw lists, and rebuilding them per check meant each
+	// consumer re-walked the same census. They memoize like the
+	// censuses: the derived error is the census's own.
+	nodeZones    map[string]string
+	nodeZonesErr error
+	nodeZonesSet bool
+
+	podNodes    map[string]string
+	podNodesErr error
+	podNodesSet bool
 }
 
 // WithSweepSnapshot installs a fresh, empty snapshot on ctx — the
@@ -141,10 +154,13 @@ func (s *sweepSnapshot) listCtx(caller context.Context) (context.Context, contex
 // EndpointSlices, Services and Namespaces keep their memoized reads:
 // a pod delete changes none of them, and a blanket invalidate used
 // to make every later check pay for LISTs that could not have gone
-// stale. A no-op outside a sweep.
+// stale. The pod-derived join (PodNodes) drops WITH the census — a
+// pre-delete placement map would misplace the dead pod's endpoints
+// for every later check. A no-op outside a sweep.
 func (d *Deps) InvalidatePods(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		s.pods, s.podsErr, s.podsSet = nil, nil, false
+		s.podNodes, s.podNodesErr, s.podNodesSet = nil, nil, false
 	}
 }
 
@@ -275,4 +291,56 @@ func (d *Deps) PodsMatching(ctx context.Context, ns, selector string) ([]*corev1
 		}
 	}
 	return out, nil
+}
+
+// NodeZones is the memoized node → topology-zone join the
+// zone-aware checks used to each rebuild inline from AllNodes —
+// the stateful site-skew signatures place endpoints and STS
+// replicas through it, the zone-starvation check derives its
+// worker-zone set on top. A zoneless node maps to "" — value-
+// identical to a missing key for every consumer (they read the
+// zone, never test presence). Built on the shared node census:
+// the first caller pays that LIST, the error memoizes with the
+// join exactly like the census errors do. The map is read-only —
+// the serial sweep shares it across checks.
+func (d *Deps) NodeZones(ctx context.Context) (map[string]string, error) {
+	s := sweepSnap(ctx)
+	if !s.nodeZonesSet {
+		s.nodeZonesSet = true
+		var nodes []corev1.Node
+		nodes, s.nodeZonesErr = d.AllNodes(ctx)
+		if s.nodeZonesErr == nil {
+			s.nodeZones = make(map[string]string, len(nodes))
+			for i := range nodes {
+				s.nodeZones[nodes[i].Name] =
+					nodes[i].Labels[corev1.LabelTopologyZone]
+			}
+		}
+	}
+	return s.nodeZones, s.nodeZonesErr
+}
+
+// PodNodes is the pod twin: "ns/name" → spec.nodeName over the
+// shared pod census — the placement join the endpoint zone
+// resolvers walk as their last fallback (a slice's own zone and
+// nodeName hints can lag a rebinding; the pod's bound node is the
+// ground truth) and the targetRef → node hop the skew checks make.
+// Same memoized-error posture as NodeZones, and pod-derived — a
+// mid-sweep pod delete stales it, so InvalidatePods drops it
+// alongside the census. Read-only like every snapshot payload.
+func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
+	s := sweepSnap(ctx)
+	if !s.podNodesSet {
+		s.podNodesSet = true
+		var pods []corev1.Pod
+		pods, s.podNodesErr = d.AllPods(ctx)
+		if s.podNodesErr == nil {
+			s.podNodes = make(map[string]string, len(pods))
+			for i := range pods {
+				s.podNodes[pods[i].Namespace+"/"+pods[i].Name] =
+					pods[i].Spec.NodeName
+			}
+		}
+	}
+	return s.podNodes, s.podNodesErr
 }
