@@ -1,4 +1,5 @@
-// kine_self_healing.go — Wave 8 kine-DB self-healing:
+// selfheal.go — the probe-cadence half of the Wave-8 kine-DB
+// self-healing block (was kine_self_healing.go):
 //
 //  1. Session reaper — every probe round terminates stuck kine
 //     sessions (idle-in-transaction >5m, non-maintenance active
@@ -15,11 +16,10 @@
 //     pool holds server conns means stalled half-open conns →
 //     `RECONNECT` on the admin console (restart fallback),
 //     2 consecutive probes, same 15m budget.
-//  3. pg_repack headroom gate — a repack shadows the heap plus WAL
-//     churn, so it only runs when the data filesystem's free space
-//     covers 2.5*(heap+wal); otherwise the cycle falls back to a
-//     VACUUM (ANALYZE) and warns.
-package kinedb
+//
+// (Item 3 of the old file — the pg_repack headroom gate — moved
+// with the maint loop it gates to maint/freeze.go.)
+package probe
 
 import (
 	"context"
@@ -29,15 +29,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
 const (
 	// pgbWedgeRestartBudget — the last-pgb-restart cooldown file
 	// under GuardStateDir (15m between pooler restarts).
 	pgbWedgeRestartBudget = 15 * time.Minute
-	// repackHeadroomFactor — free space must cover this multiple of
-	// (heap + WAL) before pg_repack may run.
-	repackHeadroomFactor = 2.5
 	// pgbE2EFailFile counts consecutive e2e-auth failures under
 	// GuardStateDir (cross-restart persistence).
 	pgbE2EFailFile = "e2e-auth-fails"
@@ -49,14 +48,13 @@ const (
 	pgbMaxWaitStarveSecs = 10
 	// pgbStarveCycles — consecutive starved probes before the
 	// RECONNECT fires (same "two probes" convention as e2e-auth).
-	pgbStarveCycles  = 2
-	pgbRestartFile   = "last-pgb-restart"
-	defaultPGDataDir = "/var/lib/postgresql/data"
+	pgbStarveCycles = 2
+	pgbRestartFile  = "last-pgb-restart"
 )
 
 // reapStuckSessions terminates stuck kine sessions — W8-CP2 item 1.
 // The kine TABLE lives inside the database named 'postgres' (the
-// psqlArgs -d postgres contract), so datname='kine' alone matched
+// PsqlArgs -d postgres contract), so datname='kine' alone matched
 // nothing: the IN list covers both the real backend database and
 // stacks that did create a dedicated kine database. Best-effort: a
 // failed query only notes, never fails the probe.
@@ -70,22 +68,22 @@ const stuckSessionPredicate = "WHERE datname IN ('postgres', 'kine') " +
 	"AND query NOT ILIKE '%VACUUM%' AND query NOT ILIKE '%REINDEX%' " +
 	"AND query NOT ILIKE '%pg_repack%'))"
 
-func (k *KineDB) reapStuckSessions(ctx context.Context, pg, user, pass string,
+func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	note func(string)) {
-	if k.cfg.ReadOnly {
+	if p.d.Cfg.ReadOnly {
 		// COUNT what the reaper WOULD kill — diagnostics only.
-		out, err := k.psqlQuery(ctx, pg, user, pass,
+		out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 			"SELECT COUNT(pid) FROM pg_stat_activity "+stuckSessionPredicate)
 		if err != nil {
 			note(fmt.Sprintf("reap-sessions-fail: %v", err))
 			return
 		}
-		if n := strings.TrimSpace(firstLine(out)); n != "0" {
+		if n := strings.TrimSpace(kdeps.FirstLine(out)); n != "0" {
 			note(fmt.Sprintf("read-only: %s stuck kine session(s) would be reaped", n))
 		}
 		return
 	}
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
 			stuckSessionPredicate)
 	if err != nil {
@@ -94,8 +92,8 @@ func (k *KineDB) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	}
 	// -tA returns one 't' per terminated backend.
 	if n := strings.Count(out, "t\n") + boolToInt(strings.TrimSpace(out) == "t"); n > 0 {
-		k.m.idleTxTerm.Add(float64(n))
-		k.m.idleTermTotal += int64(n) // textfile mirror of the counter
+		p.d.M.IdleTxTerm.Add(float64(n))
+		p.d.M.IdleTermTotal += int64(n) // textfile mirror of the counter
 		note(fmt.Sprintf("reaped %d stuck kine session(s)", n))
 		logger().Warn("kinedb: terminated stuck kine sessions", "count", n)
 	}
@@ -114,9 +112,9 @@ func boolToInt(b bool) int {
 // conns: far fewer active queries than server conns means the conns
 // sit in a stalled half-open state (sv_login/sv_tested wedge), not
 // real backend load — a RECONNECT flushes them, not a backend fix.
-func (k *KineDB) activeBackendQueries(ctx context.Context, pg, user, pass string,
+func (p *Probe) activeBackendQueries(ctx context.Context, pg, user, pass string,
 	note func(string)) (int64, bool) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COUNT(pid) FROM pg_stat_activity "+
 			"WHERE datname IN ('postgres', 'kine') AND state = 'active' "+
 			"AND pid <> pg_backend_pid()")
@@ -124,7 +122,7 @@ func (k *KineDB) activeBackendQueries(ctx context.Context, pg, user, pass string
 		note(fmt.Sprintf("active-queries-fail: %v", err))
 		return 0, false
 	}
-	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("active-queries-unparsed: %v", perr))
 		return 0, false
@@ -149,17 +147,17 @@ func (k *KineDB) activeBackendQueries(ctx context.Context, pg, user, pass string
 //
 // All three share the last-pgb-restart budget (15m) so the paths
 // cannot double-fire inside one cooldown window.
-func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
-	res *probeResult, note func(string)) {
-	dir := k.cfg.GuardStateDir
+func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
+	res *Result, note func(string)) {
+	dir := p.d.Cfg.GuardStateDir
 	failPath := filepath.Join(dir, pgbE2EFailFile)
 
-	saturated := res.poolSeen && res.pool.clWaiting > k.cfg.WaitMax
+	saturated := res.poolSeen && res.pool.clWaiting > p.d.Cfg.WaitMax
 	// e2e failed AND the raw backend env login still succeeded —
 	// backend_env==0 means postgres itself is broken and a pooler
 	// restart can't help.
-	authWedge := res.checks[checkE2EAuth] == 0 &&
-		res.checks[checkBackendEnv] == 1
+	authWedge := res.Checks[CheckE2EAuth] == 0 &&
+		res.Checks[CheckBackendEnv] == 1
 
 	// W12-CP1: server-pool starvation evaluation. The backend-env
 	// gate is required like the auth wedge's — a broken postgres
@@ -169,23 +167,23 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// resets the streak, never evidence). Evaluated before the
 	// state files below so the ReadOnly path reports it too.
 	starved := false
-	if res.poolSeen && res.checks[checkBackendEnv] == 1 &&
+	if res.poolSeen && res.Checks[CheckBackendEnv] == 1 &&
 		res.pool.serverConns > 0 &&
 		(res.pool.maxWaitSec > pgbMaxWaitStarveSecs ||
 			(res.pool.clWaiting > 0 && res.pool.svActive == 0)) {
-		if n, ok := k.activeBackendQueries(ctx, pg, user, pass, note); ok {
+		if n, ok := p.activeBackendQueries(ctx, pg, user, pass, note); ok {
 			starved = n < res.pool.serverConns
 		}
 	}
 
-	if k.cfg.ReadOnly {
+	if p.d.Cfg.ReadOnly {
 		// Diagnostics only — the streak files, the 15m budget
 		// spend, RECONNECT and the container restart all stay
 		// untouched.
 		switch {
 		case saturated:
 			note(fmt.Sprintf("read-only: pgbouncer saturated cl_waiting=%d>%d — restart suppressed",
-				res.pool.clWaiting, k.cfg.WaitMax))
+				res.pool.clWaiting, p.d.Cfg.WaitMax))
 		case starved:
 			note(fmt.Sprintf("read-only: pgbouncer server-pool starvation (maxwait=%ds cl_waiting=%d sv_active=%d sv=%d) — RECONNECT suppressed",
 				res.pool.maxWaitSec, res.pool.clWaiting, res.pool.svActive,
@@ -198,20 +196,20 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 
 	fails := 0
 	if authWedge {
-		prev, _ := readIntFile(failPath)
+		prev, _ := kdeps.ReadIntFile(failPath)
 		fails = int(prev) + 1
-		writeIntFile(failPath, int64(fails))
+		kdeps.WriteIntFile(failPath, int64(fails))
 	} else {
-		writeIntFile(failPath, 0)
+		kdeps.WriteIntFile(failPath, 0)
 	}
 	starvePath := filepath.Join(dir, pgbStarveFile)
 	streaks := 0
 	if starved {
-		prev, _ := readIntFile(starvePath)
+		prev, _ := kdeps.ReadIntFile(starvePath)
 		streaks = int(prev) + 1
-		writeIntFile(starvePath, int64(streaks))
+		kdeps.WriteIntFile(starvePath, int64(streaks))
 	} else {
-		writeIntFile(starvePath, 0)
+		kdeps.WriteIntFile(starvePath, 0)
 	}
 
 	fires := 2 // e2e_auth + starvation must persist two consecutive probes
@@ -222,7 +220,7 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// last-pgb-restart is a last-* rate budget — the shared
 	// hoststate rateOK/rateSpend parity (absent/garbage/expired
 	// → ok; the spend lands on the remediation ATTEMPT).
-	if !k.state.RateOK(pgbRestartFile, pgbWedgeRestartBudget) {
+	if !p.d.State.RateOK(pgbRestartFile, pgbWedgeRestartBudget) {
 		note(fmt.Sprintf("pgb-wedge but in restart cooldown (<15m) cl_waiting=%d e2e_fails=%d starve_streak=%d",
 			res.pool.clWaiting, fails, streaks))
 		return
@@ -230,7 +228,7 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	reason := fmt.Sprintf("auth wedge (e2e fail %dx, backend_env ok)", fails)
 	switch {
 	case saturated:
-		reason = fmt.Sprintf("cl_waiting=%d>%d", res.pool.clWaiting, k.cfg.WaitMax)
+		reason = fmt.Sprintf("cl_waiting=%d>%d", res.pool.clWaiting, p.d.Cfg.WaitMax)
 	case starveFire:
 		reason = fmt.Sprintf("server-pool starvation (maxwait=%ds cl_waiting=%d sv_active=%d sv=%d, streak=%d)",
 			res.pool.maxWaitSec, res.pool.clWaiting, res.pool.svActive,
@@ -239,10 +237,10 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	note(fmt.Sprintf("pgbouncer wedge: %s — remediating %s", reason, pgb))
 	logger().Warn("kinedb: pgbouncer wedge — remediating pooler",
 		"reason", reason, "container", pgb)
-	// writeIntFile's lazy MkdirAll — Store.WriteEpochFile does
+	// WriteIntFile's lazy MkdirAll — Store.WriteEpochFile does
 	// not create the state dir itself.
 	_ = os.MkdirAll(dir, 0o755)
-	k.state.RateSpend(pgbRestartFile)
+	p.d.State.RateSpend(pgbRestartFile)
 
 	// A starvation-only wedge gets RECONNECT first: it closes and
 	// reopens every backend conn — the half-open conns are the
@@ -250,65 +248,20 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// restart` would kill. Saturation/auth wedges skip it: a queue
 	// past WaitMax or a broken auth path wants the full bounce.
 	if starveFire && !saturated && fails < fires {
-		if _, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+		if _, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
 			"-e", "PGPASSWORD", pg,
-			"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
+			"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 			"-U", user, "-d", pgbAdminDB, "-Aqc", "RECONNECT"}, ""); err == nil {
-			k.m.cycles.WithLabelValues("probe", "pgb_reconnect").Inc()
+			p.d.M.Cycles.WithLabelValues("probe", "pgb_reconnect").Inc()
 			return
 		} else {
 			note(fmt.Sprintf("pgb-reconnect-fail: %v — falling back to restart", err))
 		}
 	}
-	if _, err := k.exec(ctx,
-		[]string{k.cfg.Runtime, "restart", pgb}, ""); err != nil {
+	if _, err := p.d.Exec(ctx,
+		[]string{p.d.Cfg.Runtime, "restart", pgb}, ""); err != nil {
 		note(fmt.Sprintf("pgb-restart-fail: %v", err))
 		return
 	}
-	k.m.cycles.WithLabelValues("probe", "pgb_restart").Inc()
-}
-
-// repackHeadroom checks whether the postgres data filesystem has
-// >= 2.5*(heap+wal) free before pg_repack — W8-CP2 item 3. walBytes
-// comes from pg_ls_waldir; free bytes from `df -B1 <datadir>` inside
-// the container. Returns ok=false (and a note) when the check itself
-// can't run — inconclusive means DON'T repack, same as assess-fail.
-func (k *KineDB) repackHeadroom(ctx context.Context, pg, user, pass string,
-	heapBytes int64, note func(string)) (free, wal int64, ok bool) {
-	dataDir := k.cfg.PGDataDir
-	if dataDir == "" {
-		dataDir = defaultPGDataDir
-	}
-	out, err := k.psqlQuery(ctx, pg, user, pass,
-		"SELECT COALESCE((SELECT SUM(size) FROM pg_ls_waldir()),0)")
-	if err != nil {
-		note(fmt.Sprintf("wal-size-fail: %v", err))
-		return 0, 0, false
-	}
-	wal, err = strconv.ParseInt(firstLine(out), 10, 64)
-	if err != nil {
-		note(fmt.Sprintf("wal-size-unparsed: %v", err))
-		return 0, 0, false
-	}
-	df, err := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
-		"df", "-B1", "--output=avail", dataDir}, "")
-	if err != nil {
-		note(fmt.Sprintf("df-fail: %v", err))
-		return 0, 0, false
-	}
-	// df --output=avail prints a header line then the number.
-	var lastLine string
-	for _, l := range strings.Split(strings.TrimSpace(df), "\n") {
-		lastLine = strings.TrimSpace(l)
-	}
-	free, err = strconv.ParseInt(lastLine, 10, 64)
-	if err != nil {
-		note(fmt.Sprintf("df-unparsed: %v", err))
-		return 0, 0, false
-	}
-	need := int64(repackHeadroomFactor * float64(heapBytes+wal))
-	if free < need {
-		return free, wal, false
-	}
-	return free, wal, true
+	p.d.M.Cycles.WithLabelValues("probe", "pgb_restart").Inc()
 }

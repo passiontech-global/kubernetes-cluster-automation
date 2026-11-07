@@ -1,4 +1,4 @@
-package kinedb
+package probe
 
 import (
 	"context"
@@ -8,14 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// hygieneRules is probeOKRules plus canned replies for the
+// hygieneRules is kdepstest.ProbeOKRules plus canned replies for the
 // kine-pg-hygiene + WAL archive guard queries — 2 idle-in-tx
 // sessions, a quiet dead-tuple ratio, healthy XID age, 1GiB WAL on
 // a 100GiB filesystem, clean archiver and no inactive slots.
-var hygieneRules = append(append([]testutil.ExecRule{}, probeOKRules...),
+var hygieneRules = append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules...),
 	testutil.ExecRule{Substr: "pg_terminate_backend", Out: "t\nt\n"},
 	testutil.ExecRule{Substr: "COUNT(pid)", Out: "2\n"},
 	testutil.ExecRule{Substr: "n_dead_tup, n_live_tup", Out: "100|1000\n"},
@@ -28,7 +30,7 @@ var hygieneRules = append(append([]testutil.ExecRule{}, probeOKRules...),
 
 func TestProbeCycleHygieneEmitsAllSeries(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
@@ -57,7 +59,7 @@ func TestProbeCycleHygieneEmitsAllSeries(t *testing.T) {
 	if h.slotRetained != 0 || !h.slotSeen || h.slotsDropped != 0 {
 		t.Fatalf("slots=%+v", h)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, want := range []string{
 		"kine_db_idle_in_tx_sessions 2",
 		"node_agent_kine_pg_idle_in_tx_sessions 2",
@@ -84,18 +86,18 @@ func TestProbeCycleHygieneEmitsAllSeries(t *testing.T) {
 // A failed hygiene query gates only its own series — the probe
 // still succeeds and the unaffected series still emit.
 func TestProbeHygieneDegradesOnQueryFailure(t *testing.T) {
-	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, probeOKRules...),
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules...),
 		testutil.ExecRule{Substr: "pg_ls_waldir", Err: errors.New("connection reset")},
 		testutil.ExecRule{Substr: "pg_stat_archiver", Err: errors.New("connection reset")},
 	))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
 	if res.hyg.walSeen || res.hyg.walDiskSeen || res.hyg.archiveSeen {
 		t.Fatalf("failed reads must stay unseen: %+v", res.hyg)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, absent := range []string{
 		"kine_db_wal_bytes", "kine_db_wal_disk_ratio", "kine_db_wal_archive_stale",
 	} {
@@ -112,7 +114,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 		testutil.ExecRule{Substr: "ON_ERROR_STOP", Out: "VACUUM\n"},
 	))
 	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.hyg.vacuumFired {
 		t.Fatalf("vacuum did not fire: notes=%v", res.notes)
 	}
@@ -121,20 +123,20 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 		"pg_try_advisory_lock(20260921)",
 		`VACUUM (ANALYZE) "kine";`,
 		"pg_advisory_unlock(20260921)",
-		lockBusyMarker,
+		kdeps.LockBusyMarker,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("vacuum script missing %q:\n%s", want, script)
 		}
 	}
 	// The cooldown budget file landed under GuardStateDir.
-	if _, err := os.Stat(filepath.Join(k.cfg.GuardStateDir, deadTupleVacuumFile)); err != nil {
+	if _, err := os.Stat(filepath.Join(k.d.Cfg.GuardStateDir, deadTupleVacuumFile)); err != nil {
 		t.Fatalf("cooldown file missing: %v", err)
 	}
 
 	// Second round inside the 30m budget → no script session at all.
 	fr.ClearLog()
-	res = k.probeCycle(context.Background())
+	res = k.Cycle(context.Background())
 	if res.hyg.vacuumFired {
 		t.Fatal("vacuum fired inside the cooldown window")
 	}
@@ -148,8 +150,8 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 func TestDeadTupleVacuumLockBusy(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
 	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
-	fr.On("ON_ERROR_STOP", lockBusyMarker+"\n")
-	res := k.probeCycle(context.Background())
+	fr.On("ON_ERROR_STOP", kdeps.LockBusyMarker+"\n")
+	res := k.Cycle(context.Background())
 	if res.hyg.vacuumFired {
 		t.Fatal("vacuum reported fired while the lock was busy")
 	}
@@ -166,7 +168,7 @@ func TestDeadTupleVacuumLockBusy(t *testing.T) {
 
 func TestDeadTupleVacuumSkippedBelowThreshold(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules) // ratio 0.1 — quiet
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.hyg.vacuumFired {
 		t.Fatal("vacuum fired below threshold")
 	}
@@ -190,7 +192,7 @@ func TestParseSlotRows(t *testing.T) {
 func TestInactiveSlotDropAndWarn(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	fr.On("pg_replication_slots", "slot-old|16106127360\nslot-warn|7516192768\n")
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	h := res.hyg
 	if !h.slotSeen || h.slotsDropped != 1 {
 		t.Fatalf("slots=%+v notes=%v", h, res.notes)
@@ -205,7 +207,7 @@ func TestInactiveSlotDropAndWarn(t *testing.T) {
 	if strings.Contains(j, "pg_drop_replication_slot('slot-warn')") {
 		t.Fatalf("warn-level slot was dropped:\n%s", j)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, "kine_db_inactive_slot_retained_bytes 23622320128") {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -214,64 +216,9 @@ func TestInactiveSlotDropAndWarn(t *testing.T) {
 func TestProbeArchiveStaleEmitsOne(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	fr.On("pg_stat_archiver", "1\n")
-	k.probeCycle(context.Background())
-	content := readText(t, dir, "kine-db.prom")
+	k.Cycle(context.Background())
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, "kine_db_wal_archive_stale 1") {
-		t.Fatalf("textfile:\n%s", content)
-	}
-}
-
-// maintXIDRules — below the repack gate so the cycle stays quiet
-// except the freeze decision under test.
-var maintXIDRules = []testutil.ExecRule{
-	{Substr: "inspect", Out: "true"},
-	{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
-	{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
-	{Substr: "datfrozenxid", Out: "1000000\n"},
-}
-
-func TestMaintCycleXIDFreezeFires(t *testing.T) {
-	k, fr, dir := fixture(t, maintXIDRules)
-	fr.On("datfrozenxid", "200000000\n")
-	res := k.maintCycle(context.Background())
-	if !res.xidSeen || res.freezeState != "done" || !res.okFreeze {
-		t.Fatalf("res=%+v", res)
-	}
-	if !strings.Contains(fr.Joined(), `VACUUM (FREEZE, ANALYZE) "kine"`) {
-		t.Fatalf("freeze vacuum did not run:\n%s", fr.Joined())
-	}
-	content := readText(t, dir, "kine-db-maint.prom")
-	if !strings.Contains(content, `kine_db_maint_ok{check="vacuum_freeze"} 1`) {
-		t.Fatalf("textfile:\n%s", content)
-	}
-}
-
-func TestMaintCycleXIDFreezeSkipped(t *testing.T) {
-	k, fr, dir := fixture(t, maintXIDRules)
-	res := k.maintCycle(context.Background())
-	if res.freezeState != "skipped" || !res.okFreeze {
-		t.Fatalf("res=%+v", res)
-	}
-	if strings.Contains(fr.Joined(), "FREEZE") {
-		t.Fatalf("freeze vacuum ran below threshold:\n%s", fr.Joined())
-	}
-	content := readText(t, dir, "kine-db-maint.prom")
-	if !strings.Contains(content, `kine_db_maint_ok{check="vacuum_freeze"} 1`) {
-		t.Fatalf("skipped freeze must still read ok:\n%s", content)
-	}
-}
-
-func TestMaintCycleXIDFreezeFailure(t *testing.T) {
-	k, fr, dir := fixture(t, append(append([]testutil.ExecRule{}, maintXIDRules...),
-		testutil.ExecRule{Substr: "FREEZE", Err: errors.New("lock timeout")},
-	))
-	fr.On("datfrozenxid", "200000000\n")
-	res := k.maintCycle(context.Background())
-	if res.okFreeze || res.freezeState != "fail" {
-		t.Fatalf("res=%+v", res)
-	}
-	content := readText(t, dir, "kine-db-maint.prom")
-	if !strings.Contains(content, `kine_db_maint_ok{check="vacuum_freeze"} 0`) {
 		t.Fatalf("textfile:\n%s", content)
 	}
 }
@@ -282,14 +229,14 @@ func TestProbeHygieneMultiXactEmits(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "datminmxid", Out: "250000\n"},
 	))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
 	if res.hyg.mxidAge != 250000 || !res.hyg.mxidSeen {
 		t.Fatalf("mxid=%+v", res.hyg)
 	}
-	content := readText(t, dir, xactPromFile)
+	content := kdepstest.ReadText(t, dir, xactPromFile)
 	if !strings.Contains(content, "kine_db_multixact_age_transactions 250000") {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -301,14 +248,14 @@ func TestProbeHygieneMultiXactQueryFailure(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "datminmxid", Err: errors.New("connection reset")},
 	))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
 	if res.hyg.mxidSeen {
 		t.Fatal("failed mxid read must stay unseen")
 	}
-	content := readText(t, dir, xactPromFile)
+	content := kdepstest.ReadText(t, dir, xactPromFile)
 	if !strings.Contains(content, "# TYPE kine_db_multixact_age_transactions") {
 		t.Fatalf("header missing:\n%s", content)
 	}
@@ -328,7 +275,7 @@ func TestOrphanPreparedXactsRolledBack(t *testing.T) {
 	fr.On("pg_prepared_xacts", "gid-orphan-1\ngid'quo\n")
 	fr.On("ROLLBACK PREPARED", "ROLLBACK PREPARED\n")
 	before := preparedXactRolledBackTotal.Load()
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	h := res.hyg
 	if !h.preparedSeen || h.preparedXacts != 2 || h.preparedRolled != 2 {
 		t.Fatalf("prepared=%+v notes=%v", h, res.notes)
@@ -345,7 +292,7 @@ func TestOrphanPreparedXactsRolledBack(t *testing.T) {
 	if got := preparedXactRolledBackTotal.Load() - before; got != 2 {
 		t.Fatalf("rolled-back total delta=%d want 2", got)
 	}
-	content := readText(t, dir, xactPromFile)
+	content := kdepstest.ReadText(t, dir, xactPromFile)
 	for _, want := range []string{
 		"kine_db_orphan_prepared_xacts 2",
 		"kine_db_orphan_prepared_xacts_rolled_back_total ",
@@ -363,7 +310,7 @@ func TestOrphanPreparedXactsPartialFailure(t *testing.T) {
 	fr.On("pg_prepared_xacts", "gid-bad\ngid-good\n")
 	fr.On("ROLLBACK PREPARED 'gid-good'", "ROLLBACK PREPARED\n")
 	fr.FailOn("ROLLBACK PREPARED 'gid-bad'", errors.New("already aborted"))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	h := res.hyg
 	if !h.preparedSeen || h.preparedXacts != 2 || h.preparedRolled != 1 {
 		t.Fatalf("prepared=%+v notes=%v", h, res.notes)
@@ -383,7 +330,7 @@ func TestOrphanPreparedXactsPartialFailure(t *testing.T) {
 // runs a rollback.
 func TestNoOrphanPreparedXacts(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules) // pg_prepared_xacts unmatched → ""
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	h := res.hyg
 	if !h.preparedSeen || h.preparedXacts != 0 || h.preparedRolled != 0 {
 		t.Fatalf("prepared=%+v", h)
@@ -391,7 +338,7 @@ func TestNoOrphanPreparedXacts(t *testing.T) {
 	if strings.Contains(fr.Joined(), "ROLLBACK PREPARED") {
 		t.Fatalf("rollback ran with no orphans:\n%s", fr.Joined())
 	}
-	content := readText(t, dir, xactPromFile)
+	content := kdepstest.ReadText(t, dir, xactPromFile)
 	if !strings.Contains(content, "kine_db_orphan_prepared_xacts 0") {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -402,14 +349,14 @@ func TestNoOrphanPreparedXacts(t *testing.T) {
 func TestProbeInvalidIndexCensusEmits(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "indisvalid", Out: "2\n"}))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
 	if res.hyg.invalidIdx != 2 || !res.hyg.invalidSeen {
 		t.Fatalf("invalid=%+v", res.hyg)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, "kine_db_invalid_indexes 2") {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -421,7 +368,7 @@ func TestProbeInvalidIndexCensusEmits(t *testing.T) {
 func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	fr.On("seq_tup_read", "120|100000\n")
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
@@ -431,7 +378,7 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 	if res.hyg.analyzeFired {
 		t.Fatal("ANALYZE fired on the baseline read")
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, want := range []string{
 		"kine_db_seq_scans_total 120",
 		"kine_db_seq_tuples_read_total 100000",
@@ -446,21 +393,21 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 	// Second probe: +600K tuples read via seq scan → the planner
 	// regressed; ANALYZE runs immediately, budgeted.
 	fr.On("seq_tup_read", "180|700000\n")
-	res = k.probeCycle(context.Background())
+	res = k.Cycle(context.Background())
 	if !res.hyg.analyzeFired {
 		t.Fatalf("ANALYZE did not fire on a 600K delta: %v", res.notes)
 	}
 	if !strings.Contains(fr.Joined(), `ANALYZE "kine"`) {
 		t.Fatalf("ANALYZE missing from command log:\n%s", fr.Joined())
 	}
-	if _, err := os.Stat(filepath.Join(k.cfg.GuardStateDir, kineAnalyzeFile)); err != nil {
+	if _, err := os.Stat(filepath.Join(k.d.Cfg.GuardStateDir, kineAnalyzeFile)); err != nil {
 		t.Fatalf("analyze budget file missing: %v", err)
 	}
 
 	// Third probe still spikes but inside the 30m budget → cooldown.
 	fr.ClearLog()
 	fr.On("seq_tup_read", "200|1400000\n")
-	res = k.probeCycle(context.Background())
+	res = k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatal("ANALYZE re-fired inside the 30m budget")
 	}
@@ -473,12 +420,12 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 func TestProbeSeqScanBelowDeltaNoAnalyze(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
 	fr.On("seq_tup_read", "50|400000\n")
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatal("ANALYZE fired on the baseline read")
 	}
 	fr.On("seq_tup_read", "55|890000\n") // +490K — under the trip line
-	res = k.probeCycle(context.Background())
+	res = k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatalf("ANALYZE fired under the delta gate: %v", res.notes)
 	}
@@ -493,14 +440,14 @@ func TestProbeSeqScanDegradesOnQueryFailure(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "seq_tup_read", Err: errors.New("connection reset")},
 		testutil.ExecRule{Substr: "indisvalid", Err: errors.New("connection reset")}))
-	res := k.probeCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
 	if res.hyg.seqSeen || res.hyg.invalidSeen {
 		t.Fatalf("failed reads must stay unseen: %+v", res.hyg)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, absent := range []string{
 		"kine_db_invalid_indexes",
 		"kine_db_seq_scans_total",

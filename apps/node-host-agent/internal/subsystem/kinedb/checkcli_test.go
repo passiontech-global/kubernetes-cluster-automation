@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -26,13 +27,13 @@ func cliConfig(t *testing.T, rules []testutil.ExecRule) (Config, *testutil.FakeE
 	return Config{
 		EnvFile: envFile,
 		Runtime: "podman",
-		run:     fr.RunStdin,
-		wireFn:  func(context.Context, string) bool { return true },
+		Run:     fr.RunStdin,
+		WireFn:  func(context.Context, string) bool { return true },
 	}, fr
 }
 
 func TestRunCheckCLIAllOK(t *testing.T) {
-	cfg, _ := cliConfig(t, probeOKRules)
+	cfg, _ := cliConfig(t, kdepstest.ProbeOKRules)
 	var out bytes.Buffer
 	code := RunCheckCLI(context.Background(), cfg, &out)
 	if code != 0 {
@@ -70,7 +71,7 @@ func TestRunCheckCLIFailures(t *testing.T) {
 		{Substr: "MAX(id)", Out: "1000|200|290\n"},
 		{Substr: "select 1", Out: "1\n"},
 	})
-	cfg.wireFn = func(context.Context, string) bool { return false }
+	cfg.WireFn = func(context.Context, string) bool { return false }
 	var out bytes.Buffer
 	code := RunCheckCLI(context.Background(), cfg, &out)
 	if code != 1 {

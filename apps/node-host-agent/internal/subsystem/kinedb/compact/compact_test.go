@@ -1,4 +1,4 @@
-package kinedb
+package compact
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -48,13 +50,13 @@ func TestGuardFreezeCounter(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "MAX(id)", Out: "300|50|1000\n"},
 	})
-	dir := k.cfg.GuardStateDir
+	dir := k.d.Cfg.GuardStateDir
 	// Previous run: head 100, compact_rev 50, 3 frozen cycles.
-	writeIntFile(filepath.Join(dir, guardFileLastHead), 100)
-	writeIntFile(filepath.Join(dir, guardFileLastCompactRev), 50)
-	writeIntFile(filepath.Join(dir, guardFileFreeze), 3)
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileLastHead), 100)
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileLastCompactRev), 50)
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileFreeze), 3)
 
-	res := k.guardCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.frozen != 4 {
 		t.Fatalf("frozen=%d want 4", res.frozen)
 	}
@@ -65,11 +67,11 @@ func TestGuardFreezeCounter(t *testing.T) {
 	}
 
 	// compact_rev moved → counter resets.
-	k.cfg.run = testutil.NewFakeExec(
+	k.d.Cfg.Run = testutil.NewFakeExec(
 		testutil.ExecRule{Substr: "inspect", Out: "true"},
 		testutil.ExecRule{Substr: "MAX(id)", Out: "400|300|1000\n"},
 	).RunStdin
-	res = k.guardCycle(context.Background())
+	res = k.Cycle(context.Background())
 	if res.frozen != 0 {
 		t.Fatalf("frozen=%d want 0 after compact_rev advanced", res.frozen)
 	}
@@ -90,7 +92,7 @@ func TestBuildCompactScript(t *testing.T) {
 		"kd.deleted != 0",
 		`VACUUM (ANALYZE) "kine";`,
 		"pg_advisory_unlock(20260921)",
-		lockBusyMarker,
+		kdeps.LockBusyMarker,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("script missing %q:\n%s", want, s)
@@ -124,7 +126,7 @@ func TestGuardCycleFiresAndLocks(t *testing.T) {
 		guardAfterRule,
 		guardStatsRule,
 	})
-	res := k.guardCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.ok || !res.fired {
 		t.Fatalf("res=%+v", res)
 	}
@@ -149,11 +151,11 @@ func TestGuardCycleFiresAndLocks(t *testing.T) {
 		t.Fatalf("after=%+v", res)
 	}
 	// last compact timestamp persisted.
-	ts, err := readIntFile(filepath.Join(k.cfg.GuardStateDir, guardFileCompactTS))
-	if err != nil || ts != testNow {
+	ts, err := kdeps.ReadIntFile(filepath.Join(k.d.Cfg.GuardStateDir, guardFileCompactTS))
+	if err != nil || ts != kdepstest.TestNow {
 		t.Fatalf("compact ts=%d err=%v", ts, err)
 	}
-	content := readText(t, dir, "kine-compact-guard.prom")
+	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
 	for _, want := range []string{
 		"kine_db_guard_ok 1",
 		"kine_db_guard_fired 1",
@@ -177,10 +179,10 @@ func TestGuardCycleFiresAndLocks(t *testing.T) {
 func TestGuardCycleLockBusy(t *testing.T) {
 	k, _, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect", Out: "true"},
-		{Substr: "ON_ERROR_STOP", Out: lockBusyMarker + "\n"},
+		{Substr: "ON_ERROR_STOP", Out: kdeps.LockBusyMarker + "\n"},
 		guardStatsRule,
 	})
-	res := k.guardCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.ok {
 		t.Fatalf("lock-busy should stay ok: %+v", res)
 	}
@@ -190,7 +192,7 @@ func TestGuardCycleLockBusy(t *testing.T) {
 	if res.deleted != 0 {
 		t.Fatalf("deleted=%d", res.deleted)
 	}
-	if _, err := os.Stat(filepath.Join(k.cfg.GuardStateDir, guardFileCompactTS)); err == nil {
+	if _, err := os.Stat(filepath.Join(k.d.Cfg.GuardStateDir, guardFileCompactTS)); err == nil {
 		t.Fatal("compact ts written on a busy run")
 	}
 }
@@ -200,14 +202,14 @@ func TestGuardCycleQuiet(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "MAX(id)", Out: "2000|1000|3000\n"},
 	})
-	res := k.guardCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.ok || res.fired {
 		t.Fatalf("res=%+v", res)
 	}
 	if strings.Contains(fr.Joined(), "pg_try_advisory_lock") {
 		t.Fatal("compact session ran on a quiet cycle")
 	}
-	content := readText(t, dir, "kine-compact-guard.prom")
+	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
 	for _, want := range []string{
 		// kine_db_rows lives in the guard file — the probe dropped
 		// its per-2min COUNT(*).
@@ -230,11 +232,11 @@ func TestGuardCycleScriptError(t *testing.T) {
 		{Substr: "ON_ERROR_STOP", Err: errors.New("psql error")},
 		guardStatsRule,
 	})
-	res := k.guardCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.ok {
 		t.Fatal("expected failure")
 	}
-	content := readText(t, dir, "kine-compact-guard.prom")
+	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
 	if !strings.Contains(content, "kine_db_guard_ok 0") {
 		t.Fatalf("textfile:\n%s", content)
 	}

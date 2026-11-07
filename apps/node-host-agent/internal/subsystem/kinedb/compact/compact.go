@@ -1,5 +1,5 @@
-// compact.go — the 10-minute emergency compactor
-// (kine-compact-guard.sh port).
+// Package compact ports kine-compact-guard.sh — the 10-minute
+// emergency compactor for the kine DB VM.
 //
 // Why it exists: kine's poll catch-up streams every row since
 // compact_rev into heap on boot. When compaction stalls (OOM loop,
@@ -21,17 +21,22 @@
 // with DB access — sees the lock taken and skips.
 //
 // State under GuardStateDir: last-head, last-compact-rev,
-// freeze-cycles, last-compact-ts.
-package kinedb
+// freeze-cycles, last-compact-ts. The W13-ST2 physical-backup
+// verifier rides the same cycle (backup.go). The probe and maint
+// loops live in sibling packages; everything shared goes through
+// kdeps.Deps.
+package compact
 
 import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
 // Guard state file names under GuardStateDir.
@@ -42,6 +47,21 @@ const (
 	guardFileCompactTS      = "last-compact-ts"
 )
 
+// reDeleted matches the `deleted=N` notices the compact script's
+// chunk DO blocks SELECT back.
+var reDeleted = regexp.MustCompile(`deleted=([0-9]+)`)
+
+// Guard runs the 10-minute emergency compactor — the
+// kine-compact-guard.sh port plus the backup verifier that shares
+// its cadence. It keeps no state of its own: config, metrics and
+// the exec plumbing live on the shared *kdeps.Deps.
+type Guard struct {
+	d *kdeps.Deps
+}
+
+// New returns the compact-guard loop over d.
+func New(d *kdeps.Deps) *Guard { return &Guard{d: d} }
+
 // guardState is the cross-run history read from GuardStateDir.
 type guardState struct {
 	head       int64
@@ -50,41 +70,41 @@ type guardState struct {
 	seen       bool // false when the state files are absent/unreadable
 }
 
-func (k *KineDB) readGuardState() guardState {
-	dir := k.cfg.GuardStateDir
-	head, errH := readIntFile(filepath.Join(dir, guardFileLastHead))
-	crev, errC := readIntFile(filepath.Join(dir, guardFileLastCompactRev))
-	fz, _ := readIntFile(filepath.Join(dir, guardFileFreeze))
+func (g *Guard) readGuardState() guardState {
+	dir := g.d.Cfg.GuardStateDir
+	head, errH := kdeps.ReadIntFile(filepath.Join(dir, guardFileLastHead))
+	crev, errC := kdeps.ReadIntFile(filepath.Join(dir, guardFileLastCompactRev))
+	fz, _ := kdeps.ReadIntFile(filepath.Join(dir, guardFileFreeze))
 	return guardState{head: head, compactRev: crev, freeze: fz,
 		seen: errH == nil && errC == nil}
 }
 
-func (k *KineDB) writeGuardState(head, compactRev, freeze int64) {
-	dir := k.cfg.GuardStateDir
-	writeIntFile(filepath.Join(dir, guardFileLastHead), head)
-	writeIntFile(filepath.Join(dir, guardFileLastCompactRev), compactRev)
-	writeIntFile(filepath.Join(dir, guardFileFreeze), freeze)
+func (g *Guard) writeGuardState(head, compactRev, freeze int64) {
+	dir := g.d.Cfg.GuardStateDir
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileLastHead), head)
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileLastCompactRev), compactRev)
+	kdeps.WriteIntFile(filepath.Join(dir, guardFileFreeze), freeze)
 }
 
-func (k *KineDB) readGuardCompactTS() int64 {
-	v, _ := readIntFile(filepath.Join(k.cfg.GuardStateDir, guardFileCompactTS))
+func (g *Guard) readGuardCompactTS() int64 {
+	v, _ := kdeps.ReadIntFile(filepath.Join(g.d.Cfg.GuardStateDir, guardFileCompactTS))
 	return v
 }
 
-func (k *KineDB) writeGuardCompactTS(ts int64) {
-	writeIntFile(filepath.Join(k.cfg.GuardStateDir, guardFileCompactTS), ts)
+func (g *Guard) writeGuardCompactTS(ts int64) {
+	kdeps.WriteIntFile(filepath.Join(g.d.Cfg.GuardStateDir, guardFileCompactTS), ts)
 }
 
 // guardTrigger is the pure trigger predicate — separated for tests.
-func (k *KineDB) guardTrigger(head, compactRev, rows, retained, freeze int64, prev guardState) (bool, string) {
+func (g *Guard) guardTrigger(head, compactRev, rows, retained, freeze int64, prev guardState) (bool, string) {
 	switch {
-	case retained > k.cfg.RetainedMax:
+	case retained > g.d.Cfg.RetainedMax:
 		return true, "retained-debt"
-	case rows > k.cfg.RowsMax:
+	case rows > g.d.Cfg.RowsMax:
 		return true, "rows-debt"
-	case prev.seen && freeze >= k.cfg.FrozenCycles &&
-		head > prev.head+k.cfg.FrozenHeadAdvance &&
-		retained > k.cfg.FrozenRetainedMin:
+	case prev.seen && freeze >= g.d.Cfg.FrozenCycles &&
+		head > prev.head+g.d.Cfg.FrozenHeadAdvance &&
+		retained > g.d.Cfg.FrozenRetainedMin:
 		return true, "compact-rev-frozen"
 	}
 	return false, ""
@@ -95,21 +115,21 @@ func (k *KineDB) guardTrigger(head, compactRev, rows, retained, freeze int64, pr
 // (each DO block is its own autocommitted statement = one txn per
 // chunk, same as the bash per-chunk DO), VACUUM, unlock. The \gset +
 // \if keeps every statement behind the lock check; a busy lock echoes
-// the lockBusyMarker and skips everything. Each chunk's row count is
+// the LockBusyMarker and skips everything. Each chunk's row count is
 // also INSERTed into the kcg_deleted temp table and SELECTed back at
 // the end: RAISE NOTICE travels on stderr, which the runner keeps
 // out of stdout, so the `deleted=N` lines sumDeleted parses must be
 // real query output.
-func (k *KineDB) buildCompactScript(cur, target int64) string {
-	t := sqlIdent(k.cfg.Table)
+func (g *Guard) buildCompactScript(cur, target int64) string {
+	t := kdeps.SQLIdent(g.d.Cfg.Table)
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
-		k.cfg.AdvisoryLockID)
+		g.d.Cfg.AdvisoryLockID)
 	b.WriteString("\\gset\n\\if :kcg_locked\n")
 	b.WriteString("CREATE TEMP TABLE kcg_deleted(n int);\n")
-	for chunks := 0; cur < target && chunks < k.cfg.MaxChunks; chunks++ {
-		next := cur + k.cfg.ChunkRevisions
+	for chunks := 0; cur < target && chunks < g.d.Cfg.MaxChunks; chunks++ {
+		next := cur + g.d.Cfg.ChunkRevisions
 		if next > target {
 			next = target
 		}
@@ -129,21 +149,14 @@ BEGIN
   INSERT INTO kcg_deleted VALUES (n);
   RAISE NOTICE 'deleted=%%', n;
 END $$;
-`, t, next, compactRevKey, t, t, compactRevKey, cur, next, t, cur, next)
+`, t, next, kdeps.CompactRevKey, t, t, kdeps.CompactRevKey, cur, next, t, cur, next)
 		cur = next
 	}
 	b.WriteString("SELECT 'deleted=' || n AS deleted FROM kcg_deleted;\n")
 	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", t)
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", k.cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + lockBusyMarker + "'\n\\endif\n")
+	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", g.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
 	return b.String()
-}
-
-func reasonOrDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
 }
 
 // sumDeleted totals the deleted=N notices from the chunk run.
@@ -158,8 +171,9 @@ func sumDeleted(out string) int64 {
 	return total
 }
 
-// guardResult captures one guard run for emission + tests.
-type guardResult struct {
+// Result captures one guard run for emission + tests — was
+// guardResult.
+type Result struct {
 	ok       bool
 	fired    bool
 	deleted  int64
@@ -179,60 +193,60 @@ type guardResult struct {
 	notes       []string
 }
 
-// guardCycle runs one guard round and emits metrics + textfile.
-// Returns the result for tests.
-func (k *KineDB) guardCycle(ctx context.Context) *guardResult {
-	res := &guardResult{ok: true}
+// Cycle runs one guard round and emits metrics + textfile — was
+// guardCycle. Returns the result for tests.
+func (g *Guard) Cycle(ctx context.Context) *Result {
+	res := &Result{ok: true}
 	note := func(s string) { res.notes = append(res.notes, s) }
 
-	user, pass, credOK := k.creds()
-	pg := k.pgContainerName(ctx)
+	user, pass, credOK := g.d.Creds()
+	pg := g.d.PGContainerName(ctx)
 	switch {
 	case !credOK:
 		res.ok = false
-		note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
-	case !k.containerRunning(ctx, pg):
+		note(fmt.Sprintf("missing .env creds (%s)", g.d.Cfg.EnvFile))
+	case !g.d.ContainerRunning(ctx, pg):
 		res.ok = false
 		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
-		k.guardRun(ctx, pg, user, pass, res, note)
+		g.guardRun(ctx, pg, user, pass, res, note)
 		// W13-ST2/Gap#4: physical-backup verifier — pg_dump -Fc
 		// every BackupInterval when free space allows, header
 		// verified; emits kine_db_backup_{age_seconds,valid} in
 		// the same textfile.
-		k.backupVerify(ctx, pg, user, pass, res, note)
+		g.backupVerify(ctx, pg, user, pass, res, note)
 	}
-	k.emitGuard(res)
+	g.emitGuard(res)
 	sum := fmt.Sprintf("head=%d compact_rev=%d rows=%d frozen=%d fired=%v "+
 		"trigger=%s deleted=%d compact_rev_after=%s",
 		res.head, res.compact, res.rows, res.frozen, res.fired,
-		reasonOrDash(res.reason), res.deleted, intOrNA(res.revSeen, res.revAfter))
+		kdeps.ReasonOrDash(res.reason), res.deleted, kdeps.IntOrNA(res.revSeen, res.revAfter))
 	if res.ok {
 		logger().Info("kine-compact-guard OK: " + sum)
-		k.m.cycles.WithLabelValues("compact-guard", "ok").Inc()
+		g.d.M.Cycles.WithLabelValues("compact-guard", "ok").Inc()
 	} else {
 		logger().Warn("kine-compact-guard FAIL: "+sum, "notes", strings.Join(res.notes, " "))
-		k.m.cycles.WithLabelValues("compact-guard", "fail").Inc()
+		g.d.M.Cycles.WithLabelValues("compact-guard", "fail").Inc()
 	}
 	return res
 }
 
 // guardRun does the stats read, freeze bookkeeping, trigger decision
 // and (on fire) the locked compact session.
-func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
-	res *guardResult, note func(string)) {
+func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
+	res *Result, note func(string)) {
 
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := g.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 			"COUNT(*) FROM %[1]s",
-		sqlIdent(k.cfg.Table), sqlIdent(k.cfg.Table), compactRevKey))
+		kdeps.SQLIdent(g.d.Cfg.Table), kdeps.SQLIdent(g.d.Cfg.Table), kdeps.CompactRevKey))
 	if err != nil {
 		res.ok = false
 		note(fmt.Sprintf("stats query fail: %v", err))
 		return
 	}
-	head, crev, rows, perr := parseTriple(out)
+	head, crev, rows, perr := kdeps.ParseTriple(out)
 	if perr != nil {
 		res.ok = false
 		note(fmt.Sprintf("stats unparsed: %v", perr))
@@ -245,14 +259,14 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 	// advanced = neither kine nor apiserver lived long enough to
 	// compact (OOM-loop signature). A guard fire advances compact_rev
 	// itself, so the counter resets naturally on the next run.
-	prev := k.readGuardState()
+	prev := g.readGuardState()
 	res.frozen = 0
 	if prev.seen && crev == prev.compactRev && head > prev.head {
 		res.frozen = prev.freeze + 1
 	}
 	retained := head - crev
-	trig, reason := k.guardTrigger(head, crev, rows, retained, res.frozen, prev)
-	k.writeGuardState(head, crev, res.frozen)
+	trig, reason := g.guardTrigger(head, crev, rows, retained, res.frozen, prev)
+	g.writeGuardState(head, crev, res.frozen)
 	if !trig {
 		return
 	}
@@ -261,31 +275,31 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 
 	// Marker off-by-one parity with the shell: compact to head-TAIL,
 	// except when the marker is already ahead (then to head).
-	target := head - k.cfg.Tail
+	target := head - g.d.Cfg.Tail
 	if target <= crev {
 		target = head
 	}
-	sout, err := k.psqlScript(ctx, pg, user, pass,
-		k.buildCompactScript(crev, target))
+	sout, err := g.d.PsqlScript(ctx, pg, user, pass,
+		g.buildCompactScript(crev, target))
 	switch {
 	case err != nil:
 		res.ok = false
 		note(fmt.Sprintf("compact-fail: %v", err))
-	case strings.Contains(sout, lockBusyMarker):
+	case strings.Contains(sout, kdeps.LockBusyMarker):
 		res.fired = false
 		note("guard already running")
 	default:
 		res.deleted = sumDeleted(sout)
-		k.writeGuardCompactTS(k.cfg.Clock.Now().Unix())
+		g.writeGuardCompactTS(g.d.Cfg.Clock.Now().Unix())
 		// The bash re-read compact_rev + rows after the loop —
 		// how far the chunks actually got and the post-VACUUM
 		// table size. Failure only means the after-gauges go
 		// stale, never the run.
-		if aout, aerr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		if aout, aerr := g.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 			"SELECT COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 				"COUNT(*) FROM %[1]s",
-			sqlIdent(k.cfg.Table), compactRevKey)); aerr == nil {
-			if after, rows, perr := parsePair(aout); perr == nil {
+			kdeps.SQLIdent(g.d.Cfg.Table), kdeps.CompactRevKey)); aerr == nil {
+			if after, rows, perr := kdeps.ParsePair(aout); perr == nil {
 				res.revAfter, res.revSeen = after, true
 				res.rows = rows
 			}
@@ -294,7 +308,7 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 }
 
 // emitGuard renders the textfile and updates the collectors.
-func (k *KineDB) emitGuard(res *guardResult) {
+func (g *Guard) emitGuard(res *Result) {
 	var p promfile.Builder
 	ok := 0.0
 	if res.ok {
@@ -302,14 +316,14 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	}
 	p.Gauge("kine_db_guard_ok",
 		"Compact guard result (1 = ok/skip, 0 = fail)", ok)
-	k.m.guardOK.Set(ok)
+	g.d.M.GuardOK.Set(ok)
 	fired := 0.0
 	if res.fired {
 		fired = 1
 	}
 	p.Gauge("kine_db_guard_fired",
 		"1 when the last guard run executed a compact session", fired)
-	k.m.guardFired.Set(fired)
+	g.d.M.GuardFired.Set(fired)
 	// freeze_cycles + kine_db_rows come out of the stats read —
 	// kine_db_rows lives here, not in the probe textfile, because
 	// the COUNT(*) it needs seq-scans the table (10-min cadence)
@@ -321,45 +335,45 @@ func (k *KineDB) emitGuard(res *guardResult) {
 		p.Gauge("kine_db_guard_freeze_cycles",
 			"Consecutive runs compact_rev stayed frozen while head advanced",
 			float64(res.frozen))
-		k.m.guardFreeze.Set(float64(res.frozen))
+		g.d.M.GuardFreeze.Set(float64(res.frozen))
 		p.Gauge("kine_db_rows",
 			"Row count of the kine table — kine boot fill cost",
 			float64(res.rows))
-		k.m.rows.Set(float64(res.rows))
+		g.d.M.Rows.Set(float64(res.rows))
 	}
 	if res.revSeen {
 		p.Gauge("kine_db_guard_compact_rev_after",
 			"compact_rev re-read after the last completed compact run",
 			float64(res.revAfter))
-		k.m.guardRevAfter.Set(float64(res.revAfter))
+		g.d.M.GuardRevAfter.Set(float64(res.revAfter))
 	}
 	p.Gauge("kine_db_guard_last_deleted_rows",
 		"Rows deleted by the last compact run", float64(res.deleted))
-	k.m.guardLastDeleted.Set(float64(res.deleted))
-	lastCompact := float64(k.readGuardCompactTS())
+	g.d.M.GuardLastDeleted.Set(float64(res.deleted))
+	lastCompact := float64(g.readGuardCompactTS())
 	p.Gauge("kine_db_guard_last_compact_timestamp_seconds",
 		"Timestamp of the last completed compact run", lastCompact)
-	k.m.guardLastCompact.Set(lastCompact)
-	ts := float64(k.cfg.Clock.Now().Unix())
+	g.d.M.GuardLastCompact.Set(lastCompact)
+	ts := float64(g.d.Cfg.Clock.Now().Unix())
 	p.Gauge("kine_db_guard_last_run_timestamp_seconds",
 		"Last guard run", ts)
-	k.m.guardLastRun.Set(ts)
+	g.d.M.GuardLastRun.Set(ts)
 	// W13-CP4: the probe loop's top-5 churn sample renders here —
 	// this file owns the churn series (the probe's own .prom must
-	// never duplicate it). The probe goroutine refreshes churnTop
-	// asynchronously — snapshot it under churnMu. And the GaugeVec
+	// never duplicate it). The probe goroutine refreshes ChurnTop
+	// asynchronously — snapshot it under ChurnMu. And the GaugeVec
 	// is Reset+repopulated rather than merged: a resource that
 	// falls out of the top-5 must lose its series instead of
 	// pinning a stale value on /metrics forever.
-	k.churnMu.RLock()
-	churnTop := append([]churnEntry(nil), k.churnTop...)
-	k.churnMu.RUnlock()
-	k.m.topChurn.Reset()
+	g.d.ChurnMu.RLock()
+	churnTop := append([]kdeps.ChurnEntry(nil), g.d.ChurnTop...)
+	g.d.ChurnMu.RUnlock()
+	g.d.M.TopChurn.Reset()
 	for _, e := range churnTop {
 		p.GaugeLabels("kine_db_top_churn_revisions_5m",
 			"Top-5 resource prefixes by revision count in the last 5-minute window",
-			fmt.Sprintf("resource=%q", e.resource), float64(e.revs))
-		k.m.topChurn.WithLabelValues(e.resource).Set(float64(e.revs))
+			fmt.Sprintf("resource=%q", e.Resource), float64(e.Revs))
+		g.d.M.TopChurn.WithLabelValues(e.Resource).Set(float64(e.Revs))
 	}
 	// W13-ST2: physical-backup verifier series — seen-gated like
 	// the stats series: an unmeasured cycle must not fabricate a
@@ -375,8 +389,8 @@ func (k *KineDB) emitGuard(res *guardResult) {
 		p.Gauge("kine_db_backup_valid",
 			"1 when the newest physical pg_dump passed header verification",
 			valid)
-		k.m.backupAge.Set(float64(res.backupAge))
-		k.m.backupValid.Set(valid)
+		g.d.M.BackupAge.Set(float64(res.backupAge))
+		g.d.M.BackupValid.Set(valid)
 	}
-	k.emitTextfile("kine-compact-guard.prom", &p)
+	g.d.EmitTextfile("kine-compact-guard.prom", &p)
 }

@@ -1,6 +1,8 @@
-// w13_test.go — Wave-13 kinedb tests: the W13-CP4 top-churn
-// watermark sampler and the W13-ST2 physical-backup verifier.
-package kinedb
+// backup_test.go — the W13-ST2 physical-backup verifier tests plus
+// the guard-side emit coverage of the W13-CP4 churn series (the
+// sampler half lives in the probe suite), lifted out of the flat
+// package's w13_test.go.
+package compact
 
 import (
 	"context"
@@ -10,46 +12,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// --- W13-CP4: top-5 churn ---
-
-func TestProbeTopChurn(t *testing.T) {
-	rules := []testutil.ExecRule{
-		{Substr: "split_part(name", Out: "pods|120\nleases|40\n"},
-		{Substr: "MAX(id)", Out: "9000\n"},
+// The probe fills Deps.ChurnTop; the guard render owns the series —
+// a populated snapshot must render resource-labelled samples in
+// kine-compact-guard.prom.
+func TestEmitGuardChurn(t *testing.T) {
+	k, _, dir := fixture(t, nil)
+	k.d.ChurnTop = []kdeps.ChurnEntry{
+		{Resource: "pods", Revs: 120}, {Resource: "leases", Revs: 40},
 	}
-	k, _, dir := fixture(t, rules)
-	// Watermark files: head=8000, ts well past the 5m window → the
-	// query runs this round and the watermark advances.
-	gdir := filepath.Join(dir, "guard")
-	writeIntFile(filepath.Join(gdir, churnFileHead), 8000)
-	writeIntFile(filepath.Join(gdir, churnFileTS), testNow-600)
-	var notes []string
-	note := func(s string) { notes = append(notes, s) }
-	k.probeTopChurn(context.Background(), "pg", "postgres", "secret", note)
-	if len(k.churnTop) != 2 || k.churnTop[0].resource != "pods" ||
-		k.churnTop[0].revs != 120 {
-		t.Fatalf("churnTop=%+v", k.churnTop)
-	}
-	// Watermark advanced to the fresh head.
-	if h, _ := readIntFile(filepath.Join(gdir, churnFileHead)); h != 9000 {
-		t.Fatalf("churn head=%d want 9000", h)
-	}
-	// Guard textfile renders the series.
-	k.emitGuard(&guardResult{backupSeen: false})
-	content := readText(t, dir, "kine-compact-guard.prom")
-	if !strings.Contains(content,
-		`kine_db_top_churn_revisions_5m{resource="pods"} 120`) {
-		t.Fatalf("churn series missing:\n%s", content)
-	}
-	// A fresh window (<5m) keeps the last result and does NOT query.
-	k.churnTop = nil
-	writeIntFile(filepath.Join(gdir, churnFileTS), testNow-10)
-	k.probeTopChurn(context.Background(), "pg", "postgres", "secret", note)
-	if k.churnTop != nil {
-		t.Fatalf("churnTop refreshed inside window: %+v", k.churnTop)
+	k.emitGuard(&Result{})
+	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
+	for _, want := range []string{
+		`kine_db_top_churn_revisions_5m{resource="pods"} 120`,
+		`kine_db_top_churn_revisions_5m{resource="leases"} 40`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("churn series missing %q:\n%s", want, content)
+		}
 	}
 }
 
@@ -64,14 +48,14 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	}
 	k, fr, dir := fixture(t, rules)
 	bdir := filepath.Join(dir, "backups")
-	k.cfg.BackupDir = bdir
+	k.d.Cfg.BackupDir = bdir
 	// Stub the free-space probe: the real statfs of the test fs is
 	// environment-dependent (a tmpfs under memory pressure can dip
 	// below the 30% gate and flake the pipeline assertions).
-	k.cfg.statfsFn = func(string) (float64, error) { return 0.9, nil }
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
 	// cp publishes via <dest>.tmp -> rename; the fake exec produces
 	// no bytes, so lay down the file a real cp would have written
-	// (dest is kine-<testNow>.dump — the fixture clock is fixed).
+	// (dest is kine-<TestNow>.dump — the fixture clock is fixed).
 	if err := os.MkdirAll(bdir, 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +69,7 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	if err := os.WriteFile(staleTmp, []byte("PGD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res := &guardResult{}
+	res := &Result{}
 	var notes []string
 	note := func(s string) { notes = append(notes, s) }
 	k.backupVerify(context.Background(), "pg", "postgres", "secret", res, note)
@@ -115,7 +99,7 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 	k, fr, dir := fixture(t, nil)
 	bdir := filepath.Join(dir, "backups")
-	k.cfg.BackupDir = bdir
+	k.d.Cfg.BackupDir = bdir
 	if err := os.MkdirAll(bdir, 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +107,7 @@ func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 	if err := os.WriteFile(dump, []byte("PGDMP fake"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res := &guardResult{}
+	res := &Result{}
 	k.backupVerify(context.Background(), "pg", "postgres", "secret", res,
 		func(string) {})
 	if !res.backupSeen || !res.backupValid {
@@ -136,7 +120,7 @@ func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 	if err := os.WriteFile(dump, []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res2 := &guardResult{}
+	res2 := &Result{}
 	k.backupVerify(context.Background(), "pg", "postgres", "secret", res2,
 		func(string) {})
 	if res2.backupValid {

@@ -1,13 +1,15 @@
-// wal_xid_hygiene.go — the kine postgres hygiene block: the
-// kine-pg-hygiene census and the postgres WAL archive guard, riding
-// the 2-minute probe cycle (every input is a cheap pg_stat view —
-// the heavy COUNT(*) stays in the guard cycle).
+// hygiene.go — the kine postgres hygiene block: the kine-pg-hygiene
+// census and the postgres WAL archive guard, riding the 2-minute
+// probe cycle (every input is a cheap pg_stat view — the heavy
+// COUNT(*) stays in the guard cycle). Was wal_xid_hygiene.go minus
+// the maint-cycle VACUUM (FREEZE) remediation, which moved to
+// maint/freeze.go with the loop that owns it.
 //
 //  1. Idle-in-transaction census — sessions older than 3 minutes on
 //     the postgres/kine databases pin snapshots and block autovacuum
 //     of the kine table (Datadog/CERN class of apiserver OOM). The
 //     gauge trips at 3min so the build-up is visible before the
-//     5-minute session reaper in kine_self_healing.go kills them.
+//     5-minute session reaper in selfheal.go kills them.
 //  2. Dead-tuple ratio — n_dead_tup/GREATEST(n_live_tup,1) of the
 //     kine table. Above 0.50 with >50K dead tuples autovacuum has
 //     clearly lost the race → an advisory-locked VACUUM (ANALYZE)
@@ -53,10 +55,10 @@
 //
 // Items 5–6 export through their own textfile (kine-db-xact.prom)
 // rather than emitProbe's kine-db.prom — the prometheus collector
-// list lives in kinedb.go/probe.go outside this file, so the
+// list lives in kdeps/probe.go outside this file, so the
 // node-exporter textfile channel is the export path (the
 // controllerhygiene textfile_prom convention).
-package kinedb
+package probe
 
 import (
 	"context"
@@ -69,6 +71,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
 const (
@@ -83,13 +86,6 @@ const (
 	// on a near-empty table (one dead tuple out of two rows = 0.5).
 	deadTupleRatioMax = 0.50
 	deadTupleMinCount = 50000
-
-	// xidFreezeAge — MAX(age(datfrozenxid)) past which the maint
-	// cycle forces VACUUM (FREEZE, ANALYZE): ~7% of the 2^31
-	// wraparound horizon, far ahead of the autovacuum-freeze panic
-	// zone yet early enough that the freeze storm finishes in the
-	// daily window.
-	xidFreezeAge = 150_000_000
 
 	// slotRetainedWarn / slotRetainedDrop — WAL bytes an inactive
 	// replication slot may pin before the guard reacts. Warn only
@@ -164,7 +160,7 @@ type hygieneResult struct {
 
 // preparedXactRolledBackTotal is the lifetime count behind
 // kine_db_orphan_prepared_xacts_rolled_back_total — in-process
-// cumulative like metrics.idleTermTotal (a prometheus Counter
+// cumulative like Metrics.IdleTermTotal (a prometheus Counter
 // resets on restart anyway; the textfile emits the running total
 // every round the block runs).
 var preparedXactRolledBackTotal atomic.Int64
@@ -182,21 +178,21 @@ const preparedXactOrphanAge = "15 minutes"
 const xactPromFile = "kine-db-xact.prom"
 
 // pgHygiene runs the whole hygiene block once — called from
-// runProbeChecks only after containers+creds pass, so every query
+// RunChecks only after containers+creds pass, so every query
 // here can still assume a live postgres.
-func (k *KineDB) pgHygiene(ctx context.Context, pg, user, pass string,
-	res *probeResult, note func(string)) {
+func (p *Probe) pgHygiene(ctx context.Context, pg, user, pass string,
+	res *Result, note func(string)) {
 	h := &hygieneResult{}
 	res.hyg = h
-	k.hygieneIdleInTx(ctx, pg, user, pass, h, note)
-	k.hygieneDeadTuple(ctx, pg, user, pass, h, note)
-	k.hygieneXID(ctx, pg, user, pass, h, note)
-	k.hygieneWAL(ctx, pg, user, pass, h, note)
-	k.hygieneMultiXact(ctx, pg, user, pass, h, note)
-	k.hygienePreparedXacts(ctx, pg, user, pass, h, note)
-	k.hygieneInvalidIndexes(ctx, pg, user, pass, h, note)
-	k.hygieneSeqScan(ctx, pg, user, pass, h, note)
-	k.emitXactTextfile(h)
+	p.hygieneIdleInTx(ctx, pg, user, pass, h, note)
+	p.hygieneDeadTuple(ctx, pg, user, pass, h, note)
+	p.hygieneXID(ctx, pg, user, pass, h, note)
+	p.hygieneWAL(ctx, pg, user, pass, h, note)
+	p.hygieneMultiXact(ctx, pg, user, pass, h, note)
+	p.hygienePreparedXacts(ctx, pg, user, pass, h, note)
+	p.hygieneInvalidIndexes(ctx, pg, user, pass, h, note)
+	p.hygieneSeqScan(ctx, pg, user, pass, h, note)
+	p.emitXactTextfile(h)
 }
 
 // hygieneMultiXact — item 5: MAX(age(datminmxid)) across databases.
@@ -204,15 +200,15 @@ func (k *KineDB) pgHygiene(ctx context.Context, pg, user, pass string,
 // checking referenced rows); exhaustion forces the same emergency
 // freeze cycle as XID wraparound, so the gauge rides the same
 // 2-minute freshness as kine_db_xid_age_transactions.
-func (k *KineDB) hygieneMultiXact(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneMultiXact(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database")
 	if err != nil {
 		note(fmt.Sprintf("mxid-age-fail: %v", err))
 		return
 	}
-	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("mxid-age-unparsed: %v", perr))
 		return
@@ -227,9 +223,9 @@ func (k *KineDB) hygieneMultiXact(ctx context.Context, pg, user, pass string,
 // before 15min), and ABORT is the conservative half of the outcome
 // — no data commit happens, only the xmin pin releases. A failed
 // rollback is noted and retried next round, never fatal.
-func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT gid FROM pg_prepared_xacts "+
 			"WHERE database IN ('postgres','kine') "+
 			"AND prepared < now() - interval '%s'", preparedXactOrphanAge))
@@ -238,13 +234,13 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 		return
 	}
 	h.preparedSeen = true // a successful empty read = no orphans
-	for _, gid := range parseGIDs(out) {
+	for _, gid := range kdeps.ParseGIDs(out) {
 		h.preparedXacts++
-		if k.cfg.ReadOnly {
+		if p.d.Cfg.ReadOnly {
 			continue // diagnostics only — no ROLLBACK PREPARED
 		}
-		if _, rerr := k.psqlQuery(ctx, pg, user, pass,
-			"ROLLBACK PREPARED "+sqlQuote(gid)); rerr != nil {
+		if _, rerr := p.d.PsqlQuery(ctx, pg, user, pass,
+			"ROLLBACK PREPARED "+kdeps.SQLQuote(gid)); rerr != nil {
 			note(fmt.Sprintf("rollback-prepared-%s-fail: %v", gid, rerr))
 			continue
 		}
@@ -253,7 +249,7 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 		logger().Warn("kinedb: rolled back orphaned prepared transaction",
 			"gid", gid)
 	}
-	if k.cfg.ReadOnly && h.preparedXacts > 0 {
+	if p.d.Cfg.ReadOnly && h.preparedXacts > 0 {
 		note(fmt.Sprintf("read-only: %d orphaned prepared xact(s) left in place",
 			h.preparedXacts))
 	}
@@ -265,21 +261,21 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 // uses it, and the next REINDEX CONCURRENTLY errors or silently
 // leaves it. The probe only counts (kine_db_invalid_indexes feeds
 // the alert); the DROP itself belongs to the maint cycle's
-// invalid-index reaper (maint.go) where the daily serialisation
+// invalid-index reaper (maint package) where the daily serialisation
 // already gates the index churn.
 // COUNT(indexrelid), not COUNT(*): the probe contract bans a bare
 // COUNT(*) in the 2-minute loop — counting a catalog column is
 // semantically identical and keeps the kine-heap seq-scan guard
 // (probe_test.go) airtight.
-func (k *KineDB) hygieneInvalidIndexes(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneInvalidIndexes(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid")
 	if err != nil {
 		note(fmt.Sprintf("invalid-indexes-fail: %v", err))
 		return
 	}
-	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("invalid-indexes-unparsed: %v", perr))
 		return
@@ -296,16 +292,16 @@ func (k *KineDB) hygieneInvalidIndexes(ctx context.Context, pg, user, pass strin
 // planner stats get refreshed immediately: ANALYZE under the 30m
 // last-kine-analyze budget (spend-on-attempt, same contract as
 // last-dead-tuple-vacuum).
-func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) "+
-			"FROM pg_stat_user_tables WHERE relname=%s", sqlQuote(k.cfg.Table)))
+			"FROM pg_stat_user_tables WHERE relname=%s", kdeps.SQLQuote(p.d.Cfg.Table)))
 	if err != nil {
 		note(fmt.Sprintf("seq-scan-fail: %v", err))
 		return
 	}
-	scans, tupRead, perr := parsePair(out)
+	scans, tupRead, perr := kdeps.ParsePair(out)
 	if perr != nil {
 		// An empty result means the stats view has no row for the
 		// table yet — inconclusive, like a parse failure.
@@ -317,14 +313,14 @@ func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 	// Delta vs the previous probe — persisted under GuardStateDir
 	// so the guard survives an agent restart. A pg_stat reset (DB
 	// restart) reads as a negative delta and simply re-baselines.
-	prevPath := filepath.Join(k.cfg.GuardStateDir, seqTupReadFile)
-	prev, perr := readIntFile(prevPath)
-	if k.cfg.ReadOnly {
+	prevPath := filepath.Join(p.d.Cfg.GuardStateDir, seqTupReadFile)
+	prev, perr := kdeps.ReadIntFile(prevPath)
+	if p.d.Cfg.ReadOnly {
 		// Diagnostics only — never the baseline write, the
 		// ANALYZE, or the last-kine-analyze budget spend.
 		return
 	}
-	writeIntFile(prevPath, tupRead)
+	kdeps.WriteIntFile(prevPath, tupRead)
 	if perr != nil {
 		// First observation (or an unreadable baseline): the
 		// lifetime seq_tup_read is NOT a delta — seed prev with the
@@ -337,72 +333,58 @@ func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 		return
 	}
 	note(fmt.Sprintf("seq-tup-read +%d>%d between probes — planner fell back to seq scan; ANALYZE %s",
-		delta, seqTupReadDeltaMax, k.cfg.Table))
+		delta, seqTupReadDeltaMax, p.d.Cfg.Table))
 	// MkdirAll before the spend — Store.WriteEpochFile does not
 	// create the state dir itself (same note as deadTupleVacuum).
-	_ = os.MkdirAll(k.cfg.GuardStateDir, 0o755)
-	if !k.state.RateTrySpend(kineAnalyzeFile, kineAnalyzeBudget) {
+	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
+	if !p.d.State.RateTrySpend(kineAnalyzeFile, kineAnalyzeBudget) {
 		note("kine-analyze cooldown (<30m)")
 		return
 	}
-	if _, aerr := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
-		"-qc", "ANALYZE "+sqlIdent(k.cfg.Table)), ""); aerr != nil {
+	if _, aerr := p.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), p.d.PsqlArgs(pg, user, false,
+		"-qc", "ANALYZE "+kdeps.SQLIdent(p.d.Cfg.Table)), ""); aerr != nil {
 		note(fmt.Sprintf("kine-analyze-fail: %v", aerr))
 		return
 	}
 	h.analyzeFired = true
 	logger().Warn("kinedb: seq-scan regression — ran ANALYZE",
-		"table", k.cfg.Table, "seq_tup_read_delta", delta)
-}
-
-// parseGIDs splits the gid list of the prepared-xacts query — one
-// identifier per -tA line; empty/blank lines are skipped.
-func parseGIDs(out string) []string {
-	var gids []string
-	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		gids = append(gids, l)
-	}
-	return gids
+		"table", p.d.Cfg.Table, "seq_tup_read_delta", delta)
 }
 
 // emitXactTextfile renders kine-db-xact.prom for items 5–6 — header
 // always, sample only behind its *Seen flag (a failed read goes
 // absent rather than fabricating a zero), and the lifetime rollback
 // counter every round like idleTermTotal.
-func (k *KineDB) emitXactTextfile(h *hygieneResult) {
-	if k.cfg.ReadOnly {
+func (p *Probe) emitXactTextfile(h *hygieneResult) {
+	if p.d.Cfg.ReadOnly {
 		// A zeroed in-process counter would overwrite the daemon's
 		// series — read-only mode never writes textfiles.
 		return
 	}
-	var p promfile.Builder
+	var b promfile.Builder
 	mxidHelp := "MAX(age(datminmxid)) across databases — distance " +
 		"to MultiXact wraparound pressure."
 	if h.mxidSeen {
-		p.Gauge("kine_db_multixact_age_transactions", mxidHelp,
+		b.Gauge("kine_db_multixact_age_transactions", mxidHelp,
 			float64(h.mxidAge))
 	} else {
-		p.Header("kine_db_multixact_age_transactions", mxidHelp)
+		b.Header("kine_db_multixact_age_transactions", mxidHelp)
 	}
 	preparedHelp := "Prepared transactions older than " +
 		preparedXactOrphanAge + " on the postgres/kine databases — " +
 		"orphaned xacts pinning the xmin horizon."
 	if h.preparedSeen {
-		p.Gauge("kine_db_orphan_prepared_xacts", preparedHelp,
+		b.Gauge("kine_db_orphan_prepared_xacts", preparedHelp,
 			float64(h.preparedXacts))
 	} else {
-		p.Header("kine_db_orphan_prepared_xacts", preparedHelp)
+		b.Header("kine_db_orphan_prepared_xacts", preparedHelp)
 	}
-	p.HeaderType("kine_db_orphan_prepared_xacts_rolled_back_total",
+	b.HeaderType("kine_db_orphan_prepared_xacts_rolled_back_total",
 		"Orphaned prepared transactions rolled back by the agent "+
 			"(ROLLBACK PREPARED) to release the xmin horizon.", "counter")
-	p.Line(fmt.Sprintf("kine_db_orphan_prepared_xacts_rolled_back_total %d",
+	b.Line(fmt.Sprintf("kine_db_orphan_prepared_xacts_rolled_back_total %d",
 		preparedXactRolledBackTotal.Load()))
-	k.emitTextfile(xactPromFile, &p)
+	p.d.EmitTextfile(xactPromFile, &b)
 }
 
 // hygieneIdleInTx — item 1: sessions idle-in-transaction >3min on
@@ -410,9 +392,9 @@ func (k *KineDB) emitXactTextfile(h *hygieneResult) {
 // probe contract bans a bare COUNT(*) in the 2-minute loop (the
 // tests guard against the kine heap seq-scan creeping back), and
 // counting a NOT NULL column is identical semantics on a stats view.
-func (k *KineDB) hygieneIdleInTx(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneIdleInTx(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COUNT(pid) FROM pg_stat_activity "+
 			"WHERE datname IN ('postgres', 'kine') "+
 			"AND state = 'idle in transaction' "+
@@ -421,7 +403,7 @@ func (k *KineDB) hygieneIdleInTx(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("idle-tx-fail: %v", err))
 		return
 	}
-	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("idle-tx-unparsed: %v", perr))
 		return
@@ -431,16 +413,16 @@ func (k *KineDB) hygieneIdleInTx(ctx context.Context, pg, user, pass string,
 
 // hygieneDeadTuple — item 2: dead-tuple ratio plus the emergency
 // VACUUM trigger when autovacuum is visibly losing.
-func (k *KineDB) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT n_dead_tup, n_live_tup FROM pg_stat_user_tables "+
-			"WHERE relname=%s", sqlQuote(k.cfg.Table)))
+			"WHERE relname=%s", kdeps.SQLQuote(p.d.Cfg.Table)))
 	if err != nil {
 		note(fmt.Sprintf("dead-tuple-fail: %v", err))
 		return
 	}
-	dead, live, perr := parsePair(out)
+	dead, live, perr := kdeps.ParsePair(out)
 	if perr != nil {
 		// An empty result means the stats view has no row for the
 		// table yet — inconclusive, like a parse failure.
@@ -452,15 +434,15 @@ func (k *KineDB) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 	if h.deadRatio <= deadTupleRatioMax || dead <= deadTupleMinCount {
 		return
 	}
-	if k.cfg.ReadOnly {
+	if p.d.Cfg.ReadOnly {
 		note(fmt.Sprintf("read-only: dead-tuple VACUUM (ANALYZE) suppressed (dead=%d ratio=%.2f)",
 			dead, h.deadRatio))
 		return
 	}
-	if k.deadTupleVacuum(ctx, pg, user, pass, note) {
+	if p.deadTupleVacuum(ctx, pg, user, pass, note) {
 		h.vacuumFired = true
 		logger().Warn("kinedb: emergency dead-tuple VACUUM (ANALYZE)",
-			"table", k.cfg.Table, "dead_tup", dead, "ratio", h.deadRatio)
+			"table", p.d.Cfg.Table, "dead_tup", dead, "ratio", h.deadRatio)
 	}
 }
 
@@ -470,28 +452,28 @@ func (k *KineDB) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 // instead of queueing. The RateTrySpend lands on the ATTEMPT like
 // the pgb-restart budget: a failing vacuum does not retry every
 // probe round.
-func (k *KineDB) deadTupleVacuum(ctx context.Context, pg, user, pass string,
+func (p *Probe) deadTupleVacuum(ctx context.Context, pg, user, pass string,
 	note func(string)) bool {
 	// MkdirAll before the spend — Store.WriteEpochFile does not
 	// create the state dir itself (same note as checkPGBWedge).
-	_ = os.MkdirAll(k.cfg.GuardStateDir, 0o755)
-	if !k.state.RateTrySpend(deadTupleVacuumFile, deadTupleVacuumBudget) {
+	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
+	if !p.d.State.RateTrySpend(deadTupleVacuumFile, deadTupleVacuumBudget) {
 		note("dead-tuple-vacuum-cooldown (<30m)")
 		return false
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kh_locked;\n",
-		k.cfg.AdvisoryLockID)
+		p.d.Cfg.AdvisoryLockID)
 	b.WriteString("\\gset\n\\if :kh_locked\n")
-	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", sqlIdent(k.cfg.Table))
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", k.cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + lockBusyMarker + "'\n\\endif\n")
-	sout, err := k.psqlScript(ctx, pg, user, pass, b.String())
+	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", kdeps.SQLIdent(p.d.Cfg.Table))
+	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", p.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
+	sout, err := p.d.PsqlScript(ctx, pg, user, pass, b.String())
 	switch {
 	case err != nil:
 		note(fmt.Sprintf("dead-tuple-vacuum-fail: %v", err))
-	case strings.Contains(sout, lockBusyMarker):
+	case strings.Contains(sout, kdeps.LockBusyMarker):
 		note("dead-tuple-vacuum lock busy (compact running)")
 	default:
 		return true
@@ -502,15 +484,15 @@ func (k *KineDB) deadTupleVacuum(ctx context.Context, pg, user, pass string,
 // hygieneXID — item 3: MAX(age(datfrozenxid)) across databases. Only
 // the gauge lives here; the VACUUM (FREEZE, ANALYZE) remediation is
 // xidFreezeCheck in the maint cycle.
-func (k *KineDB) hygieneXID(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneXID(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COALESCE(MAX(age(datfrozenxid)),0) FROM pg_database")
 	if err != nil {
 		note(fmt.Sprintf("xid-age-fail: %v", err))
 		return
 	}
-	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("xid-age-unparsed: %v", perr))
 		return
@@ -520,15 +502,15 @@ func (k *KineDB) hygieneXID(ctx context.Context, pg, user, pass string,
 
 // hygieneWAL — item 4: pg_wal size, wal/datafs ratio, archiver
 // staleness and inactive-slot retention (with the orphan-slot drop).
-func (k *KineDB) hygieneWAL(ctx context.Context, pg, user, pass string,
+func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
 
 	// (a) total WAL bytes — same pg_ls_waldir read repackHeadroom does.
-	out, err := k.psqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COALESCE((SELECT SUM(size) FROM pg_ls_waldir()),0)")
 	if err != nil {
 		note(fmt.Sprintf("wal-size-fail: %v", err))
-	} else if wal, perr := strconv.ParseInt(firstLine(out), 10, 64); perr != nil {
+	} else if wal, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64); perr != nil {
 		note(fmt.Sprintf("wal-size-unparsed: %v", perr))
 	} else {
 		h.walBytes, h.walSeen = wal, true
@@ -539,11 +521,11 @@ func (k *KineDB) hygieneWAL(ctx context.Context, pg, user, pass string,
 	// pressure, not remaining headroom). Only meaningful when the
 	// WAL read succeeded.
 	if h.walSeen {
-		dataDir := k.cfg.PGDataDir
+		dataDir := p.d.Cfg.PGDataDir
 		if dataDir == "" {
-			dataDir = defaultPGDataDir
+			dataDir = kdeps.DefaultPGDataDir
 		}
-		df, derr := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
+		df, derr := p.d.Exec(ctx, []string{p.d.Cfg.Runtime, "exec", pg,
 			"df", "-B1", "--output=size", dataDir}, "")
 		if derr != nil {
 			note(fmt.Sprintf("wal-df-fail: %v", derr))
@@ -565,21 +547,21 @@ func (k *KineDB) hygieneWAL(ctx context.Context, pg, user, pass string,
 	// success is "failing"; it only counts as STALE once the last
 	// success (or, when it never archived, the stats reset) is >30m
 	// old. A recent failure that then succeeded reads clean.
-	out, err = k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT CASE WHEN failed_count > 0 "+
 			"AND last_failed_time > COALESCE(last_archived_time, '-infinity'::timestamptz) "+
 			"AND EXTRACT(EPOCH FROM now() - COALESCE(last_archived_time, stats_reset)) > %d "+
 			"THEN 1 ELSE 0 END FROM pg_stat_archiver", archiveStaleSecs))
 	if err != nil {
 		note(fmt.Sprintf("archiver-fail: %v", err))
-	} else if v, perr := strconv.ParseInt(firstLine(out), 10, 64); perr != nil {
+	} else if v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64); perr != nil {
 		note(fmt.Sprintf("archiver-unparsed: %v", perr))
 	} else {
 		h.archiveStale, h.archiveSeen = v, true
 	}
 
 	// (d) inactive replication slots — retained WAL since restart_lsn.
-	out, err = k.psqlQuery(ctx, pg, user, pass,
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT slot_name, "+
 			"COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint "+
 			"FROM pg_replication_slots WHERE NOT active")
@@ -595,15 +577,15 @@ func (k *KineDB) hygieneWAL(ctx context.Context, pg, user, pass string,
 			// Past the critical threshold the slot is an orphan
 			// pinning the disk to PANIC — drop it and let the
 			// consumer resync from scratch if it ever returns.
-			if k.cfg.ReadOnly {
+			if p.d.Cfg.ReadOnly {
 				note(fmt.Sprintf("read-only: inactive slot %s pins %dB WAL (>%dGiB) — drop suppressed",
 					s.name, s.retained, slotRetainedDrop>>30))
 				continue
 			}
 			note(fmt.Sprintf("inactive slot %s pins %dB WAL (>%dGiB) — dropping",
 				s.name, s.retained, slotRetainedDrop>>30))
-			if _, derr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-				"SELECT pg_drop_replication_slot(%s)", sqlQuote(s.name))); derr != nil {
+			if _, derr := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+				"SELECT pg_drop_replication_slot(%s)", kdeps.SQLQuote(s.name))); derr != nil {
 				note(fmt.Sprintf("drop-slot-%s-fail: %v", s.name, derr))
 			} else {
 				h.slotsDropped++
@@ -638,57 +620,4 @@ func parseSlotRows(out string) []inactiveSlot {
 			name: strings.TrimSpace(f[0]), retained: v})
 	}
 	return slots
-}
-
-// sqlQuote wraps s as a single-quoted SQL literal — slot names come
-// back from the server rather than user input, but a stray quote in
-// the name must still not break the DROP statement.
-func sqlQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
-// sqlIdent wraps s as a double-quoted SQL identifier — cfg.Table is
-// validated as a plain identifier by applyDefaults, but it lands in
-// DDL positions (VACUUM/REINDEX/FROM/UPDATE) where sqlQuote's string
-// literal would be wrong; quoting keeps the interpolation safe even
-// if a name ever bypasses the config check.
-func sqlIdent(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
-// xidFreezeCheck is the maint-cycle half of item 3: the probe owns
-// the kine_db_xid_age_transactions series (2-minute freshness); the
-// freeze remediation runs here where the daily cadence already
-// serialises the heavy reindex/repack work — a FREEZE vacuum is a
-// full-table rewrite freeze storm, not a probe-time action.
-func (k *KineDB) xidFreezeCheck(ctx context.Context, pg, user, pass string,
-	res *maintResult, note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass,
-		"SELECT COALESCE(MAX(age(datfrozenxid)),0) FROM pg_database")
-	if err != nil {
-		note(fmt.Sprintf("xid-age-fail: %v", err))
-		return
-	}
-	age, perr := strconv.ParseInt(firstLine(out), 10, 64)
-	if perr != nil {
-		note(fmt.Sprintf("xid-age-unparsed: %v", perr))
-		return
-	}
-	res.xidAge, res.xidSeen = age, true
-	res.freezeState = "skipped"
-	k.m.xidAge.Set(float64(age))
-	if age <= xidFreezeAge {
-		return
-	}
-	note(fmt.Sprintf("xid-age=%d>%d — VACUUM (FREEZE, ANALYZE)", age, xidFreezeAge))
-	logger().Warn("kinedb: XID age past freeze threshold — VACUUM (FREEZE, ANALYZE)",
-		"xid_age", age, "threshold", xidFreezeAge)
-	if _, verr := k.execLongEnv(ctx, psqlPassEnv(pass), k.psqlArgs(pg, user, false,
-		"-qc", "VACUUM (FREEZE, ANALYZE) "+sqlIdent(k.cfg.Table)), ""); verr != nil {
-		res.okFreeze = false
-		res.freezeState = "fail"
-		note(fmt.Sprintf("freeze-vacuum-fail: %v", verr))
-		return
-	}
-	res.freezeState = "done"
 }

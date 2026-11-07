@@ -1,4 +1,4 @@
-package kinedb
+package maint
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -42,7 +43,7 @@ var maintBloatRules = []testutil.ExecRule{
 
 func TestMaintCycleRepacksWhenBloated(t *testing.T) {
 	k, fr, dir := fixture(t, maintBloatRules)
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.okReindex || !res.okRepack || res.repackState != "done" {
 		t.Fatalf("res=%+v", res)
 	}
@@ -57,7 +58,7 @@ func TestMaintCycleRepacksWhenBloated(t *testing.T) {
 	if !strings.Contains(j, "CREATE EXTENSION IF NOT EXISTS pg_repack") {
 		t.Fatalf("missing extension creation:\n%s", j)
 	}
-	content := readText(t, dir, "kine-db-maint.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db-maint.prom")
 	for _, want := range []string{
 		`kine_db_maint_ok{check="reindex"} 1`,
 		`kine_db_maint_ok{check="repack"} 1`,
@@ -86,7 +87,7 @@ func TestMaintCycleSkipsRepackBelowThreshold(t *testing.T) {
 		// dead 1% on a huge heap → no repack (autovacuum copes).
 		{Substr: "pg_indexes_size", Out: "500000000|14572800|10000|800000\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.repackState != "skipped" {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
@@ -105,7 +106,7 @@ func TestMaintCycleRepackMissingBinary(t *testing.T) {
 		{Substr: "pg_ls_waldir", Out: "0\n"},
 		{Substr: "df", Out: "Avail\n107374182400\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.repackState != "no-binary" {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
@@ -129,7 +130,7 @@ func TestMaintCycleRepackSkippedOnLowHeadroom(t *testing.T) {
 		// VACUUM-only fallback, no repack.
 		{Substr: "df", Out: "Avail\n800000000\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.repackState != "skipped-headroom" {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
@@ -152,11 +153,11 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 		{Substr: "pg_ls_waldir", Out: "0\n"},
 		{Substr: "df", Out: "Avail\n107374182400\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.okRepack || res.repackState != "fail" {
 		t.Fatalf("res=%+v", res)
 	}
-	content := readText(t, dir, "kine-db-maint.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db-maint.prom")
 	if !strings.Contains(content, `kine_db_maint_ok{check="repack"} 0`) {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -168,11 +169,11 @@ func TestMaintCycleReindexFailure(t *testing.T) {
 		{Substr: "REINDEX TABLE CONCURRENTLY", Err: errors.New("lock timeout")},
 		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.okReindex {
 		t.Fatal("reindex should fail")
 	}
-	content := readText(t, dir, "kine-db-maint.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db-maint.prom")
 	if !strings.Contains(content, `kine_db_maint_ok{check="reindex"} 0`) {
 		t.Fatalf("textfile:\n%s", content)
 	}
@@ -183,7 +184,7 @@ func TestMaintCycleContainerDown(t *testing.T) {
 		{Substr: "inspect", Err: errors.New("down")},
 		{Substr: "ps --format", Out: ""},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.okReindex {
 		t.Fatal("reindex must fail with the container down")
 	}
@@ -202,11 +203,11 @@ func TestMaintCycleAssessFailGatesGauges(t *testing.T) {
 		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 		{Substr: "pg_indexes_size", Err: errors.New("connection reset")},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.repackState != "assess-fail" || res.okRepack {
 		t.Fatalf("res=%+v", res)
 	}
-	content := readText(t, dir, "kine-db-maint.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db-maint.prom")
 	if strings.Contains(content, "kine_db_maint_relation_bytes") {
 		t.Fatalf("fabricated relation_bytes on assess-fail:\n%s", content)
 	}
@@ -229,7 +230,7 @@ func TestMaintReapsInvalidIndexes(t *testing.T) {
 		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
 		{Substr: "datfrozenxid", Out: "1000000\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if res.invalidDropped != 2 || res.invalidKept != 1 {
 		t.Fatalf("res=%+v", res)
 	}
@@ -270,7 +271,7 @@ func TestMaintReaperSkipsOnListFailure(t *testing.T) {
 		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
 	})
-	res := k.maintCycle(context.Background())
+	res := k.Cycle(context.Background())
 	if !res.okReindex || res.invalidDropped != 0 {
 		t.Fatalf("res=%+v", res)
 	}
