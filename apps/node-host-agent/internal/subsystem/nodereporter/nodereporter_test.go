@@ -480,22 +480,28 @@ func TestZeroChurn(t *testing.T) {
 
 // TestSeedFromLiveNode: when the node already carries matching
 // conditions (e.g. written before an agent restart), the first cycle
-// must not PATCH — restart doesn't churn the API.
+// must not PATCH — restart doesn't churn the API. The seeded shapes
+// carry a fresh lastHeartbeatTime: every patch the reporter writes
+// includes one, so "matching" includes the stamp.
 func TestSeedFromLiveNode(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
 	for _, d := range conditionDefs {
 		node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
-			Type:    d.typ,
-			Status:  corev1.ConditionFalse,
-			Reason:  d.defaultReason,
-			Message: d.defaultMessage,
+			Type:               d.typ,
+			Status:             corev1.ConditionFalse,
+			Reason:             d.defaultReason,
+			Message:            d.defaultMessage,
+			LastHeartbeatTime:  metav1.Now(),
+			LastTransitionTime: metav1.Now(),
 		})
 	}
 	node.Status.Conditions = append(node.Status.Conditions,
 		corev1.NodeCondition{Type: "KernelDeadlock", Status: corev1.ConditionFalse,
-			Reason: kernelDeadlockDefaultReason, Message: kernelDeadlockDefaultMsg},
+			Reason: kernelDeadlockDefaultReason, Message: kernelDeadlockDefaultMsg,
+			LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()},
 		corev1.NodeCondition{Type: "ReadonlyFilesystem", Status: corev1.ConditionFalse,
-			Reason: readonlyDefaultReason, Message: readonlyDefaultMsg})
+			Reason: readonlyDefaultReason, Message: readonlyDefaultMsg,
+			LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()})
 	e := fixture(t, node)
 	e.cycle()
 	if n := e.patches(); n != 0 {
@@ -724,5 +730,71 @@ func TestJournalUnreadableLatchSetsCondition(t *testing.T) {
 	if c.Status != corev1.ConditionFalse || c.Reason != "JournaldReadable" {
 		t.Fatalf("cleared JournaldUnreadable = {%s %s}, want False/JournaldReadable",
 			c.Status, c.Reason)
+	}
+}
+
+// TestHeartbeatRefreshPatchesStaleConditions: lastHeartbeatTime is
+// the reporter-liveness stamp node-hang-precordon trusts — a steady
+// condition set re-patches once per HeartbeatInterval so "fresh"
+// keeps meaning "alive", while the Status/Reason zero-churn gate
+// still holds between refreshes.
+func TestHeartbeatRefreshPatchesStaleConditions(t *testing.T) {
+	e := fixture(t)
+	e.cycle()
+	if n := e.patches(); n != 1 {
+		t.Fatalf("first cycle: %d patches, want 1", n)
+	}
+	// Inside the interval: unchanged set, still zero-churn.
+	e.now = e.now.Add(time.Minute)
+	e.cycle()
+	if n := e.patches(); n != 1 {
+		t.Fatalf("inside HeartbeatInterval: %d patches, want 1", n)
+	}
+	// Past the interval the stamp ages out → one heartbeat-only
+	// patch: Status/Reason/LTT untouched, heartbeat re-stamped.
+	e.now = e.now.Add(defaultHeartbeatInterval + time.Second)
+	lttBefore := e.cond(t, "NodeOverloaded").LastTransitionTime
+	e.cycle()
+	if n := e.patches(); n != 2 {
+		t.Fatalf("heartbeat refresh: %d patches, want 2", n)
+	}
+	c := e.cond(t, "NodeOverloaded")
+	if c.Status != corev1.ConditionFalse || c.Reason != "NodeLoadNormal" {
+		t.Fatalf("heartbeat patch rewrote the verdict: {%s %s}", c.Status, c.Reason)
+	}
+	if !c.LastTransitionTime.Time.Equal(lttBefore.Time) {
+		t.Fatalf("heartbeat patch moved LTT: %v -> %v", lttBefore, c.LastTransitionTime)
+	}
+	if got := c.LastHeartbeatTime.Time; !got.Equal(e.now) {
+		t.Fatalf("heartbeat = %v, want refreshed %v", got, e.now)
+	}
+	// The refresh re-arms the interval — no churn until it lapses
+	// again.
+	e.cycle()
+	if n := e.patches(); n != 2 {
+		t.Fatalf("post-refresh: %d patches, want 2", n)
+	}
+}
+
+// TestCycleDeadlineAbortsWedgedSync is the 2026-11-06 wedge
+// regression: runCycle wraps Cycle in CycleTimeout, so a ctx-aware
+// call that hangs forever aborts the cycle instead of freezing the
+// reporter with subsystem_up pinned at 1. The journalFetch seam
+// plays the wedge — like the real journald/kube paths it only
+// releases on ctx cancel.
+func TestCycleDeadlineAbortsWedgedSync(t *testing.T) {
+	e := fixture(t)
+	e.r.cfg.CycleTimeout = 150 * time.Millisecond
+	e.r.cfg.journalFetch = func(ctx context.Context, _ ...string) (string, error) {
+		<-ctx.Done() // the wedged fetch — a cancelled ctx is the only release
+		return "", ctx.Err()
+	}
+	start := time.Now()
+	e.r.runCycle(context.Background())
+	if d := time.Since(start); d >= 3*time.Second {
+		t.Fatalf("runCycle blocked %v — the deadline did not interrupt the wedge", d)
+	}
+	if got := testutil.ToFloat64(e.r.cycles.WithLabelValues("error")); got != 1 {
+		t.Fatalf("cycles{error} = %v, want 1 (aborted cycle counts as error)", got)
 	}
 }

@@ -451,28 +451,41 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	for _, c := range node.Status.Conditions {
 		live[c.Type] = c
 	}
+	now := metav1.NewTime(r.cfg.nowFn())
 
 	// Zero-churn gate: PATCH only when a Status or Reason differs —
 	// message-only drift (e.g. the WatchdogStale age counter ticking)
 	// does not churn the API.
 	changed := false
 	var changedList []string
+	// heartbeatDue is the gate's other trigger: lastHeartbeatTime is
+	// the reporter-liveness stamp cluster-side checks trust
+	// (node-hang-precordon refuses a condition whose heartbeat
+	// froze — a dead reporter's True value may be a zombie). A
+	// steady condition set still re-patches once per
+	// HeartbeatInterval so "heartbeat fresh" keeps meaning
+	// "reporter alive"; anything that writes our conditions without
+	// a stamp is refreshed on the next cycle.
+	heartbeatDue := false
 	for _, w := range all {
 		cur, ok := live[w.typ]
 		if !ok || cur.Status != w.status || cur.Reason != w.reason {
 			changed = true
 			changedList = append(changedList, fmt.Sprintf(
 				"%s=%s(%s)", w.typ, w.status, w.reason))
+			continue
+		}
+		if now.Sub(cur.LastHeartbeatTime.Time) >= r.cfg.HeartbeatInterval {
+			heartbeatDue = true
 		}
 	}
-	if !changed {
+	if !changed && !heartbeatDue {
 		return nil
 	}
 
 	// conditions carry patchStrategy=merge patchMergeKey=type — a
 	// strategic merge patch updates only our entries and leaves
 	// kubelet-owned conditions (Ready, *Pressure, ...) untouched.
-	now := metav1.NewTime(r.cfg.nowFn())
 	conds := make([]corev1.NodeCondition, 0, len(all))
 	for _, w := range all {
 		ltt := now
@@ -501,8 +514,15 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "status"); err != nil {
 		return fmt.Errorf("patch node %s status: %w", r.cfg.NodeName, err)
 	}
-	logger().Info("nodereporter: node conditions updated",
-		"node", r.cfg.NodeName, "changed", changedList)
+	if len(changedList) > 0 {
+		logger().Info("nodereporter: node conditions updated",
+			"node", r.cfg.NodeName, "changed", changedList)
+	} else {
+		// Routine heartbeat refresh — Debug, or the periodic
+		// re-patch would read as real churn in the logs.
+		logger().Debug("nodereporter: node condition heartbeats refreshed",
+			"node", r.cfg.NodeName)
+	}
 	return nil
 }
 

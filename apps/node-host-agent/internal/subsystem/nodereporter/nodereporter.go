@@ -70,6 +70,25 @@ const (
 	defaultWatchdogLogFile  = "/host/var/log/node-watchdog.log"
 	defaultEventNamespace   = "default" // node events conventionally land in default
 
+	// defaultCycleTimeout is the per-Cycle hard bound Run applies —
+	// controllerhygiene's runCycle parity. The ticker loop calls
+	// Cycle synchronously, so without the bound one hung child
+	// freezes the reporter forever: 2026-11-06 all six agents wedged
+	// mid-Cycle during an apiserver flap (subsystem_up stayed 1,
+	// logs stopped, NodeCondition lastHeartbeatTime froze ~17h; only
+	// a pod delete recovered). Every kube/journal call in Cycle is
+	// ctx-aware, so the deadline actually interrupts the stall;
+	// host file reads can't be, but they were never the wedge.
+	defaultCycleTimeout = 5 * time.Minute
+	// defaultHeartbeatInterval is how often syncConditions
+	// re-patches lastHeartbeatTime on its NodeConditions even when
+	// nothing else changed — the heartbeat is the reporter-liveness
+	// signal cluster-side checks trust (node-hang-precordon refuses
+	// a condition whose heartbeat froze). ~4 cycles at the default
+	// Interval keeps the stamp fresh while staying well under the
+	// controller's 10m staleness window.
+	defaultHeartbeatInterval = 2 * time.Minute
+
 	// NPD-monitor port defaults — see npd_monitors.go. The DaemonSet
 	// runs hostPID and bind-mounts host /dev/kmsg at /dev/kmsg, so
 	// /proc/1/mounts and /proc/uptime are already the HOST tables
@@ -97,10 +116,23 @@ type Config struct {
 	WatchdogStateDir string        // host latch dir (state-*, installed, last-run)
 	WatchdogLogFile  string        // appended node-watchdog log (filelog parity)
 	Interval         time.Duration // sync cadence
-	EventNamespace   string        // ns the Events are created in
-	StaleThreshold   time.Duration // last-run age → WatchdogStale=True
-	LogLookback      time.Duration // first-scan replay window (NPD lookback parity)
-	EventDedupTTL    time.Duration // series-aggregation window per reason+message
+	// CycleTimeout is the per-Cycle deadline Run applies around each
+	// Cycle: Run calls Cycle synchronously inside the ticker loop,
+	// so a kube/journal call that ignores the client timeout would
+	// otherwise stall the reporter indefinitely (the 2026-11-06
+	// ~17h fleet wedge). <=0 → defaultCycleTimeout (5m).
+	CycleTimeout time.Duration
+	// HeartbeatInterval is how often lastHeartbeatTime on the
+	// reporter's NodeConditions is refreshed even when Status and
+	// Reason are unchanged — the stamp is the reporter-liveness
+	// evidence consumers like node-hang-precordon use to distrust a
+	// condition whose writer may be dead. <=0 →
+	// defaultHeartbeatInterval (2m).
+	HeartbeatInterval time.Duration
+	EventNamespace    string        // ns the Events are created in
+	StaleThreshold    time.Duration // last-run age → WatchdogStale=True
+	LogLookback       time.Duration // first-scan replay window (NPD lookback parity)
+	EventDedupTTL     time.Duration // series-aggregation window per reason+message
 
 	// --- NPD monitor port (npd_monitors.go) ---
 	HostRoot           string   // host fs root mount; "/" = running on the host
@@ -122,6 +154,12 @@ type Config struct {
 func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = defaultInterval
+	}
+	if c.CycleTimeout <= 0 {
+		c.CycleTimeout = defaultCycleTimeout
+	}
+	if c.HeartbeatInterval <= 0 {
+		c.HeartbeatInterval = defaultHeartbeatInterval
 	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
@@ -283,7 +321,27 @@ func (r *Reporter) Name() string { return "nodereporter" }
 // it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
 	defer r.kmsgTail.Close()
-	cycle.Every("nodereporter", r.cfg.Interval, r.Cycle).Run(ctx)
+	cycle.Every("nodereporter", r.cfg.Interval, r.runCycle).Run(ctx)
+}
+
+// runCycle executes one Cycle under the per-cycle deadline
+// (Config.CycleTimeout) — controllerhygiene's runCycle parity.
+// The ticker loop calls Cycle synchronously, so without the bound a
+// single hung child — a kube API call with no effective deadline
+// during an apiserver flap, a journald fetch that never returns —
+// starves the sync for as long as it hangs (the ~17h 2026-11-06
+// wedge: all six agents silent mid-Cycle while subsystem_up stayed
+// 1). Hitting the deadline is a degraded cycle, not a failure — the
+// Warn line keeps a silently-starved reporter visible.
+func (r *Reporter) runCycle(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, r.cfg.CycleTimeout)
+	defer cancel()
+	r.Cycle(cctx)
+	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		logger().Warn("nodereporter: cycle deadline exceeded — "+
+			"stalled sync aborted, retrying next cycle",
+			"node", r.cfg.NodeName, "timeout", r.cfg.CycleTimeout)
+	}
 }
 
 // Cycle runs one sync round: one-time heartbeat initialization,
