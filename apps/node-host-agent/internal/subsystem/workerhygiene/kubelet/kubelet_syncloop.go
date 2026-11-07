@@ -22,11 +22,14 @@ import (
 const (
 	unixSockProbeTimeout = 5 * time.Second
 	// plegRelistHighSec is the kubelet_pleg_relist_duration_seconds
-	// threshold — avg or any quantile above it means the PLEG
-	// relist itself is degrading.
+	// threshold — a per-scrape avg (Δsum/Δcount), a summary
+	// quantile, or new >5s relists in the histogram tail above it
+	// means the PLEG relist itself is degrading.
 	plegRelistHighSec = 5.0
-	// plegLastSeenHighSec is the kubelet_pleg_last_seen_seconds lag
-	// above which PLEG has stopped observing state changes at all.
+	// plegLastSeenHighSec is the age of the
+	// kubelet_pleg_last_seen_seconds TIMESTAMP above which PLEG has
+	// stopped observing state changes at all — the metric is the
+	// wall-clock instant PLEG was last active, not a lag.
 	plegLastSeenHighSec = 30.0
 )
 
@@ -51,10 +54,14 @@ const (
 type SyncloopCheck struct {
 	d           *wdeps.Deps
 	fails       int
-	unauth      bool  // last probe was 401/403 — log the streak once
-	plegFails   int   // consecutive over-threshold PLEG metric cycles
-	prevDiscard int64 // last kubelet_pleg_discard_events read
-	discardSeen bool  // prevDiscard holds a real baseline
+	unauth      bool    // last probe was 401/403 — log the streak once
+	plegFails   int     // consecutive over-threshold PLEG metric cycles
+	prevDiscard int64   // last kubelet_pleg_discard_events read
+	discardSeen bool    // prevDiscard holds a real baseline
+	prevSum     float64 // last relist_duration_seconds_sum read
+	prevCount   float64 // last relist_duration_seconds_count read
+	prevFast    float64 // last fast-relist cumulative count read
+	relistSeen  bool    // prev*/prevFast hold a real baseline
 }
 
 // Name returns the check label / WD_SIG key.
@@ -174,16 +181,18 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 }
 
 // --- PLEG relist-latency early warning (kubelet /metrics) ---
-// kubelet_pleg_relist_duration_seconds (summary: quantiles + sum +
-// count), kubelet_pleg_last_seen_seconds (gauge) and
-// kubelet_pleg_discard_events (counter) tell the PLEG-health story a
-// full cycle before /healthz/syncloop dies: relist avg/quantile >5s
-// or last-seen lag >30s means the relist loop is starving. The
-// scrape goes through the KubeletMetricsFn seam — same :10250
-// listener and SA bearer as the healthz probe. A scrape error or a
-// body without PLEG series is inconclusive (streak and latch kept —
-// never count, never clear on missing evidence). ConsecNeeded
-// consecutive over-threshold cycles enter
+// kubelet_pleg_relist_duration_seconds (a summary on older kubelets,
+// a histogram on newer — _bucket/_sum/_count),
+// kubelet_pleg_last_seen_seconds (gauge carrying the Unix TIMESTAMP
+// PLEG was last active — not an age) and kubelet_pleg_discard_events
+// (counter) tell the PLEG-health story a full cycle before
+// /healthz/syncloop dies: a recent relist avg >5s, any new relist
+// slower than 5s, or a last-seen stamp >30s old means the relist
+// loop is starving. The scrape goes through the KubeletMetricsFn
+// seam — same :10250 listener and SA bearer as the healthz probe. A
+// scrape error or a body without PLEG series is inconclusive
+// (streak and latch kept — never count, never clear on missing
+// evidence). ConsecNeeded consecutive over-threshold cycles enter
 // state-kubelet-pleg-unhealthy so nodereporter flips
 // KubeletPLEGUnhealthy early; a healthy scrape clears both.
 
@@ -191,26 +200,29 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // W12-KR4 storage-operation error counter the same :10250
 // exposition carries.
 type plegSample struct {
-	relistAvg      float64 // relist_duration_seconds_sum / _count
-	relistQuant    float64 // worst quantile sample
-	lastSeen       float64 // pleg_last_seen_seconds
+	relistSum      float64 // relist_duration_seconds_sum (lifetime)
+	relistCount    float64 // relist_duration_seconds_count (lifetime)
+	relistQuant    float64 // worst quantile sample (summary form only)
+	relistFastCum  float64 // histogram: count at the highest le <= plegRelistHighSec
+	lastSeen       float64 // pleg_last_seen_seconds — Unix timestamp
 	discard        int64   // pleg_discard_events counter
 	storageErrs    float64 // storage_operation_errors_total summed over labels
 	hasRelist      bool
 	hasLastSeen    bool
 	hasDiscard     bool
 	hasStorageErrs bool
+	hasFastCum     bool
 }
 
 // parsePLEGMetrics picks the PLEG series out of a kubelet /metrics
 // text exposition. Sample lines are "<name>{labels} value" or
-// "<name> value"; HELP/TYPE comments are skipped. The summary emits
-// quantile samples plus _sum/_count — avg is computed from the pair
-// and the worst quantile is kept; a histogram variant (only
-// _bucket/_sum/_count lines) still yields the avg.
+// "<name> value"; HELP/TYPE comments are skipped. Older kubelets
+// expose the relist duration as a summary (quantile rows plus
+// _sum/_count); newer ones emit a histogram (_bucket/_sum/_count) —
+// either way _sum/_count carry the lifetime avg and the cumulative
+// bucket counts carry the fast/slow split.
 func parsePLEGMetrics(body string) plegSample {
 	var s plegSample
-	var sum, cnt float64
 	for _, line := range strings.Split(body, "\n") {
 		if line == "" || line[0] == '#' {
 			continue
@@ -237,10 +249,21 @@ func parsePLEGMetrics(body string) plegSample {
 					s.relistQuant = v
 				}
 			}
+		case "kubelet_pleg_relist_duration_seconds_bucket":
+			// Histogram form: cumulative bucket counts. The count
+			// at the highest le <= plegRelistHighSec is the "fast"
+			// total; count - fastCum is the slow tail. Cumulative
+			// counts are monotonic in le so the max over the
+			// qualifying buckets IS that bucket's count.
+			if le, ok := plegBucketLE(f[0]); ok &&
+				le <= plegRelistHighSec && v > s.relistFastCum {
+				s.relistFastCum, s.hasFastCum = v, true
+			}
+			s.hasRelist = true
 		case "kubelet_pleg_relist_duration_seconds_sum":
-			sum, s.hasRelist = v, true
+			s.relistSum, s.hasRelist = v, true
 		case "kubelet_pleg_relist_duration_seconds_count":
-			cnt, s.hasRelist = v, true
+			s.relistCount, s.hasRelist = v, true
 		case "kubelet_pleg_last_seen_seconds":
 			s.lastSeen, s.hasLastSeen = v, true
 		case "kubelet_pleg_discard_events":
@@ -254,10 +277,24 @@ func parsePLEGMetrics(body string) plegSample {
 			s.hasStorageErrs = true
 		}
 	}
-	if cnt > 0 {
-		s.relistAvg = sum / cnt
-	}
 	return s
+}
+
+// plegBucketLE pulls the le="X" bound out of a histogram bucket
+// sample name ("...+Inf" parses to +Inf and is dropped by the
+// caller's range check).
+func plegBucketLE(name string) (float64, bool) {
+	i := strings.Index(name, `le="`)
+	if i < 0 {
+		return 0, false
+	}
+	rest := name[i+len(`le="`):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(rest[:j], 64)
+	return v, err == nil
 }
 
 // probePLEG scrapes kubelet /metrics once and updates the PLEG
@@ -284,8 +321,20 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 		// inconclusive (metrics stripped/downgraded), keep state.
 		return
 	}
-	if s.hasLastSeen {
-		c.d.KubeletPLEGLastSeenAgeSec = s.lastSeen
+	// kubelet_pleg_last_seen_seconds is a Unix timestamp — the
+	// wall-clock instant PLEG was last active — NOT an age: the lag
+	// is host-clock minus the stamp. A stamp <=0 means PLEG never
+	// ran since kubelet start — inconclusive, don't flag on it.
+	var lastSeenAge float64
+	lastSeenOK := false
+	if s.hasLastSeen && s.lastSeen > 0 {
+		lastSeenAge = c.d.Cfg.Seams.Host.NowFn().Sub(
+			time.Unix(int64(s.lastSeen), 0)).Seconds()
+		if lastSeenAge < 0 {
+			lastSeenAge = 0 // stamp in the future — treat as just-seen
+		}
+		c.d.KubeletPLEGLastSeenAgeSec = lastSeenAge
+		lastSeenOK = true
 	}
 	discardDelta := int64(0)
 	if s.hasDiscard {
@@ -295,9 +344,34 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 		}
 		c.prevDiscard, c.discardSeen = s.discard, true
 	}
-	over := (s.hasRelist && (s.relistAvg > plegRelistHighSec ||
-		s.relistQuant > plegRelistHighSec)) ||
-		(s.hasLastSeen && s.lastSeen > plegLastSeenHighSec)
+	// The lifetime avg (sum/count since kubelet start) can never
+	// move on a long-lived kubelet, so verdicts come from
+	// per-scrape deltas: Δsum/Δcount plus the new >plegRelistHighSec
+	// tail growth (count − fastCum). The first scrape after
+	// (re)start only seeds the baseline — unless the lifetime avg
+	// itself is already over, which still flags.
+	relistAvg := 0.0
+	relistOver := s.relistQuant > plegRelistHighSec
+	if s.relistCount > 0 {
+		relistAvg = s.relistSum / s.relistCount
+		switch {
+		case c.relistSeen && s.relistCount > c.prevCount:
+			relistAvg = (s.relistSum - c.prevSum) / (s.relistCount - c.prevCount)
+			if relistAvg > plegRelistHighSec ||
+				(s.hasFastCum && s.relistCount-s.relistFastCum >
+					c.prevCount-c.prevFast) {
+				relistOver = true
+			}
+		case !c.relistSeen && relistAvg > plegRelistHighSec:
+			relistOver = true
+		}
+		c.prevSum, c.prevCount, c.relistSeen = s.relistSum, s.relistCount, true
+		if s.hasFastCum {
+			c.prevFast = s.relistFastCum
+		}
+	}
+	over := relistOver ||
+		(lastSeenOK && lastSeenAge > plegLastSeenHighSec)
 	if !over {
 		c.plegFails = 0
 		c.d.State.Exit(hoststate.LatchKubeletPLEGUnhealthy, nil)
@@ -306,14 +380,14 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 	c.plegFails++
 	if c.plegFails < c.d.Cfg.ConsecNeeded {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-pleg-unhealthy relist_avg=%.2f relist_q=%.2f last_seen=%.1f discards=+%d (check %d/%d)",
-			s.relistAvg, s.relistQuant, s.lastSeen, discardDelta,
+			"suspect: kubelet-pleg-unhealthy relist_avg=%.2f relist_q=%.2f last_seen_age=%.1f discards=+%d (check %d/%d)",
+			relistAvg, s.relistQuant, lastSeenAge, discardDelta,
 			c.plegFails, c.d.Cfg.ConsecNeeded))
 		return
 	}
 	c.d.State.Enter(hoststate.LatchKubeletPLEGUnhealthy, fmt.Sprintf(
-		"relist_avg=%.2f relist_q=%.2f last_seen=%.1f discards=+%d",
-		s.relistAvg, s.relistQuant, s.lastSeen, discardDelta))
+		"relist_avg=%.2f relist_q=%.2f last_seen_age=%.1f discards=+%d",
+		relistAvg, s.relistQuant, lastSeenAge, discardDelta))
 }
 
 // kubeletBearer reads the service-account token kubelet's :10250
