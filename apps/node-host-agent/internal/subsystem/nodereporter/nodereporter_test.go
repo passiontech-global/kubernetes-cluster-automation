@@ -498,10 +498,10 @@ func TestSeedFromLiveNode(t *testing.T) {
 	}
 	node.Status.Conditions = append(node.Status.Conditions,
 		corev1.NodeCondition{Type: "KernelDeadlock", Status: corev1.ConditionFalse,
-			Reason: kernelDeadlockDefaultReason, Message: kernelDeadlockDefaultMsg,
+			Reason: "KernelHasNoDeadlock", Message: "kernel has no deadlock",
 			LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()},
 		corev1.NodeCondition{Type: "ReadonlyFilesystem", Status: corev1.ConditionFalse,
-			Reason: readonlyDefaultReason, Message: readonlyDefaultMsg,
+			Reason: "FilesystemIsNotReadOnly", Message: "Filesystem is not read-only",
 			LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()})
 	e := fixture(t, node)
 	e.cycle()

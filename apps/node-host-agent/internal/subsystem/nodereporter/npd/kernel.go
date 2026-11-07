@@ -1,4 +1,4 @@
-// npd_kernel.go — the kernel-monitor port (upstream
+// kernel.go — the kernel-monitor port (upstream
 // kernel-monitor.json, kmsg plugin): drains the host kernel ring
 // buffer — the DaemonSet bind-mounts host /dev/kmsg at /dev/kmsg
 // (CharDevice, ro), with <HostRoot>/dev/kmsg as the fallback path —
@@ -17,8 +17,9 @@
 // kernel-softlockup-monitor additions extend the deadlock class to
 // the watchdog soft-lockup and RCU-stall signatures — each is also
 // a temporary rule (counter + Event) and Enters an evidence latch
-// KernelHungTasks' altStateKeys probe (conditions.go).
-package nodereporter
+// KernelHungTasks' altStateKeys probe (the parent's
+// conditions.go).
+package npd
 
 import (
 	"context"
@@ -48,7 +49,7 @@ var (
 // kernel-monitor.json temporary rules (the upstream set, trimmed to
 // the reasons kept by this deployment's alert rules), plus the
 // kernel-softlockup-monitor pair at the tail.
-var kernelTempRules = []logRule{
+var kernelTempRules = []rule{
 	{"OOMKilling", regexp.MustCompile(`Killed process \d+ .* out of memory|Out of memory: Killed process`)},
 	{"TaskHung", regexp.MustCompile(`task [\S ]+:\w+ blocked for more than \w+ seconds`)},
 	{"KernelOops", regexp.MustCompile(`BUG: unable to handle kernel|kernel BUG at|Oops:`)},
@@ -81,10 +82,10 @@ var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than` 
 // evidence latches the kernel monitor Enters on a soft-lockup /
 // RCU-stall signature — the same hang class as the workerhygiene
 // D-state storm, surfaced through KernelHungTasks' altStateKeys in
-// conditions.go. The reporter owns the latch names (no hygiene check
-// produces kmsg lines) and never Exits them: a lockup/stall is
-// permanent-class evidence, so only the janitor's max-age reaper
-// clears a latch whose signature stopped recurring.
+// the parent's conditions.go. The reporter owns the latch names (no
+// hygiene check produces kmsg lines) and never Exits them: a
+// lockup/stall is permanent-class evidence, so only the janitor's
+// max-age reaper clears a latch whose signature stopped recurring.
 const (
 	kernelSoftLockupLatch = hoststate.LatchKernelSoftLockup
 	kernelRCUStallLatch   = hoststate.LatchKernelRCUStall
@@ -101,9 +102,16 @@ var kernelHungLatchRules = []struct {
 	{kernelRCUStallRe, kernelRCUStallLatch},
 }
 
-// maxKmsgReadBytes bounds one kmsg drain per cycle — a printk flood
-// is sliced across cycles instead of slurping the whole ring.
-const maxKmsgReadBytes = 4 << 20
+const (
+	// maxKmsgReadBytes bounds one kmsg drain per cycle — a printk
+	// flood is sliced across cycles instead of slurping the whole
+	// ring.
+	maxKmsgReadBytes = 4 << 20
+	// maxKmsgPendingBytes bounds the carried partial record — a
+	// line that never terminates cannot grow the carry forever
+	// (same bound the watchdog filelog tail uses).
+	maxKmsgPendingBytes = 64 << 10
+)
 
 // The KernelDeadlock NodeCondition and its upstream strings
 // (kernel-monitor.json conditions[]).
@@ -115,22 +123,6 @@ const (
 	kernelDeadlockProblemReason = "KernelDeadlock"
 )
 
-// kernelLine is one kernel record: the message text plus its
-// µs-since-boot timestamp (-1 when unknown, e.g. journald path where
-// the cursor already bounds the window).
-type kernelLine struct {
-	msg  string
-	usec int64
-}
-
-// parseKmsgRecord splits a /dev/kmsg record "pri,seq,usec,flags;msg"
-// into its message and boot-relative timestamp. Lines without the
-// kmsg header pass through whole with an unknown timestamp.
-func parseKmsgRecord(line []byte) kernelLine {
-	r := kmsg.ParseRecord(line)
-	return kernelLine{msg: r.Msg, usec: r.Usec}
-}
-
 // kernelLines returns new kernel records and whether they must pass
 // the first-scan lookback filter. kmsg path: the tailer lazily opens
 // the device (a reopen after a read error re-arms the lookback
@@ -141,41 +133,44 @@ func parseKmsgRecord(line []byte) kernelLine {
 // line would otherwise latch a PERMANENT KernelDeadlock on a fresh
 // agent start). Journald fallback: permanent once kmsg cannot be
 // opened, bounded by its own cursor so replay is never needed.
-func (r *Reporter) kernelLines(ctx context.Context) ([]kernelLine, bool, error) {
+// Records come back as kmsg.Record — Msg is the payload text,
+// Usec the µs-since-boot timestamp (-1 when unknown, e.g. the
+// journald path where the cursor already bounds the window).
+func (m *Monitor) kernelLines(ctx context.Context) ([]kmsg.Record, bool, error) {
 	for {
-		if r.kmsgJournalMode {
-			entries, err := r.fetchJournal(ctx, &r.kernelJournalUS, "-k")
+		if m.kmsgJournalMode {
+			entries, err := m.fetchJournal(ctx, &m.kernelJournalUS, "-k")
 			if err != nil {
 				return nil, false, err
 			}
-			lines := make([]kernelLine, 0, len(entries))
+			lines := make([]kmsg.Record, 0, len(entries))
 			for _, e := range entries {
-				lines = append(lines, kernelLine{msg: e.Msg, usec: -1})
+				lines = append(lines, kmsg.Record{Msg: e.Msg, Usec: -1})
 			}
 			return lines, false, nil
 		}
-		raw, res, err := r.kmsgTail.Read()
+		raw, res, err := m.kmsgTail.Read()
 		switch {
 		case errors.Is(err, kmsg.ErrNoDevice):
 			// No openable kmsg device — permanent journalctl -k
 			// fallback for the process lifetime.
-			r.kmsgJournalMode = true
+			m.kmsgJournalMode = true
 			logger().Warn("nodereporter: /dev/kmsg unreadable, kernel monitor "+
 				"falls back to journalctl -k for the process lifetime",
-				"kmsg", r.cfg.KmsgFile, "hostRoot", r.cfg.HostRoot)
+				"kmsg", m.cfg().KmsgFile, "hostRoot", m.cfg().HostRoot)
 			continue
 		case err != nil:
-			r.closeKmsg() // reopen next cycle → lookback re-armed
-			return nil, false, fmt.Errorf("read %s: %w", r.cfg.KmsgFile, err)
+			m.closeKmsg() // reopen next cycle → lookback re-armed
+			return nil, false, fmt.Errorf("read %s: %w", m.cfg().KmsgFile, err)
 		}
 		replay := res.Backlog
 		// kmsgScanned is "caught up at least once on this handle"
 		// (the field name predates the EAGAIN semantics); the
 		// tailer's post-read flag mirrors it.
-		r.kmsgScanned = res.CaughtUp
-		lines := make([]kernelLine, 0, len(raw))
+		m.kmsgScanned = res.CaughtUp
+		lines := make([]kmsg.Record, 0, len(raw))
 		for _, l := range raw {
-			lines = append(lines, parseKmsgRecord(l))
+			lines = append(lines, kmsg.ParseRecord(l))
 		}
 		return lines, replay, nil
 	}
@@ -185,15 +180,15 @@ func (r *Reporter) kernelLines(ctx context.Context) ([]kernelLine, bool, error) 
 // path above uses it to force a fresh open next cycle (the
 // partial-line carry survives inside the tailer; only the handle is
 // dropped).
-func (r *Reporter) closeKmsg() {
-	r.kmsgTail.Close()
+func (m *Monitor) closeKmsg() {
+	m.kmsgTail.Close()
 }
 
-// syncKernelMonitor is the kernel-monitor port: new kernel lines →
+// SyncKernelMonitor is the kernel-monitor port: new kernel lines →
 // temporary rules (counter + Event) plus the permanent KernelDeadlock
 // latch.
-func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
-	lines, replay, err := r.kernelLines(ctx)
+func (m *Monitor) SyncKernelMonitor(ctx context.Context, s Sink) error {
+	lines, replay, err := m.kernelLines(ctx)
 	if err != nil {
 		return err
 	}
@@ -203,7 +198,7 @@ func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
 		// under hostPID this is the HOST uptime, which converts kmsg
 		// µs-since-boot timestamps into ages for the first-scan
 		// lookback (hostutil.UptimeSeconds is the shared parser).
-		if u, e := hostutil.UptimeSeconds(r.cfg.ProcUptimeFile); e == nil {
+		if u, e := hostutil.UptimeSeconds(m.cfg().ProcUptimeFile); e == nil {
 			uptime = u
 		}
 	}
@@ -212,14 +207,14 @@ func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
 			// kmsg records: age = uptime - usec. Unknown ts or an
 			// unreadable uptime → drop the backlog line rather than
 			// replay ancient ring history as live (filelog parity).
-			if l.usec <= 0 || uptime < 0 {
+			if l.Usec <= 0 || uptime < 0 {
 				continue
 			}
-			if uptime-float64(l.usec)/1e6 > r.cfg.LogLookback.Seconds() {
+			if uptime-float64(l.Usec)/1e6 > m.cfg().LogLookback.Seconds() {
 				continue
 			}
 		}
-		r.processKernelLine(ctx, l.msg)
+		m.processKernelLine(ctx, s, l.Msg)
 	}
 	return nil
 }
@@ -227,19 +222,19 @@ func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
 // processKernelLine applies the temporary kernel rules plus the
 // permanent KernelDeadlock latch to one kernel message. The
 // soft-lockup/RCU-stall signatures additionally Enter their
-// KernelHungTasks evidence latches — r.state carries an empty
-// LogFile, so the STATE-ENTER never circles back into the filelog
-// rules this same reporter tails.
-func (r *Reporter) processKernelLine(ctx context.Context, msg string) {
-	r.matchEventRules(ctx, kernelTempRules, msg)
+// KernelHungTasks evidence latches — the sink's state store carries
+// an empty LogFile, so the STATE-ENTER never circles back into the
+// filelog rules the reporter tails.
+func (m *Monitor) processKernelLine(ctx context.Context, s Sink, msg string) {
+	m.matchEventRules(ctx, s, kernelTempRules, msg)
 	if kernelDeadlockRe.MatchString(msg) {
-		r.problemCounter.WithLabelValues(kernelDeadlockProblemReason).Inc()
-		if !r.kernelDeadlock {
+		s.BumpCounter(kernelDeadlockProblemReason)
+		if !m.kernelDeadlock {
 			// Permanent: latch True for the agent lifetime (NPD
 			// permanent-rule parity) and emit the transition Event.
-			r.kernelDeadlock = true
-			r.kernelDeadlockMsg = msg
-			if err := r.emitEvent(ctx, kernelDeadlockProblemReason, msg); err != nil {
+			m.kernelDeadlock = true
+			m.kernelDeadlockMsg = msg
+			if err := s.EmitEvent(ctx, kernelDeadlockProblemReason, msg); err != nil {
 				logger().Error("nodereporter: event emit failed",
 					"reason", kernelDeadlockProblemReason, "error", err)
 			}
@@ -247,7 +242,7 @@ func (r *Reporter) processKernelLine(ctx context.Context, msg string) {
 	}
 	for _, hr := range kernelHungLatchRules {
 		if hr.re.MatchString(msg) {
-			r.state.Enter(hr.latch, msg)
+			s.EnterLatch(hr.latch, msg)
 		}
 	}
 }

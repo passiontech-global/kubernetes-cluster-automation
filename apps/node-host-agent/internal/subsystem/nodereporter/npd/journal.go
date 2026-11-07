@@ -1,4 +1,4 @@
-// npd_journal.go — the journald-plugin monitor port
+// journal.go — the journald-plugin monitor port
 // (kubelet-stale-monitor.json custom_monitor_definitions in the
 // NPD helm values, journald plugin on unit k0sworker.service):
 // journald lines are fetched via `journalctl -u <unit> --since
@@ -9,8 +9,8 @@
 // LogLookback (5m) — the NPD "lookback" parity. Matching lines bump
 // problem_counter{reason} and emit Events; no conditions (the JSON
 // had "conditions": []). The kernel monitor's `journalctl -k`
-// fallback shares the same fetch (npd_kernel.go).
-package nodereporter
+// fallback shares the same fetch (kernel.go).
+package npd
 
 import (
 	"context"
@@ -19,11 +19,19 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 )
 
+// rule is one temporary monitor rule — reason → K8s Event reason +
+// problem_counter label, pattern → unanchored match on the message.
+// Same shape as the parent's filelog logRule.
+type rule struct {
+	reason string
+	re     *regexp.Regexp
+}
+
 // kubelet-stale-monitor.json rules — journald plugin, temporary
 // only. KubeletNodeNotFound covers both the klog-escaped quoting the
 // values.yaml pattern decoded to (`node \"X\" not found` — the
 // informer-zombie spam signature) and the plain form.
-var kubeletJournalRules = []logRule{
+var kubeletJournalRules = []rule{
 	{"KubeletNodeNotFound", regexp.MustCompile(`node \\?"[^"\\]+\\?" not found|not registered yet`)},
 	{"KubeletObjectNotRegistered", regexp.MustCompile(`not registered|no relationship found between node`)},
 }
@@ -37,37 +45,37 @@ var kubeletJournalRules = []logRule{
 // unboundedly; entries ≤ cursor were already processed. A fetch
 // error leaves the cursor untouched — the same window is retried
 // next cycle.
-func (r *Reporter) fetchJournal(ctx context.Context, cursor *int64, args ...string) ([]journalwatch.Entry, error) {
-	return journalwatch.Fetch(ctx, r.cfg.journalFetch, r.cfg.Clock.Now(),
-		r.cfg.LogLookback, cursor, args...)
+func (m *Monitor) fetchJournal(ctx context.Context, cursor *int64, args ...string) ([]journalwatch.Entry, error) {
+	return journalwatch.Fetch(ctx, m.deps.JournalFetch, m.deps.Now(),
+		m.cfg().LogLookback, cursor, args...)
 }
 
-// syncKubeletJournal is the kubelet-stale-monitor port: new
+// SyncKubeletJournal is the kubelet-stale-monitor port: new
 // k0sworker.service journal lines → rules → problem_counter + Event.
-func (r *Reporter) syncKubeletJournal(ctx context.Context) error {
-	entries, err := r.fetchJournal(ctx, &r.kubeletJournalUS,
-		"-u", r.cfg.KubeletJournalUnit)
+func (m *Monitor) SyncKubeletJournal(ctx context.Context, s Sink) error {
+	entries, err := m.fetchJournal(ctx, &m.kubeletJournalUS,
+		"-u", m.cfg().KubeletJournalUnit)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		r.matchEventRules(ctx, kubeletJournalRules, e.Msg)
+		m.matchEventRules(ctx, s, kubeletJournalRules, e.Msg)
 	}
 	return nil
 }
 
 // matchEventRules applies a temporary rule set to one line: every
 // matching rule increments problem_counter and emits/aggregates an
-// Event — same semantics as processLogLine for the watchdog filelog.
-func (r *Reporter) matchEventRules(ctx context.Context, rules []logRule, msg string) {
-	for _, rule := range rules {
-		if !rule.re.MatchString(msg) {
+// Event — same semantics as the parent's filelog processLogLine.
+func (m *Monitor) matchEventRules(ctx context.Context, s Sink, rules []rule, msg string) {
+	for _, r := range rules {
+		if !r.re.MatchString(msg) {
 			continue
 		}
-		r.problemCounter.WithLabelValues(rule.reason).Inc()
-		if err := r.emitEvent(ctx, rule.reason, msg); err != nil {
+		s.BumpCounter(r.reason)
+		if err := s.EmitEvent(ctx, r.reason, msg); err != nil {
 			logger().Error("nodereporter: event emit failed",
-				"reason", rule.reason, "error", err)
+				"reason", r.reason, "error", err)
 		}
 	}
 }

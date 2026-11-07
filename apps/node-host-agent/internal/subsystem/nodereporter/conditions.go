@@ -157,12 +157,14 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
 		problemReason:  "KernelHungTasksDetected",
 		stateKey:       hoststate.LatchDStateStorm,
-		// kernel-softlockup-monitor (npd_monitors.go): a kmsg
+		// kernel-softlockup-monitor (npd subpackage): a kmsg
 		// soft-lockup/RCU-stall signature is the same hang class —
 		// the kernel monitor Enters one evidence latch per
 		// signature so a CPU wedged inside the kernel raises
 		// KernelHungTasks even when no D-state storm is counted.
-		altStateKeys: []string{kernelSoftLockupLatch, kernelRCUStallLatch},
+		altStateKeys: []string{
+			hoststate.LatchKernelSoftLockup, hoststate.LatchKernelRCUStall,
+		},
 	},
 	// --- Wave-8 latch→condition surface ---
 	// Agent-added conditions for the latches the hygiene subsystems
@@ -432,8 +434,10 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 		all = append(all, wantedCond{e.def.typ, e.status, e.reason,
 			e.message, e.def.problemReason})
 	}
-	for _, e := range r.evalNPDConditions() {
-		all = append(all, wantedCond(e))
+	for _, e := range r.monitors.EvalConditions() {
+		all = append(all, wantedCond{
+			typ: e.Type, status: e.Status, reason: e.Reason,
+			message: e.Message, gaugeReason: e.GaugeReason})
 	}
 	for _, w := range all {
 		v := 0.0

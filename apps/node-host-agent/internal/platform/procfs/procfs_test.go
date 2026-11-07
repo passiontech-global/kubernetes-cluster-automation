@@ -305,3 +305,43 @@ func TestFindByComm(t *testing.T) {
 		t.Fatalf("FindByComm on unreadable root = %d, want 0", got)
 	}
 }
+
+func TestParseMounts(t *testing.T) {
+	ms := ParseMounts([]byte(
+		"proc /proc proc rw,nosuid,nodev 0 0\n" +
+			"/dev/vda1 / ext4 rw,relatime 0 0\n" +
+			"/dev/vdb1 /var ext4 ro,relatime 0 0\n" +
+			"bad line\n" +
+			"short row three\n" +
+			"/dev/vdc1 /var/lib/k0s xfs ro 0 0\n"))
+	if len(ms) != 4 {
+		t.Fatalf("parsed %d mounts, want 4 (bad/short rows skipped)", len(ms))
+	}
+	if ms[1].Source != "/dev/vda1" || ms[1].MountPoint != "/" || ms[1].FSType != "ext4" {
+		t.Fatalf("mount[1] = %+v", ms[1])
+	}
+	if ms[0].Opts["ro"] || !ms[2].Opts["ro"] || !ms[3].Opts["ro"] {
+		t.Fatal("ro opt lookup wrong")
+	}
+	if !ms[0].Opts["nosuid"] || !ms[1].Opts["relatime"] {
+		t.Fatal("non-ro opts missing")
+	}
+}
+
+func TestLastByMountPoint(t *testing.T) {
+	// Stacked binds on the same mountpoint keep the LAST row — the
+	// kernel's topmost-mount view.
+	by := LastByMountPoint(ParseMounts([]byte(
+		"/dev/vda1 /var ext4 rw 0 0\n" +
+			"/dev/vdb1 /var ext4 ro 0 0\n" +
+			"/dev/vdc1 /other xfs rw 0 0\n")))
+	if len(by) != 2 {
+		t.Fatalf("got %d mountpoints, want 2", len(by))
+	}
+	if m := by["/var"]; !m.Opts["ro"] || m.Source != "/dev/vdb1" {
+		t.Fatalf("/var = %+v, want the LAST (ro) row", m)
+	}
+	if m := by["/other"]; m.FSType != "xfs" || m.Opts["ro"] {
+		t.Fatalf("/other = %+v", m)
+	}
+}

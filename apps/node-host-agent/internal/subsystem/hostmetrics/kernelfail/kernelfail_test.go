@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -224,8 +225,11 @@ func TestClockSkew(t *testing.T) {
 
 // --- W10-ST1: ro mounts ---
 
+// The parser itself is covered in platform/procfs — this pins the
+// consumer-side contract (ro opt lookup) the evidence scan relies
+// on.
 func TestParseProcMounts(t *testing.T) {
-	ms := parseProcMounts([]byte(
+	ms := procfs.ParseMounts([]byte(
 		"/dev/sda1 /var/openebs/local/pvc-abc ext4 rw,relatime 0 0\n" +
 			"/dev/sdb1 /var/openebs/local/pvc-def xfs ro,relatime 0 0\n" +
 			"tmpfs /var/openebs/local/pvc-ghi tmpfs ro 0 0\n" +
@@ -233,7 +237,7 @@ func TestParseProcMounts(t *testing.T) {
 	if len(ms) != 3 {
 		t.Fatalf("parsed %d mounts want 3", len(ms))
 	}
-	if !ms[1].ro || ms[0].ro {
+	if !ms[1].Opts["ro"] || ms[0].Opts["ro"] {
 		t.Fatal("ro flag wrong")
 	}
 }
