@@ -220,6 +220,18 @@ func TestGetenvFloatPositive(t *testing.T) {
 			t.Fatalf("GetenvFloatPositive=%v, want 0.9", got)
 		}
 	})
+	// ParseFloat accepts non-finite literals — "+Inf" satisfies the
+	// f > 0 check but silently disables every threshold comparison
+	// downstream, so it takes the same warn-and-default path as
+	// GetenvFloat.
+	t.Run("non-finite falls back to default", func(t *testing.T) {
+		for _, v := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "inf", "Infinity"} {
+			t.Setenv(key, v)
+			if got := GetenvFloatPositive(key, 0.9); got != 0.9 {
+				t.Fatalf("GetenvFloatPositive(%q)=%v, want 0.9", v, got)
+			}
+		}
+	})
 }
 
 func TestGate(t *testing.T) {

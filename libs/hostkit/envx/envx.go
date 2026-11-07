@@ -341,11 +341,15 @@ func GetenvIntMin(key string, def, min int) int {
 
 // GetenvFloatPositive is GetenvFloat restricted to strictly positive
 // values: unparseable input and f <= 0 warn and fall back to def.
-// Values > 1 are kept — several threshold knobs document ">1 disables
-// the check" as the operator escape hatch.
+// Non-finite values take the same warn-and-default path as
+// GetenvFloat — "+Inf" parses and satisfies f > 0, but it silently
+// disables every threshold comparison downstream. Values > 1 are
+// kept — several threshold knobs document ">1 disables the check" as
+// the operator escape hatch.
 func GetenvFloatPositive(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+		if f, err := strconv.ParseFloat(v, 64); err == nil &&
+			!math.IsNaN(f) && !math.IsInf(f, 0) && f > 0 {
 			return f
 		}
 		Warnf("invalid float env value, using default",
