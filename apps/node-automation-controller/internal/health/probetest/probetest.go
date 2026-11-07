@@ -63,6 +63,14 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 				LeaseMaxAge:  30 * time.Second,
 				FreezeMinAge: 10 * time.Minute,
 			},
+			// Env-equivalent datastore defaults (the values
+			// datastore.ConfigFromEnv resolves) — the shared
+			// scaffold deliberately stays free of domain-package
+			// imports, so the W13-ST3 window numbers repeat here.
+			Datastore: probefw.DatastoreConfig{
+				CNPGUnhealthyMinAge:  15 * time.Minute,
+				PVCResizeStallMinAge: 30 * time.Minute,
+			},
 		},
 		LookupHost: func(context.Context, string) ([]string, error) {
 			return []string{"10.0.0.1"}, nil

@@ -776,3 +776,130 @@ func TestVeleroAuditorEverestCRDAbsent(t *testing.T) {
 		t.Fatalf("absent Everest CRDs must be a quiet no-op: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W13-ST2 — BackupRepository health audit
+// ---------------------------------------------------------------------------
+
+// veleroRepo builds a BackupRepository — status.phase plus an
+// optional lastMaintenanceTime (zero value omits the field) drive
+// the W13-ST2 health verdicts.
+func veleroRepo(ns, name, phase string, lastMaint time.Time) *unstructured.Unstructured {
+	status := map[string]any{"phase": phase}
+	if !lastMaint.IsZero() {
+		status["lastMaintenanceTime"] = lastMaint.UTC().Format(time.RFC3339)
+	}
+	return testutil.Unstructured(
+		veleroRepoGVR.GroupVersion().WithKind("BackupRepository"), ns, name,
+		map[string]any{"status": status})
+}
+
+func repoSeries(t *testing.T, ns, name, reason string) (float64, bool) {
+	t.Helper()
+	return testutil.GaugeSeriesValue(t, "node_automation_velero_repo_unhealthy",
+		map[string]string{"namespace": ns, "name": name, "reason": reason})
+}
+
+// A repo whose phase is not Ready flags phase_not_ready; a Ready
+// repo whose lastMaintenanceTime is older than 7d flags
+// maintenance_stale. A Ready repo with fresh maintenance — and one
+// whose maintenance time was never stamped — emit nothing.
+func TestVeleroAuditorRepoUnhealthy(t *testing.T) {
+	now := time.Now()
+	notReady := veleroRepo("velero", "repo-broken", "NotReady", now.Add(-time.Hour))
+	stale := veleroRepo("velero", "repo-stale", "Ready", now.Add(-8*24*time.Hour))
+	healthy := veleroRepo("velero", "repo-ok", "Ready", now.Add(-2*time.Hour))
+	noStamp := veleroRepo("velero", "repo-new", "Ready", time.Time{})
+	dyn := newDynFake(notReady, stale, healthy, noStamp)
+	a := newVeleroAuditor(dyn, now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := repoSeries(t, "velero", "repo-broken",
+		"phase_not_ready"); !ok || v != 1 {
+		t.Fatalf("repo-broken series = %v,%v want 1,true", v, ok)
+	}
+	if v, ok := repoSeries(t, "velero", "repo-stale",
+		"maintenance_stale"); !ok || v != 1 {
+		t.Fatalf("repo-stale series = %v,%v want 1,true", v, ok)
+	}
+	for _, tc := range [][3]string{
+		{"velero", "repo-ok", "phase_not_ready"},
+		{"velero", "repo-ok", "maintenance_stale"},
+		{"velero", "repo-new", "maintenance_stale"},
+	} {
+		if _, ok := repoSeries(t, tc[0], tc[1], tc[2]); ok {
+			t.Fatalf("%s/%s must not flag %s", tc[0], tc[1], tc[2])
+		}
+	}
+}
+
+// A repo that goes Ready again and gets a fresh maintenance stamp
+// loses both series on the next sweep — the seenRepo prune keeps
+// /metrics honest.
+func TestVeleroAuditorRepoClearsResolved(t *testing.T) {
+	now := time.Now()
+	repo := veleroRepo("velero", "repo", "NotReady", now.Add(-9*24*time.Hour))
+	dyn := newDynFake(repo)
+	a := newVeleroAuditor(dyn, now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{"phase_not_ready", "maintenance_stale"} {
+		if _, ok := repoSeries(t, "velero", "repo", reason); !ok {
+			t.Fatalf("%s series missing before the resolve", reason)
+		}
+	}
+
+	u, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(u.Object, "Ready", "status", "phase")
+	_ = unstructured.SetNestedField(u.Object,
+		now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		"status", "lastMaintenanceTime")
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{"phase_not_ready", "maintenance_stale"} {
+		if metrics.VeleroRepoUnhealthy.DeleteLabelValues(
+			"velero", "repo", reason) {
+			t.Fatalf("%s series kept after the repo healed", reason)
+		}
+	}
+}
+
+// An older Velero without the BackupRepository CRD 404s the list —
+// a quiet skip, not a run error (same contract as the BSL audit).
+func TestVeleroAuditorRepoCRDAbsent(t *testing.T) {
+	dyn := newDynFake(veleroSchedule("velero", "daily", false, time.Hour))
+	dyn.PrependReactor("list", "backuprepositories",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				veleroRepoGVR.GroupResource(), "")
+		})
+	a := newVeleroAuditor(dyn, time.Now())
+	if err := a.run(ctx); err != nil {
+		t.Fatalf("absent backuprepositories CRD must skip cleanly, got %v", err)
+	}
+}
+
+// A repo list failure is a real run error — the periodic wrapper
+// owns the IncError for it.
+func TestVeleroAuditorRepoListError(t *testing.T) {
+	dyn := newDynFake(veleroSchedule("velero", "daily", false, time.Hour))
+	dyn.PrependReactor("list", "backuprepositories",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	a := newVeleroAuditor(dyn, time.Now())
+	if err := a.run(ctx); err == nil {
+		t.Fatal("expected error when the backuprepositories list fails")
+	}
+}

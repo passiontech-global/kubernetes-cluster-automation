@@ -18,6 +18,13 @@
 // Clusters without Velero have no CRDs — the Schedule List 404s and
 // the sweep no-ops quietly (same contract as externalsecret-nudge).
 //
+// W13-ST2 adds the BackupRepository audit: a repo whose status.phase
+// is not Ready cannot be opened by restic/kopia, and a
+// status.lastMaintenanceTime older than 7 days means the scheduled
+// prune/repack maintenance loop stopped — either way the next
+// restore reads an unmaintained or unreachable repo. Both flag on
+// VeleroRepoUnhealthy{namespace,name,reason}.
+//
 // Series lifecycle mirrors cert-drift-auditor: seen-sets prune the
 // gauges the moment the condition resolves (unpaused, healthy new
 // backup, object deleted).
@@ -65,6 +72,10 @@ var (
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
 	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
+	// W13-ST2 — backuprepositories.velero.io: the restic/kopia repo
+	// each BSL's snapshots land in; its phase and maintenance clock
+	// say whether a restore can actually read them.
+	veleroRepoGVR = kube.GVVeleroBackupRepository
 	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
 	// declares spec.backup.enabled and the DatabaseClusterBackup
 	// carries spec.dbClusterName + status.state.
@@ -86,6 +97,14 @@ var veleroStuckPhases = map[string]string{
 }
 
 const veleroStuckMaxAge = 6 * time.Hour
+
+// veleroRepoMaintenanceMaxAge is the W13-ST2 repo-maintenance bound:
+// velero runs restic/kopia repository maintenance (prune + repack)
+// on a regular cycle — default hourly, never sparser than daily — so
+// a lastMaintenanceTime older than 7 days means the maintenance loop
+// stopped (dead velero server, unreachable repo, wedged maintenance
+// job) and the next restore reads an unmaintained repo.
+const veleroRepoMaintenanceMaxAge = 7 * 24 * time.Hour
 
 // veleroList pages a full dynamic List through the shared page bound —
 // same contract as a raw .List but bounded per response (Velero and
@@ -137,6 +156,11 @@ type backupKey struct{ namespace, schedule, reason string }
 // it again once the cluster's backup posture recovers.
 type everestKey struct{ namespace, cluster, reason string }
 
+// repoKey identifies one VeleroRepoUnhealthy series — the label
+// triple (namespace, BackupRepository name, reason) of the W13-ST2
+// repo audit.
+type repoKey struct{ namespace, name, reason string }
+
 // pausedLedgerKey identifies one Schedule generation for the
 // firstSeenPaused clock — the UID distinguishes a delete+recreate
 // with the same name (a fresh object re-arms the 24h measurement
@@ -160,6 +184,10 @@ type veleroBackupAuditor struct {
 	// seenBSL: series ledger for VeleroBSLUnavailable — an
 	// Available-again or deleted BSL gets DeleteLabelValues.
 	seenBSL state.GaugeLedger[pausedKey]
+	// seenRepo: series ledger for VeleroRepoUnhealthy (W13-ST2) — a
+	// repo that goes Ready again or gets a fresh maintenance stamp
+	// loses its series.
+	seenRepo state.GaugeLedger[repoKey]
 	// firstSeenPaused: when the sweep first saw this Schedule
 	// generation paused — measures the actual pause duration. A
 	// Schedule carries no "paused since" timestamp, so the ledger is
@@ -208,6 +236,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	a.seenBSL.Begin()    // drop any aborted sweep's leftover emissions
 	a.seenBad.Begin()    // drop any aborted sweep's leftover emissions
 	a.seenPaused.Begin() // drop any aborted sweep's leftover emissions
+	a.seenRepo.Begin()   // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
@@ -314,6 +343,51 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		}
 	}
 	a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
+
+	// W13-ST2 — BackupRepository health: the restic/kopia repo every
+	// snapshot lands in. A repo whose phase is not Ready cannot be
+	// opened at all, and a lastMaintenanceTime older than 7d means
+	// the scheduled maintenance (prune/repack) stopped — both leave
+	// "successful" backups unrestorable. reason=phase_not_ready |
+	// maintenance_stale.
+	repos, err := a.veleroList(ctx, veleroRepoGVR)
+	switch {
+	case apierrors.IsNotFound(err):
+		// CRD absent (older Velero without the repo API) — nothing
+		// to audit.
+	case err != nil:
+		return errors.Join(everestErr,
+			fmt.Errorf("list velero backuprepositories: %w", err))
+	default:
+		for i := range repos.Items {
+			repo := &repos.Items[i]
+			ns, name := repo.GetNamespace(), repo.GetName()
+			if phase, ok := kube.NestedString(
+				repo.Object, "status", "phase"); ok && phase != "Ready" {
+				a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
+					repoKey{ns, name, "phase_not_ready"},
+					ns, name, "phase_not_ready")
+				log.Info("velero backup repository not Ready — repo cannot be opened",
+					"repo", ns+"/"+name, "phase", phase)
+			}
+			lmt, ok := kube.NestedString(
+				repo.Object, "status", "lastMaintenanceTime")
+			if !ok {
+				continue // never stamped — can't tell, not stale
+			}
+			t, perr := time.Parse(time.RFC3339, lmt)
+			if perr != nil || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
+				continue
+			}
+			a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
+				repoKey{ns, name, "maintenance_stale"},
+				ns, name, "maintenance_stale")
+			log.Info("velero backup repository maintenance stale — prune/repack loop stopped",
+				"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
+				"age", a.now.Now().Sub(t).Truncate(time.Hour))
+		}
+	}
+	a.seenRepo.Prune(metrics.VeleroRepoUnhealthy.DeleteLabelValues)
 
 	// W10-ST6 — in-flight transfer audit: mark Backups/PVBs wedged
 	// InProgress|Deleting >6h, and clean up PVBs whose node-agent

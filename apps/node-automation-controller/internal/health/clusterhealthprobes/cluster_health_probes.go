@@ -1,5 +1,5 @@
 // cluster_health_probes.go — the sweep module root: Setup, the
-// prober and the checkDefs registry. The 38 checks it drives live in
+// prober and the checkDefs registry. The 39 checks it drives live in
 // per-domain subpackages under internal/health on top of the shared
 // probefw framework:
 //
@@ -25,7 +25,8 @@
 //     map pressure + node IPAM exhaustion).
 //   - datastore — datastore operator health (scylla, rabbitmq
 //     quorum + suspended listener, dragonfly sync storm, percona
-//     quorum, stateful-masterless-services W6.2, OLM subscriptions).
+//     quorum, stateful-masterless-services W6.2, OLM subscriptions,
+//     PVC resize stalls W13-ST3).
 //   - gitops — argocd-app-stuck and flux-helmrelease-retries.
 //
 // Layout: each check lives in its domain package alongside its state
@@ -105,6 +106,8 @@ func healthProbeConfigFromEnv() probefw.Config {
 	ported.ConfigFromEnv(&cfg)
 	watchdogs.KCMConfigFromEnv(&cfg)
 	probefw.CiliumConfigFromEnv(&cfg)
+	datastore.ConfigFromEnv(&cfg)
+	nethealth.LinkerdConfigFromEnv(&cfg)
 	return cfg
 }
 
@@ -116,16 +119,26 @@ type checkEntry struct {
 	check probefw.Check
 }
 
+// checkDef is one checkDefs roster row: the kuberhealthy_check label
+// value alerts key on plus the constructor that builds the check
+// instance against the shared Deps.
+type checkDef struct {
+	name string
+	new  func(*probefw.Deps) probefw.Check
+}
+
 // checkDefs is the data-driven check registry — the single sweep-order
 // roster the prober is built from. Order is the ops contract: the
 // historical sweep order is preserved verbatim and the names are the
 // kuberhealthy_check label values, so neither may change. Each row's
 // constructor lives in the check's own domain package so its state-map
 // initialization colocates with the check logic.
-var checkDefs = []struct {
-	name string
-	new  func(*probefw.Deps) probefw.Check
-}{
+//
+// The roster is appendable: per-check module rows in internal/registry
+// (the W13 gitops checks) register their check into it during their own
+// Setup — see check_modules.go — which runs before cluster-health-probes
+// builds the prober.
+var checkDefs = []checkDef{
 	{ported.CheckNameDNS, ported.NewDNSStatusCheck},
 	{ported.CheckNameHTTPContent, ported.NewHTTPContentCheck},
 	{ported.CheckNamePodRestarts, ported.NewPodRestartsCheck},
@@ -167,6 +180,9 @@ var checkDefs = []struct {
 	{nodehealth.CheckNameKedaScaledObjectGuard, nodehealth.NewKedaScaledObjectGuardCheck},
 	{nethealth.CheckNameGatewayRouteHealth, nethealth.NewGatewayRouteHealthCheck},
 	{nodehealth.CheckNameControllerLeaseGuard, nodehealth.NewControllerLeaseGuardCheck},
+	{datastore.CheckNamePVCResizeStallGuard, datastore.NewPVCResizeStallGuardCheck},
+	{nethealth.CheckNameEndpointSliceZoneStarvation, nethealth.NewEndpointSliceZoneStarvationCheck},
+	{nethealth.CheckNameLinkerdOutlierGuard, nethealth.NewLinkerdOutlierGuardCheck},
 }
 
 // clusterHealthProber is the thin sweep runner: the shared deps, the
