@@ -329,6 +329,12 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(args) > 0 {
 			n, _ = ToInt(args[0])
 		}
+		// A negative width is no indentation at all (python's
+		// ' ' * -n is '') — and strings.Repeat PANICS on a negative
+		// count, so clamp instead of passing it through.
+		if n < 0 {
+			n = 0
+		}
 		pad := strings.Repeat(" ", int(n))
 		return pad + strings.ReplaceAll(Stringify(v), "\n", "\n"+pad), nil
 	case "flatten":

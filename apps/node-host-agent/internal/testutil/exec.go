@@ -34,6 +34,7 @@ type ExecRule struct {
 type FakeExec struct {
 	mu     sync.Mutex
 	cmds   [][]string
+	envs   [][]string
 	stdins []string
 	rules  []ExecRule
 	miss   error
@@ -118,18 +119,21 @@ func (f *FakeExec) lookup(joined string) (string, error) {
 // Run is the hostexec.Config.RunCmd/RunCmdCombined drop-in: logs argv
 // and replies by rule.
 func (f *FakeExec) Run(_ context.Context, argv []string) (string, error) {
-	return f.record(argv, "")
+	return f.record(nil, argv, "")
 }
 
-// RunStdin is the stdin-feeding runner variant (kinedb's runner seam).
-func (f *FakeExec) RunStdin(_ context.Context, argv []string, stdin string) (string, error) {
-	return f.record(argv, stdin)
+// RunStdin is the stdin-feeding runner variant (kinedb's runner
+// seam — env is the secret channel: it reaches the child's
+// environment, never argv).
+func (f *FakeExec) RunStdin(_ context.Context, env, argv []string, stdin string) (string, error) {
+	return f.record(env, argv, stdin)
 }
 
-func (f *FakeExec) record(argv []string, stdin string) (string, error) {
+func (f *FakeExec) record(env, argv []string, stdin string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cmds = append(f.cmds, append([]string(nil), argv...))
+	f.envs = append(f.envs, append([]string(nil), env...))
 	f.stdins = append(f.stdins, stdin)
 	return f.lookup(strings.Join(argv, " "))
 }
@@ -140,6 +144,7 @@ func (f *FakeExec) ClearLog() *FakeExec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cmds = nil
+	f.envs = nil
 	f.stdins = nil
 	return f
 }
@@ -151,6 +156,18 @@ func (f *FakeExec) Cmds() [][]string {
 	out := make([][]string, len(f.cmds))
 	for i, c := range f.cmds {
 		out[i] = append([]string(nil), c...)
+	}
+	return out
+}
+
+// Envs returns every recorded child-env set in call order (nil for
+// calls through Run — only RunStdin callers pass env).
+func (f *FakeExec) Envs() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.envs))
+	for i, e := range f.envs {
+		out[i] = append([]string(nil), e...)
 	}
 	return out
 }

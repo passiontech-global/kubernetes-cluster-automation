@@ -137,25 +137,19 @@ func (l *Latches) updatePidFDPressure() {
 		if n >= kernelProcPressureNeeded {
 			l.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchPIDFDPressure,
 				fmt.Sprintf("%s ratio=%.3f", what, worst))
-		} else if _, err := os.Stat(latchPath); err == nil {
+		} else {
 			// A latch from an earlier episode outliving a fresh
 			// sub-threshold streak can't happen (the else branch
-			// clears it) — remove defensively anyway.
-			_ = os.Remove(latchPath)
+			// clears it) — release defensively anyway (Exit no-ops
+			// when the file is absent).
+			l.c.state.Exit(hoststate.LatchPIDFDPressure, nil)
 		}
 		return
 	}
-	// Below threshold — reset the streak and release the latch.
+	// Below threshold — reset the streak and release the latch
+	// (Exit logs STATE-EXIT, the filelog's transition contract).
 	_ = os.Remove(countPath)
-	if _, err := os.Stat(latchPath); err == nil {
-		if rerr := os.Remove(latchPath); rerr != nil {
-			logger().Warn("hostmetrics: pid-fd-pressure latch remove failed",
-				"path", latchPath, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: pid-fd-pressure latch cleared",
-				"worst", what, "ratio", worst, "path", latchPath)
-		}
-	}
+	l.c.state.Exit(hoststate.LatchPIDFDPressure, nil)
 }
 
 // --- W10 textfile metrics (node-exporter channel) ---

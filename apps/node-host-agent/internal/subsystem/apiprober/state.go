@@ -129,11 +129,18 @@ func dashedIP(addr string) string {
 }
 
 // writeGapFile records the last measured rv gap for prom_emit.
-// Best-effort: a write failure is logged, never fatal.
+// Best-effort: a write failure is logged, never fatal. The
+// read-compare gate skips the full tmp+fsync+rename+dir-fsync when
+// the content is unchanged — a healthy backend writes the same
+// "0\n"-ish value every 30s (the collect_nebula.go cert-days
+// pattern).
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
-	if err := hostutil.WriteFileAtomicBytes(f,
-		[]byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
+	content := strconv.FormatInt(gap, 10) + "\n"
+	if cur, err := os.ReadFile(f); err == nil && string(cur) == content {
+		return
+	}
+	if err := hostutil.WriteFileAtomicBytes(f, []byte(content)); err != nil {
 		logger().Warn("watchdog gap file write failed",
 			"file", f, "backend", b.Name, "error", err,
 		)

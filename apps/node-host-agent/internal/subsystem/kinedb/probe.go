@@ -311,8 +311,8 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// in-container port 5432 with credentials in pgbouncer.ini +
 	// userlist.txt (edoburu/pgbouncer compose stack), fall back to
 	// querying 127.0.0.1:5432 inside the pgbouncer container.
-	out, err := k.exec(ctx, []string{k.cfg.Runtime, "exec",
-		"-e", "PGPASSWORD=" + pass, pg,
+	out, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+		"-e", "PGPASSWORD", pg,
 		"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
 		"-U", user, "-d", "postgres", "-tAc", "select 1"}, "")
 	if err != nil || strings.TrimSpace(out) != "1" {
@@ -333,8 +333,8 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// depth (client spiral leading indicator). Falls back to
 	// in-container :5432 with stats_users from pgbouncer.ini when
 	// the direct .env credential/port path is unavailable.
-	pools, err := k.exec(ctx, []string{k.cfg.Runtime, "exec",
-		"-e", "PGPASSWORD=" + pass, pg,
+	pools, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+		"-e", "PGPASSWORD", pg,
 		"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
 		"-U", user, "-d", pgbAdminDB, "-Aqc", "SHOW POOLS"}, "")
 	st, ok := parseShowPools(pools, poolDatabase)

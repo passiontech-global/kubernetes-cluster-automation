@@ -408,18 +408,39 @@ type condEval struct {
 	message string
 }
 
-// syncConditions evaluates the conditions, updates problem_gauge,
-// then patches the node status iff any Status/Reason differs from the
-// live object. A GET failure skips the patch only — gauges are purely
-// local and always update.
+// wantedCond flattens one evaluated condition — a watchdog latch
+// condition or an NPD monitor condition — to the fields the
+// diff/patch pass needs.
+type wantedCond struct {
+	typ         corev1.NodeConditionType
+	status      corev1.ConditionStatus
+	reason      string
+	message     string
+	gaugeReason string // problem_gauge reason label
+}
+
+// syncConditions evaluates BOTH the watchdog latch conditions and
+// the two NPD monitor conditions, updates problem_gauge for all of
+// them, then merges every diff into ONE status patch — one Node
+// GET + at most one PATCH per cycle (the two evaluators used to
+// fetch and patch separately, doubling apiserver traffic). A GET
+// failure skips the patch only — gauges are purely local and
+// always update.
 func (r *Reporter) syncConditions(ctx context.Context) error {
-	evals := r.evalConditions()
-	for _, e := range evals {
+	var all []wantedCond
+	for _, e := range r.evalConditions() {
+		all = append(all, wantedCond{e.def.typ, e.status, e.reason,
+			e.message, e.def.problemReason})
+	}
+	for _, e := range r.evalNPDConditions() {
+		all = append(all, wantedCond(e))
+	}
+	for _, w := range all {
 		v := 0.0
-		if e.status == corev1.ConditionTrue {
+		if w.status == corev1.ConditionTrue {
 			v = 1
 		}
-		r.problemGauge.WithLabelValues(string(e.def.typ), e.def.problemReason).Set(v)
+		r.problemGauge.WithLabelValues(string(w.typ), w.gaugeReason).Set(v)
 	}
 
 	node, err := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName, metav1.GetOptions{})
@@ -436,12 +457,12 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	// does not churn the API.
 	changed := false
 	var changedList []string
-	for _, e := range evals {
-		cur, ok := live[e.def.typ]
-		if !ok || cur.Status != e.status || cur.Reason != e.reason {
+	for _, w := range all {
+		cur, ok := live[w.typ]
+		if !ok || cur.Status != w.status || cur.Reason != w.reason {
 			changed = true
 			changedList = append(changedList, fmt.Sprintf(
-				"%s=%s(%s)", e.def.typ, e.status, e.reason))
+				"%s=%s(%s)", w.typ, w.status, w.reason))
 		}
 	}
 	if !changed {
@@ -449,23 +470,23 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	}
 
 	// conditions carry patchStrategy=merge patchMergeKey=type — a
-	// strategic merge patch updates only our 9 entries and leaves
+	// strategic merge patch updates only our entries and leaves
 	// kubelet-owned conditions (Ready, *Pressure, ...) untouched.
 	now := metav1.NewTime(r.cfg.nowFn())
-	conds := make([]corev1.NodeCondition, 0, len(evals))
-	for _, e := range evals {
+	conds := make([]corev1.NodeCondition, 0, len(all))
+	for _, w := range all {
 		ltt := now
 		// Transition time moves only on a status flip; a reason-only
 		// change keeps the original transition timestamp (the NPD and
 		// kubelet convention).
-		if cur, ok := live[e.def.typ]; ok && cur.Status == e.status {
+		if cur, ok := live[w.typ]; ok && cur.Status == w.status {
 			ltt = cur.LastTransitionTime
 		}
 		conds = append(conds, corev1.NodeCondition{
-			Type:               e.def.typ,
-			Status:             e.status,
-			Reason:             e.reason,
-			Message:            e.message,
+			Type:               w.typ,
+			Status:             w.status,
+			Reason:             w.reason,
+			Message:            w.message,
 			LastHeartbeatTime:  now,
 			LastTransitionTime: ltt,
 		})

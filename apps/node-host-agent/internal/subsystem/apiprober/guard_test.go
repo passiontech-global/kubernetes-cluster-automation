@@ -5,9 +5,11 @@ package apiprober
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -230,5 +232,72 @@ FAIL_CYCLES=4
 	}
 	if got := p.staticAddr("ctl1"); got != "10.0.0.9:443" {
 		t.Fatalf("staticAddr=%q want conf addr + :443", got)
+	}
+}
+
+// Env-set knobs must NOT be shadowed by the live conf overlay —
+// the documented chain is env > guard.conf > default, but
+// refreshGuard used to overlay the conf on top of env outright.
+func TestEnvSetWinsOverGuardConfOverlay(t *testing.T) {
+	confPath := filepath.Join(t.TempDir(), "api-backend-guard.conf")
+	testutil.WriteFile(t, confPath, "MODE=enforce\nGAP_MIN=500\nHAPROXY_SOCKET=/run/other.sock\n")
+	t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "dry-run")
+	t.Setenv("NODE_HOST_AGENT_APIPROBER_GAP_MIN", "123")
+	cfg := ConfigFromEnv(EnvDeps{})
+	cfg.HTTPClient = &http.Client{} // skip CA client build
+	cfg.GuardSrc = NewGuardReloader(confPath, GuardDefaults{})
+	p, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.eff.mode != "dry-run" {
+		t.Fatalf("env-set mode shadowed by conf: %q", p.eff.mode)
+	}
+	if p.eff.gapMin != 123 {
+		t.Fatalf("env-set gapMin shadowed by conf: %d", p.eff.gapMin)
+	}
+	// Env-unset fields still take the live conf overlay.
+	if p.eff.socket != "/run/other.sock" {
+		t.Fatalf("env-unset socket should take conf: %q", p.eff.socket)
+	}
+	// A mid-run conf edit still applies to env-unset fields and is
+	// still ignored on env-set ones.
+	testutil.WriteFile(t, confPath, "MODE=enforce\nGAP_MIN=500\nHAPROXY_SOCKET=/run/newer.sock\n")
+	p.refreshGuard()
+	if p.eff.socket != "/run/newer.sock" {
+		t.Fatalf("conf edit not picked up: %q", p.eff.socket)
+	}
+	if p.eff.mode != "dry-run" || p.eff.gapMin != 123 {
+		t.Fatalf("env-set fields moved on conf edit: mode=%q gapMin=%d",
+			p.eff.mode, p.eff.gapMin)
+	}
+}
+
+// writeGapFile must skip the atomic write when the on-disk content
+// is already identical — a healthy backend rewrites the same gap
+// value every 30s otherwise.
+func TestWriteGapFileSkipsIdentical(t *testing.T) {
+	dir := t.TempDir()
+	p := &Prober{}
+	b := backend{Name: "hub1", Addr: "10.0.0.1:6443"}
+	p.writeGapFile(dir, b, 42)
+	f := dir + "/apibe-gap-10-0-0-1"
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(f, old, old); err != nil {
+		t.Fatal(err)
+	}
+	p.writeGapFile(dir, b, 42)
+	fi, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(old) {
+		t.Fatal("identical gap content was rewritten")
+	}
+	// A real change still lands.
+	p.writeGapFile(dir, b, 43)
+	got, err := os.ReadFile(f)
+	if err != nil || string(got) != "43\n" {
+		t.Fatalf("gap file = %q err=%v want 43", got, err)
 	}
 }

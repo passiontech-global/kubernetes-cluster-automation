@@ -17,14 +17,11 @@ package nodereporter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // The ReadonlyFilesystem NodeCondition and its upstream strings
@@ -126,7 +123,11 @@ type npdCond struct {
 
 // evalNPDConditions computes the wanted state of the two NPD
 // conditions — same default/True reason+message contract as the
-// upstream conditions[] declarations.
+// upstream conditions[] declarations. The Node GET + merged status
+// PATCH lives in conditions.go's syncConditions, which evaluates
+// this set alongside the watchdog latch conditions and ships both
+// in ONE apiserver round-trip per cycle (each evaluator used to
+// fetch and patch separately).
 func (r *Reporter) evalNPDConditions() []npdCond {
 	kd := npdCond{typ: condKernelDeadlock, status: corev1.ConditionFalse,
 		reason: kernelDeadlockDefaultReason, message: kernelDeadlockDefaultMsg,
@@ -145,74 +146,4 @@ func (r *Reporter) evalNPDConditions() []npdCond {
 		ro.message = r.readonlyFSMsg
 	}
 	return []npdCond{kd, ro}
-}
-
-// syncNPDConditions pushes the two NPD conditions to node status —
-// same zero-churn strategic-merge mechanics as syncConditions for
-// the watchdog conditions (conditions carry patchStrategy=merge on
-// type, so this patch only touches our two entries). problem_gauge
-// is local and always updates; the PATCH fires only on a
-// Status/Reason diff.
-func (r *Reporter) syncNPDConditions(ctx context.Context) error {
-	evals := r.evalNPDConditions()
-	for _, e := range evals {
-		v := 0.0
-		if e.status == corev1.ConditionTrue {
-			v = 1
-		}
-		r.problemGauge.WithLabelValues(string(e.typ), e.gaugeReason).Set(v)
-	}
-
-	node, err := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get node %s: %w", r.cfg.NodeName, err)
-	}
-	live := make(map[corev1.NodeConditionType]corev1.NodeCondition, len(node.Status.Conditions))
-	for _, c := range node.Status.Conditions {
-		live[c.Type] = c
-	}
-
-	changed := false
-	var changedList []string
-	for _, e := range evals {
-		cur, ok := live[e.typ]
-		if !ok || cur.Status != e.status || cur.Reason != e.reason {
-			changed = true
-			changedList = append(changedList, fmt.Sprintf(
-				"%s=%s(%s)", e.typ, e.status, e.reason))
-		}
-	}
-	if !changed {
-		return nil
-	}
-
-	now := metav1.NewTime(r.cfg.nowFn())
-	conds := make([]corev1.NodeCondition, 0, len(evals))
-	for _, e := range evals {
-		ltt := now
-		if cur, ok := live[e.typ]; ok && cur.Status == e.status {
-			ltt = cur.LastTransitionTime // reason-only change keeps LTT
-		}
-		conds = append(conds, corev1.NodeCondition{
-			Type:               e.typ,
-			Status:             e.status,
-			Reason:             e.reason,
-			Message:            e.message,
-			LastHeartbeatTime:  now,
-			LastTransitionTime: ltt,
-		})
-	}
-	payload, err := json.Marshal(map[string]any{
-		"status": map[string]any{"conditions": conds},
-	})
-	if err != nil {
-		return fmt.Errorf("marshal status patch: %w", err)
-	}
-	if _, err := r.cfg.Client.CoreV1().Nodes().Patch(ctx, r.cfg.NodeName,
-		types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "status"); err != nil {
-		return fmt.Errorf("patch node %s status: %w", r.cfg.NodeName, err)
-	}
-	logger().Info("nodereporter: npd node conditions updated",
-		"node", r.cfg.NodeName, "changed", changedList)
-	return nil
 }

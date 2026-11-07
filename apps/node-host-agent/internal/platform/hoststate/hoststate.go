@@ -75,6 +75,13 @@ type Store struct {
 	// double-spend a restart) and Incr's check-then-write counter
 	// bump (the shared consecutive-journal-unreadable streak).
 	mu sync.Mutex
+	// owners is the RAM-side registry behind EnterFrom/ExitFrom:
+	// latch name → the set of owner ids currently holding it. A
+	// shared latch (state-pod-teardown-wedged is held by BOTH
+	// pod-teardown's stuck-pod count and ctr-tasks' unkillable
+	// orphan shims) must outlive the FIRST owner's exit — the file
+	// is removed only when the last hold releases.
+	owners map[string]map[string]bool
 }
 
 // New returns a Store for dir/logFile. now and log may be nil.
@@ -157,6 +164,78 @@ func (s *Store) Exit(name string, cleanup func()) {
 		cleanup()
 	}
 	s.AppendLog("STATE-EXIT: " + name)
+}
+
+// EnterFrom is Enter for a latch shared by several producers: the
+// caller registers ITS owner id and the latch file is entered
+// (create + STATE-ENTER only while absent, mtime refresh while
+// held — the on-disk contract is identical to Enter). The file then
+// stays latched until every recorded owner has ExitFrom'ed —
+// pod-teardown clearing "no wedged pods" must not delete a latch
+// ctr-tasks entered for an unkillable orphan shim inside the same
+// Cycle. The owner set is process-local: a producer re-registers
+// its hold every cycle, so the dispatch order inside a Cycle
+// (load-bearing, checks.Group) repopulates it before any ExitFrom
+// can observe a stale empty set.
+func (s *Store) EnterFrom(name, owner, extra string) {
+	s.mu.Lock()
+	if s.owners == nil {
+		s.owners = map[string]map[string]bool{}
+	}
+	set := s.owners[name]
+	if set == nil {
+		set = map[string]bool{}
+		s.owners[name] = set
+	}
+	set[owner] = true
+	s.mu.Unlock()
+	s.Enter(name, extra)
+}
+
+// ExitFrom releases one owner's hold on a shared latch: the
+// state-<name> file is removed (plain Exit semantics — STATE-EXIT
+// line + cleanup hook) only when no owner still holds it. When no
+// owner set is recorded and a file exists — e.g. the first cycle
+// after a restart, before the holding check has re-entered, or a
+// latch minted through plain Enter — a latch with DECLARED owners
+// (LatchDef.Owners) is treated as held by all of them: the seed
+// release below drops only this owner, so a foreign latch never
+// dies to a check that never held it (the latch pod-teardown
+// entered must survive ctr-tasks' clean scan, and vice versa).
+// Once every declared owner has released, the set empties and the
+// file exits normally — a genuinely stale shared latch still
+// clears within a couple of cycles instead of the janitor's 24h
+// reap. Latches with no declared owners keep legacy semantics:
+// an unowned file exits like a plain Exit.
+func (s *Store) ExitFrom(name, owner string, cleanup func()) {
+	s.mu.Lock()
+	held := false
+	if set, ok := s.owners[name]; ok {
+		delete(set, owner)
+		held = len(set) > 0
+		if !held {
+			delete(s.owners, name)
+		}
+	} else if declared := SharedOwners(name); declared != nil &&
+		s.Exists(name) {
+		set := make(map[string]bool, len(declared))
+		for _, o := range declared {
+			set[o] = true
+		}
+		delete(set, owner)
+		held = len(set) > 0
+		if held {
+			if s.owners == nil {
+				s.owners = map[string]map[string]bool{}
+			}
+			s.owners[name] = set
+		}
+	}
+	s.mu.Unlock()
+	if held {
+		return
+	}
+	s.Exit(name, cleanup)
 }
 
 // ExitClearSuspect is Exit plus removal of this latch's suspect-log
@@ -348,9 +427,27 @@ func (s *Store) AppendLogWarn(msg string) {
 	s.appendFile(msg)
 }
 
+// watchdogLogMaxBytes bounds LogFile — appendFile rotates the log
+// to <file>.1 once it passes this size before appending. The
+// nodereporter filelog tails by byte offset and already resets to 0
+// (with a lookback-filtered rescan) whenever the file SHRINKS, so a
+// rename-to-.1 + fresh file presents exactly the rotation case the
+// reader handles; no offset bookkeeping is needed on this side.
+const watchdogLogMaxBytes = 10 << 20
+
 func (s *Store) appendFile(msg string) {
 	if s.LogFile == "" {
 		return
+	}
+	if fi, err := os.Stat(s.LogFile); err == nil &&
+		fi.Size() >= watchdogLogMaxBytes {
+		// Single-file rotation: <log> → <log>.1, then append to a
+		// fresh file. Best-effort — a failed rename still appends
+		// to the oversized file rather than dropping the line.
+		if rerr := os.Rename(s.LogFile, s.LogFile+".1"); rerr != nil {
+			s.log().Warn("watchdog log rotate failed",
+				"file", s.LogFile, "error", rerr)
+		}
 	}
 	f, err := os.OpenFile(s.LogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

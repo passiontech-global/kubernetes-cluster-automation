@@ -4,9 +4,6 @@
 package hostmetrics
 
 import (
-	"os"
-	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
@@ -221,33 +218,15 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 // once every probed mount is rw again. probed=false (every statfs
 // failed or stalled) leaves the latch untouched — inconclusive
 // evidence must neither set nor clear it, the same rule the
-// overload latch follows on an unparseable PSI file.
+// overload latch follows on an unparseable PSI file. Enter/Exit
+// carry the file contract AND the STATE-ENTER/STATE-EXIT log lines
+// nodereporter's FilesystemReadOnly event rule consumes.
 func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
-	p := c.state.Path(hoststate.LatchFilesystemReadonly)
-	_, err := os.Stat(p)
 	switch {
-	case anyRO && err != nil:
-		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
-		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			logger().Warn("hostmetrics: filesystem-readonly latch write failed",
-				"path", p, "error", werr)
-		} else if rerr := os.Rename(tmp, p); rerr != nil {
-			logger().Warn("hostmetrics: filesystem-readonly latch install failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Warn("hostmetrics: filesystem-readonly latch set — "+
-				"a probed mount reports ST_RDONLY",
-				"path", p)
-		}
-	case probed && !anyRO && err == nil:
-		if rerr := os.Remove(p); rerr != nil {
-			logger().Warn("hostmetrics: filesystem-readonly latch remove failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: filesystem-readonly latch cleared — "+
-				"all probed mounts rw again",
-				"path", p)
-		}
+	case anyRO:
+		c.state.Enter(hoststate.LatchFilesystemReadonly,
+			"a probed mount reports ST_RDONLY")
+	case probed:
+		c.state.Exit(hoststate.LatchFilesystemReadonly, nil)
 	}
 }

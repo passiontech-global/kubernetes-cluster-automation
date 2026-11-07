@@ -85,8 +85,16 @@ func Deploy(ctx context.Context, o FileOps, path string, content []byte, mode os
 				strings.Join(check, " "), out, err)
 		}
 	}
-	changed, _ = o.WriteManaged(path, content, mode)
+	// The promote write is NOT best-effort: a failure must surface
+	// ErrManagedWrite-wrapped (the Ops impl already attributed it —
+	// callers skip re-counting), otherwise a checkedDeploy caller
+	// reads ok=true and unmask/enables/restarts onto a stale or
+	// missing config. The candidate is swept on this outcome too.
+	changed, werr := o.WriteManaged(path, content, mode)
 	_, _ = o.RemoveManaged(cand)
+	if werr != nil {
+		return false, fmt.Errorf("%w: %s: %s", ErrManagedWrite, path, werr)
+	}
 	return changed, nil
 }
 

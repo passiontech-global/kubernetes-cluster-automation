@@ -86,18 +86,19 @@ func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error
 // copy module + mv produced, and the ordering the tests assert.
 func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode string) error {
 	tmp := tmpPath(remotePath)
+	// Secret material (0600 mode: tokens, .key files) must never
+	// sit world-readable on the target — `cat >`/`tee` creates the
+	// tmp file under the remote umask (~0644), so pre-create it at
+	// 0600 BEFORE the upload: install(1) also fixes the mode of a
+	// stale tmp left by an interrupted run, and the subsequent
+	// `cat >`/`tee` only truncates — the inode keeps 0600.
+	if mode == "0600" || isKeyMaterial(path.Base(remotePath)) {
+		if _, err := c.Run(ctx, "install -m 600 /dev/null "+shq(tmp)); err != nil {
+			return fmt.Errorf("install %s: %w", tmp, err)
+		}
+	}
 	if err := c.Write(ctx, tmp, r); err != nil {
 		return fmt.Errorf("upload %s: %w", tmp, err)
-	}
-	// The staging file lands under the remote umask (~0644 via
-	// `cat >`/`tee`) — for secret material (0600 mode: tokens,
-	// .key files) tighten it IMMEDIATELY after the upload so the
-	// tmp copy is never world-readable, then the final-mode chmod
-	// below still applies before the atomic rename.
-	if mode == "0600" || isKeyMaterial(path.Base(remotePath)) {
-		if _, err := c.Run(ctx, "chmod 0600 "+shq(tmp)); err != nil {
-			return fmt.Errorf("chmod 0600 %s: %w", tmp, err)
-		}
 	}
 	if _, err := c.Run(ctx, "chmod "+mode+" "+shq(tmp)); err != nil {
 		return fmt.Errorf("chmod %s: %w", tmp, err)
@@ -181,24 +182,37 @@ type sshConn struct {
 
 func (c *sshConn) Close() error { return c.link.Close() }
 
-// newSession opens a session channel under a per-op conn deadline —
-// NewSession can block indefinitely on a wedged target since the
-// handshake cleared the conn deadline and the call takes no ctx.
-// link.DeadlineConn picks the conn SetDeadline actually works on
-// (the jump's TCP conn behind a bastion — see sshclient.Link).
-func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, error) {
-	defer sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)()
-	return c.link.Client.NewSession()
+// newSession opens a session channel and returns it together with
+// the body-deadline release func the caller MUST defer for the
+// session's whole span. Two bounds apply: BoundOp covers just the
+// channel-open (NewSession takes no ctx and a wedged target blocks
+// it indefinitely), then BoundOpCtx re-arms the conn at the ctx
+// budget for the SESSION BODY — Session.Close only sends an SSH
+// channel-close, which a blackholed transport never drains, so
+// CombinedOutput/io.Copy/Wait need a real transport deadline or
+// they hang past ctx cancel. link.DeadlineConn picks the conn
+// SetDeadline actually works on (the jump's TCP conn behind a
+// bastion — see sshclient.Link).
+func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, func(), error) {
+	clear := sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)
+	sess, err := c.link.Client.NewSession()
+	clear()
+	if err != nil {
+		return nil, nil, err
+	}
+	return sess, sshclient.BoundOpCtx(ctx, c.log,
+		c.link.DeadlineConn(), c.timeout), nil
 }
 
 func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	if c.sudo {
 		cmd = "sudo -n " + cmd
 	}
-	sess, err := c.newSession(ctx)
+	sess, unbind, err := c.newSession(ctx)
 	if err != nil {
 		return "", err
 	}
+	defer unbind()
 	defer func() { _ = sess.Close() }()
 	done := make(chan struct{})
 	var out []byte
@@ -209,7 +223,15 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	}()
 	select {
 	case <-ctx.Done():
-		_ = sess.Close()
+		// sess.Close alone CANNOT unblock a dead transport — it only
+		// sends an SSH channel-close, which a blackholed conn never
+		// drains, so CombinedOutput (and the <-done wait) would hang
+		// forever and take the whole converge loop down. Closing the
+		// LINK kills the transport conn: every session read/write
+		// fails and done closes. The conn dies with this op anyway —
+		// syncTarget dials per target and its deferred conn.Close is
+		// idempotent.
+		_ = c.link.Close()
 		<-done
 		return "", ctx.Err()
 	case <-done:
@@ -230,10 +252,11 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 // targets escalate through `sudo -n tee` instead (a `>` redirect
 // can't elevate — the shell opens the file as the SSH user).
 func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) error {
-	sess, err := c.newSession(ctx)
+	sess, unbind, err := c.newSession(ctx)
 	if err != nil {
 		return err
 	}
+	defer unbind()
 	defer func() { _ = sess.Close() }()
 	stdin, err := sess.StdinPipe()
 	if err != nil {
@@ -258,7 +281,10 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	}()
 	select {
 	case <-ctx.Done():
-		_ = sess.Close()
+		// Same dead-transport reasoning as Run: closing the link is
+		// what actually unblocks the copy goroutine — sess.Close's
+		// channel-close can't reach a blackholed peer.
+		_ = c.link.Close()
 		// Wait for the copy goroutine to release r before returning
 		// — the caller closes the file/handle right after Write.
 		// The value is the sess.Wait() result — non-actionable on the

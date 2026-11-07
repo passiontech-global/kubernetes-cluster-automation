@@ -140,13 +140,6 @@ func (l *Latches) checkClockSkew() {
 		return
 	}
 	_ = os.Remove(countPath)
-	if _, err := os.Stat(latchPath); err == nil {
-		if rerr := os.Remove(latchPath); rerr != nil {
-			logger().Warn("hostmetrics: clock-skew latch remove failed",
-				"path", latchPath, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: clock-skew latch cleared",
-				"offset", off, "path", latchPath)
-		}
-	}
+	// Exit self-gates on the file existing and logs STATE-EXIT.
+	l.c.state.Exit(hoststate.LatchClockSkew, nil)
 }

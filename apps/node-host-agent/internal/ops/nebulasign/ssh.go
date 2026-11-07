@@ -52,11 +52,19 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	}
 	defer func() { _ = link.Close() }()
 
+	// Bound the channel-open on the conn (NewSession takes no ctx —
+	// a wedged target would block it forever), then re-arm at the
+	// ctx budget for the session BODY: CombinedOutput needs a real
+	// transport deadline — Session.Close only sends an SSH
+	// channel-close, which a blackholed conn never drains.
+	clear := sshclient.BoundOp(ctx, cfg.Log, link.DeadlineConn(), cfg.Timeout)
 	sess, err := link.Client.NewSession()
+	clear()
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = sess.Close() }()
+	defer sshclient.BoundOpCtx(ctx, cfg.Log, link.DeadlineConn(), cfg.Timeout)()
 	type result struct {
 		out []byte
 		err error
@@ -69,7 +77,10 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	}()
 	select {
 	case <-ctx.Done():
-		_ = sess.Close()
+		// sess.Close can't unblock a dead transport — only killing
+		// the conn makes the CombinedOutput goroutine return (the
+		// deferred link.Close above is idempotent).
+		_ = link.Close()
 		return "", ctx.Err()
 	case r := <-done:
 		if r.err != nil {

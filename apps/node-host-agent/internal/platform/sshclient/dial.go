@@ -156,8 +156,10 @@ func (c Config) Handshake(ctx context.Context, nc, carrier net.Conn,
 // NewSession/Client.Dial take no ctx and the handshake clears the
 // conn deadline, so without this a wedged target blocks forever.
 // The deadline is min(now+timeout, ctx deadline); the returned func
-// clears it so steady-state session I/O stays governed by ctx +
-// Session.Close. A rejected SetDeadline leaves the op unbounded —
+// clears it. For the SESSION BODY that follows a channel-open use
+// BoundOpCtx instead: Session.Close alone cannot unblock a dead
+// transport (it only sends an SSH channel-close), so the body needs
+// its own deadline. A rejected SetDeadline leaves the op unbounded —
 // warn so a silent hang is at least loud in the logs. A nil log
 // falls back to the package logger.
 func BoundOp(ctx context.Context, log *slog.Logger, nc net.Conn,
@@ -168,6 +170,32 @@ func BoundOp(ctx context.Context, log *slog.Logger, nc net.Conn,
 	dl := time.Now().Add(timeout)
 	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
 		dl = cdl
+	}
+	if err := nc.SetDeadline(dl); err != nil {
+		log.Warn("sshclient: conn deadline rejected — op unbounded", "error", err)
+	}
+	return func() { _ = nc.SetDeadline(time.Time{}) }
+}
+
+// BoundOpCtx sets a conn deadline covering a whole ctx-scoped op —
+// the session body a caller runs after a BoundOp-bounded channel
+// open. The bound is the ctx deadline itself (the caller's op
+// budget — hubsync's per-target converge timeout), falling back to
+// now+timeout on a deadline-less ctx: a CombinedOutput/io.Copy/Wait
+// blocked on a blackholed transport then fails AT the op budget
+// instead of hanging forever (Session.Close only writes a
+// channel-close, which a dead transport never drains). The returned
+// func clears the deadline; a rejected SetDeadline leaves the op
+// unbounded — warn, same contract as BoundOp. A nil log falls back
+// to the package logger.
+func BoundOpCtx(ctx context.Context, log *slog.Logger, nc net.Conn,
+	timeout time.Duration) func() {
+	if log == nil {
+		log = logger()
+	}
+	dl, ok := ctx.Deadline()
+	if !ok {
+		dl = time.Now().Add(timeout)
 	}
 	if err := nc.SetDeadline(dl); err != nil {
 		log.Warn("sshclient: conn deadline rejected — op unbounded", "error", err)

@@ -214,3 +214,70 @@ func TestHostnamePinNoGlueOnMissingNewline(t *testing.T) {
 		t.Fatalf("hostname pin glued onto the last line:\n%q", hosts)
 	}
 }
+
+// The 127.0.1.1 pin must match the hostname as a whole field —
+// "127.0.1.1 worker-10" satisfied the old substring check for
+// hn="worker-1" and left the wrong pin live.
+func TestHostsPinHostnameFieldExact(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{NodeName: "worker-1", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n127.0.1.1 worker-10\n")
+
+	c := loadCyc(t, r, vars, "worker-1")
+	c.groupBase()
+
+	hosts := hostRead(t, r, "/etc/hosts")
+	if !strings.Contains(hosts, "127.0.1.1 worker-1\n") {
+		t.Fatalf("correct pin not written:\n%s", hosts)
+	}
+	if strings.Contains(hosts, "worker-10") {
+		t.Fatalf("stale worker-10 pin kept:\n%s", hosts)
+	}
+	// Idempotent: the exact pin already present is left untouched.
+	c.groupBase()
+	if got := hostRead(t, r, "/etc/hosts"); got != hosts {
+		t.Fatalf("hosts rewritten despite exact pin:\n%s", got)
+	}
+}
+
+// On chrony hosts systemd-timesyncd is installed but INACTIVE —
+// the conf drop-in still lands but the service must NOT be
+// restarted (a second NTP daemon would fight chrony for adjtimex).
+func TestGroupResolvedTimesyncdRestartGatedOnActive(t *testing.T) {
+	newCyc := func(t *testing.T, timesyncdState string) (*cyc, *scriptedRunner, *Reconciler) {
+		vars := writeVarsDir(t, "")
+		sr := &scriptedRunner{res: map[string]string{
+			"systemctl show systemd-resolved.service":  "active\n",
+			"systemctl show systemd-timesyncd.service": timesyncdState,
+		}, errs: map[string]bool{}}
+		r, err := New(Config{NodeName: "node-x", HostRoot: t.TempDir(),
+			VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+			Runner: sr}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return loadCyc(t, r, vars, "node-x"), sr, r
+	}
+
+	c, sr, r := newCyc(t, "inactive\n")
+	c.groupResolved()
+	if !r.fileExists("/etc/systemd/timesyncd.conf.d/99-fallback.conf") {
+		t.Fatal("timesyncd fallback conf not written for an installed unit")
+	}
+	if len(sr.callsMatching("systemctl restart systemd-timesyncd.service")) > 0 {
+		t.Fatalf("inactive timesyncd restarted: %v",
+			sr.callsMatching("systemctl restart systemd-timesyncd.service"))
+	}
+
+	c2, sr2, _ := newCyc(t, "active\n")
+	c2.groupResolved()
+	if len(sr2.callsMatching("systemctl restart systemd-timesyncd.service")) == 0 {
+		t.Fatal("active timesyncd not restarted after conf change")
+	}
+}

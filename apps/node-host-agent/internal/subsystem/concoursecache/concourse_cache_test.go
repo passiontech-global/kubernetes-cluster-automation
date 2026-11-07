@@ -685,3 +685,59 @@ func TestStatfsErrorFailsOpen(t *testing.T) {
 	ccMissing(t, old)  // normal 72h age still prunes
 	ccPresent(t, f40h) // 40h survives — no escalation
 }
+
+// removeTree: a plain writable tree needs no chmod walk at all; a
+// read-only tree is made removable by u+w-ing DIRECTORIES only —
+// file modes never gate rm, and os.Chmod must never follow a
+// CI-planted symlink onto a host path.
+func TestRemoveTree(t *testing.T) {
+	// Writable tree — gone in one RemoveAll (no chmod walk).
+	plain := filepath.Join(t.TempDir(), "plain")
+	if err := os.MkdirAll(filepath.Join(plain, "pkg", "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeTree(plain); err != nil {
+		t.Fatalf("plain tree: %v", err)
+	}
+
+	// Read-only tree: dir perms gate rm, file perms do not.
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("keep"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "ro")
+	inner := filepath.Join(root, "sub")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(inner, "f.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(inner, "lnk")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	// Read-only dirs (bun install chmod a-w parity) — applied after
+	// the content is in place; rm needs the dir's u+w, not the file's.
+	for _, d := range []string{inner, root} {
+		if err := os.Chmod(d, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { _ = os.Chmod(root, 0o755); _ = os.Chmod(inner, 0o755) }()
+
+	if err := removeTree(root); err != nil {
+		t.Fatalf("read-only tree: %v", err)
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatal("read-only tree not removed")
+	}
+	// The symlink's TARGET was never chmod'd or removed.
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {
+		t.Fatalf("symlink target touched: %q %v", got, err)
+	}
+	if fi, err := os.Stat(outside); err != nil || fi.Mode().Perm() != 0o444 {
+		t.Fatalf("symlink target mode changed: %v", fi)
+	}
+}

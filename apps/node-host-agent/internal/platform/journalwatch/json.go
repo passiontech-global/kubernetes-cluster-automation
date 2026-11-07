@@ -85,6 +85,15 @@ func messageField(raw json.RawMessage) string {
 // grows unboundedly; entries <= cursor were already processed. A
 // fetch error leaves the cursor untouched — the same window is
 // retried next call.
+//
+// Cursor monotonicity: `next` is clamped at *cursor so a rewound
+// host clock can never rewind the resume point and replay the
+// window. And a fetch that kept ZERO entries parks the cursor
+// instead of advancing to now — journald may hold records written
+// before now that this read could not yet see (journalctl's own
+// flush latency); jumping past them would drop them forever on the
+// next strictly-newer fetch. The same window is re-scanned next
+// call and the <= cursor filter absorbs the replay.
 func Fetch(ctx context.Context, execFn ExecFunc, now time.Time,
 	lookback time.Duration, cursor *int64, args ...string) ([]Entry, error) {
 	sinceUS := *cursor
@@ -100,6 +109,12 @@ func Fetch(ctx context.Context, execFn ExecFunc, now time.Time,
 	}
 	var kept []Entry
 	next := now.UnixMicro()
+	if *cursor > next {
+		// Clock stepped back — keep the resume point. A rewound
+		// cursor would re-emit the whole window and, worse, a later
+		// correct clock would strand entries between the two marks.
+		next = *cursor
+	}
 	for _, e := range ParseJSON(out) {
 		if e.TSUS <= *cursor {
 			continue // already processed on a previous cycle
@@ -108,6 +123,12 @@ func Fetch(ctx context.Context, execFn ExecFunc, now time.Time,
 		if e.TSUS > next {
 			next = e.TSUS
 		}
+	}
+	if len(kept) == 0 {
+		// Nothing new — do NOT advance into the unflushed window:
+		// records journald accepted before `now` may still be in
+		// flight; parking keeps them fetchable next round.
+		next = *cursor
 	}
 	*cursor = next
 	return kept, nil

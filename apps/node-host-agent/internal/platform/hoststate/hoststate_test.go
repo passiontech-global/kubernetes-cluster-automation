@@ -225,6 +225,126 @@ func TestStampLastRunNoInstalled(t *testing.T) {
 	}
 }
 
+// TestOwnerLatchSharedHold: a multi-owner latch survives the FIRST
+// owner's exit — pod-teardown's "nothing wedged" must not delete a
+// latch ctr-tasks still holds for an unkillable orphan shim. The
+// file leaves only when the last owner releases, with exactly one
+// STATE-ENTER and one STATE-EXIT for the whole episode.
+func TestOwnerLatchSharedHold(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+
+	s.EnterFrom("wedged", "ctr-tasks", "shim pid=9 state=D")
+	s.ExitFrom("wedged", "pod-teardown", nil)
+
+	if !s.Exists("wedged") {
+		t.Fatal("latch cleared while ctr-tasks still holds it")
+	}
+	log := testutil.ReadFile(t, logFile)
+	if strings.Contains(log, "STATE-EXIT: wedged") {
+		t.Fatalf("STATE-EXIT logged while an owner still holds: %q", log)
+	}
+	if n := strings.Count(log, "STATE-ENTER: wedged"); n != 1 {
+		t.Fatalf("STATE-ENTER logged %d times want 1", n)
+	}
+
+	// The surviving owner's hold releases → the file goes + one
+	// STATE-EXIT total.
+	s.ExitFrom("wedged", "ctr-tasks", nil)
+	if s.Exists("wedged") {
+		t.Fatal("latch still present after last owner released")
+	}
+	log = testutil.ReadFile(t, logFile)
+	if n := strings.Count(log, "STATE-EXIT: wedged"); n != 1 {
+		t.Fatalf("STATE-EXIT logged %d times want 1", n)
+	}
+}
+
+// TestOwnerLatchExitWithoutHold: an ExitFrom from an owner that
+// never held — and with no other owner recorded (post-restart, or
+// a latch minted through plain Enter) — falls back to legacy
+// single-owner semantics and removes the file, so stale latches
+// still clear instead of waiting for the janitor's 24h reap.
+func TestOwnerLatchExitWithoutHold(t *testing.T) {
+	s, _, _ := newTestStore(t)
+	s.Enter("wedged", "") // plain Enter — no owner recorded
+	s.ExitFrom("wedged", "pod-teardown", nil)
+	if s.Exists("wedged") {
+		t.Fatal("owner-less latch survived an ExitFrom")
+	}
+}
+
+// TestOwnerLatchSecondOwnerJoins: a second owner joining an already-
+// held latch must not re-log STATE-ENTER (file already present) —
+// the log contract stays one line per episode.
+func TestOwnerLatchSecondOwnerJoins(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	s.EnterFrom("wedged", "ctr-tasks", "")
+	s.EnterFrom("wedged", "pod-teardown", "")
+	if n := strings.Count(testutil.ReadFile(t, logFile),
+		"STATE-ENTER: wedged"); n != 1 {
+		t.Fatalf("STATE-ENTER logged %d times want 1", n)
+	}
+	// First owner releases — file stays for the second.
+	s.ExitFrom("wedged", "ctr-tasks", nil)
+	if !s.Exists("wedged") {
+		t.Fatal("latch cleared while pod-teardown still holds")
+	}
+	s.ExitFrom("wedged", "pod-teardown", nil)
+	if s.Exists("wedged") {
+		t.Fatal("latch present after all owners released")
+	}
+}
+
+// TestOwnerLatchLegacyFile: a latch file minted OUTSIDE the owner
+// API (plain Enter, or a pre-restart EnterFrom) is treated as held
+// by every DECLARED owner of a shared latch — the first ExitFrom
+// seeds the remaining owners, so a check that never held it can't
+// clear it; once every declared owner has released, the file exits.
+// "wedged" here must be the real shared latch so SharedOwners
+// resolves its declared set.
+func TestOwnerLatchLegacyFile(t *testing.T) {
+	s, _, _ := newTestStore(t)
+	name := LatchPodTeardownWedged
+	s.Enter(name, "") // legacy file — no recorded owners
+
+	// One owner's release must NOT clear the file — the seed
+	// treats the legacy file as held by every declared owner, so
+	// ctr-tasks' hold remains (a check that never EnterFrom'ed
+	// can't kill another owner's latch — the
+	// TestListFailureKeepsLatch scenario).
+	s.ExitFrom(name, "pod-teardown", nil)
+	if !s.Exists(name) {
+		t.Fatal("legacy shared latch cleared after one owner's release")
+	}
+	// Every declared owner has now released → the stale latch
+	// exits on the SAME cycle, not the janitor's 24h reap.
+	s.ExitFrom(name, "ctr-tasks", nil)
+	if s.Exists(name) {
+		t.Fatal("legacy shared latch kept after all declared owners released")
+	}
+}
+
+// TestAppendLogRotates: past watchdogLogMaxBytes the log is renamed
+// to <file>.1 and the new line lands in a fresh file — the shrink
+// is what nodereporter's offset reset keys on.
+func TestAppendLogRotates(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	big := strings.Repeat("x", int(watchdogLogMaxBytes))
+	if err := os.WriteFile(logFile, []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.AppendLog("after-rotation")
+	if got := testutil.ReadFile(t, logFile); !strings.Contains(got, "after-rotation") ||
+		len(got) > 1024 {
+		t.Fatalf("fresh log = %d bytes, want just the new line", len(got))
+	}
+	rotated, err := os.ReadFile(logFile + ".1")
+	if err != nil || len(rotated) != len(big) {
+		t.Fatalf("rotated .1 = %d bytes err=%v, want %d",
+			len(rotated), err, len(big))
+	}
+}
+
 func TestTmpNameStaysOutOfStateScan(t *testing.T) {
 	s, _, _ := newTestStore(t)
 	// A failed write must not strand a "state-x.tmp"-shaped file —

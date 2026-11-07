@@ -453,29 +453,28 @@ func TestWatchdogStaleNotRefreshedAcrossCycles(t *testing.T) {
 }
 
 // TestZeroChurn: repeated cycles with unchanged latches must not
-// PATCH the node again; a change PATCHes exactly once more. The NPD
-// conditions live in a second patch, so the first cycle patches
-// twice (watchdog conditions + NPD conditions), then a watchdog
-// latch change adds one.
+// PATCH the node again; a change PATCHes exactly once more. Watchdog
+// and NPD conditions now ship in ONE merged patch — the first cycle
+// patches once, then a watchdog latch change adds one.
 func TestZeroChurn(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("first cycle: %d patches, want 2", n)
+	if n := e.patches(); n != 1 {
+		t.Fatalf("first cycle: %d patches, want 1", n)
 	}
 	e.cycle()
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("unchanged cycles: %d patches, want 2 (zero-churn)", n)
+	if n := e.patches(); n != 1 {
+		t.Fatalf("unchanged cycles: %d patches, want 1 (zero-churn)", n)
 	}
 	e.writeFile("state-node-overloaded", "1700000002")
 	e.cycle()
-	if n := e.patches(); n != 3 {
-		t.Fatalf("after latch: %d patches, want 3", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("after latch: %d patches, want 2", n)
 	}
 	e.cycle()
-	if n := e.patches(); n != 3 {
-		t.Fatalf("after stable latch: %d patches, want 3", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("after stable latch: %d patches, want 2", n)
 	}
 }
 
@@ -511,13 +510,13 @@ func TestMessageOnlyNoChurn(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("state-node-overloaded", "1700000001")
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("first cycle: %d patches, want 2 (watchdog + npd)", n)
+	if n := e.patches(); n != 1 {
+		t.Fatalf("first cycle: %d patches, want 1 (merged watchdog + npd)", n)
 	}
 	e.writeFile("state-node-overloaded", "1700000009")
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("message-only change: %d patches, want 2", n)
+	if n := e.patches(); n != 1 {
+		t.Fatalf("message-only change: %d patches, want 1", n)
 	}
 }
 

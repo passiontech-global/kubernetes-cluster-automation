@@ -111,6 +111,14 @@ func (n *NetHealth) spawnMTUProber(ctx context.Context) {
 			st.mu.Lock()
 			st.running = false
 			st.mu.Unlock()
+			// Run(ctx) is over (ctx done) — drop this instance's
+			// map entry so a stopped NetHealth can't pin its
+			// prober state in the global sync.Map forever. A
+			// panic-respawn keeps the entry (running==false lets
+			// the next tick re-arm the SAME state).
+			if ctx.Err() != nil {
+				mtuProbeStates.Delete(n)
+			}
 		}()
 		n.mtuProbeLoop(ctx, st)
 	}()

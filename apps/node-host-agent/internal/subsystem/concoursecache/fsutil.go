@@ -140,21 +140,36 @@ func topLevelDirsByAge(root string) []cacheFile {
 	return out
 }
 
-// makeWritable is `chmod -R u+w` — node-deps subdirs can be read-only
-// (bun install chmod a-w), which would defeat rm -rf.
-func makeWritable(root string) {
+// removeTree is rm -rf for cache trees: a bare RemoveAll first —
+// the common writable-tree case needs no chmod walk at all (the old
+// makeWritable-everything + RemoveAll walked each tree 3×). Only
+// when removal FAILS does it walk once, u+w-ing DIRECTORIES only
+// (removal permission lives on the containing dir — a file's own
+// mode never matters for rm), then retries RemoveAll once.
+func removeTree(root string) error {
+	if err := os.RemoveAll(root); err == nil {
+		return nil
+	}
+	makeWritableDirs(root)
+	return os.RemoveAll(root)
+}
+
+// makeWritableDirs adds u+w to every DIRECTORY under root —
+// node-deps subdirs can be read-only (bun install chmod a-w), which
+// defeats rm -rf. DirEntry.IsDir is Lstat-based and WalkDir never
+// descends into symlinked dirs, so links and their targets are
+// never touched: os.Chmod follows links, and running as root in a
+// CI-owned tree makes a planted `dir -> /etc` a host-chmod gadget.
+// Files are skipped — their mode is irrelevant to removal.
+func makeWritableDirs(root string) {
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			logger().Debug("chmod -R: unreadable entry skipped",
-				"path", path, "error", err)
-			return nil // unreadable entries are skipped, never fatal
+			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
 		}
-		// Skip symlinks: coreutils chmod -R never touches link targets
-		// (node_modules .bin is a symlink farm onto other trees).
-		if d.Type()&os.ModeSymlink != 0 {
+		if !d.IsDir() {
 			return nil
 		}
-		if info, err := d.Info(); err == nil {
+		if info, ierr := d.Info(); ierr == nil {
 			_ = os.Chmod(path, info.Mode().Perm()|0o200)
 		}
 		return nil

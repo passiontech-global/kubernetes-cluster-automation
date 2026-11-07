@@ -146,7 +146,11 @@ var (
 // separately — folded into the error on failure, debug-logged on
 // success — so psql WARNING/NOTICE/version-skew lines cannot poison
 // the exact-match stdout parsers.
-type runner func(ctx context.Context, argv []string, stdin string) (string, error)
+// env lets a caller feed secrets to the child without placing them
+// on argv (`docker exec -e PGPASSWORD` forwards the parent's env —
+// `docker exec -e PGPASSWORD=...` would leak the password through
+// /proc/<pid>/cmdline). nil env for everything else.
+type runner func(ctx context.Context, env, argv []string, stdin string) (string, error)
 
 // Config carries the kinedb knobs — all test-injectable.
 type Config struct {
@@ -186,6 +190,15 @@ type Config struct {
 
 	CmdTimeout     time.Duration // per command budget
 	LongCmdTimeout time.Duration // compact/vacuum/reindex/repack budget
+
+	// ReadOnly suppresses every mutating path in runProbeChecks and
+	// the WAL/XID hygiene block — the check-kine-db CLI mode:
+	// pg_terminate_backend, VACUUM/ANALYZE, ROLLBACK PREPARED,
+	// replication-slot drops, pgbouncer RECONNECT/container restarts
+	// and every state-file/Prom-textfile write are replaced by
+	// "would have done X" diagnostics. The subsystem daemon leaves
+	// this false — remediation is its job.
+	ReadOnly bool
 
 	// --- injectable seams (defaults follow) ---
 	nowFn  timex.Clock
@@ -283,8 +296,8 @@ func (c *Config) applyDefaults() error {
 		c.nowFn = timex.SystemClock
 	}
 	if c.run == nil {
-		c.run = func(ctx context.Context, argv []string, stdin string) (string, error) {
-			out, serr, err := hostexec.Run(ctx, argv, stdin)
+		c.run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+			out, serr, err := hostexec.RunEnv(ctx, env, argv, stdin)
 			// stderr stays out of the returned output — the same
 			// split as etcdmaint's CmdRunner. A psql WARNING or a
 			// "server version" notice on stderr would otherwise
