@@ -195,26 +195,26 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_kubelet_storage_operation_errors_total",
 		"storage_operation_errors_total summed over volume_plugin/operation labels from the kubelet :10250/metrics scrape (W12-KR4).",
 		d.Series.KubeletStorageOperationErrors)
-	// Wave-13 series — the subproc-OOM, SA-token, LocalPV-quota,
+	// Guard series — the subproc-OOM, SA-token, LocalPV-quota,
 	// memory-compaction and /run tmpfs guards refresh these fields
 	// each cycle (deps.go Series owns the contract).
 	counter("node_agent_container_subprocess_oom_total",
-		"Container subprocess OOM kills where container PID 1 survived (living-dead) — W13-KR4.",
+		"Container subprocess OOM kills where container PID 1 survived (living-dead) — subproc-oom.",
 		d.Series.ContainerSubprocessOOM)
 	b.Gauge("node_agent_sa_token_min_ttl_seconds",
-		"Lowest projected service-account token TTL observed across Running pods (-1 = none measured) — W13-CP3.",
+		"Lowest projected service-account token TTL observed across Running pods (-1 = none measured) — sa-token-ttl.",
 		d.Series.SATokenMinTTLSec)
 	counter("node_agent_localpv_quota_throttled_total",
-		"Pods deprioritized (renice+ionice+io.weight) for LocalPV usage >1.5x PV capacity under disk pressure — W13-ST1.",
+		"Pods deprioritized (renice+ionice+io.weight) for LocalPV usage >1.5x PV capacity under disk pressure — localpv-quota.",
 		d.Series.LocalPVQuotaThrottled)
 	counter("node_agent_memory_compaction_runs_total",
-		"vm.compact_memory writes triggered by the page-alloc-failure latch — W13-KR1.",
+		"vm.compact_memory writes triggered by the page-alloc-failure latch — kernel-pressure.",
 		d.Series.MemoryCompactionRuns)
 	b.Gauge("node_agent_run_tmpfs_used_ratio",
-		"/run tmpfs fill ratio, max of bytes and inode usage — W13-KR3.",
+		"/run tmpfs fill ratio, max of bytes and inode usage — run-tmpfs.",
 		d.Series.RunTmpfsUsedRatio)
 	counter("node_agent_run_tmpfs_cleanups_total",
-		"journal vacuum + orphan .tmp sweeps run by the /run tmpfs guard — W13-KR3.",
+		"journal vacuum + orphan .tmp sweeps run by the /run tmpfs guard — run-tmpfs.",
 		d.Series.RunTmpfsCleanups)
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {

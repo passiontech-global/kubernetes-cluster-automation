@@ -52,7 +52,7 @@ func (c *GuardCheck) Run(ctx context.Context) {
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "no_etcd_pki").Inc()
 		return
 	}
-	// W13-ST2: the snapshot verifier rides this embedded-etcd
+	// backup-health: the snapshot verifier rides this embedded-etcd
 	// gate — a controller with no local etcd has no snapshot
 	// dirs to verify.
 	c.VerifySnapshots()
@@ -196,7 +196,7 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	}
 }
 
-// VerifySnapshots is the W13-ST2 embedded-etcd backup check: the
+// VerifySnapshots is the backup-health embedded-etcd backup check: the
 // newest snapshot under the configured dir (or the two k0s
 // defaults — <K0sDir>/etcd/snapshots and EtcdBackupDir, the
 // host-root-joined /var/backups/etcd) must
@@ -237,7 +237,7 @@ func (c *GuardCheck) VerifySnapshots() {
 	if newest == "" {
 		c.d.State.SuspectLog(cdeps.CheckEtcd,
 			"suspect: no etcd snapshot found under "+strings.Join(dirs, ", ")+
-				" — etcd snapshot pipeline may be down (W13-ST2)",
+				" — etcd snapshot pipeline may be down (backup-health)",
 			c.d.Cfg.SuspectLogCadence)
 		return
 	}

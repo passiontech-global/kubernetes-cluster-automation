@@ -29,12 +29,12 @@ const orphanHostPathMinAge = 24 * time.Hour
 
 const lastHostOOMEventFile = "last-host-oom-event"
 
-// The W13-KR1 producer latch this check consumes lives in the
+// The kernel-pressure producer latch this check consumes lives in the
 // hoststate registry: hostmetrics' kmsg scanner enters
 // hoststate.LatchPageAllocFailure (state-page-alloc-failure) when
 // the kernel logs "page allocation failure: order:N".
 
-// memoryCompactEvery is the W13-KR1 compaction cooldown — one
+// memoryCompactEvery is the kernel-pressure compaction cooldown — one
 // vm.compact_memory write per 30 minutes: direct compaction is a
 // non-invasive buddy-allocator defrag pass but it still stalls
 // page allocation while it runs.
@@ -42,7 +42,7 @@ const memoryCompactEvery = 30 * time.Minute
 
 // HostOOMCheck is the W10-KR1 hostmetrics kmsg-marker consumer as
 // a Check (no streak — the dedup marker file is the state). It also
-// owns the W13-KR1 memory-compaction remedy, consuming the
+// owns the kernel-pressure memory-compaction remedy, consuming the
 // state-page-alloc-failure latch produced by the hostmetrics kmsg
 // scanner.
 type HostOOMCheck struct{ d *wdeps.Deps }
@@ -105,7 +105,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 	c.d.Cycles.WithLabelValues(wdeps.CheckHostOOM, "ok").Inc()
 }
 
-// compactMemory is the W13-KR1 remedy half: while the hostmetrics
+// compactMemory is the kernel-pressure remedy half: while the hostmetrics
 // kmsg scanner's state-page-alloc-failure latch is held (kernel
 // "page allocation failure: order:N" — the buddy allocator can't
 // serve a contiguous block, fragmentation is winning), write 1 to
@@ -134,7 +134,7 @@ func (c *HostOOMCheck) compactMemory() {
 	c.d.State.Exit(hoststate.LatchPageAllocFailure, nil)
 	c.d.MemoryCompactionRuns++
 	c.d.State.AppendLog(
-		"ACTION: page-alloc-failure latch held — triggered vm.compact_memory (W13-KR1 defrag)")
+		"ACTION: page-alloc-failure latch held — triggered vm.compact_memory (kernel-pressure defrag)")
 	c.d.Actions.WithLabelValues(wdeps.CheckHostOOM, "compact_memory").Inc()
 }
 

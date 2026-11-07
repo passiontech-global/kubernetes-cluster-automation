@@ -1,4 +1,4 @@
-// kmsg_rules_test.go — W13-KR1: isHostOOMComm coverage and the
+// kmsg_rules_test.go — kernel-pressure: isHostOOMComm coverage and the
 // page-alloc-failure latch the kmsg drain produces for
 // workerhygiene's vm.compact_memory trigger.
 package kernelfail
@@ -9,14 +9,14 @@ import (
 	"testing"
 )
 
-func TestIsHostOOMCommWave13(t *testing.T) {
+func TestIsHostOOMCommInfraDaemon(t *testing.T) {
 	for comm, want := range map[string]bool{
 		"kubelet":            true,
 		"k0s":                true,
 		"k0scontroller-shim": true, // k0s prefix
 		"containerd":         true,
 		"containerd-shim":    true, // substring
-		// W13-KR1 additions.
+		// kernel-pressure additions.
 		"nebula":          true,
 		"haproxy":         true,
 		"coredns":         true,

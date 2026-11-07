@@ -102,7 +102,7 @@ const (
 	defaultRemediateMinRst = 30 * time.Minute // WDREM_MIN_RESTART_INTERVAL=1800
 	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
 	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
-	// spofStreakMultiplier is the W13 Gap#2 rule: on a
+	// spofStreakMultiplier is the spof-streak rule: on a
 	// single-controller topology every consecutive-failure streak
 	// gating a k0scontroller restart is doubled — a transient flap
 	// costs 30-45s of API downtime with no peer to serve the gap
@@ -223,7 +223,7 @@ type Config struct {
 	// PKIDrift is the W8-CP4 on-disk-vs-served PKI cert drift check —
 	// no env wiring; package defaults unless set programmatically.
 	PKIDrift PKIDriftConfig
-	// TotalControllers is the W13 Gap#2 topology override: >0 pins
+	// TotalControllers is the spof-streak topology override: >0 pins
 	// the control-plane size explicitly; 0 (default) = auto — an
 	// unset Hub.PeerAPI means a single-controller cluster.
 	TotalControllers int

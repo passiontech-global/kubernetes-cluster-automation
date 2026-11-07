@@ -32,7 +32,7 @@
 //     dead-fallback), cp_freeze_heal.go (W8-CP3 KCM/scheduler freeze
 //   - W10-FIX1 workqueue stall + the APF queue-starvation probe)
 //   - etcd/      — etcdguard.go (embedded-etcd quota self-defence +
-//     W13-ST2 snapshot verifier)
+//     backup-health snapshot verifier)
 //   - pki/       — pki_cert_drift.go (W8-CP4 reload drift + W12-CP4a
 //     sa.pub fingerprint), kubeconfig_cert_expiry.go (W10-CP5)
 //   - oom/       — oomloop.go (memcg OOM-loop detector + shield)
@@ -224,14 +224,14 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	d.TerminatedWatchers = prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name: "node_host_agent_apiserver_terminated_watchers",
 		Help: "apiserver_terminated_watchers_total mirrored from the " +
-			"local apiserver — 410-Gone relist storm signal (W13-CP1).",
+			"local apiserver — 410-Gone relist storm signal (relist-storm).",
 	}, func() float64 {
 		return math.Float64frombits(d.TerminatedWatchersVal.Load())
 	})
 	d.EtcdSnapAge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_snapshot_age_seconds",
 		Help: "Age of the newest etcd snapshot under the snapshot " +
-			"dirs (embedded-etcd controllers only, W13-ST2).",
+			"dirs (embedded-etcd controllers only, backup-health).",
 	})
 
 	h := &Hygiene{Deps: d}

@@ -218,7 +218,7 @@ func TestDescribe(t *testing.T) {
 	// + 4 W12-KR3 descs (ephemeral port saturation, tcp CLOSE_WAIT
 	// count, node_exporter-named nf_conntrack insert_failed/drop).
 	// + 1 W12-CP4a desc (sa.pub signer-key fingerprint hash).
-	// + 6 W13 descs (daemon fd ratio, containerd meta.db,
+	// + 6 guard descs (daemon fd ratio, containerd meta.db,
 	//   k0scontroller children RSS, fs bytes used ratio, eBPF
 	//   programs/maps counts).
 	if got := len(ch); got != 68 {

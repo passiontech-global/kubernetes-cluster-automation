@@ -1,4 +1,4 @@
-// collect_daemon_fd_test.go — W13-KR2 per-daemon fd ratio +
+// collect_daemon_fd_test.go — daemon-fd per-daemon fd ratio +
 // containerd meta.db size.
 package hostmetrics
 

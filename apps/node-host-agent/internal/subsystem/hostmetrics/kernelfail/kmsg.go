@@ -368,7 +368,7 @@ func (r *Runner) noteKernelFsError(msg string) {
 // evidence: MemAvailable can still read GBs free while the buddy
 // allocator fails to find a contiguous block for sk_buff,
 // WireGuard (cilium_wg0) or XFS metadata. The latch is the
-// hostmetrics→workerhygiene hand-off for the W13-KR1
+// hostmetrics→workerhygiene hand-off for the kernel-pressure
 // vm.compact_memory trigger (the compact itself + its cooldown live
 // in workerhygiene); Enter is idempotent, so repeat failure lines
 // only refresh the latch mtime and never spam STATE-ENTER lines —

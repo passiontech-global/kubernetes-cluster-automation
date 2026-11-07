@@ -214,7 +214,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	serve("metrics", metricsLn, a.metricsMux())
 	serve("probe", probeLn, a.probeMux())
 
-	// W13-OBS2: systemd self-watchdog — READY=1 now that both
+	// sd-watchdog: systemd self-watchdog — READY=1 now that both
 	// listeners are bound and ready flipped, then WATCHDOG=1 every
 	// 30s while the probe mux answers. sctx-scoped so a listener
 	// failure stops feeding before Run returns the error.

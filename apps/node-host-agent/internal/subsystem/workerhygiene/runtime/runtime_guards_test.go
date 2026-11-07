@@ -1,7 +1,7 @@
-// runtime_w13_test.go — Wave-13 guard tests: the W13-KR4
-// living-dead subproc OOM detector, the W13-CP3 SA-token TTL
-// guard, the W13-ST1 LocalPV quota enforcer, the W13-KR3 /run
-// tmpfs guard and the W13-KR1 memory-compaction remedy.
+// runtime_guards_test.go — guard tests: the subproc-oom
+// living-dead subproc OOM detector, the sa-token-ttl SA-token TTL
+// guard, the localpv-quota LocalPV quota enforcer, the run-tmpfs /run
+// tmpfs guard and the kernel-pressure memory-compaction remedy.
 package runtime_test
 
 import (
@@ -43,7 +43,7 @@ func mkOOMScope(t *testing.T, e *env, uid, ctrID string, oomKill int64, pid1 int
 	return scope
 }
 
-// --- W13-KR4: living-dead subprocess OOM detector ---
+// --- subproc-oom: living-dead subprocess OOM detector ---
 
 func TestSubprocOOMLivingDead(t *testing.T) {
 	pod := &corev1.Pod{
@@ -157,7 +157,7 @@ func TestSubprocOOMKillStormStillConfirms(t *testing.T) {
 	}
 }
 
-// --- W13-CP3: projected SA token TTL guard ---
+// --- sa-token-ttl: projected SA token TTL guard ---
 
 // fakeJWT builds a syntactically-valid compact JWT carrying exp.
 func fakeJWT(exp int64) string {
@@ -253,7 +253,7 @@ func TestSATokenTTLHealthy(t *testing.T) {
 	}
 }
 
-// --- W13-ST1: LocalPV quota enforcer ---
+// --- localpv-quota: LocalPV quota enforcer ---
 
 func TestLocalPVQuotaThrottle(t *testing.T) {
 	pv := &corev1.PersistentVolume{
@@ -348,7 +348,7 @@ func TestLocalPVQuotaThrottle(t *testing.T) {
 	}
 }
 
-// --- W13-KR3: /run tmpfs guard ---
+// --- run-tmpfs: /run tmpfs guard ---
 
 func TestRunTmpfsGuard(t *testing.T) {
 	e := fixture(t)
@@ -401,7 +401,7 @@ func TestRunTmpfsGuard(t *testing.T) {
 	}
 }
 
-// --- W13-KR1: page-alloc-failure → compact_memory ---
+// --- kernel-pressure: page-alloc-failure → compact_memory ---
 
 func TestPageAllocCompaction(t *testing.T) {
 	e := fixture(t)

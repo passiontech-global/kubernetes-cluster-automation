@@ -1,8 +1,8 @@
 // disk_bloat.go — the W6.3 runaway-dir detector
-// (wdeps.CheckDiskBloat) plus the W13 disk side-guards that ride
-// the same cycle slot: the W13-ST1 LocalPV hard-quota enforcer
+// (wdeps.CheckDiskBloat) plus the disk side-guards that ride
+// the same cycle slot: the localpv-quota LocalPV hard-quota enforcer
 // (pvc-* over 1.5x capacity under disk pressure → deprioritize the
-// owning pod's tasks) and the W13-KR3 host /run tmpfs guard
+// owning pod's tasks) and the run-tmpfs host /run tmpfs guard
 // (80% fill → journald vacuum + orphan .tmp sweep, 15m budget).
 package runtime
 
@@ -178,7 +178,7 @@ func (c *DiskBloatCheck) snapshotPodUID(id string) string {
 type DiskBloatCheck struct {
 	d        *wdeps.Deps
 	lastScan time.Time
-	// localPVThrottled is the W13-ST1 per-PVC throttle ledger —
+	// localPVThrottled is the localpv-quota per-PVC throttle ledger —
 	// a pod is deprioritized once per process lifetime (the
 	// throttle is sticky until the pod restarts anyway).
 	localPVThrottled map[string]bool
@@ -193,7 +193,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "gated").Inc()
 		return
 	}
-	// W13 side-guards run every cycle — their own watermarks
+	// Disk side-guards run every cycle — their own watermarks
 	// decide, independent of the /var/lib/k0s bloat watermark.
 	c.runTmpfsGuard(ctx)
 	c.localPVQuota(ctx, e)
@@ -283,7 +283,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
 }
 
-// --- W13-ST1: LocalPV hard-quota enforcer ---
+// --- localpv-quota: LocalPV hard-quota enforcer ---
 //
 // A pod writing past 1.5x its PV's capacity on an OpenEBS localpv
 // hostpath under disk pressure (>80% used) starves every other
@@ -305,7 +305,7 @@ func (c *DiskBloatCheck) localPVScanRoots() []string {
 	return c.d.Cfg.Disk.OrphanHostPathDirs
 }
 
-// localPVQuota runs one W13-ST1 round: over-quota pvc-* dirs under
+// localPVQuota runs one localpv-quota round: over-quota pvc-* dirs under
 // disk pressure get their owning pod's tasks deprioritized and a
 // LocalPVQuotaExceeded event emitted.
 func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
@@ -483,7 +483,7 @@ func (c *DiskBloatCheck) emitPVQuotaEvent(ctx context.Context,
 		c.d.Cfg.Disk.LocalPVQuotaRatio, cap, throttled))
 }
 
-// --- W13-KR3: host /run tmpfs guard ---
+// --- run-tmpfs: host /run tmpfs guard ---
 //
 // A full /run tmpfs kills containerd.sock, dbus and every lockfile
 // on the host while every probe still answers — the classic
@@ -502,7 +502,7 @@ const (
 	runTmpfsSweepMax   = 64 // bound one cycle's tmp sweep
 )
 
-// runTmpfsGuard executes one W13-KR3 round.
+// runTmpfsGuard executes one run-tmpfs round.
 func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 	var st unix.Statfs_t
 	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.Disk.HostRunDir, &st); err != nil ||

@@ -55,7 +55,7 @@ const (
 	defaultRepackDeadPct      = 40
 	defaultRepackMinHeapBytes = 209715200 // 200MB
 
-	// W13-CP4/ST2: top-churn window and the physical-backup
+	// kine-churn/backup-health: top-churn window and the physical-backup
 	// verifier defaults.
 	defaultBackupDir      = "/var/backups/kine"
 	defaultBackupInterval = 6 * time.Hour
@@ -146,7 +146,7 @@ type Config struct {
 	// space gates pg_repack (W8-CP2); "" → /var/lib/postgresql/data.
 	PGDataDir string
 
-	// W13-ST2/Gap#4 physical-backup verifier: BackupDir is the
+	// backup-health physical-backup verifier: BackupDir is the
 	// host dir holding pg_dump -Fc dumps ("" → /var/backups/kine);
 	// BackupInterval is the max dump age before the guard creates
 	// a fresh one ("" → 6h). Creation also requires >30% free on
@@ -309,7 +309,7 @@ func (c *Config) ApplyDefaults() error {
 }
 
 // statfsFree returns the free-byte ratio of the fs holding path —
-// the StatFSFn default the W13-ST2 backup verifier's >30%-free gate
+// the StatFSFn default the backup-health backup verifier's >30%-free gate
 // reads.
 func statfsFree(path string) (float64, error) {
 	var st unix.Statfs_t

@@ -21,7 +21,7 @@
 // with DB access — sees the lock taken and skips.
 //
 // State under GuardStateDir: last-head, last-compact-rev,
-// freeze-cycles, last-compact-ts. The W13-ST2 physical-backup
+// freeze-cycles, last-compact-ts. The backup-health physical-backup
 // verifier rides the same cycle (backup.go). The probe and maint
 // loops live in sibling packages; everything shared goes through
 // kdeps.Deps.
@@ -185,7 +185,7 @@ type Result struct {
 	revSeen  bool  // revAfter is valid
 	statsOK  bool  // head/compact/rows were actually read this run
 	reason   string
-	// W13-ST2 backup verifier outcome — seen=false when the
+	// backup-health backup verifier outcome — seen=false when the
 	// verifier could neither measure nor create a dump this run.
 	backupAge   int64
 	backupValid bool
@@ -210,7 +210,7 @@ func (g *Guard) Cycle(ctx context.Context) *Result {
 		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
 		g.guardRun(ctx, pg, user, pass, res, note)
-		// W13-ST2/Gap#4: physical-backup verifier — pg_dump -Fc
+		// backup-health: physical-backup verifier — pg_dump -Fc
 		// every BackupInterval when free space allows, header
 		// verified; emits kine_db_backup_{age_seconds,valid} in
 		// the same textfile.
@@ -358,7 +358,7 @@ func (g *Guard) emitGuard(res *Result) {
 	p.Gauge("kine_db_guard_last_run_timestamp_seconds",
 		"Last guard run", ts)
 	g.d.M.GuardLastRun.Set(ts)
-	// W13-CP4: the probe loop's top-5 churn sample renders here —
+	// kine-churn: the probe loop's top-5 churn sample renders here —
 	// this file owns the churn series (the probe's own .prom must
 	// never duplicate it). The probe goroutine refreshes ChurnTop
 	// asynchronously — snapshot it under ChurnMu. And the GaugeVec
@@ -375,7 +375,7 @@ func (g *Guard) emitGuard(res *Result) {
 			fmt.Sprintf("resource=%q", e.Resource), float64(e.Revs))
 		g.d.M.TopChurn.WithLabelValues(e.Resource).Set(float64(e.Revs))
 	}
-	// W13-ST2: physical-backup verifier series — seen-gated like
+	// backup-health: physical-backup verifier series — seen-gated like
 	// the stats series: an unmeasured cycle must not fabricate a
 	// passing backup state.
 	if res.backupSeen {

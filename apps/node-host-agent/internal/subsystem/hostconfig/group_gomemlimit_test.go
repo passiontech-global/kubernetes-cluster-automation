@@ -1,4 +1,4 @@
-// group_gomemlimit_test.go — W13-CP2 GOMEMLIMIT sum guard: the
+// group_gomemlimit_test.go — gomemlimit-sum GOMEMLIMIT sum guard: the
 // 52-go-memlimit-sumguard.conf drop-in clamps only when the
 // configured cap leaves < 2GiB sibling headroom under MemoryMax.
 package hostconfig

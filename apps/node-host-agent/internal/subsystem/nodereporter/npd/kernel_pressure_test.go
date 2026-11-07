@@ -1,4 +1,4 @@
-// kernel_w13_test.go — W13-KR1 kernel temp rules:
+// kernel_pressure_test.go — kernel-pressure temp rules:
 // PageAllocFailure, NeighborTableOverflow, NetdevTxTimeout,
 // TCPMemoryPressure as counter+Event rules.
 package npd
@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestKernelWave13TempRules(t *testing.T) {
+func TestKernelPressureTempRules(t *testing.T) {
 	e := fixture(t)
 	for reason, msg := range map[string]string{
 		"PageAllocFailure":      "python3: page allocation failure: order:4, mode:0x20",

@@ -32,7 +32,7 @@ var (
 	oomConstraintRe = regexp.MustCompile(`oom-kill:constraint=`)
 	oomMemcgRe      = regexp.MustCompile(`(?:oom_memcg|task_memcg)=([^\s,]+)`)
 	oomTaskRe       = regexp.MustCompile(`(?:^|,)task=([^\s,]+)`)
-	// W13-KR1: higher-order page allocation failure — the buddy
+	// kernel-pressure: higher-order page allocation failure — the buddy
 	// allocator can't find a contiguous order>=1 block for
 	// sk_buff/WireGuard/XFS even while MemAvailable stays high.
 	// order:0 failures are routine pressure noise; order:[1-9] is
@@ -81,7 +81,7 @@ func parseOOMConstraint(msg string) *oomKillCtx {
 }
 
 // isHostOOMComm reports whether comm names a host-level daemon —
-// the containerd/k0s/kubelet set plus the W13-KR1 infra daemons
+// the containerd/k0s/kubelet set plus the kernel-pressure infra daemons
 // (nebula, haproxy on the api-lb VM, the coredns host stub, the
 // postgres/pgbouncer pair on db-vm, every cilium daemon and the
 // agent itself) whose kernel-OOM death is as load-bearing as the

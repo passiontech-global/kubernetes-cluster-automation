@@ -133,15 +133,15 @@ type Config struct {
 	OpenEBSLocalDir     string
 	LocalPVScanInterval time.Duration
 	// FSBytesTargets are the mounts statfs'd per scrape for the
-	// W13-KR3 used-BYTE ratio — tmpfs fills by bytes while the inode
+	// run-tmpfs used-BYTE ratio — tmpfs fills by bytes while the inode
 	// gauges still read idle (/run's sockets die first). Defaults
 	// are HostRoot-joined for run/k0s and literal for the
 	// shared-layout paths (/dev/shm, /var/openebs/local).
 	FSBytesTargets []string
 	// ContainerdMetaDBFile is the containerd bbolt metadata db —
-	// the W13-KR2 bloat gauge (HostRoot-joined by applyDefaults).
+	// the metadb-bloat bloat gauge (HostRoot-joined by applyDefaults).
 	ContainerdMetaDBFile string
-	// BpffsDir is the bpffs mount the W13-OBS1 eBPF inventory walks
+	// BpffsDir is the bpffs mount the ebpf-inventory eBPF inventory walks
 	// for pinned objects (HostRoot-joined by applyDefaults — pod mode
 	// reads /host/sys/fs/bpf, the container's own /sys is wrong);
 	// EBPFScanInterval caches the /proc/*/fdinfo sweep like
@@ -324,7 +324,7 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.FSBytesTargets) == 0 {
 		// HostRoot-joined for the host-side mounts ("/host/run",
-		// "/host/var/lib/k0s" in pod mode — the W13-KR3 spec paths);
+		// "/host/var/lib/k0s" in pod mode — the run-tmpfs spec paths);
 		// /dev/shm and /var/openebs/local mount at the same path in
 		// both layouts (OpenEBSLocalDir parity).
 		c.FSBytesTargets = []string{

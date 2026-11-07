@@ -37,7 +37,7 @@ type Deps struct {
 	// last-kine-analyze) go through its RateOK/RateSpend/RateTrySpend.
 	State *hoststate.Store
 
-	// ChurnTop is the W13-CP4 top-5 churn result computed by the
+	// ChurnTop is the kine-churn top-5 churn result computed by the
 	// probe loop (churn window watermark lives in GuardStateDir)
 	// and emitted by the guard cycle into kine-compact-guard.prom.
 	// ChurnMu guards the slice header — probe and compact-guard

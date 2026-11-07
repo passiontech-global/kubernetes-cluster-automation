@@ -1,5 +1,5 @@
 // runtime_sa_token_ttl.go — the sa-token-ttl guard
-// (wdeps.CheckSATokenTTL, W13-CP3). BoundServiceAccountTokenVolume
+// (wdeps.CheckSATokenTTL, sa-token-ttl). BoundServiceAccountTokenVolume
 // projected tokens are rotated by kubelet's volumeManager on an
 // ~80%-of-TTL refresh. When the volume plugin stalls (watch
 // backlog, remount queue wedge) the token on disk quietly nears
@@ -43,7 +43,7 @@ const saTokenResyncAnnotation = "node-ops.passiontech.io/token-resync-at"
 // already carries a fresh stamp), so no last-* file is needed.
 const saTokenNudgeCooldown = 15 * time.Minute
 
-// SATokenTTLCheck is the W13-CP3 projected-token expiry guard as a
+// SATokenTTLCheck is the sa-token-ttl projected-token expiry guard as a
 // Check — stateless: the nudge dedupe rides the pod annotation.
 type SATokenTTLCheck struct{ d *wdeps.Deps }
 

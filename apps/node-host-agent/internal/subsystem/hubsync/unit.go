@@ -37,7 +37,7 @@ Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=%s
 ExecStart=%s --standalone --node-name=%s --health-probe-bind-address=:8091
 Restart=always
 RestartSec=5s
-# W13-OBS2 self-watchdog: the agent sd_notifies READY=1 + WATCHDOG=1
+# sd-watchdog self-watchdog: the agent sd_notifies READY=1 + WATCHDOG=1
 # while its probe mux answers — a wedged process stops feeding and
 # systemd restarts it after 120s. MemoryMax + GOMEMLIMIT bound the
 # agent's own footprint on the infra VMs it guards (no kubelet QoS

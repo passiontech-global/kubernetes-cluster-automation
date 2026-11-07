@@ -69,13 +69,13 @@ func NewOrphanHP(d *wdeps.Deps) *OrphanHPCheck {
 	return &OrphanHPCheck{d: d}
 }
 
-// NewSubprocOOM returns the W13-KR4 living-dead container OOM
+// NewSubprocOOM returns the subproc-oom living-dead container OOM
 // detector.
 func NewSubprocOOM(d *wdeps.Deps) *SubprocOOMCheck {
 	return &SubprocOOMCheck{d: d}
 }
 
-// NewSATokenTTL returns the W13-CP3 projected SA-token expiry
+// NewSATokenTTL returns the sa-token-ttl projected SA-token expiry
 // guard.
 func NewSATokenTTL(d *wdeps.Deps) *SATokenTTLCheck {
 	return &SATokenTTLCheck{d: d}

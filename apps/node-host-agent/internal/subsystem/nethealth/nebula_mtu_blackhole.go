@@ -221,7 +221,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 	wd *watchdogconf.Config, st *mtuProbeState) {
 	st.mu.Lock()
-	if time.Since(st.lastClamp) < mtuClampEvery {
+	if n.cfg.Clock.Now().Sub(st.lastClamp) < mtuClampEvery {
 		st.mu.Unlock()
 		return
 	}

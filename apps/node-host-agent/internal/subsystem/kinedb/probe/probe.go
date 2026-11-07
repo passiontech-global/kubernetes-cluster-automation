@@ -295,7 +295,7 @@ func (p *Probe) RunChecks(ctx context.Context) *Result {
 			// the backend idles below the pool's conn count →
 			// RECONNECT the stalled server conns first.
 			p.checkPGBWedge(ctx, pg, pgb, user, pass, res, note)
-			// W13-CP4: top-5 write churn — a mutating webhook
+			// kine-churn: top-5 write churn — a mutating webhook
 			// ping-pong shows up as one resource prefix churning
 			// thousands of revisions.
 			p.probeTopChurn(ctx, pg, user, pass, note)

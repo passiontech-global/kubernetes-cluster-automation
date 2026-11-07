@@ -36,8 +36,8 @@ const (
 	EnvOomloopAutofix        = "NODE_HOST_AGENT_OOMLOOP_AUTOFIX"
 	EnvOomloopMinKills       = "NODE_HOST_AGENT_OOMLOOP_MIN_KILLS"
 	EnvOomloopWindowS        = "NODE_HOST_AGENT_OOMLOOP_WINDOW_S"
-	// W13 Gap#2 single-controller SPOF guard (0 = auto: PeerAPI
-	// unset means a single-controller topology) and the W13-ST2
+	// spof-streak single-controller SPOF guard (0 = auto: PeerAPI
+	// unset means a single-controller topology) and the backup-health
 	// etcd snapshot verifier dir.
 	EnvTotalControllers = "NODE_HOST_AGENT_TOTAL_CONTROLLERS"
 	EnvEtcdSnapshotDir  = "NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR"

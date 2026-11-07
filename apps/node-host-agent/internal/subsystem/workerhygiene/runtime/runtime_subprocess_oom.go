@@ -1,5 +1,5 @@
 // runtime_subprocess_oom.go — the container-subproc-oom guard
-// (wdeps.CheckSubprocOOM, W13-KR4). The kernel's memcg OOM killer
+// (wdeps.CheckSubprocOOM, subproc-oom). The kernel's memcg OOM killer
 // picks the LARGEST RSS task in the cgroup — not necessarily the
 // container's PID 1. When a subprocess (a worker thread, a forked
 // helper) eats the kill while PID 1 survives, kubelet sees the
@@ -45,7 +45,7 @@ type oomScope struct {
 	reported  int64     // oom_kill value the event already covers
 }
 
-// SubprocOOMCheck is the W13-KR4 living-dead OOM detector as a
+// SubprocOOMCheck is the subproc-oom living-dead OOM detector as a
 // Check. scopes is its delta ledger — per scope-dir last state;
 // vanished cgroups are pruned each cycle.
 type SubprocOOMCheck struct {
