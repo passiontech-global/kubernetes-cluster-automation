@@ -1,4 +1,4 @@
-// collect_ebpf.go — W13-OBS1 eBPF program/map inventory: unique
+// collect_ebpf.go — ebpf-inventory eBPF program/map inventory: unique
 // prog_id/map_id across /proc/<pid>/fdinfo/* plus pinned objects
 // under the bpffs mount — zero forks, the leak-audit counters a
 // cilium/eBPF map leak grows against.

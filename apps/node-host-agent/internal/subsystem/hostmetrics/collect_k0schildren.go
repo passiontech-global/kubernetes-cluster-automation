@@ -1,4 +1,4 @@
-// collect_k0schildren.go — W13-CP2 per-child RSS inside the
+// collect_k0schildren.go — gomemlimit-sum per-child RSS inside the
 // k0scontroller.service cgroup. GOMEMLIMIT is a PER-PROCESS soft cap
 // for every Go child in the unit, so the cgroup-OOM risk is the SUM
 // of children RSS vs MemoryMax — this series is the evidence the

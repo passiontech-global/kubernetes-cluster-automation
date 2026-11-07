@@ -116,7 +116,7 @@ func (f *Feeder) Run(ctx context.Context) {
 			doFeed = true
 		} else {
 			fails++
-			// W13 Gap#2: the post-arm MaxFail streak doubles on a
+			// spof-streak: the post-arm MaxFail streak doubles on a
 			// single-controller topology (startup GraceFails stays
 			// — it never gates a restart, only the first feed).
 			limit := f.d.StreakCycles(fcfg.MaxFail)

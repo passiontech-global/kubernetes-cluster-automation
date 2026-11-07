@@ -1,4 +1,4 @@
-// churn_test.go — the W13-CP4 top-churn watermark sampler tests,
+// churn_test.go — the kine-churn top-churn watermark sampler tests,
 // lifted out of the flat package's w13_test.go. The emit half of
 // the old test lives in compact's suite now (the guard owns the
 // textfile render of Deps.ChurnTop).

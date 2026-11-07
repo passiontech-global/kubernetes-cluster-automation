@@ -23,7 +23,7 @@ type RuntimeConfig struct {
 	// gets the unprefixed host paths from applyDefaults.
 	CgroupRoot  string // cgroup v2 root ("/host/sys/fs/cgroup" in-pod)
 	SessionsDir string // /run/systemd/sessions on the host
-	// SATokenMinTTLSec is the W13-CP3 floor: a Running pod whose
+	// SATokenMinTTLSec is the sa-token-ttl floor: a Running pod whose
 	// projected SA token expires in less than this many seconds
 	// gets a SATokenRotationStalled event + a resync nudge.
 	SATokenMinTTLSec int64

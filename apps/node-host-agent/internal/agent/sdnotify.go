@@ -1,4 +1,4 @@
-// sdnotify.go — W13-OBS2: the sd_notify self-watchdog for the
+// sdnotify.go — sd-watchdog: the sd_notify self-watchdog for the
 // standalone systemd mode, split out of agent.go. On the standalone
 // hosts hubsync converges (db-vm, api-lb VMs, controllers) there is
 // no kubelet livenessProbe to kill a wedged agent — the unit carries

@@ -1,5 +1,5 @@
-// backup_test.go — the W13-ST2 physical-backup verifier tests plus
-// the guard-side emit coverage of the W13-CP4 churn series (the
+// backup_test.go — the backup-health physical-backup verifier tests plus
+// the guard-side emit coverage of the kine-churn churn series (the
 // sampler half lives in the probe suite), lifted out of the flat
 // package's w13_test.go.
 package compact
@@ -37,7 +37,7 @@ func TestEmitGuardChurn(t *testing.T) {
 	}
 }
 
-// --- W13-ST2: physical backup verifier ---
+// --- backup-health: physical backup verifier ---
 
 func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	rules := []testutil.ExecRule{

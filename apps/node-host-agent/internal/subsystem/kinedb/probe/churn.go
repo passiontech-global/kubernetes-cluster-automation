@@ -1,4 +1,4 @@
-// churn.go — the W13-CP4 top-5 write-churn sampler, riding the
+// churn.go — the kine-churn top-5 write-churn sampler, riding the
 // probe cycle. The kine table carries no wall-clock column, so
 // "last 5m" is a watermark window under GuardStateDir; the guard
 // cycle owns the textfile emission of the result (the probe's own
@@ -26,7 +26,7 @@ const (
 	churnFileTS        = "last-churn-ts"
 )
 
-// probeTopChurn is the W13-CP4 top-5 write-churn sampler. The kine
+// probeTopChurn is the kine-churn top-5 write-churn sampler. The kine
 // table carries no wall-clock column, so "last 5m" is a watermark
 // window: once the stored (head, ts) pair is >= defaultChurnWindow
 // old, one light grouped query counts revisions minted since it

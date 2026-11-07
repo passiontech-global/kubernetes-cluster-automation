@@ -27,7 +27,7 @@
 //     remediations (session reaper + pgbouncer wedge in
 //     selfheal.go, the pg hygiene/WAL census in hygiene.go, the
 //     top-churn sampler in churn.go)
-//   - compact/ — the compaction guard plus the W13-ST2
+//   - compact/ — the compaction guard plus the backup-health
 //     physical-backup verifier that rides its cycle (backup.go)
 //   - maint/   — the daily reindex/freeze/repack window
 //   - kdeps/   — the shared dependency surface (Config/EnvDeps,

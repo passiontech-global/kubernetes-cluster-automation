@@ -3,7 +3,7 @@
 // to the address NOTIFY_SOCKET carries.
 //
 // Two senders used to keep private copies of the same '@'-
-// translation + bounded write — internal/agent's W13-OBS2 self-
+// translation + bounded write — internal/agent's sd-watchdog self-
 // watchdog feed (one conn, READY=1 then WATCHDOG=1 on a cadence) and
 // controllerhygiene's apiserver watchdog feeder (re-dial per
 // message) — and the mechanism was duplicated verbatim. The

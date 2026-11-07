@@ -400,7 +400,7 @@ func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
 	}
 }
 
-// --- W13-ST2: etcd snapshot verifier ---
+// --- backup-health: etcd snapshot verifier ---
 
 func TestVerifySnapshots(t *testing.T) {
 	e := fixture(t)

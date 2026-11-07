@@ -109,7 +109,7 @@ TasksMax=infinity
 `, c.v("k0scontroller_limit_nofile"))), 0o644); ch {
 			r.daemonReload(ctx)
 		}
-		// W13-CP2: clamp GOMEMLIMIT so the per-child soft cap can
+		// gomemlimit-sum: clamp GOMEMLIMIT so the per-child soft cap can
 		// never leave the unit's sibling processes without room under
 		// MemoryMax (the multi-child cgroup OOMKill shape).
 		c.k0scontrollerGoMemlimitSumGuard()
@@ -467,7 +467,7 @@ func (c *cyc) t16Pairs() [][2]string {
 	return p
 }
 
-// ---------- W13-CP2: k0scontroller GOMEMLIMIT sum guard ----------
+// ---------- gomemlimit-sum: k0scontroller GOMEMLIMIT sum guard ----------
 
 // goMemlimitSiblingReserve is the budget the OTHER k0scontroller
 // children need inside MemoryMax while the capped child sits at
@@ -487,7 +487,7 @@ const goMemlimitSiblingReserve = 2 << 30 // 2 GiB
 const goMemlimitGuardDropIn = "/etc/systemd/system/k0scontroller.service.d/52-go-memlimit-sumguard.conf"
 
 // k0scontrollerGoMemlimitSumGuard is the cgroup-OOMKill side of
-// W13-CP2. GOMEMLIMIT is a PER-PROCESS soft cap systemd plants on
+// gomemlimit-sum. GOMEMLIMIT is a PER-PROCESS soft cap systemd plants on
 // every Go child of k0scontroller.service (kube-apiserver, kine or
 // etcd, kube-controller-manager, kube-scheduler,
 // konnectivity-server) — no single child's GC ever sees the
@@ -526,7 +526,7 @@ func (c *cyc) k0scontrollerGoMemlimitSumGuard() {
 			"k0scontroller_memory_max_by_host"), r.cfg.NodeName),
 		"clamped_mib", clamped)
 	if ch, _ := r.writeManaged(goMemlimitGuardDropIn,
-		[]byte(fmt.Sprintf(`# Managed by node-config-agent - W13-CP2 GOMEMLIMIT sum guard
+		[]byte(fmt.Sprintf(`# Managed by node-config-agent - gomemlimit-sum GOMEMLIMIT sum guard
 # The configured cap leaves < 2GiB for the unit's other children
 # (etcd/kine + kcm + scheduler + konnectivity + non-heap). Sum of
 # children RSS must stay under MemoryMax or the cgroup OOM-kills

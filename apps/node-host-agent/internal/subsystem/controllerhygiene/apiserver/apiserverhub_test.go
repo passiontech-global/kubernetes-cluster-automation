@@ -56,7 +56,7 @@ func TestFrozenWedgeSoloAfterCycles(t *testing.T) {
 	e := fixture(t)
 	self := "127.0.0.1:6443"
 	e.H.Cfg.Hub.PeerAPI = "" // single-hub => always first
-	// W13 Gap#2: pin a 2-controller topology so the solo-restart
+	// spof-streak: pin a 2-controller topology so the solo-restart
 	// mechanics under test are not masked by the SPOF doubled
 	// streak (TestSPOFStreakCycles owns that contract).
 	e.H.Cfg.TotalControllers = 2
@@ -124,7 +124,7 @@ func TestRecoveryClearsWedge(t *testing.T) {
 func TestDeadFallbackKineOK(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.Hub.PeerAPI = "" // single hub
-	// W13 Gap#2: pin a 2-controller topology — the dead-fallback
+	// spof-streak: pin a 2-controller topology — the dead-fallback
 	// streak would otherwise double before the restart.
 	e.H.Cfg.TotalControllers = 2
 	e.H.Cfg.Hub.KineDBProbe = "10.0.0.9:6432"

@@ -1,4 +1,4 @@
-// collect_ebpf_test.go — W13-OBS1 unique prog/map id inventory.
+// collect_ebpf_test.go — ebpf-inventory unique prog/map id inventory.
 package hostmetrics
 
 import (

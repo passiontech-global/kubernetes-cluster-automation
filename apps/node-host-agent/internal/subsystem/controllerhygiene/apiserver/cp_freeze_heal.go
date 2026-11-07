@@ -447,7 +447,7 @@ const (
 	apfInqueueMetric = "node_host_agent_apiserver_apf_inqueue_requests"
 	APFPromFile      = "node-agent-apiserver-apf.prom"
 	// terminatedWatchersMetric mirrors the apiserver's cumulative
-	// apiserver_terminated_watchers_total — the W13-CP1 410-Gone
+	// apiserver_terminated_watchers_total — the relist-storm 410-Gone
 	// relist-storm signature (watch clients relisting en masse).
 	terminatedWatchersMetric = "node_host_agent_apiserver_terminated_watchers"
 	// logKeyAPFStarve keys the suspectLog dedupe budget for the
@@ -527,7 +527,7 @@ func ParseAPFMetrics(body string) (rejected, inqueue map[APFSeriesKey]float64) {
 
 // ParseTerminatedWatchers sums the apiserver's
 // apiserver_terminated_watchers_total counter across its label
-// sets — W13-CP1 relist-storm evidence. seen=false when the family
+// sets — relist-storm relist-storm evidence. seen=false when the family
 // is absent (older apiserver / non-flowcontrol endpoint).
 func ParseTerminatedWatchers(body string) (total float64, seen bool) {
 	for _, m := range terminatedWatchersRe.FindAllStringSubmatch(body, -1) {
@@ -691,7 +691,7 @@ func (c *FreezeCheck) EmitAPFMetrics(rejected, inqueue map[APFSeriesKey]float64,
 			promfile.EscapeLabelValue(k.FlowSchema),
 			promfile.EscapeLabelValue(k.PriorityLevel)), inqueue[k])
 	}
-	// W13-CP1: the terminated-watchers counter rides the same
+	// relist-storm: the terminated-watchers counter rides the same
 	// textfile — headers-only when the family wasn't in the
 	// scrape so a blind scrape drops the series rather than
 	// pinning a stale reading.

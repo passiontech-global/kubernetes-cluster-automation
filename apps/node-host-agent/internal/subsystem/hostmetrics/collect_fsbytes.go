@@ -1,4 +1,4 @@
-// collect_fsbytes.go — W13-KR3 tmpfs/data-fs byte fill ratio. The
+// collect_fsbytes.go — run-tmpfs tmpfs/data-fs byte fill ratio. The
 // inode gauges in collect_fs.go can't see a tmpfs that fills by
 // BYTES (host /run carrying containerd.sock/dbus sockets, /dev/shm,
 // the k0s data dir, the OpenEBS local root) — a full /run kills

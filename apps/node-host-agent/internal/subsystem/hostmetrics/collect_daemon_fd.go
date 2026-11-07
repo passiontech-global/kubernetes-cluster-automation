@@ -1,4 +1,4 @@
-// collect_daemon_fd.go — W13-KR2 per-daemon fd exhaustion plus the
+// collect_daemon_fd.go — daemon-fd per-daemon fd exhaustion plus the
 // containerd bbolt metadata size. fs.file-nr can read 1% while one
 // daemon sits at ITS RLIMIT_NOFILE — the first symptom of a
 // socket/pipe leak is per-process, not per-host.
@@ -14,7 +14,7 @@ import (
 )
 
 // daemonFDTargets are the daemons whose /proc/<pid>/fd count is
-// divided by their RLIMIT_NOFILE soft limit (W13-KR2). comm is the
+// divided by their RLIMIT_NOFILE soft limit (daemon-fd). comm is the
 // 15-char TASK_COMM match; cmdlineArg disambiguates procs sharing a
 // comm — k0sworker and k0scontroller both run with comm "k0s", only
 // argv[1] tells them apart.

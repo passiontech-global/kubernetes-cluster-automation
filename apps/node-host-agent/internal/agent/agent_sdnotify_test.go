@@ -1,4 +1,4 @@
-// agent_sdnotify_test.go — W13-OBS2 sd_notify self-watchdog: the
+// agent_sdnotify_test.go — sd-watchdog sd_notify self-watchdog: the
 // unixgram READY=1/WATCHDOG=1 feed, the probe-mux health gate and
 // the no-NOTIFY_SOCKET no-op path.
 package agent

@@ -1,14 +1,13 @@
-// w13_test.go — Wave-13 controller-hygiene tests: the W13 Gap#2
-// single-controller streak multiplier (the W13-CP1 terminated-
-// watchers mirror moved to apiserver/, the W13-ST2 etcd snapshot
-// verifier to etcd/).
+// spof_streak_test.go — the spof-streak single-controller streak
+// multiplier tests (the relist-storm terminated-watchers mirror moved
+// to apiserver/, the backup-health etcd snapshot verifier to etcd/).
 package controllerhygiene
 
 import (
 	"testing"
 )
 
-// --- W13 Gap#2: single-controller streak multiplier ---
+// --- spof-streak: single-controller streak multiplier ---
 
 func TestSPOFStreakCycles(t *testing.T) {
 	e := fixture(t)

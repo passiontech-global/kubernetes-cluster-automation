@@ -59,7 +59,7 @@ var kernelTempRules = []rule{
 	{"FilesystemIOError", regexp.MustCompile(`Buffer I/O error on dev|XFS.*[Mm]etadata I/O error`)},
 	{"KernelSoftLockup", kernelSoftLockupRe},
 	{"KernelRCUStall", kernelRCUStallRe},
-	// W13-KR1 additions — the fragmentation/neighbour/NIC/TCP
+	// kernel-pressure additions — the fragmentation/neighbour/NIC/TCP
 	// signatures hostmetrics' kmsg drain also classifies into
 	// state-dir latches; here they are temporary rules (counter +
 	// Event) like the upstream kernel-monitor set.

@@ -1,4 +1,4 @@
-// collect_fsbytes_test.go — W13-KR3 used-byte ratio per mount.
+// collect_fsbytes_test.go — run-tmpfs used-byte ratio per mount.
 package hostmetrics
 
 import (

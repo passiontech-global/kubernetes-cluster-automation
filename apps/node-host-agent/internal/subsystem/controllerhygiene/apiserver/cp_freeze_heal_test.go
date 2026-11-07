@@ -479,7 +479,7 @@ func TestAPFProbeCounterResetInconclusive(t *testing.T) {
 	}
 }
 
-// --- W13-CP1: apiserver_terminated_watchers_total mirror ---
+// --- relist-storm: apiserver_terminated_watchers_total mirror ---
 
 func TestParseTerminatedWatchers(t *testing.T) {
 	body := "# HELP apiserver_terminated_watchers_total x\n" +

@@ -1,4 +1,4 @@
-// backup.go — the W13-ST2/Gap#4 physical-backup verifier, riding
+// backup.go — the backup-health physical-backup verifier, riding
 // the guard cycle (it writes the guard's Result and its series land
 // in kine-compact-guard.prom). Was the backupVerify block that sat
 // at the tail of the flat package's maint.go.
@@ -25,7 +25,7 @@ const (
 	backupKeepDumps = 4
 )
 
-// backupVerify is the W13-ST2/Gap#4 physical-backup verifier: the
+// backupVerify is the backup-health physical-backup verifier: the
 // newest *.dump in BackupDir must be younger than BackupInterval
 // AND header-valid. A stale (or absent) dump is refreshed with
 // `pg_dump -Fc` inside the postgres container + `pg_restore -l`

@@ -70,7 +70,7 @@ type Metrics struct {
 	SeqScansVal    atomic.Int64
 	SeqTupReadVal  atomic.Int64
 
-	// W13-CP4/ST2: top-churn + physical-backup verifier series.
+	// kine-churn/backup-health: top-churn + physical-backup verifier series.
 	TopChurn    *prometheus.GaugeVec // resource
 	BackupAge   prometheus.Gauge
 	BackupValid prometheus.Gauge
@@ -204,15 +204,15 @@ func NewMetrics() *Metrics {
 		}),
 		TopChurn: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "kine_db_top_churn_revisions_5m",
-			Help: "Top-5 resource prefixes by revision count in the last 5-minute window — mutating-webhook ping-pong detector (W13-CP4).",
+			Help: "Top-5 resource prefixes by revision count in the last 5-minute window — mutating-webhook ping-pong detector (kine-churn).",
 		}, []string{"resource"}),
 		BackupAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kine_db_backup_age_seconds",
-			Help: "Age of the newest physical pg_dump in the backup dir — staleness of the disaster-recovery path (W13-ST2).",
+			Help: "Age of the newest physical pg_dump in the backup dir — staleness of the disaster-recovery path (backup-health).",
 		}),
 		BackupValid: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kine_db_backup_valid",
-			Help: "1 when the newest physical pg_dump passed header verification (PGDMP magic / pg_restore -l) — W13-ST2.",
+			Help: "1 when the newest physical pg_dump passed header verification (PGDMP magic / pg_restore -l) — backup-health.",
 		}),
 		Cycles: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "node_host_agent_kinedb_cycles_total",

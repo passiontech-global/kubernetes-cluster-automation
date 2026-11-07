@@ -1,4 +1,4 @@
-// collect_k0schildren_test.go — W13-CP2 per-child RSS of
+// collect_k0schildren_test.go — gomemlimit-sum per-child RSS of
 // k0scontroller.service.
 package hostmetrics
 

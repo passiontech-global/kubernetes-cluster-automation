@@ -32,7 +32,7 @@ type DiskConfig struct {
 	// OrphanHostPathDirs are the host-side local-provisioner roots
 	// ST2 scans for pvc-* dirs whose PV is gone.
 	OrphanHostPathDirs []string
-	// LocalPVQuotaRatio is the W13-ST1 hard-quota multiplier: a
+	// LocalPVQuotaRatio is the localpv-quota hard-quota multiplier: a
 	// pvc-* dir under OrphanHostPathDirs (or LocalPVQuotaDir when
 	// set) larger than ratio x its PV capacity while the backing
 	// filesystem is >80% full gets the owning pod deprioritized.
@@ -41,7 +41,7 @@ type DiskConfig struct {
 	// quota-scan root list (single dir — the OpenEBS hostpath root).
 	LocalPVQuotaDir string
 	// HostRunDir is the host /run tmpfs as the agent sees it
-	// (/host/run in the DaemonSet) — the W13-KR3 guard statfs's it
+	// (/host/run in the DaemonSet) — the run-tmpfs guard statfs's it
 	// and sweeps orphan .tmp files under it.
 	HostRunDir string
 	// JournalVacuumDir is the journal directory passed to
@@ -94,7 +94,7 @@ func (d *DiskConfig) applyDefaults() {
 	}
 }
 
-// envKnobs returns the W13 disk-guard env rows — hostPath defaults
+// envKnobs returns the disk-guard env rows — hostPath defaults
 // for the /run view like the wiring block.
 func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 	return []envx.Knob{
