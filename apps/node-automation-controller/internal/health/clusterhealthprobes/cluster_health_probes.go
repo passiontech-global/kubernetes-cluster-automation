@@ -1,7 +1,9 @@
 // cluster_health_probes.go — the sweep module root: Setup, the
-// prober and the checkDefs registry. The 39 checks it drives live in
+// prober and the checkDefs registry. The 47 checks it drives live in
 // per-domain subpackages under internal/health on top of the shared
-// probefw framework:
+// probefw framework — the 44 static checkDefs rows below plus the
+// three per-check registry rows (the W13 gitops checks) whose
+// CheckRegs arrive collected on Deps.CheckRegs:
 //
 //   - ported — the five kuberhealthy "passive" HealthChecks that used
 //     to run as periodic checker Pods in the kuberhealthy namespace
@@ -78,14 +80,15 @@ import (
 )
 
 // healthProbeConfigFromEnv resolves the check knobs once at Setup.
-// It fills the sweep-level Timeouts itself and delegates each
-// domain's knobs to the package that consumes them — the ported
-// kuberhealthy checks to ported.ConfigFromEnv, the
-// kcm-workqueue-watchdog knobs to watchdogs.KCMConfigFromEnv, the
-// cilium nethealth knobs to probefw.CiliumConfigFromEnv (without it
-// the cilium checks read zero-value thresholds).
+// It fills the sweep-level Timeouts itself and pulls each domain's
+// knobs from the package that consumes them — the ported
+// kuberhealthy checks' fields from the ported.*ConfigFromEnv
+// resolvers, the kcm-workqueue-watchdog knobs from
+// watchdogs.KCMConfigFromEnv, the cilium and linkerd nethealth knobs
+// from the nethealth resolvers (without them the checks read
+// zero-value thresholds).
 func healthProbeConfigFromEnv() probefw.Config {
-	cfg := probefw.Config{
+	return probefw.Config{
 		Timeouts: probefw.TimeoutsConfig{
 			// envx.GetenvDuration floors every duration knob at
 			// 1s (the retired helpers accepted any d > 0) —
@@ -102,13 +105,15 @@ func healthProbeConfigFromEnv() probefw.Config {
 			// bounded.
 			PerCheck: envx.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 		},
+		DNS:         ported.DNSConfigFromEnv(),
+		HTTPContent: ported.HTTPContentConfigFromEnv(),
+		Pods:        ported.PodsConfigFromEnv(),
+		Quota:       ported.QuotaConfigFromEnv(),
+		KCM:         watchdogs.KCMConfigFromEnv(),
+		Cilium:      nethealth.CiliumConfigFromEnv(),
+		Datastore:   datastore.ConfigFromEnv(),
+		Linkerd:     nethealth.LinkerdConfigFromEnv(),
 	}
-	ported.ConfigFromEnv(&cfg)
-	watchdogs.KCMConfigFromEnv(&cfg)
-	probefw.CiliumConfigFromEnv(&cfg)
-	datastore.ConfigFromEnv(&cfg)
-	nethealth.LinkerdConfigFromEnv(&cfg)
-	return cfg
 }
 
 // checkEntry is one registry row: the check name — the
@@ -127,17 +132,19 @@ type checkDef struct {
 	new  func(*probefw.Deps) probefw.Check
 }
 
-// checkDefs is the data-driven check registry — the single sweep-order
-// roster the prober is built from. Order is the ops contract: the
-// historical sweep order is preserved verbatim and the names are the
-// kuberhealthy_check label values, so neither may change. Each row's
-// constructor lives in the check's own domain package so its state-map
-// initialization colocates with the check logic.
+// checkDefs is the data-driven check registry — the static half of
+// the sweep-order roster the prober is built from. Order is the ops
+// contract: the historical sweep order is preserved verbatim and the
+// names are the kuberhealthy_check label values, so neither may
+// change. Each row's constructor lives in the check's own domain
+// package so its state-map initialization colocates with the check
+// logic.
 //
-// The roster is appendable: per-check module rows in internal/registry
-// (the W13 gitops checks) register their check into it during their own
-// Setup — see check_modules.go — which runs before cluster-health-probes
-// builds the prober.
+// The dynamic half is Deps.CheckRegs: the per-check module rows in
+// internal/registry (the W13 gitops checks) contribute their
+// {name, ctor} pair through SetupModules' collection pass — see
+// check_modules.go — and land after the static rows at prober
+// construction.
 var checkDefs = []checkDef{
 	{ported.CheckNameDNS, ported.NewDNSStatusCheck},
 	{ported.CheckNameHTTPContent, ported.NewHTTPContentCheck},
@@ -183,7 +190,15 @@ var checkDefs = []checkDef{
 	{datastore.CheckNamePVCResizeStallGuard, datastore.NewPVCResizeStallGuardCheck},
 	{nethealth.CheckNameEndpointSliceZoneStarvation, nethealth.NewEndpointSliceZoneStarvationCheck},
 	{nethealth.CheckNameLinkerdOutlierGuard, nethealth.NewLinkerdOutlierGuardCheck},
+	{nodehealth.CheckNameNodeCondSweeper, nodehealth.NewNodeConditionSweeperCheck},
 }
+
+// sharedHealsMaxAge bounds the shared Deps.Heals cooldown ledger —
+// every self-healing check stamps into it, mostly under pod and
+// controller names that die with the workload, so the sweep prunes
+// stamps older than the widest cooldown the ledger serves (1h: the
+// mesh watchdog's cilium-operator bounce; every other stamp is 30m).
+const sharedHealsMaxAge = time.Hour
 
 // clusterHealthProber is the thin sweep runner: the shared deps, the
 // check registry run() iterates (built once at construction in the
@@ -208,11 +223,12 @@ type clusterHealthProber struct {
 	lastPass map[string]time.Time
 
 	// checks is the run() registry — built once at construction from
-	// checkDefs, in the historical sweep order.
+	// checkDefs plus the collected CheckRegs (extra), in the
+	// historical sweep order.
 	checks []checkEntry
 }
 
-func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.Interface, nr kube.CachedNodeReader, cfg probefw.Config) *clusterHealthProber {
+func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.Interface, nr kube.CachedNodeReader, cfg probefw.Config, extra []shared.CheckReg) (*clusterHealthProber, error) {
 	d := &probefw.Deps{
 		Name:       name,
 		NodeReader: nr,
@@ -236,7 +252,14 @@ func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.In
 	for _, def := range checkDefs {
 		p.checks = append(p.checks, checkEntry{name: def.name, check: def.new(d)})
 	}
-	return p
+	// The CheckRegs SetupModules collected from the enabled
+	// per-check rows land after the static roster — a mistyped
+	// registration fails boot here instead of silently dropping the
+	// check (see check_modules.go).
+	if err := p.appendCheckRegs(extra); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // Setup registers the 5-minute probe sweep. The
@@ -246,10 +269,15 @@ func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.In
 // disabled skips mgr.Add entirely, matching the
 // cilium-taint-reaper pattern. dyn feeds the CRD scans inside the
 // self-healing checks (W5.8/W6.2) — wired like every other
-// dynamic-client module.
+// dynamic-client module. Deps.CheckRegs carries the enabled
+// per-check rows' contributions — a mistyped one fails boot here,
+// not silently.
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, setupConfigFromEnv, func(cfg setupConfig) error {
-		p := newClusterHealthProber(d.Name, d.CS, d.Dyn, d.Mgr.GetClient(), cfg.probes)
+		p, err := newClusterHealthProber(d.Name, d.CS, d.Dyn, d.Mgr.GetClient(), cfg.probes, d.CheckRegs)
+		if err != nil {
+			return err
+		}
 		// Surface the resolved HEALTH_* knobs once at registration so an
 		// operator can tell from the logs which targets/thresholds the
 		// checks run with (an unparseable env value silently falls back
@@ -291,13 +319,17 @@ func setupConfigFromEnv() setupConfig {
 
 func (p *clusterHealthProber) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// One fresh cluster-state snapshot per sweep: the ~30 checks
+	// One fresh cluster-state snapshot per sweep: the ~40 checks
 	// that census pods/nodes/EndpointSlices/Services/Namespaces used
 	// to each issue their own full LIST (~17 pod + ~11 node LISTs
 	// per cycle); the ctx-carried memoizer turns that into one LIST
 	// per resource per run. Checks invalidate it on their own
 	// mutations via Deps.InvalidateSweep.
 	ctx = probefw.WithSweepSnapshot(ctx)
+	// Deps.Heals accumulates one stamp per healed target under keys
+	// that outlive the object (pod/controller names) — bound the
+	// shared ledger once per sweep at the widest cooldown it serves.
+	p.Heals.PruneExpired(p.Now(), sharedHealsMaxAge)
 	for _, c := range p.checks {
 		// Bound one check's share of the serial sweep — a hung
 		// apiserver call used to stretch the whole cycle. The child

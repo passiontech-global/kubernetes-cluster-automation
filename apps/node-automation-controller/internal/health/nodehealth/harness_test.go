@@ -29,5 +29,6 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewCPUStealTaintSyncCheck,
 		NewKedaScaledObjectGuardCheck,
 		NewControllerLeaseGuardCheck,
+		NewNodeConditionSweeperCheck,
 	)
 }
