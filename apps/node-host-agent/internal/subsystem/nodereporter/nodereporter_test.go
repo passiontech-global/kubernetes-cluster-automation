@@ -20,6 +20,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // env is the shared fixture: tempdir watchdog state dir + log file, a
@@ -83,7 +84,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		ProcMountsFile:   e.mounts,
 		ProcUptimeFile:   e.uptime,
 		journalFetch:     func(context.Context, ...string) (string, error) { return "", nil },
-		nowFn:            func() time.Time { return e.now },
+		Clock:            timex.NewCell(func() time.Time { return e.now }),
 	}, e.reg)
 	if err != nil {
 		t.Fatal(err)
@@ -797,4 +798,40 @@ func TestCycleDeadlineAbortsWedgedSync(t *testing.T) {
 	if got := testutil.ToFloat64(e.r.cycles.WithLabelValues("error")); got != 1 {
 		t.Fatalf("cycles{error} = %v, want 1 (aborted cycle counts as error)", got)
 	}
+}
+
+// TestConditionsSyncBeforeMonitorWedge is the 2026-11-07 gap: a Cycle
+// wedged inside a monitor step must not starve the condition sync —
+// syncConditions runs before the monitors, so a zombie True left by
+// a dead reporter reconciles to False even though the same Cycle
+// never reaches its end. The journalFetch seam blocks on a channel
+// the Cycle never escapes (not ctx-aware — the class of wedge the
+// CycleTimeout can't preempt); the condition patch must land first.
+func TestConditionsSyncBeforeMonitorWedge(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-20 * time.Minute))
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:               "KubeletPLEGUnhealthy",
+			Status:             corev1.ConditionTrue,
+			Reason:             "KubeletPLEGUnhealthyDetected",
+			Message:            "watchdog state kubelet-pleg-unhealthy active since 1700000001",
+			LastHeartbeatTime:  old,
+			LastTransitionTime: old,
+		}}}}
+	e := fixture(t, node)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	e.r.cfg.journalFetch = func(context.Context, ...string) (string, error) {
+		<-release // hard wedge — ignores ctx entirely
+		return "", nil
+	}
+	go e.cycle()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.cond(t, "KubeletPLEGUnhealthy").Status == corev1.ConditionFalse {
+			return // reconciled ahead of the wedge — pass
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("zombie condition never reconciled — monitor wedge starved syncConditions")
 }

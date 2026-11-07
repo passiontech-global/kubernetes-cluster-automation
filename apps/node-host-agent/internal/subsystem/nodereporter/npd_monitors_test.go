@@ -134,7 +134,10 @@ func TestJournalCursorAdvancement(t *testing.T) {
 	since1 := calls[0][len(calls[0])-4]
 	since2 := calls[1][len(calls[1])-4]
 	want1 := "@" + strconv.FormatInt(e.now.Add(-e.r.cfg.LogLookback).Unix(), 10)
-	want2 := "@" + strconv.FormatInt(e.now.Unix(), 10)
+	// The cursor parks on the newest KEPT entry's timestamp — it no
+	// longer jumps to `now`, so the second window re-opens one sec
+	// earlier and the <= cursor filter absorbs the replay.
+	want2 := "@" + strconv.FormatInt((e.now.UnixMicro()-1000)/1e6, 10)
 	if since1 != want1 || since2 != want2 {
 		t.Fatalf("--since args = %q then %q, want %q then %q", since1, since2, want1, want2)
 	}
@@ -437,6 +440,7 @@ func TestKernelDeadlockPermanent(t *testing.T) {
 	e.appendKmsg(t,
 		"6,1,3599000000,-;INFO: task jbd2/vda1-8:439 blocked for more than 120 seconds.")
 	e.cycle()
+	e.cycle() // monitor-computed condition ships a cycle late
 
 	c := e.cond(t, "KernelDeadlock")
 	if c.Status != corev1.ConditionTrue || c.Reason != "KernelDeadlock" {
@@ -581,12 +585,15 @@ func TestReadonlyCondition(t *testing.T) {
 		t.Fatalf("baseline gauge = %v, want 0", got)
 	}
 
-	// Flip /var/lib/k0s ro.
+	// Flip /var/lib/k0s ro. Monitor-computed conditions ship the
+	// PREVIOUS cycle's state — syncConditions runs before the
+	// monitors — so the flip lands on the second cycle.
 	if err := os.WriteFile(e.mounts, []byte(
 		"/dev/vda1 / ext4 rw,relatime 0 0\n"+
 			"/dev/vdb1 /var/lib/k0s ext4 ro,relatime 0 0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	e.cycle()
 	e.cycle()
 	c := e.cond(t, "ReadonlyFilesystem")
 	if c.Status != corev1.ConditionTrue || c.Reason != "FilesystemIsReadOnly" {
@@ -608,12 +615,14 @@ func TestReadonlyCondition(t *testing.T) {
 		t.Fatalf("steady-state events = %d, want 1", n)
 	}
 
-	// Remount rw → condition + gauge clear.
+	// Remount rw → condition + gauge clear (same one-cycle lag as
+	// the flip — the monitor state ships next cycle).
 	if err := os.WriteFile(e.mounts, []byte(
 		"/dev/vda1 / ext4 rw,relatime 0 0\n"+
 			"/dev/vdb1 /var/lib/k0s ext4 rw,relatime 0 0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	e.cycle()
 	e.cycle()
 	c = e.cond(t, "ReadonlyFilesystem")
 	if c.Status != corev1.ConditionFalse || c.Reason != "FilesystemIsNotReadOnly" {
@@ -634,6 +643,7 @@ func TestReadonlyMissingMounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.cycle()
+	e.cycle() // monitor-computed state ships a cycle late
 	if c := e.cond(t, "ReadonlyFilesystem"); c.Status != corev1.ConditionTrue {
 		t.Fatalf("setup: ReadonlyFilesystem = %s, want True", c.Status)
 	}
