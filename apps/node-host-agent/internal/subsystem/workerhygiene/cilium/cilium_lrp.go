@@ -178,7 +178,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // Ready endpoints server-side but the local map carries 0 backends
 // — every socket-LB service lookup on this node resolves to nothing
 // (a silent cluster-DNS outage the nld pod can't fix). The evidence
-// comes from the CiliumServiceBackendsFn seam (GET /v1/service —
+// comes from the Seams.Cilium.ServiceBackends read (GET /v1/service —
 // `cilium-dbg service list -o json` equivalent). An unreadable map
 // is inconclusive — never counted. ConsecNeeded consecutive desync
 // cycles restart cilium-agent through the shared
@@ -199,7 +199,7 @@ var desyncServices = []struct{ ns, name string }{
 // wrong component.
 func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 	e *wdeps.CycleEnv, agentTasks []wdeps.CtrTask) bool {
-	backends, err := c.d.Cfg.Seams.Cilium.CiliumServiceBackendsFn(ctx)
+	backends, err := c.d.Cfg.Seams.Cilium.ServiceBackends(ctx, c.d.Cfg.Cilium.Socket)
 	if err != nil {
 		// Inconclusive — the agent API hiccuped; the healthz check
 		// owns the agent verdict.

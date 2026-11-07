@@ -14,6 +14,7 @@ package wdepstest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -89,11 +90,15 @@ type Fixture struct {
 	Journal    string // k0sworker journal snapshot body
 	JournalErr error
 
-	DNSTCP      bool           // cilium-lrp :53 TCP probe canned answer
-	SvcBackends map[string]int // cilium-lrp BPF service-map backends
-	SvcErr      error          // cilium-lrp service-map probe error
-	MetricsBody string         // kubelet /metrics canned body (PLEG)
-	MetricsErr  error          // kubelet /metrics canned error
+	DNSTCP bool // cilium-lrp :53 TCP probe canned answer
+	// SvcBackends is the canned cilium-lrp BPF service map —
+	// "<ns>/<name>" → backend count, rendered into the /v1/service
+	// wire shape by the UnixGet stub (SvcErr wins: an unreadable
+	// map probe).
+	SvcBackends map[string]int
+	SvcErr      error
+	MetricsBody string // kubelet /metrics canned body (PLEG)
+	MetricsErr  error  // kubelet /metrics canned error
 
 	mu sync.Mutex // guards SDCmds (feeder goroutine + Cycle both record)
 }
@@ -257,7 +262,14 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	d.Cfg.Seams.Probe.ProbeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
 		return f.BodyOK[url]
 	}
-	d.Cfg.Seams.Cilium.UnixGet = func(_ context.Context, _, _ string) ([]byte, error) {
+	// The agent socket stub is path-aware: /v1/service is rendered
+	// from SvcBackends so the cilium-lrp desync check's canned map
+	// goes through the real ParseCiliumServiceBackends wire shape;
+	// every other path answers the flat UnixBody/UnixErr.
+	d.Cfg.Seams.Cilium.UnixGet = func(_ context.Context, _, path string) ([]byte, error) {
+		if path == "/v1/service" {
+			return f.serviceBody()
+		}
 		return f.UnixBody, f.UnixErr
 	}
 	d.Cfg.Seams.Host.JournalFn = func(_ context.Context) (string, error) {
@@ -285,9 +297,6 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	d.Cfg.Seams.Probe.DNSProbeTCP = func(string, string, time.Duration) bool {
 		return f.DNSTCP
 	}
-	d.Cfg.Seams.Cilium.CiliumServiceBackendsFn = func(context.Context) (map[string]int, error) {
-		return f.SvcBackends, f.SvcErr
-	}
 	d.Cfg.Seams.Probe.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {
 		return f.MetricsBody, f.MetricsErr
 	}
@@ -296,12 +305,43 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		st.Bavail = uint64(100 - int(f.DiskUsed*100))
 		return nil
 	}
-	d.Cfg.Seams.Ctr.CtrRmIngest = func(_ context.Context, ref string) error {
+	// The single Ctr exec seam — record the argv like the systemd
+	// fake does (SDRan substring assertions keep working on the
+	// joined command line) and succeed quietly, the same default
+	// the old CtrRmIngest stub carried. Tests needing exec
+	// failures or argv inspection re-stub Seams.Ctr.Exec.
+	d.Cfg.Seams.Ctr.Exec = func(_ context.Context, argv ...string) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		f.SDCmds = append(f.SDCmds, []string{"ctr", "ingest", "rm", ref})
+		f.SDCmds = append(f.SDCmds, append([]string(nil), argv...))
 		return nil
 	}
+}
+
+// serviceBody renders f.SvcBackends ("<ns>/<name>" → backend count)
+// in the GET /v1/service wire shape ParseCiliumServiceBackends
+// consumes — the canned body the UnixGet stub serves for that one
+// path. f.SvcErr wins when set: an unreadable-map probe.
+func (f *Fixture) serviceBody() ([]byte, error) {
+	if f.SvcErr != nil {
+		return nil, f.SvcErr
+	}
+	type svcEntry struct {
+		Spec struct {
+			Name             string `json:"name"`
+			Namespace        string `json:"namespace"`
+			BackendAddresses []int  `json:"backend-addresses"`
+		} `json:"spec"`
+	}
+	list := []svcEntry{}
+	for key, n := range f.SvcBackends {
+		ns, name, _ := strings.Cut(key, "/")
+		var e svcEntry
+		e.Spec.Name, e.Spec.Namespace = name, ns
+		e.Spec.BackendAddresses = make([]int, n)
+		list = append(list, e)
+	}
+	return json.Marshal(list)
 }
 
 // MkTask creates a containerd task dir for pod uid; pid goes into

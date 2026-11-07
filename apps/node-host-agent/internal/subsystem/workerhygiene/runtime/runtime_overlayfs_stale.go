@@ -3,7 +3,7 @@
 // mount failure does not heal by kubelet retrying the same corrupt
 // snapshot — the layer on disk IS the problem. After the evidence
 // persists for ConsecNeeded cycles the check removes the image
-// through the same ctrRmImage seam + shared 15m last-ctr-image-rm
+// through the same Seams.Ctr.RmImage + shared 15m last-ctr-image-rm
 // budget the corrupted-image healer uses, so kubelet's next pull
 // re-fetches the layer.
 package runtime
@@ -124,7 +124,7 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed it.
 	for _, img := range images {
-		if err := c.d.Cfg.Seams.Ctr.CtrRmImage(ctx, img); err != nil {
+		if err := c.d.Cfg.Seams.Ctr.RmImage(ctx, img); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: overlayfs-stale-mount image rm %s failed: %v", img, err))
 			continue

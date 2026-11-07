@@ -2,7 +2,6 @@ package workerhygiene
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,8 +71,11 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 	e.Live[4242] = true
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.MkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
-	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) { return 0, nil }
-	e.H.Cfg.Seams.Cilium.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 3, nil }
+	// actual=0 wiped peers — the `wg allowed-ips` exec answers via
+	// the systemd fake; expected=3 remote cluster members — the
+	// UnixGet stub serves this /v1/healthz body.
+	e.SDReply["allowed-ips"] = "peerA=\t(none)\npeerB=\t(none)\npeerC=\t(none)\n"
+	e.UnixBody = []byte(`{"cluster":{"nodes":[{},{},{}]}}`)
 	e.H.Cycle(context.Background())
 	if len(e.Kills) != 0 {
 		t.Fatalf("first cycle: kills = %v, want none (streak 1/2)", e.Kills)
@@ -100,12 +102,19 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 
 func TestCheckCiliumWGPeersGates(t *testing.T) {
 	e := fixture(t)
-	// No cilium_wg0 in sysfs → the check is a silent no-op.
-	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) {
-		return 0, errors.New("must not be called")
+	// No cilium_wg0 in sysfs → the check is a silent no-op: neither
+	// evidence read may run (the wg exec would land in SDCmds, an
+	// agent socket GET would count a UnixGet call).
+	unixCalls := 0
+	e.H.Cfg.Seams.Cilium.UnixGet = func(_ context.Context, _, _ string) ([]byte, error) {
+		unixCalls++
+		return e.UnixBody, e.UnixErr
 	}
 	wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
+	if unixCalls != 0 || e.SDRan("allowed-ips") {
+		t.Fatal("wg evidence reads ran with no cilium_wg0 datapath")
+	}
 	if wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails != 0 {
 		t.Fatalf("no-iface: ciliumWGFails = %d, want 0", wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails)
 	}
@@ -119,9 +128,11 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 	if wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails != 1 {
 		t.Fatalf("api-down: ciliumWGFails = %d, want kept 1", wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails)
 	}
-	// Healthy peers → streak resets, latch clears.
-	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) { return 5, nil }
-	e.H.Cfg.Seams.Cilium.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 5, nil }
+	// Healthy peers → streak resets, latch clears. actual=5 real
+	// allowed-ips peers, expected=5 remote cluster members.
+	e.SDReply["allowed-ips"] = "p1=\t10.0.0.1/32\np2=\t10.0.0.2/32\np3=\t10.0.0.3/32\n" +
+		"p4=\t10.0.0.4/32\np5=\t10.0.0.5/32\n"
+	e.UnixBody = []byte(`{"cluster":{"nodes":[{},{},{},{},{}]}}`)
 	e.Live[4242] = true
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.MkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
