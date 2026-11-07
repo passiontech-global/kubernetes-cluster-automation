@@ -240,90 +240,77 @@ linters:
           deny:
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
               desc: "test fakes belong in _test.go imports, not module code"
+        # The six no-cross rules each deny the OTHER five domains, so
+        # every deny item is a YAML anchor defined at first use and
+        # aliased below — anchors resolve at parse time, so the
+        # depguard rules golangci-lint sees are identical to spelling
+        # all 30 items out (same globs, same pkgs, same desc text).
         nac-domain-no-cross:
           files:
             - "**/node-automation-controller/internal/apiserver/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+            - &nac-deny-health
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+            - &nac-deny-integration
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+            - &nac-deny-janitor
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+            - &nac-deny-node
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+            - &nac-deny-system
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
         nac-domain-no-cross-health:
           files:
             - "**/node-automation-controller/internal/health/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+            - &nac-deny-apiserver
+              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
               desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
         nac-domain-no-cross-integration:
           files:
             - "**/node-automation-controller/internal/integration/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
         nac-domain-no-cross-janitor:
           files:
             - "**/node-automation-controller/internal/janitor/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-node
+            - *nac-deny-system
         nac-domain-no-cross-node:
           files:
             - "**/node-automation-controller/internal/node/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-system
         nac-domain-no-cross-system:
           files:
             - "**/node-automation-controller/internal/system/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
         nac-testutil-no-domain:
           files:
             - "**/node-automation-controller/internal/testutil/**"
