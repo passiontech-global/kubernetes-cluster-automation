@@ -19,8 +19,8 @@ WORKDIR /src/apps/node-automation-controller
 RUN go mod download
 # Full source only after deps are cached. ARG VERSION sits just above
 # `go build` so bumping it invalidates the link layer, not the downloads.
-COPY libs/hostkit/ libs/hostkit/
-COPY apps/node-automation-controller/ apps/node-automation-controller/
+COPY libs/hostkit/ /src/libs/hostkit/
+COPY apps/node-automation-controller/ /src/apps/node-automation-controller/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \

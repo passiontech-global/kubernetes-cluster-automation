@@ -22,8 +22,10 @@ WORKDIR /src/apps/node-host-agent
 RUN go mod download
 # Full source only after deps are cached. ARG VERSION sits just above
 # `go build` so bumping it invalidates the link layer, not the downloads.
-COPY libs/hostkit/ libs/hostkit/
-COPY apps/node-host-agent/ apps/node-host-agent/
+# Destinations are absolute: WORKDIR is already /src/apps/node-host-agent
+# here, so a relative dest would nest under it instead of landing at /src.
+COPY libs/hostkit/ /src/libs/hostkit/
+COPY apps/node-host-agent/ /src/apps/node-host-agent/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
