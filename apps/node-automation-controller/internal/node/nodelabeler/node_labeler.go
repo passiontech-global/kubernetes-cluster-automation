@@ -202,7 +202,12 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				log.Info("WARN: node in labels.txt not found", "node", name, "label", label)
 				continue
 			}
-			if node.Labels[key] == val {
+			// Comma-ok matters for empty-valued labels: a missing key
+			// reads as "" through the plain map lookup, so
+			// `node.Labels[key] == ""` reported "already applied" for
+			// `key=` lines the node never carried — they were dropped
+			// forever (e.g. node-role.kubernetes.io/worker=).
+			if cur, ok := node.Labels[key]; ok && cur == val {
 				continue
 			}
 			if err := kube.PatchNodeLabels(ctx, r.cs, name, map[string]string{key: val}); err != nil {

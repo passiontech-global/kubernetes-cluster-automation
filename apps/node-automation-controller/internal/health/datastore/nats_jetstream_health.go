@@ -163,7 +163,15 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list nats statefulsets: %w", err)}
 	}
 	if len(stss.Items) == 0 {
-		return probefw.Result{Pass: true}
+		// No NATS on this cluster — still reconcile the ledgers: a
+		// tuple emitted while NATS existed (or a removed deployment
+		// that left wedge evidence behind) must DeleteLabelValues,
+		// and the first-seen entries drop so a redeploy starts a
+		// fresh window. Returning Pass early leaks a stale 1.
+		var rep probefw.SweepReport
+		p.seen.Prune(func(string) bool { return false })
+		return rep.Result(&p.emitted, natsJetstreamUnhealthyGauge.DeleteLabelValues,
+			"nats jetstream wedge signatures: ", ", ")
 	}
 	natsNamespaces := map[string]bool{}
 	for i := range stss.Items {

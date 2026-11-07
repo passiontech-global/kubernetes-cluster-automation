@@ -51,6 +51,10 @@ type Guard struct {
 	// one evaluation per Verdict TTL instead of three API reads per
 	// consumer.
 	Verdict kube.Verdict
+	// NodeReader backs ListNodesCached — the manager's
+	// informer-backed client. A nil reader (literally-built test
+	// fixtures) falls back to the direct clientset read.
+	NodeReader kube.CachedNodeReader
 }
 
 // Snapshot carries the cluster state one run shares across its
@@ -108,7 +112,7 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	// "Ready" webhook pod on a partitioned node cannot be called by
 	// the apiserver, so it must not count toward backend health.
 	s.UnhealthyNodes = map[string]bool{}
-	nodes, err := kube.ListNodes(ctx, g.CS)
+	nodes, err := kube.ListNodesCached(ctx, g.NodeReader, g.CS)
 	s.NodesErr = err
 	if err == nil {
 		for i := range nodes {

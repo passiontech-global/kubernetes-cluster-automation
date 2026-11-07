@@ -59,6 +59,11 @@ type Deps struct {
 	// the registered periodic.
 	Name string
 	CS   kubernetes.Interface
+	// NodeReader is the informer-cache reader AllNodes prefers —
+	// mgr.GetClient() in production, nil in tests (falls back to the
+	// direct ListNodes). Read-only censuses only; destructive acts
+	// still confirm on CS.
+	NodeReader kube.CachedNodeReader
 	// Dyn reads the CRD types the W5.8 stuck signatures scan
 	// (gateway-api, scylladb, dragonflydb, flux) and the autopilot
 	// Plan inside the maintenance mutex — no typed clients exist.

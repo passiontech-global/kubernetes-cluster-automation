@@ -264,7 +264,7 @@ func TestStuckTerminatingAuditMarksStuck(t *testing.T) {
 			Namespace: "data", Name: "live-pvc"}},
 	)
 	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, key := range [][3]string{
@@ -305,7 +305,7 @@ func TestStuckTerminatingAuditMarksStuckVA(t *testing.T) {
 			Name: "va-live"}},
 	)
 	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !metrics.StuckTerminatingResources.DeleteLabelValues(
@@ -331,7 +331,7 @@ func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
 			Namespace: "data", Name: "stuck-pvc", DeletionTimestamp: &old}},
 	)
 	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := j.stuckEmitted.Last()[stuckTerminatingKey{
@@ -343,7 +343,7 @@ func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
 		Delete(ctx, "stuck-pvc", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if metrics.StuckTerminatingResources.DeleteLabelValues(
@@ -383,7 +383,7 @@ func TestStuckTerminatingAuditListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	j := &failedJobsJanitor{cs: cs, now: time.Now}
-	if err := j.auditStuckTerminating(ctx); err == nil {
+	if err := j.auditStuckTerminating(ctx, nil); err == nil {
 		t.Fatal("expected error when the namespaces list fails")
 	}
 }
@@ -403,7 +403,7 @@ func TestAuditStuckPVCFinalizerStrip(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(pvc)
 	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "data", metav1.GetOptions{})
@@ -437,7 +437,7 @@ func TestAuditStuckPVCReferencedKept(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(pvc, pod)
 	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
-	if err := j.auditStuckTerminating(ctx); err != nil {
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "data", metav1.GetOptions{})
@@ -762,7 +762,7 @@ func TestOrphanWorkspacePVCReaper(t *testing.T) {
 		cs: cs, dyn: dyn, now: time.Now,
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
-	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
@@ -801,7 +801,7 @@ func TestOrphanWorkspacePVCUIDPrecondition(t *testing.T) {
 		cs: cs, dyn: fjjDynFake(), now: time.Now,
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
-	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if gotUID == nil || *gotUID != pvc.UID {
@@ -825,7 +825,7 @@ func TestOrphanWorkspacePVCFailClosedOnRefGetError(t *testing.T) {
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
 	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
-	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
 		t.Fatalf("unverifiable ref must not error the sweep: %v", err)
 	}
 	if !fjjPVCExists(t, cs, "cicd", "pvc-orphan") {
@@ -849,7 +849,7 @@ func TestOrphanWorkspacePVCNilDyn(t *testing.T) {
 		cs: cs, now: time.Now,
 		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
-	if err := j.sweepOrphanWorkspacePVCs(ctx); err != nil {
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !fjjPVCExists(t, cs, "cicd", "pvc-crd-owned") {

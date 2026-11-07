@@ -46,7 +46,13 @@ func FetchPodMetrics(ctx context.Context, client *http.Client,
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		// Drain before Close (bounded): a body bigger than maxBytes
+		// leaves the tail unread, which makes the connection
+		// unreusable and silently kills keep-alive on client.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
 		return nil, err

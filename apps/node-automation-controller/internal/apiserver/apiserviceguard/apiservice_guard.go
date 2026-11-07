@@ -46,6 +46,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
@@ -123,14 +124,18 @@ func Setup(d shared.Deps) error {
 
 // apiServiceSnapshot carries the cluster state one run shares across
 // its duties: all three read the same APIService set, so it is
-// listed ONCE per run instead of once per consumer. A list failure
-// is recorded on the snapshot, not returned — every duty still
-// decides for itself whether the missing piece aborts it
-// (fail-closed source) or merely skips a check.
+// listed ONCE per run instead of once per consumer — the namespace
+// census the orphan pass and the unblock pass both build gets the
+// same treatment (one List per run, not two). A list failure is
+// recorded on the snapshot, not returned — every duty still decides
+// for itself whether the missing piece aborts it (fail-closed
+// source) or merely skips a check.
 type apiServiceSnapshot struct {
-	g    *apiServiceGuard
-	svcs *unstructured.UnstructuredList
-	err  error
+	g     *apiServiceGuard
+	svcs  *unstructured.UnstructuredList
+	err   error
+	nss   []corev1.Namespace
+	nsErr error
 }
 
 // takeSnapshot lists the shared APIService set once — see
@@ -139,10 +144,15 @@ func (g *apiServiceGuard) takeSnapshot(ctx context.Context) *apiServiceSnapshot 
 	items, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: apiServiceListPageSize},
 		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+	nss, nsErr := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: apiServiceListPageSize},
+		kube.Namespaces(g.cs))
 	return &apiServiceSnapshot{
-		g:    g,
-		svcs: &unstructured.UnstructuredList{Items: items},
-		err:  err,
+		g:     g,
+		svcs:  &unstructured.UnstructuredList{Items: items},
+		err:   err,
+		nss:   nss,
+		nsErr: nsErr,
 	}
 }
 

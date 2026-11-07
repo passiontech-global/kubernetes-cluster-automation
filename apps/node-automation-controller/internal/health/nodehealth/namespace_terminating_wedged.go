@@ -8,6 +8,7 @@ package nodehealth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -145,9 +147,22 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 	}
 	lists, err := p.CS.Discovery().ServerPreferredResources()
 	if err != nil {
-		log.Info("WARN: namespace finalizer sweep — discovery failed, skipping",
+		// ServerPreferredResources returns the resolved group lists
+		// AND *discovery.ErrGroupDiscoveryFailed when even one
+		// aggregated APIService is down — commonly the APIService
+		// living in THIS terminating namespace, i.e. exactly when
+		// the sweep is needed. Proceeding with the returned lists
+		// loses only the broken group; aborting paralyzes the whole
+		// sweep behind an unrelated backend's outage.
+		var groupErr *discovery.ErrGroupDiscoveryFailed
+		if !errors.As(err, &groupErr) || len(lists) == 0 {
+			log.Info("WARN: namespace finalizer sweep — discovery failed, skipping",
+				"namespace", nsName, "error", err)
+			return
+		}
+		metrics.IncError(p.Name)
+		log.Info("WARN: partial discovery failure — sweeping the resolved groups",
 			"namespace", nsName, "error", err)
-		return
 	}
 	stripped := 0
 	for _, rl := range lists {

@@ -107,6 +107,16 @@ var CFTunnelWedgePodsDeletedTotal = prometheus.NewCounterVec(prometheus.CounterO
 	Help: "Wedged cloudflared connector pods deleted, by namespace and reason.",
 }, []string{"namespace", "reason"})
 
+// HealBudgetExhaustedTotal counts heal grants denied by the global
+// heal budget (internal/platform/heal — consulted inside
+// heal.AllowedV so every heal-gated module shares the aggregate
+// ceiling). A sustained rate means a fleet-wide signature is
+// churning heals faster than the budget allows.
+var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "node_automation_heal_budget_exhausted_total",
+	Help: "Heal grants denied by the global heal budget (aggregate blast-radius cap).",
+})
+
 // init registers exactly the vectors declared in this file — the
 // per-domain init() split means adding an operations-domain metric
 // touches only this file, not a central registry list. Order
@@ -119,5 +129,5 @@ func init() {
 		StatefulSetOnDeletePodsRolledTotal,
 		CronJobTooManyMissedStarts,
 		VolumeAttachmentFinalizersRemovedTotal,
-		CFTunnelWedgePodsDeletedTotal)
+		CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal)
 }

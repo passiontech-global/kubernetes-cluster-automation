@@ -139,9 +139,11 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 		return
 	}
 	// The pod census the next check reads must not contain the pod
-	// this delete just removed — drop the sweep snapshot so it
-	// re-lists.
-	d.InvalidateSweep(ctx)
+	// this delete just removed — drop the pod snapshot so it
+	// re-lists. The other censuses (nodes/slices/services/
+	// namespaces) cannot have gone stale from a pod delete, so they
+	// keep their memoized reads.
+	d.InvalidatePods(ctx)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 	log.Info("DELETE: pod heal — forcing pod restart",
 		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)

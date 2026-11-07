@@ -340,21 +340,26 @@ type orphanWorkspaceTarget struct {
 // sweepOrphanWorkspacePVCs deletes workspace PVCs whose every run ref
 // is gone or terminal and which no non-terminal pod mounts. Orphan
 // collection is exempt from the maintenance mutex like every GC in
-// this module — the mutex defers heal churn, not cleanup.
-func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context) error {
+// this module — the mutex defers heal churn, not cleanup. census is
+// the run-shared PVC/pod-scan read share (see pvcCensus); nil means
+// an unshared private census (test fixtures driving one duty).
+func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
+	census *pvcCensus) error {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	log := logf.FromContext(ctx)
 	now := j.now.Now()
-	pvcs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+	pvcs, err := census.listPVCs(ctx, j)
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
 
 	// claimsCache lazily fills one "who still claims what" pod scan per
-	// candidate namespace — shared between the collect filter and the
-	// Confirm re-vet so a namespace is listed at most once per sweep.
-	claimsCache := map[string]pvcUseProbe{}
+	// candidate namespace — shared between the collect filter, the
+	// Confirm re-vet AND the stuck-terminating audit so a namespace is
+	// listed at most once per RUN, not once per duty.
+	claimsCache := census.claims()
 	claimed := func(ns, name string) bool {
 		pr, ok := claimsCache[ns]
 		if !ok {

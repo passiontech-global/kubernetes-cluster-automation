@@ -156,6 +156,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	// proof and the heal target) is skipped on the common path. A
 	// wholly empty result reads as healthy here: konnectivity-agent
 	// never scraped is a monitoring gap, not tunnel evidence.
+	var rep probefw.SweepReport
 	deficit := false
 	for _, v := range conns {
 		if v < float64(expectedCP) {
@@ -164,7 +165,14 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		}
 	}
 	if !deficit {
-		return probefw.Result{Pass: true}
+		// Healthy — but the reconcile still owes the ledgers: a tuple
+		// emitted last sweep must be DeleteLabelValues'd now that the
+		// deficit is gone, and seen entries must drop so a recovering
+		// agent re-arms the window. Returning Pass without the
+		// reconcile leaks a series pinned at 1 forever.
+		p.seen.Prune(func(string) bool { return false })
+		return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
+			"konnectivity-agent pods with half-open tunnels: ", ", ")
 	}
 	pods, err := p.PodsIn(ctx, konnAgentNS)
 	if err != nil {
@@ -198,7 +206,6 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		targets = append(targets, pod)
 	}
 
-	var rep probefw.SweepReport
 	for _, pod := range targets {
 		key := pod.Namespace + "/" + pod.Name
 		if !probefw.Persisted(&p.seen, key, now, konnHalfOpenMinAge, log) {

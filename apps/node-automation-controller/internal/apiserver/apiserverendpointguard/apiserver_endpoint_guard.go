@@ -82,7 +82,9 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"reflect"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -176,7 +178,13 @@ type apiServerEndpointGuard struct {
 	// http.Client per request would still reuse rt's pool, but the
 	// old code also never drained resp.Body, which killed keep-alive
 	// outright; the shared client + drain keeps conns reusable.
-	client   *http.Client
+	client *http.Client
+	// clientMu serializes the lazy rt/client build — evaluateBackends
+	// probes every backend in parallel, so the first cycle's
+	// client==nil && rt==nil path would otherwise race N goroutines
+	// into building duplicate http.Transport TLS pools (and trip the
+	// race detector on the g.rt/g.client reads).
+	clientMu sync.Mutex
 	backends map[string]*backendProbeState
 	log      logr.Logger
 	// quarantineActive switches Start to the faster re-apply cadence —
@@ -371,7 +379,29 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	toRemove, toAdd, healthyActive := g.decideQuarantine(log, results,
 		activeIPs, routableIPs, quarantinedIPs)
 
-	if len(toRemove) == 0 && len(toAdd) == 0 && len(toExpire) == 0 {
+	// On the Endpoints-SSOT path the sweep also mirrors the decision
+	// onto the EndpointSlices below — a slice update that failed last
+	// cycle ("retries next cycle") leaves the slice drifted while the
+	// Endpoints-derived toAdd/toRemove diff is empty, so "is there
+	// work" must be answered by diffing the ACTUAL slice contents
+	// against the post-decision quarantine set: a drifted slice is
+	// repaired every cycle until it matches, not just on cycles the
+	// Endpoints object itself changes.
+	qPost := maps.Clone(quarantinedIPs)
+	for _, ip := range toRemove {
+		qPost[ip] = true
+	}
+	for _, ip := range toAdd {
+		delete(qPost, ip)
+	}
+	var sliceCopies []*discoveryv1.EndpointSlice
+	var sliceDirty []bool
+	if !useSlice {
+		sliceCopies, sliceDirty = convergeSlices(epsList, qPost, toAdd)
+	}
+
+	if len(toRemove) == 0 && len(toAdd) == 0 && len(toExpire) == 0 &&
+		!slices.Contains(sliceDirty, true) {
 		log.Info("sweep done", "backends", len(allIPs), "healthyActive", healthyActive,
 			"quarantined", len(quarantinedIPs))
 		return nil
@@ -414,22 +444,28 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 			}
 		}
 	} else {
-		ep = ep.DeepCopy()
+		mutated := ep.DeepCopy()
 		for _, ip := range toRemove {
-			removeEndpointIP(ep, ip)
+			removeEndpointIP(mutated, ip)
 			quarantinedIPs[ip] = true
 			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes endpoints",
 				"ip", ip, "remainingHealthy", healthyActive)
 		}
 		for _, ip := range toAdd {
-			addEndpointIP(ep, ip)
+			addEndpointIP(mutated, ip)
 			delete(quarantinedIPs, ip)
 			log.Info("RE-ADD: recovered apiserver back in kubernetes endpoints", "ip", ip)
 		}
-		writeQuarantineAnnotation(ep, quarantinedIPs)
-		if _, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
-			Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
+		writeQuarantineAnnotation(mutated, quarantinedIPs)
+		// Skip the write when the mutation produced the identical
+		// object — a pure slice-repair cycle (drift retry) would
+		// otherwise churn a no-op Endpoints update every sweep. A
+		// reconciler-wiped annotation still diffs and gets restored.
+		if !reflect.DeepEqual(mutated.Object, ep.Object) {
+			if _, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+				Update(ctx, mutated, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
+			}
 		}
 
 		// EndpointSlices converge to the FULL quarantine set (not just
@@ -437,23 +473,12 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		// is retried instead of leaving a wedged IP routable forever.
 		// On hosted planes the mirror controller propagates the
 		// Endpoints write itself within ~1s — this write just wins the
-		// race when propagation lags.
-		copies := deepCopySlices(epsList)
-		dirty := make([]bool, len(copies))
-		for i := range copies {
-			for ip := range quarantinedIPs {
-				if removeSliceIP(copies[i], ip) {
-					dirty[i] = true
-				}
-			}
-		}
-		for _, ip := range toAdd {
-			if i := sliceIdxForIP(copies, ip); i >= 0 && addSliceIP(copies[i], ip) {
-				dirty[i] = true
-			}
-		}
-		for i, s := range copies {
-			if !dirty[i] {
+		// race when propagation lags. The diff itself was computed
+		// above against the actual slice contents — reaching this
+		// block on drift alone repairs the slice without touching
+		// the Endpoints object at all.
+		for i, s := range sliceCopies {
+			if !sliceDirty[i] {
 				continue
 			}
 			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).

@@ -346,7 +346,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // pod gone — drop the census
+		p.InvalidatePods(ctx) // pod gone — drop the census
 		deleted = true
 		log.Info("DELETE: wedged olm-operator — stuck CSV/cert-rotation queues need a resync",
 			"pod", pod.Namespace+"/"+pod.Name,

@@ -70,6 +70,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -195,9 +196,10 @@ type clusterHealthProber struct {
 	checks []checkEntry
 }
 
-func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.Interface, cfg probefw.Config) *clusterHealthProber {
+func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.Interface, nr kube.CachedNodeReader, cfg probefw.Config) *clusterHealthProber {
 	d := &probefw.Deps{
 		Name:       name,
+		NodeReader: nr,
 		CS:         cs,
 		Dyn:        dyn,
 		Cfg:        cfg,
@@ -231,7 +233,7 @@ func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.In
 // dynamic-client module.
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, setupConfigFromEnv, func(cfg setupConfig) error {
-		p := newClusterHealthProber(d.Name, d.CS, d.Dyn, cfg.probes)
+		p := newClusterHealthProber(d.Name, d.CS, d.Dyn, d.Mgr.GetClient(), cfg.probes)
 		// Surface the resolved HEALTH_* knobs once at registration so an
 		// operator can tell from the logs which targets/thresholds the
 		// checks run with (an unparseable env value silently falls back

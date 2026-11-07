@@ -93,8 +93,12 @@ type cfTunnelProxyWatchdog struct {
 	// come from one place.
 	queue     string
 	namespace string
-	// lastHeal is "<ns>/<name>" -> last delete time; bounds restart
-	// churn on a pod that wedges again immediately after recreation.
+	// lastHeal is kube.PodControllerKey -> last delete time; bounds
+	// restart churn on a workload that wedges again immediately after
+	// recreation. Keyed by the pod's CONTROLLER (ReplicaSet), not the
+	// pod name: a recreated pod carries a fresh name suffix, so a
+	// pod-name cooldown never suppressed the re-heal — the replacement
+	// was deleted every sweep until the wedge cleared.
 	lastHeal state.CooldownSet
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
@@ -278,6 +282,10 @@ func (w *cfTunnelProxyWatchdog) connectorTargets() []cfTunnelConnectorTarget {
 func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
 	now := w.now.Now()
+	// The ledger keys carry controller names that outlive their pods
+	// but die with their Deployments — bound the map so decommissioned
+	// workloads' stamps cannot accumulate forever.
+	w.lastHeal.PruneExpired(now, cfTunnelHealCooldown)
 	healed := 0
 	for _, tgt := range w.connectorTargets() {
 		n, err := w.healConnectorTarget(ctx, tgt, now)
@@ -350,7 +358,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				"pod", p.Namespace+"/"+p.Name)
 			continue
 		}
-		w.lastHeal.Stamp(p.Namespace+"/"+p.Name, now)
+		w.lastHeal.Stamp(kube.PodControllerKey(p), now)
 		healed++
 	}
 	// readyCount==0 deadlock: every running replica unready — the
@@ -370,7 +378,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				log.Error(err, "delete oldest unready connector pod failed",
 					"pod", oldest.Namespace+"/"+oldest.Name)
 			} else {
-				w.lastHeal.Stamp(oldest.Namespace+"/"+oldest.Name, now)
+				w.lastHeal.Stamp(kube.PodControllerKey(oldest), now)
 				healed++
 			}
 		}
@@ -378,11 +386,12 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 	return healed, nil
 }
 
-// healOnCooldown reports whether this pod was already deleted within
-// cfTunnelHealCooldown — a recreated pod that wedges again must wait
-// out the window instead of being killed every sweep.
+// healOnCooldown reports whether this pod's controller was already
+// healed within cfTunnelHealCooldown — keyed on the owner (not the
+// pod name) so a recreated pod that wedges again waits out the
+// window instead of being killed every sweep under a fresh name.
 func (w *cfTunnelProxyWatchdog) healOnCooldown(p *corev1.Pod, now time.Time) bool {
-	return w.lastHeal.CooledDown(p.Namespace+"/"+p.Name, cfTunnelHealCooldown, now)
+	return w.lastHeal.CooledDown(kube.PodControllerKey(p), cfTunnelHealCooldown, now)
 }
 
 // deleteConnectorPod deletes a connector pod with a UID precondition

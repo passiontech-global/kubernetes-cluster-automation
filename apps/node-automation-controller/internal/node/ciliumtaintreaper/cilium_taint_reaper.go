@@ -61,9 +61,16 @@ var nodeSweepRequests = shared.SweepRequests("cilium-taint-reaper-sweep")
 
 // ciliumPodSweepRequests maps a scheduled cilium pod onto the same
 // fixed sweep key; an unscheduled pod carries no verdict signal and
-// enqueues nothing.
+// enqueues nothing. The assert must be comma-ok: informer delete
+// delivery can surface a cache.DeletedFinalStateUnknown tombstone
+// whose unwrapped .Obj (or any non-Pod object reaching the mapper)
+// panics a hard assertion — a non-Pod carries no verdict signal.
 var ciliumPodSweepRequests handler.MapFunc = func(_ context.Context, o client.Object) []reconcile.Request {
-	if o.(*corev1.Pod).Spec.NodeName == "" {
+	pod, ok := o.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+	if pod.Spec.NodeName == "" {
 		return nil // unscheduled pod carries no verdict signal
 	}
 	return shared.FixedSweepRequest("cilium-taint-reaper-sweep")

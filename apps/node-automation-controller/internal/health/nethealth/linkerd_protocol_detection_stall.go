@@ -27,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -294,8 +295,14 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 		return
 	}
 	templateOK := p.patchLinkerdTemplate(ctx, log, pod, missing, now, rep, driftNow)
-	p.patchLinkerdPodAnno(ctx, log, pod, missing)
 	if !templateOK {
+		// No pod-side annotation here: writing opaque-ports onto a pod
+		// that stays RUNNING (GitOps-reverted template inside the 6h
+		// stamp window, RBAC-refused patch) makes missingBinaryPorts()
+		// read the still-broken pod as covered next sweep — the check
+		// would self-blind and clear BOTH linkerd_opaque_port_missing
+		// and linkerd_gitops_opaque_drift while the proxy never got
+		// the fix.
 		log.Info("opaque-ports heal: owning workload template not patched — leaving pod running (annotation alone cannot reach a live proxy)",
 			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
 		return
@@ -306,7 +313,10 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
-	p.InvalidateSweep(ctx) // pod gone — drop the census
+	// Bookkeeping annotation lands only once the delete is delivered —
+	// the same self-blind hazard applies to a pod whose delete failed.
+	p.patchLinkerdPodAnno(ctx, log, pod, missing)
+	p.InvalidatePods(ctx) // pod gone — drop the census
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameLinkerdOpaqueStall).Inc()
 	log.Info("DELETE: linkerd protocol-detection stall — template patched, re-rolling pod",
 		"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
@@ -560,6 +570,11 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdPodAnno(ctx context.Con
 	}
 	if _, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		// The patch runs after the delete is delivered — a fast
+		// teardown can beat it; NotFound is benign there.
+		if apierrors.IsNotFound(err) {
+			return
+		}
 		log.Info("WARN: linkerd heal — pod annotation patch failed (RBAC?)",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 	}

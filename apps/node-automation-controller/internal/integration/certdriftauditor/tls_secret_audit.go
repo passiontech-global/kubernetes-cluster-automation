@@ -129,9 +129,14 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	if serial == a.linkerdIssuerSerial {
 		return
 	}
-	a.linkerdIssuerSerial = serial
 	now := a.now.Now()
 	if now.Sub(a.linkerdIssuerHealed) < linkerdIssuerCooldown {
+		// Deliberately NOT latching the serial here: sealing the new
+		// fingerprint before the rollout is delivered means the next
+		// sweep reads serial == linkerdIssuerSerial and returns early
+		// — a cooldown-window or transient patch failure would drop
+		// the re-roll forever. The fingerprint is stored only after
+		// the Patch below succeeds.
 		log.Info("skip issuer rollout: inside cooldown",
 			"ago", now.Sub(a.linkerdIssuerHealed).Truncate(time.Minute))
 		return
@@ -152,6 +157,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 		log.Error(err, "linkerd-identity rollout stamp failed")
 		return
 	}
+	a.linkerdIssuerSerial = serial
 	a.linkerdIssuerHealed = now
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(linkerdIssuerDeploy).Inc()
 	log.Info("ACTION: issuer cert rotated (serial changed) — stamped rollout annotation on linkerd-identity")

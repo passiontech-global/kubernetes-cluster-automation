@@ -18,18 +18,30 @@
 // every call" semantics exactly — a test that mutates the fake
 // clientset between two Run calls sees the new fixtures.
 //
+// The ctx each memoized LIST runs under is the ctx WithSweepSnapshot
+// captured (or the caller's own ctx outside a sweep) — NEVER the
+// per-check ctx passed to AllXxx: each check's Run gets a
+// WithTimeout(ctx, PerCheck) child, so a LIST under the first
+// caller's ctx could die with that check's deadline and cache a
+// context.DeadlineExceeded every later check then reads as a real
+// apiserver failure — one slow check poisoning the whole roster.
+// The snapshot ctx gets its own bound (snapshotListTimeout) so a
+// wedged apiserver read still cannot stall the sweep forever.
+//
 // Mutation + staleness: a check that deletes a pod or mutates a
-// node mid-sweep must call InvalidateSweep so later checks re-list
-// instead of acting on the pre-mutation view (a stale pod would
-// otherwise be evaluated — and possibly re-healed — as if still
-// alive; UID-preconditioned deletes make that harmless but noisy).
-// The snapshot is read-only: callers must not mutate returned
-// objects in place (several checks sort/filter — sort a copy).
+// node mid-sweep must call InvalidatePods/InvalidateSweep so later
+// checks re-list instead of acting on the pre-mutation view (a
+// stale pod would otherwise be evaluated — and possibly re-healed —
+// as if still alive; UID-preconditioned deletes make that harmless
+// but noisy). The snapshot is read-only: callers must not mutate
+// returned objects in place (several checks sort/filter — sort a
+// copy).
 package probefw
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -38,6 +50,15 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
+
+// snapshotListTimeout bounds one memoized LIST below the sweep ctx —
+// a dedicated snapshot deadline, deliberately NOT any single check's
+// PerCheck ctx (an expiring per-check ctx would cache its
+// DeadlineExceeded and fail every later check in the cycle). Sized
+// at the default PerCheck budget: a cluster-wide read slower than
+// that is a real apiserver problem and caches as a legitimate shared
+// failure, not a poisoned one.
+const snapshotListTimeout = 2 * time.Minute
 
 // sweepCtxKey is the context key WithSweepSnapshot installs the
 // per-sweep memoizer under. Unexported: the sweep attaches it once
@@ -50,7 +71,14 @@ type sweepCtxKey struct{}
 // apiserver failure must read identically to every check in the
 // cycle rather than costing a retry storm) — and every later caller
 // reads the copy. The serial sweep needs no locking.
+//
+// ctx is the snapshot's LIST context: captured at WithSweepSnapshot
+// (the sweep ctx) or the caller's ctx in the direct-Run path. It
+// must outlive any single check's PerCheck deadline — see the file
+// header for the poisoning bug that motivates it.
 type sweepSnapshot struct {
+	ctx context.Context
+
 	pods    []corev1.Pod
 	podsErr error
 	podsSet bool
@@ -74,30 +102,61 @@ type sweepSnapshot struct {
 
 // WithSweepSnapshot installs a fresh, empty snapshot on ctx — the
 // sweep-root calls it once per run() so the whole check roster
-// shares the cycle's cluster reads. Safe to call on a ctx that
-// already carries one (the old snapshot is simply replaced).
+// shares the cycle's cluster reads. The snapshot captures ctx as its
+// LIST context: the sweep parent outlives every per-check PerCheck
+// child, so one check's expired deadline can no longer poison the
+// shared census. Safe to call on a ctx that already carries one (the
+// old snapshot is simply replaced).
 func WithSweepSnapshot(ctx context.Context) context.Context {
-	return context.WithValue(ctx, sweepCtxKey{}, &sweepSnapshot{})
+	return context.WithValue(ctx, sweepCtxKey{},
+		&sweepSnapshot{ctx: ctx})
 }
 
 // snap returns the ctx-carried snapshot, or a fresh one when ctx
 // carries none — the direct-Run (test/ad-hoc) path, where per-call
-// freshness is the correct legacy semantics.
+// freshness is the correct legacy semantics and the caller's own ctx
+// is the right LIST deadline.
 func sweepSnap(ctx context.Context) *sweepSnapshot {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		return s
 	}
-	return &sweepSnapshot{}
+	return &sweepSnapshot{ctx: ctx}
+}
+
+// listCtx returns the ctx one memoized LIST runs under: the
+// snapshot's captured ctx (sweep ctx inside a sweep, caller ctx
+// outside) bounded by snapshotListTimeout — never the calling
+// check's PerCheck ctx, whose deadline belongs to that check alone.
+// caller is the fallback for a snapshot that somehow captured none.
+func (s *sweepSnapshot) listCtx(caller context.Context) (context.Context, context.CancelFunc) {
+	base := s.ctx
+	if base == nil {
+		base = caller
+	}
+	return context.WithTimeout(base, snapshotListTimeout)
+}
+
+// InvalidatePods drops only the pod census on the ctx-carried
+// snapshot — the common case of "a check deleted a pod". Nodes,
+// EndpointSlices, Services and Namespaces keep their memoized reads:
+// a pod delete changes none of them, and a blanket invalidate used
+// to make every later check pay for LISTs that could not have gone
+// stale. A no-op outside a sweep.
+func (d *Deps) InvalidatePods(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.pods, s.podsErr, s.podsSet = nil, nil, false
+	}
 }
 
 // InvalidateSweep drops every memoized read on the ctx-carried
-// snapshot — call it after a check mutates cluster state (pod
-// delete, node taint/cordon, EndpointSlice delete) so later checks
-// re-list fresh data instead of acting on the pre-mutation view.
-// A no-op outside a sweep (each call already sees fresh data).
+// snapshot — call it after a check mutates cluster state beyond pod
+// deletes (node taint/cordon, EndpointSlice delete, Service or
+// Namespace mutation) so later checks re-list fresh data instead of
+// acting on the pre-mutation view. A no-op outside a sweep (each
+// call already sees fresh data).
 func (d *Deps) InvalidateSweep(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
-		*s = sweepSnapshot{}
+		*s = sweepSnapshot{ctx: s.ctx}
 	}
 }
 
@@ -108,7 +167,9 @@ func (d *Deps) AllPods(ctx context.Context) ([]corev1.Pod, error) {
 	s := sweepSnap(ctx)
 	if !s.podsSet {
 		s.podsSet = true
-		s.pods, s.podsErr = kube.ListAll(ctx,
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.pods, s.podsErr = kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Pods(d.CS, metav1.NamespaceAll))
 	}
@@ -121,7 +182,9 @@ func (d *Deps) AllNodes(ctx context.Context) ([]corev1.Node, error) {
 	s := sweepSnap(ctx)
 	if !s.nodesSet {
 		s.nodesSet = true
-		s.nodes, s.nodesErr = kube.ListNodes(ctx, d.CS)
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.nodes, s.nodesErr = kube.ListNodesCached(lctx, d.NodeReader, d.CS)
 	}
 	return s.nodes, s.nodesErr
 }
@@ -132,7 +195,9 @@ func (d *Deps) AllEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSli
 	s := sweepSnap(ctx)
 	if !s.slicesSet {
 		s.slicesSet = true
-		s.slices, s.slicesErr = kube.ListAll(ctx,
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.slices, s.slicesErr = kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.EndpointSlices(d.CS, metav1.NamespaceAll))
 	}
@@ -144,7 +209,9 @@ func (d *Deps) AllServices(ctx context.Context) ([]corev1.Service, error) {
 	s := sweepSnap(ctx)
 	if !s.servicesSet {
 		s.servicesSet = true
-		s.services, s.servicesErr = kube.ListAll(ctx,
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.services, s.servicesErr = kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Services(d.CS, metav1.NamespaceAll))
 	}
@@ -156,7 +223,9 @@ func (d *Deps) AllNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
 	s := sweepSnap(ctx)
 	if !s.namespacesSet {
 		s.namespacesSet = true
-		s.namespaces, s.namespacesErr = kube.ListAll(ctx,
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.namespaces, s.namespacesErr = kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Namespaces(d.CS))
 	}

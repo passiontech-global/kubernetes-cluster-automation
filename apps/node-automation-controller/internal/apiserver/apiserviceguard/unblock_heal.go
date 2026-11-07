@@ -116,7 +116,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	// Wedge evidence: namespaces stuck Terminating >=15m, each with
 	// a lowercased corpus of its conditions + events for group
 	// matching.
-	stuck, err := u.stuckTerminatingNamespaces(ctx, g, now)
+	stuck, err := u.stuckTerminatingNamespaces(ctx, snap, now)
 	if err != nil {
 		return err
 	}
@@ -178,13 +178,13 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 // reference corpus (conditions + events) for every namespace that
 // has been in phase Terminating for >= apiServiceUnblockMinAge. A
 // namespace without a deletionTimestamp cannot prove its age — it
-// is skipped (fail closed).
+// is skipped (fail closed). The census itself is the shared
+// per-run snapshot (the orphan pass lists the same input once).
 func (u *unblockHealer) stuckTerminatingNamespaces(ctx context.Context,
-	g *apiServiceGuard, now time.Time) (map[string]string, error) {
+	snap *apiServiceSnapshot, now time.Time) (map[string]string, error) {
+	g := snap.g
 	log := logf.FromContext(ctx)
-	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
-		kube.Namespaces(g.cs))
+	nss, err := snap.nss, snap.nsErr
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces (unblock pass): %w", err)
 	}

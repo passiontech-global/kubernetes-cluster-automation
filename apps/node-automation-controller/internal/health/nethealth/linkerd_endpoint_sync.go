@@ -564,7 +564,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 				"pod", target.Namespace+"/"+target.Name)
 		} else {
 			healed = true
-			p.InvalidateSweep(ctx) // pod gone — drop the census
+			p.InvalidatePods(ctx) // pod gone — drop the census
 			metrics.ControlPlanePodHealsTotal.WithLabelValues(probefw.LinkerdDestinationName).Inc()
 			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
 				"pod", target.Namespace+"/"+target.Name, "service", svcKey)

@@ -96,6 +96,10 @@ const (
 
 type volumeAttachmentCleaner struct {
 	cs kubernetes.Interface
+	// nodeReader backs ListNodesCached — the informer-backed node
+	// census; destructive gates still confirm on the direct
+	// clientset. Nil (test fixtures) falls back to ListNodes.
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -124,9 +128,10 @@ type volumeAttachmentCleaner struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		c := &volumeAttachmentCleaner{
-			cs:    d.CS,
-			queue: d.Name,
-			now:   shared.SystemClock,
+			cs:         d.CS,
+			nodeReader: d.Mgr.GetClient(),
+			queue:      d.Name,
+			now:        shared.SystemClock,
 		}
 		return shared.AddPeriodic(d.Mgr, c.queue, vaCleanerInterval, c.run)
 	})
@@ -139,7 +144,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// Gate 1: the node list is the single source of truth for
 	// "should this attachment exist". Abort on error — a partial or
 	// blippy list would brand healthy attachments orphaned.
-	nodes, err := kube.ListNodes(ctx, c.cs)
+	nodes, err := kube.ListNodesCached(ctx, c.nodeReader, c.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err) // periodic wrapper IncErrors volumeattachment-cleaner
 	}

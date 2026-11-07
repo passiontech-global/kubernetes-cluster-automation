@@ -121,7 +121,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 				"pod", pod.Namespace+"/"+pod.Name, "operator", op.name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // drop the pod census the delete just invalidated
+		p.InvalidatePods(ctx) // drop the pod census the delete just invalidated
 		deleted = true
 		log.Info("DELETE: stuck operator leader pod — forcing re-election",
 			"operator", op.name, "pod", pod.Namespace+"/"+pod.Name,

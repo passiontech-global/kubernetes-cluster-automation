@@ -10,11 +10,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 )
+
+// maxResponseBytes caps one instant-query response. A vector larger
+// than this is a runaway query, not data — and silently truncating
+// it would decode a CORRUPT vector (the tail sample cut mid-JSON
+// fails decode, but a cut landing exactly on a boundary would parse
+// as a complete, wrong answer). Read limit+1 bytes and fail loudly
+// instead.
+const maxResponseBytes = 4 << 20
+
+// drainOnClose is the leftover-body drain bound: reading the
+// remaining bytes before Close lets Go's HTTP transport reuse the
+// connection (keep-alive) — without the drain every query forces a
+// fresh TCP/TLS handshake to the Prometheus endpoint.
+const drainOnClose = 64 << 10
 
 // Sample is one instant-vector result element: the series labels plus
 // the scalar value at the query timestamp.
@@ -80,10 +95,19 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	if err != nil {
 		return nil, fmt.Errorf("prometheus query: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	defer func() {
+		// Drain before Close so the transport can reuse the
+		// connection — an early return still leaves a bounded tail.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainOnClose))
+		_ = resp.Body.Close()
+	}()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read prometheus response: %w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, fmt.Errorf("prometheus response exceeds %d MiB limit — "+
+			"refusing to decode a truncated vector", maxResponseBytes>>20)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("prometheus query status %d: %.200s",
@@ -117,6 +141,15 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 		}
 		v, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
+			continue
+		}
+		// ParseFloat happily accepts "NaN"/"+Inf"/"-Inf" — real
+		// Prometheus values. A NaN poisons every downstream
+		// comparison (v > threshold is false, v <= threshold is also
+		// false), and an Inf reads as a permanent breach; skip them
+		// like any other unparseable sample rather than feeding a
+		// bogus verdict.
+		if math.IsNaN(v) || math.IsInf(v, 0) {
 			continue
 		}
 		out = append(out, Sample{Metric: r.Metric, Value: v})

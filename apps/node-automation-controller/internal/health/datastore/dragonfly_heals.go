@@ -47,6 +47,9 @@ func init() {
 // that triggered it (survives operator restarts).
 func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, now time.Time) {
+	// drHealed keys on controller names that die with their
+	// Deployments — bound the map so stale stamps cannot accumulate.
+	p.drHealed.PruneExpired(now, dragonflyHealCooldown)
 	// The cheap persisted-stamp cooldown runs BEFORE the mutex —
 	// same ordering healDragonflyReplicaDeadlock carries: a stamp
 	// inside the window skips the three-signal API reads entirely.
@@ -90,14 +93,20 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 		if !strings.HasPrefix(pod.Name, dragonflyOperatorPodPrefix) {
 			continue
 		}
-		key := pod.Namespace + "/" + pod.Name
+		// The cooldown keys on the pod's CONTROLLER, not its name —
+		// a deleted operator pod is recreated by its ReplicaSet under
+		// a fresh suffix, so a pod-name stamp never suppressed the
+		// re-heal and the leader was deleted every sweep.
+		key := kube.PodControllerKey(pod)
 		if p.drHealed.CooledDown(key, dragonflyHealCooldown, now) {
-			log.Info("skip heal: dragonfly operator inside cooldown", "pod", key)
+			log.Info("skip heal: dragonfly operator inside cooldown",
+				"controller", key, "pod", pod.Name)
 			continue
 		}
 		if _, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, pod, now); err != nil {
 			metrics.IncError(p.Name)
-			log.Error(err, "dragonfly operator delete failed", "pod", key)
+			log.Error(err, "dragonfly operator delete failed",
+				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
 		if now.After(p.drOpHealAt[stsKey]) {
@@ -108,7 +117,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 		}
 		deleted = true
 		log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
-			"pod", key, "service", sig.ns+"/"+sig.svc,
+			"pod", pod.Namespace+"/"+pod.Name, "service", sig.ns+"/"+sig.svc,
 			"statefulset", sig.sts.Name)
 	}
 	if !deleted {
@@ -171,6 +180,10 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	sig masterSvc, now time.Time) {
 
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
+
+	// drPodHealed keys on StatefulSets that may be decommissioned —
+	// bound the map so their stamps cannot accumulate.
+	p.drPodHealed.PruneExpired(now, dragonflyPodHealCooldown)
 
 	// Gate 1 — the operator heal must have settled first.
 	opHealedAt, healed := p.dragonflyOperatorHealedAt(sig)

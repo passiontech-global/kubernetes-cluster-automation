@@ -57,6 +57,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/flowcontrol"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,6 +67,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -254,6 +258,14 @@ func main() {
 	// ceiling.
 	cfg.QPS = float32(envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50))
 	cfg.Burst = envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100)
+	// ONE token bucket for every client built off this config:
+	// rest.Config carries the RateLimiter interface by reference
+	// through NewForConfig/CopyConfig, so installing it here makes
+	// the manager's client, the typed clientset and the dynamic
+	// client draw from the same 50/100 bucket. Left nil, each of the
+	// three constructors builds its own limiter and the fleet's real
+	// ceiling silently triples to 150 QPS / 300 burst.
+	cfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(cfg.QPS, cfg.Burst)
 
 	mgr, err := ctrl.NewManager(cfg,
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
@@ -275,18 +287,40 @@ func main() {
 	// duplicate the http.Transport and its TLS connection pool just
 	// to silence one warning header.
 	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
-	cs, err := kubernetes.NewForConfig(cfg)
+	// The direct clients also get a per-request Timeout: the serial
+	// sweep loops issue plain REST calls with no sub-context
+	// deadline, so a dead TCP/conntrack path would hang a whole
+	// module forever without one. It is set on a COPY, not the shared
+	// cfg — rest.Config.Timeout becomes http.Client.Timeout, which
+	// would also bound the informer WATCH streams the manager opens
+	// off cfg and churn every watch into a 30s reconnect loop.
+	directCfg := rest.CopyConfig(cfg)
+	directCfg.Timeout = envx.GetenvDuration(
+		"NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT", 30*time.Second)
+	cs, err := kubernetes.NewForConfig(directCfg)
 	if err != nil {
 		log.Error(err, "unable to create clientset")
 		os.Exit(1)
 	}
 	// Dynamic client for CRD types (helmreleases, cert-manager,
 	// externalsecrets, medik8s, cilium) — no typed clients in-tree.
-	dyn, err := dynamic.NewForConfig(cfg)
+	dyn, err := dynamic.NewForConfig(directCfg)
 	if err != nil {
 		log.Error(err, "unable to create dynamic client")
 		os.Exit(1)
 	}
+
+	// The global heal budget — the aggregate blast-radius cap every
+	// heal-gated module shares (platform/heal consults it inside
+	// AllowedV, so the per-target cooldowns keep working and only
+	// the fleet-wide rate is throttled). NODE_AUTOMATION_HEAL_
+	// BUDGET_MAX=0 disables the gate; the exhaustion counter is
+	// wired through the package's hook because platform cannot
+	// import internal/metrics (depguard leaf rule).
+	heal.ConfigureBudget(
+		envx.GetenvInt("NODE_AUTOMATION_HEAL_BUDGET_MAX", 10),
+		envx.GetenvDuration("NODE_AUTOMATION_HEAL_BUDGET_WINDOW", 5*time.Minute))
+	heal.SetBudgetExhaustedHook(metrics.HealBudgetExhaustedTotal.Inc)
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {

@@ -223,8 +223,13 @@ func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
 func (p *controllerLeaseGuardCheck) ksmReflectorErrorIncrease(
 	ctx context.Context, pod *corev1.Pod) (float64, error) {
 
+	// Each side defaults to vector(0): bare `sum + sum` yields an
+	// EMPTY vector when only one of the two error counters exists
+	// (PromQL arithmetic drops absent operands) — e.g. a wedge that
+	// only ever produced watch errors would sum to nothing and the
+	// signal would never fire.
 	samples, err := p.PromQuery(ctx, fmt.Sprintf(
-		`sum(increase(kube_state_metrics_list_total{result="error",pod="%s"}[10m])) + sum(increase(kube_state_metrics_watch_total{result="error",pod="%s"}[10m]))`,
+		`(sum(increase(kube_state_metrics_list_total{result="error",pod="%s"}[10m])) or vector(0)) + (sum(increase(kube_state_metrics_watch_total{result="error",pod="%s"}[10m])) or vector(0))`,
 		pod.Name, pod.Name))
 	if err != nil {
 		return 0, err

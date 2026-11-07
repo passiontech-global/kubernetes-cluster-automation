@@ -193,7 +193,16 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 					degradedLive[dkey] = true
 					if probefw.Persisted(&p.perconaDegradedSeen, dkey,
 						now, perconaDegradedMinAge, log) {
-						rep.Emit(perconaClusterDegradedGauge, dkey,
+						// The emitted ledger keys one entry per
+						// LABEL TUPLE (kind/ns/name) — the gauge
+						// declares no signature label, so a
+						// signature-qualified key would make
+						// Reconcile delete the cluster's still-
+						// firing series when any sibling signature
+						// (wsrep, patroni) resolved first.
+						rep.Emit(perconaClusterDegradedGauge,
+							perconaGVRKind[gvr]+"/"+
+								o.GetNamespace()+"/"+o.GetName(),
 							[]string{perconaGVRKind[gvr],
 								o.GetNamespace(), o.GetName()},
 							fmt.Sprintf("%s/%s ready %d/%d degraded >=%s",
@@ -235,8 +244,10 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 					name = "-"
 				}
 				ns := s.Label("namespace")
+				// Ledger key is the LABEL TUPLE, not the
+				// signature — see the degraded branch above.
 				rep.Emit(perconaClusterDegradedGauge,
-					"wsrep/"+ns+"/"+name+"/"+q.detail,
+					"PerconaXtraDBCluster/"+ns+"/"+name,
 					[]string{"PerconaXtraDBCluster", ns, name},
 					fmt.Sprintf("%s/%s %s", ns, name, q.detail))
 			}
@@ -303,7 +314,10 @@ func (p *perconaQuorumCheck) checkPatroniLeaderLock(ctx context.Context,
 		degradedLive[pkey] = true
 		if probefw.Persisted(&p.perconaDegradedSeen, pkey, now,
 			perconaPatroniLockMinAge, log) {
-			rep.Emit(perconaClusterDegradedGauge, pkey,
+			// Ledger key is the LABEL TUPLE — see the degraded
+			// branch in Run.
+			rep.Emit(perconaClusterDegradedGauge,
+				"PerconaPGCluster/"+ns+"/"+name,
 				[]string{"PerconaPGCluster", ns, name},
 				fmt.Sprintf("%s/%s patroni leader lock >=%s",
 					ns, name, perconaPatroniLockMinAge))

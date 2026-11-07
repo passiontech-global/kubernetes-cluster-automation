@@ -530,6 +530,33 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		return nil
 	}
 
+	// svcVerdict caches each backend Service's existence check for the
+	// sweep — a single conversion server commonly backs an operator's
+	// whole API group (dozens of CRDs), so re-Getting the same Service
+	// per CRD is pure apiserver churn. Inconclusive gets (flap,
+	// timeout) are NOT cached: a transient error must not freeze the
+	// verdict for the rest of the sweep.
+	svcVerdicts := map[string]bool{} // svcKey -> confirmed present
+	svcMissing := map[string]bool{}  // svcKey -> confirmed NotFound
+	svcExists := func(svcKey, ns, name string) (missing, exists bool, err error) {
+		if svcVerdicts[svcKey] {
+			return false, true, nil
+		}
+		if svcMissing[svcKey] {
+			return true, false, nil
+		}
+		_, gerr := g.CS.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(gerr):
+			svcMissing[svcKey] = true
+			return true, false, nil
+		case gerr != nil:
+			return false, false, gerr
+		}
+		svcVerdicts[svcKey] = true
+		return false, true, nil
+	}
+
 	var hung []string
 	bounceSeen := map[string]bool{}
 	for i := range snap.CRDs {
@@ -539,10 +566,9 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 			continue // no webhook conversion or a URL backend — unmeasurable
 		}
 		reason := ""
-		_, err := g.CS.CoreV1().Services(svcNS).
-			Get(ctx, svcName, metav1.GetOptions{})
+		missing, _, err := svcExists(svcKey, svcNS, svcName)
 		switch {
-		case apierrors.IsNotFound(err):
+		case missing:
 			reason = CRDReasonMissingService
 			log.Info("UNHEALTHY: CRD conversion webhook backend Service missing",
 				"crd", crd.GetName(), "service", svcKey)

@@ -96,6 +96,10 @@ var partitionCondTypes = []corev1.NodeConditionType{
 
 type partitionEvictor struct {
 	cs kubernetes.Interface
+	// nodeReader backs ListNodesCached — the informer-backed node
+	// census; the taint/untaint writes still confirm on the direct
+	// clientset. Nil (test fixtures) falls back to ListNodes.
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -117,6 +121,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg evictorConfig) error {
 		e := &partitionEvictor{
 			cs:         d.CS,
+			nodeReader: d.Mgr.GetClient(),
 			queue:      d.Name,
 			now:        shared.SystemClock,
 			namespaces: cfg.namespaces,
@@ -264,7 +269,7 @@ func podOnNodePinnedPVC(p *corev1.Pod, pinned map[string]struct{}) bool {
 func (e *partitionEvictor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	nodes, err := kube.ListNodes(ctx, e.cs)
+	nodes, err := kube.ListNodesCached(ctx, e.nodeReader, e.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}

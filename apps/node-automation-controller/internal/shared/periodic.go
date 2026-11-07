@@ -67,15 +67,22 @@ func (p *Periodic) Start(ctx context.Context) error {
 	// fire all modules on the same wall-clock minute — a thundering
 	// herd of LIST calls (heap burst) at every common multiple of
 	// 5/10/15/30/60m. A one-shot random phase offset uniform in
-	// [0, interval) spreads them; the first run lands in
-	// [interval, 2*interval), acceptable for crontab-equivalent
-	// sweeps. ctx is honored so shutdown is never delayed.
+	// [0, interval) spreads them; the first run then lands in
+	// [0, interval) — running immediately after the offset, not
+	// waiting out a full extra ticker interval (which used to push
+	// the first scan to [interval, 2*interval) and double the blind
+	// window a fresh pod rollout sits in). ctx is honored so
+	// shutdown is never delayed.
 	timer := time.NewTimer(rand.N(p.Interval))
 	select {
 	case <-ctx.Done():
 		timer.Stop()
 		return nil
 	case <-timer.C:
+	}
+	if err := p.runOnce(runCtx); err != nil {
+		metrics.IncError(p.Name)
+		log.Error(err, "periodic run failed")
 	}
 	t := time.NewTicker(p.Interval)
 	defer t.Stop()

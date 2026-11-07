@@ -209,7 +209,7 @@ func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logge
 		log.Error(err, "control-plane pod delete failed", "pod", key)
 		return
 	}
-	p.InvalidateSweep(ctx) // drop the pod census the delete just invalidated
+	p.InvalidatePods(ctx) // drop the pod census the delete just invalidated
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(component).Inc()
 	log.Info("DELETE: wedged control-plane pod — forcing re-roll",
 		"component", component, "pod", key)

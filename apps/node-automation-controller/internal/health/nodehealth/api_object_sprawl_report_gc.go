@@ -154,7 +154,13 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	orphanBudget := sprawlMaxOrphanDeletes
 	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
-		items, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
+		// Paged like every cluster-wide list — trivy emits one
+		// report per workload revision, so an unpaginated List is
+		// exactly the etcd-serializes-everything shape this check
+		// exists to fight.
+		items, err := kube.ListAll(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.DynamicPage(p.Dyn.Resource(rk.gvr)))
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // report CRD absent on this cluster — no census, no GC
@@ -165,8 +171,8 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		}
 		perNS := map[string]int{}
 		orphaned := 0
-		for i := range items.Items {
-			obj := &items.Items[i]
+		for i := range items {
+			obj := &items[i]
 			perNS[obj.GetNamespace()]++
 			if now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
 				continue

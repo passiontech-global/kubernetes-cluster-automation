@@ -63,22 +63,25 @@ const (
 // VolumeAttachment) the "namespace" label is the empty string —
 // there is no containing namespace, and repeating the object name
 // would only make the two labels redundant.
-func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
+func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
+	census *pvcCensus) error {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	j.stuckEmitted.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := j.now.Now()
 
 	// All lists land before any series is emitted — a failed later
 	// list must not leave the gauge half-populated for an hour.
+	// (The PVC read is the shared per-run census — see pvcCensus.)
 	nss, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Namespaces(j.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
-	pvcs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+	pvcs, err := census.listPVCs(ctx, j)
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
@@ -114,8 +117,9 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	// kubernetes.io/pvc-protection is stuck waiting on the protection
 	// controller to prove no pod uses it — when zero pods in the
 	// namespace still reference it, the finalizer is stripped. The
-	// per-namespace reference scan is cached per audit pass.
-	nsClaims := map[string]pvcUseProbe{}
+	// per-namespace reference scan rides the run-shared census — the
+	// orphan-PVC pass runs the identical pod scan in the same run.
+	nsClaims := census.claims()
 	for i := range pvcs {
 		p := &pvcs[i]
 		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
@@ -150,6 +154,42 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 type pvcUseProbe struct {
 	claims map[string]bool // claim names still referenced by a live pod
 	err    error
+}
+
+// pvcCensus is the per-run read-share between sweepOrphanWorkspacePVCs
+// and auditStuckTerminating: both duties walk the SAME cluster-wide
+// PVC list and both run the same per-namespace "which claims do live
+// pods still reference" pod scan (claimedPVCNames and the
+// unstickPVCProtection probe are identical reads) — the census pays
+// the PVC list once per run and hands both duties one claims map.
+// A nil census (a test driving a single duty) builds a private one —
+// same reads, just unshared.
+type pvcCensus struct {
+	pvcs     []corev1.PersistentVolumeClaim
+	pvcsErr  error
+	pvcsSet  bool
+	nsClaims map[string]pvcUseProbe
+}
+
+// listPVCs returns the shared cluster-wide PVC list, listing on first
+// call only.
+func (c *pvcCensus) listPVCs(ctx context.Context,
+	j *failedJobsJanitor) ([]corev1.PersistentVolumeClaim, error) {
+	if !c.pvcsSet {
+		c.pvcsSet = true
+		c.pvcs, c.pvcsErr = kube.ListAll(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+	}
+	return c.pvcs, c.pvcsErr
+}
+
+// claims returns the shared per-namespace claims-probe cache.
+func (c *pvcCensus) claims() map[string]pvcUseProbe {
+	if c.nsClaims == nil {
+		c.nsClaims = map[string]pvcUseProbe{}
+	}
+	return c.nsClaims
 }
 
 // unstickPVCProtection strips the pvc-protection finalizer from a
