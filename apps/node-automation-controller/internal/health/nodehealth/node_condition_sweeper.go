@@ -99,9 +99,9 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 					now.Sub(c.LastHeartbeatTime.Time).Round(time.Second))
 			}
 			stale = append(stale, corev1.NodeCondition{
-				Type:    c.Type,
-				Status:  corev1.ConditionFalse,
-				Reason:  "StaleConditionCleared",
+				Type:   c.Type,
+				Status: corev1.ConditionFalse,
+				Reason: "StaleConditionCleared",
 				Message: fmt.Sprintf("heartbeat %s — owning reporter presumed dead; cleared by %s",
 					hbAge, CheckNameNodeCondSweeper),
 				LastHeartbeatTime:  metav1.NewTime(now),

@@ -13,7 +13,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -281,28 +280,17 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
 	}
-	for _, s := range slices {
-		svc := s.Labels[discoveryv1.LabelServiceName]
-		if svc == "" {
-			continue
-		}
-		key := s.Namespace + "/" + svc
-		set := esAddrs[key]
-		if set == nil {
-			set = map[string]bool{}
-			esAddrs[key] = set
-		}
-		for _, ep := range s.Endpoints {
-			// Ready-only — a slice holding the pod IP but
-			// marked unready is still a desync for traffic.
-			// nil Ready counts as ready (k8s convention).
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-				continue
-			}
-			for _, a := range ep.Addresses {
+	// Ready-only — a slice holding the pod IP but marked unready is
+	// still a desync for traffic (the shared rollup already dropped
+	// unready endpoints; nil Ready counts as ready).
+	for key, eps := range kube.ReadyEndpointsByService(slices) {
+		set := map[string]bool{}
+		for _, e := range eps {
+			for _, a := range e.Addresses {
 				set[a] = true
 			}
 		}
+		esAddrs[key] = set
 	}
 
 	podsByKey := map[string]*corev1.Pod{}

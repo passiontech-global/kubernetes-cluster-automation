@@ -9,11 +9,13 @@ package datastore
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -153,6 +155,30 @@ func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time
 		latest = t
 	}
 	return latest, !latest.IsZero()
+}
+
+// smallestOrdinalPod returns the pod with the lowest StatefulSet
+// ordinal — "<sts>-0" in the common case — or nil when none of the
+// pods match the "<sts>-<n>" naming. StatefulSet pod names are the
+// only source of truth for the ordinal (there is no field for it).
+func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
+	var best *corev1.Pod
+	bestOrd := -1
+	for i := range pods {
+		name := pods[i].Name
+		if !strings.HasPrefix(name, stsName+"-") {
+			continue
+		}
+		ord, err := strconv.Atoi(name[len(stsName)+1:])
+		if err != nil {
+			continue
+		}
+		if bestOrd < 0 || ord < bestOrd {
+			bestOrd = ord
+			best = &pods[i]
+		}
+	}
+	return best
 }
 
 // healDragonflyReplicaDeadlock is the W7-C3 step-2 heal: the

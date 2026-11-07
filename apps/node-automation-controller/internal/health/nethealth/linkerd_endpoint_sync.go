@@ -16,11 +16,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,7 +26,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -100,136 +97,15 @@ var (
 		Name: "node_automation_linkerd_endpoint_desync",
 		Help: "1 while the Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
 	}, []string{"namespace", "service"})
-
-	// W12-NM1b — the socket-LB conflict signal: 1 while Cilium runs
-	// pod-netns bpf-lb-sock alongside Linkerd without either
-	// compatibility knob (cni-exclusive=false keeps linkerd-init's
-	// iptables redirect authoritative; bpf-lb-sock-hostns-only=true
-	// confines socket-LB to the host netns for the node-local-dns
-	// LRPs). A plain gauge — the conflict is cluster-wide, not
-	// per-object.
-	ciliumLinkerdSockLBConflictGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "node_automation_cilium_linkerd_socklb_conflict",
-		Help: "1 while Cilium pod-netns socket-LB is enabled alongside Linkerd without cni-exclusive=false or bpf-lb-sock-hostns-only=true.",
-	})
 )
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(
-		linkerdEndpointDesyncGauge,
-		ciliumLinkerdSockLBConflictGauge)
+	ctrlmetrics.Registry.MustRegister(linkerdEndpointDesyncGauge)
 }
 
 // ---------------------------------------------------------------------------
 // W9-NM2 — linkerd-endpoint-sync
 // ---------------------------------------------------------------------------
-
-// linkerdEndpointSetsDiverge reports whether a Service's
-// EndpointSlice view diverged from its pods: a Ready pod IP missing
-// from the Ready endpoint addresses (linkerd-destination never learns
-// the endpoint exists), or a Ready endpoint address no live selected
-// pod owns anymore (a deleted pod's stale IP keeps receiving traffic).
-// readyIPs/liveIPs nil-safe: an empty pod set can still flag stale
-// endpoint addresses.
-func linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady map[string]bool) bool {
-	for ip := range readyIPs {
-		if !esReady[ip] {
-			return true
-		}
-	}
-	for ip := range esReady {
-		if !liveIPs[ip] {
-			return true
-		}
-	}
-	return false
-}
-
-// linkerdSliceRef is one endpointslice-controller-owned EndpointSlice
-// of an audited Service — a delete candidate when it
-// provably holds stale endpoint data (W10-FIX7). addrs is the set of
-// Ready endpoint addresses (nil Ready counts as ready, same
-// convention as the aggregate census).
-type linkerdSliceRef struct {
-	ns, name string
-	uid      types.UID
-	addrs    map[string]bool
-}
-
-// podReadySince returns the pod's PodReady=True LastTransitionTime —
-// the clock for the EndpointSlice heal's missing-IP fuse. ok=false
-// when the pod is not Ready (mirrors kube.PodReadyCond, which
-// returns on the first PodReady-typed condition).
-func podReadySince(pod *corev1.Pod) (since time.Time, ok bool) {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			if c.Status != corev1.ConditionTrue {
-				return time.Time{}, false
-			}
-			return c.LastTransitionTime.Time, true
-		}
-	}
-	return time.Time{}, false
-}
-
-// staleLinkerdSlices picks the controller-owned EndpointSlices of a
-// desynced Service that provably hold stale endpoint data
-// (W10-FIX7):
-//
-//   - a slice retaining a Ready address no live selected pod owns
-//     (a deleted pod's IP still receiving traffic) is stale on its
-//     own — only that slice is returned;
-//   - a Ready pod IP past linkerdSliceHealMinAge absent from the
-//     UNION of all the service's managed slices means the slice SET
-//     is incomplete — no single member is identifiable as the stale
-//     one, so every managed slice is returned: deleting them forces
-//     endpointslice-controller to rebuild the whole set.
-//
-// readyAged is the service's pod-IP set filtered to pods Ready past
-// the fuse; liveIPs is every live selected pod IP. Both nil-safe.
-func staleLinkerdSlices(slices []linkerdSliceRef,
-	readyAged, liveIPs map[string]bool) []linkerdSliceRef {
-	if len(slices) == 0 {
-		return nil
-	}
-	union := map[string]bool{}
-	var stale []linkerdSliceRef
-	for _, sl := range slices {
-		dead := false
-		for a := range sl.addrs {
-			union[a] = true
-			if !liveIPs[a] {
-				dead = true
-			}
-		}
-		if dead {
-			stale = append(stale, sl)
-		}
-	}
-	for ip := range readyAged {
-		if !union[ip] {
-			return slices
-		}
-	}
-	return stale
-}
-
-// linkerdAuditedService reports whether a Service is in the
-// endpoint-sync census: in a linkerd-injected namespace, carrying a
-// pod selector (selectorless Services are manually managed — their
-// endpoints are user-owned), not ExternalName (a DNS alias has no
-// EndpointSlices of its own), and not publishNotReadyAddresses —
-// that flag intentionally pins not-ready addresses into the slices,
-// so ghost/missing-IP detection cannot tell intent from desync.
-// Headless AND ordinary ClusterIP/NodePort/LoadBalancer Services all
-// qualify: linkerd-destination builds its endpoint table from
-// EndpointSlices for each of them.
-func linkerdAuditedService(injected map[string]bool, svc *corev1.Service) bool {
-	return injected[svc.Namespace] &&
-		len(svc.Spec.Selector) > 0 &&
-		svc.Spec.Type != corev1.ServiceTypeExternalName &&
-		!svc.Spec.PublishNotReadyAddresses
-}
 
 // checkLinkerdEndpointSync audits every selector-bearing Service in
 // namespaces opted into linkerd injection: linkerd-destination builds
@@ -466,170 +342,4 @@ func (p *linkerdEndpointSyncCheck) linkerdSvcPatch(
 				metav1.PatchOptions{})
 		return err
 	}
-}
-
-// healLinkerdDestination repairs a desynced Service on two
-// fronts (W10-FIX7):
-//
-//  1. DELETE the provably-stale endpointslice-controller-owned
-//     EndpointSlices staleLinkerdSlices flagged — a bounce only
-//     re-reads the slices, so without this the destination pod would
-//     resync from the same stale data. KCM's endpointslice-controller
-//     recreates them from current pod state (UID-preconditioned,
-//     same delete shape as the orphan-slice cleaner).
-//  2. delete the OLDEST linkerd-destination pod — the component that
-//     turns EndpointSlices into proxy endpoint state, so restarting
-//     it forces a full resync from the (now corrected) slices.
-//
-// Gates: the 1h in-RAM cooldown keyed on the desynced service (the
-// heal targets are the slices + pod — nothing else can carry the
-// stamp; one stamp covers BOTH actions so a 5m sweep cannot churn
-// slice deletes inside the pod-bounce cooldown) and the maintenance
-// mutex, same shape as every pod-delete heal in this sweep. The
-// cooldown stamps when ANY heal action succeeded — a failed delete
-// retries next sweep instead of burning the hour.
-func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
-	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
-
-	// linkerdDesyncHealed keys "ns/svc" — Services can be
-	// decommissioned, so bound the map so their stamps cannot
-	// accumulate.
-	p.linkerdDesyncHealed.PruneExpired(now, linkerdDestHealCooldown)
-
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-
-	healed := false
-	for _, sl := range stale {
-		err := p.CS.DiscoveryV1().EndpointSlices(sl.ns).Delete(ctx, sl.name,
-			kube.UIDDeleteOptions(sl.uid, ""))
-		switch {
-		case err == nil:
-			healed = true
-			p.InvalidateSweep(ctx) // slice census changed — drop the snapshot
-			log.Info("DELETE: stale EndpointSlice for endpoint desync — endpointslice-controller rebuild forced",
-				"endpointslice", sl.ns+"/"+sl.name, "service", svcKey)
-		case apierrors.IsNotFound(err):
-			// Already gone — another actor or the controller beat
-			// us to it; nothing to heal.
-		default:
-			metrics.IncError(p.Name)
-			log.Error(err, "stale endpointslice delete failed",
-				"endpointslice", sl.ns+"/"+sl.name, "service", svcKey)
-		}
-	}
-
-	pods, err := p.PodsIn(ctx, probefw.LinkerdNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list linkerd pods failed — heal deferred",
-			"error", err)
-		if healed {
-			// Slice deletes already landed — stamp them now or an
-			// unstamped sweep re-deletes the slices the
-			// endpointslice-controller just rebuilt.
-			p.linkerdDesyncHealed.Stamp(svcKey, now)
-		}
-		return
-	}
-	// The pod pick stays bespoke — the component matcher is not a
-	// plain name-prefix list (exact name + Deployment prefix +
-	// control-plane-component label, any phase), which
-	// heal.OldestRunningPod's Running-only prefix scan cannot express.
-	var target *corev1.Pod
-	for i := range pods {
-		pod := pods[i]
-		if pod.DeletionTimestamp != nil ||
-			!probefw.LinkerdPodMatchesComponent(pod, probefw.LinkerdDestinationName) {
-			continue
-		}
-		if target == nil ||
-			pod.CreationTimestamp.Before(&target.CreationTimestamp) {
-			target = pod
-		}
-	}
-	if target != nil {
-		// The stamp is NOT the ledger's here — svcKey stamps once at
-		// the end when ANY heal action (slice or pod delete) landed.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", target, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "linkerd-destination delete failed",
-				"pod", target.Namespace+"/"+target.Name)
-		} else {
-			healed = true
-			p.InvalidatePods(ctx) // pod gone — drop the census
-			metrics.ControlPlanePodHealsTotal.WithLabelValues(probefw.LinkerdDestinationName).Inc()
-			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
-				"pod", target.Namespace+"/"+target.Name, "service", svcKey)
-		}
-	}
-	if healed {
-		p.linkerdDesyncHealed.Stamp(svcKey, now)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit
-// ---------------------------------------------------------------------------
-
-// ciliumSockLBConflictsWithLinkerd reports whether the cilium-config
-// data runs pod-netns Socket-LB in a shape that bypasses linkerd's
-// iptables redirect: bpf-lb-sock="true" with NEITHER compatibility
-// knob set. cni-exclusive="false" keeps linkerd-init's rules
-// authoritative (Cilium shares the CNI chain instead of owning it);
-// bpf-lb-sock-hostns-only="true" confines socket-LB to the host
-// netns — the node-local-dns LRPs keep working while pod traffic
-// still flows through linkerd-proxy.
-func ciliumSockLBConflictsWithLinkerd(data map[string]string) bool {
-	if data["bpf-lb-sock"] != "true" {
-		return false
-	}
-	return data["cni-exclusive"] != "false" &&
-		data["bpf-lb-sock-hostns-only"] != "true"
-}
-
-// auditCiliumLinkerdSockLB runs the W12-NM1b runtime half of the
-// static socket-LB gate: with Linkerd installed AND Cilium's
-// ConfigMap present, pod-netns bpf-lb-sock without a compatibility
-// knob silently bypasses linkerd-proxy (SO_ORIGINAL_DST never sees
-// the original ClusterIP). No mesh → no conflict; no cilium-config →
-// no Cilium, so no socket-LB to conflict with. A ConfigMap read
-// failure is tolerated (WARN + InfraErr) — "can't tell" must not
-// read as resolved, so the gauge keeps its last value.
-func (p *linkerdEndpointSyncCheck) auditCiliumLinkerdSockLB(
-	ctx context.Context, log logr.Logger, linkerdInstalled bool,
-	rep *probefw.SweepReport) {
-
-	if !linkerdInstalled {
-		ciliumLinkerdSockLBConflictGauge.Set(0)
-		return
-	}
-	cm, err := p.CS.CoreV1().ConfigMaps(ciliumConfigNS).
-		Get(ctx, ciliumConfigName, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-		ciliumLinkerdSockLBConflictGauge.Set(0)
-		return
-	case err != nil:
-		log.Info("WARN: cilium-config get failed — socket-LB audit inconclusive",
-			"error", err)
-		rep.InfraErr(fmt.Errorf("get configmap %s/%s: %w",
-			ciliumConfigNS, ciliumConfigName, err))
-		return
-	}
-	if !ciliumSockLBConflictsWithLinkerd(cm.Data) {
-		ciliumLinkerdSockLBConflictGauge.Set(0)
-		return
-	}
-	ciliumLinkerdSockLBConflictGauge.Set(1)
-	rep.Find(ciliumConfigNS + "/" + ciliumConfigName +
-		": bpf-lb-sock=true without cni-exclusive=false or " +
-		"bpf-lb-sock-hostns-only=true — pod-netns socket-LB bypasses linkerd-proxy")
 }

@@ -2,11 +2,15 @@
 // bookkeeping: the WebhookCircuitBroken gauge tuples a sweep asserts
 // (and the trips counter) are applied only after the config patch
 // landed, so a failed patch retries next sweep without
-// double-counting, and the sweep-end ledger prune drops whatever was
-// not re-seen instead of pinning circuit_broken=1 forever.
+// double-counting, the carry-forward re-asserts the last confirmed
+// tuples while the post-patch annotation is unverifiable, and the
+// sweep-end ledger prune drops whatever was not re-seen instead of
+// pinning circuit_broken=1 forever.
 package circuitbreaker
 
 import (
+	"strings"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -32,5 +36,20 @@ func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string,
 	}
 	for _, n := range recovered {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, n)
+	}
+}
+
+// carryBrokenForward re-asserts last sweep's WebhookCircuitBroken
+// tuples for one config after its patch failed — the same
+// carry-forward the CRD conversion sweep runs on an unverifiable
+// read: a failed patch leaves the annotation (and the truth the
+// series reports) at its last confirmed state, so the sweep-end
+// prune must not flap a still-broken series off.
+func (b *Breaker) carryBrokenForward(kind, cfgName string) {
+	prefix := kind + "/" + cfgName + "/"
+	for k, lv := range b.brokenEmitted.Last() {
+		if strings.HasPrefix(k, prefix) {
+			b.brokenEmitted.Emit(k, lv...)
+		}
 	}
 }
