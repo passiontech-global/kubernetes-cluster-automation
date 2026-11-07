@@ -27,8 +27,8 @@ type Prober struct {
 
 // NewProber builds the shared Deps via NewDeps, then constructs one
 // check per factory against them — the same func(*Deps) Check shape
-// the root checkDefs registry uses, so each domain package passes its
-// own NewXxxCheck constructors verbatim.
+// the registry's CheckReg rows carry, so each domain package passes
+// its own NewXxxCheck constructors verbatim.
 func NewProber(cs kubernetes.Interface, dyn dynamic.Interface,
 	factories ...func(*probefw.Deps) probefw.Check) *Prober {
 	d := NewDeps(cs, dyn)

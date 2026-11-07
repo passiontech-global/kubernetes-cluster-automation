@@ -1,9 +1,10 @@
 // check_modules_test.go — the CheckReg merge contract: collected
-// check registrations join the prober roster via Deps.CheckRegs,
-// dedupe by name, and a wrong-typed New fails prober construction
-// loudly (a silent skip would boot a roster missing a check ops
-// believes is gated on). The gated-off-collection half is covered at
-// registry level (TestSetupModulesCheckRegGate).
+// check registrations BECOME the prober roster via Deps.CheckRegs
+// (in collection order), dedupe by name, and a wrong-typed New
+// fails prober construction loudly (a silent skip would boot a
+// roster missing a check ops believes is registered). The
+// gated-off-collection half is covered at registry level
+// (TestSetupModulesCheckRegGate).
 package clusterhealthprobes
 
 import (
@@ -30,26 +31,32 @@ func countCheck(p *clusterHealthProber, name string) int {
 }
 
 // An enabled check row's contribution — the CheckReg SetupModules
-// collected into Deps.CheckRegs — lands in the prober's roster after
-// the static checkDefs.
+// collected into Deps.CheckRegs — lands in the prober's roster in
+// collection order. There is no static half anymore: the regs ARE
+// the whole roster.
 func TestCheckRegJoinsRoster(t *testing.T) {
-	p, err := newClusterHealthProber("cluster-health-probes",
-		fake.NewSimpleClientset(), testutil.NewDynamicClient(), nil,
-		probefw.Config{}, []shared.CheckReg{{
-			Name: gitops.CheckNameFluxKustomizationHealth,
-			New:  gitops.NewFluxKustomizationHealthCheck,
-		}})
+	p, err := newClusterHealthProber(shared.Deps{
+		Name: "cluster-health-probes",
+		CS:   fake.NewSimpleClientset(), Dyn: testutil.NewDynamicClient(),
+		CheckRegs: []shared.CheckReg{
+			{Name: gitops.CheckNameFluxKustomizationHealth,
+				New: gitops.NewFluxKustomizationHealthCheck},
+			{Name: gitops.CheckNameWorkloadScaleFlapping,
+				New: gitops.NewWorkloadScaleFlappingCheck},
+		},
+	}, probefw.Config{})
 	if err != nil {
 		t.Fatalf("newClusterHealthProber: %v", err)
 	}
-	if got := countCheck(p, gitops.CheckNameFluxKustomizationHealth); got != 1 {
-		t.Fatalf("%q appears %d times in roster, want 1",
-			gitops.CheckNameFluxKustomizationHealth, got)
+	if len(p.checks) != 2 {
+		t.Fatalf("roster = %d checks, want exactly the 2 collected regs", len(p.checks))
 	}
-	// CheckReg entries sort after the static roster.
-	if p.checks[len(p.checks)-1].name != gitops.CheckNameFluxKustomizationHealth {
-		t.Fatalf("CheckReg check not appended after checkDefs: last = %q",
-			p.checks[len(p.checks)-1].name)
+	// Roster order follows collection order — that is the sweep
+	// order contract.
+	if p.checks[0].name != gitops.CheckNameFluxKustomizationHealth ||
+		p.checks[1].name != gitops.CheckNameWorkloadScaleFlapping {
+		t.Fatalf("roster order = %q,%q — want collection order",
+			p.checks[0].name, p.checks[1].name)
 	}
 }
 
@@ -90,31 +97,40 @@ func TestSetupConsumesCheckRegs(t *testing.T) {
 	}
 }
 
-// Roster dedupe: a CheckReg repeating a static checkDefs name — or a
-// sibling CheckReg's name — is skipped, the old registerCheck
-// idempotence.
+// Roster dedupe: a CheckReg repeating an earlier reg's name is
+// skipped — the old registerCheck idempotence — so a duplicated row
+// (or a stray second row naming the same check) can never
+// double-register. The name is the identity: the FIRST reg under a
+// name wins, even when a repeat carries a different constructor.
 func TestCheckRegDedupes(t *testing.T) {
-	p, err := newClusterHealthProber("cluster-health-probes",
-		fake.NewSimpleClientset(), testutil.NewDynamicClient(), nil,
-		probefw.Config{}, []shared.CheckReg{
+	p, err := newClusterHealthProber(shared.Deps{
+		Name: "cluster-health-probes",
+		CS:   fake.NewSimpleClientset(), Dyn: testutil.NewDynamicClient(),
+		CheckRegs: []shared.CheckReg{
+			{Name: ported.CheckNameDNS,
+				New: ported.NewDNSStatusCheck},
 			{Name: gitops.CheckNameImagePullSecretAuditor,
 				New: gitops.NewImagePullSecretAuditorCheck},
-			{Name: gitops.CheckNameImagePullSecretAuditor,
-				New: gitops.NewImagePullSecretAuditorCheck},
-			// A name already in the static roster is skipped too —
-			// even with a valid constructor.
+			// Repeats — one under an already-taken name with a
+			// different constructor, one exact.
 			{Name: ported.CheckNameDNS,
 				New: gitops.NewImagePullSecretAuditorCheck},
-		})
+			{Name: gitops.CheckNameImagePullSecretAuditor,
+				New: gitops.NewImagePullSecretAuditorCheck},
+		},
+	}, probefw.Config{})
 	if err != nil {
 		t.Fatalf("newClusterHealthProber: %v", err)
+	}
+	if got := countCheck(p, ported.CheckNameDNS); got != 1 {
+		t.Fatalf("%q appears %d times, want 1 (first wins)",
+			ported.CheckNameDNS, got)
 	}
 	if got := countCheck(p, gitops.CheckNameImagePullSecretAuditor); got != 1 {
 		t.Fatalf("%q appears %d times, want 1 (dedupe)",
 			gitops.CheckNameImagePullSecretAuditor, got)
 	}
-	if got := countCheck(p, ported.CheckNameDNS); got != 1 {
-		t.Fatalf("%q appears %d times, want 1 (static only)",
-			ported.CheckNameDNS, got)
+	if len(p.checks) != 2 {
+		t.Fatalf("roster = %d checks, want 2 (deduped)", len(p.checks))
 	}
 }

@@ -30,7 +30,12 @@
 //     section via an @-selector (@system, @node, @apiserver,
 //     @janitors, @integration, @health); default: all — blast-radius
 //     control for isolating a module or splitting auditors from
-//     healers across Deployments.
+//     healers across Deployments. Health-sweep check names are
+//     registry names too: a check row contributes a check to the
+//     cluster-health-probes roster rather than a runnable, so
+//     "dns-status-internal,cluster-health-probes" sweeps just that
+//     check while a check row selected alone wires nothing (and
+//     cluster-health-probes selected alone sweeps an empty roster).
 //
 // Registration gates (the *_ENABLED flags that decide whether a
 // module wires anything at all) live in the shared.Module registry —
@@ -218,7 +223,9 @@ func main() {
 	flag.StringVar(&modulesFilter, "modules", "",
 		"comma-separated module names or @groups to run (default: all); "+
 			"names are the registry ops names from internal/registry "+
-			"and @<group> expands to a whole section (e.g. @janitors)")
+			"(health-sweep check names count as module names — a check "+
+			"row still needs cluster-health-probes to run) and "+
+			"@<group> expands to a whole section (e.g. @janitors)")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()

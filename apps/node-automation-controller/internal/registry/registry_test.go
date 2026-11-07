@@ -243,8 +243,8 @@ func TestParseModulesFlag(t *testing.T) {
 }
 
 // Every runnable module registers exactly one runnable on the
-// manager — 32 runnable rows in the 35-row registry (the three
-// health CheckReg rows contribute checks to the sweep roster, not
+// manager — 32 runnable rows in the 80-row registry (the 48 health
+// CheckReg rows contribute checks to the sweep roster, not
 // runnables) — except the gate-skippers, which SetupModules hands
 // Deps.Disabled and which then skip mgr.Add entirely. Modules whose
 // flag only gates the tick body (csr-watcher approve mode,
@@ -280,7 +280,7 @@ func TestSetupModules(t *testing.T) {
 			t.Fatalf("SetupModules: %v", err)
 		}
 		// 32 runnable rows minus the 18 gate-skippers = 14 runnables
-		// (the 3 CheckReg rows register nothing regardless).
+		// (the 48 CheckReg rows register nothing regardless).
 		if len(m.Added) != 14 {
 			t.Fatalf("registered %d runnables, want 14", len(m.Added))
 		}

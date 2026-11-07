@@ -10,6 +10,7 @@
 package registry
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
@@ -35,11 +36,93 @@ func TestCheckRegContract(t *testing.T) {
 			if m.CheckReg.Name == "" {
 				t.Fatal("CheckReg.Name is empty — it becomes the kuberhealthy_check label value")
 			}
+			// The row's module name doubles as the check name:
+			// -modules selects checks by their kuberhealthy_check
+			// label value and the predeclared queue series labels
+			// match what an operator greps for — a row named
+			// differently from its check would split that identity
+			// for no gain.
+			if m.Name != m.CheckReg.Name {
+				t.Fatalf("module name %q != CheckReg.Name %q — check rows are named after the check",
+					m.Name, m.CheckReg.Name)
+			}
 			if _, ok := m.CheckReg.New.(func(*probefw.Deps) probefw.Check); !ok {
 				t.Fatalf("CheckReg.New is %T, want func(*probefw.Deps) probefw.Check",
 					m.CheckReg.New)
 			}
 		})
+	}
+}
+
+// TestCheckRegSweepOrder pins the check roster order — the relative
+// order of the health section's CheckReg rows in Modules is the
+// cluster-health-probes sweep order verbatim (SetupModules collects
+// in registry order), and that order is the ops contract the
+// kuberhealthy checker Pods established. A reorder here reorders
+// the sweep; this list is the migration-time checkDefs sequence
+// kept as the explicit contract.
+func TestCheckRegSweepOrder(t *testing.T) {
+	want := []string{
+		"dns-status-internal",
+		"http-content-check",
+		"pod-restarts",
+		"pod-status-check",
+		"resource-quota-check",
+		"kcm-workqueue-watchdog",
+		"operator-workqueue-watchdog",
+		"stateful-masterless-services",
+		"rabbitmq-suspended-listener",
+		"localpv-stranded-pods",
+		"olm-subscription-health",
+		"scheduler-watchdog",
+		"mesh-controlplane-watchdog",
+		"node-hang-precordon",
+		"linkerd-endpoint-sync",
+		"scylla-cluster-health",
+		"flux-helmrelease-retries",
+		"percona-cluster-quorum",
+		"cilium-bpf-map-pressure",
+		"linkerd-protocol-detection-stall",
+		"coredns-upstream",
+		"cilium-node-ipam-exhaustion",
+		"namespace-terminating-wedged",
+		"argocd-app-stuck",
+		"kargo-promotion-health",
+		"rabbitmq-quorum-health",
+		"dragonfly-replica-sync-storm",
+		"image-pull-storm",
+		"api-object-sprawl-report-gc",
+		"cpu-steal-taint-sync",
+		"cilium-missing-endpoint",
+		"linkerd-h2-stream-guard",
+		"cloudflared-tunnel-health",
+		"liqo-tunnel-health",
+		"konnectivity-tunnel-health",
+		"postgres-wal-archive-guard",
+		"scylla-compaction-schema-guard",
+		"nats-jetstream-health",
+		"keda-scaledobject-guard",
+		"gateway-route-health",
+		"controller-lease-guard",
+		"pvc-resize-stall-guard",
+		"endpointslice-zone-starvation",
+		"linkerd-outlier-guard",
+		"node-condition-sweeper",
+		// The three gated W13 gitops rows close out the roster —
+		// they landed after the always-on sequence when checks first
+		// became registry rows, so they stay last.
+		"flux-kustomization-health",
+		"workload-scale-flapping",
+		"imagepull-secret-auditor",
+	}
+	var got []string
+	for _, m := range Modules {
+		if m.CheckReg != nil {
+			got = append(got, m.CheckReg.Name)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("CheckReg sweep order = %v,\nwant %v", got, want)
 	}
 }
 

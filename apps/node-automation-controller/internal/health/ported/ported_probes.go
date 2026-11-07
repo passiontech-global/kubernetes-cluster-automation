@@ -43,8 +43,9 @@ type podStatusCheck struct{ *probefw.Deps }
 type resourceQuotaCheck struct{ *probefw.Deps }
 
 // The ported-check constructors — every check exposes a
-// NewXxxCheck(d *probefw.Deps) probefw.Check factory so the checkDefs registry
-// can stay data-driven; these five carry no per-check state.
+// NewXxxCheck(d *probefw.Deps) probefw.Check factory so the
+// registry's CheckReg rows can stay data-driven; these five carry
+// no per-check state.
 func NewDNSStatusCheck(d *probefw.Deps) probefw.Check     { return &dnsStatusCheck{Deps: d} }
 func NewHTTPContentCheck(d *probefw.Deps) probefw.Check   { return &httpContentCheck{Deps: d} }
 func NewPodRestartsCheck(d *probefw.Deps) probefw.Check   { return &podRestartsCheck{Deps: d} }

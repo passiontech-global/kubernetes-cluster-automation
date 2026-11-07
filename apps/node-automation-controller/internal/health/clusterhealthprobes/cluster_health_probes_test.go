@@ -18,9 +18,14 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // testProber builds a prober with the env-equivalent defaults but
@@ -35,9 +40,13 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProber {
-	// nil extra cannot fail — an error here is a refactor bug.
-	p, err := newClusterHealthProber("cluster-health-probes", cs, dyn, nil,
-		probetest.NewDeps(cs, dyn).Cfg, nil)
+	// fleetCheckRegs() is valid by construction — an error here is a
+	// refactor bug, not a fixture failure.
+	p, err := newClusterHealthProber(shared.Deps{
+		Name: "cluster-health-probes",
+		CS:   cs, Dyn: dyn,
+		CheckRegs: fleetCheckRegs(),
+	}, probetest.NewDeps(cs, dyn).Cfg)
 	if err != nil {
 		panic(err)
 	}
@@ -45,6 +54,71 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 		return []string{"10.0.0.1"}, nil
 	}
 	return p
+}
+
+// fleetCheckRegs mirrors the health section of registry.Modules —
+// the full 48-check roster in sweep order, which is what
+// SetupModules collects into Deps.CheckRegs on a default boot.
+// clusterhealthprobes may not import internal/registry (depguard:
+// domains never import the wiring layer — and a test-internal
+// import would be an outright cycle since registry imports this
+// package), so the mirror lives here; registry's
+// TestCheckRegSweepOrder pins the canonical sequence this list
+// copies, so drift between them fails THERE, not silently here.
+func fleetCheckRegs() []shared.CheckReg {
+	return []shared.CheckReg{
+		{Name: ported.CheckNameDNS, New: ported.NewDNSStatusCheck},
+		{Name: ported.CheckNameHTTPContent, New: ported.NewHTTPContentCheck},
+		{Name: ported.CheckNamePodRestarts, New: ported.NewPodRestartsCheck},
+		{Name: ported.CheckNamePodStatus, New: ported.NewPodStatusCheck},
+		{Name: ported.CheckNameResourceQuota, New: ported.NewResourceQuotaCheck},
+		{Name: watchdogs.CheckNameKCMWorkqueue, New: watchdogs.NewKcmWorkqueueCheck},
+		{Name: watchdogs.CheckNameOperatorWorkqueue, New: watchdogs.NewOperatorWorkqueueCheck},
+		{Name: datastore.CheckNameStatefulMasterless, New: datastore.NewStatefulMasterlessCheck},
+		{Name: datastore.CheckNameRabbitMQSuspended, New: datastore.NewRabbitMQSuspendedCheck},
+		{Name: nodehealth.CheckNameLocalPVStranded, New: nodehealth.NewLocalPVStrandedCheck},
+		{Name: datastore.CheckNameOLMHealth, New: datastore.NewOlmHealthCheck},
+		{Name: watchdogs.CheckNameSchedulerWatchdog, New: watchdogs.NewSchedulerWatchdogCheck},
+		{Name: watchdogs.CheckNameMeshWatchdog, New: watchdogs.NewMeshControlPlaneCheck},
+		{Name: nodehealth.CheckNameNodeHang, New: nodehealth.NewNodeHangCheck},
+		{Name: nethealth.CheckNameLinkerdEndpointSync, New: nethealth.NewLinkerdEndpointSyncCheck},
+		{Name: datastore.CheckNameScyllaHealth, New: datastore.NewScyllaHealthCheck},
+		{Name: gitops.CheckNameFluxHRRetries, New: gitops.NewFluxHRRetriesCheck},
+		{Name: datastore.CheckNamePerconaQuorum, New: datastore.NewPerconaQuorumCheck},
+		{Name: nethealth.CheckNameCiliumBPFMapPressure, New: nethealth.NewCiliumBPFMapPressureCheck},
+		{Name: nethealth.CheckNameLinkerdOpaqueStall, New: nethealth.NewLinkerdProtocolDetectionStallCheck},
+		{Name: nethealth.CheckNameCoreDNSUpstream, New: nethealth.NewCoreDNSUpstreamCheck},
+		{Name: nethealth.CheckNameCiliumNodeIPAM, New: nethealth.NewCiliumNodeIPAMExhaustionCheck},
+		{Name: nodehealth.CheckNameNamespaceWedged, New: nodehealth.NewNamespaceTerminatingWedgedCheck},
+		{Name: gitops.CheckNameArgoCDAppStuck, New: gitops.NewArgoCDAppStuckCheck},
+		{Name: gitops.CheckNameKargoPromotionHealth, New: gitops.NewKargoPromotionHealthCheck},
+		{Name: datastore.CheckNameRabbitMQQuorum, New: datastore.NewRabbitMQQuorumHealthCheck},
+		{Name: datastore.CheckNameDragonflySyncStorm, New: datastore.NewDragonflyReplicaSyncStormCheck},
+		{Name: nodehealth.CheckNameImagePullStorm, New: nodehealth.NewImagePullStormCheck},
+		{Name: nodehealth.CheckNameAPIObjectSprawlReportGC, New: nodehealth.NewAPIObjectSprawlReportGCCheck},
+		{Name: nodehealth.CheckNameCPUStealTaintSync, New: nodehealth.NewCPUStealTaintSyncCheck},
+		{Name: nethealth.CheckNameCiliumMissingEndpoints, New: nethealth.NewCiliumMissingEndpointsCheck},
+		{Name: nethealth.CheckNameLinkerdH2StreamGuard, New: nethealth.NewLinkerdH2StreamGuardCheck},
+		{Name: nethealth.CheckNameCloudflaredTunnelHealth, New: nethealth.NewCloudflaredTunnelHealthCheck},
+		{Name: nethealth.CheckNameLiqoTunnelHealth, New: nethealth.NewLiqoTunnelHealthCheck},
+		{Name: nethealth.CheckNameKonnectivityTunnelHealth, New: nethealth.NewKonnectivityTunnelHealthCheck},
+		{Name: datastore.CheckNamePostgresWALArchiveGuard, New: datastore.NewPostgresWALArchiveGuardCheck},
+		{Name: datastore.CheckNameScyllaCompactionSchemaGuard, New: datastore.NewScyllaCompactionSchemaGuardCheck},
+		{Name: datastore.CheckNameNatsJetstreamHealth, New: datastore.NewNatsJetstreamHealthCheck},
+		{Name: nodehealth.CheckNameKedaScaledObjectGuard, New: nodehealth.NewKedaScaledObjectGuardCheck},
+		{Name: nethealth.CheckNameGatewayRouteHealth, New: nethealth.NewGatewayRouteHealthCheck},
+		{Name: nodehealth.CheckNameControllerLeaseGuard, New: nodehealth.NewControllerLeaseGuardCheck},
+		{Name: datastore.CheckNamePVCResizeStallGuard, New: datastore.NewPVCResizeStallGuardCheck},
+		{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck},
+		{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck},
+		{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck},
+		// The three gated W13 gitops rows close out the roster —
+		// the sweep-order contract keeps them after the always-on
+		// sequence.
+		{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck},
+		{Name: gitops.CheckNameWorkloadScaleFlapping, New: gitops.NewWorkloadScaleFlappingCheck},
+		{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck},
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -157,13 +231,15 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// linkerd-h2-stream-guard, cloudflared-tunnel-health,
 	// postgres-wal-archive-guard, scylla-compaction-schema-guard,
 	// controller-lease-guard (KSM wedge scan), plus
-	// endpointslice-zone-starvation (W13-NM1) -> eighteen total.
+	// endpointslice-zone-starvation (W13-NM1) AND
+	// imagepull-secret-auditor (W13-SC1 — its pull-secret census
+	// starts at AllPods) -> nineteen total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and
 	// linkerd-outlier-guard bails on the failed Prometheus query
 	// before ever listing pods.)
-	if got := errCount() - before; got != 18 {
-		t.Fatalf("run errors delta = %v, want 18", got)
+	if got := errCount() - before; got != 19 {
+		t.Fatalf("run errors delta = %v, want 19", got)
 	}
 }
 
