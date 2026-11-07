@@ -1,5 +1,5 @@
 // linkerd_outlier_guard.go — the linkerd-outlier-guard check
-// (W13-NM2): a single meshed pod whose inbound request traffic
+// (linkerd-outlier): a single meshed pod whose inbound request traffic
 // fails at >=80% while serving >=1 rps — with every same-revision
 // sibling healthy (median sibling error <5%) — is a gray-failed
 // replica: readiness probes ride HTTP/1.1 and stay green while the
@@ -72,7 +72,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
-// linkerdOutlierGuardCheck is the W13-NM2 single-pod 5xx gray-
+// linkerdOutlierGuardCheck is the linkerd-outlier single-pod 5xx gray-
 // failure watchdog — detection on response_total, eviction behind
 // the six gates documented in the file header.
 type linkerdOutlierGuardCheck struct {
@@ -90,7 +90,7 @@ type linkerdOutlierGuardCheck struct {
 	seen state.FirstSeenLedger
 }
 
-// NewLinkerdOutlierGuardCheck builds the W13-NM2 check — its state
+// NewLinkerdOutlierGuardCheck builds the linkerd-outlier check — its state
 // is the emitted-gauge and first-seen ledgers; evict cooldowns ride
 // the shared Deps.Heals set.
 func NewLinkerdOutlierGuardCheck(d *probefw.Deps) probefw.Check {
@@ -100,7 +100,7 @@ func NewLinkerdOutlierGuardCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameLinkerdOutlierGuard = "linkerd-outlier-guard"
 
-	// linkerd-outlier-guard knobs (W13-NM2 resolved design
+	// linkerd-outlier-guard knobs (linkerd-outlier resolved design
 	// decision 1 — the cohort-math thresholds are compile-time:
 	// they are the false-positive boundary, not tuning knobs).
 	linkerdOutlierMinRPS        = 1.0              // condition 1
@@ -113,12 +113,12 @@ const (
 )
 
 var (
-	// W13-NM2 — a confirmed single-pod gray failure: the pod serves
+	// linkerd-outlier — a confirmed single-pod gray failure: the pod serves
 	// real traffic (>=1 rps inbound) and fails >=80% of it while its
 	// same-revision siblings stay healthy (<5% median).
 	linkerdOutlierPodsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_linkerd_outlier_pods",
-		Help: "1 while the meshed pod's inbound request error ratio is >=80% at >=1 rps with healthy same-revision siblings — W13-NM2 gray-failure outlier.",
+		Help: "1 while the meshed pod's inbound request error ratio is >=80% at >=1 rps with healthy same-revision siblings — linkerd-outlier gray-failure outlier.",
 	}, []string{"namespace", "deployment", "pod"})
 )
 

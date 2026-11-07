@@ -1,5 +1,5 @@
 // endpointslice_zone_starvation.go — the endpointslice-zone-starvation
-// check (W13-NM1): a Service opted into topology-aware routing must
+// check (zone-starvation): a Service opted into topology-aware routing must
 // keep at least one READY endpoint hinted for every ACTIVE zone — a
 // zone holding a Ready worker node plus a Running pod (a client).
 // A zone left with zero covering endpoints starves: every consumer
@@ -38,7 +38,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// endpointSliceZoneStarvationCheck is the W13-NM1 topology-aware
+// endpointSliceZoneStarvationCheck is the zone-starvation topology-aware
 // routing zone-starvation watchdog.
 type endpointSliceZoneStarvationCheck struct {
 	*probefw.Deps
@@ -54,7 +54,7 @@ type endpointSliceZoneStarvationCheck struct {
 	evented state.SeenSet
 }
 
-// NewEndpointSliceZoneStarvationCheck builds the W13-NM1 check —
+// NewEndpointSliceZoneStarvationCheck builds the zone-starvation check —
 // its only state is the emitted-gauge ledger and the event dedup
 // set.
 func NewEndpointSliceZoneStarvationCheck(d *probefw.Deps) probefw.Check {
@@ -65,7 +65,7 @@ const (
 	CheckNameEndpointSliceZoneStarvation = "endpointslice-zone-starvation"
 
 	// starvedEventReason is the Warning Event reason stamped on the
-	// starved Service — the byte-stable reason the Wave-13 alert
+	// starved Service — the byte-stable reason the zone-starvation alert
 	// runbook references.
 	starvedEventReason = "EndpointSliceZoneHintStarved"
 
@@ -75,11 +75,11 @@ const (
 )
 
 var (
-	// W13-NM1 — a topology-routed Service with zero ready endpoints
+	// zone-starvation — a topology-routed Service with zero ready endpoints
 	// hinted for an active zone.
 	serviceTopologyZoneStarvedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_service_topology_zone_starved",
-		Help: "1 while a topology-aware Service has no ready endpoint hinted for an active zone (Ready worker + running pods) — W13-NM1.",
+		Help: "1 while a topology-aware Service has no ready endpoint hinted for an active zone (Ready worker + running pods) — zone-starvation.",
 	}, []string{"namespace", "service", "zone"})
 )
 

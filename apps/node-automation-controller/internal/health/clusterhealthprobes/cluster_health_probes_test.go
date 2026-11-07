@@ -112,7 +112,7 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck},
 		{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck},
 		{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck},
-		// The three gated W13 gitops rows close out the roster —
+		// The three gated gitops rows close out the roster —
 		// the sweep-order contract keeps them after the always-on
 		// sequence.
 		{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck},
@@ -231,8 +231,8 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// linkerd-h2-stream-guard, cloudflared-tunnel-health,
 	// postgres-wal-archive-guard, scylla-compaction-schema-guard,
 	// controller-lease-guard (KSM wedge scan), plus
-	// endpointslice-zone-starvation (W13-NM1) AND
-	// imagepull-secret-auditor (W13-SC1 — its pull-secret census
+	// endpointslice-zone-starvation (zone-starvation) AND
+	// imagepull-secret-auditor (pullsecret-audit — its pull-secret census
 	// starts at AllPods) -> nineteen total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and

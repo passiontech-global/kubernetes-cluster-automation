@@ -110,7 +110,7 @@ var (
 	GVVeleroPodVolumeBackup = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "podvolumebackups"}
 	// GVVeleroBackupRepository is the restic/kopia BackupRepository —
-	// velero-backup-auditor's W13-ST2 repo health/maintenance scan.
+	// velero-backup-auditor's backup-health repo health/maintenance scan.
 	GVVeleroBackupRepository = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backuprepositories"}
 

@@ -3,7 +3,7 @@
 // under internal/health on top of the shared probefw framework; the
 // roster itself is a registry concern — every check is a CheckReg
 // row in internal/registry (the 45 always-on rows plus the three
-// gated W13 gitops rows), collected into Deps.CheckRegs in
+// gated gitops rows), collected into Deps.CheckRegs in
 // registry order, which IS the sweep order:
 //
 //   - ported — the five kuberhealthy "passive" HealthChecks that used
@@ -29,9 +29,9 @@
 //   - datastore — datastore operator health (scylla, rabbitmq
 //     quorum + suspended listener, dragonfly sync storm, percona
 //     quorum, stateful-masterless-services W6.2, OLM subscriptions,
-//     PVC resize stalls W13-ST3).
+//     PVC resize stalls pvc-resize).
 //   - gitops — argocd-app-stuck, flux-helmrelease-retries,
-//     kargo-promotion-health plus the three gated W13 rows
+//     kargo-promotion-health plus the three gated gitops rows
 //     (flux-kustomization-health, workload-scale-flapping,
 //     imagepull-secret-auditor).
 //

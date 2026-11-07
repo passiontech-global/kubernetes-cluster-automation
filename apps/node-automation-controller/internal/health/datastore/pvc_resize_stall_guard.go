@@ -1,5 +1,5 @@
 // pvc_resize_stall_guard.go — the pvc-resize-stall-guard check
-// (W13-ST3): a PersistentVolumeClaim wedged in filesystem-expansion
+// (pvc-resize): a PersistentVolumeClaim wedged in filesystem-expansion
 // limbo. Two condition types mark an in-flight resize:
 //
 //   - FileSystemResizePending=True — the control-plane resize
@@ -31,7 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// pvcResizeStallGuardCheck is the W13-ST3 PVC expansion watchdog.
+// pvcResizeStallGuardCheck is the pvc-resize PVC expansion watchdog.
 type pvcResizeStallGuardCheck struct {
 	*probefw.Deps
 
@@ -47,7 +47,7 @@ type pvcResizeStallGuardCheck struct {
 	seen state.FirstSeenLedger
 }
 
-// NewPVCResizeStallGuardCheck builds the W13-ST3 check — its only
+// NewPVCResizeStallGuardCheck builds the pvc-resize check — its only
 // state is the two ledgers; the check is detection-only and carries
 // no heal state.
 func NewPVCResizeStallGuardCheck(d *probefw.Deps) probefw.Check {
@@ -56,13 +56,13 @@ func NewPVCResizeStallGuardCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	// CheckNamePVCResizeStallGuard is the check's kuberhealthy_check
-	// label value — W13-ST3; not a ported HealthCheck but reports
+	// label value — pvc-resize; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNamePVCResizeStallGuard = "pvc-resize-stall-guard"
 )
 
-// pvcResizeStalledGauge is the W13-ST3 signal: 1 while a PVC carries
+// pvcResizeStalledGauge is the pvc-resize signal: 1 while a PVC carries
 // FileSystemResizePending or Resizing True past the stall window —
 // the filesystem never caught up to the expanded volume.
 var pvcResizeStalledGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{

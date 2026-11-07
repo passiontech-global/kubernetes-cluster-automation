@@ -84,7 +84,7 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "velero.io", Version: "v1", Kind: "Backup"},
 	{Group: "velero.io", Version: "v1", Kind: "BackupStorageLocation"},
 	{Group: "velero.io", Version: "v1", Kind: "PodVolumeBackup"},
-	// BackupRepository — velero-backup-auditor's W13-ST2 repo scan;
+	// BackupRepository — velero-backup-auditor's backup-health repo scan;
 	// BackupRepository -> "backuprepositories" pluralizes correctly
 	// via the trailing-"y" -> "ies" rule.
 	{Group: "velero.io", Version: "v1", Kind: "BackupRepository"},

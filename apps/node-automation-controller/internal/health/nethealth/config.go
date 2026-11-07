@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	// LinkerdOutlierEvictEnabledDefault keeps the W13-NM2 auto-evict
+	// LinkerdOutlierEvictEnabledDefault keeps the linkerd-outlier auto-evict
 	// armed unless an operator explicitly sets
 	// LINKERD_OUTLIER_EVICT_ENABLED=false — the Resolved Design
 	// Decisions default (auto-evict on with the six safety gates).

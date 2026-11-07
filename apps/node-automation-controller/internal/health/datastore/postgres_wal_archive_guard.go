@@ -3,7 +3,7 @@
 // operator families (Percona pgv2, CloudNativePG, Percona Everest) —
 // a stalled archiver, an inactive replication slot retaining WAL, a
 // data volume filling past the threshold, or pg_wal disk-full crash
-// evidence in pod logs. W13-ST3 folds the CloudNativePG cluster-liveness
+// evidence in pod logs. cnpg-health folds the CloudNativePG cluster-liveness
 // guard in on top of the same CR scan: a failover phase wedged past
 // CNPGUnhealthyMinAge, a ready<instances shortfall, or disabled
 // continuous archiving flags node_automation_cnpg_cluster_unhealthy.
@@ -43,7 +43,7 @@ type postgresWALArchiveGuardCheck struct {
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	// emittedSlot is the same ledger for the W12-ST2 slot-bloat
 	// gauge — a slot that drains or goes active loses its series.
-	// emittedCNPG is the W13-ST3 cnpg_cluster_unhealthy ledger —
+	// emittedCNPG is the cnpg-health cnpg_cluster_unhealthy ledger —
 	// a cluster that recovers its phase/quorum/archiving loses the
 	// series via DeleteLabelValues.
 	emitted     state.GaugeLedger[string]
@@ -51,7 +51,7 @@ type postgresWALArchiveGuardCheck struct {
 	emittedCNPG state.GaugeLedger[string]
 
 	// cnpgSeen: "phase/ns/name" | "replicas/ns/name" → first sweep
-	// the W13-ST3 stuck-phase or under-replicated signature held —
+	// the cnpg-health stuck-phase or under-replicated signature held —
 	// each must persist p.Cfg.Datastore.CNPGUnhealthyMinAge before
 	// it counts; pruned on resolve so a flap re-arms.
 	cnpgSeen state.FirstSeenLedger
@@ -113,7 +113,7 @@ var (
 		Help: "Retained WAL bytes behind an inactive replication slot (pg_replication_slots_active==0) past the 5GiB floor — the bloat that precedes the pg_wal disk-full crash.",
 	}, []string{"namespace", "cluster", "slot"})
 
-	// W13-ST3 — a CloudNativePG Cluster.postgresql.cnpg.io whose
+	// cnpg-health — a CloudNativePG Cluster.postgresql.cnpg.io whose
 	// failover never lands (phase wedged Failing over / Waiting for
 	// the instances to become active), whose ready instances stay
 	// short of the declared count, or whose continuous archiving is
@@ -253,7 +253,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		for i := range items.Items {
 			cr := &items.Items[i]
-			// W13-ST3 — CNPG clusters get the dedicated cluster-health
+			// cnpg-health — CNPG clusters get the dedicated cluster-health
 			// pass below on top of the archive-condition scan.
 			if rk.gvr == kube.GVRCNPGCluster {
 				cnpgClusters = append(cnpgClusters, cr)
@@ -362,7 +362,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// W13-ST3 — CloudNativePG cluster liveness: a wedged failover
+	// cnpg-health — CloudNativePG cluster liveness: a wedged failover
 	// phase, a ready<count shortfall or disabled continuous archiving
 	// ride their own gauge — the WAL signatures above say the
 	// archiver is sick, these say the cluster underneath is.
@@ -407,14 +407,14 @@ func (p *postgresWALArchiveGuardCheck) emitSlotBloat(
 }
 
 // ---------------------------------------------------------------------------
-// W13-ST3 — CloudNativePG cluster health.
+// cnpg-health — CloudNativePG cluster health.
 // ---------------------------------------------------------------------------
 
 // cnpgStuckPhases are the CloudNativePG status.phase values that mark
 // a failover/restart which never lands — normalized (lower-cased,
 // spaces stripped) so the CRD's spaced spellings ("Failing over",
 // "Waiting for the instances to become active") and the CamelCase
-// enum names the W13-ST3 incident cites ("FailingOver",
+// enum names the cnpg-health incident cites ("FailingOver",
 // "WaitingForInstancesToBecomeActive") all match.
 var cnpgStuckPhases = map[string]bool{
 	"failingover":                          true,
@@ -428,7 +428,7 @@ func cnpgPhaseKey(phase string) string {
 	return strings.ToLower(strings.ReplaceAll(phase, " ", ""))
 }
 
-// checkCNPGClusterHealth is the W13-ST3 CloudNativePG guard folded
+// checkCNPGClusterHealth is the cnpg-health CloudNativePG guard folded
 // into this check's CNPG CR scan — the WAL signatures above watch the
 // archiver, these three watch the cluster's failover/quorum liveness
 // the archiver sits on top of:

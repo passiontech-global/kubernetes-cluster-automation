@@ -1,5 +1,5 @@
 // config.go — env resolution for the datastore checks' knobs:
-// ConfigFromEnv returns the DatastoreConfig — the W13-ST3 persistence
+// ConfigFromEnv returns the DatastoreConfig — the cnpg-health persistence
 // windows postgres-wal-archive-guard's CloudNativePG signatures and
 // the pvc-resize-stall-guard run under. Resolved once at sweep Setup
 // via clusterhealthprobes.healthProbeConfigFromEnv (the same

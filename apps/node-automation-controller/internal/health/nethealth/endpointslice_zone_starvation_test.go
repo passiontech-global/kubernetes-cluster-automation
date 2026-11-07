@@ -1,5 +1,5 @@
 // endpointslice_zone_starvation_test.go — coverage for the
-// endpointslice-zone-starvation check (W13-NM1): starved/covered
+// endpointslice-zone-starvation check (zone-starvation): starved/covered
 // zones, the zero-endpoint outage exclusion, audit-scope gating,
 // the inactive-zone exclusion, gauge reconcile and event dedup.
 package nethealth
