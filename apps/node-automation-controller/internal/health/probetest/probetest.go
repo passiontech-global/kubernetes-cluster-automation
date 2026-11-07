@@ -180,6 +180,12 @@ func ReadyWorkerNode(name string, cond corev1.NodeConditionType, condAge time.Du
 			Type:               cond,
 			Status:             corev1.ConditionTrue,
 			LastTransitionTime: metav1.NewTime(time.Now().Add(-condAge)),
+			// A live writer re-stamps the heartbeat — node-hang
+			// precordon refuses fused latches whose heartbeat is
+			// stale, so the default shape is a fresh stamp; tests
+			// for the zombie-latch gate overwrite it with an old
+			// (or zero) value.
+			LastHeartbeatTime: metav1.NewTime(time.Now()),
 		})
 	}
 	return n

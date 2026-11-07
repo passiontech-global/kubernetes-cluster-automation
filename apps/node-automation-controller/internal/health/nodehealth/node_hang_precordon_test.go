@@ -241,6 +241,93 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Stale-heartbeat gate (2026-11-06 zombie-latch outage)
+// ---------------------------------------------------------------------------
+
+// A fused latch whose lastHeartbeatTime froze — the reporter may be
+// dead and the True value a zombie — is NOT cordon evidence. This is
+// the 2026-11-06 fleet shape: wedged node-host-agents left a
+// ~70m-old KubeletPLEGUnhealthy latch live and precordoned half the
+// workers.
+func TestCheckNodeHangIgnoresStaleHeartbeat(t *testing.T) {
+	stale := probetest.ReadyWorkerNode("w-zombie", "KubeletPLEGUnhealthy", 30*time.Minute, false)
+	stale.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(stale, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("stale-heartbeat latch must not fail the check: %+v", res)
+	}
+	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-zombie", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("zombie latch cordoned the node")
+	}
+}
+
+// A latch with NO heartbeat at all is equally unproven — refused.
+func TestCheckNodeHangIgnoresMissingHeartbeat(t *testing.T) {
+	noHB := probetest.ReadyWorkerNode("w-nohb", "KernelHungTasks", 5*time.Minute, false)
+	noHB.Status.Conditions[1].LastHeartbeatTime = metav1.Time{}
+	cs := fake.NewSimpleClientset(noHB, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("heartbeat-less latch must not fail the check: %+v", res)
+	}
+	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-nohb", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("heartbeat-less latch cordoned the node")
+	}
+}
+
+// A stale latch on a second condition does not shield a live one —
+// the fresh latch still cordons.
+func TestCheckNodeHangStaleLatchDoesNotShieldLiveLatch(t *testing.T) {
+	n := probetest.ReadyWorkerNode("w-mixed", "KernelHungTasks", 30*time.Minute, false)
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               "FilesystemReadOnly",
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
+	})
+	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("a live latch beside a stale one must still fail the check")
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-mixed", metav1.GetOptions{})
+	if !got.Spec.Unschedulable {
+		t.Fatal("live latch not cordoned beside a stale one")
+	}
+}
+
+// A stamped cordon stays cordoned while the latch is still True —
+// even a frozen heartbeat: a dead reporter can't prove recovery, so
+// the stale gate must not accidentally auto-uncordon.
+func TestCheckNodeHangStaleLatchHoldsPreCordon(t *testing.T) {
+	n := precordonedWorkerNode("w-held", true)
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               "KubeletPLEGUnhealthy",
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-30 * time.Minute)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute)),
+	})
+	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("stale latch is a warning, not a check failure: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-held", metav1.GetOptions{})
+	if !got.Spec.Unschedulable {
+		t.Fatal("stale latch auto-uncordoned a possibly-hung node")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
+		t.Fatal("pre-cordon stamp removed while latch still True")
+	}
+}
+
 // precordonedWorkerNode builds a worker node carrying our pre-cordon stamp —
 // unschedulable with passiontech.dev/precordoned-by=node-hang-precordon and
 // no active latch (the auto-uncordon shape).
