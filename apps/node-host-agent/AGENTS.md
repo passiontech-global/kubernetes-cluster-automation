@@ -19,8 +19,9 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   subsystem, table order IS startup order. `localbin.go`, `sigctx.go`
   hold small seams lifted out of main.
 - `internal/agent` — the runtime: shared `prometheus.Registry`,
-  metrics/probe HTTP servers, and the subsystem supervisor
-  (`Subsystem` = `Name() + Run(ctx)`, a blocking loop).
+  metrics/probe HTTP servers, the subsystem supervisor
+  (`Subsystem` = `Name() + Run(ctx)`, a blocking loop), and the
+  standalone-mode sd_notify self-watchdog (`sdnotify.go`).
 - `internal/envnames` — the single source of truth for the
   `NODE_HOST_AGENT_*` env contract: every env var name the binary
   reads is declared once as an `Env*` const (files split per
@@ -41,7 +42,16 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   concoursecache, apiprober, hostmetrics, workerhygiene, nethealth,
   janitor, nodereporter, controllerhygiene, hostconfig, hubsync,
   kinedb). Convention: `Config` struct + `EnvDeps` (non-env inputs) +
-  `ConfigFromEnv(EnvDeps) Config` + `New(cfg, reg)`.
+  `ConfigFromEnv(EnvDeps) Config` + `New(cfg, reg)`. Subsystems big
+  enough to have distinct duties split into domain subpackages with
+  a shared deps bundle + exported test fixture: workerhygiene
+  (`{cilium,ctr,guards,kubelet,pods,runtime}` + `wdeps` +
+  `wdepstest`), controllerhygiene
+  (`{apiserver,etcd,kine,oom,pki,feeder}` + `cdeps` + `cdepstest`),
+  kinedb (`{probe,compact,maint}` + `kdeps` + `kdepstest`),
+  nodereporter (`npd` — the NPD monitor ports behind a
+  `Monitor`/`Deps`/`Sink` injection boundary; no deps bundle since
+  the parent stays the only consumer).
 - `internal/domain/*` — importable domain libraries shared by
   subsystems and ops (etcdmaint, eventpurge, topology): the
   `Run(ctx, Config, ...)`-style logic behind a one-shot op that a
@@ -62,10 +72,11 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   import ops.
 - `internal/testutil` — shared fakes/fixture builders for the
   internal test suites.
-- `internal/subsystem/workerhygiene/wdepstest` — exported fixture
-  builder (`Fixture` + `wdepstest.Check[T]` accessor) so the domain
-  packages' external `package X_test` files can drive a full
-  `*workerhygiene.Hygiene` without importing the parent package.
+- `internal/subsystem/*/depstest` (`wdepstest`, `cdepstest`,
+  `kdepstest`) — exported fixture builders (`Fixture` + the generic
+  `Check[T]` accessor) so the domain subpackages' external
+  `package X_test` files can drive the full subsystem without
+  importing the parent package.
 
 ## Layering (enforced by depguard in the root .golangci.yml)
 
@@ -107,7 +118,19 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   (ports lib.sh state_enter/state_exit semantics).
 - Every package with logging has `logging.go` exposing
   `logger() *slog.Logger` via `logx.For("<pkg>")` — resolution is
-  per call on purpose.
+  per call on purpose. Subpackages keep the PARENT's log identity
+  (`logx.For("kinedb")` inside `kinedb/probe`,
+  `logx.For("nodereporter")` inside `nodereporter/npd`) — the
+  subsystem attribute is the external log contract.
+- Test seams are LOW-LEVEL transports only: the `wdeps`/`cdeps`
+  `Seams` func fields stand in for independent I/O (an HTTP GET, a
+  unix-socket dial, a signal, an exec transport). A derived read —
+  a field that is just (sibling seam + fixed argv + parse) — is NOT
+  a seam: keep it as a method or package function that takes the
+  low-level seam (`(*Cilium).ServiceBackends` composes `UnixGet`;
+  the `cdeps.Host` named methods compose `HostExecFn`). Tests stub
+  the transport, so the parser is exercised for real instead of
+  being bypassed.
 - Ops subcommands keep flag parsing + dispatch in `Cmd` and reusable
   domain logic in `internal/domain/<name>` so subsystems can share it
   without importing a CLI package (domain/eventpurge vs ops/evpurge
