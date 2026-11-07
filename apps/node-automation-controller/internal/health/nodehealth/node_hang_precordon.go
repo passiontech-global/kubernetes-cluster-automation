@@ -48,6 +48,18 @@ const (
 	// lands on the node, same blast radius.
 	nodeClockSkewCordonAge = 10 * time.Minute
 
+	// nodeHangCondHeartbeatMaxAge is how old a condition's
+	// lastHeartbeatTime may be before the value stops being cordon
+	// evidence: the writer (nodereporter refreshes it every ~2m on
+	// a live agent; kubelet refreshes its own conditions on every
+	// status post) may be dead and the True a zombie — 2026-11-06
+	// all six node-host-agents wedged mid-Cycle during an apiserver
+	// flap and a frozen ~70m-old KubeletPLEGUnhealthy latch
+	// precordoned half the fleet. 10m tolerates several missed
+	// heartbeat refreshes (apiserver flap, agent restart) while
+	// still catching a dead writer far inside the observed freeze.
+	nodeHangCondHeartbeatMaxAge = 10 * time.Minute
+
 	// nodeHangPreCordonAnno stamps every cordon this check applies so
 	// the auto-uncordon path only ever lifts cordons IT created — a
 	// kubectl cordon or an NHC fence carries no stamp and is never
@@ -117,34 +129,65 @@ func init() {
 // ---------------------------------------------------------------------------
 
 // nodeHangLatch reports the first hang latch past its cordon fuse on
-// the node — "" when none qualifies. Every nodeHangConds entry fuses
-// at nodeHangCondMinAge; the nodeClockSkewConds latches (W9-CP3)
-// get nodeClockSkewCordonAge so an NTP daemon restart has time to
-// resync before the node counts as hanging.
-func nodeHangLatch(n *corev1.Node, now time.Time) string {
-	for _, t := range nodeHangConds {
+// the node whose lastHeartbeatTime is still fresh — "" when none
+// qualifies. Every nodeHangConds entry fuses at nodeHangCondMinAge;
+// the nodeClockSkewConds latches (W9-CP3) get
+// nodeClockSkewCordonAge so an NTP daemon restart has time to
+// resync before the node counts as hanging. stale returns the first
+// fused latch the heartbeat-freshness gate rejected — a frozen or
+// absent heartbeat means the writer may be dead and the True value
+// a zombie, so it warns instead of cordoning.
+func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
+	fused := func(t corev1.NodeConditionType, fuse time.Duration) *corev1.NodeCondition {
 		c := kube.NodeCondition(n, t)
-		if c != nil && c.Status == corev1.ConditionTrue &&
-			!c.LastTransitionTime.IsZero() &&
-			now.Sub(c.LastTransitionTime.Time) >= nodeHangCondMinAge {
-			return string(t)
+		if c == nil || c.Status != corev1.ConditionTrue ||
+			c.LastTransitionTime.IsZero() ||
+			now.Sub(c.LastTransitionTime.Time) < fuse {
+			return nil
+		}
+		return c
+	}
+	for _, t := range nodeHangConds {
+		if c := fused(t, nodeHangCondMinAge); c != nil {
+			if condHeartbeatLive(c, now) {
+				return string(t), stale
+			}
+			if stale == "" {
+				stale = string(t)
+			}
 		}
 	}
 	for _, t := range nodeClockSkewConds {
-		if c := kube.NodeCondition(n, t); c != nil &&
-			c.Status == corev1.ConditionTrue &&
-			!c.LastTransitionTime.IsZero() &&
-			now.Sub(c.LastTransitionTime.Time) >= nodeClockSkewCordonAge {
-			return string(t)
+		if c := fused(t, nodeClockSkewCordonAge); c != nil {
+			if condHeartbeatLive(c, now) {
+				return string(t), stale
+			}
+			if stale == "" {
+				stale = string(t)
+			}
 		}
 	}
-	return ""
+	return "", stale
+}
+
+// condHeartbeatLive reports whether a condition's
+// lastHeartbeatTime is fresh enough to trust the value: the writer
+// (nodereporter, kubelet) re-stamps it while alive, so a heartbeat
+// older than nodeHangCondHeartbeatMaxAge — or never set — means the
+// condition may be a zombie left by a dead reporter.
+func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
+	return !c.LastHeartbeatTime.IsZero() &&
+		now.Sub(c.LastHeartbeatTime.Time) < nodeHangCondHeartbeatMaxAge
 }
 
 // nodeHangLatchActive reports whether ANY hang latch is currently
 // True on the node — the auto-uncordon guard. Status only, no age
-// floor: a latch that just re-asserted still means the node is
-// hanging, so the pre-cordon stays.
+// floor and NO heartbeat-freshness gate: a latch that just
+// re-asserted still means the node is hanging, so the pre-cordon
+// stays — and a frozen-True zombie latch holds it too, deliberately
+// conservative (a dead reporter can't prove the node recovered;
+// lifting the cordon on stale data would reschedule onto a node
+// that may still be hung).
 func nodeHangLatchActive(n *corev1.Node) bool {
 	for _, t := range nodeHangConds {
 		if c := kube.NodeCondition(n, t); c != nil &&
@@ -163,7 +206,9 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 
 // checkNodeHangPreCordon patches spec.unschedulable=true onto worker
 // nodes carrying a sustained hang latch (any nodeHangConds entry
-// >=2m, a nodeClockSkewConds latch >=10m) — NHC/SNR will
+// >=2m, a nodeClockSkewConds latch >=10m, and a lastHeartbeatTime
+// fresh enough that the condition's writer is provably alive —
+// a frozen heartbeat warns instead of cordoning) — NHC/SNR will
 // reboot the node, but pods keep scheduling onto it until then. The
 // cordon is stamped passiontech.dev/precordoned-by=node-hang-precordon and
 // the same sweep AUTO-UNCORDONS a stamped node once every latch has
@@ -202,7 +247,18 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 				staleStamp = append(staleStamp, n.Name)
 			}
 		}
-		if latch := nodeHangLatch(n, now); latch != "" {
+		latch, stale := nodeHangLatch(n, now)
+		if stale != "" {
+			// Stale heartbeat = the condition's writer may be dead —
+			// the True value is not cordon evidence, but a dead
+			// reporter is itself worth surfacing (the 2026-11-06
+			// wedge froze these heartbeats fleet-wide).
+			log.Info("WARN: ignoring stale hang condition — "+
+				"condition heartbeat frozen, not cordon evidence",
+				"node", n.Name, "condition", stale,
+				"maxHeartbeatAge", nodeHangCondHeartbeatMaxAge)
+		}
+		if latch != "" {
 			rep.Find(n.Name + ":" + latch)
 		}
 	}
