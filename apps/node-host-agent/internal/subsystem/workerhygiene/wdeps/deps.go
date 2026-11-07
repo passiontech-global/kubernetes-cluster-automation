@@ -51,9 +51,10 @@ type Series struct {
 	UnlinkedOpenFileBytes  int64   // deleted-but-open regular-file bytes held
 	UnlinkedOpenFileCount  int64   // deleted-but-open regular files (deduped)
 	KubepodsSwapUsedBytes  int64   // kubepods.slice memory.swap.current
-	// KubeletPLEGLastSeenAgeSec is the kubelet_pleg_last_seen_seconds
-	// gauge passthrough — seconds since PLEG last observed a container
-	// state change; KubeletPLEGDiscardEvents is the cumulative
+	// KubeletPLEGLastSeenAgeSec is the age the check derives from
+	// kubelet_pleg_last_seen_seconds — a Unix timestamp of the last
+	// PLEG activity, not an age itself — against the host clock;
+	// KubeletPLEGDiscardEvents is the cumulative
 	// kubelet_pleg_discard_events counter.
 	KubeletPLEGLastSeenAgeSec float64
 	KubeletPLEGDiscardEvents  int64

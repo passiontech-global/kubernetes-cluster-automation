@@ -8,7 +8,9 @@ package kubelet_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // TestStorageOperationErrorsExported: every labelled sample of
@@ -18,11 +20,11 @@ import (
 func TestStorageOperationErrorsExported(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["is-active k0sworker.service"] = "active"
-	e.MetricsBody = `# HELP storage_operation_errors_total x
+	e.MetricsBody = fmt.Sprintf(`# HELP storage_operation_errors_total x
 storage_operation_errors_total{operation_name="volume_attach",volume_plugin="kubernetes.io/csi"} 3
 storage_operation_errors_total{operation_name="volume_mount",volume_plugin="kubernetes.io/csi"} 2
-kubelet_pleg_last_seen_seconds 1
-`
+kubelet_pleg_last_seen_seconds %d
+`, time.Now().Unix())
 	e.H.Cycle(context.Background())
 	if e.H.KubeletStorageOperationErrors != 5 {
 		t.Fatalf("storage errors=%d want 5 (3 attach + 2 mount)",

@@ -6,6 +6,7 @@ package kubelet_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -172,24 +173,47 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 
 // --- PLEG metrics early warning (kubelet /metrics) ---
 
-const plegMetricsHealthy = `# HELP kubelet_pleg_relist_duration_seconds x
+// kubelet_pleg_last_seen_seconds is a Unix TIMESTAMP upstream —
+// fixtures must stamp it relative to the fixture clock, never a
+// bare "age" number.
+func plegMetricsHealthy(now time.Time) string {
+	return fmt.Sprintf(`# HELP kubelet_pleg_relist_duration_seconds x
 kubelet_pleg_relist_duration_seconds{quantile="0.5"} 0.2
 kubelet_pleg_relist_duration_seconds{quantile="0.9"} 0.5
 kubelet_pleg_relist_duration_seconds{quantile="0.99"} 1.0
 kubelet_pleg_relist_duration_seconds_sum 40
 kubelet_pleg_relist_duration_seconds_count 200
-kubelet_pleg_last_seen_seconds 2
+kubelet_pleg_last_seen_seconds %d
 kubelet_pleg_discard_events 7
-`
+`, now.Unix()-2)
+}
 
-const plegMetricsSlow = `kubelet_pleg_relist_duration_seconds{quantile="0.5"} 1.0
+func plegMetricsSlow(now time.Time) string {
+	return fmt.Sprintf(`kubelet_pleg_relist_duration_seconds{quantile="0.5"} 1.0
 kubelet_pleg_relist_duration_seconds{quantile="0.9"} 6.5
 kubelet_pleg_relist_duration_seconds{quantile="0.99"} 8.0
 kubelet_pleg_relist_duration_seconds_sum 120
 kubelet_pleg_relist_duration_seconds_count 200
-kubelet_pleg_last_seen_seconds 45
+kubelet_pleg_last_seen_seconds %d
 kubelet_pleg_discard_events 12
-`
+`, now.Unix()-45)
+}
+
+// plegHistogram is the kubelet-1.37 exposition shape: relist
+// duration is a HISTOGRAM (no quantile rows), last_seen a Unix
+// timestamp. fast/sum/count describe the cumulative counters.
+func plegHistogram(now time.Time, fast, slow, sum, count float64) string {
+	return fmt.Sprintf(`kubelet_pleg_relist_duration_seconds_bucket{le="0.005"} 0
+kubelet_pleg_relist_duration_seconds_bucket{le="0.05"} 80
+kubelet_pleg_relist_duration_seconds_bucket{le="0.5"} %v
+kubelet_pleg_relist_duration_seconds_bucket{le="5"} %v
+kubelet_pleg_relist_duration_seconds_bucket{le="10"} %v
+kubelet_pleg_relist_duration_seconds_bucket{le="+Inf"} %v
+kubelet_pleg_relist_duration_seconds_sum %v
+kubelet_pleg_relist_duration_seconds_count %v
+kubelet_pleg_last_seen_seconds %d
+`, fast-20, fast, fast+slow, fast+slow, sum, count, now.Unix())
+}
 
 // TestPLEGUnhealthyLatchesAfterConsecNeeded: a degraded relist /
 // last-seen scrape must latch state-kubelet-pleg-unhealthy after
@@ -198,15 +222,15 @@ kubelet_pleg_discard_events 12
 func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["is-active k0sworker.service"] = "active"
-	e.MetricsBody = plegMetricsSlow
+	e.MetricsBody = plegMetricsSlow(e.Now)
 	for i := 0; i < 2; i++ {
 		e.H.Cycle(context.Background())
 	}
 	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("state-kubelet-pleg-unhealthy should latch after 2 over-threshold scrapes")
 	}
-	if e.H.KubeletPLEGLastSeenAgeSec != 45 {
-		t.Fatalf("last-seen gauge=%v want 45", e.H.KubeletPLEGLastSeenAgeSec)
+	if a := e.H.KubeletPLEGLastSeenAgeSec; a < 45 || a >= 46 {
+		t.Fatalf("last-seen age gauge=%v want ~45 (timestamp-derived)", a)
 	}
 	if e.H.KubeletPLEGDiscardEvents != 12 {
 		t.Fatalf("discard counter=%v want 12", e.H.KubeletPLEGDiscardEvents)
@@ -215,7 +239,7 @@ func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
 	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("PLEG metric degrade must not trip the syncloop latch")
 	}
-	e.MetricsBody = plegMetricsHealthy
+	e.MetricsBody = plegMetricsHealthy(e.Now)
 	e.H.Cycle(context.Background())
 	if e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("recovery should clear the pleg latch")
@@ -225,13 +249,89 @@ func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
 	}
 }
 
+// TestPLEGLiveTimestampNeverFlags — regression for the fleet-wide
+// false cordon (all 6 workers latched KubeletPLEGUnhealthy at
+// rollout): the metric is a Unix timestamp (~1.7e9 on a live node),
+// which an age-comparison flags on EVERY scrape of EVERY node. A
+// current timestamp must keep the latch clear — here in the
+// kubelet-1.37 histogram exposition.
+func TestPLEGLiveTimestampNeverFlags(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.MetricsBody = plegHistogram(e.Now, 100, 0, 3, 100)
+	for i := 0; i < 3; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if e.H.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("a live last-seen timestamp must never flag kubelet-pleg-unhealthy")
+	}
+}
+
+// TestPLEGStaleTimestampLatches: a last-seen stamp older than 30s
+// IS the stall signal — two consecutive stale scrapes latch.
+func TestPLEGStaleTimestampLatches(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.MetricsBody = plegHistogram(e.Now.Add(-45*time.Second), 100, 0, 3, 100)
+	for i := 0; i < 2; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("a 45s-old last-seen stamp should latch kubelet-pleg-unhealthy")
+	}
+}
+
+// TestPLEGHistogramBaselineSeedsBeforeFlagging: the first scrape
+// only seeds the relist baseline — a pre-existing slow tail is not
+// counted. Only NEW >5s relists after the baseline flag.
+func TestPLEGHistogramBaselineSeedsBeforeFlagging(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	// Node with 5 historical >5s relists — cumulative, not current.
+	e.MetricsBody = plegHistogram(e.Now, 95, 5, 30, 100)
+	for i := 0; i < 2; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if e.H.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("a stable historical slow tail must not flag")
+	}
+	// Two consecutive scrapes each adding new >5s relists:
+	// cumulative slow tail 5→10→15 flags on both cycles.
+	e.MetricsBody = plegHistogram(e.Now, 190, 10, 35, 200)
+	e.H.Cycle(context.Background())
+	e.MetricsBody = plegHistogram(e.Now, 285, 15, 40, 300)
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("new >5s relists in the histogram tail should latch")
+	}
+}
+
+// TestPLEGHistogramDeltaAvgLatches: new relists averaging over 5s
+// flag via the Δsum/Δcount path even when none lands above le=5
+// individually (impossible in practice — covers the avg half).
+func TestPLEGHistogramDeltaAvgLatches(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.MetricsBody = plegHistogram(e.Now, 100, 0, 3, 100)
+	e.H.Cycle(context.Background()) // seed baseline
+	// Two consecutive scrapes of ~6s relists: delta avg 6.0 > 5
+	// on both cycles (deltas only exist while count grows).
+	e.MetricsBody = plegHistogram(e.Now, 100, 10, 63, 110)
+	e.H.Cycle(context.Background())
+	e.MetricsBody = plegHistogram(e.Now, 110, 10, 120, 120)
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("a >5s delta avg should latch kubelet-pleg-unhealthy")
+	}
+}
+
 // TestPLEGScrapeErrorIsInconclusive: a failed /metrics GET must
 // neither count a fail nor clear a held latch — same keep-state
 // rule as the other failed-probe paths.
 func TestPLEGScrapeErrorIsInconclusive(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["is-active k0sworker.service"] = "active"
-	e.MetricsBody = plegMetricsSlow
+	e.MetricsBody = plegMetricsSlow(e.Now)
 	for i := 0; i < 2; i++ {
 		e.H.Cycle(context.Background())
 	}

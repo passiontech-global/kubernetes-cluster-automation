@@ -181,7 +181,7 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 		"memory.swap.current of kubepods.slice — pod swap-out in progress.",
 		float64(d.Series.KubepodsSwapUsedBytes))
 	b.Gauge("node_agent_kubelet_pleg_last_seen_age_seconds",
-		"kubelet_pleg_last_seen_seconds — seconds since PLEG last saw a container state change.",
+		"Age of the kubelet_pleg_last_seen_seconds timestamp — seconds since PLEG was last active.",
 		d.Series.KubeletPLEGLastSeenAgeSec)
 	counter("node_agent_kubelet_pleg_discard_events_total",
 		"kubelet_pleg_discard_events counter passthrough — PLEG events dropped under backlog.",
