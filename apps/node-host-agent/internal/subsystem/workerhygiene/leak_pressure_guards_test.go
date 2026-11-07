@@ -643,6 +643,19 @@ func TestOrphanCNINetnsReappearedResetsWindow(t *testing.T) {
 
 // --- W9-NM4: containerd content-store prune ---
 
+// stubPruneCount stubs the single Seams.Ctr.Exec seam to count
+// `content prune` execs (the argv the PruneContent method builds —
+// "prune" is the last element); an ingest-rm exec in the same
+// cycle must not inflate the count.
+func stubPruneCount(e *env, n *int) {
+	e.H.Cfg.Seams.Ctr.Exec = func(_ context.Context, argv ...string) error {
+		if argv[len(argv)-1] == "prune" {
+			*n++
+		}
+		return nil
+	}
+}
+
 // TestCtrIngestGCContentPruneAboveWatermark: above the disk high
 // watermark the store-wide `content prune` fires on its own 6h
 // budget — in addition to the stale-ingest sweep.
@@ -650,10 +663,7 @@ func TestCtrIngestGCContentPruneAboveWatermark(t *testing.T) {
 	e := fixture(t)
 	e.DiskUsed = 0.80
 	prunes := 0
-	e.H.Cfg.Seams.Ctr.CtrPruneContent = func(context.Context) error {
-		prunes++
-		return nil
-	}
+	stubPruneCount(e, &prunes)
 
 	wdepstest.Check[*ctr.IngestGCCheck](e.H, wdeps.CheckIngestGC).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 1 {
@@ -684,10 +694,7 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 	e := fixture(t)
 	e.DiskUsed = 0.50
 	prunes := 0
-	e.H.Cfg.Seams.Ctr.CtrPruneContent = func(context.Context) error {
-		prunes++
-		return nil
-	}
+	stubPruneCount(e, &prunes)
 	wdepstest.Check[*ctr.IngestGCCheck](e.H, wdeps.CheckIngestGC).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 0 {
 		t.Fatalf("content prunes below the watermark = %d, want 0", prunes)
@@ -700,8 +707,11 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	e := fixture(t)
 	e.DiskUsed = 0.80
-	e.H.Cfg.Seams.Ctr.CtrPruneContent = func(context.Context) error {
-		return errors.New("ctr content prune: exit status 1")
+	e.H.Cfg.Seams.Ctr.Exec = func(_ context.Context, argv ...string) error {
+		if argv[len(argv)-1] == "prune" {
+			return errors.New("ctr content prune: exit status 1")
+		}
+		return nil
 	}
 	wdepstest.Check[*ctr.IngestGCCheck](e.H, wdeps.CheckIngestGC).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if got := e.LogLines(t); !strings.Contains(got, "content prune failed") {
@@ -713,10 +723,7 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	}
 	// Budget spent → an immediate retry does not re-run the prune.
 	calls := 0
-	e.H.Cfg.Seams.Ctr.CtrPruneContent = func(context.Context) error {
-		calls++
-		return nil
-	}
+	stubPruneCount(e, &calls)
 	wdepstest.Check[*ctr.IngestGCCheck](e.H, wdeps.CheckIngestGC).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if calls != 0 {
 		t.Fatalf("prune retried inside the budget (%d calls)", calls)

@@ -102,7 +102,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		ref := e.Name()
 		d := filepath.Join(c.d.Cfg.Ctr.IngestDir, ref)
-		if rerr := c.d.Cfg.Seams.Ctr.CtrRmIngest(ctx, ref); rerr != nil {
+		if rerr := c.d.Cfg.Seams.Ctr.RmIngest(ctx, ref); rerr != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
 		}
@@ -136,7 +136,7 @@ func maybePruneContentStore(d *wdeps.Deps, ctx context.Context) {
 	if !d.State.RateTrySpend("last-content-gc", contentPruneInterval) {
 		return
 	}
-	if err := d.Cfg.Seams.Ctr.CtrPruneContent(ctx); err != nil {
+	if err := d.Cfg.Seams.Ctr.PruneContent(ctx); err != nil {
 		d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-ingest-gc content prune failed: %v", err))
 		return

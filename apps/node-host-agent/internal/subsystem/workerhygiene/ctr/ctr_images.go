@@ -210,7 +210,7 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// not consume it.
 			c.execFormatHealed[img] = true
 		}
-		if err := c.d.Cfg.Seams.Ctr.CtrRmImage(ctx, img); err != nil {
+		if err := c.d.Cfg.Seams.Ctr.RmImage(ctx, img); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ctr image rm %s failed: %v", img, err))
 			continue

@@ -2,11 +2,19 @@
 // flat ~24-func list outgrew readability, so the fields now live in
 // the four embedded groups below: Probe (evidence reads over
 // HTTP/DNS/unix/kubelet-metrics/pod-log), Host (signals, clock,
-// fs/scheduling/journal/proc primitives), Ctr (containerd content
-// execs) and Cilium (agent unix-API + WireGuard). Field names are
+// fs/scheduling/journal/proc primitives), Ctr (the one containerd
+// exec) and Cilium (the one agent unix-API GET). Field names are
 // unchanged inside each group and every default is the same nil →
 // production impl the flat applyDefaults filled — only the
 // organization moved.
+//
+// DERIVED reads are not seams: a (low-level seam + fixed argv +
+// parsing) composition adds no test coverage a stub of the
+// low-level seam doesn't already give, so those live as named
+// methods on their group instead of func fields — Ctr.RmImage /
+// RmIngest / PruneContent build argv over the single Ctr.Exec seam,
+// and Cilium.WGAllowedIPs / EncryptPeers / ServiceBackends compose
+// Cilium.UnixGet (or Config.Systemd for `wg`) with the parsers.
 package wdeps
 
 import (
@@ -19,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -114,50 +123,106 @@ type Host struct {
 	DeletedFDStatFn func(path string) (dev, ino uint64, size int64, ok bool)
 }
 
-// Ctr holds the containerd content seams — the `k0s ctr` execs
-// (image removal, stale ingest ref GC, watermark-gated content
-// prune) that all run through the systemd exec wrapper.
+// Ctr holds the ONE containerd content seam — the exec every `k0s
+// ctr` mutation (image removal, stale ingest ref GC,
+// watermark-gated content prune) shares through the systemd exec
+// wrapper. The named methods below build each command's argv, so
+// call sites keep their readable names and tests stub exactly one
+// func.
 type Ctr struct {
-	// CtrRmImage removes one image from the k8s.io containerd
-	// namespace — the corrupted-layer remedy (37), `k0s ctr
-	// --namespace k8s.io images rm --sync <image>` via the systemd
-	// exec wrapper. nil → Systemd.Exec default. Seam.
-	CtrRmImage func(ctx context.Context, image string) error
-	// CtrRmIngest removes one stale ingest ref — `k0s ctr -n k8s.io
-	// content ingest rm <ref>` via the systemd exec wrapper (A3).
-	// nil → Systemd.Exec default. Seam.
-	CtrRmIngest func(ctx context.Context, ref string) error
-	// CtrPruneContent runs the store-wide content GC — `k0s ctr -n
-	// k8s.io content prune` via the systemd exec wrapper (W9). It
-	// only fires while /var/lib/k0s sits above the high watermark,
-	// on the last-content-gc 6h budget. nil → Systemd.Exec
-	// default. Seam.
-	CtrPruneContent func(ctx context.Context) error
+	// Exec runs one argv through the systemd exec wrapper — a
+	// full-argv passthrough (argv[0] is the binary name, the
+	// Systemd.Exec name+args shape). nil → Systemd.Exec default; a
+	// nil Systemd client errors the same "no systemd client wired".
+	// Seam.
+	Exec func(ctx context.Context, argv ...string) error
 }
 
-// Cilium holds the cilium seams — the unix-socket GET every agent
-// endpoint shares plus the WireGuard allowed-ips / encrypt-status /
-// BPF service-map evidence reads.
+// RmImage removes one image from the k8s.io containerd namespace —
+// the corrupted-layer remedy (37), `k0s ctr --namespace k8s.io
+// images rm --sync <image>` over the Exec seam.
+func (s *Ctr) RmImage(ctx context.Context, image string) error {
+	return s.Exec(ctx,
+		"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
+}
+
+// RmIngest removes one stale ingest ref — `k0s ctr -n k8s.io
+// content ingest rm <ref>` over the Exec seam (A3).
+func (s *Ctr) RmIngest(ctx context.Context, ref string) error {
+	return s.Exec(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
+}
+
+// PruneContent runs the store-wide content GC — `k0s ctr -n k8s.io
+// content prune` over the Exec seam (W9). It only fires while
+// /var/lib/k0s sits above the high watermark, on the
+// last-content-gc 6h budget.
+func (s *Ctr) PruneContent(ctx context.Context) error {
+	return s.Exec(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "content", "prune")
+}
+
+// Cilium holds the ONE cilium seam — the unix-socket GET every
+// agent endpoint shares. The WireGuard allowed-ips / encrypt-peers /
+// BPF service-map evidence reads are derived from it (or from
+// Config.Systemd for the `wg` exec): they are methods below, not
+// seams — stubbing UnixGet and testing the parsers directly gives
+// equal coverage with less surface.
 type Cilium struct {
 	// UnixGet GETs path over a unix socket and returns the body —
 	// the cilium-dbg endpoint list replacement (35). Seam.
 	UnixGet func(ctx context.Context, socket, path string) ([]byte, error)
-	// WGAllowedIPsFn returns how many cilium_wg0 peers carry a real
-	// allowed-ips set — `wg show cilium_wg0 allowed-ips` parsed
-	// (peers at "(none)" are wiped). nil → Systemd.Exec default.
-	// Seam for the W5.6 check.
-	WGAllowedIPsFn func(ctx context.Context) (int, error)
-	// CiliumEncryptPeersFn returns the expected WG peer count —
-	// `cilium-dbg encrypt status` parsed. An error or a count <=0
-	// makes the caller fall back to ReadyNodes-1. nil →
-	// Systemd.Exec default. Seam.
-	CiliumEncryptPeersFn func(ctx context.Context) (int, error)
-	// CiliumServiceBackendsFn returns the local BPF service map's
-	// backend counts keyed "<namespace>/<name>" — the cilium-lrp
-	// desync evidence source. Default: GET /v1/service off the
-	// agent socket via UnixGet (`cilium-dbg service list -o json`
-	// equivalent — same API the CLI scrapes). Seam.
-	CiliumServiceBackendsFn func(ctx context.Context) (map[string]int, error)
+}
+
+// WGAllowedIPs returns how many cilium_wg0 peers carry a real
+// allowed-ips set — `wg show cilium_wg0 allowed-ips` through the
+// systemd exec wrapper (sd is Config.Systemd), ParseWGAllowedIPs'd
+// (peers at "(none)" are wiped). The W5.6 check's derived read —
+// tests drive it through the systemd exec fake.
+func (s *Cilium) WGAllowedIPs(ctx context.Context, sd *systemd.Client) (int, error) {
+	if sd == nil {
+		return 0, errors.New("no systemd client wired")
+	}
+	out, err := sd.Exec(ctx, "wg", "show", "cilium_wg0", "allowed-ips")
+	if err != nil {
+		return 0, err
+	}
+	return ParseWGAllowedIPs(out), nil
+}
+
+// EncryptPeers returns the expected WG peer count — the agent's
+// /v1/healthz cluster.nodes[] member count through the UnixGet
+// seam. The agent's own API beats `cilium-dbg`: the binary only
+// lives INSIDE the cilium-agent container — an sd.Exec on the host
+// always fails and silently degrades every cycle to the
+// ReadyNodes-1 fallback. /v1/healthz's cluster.nodes[] lists
+// exactly the remote cilium members this node should peer with
+// (virtual/liqo nodes run no agent, so they never appear). An error
+// or a count <=0 makes the caller fall back to ReadyNodes-1.
+func (s *Cilium) EncryptPeers(ctx context.Context, socket string) (int, error) {
+	body, err := s.UnixGet(ctx, socket, "/v1/healthz")
+	if err != nil {
+		return 0, err
+	}
+	n, ok := ParseCiliumHealthNodes(body)
+	if !ok {
+		return 0, errors.New("no cluster.nodes in cilium healthz")
+	}
+	return n, nil
+}
+
+// ServiceBackends returns the local BPF service map's backend
+// counts keyed "<namespace>/<name>" — the cilium-lrp desync
+// evidence source. GET /v1/service off the agent socket through
+// the UnixGet seam (`cilium-dbg service list -o json` equivalent —
+// the CLI scrapes the same endpoint over the same socket; no
+// container exec).
+func (s *Cilium) ServiceBackends(ctx context.Context, socket string) (map[string]int, error) {
+	body, err := s.UnixGet(ctx, socket, "/v1/service")
+	if err != nil {
+		return nil, err
+	}
+	return ParseCiliumServiceBackends(body)
 }
 
 // Seams groups the unexported test-seam funcs. Every one has a
@@ -175,18 +240,16 @@ type Seams struct {
 	Probe
 	// Host — signals, clock, fs/scheduling/journal/proc primitives.
 	Host
-	// Ctr — containerd image/ingest/content-prune execs.
+	// Ctr — the containerd exec behind the named rm/prune methods.
 	Ctr
-	// Cilium — agent unix-API + WireGuard seams.
+	// Cilium — the agent unix-API GET behind the derived reads.
 	Cilium
 }
 
 // applyDefaults fills the production implementations of every test
 // seam. cfg carries the already-defaulted knob groups — the systemd
-// exec defaults capture c.Systemd, and the cilium encrypt-peers
-// default goes through the UnixGet seam + Cilium.Socket. The group
-// calls are independent nil-checks (the cilium closures read
-// UnixGet lazily at call time), so their order is unobservable.
+// exec default captures c.Systemd. The group calls are independent
+// nil-checks, so their order is unobservable.
 func (s *Seams) applyDefaults(c *Config) {
 	s.Probe.applyDefaults(c)
 	s.Host.applyDefaults(c)
@@ -296,95 +359,29 @@ func (s *Host) applyDefaults(c *Config) {
 	}
 }
 
-// applyDefaults fills the Ctr group's production implementations —
-// same nil → default logic and order the flat pass had.
+// applyDefaults fills the Ctr group's production implementation —
+// the one exec seam: a full-argv passthrough onto Systemd.Exec,
+// nil-safe the same way the three per-command defaults were (the
+// named methods carry the argv each old default hardcoded).
 func (s *Ctr) applyDefaults(c *Config) {
-	if s.CtrRmImage == nil {
+	if s.Exec == nil {
 		sd := c.Systemd
-		s.CtrRmImage = func(ctx context.Context, image string) error {
+		s.Exec = func(ctx context.Context, argv ...string) error {
 			if sd == nil {
 				return errors.New("no systemd client wired")
 			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
-			return err
-		}
-	}
-	if s.CtrRmIngest == nil {
-		sd := c.Systemd
-		s.CtrRmIngest = func(ctx context.Context, ref string) error {
-			if sd == nil {
-				return errors.New("no systemd client wired")
-			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
-			return err
-		}
-	}
-	if s.CtrPruneContent == nil {
-		sd := c.Systemd
-		s.CtrPruneContent = func(ctx context.Context) error {
-			if sd == nil {
-				return errors.New("no systemd client wired")
-			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "-n", "k8s.io", "content", "prune")
+			_, err := sd.Exec(ctx, argv[0], argv[1:]...)
 			return err
 		}
 	}
 }
 
-// applyDefaults fills the Cilium group's production implementations —
-// same nil → default logic and order the flat pass had. The service
-// backends and encrypt-peers closures read s.UnixGet at CALL time so
-// a test re-stub of the socket GET still reaches them.
-func (s *Cilium) applyDefaults(c *Config) {
+// applyDefaults fills the Cilium group's production implementation —
+// just the UnixGet socket GET now; the WG/service-map reads are the
+// derived methods on the group (they read s.UnixGet at CALL time so
+// a test re-stub of the socket GET still reaches them).
+func (s *Cilium) applyDefaults(_ *Config) {
 	if s.UnixGet == nil {
 		s.UnixGet = probee.UnixGet
-	}
-	if s.WGAllowedIPsFn == nil {
-		sd := c.Systemd
-		s.WGAllowedIPsFn = func(ctx context.Context) (int, error) {
-			if sd == nil {
-				return 0, errors.New("no systemd client wired")
-			}
-			out, err := sd.Exec(ctx, "wg", "show", "cilium_wg0", "allowed-ips")
-			if err != nil {
-				return 0, err
-			}
-			return ParseWGAllowedIPs(out), nil
-		}
-	}
-	if s.CiliumServiceBackendsFn == nil {
-		s.CiliumServiceBackendsFn = func(ctx context.Context) (map[string]int, error) {
-			// The agent API /v1/service is the `cilium-dbg service
-			// list -o json` equivalent — the CLI scrapes the same
-			// endpoint over the same socket; no container exec.
-			body, err := s.UnixGet(ctx, c.Cilium.Socket, "/v1/service")
-			if err != nil {
-				return nil, err
-			}
-			return ParseCiliumServiceBackends(body)
-		}
-	}
-	if s.CiliumEncryptPeersFn == nil {
-		s.CiliumEncryptPeersFn = func(ctx context.Context) (int, error) {
-			// The agent's own API beats `cilium-dbg`: the binary only
-			// lives INSIDE the cilium-agent container — an sd.Exec on
-			// the host always fails and silently degrades every cycle
-			// to the ReadyNodes-1 fallback. /v1/healthz's
-			// cluster.nodes[] lists exactly the remote cilium members
-			// this node should peer with (virtual/liqo nodes run no
-			// agent, so they never appear).
-			body, err := s.UnixGet(ctx, c.Cilium.Socket, "/v1/healthz")
-			if err != nil {
-				return 0, err
-			}
-			n, ok := ParseCiliumHealthNodes(body)
-			if !ok {
-				return 0, errors.New("no cluster.nodes in cilium healthz")
-			}
-			return n, nil
-		}
 	}
 }

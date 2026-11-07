@@ -294,6 +294,19 @@ func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 
 // --- check: ctr-image-healer (37) ---
 
+// recordImageRm points the single Seams.Ctr.Exec seam at a recorder
+// for `images rm --sync <ref>` calls (the argv the RmImage method
+// builds — the ref is the last element). Other ctr execs pass
+// through quietly.
+func recordImageRm(e *env, removed *[]string) {
+	e.H.Cfg.Seams.Ctr.Exec = func(_ context.Context, argv ...string) error {
+		if slices.Contains(argv, "--sync") {
+			*removed = append(*removed, argv[len(argv)-1])
+		}
+		return nil
+	}
+}
+
 // waitingPod builds a Pending pod on node-a whose single container is
 // stuck Waiting with the given reason/message/image — 37 evidence.
 // imageID is the CRI repoDigest record (e.g.
@@ -322,10 +335,7 @@ func waitingPod(name, ns, uid, image, imageID, reason, msg string) *corev1.Pod {
 func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("stuck-pull", "default", wdepstest.UIDA, "registry.local/app:v1",
 		"registry.local/app@sha256:f00dcafe",
 		"ImagePullBackOff",
@@ -352,10 +362,7 @@ func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	mk := func(name, uid, image, imageID, reason, msg string) {
 		p := waitingPod(name, "default", uid, image, imageID, reason, msg)
 		if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
@@ -394,10 +401,7 @@ func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 func TestCtrImageHealerAllSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	mk := func(name, uid, image, imageID, reason, msg string) {
 		p := waitingPod(name, "default", uid, image, imageID, reason, msg)
 		if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
@@ -426,10 +430,7 @@ func TestCtrImageHealerAllSignatures(t *testing.T) {
 func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	msg := "content digest sha256:aaa111: not found"
 	for i, uid := range []string{wdepstest.UIDA, wdepstest.UIDB} {
 		p := waitingPod(fmt.Sprintf("dup-%d", i), "default", uid,
@@ -461,8 +462,9 @@ func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 
 func TestCtrImageHealerRmErrorKeepsGoing(t *testing.T) {
 	e := fixture(t)
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		if img == "docker.io/library/bad:1" {
+	e.H.Cfg.Seams.Ctr.Exec = func(_ context.Context, argv ...string) error {
+		if slices.Contains(argv, "--sync") &&
+			argv[len(argv)-1] == "docker.io/library/bad:1" {
 			return errors.New("ctr exploded")
 		}
 		return nil
@@ -489,8 +491,14 @@ func TestCtrImageHealerRmErrorKeepsGoing(t *testing.T) {
 
 func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 	e := fixture(t)
-	// No seam override — the default wraps Systemd.Exec. The fake
-	// answers any `ctr images rm` argv with success.
+	// Bind stubs Seams.Ctr.Exec — restore the production default's
+	// shape (a full-argv passthrough onto Systemd.Exec) so the rm
+	// argv lands on the systemd fake, which answers any `ctr
+	// images rm` with success.
+	e.H.Cfg.Seams.Ctr.Exec = func(ctx context.Context, argv ...string) error {
+		_, err := e.H.Cfg.Systemd.Exec(ctx, argv[0], argv[1:]...)
+		return err
+	}
 	e.SDReply["images rm"] = ""
 	p := waitingPod("stuck", "default", wdepstest.UIDA, "registry.local/app:v1",
 		"registry.local/app@sha256:feed",
@@ -500,20 +508,17 @@ func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 	}
 	e.H.Cycle(context.Background())
 	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync registry.local/app:v1") {
-		t.Fatalf("default seam did not exec ctr images rm, cmds=%v", e.SDCmds)
+		t.Fatalf("RmImage did not exec ctr images rm, cmds=%v", e.SDCmds)
 	}
 	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync registry.local/app@sha256:feed") {
-		t.Fatalf("default seam did not exec ctr images rm on the repoDigest, cmds=%v", e.SDCmds)
+		t.Fatalf("RmImage did not exec ctr images rm on the repoDigest, cmds=%v", e.SDCmds)
 	}
 }
 
 func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	e.CS.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("apiserver flake")
 	})
@@ -563,15 +568,12 @@ func TestNormalizeCRIImageName(t *testing.T) {
 }
 
 // The whole point of the fix: a short dockerhub spec must reach
-// ctrRmImage as the canonical docker.io/library/… ref, and the
+// Ctr.RmImage as the canonical docker.io/library/… ref, and the
 // repoDigest record goes with it.
 func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("stuck-pull", "default", wdepstest.UIDA, "nginx:1.25",
 		"docker.io/library/nginx@sha256:beef",
 		"ImagePullBackOff", "content digest sha256:abc123: not found")
@@ -590,10 +592,7 @@ func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("stuck-pull", "default", wdepstest.UIDA, "nginx@sha256:beef",
 		"docker.io/library/nginx@sha256:beef",
 		"CreateContainerError", "failed to extract layer sha256:abc")
@@ -611,10 +610,7 @@ func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("stuck-pull", "default", wdepstest.UIDA, "nginx:1.25@sha256:beef",
 		"docker.io/library/nginx@sha256:beef",
 		"ImagePullBackOff", "content digest sha256:abc123: not found")
@@ -629,14 +625,11 @@ func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 }
 
 // Private-registry refs (with port, multi-segment path) must reach
-// ctrRmImage byte-for-byte unchanged — no docker.io/library rewrite.
+// Ctr.RmImage byte-for-byte unchanged — no docker.io/library rewrite.
 func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("stuck-pull", "default", wdepstest.UIDA,
 		"registry.local:5000/team/app:v2", "registry.local:5000/team/app@sha256:cafe",
 		"ErrImagePull", "parent snapshot sha256:def456 does not exist")
@@ -659,10 +652,7 @@ func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 func TestCtrImageHealerCorruptLayerSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	for i, tc := range []struct {
 		reason, msg string
 	}{
@@ -691,10 +681,7 @@ func TestCtrImageHealerCorruptLayerSignatures(t *testing.T) {
 func TestCtrImageHealerExecFormatOncePerImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	p := waitingPod("wrongarch", "default", wdepstest.UIDA, "app:v1",
 		"registry.local/app@sha256:beef",
 		"StartError", "exec /bin/app: exec format error")
@@ -725,10 +712,7 @@ func TestCtrImageHealerExecFormatOncePerImage(t *testing.T) {
 func TestCtrImageHealerExecFormatPerRef(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
-		removed = append(removed, img)
-		return nil
-	}
+	recordImageRm(e, &removed)
 	for i, img := range []string{"bad-a:1", "bad-b:2"} {
 		p := waitingPod("w"+strconv.Itoa(i), "default",
 			wdepstest.UIDA[:8]+strconv.Itoa(i), img, "",
@@ -777,7 +761,7 @@ func TestCtrIngestGCCleansStaleDirs(t *testing.T) {
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale ingest dir should be removed, stat err=%v", err)
 	}
-	if !e.SDRan("ctr ingest rm deadbeefref") {
+	if !e.SDRan("content ingest rm deadbeefref") {
 		t.Fatal("ctr ingest rm should run for the stale ref")
 	}
 	got, err := counterValue(e.H.CtrIngestsCleaned)

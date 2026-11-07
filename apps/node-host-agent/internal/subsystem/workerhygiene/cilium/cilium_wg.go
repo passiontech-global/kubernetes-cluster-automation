@@ -158,14 +158,14 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
 		return
 	}
-	actual, err := c.d.Cfg.Seams.Cilium.WGAllowedIPsFn(ctx)
+	actual, err := c.d.Cfg.Seams.Cilium.WGAllowedIPs(ctx, c.d.Cfg.Systemd)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
 		return
 	}
-	expected, err := c.d.Cfg.Seams.Cilium.CiliumEncryptPeersFn(ctx)
+	expected, err := c.d.Cfg.Seams.Cilium.EncryptPeers(ctx, c.d.Cfg.Cilium.Socket)
 	if err != nil || expected <= 0 {
 		// encrypt status unreadable or carries no count — fall back
 		// to ReadyNodes-1 (every OTHER Ready node is a peer).

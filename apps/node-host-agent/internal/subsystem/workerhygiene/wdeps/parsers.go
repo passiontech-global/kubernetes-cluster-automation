@@ -1,8 +1,9 @@
-// parsers.go — the response parsers the Seams production defaults
-// need: Seams.applyDefaults wires the WG allowed-ips counter and
-// the cilium encrypt-peers fallback, and both parse command/API
-// output. They live here (not in cilium/) because wdeps cannot
-// import a domain package that itself imports wdeps.
+// parsers.go — the response parsers the Cilium group's derived
+// reads (seams.go: WGAllowedIPs / EncryptPeers / ServiceBackends)
+// need — the `wg allowed-ips` peer count, the /v1/healthz cluster
+// nodes and the /v1/service backend map. They live here (not in
+// cilium/) because wdeps cannot import a domain package that
+// itself imports wdeps.
 package wdeps
 
 import (

@@ -22,7 +22,7 @@
 //   - overlayfs-stale-mount   — runtime_overlayfs_stale.go: pods
 //     stuck Waiting/Failed on ESTALE/missing-lowerdir overlay errors
 //     never heal by retrying: the corrupt layer is removed via
-//     ctrRmImage so the next pull re-fetches (15m shared
+//     Ctr.RmImage so the next pull re-fetches (15m shared
 //     last-ctr-image-rm budget).
 //   - io-pressure-throttler   — runtime_io_pressure.go: disk
 //     io_ticks util, write await and PSI io full avgs exported every
