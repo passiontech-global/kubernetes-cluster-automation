@@ -117,7 +117,8 @@ type statefulSetOnDeleteRoller struct {
 // entirely — same contract as cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+		r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
 		return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
 	})
 }
@@ -195,7 +196,8 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	rolled := 0
 	for _, d := range due {
 		sts := &stsItems[d.idx]
-		if err := r.rollOne(ctx, sts, now, log); err != nil {
+		didRoll, err := r.rollOne(ctx, sts, now, log)
+		if err != nil {
 			// Per-STS failures must not starve the rest — tolerated
 			// sub-operation failure, counted here so the nil return
 			// still leaves a trace.
@@ -203,7 +205,9 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 			metrics.IncError(r.queue)
 			continue
 		}
-		rolled++
+		if didRoll {
+			rolled++
+		}
 	}
 	log.Info("sweep done", "due", len(due), "rolled", rolled)
 	return nil
@@ -211,16 +215,18 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 
 // rollOne applies gates 2+3 to one StatefulSet and deletes exactly
 // one stale pod when they hold. A gate failure is a skip, not an
-// error — only API/validation failures return one.
+// error — only API/validation failures return one. The bool reports
+// whether a pod eviction actually landed — the caller's "rolled"
+// count must not count gate-skips as rolls.
 func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
-	sts *appsv1.StatefulSet, now time.Time, log logr.Logger) error {
+	sts *appsv1.StatefulSet, now time.Time, log logr.Logger) (bool, error) {
 
 	pods, err := r.ownedPods(ctx, sts)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(pods) == 0 {
-		return nil // nothing to roll
+		return false, nil // nothing to roll
 	}
 
 	// Membership gate (BUG-C3): the full desired set must be present
@@ -236,7 +242,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 			"pods", len(pods),
 			"specReplicas", ptr.Deref(sts.Spec.Replicas, -1),
 			"readyReplicas", sts.Status.ReadyReplicas)
-		return nil
+		return false, nil
 	}
 
 	// Gate 3: every owned pod Ready, the newest one stable >= 5m —
@@ -248,7 +254,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 			log.Info("skip: owned pod not Ready",
 				"statefulset", sts.Namespace+"/"+sts.Name,
 				"pod", p.Name)
-			return nil
+			return false, nil
 		}
 		if p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
 			newest = p
@@ -259,7 +265,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 			"statefulset", sts.Namespace+"/"+sts.Name,
 			"pod", newest.Name,
 			"stableFor", stsOnDeleteStableMin)
-		return nil
+		return false, nil
 	}
 
 	// Find the highest-ordinal pod still on the OLD revision — the
@@ -280,7 +286,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		}
 	}
 	if candidate == nil {
-		return nil // every pod already on the new revision — status lags
+		return false, nil // every pod already on the new revision — status lags
 	}
 
 	// Gate 2: every PDB in the namespace selecting this pod must
@@ -291,7 +297,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PodDisruptionBudgets(r.cs, sts.Namespace))
 	if err != nil {
-		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
+		return false, fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
 			sts.Namespace, err)
 	}
 	for i := range pdbItems {
@@ -310,7 +316,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 				"statefulset", sts.Namespace+"/"+sts.Name,
 				"pdb", pdb.Name,
 				"disruptionsAllowed", pdb.Status.DisruptionsAllowed)
-			return nil
+			return false, nil
 		}
 	}
 
@@ -328,10 +334,10 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		// error, so count it here (same shape as every other
 		// unverifiable-mutex skip: fail closed, never evict blind).
 		metrics.IncError(r.queue)
-		return nil
+		return false, nil
 	}
 	if !proceed {
-		return nil
+		return false, nil
 	}
 
 	log.Info("EVICT: roll OnDelete StatefulSet — highest stale ordinal",
@@ -354,11 +360,11 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	}
 	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
 		Evict(ctx, ev); err != nil {
-		return fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
+		return false, fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
 	}
 	metrics.StatefulSetOnDeletePodsRolledTotal.
 		WithLabelValues(sts.Namespace, sts.Name).Inc()
-	return nil
+	return true, nil
 }
 
 // stsAutoRollOptedIn reports the opt-in: passiontech.dev/auto-roll-ondelete

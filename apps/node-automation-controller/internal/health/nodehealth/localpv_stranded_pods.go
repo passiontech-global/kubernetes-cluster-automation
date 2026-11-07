@@ -447,7 +447,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // pod gone — drop the snapshot census
+		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
@@ -502,7 +502,7 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // pod gone — drop the snapshot census
+		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
 		deleted = true
 		log.Info("DELETE: wedged localpv provisioner — stalled claims need a resync",
 			"pod", pod.Namespace+"/"+pod.Name)

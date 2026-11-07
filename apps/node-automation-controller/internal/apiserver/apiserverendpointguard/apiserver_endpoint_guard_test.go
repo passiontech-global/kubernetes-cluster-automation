@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1433,11 +1434,14 @@ func TestEndpointGuardMirrorSliceIgnoredOnNewVersion(t *testing.T) {
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	fakeServerVersion(cs, "1", "34")
 	probed := map[string]int{}
+	var probedMu sync.Mutex // probes run in parallel per cycle
 	g := &apiServerEndpointGuard{
 		cs:  cs,
 		dyn: dyn,
 		probeFn: func(_ context.Context, ip string) apiProbeResult {
+			probedMu.Lock()
 			probed[ip]++
+			probedMu.Unlock()
 			return *apiHealthyProbe(100)
 		},
 		backends: map[string]*backendProbeState{},
@@ -1459,6 +1463,7 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probed := map[string]int{}
+	var probedMu sync.Mutex // probes run in parallel per cycle
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
@@ -1467,7 +1472,9 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 		cs:  cs,
 		dyn: dyn,
 		probeFn: func(_ context.Context, ip string) apiProbeResult {
+			probedMu.Lock()
 			probed[ip]++
+			probedMu.Unlock()
 			return probes.fn(context.Background(), ip)
 		},
 		backends: map[string]*backendProbeState{},

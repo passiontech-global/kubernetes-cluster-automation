@@ -90,7 +90,14 @@ func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeR
 // the probe timeout), built once on first use — including when tests
 // inject rt directly. Sharing one client (and one drained-body
 // policy, see fetchListRV) is what makes keep-alive actually work.
+// The mutex covers the whole check-and-build: the backend probes run
+// in parallel, so an unguarded first cycle would race every goroutine
+// through the InClusterConfig+TransportFor build and keep one client
+// plus N leaked transports. A failed build caches nothing, so a later
+// probe still retries instead of latching a broken client.
 func (g *apiServerEndpointGuard) probeClient() (*http.Client, error) {
+	g.clientMu.Lock()
+	defer g.clientMu.Unlock()
 	if g.client != nil {
 		return g.client, nil
 	}
@@ -431,13 +438,19 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 		}
 		toRemove = append(toRemove, ip)
 	}
-	if len(toRemove) > 0 && g.client != nil {
+	if len(toRemove) > 0 {
 		// W8-CP1: quarantining the IP only protects NEW dials —
 		// pooled keep-alive connections to the wedged backend stay
 		// pinned until they break. Drop them so the very next probe
 		// (and anything sharing this transport) re-dials onto a
-		// healthy backend.
-		g.client.CloseIdleConnections()
+		// healthy backend. The mutex read keeps the field access
+		// paired with probeClient's writes.
+		g.clientMu.Lock()
+		client := g.client
+		g.clientMu.Unlock()
+		if client != nil {
+			client.CloseIdleConnections()
+		}
 	}
 
 	// ---- Decide re-adds --------------------------------------------------

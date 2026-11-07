@@ -92,6 +92,11 @@ var (
 type deadNodeSweeper struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
+	// nodeReader backs ListNodesCached — the informer-backed node
+	// census; the destructive confirm (UntaintNode/TaintNode re-Get)
+	// stays on the direct clientset. Nil (test fixtures) falls back
+	// to ListNodes.
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -108,7 +113,8 @@ type deadNodeSweeper struct {
 
 // Setup registers the 5-minute sweep.
 func Setup(d shared.Deps) error {
-	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+		nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
 	s.probeFn = s.probe
 	return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
 }
@@ -116,7 +122,7 @@ func Setup(d shared.Deps) error {
 func (s *deadNodeSweeper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	nodes, err := kube.ListNodes(ctx, s.cs)
+	nodes, err := kube.ListNodesCached(ctx, s.nodeReader, s.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}

@@ -23,8 +23,16 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 
 | Env var | Module | Default | Notes |
 |---|---|---|---|
-| `NODE_AUTOMATION_KUBE_CLIENT_QPS` | manager | `50` | client-go QPS on the shared rest.Config every module sweeps/reconciles through (client-go's `5` was far under this fleet's aggregate rate). |
+| `NODE_AUTOMATION_KUBE_CLIENT_QPS` | manager | `50` | client-go QPS on the shared rest.Config every module sweeps/reconciles through (client-go's `5` was far under this fleet's aggregate rate). All three clients (manager, clientset, dynamic) share one token bucket installed on the config. |
 | `NODE_AUTOMATION_KUBE_CLIENT_BURST` | manager | `100` | client-go burst paired with the QPS knob above. |
+| `NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT` | manager | `30s` | Per-request timeout on the direct (uncached) typed/dynamic clients the sweep loops use — bounds a hung apiserver call. NOT applied to the manager's client, where it would cut informer watch streams. |
+
+## Global heal budget
+
+| Env var | Module | Default | Notes |
+|---|---|---|---|
+| `NODE_AUTOMATION_HEAL_BUDGET_MAX` | manager (platform/heal) | `10` | Max heal grants (AllowedV "proceed" verdicts) per window across ALL heal-gated modules — the aggregate blast-radius cap. `0` disables the budget. Denials count on `node_automation_heal_budget_exhausted_total`. |
+| `NODE_AUTOMATION_HEAL_BUDGET_WINDOW` | manager (platform/heal) | `5m` | Sliding window the heal-budget grant count is measured over. |
 
 ## System patchers / watchdogs
 

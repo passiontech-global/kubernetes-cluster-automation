@@ -113,7 +113,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	for _, cfg := range mwc.Items {
 		var removed []string
 		for i, w := range cfg.Webhooks {
-			if orphanEntry(log, "mutatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
+			if orphanEntry(ctx, g, log, "mutatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
 				removed = append(removed, w.Name)
 			}
 		}
@@ -122,7 +122,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	for _, cfg := range vwc.Items {
 		var removed []string
 		for i, w := range cfg.Webhooks {
-			if orphanEntry(log, "validatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
+			if orphanEntry(ctx, g, log, "validatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
 				removed = append(removed, w.Name)
 			}
 		}
@@ -202,11 +202,35 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 // orphanEntry classifies one webhook entry. Returns true only when the
 // backend Service's namespace is gone (→ caller drops the entry).
 // A missing Service in a still-live namespace warns and is never patched.
-func orphanEntry(log logr.Logger, kind, cfg string, idx int, svcRef *admissionv1.ServiceReference, namespaces, services map[string]bool, haveSvc bool) bool {
+//
+// The snapshot's namespace census can lag the apiserver: TakeSnapshot
+// lists Namespaces BEFORE the webhook-config lists, so an operator
+// creating namespace+webhook between the two lands a live entry whose
+// svcRef.Namespace is absent from the census — swept as "orphan" with
+// no further check (the TOCTOU the apiservice-guard orphan pass already
+// guards). A namespace-verdict removal therefore live-confirms with a
+// Namespaces().Get first: only an apiserver NotFound counts as orphan
+// (fail closed on any other error — inconclusive keeps the entry).
+func orphanEntry(ctx context.Context, g *guardstate.Guard, log logr.Logger,
+	kind, cfg string, idx int, svcRef *admissionv1.ServiceReference,
+	namespaces, services map[string]bool, haveSvc bool) bool {
+
 	if svcRef == nil || svcRef.Namespace == "" {
 		return false // malformed/no-service entry — not an orphan
 	}
 	if !namespaces[svcRef.Namespace] {
+		_, getErr := g.CS.CoreV1().Namespaces().Get(ctx, svcRef.Namespace, metav1.GetOptions{})
+		gone, err := kube.ConfirmAbsent(getErr)
+		if err != nil {
+			log.Info("WARN: namespace confirm failed — webhook entry kept (fail closed)",
+				"kind", kind, "config", cfg, "webhookIndex", idx,
+				"namespace", svcRef.Namespace, "error", err)
+			metrics.IncError(g.Queue)
+			return false
+		}
+		if !gone {
+			return false // namespace exists — the census was stale
+		}
 		log.Info("ORPHAN: namespace gone — removing entry",
 			"kind", kind, "config", cfg, "webhookIndex", idx,
 			"service", svcRef.Namespace+"/"+svcRef.Name)

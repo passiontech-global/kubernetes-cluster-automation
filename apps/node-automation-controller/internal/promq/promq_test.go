@@ -233,3 +233,48 @@ func TestInstantQueryNilHTTPUsesDefaultClient(t *testing.T) {
 		t.Fatalf("samples = %+v, want empty", got)
 	}
 }
+
+// A response larger than the 4 MiB cap must error, never decode a
+// silently truncated vector.
+func TestInstantQueryTruncationDetected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// 4 MiB + a byte of valid-looking payload: the old
+		// LimitReader would have swallowed the tail silently.
+		_, _ = w.Write(make([]byte, maxResponseBytes+1))
+	}))
+	defer srv.Close()
+
+	_, err := (&Client{HTTP: srv.Client()}).InstantQuery(
+		context.Background(), srv.URL, "up")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want a truncation error", err)
+	}
+}
+
+// NaN/Inf sample values are skipped like any other malformed sample:
+// ParseFloat accepts them but they poison every downstream
+// threshold comparison.
+func TestInstantQuerySkipsNonFiniteSamples(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"status": "success",
+			"data": {"result": [
+				{"metric": {"node": "ok"}, "value": [1710000000, "1.5"]},
+				{"metric": {"node": "nan"}, "value": [1710000000, "NaN"]},
+				{"metric": {"node": "pinf"}, "value": [1710000000, "+Inf"]},
+				{"metric": {"node": "ninf"}, "value": [1710000000, "-Inf"]}
+			]}
+		}`))
+	}))
+	defer srv.Close()
+
+	got, err := (&Client{HTTP: srv.Client()}).InstantQuery(
+		context.Background(), srv.URL, "up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Metric["node"] != "ok" || got[0].Value != 1.5 {
+		t.Fatalf("samples = %+v, want only node=ok value=1.5", got)
+	}
+}

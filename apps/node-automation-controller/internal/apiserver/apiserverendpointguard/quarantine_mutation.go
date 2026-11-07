@@ -327,3 +327,33 @@ func addSliceIP(eps *discoveryv1.EndpointSlice, ip string) bool {
 	})
 	return true
 }
+
+// convergeSlices returns deep copies of the slices with the full
+// quarantine set applied — every quarantined IP dropped, every
+// recovered IP re-added to its address-family slice — plus the
+// per-slice dirty flags. The Endpoints-SSOT path runs it once per
+// cycle and uses the result twice: the dirty flags ARE the drift
+// verdict (a slice update that failed last cycle leaves contents the
+// Endpoints-derived toAdd/toRemove diff can no longer see), and the
+// copies are what gets Updated. Diffing the actual slice contents —
+// not the decision delta — is what lets a drifted slice be detected
+// and repaired every cycle until it matches.
+func convergeSlices(epsList []*discoveryv1.EndpointSlice,
+	quarantined map[string]bool, readd []string) ([]*discoveryv1.EndpointSlice, []bool) {
+
+	copies := deepCopySlices(epsList)
+	dirty := make([]bool, len(copies))
+	for i := range copies {
+		for ip := range quarantined {
+			if removeSliceIP(copies[i], ip) {
+				dirty[i] = true
+			}
+		}
+	}
+	for _, ip := range readd {
+		if i := sliceIdxForIP(copies, ip); i >= 0 && addSliceIP(copies[i], ip) {
+			dirty[i] = true
+		}
+	}
+	return copies, dirty
+}

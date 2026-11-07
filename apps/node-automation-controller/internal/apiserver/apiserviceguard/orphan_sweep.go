@@ -35,14 +35,13 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *apiServiceSnapshot
 	g := snap.g
 	log := logf.FromContext(ctx)
 
-	// Namespace snapshot — the ONLY source of "deleted" truth. An
-	// error aborts the whole pass; an EMPTY list means the
-	// apiserver/RBAC lied (every APIService would look orphaned), so
-	// the pass skips itself without failing the run — the
-	// availability watchdog still evaluates.
-	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
-		kube.Namespaces(g.cs))
+	// Namespace snapshot — the ONLY source of "deleted" truth, listed
+	// once per run on the shared snapshot (the unblock pass consumes
+	// the same census). An error aborts the whole pass; an EMPTY
+	// list means the apiserver/RBAC lied (every APIService would look
+	// orphaned), so the pass skips itself without failing the run —
+	// the availability watchdog still evaluates.
+	nss, err := snap.nss, snap.nsErr
 	if err != nil {
 		return fmt.Errorf("list namespaces (API flap) — abort orphan pass: %w", err)
 	}

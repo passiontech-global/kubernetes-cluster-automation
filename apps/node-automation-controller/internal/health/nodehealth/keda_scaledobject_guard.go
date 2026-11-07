@@ -100,7 +100,15 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 	sos, err := p.Dyn.Resource(kube.GVRKedaScaledObject).List(ctx, metav1.ListOptions{})
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		return probefw.Result{Pass: true} // KEDA absent — nothing to guard
+		// KEDA absent — still reconcile the ledgers: a tuple/seen
+		// entry held from when KEDA existed is resolved, and
+		// returning Pass early leaks the series pinned at 1. (The
+		// Infra path below deliberately skips the reconcile — an
+		// unevaluated sweep carries last state, per Carry.)
+		var rep probefw.SweepReport
+		p.seen.Prune(func(string) bool { return false })
+		return rep.Result(&p.emitted, kedaScaledObjectUnhealthyGauge.DeleteLabelValues,
+			fmt.Sprintf("scaledobjects unhealthy >=%s: ", kedaUnhealthyMinAge), ", ")
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list scaledobjects: %w", err)}
 	}

@@ -125,3 +125,29 @@ func TestFirstSeenLedgerSeed(t *testing.T) {
 		t.Fatalf("Seed(older) did not move the stamp back: %v", got)
 	}
 }
+
+// PruneExpired is the leak bound for ephemeral-key ledgers: stamps
+// past the retention bound are evicted, live ones are kept, and the
+// zero-value ledger is a safe no-op.
+func TestCooldownSetPruneExpired(t *testing.T) {
+	var c CooldownSet
+	now := time.Now()
+	c.Stamp("live", now.Add(-time.Minute))
+	c.Stamp("dead-pod-abc12", now.Add(-time.Hour))
+	c.Stamp("dead-pod-def34", now.Add(-2*time.Hour))
+
+	if n := c.PruneExpired(now, 30*time.Minute); n != 2 {
+		t.Fatalf("PruneExpired = %d, want 2", n)
+	}
+	if !c.CooledDown("live", 5*time.Minute, now) {
+		t.Fatal("live stamp was evicted")
+	}
+	if _, ok := c.Last("dead-pod-abc12"); ok {
+		t.Fatal("expired stamp survived PruneExpired")
+	}
+	// A zero-value ledger must not panic.
+	var empty CooldownSet
+	if n := empty.PruneExpired(now, time.Minute); n != 0 {
+		t.Fatalf("zero-value PruneExpired = %d, want 0", n)
+	}
+}

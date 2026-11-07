@@ -240,7 +240,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
-		p.InvalidateSweep(ctx) // pod gone — drop the census
+		p.InvalidatePods(ctx) // pod gone — drop the census
 		rabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

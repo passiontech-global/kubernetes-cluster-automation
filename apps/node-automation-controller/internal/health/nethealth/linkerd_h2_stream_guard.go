@@ -578,7 +578,14 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		}
 		podKey := ns + "/" + podName
 		lv := []string{ns, podName}
-		balancerRep.Flag(linkerdOutboundBalancerWedgedGauge, key, lv)
+		// The emitted ledger keys one entry per LABEL TUPLE
+		// (ns/pod), not per wedged target: the gauge declares only
+		// (namespace, pod), so a target-qualified key would make
+		// Reconcile delete the still-wedged series the moment any
+		// ONE of the pod's targets recovered (key vanished →
+		// DeleteLabelValues(ns, pod)). balancerSeen keeps the
+		// per-target granularity — only the emitted key collapses.
+		balancerRep.Flag(linkerdOutboundBalancerWedgedGauge, podKey, lv)
 		rep.Find(podKey + "(outbound balancer wedged: " + target + ")")
 		pod := podByKey[podKey]
 		switch {

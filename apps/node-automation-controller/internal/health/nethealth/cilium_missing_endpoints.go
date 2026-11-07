@@ -113,16 +113,29 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	ceps, err := p.Dyn.Resource(kube.GVRCiliumEndpoint).List(ctx, metav1.ListOptions{})
+	// Paged like every cluster-wide list — an unpaginated CEP list
+	// forces etcd to serialize every endpoint into one response.
+	ceps, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.DynamicPage(p.Dyn.Resource(kube.GVRCiliumEndpoint)))
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		return probefw.Result{Pass: true} // no Cilium on this cluster
+		// No Cilium on this cluster — still reconcile the ledgers:
+		// a tuple/streak held from when Cilium existed is resolved,
+		// and returning Pass early would leak the series pinned at
+		// 1. (The Infra path below deliberately skips the reconcile —
+		// an unevaluated sweep carries last state, per Carry.)
+		var rep probefw.SweepReport
+		p.streak.Prune(func(string) bool { return false })
+		return rep.Result(&p.emitted, ciliumMissingCEPPodsGauge.DeleteLabelValues,
+			fmt.Sprintf("pods missing a programmed CiliumEndpoint across %d sweeps: ",
+				ciliumCEPMinStreak), ", ")
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list ciliumendpoints: %w", err)}
 	}
 	cepByKey := map[string]*unstructured.Unstructured{}
-	for i := range ceps.Items {
-		cep := &ceps.Items[i]
+	for i := range ceps {
+		cep := &ceps[i]
 		cepByKey[cep.GetNamespace()+"/"+cep.GetName()] = cep
 	}
 	pods, err := p.AllPods(ctx)

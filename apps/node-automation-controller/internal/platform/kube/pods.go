@@ -7,6 +7,7 @@ package kube
 import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,21 @@ func PodReadyCond(p *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// PodControllerKey returns the cooldown/ledger key that survives pod
+// replacement: "<ns>/<controller name>" when a controller owner
+// reference exists — a "<ns>/<pod>" key is useless for workload pods
+// because the recreated pod carries a fresh random suffix (Deployment
+// pods get the ReplicaSet's name, which outlives every pod it
+// spawns), so the re-heal of the SAME failure reads as a brand-new
+// target and fires every sweep. Standalone pods fall back to
+// "<ns>/<pod>" — with no controller there is no churn to key across.
+func PodControllerKey(p *corev1.Pod) string {
+	if ref := metav1.GetControllerOf(p); ref != nil && ref.Name != "" {
+		return p.Namespace + "/" + ref.Name
+	}
+	return p.Namespace + "/" + p.Name
 }
 
 // PodSpecHasContainer reports whether the pod spec carries a container

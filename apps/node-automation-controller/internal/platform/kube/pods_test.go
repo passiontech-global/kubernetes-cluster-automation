@@ -92,3 +92,41 @@ func TestPodReadyCond(t *testing.T) {
 		t.Fatal("Ready=True pod reported not ready")
 	}
 }
+
+// PodControllerKey keys a workload pod's cooldown on its controller
+// (stable across the replacement-name churn) and a standalone pod on
+// itself — the distinction the per-pod heal cooldowns rely on so a
+// recreated Deployment pod does not read as a brand-new target.
+func TestPodControllerKey(t *testing.T) {
+	ctrl := true
+	deploymentPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "web-6f4b-x7q2p",
+		OwnerReferences: []metav1.OwnerReference{{
+			Kind: "ReplicaSet", Name: "web-6f4b",
+			Controller: &ctrl}}},
+	}
+	if got := PodControllerKey(deploymentPod); got != "apps/web-6f4b" {
+		t.Fatalf("PodControllerKey = %q, want apps/web-6f4b", got)
+	}
+	// A recreated pod under the same ReplicaSet must map to the SAME
+	// key — the whole point of the helper.
+	deploymentPod.Name = "web-6f4b-m9zkw"
+	if got := PodControllerKey(deploymentPod); got != "apps/web-6f4b" {
+		t.Fatalf("recreated pod keyed %q, want stable apps/web-6f4b", got)
+	}
+	standalone := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "debug-shell"}}
+	if got := PodControllerKey(standalone); got != "apps/debug-shell" {
+		t.Fatalf("standalone pod keyed %q, want apps/debug-shell", got)
+	}
+	// A non-controller owner reference (e.g. a plain "owned-by" link)
+	// does not re-create pods — the pod's own name is the key.
+	nonCtrl := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "orphan",
+		OwnerReferences: []metav1.OwnerReference{{
+			Kind: "ConfigMap", Name: "settings"}}},
+	}
+	if got := PodControllerKey(nonCtrl); got != "apps/orphan" {
+		t.Fatalf("non-controller-owned pod keyed %q, want apps/orphan", got)
+	}
+}

@@ -131,7 +131,7 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 			"pod", target.Namespace+"/"+target.Name, "operator", operator)
 		return
 	}
-	p.InvalidateSweep(ctx) // pod gone — drop the census
+	p.InvalidatePods(ctx) // pod gone — drop the census
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(operator).Inc()
 	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
 		"operator", operator, "pod", target.Namespace+"/"+target.Name,

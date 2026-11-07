@@ -69,6 +69,18 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 			"target", key, "why", why)
 		return false, false
 	}
+	// The global heal budget is the last gate: a grant is consumed
+	// only once cooldown AND mutex already passed, so a spent window
+	// defers heals that would otherwise have fired — fail closed,
+	// exactly like a held mutex (see budget.go for why the aggregate
+	// ceiling exists and why the deny is (false,false), not
+	// unverifiable: an exhausted budget is normal operation, not a
+	// check the caller should IncError).
+	if !budgetGate(now) {
+		log.Info("heal budget exhausted — heal deferred",
+			"target", key)
+		return false, false
+	}
 	return true, false
 }
 

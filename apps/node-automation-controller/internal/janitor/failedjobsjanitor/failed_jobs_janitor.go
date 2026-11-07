@@ -87,8 +87,11 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	// neither the job list nor the delete cap. The W9-GO2/W12-GO2
 	// retention sweeps join it: completed runs first so a just-reaped
 	// run's workspace PVC reads "owner gone" in the same pass — all
-	// three are cluster-wide retention hygiene.
+	// three are cluster-wide retention hygiene. The PVC census is
+	// shared so the two PVC-consuming duties pay one cluster list +
+	// one pod scan per namespace per run, not two.
+	census := &pvcCensus{}
 	return errors.Join(j.sweepCompletedRuns(ctx),
-		j.sweepOrphanWorkspacePVCs(ctx),
-		j.auditStuckTerminating(ctx))
+		j.sweepOrphanWorkspacePVCs(ctx, census),
+		j.auditStuckTerminating(ctx, census))
 }

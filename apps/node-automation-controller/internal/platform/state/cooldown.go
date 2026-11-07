@@ -80,6 +80,27 @@ func (c *CooldownSet) Entries() map[string]time.Time {
 	return out
 }
 
+// PruneExpired evicts every stamp older than maxAge and returns the
+// evicted count — the leak bound for ledgers keyed by EPHEMERAL
+// names (pod/Job/CertificateRequest names with rotating suffixes):
+// a stamp whose window has long passed can never suppress an action
+// again, so holding it only grows the map one dead name per heal
+// forever. Call once per sweep with the LONGEST cooldown the ledger
+// serves — a shorter bound would drop still-binding stamps (when a
+// keyspace mixes cooldowns, the widest window wins). Unlike Prune
+// this needs no complete-sweep precondition: expiry is computed per
+// entry, not voted by a keep set.
+func (c *CooldownSet) PruneExpired(now time.Time, maxAge time.Duration) int {
+	pruned := 0
+	for k, last := range c.last {
+		if now.Sub(last) > maxAge {
+			delete(c.last, k)
+			pruned++
+		}
+	}
+	return pruned
+}
+
 // Last returns key's last-action stamp without copying the ledger —
 // the single-key read for "when did this one fire" diagnostics;
 // Entries() is for bulk inspection only (it copies the whole map).

@@ -257,7 +257,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // pod gone — drop the census
+		p.InvalidatePods(ctx) // pod gone — drop the census
 		reaped++
 	}
 	if reaped > 0 {

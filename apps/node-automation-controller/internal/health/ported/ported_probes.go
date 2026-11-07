@@ -80,7 +80,14 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: %v", p.Cfg.HTTPContent.URL, err)}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		// Drain before Close (bounded): an unread body makes the
+		// connection unreusable, killing keep-alive on the shared
+		// client — and the LimitReader read below may stop short of
+		// the real body.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: status %d, want 200",
 			p.Cfg.HTTPContent.URL, resp.StatusCode)}
