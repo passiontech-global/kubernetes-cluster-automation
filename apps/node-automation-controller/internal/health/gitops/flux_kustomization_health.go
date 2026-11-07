@@ -119,6 +119,10 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	// reconcileHealed keys on Kustomization names that die with the
+	// object — bound the map so decommissioned names' stamps cannot
+	// accumulate (pruned every sweep, not only on a stuck hit).
+	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
 	var rep probefw.SweepReport
 	kusts, err := p.Dyn.Resource(fluxKustomizationGVR).List(ctx, metav1.ListOptions{})
 	switch {
@@ -175,10 +179,6 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Context,
 	log logr.Logger, kust *unstructured.Unstructured, reason string, now time.Time) {
 
-	// reconcileHealed keys on Kustomization names that die with the
-	// object — bound the map so decommissioned names' stamps cannot
-	// accumulate.
-	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
 	key := kust.GetNamespace() + "/" + kust.GetName()
 	if !p.fluxKustDepsReady(ctx, kust) {
 		return

@@ -161,6 +161,7 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		pod := dnsByName[name]
 		if pod != nil && pod.Namespace == ns {
 			rep.Flag(coreDNSUpstreamFailingGauge, key, []string{ns, name})
+			rep.Find(key + "(" + flagged[key] + ")")
 		}
 		// Isolated-failure heal: a healthy Ready sibling in the same
 		// namespace means this is per-pod wedge, not a fleet outage.
@@ -181,9 +182,6 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 				healed = true
 			}
 		}
-	}
-	for k, d := range flagged {
-		rep.Find(k + "(" + d + ")")
 	}
 	return rep.Result(&p.emitted, coreDNSUpstreamFailingGauge.DeleteLabelValues,
 		"coredns/node-local-dns upstream failures: ", ", ")

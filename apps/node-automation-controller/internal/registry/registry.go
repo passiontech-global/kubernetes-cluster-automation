@@ -16,7 +16,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserviceguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/clusterhealthprobes"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/certdriftauditor"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/certmanagerreaper"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/ciliumidentityauditor"
@@ -52,8 +57,10 @@ import (
 
 // Modules is the single registration point for every node-ops
 // module — one shared.Module row each: the ops name, the
-// REGISTRATION gate env (when the module has one) and the uniform
-// `Setup(d shared.Deps) error` entry point. Registration gates live
+// REGISTRATION gate env (when the module has one) and either the
+// uniform `Setup(d shared.Deps) error` entry point or, for
+// health-sweep check rows, a CheckReg contributing a check to the
+// cluster-health-probes roster. Registration gates live
 // here and nowhere else: SetupModules evaluates GateEnv/DefaultOn
 // and stamps Deps.Disabled, so the env var is named in exactly one
 // place instead of being re-resolved inside each module's Setup.
@@ -145,18 +152,75 @@ var Modules = []shared.Module{
 	{Name: "cert-drift-auditor", Group: groupIntegration, GateEnv: "CERT_DRIFT_AUDITOR_ENABLED", DefaultOn: true, Setup: certdriftauditor.Setup},
 	{Name: "velero-backup-auditor", Group: groupIntegration, GateEnv: "VELERO_BACKUP_AUDITOR_ENABLED", DefaultOn: true, Setup: velerobackupauditor.Setup},
 
-	// Cluster health probes.
+	// Cluster health probes — one CheckReg row per check the
+	// cluster-health-probes sweep runs, then the sweep row itself
+	// (the section's only Setup). A check row carries CheckReg
+	// instead of Setup: it contributes a {check-name, ctor} pair
+	// into the sweep roster — SetupModules collects the enabled,
+	// selected rows' registrations into Deps.CheckRegs in registry
+	// order (see
+	// internal/health/clusterhealthprobes/check_modules.go) — rather
+	// than registering runnables, so THE ROW ORDER BELOW IS THE
+	// SWEEP ORDER: the historical kuberhealthy sequence is an ops
+	// contract and must not be reordered. Each row's module Name is
+	// the check's kuberhealthy_check label value, so a check is
+	// also selectable by name via -modules — but it still requires
+	// the cluster-health-probes module to actually run the sweep
+	// (a check row selected alone contributes to a roster nothing
+	// consumes; cluster-health-probes selected alone sweeps an
+	// empty roster).
 	//
-	// The W13 gitops check rows carry CheckReg instead of Setup:
-	// they contribute a check into the cluster-health-probes roster
-	// (SetupModules collects the enabled rows' registrations into
-	// Deps.CheckRegs — see
-	// internal/health/clusterhealthprobes/check_modules.go) rather
-	// than registering runnables, so no ordering constraint exists
-	// between these rows and the cluster-health-probes row. Each
-	// check gates on its own NODE_AUTOMATION_*_ENABLED flag and is
-	// selectable by name via -modules — but it still requires the
-	// cluster-health-probes module to actually run the sweep.
+	// The first block is the always-on checks — no GateEnv: the
+	// ported kuberhealthy checks and their successor checks ran
+	// unconditionally and keep doing so.
+	{Name: "dns-status-internal", Group: groupHealth, CheckReg: &shared.CheckReg{Name: ported.CheckNameDNS, New: ported.NewDNSStatusCheck}},
+	{Name: "http-content-check", Group: groupHealth, CheckReg: &shared.CheckReg{Name: ported.CheckNameHTTPContent, New: ported.NewHTTPContentCheck}},
+	{Name: "pod-restarts", Group: groupHealth, CheckReg: &shared.CheckReg{Name: ported.CheckNamePodRestarts, New: ported.NewPodRestartsCheck}},
+	{Name: "pod-status-check", Group: groupHealth, CheckReg: &shared.CheckReg{Name: ported.CheckNamePodStatus, New: ported.NewPodStatusCheck}},
+	{Name: "resource-quota-check", Group: groupHealth, CheckReg: &shared.CheckReg{Name: ported.CheckNameResourceQuota, New: ported.NewResourceQuotaCheck}},
+	{Name: "kcm-workqueue-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameKCMWorkqueue, New: watchdogs.NewKcmWorkqueueCheck}},
+	{Name: "operator-workqueue-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameOperatorWorkqueue, New: watchdogs.NewOperatorWorkqueueCheck}},
+	{Name: "stateful-masterless-services", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameStatefulMasterless, New: datastore.NewStatefulMasterlessCheck}},
+	{Name: "rabbitmq-suspended-listener", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameRabbitMQSuspended, New: datastore.NewRabbitMQSuspendedCheck}},
+	{Name: "localpv-stranded-pods", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameLocalPVStranded, New: nodehealth.NewLocalPVStrandedCheck}},
+	{Name: "olm-subscription-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameOLMHealth, New: datastore.NewOlmHealthCheck}},
+	{Name: "scheduler-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameSchedulerWatchdog, New: watchdogs.NewSchedulerWatchdogCheck}},
+	{Name: "mesh-controlplane-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameMeshWatchdog, New: watchdogs.NewMeshControlPlaneCheck}},
+	{Name: "node-hang-precordon", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNodeHang, New: nodehealth.NewNodeHangCheck}},
+	{Name: "linkerd-endpoint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdEndpointSync, New: nethealth.NewLinkerdEndpointSyncCheck}},
+	{Name: "scylla-cluster-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameScyllaHealth, New: datastore.NewScyllaHealthCheck}},
+	{Name: "flux-helmrelease-retries", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameFluxHRRetries, New: gitops.NewFluxHRRetriesCheck}},
+	{Name: "percona-cluster-quorum", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNamePerconaQuorum, New: datastore.NewPerconaQuorumCheck}},
+	{Name: "cilium-bpf-map-pressure", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumBPFMapPressure, New: nethealth.NewCiliumBPFMapPressureCheck}},
+	{Name: "linkerd-protocol-detection-stall", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdOpaqueStall, New: nethealth.NewLinkerdProtocolDetectionStallCheck}},
+	{Name: "coredns-upstream", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCoreDNSUpstream, New: nethealth.NewCoreDNSUpstreamCheck}},
+	{Name: "cilium-node-ipam-exhaustion", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumNodeIPAM, New: nethealth.NewCiliumNodeIPAMExhaustionCheck}},
+	{Name: "namespace-terminating-wedged", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNamespaceWedged, New: nodehealth.NewNamespaceTerminatingWedgedCheck}},
+	{Name: "argocd-app-stuck", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameArgoCDAppStuck, New: gitops.NewArgoCDAppStuckCheck}},
+	{Name: "kargo-promotion-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameKargoPromotionHealth, New: gitops.NewKargoPromotionHealthCheck}},
+	{Name: "rabbitmq-quorum-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameRabbitMQQuorum, New: datastore.NewRabbitMQQuorumHealthCheck}},
+	{Name: "dragonfly-replica-sync-storm", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameDragonflySyncStorm, New: datastore.NewDragonflyReplicaSyncStormCheck}},
+	{Name: "image-pull-storm", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameImagePullStorm, New: nodehealth.NewImagePullStormCheck}},
+	{Name: "api-object-sprawl-report-gc", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameAPIObjectSprawlReportGC, New: nodehealth.NewAPIObjectSprawlReportGCCheck}},
+	{Name: "cpu-steal-taint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameCPUStealTaintSync, New: nodehealth.NewCPUStealTaintSyncCheck}},
+	{Name: "cilium-missing-endpoint", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumMissingEndpoints, New: nethealth.NewCiliumMissingEndpointsCheck}},
+	{Name: "linkerd-h2-stream-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdH2StreamGuard, New: nethealth.NewLinkerdH2StreamGuardCheck}},
+	{Name: "cloudflared-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCloudflaredTunnelHealth, New: nethealth.NewCloudflaredTunnelHealthCheck}},
+	{Name: "liqo-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLiqoTunnelHealth, New: nethealth.NewLiqoTunnelHealthCheck}},
+	{Name: "konnectivity-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameKonnectivityTunnelHealth, New: nethealth.NewKonnectivityTunnelHealthCheck}},
+	{Name: "postgres-wal-archive-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNamePostgresWALArchiveGuard, New: datastore.NewPostgresWALArchiveGuardCheck}},
+	{Name: "scylla-compaction-schema-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameScyllaCompactionSchemaGuard, New: datastore.NewScyllaCompactionSchemaGuardCheck}},
+	{Name: "nats-jetstream-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameNatsJetstreamHealth, New: datastore.NewNatsJetstreamHealthCheck}},
+	{Name: "keda-scaledobject-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameKedaScaledObjectGuard, New: nodehealth.NewKedaScaledObjectGuardCheck}},
+	{Name: "gateway-route-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameGatewayRouteHealth, New: nethealth.NewGatewayRouteHealthCheck}},
+	{Name: "controller-lease-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameControllerLeaseGuard, New: nodehealth.NewControllerLeaseGuardCheck}},
+	{Name: "pvc-resize-stall-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNamePVCResizeStallGuard, New: datastore.NewPVCResizeStallGuardCheck}},
+	{Name: "endpointslice-zone-starvation", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck}},
+	{Name: "linkerd-outlier-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck}},
+	{Name: "node-condition-sweeper", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck}},
+	// The W13 gitops check rows carry the section's only per-check
+	// registration gates; they close out the roster — the sweep
+	// order contract puts them after the always-on block.
 	{Name: "flux-kustomization-health", Group: groupHealth, GateEnv: "NODE_AUTOMATION_FLUX_KUSTOMIZATION_HEALTH_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck}},
 	{Name: "workload-scale-flapping", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_SCALE_FLAPPING_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameWorkloadScaleFlapping, New: gitops.NewWorkloadScaleFlappingCheck}},
 	{Name: "imagepull-secret-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGEPULL_SECRET_AUDITOR_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck}},
@@ -259,14 +323,23 @@ func ValidGroups() []string {
 // for the FULL registry first — /metrics must expose the complete
 // 0-valued fleet even on a Deployment where -modules (or a gate)
 // runs only a subset, so a mid-flight flag change can never gap a
-// series. Then `mods` goes through two passes:
+// series. Predeclaration is deliberately uniform — CheckReg rows
+// get a queue series too (~48 extra
+// shell_operator_hook_run_errors_total{queue="<check-name>"}
+// series pinned at 0: the sweep reports its run errors under the
+// cluster-health-probes queue only). That matches the three gated
+// check rows that already carried series and keeps predeclaration
+// a plain row walk rather than a Setup/CheckReg type switch.
+// Then `mods` goes through two passes:
 //
 //  1. Gate evaluation + CheckReg collection. Each row's GateEnv
 //     (when set) is resolved ONCE here. Health-sweep check rows
 //     (CheckReg instead of Setup) contribute their registration
 //     into regs only while their own gate is ON — a gated-off or
 //     unselected check row simply never reaches the roster, which
-//     IS the per-check gate the rows exist for.
+//     IS the per-check gate the rows exist for. Collection order
+//     is `mods` order — registry order — so the check rows'
+//     relative order in Modules IS the sweep order.
 //  2. Runnable wiring, registry order. Every row's Deps gets the
 //     collected regs stamped — only the cluster-health-probes sweep
 //     reads them, and because collection finished before ANY Setup

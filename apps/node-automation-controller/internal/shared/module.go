@@ -35,9 +35,11 @@ package shared
 //   - CheckReg is the alternative to Setup for health-sweep check
 //     rows: the row contributes a check into the
 //     cluster-health-probes roster instead of registering
-//     runnables. SetupModules collects the enabled rows' CheckRegs
-//     into Deps.CheckRegs for the sweep to consume; rows with
-//     CheckReg have Setup == nil and are never Setup-called.
+//     runnables. Every sweep check registers this way — the
+//     cluster-health-probes row carries the sweep's Setup.
+//     SetupModules collects the enabled rows' CheckRegs into
+//     Deps.CheckRegs for the sweep to consume; rows with CheckReg
+//     have Setup == nil and are never Setup-called.
 type Module struct {
 	Name      string
 	Group     string

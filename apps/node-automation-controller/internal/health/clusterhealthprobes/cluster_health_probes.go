@@ -1,9 +1,10 @@
-// cluster_health_probes.go — the sweep module root: Setup, the
-// prober and the checkDefs registry. The 47 checks it drives live in
-// per-domain subpackages under internal/health on top of the shared
-// probefw framework — the 44 static checkDefs rows below plus the
-// three per-check registry rows (the W13 gitops checks) whose
-// CheckRegs arrive collected on Deps.CheckRegs:
+// cluster_health_probes.go — the sweep module root: Setup and the
+// prober. The 48 checks it drives live in per-domain subpackages
+// under internal/health on top of the shared probefw framework; the
+// roster itself is a registry concern — every check is a CheckReg
+// row in internal/registry (the 45 always-on rows plus the three
+// gated W13 gitops rows), collected into Deps.CheckRegs in
+// registry order, which IS the sweep order:
 //
 //   - ported — the five kuberhealthy "passive" HealthChecks that used
 //     to run as periodic checker Pods in the kuberhealthy namespace
@@ -29,14 +30,18 @@
 //     quorum + suspended listener, dragonfly sync storm, percona
 //     quorum, stateful-masterless-services W6.2, OLM subscriptions,
 //     PVC resize stalls W13-ST3).
-//   - gitops — argocd-app-stuck and flux-helmrelease-retries.
+//   - gitops — argocd-app-stuck, flux-helmrelease-retries,
+//     kargo-promotion-health plus the three gated W13 rows
+//     (flux-kustomization-health, workload-scale-flapping,
+//     imagepull-secret-auditor).
 //
 // Layout: each check lives in its domain package alongside its state
-// maps and the NewXxxCheck constructor that builds it; the checkDefs
-// registry below is the single sweep-order roster. Adding a check is
-// two touch points — a checkDefs row + the constructor in the check's
-// file — instead of the five (constant, prober field, lastPass seed,
-// constructor literal, checks row) the monolithic prober needed.
+// maps and the NewXxxCheck constructor that builds it; the
+// registry's health CheckReg rows are the single sweep-order roster.
+// Adding a check is two touch points — a CheckReg row + the
+// constructor in the check's file — instead of the five (constant,
+// prober field, lastPass seed, constructor literal, checks row) the
+// monolithic prober needed.
 //
 // Metric contract: results go out on the SAME series kuberhealthy
 // exported — kuberhealthy_check{check,namespace,status} and
@@ -57,24 +62,16 @@ package clusterhealthprobes
 
 import (
 	"context"
-	"net"
-	"net/http"
 	"time"
 
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -116,81 +113,12 @@ func healthProbeConfigFromEnv() probefw.Config {
 	}
 }
 
-// checkEntry is one registry row: the check name — the
+// checkEntry is one roster row: the check name — the
 // kuberhealthy_check label value alerts key on — and the check
 // instance Run() invokes.
 type checkEntry struct {
 	name  string
 	check probefw.Check
-}
-
-// checkDef is one checkDefs roster row: the kuberhealthy_check label
-// value alerts key on plus the constructor that builds the check
-// instance against the shared Deps.
-type checkDef struct {
-	name string
-	new  func(*probefw.Deps) probefw.Check
-}
-
-// checkDefs is the data-driven check registry — the static half of
-// the sweep-order roster the prober is built from. Order is the ops
-// contract: the historical sweep order is preserved verbatim and the
-// names are the kuberhealthy_check label values, so neither may
-// change. Each row's constructor lives in the check's own domain
-// package so its state-map initialization colocates with the check
-// logic.
-//
-// The dynamic half is Deps.CheckRegs: the per-check module rows in
-// internal/registry (the W13 gitops checks) contribute their
-// {name, ctor} pair through SetupModules' collection pass — see
-// check_modules.go — and land after the static rows at prober
-// construction.
-var checkDefs = []checkDef{
-	{ported.CheckNameDNS, ported.NewDNSStatusCheck},
-	{ported.CheckNameHTTPContent, ported.NewHTTPContentCheck},
-	{ported.CheckNamePodRestarts, ported.NewPodRestartsCheck},
-	{ported.CheckNamePodStatus, ported.NewPodStatusCheck},
-	{ported.CheckNameResourceQuota, ported.NewResourceQuotaCheck},
-	{watchdogs.CheckNameKCMWorkqueue, watchdogs.NewKcmWorkqueueCheck},
-	{watchdogs.CheckNameOperatorWorkqueue, watchdogs.NewOperatorWorkqueueCheck},
-	{datastore.CheckNameStatefulMasterless, datastore.NewStatefulMasterlessCheck},
-	{datastore.CheckNameRabbitMQSuspended, datastore.NewRabbitMQSuspendedCheck},
-	{nodehealth.CheckNameLocalPVStranded, nodehealth.NewLocalPVStrandedCheck},
-	{datastore.CheckNameOLMHealth, datastore.NewOlmHealthCheck},
-	{watchdogs.CheckNameSchedulerWatchdog, watchdogs.NewSchedulerWatchdogCheck},
-	{watchdogs.CheckNameMeshWatchdog, watchdogs.NewMeshControlPlaneCheck},
-	{nodehealth.CheckNameNodeHang, nodehealth.NewNodeHangCheck},
-	{nethealth.CheckNameLinkerdEndpointSync, nethealth.NewLinkerdEndpointSyncCheck},
-	{datastore.CheckNameScyllaHealth, datastore.NewScyllaHealthCheck},
-	{gitops.CheckNameFluxHRRetries, gitops.NewFluxHRRetriesCheck},
-	{datastore.CheckNamePerconaQuorum, datastore.NewPerconaQuorumCheck},
-	{nethealth.CheckNameCiliumBPFMapPressure, nethealth.NewCiliumBPFMapPressureCheck},
-	{nethealth.CheckNameLinkerdOpaqueStall, nethealth.NewLinkerdProtocolDetectionStallCheck},
-	{nethealth.CheckNameCoreDNSUpstream, nethealth.NewCoreDNSUpstreamCheck},
-	{nethealth.CheckNameCiliumNodeIPAM, nethealth.NewCiliumNodeIPAMExhaustionCheck},
-	{nodehealth.CheckNameNamespaceWedged, nodehealth.NewNamespaceTerminatingWedgedCheck},
-	{gitops.CheckNameArgoCDAppStuck, gitops.NewArgoCDAppStuckCheck},
-	{gitops.CheckNameKargoPromotionHealth, gitops.NewKargoPromotionHealthCheck},
-	{datastore.CheckNameRabbitMQQuorum, datastore.NewRabbitMQQuorumHealthCheck},
-	{datastore.CheckNameDragonflySyncStorm, datastore.NewDragonflyReplicaSyncStormCheck},
-	{nodehealth.CheckNameImagePullStorm, nodehealth.NewImagePullStormCheck},
-	{nodehealth.CheckNameAPIObjectSprawlReportGC, nodehealth.NewAPIObjectSprawlReportGCCheck},
-	{nodehealth.CheckNameCPUStealTaintSync, nodehealth.NewCPUStealTaintSyncCheck},
-	{nethealth.CheckNameCiliumMissingEndpoints, nethealth.NewCiliumMissingEndpointsCheck},
-	{nethealth.CheckNameLinkerdH2StreamGuard, nethealth.NewLinkerdH2StreamGuardCheck},
-	{nethealth.CheckNameCloudflaredTunnelHealth, nethealth.NewCloudflaredTunnelHealthCheck},
-	{nethealth.CheckNameLiqoTunnelHealth, nethealth.NewLiqoTunnelHealthCheck},
-	{nethealth.CheckNameKonnectivityTunnelHealth, nethealth.NewKonnectivityTunnelHealthCheck},
-	{datastore.CheckNamePostgresWALArchiveGuard, datastore.NewPostgresWALArchiveGuardCheck},
-	{datastore.CheckNameScyllaCompactionSchemaGuard, datastore.NewScyllaCompactionSchemaGuardCheck},
-	{datastore.CheckNameNatsJetstreamHealth, datastore.NewNatsJetstreamHealthCheck},
-	{nodehealth.CheckNameKedaScaledObjectGuard, nodehealth.NewKedaScaledObjectGuardCheck},
-	{nethealth.CheckNameGatewayRouteHealth, nethealth.NewGatewayRouteHealthCheck},
-	{nodehealth.CheckNameControllerLeaseGuard, nodehealth.NewControllerLeaseGuardCheck},
-	{datastore.CheckNamePVCResizeStallGuard, datastore.NewPVCResizeStallGuardCheck},
-	{nethealth.CheckNameEndpointSliceZoneStarvation, nethealth.NewEndpointSliceZoneStarvationCheck},
-	{nethealth.CheckNameLinkerdOutlierGuard, nethealth.NewLinkerdOutlierGuardCheck},
-	{nodehealth.CheckNameNodeCondSweeper, nodehealth.NewNodeConditionSweeperCheck},
 }
 
 // sharedHealsMaxAge bounds the shared Deps.Heals cooldown ledger —
@@ -222,41 +150,26 @@ type clusterHealthProber struct {
 	// staleness.
 	lastPass map[string]time.Time
 
-	// checks is the run() registry — built once at construction from
-	// checkDefs plus the collected CheckRegs (extra), in the
-	// historical sweep order.
+	// checks is the run() roster — built once at construction from
+	// the collected CheckRegs in the order SetupModules collected
+	// them (registry order — the historical sweep order).
 	checks []checkEntry
 }
 
-func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.Interface, nr kube.CachedNodeReader, cfg probefw.Config, extra []shared.CheckReg) (*clusterHealthProber, error) {
-	d := &probefw.Deps{
-		Name:       name,
-		NodeReader: nr,
-		CS:         cs,
-		Dyn:        dyn,
-		Cfg:        cfg,
-		LookupHost: (&net.Resolver{}).LookupHost,
-		HTTPClient: &http.Client{},
-		Now:        time.Now,
-	}
-	// The Prometheus client shares the HTTPClient seam tests swap
-	// post-construction (PromQuery re-reads it per call) and bounds
-	// each query by the check timeout — the posture the retired
-	// promInstantQuery encoded inline.
-	d.Prom = promq.Client{HTTP: d.HTTPClient, Timeout: cfg.Timeouts.Check}
+// newClusterHealthProber wires the sweep runner from the module's
+// registry-stamped Deps: probefw.NewDeps centralizes the shared
+// check dependencies (clients, seams, the Prom client) and
+// d.CheckRegs carries the roster SetupModules collected from the
+// selected, enabled check rows — a mistyped registration fails boot
+// here instead of silently dropping the check (see
+// check_modules.go).
+func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthProber, error) {
 	p := &clusterHealthProber{
-		Deps:     d,
+		Deps:     probefw.NewDeps(d, cfg),
 		boot:     time.Now(),
 		lastPass: map[string]time.Time{},
 	}
-	for _, def := range checkDefs {
-		p.checks = append(p.checks, checkEntry{name: def.name, check: def.new(d)})
-	}
-	// The CheckRegs SetupModules collected from the enabled
-	// per-check rows land after the static roster — a mistyped
-	// registration fails boot here instead of silently dropping the
-	// check (see check_modules.go).
-	if err := p.appendCheckRegs(extra); err != nil {
+	if err := p.appendCheckRegs(d.CheckRegs); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -269,12 +182,13 @@ func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.In
 // disabled skips mgr.Add entirely, matching the
 // cilium-taint-reaper pattern. dyn feeds the CRD scans inside the
 // self-healing checks (W5.8/W6.2) — wired like every other
-// dynamic-client module. Deps.CheckRegs carries the enabled
-// per-check rows' contributions — a mistyped one fails boot here,
+// dynamic-client module. Deps.CheckRegs carries the whole check
+// roster — the registrations SetupModules collected from the
+// selected, enabled check rows — a mistyped one fails boot here,
 // not silently.
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, setupConfigFromEnv, func(cfg setupConfig) error {
-		p, err := newClusterHealthProber(d.Name, d.CS, d.Dyn, d.Mgr.GetClient(), cfg.probes, d.CheckRegs)
+		p, err := newClusterHealthProber(d, cfg.probes)
 		if err != nil {
 			return err
 		}
@@ -283,6 +197,10 @@ func Setup(d shared.Deps) error {
 		// checks run with (an unparseable env value silently falls back
 		// to the default — the effective value is what matters here).
 		logf.Log.WithName(d.Name).Info("registered",
+			// checks surfaces the roster size — a -modules selection
+			// that picks cluster-health-probes without any check row
+			// sweeps an empty roster, which only this line reveals.
+			"checks", len(p.checks),
 			"interval", cfg.interval, "perCheckTimeout", p.Cfg.Timeouts.PerCheck,
 			"dnsHostnames", p.Cfg.DNS.Hostnames,
 			"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,

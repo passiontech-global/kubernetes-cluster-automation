@@ -1,24 +1,30 @@
-// check_modules.go — the CheckReg merge: the per-check registry rows
-// (the W13 gitops checks) carry shared.CheckReg instead of a Setup —
-// they contribute one check into this sweep's roster rather than
-// registering runnables of their own. registry.SetupModules collects
-// the ENABLED rows' registrations into Deps.CheckRegs (stamped on
-// every module's Deps) and appendCheckRegs folds them into the
-// prober's check list after the static checkDefs.
+// check_modules.go — the CheckReg merge: every health-section
+// registry row carries shared.CheckReg instead of a Setup — it
+// contributes one check into this sweep's roster rather than
+// registering runnables of its own. registry.SetupModules collects
+// the ENABLED, SELECTED rows' registrations into Deps.CheckRegs
+// (stamped on every module's Deps, in registry order — which IS the
+// sweep order) and appendCheckRegs folds them into the prober's
+// check list. There is no second roster: Deps.CheckRegs is the
+// whole thing.
 //
 // Semantics that fall out of the shape:
 //
 //   - GateEnv off (or -modules excludes the check row) → the row's
 //     CheckReg is never collected → the check never joins the
-//     roster. That is the per-check gate the rows exist for.
+//     roster. That is the per-check gate the gated rows exist for.
 //   - The check still requires the cluster-health-probes module
 //     itself: a check row selected WITHOUT cluster-health-probes
-//     contributes to a Deps.CheckRegs nothing consumes. Documented
-//     next to the registry rows and in docs/env.md.
-//   - No ordering constraint: collection runs before ANY Setup, so a
-//     check row may sit anywhere in registry.Modules — the
-//     checkDefs-mutation era's "check rows must precede
-//     cluster-health-probes" constraint is gone.
+//     contributes to a Deps.CheckRegs nothing consumes — and
+//     cluster-health-probes selected without any check row sweeps
+//     an empty roster. Documented next to the registry rows and in
+//     docs/env.md.
+//   - No ordering constraint RELATIVE to the sweep row: collection
+//     runs before ANY Setup, so a check row may sit anywhere in
+//     registry.Modules — the checkDefs-mutation era's "check rows
+//     must precede cluster-health-probes" constraint is gone. The
+//     check rows' order among THEMSELVES is the ops contract
+//     though — reordering them reorders the sweep.
 package clusterhealthprobes
 
 import (
@@ -30,11 +36,11 @@ import (
 
 // appendCheckRegs folds the SetupModules-collected check
 // registrations into the prober roster, deduped by name — a repeat
-// registration (SetupModules driven twice in one test binary, or a
-// CheckReg naming an already-static checkDefs check) cannot
-// double-register, preserving the old registerCheck idempotence.
-// r.New is `any` because shared cannot name probefw (import cycle +
-// depguard); a registration that isn't the standard
+// registration (SetupModules driven twice in one test binary, or
+// two rows naming the same check) cannot double-register,
+// preserving the old registerCheck idempotence. r.New is `any`
+// because shared cannot name probefw (import cycle + depguard); a
+// registration that isn't the standard
 // `func(*probefw.Deps) probefw.Check` shape is a boot-time error
 // naming the check, never a silent skip.
 func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) error {

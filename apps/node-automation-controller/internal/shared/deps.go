@@ -38,10 +38,10 @@ import (
 //     gate-on.
 //   - CheckRegs carries the health-sweep check registrations
 //     registry.SetupModules collected from the ENABLED CheckReg
-//     module rows (the per-check gate rows — a gated-off or
-//     unselected row contributes nothing). SetupModules stamps the
-//     same slice on every row's Deps; only the
-//     cluster-health-probes sweep consumes it. Nil in
+//     module rows, in registry order — that order IS the sweep
+//     order (a gated-off or unselected row contributes nothing).
+//     SetupModules stamps the same slice on every row's Deps; only
+//     the cluster-health-probes sweep consumes it. Nil in
 //     literally-constructed test Deps.
 type Deps struct {
 	Name      string
