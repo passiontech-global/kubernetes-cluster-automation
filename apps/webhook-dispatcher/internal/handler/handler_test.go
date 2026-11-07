@@ -550,6 +550,38 @@ func TestFanoutBoundsConcurrency(t *testing.T) {
 	}
 }
 
+func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
+	// The fan-out semaphore belongs to the Handler, not to one
+	// dispatch — several deliveries fanning out at once must keep
+	// TOTAL in-flight checks <= fanoutWorkers. A per-dispatch
+	// semaphore would let each run fanoutWorkers in parallel.
+	b := &throttledBackend{delay: 10 * time.Millisecond}
+	h := New(testSecret, b)
+	var resources []concourse.Resource
+	for i := 0; i < fanoutWorkers; i++ {
+		resources = append(resources, concourse.Resource{
+			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
+			Type: "git", Repo: "org/repo",
+		})
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.dispatch(resources, "d", "push", "org/repo")
+		}()
+	}
+	wg.Wait()
+	if got := b.maxInflight(); got > fanoutWorkers {
+		t.Fatalf("max in-flight checks=%d want <= %d (semaphore must be shared across fan-outs)",
+			got, fanoutWorkers)
+	}
+	if got := b.calls(); got != 3*len(resources) {
+		t.Fatalf("check calls=%d want %d", got, 3*len(resources))
+	}
+}
+
 // throttledBackend sleeps per check and tracks peak concurrency.
 type throttledBackend struct {
 	resources []concourse.Resource

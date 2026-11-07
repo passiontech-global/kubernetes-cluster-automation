@@ -80,6 +80,11 @@ type summary struct {
 type Handler struct {
 	secret  string
 	backend Backend
+	// sem bounds concurrent check-webhook POSTs across ALL in-flight
+	// fan-outs — allocated once here, not per dispatch: a per-request
+	// semaphore would still let N concurrent deliveries fire
+	// fanoutWorkers*N parallel requests at the ATC.
+	sem chan struct{}
 	// wg tracks in-flight background fan-outs so tests and the
 	// graceful-shutdown path (Wait) can wait for the last check to
 	// land.
@@ -89,7 +94,11 @@ type Handler struct {
 // New returns a Handler verifying signatures against secret and
 // fanning out through b.
 func New(secret string, b Backend) *Handler {
-	return &Handler{secret: secret, backend: b}
+	return &Handler{
+		secret:  secret,
+		backend: b,
+		sem:     make(chan struct{}, fanoutWorkers),
+	}
 }
 
 // Wait blocks until every in-flight background fan-out has finished —
@@ -266,23 +275,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // dispatch POSTs every matched resource's check webhook on a detached
-// context — the request is already answered. A worker semaphore
-// bounds concurrency so a large match set can't stampede the ATC;
-// each target gets its own timeout so one wedged pipeline can't
-// stall the rest of the fan-out.
+// context — the request is already answered. The Handler-wide worker
+// semaphore bounds concurrency so a large match set (or several
+// deliveries at once) can't stampede the ATC; each target gets its
+// own timeout so one wedged pipeline can't stall the rest of the
+// fan-out.
 func (h *Handler) dispatch(resources []concourse.Resource,
 	delivery, event, repo string) {
 	start := time.Now()
 	ctx := context.Background()
-	sem := make(chan struct{}, fanoutWorkers)
 	var wg sync.WaitGroup
 	var checked atomic.Int64
 	for _, res := range resources {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			h.sem <- struct{}{}
+			defer func() { <-h.sem }()
 			tctx, cancel := context.WithTimeout(ctx, fanoutTimeout)
 			defer cancel()
 			status, err := h.backend.CheckWebhook(tctx, res)

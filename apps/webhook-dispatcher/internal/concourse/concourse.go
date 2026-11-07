@@ -115,11 +115,20 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 // pipeline zero-match every delivery, so an unthrottled refresh would
 // turn org-webhook volume into constant index rebuilds. A failed
 // refresh keeps the previous index.
+//
+// The throttle watches lastAttemptAt, not just fetchedAt: fetchedAt
+// only moves on success, so during an ATC outage an unmatched
+// delivery would otherwise grab the mutex and block on a doomed
+// network fetch every time — stalling every other webhook behind
+// the HTTP timeout.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if time.Since(c.fetchedAt) < c.minRefreshInterval() {
+	// lastAttemptAt >= fetchedAt always (a success stamps both, a
+	// failure stamps only the attempt), so the attempt stamp alone
+	// covers both "recently fetched" and "recently failed".
+	if time.Since(c.lastAttemptAt) < c.minRefreshInterval() {
 		return c.index, nil
 	}
 	index, err := c.fetchIndex(ctx)
@@ -166,6 +175,11 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 	}
 
 	results := make([][]Resource, len(pipelines))
+	// lost[i] records a pipeline whose listing failed with nothing in
+	// the previous index to carry over — the refreshed index would be
+	// silently missing its resources, so the fetch must fail instead
+	// of caching an incomplete view (see below).
+	lost := make([]string, len(pipelines))
 	sem := make(chan struct{}, fetchIndexWorkers)
 	var wg sync.WaitGroup
 	for i, p := range pipelines {
@@ -188,6 +202,11 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 				// Pipelines truly gone drop out via the pipeline list
 				// itself, not through this path.
 				results[i] = append(results[i], prev[p.Name]...)
+				if len(prev[p.Name]) == 0 {
+					// Nothing to carry over — the new index would
+					// silently lack this pipeline's resources.
+					lost[i] = p.Name
+				}
 				logger().Warn("pipeline resource listing failed — keeping last-known resources",
 					"concourse_url", c.BaseURL, "team", c.Team,
 					"pipeline", p.Name, "error", err)
@@ -208,6 +227,23 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		}()
 	}
 	wg.Wait()
+
+	// A pipeline whose listing failed with no last-known resources to
+	// carry means the index is incomplete: caching it would stamp
+	// fetchedAt and answer 202/nothing-matched for the TTL window,
+	// dropping build triggers. Fail the fetch instead — the callers
+	// then serve the stale index (or 502 on a cold start) and retry.
+	var missing []string
+	for _, name := range lost {
+		if name != "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"resource listings failed with no prior data: %s",
+			strings.Join(missing, ","))
+	}
 
 	var index []Resource
 	for _, rs := range results {
@@ -293,11 +329,17 @@ func sourceRepo(source map[string]any) string {
 }
 
 // NormalizeRepo reduces a GitHub repo identifier — scp-like SSH
-// (git@github.com:org/repo.git), HTTPS URL
-// (https://github.com/org/repo[.git]) or bare "org/repo" — to the
-// lowercase "org/repo" form used for equality matching.
+// (git@github.com:org/repo.git), ssh:// or HTTPS URL
+// (ssh://git@github.com[:port]/org/repo[.git],
+// https://github.com[:port]/org/repo[.git]) or bare "org/repo" — to
+// the lowercase "org/repo" form used for equality matching.
 func NormalizeRepo(s string) string {
-	s = strings.TrimSpace(s)
+	// Lowercase and strip the trailing ".git" up front: the host
+	// match and the suffix strip are both case-sensitive, and an
+	// upper-cased "GitHub.COM"/"Repo.GIT" must still normalize.
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
 	// Strip the "github.com" host prefix from URL/scp-like forms. The
 	// boundary check keeps lookalike hosts (e.g. "notgithub.com")
 	// from being treated as github.com.
@@ -305,21 +347,31 @@ func NormalizeRepo(s string) string {
 		(i == 0 || strings.ContainsRune("/@.", rune(s[i-1]))) {
 		rest := s[i+len("github.com"):]
 		if rest != "" && rest[0] == ':' {
-			// After the colon: either an optional :port (URL form —
-			// digits immediately followed by /) or the scp-style
-			// separator itself.
 			rest = rest[1:]
-			j := 0
-			for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
-				j++
-			}
-			if j > 0 && j < len(rest) && rest[j] == '/' {
-				rest = rest[j:]
+			// What the colon means depends on the syntax around the
+			// host:
+			//   scheme://[user@]host:port/path — a :<digits>/ segment
+			//     is a TCP port to drop;
+			//   host:port/path with no user part — likewise a port;
+			//   user@host:path (scp-like, "git@github.com:…") — the
+			//     colon IS the path separator, so an all-numeric
+			//     first segment is an org, not a port.
+			// Scp-like = a user@ part ahead of the host with no "//"
+			// authority marker before it.
+			prefix := s[:i]
+			scpLike := strings.ContainsRune(prefix, '@') &&
+				!strings.Contains(prefix, "//")
+			if !scpLike {
+				j := 0
+				for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+					j++
+				}
+				if j > 0 && j < len(rest) && rest[j] == '/' {
+					rest = rest[j:]
+				}
 			}
 		}
 		s = strings.TrimLeft(rest, "/")
 	}
-	s = strings.TrimSuffix(s, "/")
-	s = strings.TrimSuffix(s, ".git")
-	return strings.ToLower(s)
+	return s
 }

@@ -32,6 +32,17 @@ func TestNormalizeRepo(t *testing.T) {
 		// Digits after the scp colon that aren't followed by a slash
 		// are part of the repo name, not a port.
 		{"git@github.com:22org/repo", "22org/repo"},
+		// An all-numeric org after the scp colon is an ORG, not a
+		// port — "git@host:path" carries no port syntax.
+		{"git@github.com:12345/repo.git", "12345/repo"},
+		{"git@github.com:12345/Repo", "12345/repo"},
+		// Real ports on URL forms are still dropped.
+		{"ssh://git@github.com:2222/org/repo.git", "org/repo"},
+		{"https://github.com:8443/org/repo", "org/repo"},
+		// Case is normalized everywhere — host match and the .git
+		// strip must see the lowercased input.
+		{"HTTPS://GitHub.COM/Org/Repo.GIT", "org/repo"},
+		{"SSH://Git@GitHub.Com:2222/Org/Repo.Git", "org/repo"},
 		{"git://github.com/org/repo", "org/repo"},
 		{"github.com/org/repo", "org/repo"},
 		{"org/repo", "org/repo"},
@@ -116,6 +127,12 @@ func (a *atcStub) fail(path string, status int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.fails[path] = status
+}
+
+func (a *atcStub) unfail(path string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.fails, path)
 }
 
 func (a *atcStub) setRoute(path, body string) {
@@ -317,8 +334,10 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	// it from Resources for an hour.
 	stub.setRoute("/api/v1/teams/main/pipelines/p2/resources",
 		`[{"name":"new","type":"git","source":{"uri":"org/new"}}]`)
-	// Past the forced-refresh throttle window.
+	// Past the forced-refresh throttle window — it keys on
+	// lastAttemptAt now, so age both stamps.
 	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.lastAttemptAt = c.fetchedAt
 
 	fresh, err := c.Refresh(context.Background())
 	if err != nil {
@@ -336,12 +355,65 @@ func TestRefreshBypassesTTL(t *testing.T) {
 
 	// A failed refresh keeps the previous index.
 	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.lastAttemptAt = c.fetchedAt
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if _, err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh(500) want error")
 	}
 	if cached, _ := c.Resources(context.Background()); len(cached) != len(fresh) {
 		t.Fatalf("index after failed refresh=%d want %d", len(cached), len(fresh))
+	}
+}
+
+func TestFetchIndexColdStartListingFailureErrors(t *testing.T) {
+	// Cold start: the pipeline list succeeds but a per-pipeline
+	// resource listing fails with nothing in the previous index to
+	// carry over. The fetch must FAIL — caching the partial result
+	// would stamp fetchedAt and answer 202/resources_matched:0 for
+	// the TTL window, silently dropping build triggers.
+	stub := newATCStub(t, stubRoutes())
+	stub.fail("/api/v1/teams/main/pipelines/p1/resources", 500)
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}
+
+	if _, err := c.Resources(context.Background()); err == nil {
+		t.Fatal("Resources want error — the index is incomplete")
+	}
+	if c.index != nil {
+		t.Fatalf("c.index=%v want nil (incomplete index must not cache)", c.index)
+	}
+	// With the ATC recovered the next call retries (there is no
+	// stale index to back off behind) and builds the real index.
+	stub.unfail("/api/v1/teams/main/pipelines/p1/resources")
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatalf("retry after recovery: err=%v want nil", err)
+	}
+	if len(index) != 4 {
+		t.Fatalf("index=%d resources want 4", len(index))
+	}
+}
+
+func TestFetchIndexNewPipelineListingFailureServesStale(t *testing.T) {
+	// Warm cache: a pipeline that appeared since the last fetch has
+	// no last-known resources, so its failed listing makes the whole
+	// fetch fail — Resources then falls back to the stale index
+	// rather than caching an incomplete view.
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Nanosecond}
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond) // expire the TTL
+
+	// p3 is brand new (no prev data) and its listing 404s.
+	stub.setRoute("/api/v1/teams/main/pipelines",
+		`[{"name":"p1"},{"name":"p2"},{"name":"p3"}]`)
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatalf("stale fallback err=%v want nil", err)
+	}
+	if len(index) != 4 {
+		t.Fatalf("stale index=%d resources want 4", len(index))
 	}
 }
 
@@ -364,6 +436,38 @@ func TestRefreshThrottled(t *testing.T) {
 	}
 	if len(index) != 4 {
 		t.Fatalf("throttled Refresh index=%d want 4", len(index))
+	}
+}
+
+func TestRefreshFailedAttemptBacksOff(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
+
+	// Warm the index, then age the last attempt out of the throttle
+	// window and break the ATC: the next Refresh hits the network,
+	// fails, and stamps lastAttemptAt.
+	if _, err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.lastAttemptAt = time.Now().Add(-c.minRefreshInterval())
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	if _, err := c.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh(500) want error")
+	}
+	hits := stub.hitCount("/api/v1/teams/main/pipelines")
+
+	// Refreshes inside the backoff window must serve the cached
+	// index without another doomed network call — fetchedAt only
+	// moves on success, so without the lastAttemptAt throttle every
+	// zero-match webhook would take c.mu and block on the dead ATC.
+	for i := 0; i < 3; i++ {
+		index, err := c.Refresh(context.Background())
+		if err != nil || len(index) != 4 {
+			t.Fatalf("call %d: index=%v err=%v want 4, nil", i, index, err)
+		}
+	}
+	if got := stub.hitCount("/api/v1/teams/main/pipelines"); got != hits {
+		t.Fatalf("pipeline-list hits=%d want %d (failed Refresh must back off)", got, hits)
 	}
 }
 
