@@ -50,7 +50,7 @@ func (t *Topology) derive() {
 		if mo := mapGet(nv, "marker_octet"); !jinja.IsNilOrUndef(mo) {
 			return base + "." + jinja.Stringify(mo)
 		}
-		return base + "." + lastOctet(mapStr(nv, "ip"))
+		return base + "." + LastOctet(mapStr(nv, "ip"))
 	}
 
 	// --- markers + relay map ---
@@ -68,7 +68,7 @@ func (t *Topology) derive() {
 		if name != "" && ip != "" {
 			t.Markers[name] = markerOf(om)
 			if legacyBase != "" {
-				mo := lastOctet(ip)
+				mo := LastOctet(ip)
 				if m := mapGet(om, "marker_octet"); !jinja.IsNilOrUndef(m) {
 					mo = jinja.Stringify(m)
 				}

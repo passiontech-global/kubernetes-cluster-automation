@@ -187,6 +187,16 @@ func JSONFindInts(v any, out *[]int64, keys ...string) {
 	walk(v)
 }
 
+// ShellQuote single-quotes a shell word. The paths and configured
+// names it guards are admin-controlled, but quoting keeps `sh -c`
+// command strings robust against a stray space or metachar that
+// would otherwise split or glob the word (hubsync's remote puts and
+// kinedb's runtime-log scan both interpolate configured names into
+// shell strings).
+func ShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // MTUOfIface reads <sysnet>/<iface>/mtu — the sysfs MTU of one
 // interface.
 func MTUOfIface(sysnet, iface string) (int64, bool) {

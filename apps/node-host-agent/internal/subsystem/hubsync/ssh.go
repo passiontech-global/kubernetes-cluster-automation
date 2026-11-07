@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
 
@@ -40,12 +41,6 @@ type ExitError interface {
 	ExitStatus() int
 }
 
-// shq single-quotes a shell word (paths are admin-controlled, but
-// quotes keep the commands robust against stray spaces).
-func shq(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 // tmpPath is the staging path for an atomic write:
 // /usr/local/bin/node-host-agent → /usr/local/bin/.node-host-agent.tmp
 // (hub_converge copy-then-mv parity).
@@ -63,10 +58,10 @@ func tmpPath(p string) string {
 // `mv tmp remotePath` would then silently NEST the staging file
 // inside the directory instead of replacing a file.
 func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error) {
-	if _, err := c.Run(ctx, "test -d "+shq(remotePath)); err == nil {
+	if _, err := c.Run(ctx, "test -d "+hostutil.ShellQuote(remotePath)); err == nil {
 		return "", fmt.Errorf("%s is a directory", remotePath)
 	}
-	out, err := c.Run(ctx, "sha256sum "+shq(remotePath))
+	out, err := c.Run(ctx, "sha256sum "+hostutil.ShellQuote(remotePath))
 	if err != nil {
 		var ee ExitError
 		if errors.As(err, &ee) && ee.ExitStatus() == 1 {
@@ -93,17 +88,17 @@ func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode
 	// stale tmp left by an interrupted run, and the subsequent
 	// `cat >`/`tee` only truncates — the inode keeps 0600.
 	if mode == "0600" || isKeyMaterial(path.Base(remotePath)) {
-		if _, err := c.Run(ctx, "install -m 600 /dev/null "+shq(tmp)); err != nil {
+		if _, err := c.Run(ctx, "install -m 600 /dev/null "+hostutil.ShellQuote(tmp)); err != nil {
 			return fmt.Errorf("install %s: %w", tmp, err)
 		}
 	}
 	if err := c.Write(ctx, tmp, r); err != nil {
 		return fmt.Errorf("upload %s: %w", tmp, err)
 	}
-	if _, err := c.Run(ctx, "chmod "+mode+" "+shq(tmp)); err != nil {
+	if _, err := c.Run(ctx, "chmod "+mode+" "+hostutil.ShellQuote(tmp)); err != nil {
 		return fmt.Errorf("chmod %s: %w", tmp, err)
 	}
-	if _, err := c.Run(ctx, "mv "+shq(tmp)+" "+shq(remotePath)); err != nil {
+	if _, err := c.Run(ctx, "mv "+hostutil.ShellQuote(tmp)+" "+hostutil.ShellQuote(remotePath)); err != nil {
 		return fmt.Errorf("mv %s: %w", remotePath, err)
 	}
 	return nil
@@ -262,9 +257,9 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	if err != nil {
 		return err
 	}
-	cmd := "cat > " + shq(remotePath)
+	cmd := "cat > " + hostutil.ShellQuote(remotePath)
 	if c.sudo {
-		cmd = "sudo -n tee " + shq(remotePath) + " >/dev/null"
+		cmd = "sudo -n tee " + hostutil.ShellQuote(remotePath) + " >/dev/null"
 	}
 	if err := sess.Start(cmd); err != nil {
 		return err
