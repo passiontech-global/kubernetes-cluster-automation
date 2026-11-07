@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
@@ -228,11 +229,11 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 		}
 	}
 
-	if _, err := conn.Run(tctx, "mkdir -p "+shq(cfg.RemoteVarsDir)); err != nil {
+	if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteVarsDir)); err != nil {
 		return err
 	}
 	if t.InterDC {
-		if _, err := conn.Run(tctx, "mkdir -p "+shq(cfg.RemoteCertsDir)); err != nil {
+		if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteCertsDir)); err != nil {
 			return err
 		}
 	}
@@ -240,10 +241,10 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 		// Two separate runs: the conn prepends `sudo -n` to the raw
 		// string, so a `mkdir && chmod` compound would only escalate
 		// mkdir — the chmod would fail EPERM for non-root ssh_user.
-		if _, err := conn.Run(tctx, "mkdir -p "+shq(cfg.GuardDir)); err != nil {
+		if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.GuardDir)); err != nil {
 			return err
 		}
-		if _, err := conn.Run(tctx, "chmod 0700 "+shq(cfg.GuardDir)); err != nil {
+		if _, err := conn.Run(tctx, "chmod 0700 "+hostutil.ShellQuote(cfg.GuardDir)); err != nil {
 			return err
 		}
 	}
@@ -324,16 +325,16 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	}
 	svc := unitName(cfg.UnitPath)
 	if binaryUpdated || (unitChanged && !freshUnit) {
-		if _, err := conn.Run(tctx, "systemctl enable "+shq(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable "+hostutil.ShellQuote(svc)); err != nil {
 			return err
 		}
-		if _, err := conn.Run(tctx, "systemctl restart "+shq(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl restart "+hostutil.ShellQuote(svc)); err != nil {
 			return err
 		}
 		s.cfg.Log.Info("hubsync: service restarted after update",
 			"target", t.Name, "unit", svc)
 	} else {
-		if _, err := conn.Run(tctx, "systemctl enable --now "+shq(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable --now "+hostutil.ShellQuote(svc)); err != nil {
 			return err
 		}
 	}
@@ -421,7 +422,7 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 		return fmt.Errorf("prune %s: refusing to empty remote dir — local kept-set empty",
 			remoteDir)
 	}
-	out, err := c.Run(ctx, "ls -1pA "+shq(remoteDir))
+	out, err := c.Run(ctx, "ls -1pA "+hostutil.ShellQuote(remoteDir))
 	if err != nil {
 		return fmt.Errorf("ls %s: %w", remoteDir, err)
 	}
@@ -445,7 +446,7 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 				continue
 			}
 		}
-		if _, err := c.Run(ctx, "rm -f "+shq(path.Join(remoteDir, rname))); err != nil {
+		if _, err := c.Run(ctx, "rm -f "+hostutil.ShellQuote(path.Join(remoteDir, rname))); err != nil {
 			return fmt.Errorf("rm stale %s/%s: %w", remoteDir, rname, err)
 		}
 		s.cfg.Log.Info("hubsync: removed stale remote file",

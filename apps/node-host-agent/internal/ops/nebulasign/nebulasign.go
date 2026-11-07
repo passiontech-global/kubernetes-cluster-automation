@@ -174,7 +174,7 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 		ip := omStr(om, "ip")
 		octet := omStr(om, "marker_octet")
 		if octet == "" {
-			octet = lastOctet(ip)
+			octet = topology.LastOctet(ip)
 		}
 		// ip feeds Subnets and the SSH fallback, octet feeds
 		// IPCIDR — an empty one would produce "172.29.0./24" or
@@ -319,13 +319,6 @@ func stripPubArmor(s string) string {
 		b.WriteString(line)
 	}
 	return b.String()
-}
-
-func lastOctet(ip string) string {
-	if i := strings.LastIndex(ip, "."); i >= 0 {
-		return ip[i+1:]
-	}
-	return ip
 }
 
 func uniqSortedStrings(in []string) []string {

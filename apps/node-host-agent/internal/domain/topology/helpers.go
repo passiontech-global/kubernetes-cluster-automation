@@ -29,7 +29,11 @@ func mapList(m any, key string) []any { return jinja.ToIter(mapGet(m, key)) }
 
 func nodeNameOf(v any) string { return mapStr(v, "name") }
 
-func lastOctet(ip string) string {
+// LastOctet returns the trailing dotted quad of an IPv4 address —
+// the default marker_octet a node entry falls back to when the
+// registry does not pin one (ops/nebulasign shares the derivation,
+// which is why it is exported rather than duplicated).
+func LastOctet(ip string) string {
 	if i := strings.LastIndex(ip, "."); i >= 0 {
 		return ip[i+1:]
 	}

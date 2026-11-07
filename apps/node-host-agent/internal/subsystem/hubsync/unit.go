@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // systemdUnit renders the remote node-host-agent.service for target
@@ -17,7 +19,7 @@ import (
 // DaemonSet arg (:8091 — :8081 is lixo-fabric's
 // --health-probe-bind-address on production hosts) so probes/metrics
 // keep one port convention across pod and standalone deployments.
-// node-name is shq-quoted: systemd strips the quotes when splitting
+// node-name is shell-quoted: systemd strips the quotes when splitting
 // ExecStart argv, so a config-derived name with spaces stays one
 // argument instead of smuggling extra flags.
 func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
@@ -46,7 +48,7 @@ Environment=GOMEMLIMIT=400MiB
 
 [Install]
 WantedBy=multi-user.target
-`, remoteVarsDir, remoteCertsDir, remoteBinary, shq(t.Name))
+`, remoteVarsDir, remoteCertsDir, remoteBinary, hostutil.ShellQuote(t.Name))
 }
 
 // unitName derives the systemd unit name from UnitPath.
