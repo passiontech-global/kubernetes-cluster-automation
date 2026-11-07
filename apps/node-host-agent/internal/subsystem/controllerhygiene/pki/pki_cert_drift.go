@@ -142,7 +142,7 @@ func (c *DriftCheck) Run(ctx context.Context) {
 				pair.Unit, pair.CertFile, pair.Addr))
 			c.d.State.RateSpend(cdeps.FileRatePKIRestart)
 			c.d.State.ResetCounter(ctr)
-			if err := c.d.Cfg.RestartFn(ctx, pair.Unit); err != nil {
+			if err := c.d.Restart(ctx, pair.Unit); err != nil {
 				c.d.State.AppendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", pair.Unit, err))
 			}

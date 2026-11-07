@@ -81,7 +81,7 @@ func (c *HubCheck) Run(ctx context.Context) {
 	// The shell gates the whole rv probe on the admin cert existing;
 	// ensureClient()==nil is the equivalent "not a controller / k0s
 	// not initialised" no-op.
-	if c.d.EnsureClient() == nil && c.d.Cfg.ListRVFn == nil {
+	if c.d.EnsureClient() == nil {
 		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "no_creds").Inc()
 		return
 	}
@@ -236,11 +236,11 @@ func (c *HubCheck) Run(ctx context.Context) {
 			// wedge decision and pin the apiserver's watch cache —
 			// ss -K drops the zombie sockets so the restart (and the
 			// post-restart reconnect) starts clean.
-			if err := c.d.Cfg.SSKillFn(ctx); err != nil {
+			if err := c.d.SSKill(ctx); err != nil {
 				c.d.State.AppendLogWarn(fmt.Sprintf(
 					"ss -K sport = :6443 failed (zombie watch streams left): %v", err))
 			}
-			if err := c.d.Cfg.RestartFn(ctx, c.d.Cfg.RestartUnit); err != nil {
+			if err := c.d.Restart(ctx, c.d.Cfg.RestartUnit); err != nil {
 				c.d.State.AppendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", c.d.Cfg.RestartUnit, err))
 			}
@@ -313,7 +313,7 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 			c.d.Cfg.Hub.KineDBProbe, dn))
 		c.d.State.RateSpend(cdeps.FileRateRestart)
 		c.d.State.ResetCounter(cdeps.FileCtrDead)
-		if err := c.d.Cfg.RestartFn(ctx, c.d.Cfg.RestartUnit); err != nil {
+		if err := c.d.Restart(ctx, c.d.Cfg.RestartUnit); err != nil {
 			c.d.State.AppendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", c.d.Cfg.RestartUnit, err))
 		}

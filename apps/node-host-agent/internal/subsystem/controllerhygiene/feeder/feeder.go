@@ -190,11 +190,11 @@ func (f *Feeder) waitMainPID(ctx context.Context, unit string) string {
 // unitProp reads a systemd property — empty string on any failure
 // (shell `| tr -d '[:space:]'` + `|| true` parity).
 func (f *Feeder) unitProp(ctx context.Context, unit, prop string) string {
-	out, err := f.d.Cfg.PropFn(ctx, unit, prop)
+	out, err := f.d.UnitProp(ctx, unit, prop)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	return out
 }
 
 // RunRemediate is the G1..G6 ordered-gate port of
@@ -226,8 +226,8 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 
 	// G2: unit not active = something else is already restarting it
 	// (operator, PartOf chain, OOM) — never pile on.
-	state, err := f.d.Cfg.IsActiveFn(ctx, unit)
-	if err != nil || state != "active" {
+	state := f.d.UnitActiveState(ctx, unit)
+	if state != "active" {
 		f.d.State.AppendLog(fmt.Sprintf("G2 PASS: %s is-active='%s' (!= active) — already restarting, stop", unit, state))
 		return
 	}
@@ -299,7 +299,7 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	// The budget is spent BEFORE the restart call (shell stamped the
 	// epoch on success, but the remediate script ran as a oneshot —
 	// a watchdog kill mid-restart could not restart it again). In-agent
-	// a killed/hung restartFn with an unwritten budget would allow a
+	// a killed/hung restart exec with an unwritten budget would allow a
 	// second restart inside the 1800s window. FeederStateDir may not
 	// exist yet (mkdir -p parity) — create it so the mark lands.
 	if err := os.MkdirAll(fcfg.StateDir, 0o755); err != nil {
@@ -311,7 +311,7 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	f.d.State.AppendLog("G6: all gates passed — systemctl restart " + unit)
 	f.d.State.WriteEpochFile(lastPath, f.d.Cfg.Clock.Now().Unix())
 	f.d.RateMu.Unlock()
-	if err := f.d.Cfg.RestartFn(ctx, unit); err != nil {
+	if err := f.d.Restart(ctx, unit); err != nil {
 		f.d.State.AppendLogWarn(fmt.Sprintf("G6: restart %s FAIL: %v (budget spent)", unit, err))
 		return
 	}
