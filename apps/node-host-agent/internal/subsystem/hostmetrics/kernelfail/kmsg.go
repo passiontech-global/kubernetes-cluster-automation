@@ -73,17 +73,6 @@ type kmsgSession struct {
 	seq  uint64 // highest record seq consumed (resume dedup)
 }
 
-// kmsgRecord is one parsed kmsg record — seq/usec for cursor resume,
-// msg for the classifiers. parsed=false marks lines without a
-// "pri,seq,usec,flags;" header (kept for the classifiers but never
-// cursor-eligible).
-type kmsgRecord struct {
-	seq    uint64
-	usec   int64
-	msg    string
-	parsed bool
-}
-
 // kmsgCursor is the persisted resume position — one line in
 // kmsg-cursor:
 //
@@ -180,21 +169,6 @@ func (r *Runner) writeKmsgCursor(cur *kmsgCursor) {
 	}
 }
 
-// parseKmsgRecord splits "<pri>,<seq>,<usec>,<flags>;<msg>" — the
-// strict-decode gate (platform/kmsg.ParseRecord's Parsed flag) is
-// what makes a record cursor-eligible; the msg is whitespace-trimmed
-// for the classifiers.
-func parseKmsgRecord(line string) (kmsgRecord, bool) {
-	r := kmsg.ParseRecord([]byte(line))
-	if !r.Parsed {
-		return kmsgRecord{}, false
-	}
-	return kmsgRecord{
-		seq: r.Seq, usec: r.Usec,
-		msg: strings.TrimSpace(r.Msg), parsed: true,
-	}, true
-}
-
 // checkKernelDmesg runs one scan tick: prefer the persistent /dev/kmsg
 // fd (non-blocking, position-tracked by the kernel), fall back to
 // `dmesg -T` (timestamps) then plain `dmesg` (line-count cursor) when
@@ -282,10 +256,10 @@ func (r *Runner) drainKmsg(st *kernelScanState) bool {
 		return true
 	}
 	for _, rec := range recs {
-		if resume && (!rec.parsed || rec.seq <= minSeq) {
+		if resume && (!rec.Parsed || rec.Seq <= minSeq) {
 			continue
 		}
-		r.classifyKernelLine(rec.msg, st)
+		r.classifyKernelLine(rec.Msg, st)
 	}
 	// Advance the persisted position past everything consumed —
 	// including records skipped by the resume filter.
@@ -304,30 +278,35 @@ func (r *Runner) drainKmsg(st *kernelScanState) bool {
 // session's Tailer (it owns the pending carry) and returns the
 // parsed records, the read's place in the handle lifecycle (the
 // First gate is the backlog-disposition check), and the highest
-// seq/usec seen (0 when nothing parsed).
+// seq/usec seen (0 when nothing parsed). Records come back as
+// kmsg.Record — the strict-decode gate (ParseRecord's Parsed flag)
+// is what makes a record cursor-eligible; a parsed record's Msg is
+// whitespace-trimmed for the classifiers.
 func (r *Runner) readKmsgAvail(sess *kmsgSession) (
-	[]kmsgRecord, kmsg.ReadResult, uint64, int64, error) {
+	[]kmsg.Record, kmsg.ReadResult, uint64, int64, error) {
 	raw, res, err := sess.tail.Read()
 	if err != nil {
 		return nil, res, 0, 0, err
 	}
-	var recs []kmsgRecord
+	var recs []kmsg.Record
 	var maxSeq uint64
 	var maxUsec int64
 	for _, lb := range raw {
-		line := string(lb)
-		if rec, ok := parseKmsgRecord(line); ok {
-			recs = append(recs, rec)
-			if rec.seq > maxSeq {
-				maxSeq = rec.seq
-			}
-			if rec.usec > maxUsec {
-				maxUsec = rec.usec
-			}
-		} else {
+		rec := kmsg.ParseRecord(lb)
+		if !rec.Parsed {
 			// Header-less line — keep the raw text for the
-			// classifiers (seq 0 keeps it out of resume mode).
-			recs = append(recs, kmsgRecord{msg: line})
+			// classifiers (Parsed=false keeps it out of resume
+			// mode, same as the old seq-0 gate).
+			recs = append(recs, kmsg.Record{Msg: string(lb)})
+			continue
+		}
+		rec.Msg = strings.TrimSpace(rec.Msg)
+		recs = append(recs, rec)
+		if rec.Seq > maxSeq {
+			maxSeq = rec.Seq
+		}
+		if rec.Usec > maxUsec {
+			maxUsec = rec.Usec
 		}
 	}
 	return recs, res, maxSeq, maxUsec, nil

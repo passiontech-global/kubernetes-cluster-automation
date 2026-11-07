@@ -45,9 +45,9 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter/npd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -90,10 +90,11 @@ const (
 	// controller's 10m staleness window.
 	defaultHeartbeatInterval = 2 * time.Minute
 
-	// NPD-monitor port defaults — see npd_monitors.go. The DaemonSet
-	// runs hostPID and bind-mounts host /dev/kmsg at /dev/kmsg, so
-	// /proc/1/mounts and /proc/uptime are already the HOST tables
-	// (a container procfs would only see the pod's mount ns).
+	// NPD-monitor port defaults — see the npd subpackage. The
+	// DaemonSet runs hostPID and bind-mounts host /dev/kmsg at
+	// /dev/kmsg, so /proc/1/mounts and /proc/uptime are already the
+	// HOST tables (a container procfs would only see the pod's
+	// mount ns).
 	defaultHostRoot           = "/host" // nsenter boundary for journalctl
 	defaultKmsgFile           = "/dev/kmsg"
 	defaultProcMountsFile     = "/proc/1/mounts"
@@ -138,7 +139,7 @@ type Config struct {
 	LogLookback       time.Duration // first-scan replay window (NPD lookback parity)
 	EventDedupTTL     time.Duration // series-aggregation window per reason+message
 
-	// --- NPD monitor port (npd_monitors.go) ---
+	// --- NPD monitor port (the npd subpackage) ---
 	KmsgFile           string   // kernel ring source; <HostRoot>/dev/kmsg is the fallback
 	ProcMountsFile     string   // host mount table (hostPID → /proc/1/mounts)
 	ProcUptimeFile     string   // host uptime for the kmsg first-scan lookback
@@ -239,27 +240,17 @@ type Reporter struct {
 	evSeq       atomic.Uint64            // event-name uniqueness suffix
 	emittedEvts map[string]*emittedEvent // dedup key → created/aggregated Event
 
-	// NPD-monitor port state (npd_kernel.go/npd_journal.go). Journal
-	// cursors are µs wall timestamps — 0 bounds the first fetch to
-	// LogLookback.
-	kubeletJournalUS int64        // kubelet-stale monitor cursor
-	kernelJournalUS  int64        // journalctl -k fallback cursor
-	kmsgJournalMode  bool         // permanent fallback once kmsg can't be opened
-	kmsgTail         *kmsg.Tailer // the /dev/kmsg tail — handle, carry, backlog gates
-	kmsgScanned      bool         // mirrors the tail's caught-up flag (kernelLines)
+	// monitors is the NPD-monitor family (kernel/kmsg, kubelet
+	// journald, readonly mounts) — own subpackage, wired through
+	// npd.Deps + npdSink. It holds the kmsg Tailer handle, the
+	// journald cursors and the monitor-computed condition latches;
+	// Run's defer releases the kmsg fd it lazily opens.
+	monitors *npd.Monitor
 
 	// heartbeatInit marks the one-time installed/last-run
 	// initialization — periodic refreshes are the hygiene
 	// subsystems' job (BUG-H1), the reporter only reads them.
 	heartbeatInit bool
-
-	// Permanent-condition bookkeeping for the NPD monitors —
-	// KernelDeadlock latches True for the process lifetime (NPD
-	// permanent parity); ReadonlyFilesystem follows the live mounts.
-	kernelDeadlock    bool
-	kernelDeadlockMsg string
-	readonlyFS        bool
-	readonlyFSMsg     string
 }
 
 // New returns a Reporter and registers its metrics on reg. A nil
@@ -278,18 +269,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 	// The reporter never APPENDS to the watchdog log (it only tails
 	// WatchdogLogFile for events) so LogFile stays "".
 	r.state = cfg.StoreAt(cfg.WatchdogStateDir, "", logger)
-	// The kernel monitor's /dev/kmsg tail (npd_kernel.go). Paths are
-	// re-evaluated per (re)open so cfg/test re-points stay live.
-	r.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{
-		Paths: func() []string {
-			return kmsg.DevicePaths(r.cfg.KmsgFile, r.cfg.HostRoot)
-		},
-		DrainCap:   maxKmsgReadBytes,
-		PendingCap: maxLogPendingBytes,
-		// A never-terminated record keeps its tail — same carry
-		// policy as the watchdog filelog tail.
-		PendingTrimTail: true,
-	})
+	// The NPD monitor family — Deps are late-bound over r.cfg so
+	// post-New cfg/test re-points (journalFetch stub, KmsgFile
+	// re-point) still land inside the monitor.
+	r.monitors = npd.New(r.npdDeps())
 
 	r.problemGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "problem_gauge",
@@ -321,11 +304,55 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 // Name identifies the subsystem for logging.
 func (r *Reporter) Name() string { return "nodereporter" }
 
+// npdDeps wires the npd monitor family's inputs — every field is a
+// late-bound closure over r.cfg (the kernelfail Deps precedent), so
+// a test stub swapped onto the Config after New still lands.
+func (r *Reporter) npdDeps() npd.Deps {
+	return npd.Deps{
+		Cfg: func() npd.Config {
+			return npd.Config{
+				KmsgFile:           r.cfg.KmsgFile,
+				HostRoot:           r.cfg.HostRoot,
+				ProcMountsFile:     r.cfg.ProcMountsFile,
+				ProcUptimeFile:     r.cfg.ProcUptimeFile,
+				KubeletJournalUnit: r.cfg.KubeletJournalUnit,
+				ReadonlyTargets:    r.cfg.ReadonlyTargets,
+				ReadonlyFSTypes:    r.cfg.ReadonlyFSTypes,
+				LogLookback:        r.cfg.LogLookback,
+			}
+		},
+		JournalFetch: func(ctx context.Context, args ...string) (string, error) {
+			return r.cfg.journalFetch(ctx, args...)
+		},
+		Now: func() time.Time { return r.cfg.Clock.Now() },
+	}
+}
+
+// npdSink adapts the reporter's event/counter/latch sinks to the
+// npd.Sink contract — kept as an adapter so the monitor package
+// never reaches back into Reporter internals.
+type npdSink struct{ r *Reporter }
+
+func (s npdSink) EmitEvent(ctx context.Context, reason, note string) error {
+	return s.r.emitEvent(ctx, reason, note)
+}
+
+func (s npdSink) BumpCounter(reason string) {
+	s.r.problemCounter.WithLabelValues(reason).Inc()
+}
+
+// EnterLatch routes through the shared watchdog-state Store — it
+// carries an empty LogFile, so the STATE-ENTER never circles back
+// into the filelog rules this same reporter tails.
+func (s npdSink) EnterLatch(name, evidence string) {
+	s.r.state.Enter(name, evidence)
+}
+
 // Run syncs immediately, then every Interval until ctx is cancelled.
-// The lazily-opened kmsg handle is the one file the Reporter holds —
-// it is released when the subsystem stops.
+// The lazily-opened kmsg handle inside the monitor family is the one
+// file the Reporter holds — it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
-	defer r.kmsgTail.Close()
+	defer r.monitors.Close()
 	cycle.Every("nodereporter", r.cfg.Interval, r.runCycle).Run(ctx)
 }
 
@@ -414,17 +441,18 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	// NPD monitor ports — each reports its own error so one sick
 	// source never starves the others; the conditions they produce
 	// are shipped by next cycle's syncConditions.
-	if err := r.syncKubeletJournal(ctx); err != nil {
+	sink := npdSink{r}
+	if err := r.monitors.SyncKubeletJournal(ctx, sink); err != nil {
 		logger().Error("nodereporter: kubelet-stale journal scan failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
-	if err := r.syncKernelMonitor(ctx); err != nil {
+	if err := r.monitors.SyncKernelMonitor(ctx, sink); err != nil {
 		logger().Error("nodereporter: kernel monitor failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
-	if err := r.syncReadonlyMounts(ctx); err != nil {
+	if err := r.monitors.SyncReadonlyMounts(ctx, sink); err != nil {
 		logger().Error("nodereporter: readonly filesystem check failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false

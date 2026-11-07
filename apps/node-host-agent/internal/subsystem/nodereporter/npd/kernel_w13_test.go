@@ -1,7 +1,7 @@
-// npd_kernel_w13_test.go — W13-KR1 kernel temp rules:
+// kernel_w13_test.go — W13-KR1 kernel temp rules:
 // PageAllocFailure, NeighborTableOverflow, NetdevTxTimeout,
 // TCPMemoryPressure as counter+Event rules.
-package nodereporter
+package npd
 
 import (
 	"context"
@@ -16,8 +16,8 @@ func TestKernelWave13TempRules(t *testing.T) {
 		"NetdevTxTimeout":       "NETDEV WATCHDOG: ens3 (virtio_net): transmit queue 0 timed out",
 		"TCPMemoryPressure":     "TCP: out of memory -- consider tuning tcp_mem",
 	} {
-		e.r.processKernelLine(context.Background(), msg)
-		if got := e.counter(reason); got != 1 {
+		e.m.processKernelLine(context.Background(), e.sink, msg)
+		if got := e.sink.counter(reason); got != 1 {
 			t.Fatalf("problem_counter{%s}=%v want 1", reason, got)
 		}
 	}
@@ -27,11 +27,11 @@ func TestKernelWave13TempRules(t *testing.T) {
 		"neighbour: table is fine",
 		"TCP: reno recovery",
 	} {
-		e.r.processKernelLine(context.Background(), msg)
+		e.m.processKernelLine(context.Background(), e.sink, msg)
 	}
 	for _, reason := range []string{"PageAllocFailure", "NeighborTableOverflow",
 		"NetdevTxTimeout", "TCPMemoryPressure"} {
-		if got := e.counter(reason); got != 1 {
+		if got := e.sink.counter(reason); got != 1 {
 			t.Fatalf("problem_counter{%s}=%v want still 1 (no false positive)", reason, got)
 		}
 	}

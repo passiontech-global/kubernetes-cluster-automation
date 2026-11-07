@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // fsErrorLatchTTL bounds state-fs-readonly's kernel-error
@@ -37,37 +38,6 @@ var pvcMountFSTypes = map[string]bool{
 var k8sROBindExcludeRe = regexp.MustCompile(
 	`kubernetes\.io~(configmap|secret|projected|downwardapi)|` +
 		`kubernetes\.io/serviceaccount`)
-
-// procMount is one parsed /proc/*/mounts line.
-type procMount struct {
-	mp     string
-	fstype string
-	src    string
-	ro     bool
-}
-
-// parseProcMounts parses mount-table content —
-// "src mp fstype opts dump pass" per line, octal escapes ignored
-// (mountpoints with spaces are rare under the PVC roots and a
-// missed escape only narrows matching, never widens it).
-func parseProcMounts(data []byte) []procMount {
-	var out []procMount
-	for _, ln := range strings.Split(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 4 {
-			continue
-		}
-		opts := strings.Split(f[3], ",")
-		m := procMount{src: f[0], mp: f[1], fstype: f[2]}
-		for _, o := range opts {
-			if o == "ro" {
-				m.ro = true
-			}
-		}
-		out = append(out, m)
-	}
-	return out
-}
 
 // pvcMountRoots returns the host-side roots whose submounts are PVC
 // backing volumes — OpenEBS LocalPV, local-path-provisioner, and the
@@ -102,8 +72,8 @@ func (r *Runner) roPVCMounts() []string {
 	}
 	roots := r.pvcMountRoots()
 	var out []string
-	for _, m := range parseProcMounts(data) {
-		if !m.ro || !pvcMountFSTypes[m.fstype] {
+	for _, m := range procfs.ParseMounts(data) {
+		if !m.Opts["ro"] || !pvcMountFSTypes[m.FSType] {
 			continue
 		}
 		under := false
@@ -111,7 +81,7 @@ func (r *Runner) roPVCMounts() []string {
 			if root == "" {
 				continue
 			}
-			if m.mp == root || strings.HasPrefix(m.mp, root+"/") {
+			if m.MountPoint == root || strings.HasPrefix(m.MountPoint, root+"/") {
 				under = true
 				break
 			}
@@ -119,11 +89,11 @@ func (r *Runner) roPVCMounts() []string {
 		if !under {
 			continue
 		}
-		if k8sROBindExcludeRe.MatchString(m.mp) ||
-			k8sROBindExcludeRe.MatchString(m.src) {
+		if k8sROBindExcludeRe.MatchString(m.MountPoint) ||
+			k8sROBindExcludeRe.MatchString(m.Source) {
 			continue
 		}
-		out = append(out, m.mp+" ("+m.fstype+")")
+		out = append(out, m.MountPoint+" ("+m.FSType+")")
 	}
 	return out
 }
