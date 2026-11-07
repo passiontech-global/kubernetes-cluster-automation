@@ -98,7 +98,10 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 			doFeed = true
 		} else {
 			fails++
-			limit := fcfg.MaxFail
+			// W13 Gap#2: the post-arm MaxFail streak doubles on a
+			// single-controller topology (startup GraceFails stays
+			// — it never gates a restart, only the first feed).
+			limit := h.deps.streakCycles(fcfg.MaxFail)
 			if !everOK {
 				limit = fcfg.GraceFails
 			}

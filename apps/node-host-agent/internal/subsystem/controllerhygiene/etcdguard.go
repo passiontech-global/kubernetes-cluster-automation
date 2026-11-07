@@ -80,6 +80,10 @@ func (c *etcdGuardCheck) Run(ctx context.Context) {
 		c.d.cycles.WithLabelValues(checkEtcd, "no_etcd_pki").Inc()
 		return
 	}
+	// W13-ST2: the snapshot verifier rides this embedded-etcd
+	// gate — a controller with no local etcd has no snapshot
+	// dirs to verify.
+	c.verifySnapshots()
 
 	dbSize, dbUse, err := c.etcdStatus(ctx)
 	if err != nil {
@@ -217,6 +221,59 @@ func (c *etcdGuardCheck) Run(ctx context.Context) {
 		c.d.cycles.WithLabelValues(checkEtcd, "ok").Inc()
 	} else {
 		c.d.cycles.WithLabelValues(checkEtcd, "remediate_error").Inc()
+	}
+}
+
+// verifySnapshots is the W13-ST2 embedded-etcd backup check: the
+// newest snapshot under the configured dir (or the two k0s
+// defaults — <K0sDir>/etcd/snapshots and /var/backups/etcd) must
+// exist and be non-empty. Its age lands on
+// node_host_agent_controllerhygiene_etcd_snapshot_age_seconds; a
+// missing or empty snapshot is a suspect-log, never an action —
+// snapshot creation belongs to the backup tooling, the agent only
+// verifies the pipeline still runs.
+func (c *etcdGuardCheck) verifySnapshots() {
+	dirs := []string{
+		filepath.Join(c.d.cfg.K0sDir, "etcd", "snapshots"),
+		"/var/backups/etcd",
+	}
+	if c.d.cfg.EtcdSnapshotDir != "" {
+		dirs = []string{c.d.cfg.EtcdSnapshotDir}
+	}
+	var newest string
+	var newestMT time.Time
+	var newestSize int64
+	for _, dir := range dirs {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, ent := range ents {
+			if ent.IsDir() {
+				continue
+			}
+			fi, err := ent.Info()
+			if err != nil || !fi.ModTime().After(newestMT) {
+				continue
+			}
+			newest = filepath.Join(dir, ent.Name())
+			newestMT = fi.ModTime()
+			newestSize = fi.Size()
+		}
+	}
+	if newest == "" {
+		c.d.state.SuspectLog(checkEtcd,
+			"suspect: no etcd snapshot found under "+strings.Join(dirs, ", ")+
+				" — etcd snapshot pipeline may be down (W13-ST2)",
+			c.d.cfg.SuspectLogCadence)
+		return
+	}
+	age := c.d.cfg.nowFn().Sub(newestMT)
+	c.d.etcdSnapAge.Set(age.Seconds())
+	if newestSize == 0 {
+		c.d.state.SuspectLog(checkEtcd, fmt.Sprintf(
+			"suspect: newest etcd snapshot %s is empty (0 bytes) — restore path would fail",
+			newest), c.d.cfg.SuspectLogCadence)
 	}
 }
 

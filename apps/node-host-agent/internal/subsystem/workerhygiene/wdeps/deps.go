@@ -68,6 +68,20 @@ type Series struct {
 	// — summed across the volume_plugin/operation labels of the
 	// kubelet :10250/metrics scrape.
 	KubeletStorageOperationErrors int64
+	// Wave-13 series: ContainerSubprocessOOM counts living-dead
+	// container subprocess OOM kills (W13-KR4), SATokenMinTTLSec is
+	// the worst projected SA-token TTL observed (W13-CP3, -1 when
+	// no token was measured), LocalPVQuotaThrottled counts pods
+	// deprioritized for LocalPV over-quota usage (W13-ST1),
+	// MemoryCompactionRuns counts vm.compact_memory triggers
+	// (W13-KR1) and the RunTmpfs pair reports the /run tmpfs fill
+	// and the guard's cleanup runs (W13-KR3).
+	ContainerSubprocessOOM int64
+	SATokenMinTTLSec       float64
+	LocalPVQuotaThrottled  int64
+	MemoryCompactionRuns   int64
+	RunTmpfsUsedRatio      float64
+	RunTmpfsCleanups       int64
 }
 
 // Deps is the shared state every Check consumes — the split's

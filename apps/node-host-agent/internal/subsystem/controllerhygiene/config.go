@@ -131,6 +131,13 @@ type Config struct {
 	// PKIDrift is the W8-CP4 on-disk-vs-served PKI cert drift check —
 	// no env wiring; package defaults unless set programmatically.
 	PKIDrift PKIDriftConfig
+	// TotalControllers is the W13 Gap#2 topology override: >0 pins
+	// the control-plane size explicitly; 0 (default) = auto — an
+	// unset Hub.PeerAPI means a single-controller cluster.
+	TotalControllers int
+	// EtcdSnapshotDir overrides the etcd snapshot verifier's scan
+	// dir ("" → K0sDir/etcd/snapshots then /var/backups/etcd).
+	EtcdSnapshotDir string
 
 	// --- injectable seams (defaults follow) ---
 	nowFn     timex.Clock

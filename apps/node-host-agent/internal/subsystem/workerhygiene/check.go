@@ -87,6 +87,8 @@ func (h *Hygiene) initChecks() {
 	add(runtime.NewUnlinkedOpenFiles(d)) // wdeps.CheckUnlinkedOpenFiles
 	add(runtime.NewCgroupSwap(d))        // wdeps.CheckCgroupSwap
 	add(runtime.NewCgroupThrottle(d))    // wdeps.CheckCgroupThrottle
+	add(runtime.NewSubprocOOM(d))        // wdeps.CheckSubprocOOM
+	add(runtime.NewSATokenTTL(d))        // wdeps.CheckSATokenTTL
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

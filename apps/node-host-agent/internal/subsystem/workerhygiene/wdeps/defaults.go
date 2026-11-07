@@ -82,6 +82,15 @@ const (
 	// defaultPodLogsDir is the /var/log/pods host mount — the
 	// BUG-H8 pod-log attribution walk scans it.
 	defaultPodLogsDir = "/host/var/log/pods"
+	// W13-ST1/KR3 disk-guard defaults: the LocalPV hard-quota
+	// multiplier (1.5x PV capacity under disk pressure), the host
+	// /run tmpfs path as the agent sees it ("/host/run" in the
+	// DaemonSet via EnvHostRunDir's hostPath default) and the
+	// journal dir the vacuum exec sees (host mount-ns view —
+	// systemd.Exec runs nsenter -m wrapped).
+	localPVQuotaRatio       = 1.5
+	defaultHostRunDir       = "/run"
+	defaultJournalVacuumDir = "/run/log/journal"
 
 	// guards domain (was dstate_scopes.go / psi_thrash.go /
 	// spegel_calico_netns.go / journald.go).
@@ -112,6 +121,11 @@ const (
 	// caller gets the standalone path.
 	defaultCgroupRoot         = "/sys/fs/cgroup"
 	defaultSystemdSessionsDir = "/run/systemd/sessions"
+	// defaultSATokenMinTTLSec is the W13-CP3 projected SA-token TTL
+	// floor — kubelet rotates bound tokens on an ~80%-of-TTL
+	// refresh, so a Running pod with <10m left means rotation has
+	// already stalled.
+	defaultSATokenMinTTLSec = int64(600)
 )
 
 // CtrImageRmInterval is the shared last-ctr-image-rm budget — the

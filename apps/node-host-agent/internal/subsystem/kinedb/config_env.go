@@ -36,6 +36,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// W8-CP2: in-container postgres data dir for the repack
 		// headroom gate; empty → package default.
 		envx.StringKnob(envnames.EnvKinedbPgDataDir, &cfg.PGDataDir, ""),
+		// W13-ST2: the physical-backup verifier dir + cadence.
+		envx.StringKnob(envnames.EnvKinedbBackupDir, &cfg.BackupDir,
+			d.PathJoin(defaultBackupDir)),
+		envx.DurationKnob(envnames.EnvKinedbBackupInterval,
+			&cfg.BackupInterval, defaultBackupInterval),
 	})
 	return cfg
 }

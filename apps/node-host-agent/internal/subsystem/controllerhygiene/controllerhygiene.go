@@ -153,6 +153,11 @@ const (
 	defaultRemediateMinRst = 30 * time.Minute // WDREM_MIN_RESTART_INTERVAL=1800
 	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
 	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
+	// W13 Gap#2: on a single-controller topology every consecutive-
+	// failure streak gating a k0scontroller restart is doubled —
+	// a transient flap costs 30-45s of API downtime with no peer
+	// to serve the gap (production, cicd).
+	spofStreakMultiplier = 2
 
 	// defaultK0sDir is the shared k0s data dir — etcdguard probes
 	// under it and the PKI-drift default pairs derive from it.
@@ -389,12 +394,23 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Help: "1 while the embedded etcd carries a NOSPACE alarm " +
 			"(embedded-etcd controllers only).",
 	})
+	d.terminatedWatchers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_apiserver_terminated_watchers",
+		Help: "apiserver_terminated_watchers_total mirrored from the " +
+			"local apiserver — 410-Gone relist storm signal (W13-CP1).",
+	})
+	d.etcdSnapAge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_snapshot_age_seconds",
+		Help: "Age of the newest etcd snapshot under the snapshot " +
+			"dirs (embedded-etcd controllers only, W13-ST2).",
+	})
 
 	h := &Hygiene{deps: d}
 	if reg != nil {
 		for _, c := range []prometheus.Collector{
 			d.cycles, d.actions, d.rvGap, d.kineConns, d.oomWindow, d.feeding,
 			d.etcdDBSize, d.etcdDBUse, d.etcdNospace,
+			d.terminatedWatchers, d.etcdSnapAge,
 		} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)

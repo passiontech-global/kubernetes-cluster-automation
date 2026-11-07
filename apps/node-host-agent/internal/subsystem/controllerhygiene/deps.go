@@ -67,4 +67,32 @@ type deps struct {
 	etcdDBSize  prometheus.Gauge
 	etcdDBUse   prometheus.Gauge
 	etcdNospace prometheus.Gauge
+	// terminatedWatchers is the W13-CP1 410-Gone relist-storm
+	// series — the local apiserver's
+	// apiserver_terminated_watchers_total mirrored each cycle.
+	terminatedWatchers prometheus.Gauge
+	// etcdSnapAge is the W13-ST2 etcd snapshot freshness gauge
+	// (embedded-etcd controllers).
+	etcdSnapAge prometheus.Gauge
+}
+
+// singleController reports whether this node's control plane is a
+// single-controller topology (W13 Gap#2): TotalControllers is the
+// explicit override (0 = auto — an unset Hub.PeerAPI means no peer
+// exists to fence against, i.e. one controller).
+func (d *deps) singleController() bool {
+	if d.cfg.TotalControllers > 0 {
+		return d.cfg.TotalControllers == 1
+	}
+	return d.cfg.Hub.PeerAPI == ""
+}
+
+// streakCycles returns the consecutive-failure streak a restart
+// gate must pass — doubled on a single-controller topology so a
+// transient flap cannot bounce the only apiserver (W13 Gap#2).
+func (d *deps) streakCycles(base int) int {
+	if d.singleController() {
+		return base * spofStreakMultiplier
+	}
+	return base
 }

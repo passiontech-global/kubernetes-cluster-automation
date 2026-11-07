@@ -302,6 +302,38 @@ var domainTable = []domainEntry{
 			{descSNMPRcvbufErrors, "node_host_agent_snmp_udp_rcvbuf_errors_total",
 				"Udp RcvbufErrors — UDP datagrams dropped on a full receive buffer."},
 		}},
+	{name: "daemon-fd",
+		emit: (*Collector).collectDaemonFD,
+		families: []descMeta{
+			{descDaemonFDRatio, "node_host_agent_daemon_fd_used_ratio",
+				"Open fds / RLIMIT_NOFILE(soft) of the worst-off matching process per daemon."},
+		}},
+	{name: "containerd-metadb",
+		emit: (*Collector).collectContainerdMetaDB,
+		families: []descMeta{
+			{descContainerdMetaDB, "node_host_agent_containerd_metadb_bytes",
+				"Size of the containerd bbolt metadata db."},
+		}},
+	{name: "k0scontroller-children",
+		emit: (*Collector).collectK0sChildrenRSS,
+		families: []descMeta{
+			{descK0sChildrenRSS, "node_host_agent_k0scontroller_children_rss_bytes",
+				"RSS bytes per child process of k0scontroller.service."},
+		}},
+	{name: "fs-bytes",
+		emit: (*Collector).collectFSBytes,
+		families: []descMeta{
+			{descFSBytesRatio, "node_host_agent_filesystem_bytes_used_ratio",
+				"Used-block share of the probed mount (1 - Bavail/Blocks via statfs)."},
+		}},
+	{name: "ebpf",
+		emit: (*Collector).collectEBPF,
+		families: []descMeta{
+			{descEBPFProgs, "node_host_agent_ebpf_programs_count",
+				"Unique eBPF prog_id referenced by proc fdinfo plus bpffs pins."},
+			{descEBPFMaps, "node_host_agent_ebpf_maps_count",
+				"Unique eBPF map_id referenced by proc fdinfo plus bpffs pins."},
+		}},
 }
 
 // descMetaTable maps each desc to its textfile fqName/help — a

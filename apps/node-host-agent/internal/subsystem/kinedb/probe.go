@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -262,6 +263,10 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 			// the backend idles below the pool's conn count →
 			// RECONNECT the stalled server conns first.
 			k.checkPGBWedge(ctx, pg, pgb, user, pass, res, note)
+			// W13-CP4: top-5 write churn — a mutating webhook
+			// ping-pong shows up as one resource prefix churning
+			// thousands of revisions.
+			k.probeTopChurn(ctx, pg, user, pass, note)
 		}
 	}
 
@@ -435,6 +440,71 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 	} else {
 		note(fmt.Sprintf("log-errors=%d", n))
 	}
+}
+
+// probeTopChurn is the W13-CP4 top-5 write-churn sampler. The kine
+// table carries no wall-clock column, so "last 5m" is a watermark
+// window: once the stored (head, ts) pair is >= defaultChurnWindow
+// old, one light grouped query counts revisions minted since it
+// and the watermark advances to (current head, now). Skipped
+// windows keep the last result — a failed query never fabricates
+// a zero series.
+func (k *KineDB) probeTopChurn(ctx context.Context, pg, user, pass string,
+	note func(string)) {
+	dir := k.cfg.GuardStateDir
+	prevHead, _ := readIntFile(filepath.Join(dir, churnFileHead))
+	prevTS, _ := readIntFile(filepath.Join(dir, churnFileTS))
+	now := k.cfg.nowFn().Unix()
+	if prevTS == 0 {
+		// First sighting — seed the watermark only. A missing
+		// watermark treated as head=0 would group-by the WHOLE
+		// table (the COUNT(*) the probe budget forbids).
+		writeIntFile(filepath.Join(dir, churnFileTS), now)
+		writeIntFile(filepath.Join(dir, churnFileHead),
+			resHead(k, ctx, pg, user, pass))
+		return
+	}
+	if now-prevTS < int64(defaultChurnWindow.Seconds()) {
+		return // window still filling — keep the last result
+	}
+	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT split_part(name,'/',3) AS res, COUNT(*) FROM %[1]s "+
+			"WHERE id > %[2]d AND name LIKE '/registry/%%' "+
+			"GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT %d",
+		sqlIdent(k.cfg.Table), prevHead, churnTopN))
+	if err != nil {
+		note(fmt.Sprintf("top-churn-query-fail: %v", err))
+		return
+	}
+	var top []churnEntry
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), "|")
+		if len(f) < 2 || f[0] == "" {
+			continue
+		}
+		n, perr := strconv.ParseInt(f[1], 10, 64)
+		if perr == nil {
+			top = append(top, churnEntry{resource: f[0], revs: n})
+		}
+	}
+	k.churnTop = top
+	// Advance the watermark — a churn-free window still moves it
+	// so the next window measures fresh ground.
+	writeIntFile(filepath.Join(dir, churnFileHead), resHead(k, ctx, pg, user, pass))
+	writeIntFile(filepath.Join(dir, churnFileTS), now)
+}
+
+// resHead re-reads MAX(id) for the watermark advance — best-effort:
+// a failed read writes 0, which makes the next window count "id>0"
+// and safely degrade to a full-table count once.
+func resHead(k *KineDB, ctx context.Context, pg, user, pass string) int64 {
+	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT COALESCE((SELECT MAX(id) FROM %s),0)", sqlIdent(k.cfg.Table)))
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseInt(firstLine(out), 10, 64)
+	return v
 }
 
 // emitProbe renders the textfile and updates the collectors.

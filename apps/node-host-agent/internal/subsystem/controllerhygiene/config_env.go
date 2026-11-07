@@ -125,6 +125,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 			d.PathJoin("/var/lib/k0s")),
 		envx.StringKnob(envnames.EnvEtcdEndpoint, &cfg.EtcdGuard.Endpoint, defaultEtcdEndpoint),
 		envx.Int64Knob(envnames.EnvEtcdDBSizeLimit, &cfg.EtcdGuard.DBSizeLimit, 0),
+		// W13 Gap#2 + W13-ST2: the single-controller SPOF override
+		// (0 = auto — an unset PeerAPI means single-controller) and
+		// the etcd snapshot verifier dir ("" = the k0s defaults).
+		envx.IntKnob(envnames.EnvTotalControllers, &cfg.TotalControllers, 0),
+		envx.StringKnob(envnames.EnvEtcdSnapshotDir, &cfg.EtcdSnapshotDir, ""),
 	})
 	return cfg
 }

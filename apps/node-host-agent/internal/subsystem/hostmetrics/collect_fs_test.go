@@ -83,6 +83,9 @@ func TestFilesystemZeroInodesSkipsRatio(t *testing.T) {
 func TestFilesystemProbeStalledOnHang(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.FilesystemTargets = []string{"/mnt/hung"}
+	// W13-KR3 fs-bytes shares the probe machinery — same mount keeps
+	// the one-in-flight-probe-per-mount contract under test.
+	cfg.FSBytesTargets = cfg.FilesystemTargets
 	release := make(chan struct{})
 	defer close(release) // lets the stuck probe goroutine exit
 	var calls atomic.Int32

@@ -107,6 +107,12 @@ const (
 	LatchPIDFDPressure      = "pid-fd-pressure"      // W10-KR2
 	LatchClockSkew          = "clock-skew"           // W10-KR5
 	LatchCPUStealPressure   = "cpu-steal-pressure"   // cpu-steal-guard
+	// LatchPageAllocFailure is the W13-KR1 fragmentation latch:
+	// hostmetrics' kmsg drain Enters it on "page allocation
+	// failure: order:[1-9]"; workerhygiene consumes it to trigger
+	// /proc/sys/vm/compact_memory (cooldown-owned there) and Exits
+	// it after compacting.
+	LatchPageAllocFailure = "page-alloc-failure" // W13-KR1
 
 	// apiprober — the per-backend stale family; the suffix is the
 	// backend IP with dots dashed (shell ${beh//./-}), minted per
@@ -235,6 +241,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchPIDFDPressure, Owner: "hostmetrics"},
 	{Name: LatchClockSkew, Owner: "hostmetrics"},
 	{Name: LatchCPUStealPressure, Owner: "hostmetrics"},
+	{Name: LatchPageAllocFailure, Owner: "hostmetrics"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

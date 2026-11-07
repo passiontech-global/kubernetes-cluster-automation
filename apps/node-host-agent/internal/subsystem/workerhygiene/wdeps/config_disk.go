@@ -8,6 +8,9 @@ package wdeps
 
 import (
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // DiskConfig groups the disk knobs: the /var/lib/k0s watermark that
@@ -29,6 +32,24 @@ type DiskConfig struct {
 	// OrphanHostPathDirs are the host-side local-provisioner roots
 	// ST2 scans for pvc-* dirs whose PV is gone.
 	OrphanHostPathDirs []string
+	// LocalPVQuotaRatio is the W13-ST1 hard-quota multiplier: a
+	// pvc-* dir under OrphanHostPathDirs (or LocalPVQuotaDir when
+	// set) larger than ratio x its PV capacity while the backing
+	// filesystem is >80% full gets the owning pod deprioritized.
+	LocalPVQuotaRatio float64
+	// LocalPVQuotaDir, when set, replaces OrphanHostPathDirs as the
+	// quota-scan root list (single dir — the OpenEBS hostpath root).
+	LocalPVQuotaDir string
+	// HostRunDir is the host /run tmpfs as the agent sees it
+	// (/host/run in the DaemonSet) — the W13-KR3 guard statfs's it
+	// and sweeps orphan .tmp files under it.
+	HostRunDir string
+	// JournalVacuumDir is the journal directory passed to
+	// `journalctl --directory= --vacuum-size` by the /run guard —
+	// the HOST view (/run/log/journal): the systemd exec seam runs
+	// nsenter -m wrapped, so container-side /host paths would not
+	// resolve.
+	JournalVacuumDir string
 }
 
 func (d *DiskConfig) applyDefaults() {
@@ -61,5 +82,24 @@ func (d *DiskConfig) applyDefaults() {
 			"/var/openebs/local",
 			"/opt/local-path-provisioner",
 		}
+	}
+	if d.LocalPVQuotaRatio <= 0 {
+		d.LocalPVQuotaRatio = localPVQuotaRatio
+	}
+	if d.HostRunDir == "" {
+		d.HostRunDir = defaultHostRunDir
+	}
+	if d.JournalVacuumDir == "" {
+		d.JournalVacuumDir = defaultJournalVacuumDir
+	}
+}
+
+// envKnobs returns the W13 disk-guard env rows — hostPath defaults
+// for the /run view like the wiring block.
+func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
+	return []envx.Knob{
+		envx.StringKnob(envnames.EnvLocalPVQuotaDir, &d.LocalPVQuotaDir, ""),
+		envx.StringKnob(envnames.EnvHostRunDir, &d.HostRunDir,
+			hostPath("/run")),
 	}
 }

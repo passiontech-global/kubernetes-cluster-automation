@@ -5,4 +5,7 @@ const (
 	EnvKinedbEnvFile       = "NODE_HOST_AGENT_KINEDB_ENV_FILE"
 	EnvKinedbGuardStateDir = "NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR"
 	EnvKinedbPgDataDir     = "NODE_HOST_AGENT_KINEDB_PG_DATA_DIR"
+	// W13-ST2/Gap#4 — the physical pg_dump backup verifier.
+	EnvKinedbBackupDir      = "NODE_HOST_AGENT_KINEDB_BACKUP_DIR"
+	EnvKinedbBackupInterval = "NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL"
 )

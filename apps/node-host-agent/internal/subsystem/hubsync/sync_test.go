@@ -853,6 +853,10 @@ func TestSystemdUnitContent(t *testing.T) {
 		"Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=/etc/node-host-agent/nebula-certs",
 		"Type=simple",
 		"Restart=always",
+		"RestartSec=5s",
+		"WatchdogSec=120s",
+		"MemoryMax=512M",
+		"Environment=GOMEMLIMIT=400MiB",
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(u, want) {

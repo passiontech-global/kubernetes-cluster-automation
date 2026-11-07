@@ -131,6 +131,22 @@ type Config struct {
 	// with hundreds of volumes (W9).
 	OpenEBSLocalDir     string
 	LocalPVScanInterval time.Duration
+	// FSBytesTargets are the mounts statfs'd per scrape for the
+	// W13-KR3 used-BYTE ratio — tmpfs fills by bytes while the inode
+	// gauges still read idle (/run's sockets die first). Defaults
+	// are HostRoot-joined for run/k0s and literal for the
+	// shared-layout paths (/dev/shm, /var/openebs/local).
+	FSBytesTargets []string
+	// ContainerdMetaDBFile is the containerd bbolt metadata db —
+	// the W13-KR2 bloat gauge (HostRoot-joined by applyDefaults).
+	ContainerdMetaDBFile string
+	// BpffsDir is the bpffs mount the W13-OBS1 eBPF inventory walks
+	// for pinned objects (HostRoot-joined by applyDefaults — pod mode
+	// reads /host/sys/fs/bpf, the container's own /sys is wrong);
+	// EBPFScanInterval caches the /proc/*/fdinfo sweep like
+	// InotifyScanInterval does for inotify.
+	BpffsDir         string
+	EBPFScanInterval time.Duration
 	// Standalone marks systemd (non-pod) mode — informational only;
 	// the latch ticker runs regardless (BUG-H5).
 	Standalone bool
@@ -306,5 +322,26 @@ func (c *Config) applyDefaults() {
 	}
 	if c.LatchInterval <= 0 {
 		c.LatchInterval = defaultLatchInterval
+	}
+	if len(c.FSBytesTargets) == 0 {
+		// HostRoot-joined for the host-side mounts ("/host/run",
+		// "/host/var/lib/k0s" in pod mode — the W13-KR3 spec paths);
+		// /dev/shm and /var/openebs/local mount at the same path in
+		// both layouts (OpenEBSLocalDir parity).
+		c.FSBytesTargets = []string{
+			filepath.Join(c.HostRoot, "run"),
+			"/dev/shm",
+			filepath.Join(c.HostRoot, "var/lib/k0s"),
+			"/var/openebs/local",
+		}
+	}
+	if c.ContainerdMetaDBFile == "" {
+		c.ContainerdMetaDBFile = filepath.Join(c.HostRoot, defaultContainerdMetaDB)
+	}
+	if c.BpffsDir == "" {
+		c.BpffsDir = filepath.Join(c.HostRoot, defaultBpffsDir)
+	}
+	if c.EBPFScanInterval <= 0 {
+		c.EBPFScanInterval = defaultEBPFScanInterval
 	}
 }

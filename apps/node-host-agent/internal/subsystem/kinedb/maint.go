@@ -23,7 +23,12 @@ package kinedb
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
@@ -251,6 +256,107 @@ func (k *KineDB) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 				"index", base)
 		}
 	}
+}
+
+// backupVerify is the W13-ST2/Gap#4 physical-backup verifier: the
+// newest *.dump in BackupDir must be younger than BackupInterval
+// AND header-valid. A stale (or absent) dump is refreshed with
+// `pg_dump -Fc` inside the postgres container + `pg_restore -l`
+// validation, then `podman|docker cp`'d to the host dir — but only
+// while the backup filesystem keeps >30% free (a full disk must
+// not make it worse). Pre-existing dumps get the cheap PGDMP
+// magic sniff; agent-created dumps are verified with a full
+// pg_restore -l listing at creation time.
+func (k *KineDB) backupVerify(ctx context.Context, pg, user, pass string,
+	res *guardResult, note func(string)) {
+
+	newest, mtime := newestDump(k.cfg.BackupDir)
+	if mtime > 0 {
+		res.backupSeen = true
+		res.backupAge = k.cfg.nowFn().Unix() - mtime
+		res.backupValid = dumpValidMagic(newest)
+	}
+	if res.backupSeen && res.backupAge < int64(k.cfg.BackupInterval.Seconds()) {
+		return // fresh enough — nothing to create
+	}
+	if err := os.MkdirAll(k.cfg.BackupDir, 0o750); err != nil {
+		note(fmt.Sprintf("backup-mkdir-fail: %v", err))
+		return
+	}
+	// Stale/absent: only create when the fs has headroom.
+	if st, err := k.cfg.statfsFn(k.cfg.BackupDir); err != nil ||
+		st <= backupMinFreeRatio {
+		note("backup-skipped-low-free")
+		return
+	}
+	// Dump inside the container to its /tmp, verify with
+	// pg_restore -l, then cp to the host dir — streaming the
+	// dump through stdout would hit the runner capture cap.
+	tmp := "/tmp/kine-backup.dump"
+	if _, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime,
+		"exec", "-e", "PGPASSWORD", pg,
+		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, ""); err != nil {
+		note(fmt.Sprintf("pg_dump-fail: %v", err))
+		return
+	}
+	if _, err := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
+		"pg_restore", "-l", tmp}, ""); err != nil {
+		note(fmt.Sprintf("pg_restore-validate-fail: %v", err))
+		_, _ = k.exec(ctx, []string{k.cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
+		return
+	}
+	dest := filepath.Join(k.cfg.BackupDir,
+		fmt.Sprintf("kine-%d.dump", k.cfg.nowFn().Unix()))
+	if _, err := k.exec(ctx, []string{k.cfg.Runtime, "cp",
+		pg + ":" + tmp, dest}, ""); err != nil {
+		note(fmt.Sprintf("backup-cp-fail: %v", err))
+	} else {
+		res.backupSeen = true
+		res.backupAge = 0
+		res.backupValid = true
+		note("backup-created " + filepath.Base(dest))
+	}
+	_, _ = k.exec(ctx, []string{k.cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
+}
+
+// newestDump returns the newest *.dump file under dir.
+func newestDump(dir string) (string, int64) {
+	m, err := filepath.Glob(filepath.Join(dir, "*.dump"))
+	if err != nil || len(m) == 0 {
+		return "", 0
+	}
+	var best string
+	var mt int64
+	for _, f := range m {
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().Unix() > mt {
+			best, mt = f, fi.ModTime().Unix()
+		}
+	}
+	return best, mt
+}
+
+// dumpValidMagic reports whether the file starts with the pg_dump
+// custom-format magic ("PGDMP").
+func dumpValidMagic(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	var hdr [5]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return false
+	}
+	return string(hdr[:]) == "PGDMP"
+}
+
+// statfsFree returns the free-byte ratio of the fs holding path.
+func statfsFree(path string) (float64, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil || st.Blocks == 0 {
+		return 0, fmt.Errorf("statfs %s", path)
+	}
+	return float64(st.Bavail) / float64(st.Blocks), nil
 }
 
 // emitMaint renders the textfile and updates the collectors.
