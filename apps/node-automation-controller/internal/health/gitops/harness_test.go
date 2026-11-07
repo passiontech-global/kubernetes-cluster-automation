@@ -21,5 +21,8 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewArgoCDAppStuckCheck,
 		NewFluxHRRetriesCheck,
 		NewKargoPromotionHealthCheck,
+		NewFluxKustomizationHealthCheck,
+		NewWorkloadScaleFlappingCheck,
+		NewImagePullSecretAuditorCheck,
 	)
 }

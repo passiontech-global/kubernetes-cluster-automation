@@ -151,11 +151,14 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// five more pod-census checks added since: cilium-missing-endpoint,
 	// linkerd-h2-stream-guard, cloudflared-tunnel-health,
 	// postgres-wal-archive-guard, scylla-compaction-schema-guard,
-	// controller-lease-guard (KSM wedge scan) -> seventeen total.
+	// controller-lease-guard (KSM wedge scan), plus
+	// endpointslice-zone-starvation (W13-NM1) -> eighteen total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
-	// namespace carries linkerd.io/inject=enabled.)
-	if got := errCount() - before; got != 17 {
-		t.Fatalf("run errors delta = %v, want 17", got)
+	// namespace carries linkerd.io/inject=enabled, and
+	// linkerd-outlier-guard bails on the failed Prometheus query
+	// before ever listing pods.)
+	if got := errCount() - before; got != 18 {
+		t.Fatalf("run errors delta = %v, want 18", got)
 	}
 }
 

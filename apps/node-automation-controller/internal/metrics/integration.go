@@ -189,6 +189,17 @@ var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.Counte
 	Help: "Wedged velero PodVolumeBackups deleted and pods bounced, by namespace and action.",
 }, []string{"namespace", "action"})
 
+// VeleroRepoUnhealthy marks (1) each velero.io BackupRepository
+// reporting a status.phase other than Ready, or a
+// status.lastMaintenanceTime older than 7 days (W13-ST2) — the
+// restic/kopia maintenance loop stopped, so restores degrade or the
+// repo cannot be opened at all. reason is phase_not_ready or
+// maintenance_stale. Labels: namespace + name + reason.
+var VeleroRepoUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_repo_unhealthy",
+	Help: "1 while a velero.io BackupRepository is not Ready or its maintenance is >7d stale.",
+}, []string{"namespace", "name", "reason"})
+
 // init registers exactly the vectors declared in this file — the
 // per-domain init() split means adding an integration-domain metric
 // touches only this file, not a central registry list. Order
@@ -206,5 +217,5 @@ func init() {
 		HelmSecretsPrunedTotal, DBBackupUnhealthy,
 		ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
 		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
-		VeleroWedgedObjectsCleanedTotal)
+		VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy)
 }

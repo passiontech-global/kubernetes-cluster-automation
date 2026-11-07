@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
@@ -169,5 +170,195 @@ func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
 			"slot": "stale-slot"})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("slot bloat gauge = %v, want 1", m)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W13-ST3 — CloudNativePG cluster health
+// ---------------------------------------------------------------------------
+
+// cnpgClusterHealth builds a CNPG Cluster CR carrying the W13-ST3
+// status fields — phase, the declared/ready instance counts and an
+// optional phaseTimestamp (age<0 omits it, forcing the first-seen
+// ledger path).
+func cnpgClusterHealth(ns, name, phase string, phaseAge time.Duration,
+	instances, ready int64) *unstructured.Unstructured {
+	status := map[string]any{
+		"phase":          phase,
+		"instances":      instances,
+		"readyInstances": ready,
+	}
+	if phaseAge >= 0 {
+		status["phaseTimestamp"] = time.Now().
+			Add(-phaseAge).UTC().Format(time.RFC3339)
+	}
+	return testutil.Unstructured(
+		kube.GVRCNPGCluster.GroupVersion().WithKind("Cluster"), ns, name,
+		map[string]any{"status": status})
+}
+
+// cnpgSeries reads the cnpg_cluster_unhealthy gauge without
+// instantiating the tuple.
+func cnpgSeries(t *testing.T, ns, name, reason string) (float64, bool) {
+	t.Helper()
+	return testutil.GaugeSeriesValue(t, "node_automation_cnpg_cluster_unhealthy",
+		map[string]string{"namespace": ns, "name": name, "reason": reason})
+}
+
+// A Failing-over phase whose status.phaseTimestamp is older than the
+// 15m window flags stuck_phase on the first sweep — the operator's
+// own transition stamp is the honest clock.
+func TestCNPGStuckPhaseTimestampFlags(t *testing.T) {
+	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-fo", "stuck_phase")
+	t.Cleanup(func() {
+		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-fo", "stuck_phase")
+	})
+	cr := cnpgClusterHealth("db", "pg-fo", "Failing over",
+		20*time.Minute, 3, 1)
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("stuck failover phase must fail: %+v", res)
+	}
+	if v, ok := cnpgSeries(t, "db", "pg-fo", "stuck_phase"); !ok || v != 1 {
+		t.Fatalf("stuck_phase series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// Without phaseTimestamp the first-seen ledger measures the hold:
+// first sight arms the clock, a second sweep past the window flags —
+// and the CamelCase enum spelling matches the spaced CRD value.
+func TestCNPGStuckPhaseLedgerPath(t *testing.T) {
+	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-wait", "stuck_phase")
+	t.Cleanup(func() {
+		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-wait", "stuck_phase")
+	})
+	now := time.Now()
+	cr := cnpgClusterHealth("db", "pg-wait",
+		"WaitingForInstancesToBecomeActive", -1, 3, 0)
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+	probetest.FreezeNow(p.Deps, now)
+	if res := chk.Run(ctx); res.Pass {
+		if v, ok := cnpgSeries(t, "db", "pg-wait", "stuck_phase"); ok {
+			t.Fatalf("stuck_phase flagged on first sight: %v", v)
+		}
+	}
+	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
+	res := chk.Run(ctx)
+	if res.Pass {
+		t.Fatal("phase held past the window must fail")
+	}
+	if v, ok := cnpgSeries(t, "db", "pg-wait", "stuck_phase"); !ok || v != 1 {
+		t.Fatalf("stuck_phase series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// readyInstances short of instances for two consecutive sweeps past
+// the window flags under_replicated.
+func TestCNPGUnderReplicatedFlags(t *testing.T) {
+	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-short", "under_replicated")
+	t.Cleanup(func() {
+		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-short", "under_replicated")
+	})
+	now := time.Now()
+	cr := cnpgClusterHealth("db", "pg-short", "Healthy", -1, 3, 1)
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+	probetest.FreezeNow(p.Deps, now)
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("first sight of the shortfall must arm, not fail: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
+	res := chk.Run(ctx)
+	if res.Pass {
+		t.Fatal("ready<instances held past the window must fail")
+	}
+	if v, ok := cnpgSeries(t, "db", "pg-short",
+		"under_replicated"); !ok || v != 1 {
+		t.Fatalf("under_replicated series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// ContinuousArchiving=False flags archiving_disabled on the CNPG
+// gauge — and still rides the WAL archive_condition reason (the
+// cnpgCluster fixture's transition is an hour old).
+func TestCNPGArchivingDisabledFlags(t *testing.T) {
+	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-main", "archiving_disabled")
+	t.Cleanup(func() {
+		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-main", "archiving_disabled")
+	})
+	cr := cnpgCluster("db", "pg-main", time.Hour)
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("ContinuousArchiving=False must fail: %+v", res)
+	}
+	if v, ok := cnpgSeries(t, "db", "pg-main",
+		"archiving_disabled"); !ok || v != 1 {
+		t.Fatalf("archiving_disabled series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// A healthy CNPG cluster — Ready phase, full replica count, no
+// disabling conditions — emits nothing.
+func TestCNPGHealthyClusterPasses(t *testing.T) {
+	cr := cnpgClusterHealth("db", "pg-ok", "Healthy",
+		2*time.Hour, 3, 3)
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("healthy cluster must pass: %+v", res)
+	}
+	for _, reason := range []string{
+		"stuck_phase", "under_replicated", "archiving_disabled"} {
+		if _, ok := cnpgSeries(t, "db", "pg-ok", reason); ok {
+			t.Fatalf("healthy cluster produced a %s series", reason)
+		}
+	}
+}
+
+// Recovery prunes the series: a cluster that lands its phase and
+// catches its replicas up loses the emitted tuple next sweep.
+func TestCNPGRecoveryPrunesSeries(t *testing.T) {
+	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-heal", "stuck_phase")
+	now := time.Now()
+	cr := cnpgClusterHealth("db", "pg-heal", "Failing over",
+		30*time.Minute, 3, 1)
+	dyn := probetest.OpDyn(cr)
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+	probetest.FreezeNow(p.Deps, now)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("stuck phase must fail first")
+	}
+	if _, ok := cnpgSeries(t, "db", "pg-heal", "stuck_phase"); !ok {
+		t.Fatal("stuck_phase series missing before the resolve")
+	}
+
+	u, err := dyn.Resource(kube.GVRCNPGCluster).Namespace("db").
+		Get(ctx, "pg-heal", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(u.Object, "Healthy", "status", "phase")
+	_ = unstructured.SetNestedField(u.Object, int64(3),
+		"status", "readyInstances")
+	if _, err := dyn.Resource(kube.GVRCNPGCluster).Namespace("db").
+		Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	probetest.FreezeNow(p.Deps, now.Add(31*time.Minute))
+	res := chk.Run(ctx)
+	if !res.Pass {
+		// under_replicated resolves too — the replica count caught up.
+		t.Fatalf("healed cluster must pass: %+v", res)
+	}
+	if cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-heal", "stuck_phase") {
+		t.Fatal("stuck_phase series kept after the cluster healed")
 	}
 }

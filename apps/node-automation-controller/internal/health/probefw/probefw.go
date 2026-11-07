@@ -108,6 +108,8 @@ type Config struct {
 	Quota       QuotaConfig
 	KCM         KCMConfig
 	Cilium      CiliumConfig
+	Datastore   DatastoreConfig
+	Linkerd     LinkerdConfig
 }
 
 // TimeoutsConfig bounds remote calls at two levels: Check is the
@@ -161,4 +163,20 @@ type KCMConfig struct {
 type CiliumConfig struct {
 	BPFMapPressureThreshold float64 // CILIUM_BPF_MAP_PRESSURE_THRESHOLD
 	NodeIPAMMinFreeRatio    float64 // CILIUM_NODE_IPAM_MIN_FREE_RATIO
+}
+
+// DatastoreConfig — the datastore checks' persistence windows:
+// postgres-wal-archive-guard's W13-ST3 CloudNativePG signatures and
+// the pvc-resize-stall-guard's stall window.
+type DatastoreConfig struct {
+	CNPGUnhealthyMinAge  time.Duration // HEALTH_CNPG_UNHEALTHY_MIN_AGE
+	PVCResizeStallMinAge time.Duration // HEALTH_PVC_RESIZE_STALL_MIN_AGE
+}
+
+// LinkerdConfig — the linkerd nethealth knobs:
+// linkerd-outlier-guard's evict kill-switch (W13-NM2). The env name
+// carries no HEALTH_ prefix — it is an ops lever on the flags
+// ConfigMap like the other sub-feature gates.
+type LinkerdConfig struct {
+	OutlierEvictEnabled bool // LINKERD_OUTLIER_EVICT_ENABLED
 }

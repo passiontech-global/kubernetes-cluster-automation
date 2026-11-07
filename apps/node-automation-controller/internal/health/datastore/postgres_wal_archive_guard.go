@@ -3,8 +3,12 @@
 // operator families (Percona pgv2, CloudNativePG, Percona Everest) —
 // a stalled archiver, an inactive replication slot retaining WAL, a
 // data volume filling past the threshold, or pg_wal disk-full crash
-// evidence in pod logs. Detection-only: nothing here execs, deletes
-// or patches — the gauge is the alert contract.
+// evidence in pod logs. W13-ST3 folds the CloudNativePG cluster-liveness
+// guard in on top of the same CR scan: a failover phase wedged past
+// CNPGUnhealthyMinAge, a ready<instances shortfall, or disabled
+// continuous archiving flags node_automation_cnpg_cluster_unhealthy.
+// Detection-only: nothing here execs, deletes or patches — the
+// gauges are the alert contract.
 package datastore
 
 import (
@@ -13,11 +17,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -37,8 +43,18 @@ type postgresWALArchiveGuardCheck struct {
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	// emittedSlot is the same ledger for the W12-ST2 slot-bloat
 	// gauge — a slot that drains or goes active loses its series.
+	// emittedCNPG is the W13-ST3 cnpg_cluster_unhealthy ledger —
+	// a cluster that recovers its phase/quorum/archiving loses the
+	// series via DeleteLabelValues.
 	emitted     state.GaugeLedger[string]
 	emittedSlot state.GaugeLedger[string]
+	emittedCNPG state.GaugeLedger[string]
+
+	// cnpgSeen: "phase/ns/name" | "replicas/ns/name" → first sweep
+	// the W13-ST3 stuck-phase or under-replicated signature held —
+	// each must persist p.Cfg.Datastore.CNPGUnhealthyMinAge before
+	// it counts; pruned on resolve so a flap re-arms.
+	cnpgSeen state.FirstSeenLedger
 }
 
 // NewPostgresWALArchiveGuardCheck builds the WAL guard — its only
@@ -96,12 +112,24 @@ var (
 		Name: "node_automation_postgres_inactive_slot_wal_bloat",
 		Help: "Retained WAL bytes behind an inactive replication slot (pg_replication_slots_active==0) past the 5GiB floor — the bloat that precedes the pg_wal disk-full crash.",
 	}, []string{"namespace", "cluster", "slot"})
+
+	// W13-ST3 — a CloudNativePG Cluster.postgresql.cnpg.io whose
+	// failover never lands (phase wedged Failing over / Waiting for
+	// the instances to become active), whose ready instances stay
+	// short of the declared count, or whose continuous archiving is
+	// disabled. reason is stuck_phase | under_replicated |
+	// archiving_disabled.
+	cnpgClusterUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_cnpg_cluster_unhealthy",
+		Help: "1 while a CloudNativePG cluster is stuck mid-failover, under-replicated, or has continuous archiving disabled.",
+	}, []string{"namespace", "name", "reason"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		postgresWALUnhealthyGauge,
-		postgresInactiveSlotWALGauge)
+		postgresInactiveSlotWALGauge,
+		cnpgClusterUnhealthyGauge)
 }
 
 // pgWALConditionUnhealthy reports whether a cluster CR condition is
@@ -214,6 +242,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	// (a) CR conditions — the operator's own archive/backup verdicts.
+	var cnpgClusters []*unstructured.Unstructured
 	for _, rk := range postgresCRKinds {
 		items, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
 		switch {
@@ -224,6 +253,11 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		for i := range items.Items {
 			cr := &items.Items[i]
+			// W13-ST3 — CNPG clusters get the dedicated cluster-health
+			// pass below on top of the archive-condition scan.
+			if rk.gvr == kube.GVRCNPGCluster {
+				cnpgClusters = append(cnpgClusters, cr)
+			}
 			for _, c := range kube.Conditions(cr.Object, "status", "conditions") {
 				if pgWALConditionUnhealthy(c, now) {
 					emit(cr.GetNamespace(), cr.GetName(), "archive_condition")
@@ -328,6 +362,12 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
+	// W13-ST3 — CloudNativePG cluster liveness: a wedged failover
+	// phase, a ready<count shortfall or disabled continuous archiving
+	// ride their own gauge — the WAL signatures above say the
+	// archiver is sick, these say the cluster underneath is.
+	p.checkCNPGClusterHealth(ctx, log, &rep, cnpgClusters, now)
+
 	for k, f := range findings {
 		rep.Emit(postgresWALUnhealthyGauge, k,
 			[]string{f.ns, f.cluster, f.reason}, k)
@@ -364,4 +404,118 @@ func (p *postgresWALArchiveGuardCheck) emitSlotBloat(
 		[]string{ns, cluster, slot})
 	rep.Find(fmt.Sprintf("%s/%s slot %s inactive retaining %.1fGiB WAL",
 		ns, cluster, slot, s.Value/float64(1<<30)))
+}
+
+// ---------------------------------------------------------------------------
+// W13-ST3 — CloudNativePG cluster health.
+// ---------------------------------------------------------------------------
+
+// cnpgStuckPhases are the CloudNativePG status.phase values that mark
+// a failover/restart which never lands — normalized (lower-cased,
+// spaces stripped) so the CRD's spaced spellings ("Failing over",
+// "Waiting for the instances to become active") and the CamelCase
+// enum names the W13-ST3 incident cites ("FailingOver",
+// "WaitingForInstancesToBecomeActive") all match.
+var cnpgStuckPhases = map[string]bool{
+	"failingover":                          true,
+	"waitingforinstancestobecomeactive":    true,
+	"waitingfortheinstancestobecomeactive": true,
+}
+
+// cnpgPhaseKey normalizes a status.phase for the stuck-phase lookup —
+// spaces removed, lower-cased.
+func cnpgPhaseKey(phase string) string {
+	return strings.ToLower(strings.ReplaceAll(phase, " ", ""))
+}
+
+// checkCNPGClusterHealth is the W13-ST3 CloudNativePG guard folded
+// into this check's CNPG CR scan — the WAL signatures above watch the
+// archiver, these three watch the cluster's failover/quorum liveness
+// the archiver sits on top of:
+//
+//   - stuck_phase: status.phase held Failing over / Waiting for the
+//     instances to become active past CNPGUnhealthyMinAge — a
+//     failover that never lands. status.phaseTimestamp is the honest
+//     clock when the operator stamps one; the first-seen ledger is
+//     the fallback when it doesn't (and NEVER mixed with a parseable
+//     timestamp — trusting the operator's own transition time beats
+//     an in-RAM observation that can be older than the transition).
+//   - under_replicated: status.readyInstances short of
+//     status.instances past the same window — one member down still
+//     serves, a second failure loses the write quorum.
+//   - archiving_disabled: the ContinuousArchiving condition False —
+//     PITR silently dead while scheduled snapshots keep "succeeding".
+//
+// Detection-only like the rest of the file — the
+// node_automation_cnpg_cluster_unhealthy gauge is the alert contract.
+func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
+	ctx context.Context, log logr.Logger, rep *probefw.SweepReport,
+	clusters []*unstructured.Unstructured, now time.Time) {
+
+	minAge := p.Cfg.Datastore.CNPGUnhealthyMinAge
+	var cnpgRep probefw.SweepReport
+	live := map[string]bool{} // first-seen keys still holding this sweep
+	emit := func(cr *unstructured.Unstructured, reason, detail string) {
+		ns, name := cr.GetNamespace(), cr.GetName()
+		cnpgRep.Flag(cnpgClusterUnhealthyGauge, ns+"/"+name+"/"+reason,
+			[]string{ns, name, reason})
+		rep.Find(detail)
+	}
+
+	for _, cr := range clusters {
+		ns, name := cr.GetNamespace(), cr.GetName()
+		key := ns + "/" + name
+
+		// (1) wedged failover/restart phase.
+		phase, _ := kube.NestedString(cr.Object, "status", "phase")
+		if cnpgStuckPhases[cnpgPhaseKey(phase)] {
+			lk := "phase/" + key
+			live[lk] = true
+			persisted := false
+			if ts, ok := kube.NestedString(
+				cr.Object, "status", "phaseTimestamp"); ok {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					persisted = now.Sub(t) >= minAge
+				} else {
+					persisted = probefw.Persisted(
+						&p.cnpgSeen, lk, now, minAge, log)
+				}
+			} else {
+				persisted = probefw.Persisted(
+					&p.cnpgSeen, lk, now, minAge, log)
+			}
+			if persisted {
+				emit(cr, "stuck_phase", fmt.Sprintf(
+					"%s/%s cnpg phase %q held >=%s",
+					ns, name, phase, minAge))
+			}
+		}
+
+		// (2) ready instances short of the declared count.
+		instances, iok := kube.NestedNumber(cr.Object, "status", "instances")
+		ready, rok := kube.NestedNumber(cr.Object, "status", "readyInstances")
+		if iok && rok && ready < instances {
+			lk := "replicas/" + key
+			live[lk] = true
+			if probefw.Persisted(&p.cnpgSeen, lk, now, minAge, log) {
+				emit(cr, "under_replicated", fmt.Sprintf(
+					"%s/%s cnpg ready %d/%d held >=%s",
+					ns, name, ready, instances, minAge))
+			}
+		}
+
+		// (3) continuous archiving switched off — PITR dead while
+		// scheduled snapshots keep looking green.
+		if c, ok := kube.ConditionOf(cr.Object, "ContinuousArchiving"); ok &&
+			c.Status == "False" {
+			emit(cr, "archiving_disabled", fmt.Sprintf(
+				"%s/%s cnpg ContinuousArchiving=False", ns, name))
+		}
+	}
+
+	// Resolved signatures re-arm: a phase that lands or a count that
+	// catches up drops its first-seen entry so a later flap measures
+	// a fresh window, and the emitted ledger prunes the series.
+	p.cnpgSeen.Prune(func(k string) bool { return live[k] })
+	cnpgRep.Close(&p.emittedCNPG, cnpgClusterUnhealthyGauge.DeleteLabelValues)
 }
