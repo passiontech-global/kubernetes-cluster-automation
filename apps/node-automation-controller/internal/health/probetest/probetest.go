@@ -78,9 +78,9 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 		HTTPClient: &http.Client{},
 		Now:        time.Now,
 	}
-	// Same wiring the root prober applies: the Prometheus client
-	// shares the HTTPClient seam tests swap post-construction and
-	// bounds each query by the check timeout.
+	// Same wiring probefw.NewDeps applies in production: the
+	// Prometheus client shares the HTTPClient seam tests swap
+	// post-construction and bounds each query by the check timeout.
 	d.Prom = promq.Client{HTTP: d.HTTPClient, Timeout: d.Cfg.Timeouts.Check}
 	return d
 }
