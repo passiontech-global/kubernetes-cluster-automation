@@ -147,8 +147,8 @@ type Config struct {
 	// wrapper when HostRoot != "/") — nil builds the default via the
 	// systemd package; tests substitute a fake.
 	journalFetch func(ctx context.Context, args ...string) (string, error)
-	// nowFn supplies the current time — seam for tests.
-	nowFn timex.Clock
+	// Clock supplies the current time — the shared timex.Cell seam.
+	Clock *timex.Cell
 }
 
 func (c *Config) applyDefaults() {
@@ -206,8 +206,8 @@ func (c *Config) applyDefaults() {
 			return sd.Exec(ctx, "journalctl", args...)
 		}
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 }
 
@@ -218,8 +218,9 @@ type Reporter struct {
 	// state is the shared watchdog-state contract handle (hoststate):
 	// the one-time installed/last-run seed and the state-<key> latch
 	// paths. The reporter never APPENDS to the watchdog log (it only
-	// tails WatchdogLogFile for events) so LogFile stays "". Now is a
-	// closure over r.cfg.nowFn — tests re-stub the clock after New().
+	// tails WatchdogLogFile for events) so LogFile stays "". Now is
+	// r.cfg.Clock.Now — the method value binds the shared timex.Cell,
+	// so a post-New Clock.Set lands here.
 	state *hoststate.Store
 
 	// NPD-compatible metric names — PrometheusRules query these exact
@@ -274,7 +275,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 	}
 	r := &Reporter{cfg: cfg, emittedEvts: map[string]*emittedEvent{}}
 	r.state = hoststate.New(cfg.WatchdogStateDir, "",
-		func() time.Time { return r.cfg.nowFn() }, logger)
+		r.cfg.Clock.Now, logger)
 	// The kernel monitor's /dev/kmsg tail (npd_kernel.go). Paths are
 	// re-evaluated per (re)open so cfg/test re-points stay live.
 	r.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{
@@ -300,7 +301,12 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 	}, []string{"reason"})
 	r.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_nodereporter_cycles_total",
-		Help: "nodereporter sync cycles by result (ok|error).",
+		// "started" counts every Cycle entry — started minus
+		// (ok+error) is the in-flight/wedged count, so a Cycle that
+		// never returns (the 2026-11-06 ~17h fleet wedge, this time
+		// stuck on a non-ctx-aware call the deadline can't preempt)
+		// is visible in metrics even though nothing logs.
+		Help: "nodereporter sync cycles by result (started|ok|error).",
 	}, []string{"result"})
 
 	if reg != nil {
@@ -349,6 +355,7 @@ func (r *Reporter) runCycle(ctx context.Context) {
 // error so a failing piece never starves the others; all feed the
 // cycles{result} counter.
 func (r *Reporter) Cycle(ctx context.Context) {
+	r.cycles.WithLabelValues("started").Inc()
 	ok := true
 	// BUG-H1: the reporter must NOT refresh last-run — the
 	// staleness probe reads exactly this file, and a self-heartbeat
@@ -381,14 +388,33 @@ func (r *Reporter) Cycle(ctx context.Context) {
 			r.heartbeatInit = true
 		}
 	}
+	// One Node GET + at most one merged status PATCH per cycle —
+	// syncConditions covers the watchdog latch conditions AND the
+	// two NPD monitor conditions (the former split issued a
+	// GET+PATCH each). It runs FIRST, right after heartbeatInit:
+	// 2026-11-07 a Cycle wedged before ever reaching it (stuck in
+	// one of the monitor steps below on a call the CycleTimeout
+	// can't preempt) left every managed condition a frozen zombie —
+	// KubeletPLEGUnhealthy stayed True ~20min after the latch
+	// cleared until it was patched by hand. Latch→condition truth
+	// and heartbeat freshness are the critical path consumers like
+	// node-hang-precordon rely on; the NPD monitor conditions
+	// (kernelDeadlock/readonlyFS) now ship the PREVIOUS cycle's
+	// computed state — one Interval of lag, an acceptable trade for
+	// a sync that a sick monitor can't starve.
+	if err := r.syncConditions(ctx); err != nil {
+		logger().Error("nodereporter: condition sync failed",
+			"node", r.cfg.NodeName, "error", err)
+		ok = false
+	}
 	if err := r.syncLogEvents(ctx); err != nil {
 		logger().Error("nodereporter: event sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
 	// NPD monitor ports — each reports its own error so one sick
-	// source never starves the others; syncNPDConditions runs last so
-	// it ships whatever state the monitors computed this cycle.
+	// source never starves the others; the conditions they produce
+	// are shipped by next cycle's syncConditions.
 	if err := r.syncKubeletJournal(ctx); err != nil {
 		logger().Error("nodereporter: kubelet-stale journal scan failed",
 			"node", r.cfg.NodeName, "error", err)
@@ -401,16 +427,6 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	}
 	if err := r.syncReadonlyMounts(ctx); err != nil {
 		logger().Error("nodereporter: readonly filesystem check failed",
-			"node", r.cfg.NodeName, "error", err)
-		ok = false
-	}
-	// One Node GET + at most one merged status PATCH per cycle —
-	// syncConditions covers the watchdog latch conditions AND the
-	// two NPD monitor conditions (the former split issued a
-	// GET+PATCH each). It runs last so it ships whatever state the
-	// monitors computed this cycle.
-	if err := r.syncConditions(ctx); err != nil {
-		logger().Error("nodereporter: condition sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
