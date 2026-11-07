@@ -129,20 +129,19 @@ func (p *endpointSliceZoneStarvationCheck) Run(ctx context.Context) probefw.Resu
 		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 	}
 
-	// nodeZone maps schedulable targets to their zone; workerZones
-	// holds every zone owning >=1 Ready worker (control-plane zones
-	// don't run client workloads and can't starve consumers).
-	nodeZone := map[string]string{}
+	// nodeZone is the shared memoized placement join (a zoneless
+	// node reads "" on lookup — presence was never distinguished);
+	// workerZones still walks the raw census for the Ready-worker
+	// classification (control-plane zones don't run client
+	// workloads and can't starve consumers).
+	nodeZone, _ := p.NodeZones(ctx) // the same memoized read AllNodes served
 	workerZones := map[string]bool{}
 	for i := range nodes {
 		n := &nodes[i]
-		z := n.Labels[corev1.LabelTopologyZone]
-		if z == "" {
-			continue
-		}
-		nodeZone[n.Name] = z
 		if kube.NodeReady(n) && !kube.IsControlPlane(n) {
-			workerZones[z] = true
+			if z := nodeZone[n.Name]; z != "" {
+				workerZones[z] = true
+			}
 		}
 	}
 	activeZones := map[string]bool{}
