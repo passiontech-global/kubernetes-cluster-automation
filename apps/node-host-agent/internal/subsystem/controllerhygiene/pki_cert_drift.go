@@ -143,7 +143,7 @@ func (c *pkiDriftCheck) Run(ctx context.Context) {
 		}
 		anyDrift = true
 		n := c.d.state.Incr(ctr)
-		if n < c.d.cfg.PKIDrift.Cycles {
+		if n < c.d.streakCycles(c.d.cfg.PKIDrift.Cycles) {
 			continue
 		}
 		c.d.state.Enter(statePKIReloadStale, fmt.Sprintf(

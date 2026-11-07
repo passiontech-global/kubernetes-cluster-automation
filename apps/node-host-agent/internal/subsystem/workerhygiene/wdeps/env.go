@@ -72,6 +72,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 	knobs = append(knobs, cfg.Teardown.envKnobs()...)
 	knobs = append(knobs, cfg.Pressure.envKnobs()...)
 	knobs = append(knobs, cfg.Calico.envKnobs()...)
+	knobs = append(knobs, cfg.Disk.envKnobs(hostPath)...)
 	knobs = append(knobs, cfg.budgetEnvKnobs()...)
 	knobs = append(knobs, cfg.Runtime.envKnobs(hostPath)...)
 	envx.Apply(knobs)

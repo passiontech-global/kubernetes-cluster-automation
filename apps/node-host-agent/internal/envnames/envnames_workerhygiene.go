@@ -44,4 +44,10 @@ const (
 	// Runtime domain.
 	EnvCgroupRoot         = "NODE_HOST_AGENT_CGROUP_ROOT"
 	EnvSystemdSessionsDir = "NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR"
+
+	// Wave-13 guards — the W13-CP3 projected SA-token TTL floor and
+	// the W13-ST1/KR3 disk guards' knobs.
+	EnvSATokenMinTTLSec = "NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S"
+	EnvLocalPVQuotaDir  = "NODE_HOST_AGENT_LOCALPV_QUOTA_DIR"
+	EnvHostRunDir       = "NODE_HOST_AGENT_HOST_RUN_DIR"
 )

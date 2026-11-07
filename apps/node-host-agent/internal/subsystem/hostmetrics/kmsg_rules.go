@@ -32,6 +32,13 @@ var (
 	oomConstraintRe = regexp.MustCompile(`oom-kill:constraint=`)
 	oomMemcgRe      = regexp.MustCompile(`(?:oom_memcg|task_memcg)=([^\s,]+)`)
 	oomTaskRe       = regexp.MustCompile(`(?:^|,)task=([^\s,]+)`)
+	// W13-KR1: higher-order page allocation failure — the buddy
+	// allocator can't find a contiguous order>=1 block for
+	// sk_buff/WireGuard/XFS even while MemAvailable stays high.
+	// order:0 failures are routine pressure noise; order:[1-9] is
+	// the fragmentation signature workerhygiene defragments via
+	// vm.compact_memory.
+	pageAllocFailRe = regexp.MustCompile(`page allocation failure: order:[1-9]`)
 )
 
 // oomKillCtx is the pending constraint-line state — the kernel prints
@@ -55,6 +62,8 @@ func (l *Latches) classifyKernelLine(msg string, st *kernelScanState) {
 		l.noteKernelFsError(msg)
 	case conntrackFullRe.MatchString(msg):
 		l.noteConntrackFull()
+	case pageAllocFailRe.MatchString(msg):
+		l.notePageAllocFailure(msg)
 	}
 }
 
@@ -72,10 +81,21 @@ func parseOOMConstraint(msg string) *oomKillCtx {
 }
 
 // isHostOOMComm reports whether comm names a host-level daemon —
-// the plan's containerd/k0s/kubelet set. comm is TASK_COMM_LEN
-// truncated (15 chars), so prefix/substring matching is required.
+// the containerd/k0s/kubelet set plus the W13-KR1 infra daemons
+// (nebula, haproxy on the api-lb VM, the coredns host stub, the
+// postgres/pgbouncer pair on db-vm, every cilium daemon and the
+// agent itself) whose kernel-OOM death is as load-bearing as the
+// kubelet's. comm is TASK_COMM_LEN truncated (15 chars), so
+// prefix/substring matching is required ("cilium-operator" and
+// "node-host-agent" are exactly 15).
 func isHostOOMComm(comm string) bool {
-	return comm == "kubelet" || strings.HasPrefix(comm, "k0s") ||
+	switch comm {
+	case "kubelet", "nebula", "haproxy", "coredns", "postgres",
+		"pgbouncer", "node-host-agent":
+		return true
+	}
+	return strings.HasPrefix(comm, "k0s") ||
+		strings.HasPrefix(comm, "cilium-") ||
 		strings.Contains(comm, "containerd")
 }
 

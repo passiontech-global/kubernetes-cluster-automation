@@ -95,6 +95,16 @@ const (
 	defaultRepackDeadPct      = 40
 	defaultRepackMinHeapBytes = 209715200 // 200MB
 
+	// W13-CP4/ST2: top-churn window and the physical-backup
+	// verifier defaults.
+	defaultChurnWindow    = 5 * time.Minute
+	churnTopN             = 5
+	defaultBackupDir      = "/var/backups/kine"
+	defaultBackupInterval = 6 * time.Hour
+	backupMinFreeRatio    = 0.30
+	churnFileHead         = "last-churn-head"
+	churnFileTS           = "last-churn-ts"
+
 	defaultCmdTimeout     = 2 * time.Minute
 	defaultLongCmdTimeout = 15 * time.Minute // compact session, VACUUM, REINDEX, repack
 	pgWireTimeout         = 8 * time.Second
@@ -188,6 +198,14 @@ type Config struct {
 	// space gates pg_repack (W8-CP2); "" → /var/lib/postgresql/data.
 	PGDataDir string
 
+	// W13-ST2/Gap#4 physical-backup verifier: BackupDir is the
+	// host dir holding pg_dump -Fc dumps ("" → /var/backups/kine);
+	// BackupInterval is the max dump age before the guard creates
+	// a fresh one ("" → 6h). Creation also requires >30% free on
+	// the backup filesystem.
+	BackupDir      string
+	BackupInterval time.Duration
+
 	CmdTimeout     time.Duration // per command budget
 	LongCmdTimeout time.Duration // compact/vacuum/reindex/repack budget
 
@@ -201,9 +219,10 @@ type Config struct {
 	ReadOnly bool
 
 	// --- injectable seams (defaults follow) ---
-	nowFn  timex.Clock
-	run    runner
-	wireFn func(ctx context.Context, addr string) bool
+	nowFn    timex.Clock
+	run      runner
+	wireFn   func(ctx context.Context, addr string) bool
+	statfsFn func(path string) (float64, error)
 }
 
 func (c *Config) applyDefaults() error {
@@ -286,6 +305,12 @@ func (c *Config) applyDefaults() error {
 	if c.RepackMinHeapBytes <= 0 {
 		c.RepackMinHeapBytes = defaultRepackMinHeapBytes
 	}
+	if c.BackupDir == "" {
+		c.BackupDir = defaultBackupDir
+	}
+	if c.BackupInterval <= 0 {
+		c.BackupInterval = defaultBackupInterval
+	}
 	if c.CmdTimeout <= 0 {
 		c.CmdTimeout = defaultCmdTimeout
 	}
@@ -318,6 +343,9 @@ func (c *Config) applyDefaults() error {
 		c.wireFn = func(ctx context.Context, addr string) bool {
 			return pgWireProbe(ctx, addr, pgWireTimeout)
 		}
+	}
+	if c.statfsFn == nil {
+		c.statfsFn = statfsFree
 	}
 	return nil
 }
@@ -376,6 +404,11 @@ type metrics struct {
 	seqTupRead     prometheus.Collector // CounterFunc → kine_db_seq_tuples_read_total
 	seqScansVal    atomic.Int64
 	seqTupReadVal  atomic.Int64
+
+	// W13-CP4/ST2: top-churn + physical-backup verifier series.
+	topChurn    *prometheus.GaugeVec // resource
+	backupAge   prometheus.Gauge
+	backupValid prometheus.Gauge
 
 	cycles *prometheus.CounterVec // loop, result
 }
@@ -502,6 +535,18 @@ func newMetrics() *metrics {
 			Name: "kine_db_invalid_indexes",
 			Help: "Indexes with indisvalid=false in pg_index — dead shells an interrupted REINDEX CONCURRENTLY leaves behind.",
 		}),
+		topChurn: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "kine_db_top_churn_revisions_5m",
+			Help: "Top-5 resource prefixes by revision count in the last 5-minute window — mutating-webhook ping-pong detector (W13-CP4).",
+		}, []string{"resource"}),
+		backupAge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_backup_age_seconds",
+			Help: "Age of the newest physical pg_dump in the backup dir — staleness of the disaster-recovery path (W13-ST2).",
+		}),
+		backupValid: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_backup_valid",
+			Help: "1 when the newest physical pg_dump passed header verification (PGDMP magic / pg_restore -l) — W13-ST2.",
+		}),
 		cycles: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "node_host_agent_kinedb_cycles_total",
 			Help: "kinedb loop cycles by loop and result.",
@@ -533,6 +578,7 @@ func (m *metrics) collectors() []prometheus.Collector {
 		m.inactiveSlot,
 		m.pgbClientWaiting, m.pgbMaxWait, m.invalidIndexes,
 		m.seqScans, m.seqTupRead,
+		m.topChurn, m.backupAge, m.backupValid,
 		m.cycles,
 	}
 }
@@ -547,6 +593,18 @@ type KineDB struct {
 	// Now is a closure over k.cfg.nowFn — tests re-stub the clock
 	// after New() and the store must observe the new one.
 	state *hoststate.Store
+
+	// churnTop is the W13-CP4 top-5 churn result computed by the
+	// probe loop (churn window watermark lives in GuardStateDir)
+	// and emitted by the guard cycle into kine-compact-guard.prom.
+	churnTop []churnEntry
+}
+
+// churnEntry is one resource prefix's revision count in the last
+// churn window — ordered by count desc, top churnTopN only.
+type churnEntry struct {
+	resource string
+	revs     int64
 }
 
 // New returns a KineDB and registers its metrics on reg.

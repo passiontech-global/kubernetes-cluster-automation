@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them with the
-source location of the first reference (120 knobs referenced
+source location of the first reference (127 knobs referenced
 across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -73,21 +73,21 @@ subsystem has no env gate.
 
 ### `internal/subsystem/apiprober`
 
-- `NODE_HOST_AGENT_APIPROBER_BACKEND` — `config_env.go:58`
-- `NODE_HOST_AGENT_APIPROBER_CACHE_PATH` — `config_env.go:125`
-- `NODE_HOST_AGENT_APIPROBER_CA_FILE` — `config_env.go:72`
-- `NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS` — `config_env.go:61`
-- `NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES` — `config_env.go:114`
-- `NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES` — `config_env.go:115`
-- `NODE_HOST_AGENT_APIPROBER_GAP_MIN` — `config_env.go:113`
-- `NODE_HOST_AGENT_APIPROBER_INSECURE_TLS` — `config_env.go:119`
-- `NODE_HOST_AGENT_APIPROBER_INTERVAL` — `config_env.go:112`
-- `NODE_HOST_AGENT_APIPROBER_LIVE_PATH` — `config_env.go:124`
-- `NODE_HOST_AGENT_APIPROBER_MODE` — `config_env.go:68`
-- `NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES` — `config_env.go:116`
-- `NODE_HOST_AGENT_APIPROBER_SOCKET` — `config_env.go:56`
-- `NODE_HOST_AGENT_APIPROBER_TOKEN_FILE` — `config_env.go:70`
-- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober.go:517`
+- `NODE_HOST_AGENT_APIPROBER_BACKEND` — `config_env.go:60`
+- `NODE_HOST_AGENT_APIPROBER_CACHE_PATH` — `config_env.go:127`
+- `NODE_HOST_AGENT_APIPROBER_CA_FILE` — `config_env.go:74`
+- `NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS` — `config_env.go:63`
+- `NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES` — `config_env.go:116`
+- `NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES` — `config_env.go:117`
+- `NODE_HOST_AGENT_APIPROBER_GAP_MIN` — `config_env.go:115`
+- `NODE_HOST_AGENT_APIPROBER_INSECURE_TLS` — `config_env.go:121`
+- `NODE_HOST_AGENT_APIPROBER_INTERVAL` — `config_env.go:114`
+- `NODE_HOST_AGENT_APIPROBER_LIVE_PATH` — `config_env.go:126`
+- `NODE_HOST_AGENT_APIPROBER_MODE` — `config_env.go:70`
+- `NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES` — `config_env.go:118`
+- `NODE_HOST_AGENT_APIPROBER_SOCKET` — `config_env.go:58`
+- `NODE_HOST_AGENT_APIPROBER_TOKEN_FILE` — `config_env.go:72`
+- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober.go:543`
 
 ### `internal/subsystem/concoursecache`
 
@@ -102,6 +102,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `config_env.go:75`
 - `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `config_env.go:127`
 - `NODE_HOST_AGENT_ETCD_ENDPOINT` — `config_env.go:126`
+- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `config_env.go:132`
 - `NODE_HOST_AGENT_FROZEN_CYCLES` — `config_env.go:91`
 - `NODE_HOST_AGENT_GAP_CYCLES` — `config_env.go:89`
 - `NODE_HOST_AGENT_GAP_MIN` — `config_env.go:87`
@@ -123,6 +124,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `config_env.go:95`
 - `NODE_HOST_AGENT_SOLO_CYCLES` — `config_env.go:93`
 - `NODE_HOST_AGENT_STALE_MIN_ERRS` — `config_env.go:85`
+- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `config_env.go:131`
 
 ### `internal/subsystem/hostconfig`
 
@@ -162,6 +164,8 @@ subsystem has no env gate.
 
 ### `internal/subsystem/kinedb`
 
+- `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `config_env.go:40`
+- `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `config_env.go:42`
 - `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `config_env.go:32`
 - `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `config_env.go:34`
 - `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `config_env.go:38`
@@ -196,13 +200,14 @@ subsystem has no env gate.
 
 - `NODE_HOST_AGENT_CALICO_FELIX_READY_URL` — `config_calico.go:32`
 - `NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD` — `config_calico.go:33`
-- `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:46`
+- `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
 - `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
 - `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
 - `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:204`
 - `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:198`
 - `NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD` — `config_pressure.go:44`
 - `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:208`
+- `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:102`
 - `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:218`
 - `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:196`
 - `NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE` — `config_teardown.go:38`
@@ -214,9 +219,11 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
 - `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `env.go:92`
+- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `env.go:93`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
+- `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:101`
 - `NODE_HOST_AGENT_PROC_ROOT` — `config.go:197`
 - `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:200`
-- `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:48`
+- `NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S` — `config_runtime.go:57`
+- `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:55`

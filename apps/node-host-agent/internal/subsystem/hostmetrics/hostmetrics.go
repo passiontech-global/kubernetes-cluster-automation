@@ -174,6 +174,7 @@ type Collector struct {
 	fs    fsProbeState      // collect_fs.go — hung-mount probes
 	ino   inotifyCache      // collect_inotify.go — fdinfo sweep cache
 	lpv   localpvCache      // collect_localpv.go — du walk cache
+	ebpf  ebpfCache         // collect_ebpf.go — prog/map id sweep cache
 	// kscan is the W10-KR1 kernel-log drain state — the kmsg tail
 	// session (fd) + cross-line OOM pairing. Owned by the
 	// Collector directly: the Latches wrapper is recreated per

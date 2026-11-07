@@ -18,6 +18,7 @@ import (
 	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -28,8 +29,22 @@ const orphanHostPathMinAge = 24 * time.Hour
 
 const lastHostOOMEventFile = "last-host-oom-event"
 
+// The W13-KR1 producer latch this check consumes lives in the
+// hoststate registry: hostmetrics' kmsg scanner enters
+// hoststate.LatchPageAllocFailure (state-page-alloc-failure) when
+// the kernel logs "page allocation failure: order:N".
+
+// memoryCompactEvery is the W13-KR1 compaction cooldown — one
+// vm.compact_memory write per 30 minutes: direct compaction is a
+// non-invasive buddy-allocator defrag pass but it still stalls
+// page allocation while it runs.
+const memoryCompactEvery = 30 * time.Minute
+
 // HostOOMCheck is the W10-KR1 hostmetrics kmsg-marker consumer as
-// a Check (no streak — the dedup marker file is the state).
+// a Check (no streak — the dedup marker file is the state). It also
+// owns the W13-KR1 memory-compaction remedy, consuming the
+// state-page-alloc-failure latch produced by the hostmetrics kmsg
+// scanner.
 type HostOOMCheck struct{ d *wdeps.Deps }
 
 // Name returns the check label / WD_SIG key.
@@ -41,6 +56,7 @@ func (c *HostOOMCheck) Name() string { return wdeps.CheckHostOOM }
 // node_agent_host_oom_kills_total delta. Pod-cgroup kills never
 // reach the markers — hostmetrics already classified them out.
 func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
+	c.compactMemory()
 	victim := strings.TrimSpace(wdeps.ReadSmallFile(c.d.Cfg.Host.OOMVictimFile))
 	fv := strings.Fields(victim)
 	if len(fv) < 2 {
@@ -87,6 +103,39 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 		}
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckHostOOM, "ok").Inc()
+}
+
+// compactMemory is the W13-KR1 remedy half: while the hostmetrics
+// kmsg scanner's state-page-alloc-failure latch is held (kernel
+// "page allocation failure: order:N" — the buddy allocator can't
+// serve a contiguous block, fragmentation is winning), write 1 to
+// <ProcRoot>/sys/vm/compact_memory on the last-memory-compact 30m
+// budget and count node_agent_memory_compaction_runs_total. Per the
+// hoststate registry contract the consumer Exits the latch after a
+// successful compaction — without it the latch would re-fire the
+// 30m compact forever off a single past episode; the next kmsg
+// sighting re-Enters it (Enter is idempotent).
+func (c *HostOOMCheck) compactMemory() {
+	if !c.d.State.Exists(hoststate.LatchPageAllocFailure) {
+		return
+	}
+	target := filepath.Join(c.d.Cfg.ProcRoot, "sys", "vm", "compact_memory")
+	if _, err := os.Stat(target); err != nil {
+		return // non-v2 sysctl or unmounted proc — nothing to poke
+	}
+	if !c.d.State.RateTrySpend("last-memory-compact", memoryCompactEvery) {
+		return
+	}
+	if err := os.WriteFile(target, []byte("1"), 0o644); err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: page-alloc-failure compact_memory write failed: %v", err))
+		return
+	}
+	c.d.State.Exit(hoststate.LatchPageAllocFailure, nil)
+	c.d.MemoryCompactionRuns++
+	c.d.State.AppendLog(
+		"ACTION: page-alloc-failure latch held — triggered vm.compact_memory (W13-KR1 defrag)")
+	c.d.Actions.WithLabelValues(wdeps.CheckHostOOM, "compact_memory").Inc()
 }
 
 // emitOOMEvent creates the SystemOOMVictim Warning Event on this

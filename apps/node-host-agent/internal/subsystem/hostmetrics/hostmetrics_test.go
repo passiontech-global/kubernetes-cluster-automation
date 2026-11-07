@@ -202,7 +202,7 @@ func TestApplyDefaults(t *testing.T) {
 
 func TestDescribe(t *testing.T) {
 	c := New(Config{})
-	ch := make(chan *prometheus.Desc, 64)
+	ch := make(chan *prometheus.Desc, 80) // > total descs — Describe blocks on a full buffer
 	c.Describe(ch)
 	// 10 base descs + the 2 legacy prom_emit aliases
 	// (node_watchdog_state, node_watchdog_egress_relay) + 16
@@ -215,8 +215,11 @@ func TestDescribe(t *testing.T) {
 	// + 4 W12-KR3 descs (ephemeral port saturation, tcp CLOSE_WAIT
 	// count, node_exporter-named nf_conntrack insert_failed/drop).
 	// + 1 W12-CP4a desc (sa.pub signer-key fingerprint hash).
-	if got := len(ch); got != 62 {
-		t.Fatalf("Describe emitted %d descs want 62", got)
+	// + 6 W13 descs (daemon fd ratio, containerd meta.db,
+	//   k0scontroller children RSS, fs bytes used ratio, eBPF
+	//   programs/maps counts).
+	if got := len(ch); got != 68 {
+		t.Fatalf("Describe emitted %d descs want 68", got)
 	}
 }
 

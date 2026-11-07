@@ -58,6 +58,14 @@ var kernelTempRules = []logRule{
 	{"FilesystemIOError", regexp.MustCompile(`Buffer I/O error on dev|XFS.*[Mm]etadata I/O error`)},
 	{"KernelSoftLockup", kernelSoftLockupRe},
 	{"KernelRCUStall", kernelRCUStallRe},
+	// W13-KR1 additions — the fragmentation/neighbour/NIC/TCP
+	// signatures hostmetrics' kmsg drain also classifies into
+	// state-dir latches; here they are temporary rules (counter +
+	// Event) like the upstream kernel-monitor set.
+	{"PageAllocFailure", regexp.MustCompile(`page allocation failure: order:[1-9]`)},
+	{"NeighborTableOverflow", regexp.MustCompile(`neighbour: (?:arp|ndisc)_cache: neighbor table overflow`)},
+	{"NetdevTxTimeout", regexp.MustCompile(`NETDEV WATCHDOG: .* transmit queue [0-9]+ timed out`)},
+	{"TCPMemoryPressure", regexp.MustCompile(`TCP: out of memory -- consider tuning tcp_mem`)},
 }
 
 // kernelDeadlockRe is the permanent KernelDeadlock rule — the

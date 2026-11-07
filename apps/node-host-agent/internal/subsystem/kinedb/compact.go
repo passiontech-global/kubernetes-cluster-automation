@@ -171,7 +171,12 @@ type guardResult struct {
 	revSeen  bool  // revAfter is valid
 	statsOK  bool  // head/compact/rows were actually read this run
 	reason   string
-	notes    []string
+	// W13-ST2 backup verifier outcome — seen=false when the
+	// verifier could neither measure nor create a dump this run.
+	backupAge   int64
+	backupValid bool
+	backupSeen  bool
+	notes       []string
 }
 
 // guardCycle runs one guard round and emits metrics + textfile.
@@ -191,6 +196,11 @@ func (k *KineDB) guardCycle(ctx context.Context) *guardResult {
 		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
 		k.guardRun(ctx, pg, user, pass, res, note)
+		// W13-ST2/Gap#4: physical-backup verifier — pg_dump -Fc
+		// every BackupInterval when free space allows, header
+		// verified; emits kine_db_backup_{age_seconds,valid} in
+		// the same textfile.
+		k.backupVerify(ctx, pg, user, pass, res, note)
 	}
 	k.emitGuard(res)
 	sum := fmt.Sprintf("head=%d compact_rev=%d rows=%d frozen=%d fired=%v "+
@@ -334,5 +344,31 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	p.Gauge("kine_db_guard_last_run_timestamp_seconds",
 		"Last guard run", ts)
 	k.m.guardLastRun.Set(ts)
+	// W13-CP4: the probe loop's top-5 churn sample renders here —
+	// this file owns the churn series (the probe's own .prom must
+	// never duplicate it).
+	for _, e := range k.churnTop {
+		p.GaugeLabels("kine_db_top_churn_revisions_5m",
+			"Top-5 resource prefixes by revision count in the last 5-minute window",
+			fmt.Sprintf("resource=%q", e.resource), float64(e.revs))
+		k.m.topChurn.WithLabelValues(e.resource).Set(float64(e.revs))
+	}
+	// W13-ST2: physical-backup verifier series — seen-gated like
+	// the stats series: an unmeasured cycle must not fabricate a
+	// passing backup state.
+	if res.backupSeen {
+		valid := 0.0
+		if res.backupValid {
+			valid = 1
+		}
+		p.Gauge("kine_db_backup_age_seconds",
+			"Age of the newest physical pg_dump in the backup dir",
+			float64(res.backupAge))
+		p.Gauge("kine_db_backup_valid",
+			"1 when the newest physical pg_dump passed header verification",
+			valid)
+		k.m.backupAge.Set(float64(res.backupAge))
+		k.m.backupValid.Set(valid)
+	}
 	k.emitTextfile("kine-compact-guard.prom", &p)
 }

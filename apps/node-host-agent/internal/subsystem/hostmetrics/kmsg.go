@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
@@ -401,6 +402,27 @@ func (l *Latches) noteKernelFsError(msg string) {
 		logger().Warn("hostmetrics: kmsg fs-error marker write failed",
 			"path", p, "error", err)
 	}
+}
+
+// notePageAllocFailure latches state-page-alloc-failure on a
+// higher-order (order>=1) page allocation failure — fragmentation
+// evidence: MemAvailable can still read GBs free while the buddy
+// allocator fails to find a contiguous block for sk_buff,
+// WireGuard (cilium_wg0) or XFS metadata. The latch is the
+// hostmetrics→workerhygiene hand-off for the W13-KR1
+// vm.compact_memory trigger (the compact itself + its cooldown live
+// in workerhygiene); Enter is idempotent, so repeat failure lines
+// only refresh the latch mtime and never spam STATE-ENTER lines —
+// the latch exits when workerhygiene's compaction or the janitor's
+// max-age reaper clears it, which is also the re-arm for the next
+// fragmentation episode.
+func (l *Latches) notePageAllocFailure(msg string) {
+	detail := msg
+	if len(detail) > 200 {
+		detail = detail[:200]
+	}
+	l.c.state.Enter(hoststate.LatchPageAllocFailure,
+		"page allocation failure: "+detail)
 }
 
 // noteConntrackFull counts table-full records and — bounded by

@@ -331,7 +331,7 @@ func (c *cpFreezeCheck) Run(ctx context.Context) {
 	switch {
 	case !kcmOK || !schedOK:
 		n := c.d.state.Incr(fileCtrCPFreeze)
-		if n >= c.d.cfg.CPFreeze.Cycles {
+		if n >= c.d.streakCycles(c.d.cfg.CPFreeze.Cycles) {
 			frozen = true
 			reason = fmt.Sprintf("healthz dead %dx (kcm=%v sched=%v)",
 				n, kcmOK, schedOK)
@@ -452,6 +452,10 @@ const (
 	// flow_schema+priority_level — the leading edge before rejects.
 	apfInqueueMetric = "node_host_agent_apiserver_apf_inqueue_requests"
 	apfPromFile      = "node-agent-apiserver-apf.prom"
+	// terminatedWatchersMetric mirrors the apiserver's cumulative
+	// apiserver_terminated_watchers_total — the W13-CP1 410-Gone
+	// relist-storm signature (watch clients relisting en masse).
+	terminatedWatchersMetric = "node_host_agent_apiserver_terminated_watchers"
 	// logKeyAPFStarve keys the suspectLog dedupe budget for the
 	// reject-growth lines — no dedicated latch, same role as
 	// logKeyDeadFallbk.
@@ -485,6 +489,10 @@ var (
 			`(\{[^}]*\})?\s+([0-9.eE+-]+)`)
 	apfFlowSchemaRe = regexp.MustCompile(`flow_schema="([^"]*)"`)
 	apfPriorityRe   = regexp.MustCompile(`priority_level="([^"]*)"`)
+	// terminatedWatchersRe extracts the apiserver's 410-Gone
+	// terminated-watch counter (all label variants summed).
+	terminatedWatchersRe = regexp.MustCompile(
+		`(?m)^apiserver_terminated_watchers_total(\{[^}]*\})?\s+([0-9.eE+-]+)`)
 )
 
 // apfLabel extracts one label value from a `{...}` label set — ""
@@ -521,6 +529,22 @@ func parseAPFMetrics(body string) (rejected, inqueue map[apfSeriesKey]float64) {
 		}
 	}
 	return rejected, inqueue
+}
+
+// parseTerminatedWatchers sums the apiserver's
+// apiserver_terminated_watchers_total counter across its label
+// sets — W13-CP1 relist-storm evidence. seen=false when the family
+// is absent (older apiserver / non-flowcontrol endpoint).
+func parseTerminatedWatchers(body string) (total float64, seen bool) {
+	for _, m := range terminatedWatchersRe.FindAllStringSubmatch(body, -1) {
+		v, err := strconv.ParseFloat(m[2], 64)
+		if err != nil {
+			continue
+		}
+		total += v
+		seen = true
+	}
+	return total, seen
 }
 
 // apfKeysSorted returns the map keys in a stable order — the
@@ -587,13 +611,14 @@ func (c *cpFreezeCheck) apfMetrics(ctx context.Context) (string, error) {
 func (c *cpFreezeCheck) probeAPF(ctx context.Context) {
 	body, err := c.apfMetrics(ctx)
 	if err != nil {
-		c.emitAPFMetrics(nil, nil)
+		c.emitAPFMetrics(nil, nil, 0, false)
 		logger().Debug("controllerhygiene: apf metrics scrape failed",
 			"error", err)
 		return
 	}
 	rejected, inqueue := parseAPFMetrics(body)
-	c.emitAPFMetrics(rejected, inqueue)
+	tw, twOK := parseTerminatedWatchers(body)
+	c.emitAPFMetrics(rejected, inqueue, tw, twOK)
 
 	// Reject deltas vs the previous scrape — the APF counters are
 	// cumulative, so a growth window is what proves CURRENT
@@ -646,7 +671,8 @@ func (c *cpFreezeCheck) probeAPF(ctx context.Context) {
 // series is cumulative), the inqueue family as a gauge. nil maps
 // emit headers only so a blind scrape drops the series instead of
 // leaving a stale reading live.
-func (c *cpFreezeCheck) emitAPFMetrics(rejected, inqueue map[apfSeriesKey]float64) {
+func (c *cpFreezeCheck) emitAPFMetrics(rejected, inqueue map[apfSeriesKey]float64,
+	terminatedWatchers float64, twSeen bool) {
 	var p promfile.Builder
 	p.HeaderType(apfRejectedMetric,
 		"apiserver_flowcontrol_rejected_requests_total mirrored from the "+
@@ -670,6 +696,20 @@ func (c *cpFreezeCheck) emitAPFMetrics(rejected, inqueue map[apfSeriesKey]float6
 			"flow_schema=\"%s\",priority_level=\"%s\"",
 			promfile.EscapeLabelValue(k.flowSchema),
 			promfile.EscapeLabelValue(k.priorityLevel)), inqueue[k])
+	}
+	// W13-CP1: the terminated-watchers counter rides the same
+	// textfile — headers-only when the family wasn't in the
+	// scrape so a blind scrape drops the series rather than
+	// pinning a stale reading.
+	twHelp := "apiserver_terminated_watchers_total mirrored from the " +
+		"local apiserver — watches dropped with 410 Gone (relist-storm signal)."
+	if !twSeen {
+		p.HeaderType(terminatedWatchersMetric, twHelp, "counter")
+	} else {
+		p.HeaderType(terminatedWatchersMetric, twHelp, "counter")
+		p.Line(fmt.Sprintf("%s %s", terminatedWatchersMetric,
+			strconv.FormatFloat(terminatedWatchers, 'f', -1, 64)))
+		c.d.terminatedWatchers.Set(terminatedWatchers)
 	}
 	c.d.writeTextfileProm(apfPromFile, p.String())
 }

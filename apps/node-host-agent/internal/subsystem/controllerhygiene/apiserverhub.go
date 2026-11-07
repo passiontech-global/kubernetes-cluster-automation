@@ -123,7 +123,7 @@ func (c *apiserverHubCheck) Run(ctx context.Context) {
 		c.d.state.WriteEpochFile(filepath.Join(c.d.state.Dir, fileLastRVC), rvC)
 		if gapKnown && prev == strconv.FormatInt(rvC, 10) && rvN > rvC {
 			frn = c.d.state.Incr(fileCtrFrozen)
-			if frn >= c.d.cfg.Sig13.FrozenCycles {
+			if frn >= c.d.streakCycles(c.d.cfg.Sig13.FrozenCycles) {
 				frozen = true
 			}
 		} else {
@@ -148,7 +148,7 @@ func (c *apiserverHubCheck) Run(ctx context.Context) {
 			c.d.state.WriteEpochFile(filepath.Join(c.d.state.Dir, fileLastPRVC), prvRV)
 			if prevP != "" && prevP == prv && gapKnown && rvN > prvRV {
 				pfn = c.d.state.Incr(fileCtrPeerFrozen)
-				if pfn >= c.d.cfg.Sig13.FrozenCycles {
+				if pfn >= c.d.streakCycles(c.d.cfg.Sig13.FrozenCycles) {
 					peerFrozen = true
 				}
 			} else {
@@ -196,10 +196,10 @@ func (c *apiserverHubCheck) Run(ctx context.Context) {
 	// Frozen is already sustained evidence — bypass the second
 	// GAP_CYCLES gate (a big one-off gap can be transient lag; a
 	// bit-identical rv_cache cannot).
-	if !frozen && gn < c.d.cfg.Sig13.GapCycles {
+	if !frozen && gn < c.d.streakCycles(c.d.cfg.Sig13.GapCycles) {
 		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: apiserver cache %s — wedge evidence (check %d/%d)",
-			wreason, gn, c.d.cfg.Sig13.GapCycles))
+			wreason, gn, c.d.streakCycles(c.d.cfg.Sig13.GapCycles)))
 		c.d.cycles.WithLabelValues(checkHub, "ok").Inc()
 		return
 	}
@@ -223,7 +223,7 @@ func (c *apiserverHubCheck) Run(ctx context.Context) {
 	soloOK := false
 	if !peerFresh && c.d.cfg.Hub.SelfAPI != "" {
 		if (c.d.cfg.Hub.PeerAPI == "" || c.d.cfg.Hub.SelfAPI < c.d.cfg.Hub.PeerAPI) &&
-			gn >= c.d.cfg.Sig13.SoloCycles {
+			gn >= c.d.streakCycles(c.d.cfg.Sig13.SoloCycles) {
 			soloOK = true
 		}
 	}
@@ -265,7 +265,7 @@ func (c *apiserverHubCheck) Run(ctx context.Context) {
 	default:
 		c.d.state.SuspectLog(stateCacheWedged, fmt.Sprintf(
 			"suspect: apiserver-cache-wedged %s (%dx) but %s and self is not first-hub (or <%d cycles not reached) — holding",
-			wreason, gn, peerNote, c.d.cfg.Sig13.SoloCycles), c.d.cfg.SuspectLogCadence)
+			wreason, gn, peerNote, c.d.streakCycles(c.d.cfg.Sig13.SoloCycles)), c.d.cfg.SuspectLogCadence)
 		c.d.actions.WithLabelValues(checkHub, "fence_skip").Inc()
 	}
 	c.d.cycles.WithLabelValues(checkHub, "ok").Inc()
@@ -305,10 +305,10 @@ func (c *apiserverHubCheck) deadFallback(ctx context.Context) {
 	dn := c.d.state.Incr(fileCtrDead)
 	deadFirst := c.d.cfg.Hub.SelfAPI != "" &&
 		(c.d.cfg.Hub.PeerAPI == "" || c.d.cfg.Hub.SelfAPI < c.d.cfg.Hub.PeerAPI)
-	if dn < c.d.cfg.Sig13.SoloCycles || !deadFirst {
+	if dn < c.d.streakCycles(c.d.cfg.Sig13.SoloCycles) || !deadFirst {
 		c.d.state.SuspectLog(logKeyDeadFallbk, fmt.Sprintf(
 			"suspect: apiserver dead, kine db ok — dead-fallback needs %d cycles + first-hub (dn=%d first=%v)",
-			c.d.cfg.Sig13.SoloCycles, dn, deadFirst), c.d.cfg.SuspectLogCadence)
+			c.d.streakCycles(c.d.cfg.Sig13.SoloCycles), dn, deadFirst), c.d.cfg.SuspectLogCadence)
 		return
 	}
 	if !c.d.state.RateOK(fileRateRestart, c.d.cfg.Sig13.MinRestart) {
