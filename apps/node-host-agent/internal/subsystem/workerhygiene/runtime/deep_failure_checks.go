@@ -90,10 +90,10 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 	if delta < 1 {
 		delta = 1
 	}
-	emitOOMEvent(c.d, ctx, comm, epoch, delta, count)
-	// Record the emission — count first so a failed event create
-	// retries next cycle instead of being swallowed.
-	if count >= 0 {
+	// Record the emission only AFTER the event create succeeded —
+	// a failed create leaves the count unseen so next cycle retries
+	// instead of the kill being swallowed by an early marker.
+	if emitOOMEvent(c.d, ctx, comm, epoch, delta, count) && count >= 0 {
 		p := filepath.Join(c.d.Cfg.WatchdogStateDir, lastHostOOMEventFile)
 		content := strconv.FormatInt(count, 10) + " " +
 			strconv.FormatInt(epoch, 10) + "\n"
@@ -140,13 +140,15 @@ func (c *HostOOMCheck) compactMemory() {
 
 // emitOOMEvent creates the SystemOOMVictim Warning Event on this
 // Node — the events.k8s.io/v1 shape nodereporter's emitter uses
-// (Action required, deprecated* fields unset).
+// (Action required, deprecated* fields unset). It reports whether
+// the event was actually created: the caller's dedup marker may
+// only advance on true.
 func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
-	epoch, delta, total int64) {
+	epoch, delta, total int64) bool {
 	if d.Cfg.Client == nil {
-		return
+		return false
 	}
-	now := d.Cfg.Seams.Host.NowFn()
+	now := d.Cfg.Seams.Host.Clock.Now()
 	when := now
 	if epoch > 0 {
 		when = time.Unix(epoch, 0)
@@ -154,7 +156,7 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			// events.v1 names are <regarding>.<hex> — count+epoch
-			// keep repeat kills distinct even when nowFn is frozen
+			// keep repeat kills distinct even when the clock is frozen
 			// (tests) or two kills land in the same nanosecond.
 			Name: fmt.Sprintf("%s.%x.%x", d.Cfg.NodeName, total,
 				now.UnixNano()),
@@ -179,11 +181,12 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
 		d.State.AppendLog(fmt.Sprintf(
 			"suspect: SystemOOMVictim event create failed: %v", err))
-		return
+		return false
 	}
 	d.State.AppendLog(fmt.Sprintf(
 		"ACTION: SystemOOMVictim event — host-level OOM kill victim=%s delta=%d total=%d",
 		comm, delta, total))
+	return true
 }
 
 // --- W10-ST2: orphaned hostPath volume dirs ---
@@ -269,7 +272,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if err != nil {
 			continue
 		}
-		if c.d.Cfg.Seams.Host.NowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
+		if c.d.Cfg.Seams.Host.Clock.Now().Sub(fi.ModTime()) < orphanHostPathMinAge {
 			continue // inside the deletion grace window
 		}
 		if !c.d.DiskUsageAboveWatermark(filepath.Dir(cd.path)) {

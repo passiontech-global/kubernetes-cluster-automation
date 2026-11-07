@@ -58,7 +58,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -96,24 +96,21 @@ const (
 
 // Config carries the janitor knobs — all test-injectable.
 type Config struct {
-	Interval         time.Duration // sweep cadence
-	WatchdogStateDir string        // the shared node-watchdog state dir
-	WatchdogLogFile  string        // appended watchdog log (NPD filelog)
-	ProcRoot         string        // host /proc (hostPID pod or host)
+	// Base is the shared watchdog-subsystem block — cadence, the
+	// shared node-watchdog state dir + log file, ProcRoot, the
+	// systemd client the list-units probe and reset-failed/stop
+	// remedies run through (nsenter-wrapped inside the container;
+	// nil → the units sweep degrades to "gated" each cycle) and
+	// the clock cell splice (subframe.FromDeps).
+	subframe.Base
 	// LatchMaxAge is the reap age for every state-* latch — known
 	// AND unknown registry names (unknowns get the same floor so a
 	// foreign-schema writer can't be flapped). <=0 → latchMaxAge.
 	LatchMaxAge time.Duration
-	// Systemd runs the list-units probe and the reset-failed/stop
-	// remedies (nsenter-wrapped inside the container). nil → the
-	// units sweep degrades to "gated" each cycle.
-	Systemd *systemd.Client
 
 	// killFn delivers signals — seam for tests (SIGKILL on orphan
 	// monitors).
 	killFn func(pid int, sig syscall.Signal) error
-	// nowFn supplies the current time — seam for tests.
-	nowFn timex.Clock
 }
 
 func (c *Config) applyDefaults() {
@@ -137,8 +134,8 @@ func (c *Config) applyDefaults() {
 			return syscall.Kill(pid, sig)
 		}
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 }
 
@@ -155,28 +152,18 @@ type Janitor struct {
 func New(cfg Config, reg prometheus.Registerer) (*Janitor, error) {
 	cfg.applyDefaults()
 	j := &Janitor{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
-	// Now closes over the live config field — tests re-stub
-	// j.cfg.nowFn after New returns (hoststate.New doc).
+	// The store binds the shared timex.Cell — a post-New
+	// cfg.Clock.Set lands there (hoststate.New doc).
 	// The Log func keeps the "subsystem"="janitor" slog attr the old
 	// appendLog attached to every mirror line.
-	j.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return j.cfg.nowFn() },
+	j.state = cfg.Store(
 		func() *slog.Logger { return logger().With("subsystem", "janitor") })
-	j.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_janitor_cycles_total",
-		Help: "Janitor sweep cycles by check and result (ok|abort|gated).",
-	}, []string{"check", "result"})
-	j.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_janitor_actions_total",
-		Help: "Janitor remediation actions by check and action " +
-			"(reap|reset_failed|stop|kill).",
-	}, []string{"check", "action"})
-	if reg != nil {
-		for _, c := range []prometheus.Collector{j.cycles, j.actions} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register janitor metrics: %w", err)
-			}
-		}
+	j.cycles, j.actions = subframe.Counters("janitor",
+		"Janitor sweep cycles by check and result (ok|abort|gated).",
+		"Janitor remediation actions by check and action "+
+			"(reap|reset_failed|stop|kill).")
+	if err := subframe.RegisterAll(reg, j.cycles, j.actions); err != nil {
+		return nil, fmt.Errorf("register janitor metrics: %w", err)
 	}
 	return j, nil
 }

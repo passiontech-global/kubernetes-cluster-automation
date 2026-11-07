@@ -5,6 +5,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -28,10 +29,9 @@ type EnvDeps struct {
 // env-driven).
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
-		NodeName:         d.NodeName,
-		Client:           d.Client,
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogLogFile:  d.WatchdogLogFile,
+		Base:     subframe.FromDeps(d.Deps),
+		NodeName: d.NodeName,
+		Client:   d.Client,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

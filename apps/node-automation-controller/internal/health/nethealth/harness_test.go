@@ -37,7 +37,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewLinkerdOutlierGuardCheck,
 	)
 	// The production sweep resolves the CILIUM_* knobs into
-	// Cfg.Cilium once at Setup (probefw.CiliumConfigFromEnv —
+	// Cfg.Cilium once at Setup (CiliumConfigFromEnv —
 	// clusterhealthprobes wiring); NewDeps leaves it zero, so the
 	// harness stamps the documented defaults the env parse yields.
 	p.Cfg.Cilium = probefw.CiliumConfig{

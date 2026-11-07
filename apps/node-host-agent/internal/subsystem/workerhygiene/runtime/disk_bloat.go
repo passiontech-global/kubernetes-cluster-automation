@@ -216,11 +216,11 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	// The walk is IO on the disk that is full — at most once per
 	// DiskBloatScanInterval; an existing latch persists meanwhile.
-	if c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
+	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
 		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	hits, podTotals, podByUID := c.scanBloat(e.Pods)
 	if len(hits) == 0 {
 		c.d.State.Exit(hoststate.LatchDiskBloat, nil)
@@ -447,7 +447,7 @@ func (c *DiskBloatCheck) throttlePVTasks(ctx context.Context,
 func (c *DiskBloatCheck) emitPVQuotaEvent(ctx context.Context,
 	pod *corev1.Pod, dir string, size, cap int64, throttled int) {
 
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
@@ -540,7 +540,7 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 	}
 	// (2) orphan .tmp sweep — files older than 2h under /run.
 	// Bounded: at most runTmpfsSweepMax removals per cycle.
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	removed := 0
 	_ = filepath.WalkDir(c.d.Cfg.Disk.HostRunDir,
 		func(path string, de fs.DirEntry, err error) error {

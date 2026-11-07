@@ -53,6 +53,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -219,7 +221,8 @@ type Config struct {
 	ReadOnly bool
 
 	// --- injectable seams (defaults follow) ---
-	nowFn    timex.Clock
+	// Clock supplies the current time — the shared timex.Cell seam.
+	Clock    *timex.Cell
 	run      runner
 	wireFn   func(ctx context.Context, addr string) bool
 	statfsFn func(path string) (float64, error)
@@ -317,8 +320,8 @@ func (c *Config) applyDefaults() error {
 	if c.LongCmdTimeout <= 0 {
 		c.LongCmdTimeout = defaultLongCmdTimeout
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 	if c.run == nil {
 		c.run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
@@ -590,13 +593,16 @@ type KineDB struct {
 
 	// state is the shared watchdog-state contract handle (hoststate)
 	// for the GuardStateDir last-* rate budgets (last-pgb-restart).
-	// Now is a closure over k.cfg.nowFn — tests re-stub the clock
-	// after New() and the store must observe the new one.
+	// Now is k.cfg.Clock.Now — the method value binds the shared
+	// timex.Cell, so a post-New Clock.Set lands here.
 	state *hoststate.Store
 
 	// churnTop is the W13-CP4 top-5 churn result computed by the
 	// probe loop (churn window watermark lives in GuardStateDir)
 	// and emitted by the guard cycle into kine-compact-guard.prom.
+	// churnMu guards the slice header — probe and compact-guard
+	// cycles run on separate goroutines (Run spawns one loop each).
+	churnMu  sync.RWMutex
 	churnTop []churnEntry
 }
 
@@ -613,22 +619,15 @@ func New(cfg Config, reg prometheus.Registerer) (*KineDB, error) {
 		return nil, err
 	}
 	k := &KineDB{cfg: cfg, m: newMetrics()}
-	k.state = hoststate.New(cfg.GuardStateDir, "",
-		func() time.Time { return k.cfg.nowFn() }, logger)
-	if reg != nil {
-		var done []prometheus.Collector
-		for _, c := range k.m.collectors() {
-			if err := reg.Register(c); err != nil {
-				// Roll back the partial registration — without it
-				// a retry of New() hits duplicate-registration on
-				// the collectors that did succeed.
-				for _, r := range done {
-					reg.Unregister(r)
-				}
-				return nil, fmt.Errorf("register kinedb metrics: %w", err)
-			}
-			done = append(done, c)
-		}
+	// GuardStateDir is the subsystem-private compact-guard dir, not
+	// the shared WatchdogStateDir, and there is no log file —
+	// the explicit-argument StoreAt form covers it.
+	k.state = subframe.StoreAt(cfg.GuardStateDir, "", cfg.Clock, logger)
+	// RegisterAll rolls the partial set back on failure — without
+	// it a retry of New() hits duplicate-registration on the
+	// collectors that did succeed.
+	if err := subframe.RegisterAll(reg, k.m.collectors()...); err != nil {
+		return nil, fmt.Errorf("register kinedb metrics: %w", err)
 	}
 	return k, nil
 }

@@ -328,7 +328,7 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 	var lastSeenAge float64
 	lastSeenOK := false
 	if s.hasLastSeen && s.lastSeen > 0 {
-		lastSeenAge = c.d.Cfg.Seams.Host.NowFn().Sub(
+		lastSeenAge = c.d.Cfg.Seams.Host.Clock.Now().Sub(
 			time.Unix(int64(s.lastSeen), 0)).Seconds()
 		if lastSeenAge < 0 {
 			lastSeenAge = 0 // stamp in the future — treat as just-seen

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // TestLocalPVDirBytes: node_host_agent_localpv_dir_bytes sums the
@@ -70,7 +71,7 @@ func TestLocalPVDirBytesCache(t *testing.T) {
 	cfg.OpenEBSLocalDir = root
 	cfg.LocalPVScanInterval = 15 * time.Minute
 	now := time.Now()
-	cfg.nowFn = func() time.Time { return now }
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
 	vol := filepath.Join(root, "pvc-cache")
 	if err := os.MkdirAll(vol, 0o755); err != nil {
 		t.Fatal(err)
@@ -108,7 +109,7 @@ func TestLocalPVDirBytesFailedWalkKeepsSnapshot(t *testing.T) {
 	root := t.TempDir()
 	cfg.OpenEBSLocalDir = root
 	now := time.Now()
-	cfg.nowFn = func() time.Time { return now }
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
 	vol := filepath.Join(root, "pvc-keep")
 	if err := os.MkdirAll(vol, 0o755); err != nil {
 		t.Fatal(err)

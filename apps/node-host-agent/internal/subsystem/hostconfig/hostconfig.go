@@ -28,9 +28,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -181,13 +183,17 @@ func (w *DirWatcher) Changed() bool {
 
 // Config — all injectable.
 type Config struct {
+	// Base is the shared watchdog-subsystem block — converge
+	// cadence, HostRoot (host fs paths join through hp()) and the
+	// clock cell splice (subframe.FromDeps). The rest of the block
+	// is carried but unused — the store is the hp()-joined
+	// watchdogStateDir, not the shared WatchdogStateDir.
+	subframe.Base
 	NodeName           string // registry key (NODE_NAME / OS hostname)
 	Hostname           string // fallback OS hostname when NodeName unset
-	HostRoot           string
 	VarsDir            string
 	NebulaCertsDir     string
 	WatchdogScriptsDir string // optional: node-watchdog-scripts CM mount
-	Interval           time.Duration
 	// CmdTimeout is the per-host-command deadline applied inside run —
 	// a hung systemctl/apt-get/docker must fail, not wedge the
 	// converge loop on Run's ctx (effectively unbounded between
@@ -200,7 +206,6 @@ type Config struct {
 	CmdTimeoutLong time.Duration
 	Runner         Runner
 	Watcher        Watcher
-	NowFn          timex.Clock
 	HTTPTimeout    time.Duration
 	// DownloadDir caches fetched archives (nebula/coredns/haproxy deb).
 	DownloadDir string
@@ -230,8 +235,8 @@ func (c *Config) applyDefaults() {
 	if c.Runner == nil {
 		c.Runner = NsenterRunner{}
 	}
-	if c.NowFn == nil {
-		c.NowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 	if c.HTTPTimeout <= 0 {
 		c.HTTPTimeout = defaultHTTPTimeout
@@ -260,8 +265,8 @@ type Reconciler struct {
 	// state is the shared watchdog-state contract handle (hoststate)
 	// for the last-* rate budgets under watchdogStateDir — Dir is
 	// resolved through hp() once at New() (HostRoot never changes
-	// afterwards). Now is a closure over r.cfg.NowFn: tests re-stub
-	// the clock after New() and the store must observe the new one.
+	// afterwards). Now is r.cfg.Clock.Now — the method value binds
+	// the shared timex.Cell, so a post-New Clock.Set lands here.
 	state *hoststate.Store
 
 	cycles  *prometheus.CounterVec // group, result
@@ -279,6 +284,12 @@ type Reconciler struct {
 	// panic-restart re-invokes Run on the same ctx and must not stack
 	// a second Poll goroutine (routeGuardOnce parity in nethealth).
 	watchOnce sync.Once
+
+	// cycleMu serializes converges across the RunAll goroutines —
+	// Cycle mutates the shared per-cycle handle r.cur, and the old
+	// single-select Run could never overlap an interval tick with a
+	// watch edge.
+	cycleMu sync.Mutex
 }
 
 // noteErr attributes a managed-operation failure to the active
@@ -292,8 +303,10 @@ func (r *Reconciler) noteErr(err error) {
 func New(cfg Config, reg prometheus.Registerer) (*Reconciler, error) {
 	cfg.applyDefaults()
 	r := &Reconciler{cfg: cfg}
-	r.state = hoststate.New(r.hp(watchdogStateDir), "",
-		func() time.Time { return r.cfg.NowFn() }, logger)
+	// Dir is the hp()-joined shared latch dir (resolved once —
+	// HostRoot never changes afterwards), not the dep-spliced
+	// WatchdogStateDir, and there is no log file.
+	r.state = cfg.StoreAt(r.hp(watchdogStateDir), "", logger)
 	r.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_hostconfig_cycles_total",
 		Help: "hostconfig converge cycles by group and result.",
@@ -310,12 +323,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Reconciler, error) {
 		Name: "node_host_agent_hostconfig_last_success_seconds",
 		Help: "Unix time of the last fully-successful cycle.",
 	})
-	if reg != nil {
-		for _, c := range []prometheus.Collector{r.cycles, r.writes, r.actions, r.lastOK} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register hostconfig metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		r.cycles, r.writes, r.actions, r.lastOK); err != nil {
+		return nil, fmt.Errorf("register hostconfig metrics: %w", err)
 	}
 	return r, nil
 }
@@ -326,26 +336,35 @@ func (r *Reconciler) Name() string { return "hostconfig" }
 func (r *Reconciler) Run(ctx context.Context) {
 	if r.cfg.Watcher != nil {
 		r.watchOnce.Do(func() { go r.cfg.Watcher.Poll(ctx) })
+		// Swallow the startup edge: the watch loop below calls
+		// Changed() on its up-front run (cycle.Every fires fn
+		// immediately), and the pre-Poll fallback reads "no baseline
+		// yet" as a change — seeding here avoids a spurious second
+		// converge right after the startup cycle (hubsync's Run
+		// seeds the same way).
+		r.cfg.Watcher.Changed()
 	}
+	cycle.RunAll(ctx,
+		cycle.Every("hostconfig", r.cfg.Interval, r.runCycle),
+		cycle.Every("hostconfig-watch", defaultWatchPoll,
+			func(ctx context.Context) {
+				if r.cfg.Watcher != nil && r.cfg.Watcher.Changed() {
+					logger().Info("hostconfig: vars/certs changed — converging",
+						"node", r.cfg.NodeName)
+					r.runCycle(ctx)
+				}
+			}),
+	)
+}
+
+// runCycle serializes Cycle across the interval and watch goroutines.
+// A watch edge during an in-flight converge waits, then runs the
+// follow-up cycle — the old select fired the pending watch tick on
+// its next pass, the same one-extra-cycle shape.
+func (r *Reconciler) runCycle(ctx context.Context) {
+	r.cycleMu.Lock()
+	defer r.cycleMu.Unlock()
 	r.Cycle(ctx)
-	t := time.NewTicker(r.cfg.Interval)
-	defer t.Stop()
-	p := time.NewTicker(defaultWatchPoll)
-	defer p.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			r.Cycle(ctx)
-		case <-p.C:
-			if r.cfg.Watcher != nil && r.cfg.Watcher.Changed() {
-				logger().Info("hostconfig: vars/certs changed — converging",
-					"node", r.cfg.NodeName)
-				r.Cycle(ctx)
-			}
-		}
-	}
 }
 
 // hp joins HostRoot + host path.
@@ -440,7 +459,7 @@ func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	out, err := topology.Render(string(text), ctx,
-		topology.NewEnv(r.cfg.VarsDir, r.cfg.NowFn))
+		topology.NewEnv(r.cfg.VarsDir, r.cfg.Clock))
 	if err != nil {
 		return nil, fmt.Errorf("render %s: %w", name, err)
 	}

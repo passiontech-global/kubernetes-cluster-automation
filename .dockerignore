@@ -18,3 +18,4 @@
 # **/bin/ dirs already excluded above.
 apps/node-host-agent/agent
 apps/node-automation-controller/manager
+apps/webhook-dispatcher/dispatcher

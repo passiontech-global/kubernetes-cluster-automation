@@ -18,7 +18,7 @@ import (
 
 func TestHubMetricsFWRenders(t *testing.T) {
 	vars := writeVarsDir(t, "hub_metrics_extra_ports: [2380, 2381]\n")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -31,7 +31,7 @@ func TestHubMetricsFWRenders(t *testing.T) {
 	if !strings.Contains(di, "--collector.textfile.directory=/var/lib/node-exporter/textfile") {
 		t.Fatalf("bad textfile drop-in:\n%s", di)
 	}
-	calls := sr.callsMatching("iptables -N HUBMETRICS")
+	calls := sr.CallsMatching("iptables -N HUBMETRICS")
 	if len(calls) == 0 {
 		t.Fatal("HUBMETRICS rebuild not run")
 	}
@@ -50,8 +50,8 @@ func TestHubMetricsFWRenders(t *testing.T) {
 			t.Fatalf("HUBMETRICS script missing %q:\n%s", want, script)
 		}
 	}
-	if len(sr.callsMatching("systemctl enable prometheus-node-exporter.service")) == 0 ||
-		len(sr.callsMatching("systemctl start prometheus-node-exporter.service")) == 0 {
+	if len(sr.CallsMatching("systemctl enable prometheus-node-exporter.service")) == 0 ||
+		len(sr.CallsMatching("systemctl start prometheus-node-exporter.service")) == 0 {
 		t.Fatal("node-exporter not enabled+started")
 	}
 }
@@ -66,9 +66,9 @@ interdc_nexp_deb_file: "nexp.deb"
 `)
 	// dpkg reports the pinned version already installed → the whole
 	// download/verify/install chain must be skipped (ansible `when`).
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"dpkg-query -W -f=${Status} ${Version} prometheus-node-exporter": "install ok installed 1.7.0-1ubuntu0.3",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -76,11 +76,11 @@ interdc_nexp_deb_file: "nexp.deb"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("apt-get install -y /tmp/nexp.deb")) > 0 {
+	if len(sr.CallsMatching("apt-get install -y /tmp/nexp.deb")) > 0 {
 		t.Fatalf("deb install ran despite matching version: %v",
-			sr.callsMatching("apt-get"))
+			sr.CallsMatching("apt-get"))
 	}
-	if len(sr.callsMatching("systemctl enable prometheus-node-exporter.service")) == 0 {
+	if len(sr.CallsMatching("systemctl enable prometheus-node-exporter.service")) == 0 {
 		t.Fatal("node-exporter not enabled")
 	}
 }
@@ -100,12 +100,9 @@ func TestHubMetricsNexpSkipsNewerVersion(t *testing.T) {
 interdc_nexp_deb_url: "%s/nexp.deb"
 interdc_nexp_deb_sha256: "%x"
 `, srv.URL, sum))
-	sr := &scriptedRunner{
-		res: map[string]string{
-			"dpkg-query -W -f=${Status} ${Version} prometheus-node-exporter": "install ok installed 1.7.0-1ubuntu0.4",
-		},
-		errs: map[string]bool{},
-	}
+	sr := newScripted(map[string]string{
+		"dpkg-query -W -f=${Status} ${Version} prometheus-node-exporter": "install ok installed 1.7.0-1ubuntu0.4",
+	}, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -113,11 +110,11 @@ interdc_nexp_deb_sha256: "%x"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("apt-get install")) > 0 {
+	if len(sr.CallsMatching("apt-get install")) > 0 {
 		t.Fatalf("newer node_exporter triggered deb install: %v",
-			sr.callsMatching("apt-get"))
+			sr.CallsMatching("apt-get"))
 	}
-	if len(sr.callsMatching("dpkg --compare-versions")) == 0 {
+	if len(sr.CallsMatching("dpkg --compare-versions")) == 0 {
 		t.Fatal("version compare not run")
 	}
 }
@@ -136,7 +133,7 @@ interdc_nexp_deb_sha256: "%x"
 	// dpkg-query empty (package absent) → download → sha256 verify →
 	// apt-get install /tmp/<basename> (deb_file defaults to the URL
 	// basename, ansible `| basename` parity).
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -144,8 +141,8 @@ interdc_nexp_deb_sha256: "%x"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("apt-get install -y /tmp/nexp.deb")) == 0 {
-		t.Fatalf("deb install not invoked: %v", sr.callsMatching("apt"))
+	if len(sr.CallsMatching("apt-get install -y /tmp/nexp.deb")) == 0 {
+		t.Fatalf("deb install not invoked: %v", sr.CallsMatching("apt"))
 	}
 	staged := filepath.Join(r.cfg.HostRoot, "/tmp/nexp.deb")
 	got, err := os.ReadFile(staged)
@@ -163,7 +160,7 @@ func TestHubMetricsNexpRejectsBadSHA(t *testing.T) {
 interdc_nexp_deb_url: "%s/nexp.deb"
 interdc_nexp_deb_sha256: "%s"
 `, srv.URL, strings.Repeat("0", 64)))
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -171,14 +168,14 @@ interdc_nexp_deb_sha256: "%s"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("apt-get install")) > 0 {
-		t.Fatalf("install ran despite sha256 mismatch: %v", sr.callsMatching("apt-get"))
+	if len(sr.CallsMatching("apt-get install")) > 0 {
+		t.Fatalf("install ran despite sha256 mismatch: %v", sr.CallsMatching("apt-get"))
 	}
 }
 
 func TestHubMetricsNexpNoPinsNoOp(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -186,14 +183,14 @@ func TestHubMetricsNexpNoPinsNoOp(t *testing.T) {
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("dpkg-query")) > 0 || len(sr.callsMatching("apt-get")) > 0 {
-		t.Fatalf("deb chain ran without pins: %v", sr.calls)
+	if len(sr.CallsMatching("dpkg-query")) > 0 || len(sr.CallsMatching("apt-get")) > 0 {
+		t.Fatalf("deb chain ran without pins: %v", sr.Calls())
 	}
 }
 
 func TestHubMetricsFWSkipsContainer(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -201,7 +198,7 @@ func TestHubMetricsFWSkipsContainer(t *testing.T) {
 	}
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupHubMetricsFW()
-	if len(sr.callsMatching("HUBMETRICS")) > 0 {
+	if len(sr.CallsMatching("HUBMETRICS")) > 0 {
 		t.Fatal("HUBMETRICS touched on a non-standalone host")
 	}
 	if hostExists(r, "/etc/systemd/system/prometheus-node-exporter.service.d/textfile.conf") {
@@ -221,7 +218,7 @@ func TestHubMetricsScriptRefusesBadIP(t *testing.T) {
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

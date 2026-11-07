@@ -32,10 +32,36 @@ package shared
 //     called even when the gate is off (with Deps.Disabled set) so
 //     knob-parsing warnings still fire; the module must register
 //     nothing in that case.
+//   - CheckReg is the alternative to Setup for health-sweep check
+//     rows: the row contributes a check into the
+//     cluster-health-probes roster instead of registering
+//     runnables. SetupModules collects the enabled rows' CheckRegs
+//     into Deps.CheckRegs for the sweep to consume; rows with
+//     CheckReg have Setup == nil and are never Setup-called.
 type Module struct {
 	Name      string
 	Group     string
 	GateEnv   string
 	DefaultOn bool
 	Setup     func(Deps) error
+	CheckReg  *CheckReg
+}
+
+// CheckReg is one health-sweep check contribution — what a
+// CheckReg-carrying Module row hands the cluster-health-probes
+// sweep instead of runnables.
+//
+//   - Name is the check's kuberhealthy_check label value — an ops
+//     contract like Module.Name: alerts key on it, so it must stay
+//     byte-stable forever.
+//   - New is the check constructor — statically
+//     `func(*probefw.Deps) probefw.Check`. It is stored as `any`
+//     because shared may not name internal/health/probefw (probefw
+//     imports shared — naming it back would be an import cycle AND
+//     a depguard violation). The consumer type-asserts at prober
+//     build and fails boot on a wrong type — a mistyped
+//     registration must be loud, never a silently missing check.
+type CheckReg struct {
+	Name string
+	New  any
 }

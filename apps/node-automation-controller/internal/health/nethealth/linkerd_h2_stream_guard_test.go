@@ -17,6 +17,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -25,7 +26,7 @@ import (
 func meshedPod(ns, name string, ready bool, owner types.UID) *corev1.Pod {
 	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, ready, time.Hour)
 	pod.Spec.Containers = []corev1.Container{
-		{Name: "app"}, {Name: linkerdProxyContainer},
+		{Name: "app"}, {Name: kube.LinkerdProxyContainer},
 	}
 	pod.OwnerReferences = []metav1.OwnerReference{{
 		Kind: "ReplicaSet", Name: "rs-" + name,
@@ -216,7 +217,7 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 func oomKilledPod(ns, name string, owner types.UID) *corev1.Pod {
 	pod := meshedPod(ns, name, true, owner)
 	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
-		Name: linkerdProxyContainer,
+		Name: kube.LinkerdProxyContainer,
 		LastTerminationState: corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
 				Reason:   "OOMKilled",

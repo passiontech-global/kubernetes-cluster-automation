@@ -64,14 +64,13 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	}
 	// Maintenance mutex — never kill an operator mid-drain/upgrade;
 	// "cannot verify" fails closed like healOperatorLeader (W5.8).
-	// heal.AllowedV gets a nil ledger here: this heal's cooldown is the
+	// HealAllowed gets a nil ledger here: this heal's cooldown is the
 	// wider of the persisted STS stamp and the per-pod drHealed
 	// entries, not a single CooldownSet key, so only its mutex gate
-	// applies — shared via the check's verdict so the whole sweep
+	// applies — shared via the Deps-wide verdict so the whole sweep
 	// pays one evaluation.
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, nil, stsKey, 0, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log, nil, stsKey, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -109,6 +108,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
+		p.InvalidatePods(ctx) // pod gone — drop the census
 		if now.After(p.drOpHealAt[stsKey]) {
 			if p.drOpHealAt == nil {
 				p.drOpHealAt = map[string]time.Time{}
@@ -243,18 +243,17 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 
 	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted via
-	// PersistedCooledDown), then the maintenance mutex: heal.AllowedV
-	// runs with a nil ledger as the mutex-only gate (shared verdict):
-	// never kill a stateful pod mid-drain/upgrade; "cannot verify"
-	// fails closed like every other caller.
+	// PersistedCooledDown), then the maintenance mutex: HealAllowed
+	// runs with a nil ledger as the mutex-only gate (shared Deps
+	// verdict): never kill a stateful pod mid-drain/upgrade;
+	// "cannot verify" fails closed like every other caller.
 	if heal.PersistedCooledDown(&p.drPodHealed, sig.sts,
 		dragonflyPodHealAnno, stsKey, dragonflyPodHealCooldown, now) {
 		log.Info("skip heal: dragonfly pod inside cooldown",
 			"statefulset", stsKey)
 		return
 	}
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, nil, stsKey, 0, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log, nil, stsKey, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -275,6 +274,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
+	p.InvalidatePods(ctx) // pod gone — drop the census
 	dragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",

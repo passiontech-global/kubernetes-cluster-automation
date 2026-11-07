@@ -73,11 +73,14 @@ func TestFetchCursor(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("exec calls = %d, want 2", len(calls))
 	}
-	// argv tail: --since @<epoch-s> -o json --no-pager.
+	// argv tail: --since @<epoch-s> -o json --no-pager. The second
+	// window opens at the newest KEPT entry's timestamp (truncated
+	// to seconds), not at `now` — the cursor never advances past a
+	// seen entry into journald's unflushed tail.
 	since1 := calls[0][len(calls[0])-4]
 	since2 := calls[1][len(calls[1])-4]
 	want1 := "@" + strconv.FormatInt(now.Add(-lookback).Unix(), 10)
-	want2 := "@" + strconv.FormatInt(now.Unix(), 10)
+	want2 := "@" + strconv.FormatInt((now.UnixMicro()-1000)/1e6, 10)
 	if since1 != want1 || since2 != want2 {
 		t.Fatalf("--since args = %q then %q, want %q then %q",
 			since1, since2, want1, want2)
@@ -113,13 +116,14 @@ func TestFetchEmptyKeepsCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Empty read at `later`: the cursor must stay at the last
-	// advanced mark, not jump to later.UnixMicro().
+	// advanced mark — the fetch-1 entry's own timestamp — not jump
+	// to `now` or later.UnixMicro().
 	got, err := Fetch(context.Background(), exec, later, time.Minute,
 		&cursor, "-k")
 	if err != nil || len(got) != 0 {
 		t.Fatalf("empty fetch: got=%+v err=%v", got, err)
 	}
-	want := now.UnixMicro() // parked at the fetch-1 mark
+	want := now.UnixMicro() - 1000 // parked at the fetch-1 entry's TSUS
 	if cursor != want {
 		t.Fatalf("cursor advanced to %d on empty fetch, want %d", cursor, want)
 	}

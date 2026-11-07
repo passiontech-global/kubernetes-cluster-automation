@@ -33,10 +33,6 @@ type rabbitMQSuspendedCheck struct {
 	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
 	rbSuspendedSince state.FirstSeenLedger
 	rbHealed         state.CooldownSet
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-pod heal preambles share — one evaluation per Verdict TTL
-	// instead of three API reads per suspended pod.
-	verdict kube.Verdict
 }
 
 // newRabbitMQSuspendedCheck builds the W6.4 check — both ledgers
@@ -161,6 +157,11 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
+	// rbHealed keys "ns/pod" — a deleted pod's name can never
+	// suppress again once its window passed, so bound the map once
+	// per sweep at the heal cooldown.
+	p.rbHealed.PruneExpired(now, rabbitHealCooldown)
+
 	pods, err := p.PodsMatching(ctx, metav1.NamespaceAll, rabbitComponentLabel)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list rabbitmq pods: %w", err)}
@@ -207,15 +208,15 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	p.rbSuspendedSince.Prune(func(k string) bool { return live[k] })
 
 	// Per-pod heal preamble — cooldown + maintenance mutex run by
-	// heal.AllowedV like every pod-delete heal in this sweep. The
-	// check's verdict memoizes the mutex evaluation, so the loop
+	// HealAllowed like every pod-delete heal in this sweep. The
+	// Deps-wide verdict memoizes the mutex evaluation, so the loop
 	// still pays a single set of API reads when several pods are
 	// due; "cannot verify" fails closed.
 	for i := range due {
 		pod := &due[i]
 		key := pod.Namespace + "/" + pod.Name
-		proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-			p.CS, p.Dyn, &p.rbHealed, key, rabbitHealCooldown, now)
+		proceed, unverifiable := p.HealAllowed(ctx, log,
+			&p.rbHealed, key, rabbitHealCooldown, now)
 		if unverifiable {
 			metrics.IncError(p.Name)
 			continue

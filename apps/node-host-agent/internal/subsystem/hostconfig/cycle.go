@@ -13,8 +13,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 //go:embed all:templates
@@ -34,7 +34,7 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 // old fire-and-forget Cycle behaviour.
 func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 	start := time.Now()
-	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, NowFn: r.cfg.NowFn})
+	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, Clock: r.cfg.Clock})
 	if err != nil {
 		r.cycles.WithLabelValues("load", "error").Inc()
 		logger().Error("hostconfig: topology load failed",
@@ -65,7 +65,7 @@ func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 		c.err("hostconfig: vars resolution", "error", e)
 	}
 	if c.errs == 0 {
-		r.lastOK.Set(float64(r.cfg.NowFn().Unix()))
+		r.lastOK.Set(float64(r.cfg.Clock.Now().Unix()))
 	}
 	logger().Info("hostconfig: cycle done",
 		"node", r.cfg.NodeName, "errors", c.errs,

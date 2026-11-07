@@ -128,7 +128,7 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	stepped, ok := clockSteppedAt(c.d)
-	if !ok || c.d.Cfg.Seams.Host.NowFn().Sub(stepped) > clockJumpMarkerFresh {
+	if !ok || c.d.Cfg.Seams.Host.Clock.Now().Sub(stepped) > clockJumpMarkerFresh {
 		// No recent step — the signature this check heals can't be
 		// attributed to a clock jump.
 		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()

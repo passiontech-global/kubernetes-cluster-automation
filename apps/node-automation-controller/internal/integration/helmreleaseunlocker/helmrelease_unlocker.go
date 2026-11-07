@@ -258,9 +258,15 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		}
 		return keep
 	})
-	// The unwedge ledger + its alert dedup need no prune pass:
-	// CooldownSet stamps past the window read uncooled and entries
-	// for vanished HRs are dead weight (no enumeration).
+	// The unwedge ledger, its alert dedup and the immutable-Job heal
+	// ledger all key on HR/Kustomization names that can be
+	// decommissioned — bound each map once per sweep at the cooldown
+	// it serves so dead names cannot accumulate forever (a stamp
+	// inside the window always reads cooled, so maxAge IS the
+	// window).
+	u.unwedged.PruneExpired(now, helmUnlockCooldown)
+	u.stallAlerted.PruneExpired(now, helmUnlockCooldown)
+	u.immutableJobHealed.PruneExpired(now, immutableJobCooldown)
 
 	var due []string
 	for key := range stuck {

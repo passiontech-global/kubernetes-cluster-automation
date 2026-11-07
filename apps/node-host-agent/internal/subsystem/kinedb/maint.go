@@ -21,11 +21,13 @@
 package kinedb
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -273,7 +275,7 @@ func (k *KineDB) backupVerify(ctx context.Context, pg, user, pass string,
 	newest, mtime := newestDump(k.cfg.BackupDir)
 	if mtime > 0 {
 		res.backupSeen = true
-		res.backupAge = k.cfg.nowFn().Unix() - mtime
+		res.backupAge = k.cfg.Clock.Now().Unix() - mtime
 		res.backupValid = dumpValidMagic(newest)
 	}
 	if res.backupSeen && res.backupAge < int64(k.cfg.BackupInterval.Seconds()) {
@@ -292,11 +294,17 @@ func (k *KineDB) backupVerify(ctx context.Context, pg, user, pass string,
 	// Dump inside the container to its /tmp, verify with
 	// pg_restore -l, then cp to the host dir — streaming the
 	// dump through stdout would hit the runner capture cap.
+	// pg_dump runs under the LONG budget: a bloated kine table
+	// outlasts the 2-minute execEnv cap (same class of work as
+	// VACUUM/REINDEX).
 	tmp := "/tmp/kine-backup.dump"
-	if _, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime,
+	if _, err := k.execLongEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime,
 		"exec", "-e", "PGPASSWORD", pg,
 		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, ""); err != nil {
 		note(fmt.Sprintf("pg_dump-fail: %v", err))
+		// A failed pg_dump can leave a partial file in the
+		// container — drop it like the validate-fail path does.
+		_, _ = k.exec(ctx, []string{k.cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
 		return
 	}
 	if _, err := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
@@ -306,17 +314,70 @@ func (k *KineDB) backupVerify(ctx context.Context, pg, user, pass string,
 		return
 	}
 	dest := filepath.Join(k.cfg.BackupDir,
-		fmt.Sprintf("kine-%d.dump", k.cfg.nowFn().Unix()))
+		fmt.Sprintf("kine-%d.dump", k.cfg.Clock.Now().Unix()))
+	// cp lands on a .tmp sibling first, then os.Rename publishes —
+	// an interrupted cp would leave a truncated file that still
+	// passes the 5-byte PGDMP sniff, and newestDump would call it
+	// fresh (kine_db_backup_valid=1) for a whole BackupInterval.
+	// The .tmp suffix keeps partials invisible to the *.dump glob.
+	destTmp := dest + ".tmp"
 	if _, err := k.exec(ctx, []string{k.cfg.Runtime, "cp",
-		pg + ":" + tmp, dest}, ""); err != nil {
+		pg + ":" + tmp, destTmp}, ""); err != nil {
 		note(fmt.Sprintf("backup-cp-fail: %v", err))
+		_ = os.Remove(destTmp)
+	} else if err := os.Rename(destTmp, dest); err != nil {
+		note(fmt.Sprintf("backup-rename-fail: %v", err))
+		_ = os.Remove(destTmp)
 	} else {
 		res.backupSeen = true
 		res.backupAge = 0
 		res.backupValid = true
 		note("backup-created " + filepath.Base(dest))
+		// One fresh dump every BackupInterval with no expiry
+		// would fill the backup fs — keep only the newest few.
+		pruneDumps(k.cfg.BackupDir)
 	}
 	_, _ = k.exec(ctx, []string{k.cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
+}
+
+// backupKeepDumps is the *.dump retention bound under BackupDir —
+// at the default 6h cadence four dumps cover the last 24h.
+const backupKeepDumps = 4
+
+// pruneDumps deletes all but the newest backupKeepDumps *.dump
+// files under dir — oldest first by mtime — plus any *.tmp
+// partial a crashed cp never published. Best-effort: an
+// unremovable file is skipped, never fatal to the verify.
+func pruneDumps(dir string) {
+	// *.dump.tmp partials are never valid dumps — always sweep.
+	if tmps, err := filepath.Glob(filepath.Join(dir, "*.tmp")); err == nil {
+		for _, f := range tmps {
+			_ = os.Remove(f)
+		}
+	}
+	m, err := filepath.Glob(filepath.Join(dir, "*.dump"))
+	if err != nil || len(m) <= backupKeepDumps {
+		return
+	}
+	type aged struct {
+		path string
+		mt   int64
+	}
+	dumps := make([]aged, 0, len(m))
+	for _, f := range m {
+		if fi, err := os.Stat(f); err == nil {
+			dumps = append(dumps, aged{f, fi.ModTime().Unix()})
+		}
+	}
+	if len(dumps) <= backupKeepDumps {
+		return
+	}
+	slices.SortFunc(dumps, func(a, b aged) int {
+		return cmp.Compare(b.mt, a.mt) // newest first
+	})
+	for _, d := range dumps[backupKeepDumps:] {
+		_ = os.Remove(d.path)
+	}
 }
 
 // newestDump returns the newest *.dump file under dir.
@@ -390,7 +451,7 @@ func (k *KineDB) emitMaint(res *maintResult) {
 			`check="vacuum_freeze"`, freeze)
 		k.m.maintOK.WithLabelValues("vacuum_freeze").Set(freeze)
 	}
-	ts := float64(k.cfg.nowFn().Unix())
+	ts := float64(k.cfg.Clock.Now().Unix())
 	p.Gauge("kine_db_maint_last_run_timestamp_seconds",
 		"Last maintenance run", ts)
 	k.m.maintLastRun.Set(ts)

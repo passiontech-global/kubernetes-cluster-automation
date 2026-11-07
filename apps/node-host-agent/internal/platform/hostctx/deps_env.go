@@ -13,6 +13,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // EnvParams bundles the DepsFromEnv inputs that are NOT env-derived —
@@ -116,5 +117,9 @@ func DepsFromEnv(p EnvParams) Deps {
 		TextfileDir: envx.String(envnames.EnvTextfileDir,
 			hostPath("/var/lib/node-exporter/textfile")),
 		NodeName: envx.String(envnames.EnvNodeName, p.NodeName),
+		// One shared clock cell for every subsystem Config built
+		// from this bundle — production reads system time; a test
+		// Set() lands everywhere at once.
+		Clock: timex.NewCell(nil),
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -90,8 +91,10 @@ func (n *NetHealth) mtuState() *mtuProbeState {
 }
 
 // spawnMTUProber single-flights the MTU prober goroutine — the
-// routeGuardRunning parity. A dead prober (panic recovered inside)
-// clears running so the next spawnRouteGuard tick re-arms it.
+// routeGuardRunning parity. cycle.Spawn owns the panic recovery
+// (a dead prober clears running so the next spawnRouteGuard tick
+// re-arms it); the returned stop is deliberately never called — the
+// child exits when Run's ctx does.
 func (n *NetHealth) spawnMTUProber(ctx context.Context) {
 	st := n.mtuState()
 	st.mu.Lock()
@@ -101,13 +104,8 @@ func (n *NetHealth) spawnMTUProber(ctx context.Context) {
 	}
 	st.running = true
 	st.mu.Unlock()
-	go func() {
+	cycle.Spawn(ctx, "nebula-mtu-prober", func(cctx context.Context) {
 		defer func() {
-			if r := recover(); r != nil {
-				logger().Error("mtu prober panicked — exiting, "+
-					"respawn allowed next tick",
-					"panic", r)
-			}
 			st.mu.Lock()
 			st.running = false
 			st.mu.Unlock()
@@ -116,40 +114,35 @@ func (n *NetHealth) spawnMTUProber(ctx context.Context) {
 			// prober state in the global sync.Map forever. A
 			// panic-respawn keeps the entry (running==false lets
 			// the next tick re-arm the SAME state).
-			if ctx.Err() != nil {
+			if cctx.Err() != nil {
 				mtuProbeStates.Delete(n)
 			}
 		}()
-		n.mtuProbeLoop(ctx, st)
-	}()
+		n.mtuProbeLoop(cctx, st)
+	})
 }
 
 // mtuProbeLoop ticks on the nethealth Interval; every
-// mtuProbeEvery-th tick runs the DF blackhole probe. The
-// gauge is written every tick so the series reflects the CURRENT
-// latch even on off-ticks.
+// mtuProbeEvery-th invocation runs the DF blackhole probe.
+// cycle.Every's up-front call counts as invocation #1, so the first
+// probe lands ~4 intervals in (the old bare ticker waited 5 ticks) —
+// harmless: the gauge is written every invocation so the series
+// reflects the CURRENT latch even on off-invocations.
 func (n *NetHealth) mtuProbeLoop(ctx context.Context, st *mtuProbeState) {
 	interval := n.cfg.Interval
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			st.mu.Lock()
-			st.cycle++
-			probe := st.cycle%mtuProbeEvery == 0
-			st.mu.Unlock()
-			if probe {
-				n.checkNebulaMTUBlackhole(ctx, st)
-			}
-			n.writeMTUBHMetric(st)
+	cycle.Every(mtuCheckName, interval, func(ctx context.Context) {
+		st.mu.Lock()
+		st.cycle++
+		probe := st.cycle%mtuProbeEvery == 0
+		st.mu.Unlock()
+		if probe {
+			n.checkNebulaMTUBlackhole(ctx, st)
 		}
-	}
+		n.writeMTUBHMetric(st)
+	}).Run(ctx)
 }
 
 // checkNebulaMTUBlackhole runs one DF probe cycle (W10-NM4). Gating
@@ -232,7 +225,7 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 		st.mu.Unlock()
 		return
 	}
-	st.lastClamp = n.cfg.nowFn()
+	st.lastClamp = n.cfg.Clock.Now()
 	st.mu.Unlock()
 	dev := wd.NebulaDev
 	if dev == "" {

@@ -12,6 +12,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -138,12 +139,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
-		logger().Warn("webhook rejected: body read failed",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err,
-			"status", http.StatusRequestEntityTooLarge)
-		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		// "Body over maxBodyBytes" (the sender's fault -> 413) and a
+		// transport failure like a client disconnect (-> 400) both
+		// surface as a ReadAll error — split them on MaxBytesError.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
+			logger().Warn("webhook rejected: body exceeds size limit",
+				"remote_addr", r.RemoteAddr,
+				"delivery", delivery, "event", event, "error", err,
+				"status", http.StatusRequestEntityTooLarge)
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
+			logger().Warn("webhook rejected: body read failed",
+				"remote_addr", r.RemoteAddr,
+				"delivery", delivery, "event", event, "error", err,
+				"status", http.StatusBadRequest)
+			http.Error(w, "bad request", http.StatusBadRequest)
+		}
 		return
 	}
 	if !verify.Signature(h.secret, body, sig) {

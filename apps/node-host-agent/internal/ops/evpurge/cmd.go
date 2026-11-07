@@ -17,8 +17,6 @@ package evpurge
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"slices"
@@ -26,12 +24,12 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 )
 
 // Cmd is the `purge-events` subcommand entrypoint.
 func Cmd(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("purge-events", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs := opsx.FlagSet("purge-events")
 	api := fs.String("api", "https://127.0.0.1:6443", "apiserver base URL")
 	ca := fs.String("ca", "",
 		"CA bundle (default /var/lib/k0s/pki/ca.crt, fallback /var/lib/k0s/pki/etcd/ca.crt)")
@@ -75,11 +73,8 @@ func Cmd(ctx context.Context, args []string) int {
 			i++
 		}
 	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0 // -h/--help is a clean exit, not a usage error
-		}
-		return 2
+	if code, ok := opsx.Parse(fs, args); !ok {
+		return code
 	}
 	cutStr := *before
 	if cutStr == "" && positional != "" {
@@ -94,7 +89,7 @@ func Cmd(ctx context.Context, args []string) int {
 	cutoff, err := time.Parse(time.RFC3339, cutStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purge-events: bad cutoff %q: %v\n", cutStr, err)
-		return 2
+		return opsx.ExitUsage
 	}
 	if err := eventpurge.Run(ctx, eventpurge.Config{
 		API:      *api,
@@ -104,7 +99,7 @@ func Cmd(ctx context.Context, args []string) int {
 		Workers:  *workers,
 	}, cutoff, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "purge-events:", err)
-		return 1
+		return opsx.ExitRuntime
 	}
-	return 0
+	return opsx.ExitOK
 }

@@ -67,7 +67,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
@@ -89,10 +88,6 @@ type linkerdOutlierGuardCheck struct {
 	// stamp would die with it anyway — same posture as the
 	// balancer-wedge ledger in the h2 guard).
 	seen state.FirstSeenLedger
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-target heal preambles share — one evaluation per Verdict
-	// TTL instead of three API reads per pod.
-	verdict kube.Verdict
 }
 
 // NewLinkerdOutlierGuardCheck builds the W13-NM2 check — its state
@@ -387,8 +382,8 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 	// IncErrors the queue).
 	ck := probefw.SelfHealKey(CheckNameLinkerdOutlierGuard,
 		kube.PodControllerKey(pod))
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.Heals, ck, linkerdOutlierHealCool, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, linkerdOutlierHealCool, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

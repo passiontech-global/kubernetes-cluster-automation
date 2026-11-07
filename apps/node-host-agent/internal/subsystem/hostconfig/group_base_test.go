@@ -9,13 +9,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // ---------- self-stage /usr/local/bin/node-host-agent ----------
 
 func TestSelfStageBinaryCopiesAndIsIdempotent(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -60,7 +62,7 @@ func TestSelfStageBinaryCopiesAndIsIdempotent(t *testing.T) {
 
 func TestSelfStageSkippedOnStandalone(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -81,8 +83,8 @@ func TestJournaldCorruptOutputRotates(t *testing.T) {
 	// groupBase runs the probe; corrupted output must trigger the
 	// rotate+vacuum remediation.
 	c.groupBase()
-	if len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
-		t.Fatalf("corrupt journal not remediated: %v", sr.callsMatching("journalctl"))
+	if len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
+		t.Fatalf("corrupt journal not remediated: %v", sr.CallsMatching("journalctl"))
 	}
 }
 
@@ -98,8 +100,8 @@ func TestJournaldAbnormallyEmptyRotates(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.groupBase()
-	if len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
-		t.Fatalf("abnormally empty journal not remediated: %v", sr.callsMatching("journalctl"))
+	if len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
+		t.Fatalf("abnormally empty journal not remediated: %v", sr.CallsMatching("journalctl"))
 	}
 }
 
@@ -108,8 +110,8 @@ func TestJournaldHealthyNoRotate(t *testing.T) {
 		"journalctl -n 5": "Oct 01 10:00:00 node-b systemd[1]: Started node-host-agent.service",
 	}, map[string]bool{})
 	c.groupBase()
-	if len(sr.callsMatching("journalctl --rotate")) > 0 {
-		t.Fatalf("healthy journal rotated: %v", sr.callsMatching("journalctl"))
+	if len(sr.CallsMatching("journalctl --rotate")) > 0 {
+		t.Fatalf("healthy journal rotated: %v", sr.CallsMatching("journalctl"))
 	}
 }
 
@@ -118,8 +120,8 @@ func TestJournaldMissingBinaryNoRotate(t *testing.T) {
 	// corruption evidence (rotating would fail anyway) — no action.
 	c, _, sr := journaldEnv(t, map[string]string{}, map[string]bool{"journalctl": true})
 	c.groupBase()
-	if len(sr.callsMatching("--rotate")) > 0 {
-		t.Fatalf("rotate attempted without journalctl: %v", sr.callsMatching("journalctl"))
+	if len(sr.CallsMatching("--rotate")) > 0 {
+		t.Fatalf("rotate attempted without journalctl: %v", sr.CallsMatching("journalctl"))
 	}
 }
 
@@ -133,7 +135,7 @@ func TestJournaldRotateRateLimited(t *testing.T) {
 	}, map[string]bool{})
 	c.groupBase()
 	c.groupBase()
-	if got := len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")); got != 1 {
+	if got := len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")); got != 1 {
 		t.Fatalf("rotate ran %d times, want 1 (cooldown latch)", got)
 	}
 }
@@ -150,10 +152,10 @@ func TestJournaldSilentNoFilesRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.groupBase()
-	if len(sr.callsMatching("systemctl restart systemd-journald.service")) == 0 {
-		t.Fatalf("silent journald not restarted: %v", sr.callsMatching("systemctl"))
+	if len(sr.CallsMatching("systemctl restart systemd-journald.service")) == 0 {
+		t.Fatalf("silent journald not restarted: %v", sr.CallsMatching("systemctl"))
 	}
-	if len(sr.callsMatching("journalctl --rotate")) > 0 {
+	if len(sr.CallsMatching("journalctl --rotate")) > 0 {
 		t.Fatal("rotate ran for a file-less journal — rotate cannot create files")
 	}
 }
@@ -166,8 +168,8 @@ func TestJournaldSilentEmptyNoFilesRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.groupBase()
-	if len(sr.callsMatching("systemctl restart systemd-journald.service")) == 0 {
-		t.Fatalf("empty journal with storage root not restarted: %v", sr.callsMatching("systemctl"))
+	if len(sr.CallsMatching("systemctl restart systemd-journald.service")) == 0 {
+		t.Fatalf("empty journal with storage root not restarted: %v", sr.CallsMatching("systemctl"))
 	}
 }
 
@@ -178,10 +180,10 @@ func TestJournaldSilentNoStorageNoRestart(t *testing.T) {
 		"journalctl -n 5": "No journal files were found.\n",
 	}, map[string]bool{})
 	c.groupBase()
-	if len(sr.callsMatching("systemctl restart systemd-journald.service")) > 0 {
+	if len(sr.CallsMatching("systemctl restart systemd-journald.service")) > 0 {
 		t.Fatal("journald restarted with no storage configured")
 	}
-	if len(sr.callsMatching("journalctl --rotate")) > 0 {
+	if len(sr.CallsMatching("journalctl --rotate")) > 0 {
 		t.Fatal("rotate ran with no storage configured")
 	}
 }
@@ -195,7 +197,7 @@ func TestJournaldSilentRestartRateLimited(t *testing.T) {
 	}
 	c.groupBase()
 	c.groupBase()
-	if got := len(sr.callsMatching("systemctl restart systemd-journald.service")); got != 1 {
+	if got := len(sr.CallsMatching("systemctl restart systemd-journald.service")); got != 1 {
 		t.Fatalf("journald restarts = %d, want 1 (last-journald-restart cooldown)", got)
 	}
 }
@@ -220,7 +222,7 @@ func TestHostnamePinNoGlueOnMissingNewline(t *testing.T) {
 // hn="worker-1" and left the wrong pin live.
 func TestHostsPinHostnameFieldExact(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "worker-1", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -250,12 +252,12 @@ func TestHostsPinHostnameFieldExact(t *testing.T) {
 // the conf drop-in still lands but the service must NOT be
 // restarted (a second NTP daemon would fight chrony for adjtimex).
 func TestGroupResolvedTimesyncdRestartGatedOnActive(t *testing.T) {
-	newCyc := func(t *testing.T, timesyncdState string) (*cyc, *scriptedRunner, *Reconciler) {
+	newCyc := func(t *testing.T, timesyncdState string) (*cyc, *testutil.FakeRunner, *Reconciler) {
 		vars := writeVarsDir(t, "")
-		sr := &scriptedRunner{res: map[string]string{
+		sr := newScripted(map[string]string{
 			"systemctl show systemd-resolved.service":  "active\n",
 			"systemctl show systemd-timesyncd.service": timesyncdState,
-		}, errs: map[string]bool{}}
+		}, nil)
 		r, err := New(Config{NodeName: "node-x", HostRoot: t.TempDir(),
 			VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 			Runner: sr}, nil)
@@ -270,14 +272,14 @@ func TestGroupResolvedTimesyncdRestartGatedOnActive(t *testing.T) {
 	if !r.fileExists("/etc/systemd/timesyncd.conf.d/99-fallback.conf") {
 		t.Fatal("timesyncd fallback conf not written for an installed unit")
 	}
-	if len(sr.callsMatching("systemctl restart systemd-timesyncd.service")) > 0 {
+	if len(sr.CallsMatching("systemctl restart systemd-timesyncd.service")) > 0 {
 		t.Fatalf("inactive timesyncd restarted: %v",
-			sr.callsMatching("systemctl restart systemd-timesyncd.service"))
+			sr.CallsMatching("systemctl restart systemd-timesyncd.service"))
 	}
 
 	c2, sr2, _ := newCyc(t, "active\n")
 	c2.groupResolved()
-	if len(sr2.callsMatching("systemctl restart systemd-timesyncd.service")) == 0 {
+	if len(sr2.CallsMatching("systemctl restart systemd-timesyncd.service")) == 0 {
 		t.Fatal("active timesyncd not restarted after conf change")
 	}
 }

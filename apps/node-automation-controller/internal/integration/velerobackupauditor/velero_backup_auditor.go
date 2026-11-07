@@ -43,6 +43,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -352,7 +353,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// maintenance_stale.
 	repos, err := a.veleroList(ctx, veleroRepoGVR)
 	switch {
-	case apierrors.IsNotFound(err):
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent (older Velero without the repo API) — nothing
 		// to audit.
 	case err != nil:
@@ -393,7 +394,10 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// InProgress|Deleting >6h, and clean up PVBs whose node-agent
 	// provably lost the Kopia thread. Runs on the already-listed
 	// backups plus its own PVB/pod reads; independent of the
-	// schedule checks above.
+	// schedule checks above. pvbHealed keys on node names that can
+	// leave the fleet — bound the map once per sweep at the cleanup
+	// cooldown so decommissioned nodes' stamps cannot accumulate.
+	a.pvbHealed.PruneExpired(a.now.Now(), veleroPVBCleanupCooldown)
 	stuckErr := a.auditInFlightTransfers(ctx, backups)
 
 	log.Info("sweep done", "schedules", len(schedules.Items),

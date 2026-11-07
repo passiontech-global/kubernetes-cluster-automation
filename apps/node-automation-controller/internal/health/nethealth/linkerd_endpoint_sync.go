@@ -57,10 +57,6 @@ type linkerdEndpointSyncCheck struct {
 	linkerdDesyncSince   state.FirstSeenLedger
 	linkerdDesyncEmitted state.GaugeLedger[string]
 	linkerdDesyncHealed  state.CooldownSet
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-service heal preambles share — one evaluation per
-	// Verdict TTL instead of three API reads per desynced service.
-	verdict kube.Verdict
 }
 
 // newLinkerdEndpointSyncCheck builds the W9-NM2 check — every
@@ -76,7 +72,6 @@ const (
 	CheckNameLinkerdEndpointSync = "linkerd-endpoint-sync"
 	linkerdEndpointDesyncMinAge  = 10 * time.Minute
 	linkerdDestHealCooldown      = time.Hour
-	linkerdInjectLabel           = "linkerd.io/inject"
 	// linkerdSliceHealMinAge is the fuse on the missing-IP half of
 	// the W10-FIX7 stale-slice delete: a Ready pod IP must have been
 	// Ready this long before its absence from the service's managed
@@ -271,7 +266,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// deployed on this cluster.
 	linkerdInstalled := false
 	for i := range nsList {
-		if nsList[i].Labels[linkerdInjectLabel] == "enabled" {
+		if nsList[i].Labels[kube.LinkerdInjectKey] == "enabled" {
 			injected[nsList[i].Name] = true
 		}
 		if nsList[i].Name == probefw.LinkerdNS {
@@ -496,8 +491,13 @@ func (p *linkerdEndpointSyncCheck) linkerdSvcPatch(
 func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
 
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
+	// linkerdDesyncHealed keys "ns/svc" — Services can be
+	// decommissioned, so bound the map so their stamps cannot
+	// accumulate.
+	p.linkerdDesyncHealed.PruneExpired(now, linkerdDestHealCooldown)
+
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

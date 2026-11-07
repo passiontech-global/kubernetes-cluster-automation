@@ -8,6 +8,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -147,7 +149,13 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	var rep probefw.SweepReport
+	healed := false // one pod delete per cycle — see below
+	flaggedKeys := make([]string, 0, len(flagged))
 	for key := range flagged {
+		flaggedKeys = append(flaggedKeys, key)
+	}
+	sort.Strings(flaggedKeys) // deterministic pick for the one-per-cycle heal
+	for _, key := range flaggedKeys {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
 		pod := dnsByName[name]
@@ -156,9 +164,22 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		}
 		// Isolated-failure heal: a healthy Ready sibling in the same
 		// namespace means this is per-pod wedge, not a fleet outage.
-		if pod != nil && hasHealthySibling(pod, dnsByNS[ns], flagged) {
+		// At most ONE pod is deleted per cycle — a sweep flagging
+		// several members at once (upstream flap, rollout) must not
+		// halve the DNS fleet in a single pass. The cooldown keys on
+		// the pod's controller so a recreated pod that wedges again
+		// still honors the window; the ledger stamp going from
+		// missing/stale to `now` is how a DELIVERED delete reads
+		// (DeletePodHeal swallows cooldown/mutex/delete failures).
+		if pod != nil && !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) {
+			target := kube.PodControllerKey(pod)
+			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
+			before, _ := p.Heals.Last(hk)
 			p.DeletePodHeal(ctx, log, CheckNameCoreDNSUpstream,
-				ns+"/"+name, pod, coreDNSUpstreamHealCool, now)
+				target, pod, coreDNSUpstreamHealCool, now)
+			if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
+				healed = true
+			}
 		}
 	}
 	for k, d := range flagged {
@@ -223,7 +244,14 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	}
 
 	var rep probefw.SweepReport
-	for key, detail := range flagged {
+	healed := false // same one-delete-per-cycle bound as the PromQL path
+	flaggedKeys := make([]string, 0, len(flagged))
+	for key := range flagged {
+		flaggedKeys = append(flaggedKeys, key)
+	}
+	sort.Strings(flaggedKeys) // deterministic pick for the one-per-cycle heal
+	for _, key := range flaggedKeys {
+		detail := flagged[key]
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
 		pod := probefw.PodFromList(pods, ns, name)
@@ -232,9 +260,15 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 		}
 		lv := []string{ns, name}
 		rep.Flag(coreDNSUpstreamFailingGauge, key, lv)
-		if hasHealthySibling(pod, dnsByNS[ns], flagged) {
+		if !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) {
+			target := kube.PodControllerKey(pod)
+			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
+			before, _ := p.Heals.Last(hk)
 			p.DeletePodHeal(ctx, log, CheckNameCoreDNSUpstream,
-				ns+"/"+name, pod, coreDNSUpstreamHealCool, now)
+				target, pod, coreDNSUpstreamHealCool, now)
+			if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
+				healed = true
+			}
 		}
 		rep.Find(key + "(" + detail + ")")
 	}

@@ -46,6 +46,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -110,12 +111,15 @@ var (
 
 // Config carries the reporter knobs — all test-injectable.
 type Config struct {
+	// Base is the shared watchdog-subsystem block — sync cadence,
+	// the host latch dir (state-*, installed, last-run), the
+	// appended node-watchdog log the filelog monitor tails
+	// (filelog parity), the host fs root and the clock cell
+	// splice (subframe.FromDeps).
+	subframe.Base
 	NodeName string // this node (spec.nodeName) — conditions + events attach here
 	Client   kubernetes.Interface
 
-	WatchdogStateDir string        // host latch dir (state-*, installed, last-run)
-	WatchdogLogFile  string        // appended node-watchdog log (filelog parity)
-	Interval         time.Duration // sync cadence
 	// CycleTimeout is the per-Cycle deadline Run applies around each
 	// Cycle: Run calls Cycle synchronously inside the ticker loop,
 	// so a kube/journal call that ignores the client timeout would
@@ -135,7 +139,6 @@ type Config struct {
 	EventDedupTTL     time.Duration // series-aggregation window per reason+message
 
 	// --- NPD monitor port (npd_monitors.go) ---
-	HostRoot           string   // host fs root mount; "/" = running on the host
 	KmsgFile           string   // kernel ring source; <HostRoot>/dev/kmsg is the fallback
 	ProcMountsFile     string   // host mount table (hostPID → /proc/1/mounts)
 	ProcUptimeFile     string   // host uptime for the kmsg first-scan lookback
@@ -147,8 +150,6 @@ type Config struct {
 	// wrapper when HostRoot != "/") — nil builds the default via the
 	// systemd package; tests substitute a fake.
 	journalFetch func(ctx context.Context, args ...string) (string, error)
-	// Clock supplies the current time — the shared timex.Cell seam.
-	Clock *timex.Cell
 }
 
 func (c *Config) applyDefaults() {
@@ -274,8 +275,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 		return nil, errors.New("nodereporter: NodeName is required")
 	}
 	r := &Reporter{cfg: cfg, emittedEvts: map[string]*emittedEvent{}}
-	r.state = hoststate.New(cfg.WatchdogStateDir, "",
-		r.cfg.Clock.Now, logger)
+	// The reporter never APPENDS to the watchdog log (it only tails
+	// WatchdogLogFile for events) so LogFile stays "".
+	r.state = cfg.StoreAt(cfg.WatchdogStateDir, "", logger)
 	// The kernel monitor's /dev/kmsg tail (npd_kernel.go). Paths are
 	// re-evaluated per (re)open so cfg/test re-points stay live.
 	r.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{
@@ -309,12 +311,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 		Help: "nodereporter sync cycles by result (started|ok|error).",
 	}, []string{"result"})
 
-	if reg != nil {
-		for _, c := range []prometheus.Collector{r.problemGauge, r.problemCounter, r.cycles} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register nodereporter metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		r.problemGauge, r.problemCounter, r.cycles); err != nil {
+		return nil, fmt.Errorf("register nodereporter metrics: %w", err)
 	}
 	return r, nil
 }

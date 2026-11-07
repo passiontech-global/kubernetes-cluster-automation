@@ -250,7 +250,7 @@ func main() {
 
 	cfg := ctrl.GetConfigOrDie()
 	// client-go defaults (QPS 5 / Burst 10) are sized for one
-	// controller — ~32 modules share this rest.Config, so every
+	// controller — ~35 modules share this rest.Config, so every
 	// sweep and reconcile queue fought for the same 10-token
 	// bucket and throttled client-side. 50/100 matches the
 	// aggregate rate the fleet actually issues; both are

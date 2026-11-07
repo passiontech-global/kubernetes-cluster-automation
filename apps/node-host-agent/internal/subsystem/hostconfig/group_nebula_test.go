@@ -16,9 +16,9 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	// node-a (hub, site s1): only cross-site target is node-b 10.0.2.20;
 	// route get says it resolves via node-c's public IP => prune.
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"ip -o route get 10.0.2.20 mark 0x1000": "10.0.2.20 via 10.0.1.30 dev eth0 src 10.0.1.10 mark 0x1000",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
 	if err != nil {
@@ -29,15 +29,15 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 		t.Fatal("node-a should be a lighthouse")
 	}
 	c.nebulaRouting()
-	if len(sr.callsMatching("ip -o route get 10.0.2.20 mark 0x1000")) == 0 {
+	if len(sr.CallsMatching("ip -o route get 10.0.2.20 mark 0x1000")) == 0 {
 		t.Fatal("route get not issued for target")
 	}
-	if len(sr.callsMatching("ip route del 10.0.2.20/32 table main")) == 0 {
-		t.Fatalf("hairpin route not pruned: %v", sr.callsMatching("route del"))
+	if len(sr.CallsMatching("ip route del 10.0.2.20/32 table main")) == 0 {
+		t.Fatalf("hairpin route not pruned: %v", sr.CallsMatching("route del"))
 	}
 
 	// non-lighthouse node: no hairpin probing at all
-	sr2 := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr2 := newScripted(nil, nil)
 	r2, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr2}, nil)
 	if err != nil {
@@ -45,8 +45,8 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 	}
 	c2 := loadCyc(t, r2, vars, "node-b")
 	c2.nebulaRouting()
-	if len(sr2.callsMatching("route get")) > 0 {
-		t.Fatalf("hairpin probe ran on non-lighthouse: %v", sr2.callsMatching("route get"))
+	if len(sr2.CallsMatching("route get")) > 0 {
+		t.Fatalf("hairpin probe ran on non-lighthouse: %v", sr2.CallsMatching("route get"))
 	}
 }
 
@@ -123,9 +123,9 @@ firewall:
 // pinned": log+skip, never a vacuous version match, never download("").
 func TestNebulaEmptyVersionPinSkips(t *testing.T) {
 	vars := writeVarsDir(t, "interdc_nebula_version: \"\"\n")
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"/usr/local/bin/nebula -version": "nebula version 9.9.9",
-	}, errs: map[string]bool{}}
+	}, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
@@ -137,7 +137,7 @@ func TestNebulaEmptyVersionPinSkips(t *testing.T) {
 	if c.errs == 0 {
 		t.Fatal("unpinned nebula install not counted")
 	}
-	if len(sr.callsMatching("nebula -version")) > 0 {
+	if len(sr.CallsMatching("nebula -version")) > 0 {
 		t.Fatal("version probe ran on an empty pin")
 	}
 	if entries, _ := os.ReadDir(dl); len(entries) > 0 {
@@ -149,7 +149,7 @@ func TestNebulaEmptyVersionPinSkips(t *testing.T) {
 // must abort the routing converge before any sh -c is built.
 func TestNebulaRoutingRefusesBadVar(t *testing.T) {
 	vars := writeVarsDir(t, `interdc_marker_base: "172.29.0;rm -rf /"`)
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -160,8 +160,8 @@ func TestNebulaRoutingRefusesBadVar(t *testing.T) {
 	if c.errs == 0 {
 		t.Fatal("injected var not counted")
 	}
-	if len(sr.callsMatching("sh -c")) > 0 {
-		t.Fatalf("shell ran with injected marker_base: %v", sr.callsMatching("sh -c"))
+	if len(sr.CallsMatching("sh -c")) > 0 {
+		t.Fatalf("shell ran with injected marker_base: %v", sr.CallsMatching("sh -c"))
 	}
 }
 
@@ -184,7 +184,7 @@ node-b:
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -195,8 +195,8 @@ node-b:
 	if c.errs == 0 {
 		t.Fatal("empty required ip not counted")
 	}
-	if len(sr.callsMatching("sh -c")) > 0 {
-		t.Fatalf("shell ran with an empty required ip: %v", sr.callsMatching("sh -c"))
+	if len(sr.CallsMatching("sh -c")) > 0 {
+		t.Fatalf("shell ran with an empty required ip: %v", sr.CallsMatching("sh -c"))
 	}
 }
 
@@ -207,7 +207,7 @@ node-b:
 // systemctl disable cleanup still runs.
 func TestNebulaDisableRunsUnconditionalCleanup(t *testing.T) {
 	vars := writeVarsDir(t, "interdc_nebula_enabled: false\ninterdc_marker_base: \"172.29.0;rm -rf /\"\n")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -215,14 +215,14 @@ func TestNebulaDisableRunsUnconditionalCleanup(t *testing.T) {
 	}
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupNebula()
-	if len(sr.callsMatching("systemctl disable --now nebula@interdc.service")) == 0 {
+	if len(sr.CallsMatching("systemctl disable --now nebula@interdc.service")) == 0 {
 		t.Fatal("nebula unit not disabled on the gate-refused path")
 	}
-	if len(sr.callsMatching("systemctl disable --now nebula-route-guard.service")) == 0 {
+	if len(sr.CallsMatching("systemctl disable --now nebula-route-guard.service")) == 0 {
 		t.Fatal("route-guard not disabled on the gate-refused path")
 	}
-	if len(sr.callsMatching("sh -c")) > 0 {
-		t.Fatalf("interpolated sweep ran with a refused var: %v", sr.callsMatching("sh -c"))
+	if len(sr.CallsMatching("sh -c")) > 0 {
+		t.Fatalf("interpolated sweep ran with a refused var: %v", sr.CallsMatching("sh -c"))
 	}
 	if c.errs == 0 {
 		t.Fatal("refused marker_base not counted")

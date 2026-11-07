@@ -45,10 +45,6 @@ type kedaScaledObjectGuardCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
-	// verdict memoizes the maintenance-mutex evaluation the
-	// per-target rescue preambles share — one evaluation per
-	// Verdict TTL instead of three API reads per wedged ScaledObject.
-	verdict kube.Verdict
 }
 
 // NewKedaScaledObjectGuardCheck builds the keda guard — its state is
@@ -215,8 +211,8 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	}
 
 	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+target)
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.Heals, ck, kedaRescueCooldown, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, kedaRescueCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

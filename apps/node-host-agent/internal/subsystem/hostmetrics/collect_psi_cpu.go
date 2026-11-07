@@ -180,12 +180,12 @@ func (p *cpuDeliveredProbe) result() (ratio, wall float64, ok bool) {
 // scrape never blocks on wall-clock steal; the gauges serve the last
 // completed measurement.
 func (c *Collector) maybeMeasureCPU() {
-	if !c.cpu.rearm(c.cfg.nowFn(), c.cfg.CPUDeliveredInterval) {
+	if !c.cpu.rearm(c.cfg.Clock.Now(), c.cfg.CPUDeliveredInterval) {
 		return
 	}
 	go func() {
 		ratio, wall, ok := c.measureCPU()
-		c.cpu.complete(c.cfg.nowFn(), ratio, wall, ok)
+		c.cpu.complete(c.cfg.Clock.Now(), ratio, wall, ok)
 		if !ok {
 			logger().Warn("hostmetrics: cpu-delivered probe did not " +
 				"complete — serving previous result",

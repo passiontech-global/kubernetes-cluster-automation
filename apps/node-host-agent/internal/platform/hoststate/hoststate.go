@@ -55,11 +55,10 @@ type Store struct {
 	// disables the file half (slog mirror still fires).
 	LogFile string
 	// Now supplies the current time — the test seam every subsystem
-	// carried as cfg.nowFn. IMPORTANT: pass a closure over the live
-	// config field (`func() time.Time { return cfg.nowFn() }`), not
-	// the func value captured at New() — tests re-stub cfg.nowFn
-	// after construction and the store must observe the new clock.
-	// nil → system time.
+	// carries as cfg.Clock (*timex.Cell). Pass the method value
+	// `cfg.Clock.Now`: it binds the cell POINTER, so a post-New
+	// cfg.Clock.Set is observed here without the old "closure over
+	// the live config field" contract. nil → system time.
 	Now timex.Clock
 	// Log resolves the slog logger per call — pass the package
 	// `logger` func itself so the "logger"=<pkg> attr and any

@@ -171,12 +171,16 @@ func (c *cyc) groupKineService() {
 	// (k0scontroller creates that dir, but it starts AFTER because of
 	// Before=), and wait for the socket bind before Before= is
 	// satisfied (Type=simple counts "started" at exec -> k0scontroller
-	// could start while the socket does not exist yet).
+	// could start while the socket does not exist yet). The wait
+	// loop's trailing [ -S ] exit check makes a 30s socket no-show
+	// FAIL the ExecStartPost — and the unit — so Restart=always
+	// retries; an exit-0 timeout would start the apiserver against
+	// a dead endpoint.
 	execPre, execPost := "", ""
 	if sock := strings.TrimPrefix(listen, "unix://"); sock != listen {
 		execPre = "ExecStartPre=/usr/bin/mkdir -p " + filepath.Dir(sock) + "\n"
 		execPost = "ExecStartPost=/bin/sh -c 'i=0; while [ ! -S " + sock +
-			" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done'\n"
+			" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; [ -S " + sock + " ]'\n"
 	}
 	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: kine split out of k0scontroller.
 # SEPARATE cgroup boundary: a kine OOM does not drag apiserver into

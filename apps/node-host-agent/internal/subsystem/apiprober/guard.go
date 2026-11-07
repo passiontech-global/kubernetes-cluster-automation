@@ -1,11 +1,10 @@
 package apiprober
 
 import (
-	"fmt"
-	"os"
 	"strconv"
 	"strings"
-	"sync"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/fileconf"
 )
 
 // --- /etc/api-backend-guard.conf (standalone api-lb-vm defaults) ---
@@ -53,50 +52,38 @@ type GuardDefaults struct {
 // unreadable one keeps the last good parse — the shell `source`
 // semantics were "read fresh each run". Get is safe for concurrent
 // use.
+//
+// The reload skeleton (mutex, keep-last-good, edge-latched warn +
+// recovery info) is the shared platform/fileconf.Reloader —
+// embedded so Path stays the exported, Get-time-read field. The
+// guard flavour keeps its empty-Path early return (BlankPathHolds).
 type GuardReloader struct {
-	Path string
-
-	mu      sync.Mutex
-	cur     GuardDefaults
-	loadErr bool // edge-latch for the unreadable-conf Warn
+	*fileconf.Reloader[GuardDefaults]
 }
 
 // NewGuardReloader seeds the reloader with an initial parse (the
 // zero value is fine — the first Get re-reads anyway).
 func NewGuardReloader(path string, initial GuardDefaults) *GuardReloader {
-	return &GuardReloader{Path: path, cur: initial}
+	return &GuardReloader{fileconf.New(path, parseGuardConf, initial,
+		fileconf.Options{
+			Log:            logger(),
+			WarnMsg:        "apiprober: guard conf unreadable — keeping last good parse",
+			RecoveredMsg:   "apiprober: guard conf readable again",
+			BlankPathHolds: true,
+		})}
 }
 
 // Get returns the freshest parse of Path, falling back to the last
 // good one on read/parse errors. A persistent read failure warns
 // once per episode (and logs recovery once) rather than every cycle —
 // Get runs each probe cycle.
-func (r *GuardReloader) Get() GuardDefaults {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.Path == "" {
-		return r.cur
-	}
-	if g, err := LoadGuardConf(r.Path); err == nil {
-		if r.loadErr {
-			r.loadErr = false
-			logger().Info("apiprober: guard conf readable again",
-				"path", r.Path)
-		}
-		r.cur = g
-	} else if !r.loadErr {
-		r.loadErr = true
-		logger().Warn("apiprober: guard conf unreadable — keeping last "+
-			"good parse", "path", r.Path, "error", err,
-		)
-	}
-	return r.cur
-}
+func (r *GuardReloader) Get() GuardDefaults { return r.Reloader.Get() }
 
 // LoadGuardConf parses the conf at path. A missing file is NOT an
 // error (pods and non-api-lb hosts never carry it) — it returns the
 // zero GuardDefaults and nil so callers can chain env → conf →
-// default unconditionally.
+// default unconditionally. The file contract is the shared
+// fileconf.Load — identical to the reloader's per-Get read.
 //
 // Credential keys accept BOTH spellings: API_TOKEN_FILE/API_CA_FILE
 // is the original contract (the ansible api-backend-guard.conf.j2
@@ -106,14 +93,14 @@ func (r *GuardReloader) Get() GuardDefaults {
 // prefixed (original) spelling wins when both are present — it is
 // the documented contract and the one converge manages.
 func LoadGuardConf(path string) (GuardDefaults, error) {
+	return fileconf.Load(path, parseGuardConf)
+}
+
+// parseGuardConf parses conf content — split from LoadGuardConf so
+// the one-shot Load and the fileconf reloader share one parser;
+// empty content (absent file) yields the zero GuardDefaults.
+func parseGuardConf(data []byte) (GuardDefaults, error) {
 	var g GuardDefaults
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return g, nil
-		}
-		return g, fmt.Errorf("read %s: %w", path, err)
-	}
 	vars := parseShellKV(string(data))
 	g.SocketPath = vars["HAPROXY_SOCKET"]
 	g.BackendName = vars["HAPROXY_BACKEND"]

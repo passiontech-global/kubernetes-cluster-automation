@@ -7,3 +7,4 @@ changelog.md
 coverage.out
 apps/node-host-agent/agent
 apps/node-automation-controller/manager
+apps/webhook-dispatcher/dispatcher

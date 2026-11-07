@@ -21,6 +21,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -38,8 +40,8 @@ var zombieSidecarShutdownTargets = map[string]struct {
 	port int
 	path string
 }{
-	"linkerd-proxy": {port: 4191, path: "/shutdown"},
-	"istio-proxy":   {port: 15000, path: "/quitquitquit"},
+	kube.LinkerdProxyContainer: {port: 4191, path: "/shutdown"},
+	"istio-proxy":              {port: 15000, path: "/quitquitquit"},
 }
 
 // zombieSidecarHTTPClient is the module's single http.Client — the
@@ -83,7 +85,7 @@ func (r *zombieSidecarReaper) shutdownPod(ctx context.Context, p *corev1.Pod, si
 func (r *zombieSidecarReaper) proxyShutdown(ctx context.Context, p *corev1.Pod, sidecar string) error {
 	target, ok := zombieSidecarShutdownTargets[sidecar]
 	if !ok {
-		target = zombieSidecarShutdownTargets["linkerd-proxy"]
+		target = zombieSidecarShutdownTargets[kube.LinkerdProxyContainer]
 	}
 	rc := r.cs.CoreV1().RESTClient()
 	// The fake clientset returns a typed-nil *rest.RESTClient —
@@ -114,7 +116,7 @@ func (r *zombieSidecarReaper) proxyShutdown(ctx context.Context, p *corev1.Pod, 
 func zombieSidecarShutdown(ctx context.Context, podIP, sidecar string) error {
 	target, ok := zombieSidecarShutdownTargets[sidecar]
 	if !ok {
-		target = zombieSidecarShutdownTargets["linkerd-proxy"]
+		target = zombieSidecarShutdownTargets[kube.LinkerdProxyContainer]
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		// JoinHostPort brackets IPv6 podIPs — plain %s:%d breaks on them.

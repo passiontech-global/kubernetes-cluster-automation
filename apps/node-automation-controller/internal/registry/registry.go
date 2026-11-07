@@ -16,6 +16,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserviceguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/clusterhealthprobes"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/certdriftauditor"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/certmanagerreaper"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration/ciliumidentityauditor"
@@ -146,17 +147,19 @@ var Modules = []shared.Module{
 
 	// Cluster health probes.
 	//
-	// The W13 gitops check rows MUST precede cluster-health-probes:
-	// their Setups register the check into the prober's checkDefs
-	// roster (see internal/health/clusterhealthprobes/check_modules.go),
-	// which only takes effect because this row's Setup runs last and
-	// builds the prober after they have registered. Each check gates
-	// on its own NODE_AUTOMATION_*_ENABLED flag and is selectable by
-	// name via -modules — but it still requires the
+	// The W13 gitops check rows carry CheckReg instead of Setup:
+	// they contribute a check into the cluster-health-probes roster
+	// (SetupModules collects the enabled rows' registrations into
+	// Deps.CheckRegs — see
+	// internal/health/clusterhealthprobes/check_modules.go) rather
+	// than registering runnables, so no ordering constraint exists
+	// between these rows and the cluster-health-probes row. Each
+	// check gates on its own NODE_AUTOMATION_*_ENABLED flag and is
+	// selectable by name via -modules — but it still requires the
 	// cluster-health-probes module to actually run the sweep.
-	{Name: "flux-kustomization-health", Group: groupHealth, GateEnv: "NODE_AUTOMATION_FLUX_KUSTOMIZATION_HEALTH_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.SetupFluxKustomizationHealth},
-	{Name: "workload-scale-flapping", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_SCALE_FLAPPING_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.SetupWorkloadScaleFlapping},
-	{Name: "imagepull-secret-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGEPULL_SECRET_AUDITOR_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.SetupImagePullSecretAuditor},
+	{Name: "flux-kustomization-health", Group: groupHealth, GateEnv: "NODE_AUTOMATION_FLUX_KUSTOMIZATION_HEALTH_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck}},
+	{Name: "workload-scale-flapping", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_SCALE_FLAPPING_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameWorkloadScaleFlapping, New: gitops.NewWorkloadScaleFlappingCheck}},
+	{Name: "imagepull-secret-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGEPULL_SECRET_AUDITOR_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck}},
 	{Name: "cluster-health-probes", Group: groupHealth, GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.Setup},
 }
 
@@ -252,27 +255,54 @@ func ValidGroups() []string {
 }
 
 // SetupModules wires the allowlisted modules on the manager,
-// registry order. The two loops are deliberate: the queue's
-// error-metric series are predeclared for the FULL registry —
-// /metrics must expose the complete 0-valued fleet even on a
-// Deployment where -modules (or a gate) runs only a subset, so a
-// mid-flight flag change can never gap a series — while only `mods`
-// get the gate check + Setup call. Each row's GateEnv (when set) is
-// resolved ONCE here: a module whose gate is off still has its Setup
-// invoked, but with Deps.Disabled stamped so it can parse its knobs
-// (warning on bad values) while registering nothing. A returned
-// error aborts boot: a module that fails to register is a broken
-// operator, not a degraded one.
+// registry order. The queue's error-metric series are predeclared
+// for the FULL registry first — /metrics must expose the complete
+// 0-valued fleet even on a Deployment where -modules (or a gate)
+// runs only a subset, so a mid-flight flag change can never gap a
+// series. Then `mods` goes through two passes:
+//
+//  1. Gate evaluation + CheckReg collection. Each row's GateEnv
+//     (when set) is resolved ONCE here. Health-sweep check rows
+//     (CheckReg instead of Setup) contribute their registration
+//     into regs only while their own gate is ON — a gated-off or
+//     unselected check row simply never reaches the roster, which
+//     IS the per-check gate the rows exist for.
+//  2. Runnable wiring, registry order. Every row's Deps gets the
+//     collected regs stamped — only the cluster-health-probes sweep
+//     reads them, and because collection finished before ANY Setup
+//     ran, a check row may sit anywhere relative to it (the old
+//     "check rows must precede cluster-health-probes" constraint is
+//     gone). A module whose gate is off still has its Setup
+//     invoked, but with Deps.Disabled stamped so it can parse its
+//     knobs (warning on bad values) while registering nothing;
+//     CheckReg rows carry Setup == nil and are skipped. A returned
+//     error aborts boot: a module that fails to register is a
+//     broken operator, not a degraded one.
 func SetupModules(deps shared.Deps, mods []shared.Module) error {
 	for _, m := range Modules {
 		metrics.PredeclareQueue(m.Name)
 	}
+	var regs []shared.CheckReg
+	gatedOff := make(map[string]bool, len(mods))
+	for _, m := range mods {
+		if m.GateEnv != "" && !envx.Gate(m.GateEnv, m.DefaultOn) {
+			gatedOff[m.Name] = true
+			continue
+		}
+		if m.CheckReg != nil {
+			regs = append(regs, *m.CheckReg)
+		}
+	}
 	for _, m := range mods {
 		d := deps
 		d.Name = m.Name
-		if m.GateEnv != "" && !envx.Gate(m.GateEnv, m.DefaultOn) {
+		d.CheckRegs = regs
+		if gatedOff[m.Name] {
 			d.Disabled = true
 			d.Log.WithName(m.Name).Info("disabled — module not registered", "gate", m.GateEnv)
+		}
+		if m.Setup == nil {
+			continue // CheckReg row — its check already went into regs
 		}
 		if err := m.Setup(d); err != nil {
 			d.Log.WithName(m.Name).Error(err, "unable to setup module")

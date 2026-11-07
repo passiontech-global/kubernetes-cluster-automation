@@ -25,6 +25,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sdnotify"
 )
 
 // Subsystem is a long-running periodic component of the agent. Run
@@ -306,9 +308,10 @@ func gracefulShutdown(ctx context.Context, done <-chan struct{},
 // On the standalone hosts hubsync converges (db-vm, api-lb VMs,
 // controllers) there is no kubelet livenessProbe to kill a wedged
 // agent — the unit carries WatchdogSec=120s instead and expects the
-// process itself to feed it. The loop is pure Go (a unixgram
-// datagram to NOTIFY_SOCKET — `systemd-notify` parity, same wire
-// format controllerhygiene's feeder sdNotify sends): READY=1 once
+// process itself to feed it. The loop is pure Go (unixgram
+// datagrams to NOTIFY_SOCKET — `systemd-notify` parity; the wire
+// format lives in internal/platform/sdnotify, shared with
+// controllerhygiene's feeder): READY=1 once
 // both listeners are bound and a.ready flipped, then WATCHDOG=1
 // every sdWatchdogInterval while the probe mux answers a real HTTP
 // self-probe. A wedged probe server stops the feed — the skipped
@@ -336,7 +339,7 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 	if sock == "" || !a.ready.Load() {
 		return
 	}
-	conn, err := dialNotifySocket(sock)
+	conn, err := sdnotify.Dial(sock)
 	if err != nil {
 		logger().Warn("sd_notify: NOTIFY_SOCKET dial failed — watchdog feed disabled",
 			"socket", sock, "error", err)
@@ -344,10 +347,7 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 	}
 	defer func() { _ = conn.Close() }()
 	send := func(msg string) {
-		// Datagram writes are near-instant; the deadline only
-		// covers a pathological socket state (full receive queue).
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := conn.Write([]byte(msg)); err != nil {
+		if err := sdnotify.Send(conn, msg); err != nil {
 			logger().Warn("sd_notify: send failed",
 				"msg", strings.TrimSpace(msg), "error", err)
 		}
@@ -369,17 +369,6 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 		}
 		send("WATCHDOG=1\n")
 	}
-}
-
-// dialNotifySocket opens the unixgram notify socket — '@'-prefixed
-// names are systemd's abstract-socket convention.
-func dialNotifySocket(sock string) (*net.UnixConn, error) {
-	addr := sock
-	if strings.HasPrefix(addr, "@") {
-		addr = "\x00" + addr[1:]
-	}
-	return net.DialUnix("unixgram", nil,
-		&net.UnixAddr{Name: addr, Net: "unixgram"})
 }
 
 // probeSelfURL is the probe mux's loopback /healthz — "" when

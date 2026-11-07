@@ -14,10 +14,10 @@
 // series family it can produce.
 //
 // The W10 textfile-only channels (node_agent_*_utilization_ratio in
-// pidfd.go, the steal/entropy gauges in collect_steal_entropy.go)
-// are deliberately NOT rows: they ride promfile.Builder on the
-// latch ticker, not the prometheus.Collector path, so they never
-// had a desc to register.
+// kernelfail/pidfd.go, the steal/entropy gauges in
+// kernelfail/steal_entropy.go) are deliberately NOT rows: they ride
+// promfile.Builder on the latch ticker, not the
+// prometheus.Collector path, so they never had a desc to register.
 package hostmetrics
 
 import "github.com/prometheus/client_golang/prometheus"

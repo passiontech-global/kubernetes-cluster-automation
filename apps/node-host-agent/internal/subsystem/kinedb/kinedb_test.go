@@ -11,6 +11,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const testNow = 1700000000
@@ -31,7 +32,7 @@ func fixture(t *testing.T, rules []testutil.ExecRule) (*KineDB, *testutil.FakeEx
 		TextfileDir:   filepath.Join(dir, "textfile"),
 		GuardStateDir: filepath.Join(dir, "guard"),
 		Runtime:       "podman",
-		nowFn:         func() time.Time { return time.Unix(testNow, 0) },
+		Clock:         timex.NewCell(func() time.Time { return time.Unix(testNow, 0) }),
 		run:           fr.RunStdin,
 		wireFn:        func(context.Context, string) bool { return true },
 	}, nil)

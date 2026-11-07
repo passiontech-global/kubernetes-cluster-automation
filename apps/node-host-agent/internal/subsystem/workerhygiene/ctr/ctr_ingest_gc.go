@@ -50,7 +50,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 		diskHigh = used > c.d.Cfg.Disk.HighWatermark
 	}
-	due := c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval
+	due := c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval
 	if !diskHigh && !due {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
 		return
@@ -67,7 +67,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if os.IsNotExist(err) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
-			c.lastScan = c.d.Cfg.Seams.Host.NowFn()
+			c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 			c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
 			return
 		}
@@ -80,8 +80,8 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "abort").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
-	now := c.d.Cfg.Seams.Host.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	n := 0
 	for _, e := range entries {
 		if !e.IsDir() {

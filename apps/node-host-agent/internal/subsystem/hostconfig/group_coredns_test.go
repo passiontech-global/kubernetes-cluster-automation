@@ -15,13 +15,10 @@ import (
 
 func TestCoreDNSWorkerStub(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{
-		res: map[string]string{
-			"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
-			"dig @127.0.0.1":                  "10.0.1.10",
-		},
-		errs: map[string]bool{},
-	}
+	sr := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+		"dig @127.0.0.1":                  "10.0.1.10",
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -70,10 +67,7 @@ test.internal {
 
 func TestCoreDNSSkipsResolvConfWhenDigFails(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{
-		res:  map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"},
-		errs: map[string]bool{"dig @127.0.0.1": true},
-	}
+	sr := newScripted(map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"}, map[string]bool{"dig @127.0.0.1": true})
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -91,13 +85,10 @@ func TestCoreDNSSkipsResolvConfWhenDigFails(t *testing.T) {
 
 func TestCoreDNSHubZoneFile(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{
-		res: map[string]string{
-			"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
-			"dig @127.0.0.1":                  "172.29.0.10",
-		},
-		errs: map[string]bool{},
-	}
+	sr := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+		"dig @127.0.0.1":                  "172.29.0.10",
+	}, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
@@ -162,7 +153,7 @@ node-z:
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -189,9 +180,9 @@ node-z:
 // TestCoreDNSEmptyVersionPinSkips — same contract for coredns.
 func TestCoreDNSEmptyVersionPinSkips(t *testing.T) {
 	vars := writeVarsDir(t, "interdc_coredns_version: \"\"\n")
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"/usr/local/bin/coredns -version": "CoreDNS-9.9.9",
-	}, errs: map[string]bool{}}
+	}, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
@@ -203,7 +194,7 @@ func TestCoreDNSEmptyVersionPinSkips(t *testing.T) {
 	if c.errs == 0 {
 		t.Fatal("unpinned coredns install not counted")
 	}
-	if len(sr.callsMatching("coredns -version")) > 0 {
+	if len(sr.CallsMatching("coredns -version")) > 0 {
 		t.Fatal("version probe ran on an empty pin")
 	}
 	if entries, _ := os.ReadDir(dl); len(entries) > 0 {

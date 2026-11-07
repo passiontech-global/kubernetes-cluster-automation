@@ -42,9 +42,6 @@ type localPVStrandedCheck struct {
 	//     can carry the stamp).
 	//   - pvcProvHealed: provisioner → last provisioner pod delete —
 	//     the 1h cooldown.
-	//   - verdict memoizes the maintenance-mutex evaluation the
-	//     per-target heal preambles share — one evaluation per
-	//     Verdict TTL instead of three API reads per heal.
 	localPVEmitted    state.GaugeLedger[string]
 	pvcStalledEmitted state.GaugeLedger[string]
 	// strandedStatefulEmitted is the W12-SC2 ledger for the
@@ -54,7 +51,6 @@ type localPVStrandedCheck struct {
 	strandedStatefulEmitted state.GaugeLedger[string]
 	localPVHealed           state.CooldownSet
 	pvcProvHealed           state.CooldownSet
-	verdict                 kube.Verdict
 }
 
 // newLocalPVStrandedCheck builds the W7-C4 check — every ledger is
@@ -250,6 +246,15 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
+	// localPVHealed keys "ns/pvc" — claim names outlive the PVC
+	// object the heal deletes, so bound the map once per sweep at
+	// the ephemeral-heal cooldown. pvcProvHealed keys the
+	// provisioner name — a single entry in practice, but prune it
+	// on the same pass so a renamed provisioner cannot wedge the
+	// 1h cooldown forever.
+	p.localPVHealed.PruneExpired(now, localPVEphemeralHealCooldown)
+	p.pvcProvHealed.PruneExpired(now, pvcProvisionerHealCooldown)
+
 	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
@@ -390,15 +395,15 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	statefulRep.Close(&p.strandedStatefulEmitted,
 		localPVStrandedStatefulPodGauge.DeleteLabelValues)
 
-	// AllowedV folds the per-target cooldown plus the maintenance
-	// mutex (memoized on p.verdict — one evaluation per sweep) —
-	// pod/PVC kills during a drain are exactly what it exists to
-	// prevent; "cannot verify" fails closed.
+	// HealAllowed folds the per-target cooldown plus the maintenance
+	// mutex (memoized on the shared Deps verdict — one evaluation
+	// per sweep) — pod/PVC kills during a drain are exactly what it
+	// exists to prevent; "cannot verify" fails closed.
 	for i := range heals {
 		h := &heals[i]
 		pvcKey := h.pvc.Namespace + "/" + h.pvc.Name
-		proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-			p.CS, p.Dyn, &p.localPVHealed, pvcKey,
+		proceed, unverifiable := p.HealAllowed(ctx, log,
+			&p.localPVHealed, pvcKey,
 			localPVEphemeralHealCooldown, now)
 		if unverifiable {
 			metrics.IncError(p.Name)
@@ -468,12 +473,12 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 // provisioner missed a watch event; a restart makes it re-list and
 // provision. 1h cooldown (in-RAM — the pod itself is the heal
 // target, nothing else can carry the stamp), maintenance-gated via
-// the shared AllowedV preamble.
+// the shared HealAllowed preamble.
 func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.pvcProvHealed, openebsProvisionerName,
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.pvcProvHealed, openebsProvisionerName,
 		pvcProvisionerHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)

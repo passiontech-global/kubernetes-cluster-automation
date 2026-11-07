@@ -62,7 +62,7 @@ func init() {
 func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	// The CILIUM_BPF_MAP_PRESSURE_THRESHOLD knob resolves once at
-	// sweep Setup (probefw.CiliumConfigFromEnv — >1 keeps working as
+	// sweep Setup (CiliumConfigFromEnv — >1 keeps working as
 	// the documented "disable this check" escape).
 	threshold := p.Cfg.Cilium.BPFMapPressureThreshold
 	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +

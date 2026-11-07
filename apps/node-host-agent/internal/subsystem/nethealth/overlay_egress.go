@@ -208,7 +208,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					probe = "direct"
 					if _, err := os.Stat(icmpBlk); err != nil {
 						if werr := hostutil.WriteFileAtomic(icmpBlk,
-							strconv.FormatInt(n.cfg.nowFn().Unix(), 10)+"\n"); werr != nil {
+							strconv.FormatInt(n.cfg.Clock.Now().Unix(), 10)+"\n"); werr != nil {
 							logger().Warn("nethealth: egress "+
 								"icmp-blocked marker write failed",
 								"path", icmpBlk, "error", werr)

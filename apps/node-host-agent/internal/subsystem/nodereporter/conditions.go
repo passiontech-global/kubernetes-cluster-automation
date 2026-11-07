@@ -451,7 +451,7 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	for _, c := range node.Status.Conditions {
 		live[c.Type] = c
 	}
-	now := metav1.NewTime(r.cfg.nowFn())
+	now := metav1.NewTime(r.cfg.Clock.Now())
 
 	// Zero-churn gate: PATCH only when a Status or Reason differs —
 	// message-only drift (e.g. the WatchdogStale age counter ticking)
@@ -599,7 +599,7 @@ func (r *Reporter) watchdogStale() (bool, int64) {
 	} else if data, err := os.ReadFile(installedPath); err == nil {
 		ts = parseEpoch(data)
 	}
-	age := r.cfg.nowFn().Unix() - ts
+	age := r.cfg.Clock.Now().Unix() - ts
 	if age < 0 {
 		age = 0 // clock skew / future timestamp → fresh
 	}

@@ -12,16 +12,23 @@ import (
 )
 
 // circuitMetrics applies the trip/recovery side-effects — called only
-// after the config patch landed, so a failed patch retries next sweep
-// without double-counting trips. A tripped series is Emitted into the
-// sweep's ledger; a recovered one is deleted outright — a cleared
-// breaker emits no series, not a 0, and the sweep-end ledger prune
-// drops it for good.
-func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
+// after the config patch landed (or, on the nil-payload path, after
+// the live state verified no write was needed), so a failed patch
+// retries next sweep without double-counting trips. A tripped or
+// still-broken series is Emitted into the sweep's ledger; a
+// recovered one is deleted outright — a cleared breaker emits no
+// series, not a 0, and the sweep-end ledger prune drops it for
+// good.
+func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string,
+	trips, recovered, stillBroken []string) {
 	for _, n := range trips {
 		emitted.Set(metrics.WebhookCircuitBroken, 1,
 			kind+"/"+cfgName+"/"+n, kind, cfgName, n)
 		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfgName).Inc()
+	}
+	for _, n := range stillBroken {
+		emitted.Set(metrics.WebhookCircuitBroken, 1,
+			kind+"/"+cfgName+"/"+n, kind, cfgName, n)
 	}
 	for _, n := range recovered {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, n)

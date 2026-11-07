@@ -18,7 +18,7 @@ func gomemlimitEnv(t *testing.T, memMax, gomemlimit string) (*cyc, *Reconciler) 
 		"  node-b: "+memMax+"\n"+
 		"k0scontroller_go_memlimit_by_host:\n"+
 		"  node-b: "+gomemlimit+"\n")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -73,7 +73,7 @@ func TestGoMemlimitGuardClampsUnsafeConfig(t *testing.T) {
 func TestGoMemlimitGuardNoVars(t *testing.T) {
 	// Missing maps → fail-open, no drop-in.
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

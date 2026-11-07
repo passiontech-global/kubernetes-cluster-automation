@@ -2,7 +2,7 @@
 
 controller-runtime operator replacing the shell-operator Deployment +
 bash hooks for node lifecycle automation. All logic is compiled in —
-no shell, no `kubectl`/`jq`/`curl` forks. One binary runs 32 modules
+no shell, no `kubectl`/`jq`/`curl` forks. One binary runs 35 modules
 grouped in six domain trees; the interface contract is Prometheus
 metrics on `:9115/metrics` plus `/healthz`+`/readyz` on `:8081` (kept
 byte-stable with the shell-operator alerts).
@@ -40,9 +40,11 @@ byte-stable with the shell-operator alerts).
   registration inside the check file that consumes it) and the
   Prometheus instant-query client.
 - `internal/{apiserver,health,integration,janitor,node,system}/*` —
-  the 32 modules, one package per module grouped by domain. Health
+  the 35 modules, one package per module grouped by domain. Health
   checks live under `health/<sub>/` on top of `health/probefw` with
-  the `clusterhealthprobes.checkDefs` roster as sweep order.
+  the `clusterhealthprobes.checkDefs` roster (plus the CheckReg
+  registry rows' contributions collected into `Deps.CheckRegs`) as
+  sweep order.
   `apiserver/webhookguard` is the one module with subpackages —
   `circuitbreaker`, `guardstate`, `orphansweep`, `unmeshed` are leaf
   duties the facade's single `Setup`/sweep orchestrates (one

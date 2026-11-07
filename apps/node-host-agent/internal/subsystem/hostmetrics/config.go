@@ -11,25 +11,27 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Config carries the host paths — all test-injectable.
 type Config struct {
-	NodeName         string
-	WatchdogStateDir string
-	// WatchdogLogFile is the shared appended watchdog log — the
-	// latch ticker's STATE-ENTER lines must land in the FILE
-	// nodereporter tails for its Event rules (Store.AppendLog's
-	// slog mirror alone never reaches it). Same path
-	// workerhygiene/nethealth/controllerhygiene write.
-	WatchdogLogFile string
-	SysClassNet     string
-	NebulaIface     string
-	RouteFile       string
-	K0sConfigFile   string
-	K0sUnitFile     string
-	NebulaCertFile  string
+	// Base is the shared watchdog-subsystem block — the watchdog
+	// state dir, WatchdogLogFile (the shared appended watchdog log
+	// the latch ticker's STATE-ENTER lines must land in — the FILE
+	// nodereporter tails for its Event rules; Store.AppendLog's
+	// slog mirror alone never reaches it, same path
+	// workerhygiene/nethealth/controllerhygiene write), HostRoot,
+	// ProcRoot and the clock cell splice (subframe.FromDeps).
+	subframe.Base
+	NodeName       string
+	SysClassNet    string
+	NebulaIface    string
+	RouteFile      string
+	K0sConfigFile  string
+	K0sUnitFile    string
+	NebulaCertFile string
 	// PSIFile is /proc/pressure/cpu — drives the overload gauge +
 	// state-node-overloaded latch.
 	PSIFile string
@@ -75,20 +77,19 @@ type Config struct {
 	// FilesystemTargets are the mounts statfs'd per scrape for the
 	// inode gauges (H3) and the hung-mount probe (H7).
 	FilesystemTargets []string
-	// HostRoot prefixes host-side paths that live under the
+	// Base.HostRoot prefixes host-side paths that live under the
 	// DaemonSet's host-fs mount (PKI dirs, the cilium runtime
 	// config) — "/host" in the pod, "/" standalone. Empty
 	// auto-detects: "/host" when that dir exists, else "/".
-	HostRoot string
 	// PKICertPaths are the cert sources (2.4): each entry is either
 	// a directory scanned one level deep for *.crt/*.pem files or a
 	// single cert file — default the k0s/kine PKI paths under
 	// HostRoot. The {path} label carries the HostRoot-relative path
 	// so the series reads identically on pods and standalone hosts.
 	PKICertPaths []string
-	// ProcRoot is the host /proc — the inotify fdinfo and zombie
-	// scans walk it (hostPID:true makes the pod's /proc the host's).
-	ProcRoot string
+	// Base.ProcRoot is the host /proc — the inotify fdinfo and
+	// zombie scans walk it (hostPID:true makes the pod's /proc the
+	// host's).
 	// InotifyScanInterval caches the fdinfo sweep — one full
 	// /proc/*/fdinfo walk is too expensive to run per scrape.
 	InotifyScanInterval time.Duration
@@ -154,8 +155,6 @@ type Config struct {
 	// 30s. Seamed so tests don't wait real seconds.
 	LatchInterval time.Duration
 
-	// nowFn supplies the current time — seam for tests.
-	nowFn timex.Clock
 	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
 	// tests: returns (ratio, wallSeconds, ok).
 	cpuMeasure func() (ratio, wall float64, ok bool)
@@ -210,8 +209,8 @@ func (c *Config) applyDefaults() {
 	if c.CPUDeliveredInterval <= 0 {
 		c.CPUDeliveredInterval = defaultCPUDeliveredIn
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 	if len(c.RemovedFlags) == 0 {
 		c.RemovedFlags = defaultRemovedFlags

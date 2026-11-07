@@ -108,9 +108,53 @@ func TestSubprocOOMRealInitKillNoEvent(t *testing.T) {
 	if len(evs.Items) != 0 {
 		t.Fatalf("legit init-kill produced living-dead event: %+v", evs.Items)
 	}
+	// The detection counter must not have fired either — a pod-less
+	// fixture only masks the false positive at event-create time.
+	if h.ContainerSubprocessOOM != 0 {
+		t.Fatalf("ContainerSubprocessOOM=%d want 0 for a legit init-kill restart",
+			h.ContainerSubprocessOOM)
+	}
 	// Missing kubepods.slice root → abort, never panic.
 	h.Cfg.Runtime.CgroupRoot = filepath.Join(cg, "nope")
 	chk.Run(ctx, ce)
+}
+
+func TestSubprocOOMKillStormStillConfirms(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "storm", Namespace: "default",
+			UID: types.UID(wdepstest.UIDA)},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	h := e.H
+	ctx := context.Background()
+	h.Cfg.Runtime.CgroupRoot = t.TempDir()
+	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}}
+	chk := wdepstest.Check[*runtime.SubprocOOMCheck](h, wdeps.CheckSubprocOOM)
+
+	scope := mkOOMScope(t, e, wdepstest.UIDA, "ccc333", 1, 4242)
+	chk.Run(ctx, ce) // baseline — first sighting only
+	// A subprocess kill lands EVERY cycle while pid1 survives —
+	// pendingAt must stay armed from the FIRST kill so the verdict
+	// still fires ~60s out, not be postponed forever.
+	for i := int64(2); i <= 4; i++ {
+		wdepstest.WriteFile(t, filepath.Join(scope, "memory.events"),
+			fmt.Sprintf("oom_kill %d\n", i))
+		chk.Run(ctx, ce)
+		e.Now = e.Now.Add(31 * time.Second)
+	}
+	chk.Run(ctx, ce) // ~93s after the first kill
+	evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 1 || evs.Items[0].Reason != "ContainerSubprocessOOMKilled" {
+		t.Fatalf("events=%+v want one ContainerSubprocessOOMKilled", evs.Items)
+	}
+	if h.ContainerSubprocessOOM != 1 {
+		t.Fatalf("ContainerSubprocessOOM=%d want 1", h.ContainerSubprocessOOM)
+	}
 }
 
 // --- W13-CP3: projected SA token TTL guard ---

@@ -22,6 +22,26 @@
 //     apiserver answers ANY HTTP code, and re-confirm through the
 //     ordered gates (G1..G6) before restarting k0scontroller.
 //
+// This file is the orchestrator only — the checks live in
+// per-domain packages under controllerhygiene/:
+//
+//   - kine/      — kinepool.go (pool-spiral backstop), kine_ttl.go
+//     (module-22 TTL dead/rewedge tail), kine_storage.go (W10-CP2
+//     store health + WAL checkpoint)
+//   - apiserver/ — apiserverhub.go (module-22 sig13 wedge guard +
+//     dead-fallback), cp_freeze_heal.go (W8-CP3 KCM/scheduler freeze
+//   - W10-FIX1 workqueue stall + the APF queue-starvation probe)
+//   - etcd/      — etcdguard.go (embedded-etcd quota self-defence +
+//     W13-ST2 snapshot verifier)
+//   - pki/       — pki_cert_drift.go (W8-CP4 reload drift + W12-CP4a
+//     sa.pub fingerprint), kubeconfig_cert_expiry.go (W10-CP5)
+//   - oom/       — oomloop.go (memcg OOM-loop detector + shield)
+//   - feeder/    — the sd_notify watchdog feeder + G1..G6 remediate
+//   - cdeps/     — the shared dependency surface (Config/Seams, Deps,
+//     Check, the journal blindness tracker, the mTLS kube client,
+//     the textfile writer). The Config domain groups are split into
+//     cdeps/config_<domain>.go.
+//
 // Behaviour-equivalent differences from the shell versions
 // (documented, intentional):
 //   - Single 60s cycle merges the 5m module and the three 60s timers;
@@ -63,229 +83,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
-)
-
-// Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:
-// off = state + log only, dry-run = log "would ...", enforce = act.
-const (
-	ModeOff     = "off"
-	ModeDryRun  = "dry-run"
-	ModeEnforce = "enforce"
-)
-
-// Defaults mirror the shell scripts + the DaemonSet host mounts.
-const (
-	defaultInterval = 60 * time.Second // merged timer cadence
-	// Per-cycle hard bound (Config.CycleTimeout): Run drives Cycle
-	// synchronously inside the ticker loop, so without it one
-	// stalled child starves the restart-critical wedge/TTL checks
-	// for as long as the child hangs. Sized well above a normal
-	// cycle (seconds) plus the etcdguard budget.
-	defaultCycleTimeout = 15 * time.Minute
-	minUptimeSeconds    = 1200 // WD_REQUIRES: uptime
-	defaultStateDir     = "/host/var/lib/node-watchdog"
-	defaultLogFile      = "/host/var/log/node-watchdog.log"
-	defaultProcRoot     = "/proc" // hostPID:true makes pod /proc == host /proc
-	defaultUnitFile     = "/host/etc/systemd/system/k0scontroller.service"
-	defaultJournalUnit  = "k0scontroller"
-	defaultRestartUnit  = "k0scontroller.service"
-	defaultSelfEndpoint = "127.0.0.1:6443" // probe target, always loopback
-	defaultKubeconfig   = "/host/var/lib/k0s/pki/admin.conf"
-	defaultAdminCert    = "/host/var/lib/k0s/pki/admin.crt"
-	defaultAdminKey     = "/host/var/lib/k0s/pki/admin.key"
-	defaultAdminCA      = "/host/var/lib/k0s/pki/ca.crt"
-	defaultAPIPath      = "/api/v1/namespaces/default/services"
-	defaultQueryTimeout = 12 * time.Second // curl --max-time 12
-	defaultStaleMinErrs = 15
-	defaultGapMin       = int64(10000)
-	defaultGapCycles    = 2
-	defaultFrozenCycles = 2
-	defaultSoloCycles   = 8
-	defaultMinRestart   = 2 * time.Hour // SIG13_MIN_RESTART_S=7200
-
-	// kine TTL (module 22 tail)
-	defaultTTLMinRestart    = 30 * time.Minute // KINE_TTL_MIN_RESTART_S=1800
-	defaultTTLCtlRestart    = 2 * time.Hour    // KINE_TTL_CTL_RESTART_S=7200
-	defaultTTLRewedgeCycles = 2
-	defaultTTLMinProcAge    = 300 * time.Second
-
-	// kine pool (k0s-kine-pool-probe.sh)
-	defaultPoolMaxConns   = 72
-	defaultPoolCycles     = 3
-	defaultPoolMinRestart = 20 * time.Minute // KINE_POOL_MIN_RESTART_S=1200
-	defaultDBPortFallback = 6432             // pgbouncer chain default
-
-	// OOM loop (k0s-oomloop-probe.sh)
-	defaultOOMMinKills    = 3
-	defaultOOMWindow      = time.Hour
-	defaultCGroupEvents   = "/host/sys/fs/cgroup/system.slice/k0scontroller.service/memory.events"
-	defaultAPIServerAdj   = -800
-	defaultKineAdj        = 500
-	defaultJournalTimeout = 15 * time.Second
-	// defaultJournalUnreadableNeeded is the consecutive-failed-read
-	// budget for the journal-unreadable blindness latch (incident:
-	// broken journald on a cicd controller left every journal check
-	// silently seeing "0 hits").
-	defaultJournalUnreadableNeeded = 5
-
-	// systemd watchdog feeder (k0s-systemd-watchdog-feeder.sh) +
-	// remediation (k0scontroller-remediate.sh)
-	defaultFeedInterval    = 15 * time.Second // WDFEED_CHECK_INTERVAL
-	defaultFeedMaxFail     = 4                // WDFEED_MAX_FAIL
-	defaultFeedGraceFails  = 8                // WDFEED_STARTUP_GRACE_FAILS
-	defaultFeedProbeURL    = "https://127.0.0.1:6443/readyz"
-	defaultFeedProbeTO     = 5 * time.Second // curl --max-time 5
-	defaultFeederStateDir  = "/host/var/lib/k0s-systemd-watchdog"
-	defaultRemediateMinRst = 30 * time.Minute // WDREM_MIN_RESTART_INTERVAL=1800
-	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
-	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
-	// W13 Gap#2: on a single-controller topology every consecutive-
-	// failure streak gating a k0scontroller restart is doubled —
-	// a transient flap costs 30-45s of API downtime with no peer
-	// to serve the gap (production, cicd).
-	spofStreakMultiplier = 2
-
-	// defaultK0sDir is the shared k0s data dir — etcdguard probes
-	// under it and the PKI-drift default pairs derive from it.
-	defaultK0sDir = "/host/var/lib/k0s" // DaemonSet host mount
-	// defaultSuspectLogCadence is the re-reminder interval suspectLog
-	// applies to suspect/hold lines whose latch stays held: STATE-
-	// ENTER announces the transition and the raw line then repeats
-	// at most this often — the field-verified failure mode was
-	// kine-ttl-loop logging every 60s cycle for weeks on nonprod
-	// (1600+ lines), drowning the watchdog tail.
-	defaultSuspectLogCadence = time.Hour
-)
-
-// Check names — prometheus `check` label + log context.
-const (
-	checkHub      = "apiserver-hub"
-	checkKineTTL  = "kine-ttl"
-	checkKinePool = "kine-pool"
-	checkOOMLoop  = "oomloop"
-	checkFeeder   = "feeder"
-	// checkJournal is the pseudo-check label the journal-unreadable
-	// blindness accounting counts under — journald readability is a
-	// cross-cutting witness, not one of the gated checks.
-	checkJournal = "journal"
-)
-
-// State latch names — identical to the shell signal names (NPD +
-// prom_emit contract, node_watchdog_state{signal=...}); the values
-// come from the canonical hoststate latch registry.
-const (
-	stateCacheStale       = hoststate.LatchAPIServerCacheStale
-	stateCacheWedged      = hoststate.LatchAPIServerCacheWedged
-	stateKineUnreachable  = hoststate.LatchKineBackendUnreachable
-	stateKinePoolRunaway  = hoststate.LatchKinePoolRunaway
-	stateKineTTLDead      = hoststate.LatchKineTTLDead
-	stateKineTTLLoop      = hoststate.LatchKineTTLLoop
-	stateControllerOOMLop = hoststate.LatchK0sControllerOOMLoop
-	// stateJournalUnreadable latches while journal reads keep
-	// producing nothing although journal storage exists — every
-	// journal-grep check is blind until it clears (suspectLog's
-	// last-suspect- budget drops with the latch via stateExit).
-	stateJournalUnreadable = hoststate.LatchJournalUnreadable
-	// W8-CP3 latch: a KCM/scheduler component frozen while the peer
-	// apiserver stays healthy.
-	stateCPComponentFrozen = hoststate.LatchCPComponentFrozen
-	// W8-CP4 latch: an on-disk PKI cert newer than what the live
-	// socket presents — the daemon never reloaded the rotated cert.
-	statePKIReloadStale = hoststate.LatchCPCertReloadStale
-)
-
-// On-disk bookkeeping file names under WatchdogStateDir — same names
-// as the shell scripts so concurrent shell pieces share the budget.
-const (
-	fileRateRestart   = "last-sig13-restart" // shared restart budget
-	fileRateTTLKill   = "last-ttl-restart"
-	fileRatePoolKill  = "last-kinepool-kill"
-	fileCtrGap        = "consecutive-sig13-gap"
-	fileCtrFrozen     = "consecutive-sig13-frozen"
-	fileCtrPeerFrozen = "consecutive-sig13-peer-frozen"
-	fileCtrDead       = "consecutive-sig13-dead"
-	fileCtrPool       = "consecutive-kine-pool"
-	fileCtrTTLRewedge = "consecutive-ttl-rewedge"
-	fileLastRVC       = "last-rvc"
-	fileLastPRVC      = "last-prvc"
-	fileTTLWedgedPID  = "ttl-last-wedged-pid"
-	fileOOMSeen       = "oomloop-seen"
-	fileOOMKills      = "oomloop-kills"
-	fileOOMShielded   = "oomloop-shielded"
-	fileFeederLastRst = "last-restart" // under FeederStateDir
-	// W8-CP3 (KCM/scheduler freeze auto-heal) + W8-CP4 (PKI reload
-	// drift) bookkeeping.
-	fileRateCPRestart  = "last-cp-restart"
-	fileRatePKIRestart = "last-cp-cert-restart"
-	fileCtrCPFreeze    = "consecutive-cp-freeze"
-	fileCtrKCMQuiet    = "consecutive-kcm-quiet"
-	fileCtrPKIDriftPre = "consecutive-cp-cert-stale-"
-	// W8-CP3 defaults: 3 consecutive healthz failures, or a KCM that
-	// is leader yet carries zero queued work for >10m — while the
-	// peer apiserver still answers — restarts k0scontroller under a
-	// 2h budget.
-	defaultCPFreezeCycles     = 3
-	defaultCPFreezeQuietFor   = 10 * time.Minute
-	defaultCPFreezeMinRestart = 2 * time.Hour
-	// W8-CP4: an on-disk cert newer than the socket-presented cert
-	// for 2 consecutive cycles → restart the owning unit (1h budget).
-	defaultPKIDriftCycles     = 2
-	defaultPKIRestartInterval = time.Hour
-	// suspectLog dedupe budgets: hoststate.SuspectBudgetPrefix+<key>
-	// epoch files spent at most once per SuspectLogCadence — the
-	// same rateOK/last-* convention as the action budgets, applied
-	// to log noise (h.state.SuspectLog). Latch-named keys are
-	// dropped by stateExit so a latch re-entry logs a fresh first
-	// line; logKeyDeadFallbk keys the dead-fallback hold lines,
-	// which have no dedicated latch.
-	logKeyDeadFallbk = "dead-fallback"
-	clkTck           = 100.0 // getconf CLK_TCK on x86_64 Linux
-	tcpStateListen   = "0A"
-	pgAuthOK         = "RSNK"
-)
-
-// Regexes — 1:1 with the shell grep patterns.
-var (
-	// module 22 early-warning journal grep.
-	cacheErrRe = regexp.MustCompile(
-		`Cache consistency check error|required revision has been compacted|error while range on /registry`)
-	// kine TTL-dead journal grep (pkg/ttl/ttl.go workqueue ShutDown).
-	ttlErrRe = regexp.MustCompile(`TTL initial list failed|TTL event watch (failed|error)`)
-	// --endpoint=postgres://...:PORT/db on the kine cmdline (the
-	// sed 's/^--endpoint=.*:\([0-9][0-9]*\)\/[^/]*$/\1/p' of
-	// k0s-kine-pool-probe.sh, applied per argv entry).
-	endpointPortRe = regexp.MustCompile(`^--endpoint=.*:([0-9]+)/[^/]*$`)
-	// socket:[<inode>] fd symlink targets.
-	sockInodeRe = regexp.MustCompile(`^socket:\[([0-9]+)\]$`)
-	// `oom_kill <n>` row of cgroup v2 memory.events.
-	oomKillRe = regexp.MustCompile(`^oom_kill +([0-9]+)\s*$`)
-	// PEER_APISERVER="https://ip:6443" in the remediate peer file.
-	peerAPIServerRe = regexp.MustCompile(`(?m)^PEER_APISERVER=(.*)$`)
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/feeder"
 )
 
 // Hygiene runs the controller guards on one ticker plus the feeder
 // loop. It is the orchestrator only: everything the checks consume
 // (config, procfs view, mTLS client, state store, journal tracker,
 // rate mutex, metric vecs/gauges, cross-check shared state) lives
-// on the embedded *deps — see deps.go. The embed keeps the
-// pre-Check test contract compiling: h.cfg, h.state, h.journalReads,
-// h.cycles etc. promote through it.
+// on the embedded *cdeps.Deps — see cdeps/deps.go. The embed keeps
+// the test contract compiling: h.Cfg, h.State, h.JournalReads,
+// h.Cycles etc. promote through it.
 type Hygiene struct {
-	*deps
+	*cdeps.Deps
 
 	// feederOnce keeps the feeder single-flight: the agent
 	// supervisor re-invokes Run on the same ctx after a Cycle
@@ -294,25 +116,39 @@ type Hygiene struct {
 	// (routeGuardOnce parity, nethealth.go).
 	feederOnce sync.Once
 
+	// checks is the ordered check list initChecks fills — Check
+	// walks it for the domain test packages (cdepstest.Check is
+	// the typed path).
+	checks []cdeps.Check
+
 	// groups is the ordered per-Cycle dispatch table — initChecks
 	// fills it; the ungated-then-uptime-gated grouping preserves
 	// the shell timer/module split (only module 22 carried
 	// WD_REQUIRES:uptime).
 	groups []checks.Group
 
-	// The checks are also named fields so tests and the old-shape
-	// forwarders can reach them (workerhygiene parity). The
-	// dispatch-table order — not field order — is load-bearing.
-	kinePool    *kinePoolCheck
-	oomLoop     *oomLoopCheck
-	etcd        *etcdGuardCheck
-	cpFreeze    *cpFreezeCheck
-	pkiDrift    *pkiDriftCheck
-	hub         *apiserverHubCheck
-	kineTTL     *kineTTLCheck
-	kineStorage *kineStorageCheck
-	kubeCert    *kubeCertCheck
+	// feeder is the sd_notify watchdog feeder — not a Check (it
+	// runs on its own faster ticker Spawned from Run, outside the
+	// dispatch list) but owned here so tests reach it through
+	// Feeder().
+	feeder *feeder.Feeder
 }
+
+// The subsystem-convention export surface cmd/agent wires against:
+// Config and EnvDeps alias the canonical cdeps types so
+// controllerhygiene.Config IS cdeps.Config (no drift possible), and
+// ConfigFromEnv forwards to the env resolution that lives in cdeps
+// beside the defaults it fills. The name stays here because the
+// subsystem convention puts it next to New.
+type (
+	Config  = cdeps.Config
+	EnvDeps = cdeps.EnvDeps
+)
+
+// ConfigFromEnv resolves every NODE_HOST_AGENT_* knob controllerhygiene
+// reads — implementation lives in cdeps (it owns the Config
+// defaults).
+func ConfigFromEnv(d EnvDeps) Config { return cdeps.ConfigFromEnv(d) }
 
 // ShouldRun reports whether hostRoot looks like a k0s controller
 // host: the k0scontroller systemd unit file exists. hostRoot="" → "/"
@@ -328,106 +164,112 @@ func ShouldRun(hostRoot string) bool {
 
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
-	cfg.applyDefaults()
-	d := &deps{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
-	// The Now closure must read d.cfg.nowFn at call time — tests
-	// re-stub the clock after New() and the store has to observe it
+	cfg.ApplyDefaults()
+	d := &cdeps.Deps{Cfg: cfg, Proc: procfs.New(cfg.ProcRoot)}
+	// The store binds the shared timex.Cell — a post-New
+	// cfg.Clock.Set is observed by it
 	// (hoststate.Store.Now contract).
-	d.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return d.cfg.nowFn() }, logger)
-	d.journalReads = journalwatch.Tracker{
-		Needed: cfg.JournalUnreadableNeeded,
-		Dirs:   cfg.JournalDirs,
-		// The streak survives an agent restart: consecutive-
-		// journal-unreadable in the state dir is the restart witness,
-		// LatchedSeed re-reads the latch file so a restart while
-		// latched resumes latched. The counter name is shared with
-		// workerhygiene ON PURPOSE — both own the same
-		// state-journal-unreadable latch file, so the streak that
-		// arms it is shared too (either subsystem's failed reads
-		// count toward the one episode).
-		Counter:     d.state,
-		CounterName: "consecutive-journal-unreadable",
-		LatchedSeed: func() bool { return d.state.Exists(stateJournalUnreadable) },
-	}
+	d.State = cfg.Store(logger)
+	// Shared-streak contract lives in journalwatch.NewUnreadableTracker:
+	// both hygienes bump the SAME consecutive-journal-unreadable file
+	// and seed from the same state-journal-unreadable latch — a
+	// failed read on either subsystem counts toward the one episode.
+	d.JournalReads = journalwatch.NewUnreadableTracker(
+		d.State, cfg.JournalDirs, cfg.JournalUnreadableNeeded)
 	if cfg.HTTPClient != nil {
-		d.client = cfg.HTTPClient
+		d.Client = cfg.HTTPClient
 	}
 
-	d.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_controllerhygiene_cycles_total",
-		Help: "Controller-hygiene cycles by check and result (ok|abort|gated).",
-	}, []string{"check", "result"})
-	d.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_controllerhygiene_actions_total",
-		Help: "Remediation actions by check and action " +
-			"(restart_controller|dryrun|kill_kine|shield|unshield|remediate).",
-	}, []string{"check", "action"})
-	d.rvGap = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.Cycles, d.Actions = subframe.Counters("controllerhygiene",
+		"Controller-hygiene cycles by check and result (ok|abort|gated).",
+		"Remediation actions by check and action "+
+			"(restart_controller|dryrun|kill_kine|shield|unshield|remediate).")
+	d.RVGap = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_rv_gap",
 		Help: "Last observed rv_now - rv_cache on the local apiserver.",
 	})
-	d.kineConns = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.KineConns = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_kine_db_conns",
 		Help: "Kine process TCP connections to the datastore port.",
 	})
-	d.oomWindow = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.OOMWindow = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_oom_kills_window",
 		Help: "memcg OOM kills inside the sliding window.",
 	})
-	d.feeding = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.Feeding = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_feeder_feeding",
 		Help: "1 while the feeder sends WATCHDOG=1 to systemd.",
 	})
-	d.etcdDBSize = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.EtcdDBSize = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_db_size_bytes",
 		Help: "Embedded-etcd DB file size from the last etcdctl " +
 			"endpoint status probe (embedded-etcd controllers only).",
 	})
-	d.etcdDBUse = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.EtcdDBUse = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_db_in_use_bytes",
 		Help: "Embedded-etcd DB size in use from the last etcdctl " +
 			"endpoint status probe (embedded-etcd controllers only).",
 	})
-	d.etcdNospace = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.EtcdNospace = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_nospace_alarm",
 		Help: "1 while the embedded etcd carries a NOSPACE alarm " +
 			"(embedded-etcd controllers only).",
 	})
-	d.terminatedWatchers = prometheus.NewGauge(prometheus.GaugeOpts{
+	// CounterFunc parity with the textfile's TYPE counter — the
+	// mirrored apiserver series is monotonic, and the registry must
+	// report the same type as the node-agent-apiserver-apf.prom
+	// file or the two expositions of this name disagree.
+	d.TerminatedWatchers = prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name: "node_host_agent_apiserver_terminated_watchers",
 		Help: "apiserver_terminated_watchers_total mirrored from the " +
 			"local apiserver — 410-Gone relist storm signal (W13-CP1).",
+	}, func() float64 {
+		return math.Float64frombits(d.TerminatedWatchersVal.Load())
 	})
-	d.etcdSnapAge = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.EtcdSnapAge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_snapshot_age_seconds",
 		Help: "Age of the newest etcd snapshot under the snapshot " +
 			"dirs (embedded-etcd controllers only, W13-ST2).",
 	})
 
-	h := &Hygiene{deps: d}
-	if reg != nil {
-		for _, c := range []prometheus.Collector{
-			d.cycles, d.actions, d.rvGap, d.kineConns, d.oomWindow, d.feeding,
-			d.etcdDBSize, d.etcdDBUse, d.etcdNospace,
-			d.terminatedWatchers, d.etcdSnapAge,
-		} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
-			}
-		}
+	h := &Hygiene{Deps: d}
+	if err := subframe.RegisterAll(reg,
+		d.Cycles, d.Actions, d.RVGap, d.KineConns, d.OOMWindow, d.Feeding,
+		d.EtcdDBSize, d.EtcdDBUse, d.EtcdNospace,
+		d.TerminatedWatchers, d.EtcdSnapAge); err != nil {
+		return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
 	}
 	h.initChecks()
+	h.feeder = feeder.New(d)
 	return h, nil
 }
 
 // Name identifies the subsystem for logging.
 func (h *Hygiene) Name() string { return "controllerhygiene" }
 
+// Check returns the registered check with the given cdeps.Check*
+// name, or nil. This is the exported path to check state — the
+// domain test packages (package X_test beside the check) reach
+// their check's streak/latch bookkeeping through it via
+// cdepstest.Check.
+func (h *Hygiene) Check(name string) cdeps.Check {
+	for _, c := range h.checks {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// Feeder returns the sd_notify watchdog feeder — the exported path
+// to it for the domain test packages (feeder_test drives Run and
+// RunRemediate directly).
+func (h *Hygiene) Feeder() *feeder.Feeder { return h.feeder }
+
 // feederActive reports whether the sd_notify feeder loop should run:
 // enabled AND a notify path exists (injected seam or NOTIFY_SOCKET).
 func (h *Hygiene) feederActive() bool {
-	return h.cfg.Feeder.Enabled && h.cfg.notifyFn != nil
+	return h.Cfg.Feeder.Enabled && h.Cfg.NotifyFn != nil
 }
 
 // Run starts the feeder goroutine (when active), checks immediately,
@@ -455,16 +297,16 @@ func (h *Hygiene) Run(ctx context.Context) {
 					// spawned).
 					defer func() {
 						if r := recover(); r != nil {
-							h.state.AppendLogWarn(fmt.Sprintf(
+							h.State.AppendLogWarn(fmt.Sprintf(
 								"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
 							panic(r)
 						}
 					}()
-					h.runFeeder(fctx)
+					h.feeder.Run(fctx)
 				})
 		})
 	}
-	cycle.Every("controllerhygiene", h.cfg.Interval, h.runCycle).Run(ctx)
+	cycle.Every("controllerhygiene", h.Cfg.Interval, h.runCycle).Run(ctx)
 }
 
 // runCycle executes one Cycle under the per-cycle deadline
@@ -477,13 +319,13 @@ func (h *Hygiene) Run(ctx context.Context) {
 // the deadline is a degraded cycle, not a failure — it is logged
 // so a silently-starved guard shows up in the watchdog tail.
 func (h *Hygiene) runCycle(ctx context.Context) {
-	cctx, cancel := context.WithTimeout(ctx, h.cfg.CycleTimeout)
+	cctx, cancel := context.WithTimeout(ctx, h.Cfg.CycleTimeout)
 	defer cancel()
 	h.Cycle(cctx)
 	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-		h.state.AppendLogWarn(fmt.Sprintf(
+		h.State.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: cycle deadline %s exceeded — "+
-				"stalled check(s) aborted", h.cfg.CycleTimeout))
+				"stalled check(s) aborted", h.Cfg.CycleTimeout))
 	}
 }
 
@@ -491,8 +333,8 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 // /proc read error opens it (the shell's numeric test on an empty
 // UPTIME failed open the same way: the module ran).
 func (h *Hygiene) uptimeOK() bool {
-	up, err := h.proc.UptimeSeconds()
-	return err != nil || up >= minUptimeSeconds
+	up, err := h.Proc.UptimeSeconds()
+	return err != nil || up >= cdeps.MinUptimeSeconds
 }
 
 // Cycle runs one round of every check in the declared dispatch
@@ -505,193 +347,40 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// mtime, which the atomic rename refreshes each cycle).
 	// Deferred so even a gated/aborted cycle proves the loop is
 	// alive; Store.StampLastRun no-ops on an empty state dir.
-	defer h.state.StampLastRun()
-	if _, err := os.Stat(h.cfg.K0sControllerUnitFile); err != nil {
-		h.cycles.WithLabelValues("all", "gated").Inc()
+	defer h.State.StampLastRun()
+	if _, err := os.Stat(h.Cfg.K0sControllerUnitFile); err != nil {
+		h.Cycles.WithLabelValues("all", "gated").Inc()
 		return
 	}
-	_ = os.MkdirAll(h.cfg.WatchdogStateDir, 0o755)
+	_ = os.MkdirAll(h.Cfg.WatchdogStateDir, 0o755)
 	// BUG-H9: hostconfig rewrites /etc/node-watchdog.conf mid-run —
 	// refresh the conf-derived knobs before the checks consume them.
-	h.refreshWatchdogConf()
-	checks.Dispatch(ctx, nil, h.cycles, h.groups)
-}
-
-// refreshWatchdogConf re-applies the watchdogconf-derived knobs each
-// cycle when WatchdogSrc is wired (BUG-H9 — nethealth's per-cycle
-// WatchdogSrc.Get parity). The conf is one of several config sources:
-// an env-set or programmatic knob must survive a conf rewrite, so a
-// field only moves when it still carries the value the PREVIOUS conf
-// parse produced (wdApplied). Empty conf keys derive to the package
-// default — the same ${VAR:-def} fallback main's envOr chain applied
-// at construction.
-func (h *Hygiene) refreshWatchdogConf() {
-	if h.cfg.WatchdogSrc == nil {
-		return
-	}
-	wd := h.cfg.WatchdogSrc.Get()
-	if wd == nil || wd == h.wdApplied {
-		return
-	}
-	old := h.wdApplied
-	if old == nil {
-		old, _ = watchdogconf.Parse(nil)
-	}
-	// Each knob only moves when it still carries the previous
-	// conf-derived value — a knob set from elsewhere (env wiring)
-	// keeps its override.
-	apply := func(prev, next string, set func(string), cur func() string) {
-		if cur() == prev {
-			set(next)
-		}
-	}
-	// Strings.
-	apply(old.APISelf, wd.APISelf, func(v string) { h.cfg.Hub.SelfAPI = v },
-		func() string { return h.cfg.Hub.SelfAPI })
-	apply(old.APIPeer, wd.APIPeer, func(v string) { h.cfg.Hub.PeerAPI = v },
-		func() string { return h.cfg.Hub.PeerAPI })
-	apply(old.KineDBProbe, wd.KineDBProbe, func(v string) { h.cfg.Hub.KineDBProbe = v },
-		func() string { return h.cfg.Hub.KineDBProbe })
-	apply(old.Sig13Autofix, wd.Sig13Autofix, func(v string) {
-		if v != "" {
-			h.cfg.Sig13.Mode = v
-		}
-	}, func() string { return h.cfg.Sig13.Mode })
-	apply(old.KineTTLAutofix, wd.KineTTLAutofix, func(v string) {
-		if v != "" {
-			h.cfg.KineTTL.Mode = v
-		}
-	}, func() string { return h.cfg.KineTTL.Mode })
-	apply(old.KinePoolAutofix, wd.KinePoolAutofix, func(v string) {
-		if v != "" {
-			h.cfg.KinePool.Mode = v
-		}
-	}, func() string { return h.cfg.KinePool.Mode })
-	apply(old.OOMLoopAutofix, wd.OOMLoopAutofix, func(v string) {
-		if v != "" {
-			h.cfg.OOMLoop.Mode = v
-		}
-	}, func() string { return h.cfg.OOMLoop.Mode })
-	// Ints — conf 0 derives to the package default.
-	intOf := func(v, def int) int {
-		if v > 0 {
-			return v
-		}
-		return def
-	}
-	applyI := func(prevV, nextV int, set func(int), cur func() int) {
-		if cur() == prevV {
-			set(nextV)
-		}
-	}
-	applyI(intOf(old.Sig13StaleMinErrs, defaultStaleMinErrs),
-		intOf(wd.Sig13StaleMinErrs, defaultStaleMinErrs),
-		func(v int) { h.cfg.Sig13.StaleMinErrs = v },
-		func() int { return h.cfg.Sig13.StaleMinErrs })
-	applyI(intOf(old.Sig13SoloCycles, defaultSoloCycles),
-		intOf(wd.Sig13SoloCycles, defaultSoloCycles),
-		func(v int) { h.cfg.Sig13.SoloCycles = v },
-		func() int { return h.cfg.Sig13.SoloCycles })
-	applyI(intOf(old.Sig13GapCycles, defaultGapCycles),
-		intOf(wd.Sig13GapCycles, defaultGapCycles),
-		func(v int) { h.cfg.Sig13.GapCycles = v },
-		func() int { return h.cfg.Sig13.GapCycles })
-	applyI(intOf(old.Sig13FrozenCycles, defaultFrozenCycles),
-		intOf(wd.Sig13FrozenCycles, defaultFrozenCycles),
-		func(v int) { h.cfg.Sig13.FrozenCycles = v },
-		func() int { return h.cfg.Sig13.FrozenCycles })
-	applyI(intOf(old.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
-		intOf(wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
-		func(v int) { h.cfg.KineTTL.RewedgeCycles = v },
-		func() int { return h.cfg.KineTTL.RewedgeCycles })
-	applyI(intOf(old.KinePoolMaxConns, defaultPoolMaxConns),
-		intOf(wd.KinePoolMaxConns, defaultPoolMaxConns),
-		func(v int) { h.cfg.KinePool.MaxConns = v },
-		func() int { return h.cfg.KinePool.MaxConns })
-	applyI(intOf(old.KinePoolCycles, defaultPoolCycles),
-		intOf(wd.KinePoolCycles, defaultPoolCycles),
-		func(v int) { h.cfg.KinePool.Cycles = v },
-		func() int { return h.cfg.KinePool.Cycles })
-	applyI(intOf(old.OOMLoopMinKills, defaultOOMMinKills),
-		intOf(wd.OOMLoopMinKills, defaultOOMMinKills),
-		func(v int) { h.cfg.OOMLoop.MinKills = v },
-		func() int { return h.cfg.OOMLoop.MinKills })
-	// int64.
-	apply64 := func(prevV, nextV int64, set func(int64), cur func() int64) {
-		if cur() == prevV {
-			set(nextV)
-		}
-	}
-	i64 := func(v int64, def int64) int64 {
-		if v > 0 {
-			return v
-		}
-		return def
-	}
-	apply64(i64(old.Sig13GapMin, defaultGapMin),
-		i64(wd.Sig13GapMin, defaultGapMin),
-		func(v int64) { h.cfg.Sig13.GapMin = v },
-		func() int64 { return h.cfg.Sig13.GapMin })
-	// Durations — conf seconds 0 derives to the package default.
-	dur := func(v int, def time.Duration) time.Duration {
-		if v > 0 {
-			return time.Duration(v) * time.Second
-		}
-		return def
-	}
-	applyD := func(prevV, nextV time.Duration, set func(time.Duration), cur func() time.Duration) {
-		if cur() == prevV {
-			set(nextV)
-		}
-	}
-	applyD(dur(old.Sig13MinRestartS, defaultMinRestart),
-		dur(wd.Sig13MinRestartS, defaultMinRestart),
-		func(v time.Duration) { h.cfg.Sig13.MinRestart = v },
-		func() time.Duration { return h.cfg.Sig13.MinRestart })
-	applyD(dur(old.KineTTLMinRestartS, defaultTTLMinRestart),
-		dur(wd.KineTTLMinRestartS, defaultTTLMinRestart),
-		func(v time.Duration) { h.cfg.KineTTL.MinRestart = v },
-		func() time.Duration { return h.cfg.KineTTL.MinRestart })
-	applyD(dur(old.KineTTLCtlRestartS, defaultTTLCtlRestart),
-		dur(wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
-		func(v time.Duration) { h.cfg.KineTTL.CtlRestart = v },
-		func() time.Duration { return h.cfg.KineTTL.CtlRestart })
-	applyD(dur(old.KinePoolMinRestartS, defaultPoolMinRestart),
-		dur(wd.KinePoolMinRestartS, defaultPoolMinRestart),
-		func(v time.Duration) { h.cfg.KinePool.MinRestart = v },
-		func() time.Duration { return h.cfg.KinePool.MinRestart })
-	applyD(dur(old.OOMLoopWindowS, defaultOOMWindow),
-		dur(wd.OOMLoopWindowS, defaultOOMWindow),
-		func(v time.Duration) { h.cfg.OOMLoop.Window = v },
-		func() time.Duration { return h.cfg.OOMLoop.Window })
-	h.wdApplied = wd
+	h.RefreshWatchdogConf()
+	checks.Dispatch(ctx, nil, h.Cycles, h.groups)
 }
 
 // --- /proc helpers ---
-// The /proc reads live in platform/procfs (h.proc): pid-dir
+// The /proc reads live in platform/procfs (h.Proc): pid-dir
 // listing, cmdline/comm reads, stat parsing (pid age, PPID) and
 // the pgrep -x | head -1 lowest-pid comm lookup.
 
-// --- satellite files ---
-// config.go     : the Config surface — the flat wiring knobs, the
-//                 per-domain sub-config groups (Hub/Sig13/KineTTL/
-//                 KinePool/OOMLoop/Feeder/EtcdGuard/CPFreeze/
-//                 PKIDrift) and applyDefaults (package defaults +
-//                 the injectable seam defaults)
-// state.go      : the on-disk bookkeeping helpers Store does not
-//                 cover — stateExit's suspect-budget drop and the
-//                 raw-text readState/writeState for non-epoch files
-// journal.go    : journalText + the journal-unreadable blindness
-//                 accounting (classifyJournalRead/noteJournalRead)
-// exec.go       : the host-exec/env plumbing — scrubSystemdEnv,
-//                 scrubArgv, hostExecCtx (the nil-tolerant
-//                 systemd.Client wrapper every host command's seam
-//                 default routes through), sdNotify
-// probes.go     : pgWireOK (the HTTP probes moved to platform/probee)
-// kubeclient.go : apiserver credential loading + the rv LIST probe
-//                 (ensureClient/buildClient/loadCreds/resolveRel/
-//                 credFingerprint/listRV)
-// etcdguard.go  : embedded-etcd quota self-defence (checkEtcdQuota,
-//                 etcdStatus, etcdNospaceArmed, guardLogWriter)
+// --- satellite packages ---
+// cdeps/config*.go : the Config surface — the flat wiring knobs,
+//                    the per-domain sub-config groups and
+//                    ApplyDefaults
+// cdeps/seams.go   : the injectable seam funcs (Probe/Host/Etcd)
+// cdeps/env.go     : EnvDeps + ConfigFromEnv
+// cdeps/state.go   : the on-disk bookkeeping helpers Store does not
+//                    cover — StateExit's suspect-budget drop and the
+//                    raw-text ReadState/WriteState for non-epoch files
+// cdeps/journal.go : JournalText + the journal-unreadable blindness
+//                    accounting
+// cdeps/exec.go    : the host-exec/env plumbing — ScrubSystemdEnv,
+//                    scrubArgv, hostExecCtx, sdNotify
+// cdeps/probes.go  : PGWireOK + the TLSCertFn default dial
+// cdeps/kubeclient.go : apiserver credential loading + the rv LIST
+//                    probe (EnsureClient/ResolveRel/ListRV)
+// cdeps/textfile.go   : the node-exporter textfile writer
+// cdeps/refresh.go    : the BUG-H9 per-cycle watchdogconf re-apply
 // All external interactions stay behind the Config seams — only the
 // default implementations moved.

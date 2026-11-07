@@ -170,6 +170,28 @@ func TestStr(t *testing.T) {
 	}
 }
 
+// IsSet is pure presence: unset and set-but-empty both report false —
+// only a non-empty value means the env layer spoke. Whitespace counts
+// as set; trimming is the consumer's business (List's, specifically).
+func TestIsSet(t *testing.T) {
+	const key = "ENVX_TEST_ISSET"
+	if IsSet(key) {
+		t.Fatal("unset: got true want false")
+	}
+	t.Setenv(key, "")
+	if IsSet(key) {
+		t.Fatal("empty: got true want false")
+	}
+	t.Setenv(key, "v")
+	if !IsSet(key) {
+		t.Fatal("set: got false want true")
+	}
+	t.Setenv(key, " ")
+	if !IsSet(key) {
+		t.Fatal("whitespace: got false want true")
+	}
+}
+
 func TestIntOr(t *testing.T) {
 	const key = "ENVX_TEST_INT_OR"
 	cases := []struct {

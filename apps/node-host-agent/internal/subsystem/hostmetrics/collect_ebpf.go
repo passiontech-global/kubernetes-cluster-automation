@@ -66,11 +66,18 @@ func scanBPFIDLines(data []byte, progs, maps map[uint64]bool) {
 	}
 }
 
+// ebpfFDTarget is the /proc/<pid>/fd/<fd> symlink-target prefix the
+// kernel gives a bpf object fd (anon_inode:bpf-prog / bpf-map /
+// bpf-link) — the cheap pre-filter that keeps the sweep from
+// opening every fdinfo file on the host (inotify sweep parity).
+const ebpfFDTarget = "anon_inode:bpf-"
+
 // sweepEBPF counts unique eBPF prog/map ids: every prog_id:/map_id:
-// line across /proc/<pid>/fdinfo/*, plus pinned objects under
-// BpffsDir — a pinned object no process fd references (the leak
-// signature) resolves by OPENING it and reading the fresh fd's own
-// fdinfo. scanned=false when neither source read.
+// line in the fdinfo of fds whose /proc/<pid>/fd link target names
+// a bpf object, plus pinned objects under BpffsDir — a pinned
+// object no process fd references (the leak signature) resolves by
+// OPENING it and reading the fresh fd's own fdinfo. scanned=false
+// when neither source read.
 func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, scanned bool) {
 	progs, maps = map[uint64]bool{}, map[uint64]bool{}
 	if pids, err := os.ReadDir(c.cfg.ProcRoot); err == nil {
@@ -80,11 +87,18 @@ func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, scanned bool) {
 				continue
 			}
 			fds, err := os.ReadDir(filepath.Join(c.cfg.ProcRoot,
-				p.Name(), "fdinfo"))
+				p.Name(), "fd"))
 			if err != nil {
 				continue
 			}
 			for _, fd := range fds {
+				// Readlink is one cheap syscall per fd — only
+				// bpf-object fds earn the fdinfo open+read.
+				target, err := os.Readlink(filepath.Join(
+					c.cfg.ProcRoot, p.Name(), "fd", fd.Name()))
+				if err != nil || !strings.Contains(target, ebpfFDTarget) {
+					continue
+				}
 				data, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot,
 					p.Name(), "fdinfo", fd.Name()))
 				if err != nil {
@@ -131,7 +145,7 @@ func (c *Collector) selfFdinfoDir() string {
 // EBPFScanInterval.
 func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
 	c.ebpf.mu.Lock()
-	if c.cfg.nowFn().Sub(c.ebpf.at) < c.cfg.EBPFScanInterval && c.ebpf.scanned {
+	if c.cfg.Clock.Now().Sub(c.ebpf.at) < c.cfg.EBPFScanInterval && c.ebpf.scanned {
 		p, m, s := c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned
 		c.ebpf.mu.Unlock()
 		return p, m, s
@@ -142,7 +156,7 @@ func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
 	// store wins, harmless for a cache (inotifySnapshot parity).
 	ps, ms, ok := c.sweepEBPF()
 	c.ebpf.mu.Lock()
-	c.ebpf.at = c.cfg.nowFn()
+	c.ebpf.at = c.cfg.Clock.Now()
 	c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned = len(ps), len(ms), ok
 	c.ebpf.mu.Unlock()
 	return len(ps), len(ms), ok

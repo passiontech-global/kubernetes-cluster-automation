@@ -13,13 +13,10 @@ import (
 
 func TestNLDRefusePathSkipsWrite(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{
-		res: map[string]string{
-			"systemctl show systemd-resolved.service": "active",
-			"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
-		},
-		errs: map[string]bool{},
-	}
+	sr := newScripted(map[string]string{
+		"systemctl show systemd-resolved.service": "active",
+		"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -32,14 +29,14 @@ func TestNLDRefusePathSkipsWrite(t *testing.T) {
 	if hostExists(r, "/etc/systemd/resolved.conf.d/99-nodelocal-stub.conf") {
 		t.Fatal("stub-off drop-in written on the refuse path — DNS blackout risk")
 	}
-	if len(sr.callsMatching("systemctl restart systemd-resolved.service")) > 0 {
+	if len(sr.CallsMatching("systemctl restart systemd-resolved.service")) > 0 {
 		t.Fatal("systemd-resolved restarted on the refuse path")
 	}
 	// the nft guard still converges (independent concern)
 	if !hostExists(r, "/etc/nodelocaldns-guard.nft") {
 		t.Fatal("nodelocaldns guard nft not deployed")
 	}
-	if len(sr.callsMatching("nft -c -f /etc/nodelocaldns-guard.nft")) == 0 {
+	if len(sr.CallsMatching("nft -c -f /etc/nodelocaldns-guard.nft")) == 0 {
 		t.Fatal("guard ruleset not validated against the real file")
 	}
 }
@@ -48,10 +45,10 @@ func TestNLDRefusePathSkipsWrite(t *testing.T) {
 // at a temp name and renames over; no gap window and no leftover tmp.
 func TestResolvConfAtomicRepoint(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"systemctl show systemd-resolved.service": "active",
 		"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

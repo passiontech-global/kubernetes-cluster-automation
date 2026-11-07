@@ -5,6 +5,9 @@
 //     (fail closed), UID-preconditioned delete — and the
 //     "selfheal/<check>/<target>" ledger key it stamps. Thin wrapper
 //     over the platform heal package this file was the reference for.
+//   - HealAllowed: the shared heal preamble every check's heal gate
+//     runs — per-target cooldown + maintenance mutex + heal budget,
+//     memoized on the Deps-wide verdict.
 //   - RequireDyn: the "no dynamic client" preamble every CR-scanning
 //     check opens with.
 //   - PodUnreadySince / PodFromList: pod readiness helpers.
@@ -33,6 +36,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -110,6 +114,20 @@ func (d *Deps) RequireDyn(what string) *Result {
 		"no dynamic client — %s unverifiable", what)}
 }
 
+// HealAllowed is the shared preamble every check's heal gate runs
+// before picking its target: the per-target cooldown on heals (a nil
+// ledger skips it, matching heal.AllowedV's nil-heals contract),
+// then the maintenance mutex plus the global heal budget — one
+// maintenance-mutex evaluation per Verdict TTL across ALL checks in
+// the sweep (the memo lives on Deps.verdict), instead of three API
+// reads per target per check.
+func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	now time.Time) (proceed, unverifiable bool) {
+	return heal.AllowedV(ctx, log, &d.verdict, d.CS, d.Dyn,
+		heals, key, cooldown, now)
+}
+
 // DeletePodHeal is the pod-delete heal shape the self-healing checks
 // share — this body was the reference internal/platform/heal was
 // extracted from, so it now delegates: heal.AllowedV runs the
@@ -123,8 +141,8 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	cooldown time.Duration, now time.Time) {
 
 	key := SelfHealKey(checkName, targetKey)
-	proceed, unverifiable := heal.AllowedV(ctx, log, &d.verdict,
-		d.CS, d.Dyn, &d.Heals, key, cooldown, now)
+	proceed, unverifiable := d.HealAllowed(ctx, log,
+		&d.Heals, key, cooldown, now)
 	if unverifiable {
 		metrics.IncError(d.Name)
 		return

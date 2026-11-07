@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -53,6 +54,16 @@ const (
 	// Deployment/StatefulSet for every scale-up/scale-down, whoever
 	// drove it (GitOps apply, downscaler, HPA, KEDA, kubectl).
 	scaleFlapReason = "ScalingReplicaSet"
+	// stsFlapCreateReason / stsFlapDeleteReason are the StatefulSet
+	// controller's pod create/delete event reasons — the STS scale
+	// surface. StatefulSets never emit ScalingReplicaSet (that
+	// reason belongs to the Deployment→ReplicaSet path): their
+	// scale-up/down appears as SuccessfulCreate/SuccessfulDelete
+	// with messages "create Pod X in StatefulSet Y successful" /
+	// "delete Pod X in StatefulSet Y successful" and the
+	// StatefulSet as the involved object.
+	stsFlapCreateReason = "SuccessfulCreate"
+	stsFlapDeleteReason = "SuccessfulDelete"
 	// scaleFlapWindow bounds the event history the flap counter
 	// reads — events older than this cannot be evidence of a live
 	// tug-of-war (event TTLs are short anyway).
@@ -89,41 +100,61 @@ type flapKey struct {
 	ns, kind, name string
 }
 
-// Run scans corev1 Events with reason=ScalingReplicaSet over the
-// last hour — the server-side reason field selector does the first
-// cut and the in-code re-check keeps the count honest under clients
-// that accept the selector silently (and under the fake clientset).
-// Per involvedObject the events sort by their freshest timestamp
-// (kube.EventTime's LAST-observed convention); each transition from
-// "Scaled up" to "Scaled down" or back counts one flip, and >=6
-// flips in the window emits the gauge + FAILs the check.
+// Run scans corev1 Events carrying scale actions over the last hour
+// — Deployments flap on reason=ScalingReplicaSet, StatefulSets on
+// SuccessfulCreate/SuccessfulDelete (their controller never emits
+// ScalingReplicaSet). The server-side reason field selector does the
+// first cut per reason and the in-code re-check keeps the count
+// honest under clients that accept the selector silently (and under
+// the fake clientset). Per involvedObject the events sort by their
+// freshest timestamp (kube.EventTime's LAST-observed convention);
+// each transition from "Scaled up" to "Scaled down" — or create to
+// delete — counts one flip, and >=6 flips in the window emits the
+// gauge + FAILs the check.
 func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	events, err := kube.ListAll(ctx, metav1.ListOptions{
-		FieldSelector: "reason=" + scaleFlapReason,
-		Limit:         probefw.HealthListPageSize,
-	}, kube.Events(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list scaling events: %w", err)}
+	var events []corev1.Event
+	for _, reason := range []string{
+		scaleFlapReason, stsFlapCreateReason, stsFlapDeleteReason} {
+		evs, err := kube.ListAll(ctx, metav1.ListOptions{
+			FieldSelector: "reason=" + reason,
+			Limit:         probefw.HealthListPageSize,
+		}, kube.Events(p.CS, metav1.NamespaceAll))
+		if err != nil {
+			return probefw.Result{Infra: fmt.Errorf("list scaling events: %w", err)}
+		}
+		events = append(events, evs...)
 	}
 
 	perWorkload := map[flapKey][]scaleFlapEvent{}
 	for i := range events {
 		e := &events[i]
-		if e.Reason != scaleFlapReason {
-			continue // selector re-check — belt-and-braces
-		}
 		t := kube.EventTime(e)
 		if t.IsZero() || now.Sub(t) > scaleFlapWindow {
 			continue
 		}
-		// The controller's message is "Scaled up replica set X to N"
-		// / "Scaled down replica set X to N" — direction lives in the
-		// verb; anything else under this reason is not a direction
-		// signal.
-		up, down := strings.Contains(e.Message, "Scaled up"),
-			strings.Contains(e.Message, "Scaled down")
+		// Direction lives in the verb on both event surfaces: the
+		// Deployment path's message is "Scaled up replica set X to N"
+		// / "Scaled down replica set X to N"; the StatefulSet
+		// path's is "create Pod X in StatefulSet Y successful" /
+		// "delete Pod X in StatefulSet Y successful" — create is a
+		// scale-UP signal, delete a scale-DOWN one. The StatefulSet
+		// reasons additionally key on kind+message so a Job's
+		// SuccessfulCreate ("Created pod: ...") can never count.
+		var up, down bool
+		switch e.Reason {
+		case scaleFlapReason:
+			up = strings.Contains(e.Message, "Scaled up")
+			down = strings.Contains(e.Message, "Scaled down")
+		case stsFlapCreateReason, stsFlapDeleteReason:
+			if e.InvolvedObject.Kind != "StatefulSet" ||
+				!strings.Contains(e.Message, "in StatefulSet ") {
+				continue
+			}
+			up = e.Reason == stsFlapCreateReason
+			down = e.Reason == stsFlapDeleteReason
+		}
 		if !up && !down {
 			continue
 		}

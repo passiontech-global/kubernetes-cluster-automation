@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -54,9 +53,9 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -125,36 +124,23 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	}
 	cfg.ApplyDefaults()
 	d := &wdeps.Deps{Cfg: cfg, Proc: procfs.New(cfg.ProcRoot)}
-	// Now MUST close over the live config field, not the cfg
-	// parameter: tests re-stub h.Cfg.Seams.Host.NowFn after New returns and
-	// the store has to observe the new clock (hoststate.New doc).
-	d.State = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return d.Cfg.Seams.Host.NowFn() }, logger)
-	d.JournalReads = journalwatch.Tracker{
-		Needed: cfg.Journal.UnreadableNeeded,
-		Dirs:   cfg.Journal.Dirs,
-		// The streak survives an agent restart: consecutive-
-		// journal-unreadable in the state dir is the restart witness,
-		// LatchedSeed re-reads the latch file so a restart while
-		// latched resumes latched. The counter name is shared with
-		// controllerhygiene ON PURPOSE — both own the same
-		// state-journal-unreadable latch file, so the streak that
-		// arms it is shared too (either subsystem's failed reads
-		// count toward the one episode).
-		Counter:     d.State,
-		CounterName: "consecutive-journal-unreadable",
-		LatchedSeed: func() bool { return d.State.Exists(wdeps.StateJournalUnreadable) },
-	}
+	// The store binds the shared timex.Cell over Seams.Host (NOT the
+	// promoted Base.Clock — the live seam stays there): tests re-stub
+	// via h.Cfg.Seams.Host.Clock.Set after New returns and the store
+	// observes the new clock (hoststate.New doc).
+	d.State = subframe.StoreAt(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+		cfg.Seams.Host.Clock, logger)
+	// Shared-streak contract lives in journalwatch.NewUnreadableTracker:
+	// both hygienes bump the SAME consecutive-journal-unreadable file
+	// and seed from the same state-journal-unreadable latch — a
+	// failed read on either subsystem counts toward the one episode.
+	d.JournalReads = journalwatch.NewUnreadableTracker(
+		d.State, cfg.Journal.Dirs, cfg.Journal.UnreadableNeeded)
 
-	d.Cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_workerhygiene_cycles_total",
-		Help: "Worker-hygiene check cycles by check and result (ok|abort|gated).",
-	}, []string{"check", "result"})
-	d.Actions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_host_agent_workerhygiene_actions_total",
-		Help: "Worker-hygiene remediation actions by check and action " +
-			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|image_rm|remediate|sighup|swap_cap|agent_kill).",
-	}, []string{"check", "action"})
+	d.Cycles, d.Actions = subframe.Counters("workerhygiene",
+		"Worker-hygiene check cycles by check and result (ok|abort|gated).",
+		"Worker-hygiene remediation actions by check and action "+
+			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|image_rm|remediate|sighup|swap_cap|agent_kill).")
 	d.CiliumAllocated = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_workerhygiene_cilium_allocated_ips",
 		Help: "IPv4 addresses cilium IPAM reports allocated on this node.",
@@ -169,15 +155,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	})
 
 	h := &Hygiene{Deps: d, envCell: &wdeps.CycleEnv{}}
-	if reg != nil {
-		for _, c := range []prometheus.Collector{
-			d.Cycles, d.Actions, d.CiliumAllocated, d.CiliumLeaked,
-			d.CtrIngestsCleaned,
-		} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register workerhygiene metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		d.Cycles, d.Actions, d.CiliumAllocated, d.CiliumLeaked,
+		d.CtrIngestsCleaned); err != nil {
+		return nil, fmt.Errorf("register workerhygiene metrics: %w", err)
 	}
 	h.initChecks()
 	h.feeder = kubelet.NewFeeder(d)
@@ -316,10 +297,8 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// Refresh the conf every cycle when a source is wired — hostconfig
 	// rewrites /etc/node-watchdog.conf mid-run (WD_SIG_* kill switches,
 	// API_BACKENDS); the runner re-sourced it every run.
-	if h.Cfg.WatchdogSrc != nil {
-		h.Cfg.Watchdog = h.Cfg.WatchdogSrc.Get()
-	}
-	if wd := h.Cfg.Watchdog; wd != nil && h.Cfg.WatchdogSrc != nil {
+	wd, sigOn := h.Cfg.BeginCycle()
+	if wd != nil && h.Cfg.WatchdogSrc != nil {
 		h.Cfg.APIBackends = wd.APIBackendIPs()
 	}
 	// workerActive is the WD_REQUIRES k0sworker gate for ALL worker
@@ -346,9 +325,6 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// B1: an agent kill this cycle also restarts cilium-envoy — the
 	// flag is reset before any check runs.
 	h.CiliumAgentKilled = false
-	sigOn := func(name string) bool {
-		return h.Cfg.Watchdog == nil || h.Cfg.Watchdog.SignalEnabled(name)
-	}
 	// The dispatch table is static — initChecks built the
 	// checks.Entry slice once and each Run reads the env through
 	// h.envCell, so Cycle only refreshes the cell's contents: the

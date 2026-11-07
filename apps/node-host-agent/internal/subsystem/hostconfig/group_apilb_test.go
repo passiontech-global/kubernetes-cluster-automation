@@ -6,6 +6,8 @@ package hostconfig
 import (
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // ---------- #1: vendored haproxy template renders for...if ----------
@@ -21,10 +23,10 @@ api_lb_backends:
     backup: true
 `
 	vars := writeVarsDir(t, cluster)
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
+	sr := newScripted(nil, map[string]bool{
 		// probe for api_far fails -> name NOT in api_lb_probe_reachable
 		"/dev/tcp/10.0.2.99/6443": true,
-	}}
+	})
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -44,7 +46,7 @@ api_lb_backends:
 		t.Fatalf("unreachable probe backend rendered:\n%s", s)
 	}
 	// and with the probe succeeding the backend shows up with ` backup`
-	sr.errs = map[string]bool{}
+	sr.ClearFails()
 	cfg2, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
 	if err != nil {
 		t.Fatal(err)
@@ -69,17 +71,14 @@ api_lb_backends:
 `)
 }
 
-func lbRunner() *scriptedRunner {
-	return &scriptedRunner{
-		res: map[string]string{
-			"dpkg-query -W -f=${Status} ${Version} haproxy": "install ok installed 2.8.16-0ubuntu0.24.04.3",
-			"/dev/tcp/10.0.2.99/6443":                       "",
-		},
-		errs: map[string]bool{},
-	}
+func lbRunner() *testutil.FakeRunner {
+	return newScripted(map[string]string{
+		"dpkg-query -W -f=${Status} ${Version} haproxy": "install ok installed 2.8.16-0ubuntu0.24.04.3",
+		"/dev/tcp/10.0.2.99/6443":                       "",
+	}, nil)
 }
 
-func newLBHost(t *testing.T, vars string, sr *scriptedRunner) *Reconciler {
+func newLBHost(t *testing.T, vars string, sr *testutil.FakeRunner) *Reconciler {
 	t.Helper()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
@@ -116,10 +115,10 @@ func TestAPILBPinHostsHappyPath(t *testing.T) {
 		hostExists(r, "/etc/systemd/system/api-lb-dnat.service") {
 		t.Fatal("invented separate dnat unit/files must not exist")
 	}
-	if len(sr.callsMatching("systemctl disable --now haproxy.service")) == 0 {
+	if len(sr.CallsMatching("systemctl disable --now haproxy.service")) == 0 {
 		t.Fatal("distro haproxy.service not disabled")
 	}
-	if len(sr.callsMatching("nft -c -f /etc/api-local-dnat.nft")) == 0 {
+	if len(sr.CallsMatching("nft -c -f /etc/api-local-dnat.nft")) == 0 {
 		t.Fatal("nft ruleset not validated")
 	}
 }
@@ -127,7 +126,7 @@ func TestAPILBPinHostsHappyPath(t *testing.T) {
 func TestAPILBNoPinWhenProbeFails(t *testing.T) {
 	vars := lbVars(t)
 	sr := lbRunner()
-	sr.errs["/dev/tcp/127.0.0.1/6443"] = true // LB never listens
+	sr.FailOn("/dev/tcp/127.0.0.1/6443", nil) // LB never listens
 	r := newLBHost(t, vars, sr)
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupAPILB()
@@ -204,7 +203,7 @@ func TestAPILBExtraLanesProbeFiltered(t *testing.T) {
 	vars := laneVars(t)
 	sr := lbRunner()
 	// api_far probe fails -> filtered out of EVERY lane backend too.
-	sr.errs["/dev/tcp/10.0.2.99/6443"] = true
+	sr.FailOn("/dev/tcp/10.0.2.99/6443", nil)
 	r := newLBHost(t, vars, sr)
 	c := loadCyc(t, r, vars, "node-b")
 	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
@@ -238,12 +237,12 @@ func TestAPILBRestartsOnUnitDrift(t *testing.T) {
 	c.groupAPILB()
 	// Hand-edit the unit out-of-band; nothing else changed.
 	hostWrite(t, r, "/etc/systemd/system/api-local-lb.service", "[Unit]\n# hand-edited\n")
-	sr.calls = nil
+	sr.ClearLog()
 	c2 := loadCyc(t, r, vars, "node-b")
 	c2.groupAPILB()
-	if len(sr.callsMatching("systemctl restart api-local-lb.service")) == 0 {
+	if len(sr.CallsMatching("systemctl restart api-local-lb.service")) == 0 {
 		t.Fatalf("unit drift did not restart api-local-lb: %v",
-			sr.callsMatching("api-local-lb"))
+			sr.CallsMatching("api-local-lb"))
 	}
 }
 
@@ -273,17 +272,16 @@ func stageHaproxyDeb(t *testing.T, r *Reconciler) {
 func TestAPILBNewerHaproxySkipsDeb(t *testing.T) {
 	vars := lbVarsDebStaged(t)
 	sr := lbRunner()
-	sr.res["dpkg-query -W -f=${Status} ${Version} haproxy"] =
-		"install ok installed 2.8.30-0ubuntu0.24.04.2"
+	sr.On("dpkg-query -W -f=${Status} ${Version} haproxy", "install ok installed 2.8.30-0ubuntu0.24.04.2")
 	r := newLBHost(t, vars, sr)
 	stageHaproxyDeb(t, r)
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupAPILB()
-	if len(sr.callsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) > 0 {
+	if len(sr.CallsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) > 0 {
 		t.Fatalf("newer haproxy triggered deb install: %v",
-			sr.callsMatching("apt-get install"))
+			sr.CallsMatching("apt-get install"))
 	}
-	if len(sr.callsMatching("dpkg --compare-versions")) == 0 {
+	if len(sr.CallsMatching("dpkg --compare-versions")) == 0 {
 		t.Fatal("version compare not run")
 	}
 	if c.errs != 0 {
@@ -297,16 +295,15 @@ func TestAPILBNewerHaproxySkipsDeb(t *testing.T) {
 func TestAPILBOlderHaproxyInstallsDeb(t *testing.T) {
 	vars := lbVarsDebStaged(t)
 	sr := lbRunner()
-	sr.res["dpkg-query -W -f=${Status} ${Version} haproxy"] =
-		"install ok installed 2.8.10-1"
-	sr.errs["dpkg --compare-versions"] = true // ge fails: 2.8.10 < pin
+	sr.On("dpkg-query -W -f=${Status} ${Version} haproxy", "install ok installed 2.8.10-1")
+	sr.FailOn("dpkg --compare-versions", nil) // ge fails: 2.8.10 < pin
 	r := newLBHost(t, vars, sr)
 	stageHaproxyDeb(t, r)
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupAPILB()
-	if len(sr.callsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) == 0 {
+	if len(sr.CallsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) == 0 {
 		t.Fatalf("older haproxy did not install pinned deb: %v",
-			sr.callsMatching("apt-get"))
+			sr.CallsMatching("apt-get"))
 	}
 }
 
@@ -317,9 +314,9 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
   - {name: api_evil, addr: "10.0.0.1';id:6443", probe: true}
   - {name: api_ok, addr: "10.0.1.10:6443", probe: true}
 `)
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"/dev/tcp/10.0.1.10/6443": "",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -330,8 +327,8 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
 	if len(got) != 1 || got[0] != "api_ok" {
 		t.Fatalf("probeReachable = %v", got)
 	}
-	if len(sr.callsMatching("/dev/tcp/10.0.0.1")) > 0 {
-		t.Fatalf("injected addr reached the shell: %v", sr.callsMatching("/dev/tcp"))
+	if len(sr.CallsMatching("/dev/tcp/10.0.0.1")) > 0 {
+		t.Fatalf("injected addr reached the shell: %v", sr.CallsMatching("/dev/tcp"))
 	}
 	if c.errs == 0 {
 		t.Fatal("injected backend addr not counted")
@@ -345,7 +342,7 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
 func TestAPILBStagesHaproxyCandidate(t *testing.T) {
 	vars := lbVars(t)
 	sr := lbRunner()
-	sr.errs["api-local-lb.cfg.candidate"] = true
+	sr.FailOn("api-local-lb.cfg.candidate", nil)
 	r := newLBHost(t, vars, sr)
 	hostWrite(t, r, "/etc/haproxy/api-local-lb.cfg", "global\n# last good\n")
 	c := loadCyc(t, r, vars, "node-b")
@@ -360,9 +357,9 @@ func TestAPILBStagesHaproxyCandidate(t *testing.T) {
 	if hostExists(r, "/etc/haproxy/api-local-lb.cfg.candidate") {
 		t.Fatal("rejected cfg candidate left behind")
 	}
-	if len(sr.callsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
+	if len(sr.CallsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
 		t.Fatalf("haproxy -c did not target the candidate: %v",
-			sr.callsMatching("haproxy"))
+			sr.CallsMatching("haproxy"))
 	}
 }
 
@@ -371,7 +368,7 @@ func TestAPILBStagesHaproxyCandidate(t *testing.T) {
 func TestAPILBStagesNftCandidate(t *testing.T) {
 	vars := lbVars(t)
 	sr := lbRunner()
-	sr.errs["api-local-dnat.nft.candidate"] = true
+	sr.FailOn("api-local-dnat.nft.candidate", nil)
 	r := newLBHost(t, vars, sr)
 	hostWrite(t, r, "/etc/api-local-dnat.nft", "table ip good {}\n")
 	c := loadCyc(t, r, vars, "node-b")
@@ -404,13 +401,13 @@ func TestAPILBPromotesAndSweepsCandidates(t *testing.T) {
 		hostExists(r, "/etc/api-local-dnat.nft.candidate") {
 		t.Fatal("candidate lingered after promotion")
 	}
-	if len(sr.callsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
+	if len(sr.CallsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
 		t.Fatalf("haproxy -c did not target the candidate: %v",
-			sr.callsMatching("haproxy"))
+			sr.CallsMatching("haproxy"))
 	}
-	if len(sr.callsMatching("nft -c -f /etc/api-local-dnat.nft.candidate")) == 0 {
+	if len(sr.CallsMatching("nft -c -f /etc/api-local-dnat.nft.candidate")) == 0 {
 		t.Fatalf("nft -c did not target the candidate: %v",
-			sr.callsMatching("nft -c"))
+			sr.CallsMatching("nft -c"))
 	}
 }
 
@@ -423,9 +420,9 @@ func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
 	vars := writeVarsDir(t, `api_lb_backends:
   - {name: api_v6, addr: "[::1]:6443", probe: true}
 `)
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"/dev/tcp/::1/6443": "",
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
@@ -436,7 +433,7 @@ func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
 	if len(got) != 1 || got[0] != "api_v6" {
 		t.Fatalf("probeReachable = %v — bracketed IPv6 must parse", got)
 	}
-	if len(sr.callsMatching("/dev/tcp/::1/6443")) == 0 {
-		t.Fatalf("v6 probe not issued: %v", sr.callsMatching("/dev/tcp"))
+	if len(sr.CallsMatching("/dev/tcp/::1/6443")) == 0 {
+		t.Fatalf("v6 probe not issued: %v", sr.CallsMatching("/dev/tcp"))
 	}
 }

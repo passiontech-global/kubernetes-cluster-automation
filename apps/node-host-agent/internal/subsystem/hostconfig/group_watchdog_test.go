@@ -12,7 +12,7 @@ import (
 
 func TestPruneLegacyWatchdogStack(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
@@ -41,7 +41,7 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 	// units stopped+disabled — ONE batched `systemctl disable
 	// --now` covering every seeded unit file (the per-unit fork
 	// fan-out is gone; the file sweep still removes them all).
-	disableCalls := sr.callsMatching("systemctl disable --now")
+	disableCalls := sr.CallsMatching("systemctl disable --now")
 	if len(disableCalls) != 1 {
 		t.Fatalf("systemctl disable calls=%d want 1: %v",
 			len(disableCalls), disableCalls)
@@ -76,11 +76,11 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 	if !hostExists(r, "/var/lib/node-watchdog/installed") {
 		t.Fatal("state dir installed marker missing")
 	}
-	if len(sr.callsMatching("systemctl daemon-reload")) == 0 {
+	if len(sr.CallsMatching("systemctl daemon-reload")) == 0 {
 		t.Fatal("daemon-reload not run after unit removal")
 	}
 	// idempotent second cycle — no resurrected files, no errors
-	sr.calls = nil
+	sr.ClearLog()
 	c.groupWatchdog()
 	for _, u := range legacyWatchdogUnits {
 		if hostExists(r, "/etc/systemd/system/"+u) {

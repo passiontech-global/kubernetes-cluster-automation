@@ -4,7 +4,7 @@
 // and age, cmdline sweeps, raw state-dir probes and the /proc stat
 // parser the ctr and guards packages share. The /proc reads
 // themselves live in platform/procfs (d.Proc); what is here is only
-// the part that must read the live config seams (KillFn/NowFn are
+// the part that must read the live config seams (KillFn/Clock are
 // re-stubbed by tests after New).
 package wdeps
 
@@ -71,11 +71,11 @@ func (d *Deps) PidLive(pid int) bool {
 	return d.Proc.Live(pid, d.Cfg.Seams.Host.KillFn)
 }
 
-// ProcAge is procfs.FS.Age bound to the NowFn seam (tests re-stub
-// h.Cfg.Seams.Host.NowFn after New — the Deps field promotes through the
-// Hygiene embed).
+// ProcAge is procfs.FS.Age bound to the Clock seam (tests re-stub
+// h.Cfg.Seams.Host.Clock via Set after New — the Deps field promotes
+// through the Hygiene embed).
 func (d *Deps) ProcAge(pid int) time.Duration {
-	return d.Proc.Age(pid, d.Cfg.Seams.Host.NowFn())
+	return d.Proc.Age(pid, d.Cfg.Seams.Host.Clock.Now())
 }
 
 // PidsWithCmdline returns pids whose joined cmdline contains sub —

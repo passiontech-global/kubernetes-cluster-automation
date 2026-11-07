@@ -276,7 +276,7 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 		note("guard already running")
 	default:
 		res.deleted = sumDeleted(sout)
-		k.writeGuardCompactTS(k.cfg.nowFn().Unix())
+		k.writeGuardCompactTS(k.cfg.Clock.Now().Unix())
 		// The bash re-read compact_rev + rows after the loop —
 		// how far the chunks actually got and the post-VACUUM
 		// table size. Failure only means the after-gauges go
@@ -340,14 +340,22 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	p.Gauge("kine_db_guard_last_compact_timestamp_seconds",
 		"Timestamp of the last completed compact run", lastCompact)
 	k.m.guardLastCompact.Set(lastCompact)
-	ts := float64(k.cfg.nowFn().Unix())
+	ts := float64(k.cfg.Clock.Now().Unix())
 	p.Gauge("kine_db_guard_last_run_timestamp_seconds",
 		"Last guard run", ts)
 	k.m.guardLastRun.Set(ts)
 	// W13-CP4: the probe loop's top-5 churn sample renders here —
 	// this file owns the churn series (the probe's own .prom must
-	// never duplicate it).
-	for _, e := range k.churnTop {
+	// never duplicate it). The probe goroutine refreshes churnTop
+	// asynchronously — snapshot it under churnMu. And the GaugeVec
+	// is Reset+repopulated rather than merged: a resource that
+	// falls out of the top-5 must lose its series instead of
+	// pinning a stale value on /metrics forever.
+	k.churnMu.RLock()
+	churnTop := append([]churnEntry(nil), k.churnTop...)
+	k.churnMu.RUnlock()
+	k.m.topChurn.Reset()
+	for _, e := range churnTop {
 		p.GaugeLabels("kine_db_top_churn_revisions_5m",
 			"Top-5 resource prefixes by revision count in the last 5-minute window",
 			fmt.Sprintf("resource=%q", e.resource), float64(e.revs))

@@ -3,6 +3,7 @@ package nethealth
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -23,12 +24,7 @@ type EnvDeps struct {
 // (NODE_HOST_AGENT_ENABLE_NETHEALTH) stays in the caller.
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogLogFile:  d.WatchdogLogFile,
-		HostRoot:         d.HostRoot,
-		Watchdog:         d.Watchdog,
-		WatchdogSrc:      d.WatchdogSrc,
-		Systemd:          d.Systemd,
+		Base: subframe.FromDeps(d.Deps),
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

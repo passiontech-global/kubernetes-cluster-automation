@@ -48,10 +48,6 @@ type olmHealthCheck struct {
 	olmFirstSeen state.FirstSeenLedger
 	olmEmitted   state.GaugeLedger[string]
 	olmHealed    state.CooldownSet
-	// verdict memoizes the maintenance-mutex evaluation the heal
-	// preamble reads — the shared-Verdict shape every per-target
-	// heal in this sweep carries.
-	verdict kube.Verdict
 }
 
 // newOlmHealthCheck builds the W7-C5 check — the ledgers arm
@@ -313,12 +309,12 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 // certificates it owns, so a restart forces both queues to re-list.
 // Gates: the 1h in-RAM cooldown (the pod is the heal target —
 // nothing else can carry the stamp) and the maintenance mutex, run
-// together by heal.AllowedV like every pod-delete heal in this sweep.
+// together by HealAllowed like every pod-delete heal in this sweep.
 func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	log logr.Logger, reasons []string, now time.Time) {
 
-	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
-		p.CS, p.Dyn, &p.olmHealed, olmOperatorPodPrefix, olmHealCooldown, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.olmHealed, olmOperatorPodPrefix, olmHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

@@ -63,7 +63,7 @@ func TestCPUDeliveredEmitsAfterMeasure(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.CPUDeliveredInterval = time.Minute
 	c := New(cfg)
-	c.cfg.nowFn = func() time.Time { return time.Unix(1000, 0) }
+	c.cfg.Clock.Set(func() time.Time { return time.Unix(1000, 0) })
 	c.cfg.cpuMeasure = func() (float64, float64, bool) { return 0.95, 0.32, true }
 
 	// First scrape: probe launched async — wait for it.

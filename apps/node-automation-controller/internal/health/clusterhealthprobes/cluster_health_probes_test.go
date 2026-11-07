@@ -35,7 +35,12 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProber {
-	p := newClusterHealthProber("cluster-health-probes", cs, dyn, nil, probetest.NewDeps(cs, dyn).Cfg)
+	// nil extra cannot fail — an error here is a refactor bug.
+	p, err := newClusterHealthProber("cluster-health-probes", cs, dyn, nil,
+		probetest.NewDeps(cs, dyn).Cfg, nil)
+	if err != nil {
+		panic(err)
+	}
 	p.LookupHost = func(context.Context, string) ([]string, error) {
 		return []string{"10.0.0.1"}, nil
 	}

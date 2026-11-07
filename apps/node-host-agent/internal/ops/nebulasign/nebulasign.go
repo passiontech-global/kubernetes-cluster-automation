@@ -11,8 +11,6 @@ package nebulasign
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,8 +19,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // signJob is one cert request, mirroring sign.yaml's nebula_sign_jobs
@@ -53,10 +53,9 @@ type signConfig struct {
 // dispatch, returning the process exit code (0 clean, 1 runtime
 // failure, 2 usage error — same contract as the other ops subcommands).
 func Cmd(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("nebula-sign", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs := opsx.FlagSet("nebula-sign")
 	varsDir := fs.String("vars-dir",
-		getenv(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
+		envx.String(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
 		"vars dir holding cluster.yaml/interdc_nodes.yaml; nebula-<name>.crt lands here")
 	caDir := fs.String("ca-dir", "",
 		"directory holding ca.crt + ca.key (required — backup/nebula-ca)")
@@ -64,18 +63,15 @@ func Cmd(ctx context.Context, args []string) int {
 		"sign only this registry node (interdc_nodes.yaml key)")
 	duration := fs.String("duration", "8760h", "cert validity (1y; CA renews at 10y)")
 	sshKey := fs.String("ssh-key",
-		getenv(envnames.EnvConvergeSSHKey, "~/.ssh/id_ed25519"),
+		envx.String(envnames.EnvConvergeSSHKey, "~/.ssh/id_ed25519"),
 		"SSH private key for the host.pub fetch fallback")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0 // -h/--help is a clean exit, not a usage error
-		}
-		return 2
+	if code, ok := opsx.Parse(fs, args); !ok {
+		return code
 	}
 	if *caDir == "" {
 		fmt.Fprintln(os.Stderr, "nebula-sign: --ca-dir is required")
 		fs.Usage()
-		return 2
+		return opsx.ExitUsage
 	}
 	cfg := signConfig{
 		VarsDir: *varsDir, CaDir: *caDir, Node: *only,
@@ -83,18 +79,9 @@ func Cmd(ctx context.Context, args []string) int {
 	}
 	if err := nebulaSign(ctx, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "nebula-sign:", err)
-		return 1
+		return opsx.ExitRuntime
 	}
-	return 0
-}
-
-// getenv mirrors cmd/agent's env-or-default helper — the flag
-// defaults keep reading the same NODE_HOST_AGENT_* envs.
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
+	return opsx.ExitOK
 }
 
 func nebulaSign(ctx context.Context, cfg signConfig) error {

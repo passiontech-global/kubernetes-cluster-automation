@@ -35,6 +35,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 		Identity:    d.Identity,
 		VarsDir:     d.VarsDir,
 		LocalBinary: d.LocalBinary,
+		Clock:       d.Clock,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

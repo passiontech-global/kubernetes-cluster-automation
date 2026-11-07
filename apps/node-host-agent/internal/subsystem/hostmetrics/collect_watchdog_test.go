@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 func TestWatchdogStates(t *testing.T) {
@@ -56,7 +57,7 @@ func TestWatchdogStateClearsToZero(t *testing.T) {
 func TestSeenStatesTTLExpiry(t *testing.T) {
 	cfg, dirs := fixture(t)
 	now := time.Now()
-	cfg.nowFn = func() time.Time { return now }
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
 	latch := filepath.Join(dirs["state"], "state-tmp-latch")
 	testutil.WriteFile(t, latch, "1730000000\n")
 	c := New(cfg)
@@ -93,7 +94,7 @@ func TestSeenStatesTTLExpiry(t *testing.T) {
 func TestSeenStatesCapEvictsOldestCleared(t *testing.T) {
 	cfg, dirs := fixture(t)
 	now := time.Now()
-	cfg.nowFn = func() time.Time { return now }
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
 	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
 	c := New(cfg)
 	// Pre-seed over-cap cleared entries, oldest first.

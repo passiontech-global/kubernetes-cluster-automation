@@ -105,7 +105,7 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.scopes == nil {
 		c.scopes = map[string]*oomScope{}
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	podByUID := map[string]*corev1.Pod{}
 	for i := range e.Pods {
 		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
@@ -129,13 +129,26 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 			switch {
 			case kill > st.oomKill:
-				// oom_kill advanced — a kill landed this window.
-				// If the init pid is already different the
-				// container restarted (no living-dead); otherwise
-				// arm the confirm window.
-				st.pendingAt = now
-				st.pid1 = pid1
 				st.oomKill = kill
+				if pid1 != st.pid1 {
+					// The init pid already changed (or the
+					// cgroup went empty — !pidOK reads pid1=0)
+					// — the container restarted; the kill was
+					// legitimate, not a living-dead. Clear
+					// any pending verdict instead of arming a
+					// confirm window against the NEW init pid
+					// (it would false-positive 60s later).
+					st.pid1 = pid1
+					st.pendingAt = time.Time{}
+					continue
+				}
+				// Same init pid survived the kill — arm the
+				// confirm window once. Repeated kills must
+				// not push pendingAt forward forever and
+				// postpone the verdict past ConfirmWindow.
+				if st.pendingAt.IsZero() {
+					st.pendingAt = now
+				}
 			case st.pendingAt.IsZero():
 				// No pending verdict; keep pid1 current for the
 				// NEXT delta's restart-vs-survived compare.
@@ -178,7 +191,7 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 			base, uid, kill, pid1))
 		return
 	}
-	now := c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.Clock.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),

@@ -57,6 +57,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -95,10 +96,14 @@ const (
 
 // Config carries the sweeper's knobs — all test-injectable.
 type Config struct {
+	// Base is the shared watchdog-subsystem block — only the sweep
+	// cadence and the clock cell are consumed (subframe.FromDeps);
+	// the rest of the block is carried but unused — the sweeper
+	// touches no watchdog state, systemd or conf.
+	subframe.Base
 	BaseDir        string // host dir holding pvc-* volumes
 	MinAge         time.Duration
 	MaxDelete      int
-	Interval       time.Duration
 	MountsFile     string        // host mount table (/proc/1/mounts under hostPID)
 	RequestTimeout time.Duration // per-call apiserver deadline
 	Client         kubernetes.Interface
@@ -106,8 +111,6 @@ type Config struct {
 	// statfsFn measures used bytes on the BaseDir filesystem — seam for
 	// tests; nil → syscall.Statfs.
 	statfsFn func(path string) (uint64, error)
-	// nowFn supplies the current time — seam for tests; nil → time.Now.
-	nowFn timex.Clock
 }
 
 // applyDefaults fills zero-valued knobs with the production defaults.
@@ -136,8 +139,8 @@ func (c *Config) applyDefaults() {
 	if c.statfsFn == nil {
 		c.statfsFn = usedBytes
 	}
-	if c.nowFn == nil {
-		c.nowFn = timex.SystemClock
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
 	}
 }
 
@@ -188,14 +191,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Sweeper, error) {
 		Help: "Duration of the last sweep cycle.",
 	})
 
-	if reg != nil {
-		for _, c := range []prometheus.Collector{
-			s.cycles, s.dirsDeleted, s.bytesFreed, s.skips, s.dirsExamined, s.duration,
-		} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register sweeper metrics: %w", err)
-			}
-		}
+	if err := subframe.RegisterAll(reg,
+		s.cycles, s.dirsDeleted, s.bytesFreed, s.skips, s.dirsExamined,
+		s.duration); err != nil {
+		return nil, fmt.Errorf("register sweeper metrics: %w", err)
 	}
 	return s, nil
 }

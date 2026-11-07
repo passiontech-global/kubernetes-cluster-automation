@@ -295,7 +295,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "gated").Inc()
 		return
 	}
-	if c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) < systemdScopeScanInterval {
+	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < systemdScopeScanInterval {
 		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "ok").Inc()
 		return
 	}
@@ -312,7 +312,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "abort").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	n := 0
 	for _, line := range strings.Split(out, "\n") {
 		if f := strings.Fields(line); len(f) > 0 &&

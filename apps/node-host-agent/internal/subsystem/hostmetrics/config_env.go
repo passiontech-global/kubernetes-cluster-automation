@@ -3,6 +3,7 @@ package hostmetrics
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -36,10 +37,10 @@ func ConfigFromEnv(d EnvDeps) Config {
 		hostPath = func(p string) string { return p }
 	}
 	cfg := Config{
-		NodeName:         d.NodeName,
-		WatchdogStateDir: d.WatchdogStateDir,
-		Standalone:       d.Standalone,
-		EgressRelays:     d.OverlayEgressRelays,
+		Base:         subframe.FromDeps(d.Deps),
+		NodeName:     d.NodeName,
+		Standalone:   d.Standalone,
+		EgressRelays: d.OverlayEgressRelays,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

@@ -20,9 +20,9 @@ func TestAPILBVMConverge(t *testing.T) {
     mode: enforce
 `)
 	inspectJSON := `[{"Config":{"Image":"haproxy:2.8-alpine","Labels":{"com.docker.compose.project.config_files":"/opt/haproxy/docker-compose.yml"}},"Mounts":[{"Source":"/opt/haproxy/haproxy.cfg","Destination":"/usr/local/etc/haproxy/haproxy.cfg"}]}]`
-	sr := &scriptedRunner{res: map[string]string{
+	sr := newScripted(map[string]string{
 		"docker inspect haproxy": inspectJSON,
-	}, errs: map[string]bool{}}
+	}, nil)
 	r, err := New(Config{NodeName: "lb-vm-1", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
@@ -67,10 +67,10 @@ func TestAPILBVMConverge(t *testing.T) {
 	if !strings.Contains(cmp, "- /run/haproxy-admin:/run/haproxy") {
 		t.Fatalf("bind-mount line missing:\n%s", cmp)
 	}
-	if len(sr.callsMatching("haproxy -c -f /tmp/haproxy.cfg")) == 0 {
+	if len(sr.CallsMatching("haproxy -c -f /tmp/haproxy.cfg")) == 0 {
 		t.Fatal("cfg not validated in throwaway container")
 	}
-	if len(sr.callsMatching("docker compose -f '/opt/haproxy/docker-compose.yml' up -d")) == 0 {
+	if len(sr.CallsMatching("docker compose -f '/opt/haproxy/docker-compose.yml' up -d")) == 0 {
 		t.Fatal("container not recreated for missing sock mount")
 	}
 	conf := hostRead(t, r, "/etc/api-backend-guard.conf")
@@ -92,7 +92,7 @@ func TestAPILBVMConverge(t *testing.T) {
 	if fi, err := os.Stat(gd); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("credential dir mode = %v want 0700 (drift re-tightened)", fi)
 	}
-	if len(sr.callsMatching("systemctl disable --now api-backend-guard.timer api-backend-guard.service")) == 0 {
+	if len(sr.CallsMatching("systemctl disable --now api-backend-guard.timer api-backend-guard.service")) == 0 {
 		t.Fatal("legacy guard units not disabled")
 	}
 	if hostExists(r, "/etc/systemd/system/api-backend-guard.timer") ||
@@ -103,7 +103,7 @@ func TestAPILBVMConverge(t *testing.T) {
 
 func TestAPILBVMSkipsUnlisted(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {

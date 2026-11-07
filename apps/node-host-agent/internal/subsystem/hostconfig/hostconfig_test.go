@@ -10,27 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
-
-type fakeRunner struct{ calls []string }
-
-func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
-	switch name {
-	case "systemctl":
-		if len(args) > 0 && args[0] == "is-active" {
-			return "inactive", nil
-		}
-		if len(args) > 0 && args[0] == "show" {
-			return "inactive", nil
-		}
-		return "", nil
-	case "sysctl":
-		return "bbr\nfq", nil
-	}
-	return "", nil
-}
 
 func newTestReconciler(t *testing.T, varsDir string) *Reconciler {
 	t.Helper()
@@ -40,7 +22,11 @@ func newTestReconciler(t *testing.T, varsDir string) *Reconciler {
 		VarsDir:            varsDir,
 		NebulaCertsDir:     t.TempDir(),
 		WatchdogScriptsDir: t.TempDir(),
-		Runner:             &fakeRunner{},
+		Runner: testutil.NewFakeRunner(
+			testutil.RunnerRule{Substr: "systemctl is-active", Out: "inactive"},
+			testutil.RunnerRule{Substr: "systemctl show", Out: "inactive"},
+			testutil.RunnerRule{Substr: "sysctl", Out: "bbr\nfq"},
+		),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -185,26 +171,26 @@ func TestDirWatcherChangedWithoutPoll(t *testing.T) {
 }
 
 // TestRunCmdTimeout — a hung host command must fail at the
-// per-command deadline, not wedge the converge on the Run ctx.
-type hangRunner struct{ entered chan struct{} }
-
-func (h *hangRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	close(h.entered)
-	<-ctx.Done()
-	return "", ctx.Err()
-}
-
+// per-command deadline, not wedge the converge on the Run ctx. The
+// Hang rule is the wedge; the call is recorded before blocking, so
+// Count() is the "the fake is inside Run" signal entered was.
 func TestRunCmdTimeout(t *testing.T) {
 	r := newTestReconciler(t, t.TempDir())
 	r.cfg.CmdTimeout = 25 * time.Millisecond
-	hr := &hangRunner{entered: make(chan struct{})}
+	hr := testutil.NewFakeRunner(testutil.RunnerRule{Substr: "sleep", Hang: true})
 	r.cfg.Runner = hr
 	done := make(chan error, 1)
 	go func() {
 		_, err := r.run(context.Background(), "sleep", "999")
 		done <- err
 	}()
-	<-hr.entered
+	deadline := time.Now().Add(5 * time.Second)
+	for hr.Count() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("run never reached the fake runner")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	select {
 	case err := <-done:
 		if err == nil {
@@ -226,34 +212,21 @@ func TestRunCmdTimeoutDefault(t *testing.T) {
 	}
 }
 
-// budgetRunner records the deadline each command ran under — asserts
-// the run vs runLong timeout routing.
-type budgetRunner struct{ dls map[string]time.Duration }
-
-func (b *budgetRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	if b.dls == nil {
-		b.dls = map[string]time.Duration{}
-	}
-	if dl, ok := ctx.Deadline(); ok {
-		b.dls[name+" "+strings.Join(args, " ")] = time.Until(dl)
-	}
-	return "", nil
-}
-
 // TestRunLongUsesLongBudget — slow-egress commands must run under
-// CmdTimeoutLong while plain queries keep CmdTimeout.
+// CmdTimeoutLong while plain queries keep CmdTimeout. FakeRunner's
+// per-call deadline record (DeadlineFor) asserts the routing.
 func TestRunLongUsesLongBudget(t *testing.T) {
 	r := newTestReconciler(t, t.TempDir())
-	br := &budgetRunner{}
+	br := testutil.NewFakeRunner()
 	r.cfg.Runner = br
 	ctx := context.Background()
 	_, _ = r.run(ctx, "systemctl", "is-active", "x")
 	_, _ = r.runLong(ctx, "apt-get", "install", "-y", "x")
-	if d := br.dls["systemctl is-active x"]; d <= 115*time.Second || d > 120*time.Second {
-		t.Fatalf("run budget = %v, want ~120s", d)
+	if d, ok := br.DeadlineFor("systemctl is-active x"); !ok || d <= 115*time.Second || d > 120*time.Second {
+		t.Fatalf("run budget = %v (ok=%v), want ~120s", d, ok)
 	}
-	if d := br.dls["apt-get install -y x"]; d <= 9*time.Minute+55*time.Second || d > 10*time.Minute {
-		t.Fatalf("runLong budget = %v, want ~10m", d)
+	if d, ok := br.DeadlineFor("apt-get install -y x"); !ok || d <= 9*time.Minute+55*time.Second || d > 10*time.Minute {
+		t.Fatalf("runLong budget = %v (ok=%v), want ~10m", d, ok)
 	}
 }
 
@@ -262,7 +235,7 @@ func TestRunLongUsesLongBudget(t *testing.T) {
 // rateOK honours the fresh latch.
 func TestRateSpendAtomicLatch(t *testing.T) {
 	r := newTestReconciler(t, t.TempDir())
-	r.cfg.NowFn = func() time.Time { return time.Unix(1_700_000_000, 0) }
+	r.cfg.Clock.Set(func() time.Time { return time.Unix(1_700_000_000, 0) })
 	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, watchdogStateDir), 0o755); err != nil {
 		t.Fatal(err)
 	}
