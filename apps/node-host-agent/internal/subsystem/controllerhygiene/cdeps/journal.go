@@ -3,10 +3,11 @@
 // parity) feeding the journal-unreadable blindness accounting
 // (classifyJournalRead + noteJournalRead + journalwatch.Tracker).
 //
-// The journal readers themselves are Config seams (JournalFn /
-// JournalAnyFn); their defaults route through the shared
-// platform/systemd client — nsenter-wrapped to the HOST journald —
-// in ApplyDefaults.
+// The journal readers ride the single HostExecFn seam now —
+// journalRead/journalAnyRead build the journalctl argv; the seam's
+// default routes through the shared platform/systemd client,
+// nsenter-wrapped to the HOST journald (the old raw exec read the
+// container's journal view, empty in the DaemonSet).
 package cdeps
 
 import (
@@ -23,6 +24,32 @@ import (
 // the systemd.Client.Journal argv share.
 const journalSinceLayout = "2006-01-02 15:04:05"
 
+// journalRead returns the unit journal window since `since` —
+// `timeout 15 journalctl -u <unit> --since <ts> --no-pager` parity
+// over the HostExecFn seam. stderr is folded in (combined=true) so
+// journald's own corrupt/no-journal-files diagnostics stay visible
+// to classifyJournalRead; hostexec's 16MiB capture cap is the old
+// maxJournalBytes bound.
+func (d *Deps) journalRead(ctx context.Context, unit string, since time.Time) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+	defer cancel()
+	return d.Cfg.HostExecFn(cctx, true, 0, "journalctl",
+		"-u", unit, "--since",
+		since.Format(journalSinceLayout), "--no-pager")
+}
+
+// journalAnyRead is the unfiltered second probe used to classify an
+// empty unit-window read — `journalctl -n 1 --no-pager` with stderr
+// folded in. A quiet unit on a healthy journald must NOT count as
+// blindness; only when journald itself has nothing (or only "No
+// journal files") to say does the empty window count.
+func (d *Deps) journalAnyRead(ctx context.Context) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+	defer cancel()
+	return d.Cfg.HostExecFn(cctx, true, 0,
+		"journalctl", "-n", "1", "--no-pager")
+}
+
 // JournalText returns the unit journal since `since`, mapping errors
 // to empty — `journalctl ... 2>/dev/null | grep -c` parity (a failed
 // journal read counts as 0 hits, never as wedge evidence). Every
@@ -31,7 +58,7 @@ const journalSinceLayout = "2006-01-02 15:04:05"
 // ALL journal-grep checks, and that blindness must latch+log, not
 // stay a per-cycle warning line.
 func (d *Deps) JournalText(ctx context.Context, since time.Time) string {
-	out, err := d.Cfg.JournalFn(ctx, d.Cfg.JournalUnit, since)
+	out, err := d.journalRead(ctx, d.Cfg.JournalUnit, since)
 	d.noteJournalRead(ctx, out, err)
 	if err != nil {
 		d.State.AppendLogWarn(fmt.Sprintf(
@@ -56,7 +83,7 @@ func (d *Deps) classifyJournalRead(ctx context.Context, out string, err error) (
 	case journalwatch.FilesGone(out):
 		return false, "journalctl reports no journal files"
 	case strings.TrimSpace(out) == "":
-		uout, uerr := d.Cfg.JournalAnyFn(ctx)
+		uout, uerr := d.journalAnyRead(ctx)
 		switch {
 		case uerr != nil:
 			return false, fmt.Sprintf("unfiltered probe failed: %v", uerr)

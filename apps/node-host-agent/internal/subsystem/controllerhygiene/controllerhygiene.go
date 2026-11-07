@@ -57,16 +57,18 @@
 //     /proc/<kine-pid>/fd socket inodes with the remote-port column of
 //     /proc/<kine-pid>/net/tcp(6) — same "only kine's sockets to the
 //     DB port" set, no ss dependency.
-//   - journalctl greps go through an injectable journal reader; a
+//   - journalctl greps go through the injectable host-exec seam; a
 //     journal read error maps to empty output (grep -c == 0), the
 //     same degraded behaviour as `timeout 15 journalctl ... || true`.
-//     The default reader is the shared platform/systemd client —
+//     The default is the shared platform/systemd client —
 //     nsenter-wrapped to the HOST journald, so the checks see real
 //     journal data inside the DaemonSet (the pod's own journal view
 //     is empty).
-//   - systemctl invocations go through injectable funcs defaulting to
-//     the shared platform/systemd client — nsenter-wrapped host exec —
-//     with NOTIFY_SOCKET/WATCHDOG_* scrubbed from the child env via an
+//   - systemctl/ss invocations share the same single injectable
+//     host-exec seam (HostExecFn — the Deps methods build argv, the
+//     seam does the I/O) defaulting to the shared platform/systemd
+//     client — nsenter-wrapped host exec — with
+//     NOTIFY_SOCKET/WATCHDOG_* scrubbed from the child env via an
 //     `env -u` argv prefix (the journal-spam fix the shell feeder
 //     applied; the shared exec seam carries no env slot).
 //   - The feeder cannot "exit 1": on max-fail/notify-fail it runs the
@@ -376,7 +378,8 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 // cdeps/journal.go : JournalText + the journal-unreadable blindness
 //                    accounting
 // cdeps/exec.go    : the host-exec/env plumbing — ScrubSystemdEnv,
-//                    scrubArgv, hostExecCtx, sdNotify
+//                    scrubArgv, hostExecCtxBounded, sdNotify and the
+//                    named host commands over the one HostExecFn
 // cdeps/probes.go  : PGWireOK + the TLSCertFn default dial
 // cdeps/kubeclient.go : apiserver credential loading + the rv LIST
 //                    probe (EnsureClient/ResolveRel/ListRV)

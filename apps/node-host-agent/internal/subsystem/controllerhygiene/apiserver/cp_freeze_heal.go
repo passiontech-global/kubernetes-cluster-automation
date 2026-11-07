@@ -404,7 +404,7 @@ func (c *FreezeCheck) Run(ctx context.Context) {
 		c.d.State.ResetCounter(cdeps.FileCtrCPFreeze)
 		c.d.State.ResetCounter(cdeps.FileCtrKCMQuiet)
 		c.kcmQuietSince = time.Time{}
-		if err := c.d.Cfg.RestartFn(ctx, c.d.Cfg.RestartUnit); err != nil {
+		if err := c.d.Restart(ctx, c.d.Cfg.RestartUnit); err != nil {
 			c.d.State.AppendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", c.d.Cfg.RestartUnit, err))
 		}

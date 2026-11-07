@@ -188,10 +188,10 @@ func ResolveRel(kubeconfig, ref string) string {
 // endpoint — api_list_rv parity. cached=true → ?resourceVersion=0
 // (watch-cache), cached=false → ?resourceVersion= (consistent read →
 // storage backend). ok=false on any transport/HTTP/parse failure.
+// The test seam is the injected Config.HTTPClient underneath —
+// there is no ListRVFn: stubbing the client covers the probe and
+// exercises this parse for real.
 func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64, bool) {
-	if d.Cfg.ListRVFn != nil {
-		return d.Cfg.ListRVFn(ctx, endpoint, cached)
-	}
 	client := d.EnsureClient()
 	if client == nil {
 		return 0, false

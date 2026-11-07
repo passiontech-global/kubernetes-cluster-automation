@@ -6,6 +6,15 @@
 // the old xxxFn names capitalised and every default is the same
 // nil → production impl the flat applyDefaults filled — only the
 // organization moved.
+//
+// The seam surface stays LOW-LEVEL on purpose: a field that only
+// composed a lower seam with parsing was deleted rather than
+// re-stubbed. The rv LIST probe rides the injected Config.HTTPClient
+// seam through Deps.ListRV (no ListRVFn), and the six
+// journalctl/systemctl/ss wrappers collapsed into the single
+// HostExecFn — the named Deps helpers (journalRead/journalAnyRead
+// in journal.go, Restart/UnitProp/UnitActiveState/SSKill in
+// exec.go) build argv + parse, the seam does the I/O.
 package cdeps
 
 import (
@@ -27,16 +36,15 @@ import (
 
 // Probe holds the evidence-read seams — every call that fetches a
 // verdict or body over the network/TLS: the any-code liveness GET,
-// the rv LIST, the pg-wire probe, the KCM/scheduler healthz and
-// metrics reads, and the presented-cert TLS dial.
+// the pg-wire probe, the KCM/scheduler healthz and metrics reads,
+// and the presented-cert TLS dial. (The rv LIST probe has no func
+// field — it is the injected Config.HTTPClient seam plus the
+// ?resourceVersion= parse, consumed as Deps.ListRV.)
 type Probe struct {
 	// ProbeFn reports whether url answers ANY HTTP code — the
 	// "apiserver event loop alive" verdict (curl -s -o /dev/null
 	// parity). nil → probee.HTTPAnyCode at Feeder.ProbeTO.
 	ProbeFn func(ctx context.Context, url string) bool
-	// ListRVFn is the rv LIST probe seam — nil → the mTLS client
-	// path (EnsureClient + the ?resourceVersion= LIST).
-	ListRVFn func(ctx context.Context, endpoint string, cached bool) (rv int64, ok bool)
 	// PgWireFn is the kine-DB dead-fallback probe — lib.sh
 	// pg_wire_ok parity. nil → PGWireOK.
 	PgWireFn func(ctx context.Context, hostport string) bool
@@ -54,29 +62,28 @@ type Probe struct {
 
 // Host holds the host-primitive seams — the calls that touch the
 // host itself rather than a remote endpoint: sleeps, signals, the
-// journald reads, the systemctl prop/is-active/restart calls, the
-// sd_notify datagram and the `ss -K` zombie-stream kill.
+// sd_notify datagram and the ONE exec transport every
+// journalctl/systemctl/ss call shares. The per-command wrappers
+// that used to be seams (journal reads, prop/is-active/restart,
+// `ss -K`) are Deps methods now — they only built fixed argv and
+// trimmed output, so stubbing the single exec seam underneath
+// covers them identically.
 type Host struct {
 	SleepFn func(d time.Duration)
 	KillFn  func(pid int, sig syscall.Signal) error
-	// JournalFn returns the unit journal window since `since` —
-	// `journalctl -u <unit> --since <ts> --no-pager` parity. nil →
-	// the shared systemd client via hostExecCtx.
-	JournalFn func(ctx context.Context, unit string, since time.Time) (string, error)
-	// JournalAnyFn is the unfiltered second probe used to classify an
-	// empty unit-window read — `journalctl -n 1 --no-pager` with
-	// stderr folded in. A quiet unit on a healthy journald must NOT
-	// count as blindness; only when journald itself has nothing (or
-	// only "No journal files") to say does the empty window count.
-	// nil → the shared systemd client (hostExecCtx, ExecCombined).
-	JournalAnyFn func(ctx context.Context) (string, error)
-	RestartFn    func(ctx context.Context, unit string) error
-	PropFn       func(ctx context.Context, unit, prop string) (string, error)
-	IsActiveFn   func(ctx context.Context, unit string) (string, error)
-	NotifyFn     func(msg string) error
-	// SSKillFn runs `ss -K sport = :6443` — kills hung HTTP/2 watch
-	// streams before a wedge restart (W8-CP1).
-	SSKillFn func(ctx context.Context) error
+	// HostExecFn runs `name args...` on the host through the shared
+	// systemd client — the single exec seam behind every
+	// journalctl/systemctl/ss call the checks make. combined folds
+	// stderr into the returned output (journald's own diagnostics
+	// — "No journal files were found." — live there); budget >0 is
+	// the per-call ExecBounded override (the remediate `timeout 90`
+	// parity), <=0 keeps the client's Config.Timeout. nil →
+	// hostExecCtxBounded, which nsenter-wraps to host PID 1's
+	// namespaces inside the DaemonSet and prefixes argv with the
+	// `env -u NOTIFY_SOCKET -u WATCHDOG_* --` scrub.
+	HostExecFn func(ctx context.Context, combined bool,
+		budget time.Duration, name string, args ...string) (string, error)
+	NotifyFn func(msg string) error
 }
 
 // Etcd holds the etcdguard seams — the etcdctl probe exec and the
@@ -109,7 +116,7 @@ type Etcd struct {
 type Seams struct {
 	// Probe — HTTP/pg-wire/TLS evidence reads.
 	Probe
-	// Host — signals, sleeps, journal, systemctl, sd_notify, ss.
+	// Host — signals, sleeps, the one host-exec seam, sd_notify.
 	Host
 	// Etcd — etcdctl + the evpurge/rescue domain libs.
 	Etcd
@@ -117,8 +124,8 @@ type Seams struct {
 
 // applyDefaults fills the production implementations of every test
 // seam — same nil → default logic and order the flat pass had (the
-// journal/systemd closures capture c.Systemd up front; the probe
-// defaults read their knobs lazily at call time).
+// exec closure captures c.Systemd up front; the probe defaults read
+// their knobs lazily at call time).
 func (s *Seams) applyDefaults(c *Config) {
 	if c.Clock == nil {
 		c.Clock = timex.NewCell(nil)
@@ -132,71 +139,20 @@ func (s *Seams) applyDefaults(c *Config) {
 		}
 	}
 	sd := c.Systemd
-	if s.JournalFn == nil {
-		// `timeout 15 journalctl -u <unit> --since <ts> --no-pager` —
-		// routed through the shared client: nsenter-wrapped to the
-		// HOST journald (the previous raw exec read the container's
-		// journal view, empty in the DaemonSet), stderr folded in so
-		// the corrupt/no-journal-files diagnostics stay visible to
-		// classifyJournalRead, env-scrubbed via `env -u` argv
-		// (scrubArgv — ScrubSystemdEnv parity; the exec seam carries
-		// no env slot) and bounded at 16MiB by hostexec's capture
-		// cap (the old maxJournalBytes).
-		s.JournalFn = func(ctx context.Context, unit string, since time.Time) (string, error) {
-			cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
-			defer cancel()
-			return hostExecCtx(cctx, sd, true, "journalctl",
-				"-u", unit, "--since",
-				since.Format(journalSinceLayout), "--no-pager")
-		}
-	}
-	if s.JournalAnyFn == nil {
-		// `timeout 15 journalctl -n 1 --no-pager` — same routing as
-		// JournalFn: stderr folded in so journald's own diagnostics
-		// ("No journal files were found.", "File ... is corrupt")
-		// are visible to the empty-window classifier.
-		s.JournalAnyFn = func(ctx context.Context) (string, error) {
-			cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
-			defer cancel()
-			return hostExecCtx(cctx, sd, true,
-				"journalctl", "-n", "1", "--no-pager")
+	if s.HostExecFn == nil {
+		// Every journalctl/systemctl/ss call lands here — the
+		// scrubArgv env fix (ScrubSystemdEnv parity in argv form;
+		// the seam carries no env slot) and the nsenter wrap to the
+		// HOST systemd/journald/netns both live inside
+		// hostExecCtxBounded.
+		s.HostExecFn = func(ctx context.Context, combined bool,
+			budget time.Duration, name string, args ...string) (string, error) {
+			return hostExecCtxBounded(ctx, sd, combined, budget,
+				name, args...)
 		}
 	}
 	if s.PgWireFn == nil {
 		s.PgWireFn = PGWireOK
-	}
-	if s.RestartFn == nil {
-		s.RestartFn = func(ctx context.Context, unit string) error {
-			// The remediate gate's `timeout 90` budget survives as a
-			// per-call ExecBounded — a tighter wrap SIGKILLed a slow
-			// restart mid-flight while systemd finished
-			// asynchronously and the gate logged FAIL. Routed
-			// through the host exec so the restart reaches the HOST
-			// systemd — the old raw exec had no dbus socket inside
-			// the DaemonSet and could never work.
-			_, err := hostExecCtxBounded(ctx, sd, true,
-				defaultRestartBudget, "systemctl", "restart", unit)
-			return err
-		}
-	}
-	if s.PropFn == nil {
-		s.PropFn = func(ctx context.Context, unit, prop string) (string, error) {
-			cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
-			defer cancel()
-			out, err := hostExecCtx(cctx, sd, false, "systemctl",
-				"show", unit, "-p", prop, "--value")
-			return strings.TrimSpace(out), err
-		}
-	}
-	if s.IsActiveFn == nil {
-		s.IsActiveFn = func(ctx context.Context, unit string) (string, error) {
-			// is-active exits non-zero for inactive — the output is
-			// the value, not an error (shell `|| true` parity).
-			cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
-			defer cancel()
-			out, _ := hostExecCtx(cctx, sd, false, "systemctl", "is-active", unit)
-			return strings.TrimSpace(out), nil
-		}
 	}
 	if s.NotifyFn == nil && c.Feeder.NotifySocket != "" {
 		sock := c.Feeder.NotifySocket
@@ -248,25 +204,6 @@ func (s *Seams) applyDefaults(c *Config) {
 	}
 	if s.EtcdRescueFn == nil {
 		s.EtcdRescueFn = etcdmaint.Run
-	}
-	if s.SSKillFn == nil {
-		s.SSKillFn = func(ctx context.Context) error {
-			// `ss -K sport = :6443` is a HOST command — it drops the
-			// apiserver's hung HTTP/2 watch streams in the host
-			// network namespace, so it goes through the shared
-			// client (host ss binary + host netns) rather than
-			// relying on an ss binary inside the agent image (the
-			// old raw exec only worked because the pod is
-			// hostNetwork AND happened to carry ss).
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			out, err := hostExecCtx(cctx, sd, true,
-				"ss", "-K", "sport", "=", ":6443")
-			if err != nil {
-				return fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
-			}
-			return nil
-		}
 	}
 	if s.CPHealthFn == nil {
 		s.CPHealthFn = func(ctx context.Context, url string) bool {

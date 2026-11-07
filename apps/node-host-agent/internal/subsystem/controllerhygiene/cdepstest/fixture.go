@@ -17,6 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,8 +47,11 @@ type KillRecord struct {
 
 // Fixture is the shared test environment: tempdir host trees +
 // stubbed externals + a controllable clock. Tests are fully
-// hermetic — "processes" are just files under Proc, "systemctl" a
-// recorded call list, "journal" a scripted string. Cfg is a
+// hermetic — "processes" are just files under Proc, the journalctl/
+// systemctl/ss surface is one scripted exec dispatch (HostExec)
+// over the Journal/Props/Active maps with restarts recorded, the
+// apiserver LIST probe a scripted RoundTripper, and the pg-wire /
+// HTTP-liveness / sd_notify probes canned. Cfg is a
 // controllerhygiene-ready Config; the consumer builds the Hygiene
 // (controllerhygiene.New(f.Cfg, reg)) and calls Bind(h.Deps) so
 // every seam answers from this fixture.
@@ -146,39 +151,20 @@ func (f *Fixture) Bind(d *cdeps.Deps) {
 		f.Kills = append(f.Kills, KillRecord{pid, sig})
 		return nil
 	}
-	d.Cfg.ListRVFn = func(_ context.Context, ep string, cached bool) (int64, bool) {
-		r, ok := f.RV[ep][cached]
-		if !ok {
-			return 0, false
-		}
-		return r.RV, true
-	}
-	d.Cfg.JournalFn = func(context.Context, string, time.Time) (string, error) {
-		return f.Journal, f.JErr
-	}
-	// Unfiltered journald probe: report journald alive so scripted
-	// empty unit journals classify as a quiet unit, never as
-	// journald-level blindness.
-	d.Cfg.JournalAnyFn = func(context.Context) (string, error) {
-		return f.JAny, f.JAnyErr
-	}
+	// The rv LIST probe's low-level seam is the injected HTTPClient —
+	// the scripted transport answers ?resourceVersion= LISTs from the
+	// RV table so Deps.ListRV's URL build + parse run for real (the
+	// old ListRVFn field collapsed into this seam). Both fields get
+	// it: New() copies Cfg.HTTPClient into d.Client, and EnsureClient
+	// returns d.Client whenever the cfg field is set.
+	client := &http.Client{Transport: rvTransport{f}}
+	d.Cfg.HTTPClient = client
+	d.Client = client
+	// Every journalctl/systemctl/ss call routes through the one
+	// HostExecFn seam — the fixture dispatch scripts them from the
+	// Journal/JAny/Props/Active maps and records restarts in Rst.
+	d.Cfg.HostExecFn = f.HostExec
 	d.Cfg.PgWireFn = func(context.Context, string) bool { return f.PgOK }
-	d.Cfg.RestartFn = func(_ context.Context, unit string) error {
-		f.Mu.Lock()
-		defer f.Mu.Unlock()
-		f.Rst = append(f.Rst, unit)
-		return nil
-	}
-	d.Cfg.PropFn = func(_ context.Context, unit, prop string) (string, error) {
-		v, ok := f.Props[unit+":"+prop]
-		if !ok {
-			return "", errors.New("no prop")
-		}
-		return v, nil
-	}
-	d.Cfg.IsActiveFn = func(_ context.Context, unit string) (string, error) {
-		return f.Active[unit], nil
-	}
 	d.Cfg.NotifyFn = func(msg string) error {
 		f.Mu.Lock()
 		defer f.Mu.Unlock()
@@ -186,6 +172,73 @@ func (f *Fixture) Bind(d *cdeps.Deps) {
 		return nil
 	}
 	d.Cfg.ProbeFn = func(_ context.Context, url string) bool { return f.Alive[url] }
+}
+
+// HostExec is the fixture's HostExecFn dispatch — the whole
+// journalctl/systemctl/ss surface scripted from the fixture maps:
+// `journalctl -u` answers Journal/JErr, the unfiltered `journalctl
+// -n 1` answers JAny/JAnyErr, `systemctl restart` records into Rst
+// (locked — the feeder goroutine runs async), `systemctl show -p`
+// answers Props["unit:prop"], `systemctl is-active` answers
+// Active[unit]. Anything else errors: a miss must be loud, not a
+// silent success — the production default would exec on the test
+// host (wdepstest sdRun parity). Exported so a test overriding
+// HostExecFn for one argv can delegate the rest.
+func (f *Fixture) HostExec(_ context.Context, _ bool, _ time.Duration,
+	name string, args ...string) (string, error) {
+	switch {
+	case name == "journalctl" && len(args) > 0 && args[0] == "-u":
+		return f.Journal, f.JErr
+	case name == "journalctl":
+		// The unfiltered journald probe reports journald alive so
+		// scripted empty unit journals classify as a quiet unit,
+		// never as journald-level blindness.
+		return f.JAny, f.JAnyErr
+	case name == "systemctl" && len(args) >= 2 && args[0] == "restart":
+		f.Mu.Lock()
+		defer f.Mu.Unlock()
+		f.Rst = append(f.Rst, args[1])
+		return "", nil
+	case name == "systemctl" && len(args) >= 4 && args[0] == "show":
+		v, ok := f.Props[args[1]+":"+args[3]]
+		if !ok {
+			return "", errors.New("no prop")
+		}
+		return v, nil
+	case name == "systemctl" && len(args) >= 2 && args[0] == "is-active":
+		return f.Active[args[1]], nil
+	}
+	return "", fmt.Errorf("cdepstest: unscripted host exec %s %s",
+		name, strings.Join(args, " "))
+}
+
+// rvTransport is the fixture's apiserver LIST answerer — the
+// RoundTripper behind the injected HTTPClient seam. The cached/
+// consistent split rides the ?resourceVersion= query the real
+// probe builds ("0" = watch-cache read, "" = consistent); replies
+// come from the scripted RV table (endpoint → cached → result).
+// Unscripted queries and !ok rows fail like a mute apiserver — the
+// dead-fallback's evidence shape — and every non-LIST URL (the APF
+// /metrics scrape) fails the same way, degrading to headers-only
+// emission exactly like the old no-creds path did.
+type rvTransport struct{ f *Fixture }
+
+// RoundTrip answers one LIST probe from the scripted RV table.
+func (rt rvTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	cached := req.URL.Query().Get("resourceVersion") == "0"
+	r, ok := rt.f.RV[req.URL.Host][cached]
+	if !ok || !r.OK {
+		return nil, fmt.Errorf("cdepstest: apiserver %s cached=%v unreachable",
+			req.URL.Host, cached)
+	}
+	return &http.Response{
+		Status:     "200 OK",
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+			`{"metadata":{"resourceVersion":"%d"}}`, r.RV))),
+		Request: req,
+	}, nil
 }
 
 // RstN returns the restart-call count (locked — feeder runs async).

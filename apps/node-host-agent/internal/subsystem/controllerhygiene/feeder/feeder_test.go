@@ -209,16 +209,22 @@ func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 	e.Active["k0scontroller.service"] = "active"
 	e.SetUnitStart("k0scontroller.service", time.Hour)
 	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
-	// restartFn asserts the G5 budget file ALREADY exists when the
-	// restart executes — a mid-restart kill must not leave it unspent.
-	e.H.Cfg.RestartFn = func(_ context.Context, unit string) error {
-		if _, err := os.Stat(filepath.Join(e.FState, cdeps.FileFeederLastRst)); err != nil {
-			t.Errorf("G5 budget not marked before restart: %v", err)
+	// The restart exec asserts the G5 budget file ALREADY exists when
+	// the restart runs — a mid-restart kill must not leave it unspent.
+	// HostExecFn is the one exec seam now: intercept the restart argv,
+	// delegate everything else to the fixture dispatch.
+	e.H.Cfg.HostExecFn = func(ctx context.Context, combined bool,
+		budget time.Duration, name string, args ...string) (string, error) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "restart" {
+			if _, err := os.Stat(filepath.Join(e.FState, cdeps.FileFeederLastRst)); err != nil {
+				t.Errorf("G5 budget not marked before restart: %v", err)
+			}
+			e.Mu.Lock()
+			defer e.Mu.Unlock()
+			e.Rst = append(e.Rst, args[1])
+			return "", nil
 		}
-		e.Mu.Lock()
-		defer e.Mu.Unlock()
-		e.Rst = append(e.Rst, unit)
-		return nil
+		return e.HostExec(ctx, combined, budget, name, args...)
 	}
 	e.H.Feeder().RunRemediate(context.Background())
 	if e.RstN() != 1 {

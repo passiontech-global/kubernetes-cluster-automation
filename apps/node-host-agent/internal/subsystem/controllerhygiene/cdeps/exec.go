@@ -1,13 +1,17 @@
 // exec.go — the host-command/env plumbing shared by the Config seam
 // defaults: the NOTIFY_SOCKET/WATCHDOG_* scrub (argv form for the
 // shared platform/systemd client, env form for the rare in-container
-// execs), the nil-tolerant systemd-client wrapper every host command
-// routes through, and the sd_notify datagram sender's NotifyFn seam.
+// execs), the nil-tolerant systemd-client wrapper the HostExecFn
+// default routes through, the sd_notify datagram sender's NotifyFn
+// default, and the named host-command helpers the old per-command
+// seams became (they build argv + parse over the one HostExecFn —
+// methods do the munging, the seam does the I/O).
 package cdeps
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -65,27 +69,23 @@ func scrubArgv(name string, args ...string) []string {
 	return append(argv, args...)
 }
 
-// hostExecCtx runs name args... on the host through the shared
-// systemd client — nsenter-wrapped to host PID 1's namespaces inside
-// the DaemonSet, so systemctl/journalctl/ss act on the host's systemd,
-// journal and network namespace (the raw container-side execs this
-// replaces saw the pod's empty journal view and had no dbus socket).
-// combined selects ExecCombined — stderr folded into the returned
-// output, required for probes whose evidence lives off stdout
-// (journalctl prints "No journal files were found." / "File ... is
-// corrupt" on stderr). A nil client reports the unwired wiring
-// instead of returning empty output: a fake empty journal read would
-// feed the journal-unreadable tracker a bogus "journald-wide empty
-// reply" verdict (workerhygiene parity).
-func hostExecCtx(ctx context.Context, sd *systemd.Client,
-	combined bool, name string, args ...string) (string, error) {
-	return hostExecCtxBounded(ctx, sd, combined, 0, name, args...)
-}
-
-// hostExecCtxBounded is hostExecCtx with a per-call budget replacing
-// the shared client's Config.Timeout — for remediations whose shell
-// budget was longer than 30s (the apiserver wedge gate's `timeout
-// 90 systemctl restart`). budget <= 0 keeps the client default.
+// hostExecCtxBounded runs name args... on the host through the
+// shared systemd client — the HostExecFn production default.
+// nsenter-wrapped to host PID 1's namespaces inside the DaemonSet,
+// so systemctl/journalctl/ss act on the host's systemd, journal and
+// network namespace (the raw container-side execs this replaces saw
+// the pod's empty journal view and had no dbus socket). combined
+// selects ExecCombined — stderr folded into the returned output,
+// required for probes whose evidence lives off stdout (journalctl
+// prints "No journal files were found." / "File ... is corrupt" on
+// stderr). A nil client reports the unwired wiring instead of
+// returning empty output: a fake empty journal read would feed the
+// journal-unreadable tracker a bogus "journald-wide empty reply"
+// verdict (workerhygiene parity). budget >0 is the per-call
+// ExecBounded override for remediations whose shell budget was
+// longer than the shared client's 30s Config.Timeout (the apiserver
+// wedge gate's `timeout 90 systemctl restart`); <=0 keeps the
+// client default.
 func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 	combined bool, budget time.Duration,
 	name string, args ...string) (string, error) {
@@ -98,6 +98,66 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 		return sd.ExecCombinedBounded(ctx, budget, argv[0], argv[1:]...)
 	}
 	return sd.ExecBounded(ctx, budget, argv[0], argv[1:]...)
+}
+
+// --- named host commands over the HostExecFn seam ---
+// The per-command xxxFn fields collapsed into the one exec seam:
+// these methods carry the fixed argv + output munging each command
+// had (the ctx budgets stay caller-side so a stubbed seam still
+// sees the shell's `timeout N` contract).
+
+// Restart restarts unit on the HOST systemd — `timeout 90
+// systemctl restart <unit>` parity. The 90s budget goes through the
+// seam's ExecBounded arg rather than a ctx wrap: a tighter wrap
+// SIGKILLed a slow restart mid-flight while systemd finished
+// asynchronously and the gate logged FAIL. Routing through the host
+// exec is what lets the restart reach the HOST systemd — the old
+// raw exec had no dbus socket inside the DaemonSet and could never
+// work.
+func (d *Deps) Restart(ctx context.Context, unit string) error {
+	_, err := d.Cfg.HostExecFn(ctx, true, defaultRestartBudget,
+		"systemctl", "restart", unit)
+	return err
+}
+
+// UnitProp reads one `systemctl show <unit> -p <prop> --value`
+// property — `timeout 10` parity, output trimmed.
+func (d *Deps) UnitProp(ctx context.Context, unit, prop string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
+	defer cancel()
+	out, err := d.Cfg.HostExecFn(cctx, false, 0,
+		"systemctl", "show", unit, "-p", prop, "--value")
+	return strings.TrimSpace(out), err
+}
+
+// UnitActiveState is `systemctl is-active <unit>` — the output is
+// the verdict, never the error (is-active exits non-zero for
+// inactive; shell `|| true` parity — an exec failure reads as ""
+// the same way an absent unit does).
+func (d *Deps) UnitActiveState(ctx context.Context, unit string) string {
+	cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
+	defer cancel()
+	out, _ := d.Cfg.HostExecFn(cctx, false, 0,
+		"systemctl", "is-active", unit)
+	return strings.TrimSpace(out)
+}
+
+// SSKill runs `ss -K sport = :6443` — kills the apiserver's hung
+// HTTP/2 watch streams in the host network namespace before a wedge
+// restart (W8-CP1), so the restart (and the post-restart reconnect)
+// starts clean. It goes through the shared client (host ss binary +
+// host netns) rather than relying on an ss binary inside the agent
+// image — the old raw exec only worked because the pod is
+// hostNetwork AND happened to carry ss.
+func (d *Deps) SSKill(ctx context.Context) error {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := d.Cfg.HostExecFn(cctx, true, 0,
+		"ss", "-K", "sport", "=", ":6443")
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 // sdNotify sends msg as a datagram to the sd_notify unix socket —
