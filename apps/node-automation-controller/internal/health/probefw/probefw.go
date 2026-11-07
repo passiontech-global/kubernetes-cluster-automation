@@ -4,12 +4,14 @@
 // uniform Check shape the root clusterhealthprobes registry sweeps.
 //
 // Each check lives in a domain subpackage under internal/health and
-// exposes a New(*Deps) Check constructor; the root package's
-// checkDefs roster is the single sweep-order list.
+// exposes a New(*Deps) Check constructor; the registry's health
+// CheckReg rows (collected into shared.Deps.CheckRegs) are the
+// single sweep-order list.
 package probefw
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"time"
 
@@ -95,6 +97,36 @@ type Deps struct {
 	// metrics-backed checks run through PromQuery; Timeout bounds
 	// each query below the check's own deadline.
 	Prom promq.Client
+}
+
+// NewDeps builds the production-wired shared dependencies from the
+// module's registry-stamped shared.Deps: the ops name and the clients
+// pass through, and the test seams take their production defaults —
+// the system DNS resolver, a plain http.Client, the real clock.
+// NodeReader is the manager's cached client; a nil Mgr (the
+// literally-constructed test Deps shape shared.Deps documents)
+// leaves it nil, the documented fall-back-to-ListNodes posture.
+//
+// Prom deliberately shares the HTTPClient POINTER: tests swap
+// d.HTTPClient post-construction and PromQuery re-reads the field per
+// call, so the one seam serves both the plain-HTTP checks and the
+// PromQL-backed ones. Timeout bounds each query by the check timeout
+// — the posture the retired promInstantQuery encoded inline.
+func NewDeps(d shared.Deps, cfg Config) *Deps {
+	deps := &Deps{
+		Name:       d.Name,
+		CS:         d.CS,
+		Dyn:        d.Dyn,
+		Cfg:        cfg,
+		LookupHost: (&net.Resolver{}).LookupHost,
+		HTTPClient: &http.Client{},
+		Now:        time.Now,
+	}
+	if d.Mgr != nil {
+		deps.NodeReader = d.Mgr.GetClient()
+	}
+	deps.Prom = promq.Client{HTTP: deps.HTTPClient, Timeout: cfg.Timeouts.Check}
+	return deps
 }
 
 // Config carries the HEALTH_* env knobs the checker Pods read
