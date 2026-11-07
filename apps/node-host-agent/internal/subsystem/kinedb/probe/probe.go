@@ -1,36 +1,18 @@
-// probe.go — the 2-minute app-layer probe (kine-db-probe.sh port).
-// Checks, each one a kine_db_probe_ok{check=...} series:
+// Package probe ports kine-db-probe.sh — the 2-minute app-layer
+// probe of the postgres+pgbouncer stack on the kine DB VM:
+// container liveness, a pure-Go PG v3 StartupMessage wire probe,
+// SCRAM e2e auth through the pooler, .env credential-drift
+// detection, pgbouncer error-log scan, SHOW POOLS server-conn/queue
+// depth and the revision horizon (MAX(id) vs compact_rev_key) that
+// predicts "required revision has been compacted" apiserver wedges.
 //
-//	containers       kine-postgres + kine-pgbouncer running
-//	wire             StartupMessage → 'R'/'S'/'N'/'K' (TCP alone
-//	                 misses "server login has been failing",
-//	                 incident 2026-09-25)
-//	e2e_auth         .env SCRAM creds through the pooler at
-//	                 <pgbouncer>:5432 — the exact path kine takes
-//	                 (in-container port; 6432 is the published
-//	                 host port only)
-//	pools            SHOW POOLS: server conns > 0 and cl_waiting
-//	                 <= WaitMax (deep queue = apiserver flap,
-//	                 incident 2026-10-01); maxwait also feeds the
-//	                 W12-CP1 server-pool starvation detector in
-//	                 checkPGBWedge — a queue older than 10s while
-//	                 the backend runs fewer queries than the pool
-//	                 holds server conns means stalled conns, not
-//	                 a busy backend
-//	backend_env      .env creds log into the backend — catches
-//	                 the initdb-skip credential drift trap
-//	log_errors       pgbouncer log 301s clean of login_retry /
-//	                 password failed / pooler error
-//	revision_horizon MAX(id) / compact_rev_key / n_live_tup
-//	                 → head/compact/retained gauges. kine_db_rows
-//	                 is intentionally NOT counted here — COUNT(*)
-//	                 seq-scans the very table whose bloat the
-//	                 probe monitors, so the bash only ran it in the
-//	                 10-min guard. The guard emits kine_db_rows
-//	                 into kine-compact-guard.prom instead (never
-//	                 both files: duplicate series across textfiles
-//	                 fail the whole scrape).
-package kinedb
+// The probe cycle also carries the remediation blocks that share
+// its 2-minute cadence (selfheal.go: session reaper + pgbouncer
+// wedge restart, hygiene.go: the kine-pg-hygiene census + WAL
+// archive guard, churn.go: the top-5 write-churn sampler). The
+// compact-guard and maint loops live in their own packages beside
+// this one; everything shared goes through kdeps.Deps.
+package probe
 
 import (
 	"context"
@@ -38,13 +20,59 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
+
+// Check names — the kine_db_probe_ok{check=...} label contract.
+const (
+	CheckContainers = "containers"
+	CheckWire       = "wire"
+	CheckE2EAuth    = "e2e_auth"
+	CheckPools      = "pools"
+	CheckBackendEnv = "backend_env"
+	CheckLogErrors  = "log_errors"
+	CheckRevision   = "revision_horizon"
+)
+
+var probeChecks = []string{
+	CheckContainers, CheckWire, CheckE2EAuth, CheckPools,
+	CheckBackendEnv, CheckLogErrors, CheckRevision,
+}
+
+var (
+	rePGBLogErr  = regexp.MustCompile(`server_login_retry|password authentication failed|pooler error`)
+	pgbAdminDB   = "pgbouncer" // SHOW POOLS lives on the admin console db
+	poolDatabase = "postgres"  // the pool kine draws server conns from
+)
+
+const pgWireTimeout = 8 * time.Second
+
+// Probe runs the 2-minute check round — the kine-db-probe.sh port
+// plus the probe-cadence remediations. It keeps no state of its
+// own: config, metrics, the state store, the exec plumbing and the
+// churn hand-off all live on the shared *kdeps.Deps.
+type Probe struct {
+	d *kdeps.Deps
+}
+
+// New returns the probe loop over d, filling the wire-probe seam
+// default (the Go-native PG v3 StartupMessage) when the config
+// left it unset.
+func New(d *kdeps.Deps) *Probe {
+	if d.Cfg.WireFn == nil {
+		d.Cfg.WireFn = func(ctx context.Context, addr string) bool {
+			return pgWireProbe(ctx, addr, pgWireTimeout)
+		}
+	}
+	return &Probe{d: d}
+}
 
 // pgStartupMessage builds the protocol-3.0 StartupMessage — the same
 // payload the bash probe sent via python:
@@ -178,82 +206,86 @@ func parseShowPools(out, dbName string) (poolStats, bool) {
 	return st, seen
 }
 
-// probeResult captures one probe run for emission + tests.
-type probeResult struct {
-	checks    map[string]int64
-	pool      poolStats
-	poolSeen  bool
-	head      int64
-	compact   int64
-	liveTup   int64
-	revSeen   bool
-	notes     []string
-	succeeded bool
-
+// Result captures one probe run for emission + tests — was
+// probeResult. The exported half is the check-kine-db CLI's report
+// surface (the facade renders OK/FAIL lines from it); the rest is
+// emission/test internal.
+type Result struct {
+	Checks  map[string]int64
+	Head    int64
+	Compact int64
+	LiveTup int64
+	RevSeen bool
 	// Reporting fields for the check-kine-db CLI — names + counters
 	// the bash script interpolated into its check lines.
-	pgName  string // resolved postgres container name
-	pgbName string // resolved pgbouncer container name
-	envUser string // POSTGRES_USER read from the stack .env
-	logErrs int64  // error-line count in the pgbouncer log window
+	PGName  string // resolved postgres container name
+	PGBName string // resolved pgbouncer container name
+	EnvUser string // POSTGRES_USER read from the stack .env
+	LogErrs int64  // error-line count in the pgbouncer log window
+
+	pool      poolStats
+	poolSeen  bool
+	notes     []string
+	succeeded bool
 	// logScanned is false when `logs` itself failed — log_errors is
 	// then inconclusive (a fabricated clean window must neither
 	// pass nor fail the probe).
 	logScanned bool
 
 	// hyg is the kine-pg-hygiene + WAL archive guard read
-	// (wal_xid_hygiene.go) — nil when the block did not run this
-	// round (no containers/creds), so emission skips its series.
+	// (hygiene.go) — nil when the block did not run this round
+	// (no containers/creds), so emission skips its series.
 	hyg *hygieneResult
 }
 
-// runProbeChecks executes every probe check once and fills
-// probeResult — no metrics, no textfile. probeCycle adds emission
-// on top; RunCheckCLI consumes the same result for OK/FAIL lines.
-func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
-	res := &probeResult{checks: map[string]int64{}}
+// RunChecks executes every probe check once and fills Result — no
+// metrics, no textfile. Cycle adds emission on top; the facade's
+// RunCheckCLI consumes the same result for OK/FAIL lines. Was
+// runProbeChecks.
+func (p *Probe) RunChecks(ctx context.Context) *Result {
+	res := &Result{Checks: map[string]int64{}}
 	for _, c := range probeChecks {
-		res.checks[c] = 0
+		res.Checks[c] = 0
 	}
 	note := func(s string) { res.notes = append(res.notes, s) }
 
-	pg := k.pgContainerName(ctx)
-	pgb := k.pgbContainerName(ctx)
-	res.pgName, res.pgbName = pg, pgb
+	pg := p.d.PGContainerName(ctx)
+	pgb := p.d.PGBContainerName(ctx)
+	res.PGName, res.PGBName = pg, pgb
 
 	// (a) containers running.
-	if k.containerRunning(ctx, pg) && k.containerRunning(ctx, pgb) {
-		res.checks[checkContainers] = 1
+	if p.d.ContainerRunning(ctx, pg) && p.d.ContainerRunning(ctx, pgb) {
+		res.Checks[CheckContainers] = 1
 	} else {
 		note(fmt.Sprintf("containers down (%s and/or %s)", pg, pgb))
 	}
 
 	// (b) wire probe — unconditional like the shell: the whole point
 	// is catching a pooler that accepts TCP but fails backend auth.
-	if k.cfg.wireFn(ctx, k.cfg.WireAddr) {
-		res.checks[checkWire] = 1
+	if p.d.Cfg.WireFn(ctx, p.d.Cfg.WireAddr) {
+		res.Checks[CheckWire] = 1
 	} else {
-		note("wire-probe-fail " + k.cfg.WireAddr)
+		note("wire-probe-fail " + p.d.Cfg.WireAddr)
 	}
 
-	user, pass, credOK := k.creds()
-	res.envUser = user
-	if res.checks[checkContainers] == 1 {
+	user, pass, credOK := p.d.Creds()
+	res.EnvUser = user
+	if res.Checks[CheckContainers] == 1 {
 		// (e) pgbouncer log scan needs no .env creds — the bash
 		// ran it whenever both containers were up.
-		k.probeLogScan(ctx, pgb, res, note)
+		p.probeLogScan(ctx, pgb, res, note)
 		if !credOK {
-			note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
+			note(fmt.Sprintf("missing .env creds (%s)", p.d.Cfg.EnvFile))
 		} else {
 			// W8-CP2: reap stuck sessions each probe round —
 			// idle-in-transaction >5m or a non-maintenance active
 			// query >10m holds locks the compact guard needs.
-			k.reapStuckSessions(ctx, pg, user, pass, note)
-			k.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
+			p.reapStuckSessions(ctx, pg, user, pass, note)
+			p.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
 			// kine-pg-hygiene + WAL archive guard: cheap pg_stat
 			// census each round (idle-in-tx, dead tuples, XID age,
 			// pg_wal/archiver/slots) plus the gated remediations.
-			k.pgHygiene(ctx, pg, user, pass, res, note)
+			p.pgHygiene(ctx, pg, user, pass, res, note)
 			// W8-CP2: pgbouncer saturation/auth wedge — deep
 			// client queue, or e2e auth failing while the raw
 			// backend still logs in, means the pooler itself is
@@ -262,53 +294,53 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 			// (maxwait>10s / cl_waiting with sv_active==0) while
 			// the backend idles below the pool's conn count →
 			// RECONNECT the stalled server conns first.
-			k.checkPGBWedge(ctx, pg, pgb, user, pass, res, note)
+			p.checkPGBWedge(ctx, pg, pgb, user, pass, res, note)
 			// W13-CP4: top-5 write churn — a mutating webhook
 			// ping-pong shows up as one resource prefix churning
 			// thousands of revisions.
-			k.probeTopChurn(ctx, pg, user, pass, note)
+			p.probeTopChurn(ctx, pg, user, pass, note)
 		}
 	}
 
-	res.succeeded = res.checks[checkContainers] == 1 &&
-		res.checks[checkWire] == 1 &&
-		res.checks[checkE2EAuth] == 1 &&
-		res.checks[checkPools] == 1 &&
-		res.checks[checkBackendEnv] == 1 &&
+	res.succeeded = res.Checks[CheckContainers] == 1 &&
+		res.Checks[CheckWire] == 1 &&
+		res.Checks[CheckE2EAuth] == 1 &&
+		res.Checks[CheckPools] == 1 &&
+		res.Checks[CheckBackendEnv] == 1 &&
 		// log_errors only counts when the log read worked — like
 		// revision_horizon, an inconclusive check zeroes the gauge
 		// without failing the probe.
-		(!res.logScanned || res.checks[checkLogErrors] == 1)
+		(!res.logScanned || res.Checks[CheckLogErrors] == 1)
 	return res
 }
 
-// probeCycle runs one full probe round and emits metrics + textfile.
-// Returns the result for tests.
-func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
-	res := k.runProbeChecks(ctx)
+// Cycle runs one full probe round and emits metrics + textfile —
+// was probeCycle. Returns the result for tests.
+func (p *Probe) Cycle(ctx context.Context) *Result {
+	res := p.RunChecks(ctx)
 
-	k.emitProbe(res)
+	p.emitProbe(res)
 	sum := fmt.Sprintf(
 		"containers=%d wire=%d e2e_auth=%d pools=%d backend_env=%d "+
 			"log_errors=%d revision_horizon=%d head=%s compact_rev=%s live_tup=%s",
-		res.checks[checkContainers], res.checks[checkWire],
-		res.checks[checkE2EAuth], res.checks[checkPools],
-		res.checks[checkBackendEnv], res.checks[checkLogErrors],
-		res.checks[checkRevision], intOrNA(res.revSeen, res.head),
-		intOrNA(res.revSeen, res.compact), intOrNA(res.revSeen, res.liveTup))
+		res.Checks[CheckContainers], res.Checks[CheckWire],
+		res.Checks[CheckE2EAuth], res.Checks[CheckPools],
+		res.Checks[CheckBackendEnv], res.Checks[CheckLogErrors],
+		res.Checks[CheckRevision], kdeps.IntOrNA(res.RevSeen, res.Head),
+		kdeps.IntOrNA(res.RevSeen, res.Compact), kdeps.IntOrNA(res.RevSeen, res.LiveTup))
 	if res.succeeded {
 		logger().Info("kine-db-probe OK: " + sum)
-		k.m.cycles.WithLabelValues("probe", "ok").Inc()
+		p.d.M.Cycles.WithLabelValues("probe", "ok").Inc()
 	} else {
 		logger().Warn("kine-db-probe FAIL: "+sum, "notes", strings.Join(res.notes, " "))
-		k.m.cycles.WithLabelValues("probe", "fail").Inc()
+		p.d.M.Cycles.WithLabelValues("probe", "fail").Inc()
 	}
 	return res
 }
 
 // probeAppChecks covers every check that needs containers + creds.
-func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
-	res *probeResult, note func(string)) {
+func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
+	res *Result, note func(string)) {
 
 	// (c) e2e auth — psql inside the postgres container THROUGH the
 	// pooler, SCRAM-SHA-256 end to end (client auth + backend auth +
@@ -316,21 +348,21 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// in-container port 5432 with credentials in pgbouncer.ini +
 	// userlist.txt (edoburu/pgbouncer compose stack), fall back to
 	// querying 127.0.0.1:5432 inside the pgbouncer container.
-	out, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+	out, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
 		"-e", "PGPASSWORD", pg,
-		"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
+		"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 		"-U", user, "-d", "postgres", "-tAc", "select 1"}, "")
 	if err != nil || strings.TrimSpace(out) != "1" {
-		out, err = k.exec(ctx, []string{k.cfg.Runtime, "exec", pgb, "sh", "-c",
+		out, err = p.d.Exec(ctx, []string{p.d.Cfg.Runtime, "exec", pgb, "sh", "-c",
 			`U=$(sed -n "s/^admin_users *= *//p" /etc/pgbouncer/pgbouncer.ini | cut -d, -f1 | tr -d " "); ` +
 				`[ -n "$U" ] || U=$(sed -n "s/^stats_users *= *//p" /etc/pgbouncer/pgbouncer.ini | cut -d, -f1 | tr -d " "); ` +
 				`P=$(grep "^\"$U\"" /etc/pgbouncer/userlist.txt | cut -d\" -f4); ` +
 				`PGPASSWORD="$P" psql -h 127.0.0.1 -p 5432 -U "$U" postgres -tAc "select 1"`}, "")
 	}
 	if err == nil && strings.TrimSpace(out) == "1" {
-		res.checks[checkE2EAuth] = 1
+		res.Checks[CheckE2EAuth] = 1
 	} else {
-		note(fmt.Sprintf("e2e-auth-fail via %s:%s", pgb, k.cfg.PoolerPort))
+		note(fmt.Sprintf("e2e-auth-fail via %s:%s", pgb, p.d.Cfg.PoolerPort))
 	}
 
 	// (f) SHOW POOLS on the admin console — server conns > 0 means
@@ -338,13 +370,13 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// depth (client spiral leading indicator). Falls back to
 	// in-container :5432 with stats_users from pgbouncer.ini when
 	// the direct .env credential/port path is unavailable.
-	pools, err := k.execEnv(ctx, psqlPassEnv(pass), []string{k.cfg.Runtime, "exec",
+	pools, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
 		"-e", "PGPASSWORD", pg,
-		"psql", "-h", pgb, "-p", k.cfg.PoolerPort,
+		"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 		"-U", user, "-d", pgbAdminDB, "-Aqc", "SHOW POOLS"}, "")
 	st, ok := parseShowPools(pools, poolDatabase)
 	if err != nil || !ok {
-		if pools2, err2 := k.exec(ctx, []string{k.cfg.Runtime, "exec", pgb, "sh", "-c",
+		if pools2, err2 := p.d.Exec(ctx, []string{p.d.Cfg.Runtime, "exec", pgb, "sh", "-c",
 			`U=$(sed -n "s/^stats_users *= *//p" /etc/pgbouncer/pgbouncer.ini | cut -d, -f1 | tr -d " "); ` +
 				`P=$(grep "^\"$U\"" /etc/pgbouncer/userlist.txt | cut -d\" -f4); ` +
 				`PGPASSWORD="$P" psql -h 127.0.0.1 -p 5432 -U "$U" pgbouncer -Aqc "SHOW POOLS"`}, ""); err2 == nil {
@@ -359,10 +391,10 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 			switch {
 			case st.serverConns <= 0:
 				note("pool-no-server")
-			case st.clWaiting > k.cfg.WaitMax:
-				note(fmt.Sprintf("pool-queue=%d>%d", st.clWaiting, k.cfg.WaitMax))
+			case st.clWaiting > p.d.Cfg.WaitMax:
+				note(fmt.Sprintf("pool-queue=%d>%d", st.clWaiting, p.d.Cfg.WaitMax))
 			default:
-				res.checks[checkPools] = 1
+				res.Checks[CheckPools] = 1
 			}
 		} else {
 			note("show-pools-unparsed")
@@ -373,9 +405,9 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 
 	// (d) backend env drift — the .env credentials must still log
 	// into the backend postgres role (initdb-skip trap).
-	out, err = k.psqlQuery(ctx, pg, user, pass, "select 1")
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass, "select 1")
 	if err == nil && strings.TrimSpace(out) == "1" {
-		res.checks[checkBackendEnv] = 1
+		res.Checks[CheckBackendEnv] = 1
 	} else {
 		note("backend-env-drift user=" + user)
 	}
@@ -385,17 +417,17 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// bloat this probe monitors — the bash only counted rows in the
 	// 10-min guard, which owns the kine_db_rows series. A query
 	// failure only zeroes this check, never the probe.
-	out, err = k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %[1]s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %[1]s WHERE name='%s'),0), "+
 			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%s),0)",
-		sqlIdent(k.cfg.Table), compactRevKey, sqlQuote(k.cfg.Table)))
+		kdeps.SQLIdent(p.d.Cfg.Table), kdeps.CompactRevKey, kdeps.SQLQuote(p.d.Cfg.Table)))
 	if err == nil {
-		head, crev, live, perr := parseTriple(out)
+		head, crev, live, perr := kdeps.ParseTriple(out)
 		if perr == nil {
-			res.checks[checkRevision] = 1
-			res.revSeen = true
-			res.head, res.compact, res.liveTup = head, crev, live
+			res.Checks[CheckRevision] = 1
+			res.RevSeen = true
+			res.Head, res.Compact, res.LiveTup = head, crev, live
 		} else {
 			note(fmt.Sprintf("revision-unparsed: %v", perr))
 		}
@@ -408,16 +440,16 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 // + auth failures + pooler errors inside the last 301s (the bash's
 // 5m window plus the boundary second). Needs no .env creds, so it
 // runs outside probeAppChecks.
-func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
-	res *probeResult, note func(string)) {
+func (p *Probe) probeLogScan(ctx context.Context, pgb string,
+	res *Result, note func(string)) {
 	// stderr folded in for THIS call only: pgbouncer logs on its
 	// stderr stream and the runner now keeps stderr out of the
 	// returned output — without 2>&1 the scan would read nothing.
-	// Both interpolated words are shq-quoted: a runtime/container
+	// Both interpolated words are ShellQuote'd: a runtime/container
 	// name with a space or metachar must not split or glob inside
 	// the sh -c string.
-	logs, lerr := k.exec(ctx, []string{"sh", "-c",
-		shq(k.cfg.Runtime) + " logs --since 301s " + shq(pgb) + " 2>&1"}, "")
+	logs, lerr := p.d.Exec(ctx, []string{"sh", "-c",
+		hostutil.ShellQuote(p.d.Cfg.Runtime) + " logs --since 301s " + hostutil.ShellQuote(pgb) + " 2>&1"}, "")
 	if lerr != nil {
 		// A failed `logs` read is inconclusive, not clean — leave
 		// the check at 0 and exclude it from `succeeded` so a scan
@@ -434,227 +466,146 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 			n++ // grep -c parity: matching LINES, not occurrences
 		}
 	}
-	res.logErrs = n
+	res.LogErrs = n
 	if n == 0 {
-		res.checks[checkLogErrors] = 1
+		res.Checks[CheckLogErrors] = 1
 	} else {
 		note(fmt.Sprintf("log-errors=%d", n))
 	}
 }
 
-// probeTopChurn is the W13-CP4 top-5 write-churn sampler. The kine
-// table carries no wall-clock column, so "last 5m" is a watermark
-// window: once the stored (head, ts) pair is >= defaultChurnWindow
-// old, one light grouped query counts revisions minted since it
-// and the watermark advances to (current head, now). Skipped
-// windows keep the last result — a failed query never fabricates
-// a zero series.
-func (k *KineDB) probeTopChurn(ctx context.Context, pg, user, pass string,
-	note func(string)) {
-	if k.cfg.ReadOnly {
-		// The watermark files are the DAEMON's sampling window — a
-		// read-only probe (check-kine-db) must not rebase it. The
-		// sample itself feeds only the guard textfile, which the
-		// CLI does not render, so there is nothing to report here.
-		return
-	}
-	dir := k.cfg.GuardStateDir
-	prevHead, _ := readIntFile(filepath.Join(dir, churnFileHead))
-	prevTS, _ := readIntFile(filepath.Join(dir, churnFileTS))
-	now := k.cfg.Clock.Now().Unix()
-	if prevTS == 0 {
-		// First sighting — seed the watermark only. A missing
-		// watermark treated as head=0 would group-by the WHOLE
-		// table (the COUNT(*) the probe budget forbids).
-		writeIntFile(filepath.Join(dir, churnFileTS), now)
-		writeIntFile(filepath.Join(dir, churnFileHead),
-			resHead(k, ctx, pg, user, pass))
-		return
-	}
-	if now-prevTS < int64(defaultChurnWindow.Seconds()) {
-		return // window still filling — keep the last result
-	}
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT split_part(name,'/',3) AS res, COUNT(*) FROM %[1]s "+
-			"WHERE id > %[2]d AND name LIKE '/registry/%%' "+
-			"GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT %d",
-		sqlIdent(k.cfg.Table), prevHead, churnTopN))
-	if err != nil {
-		note(fmt.Sprintf("top-churn-query-fail: %v", err))
-		return
-	}
-	var top []churnEntry
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Split(strings.TrimSpace(line), "|")
-		if len(f) < 2 || f[0] == "" {
-			continue
-		}
-		n, perr := strconv.ParseInt(f[1], 10, 64)
-		if perr == nil {
-			top = append(top, churnEntry{resource: f[0], revs: n})
-		}
-	}
-	k.churnMu.Lock()
-	k.churnTop = top
-	k.churnMu.Unlock()
-	// Advance the watermark — a churn-free window still moves it
-	// so the next window measures fresh ground.
-	writeIntFile(filepath.Join(dir, churnFileHead), resHead(k, ctx, pg, user, pass))
-	writeIntFile(filepath.Join(dir, churnFileTS), now)
-}
-
-// resHead re-reads MAX(id) for the watermark advance — best-effort:
-// a failed read writes 0, which makes the next window count "id>0"
-// and safely degrade to a full-table count once.
-func resHead(k *KineDB, ctx context.Context, pg, user, pass string) int64 {
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT COALESCE((SELECT MAX(id) FROM %s),0)", sqlIdent(k.cfg.Table)))
-	if err != nil {
-		return 0
-	}
-	v, _ := strconv.ParseInt(firstLine(out), 10, 64)
-	return v
-}
-
 // emitProbe renders the textfile and updates the collectors.
-func (k *KineDB) emitProbe(res *probeResult) {
-	var p promfile.Builder
+func (p *Probe) emitProbe(res *Result) {
+	var b promfile.Builder
 	for _, c := range probeChecks {
-		p.GaugeLabels("kine_db_probe_ok",
+		b.GaugeLabels("kine_db_probe_ok",
 			"App-layer probe result on the kine DB VM (1 = ok, 0 = fail)",
-			fmt.Sprintf("check=%q", c), float64(res.checks[c]))
-		k.m.probeOK.WithLabelValues(c).Set(float64(res.checks[c]))
+			fmt.Sprintf("check=%q", c), float64(res.Checks[c]))
+		p.d.M.ProbeOK.WithLabelValues(c).Set(float64(res.Checks[c]))
 	}
 	if res.poolSeen {
-		p.GaugeLabels("kine_db_pgbouncer_server_conns",
+		b.GaugeLabels("kine_db_pgbouncer_server_conns",
 			"pgbouncer server connections for the postgres pool by state",
 			`state="active"`, float64(res.pool.svActive))
-		p.GaugeLabels("kine_db_pgbouncer_server_conns",
+		b.GaugeLabels("kine_db_pgbouncer_server_conns",
 			"pgbouncer server connections for the postgres pool by state",
 			`state="idle"`, float64(res.pool.svIdle))
-		p.Gauge("kine_db_pgbouncer_clients_waiting",
+		b.Gauge("kine_db_pgbouncer_clients_waiting",
 			"cl_waiting of the postgres pool — deep queue = client spiral",
 			float64(res.pool.clWaiting))
 		// W12-CP1 alert contract series (plan names — kept separate
 		// from the kine_db_* family above so the old dashboards do
 		// not double-count the same number under two names).
-		p.Gauge("kine_pgbouncer_client_waiting_connections",
+		b.Gauge("kine_pgbouncer_client_waiting_connections",
 			"cl_waiting of the postgres pool — clients queued for a server conn (starvation leading edge)",
 			float64(res.pool.clWaiting))
-		p.Gauge("kine_pgbouncer_maxwait_seconds",
+		b.Gauge("kine_pgbouncer_maxwait_seconds",
 			"maxwait of the postgres pool — age of the oldest queued client; >10s while the backend idles means stalled server conns",
 			float64(res.pool.maxWaitSec))
-		k.m.serverConns.WithLabelValues("active").Set(float64(res.pool.svActive))
-		k.m.serverConns.WithLabelValues("idle").Set(float64(res.pool.svIdle))
-		k.m.clientsWaiting.Set(float64(res.pool.clWaiting))
-		k.m.pgbClientWaiting.Set(float64(res.pool.clWaiting))
-		k.m.pgbMaxWait.Set(float64(res.pool.maxWaitSec))
+		p.d.M.ServerConns.WithLabelValues("active").Set(float64(res.pool.svActive))
+		p.d.M.ServerConns.WithLabelValues("idle").Set(float64(res.pool.svIdle))
+		p.d.M.ClientsWaiting.Set(float64(res.pool.clWaiting))
+		p.d.M.PgbClientWaiting.Set(float64(res.pool.clWaiting))
+		p.d.M.PgbMaxWait.Set(float64(res.pool.maxWaitSec))
 	}
-	if res.revSeen {
-		p.Gauge("kine_db_head_revision",
+	if res.RevSeen {
+		b.Gauge("kine_db_head_revision",
 			"MAX(id) of the kine table — newest revision on the DB",
-			float64(res.head))
-		p.Gauge("kine_db_compact_revision",
+			float64(res.Head))
+		b.Gauge("kine_db_compact_revision",
 			"Current compact horizon (MAX prev_revision of compact_rev_key)",
-			float64(res.compact))
-		p.Gauge("kine_db_retained_revisions",
+			float64(res.Compact))
+		b.Gauge("kine_db_retained_revisions",
 			"head - compact_rev: revisions still retained",
-			float64(res.head-res.compact))
+			float64(res.Head-res.Compact))
 		// kine_db_rows deliberately absent — emitted by the guard
 		// cycle (emitGuard), which owns the COUNT(*).
-		k.m.headRevision.Set(float64(res.head))
-		k.m.compactRevision.Set(float64(res.compact))
-		k.m.retained.Set(float64(res.head - res.compact))
+		p.d.M.HeadRevision.Set(float64(res.Head))
+		p.d.M.CompactRevision.Set(float64(res.Compact))
+		p.d.M.Retained.Set(float64(res.Head - res.Compact))
 	}
 	if h := res.hyg; h != nil {
 		// Every series gates on its own *Seen flag — a failed
 		// stats query leaves the gauge absent (stale) instead of
 		// overwriting a real value with a fabricated zero.
 		if h.idleSeen {
-			p.Gauge("kine_db_idle_in_tx_sessions",
+			b.Gauge("kine_db_idle_in_tx_sessions",
 				"Sessions idle in transaction >3min on the postgres/kine databases — autovacuum blockers",
 				float64(h.idleInTx))
-			p.Gauge("node_agent_kine_pg_idle_in_tx_sessions",
+			b.Gauge("node_agent_kine_pg_idle_in_tx_sessions",
 				"Alias of kine_db_idle_in_tx_sessions under the node_agent_* alert contract",
 				float64(h.idleInTx))
-			k.m.idleInTx.Set(float64(h.idleInTx))
-			k.m.idleInTxAlias.Set(float64(h.idleInTx))
+			p.d.M.IdleInTx.Set(float64(h.idleInTx))
+			p.d.M.IdleInTxAlias.Set(float64(h.idleInTx))
 		}
 		if h.deadSeen {
-			p.Gauge("node_agent_kine_pg_dead_tuple_ratio",
+			b.Gauge("node_agent_kine_pg_dead_tuple_ratio",
 				"n_dead_tup/GREATEST(n_live_tup,1) of the kine table — >0.5 means autovacuum lost the race",
 				h.deadRatio)
-			k.m.deadTupleRatio.Set(h.deadRatio)
+			p.d.M.DeadTupleRatio.Set(h.deadRatio)
 		}
 		if h.xidSeen {
-			p.Gauge("kine_db_xid_age_transactions",
+			b.Gauge("kine_db_xid_age_transactions",
 				"MAX(age(datfrozenxid)) across databases — wraparound distance",
 				float64(h.xidAge))
-			k.m.xidAge.Set(float64(h.xidAge))
+			p.d.M.XidAge.Set(float64(h.xidAge))
 		}
 		if h.walSeen {
-			p.Gauge("kine_db_wal_bytes",
+			b.Gauge("kine_db_wal_bytes",
 				"Total bytes in pg_wal (pg_ls_waldir)",
 				float64(h.walBytes))
-			k.m.walBytes.Set(float64(h.walBytes))
+			p.d.M.WalBytes.Set(float64(h.walBytes))
 		}
 		if h.walDiskSeen {
-			p.Gauge("kine_db_wal_disk_ratio",
+			b.Gauge("kine_db_wal_disk_ratio",
 				"pg_wal bytes / data filesystem capacity — runaway retention fills the disk to PANIC",
 				h.walDiskRatio)
-			k.m.walDiskRatio.Set(h.walDiskRatio)
+			p.d.M.WalDiskRatio.Set(h.walDiskRatio)
 		}
 		if h.archiveSeen {
-			p.Gauge("kine_db_wal_archive_stale",
+			b.Gauge("kine_db_wal_archive_stale",
 				"1 when pg_stat_archiver has been failing continuously for >30m",
 				float64(h.archiveStale))
-			k.m.walArchStale.Set(float64(h.archiveStale))
+			p.d.M.WalArchStale.Set(float64(h.archiveStale))
 		}
 		if h.slotSeen {
-			p.Gauge("kine_db_inactive_slot_retained_bytes",
+			b.Gauge("kine_db_inactive_slot_retained_bytes",
 				"WAL bytes pinned by inactive replication slots",
 				float64(h.slotRetained))
-			k.m.inactiveSlot.Set(float64(h.slotRetained))
+			p.d.M.InactiveSlot.Set(float64(h.slotRetained))
 		}
 		// W12-CP2 item 7 — invalid-index census + seq-scan
 		// regression counters. The seq_* series are cumulative
 		// pg_stat counters → TYPE counter, like the rollback total
 		// in the xact textfile.
 		if h.invalidSeen {
-			p.Gauge("kine_db_invalid_indexes",
+			b.Gauge("kine_db_invalid_indexes",
 				"Indexes with indisvalid=false in pg_index — dead shells an interrupted REINDEX CONCURRENTLY leaves behind",
 				float64(h.invalidIdx))
-			k.m.invalidIndexes.Set(float64(h.invalidIdx))
+			p.d.M.InvalidIndexes.Set(float64(h.invalidIdx))
 		}
 		if h.seqSeen {
-			p.HeaderType("kine_db_seq_scans_total",
+			b.HeaderType("kine_db_seq_scans_total",
 				"seq_scan of the kine table (pg_stat_user_tables) — sequential scans against the kine heap.",
 				"counter")
-			p.Line(fmt.Sprintf("kine_db_seq_scans_total %d", h.seqScans))
-			p.HeaderType("kine_db_seq_tuples_read_total",
+			b.Line(fmt.Sprintf("kine_db_seq_scans_total %d", h.seqScans))
+			b.HeaderType("kine_db_seq_tuples_read_total",
 				"seq_tup_read of the kine table (pg_stat_user_tables) — tuples read via seq scans; a spike means planner regression.",
 				"counter")
-			p.Line(fmt.Sprintf("kine_db_seq_tuples_read_total %d", h.seqTupRead))
-			k.m.seqScansVal.Store(h.seqScans)
-			k.m.seqTupReadVal.Store(h.seqTupRead)
+			b.Line(fmt.Sprintf("kine_db_seq_tuples_read_total %d", h.seqTupRead))
+			p.d.M.SeqScansVal.Store(h.seqScans)
+			p.d.M.SeqTupReadVal.Store(h.seqTupRead)
 		}
 	}
 	// The reaper counter is cumulative state — emitted every round
 	// (unlike the seen-gated gauges above, a skipped reap does not
 	// make the lifetime total any less true).
-	p.Gauge("node_agent_kine_pg_idle_in_tx_terminated_total",
+	b.Gauge("node_agent_kine_pg_idle_in_tx_terminated_total",
 		"Stuck kine sessions terminated by the session reaper",
-		float64(k.m.idleTermTotal))
-	ts := float64(k.cfg.Clock.Now().Unix())
-	p.Gauge("kine_db_probe_last_run_timestamp_seconds",
+		float64(p.d.M.IdleTermTotal))
+	ts := float64(p.d.Cfg.Clock.Now().Unix())
+	b.Gauge("kine_db_probe_last_run_timestamp_seconds",
 		"Last probe run", ts)
-	k.m.probeLastRun.Set(ts)
-	k.emitTextfile("kine-db.prom", &p)
-}
-
-func intOrNA(ok bool, v int64) string {
-	if !ok {
-		return "NA"
-	}
-	return strconv.FormatInt(v, 10)
+	p.d.M.ProbeLastRun.Set(ts)
+	p.d.EmitTextfile("kine-db.prom", &b)
 }

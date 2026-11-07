@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	yaml "go.yaml.in/yaml/v3"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
 // Detect reports whether this host looks like the kine DB VM: either
@@ -22,7 +24,7 @@ func Detect(hostRoot, varsDir string) bool {
 	if hostRoot == "" {
 		hostRoot = "/"
 	}
-	envPath := filepath.Join(hostRoot, strings.TrimPrefix(defaultEnvFile, "/"))
+	envPath := filepath.Join(hostRoot, strings.TrimPrefix(kdeps.DefaultEnvFile, "/"))
 	if _, err := os.Stat(envPath); err == nil {
 		return true
 	}

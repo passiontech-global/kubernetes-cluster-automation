@@ -15,6 +15,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/probe"
 )
 
 // RunCheckCLI runs the seven probe checks once — containers, wire,
@@ -37,9 +40,9 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	}
 	host, _ := os.Hostname()
 	_, _ = fmt.Fprintf(out, "== kine DB probe on %s (runtime=%s) ==\n",
-		host, k.cfg.Runtime)
+		host, k.Cfg.Runtime)
 
-	res := k.runProbeChecks(ctx)
+	res := k.probe.RunChecks(ctx)
 
 	fail := 0
 	check := func(name string, ok bool) {
@@ -51,22 +54,22 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 		fail++
 	}
 	check(fmt.Sprintf("containers %s + %s running",
-		res.pgName, res.pgbName), res.checks[checkContainers] == 1)
+		res.PGName, res.PGBName), res.Checks[probe.CheckContainers] == 1)
 	check(fmt.Sprintf("pgbouncer %s wire probe (startup -> auth request)",
-		k.cfg.WireAddr), res.checks[checkWire] == 1)
+		k.Cfg.WireAddr), res.Checks[probe.CheckWire] == 1)
 	check("e2e auth via pooler (kine path: client->pooler->backend)",
-		res.checks[checkE2EAuth] == 1)
+		res.Checks[probe.CheckE2EAuth] == 1)
 	check(fmt.Sprintf("backend auth: POSTGRES_USER=%s postgres login works",
-		res.envUser), res.checks[checkBackendEnv] == 1)
+		res.EnvUser), res.Checks[probe.CheckBackendEnv] == 1)
 	check(fmt.Sprintf("pgbouncer log clean (server_login_retry/auth fail = %d)",
-		res.logErrs), res.checks[checkLogErrors] == 1)
+		res.LogErrs), res.Checks[probe.CheckLogErrors] == 1)
 	check(fmt.Sprintf("SHOW POOLS: db postgres has server conn (sv_*>0) and cl_waiting<=%d",
-		k.cfg.WaitMax), res.checks[checkPools] == 1)
+		k.Cfg.WaitMax), res.Checks[probe.CheckPools] == 1)
 	check(fmt.Sprintf("revision horizon (head=%s compact_rev=%s live_tup=%s)",
-		intOrNA(res.revSeen, res.head),
-		intOrNA(res.revSeen, res.compact),
-		intOrNA(res.revSeen, res.liveTup)),
-		res.checks[checkRevision] == 1)
+		kdeps.IntOrNA(res.RevSeen, res.Head),
+		kdeps.IntOrNA(res.RevSeen, res.Compact),
+		kdeps.IntOrNA(res.RevSeen, res.LiveTup)),
+		res.Checks[probe.CheckRevision] == 1)
 
 	_, _ = fmt.Fprintln(out)
 	if fail == 0 {
@@ -80,6 +83,6 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	_, _ = fmt.Fprintf(out,
 		"  %s exec %s psql -U postgres -d postgres \\\n"+
 			"    -c \"ALTER ROLE <user> WITH PASSWORD '<NEW_POSTGRES_PASSWORD>'\"\n",
-		k.cfg.Runtime, res.pgName)
+		k.Cfg.Runtime, res.PGName)
 	return 1
 }

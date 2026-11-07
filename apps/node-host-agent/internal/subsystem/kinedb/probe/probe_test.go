@@ -1,4 +1,4 @@
-package kinedb
+package probe
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -81,13 +82,8 @@ func TestPGWireProbe(t *testing.T) {
 
 const testWireTO = 2 * 1e9 // 2s in ns — time.Duration
 
-const showPoolsOut = `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
-postgres|postgres|4|0|3|7|0|0|0|0|0|transaction
-pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
-`
-
 func TestParseShowPools(t *testing.T) {
-	st, ok := parseShowPools(showPoolsOut, "postgres")
+	st, ok := parseShowPools(kdepstest.ShowPoolsOut, "postgres")
 	if !ok {
 		t.Fatal("postgres row not found")
 	}
@@ -130,23 +126,12 @@ func TestParseShowPools(t *testing.T) {
 	}
 }
 
-// probeOKRules is the full-success command set. The revision query
-// answers head|compact_rev|live_tup — no COUNT(*) (the row count is
-// the guard's job; a per-2min seq-scan bloats what it measures).
-var probeOKRules = []testutil.ExecRule{
-	{Substr: "inspect", Out: "true"},
-	{Substr: "SHOW POOLS", Out: showPoolsOut},
-	{Substr: "logs --since", Out: "all quiet"},
-	{Substr: "MAX(id)", Out: "1000|200|290\n"},
-	{Substr: "select 1", Out: "1\n"},
-}
-
 func TestProbeCycleAllOK(t *testing.T) {
-	k, fr, dir := fixture(t, probeOKRules)
-	res := k.probeCycle(context.Background())
+	k, fr, dir := fixture(t, kdepstest.ProbeOKRules)
+	res := k.Cycle(context.Background())
 	for _, c := range probeChecks {
-		if res.checks[c] != 1 {
-			t.Fatalf("check %s=%d notes=%v", c, res.checks[c], res.notes)
+		if res.Checks[c] != 1 {
+			t.Fatalf("check %s=%d notes=%v", c, res.Checks[c], res.notes)
 		}
 	}
 	if !res.succeeded {
@@ -172,7 +157,7 @@ func TestProbeCycleAllOK(t *testing.T) {
 	if strings.Contains(j, "COUNT(*)") {
 		t.Fatalf("probe ran a full COUNT(*):\n%s", j)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, want := range []string{
 		`kine_db_probe_ok{check="containers"} 1`,
 		`kine_db_probe_ok{check="wire"} 1`,
@@ -217,15 +202,15 @@ func TestProbeCycleFailures(t *testing.T) {
 		{Substr: "MAX(id)", Out: "1000|200|290\n"},
 		{Substr: "select 1", Out: "1\n"},
 	})
-	k.cfg.wireFn = func(context.Context, string) bool { return false }
-	res := k.probeCycle(context.Background())
-	if res.checks[checkWire] != 0 {
+	k.d.Cfg.WireFn = func(context.Context, string) bool { return false }
+	res := k.Cycle(context.Background())
+	if res.Checks[CheckWire] != 0 {
 		t.Fatal("wire should fail")
 	}
-	if res.checks[checkPools] != 0 {
+	if res.Checks[CheckPools] != 0 {
 		t.Fatal("pools should fail (no server conns + deep queue)")
 	}
-	if res.checks[checkLogErrors] != 0 {
+	if res.Checks[CheckLogErrors] != 0 {
 		t.Fatal("log_errors should fail")
 	}
 	if res.succeeded {
@@ -234,7 +219,7 @@ func TestProbeCycleFailures(t *testing.T) {
 	if res.pool.clWaiting != 300 {
 		t.Fatalf("clWaiting=%d", res.pool.clWaiting)
 	}
-	content := readText(t, dir, "kine-db.prom")
+	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, `kine_db_probe_ok{check="wire"} 0`) ||
 		!strings.Contains(content, `kine_db_pgbouncer_clients_waiting 300`) {
 		t.Fatalf("textfile:\n%s", content)
@@ -249,15 +234,15 @@ func TestProbeCycleLogScanWithoutCreds(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "logs --since", Out: "all quiet"},
 	})
-	if err := os.Remove(k.cfg.EnvFile); err != nil {
+	if err := os.Remove(k.d.Cfg.EnvFile); err != nil {
 		t.Fatal(err)
 	}
-	res := k.probeCycle(context.Background())
-	if res.checks[checkLogErrors] != 1 {
-		t.Fatalf("log_errors must run without .env creds: %+v", res.checks)
+	res := k.Cycle(context.Background())
+	if res.Checks[CheckLogErrors] != 1 {
+		t.Fatalf("log_errors must run without .env creds: %+v", res.Checks)
 	}
-	for _, c := range []string{checkE2EAuth, checkPools, checkBackendEnv, checkRevision} {
-		if res.checks[c] != 0 {
+	for _, c := range []string{CheckE2EAuth, CheckPools, CheckBackendEnv, CheckRevision} {
+		if res.Checks[c] != 0 {
 			t.Fatalf("check %s must stay 0 without creds", c)
 		}
 	}
@@ -273,15 +258,15 @@ func TestProbeCycleContainersDown(t *testing.T) {
 		{Substr: "inspect", Err: errors.New("down")},
 		{Substr: "ps --format", Out: ""},
 	})
-	res := k.probeCycle(context.Background())
-	if res.checks[checkContainers] != 0 {
+	res := k.Cycle(context.Background())
+	if res.Checks[CheckContainers] != 0 {
 		t.Fatal("containers should fail")
 	}
 	// Wire still runs unconditionally.
-	if res.checks[checkWire] != 1 {
+	if res.Checks[CheckWire] != 1 {
 		t.Fatal("wire check must run even with containers down")
 	}
-	if res.checks[checkE2EAuth] != 0 {
+	if res.Checks[CheckE2EAuth] != 0 {
 		t.Fatal("e2e must stay 0 with containers down")
 	}
 }
@@ -294,7 +279,7 @@ func TestProbeLogScanQuoting(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "logs --since", Out: "all quiet"},
 	})
-	k.probeCycle(context.Background())
+	k.Cycle(context.Background())
 	if !strings.Contains(fr.Joined(),
 		"'podman' logs --since 301s 'kine-pgbouncer' 2>&1") {
 		t.Fatalf("log scan argv unquoted:\n%s", fr.Joined())

@@ -1,4 +1,7 @@
-package kinedb
+// env.go — the NODE_HOST_AGENT_* env contract kinedb reads, resolved
+// beside the Config defaults it fills (the cdeps/env.go role). Was
+// the flat package's config_env.go.
+package kdeps
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
@@ -28,10 +31,10 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		// PathJoin(defaultEnvFile) keeps the Detect() probe path and
+		// PathJoin(DefaultEnvFile) keeps the Detect() probe path and
 		// the configured EnvFile on the same file.
 		envx.StringKnob(envnames.EnvKinedbEnvFile, &cfg.EnvFile,
-			d.PathJoin(defaultEnvFile)),
+			d.PathJoin(DefaultEnvFile)),
 		envx.StringKnob(envnames.EnvKinedbGuardStateDir, &cfg.GuardStateDir,
 			d.PathJoin(defaultGuardStateDir)),
 		// W8-CP2: in-container postgres data dir for the repack
