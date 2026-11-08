@@ -1,7 +1,7 @@
 // latches_w12_test.go — W12-KR4 latch registry coverage: the
 // disk-slow-io latch is a known workerhygiene latch so the
 // janitor's known/unknown reap never classifies it as foreign.
-package hoststate
+package latchdefs
 
 import "testing"
 

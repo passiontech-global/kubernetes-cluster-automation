@@ -212,7 +212,7 @@ func TestConntrackStatNodeExporterAbsentWithoutFile(t *testing.T) {
 	}
 }
 
-// --- W15-K1: clocksource non-TSC drift gauge + kvm-clock restore ---
+// --- Clocksource non-TSC drift gauge + kvm-clock restore ---
 
 // clocksourceFixture wires the two sysfs seams into a temp dir and
 // writes the given contents ("" = leave the file absent).
@@ -334,7 +334,7 @@ func TestClocksourceAbsentWithoutCurrent(t *testing.T) {
 	}
 }
 
-// --- W15-K3: conntrack search_restart/invalid counters ---
+// --- Conntrack search_restart/invalid counters ---
 
 func TestConntrackSearchRestartAndInvalidCounters(t *testing.T) {
 	cfg, _ := fixture(t)

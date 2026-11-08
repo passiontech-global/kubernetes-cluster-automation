@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/pods"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -123,19 +124,18 @@ func tailFile(path string, n int64) ([]byte, error) {
 
 // Run executes one clock-jump round.
 func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckClockJump) {
 		return
 	}
 	stepped, ok := clockSteppedAt(c.d)
 	if !ok || c.d.Cfg.Seams.Host.Clock.Now().Sub(stepped) > clockJumpMarkerFresh {
 		// No recent step — the signature this check heals can't be
 		// attributed to a clock jump.
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckClockJump, "ok")
 		return
 	}
 	if !e.APIOK {
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckClockJump, "abort")
 		return
 	}
 	var konn *corev1.Pod
@@ -148,25 +148,26 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if konn == nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckClockJump, "ok")
 		return
 	}
 	logs := konnPodLog(c.d, ctx, konn)
 	if !konnClockErrorRe.MatchString(logs) {
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckClockJump, "ok")
 		return
 	}
 	if !c.d.State.RateTrySpend("last-clock-jump-konn", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(
 			"suspect: clock-jump-session-healer konn auth-fail evidence but recreate cooldown (<30m), skip")
-		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckClockJump, "ok")
 		return
 	}
-	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: clock-jump-session-healer recreating konnectivity-agent %s/%s - fresh clock-step marker + 401/x509 in log",
-		konn.Namespace, konn.Name))
+	c.d.State.AppendLog("ACTION: clock-jump-session-healer " +
+		latchdefs.ReasonKonnectivityAgentRecreate +
+		fmt.Sprintf(" %s/%s - fresh clock-step marker + 401/x509 in log",
+			konn.Namespace, konn.Name))
 	if pods.DeleteKonnectivityPod(c.d, ctx, e.Pods) {
 		c.d.Actions.WithLabelValues(wdeps.CheckClockJump, "pod_delete").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckClockJump, "ok")
 }

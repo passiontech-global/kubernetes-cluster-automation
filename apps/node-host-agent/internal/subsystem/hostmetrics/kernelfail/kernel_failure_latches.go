@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // --- shared kernel-failure helpers ---
@@ -50,8 +50,8 @@ func (r *Runner) ensureStateLatch(path, name, evidence string) {
 	// on. The line goes through the Store's AppendLog — NOT a bare
 	// logger() call — because the file half is the contract, not
 	// the slog mirror.
-	r.deps.Store.AppendLog(fmt.Sprintf("STATE-ENTER: %s (%s)",
-		strings.TrimPrefix(name, hoststate.LatchFilePrefix), evidence))
+	r.deps.Store.AppendLog(fmt.Sprintf(latchdefs.StateEnterPrefix+"%s (%s)",
+		strings.TrimPrefix(name, latchdefs.LatchFilePrefix), evidence))
 }
 
 // --- small shared helpers (uniquely named per file rules) ---

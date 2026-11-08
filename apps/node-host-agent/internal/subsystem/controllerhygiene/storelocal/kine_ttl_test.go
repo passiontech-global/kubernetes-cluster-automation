@@ -2,7 +2,7 @@
 // the suspect-log dedupe tests (split out of the old
 // apiserverhub_test.go — the TTL check lives in the kine domain
 // package).
-package kine_test
+package storelocal_test
 
 import (
 	"context"

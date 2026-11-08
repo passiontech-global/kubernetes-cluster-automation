@@ -1,15 +1,11 @@
 // envnames_controllerhygiene.go — the controllerhygiene
 // subsystem's env contract: the control-plane guards' knobs
-// (feeder gate, api self/peer, k0s dir, etcd, sig13/stale/gap/
+// (api self/peer, k0s dir, etcd, sig13/stale/gap/
 // frozen/solo budgets, kine ttl/pool, oomloop). The shared
 // EnvProcRoot lives in envnames.go.
 package envnames
 
 const (
-	// EnvEnableFeeder gates the standalone api-backend feeder
-	// inside controllerhygiene — a private gate, read directly
-	// (it is NOT a Descriptor.EnvFlag in wiring.go).
-	EnvEnableFeeder          = "NODE_HOST_AGENT_ENABLE_FEEDER"
 	EnvControllerInterval    = "NODE_HOST_AGENT_CONTROLLER_INTERVAL"
 	EnvControllerInsecureTLS = "NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS"
 	EnvAPISelf               = "NODE_HOST_AGENT_API_SELF"

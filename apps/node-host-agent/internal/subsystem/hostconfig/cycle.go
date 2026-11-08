@@ -1,6 +1,7 @@
 // cycle.go — Cycle orchestration (Cycle/CycleWithErrors), the per-cycle
 // cyc context, and the helpers shared across converge groups. The
-// generic mechanisms live in platform/converge — the helpers here are
+// generic mechanisms live in the sibling converge package (this
+// subsystem's subtree) — the helpers here are
 // thin delegates keeping the group_*.go call sites (and their tests)
 // on their original names.
 package hostconfig
@@ -14,7 +15,8 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 //go:embed all:templates
@@ -163,7 +165,7 @@ func (c *cyc) worker() bool { return c.r.fileExists("/etc/systemd/system/k0swork
 func (c *cyc) controller() bool { return c.r.fileExists("/etc/systemd/system/k0scontroller.service") }
 
 func strOf(m any, key string) string {
-	om, _ := m.(*topology.OMap)
+	om, _ := m.(*jinja.OMap)
 	if om == nil {
 		return ""
 	}
@@ -243,52 +245,41 @@ func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 	}
 }
 
-func filepath2(dir, name string) string {
-	if dir == "" {
-		return name
-	}
-	return dir + "/" + name
-}
-
 // tplCtx builds the interdc_* var context the .j2 templates expect.
 func (c *cyc) tplCtx() map[string]any {
 	t := c.t
-	lh := topology.NewOMap()
+	lh := jinja.NewOMap()
 	for _, l := range t.Lighthouses {
-		m := topology.NewOMap()
+		m := jinja.NewOMap()
 		m.Set("marker", l.Marker)
 		m.Set("ip", l.IP)
 		lh.Set(l.Name, m)
 	}
 	var routes []any
 	for _, u := range t.UnsafeRoutes {
-		m := topology.NewOMap()
+		m := jinja.NewOMap()
 		m.Set("route", u.Route)
 		m.Set("via", u.Via)
 		m.Set("metric", u.Metric)
 		m.Set("install", false)
 		routes = append(routes, m)
 	}
-	relayMap := topology.NewOMap()
+	relayMap := jinja.NewOMap()
 	for name, es := range t.RelayMap {
 		var l []any
 		for _, e := range es {
-			m := topology.NewOMap()
+			m := jinja.NewOMap()
 			m.Set("ip", e.IP)
 			l = append(l, m)
 		}
-		relayMap.Set(name, &topology.List{V: l})
+		relayMap.Set(name, &jinja.List{V: l})
 	}
 	get := func(name string) any {
 		v := c.t.Vars.Get(name)
 		return v
 	}
 	strv := func(name, def string) any {
-		s := c.v(name)
-		if s == "" || s == "None" {
-			return def
-		}
-		return s
+		return c.t.Vars.StrDef(name, def)
 	}
 	return map[string]any{
 		"interdc_node":                 t.Node,
@@ -305,28 +296,28 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_marker_base":          strv("interdc_marker_base", "172.29.0"),
 		"interdc_nebula_lighthouses":   lh,
 		"interdc_nebula_am_lighthouse": t.AmLighthouse,
-		"interdc_nebula_unsafe_routes": &topology.List{V: routes},
+		"interdc_nebula_unsafe_routes": &jinja.List{V: routes},
 		"interdc_relay_map":            relayMap,
-		"interdc_targets":              &topology.List{V: strSliceToAny(t.Targets)},
-		"interdc_egress_relays":        &topology.List{V: strSliceToAny(t.EgressRelays)},
-		"nebula_direct_tcp_ports":      &topology.List{V: strSliceToAny(c.nebulaDirectTCPPorts())},
+		"interdc_targets":              &jinja.List{V: strSliceToAny(t.Targets)},
+		"interdc_egress_relays":        &jinja.List{V: strSliceToAny(t.EgressRelays)},
+		"nebula_direct_tcp_ports":      &jinja.List{V: strSliceToAny(c.nebulaDirectTCPPorts())},
 		"interdc_overlay":              t.Overlay,
 		"interdc_dns_zone":             t.Zone,
-		"interdc_dns_resolvers":        &topology.List{V: strSliceToAny(t.DNSResolvers)},
+		"interdc_dns_resolvers":        &jinja.List{V: strSliceToAny(t.DNSResolvers)},
 		"interdc_stub_public_upstream": strv("interdc_stub_public_upstream", "1.1.1.1 8.8.8.8"),
 		"cp_endpoint":                  c.v("cp_endpoint"),
 		"api_lb_backends":              c.t.Vars.Get("api_lb_backends"),
 		"api_lb_extra_lanes":           c.t.Vars.Get("api_lb_extra_lanes"),
 		"api_lb_vip_ip":                c.v("api_lb_vip_ip"),
-		"api_lb_probe_reachable":       &topology.List{V: strSliceToAny(c.probeReachable())},
+		"api_lb_probe_reachable":       &jinja.List{V: strSliceToAny(c.probeReachable())},
 		"fail2ban_ignoreip":            c.fail2banIgnoreIP(),
 		"interdc_hub_zone_serial":      c.zoneSerial(),
 		"ansible_facts":                map[string]any{"hostname": c.r.cfg.NodeName},
 	}
 }
 
-func omapOf(m map[string]string) *topology.OMap {
-	o := topology.NewOMap()
+func omapOf(m map[string]string) *jinja.OMap {
+	o := jinja.NewOMap()
 	for k, v := range m {
 		o.Set(k, v)
 	}
@@ -343,14 +334,14 @@ func strSliceToAny(in []string) []any {
 
 func topologyPlain(v any) any {
 	switch t := v.(type) {
-	case *topology.OMap:
+	case *jinja.OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
 			m[k] = topologyPlain(vv)
 		}
 		return m
-	case *topology.List:
+	case *jinja.List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
 			out[i] = topologyPlain(x)
@@ -367,14 +358,10 @@ func sha256FileOK(path, wantHex string) bool {
 }
 
 func (c *cyc) markerBase() string {
-	b := c.v("interdc_marker_base")
-	if b == "" || b == "None" {
-		return "172.29.0"
-	}
-	return b
+	return c.t.Vars.StrDef("interdc_marker_base", "172.29.0")
 }
 
-func nodeIPStr(m *topology.OMap, key string) string {
+func nodeIPStr(m *jinja.OMap, key string) string {
 	if m == nil {
 		return ""
 	}
@@ -384,8 +371,6 @@ func nodeIPStr(m *topology.OMap, key string) string {
 }
 
 func defStr(v, d string) string { return converge.DefStr(v, d) }
-
-func containsSS(l []string, s string) bool { return converge.ContainsSS(l, s) }
 
 // lineInFile is ansible lineinfile parity: replace the LAST line
 // matching re with line; when absent insert after the last line

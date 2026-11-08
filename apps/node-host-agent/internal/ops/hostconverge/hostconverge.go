@@ -11,11 +11,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // HostRoot/RunnerFactory wire the production standalone contract
@@ -33,14 +31,10 @@ var (
 // subcommands).
 func Cmd(ctx context.Context, args []string) int {
 	fs := opsx.FlagSet("converge-once")
-	varsDir := fs.String("vars-dir",
-		envx.String(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
-		"vars dir holding defaults.yaml/cluster.yaml/interdc_nodes.yaml")
+	varsDir := opsx.VarsDirFlag(fs)
 	nodeName := fs.String("node-name", "",
 		"registry node name (default: NODE_HOST_AGENT_NODE_NAME/NODE_NAME env, then OS hostname)")
-	certsDir := fs.String("nebula-certs-dir",
-		envx.String(envnames.EnvNebulaCertsDir, "/etc/node-host-agent/nebula-certs"),
-		"nebula cert dir (hubsync pushes to /etc/node-host-agent/nebula-certs)")
+	certsDir := opsx.NebulaCertsDirFlag(fs)
 	if code, ok := opsx.Parse(fs, args); !ok {
 		return code
 	}

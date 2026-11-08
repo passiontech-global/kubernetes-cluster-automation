@@ -31,7 +31,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -64,8 +64,7 @@ func (c *KernelNetShimCheck) Name() string { return wdeps.CheckKernelNetShim }
 // Run executes one kernel-net-shim-hygiene round.
 func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	d := c.d
-	if !e.WorkerActive {
-		d.Cycles.WithLabelValues(wdeps.CheckKernelNetShim, "gated").Inc()
+	if d.Gated(e, wdeps.CheckKernelNetShim) {
 		return
 	}
 	degraded := false
@@ -144,12 +143,12 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 
 	if degraded {
-		d.State.Enter(hoststate.LatchKernelNetShim,
+		d.State.Enter(latchdefs.LatchKernelNetShim,
 			strings.Join(evidence, "; "))
 	} else {
-		d.State.Exit(hoststate.LatchKernelNetShim, nil)
+		d.State.Exit(latchdefs.LatchKernelNetShim, nil)
 	}
-	d.Cycles.WithLabelValues(wdeps.CheckKernelNetShim, "ok").Inc()
+	d.CycleResult(wdeps.CheckKernelNetShim, "ok")
 }
 
 // tcpExtListenStats returns (ListenDrops, ListenOverflows, ok) from

@@ -15,10 +15,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -31,7 +30,7 @@ const lastHostOOMEventFile = "last-host-oom-event"
 
 // The kernel-pressure producer latch this check consumes lives in the
 // hoststate registry: hostmetrics' kmsg scanner enters
-// hoststate.LatchPageAllocFailure (state-page-alloc-failure) when
+// latchdefs.LatchPageAllocFailure (state-page-alloc-failure) when
 // the kernel logs "page allocation failure: order:N".
 
 // memoryCompactEvery is the kernel-pressure compaction cooldown — one
@@ -60,7 +59,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 	victim := strings.TrimSpace(wdeps.ReadSmallFile(c.d.Cfg.Host.OOMVictimFile))
 	fv := strings.Fields(victim)
 	if len(fv) < 2 {
-		c.d.Cycles.WithLabelValues(wdeps.CheckHostOOM, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckHostOOM, "ok")
 		return
 	}
 	epoch, _ := strconv.ParseInt(fv[0], 10, 64)
@@ -80,7 +79,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 		}
 	}
 	if count >= 0 && count <= lastCount {
-		c.d.Cycles.WithLabelValues(wdeps.CheckHostOOM, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckHostOOM, "ok")
 		return
 	}
 	delta := int64(1)
@@ -102,7 +101,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 				"suspect: host-oom dedup marker write failed: %v", err))
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckHostOOM, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckHostOOM, "ok")
 }
 
 // compactMemory is the kernel-pressure remedy half: while the hostmetrics
@@ -116,7 +115,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 // 30m compact forever off a single past episode; the next kmsg
 // sighting re-Enters it (Enter is idempotent).
 func (c *HostOOMCheck) compactMemory() {
-	if !c.d.State.Exists(hoststate.LatchPageAllocFailure) {
+	if !c.d.State.Exists(latchdefs.LatchPageAllocFailure) {
 		return
 	}
 	target := filepath.Join(c.d.Cfg.ProcRoot, "sys", "vm", "compact_memory")
@@ -131,7 +130,7 @@ func (c *HostOOMCheck) compactMemory() {
 			"suspect: page-alloc-failure compact_memory write failed: %v", err))
 		return
 	}
-	c.d.State.Exit(hoststate.LatchPageAllocFailure, nil)
+	c.d.State.Exit(latchdefs.LatchPageAllocFailure, nil)
 	c.d.MemoryCompactionRuns++
 	c.d.State.AppendLog(
 		"ACTION: page-alloc-failure latch held — triggered vm.compact_memory (kernel-pressure defrag)")
@@ -145,42 +144,28 @@ func (c *HostOOMCheck) compactMemory() {
 // only advance on true.
 func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 	epoch, delta, total int64) bool {
-	if d.Cfg.Client == nil {
-		return false
-	}
 	now := d.Cfg.Seams.Host.Clock.Now()
 	when := now
 	if epoch > 0 {
 		when = time.Unix(epoch, 0)
 	}
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			// events.v1 names are <regarding>.<hex> — count+epoch
-			// keep repeat kills distinct even when the clock is frozen
-			// (tests) or two kills land in the same nanosecond.
-			Name: fmt.Sprintf("%s.%x.%x", d.Cfg.NodeName, total,
-				now.UnixNano()),
-			Namespace: d.Cfg.Host.EventNamespace,
-		},
-		EventTime: metav1.NewMicroTime(when),
+	if err := d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		// events.v1 names are <regarding>.<hex> — count+epoch
+		// keep repeat kills distinct even when the clock is frozen
+		// (tests) or two kills land in the same nanosecond.
+		Name:      fmt.Sprintf("%s.%x.%x", d.Cfg.NodeName, total, now.UnixNano()),
+		Namespace: d.Cfg.Host.EventNamespace,
 		Reason:    "SystemOOMVictim",
 		Note: fmt.Sprintf(
 			"host-level OOM kill: victim %s (+%d kills, %d total observed)",
 			comm, delta, total),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   d.Cfg.NodeName,
-		Action:              "SystemOOMVictim",
+		When: when,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Node",
 			Name:       d.Cfg.NodeName,
 		},
-	}
-	if _, err := d.Cfg.Client.EventsV1().Events(d.Cfg.Host.EventNamespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		d.State.AppendLog(fmt.Sprintf(
-			"suspect: SystemOOMVictim event create failed: %v", err))
+	}); err != nil {
 		return false
 	}
 	d.State.AppendLog(fmt.Sprintf(
@@ -210,8 +195,7 @@ func (c *OrphanHPCheck) Name() string { return wdeps.CheckOrphanHP }
 
 // Run executes one orphan-hostpath round.
 func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckOrphanHP) {
 		return
 	}
 	type cand struct {
@@ -240,7 +224,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// scan can't leave stale counts behind.
 		c.d.OrphanHostPathDirs = 0
 		c.d.OrphanHostPathBytes = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
 		return
 	}
 	pvNames := map[string]bool{}
@@ -298,7 +282,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.OrphanHostPathBytes = totalBytes
 		c.d.OrphanHostPathDirs = orphans
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
 }
 
 // checkOrphanedHostPathVolumes forwards to the migrated Check —

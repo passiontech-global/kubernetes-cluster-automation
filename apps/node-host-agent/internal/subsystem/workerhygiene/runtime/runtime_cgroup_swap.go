@@ -87,8 +87,7 @@ func (c *CgroupSwapCheck) resolveSwapSliceDir(name string) (string, bool) {
 
 // Run executes one cgroup-swap-leak round.
 func (c *CgroupSwapCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupSwap, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCgroupSwap) {
 		return
 	}
 	root := c.d.Cfg.Runtime.CgroupRoot
@@ -98,12 +97,12 @@ func (c *CgroupSwapCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		// cgroup v1 host or the unified hierarchy isn't mounted —
 		// the check is dormant (unreadable → abort, same as the
 		// other procfs/cgroupfs probes).
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupSwap, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCgroupSwap, "abort")
 		return
 	}
 	c.d.KubepodsSwapUsedBytes = used
 	if used <= kubepodsSwapHighBytes {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupSwap, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCgroupSwap, "ok")
 		return
 	}
 	// Pods are swapping — cap swap on kubepods.slice and the QoS
@@ -134,5 +133,5 @@ func (c *CgroupSwapCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			used))
 		c.d.Actions.WithLabelValues(wdeps.CheckCgroupSwap, "swap_cap").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCgroupSwap, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCgroupSwap, "ok")
 }

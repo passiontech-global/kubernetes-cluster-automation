@@ -1,9 +1,10 @@
 // disk_bloat.go — the W6.3 runaway-dir detector
 // (wdeps.CheckDiskBloat) plus the disk side-guards that ride
-// the same cycle slot: the localpv-quota LocalPV hard-quota enforcer
-// (pvc-* over 1.5x capacity under disk pressure → deprioritize the
-// owning pod's tasks) and the run-tmpfs host /run tmpfs guard
-// (80% fill → journald vacuum + orphan .tmp sweep, 15m budget).
+// the same cycle slot: the run-tmpfs host /run tmpfs guard
+// (80% fill → journald vacuum + orphan .tmp sweep, 15m budget)
+// and the coredump sweep + overlayfs writable-layer scan.
+// The localpv-quota hard-quota enforcer lives in
+// localpv_quota.go.
 package runtime
 
 import (
@@ -17,10 +18,9 @@ import (
 
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -33,7 +33,7 @@ import (
 const (
 	diskBloatEvictInterval = 15 * time.Minute // last-disk-bloat-evict budget
 	// coredumpMinAge keeps an in-progress core write from being
-	// swept the same cycle the watermark trip fires (W15-K2).
+	// swept the same cycle the watermark trip fires.
 	coredumpMinAge = 15 * time.Minute
 	// defaultPodLogsDir is the /var/log/pods host mount — the
 	// BUG-H8 pod-log attribution walk scans it.
@@ -192,15 +192,14 @@ func (c *DiskBloatCheck) Name() string { return wdeps.CheckDiskBloat }
 
 // Run executes one disk-bloat round.
 func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckDiskBloat) {
 		return
 	}
 	// Disk side-guards run every cycle — their own watermarks
 	// decide, independent of the /var/lib/k0s bloat watermark.
 	c.runTmpfsGuard(ctx)
 	c.localPVQuota(ctx, e)
-	// W15-K2: stale coredump sweep (watermark-gated) and the
+	// Stale coredump sweep (watermark-gated) and the
 	// bounded writable-layer runaway scan (interval-budgeted).
 	c.coredumpGC()
 	c.writableLayerScan(ctx, e)
@@ -213,33 +212,34 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if used < 0 {
 		// statfs failed or returned garbage — inconclusive; keep
 		// the latch like a failed probe.
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckDiskBloat, "abort")
 		return
 	}
 	if used <= c.d.Cfg.Disk.BloatWatermark {
-		c.d.State.Exit(hoststate.LatchDiskBloat, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
 	// The walk is IO on the disk that is full — at most once per
 	// DiskBloatScanInterval; an existing latch persists meanwhile.
 	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	hits, podTotals, podByUID := c.scanBloat(e.Pods)
 	if len(hits) == 0 {
-		c.d.State.Exit(hoststate.LatchDiskBloat, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
+	c.d.State.Enter(latchdefs.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
-		// NPD contract: "ACTION disk-bloat: target=... bytes=...
-		// used_pct=..." feeds DiskBloatRunaway (events.go).
+		// NPD contract: the ACTION entry line feeds DiskBloatRunaway
+		// (events.go) — ActionEntryRe(LatchDiskBloat) parses it.
 		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION disk-bloat: target=%s bytes=%d used_pct=%.1f",
+			latchdefs.ActionEntryPrefix(latchdefs.LatchDiskBloat)+
+				"target=%s bytes=%d used_pct=%.1f",
 			hit.label, hit.bytes, used*100))
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "detect").Inc()
@@ -247,7 +247,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// holding more than the threshold — kube-system/node-ops are
 	// never deleted by this check.
 	if used <= c.d.Cfg.Disk.BloatCriticalWatermark || !e.APIOK {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
 	var victim *corev1.Pod
@@ -264,14 +264,14 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if victim == nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
 	if !c.d.State.RateTrySpend("last-disk-bloat-evict", diskBloatEvictInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat victim %s/%s bytes=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, victimBytes))
-		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity —
@@ -287,207 +287,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			victim.Namespace, victim.Name, victimBytes, used*100))
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "pod_evict").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
-}
-
-// --- localpv-quota: LocalPV hard-quota enforcer ---
-//
-// A pod writing past 1.5x its PV's capacity on an OpenEBS localpv
-// hostpath under disk pressure (>80% used) starves every other
-// volume on the node — the provisioner has no quota of its own.
-// The enforcer measures each pvc-* dir under the provisioner
-// roots, resolves the owning pod through the pod LIST's
-// volume->PVC->PV chain, and deprioritizes that pod's processes
-// (renice +19 + ionice idle + cgroup io.weight=1 when the v2
-// interface exists). Throttled pods land in the
-// localPVThrottled ledger — one throttle per agent lifetime; the
-// deprioritization is sticky until the pod restarts anyway.
-
-// localPVScanRoots returns the roots the quota scan walks —
-// LocalPVQuotaDir when configured, else the ST2 provisioner roots.
-func (c *DiskBloatCheck) localPVScanRoots() []string {
-	if c.d.Cfg.Disk.LocalPVQuotaDir != "" {
-		return []string{c.d.Cfg.Disk.LocalPVQuotaDir}
-	}
-	return c.d.Cfg.Disk.OrphanHostPathDirs
-}
-
-// localPVQuota runs one localpv-quota round: over-quota pvc-* dirs under
-// disk pressure get their owning pod's tasks deprioritized and a
-// LocalPVQuotaExceeded event emitted.
-func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.APIOK || c.d.Cfg.Client == nil {
-		return // PV/PVC resolution needs the apiserver
-	}
-	if c.localPVThrottled == nil {
-		c.localPVThrottled = map[string]bool{}
-	}
-	pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: localpv-quota PV list failed: %v — quota scan inconclusive", err))
-		return
-	}
-	pvCap := map[string]int64{}
-	for _, pv := range pvs.Items {
-		if q, ok := pv.Spec.Capacity[corev1.ResourceStorage]; ok {
-			pvCap[pv.Name] = q.Value()
-		}
-	}
-	// claim->pod map: pod.Spec.Volumes[].PersistentVolumeClaim —
-	// resolve each claim to its PV name via a cluster-wide PVC list.
-	pvcs, err := c.d.Cfg.Client.CoreV1().PersistentVolumeClaims("").
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: localpv-quota PVC list failed: %v — quota scan inconclusive", err))
-		return
-	}
-	claimPV := map[string]string{} // "<ns>/<claim>" -> volumeName
-	for _, pvc := range pvcs.Items {
-		claimPV[pvc.Namespace+"/"+pvc.Name] = pvc.Spec.VolumeName
-	}
-	podByPV := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		for _, v := range e.Pods[i].Spec.Volumes {
-			if v.PersistentVolumeClaim == nil {
-				continue
-			}
-			if pv := claimPV[e.Pods[i].Namespace+"/"+
-				v.PersistentVolumeClaim.ClaimName]; pv != "" {
-				podByPV[pv] = &e.Pods[i]
-			}
-		}
-	}
-	for _, root := range c.localPVScanRoots() {
-		ents, err := os.ReadDir(root)
-		if err != nil {
-			continue
-		}
-		for _, ent := range ents {
-			if !ent.IsDir() || !strings.HasPrefix(ent.Name(), "pvc-") {
-				continue
-			}
-			dir := filepath.Join(root, ent.Name())
-			cap, ok := pvCap[ent.Name()]
-			if !ok || cap <= 0 || c.localPVThrottled[dir] {
-				continue
-			}
-			size, _ := c.d.WalkBytes(dir)
-			if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
-				continue
-			}
-			// The quota only bites under real disk pressure —
-			// over-request-but-plenty-free is a sizing problem,
-			// not a node emergency.
-			if !c.d.DiskUsageAboveWatermark(root) {
-				continue
-			}
-			pod := podByPV[ent.Name()]
-			if pod == nil {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: localpv-quota %s %dB > %.0fx PV cap (%dB) but no owning pod on this node",
-					dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap))
-				continue
-			}
-			c.throttlePVTasks(ctx, e, pod, dir, size, cap)
-		}
-	}
-}
-
-// throttlePVTasks deprioritizes every live task pid of the pod:
-// renice +19 + ionice idle via the shared seams, plus cgroup v2
-// io.weight=1 on the pod slice when the interface exists. The
-// io.max variant is deliberately NOT written — an absolute byte
-// rate has no safe value without device knowledge; io.weight
-// achieves the same relative starvation (documented deviation).
-func (c *DiskBloatCheck) throttlePVTasks(ctx context.Context,
-	e *wdeps.CycleEnv, pod *corev1.Pod, dir string, size, cap int64) {
-
-	uid := string(pod.UID)
-	tasks, _ := e.TasksOnce()
-	throttled := 0
-	for _, t := range tasks[uid] {
-		if !t.Live || t.PID <= 0 {
-			continue
-		}
-		if err := c.d.Cfg.Seams.Host.ReniceFn(t.PID); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: localpv-quota renice +19 pid=%d failed: %v", t.PID, err))
-		}
-		if err := c.d.Cfg.Seams.Host.IoniceIdleFn(t.PID); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: localpv-quota ionice -c3 pid=%d failed: %v", t.PID, err))
-		}
-		throttled++
-	}
-	// cgroup v2 io.weight drop — best-effort: write `1` (lowest
-	// weight) on the pod slice's io.weight if the file exists.
-	kubepods := filepath.Join(c.d.Cfg.Runtime.CgroupRoot, "kubepods.slice")
-	for _, podDir := range podSliceDirs(kubepods) {
-		if podUIDFromSlice(podDir) != uid {
-			continue
-		}
-		wf := filepath.Join(podDir, "io.weight")
-		if _, err := os.Stat(wf); err == nil {
-			if werr := os.WriteFile(wf, []byte("1"), 0o644); werr != nil {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: localpv-quota io.weight write %s failed: %v", wf, werr))
-			}
-		}
-		for _, scope := range containerScopeDirs(podDir) {
-			wf := filepath.Join(scope, "io.weight")
-			if _, err := os.Stat(wf); err == nil {
-				_ = os.WriteFile(wf, []byte("1"), 0o644)
-			}
-		}
-	}
-	c.localPVThrottled[dir] = true
-	c.d.LocalPVQuotaThrottled++
-	c.emitPVQuotaEvent(ctx, pod, dir, size, cap, throttled)
-	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "localpv_throttle").Inc()
-}
-
-// emitPVQuotaEvent creates the LocalPVQuotaExceeded Warning event
-// on the throttled pod.
-func (c *DiskBloatCheck) emitPVQuotaEvent(ctx context.Context,
-	pod *corev1.Pod, dir string, size, cap int64, throttled int) {
-
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-			Namespace: pod.Namespace,
-		},
-		EventTime: metav1.NewMicroTime(now),
-		Reason:    "LocalPVQuotaExceeded",
-		Note: fmt.Sprintf(
-			"localpv dir %s holds %d bytes > %.0fx PV capacity %d bytes under disk pressure — %d tasks deprioritized (ionice idle + renice +19 + io.weight)",
-			dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap, throttled),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   c.d.Cfg.NodeName,
-		Action:              "LocalPVQuotaExceeded",
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-	}
-	if _, err := c.d.Cfg.Client.EventsV1().Events(pod.Namespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: LocalPVQuotaExceeded event create failed for %s/%s: %v",
-			pod.Namespace, pod.Name, err))
-		return
-	}
-	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: LocalPVQuotaExceeded — pod %s/%s dir=%s %dB > %.0fx cap %dB, %d tasks deprioritized",
-		pod.Namespace, pod.Name, dir, size,
-		c.d.Cfg.Disk.LocalPVQuotaRatio, cap, throttled))
+	c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 }
 
 // --- run-tmpfs: host /run tmpfs guard ---
@@ -577,11 +377,11 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 	}
 }
 
-// --- W15-K2: coredump-storm guard + overlayfs writable-layer scan ---
+// --- Coredump-storm guard + overlayfs writable-layer scan ---
 
 // coredumpGC sweeps stale core dumps under CoredumpDir once the
 // filesystem holding it crosses the disk-bloat warn watermark (the
-// same evidence source the W6.3 walk gates on). The W15-K2a
+// same evidence source the W6.3 walk gates on). The coredump
 // Storage=none drop-in keeps a converged host's store empty; this is
 // the backstop for nodes the drop-in has not reached yet. Files
 // younger than coredumpMinAge survive one cycle so an in-progress
@@ -652,7 +452,7 @@ func podDeclaresEphemeralStorage(pod *corev1.Pod) bool {
 	return false
 }
 
-// writableLayerScan is the W15-K2b runaway writable-layer detector:
+// writableLayerScan is the runaway writable-layer detector:
 // a container WITHOUT a limits.ephemeral-storage bound can grow its
 // overlayfs upperdir until the node falls into DiskPressure — the
 // one write surface the kubelet's eviction chain never measures.
@@ -737,27 +537,17 @@ func (c *DiskBloatCheck) emitWLayerBloatEvent(ctx context.Context,
 		name = fmt.Sprintf("%s.wlayer.%x", pod.Name, now.UnixNano())
 		owner = "pod " + pod.Namespace + "/" + pod.Name
 	}
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-		},
-		EventTime: metav1.NewMicroTime(now),
+	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      name,
+		Namespace: ns,
 		Reason:    "ContainerWritableLayerBloat",
 		Note: fmt.Sprintf(
 			"writable layer %s holds %d bytes > threshold %d and the container declares no limits.ephemeral-storage — DiskPressure risk",
 			dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   c.d.Cfg.NodeName,
-		Action:              "ContainerWritableLayerBloat",
-		Regarding:           regarding,
-	}
-	if _, err := c.d.Cfg.Client.EventsV1().Events(ns).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: ContainerWritableLayerBloat event create failed for %s: %v",
-			owner, err))
+		When:      now,
+		Regarding: regarding,
+		Owner:     owner,
+	}); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
@@ -765,19 +555,3 @@ func (c *DiskBloatCheck) emitWLayerBloatEvent(ctx context.Context,
 		owner, dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes))
 	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "wlayer_detect").Inc()
 }
-
-// --- Check: d-state-storm (W7-H1) ---
-// A wedged block device (btrfs/jbd2 journal), loop device
-// (baggageclaim/LocalPV) or kernel mutex drops the calling process
-// into D (uninterruptible sleep) — un-killable, invisible to the
-// zombie storm (state Z) and the statfs stall probes (the mount
-// still answers while a runc/shim sits frozen in fsync/umount).
-// The check reuses the per-cycle pid sweep: every state-D process
-// is counted, and the runtime-critical subset (runc, containerd*,
-// k0s*, kubelet, btrfs-*, jbd2/* kernel threads) is tallied
-// separately — a storm in THOSE wedges the pod lifecycle, not just
-// one workload. /proc/<pid>/wchan names the kernel function holding
-// the task, reported in the latch-entry ACTION line. No remedy is
-// attempted (a D-state process survives SIGKILL and every service
-// restart): the latch drives nodereporter's KernelHungTasks
-// condition for the NHC→SNR reboot escalation path.

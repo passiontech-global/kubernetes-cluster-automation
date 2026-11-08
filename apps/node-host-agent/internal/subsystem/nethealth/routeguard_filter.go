@@ -7,7 +7,7 @@
 // delete strands the node off-mesh for minutes while a spurious
 // trigger costs one idempotent script run. The netlink socket +
 // netns bind mechanics and the generic nlmsg/rtattr decode live in
-// platform/routewatch; below is the nebula policy they filter
+// subsystem/nethealth/routewatch; below is the nebula policy they filter
 // against.
 package nethealth
 
@@ -19,7 +19,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/routewatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/routewatch"
 )
 
 // The numeric identity of the nebula dataplane — constants mirrored

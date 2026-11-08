@@ -13,7 +13,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// ---------- W15-K2a: coredump.conf.d disable drop-in ----------
+// ---------- Coredump: coredump.conf.d disable drop-in ----------
 
 func TestGroupBaseCoredumpDropInConverges(t *testing.T) {
 	vars := writeVarsDir(t, "")

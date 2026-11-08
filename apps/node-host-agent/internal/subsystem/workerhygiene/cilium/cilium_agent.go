@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -39,38 +39,37 @@ func (c *CiliumCheck) Name() string { return wdeps.CheckCilium }
 
 // Run executes one cilium round.
 func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCilium, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCilium) {
 		return
 	}
 	tasks, reachable := ciliumAgentTasks(c.d, e)
 	if !reachable {
 		// ctr unreachable → inconclusive, keep everything.
-		c.d.Cycles.WithLabelValues(wdeps.CheckCilium, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCilium, "abort")
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-agent container → this node runs no cilium
 		// (calico cluster, hub): clear any false-positive state.
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumAgentDown, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCilium, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumAgentDown, nil)
+		c.d.CycleResult(wdeps.CheckCilium, "ok")
 		return
 	}
 	err := c.d.ProbeHTTPSeries(ctx, c.d.Cfg.Cilium.HealthzURL,
 		wdeps.ProbeAttempts, ciliumProbeTime, c.d.Cfg.ProbeGap)
 	if err == nil {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumAgentDown, nil)
+		c.d.State.Exit(latchdefs.LatchCiliumAgentDown, nil)
 		// W8-NM3: a healthy healthz doesn't prove the datapath —
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
 		// the same agent socket.
 		c.CheckBPFMaps(ctx)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCilium, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCilium, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchCiliumAgentDown, "")
+	c.d.State.Enter(latchdefs.LatchCiliumAgentDown, "")
 	c.fails++
 	switch {
 	case !e.APIOK:
@@ -78,14 +77,14 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
 			c.fails))
 	case c.fails >= c.d.Cfg.ConsecNeeded &&
-		!c.d.State.Exists(hoststate.LatchNodeOverloaded) &&
+		!c.d.State.Exists(latchdefs.LatchNodeOverloaded) &&
 		c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval):
 		// Budget spent atomically BEFORE acting (rate_spend
 		// parity): a missed kill still consumed it — the feeder
 		// goroutine competes for the same file.
 		if killCiliumAgent(c.d, tasks) {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"ACTION: killed cilium-agent container - healthz down %dx (kubelet will restart)",
+			c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionCiliumAgentKill+
+				" container - healthz down %dx (kubelet will restart)",
 				c.fails))
 			c.fails = 0
 			c.d.Actions.WithLabelValues(wdeps.CheckCilium, "sigkill").Inc()
@@ -99,7 +98,7 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail (check %d/%d)",
 			c.fails, c.d.Cfg.ConsecNeeded))
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCilium, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCilium, "ok")
 }
 
 // --- W8-NM3: cilium BPF map pressure ---
@@ -199,7 +198,7 @@ func (c *CiliumCheck) CheckBPFMaps(ctx context.Context) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",
 			c.d.Cfg.Cilium.Socket, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumBPF, "abort")
 		return
 	}
 	maps := ParseCiliumBPFMaps(body)
@@ -210,11 +209,11 @@ func (c *CiliumCheck) CheckBPFMaps(ctx context.Context) {
 		}
 	}
 	if len(over) == 0 {
-		c.d.State.Exit(hoststate.LatchCiliumBPFMapPressure, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumBPFMapPressure, nil)
+		c.d.CycleResult(wdeps.CheckCiliumBPF, "ok")
 		return
 	}
 	sort.Strings(over)
-	c.d.State.Enter(hoststate.LatchCiliumBPFMapPressure, strings.Join(over, " "))
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok").Inc()
+	c.d.State.Enter(latchdefs.LatchCiliumBPFMapPressure, strings.Join(over, " "))
+	c.d.CycleResult(wdeps.CheckCiliumBPF, "ok")
 }

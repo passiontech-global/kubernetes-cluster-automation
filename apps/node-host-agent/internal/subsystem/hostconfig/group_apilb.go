@@ -8,9 +8,10 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T12 api-local-lb ----------
@@ -79,19 +80,32 @@ func (c *cyc) groupAPILB() {
 		hostDeb := "/var/lib/node-watchdog/" + debFile
 		local := r.hp(hostDeb)
 		_ = r.ensureDir("/var/lib/node-watchdog", 0o755)
-		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
-			if err := r.download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
+		sum := c.v("api_lb_haproxy_deb_sha256")
+		url := c.v("api_lb_haproxy_deb_url")
+		// dpkg probe already decided needDeb above — the spec's flow
+		// only owns stage/download/install here. A failed download
+		// aborts the whole group (no haproxy config converge against
+		// a missing binary).
+		if _, ok := c.installManagedBinary(managedBinarySpec{
+			name:   "T12",
+			url:    url,
+			sum:    sum,
+			staged: local,
+			downloadErr: func(c *cyc, err error) {
 				c.err("T12: haproxy deb download",
-					"url", c.v("api_lb_haproxy_deb_url"), "deb", hostDeb, "error", err)
-				return
-			}
-		}
-		// runLong: dep resolution on slow egress outlives the
-		// interactive budget.
-		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-			"apt-get", "install", "-y", hostDeb); err != nil {
-			c.err("T12: haproxy deb install failed — continuing with installed version",
-				"deb", hostDeb, "error", err)
+					"url", url, "deb", hostDeb, "error", err)
+			},
+			install: func(c *cyc, _ string) {
+				// runLong: dep resolution on slow egress outlives the
+				// interactive budget.
+				if _, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+					"apt-get", "install", "-y", hostDeb); err != nil {
+					c.err("T12: haproxy deb install failed — continuing with installed version",
+						"deb", hostDeb, "error", err)
+				}
+			},
+		}); !ok {
+			return
 		}
 	}
 	// distro haproxy.service ships /etc/haproxy/haproxy.cfg (:80
@@ -111,7 +125,7 @@ func (c *cyc) groupAPILB() {
 	// api-local-lb.service ExecStartPost/ExecStopPost hooks in the
 	// unit template — the table dies with the LB.
 	nftChanged := false
-	if vip := c.v("api_lb_vip_ip"); vip != "" && vip != "None" {
+	if vip := c.t.Vars.StrDef("api_lb_vip_ip", ""); vip != "" {
 		// runLong: same slow-egress budget as the haproxy deb.
 		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "install", "-y", "nftables"); err != nil {
@@ -184,7 +198,7 @@ table ip api_local_dnat {
 func (c *cyc) apiLBExtraLanes() [][2]string {
 	var out [][2]string
 	for _, it := range c.vl("api_lb_extra_lanes") {
-		m, _ := it.(*topology.OMap)
+		m, _ := it.(*jinja.OMap)
 		if m == nil {
 			continue
 		}
@@ -202,7 +216,7 @@ func (c *cyc) apiLBExtraLanes() [][2]string {
 func (c *cyc) apiLBDnatPorts() []string {
 	ports := []string{"6443"}
 	for _, lane := range c.apiLBExtraLanes() {
-		if !containsSS(ports, lane[1]) {
+		if !slices.Contains(ports, lane[1]) {
 			ports = append(ports, lane[1])
 		}
 	}
@@ -214,7 +228,7 @@ func (c *cyc) apiLBDnatPorts() []string {
 func (c *cyc) probeReachable() []string {
 	var out []string
 	for _, it := range c.vl("api_lb_backends") {
-		m, _ := it.(*topology.OMap)
+		m, _ := it.(*jinja.OMap)
 		if m == nil {
 			continue
 		}

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -160,7 +160,7 @@ func (f *Feeder) Tick(ctx context.Context) {
 				"kubelet-feeder: probe OK again after %d fail", f.WdFails))
 		}
 		f.WdFails = 0
-		d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
+		d.State.Exit(latchdefs.LatchKubeletHealthzDown, nil)
 		return
 	}
 	// PartOf=k0sworker.service parity: the shell feeder unit stood
@@ -185,7 +185,7 @@ func (f *Feeder) Tick(ctx context.Context) {
 				d.State.AppendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
 			}
 			f.WdFails = 0
-			d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
+			d.State.Exit(latchdefs.LatchKubeletHealthzDown, nil)
 			return
 		}
 	}
@@ -226,7 +226,7 @@ func (f *Feeder) remediate(ctx context.Context) {
 			d.State.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
 			f.WdFails = 0
-			d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
+			d.State.Exit(latchdefs.LatchKubeletHealthzDown, nil)
 			return
 		}
 		if i < 2 {
@@ -260,7 +260,7 @@ func (f *Feeder) remediate(ctx context.Context) {
 	// G3 overload — a kubelet wedge under CPU starvation is a
 	// symptom, not a dead kubelet; restarting dumps its load onto the
 	// surviving nodes (amplifier).
-	if d.State.Exists(hoststate.LatchNodeOverloaded) {
+	if d.State.Exists(latchdefs.LatchNodeOverloaded) {
 		d.State.AppendLog("kubelet-remediate: SKIP(G3-overload) state-node-overloaded latched")
 		return
 	}
@@ -279,7 +279,7 @@ func (f *Feeder) remediate(ctx context.Context) {
 	// window and double-restart. Exhausted → escalate to the NHC→SNR
 	// reboot path via the latch instead of piling on.
 	if !d.State.RateTrySpend("last-restart", d.Cfg.MinRestartInterval) {
-		d.State.Enter(hoststate.LatchKubeletHealthzDown, "restart-budget-exhausted")
+		d.State.Enter(latchdefs.LatchKubeletHealthzDown, "restart-budget-exhausted")
 		d.State.AppendLog("kubelet-remediate: SKIP(G5-ratelimit) k0sworker restart <30m ago — " +
 			"state-kubelet-healthz-down latched (NHC→SNR escalation)")
 		return
@@ -288,8 +288,8 @@ func (f *Feeder) remediate(ctx context.Context) {
 	// G6 act — the budget was already spent atomically above (shell
 	// parity: a hung/failed restart still consumed it). reset-failed
 	// first so a stale failed state can't wedge the unit's next start.
-	d.State.AppendLog(fmt.Sprintf(
-		"ACTION: restarting k0sworker (reason=systemd-watchdog-kubelet-healthz-60s fails=%d)",
+	d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
+		" (reason=systemd-watchdog-kubelet-healthz-60s fails=%d)",
 		d.Cfg.Kubelet.WdMaxFail))
 	resetFailedK0sWorker(d, ctx)
 	if err := restartK0sWorker(d, ctx); err != nil {

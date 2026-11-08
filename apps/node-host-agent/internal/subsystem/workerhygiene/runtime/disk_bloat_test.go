@@ -1,4 +1,4 @@
-// disk_bloat_w15_test.go — the W15-K2 disk side-guards on
+// disk_bloat_test.go — the disk side-guards on
 // DiskBloatCheck: the watermark-gated stale coredump sweep and the
 // interval-budgeted writable-layer runaway scan with its
 // ContainerWritableLayerBloat event.
@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W15-K2: coredump-storm guard ---
+// --- Coredump-storm guard ---
 
 func TestCoredumpGCSweepsStaleCoresAboveWatermark(t *testing.T) {
 	e := fixture(t)
@@ -65,7 +65,7 @@ func TestCoredumpGCSweepsStaleCoresAboveWatermark(t *testing.T) {
 	}
 }
 
-// --- W15-K2b: writable-layer runaway scan ---
+// --- Writable-layer runaway scan ---
 
 // wlayerPod builds a Running pod on node-a; lim=true adds a
 // limits.ephemeral-storage entry on its only container.

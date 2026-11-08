@@ -33,75 +33,58 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 )
 
-// Defaults — containerized default is the DaemonSet host-root mount.
-// HostRoot/Timeout come from hostexec's exported consts (single
-// source — this package used to carry a private copy of the pair).
-const (
-	// defaultProcUptimeFile: hostPID:true makes the pod's /proc the
-	// HOST /proc, so the plain path is right even when HostRoot is
-	// mounted at /host (the nsenter wrapping covers commands, not
-	// this file read).
-	defaultProcUptimeFile = "/proc/uptime"
-)
+// Config is hostexec.Config — a type alias, not a field-for-field
+// copy: the exec seam (HostRoot/Timeout/RunCmd/RunCmdCombined) is
+// owned and defaulted by hostexec, and this package uses it verbatim,
+// so a duplicate struct would only be a place for the two to drift.
+// Consumers keep the systemd.Config spelling (composite literals
+// unchanged). The one systemd-specific input — ActiveAge's
+// uptime-file override — cannot ride an alias; it travels via
+// WithProcUptimeFile (default /proc/uptime is right in every real
+// deployment: hostPID:true mounts the HOST /proc at /proc).
+type Config = hostexec.Config
 
-// Config carries the exec seam — all test-injectable.
-type Config struct {
-	// HostRoot is where the host filesystem is mounted. "/" means the
-	// process runs on the host already — commands run unwrapped.
-	HostRoot string
-	// Timeout bounds every spawned command (the shell used timeout 15
-	// on journald/ctr calls; 30s covers a loaded journald).
-	Timeout time.Duration
-	// RunCmd executes argv[0] argv[1:] and returns combined stdout.
-	// nil → exec.CommandContext. The nsenter wrapping is applied to
-	// argv BEFORE RunCmd sees it, so a fake runner observes the exact
-	// production command line.
-	RunCmd func(ctx context.Context, argv []string) (string, error)
-	// RunCmdCombined is RunCmd with the child's STDERR folded into
-	// the returned output — ExecCombined's seam. Needed for probes
-	// whose evidence lives on stderr (journalctl prints
-	// "File ... is corrupt" to stderr, not stdout). nil →
-	// exec.CommandContext writing both streams into one capped
-	// buffer.
-	RunCmdCombined func(ctx context.Context, argv []string) (string, error)
-	// ProcUptimeFile is read by ActiveAge to turn the unit's
-	// monotonic-since-boot activation timestamp into an age.
-	ProcUptimeFile string
+// Option customizes a Client at construction beyond its Config.
+type Option func(*Client)
+
+// WithProcUptimeFile overrides the file ActiveAge reads to turn the
+// unit's monotonic-since-boot activation timestamp into an age.
+// Production keeps the default; tests point it at a temp copy.
+func WithProcUptimeFile(path string) Option {
+	return func(c *Client) { c.procUptimeFile = path }
 }
 
-func (c *Config) applyDefaults() {
-	if c.HostRoot == "" {
-		c.HostRoot = hostexec.DefaultHostRoot
-	}
-	if c.Timeout <= 0 {
-		c.Timeout = hostexec.DefaultTimeout
-	}
-	if c.ProcUptimeFile == "" {
-		c.ProcUptimeFile = defaultProcUptimeFile
-	}
-	// nil RunCmd/RunCmdCombined are left for hostexec to wire to the
-	// real exec.CommandContext runners — the nsenter wrap, capped
-	// output sink and WaitDelay pipe-close grace all live there now.
-}
+// defaultProcUptimeFile: hostPID:true makes the pod's /proc the
+// HOST /proc, so the plain path is right even when HostRoot is
+// mounted at /host (the nsenter wrapping covers commands, not
+// this file read).
+const defaultProcUptimeFile = "/proc/uptime"
 
 // Client runs host systemd commands.
 type Client struct {
-	cfg  Config
-	host *hostexec.Runner
+	cfg            Config // kept for Timeout: UnitExists' background bound
+	host           *hostexec.Runner
+	procUptimeFile string
 }
 
 // New returns a Client for cfg.
-func New(cfg Config) *Client {
-	cfg.applyDefaults()
-	return &Client{
-		cfg: cfg,
-		host: hostexec.New(hostexec.Config{
-			HostRoot:       cfg.HostRoot,
-			Timeout:        cfg.Timeout,
-			RunCmd:         cfg.RunCmd,
-			RunCmdCombined: cfg.RunCmdCombined,
-		}),
+func New(cfg Config, opts ...Option) *Client {
+	// The exec fields (HostRoot, nil RunCmd/RunCmdCombined seams) are
+	// defaulted inside hostexec.New; only Timeout needs arming here —
+	// the Client reads it directly for UnitExists' background bound
+	// (the default value stays hostexec's, no local copy).
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = hostexec.DefaultTimeout
 	}
+	c := &Client{
+		cfg:            cfg,
+		host:           hostexec.New(cfg),
+		procUptimeFile: defaultProcUptimeFile,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Exec runs an arbitrary host command — systemctl and journalctl are
@@ -313,9 +296,9 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic %q (not active)",
 			unit, ts)
 	}
-	up, err := procUptimeSeconds(c.cfg.ProcUptimeFile)
+	up, err := procUptimeSeconds(c.procUptimeFile)
 	if err != nil {
-		return 0, fmt.Errorf("%s: read %s: %w", unit, c.cfg.ProcUptimeFile, err)
+		return 0, fmt.Errorf("%s: read %s: %w", unit, c.procUptimeFile, err)
 	}
 	// Same clock family (CLOCK_MONOTONIC vs boot time) — the µs
 	// rounding can push the delta a hair below zero on a unit that

@@ -21,7 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // conditionDef is one permanent NodeCondition — 1:1 with a
@@ -51,7 +51,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NodeLoadNormal",
 		defaultMessage: "node not overloaded (load15 <= 4xCPU)",
 		problemReason:  "NodeOverloadedDetected",
-		stateKey:       hoststate.LatchNodeOverloaded,
+		stateKey:       latchdefs.LatchNodeOverloaded,
 	},
 	{
 		typ:            "WatchdogStale",
@@ -65,32 +65,32 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "CiliumAgentUp",
 		defaultMessage: "cilium-agent healthz OK",
 		problemReason:  "CiliumAgentDownDetected",
-		stateKey:       hoststate.LatchCiliumAgentDown,
+		stateKey:       latchdefs.LatchCiliumAgentDown,
 	},
 	{
 		typ:            "CiliumInitStuck",
 		defaultReason:  "CiliumEndpointsReady",
 		defaultMessage: "no cilium endpoint stuck in init (informer healthy)",
 		problemReason:  "CiliumInitStuckDetected",
-		stateKey:       hoststate.LatchCiliumInitStuck,
+		stateKey:       latchdefs.LatchCiliumInitStuck,
 	},
 	{
 		typ:            "KubeletRuntimeStall",
 		defaultReason:  "KubeletRuntimeOk",
 		defaultMessage: "no phantom-pods wedge (ctr alive, tasks > 0)",
 		problemReason:  "KubeletRuntimeStallDetected",
-		stateKey:       hoststate.LatchKubeletRuntimeStall,
+		stateKey:       latchdefs.LatchKubeletRuntimeStall,
 		// BUG-H4: the PLEG/syncloop freeze and the hung containerd
 		// socket are runtime stalls too — every latch must light
 		// the condition. W10-KR6 adds the kubelet watch-stream wedge
 		// and the containerd meta.db corruption latch (restart can't
 		// recover a corrupt store — same remediation class).
 		altStateKeys: []string{
-			hoststate.LatchKubeletHealthzDown,
-			hoststate.LatchKubeletSyncloopDown,
-			hoststate.LatchContainerdSockDown,
-			hoststate.LatchKubeletWatchWedge,
-			hoststate.LatchContainerdCorrupt,
+			latchdefs.LatchKubeletHealthzDown,
+			latchdefs.LatchKubeletSyncloopDown,
+			latchdefs.LatchContainerdSockDown,
+			latchdefs.LatchKubeletWatchWedge,
+			latchdefs.LatchContainerdCorrupt,
 		},
 	},
 	{
@@ -98,28 +98,28 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "DnsDirectOk",
 		defaultMessage: "DNS via resolv.conf healthy, no /etc/hosts pin",
 		problemReason:  "DnsFallbackEngaged",
-		stateKey:       hoststate.LatchDNSFallback,
+		stateKey:       latchdefs.LatchDNSFallback,
 	},
 	{
 		typ:            "DnsResolvStale",
 		defaultReason:  "DnsResolvFresh",
 		defaultMessage: "DNS pods (nld/coredns) resolv.conf matches host",
 		problemReason:  "DnsResolvStaleDetected",
-		stateKey:       hoststate.LatchDNSResolvStale,
+		stateKey:       latchdefs.LatchDNSResolvStale,
 	},
 	{
 		typ:            "PodTeardownWedged",
 		defaultReason:  "PodTeardownOk",
 		defaultMessage: "no long-Terminating pod with leftover task",
 		problemReason:  "PodTeardownWedgedDetected",
-		stateKey:       hoststate.LatchPodTeardownWedged,
+		stateKey:       latchdefs.LatchPodTeardownWedged,
 	},
 	{
 		typ:            "KubeletWatchWedge",
 		defaultReason:  "KubeletWatchOk",
 		defaultMessage: "kubelet receives pod assignment normally (no unseen pod)",
 		problemReason:  "KubeletWatchWedgeDetected",
-		stateKey:       hoststate.LatchKubeletWatchWedge,
+		stateKey:       latchdefs.LatchKubeletWatchWedge,
 	},
 	{
 		// Agent-added (not in the NPD JSON): the journalwatch
@@ -130,7 +130,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "JournaldReadable",
 		defaultMessage: "journald journal reads return entries",
 		problemReason:  "JournaldUnreadableDetected",
-		stateKey:       hoststate.LatchJournalUnreadable,
+		stateKey:       latchdefs.LatchJournalUnreadable,
 	},
 	{
 		// Agent-added (W5.3): hostmetrics' statfs probes found a
@@ -144,8 +144,8 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "FilesystemReadWrite",
 		defaultMessage: "all probed filesystems are read-write",
 		problemReason:  "FilesystemReadOnlyDetected",
-		stateKey:       hoststate.LatchFilesystemReadonly,
-		altStateKeys:   []string{hoststate.LatchFSReadonly},
+		stateKey:       latchdefs.LatchFilesystemReadonly,
+		altStateKeys:   []string{latchdefs.LatchFSReadonly},
 	},
 	{
 		// Agent-added (W7-H1): workerhygiene's D-state storm
@@ -156,14 +156,14 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelTasksRunOk",
 		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
 		problemReason:  "KernelHungTasksDetected",
-		stateKey:       hoststate.LatchDStateStorm,
+		stateKey:       latchdefs.LatchDStateStorm,
 		// kernel-softlockup-monitor (npd subpackage): a kmsg
 		// soft-lockup/RCU-stall signature is the same hang class —
 		// the kernel monitor Enters one evidence latch per
 		// signature so a CPU wedged inside the kernel raises
 		// KernelHungTasks even when no D-state storm is counted.
 		altStateKeys: []string{
-			hoststate.LatchKernelSoftLockup, hoststate.LatchKernelRCUStall,
+			latchdefs.LatchKernelSoftLockup, latchdefs.LatchKernelRCUStall,
 		},
 	},
 	// --- Wave-8 latch→condition surface ---
@@ -176,91 +176,91 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NebulaMeshHealthy",
 		defaultMessage: "all nebula peers handshake normally",
 		problemReason:  "NebulaIsolatedDetected",
-		stateKey:       hoststate.LatchNebulaIsolated,
+		stateKey:       latchdefs.LatchNebulaIsolated,
 	},
 	{
 		typ:            "NebulaDegraded",
 		defaultReason:  "NebulaDataplaneOk",
 		defaultMessage: "nebula dataplane healthy (no relay/latency degradation)",
 		problemReason:  "NebulaDegradedDetected",
-		stateKey:       hoststate.LatchNebulaDegraded,
+		stateKey:       latchdefs.LatchNebulaDegraded,
 	},
 	{
 		typ:            "CiliumEnvoyDown",
 		defaultReason:  "CiliumEnvoyReady",
 		defaultMessage: "cilium-envoy admin /ready OK",
 		problemReason:  "CiliumEnvoyDownDetected",
-		stateKey:       hoststate.LatchCiliumEnvoyDown,
+		stateKey:       latchdefs.LatchCiliumEnvoyDown,
 	},
 	{
 		typ:            "CiliumIPAMExhausted",
 		defaultReason:  "CiliumIPAMOk",
 		defaultMessage: "cilium IPAM pool has headroom (no address leak)",
 		problemReason:  "CiliumIPAMExhaustedDetected",
-		stateKey:       hoststate.LatchCiliumIPAMExhausted,
+		stateKey:       latchdefs.LatchCiliumIPAMExhausted,
 	},
 	{
 		typ:            "CiliumBPFMapPressure",
 		defaultReason:  "CiliumBPFMapsOk",
 		defaultMessage: "critical cilium BPF maps below 90% capacity",
 		problemReason:  "CiliumBPFMapPressureDetected",
-		stateKey:       hoststate.LatchCiliumBPFMapPressure,
+		stateKey:       latchdefs.LatchCiliumBPFMapPressure,
 	},
 	{
 		typ:            "SpegelMirrorDegraded",
 		defaultReason:  "SpegelMirrorReady",
 		defaultMessage: "spegel P2P mirror pod Ready",
 		problemReason:  "SpegelMirrorDegradedDetected",
-		stateKey:       hoststate.LatchSpegelMirrorDegraded,
+		stateKey:       latchdefs.LatchSpegelMirrorDegraded,
 	},
 	{
 		typ:            "CalicoVethLeak",
 		defaultReason:  "CalicoVethCountOk",
 		defaultMessage: "cali* veth count matches pod count (no CNI DEL leak)",
 		problemReason:  "CalicoVethLeakDetected",
-		stateKey:       hoststate.LatchCalicoVethLeak,
+		stateKey:       latchdefs.LatchCalicoVethLeak,
 	},
 	{
 		typ:            "CalicoFelixDown",
 		defaultReason:  "CalicoFelixReady",
 		defaultMessage: "calico felix :9099 readiness OK",
 		problemReason:  "CalicoFelixDownDetected",
-		stateKey:       hoststate.LatchCalicoFelixDown,
+		stateKey:       latchdefs.LatchCalicoFelixDown,
 	},
 	{
 		typ:            "Fail2banDown",
 		defaultReason:  "Fail2banActive",
 		defaultMessage: "fail2ban service installed and active",
 		problemReason:  "Fail2banDownDetected",
-		stateKey:       hoststate.LatchFail2banDown,
+		stateKey:       latchdefs.LatchFail2banDown,
 	},
 	{
 		typ:            "ConntrackPressure",
 		defaultReason:  "ConntrackNormal",
 		defaultMessage: "nf_conntrack table below pressure threshold",
 		problemReason:  "ConntrackPressureDetected",
-		stateKey:       hoststate.LatchConntrackPressure,
+		stateKey:       latchdefs.LatchConntrackPressure,
 	},
 	{
 		typ:            "KernelKeysPressure",
 		defaultReason:  "KernelKeysNormal",
 		defaultMessage: "kernel keyring quota below pressure threshold",
 		problemReason:  "KernelKeysPressureDetected",
-		stateKey:       hoststate.LatchKernelKeysPressure,
+		stateKey:       latchdefs.LatchKernelKeysPressure,
 	},
 	{
 		typ:            "ControlPlaneCertReloadStale",
 		defaultReason:  "ControlPlaneCertReloadFresh",
 		defaultMessage: "control-plane cert reload markers fresh",
 		problemReason:  "ControlPlaneCertReloadStaleDetected",
-		stateKey:       hoststate.LatchCPCertReloadStale,
+		stateKey:       latchdefs.LatchCPCertReloadStale,
 	},
 	{
 		typ:            "MemoryPSIThrashing",
 		defaultReason:  "MemoryPSINormal",
 		defaultMessage: "memory PSI full avg60 <= 25% or free memory >= 8%",
 		problemReason:  "MemoryPSIThrashingDetected",
-		stateKey:       hoststate.LatchPSIMemoryThrash,
+		stateKey:       latchdefs.LatchPSIMemoryThrash,
 	},
 	// --- Wave-9 latch→condition surface ---
 	// Agent-added conditions for the latches Wave-9 adds (or the
@@ -273,7 +273,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "ClockSynchronized",
 		defaultMessage: "kernel clock disciplined (adjtimex synced, esterror <= 500ms)",
 		problemReason:  "ClockUnsynchronizedDetected",
-		stateKey:       hoststate.LatchClockUnsync,
+		stateKey:       latchdefs.LatchClockUnsync,
 	},
 	{
 		// workerhygiene's W9-KR3 slab-leak guard — SUnreclaim above
@@ -284,7 +284,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelSlabNormal",
 		defaultMessage: "unreclaimable kernel slab below pressure threshold",
 		problemReason:  "KernelSlabLeakDetected",
-		stateKey:       hoststate.LatchKernelSlabLeak,
+		stateKey:       latchdefs.LatchKernelSlabLeak,
 	},
 	{
 		// nethealth's W9-NM1 DF PMTU probe — small-packet overlay
@@ -294,7 +294,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NebulaPMTUOk",
 		defaultMessage: "nebula overlay passes DF probes at probe size",
 		problemReason:  "NebulaPMTUBlackholeDetected",
-		stateKey:       hoststate.LatchNebulaPMTUBlackhole,
+		stateKey:       latchdefs.LatchNebulaPMTUBlackhole,
 	},
 	// --- Wave-10 latch→condition surface ---
 	{
@@ -306,7 +306,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelResourcesNormal",
 		defaultMessage: "kernel threads/pids and fd table below exhaustion threshold",
 		problemReason:  "KernelResourceExhaustionDetected",
-		stateKey:       hoststate.LatchPIDFDPressure,
+		stateKey:       latchdefs.LatchPIDFDPressure,
 	},
 	{
 		// nethealth's W10-KR5 clock-skew guard — chronyc/adjtimex
@@ -317,7 +317,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "ClockSkewOk",
 		defaultMessage: "clock offset within 2.0s of NTP source",
 		problemReason:  "ClockSkewDetected",
-		stateKey:       hoststate.LatchClockSkew,
+		stateKey:       latchdefs.LatchClockSkew,
 	},
 	// --- latch→condition surface: kernel/host deep-failure + hygiene ---
 	// The remaining registered latches each map 1:1 to a permanent
@@ -336,7 +336,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KubeconfigCertValid",
 		defaultMessage: "kubeconfig client certificates valid beyond the expiry horizon",
 		problemReason:  "KubeconfigCertExpiringDetected",
-		stateKey:       hoststate.LatchKubeconfigCertExpiring,
+		stateKey:       latchdefs.LatchKubeconfigCertExpiring,
 	},
 	{
 		// hostmetrics' cpu-steal guard — hypervisor steal time above
@@ -347,7 +347,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "CPUStealNormal",
 		defaultMessage: "hypervisor CPU steal below pressure threshold",
 		problemReason:  "CPUStealPressureDetected",
-		stateKey:       hoststate.LatchCPUStealPressure,
+		stateKey:       latchdefs.LatchCPUStealPressure,
 	},
 	{
 		// workerhygiene's cgroup-dying-reclaim — cgroup v2
@@ -358,7 +358,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "CgroupDyingNormal",
 		defaultMessage: "cgroup dying descendants below pressure threshold",
 		problemReason:  "CgroupDyingLeakDetected",
-		stateKey:       hoststate.LatchCgroupDyingLeak,
+		stateKey:       latchdefs.LatchCgroupDyingLeak,
 	},
 	{
 		// workerhygiene's systemd-session-hygiene — abandoned logind
@@ -368,7 +368,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "SystemdSessionsNormal",
 		defaultMessage: "logind session count and D-Bus latency healthy",
 		problemReason:  "SystemdSessionBloatDetected",
-		stateKey:       hoststate.LatchSystemdSessionBloat,
+		stateKey:       latchdefs.LatchSystemdSessionBloat,
 	},
 	{
 		// workerhygiene's kubelet-syncloop PLEG metrics guard —
@@ -381,7 +381,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KubeletPLEGHealthy",
 		defaultMessage: "kubelet PLEG relist latency and last-seen lag healthy",
 		problemReason:  "KubeletPLEGUnhealthyDetected",
-		stateKey:       hoststate.LatchKubeletPLEGUnhealthy,
+		stateKey:       latchdefs.LatchKubeletPLEGUnhealthy,
 	},
 	// --- Wave-12 latch→condition surface ---
 	{
@@ -398,7 +398,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "DiskIONormal",
 		defaultMessage: "disk write await and io PSI within normal bounds",
 		problemReason:  "DiskSlowIODetected",
-		stateKey:       hoststate.LatchDiskSlowIO,
+		stateKey:       latchdefs.LatchDiskSlowIO,
 	},
 	{
 		// workerhygiene's kernel-net-shim-hygiene guard — sustained
@@ -408,11 +408,11 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelNetShimNormal",
 		defaultMessage: "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds",
 		problemReason:  "KernelNetShimDegradedDetected",
-		stateKey:       hoststate.LatchKernelNetShim,
+		stateKey:       latchdefs.LatchKernelNetShim,
 	},
-	// --- Wave-15 latch→condition surface ---
+	// --- Clocksource latch→condition surface ---
 	{
-		// hostmetrics' W15-K1 clocksource guard — the kernel marked
+		// hostmetrics' clocksource guard — the kernel marked
 		// its clocksource unstable (kmsg evidence latch) or the
 		// collector found the current clocksource drifted off
 		// tsc/kvm-clock. A demoted clocksource degrades every vDSO
@@ -421,7 +421,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "ClocksourceStable",
 		defaultMessage: "kernel clocksource stable (tsc/kvm-clock, no instability records)",
 		problemReason:  "ClocksourceUnstableDetected",
-		stateKey:       hoststate.LatchClocksourceUnstable,
+		stateKey:       latchdefs.LatchClocksourceUnstable,
 	},
 }
 

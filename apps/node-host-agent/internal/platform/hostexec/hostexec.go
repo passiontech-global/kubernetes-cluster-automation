@@ -30,9 +30,10 @@ import (
 )
 
 // Defaults — containerized default is the DaemonSet host-root mount.
-// Exported as the single source: systemd.Config.applyDefaults
-// references these instead of carrying its own private copy of the
-// same two numbers (the copies drifted risk-free only by luck).
+// Exported as the single source: systemd.Config is an alias of
+// hostexec.Config, so the systemd client inherits these defaults
+// through hostexec's own applyDefaults (it used to carry a private
+// copy of the pair — the copies drifted risk-free only by luck).
 const (
 	// DefaultHostRoot is where the DaemonSet mounts the host fs.
 	DefaultHostRoot = "/host"
@@ -99,23 +100,6 @@ var nsenterFlag = []struct {
 	{NSIPC, "-i"},
 	{NSNet, "-n"},
 	{NSPID, "-p"},
-}
-
-// NSFlags renders ns as the nsenter namespace short flags in
-// declaration order (m, u, i, n, p) — the argv fragment that
-// follows `nsenter -t 1` and precedes `--`. Exported so converge's
-// NsenterRunner shares ONE flag list with the wrap applied here:
-// its prefix must stay flag-identical (the NSAll set) even though
-// it deliberately keeps its own timeout policy instead of stacking
-// Config.Timeout.
-func NSFlags(ns NS) []string {
-	var flags []string
-	for _, f := range nsenterFlag {
-		if ns&f.bit != 0 {
-			flags = append(flags, f.opt)
-		}
-	}
-	return flags
 }
 
 // Config carries the exec seam — all test-injectable.
@@ -271,7 +255,13 @@ func (r *Runner) argv(ns NS, name string, args []string) []string {
 	if r.cfg.HostRoot == "/" || ns == NSNone {
 		return argv
 	}
-	prefix := append([]string{"nsenter", "-t", "1"}, NSFlags(ns)...)
+	var flags []string
+	for _, f := range nsenterFlag {
+		if ns&f.bit != 0 {
+			flags = append(flags, f.opt)
+		}
+	}
+	prefix := append([]string{"nsenter", "-t", "1"}, flags...)
 	return append(append(prefix, "--"), argv...)
 }
 

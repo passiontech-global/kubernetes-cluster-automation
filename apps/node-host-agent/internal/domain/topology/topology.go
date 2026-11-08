@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -60,13 +61,13 @@ type AuditTarget struct {
 // Topology is the fully derived per-node view.
 type Topology struct {
 	Vars     *Vars
-	Nodes    *OMap  // raw registry (ordered)
-	Node     *OMap  // this node's registry entry (empty when absent)
-	Found    bool   // node present in registry
-	Overlay  string // 'nebula'|'tinc'
-	Zone     *OMap  // interdc_dns_zone
-	NodeKey  string // registry key (hostname)
-	MeshName string // node.name (nebula cert name)
+	Nodes    *jinja.OMap // raw registry (ordered)
+	Node     *jinja.OMap // this node's registry entry (empty when absent)
+	Found    bool        // node present in registry
+	Overlay  string      // 'nebula'|'tinc'
+	Zone     *jinja.OMap // interdc_dns_zone
+	NodeKey  string      // registry key (hostname)
+	MeshName string      // node.name (nebula cert name)
 
 	Markers        map[string]string
 	MarkersLegacy  map[string]string
@@ -104,22 +105,22 @@ func Load(cfg Config) (*Topology, error) {
 		if err != nil {
 			return nil, err
 		}
-		return DecodeYAML(b)
+		return jinja.DecodeYAML(b)
 	}
 
 	nodesV, err := rd("interdc_nodes.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("interdc_nodes.yaml: %w", err)
 	}
-	nodes, ok := nodesV.(*OMap)
+	nodes, ok := nodesV.(*jinja.OMap)
 	if !ok || nodes == nil {
 		return nil, errors.New("interdc_nodes.yaml: not a mapping")
 	}
 	t.Nodes = nodes
 
-	var zone *OMap
+	var zone *jinja.OMap
 	if zv, zerr := rd("interdc_dns_zone.yaml"); zerr == nil {
-		zone, _ = zv.(*OMap)
+		zone, _ = zv.(*jinja.OMap)
 		if zv != nil && zone == nil {
 			t.Errors = append(t.Errors,
 				"interdc_dns_zone.yaml: top level is not a mapping — treating as empty zone")
@@ -132,16 +133,16 @@ func Load(cfg Config) (*Topology, error) {
 			fmt.Sprintf("interdc_dns_zone.yaml: %v — treating as empty zone", zerr))
 	}
 	if zone == nil {
-		zone = NewOMap()
+		zone = jinja.NewOMap()
 	}
 	t.Zone = zone
 
 	env := NewEnv(cfg.VarsDir, cfg.Clock)
 
-	raw := NewOMap()
+	raw := jinja.NewOMap()
 	for _, f := range []string{"defaults.yaml", "cluster.yaml"} {
 		if dv, err := rd(f); err == nil {
-			if m, ok := dv.(*OMap); ok {
+			if m, ok := dv.(*jinja.OMap); ok {
 				for _, k := range m.Keys() {
 					vv, _ := m.Get(k)
 					raw.Set(k, vv)
@@ -168,10 +169,10 @@ func Load(cfg Config) (*Topology, error) {
 	// get() resolves+caches extras so embedded {{ }} renders (they
 	// used to reach jinja lookups raw), and derive() works on the
 	// same resolved copies.
-	if rn, ok := t.Vars.get("interdc_nodes").(*OMap); ok && rn != nil {
+	if rn, ok := t.Vars.get("interdc_nodes").(*jinja.OMap); ok && rn != nil {
 		t.Nodes = rn
 	}
-	if zr, ok := t.Vars.get("interdc_dns_zone").(*OMap); ok && zr != nil {
+	if zr, ok := t.Vars.get("interdc_dns_zone").(*jinja.OMap); ok && zr != nil {
 		t.Zone = zr
 	}
 	t.derive()

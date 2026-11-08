@@ -39,7 +39,7 @@ var (
 	// the fragmentation signature workerhygiene defragments via
 	// vm.compact_memory.
 	pageAllocFailRe = regexp.MustCompile(`page allocation failure: order:[1-9]`)
-	// W15-K1: the kernel giving up on a clocksource —
+	// Clocksource fallback: the kernel giving up on a clocksource —
 	// "Marking clocksource 'tsc' as unstable" or the
 	// "clocksource: ... unstable" family line. After this the kernel
 	// falls back to a slower clocksource (hpet/acpi_pm) and every

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -95,8 +95,7 @@ func (c *SystemdSessionCheck) scanSessions() (total int, stale []string) {
 
 // Run executes one systemd-session round.
 func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSystemdSessions, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckSystemdSessions) {
 		return
 	}
 	total, stale := c.scanSessions()
@@ -124,15 +123,15 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	triggered := len(stale) >= systemdSessionAbandonedMin ||
 		latency > systemdDbusSlowSeconds
 	if !triggered {
-		c.d.State.Exit(hoststate.LatchSystemdSessionBloat, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckSystemdSessions, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchSystemdSessionBloat, nil)
+		c.d.CycleResult(wdeps.CheckSystemdSessions, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchSystemdSessionBloat, fmt.Sprintf(
+	c.d.State.Enter(latchdefs.LatchSystemdSessionBloat, fmt.Sprintf(
 		"abandoned=%d dbus_latency=%.2fs", len(stale), latency))
 	if sd == nil {
 		// No host exec wired — evidence + latch only.
-		c.d.Cycles.WithLabelValues(wdeps.CheckSystemdSessions, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckSystemdSessions, "ok")
 		return
 	}
 	reaped := 0
@@ -163,5 +162,5 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckSystemdSessions, "reset_failed").Inc()
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckSystemdSessions, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckSystemdSessions, "ok")
 }

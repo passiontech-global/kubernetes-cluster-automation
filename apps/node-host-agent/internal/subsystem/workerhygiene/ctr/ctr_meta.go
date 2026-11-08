@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -60,8 +60,7 @@ func (c *CtrMetaCheck) Name() string { return wdeps.CheckCtrMeta }
 
 // Run executes one containerd-meta round.
 func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrMeta, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCtrMeta) {
 		return
 	}
 	evidence := ""
@@ -95,13 +94,13 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: containerd meta.db corruption evidence (%s) — run %d/%d",
 			evidence, c.fails, c.d.Cfg.ConsecNeeded))
 		if c.fails >= c.d.Cfg.ConsecNeeded {
-			c.d.State.Enter(hoststate.LatchContainerdCorrupt, evidence)
+			c.d.State.Enter(latchdefs.LatchContainerdCorrupt, evidence)
 		}
 	} else {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchContainerdCorrupt, nil)
+		c.d.State.Exit(latchdefs.LatchContainerdCorrupt, nil)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCtrMeta, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCtrMeta, "ok")
 }
 
 // countMetaOrphanShims counts containerd-shim-runc-v2 processes that

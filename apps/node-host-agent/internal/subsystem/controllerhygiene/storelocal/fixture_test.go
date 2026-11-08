@@ -3,7 +3,7 @@
 // build the Hygiene itself (importing controllerhygiene would
 // cycle back into this test package), so every consuming package
 // declares this same thin pair.
-package kine_test
+package storelocal_test
 
 import (
 	"testing"

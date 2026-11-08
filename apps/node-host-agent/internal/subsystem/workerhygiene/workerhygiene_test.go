@@ -339,8 +339,7 @@ func TestRunCycleDeadlineAbortsStall(t *testing.T) {
 		RunCmdCombined: func(ctx context.Context, argv []string) (string, error) {
 			return "", ctx.Err()
 		},
-		ProcUptimeFile: filepath.Join(e.ProcDir, "uptime"),
-	})
+	}, systemd.WithProcUptimeFile(filepath.Join(e.ProcDir, "uptime")))
 	e.H.Cfg.Systemd = sd
 
 	// Cycle one: the stall is aborted at the deadline and logged.
@@ -381,8 +380,7 @@ func TestRunLoopTicksPastHungCycle(t *testing.T) {
 			<-ctx.Done()
 			return "", ctx.Err()
 		},
-		ProcUptimeFile: filepath.Join(e.ProcDir, "uptime"),
-	})
+	}, systemd.WithProcUptimeFile(filepath.Join(e.ProcDir, "uptime")))
 	e.H.Cfg.Systemd = sd
 
 	ctx, cancel := context.WithCancel(context.Background())

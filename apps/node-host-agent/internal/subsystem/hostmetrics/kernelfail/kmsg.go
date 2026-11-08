@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
@@ -380,12 +380,12 @@ func (r *Runner) notePageAllocFailure(msg string) {
 	if len(detail) > 200 {
 		detail = detail[:200]
 	}
-	r.deps.Store.Enter(hoststate.LatchPageAllocFailure,
+	r.deps.Store.Enter(latchdefs.LatchPageAllocFailure,
 		"page allocation failure: "+detail)
 }
 
 // noteClocksourceUnstable latches state-clocksource-unstable on a
-// kernel clocksource-unstable kmsg record (W15-K1) — the kernel
+// kernel clocksource-unstable kmsg record — the kernel
 // demoted its clock (typically tsc) to a slower fallback, so every
 // vDSO clock_gettime degrades and clock-skew false positives follow.
 // Like the nodereporter soft-lockup evidence latches this is a
@@ -397,7 +397,7 @@ func (r *Runner) noteClocksourceUnstable(msg string) {
 	if len(detail) > 200 {
 		detail = detail[:200]
 	}
-	r.deps.Store.Enter(hoststate.LatchClocksourceUnstable,
+	r.deps.Store.Enter(latchdefs.LatchClocksourceUnstable,
 		"clocksource unstable: "+detail)
 }
 

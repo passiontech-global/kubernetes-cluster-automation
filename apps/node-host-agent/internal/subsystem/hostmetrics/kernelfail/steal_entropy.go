@@ -30,7 +30,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -174,13 +174,13 @@ func (r *Runner) updateStealEntropy() {
 	if !ratioOK {
 		return
 	}
-	latchPath := r.deps.Store.Path(hoststate.LatchCPUStealPressure)
+	latchPath := r.deps.Store.Path(latchdefs.LatchCPUStealPressure)
 	switch {
 	case ratio > cpuStealOnRatio:
 		r.deps.Store.ResetCounter(cpuStealLowCountFile)
 		if n := r.deps.Store.Incr(cpuStealHighCountFile); n >= cpuStealEnterTicks {
 			r.ensureStateLatch(latchPath,
-				hoststate.LatchFilePrefix+hoststate.LatchCPUStealPressure,
+				latchdefs.LatchFilePrefix+latchdefs.LatchCPUStealPressure,
 				fmt.Sprintf("steal_ratio=%.3f", ratio))
 		}
 	case ratio < cpuStealOffRatio:
@@ -189,7 +189,7 @@ func (r *Runner) updateStealEntropy() {
 			return
 		}
 		// Exit self-gates on the file existing and logs STATE-EXIT.
-		r.deps.Store.Exit(hoststate.LatchCPUStealPressure, nil)
+		r.deps.Store.Exit(latchdefs.LatchCPUStealPressure, nil)
 		// The exit streak is consumed — a later re-entry must
 		// build its own 2-tick release, not inherit this count.
 		r.deps.Store.ResetCounter(cpuStealLowCountFile)
@@ -225,9 +225,9 @@ func (r *Runner) writeStealEntropyProm(ratio float64, ratioOK bool,
 			"Kernel entropy pool fill — /proc/sys/kernel/random/entropy_avail.", entropy)
 	}
 	dir := r.textfileDir()
-	if err := promfile.Write(dir, stealEntropyPromName,
-		[]byte(b.String())); err != nil {
-		logger().Debug("hostmetrics: steal/entropy textfile install failed",
-			"dir", dir, "error", err)
-	}
+	_ = promfile.WriteLogged(dir, stealEntropyPromName,
+		[]byte(b.String()), func(dir, _ string, err error) {
+			logger().Warn("hostmetrics: steal/entropy textfile install failed",
+				"dir", dir, "error", err)
+		})
 }

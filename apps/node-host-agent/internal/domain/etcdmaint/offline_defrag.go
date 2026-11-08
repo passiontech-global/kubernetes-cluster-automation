@@ -15,21 +15,20 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 // waitHealthy polls `endpoint health` up to tries times (1s cadence)
 // — the post-stop/start equivalent of the script's `ss -tln | grep
 // :2379` loop, but asserting an actual healthy member.
 func (r *rescuer) waitHealthy(ctx context.Context, tries int) error {
-	for i := 0; i < tries; i++ {
-		if _, err := r.etcdctl(ctx, healthProbeTimeout,
-			"endpoint", "health"); err == nil {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		r.cfg.SleepFn(time.Second)
+	if cycle.Poll(ctx, tries, time.Second, func() bool {
+		_, err := r.etcdctl(ctx, healthProbeTimeout,
+			"endpoint", "health")
+		return err == nil
+	}, r.cfg.SleepFn) {
+		return nil
 	}
 	return fmt.Errorf("etcd still unhealthy after %ds", tries)
 }

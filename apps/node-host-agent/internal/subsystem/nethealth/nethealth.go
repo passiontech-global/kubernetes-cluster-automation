@@ -173,7 +173,7 @@ type Config struct {
 	// exec-storm cap for sustained DEL-event floods.
 	routeMinRestore time.Duration
 	// openRouteSocket overrides the route guard's NETLINK_ROUTE
-	// socket factory — default is platform/routewatch.Bind: binds
+	// socket factory — default is subsystem/nethealth/routewatch.Bind: binds
 	// RTMGRP_IPV4_ROUTE|RTMGRP_IPV4_RULE in the host netns, directly
 	// when the pod netns IS the host's (hostNetwork, same inode as
 	// /proc/1/ns/net), else setns into pid-1's netns (hostPID — no
@@ -319,8 +319,13 @@ func (c *Config) applyDefaults() {
 	if c.probeHTTP == nil {
 		// probee.HTTPGet is the old probeHTTPGet verbatim — the
 		// nebula stats target is plaintext http so the shared
-		// insecure-TLS client is a superset with zero delta.
-		c.probeHTTP = probee.HTTPGet
+		// insecure-TLS client is a superset with zero delta. The
+		// closure adapts the seam type to HTTPGet's variadic
+		// optional client (default package client, nil injected).
+		c.probeHTTP = func(ctx context.Context, url string,
+			timeout time.Duration) error {
+			return probee.HTTPGet(ctx, url, timeout)
+		}
 	}
 	if c.sysClassNet == "" {
 		c.sysClassNet = defaultSysClassNet
@@ -358,6 +363,11 @@ type NetHealth struct {
 	// restart vs an unset baseline.
 	ctStatPrev uint64
 	ctStatSeen bool
+
+	// mtuProbe is the nebula-mtu-blackhole prober state (see
+	// nebula_mtu_blackhole.go) — per-instance, so its lifetime is
+	// the NetHealth's own and no global keyed map is needed.
+	mtuProbe mtuProbeState
 
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action

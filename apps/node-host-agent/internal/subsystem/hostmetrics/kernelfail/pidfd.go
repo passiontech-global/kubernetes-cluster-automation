@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -128,7 +128,7 @@ func (r *Runner) updatePidFDPressure() {
 		}
 	}
 	countPath := r.statePath(pidFDCountFile)
-	latchPath := r.deps.Store.Path(hoststate.LatchPIDFDPressure)
+	latchPath := r.deps.Store.Path(latchdefs.LatchPIDFDPressure)
 	if worst > kernelProcPressureRatio {
 		n := int64(1)
 		if b, err := os.ReadFile(countPath); err == nil {
@@ -143,21 +143,21 @@ func (r *Runner) updatePidFDPressure() {
 				"path", countPath, "error", err)
 		}
 		if n >= kernelProcPressureNeeded {
-			r.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchPIDFDPressure,
+			r.ensureStateLatch(latchPath, latchdefs.LatchFilePrefix+latchdefs.LatchPIDFDPressure,
 				fmt.Sprintf("%s ratio=%.3f", what, worst))
 		} else {
 			// A latch from an earlier episode outliving a fresh
 			// sub-threshold streak can't happen (the else branch
 			// clears it) — release defensively anyway (Exit no-ops
 			// when the file is absent).
-			r.deps.Store.Exit(hoststate.LatchPIDFDPressure, nil)
+			r.deps.Store.Exit(latchdefs.LatchPIDFDPressure, nil)
 		}
 		return
 	}
 	// Below threshold — reset the streak and release the latch
 	// (Exit logs STATE-EXIT, the filelog's transition contract).
 	_ = os.Remove(countPath)
-	r.deps.Store.Exit(hoststate.LatchPIDFDPressure, nil)
+	r.deps.Store.Exit(latchdefs.LatchPIDFDPressure, nil)
 }
 
 // --- W10 textfile metrics (node-exporter channel) ---
@@ -178,9 +178,8 @@ func (r *Runner) textfileDir() string {
 // node_agent_{pids,threads,file_nr}_utilization_ratio. Each series
 // appears only when its source parsed (no fake 0s — the
 // collectFileFD rule). promfile.Write stages + renames so
-// node_exporter never reads a partial file. Failures log at Debug:
-// the refresh tick runs every 30s and an unwritable mount must not
-// spam the watchdog tail.
+// node_exporter never reads a partial file. Failures log at Warn
+// (converged with the other textfile emitters):
 func (r *Runner) writeKernelUtilProm(pids, threads, filefd float64,
 	pidsOK, threadsOK, fdOK bool) {
 	var b promfile.Builder
@@ -197,9 +196,9 @@ func (r *Runner) writeKernelUtilProm(pids, threads, filefd float64,
 			"file-nr allocated over maximum — fd table pressure.", filefd)
 	}
 	dir := r.textfileDir()
-	if err := promfile.Write(dir,
-		"node-agent-kernel.prom", []byte(b.String())); err != nil {
-		logger().Debug("hostmetrics: kernel textfile install failed",
-			"dir", dir, "error", err)
-	}
+	_ = promfile.WriteLogged(dir,
+		"node-agent-kernel.prom", []byte(b.String()), func(dir, _ string, err error) {
+			logger().Warn("hostmetrics: kernel textfile install failed",
+				"dir", dir, "error", err)
+		})
 }

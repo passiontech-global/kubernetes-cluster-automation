@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T7 + T17 ----------
@@ -89,11 +89,11 @@ func (c *cyc) kubeletCfgPath() string {
 // evictionMinReclaimMap returns the expected evictionMinimumReclaim
 // nested map (var kubelet_eviction_min_reclaim as mapping, else the
 // ansible hardcoded block order).
-func (c *cyc) evictionMinReclaimMap() *topology.OMap {
-	if om, ok := c.t.Vars.Get("kubelet_eviction_min_reclaim").(*topology.OMap); ok && om.Len() > 0 {
+func (c *cyc) evictionMinReclaimMap() *jinja.OMap {
+	if om, ok := c.t.Vars.Get("kubelet_eviction_min_reclaim").(*jinja.OMap); ok && om.Len() > 0 {
 		return om
 	}
-	m := topology.NewOMap()
+	m := jinja.NewOMap()
 	m.Set("memory.available", "200Mi")
 	m.Set("nodefs.available", "1Gi")
 	m.Set("imagefs.available", "2Gi")
@@ -102,7 +102,7 @@ func (c *cyc) evictionMinReclaimMap() *topology.OMap {
 
 // evictionBlock renders the evictionMinimumReclaim block (ansible
 // t17_emr_block shape — sub-keys quoted when string).
-func evictionBlock(m *topology.OMap) string {
+func evictionBlock(m *jinja.OMap) string {
 	var b strings.Builder
 	b.WriteString("evictionMinimumReclaim:\n")
 	for _, k := range m.Keys() {
@@ -118,12 +118,12 @@ func evictionBlock(m *topology.OMap) string {
 
 // emrMapEqual compares the on-disk sub-key block semantically (parse
 // via YAML, same as ansible from_yaml compare).
-func emrMapEqual(cur string, want *topology.OMap) bool {
-	v, err := topology.DecodeYAML([]byte(cur))
+func emrMapEqual(cur string, want *jinja.OMap) bool {
+	v, err := jinja.DecodeYAML([]byte(cur))
 	if err != nil {
 		return false
 	}
-	got, ok := v.(*topology.OMap)
+	got, ok := v.(*jinja.OMap)
 	if !ok || got == nil || got.Len() != want.Len() {
 		return false
 	}

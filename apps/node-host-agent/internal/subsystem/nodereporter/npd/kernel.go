@@ -29,7 +29,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
@@ -87,8 +87,8 @@ var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than` 
 // lockup/stall is permanent-class evidence, so only the janitor's
 // max-age reaper clears a latch whose signature stopped recurring.
 const (
-	kernelSoftLockupLatch = hoststate.LatchKernelSoftLockup
-	kernelRCUStallLatch   = hoststate.LatchKernelRCUStall
+	kernelSoftLockupLatch = latchdefs.LatchKernelSoftLockup
+	kernelRCUStallLatch   = latchdefs.LatchKernelRCUStall
 )
 
 // kernelHungLatchRules map a kernel-hang signature regex to the

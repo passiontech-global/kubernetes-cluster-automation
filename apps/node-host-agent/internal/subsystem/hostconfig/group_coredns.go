@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T9 coredns stub + hub ----------
@@ -240,7 +240,7 @@ func (c *cyc) pinZoneRecords(zone string) {
 		blk.WriteString("\n")
 		for _, k := range c.t.Nodes.Keys() {
 			nv, _ := c.t.Nodes.Get(k)
-			om, _ := nv.(*topology.OMap)
+			om, _ := nv.(*jinja.OMap)
 			if om == nil {
 				continue
 			}
@@ -261,20 +261,20 @@ func (c *cyc) pinZoneRecords(zone string) {
 // to that node's marker IP.
 func (c *cyc) eachZoneRecord(fn func(name, ip string)) {
 	recs, _ := c.t.Zone.Get("records")
-	rom, _ := recs.(*topology.OMap)
+	rom, _ := recs.(*jinja.OMap)
 	if rom == nil {
 		return
 	}
 	for _, rn := range rom.Keys() {
 		rv, _ := rom.Get(rn)
-		rm, _ := rv.(*topology.OMap)
+		rm, _ := rv.(*jinja.OMap)
 		if rm == nil {
 			continue
 		}
 		if nv, ok := rm.Get("node"); ok {
 			// node: <registry key> -> marker of that node's name
 			if nvv, ok2 := c.t.Nodes.Get(fmt.Sprint(nv)); ok2 {
-				if om, ok3 := nvv.(*topology.OMap); ok3 {
+				if om, ok3 := nvv.(*jinja.OMap); ok3 {
 					if mk := c.t.Markers[nodeIPStr(om, "name")]; mk != "" {
 						fn(rn, mk)
 					}
@@ -307,7 +307,7 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 	var hubs []string
 	for _, k := range t.Nodes.Keys() {
 		nv, _ := t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
@@ -351,7 +351,7 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 		b.WriteString("\n") // {% if node_records %}
 		for _, k := range t.Nodes.Keys() {
 			nv, _ := t.Nodes.Get(k)
-			om, _ := nv.(*topology.OMap)
+			om, _ := nv.(*jinja.OMap)
 			if om == nil {
 				continue
 			}
@@ -381,14 +381,14 @@ func (c *cyc) zoneSerial() int64 {
 // jsonPlain renders OMap/List as sorted-key JSON-compatible values.
 func jsonPlain(v any) any {
 	switch t := v.(type) {
-	case *topology.OMap:
+	case *jinja.OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
 			m[k] = jsonPlain(vv)
 		}
 		return m
-	case *topology.List:
+	case *jinja.List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
 			out[i] = jsonPlain(x)
@@ -406,35 +406,36 @@ func jsonPlain(v any) any {
 }
 
 func (c *cyc) corednsInstallBinary() {
-	ver := c.v("interdc_coredns_version")
-	if ver == "" || ver == "None" {
+	ver := c.t.Vars.StrDef("interdc_coredns_version", "")
+	if ver == "" {
 		// Same empty-pin rule as nebula: "CoreDNS-"+"" matches every
 		// -version output (never upgrades) and download("") is a
 		// counted bogus fetch. Not pinned = not installed.
 		c.err("T9: interdc_coredns_version not pinned — coredns not installed")
 		return
 	}
-	if out, err := c.r.run(c.ctx, "/usr/local/bin/coredns", "-version"); err == nil &&
-		strings.Contains(out, "CoreDNS-"+ver) {
-		return
-	}
 	tgz := c.v("interdc_coredns_tgz")
 	sum := c.v("interdc_coredns_sha256")
 	url := c.v("interdc_coredns_url")
-	local := filepath.Join(c.r.cfg.DownloadDir, tgz)
-	if fileExistsNoRoot(local) {
+	c.installManagedBinary(managedBinarySpec{
+		name:     "T9",
+		artifact: "coredns tgz",
+		probe: func(c *cyc) bool {
+			out, err := c.r.run(c.ctx, "/usr/local/bin/coredns", "-version")
+			return err == nil && strings.Contains(out, "CoreDNS-"+ver)
+		},
+		url:    url,
+		sum:    sum,
+		staged: filepath.Join(c.r.cfg.DownloadDir, tgz),
 		// ansible: sha256sum -c every run when outdated.
-		if !sha256FileOK(local, sum) {
-			c.err("T9: staged coredns tgz sha256 mismatch — not installing",
-				"file", local, "sha256", sum)
-			return
-		}
-	} else if err := c.r.download(c.ctx, url, local, sum); err != nil {
-		c.err("T9: coredns download", "url", url, "file", local, "error", err)
-		return
-	}
-	if err := untarInstall(local, "coredns", c.r.hp("/usr/local/bin/coredns"), 0o755); err != nil {
-		c.err("T9: coredns install failed — stub will not run",
-			"file", local, "error", err)
-	}
+		refuseBadStaged: true,
+		downloadLine:    "T9: coredns download",
+		member:          "coredns",
+		dest:            "/usr/local/bin/coredns",
+		mode:            0o755,
+		installErr: func(c *cyc, local string, err error) {
+			c.err("T9: coredns install failed — stub will not run",
+				"file", local, "error", err)
+		},
+	})
 }

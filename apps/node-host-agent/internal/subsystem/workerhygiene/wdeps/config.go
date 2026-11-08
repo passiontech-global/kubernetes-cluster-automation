@@ -70,7 +70,7 @@ type Config struct {
 	CtrTaskRoot       string // containerd runtime-v2 task dirs
 	SandboxCtlRoot    string // sandbox-controller shim dirs
 	K0sWorkerUnitFile string // presence gates all checks
-	// MountinfoFile is the HOST /proc/1/mountinfo the W15-R1b
+	// MountinfoFile is the HOST /proc/1/mountinfo the
 	// mountinfo-hygiene check reads — ProcRoot is the host /proc
 	// (hostPID), so the default derives from it.
 	MountinfoFile string

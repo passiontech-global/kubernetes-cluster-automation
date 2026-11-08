@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -30,17 +30,16 @@ func (c *CiliumInitCheck) Name() string { return wdeps.CheckCiliumInit }
 
 // Run executes one cilium-init-stuck round.
 func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumInit) {
 		return
 	}
 	tasks, reachable := ciliumAgentTasks(c.d, e)
 	if !reachable {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumInit, "abort")
 		return
 	}
 	if len(tasks) == 0 {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumInit, "ok")
 		return
 	}
 	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/endpoint")
@@ -50,31 +49,29 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck endpoint query on %s failed: %v — inconclusive, keeping state",
 			c.d.Cfg.Cilium.Socket, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumInit, "abort")
 		return
 	}
 	initEps := strings.Count(string(body), "reserved:init")
 	if initEps == 0 {
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumInitStuck, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumInitStuck, nil)
+		c.d.CycleResult(wdeps.CheckCiliumInit, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d (check %d/%d)",
-			initEps, c.Fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
+	if c.d.StreakPending(&c.Fails,
+		fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d", initEps)) {
+		c.d.CycleResult(wdeps.CheckCiliumInit, "ok")
 		return
 	}
 	// Wedge confirmed — latch before any gate like the shell.
-	c.d.State.Enter(hoststate.LatchCiliumInitStuck, fmt.Sprintf("init_eps=%d", initEps))
+	c.d.State.Enter(latchdefs.LatchCiliumInitStuck, fmt.Sprintf("init_eps=%d", initEps))
 	switch {
 	case !e.APIOK:
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but API unreachable — skip kill (agent still cannot resync even after restart)",
 			initEps, c.Fails))
-	case c.d.State.Exists(hoststate.LatchNodeOverloaded):
+	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
 			initEps, c.Fails))
@@ -86,8 +83,8 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
 		if killCiliumAgent(c.d, tasks) {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet will restart -> informer resync)",
+			c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionCiliumAgentKill+
+				" container - init_eps=%d %dx (kubelet will restart -> informer resync)",
 				initEps, c.Fails))
 			c.Fails = 0
 			c.d.Actions.WithLabelValues(wdeps.CheckCiliumInit, "sigkill").Inc()
@@ -97,5 +94,5 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				initEps, c.Fails))
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCiliumInit, "ok")
 }

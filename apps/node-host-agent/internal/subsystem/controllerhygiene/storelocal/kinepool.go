@@ -1,4 +1,4 @@
-package kine
+package storelocal
 
 // kinepool.go — port of scripts/k0s-kine-pool-probe.sh (60s timer):
 // the kine -> datastore connection-spiral backstop.

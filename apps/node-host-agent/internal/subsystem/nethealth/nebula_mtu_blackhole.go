@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -42,10 +42,9 @@ import (
 // The prober is a separate goroutine from the netlink guard: the
 // guard blocks inside routeGuardRead while the socket lives, so a
 // periodic check can't share its loop. spawnRouteGuard (called by
-// Run every tick) re-arms it after death via mtuProbeStates — the
-// same single-flight+respawn shape routeGuardRunning gives the
-// guard, kept file-local because NetHealth's struct lives in
-// nethealth.go.
+// Run every tick) re-arms it after death via the n.mtuProbe field —
+// the same single-flight+respawn shape routeGuardRunning gives the
+// guard.
 
 const (
 	// mtuProbeEvery — the plan's "every 5th cycle": the prober
@@ -58,7 +57,7 @@ const (
 	// mtuDFCount/Wait — ping -c 2 -W 2 parity with the plan.
 	mtuDFCount = "2"
 	mtuDFWait  = "2"
-	// mtuCiliumWGMTUInvariant — W15-NM1: max MTU(cilium_wg0)
+	// mtuCiliumWGMTUInvariant — max MTU(cilium_wg0)
 	// relative to MTU(neb1); WireGuard overhead is 60B, keep 80B
 	// headroom per the plan's invariant.
 	mtuCiliumWGOverhead = 80
@@ -70,8 +69,9 @@ const (
 	mtuCheckName = "nebula-mtu-blackhole"
 )
 
-// mtuProbeState is the per-NetHealth prober state — NetHealth's
-// struct is in nethealth.go so the prober keeps keyed state.
+// mtuProbeState is NetHealth's nebula-mtu-blackhole prober state —
+// a plain field on NetHealth (n.mtuProbe), so its lifetime is the
+// instance's own.
 type mtuProbeState struct {
 	mu        sync.Mutex
 	running   bool
@@ -81,17 +81,9 @@ type mtuProbeState struct {
 	lastGauge string // last written gauge value — skip identical writes
 }
 
-var mtuProbeStates sync.Map // *NetHealth → *mtuProbeState
-
-// mtuState returns (creating if needed) this instance's prober
-// state.
+// mtuState returns this instance's prober state.
 func (n *NetHealth) mtuState() *mtuProbeState {
-	if v, ok := mtuProbeStates.Load(n); ok {
-		return v.(*mtuProbeState)
-	}
-	st := &mtuProbeState{}
-	actual, _ := mtuProbeStates.LoadOrStore(n, st)
-	return actual.(*mtuProbeState)
+	return &n.mtuProbe
 }
 
 // spawnMTUProber single-flights the MTU prober goroutine — the
@@ -113,14 +105,6 @@ func (n *NetHealth) spawnMTUProber(ctx context.Context) {
 			st.mu.Lock()
 			st.running = false
 			st.mu.Unlock()
-			// Run(ctx) is over (ctx done) — drop this instance's
-			// map entry so a stopped NetHealth can't pin its
-			// prober state in the global sync.Map forever. A
-			// panic-respawn keeps the entry (running==false lets
-			// the next tick re-arm the SAME state).
-			if cctx.Err() != nil {
-				mtuProbeStates.Delete(n)
-			}
 		}()
 		n.mtuProbeLoop(cctx, st)
 	})
@@ -164,7 +148,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		st.mu.Lock()
 		st.mtuFails = 0
 		st.mu.Unlock()
-		n.stateExit(hoststate.LatchNebulaMTUBlackhole)
+		n.stateExit(latchdefs.LatchNebulaMTUBlackhole)
 	}
 	if wd == nil || wd.NebulaNet == "" ||
 		!n.unitEnabledActive(ctx, "nebula@"+wd.NebulaNet) ||
@@ -172,6 +156,15 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		reset()
 		return
 	}
+	// The cilium_wg0 MTU invariant is a config-drift check,
+	// not a blackhole symptom — enforce it every probe cycle,
+	// independent of this cycle's DF ping verdict (a healthy neb1
+	// must still catch cilium_wg0 sized against the underlay).
+	dev := wd.NebulaDev
+	if dev == "" {
+		dev = "neb1"
+	}
+	n.checkCiliumWGMTUInvariant(ctx, dev)
 	// Peer fanout: the overlay probe sets are the known nebula
 	// endpoints — same source checkNebulaHealth pings. The first
 	// peer answering the SMALL ping is this cycle's DF target, so
@@ -201,12 +194,12 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		st.mtuFails++
 		fails := st.mtuFails
 		st.mu.Unlock()
-		n.state.SuspectLog(hoststate.LatchNebulaMTUBlackhole, fmt.Sprintf(
+		n.state.SuspectLog(latchdefs.LatchNebulaMTUBlackhole, fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole df_probe_failed peer=%s size=%s (check %d/%d): %v (%s)",
 			peer, mtuDFSize, fails, mtuBlackholeNeeded, err,
 			trimRunErr(out)), suspectLogCadence)
 		if fails >= mtuBlackholeNeeded {
-			n.state.Enter(hoststate.LatchNebulaMTUBlackhole,
+			n.state.Enter(latchdefs.LatchNebulaMTUBlackhole,
 				fmt.Sprintf("peer=%s df_size=%s", peer, mtuDFSize))
 			n.maybeClampNebulaMSS(ctx, wd, st)
 		}
@@ -214,7 +207,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 	}
 	st.mtuFails = 0
 	st.mu.Unlock()
-	n.stateExit(hoststate.LatchNebulaMTUBlackhole)
+	n.stateExit(latchdefs.LatchNebulaMTUBlackhole)
 }
 
 // maybeClampNebulaMSS installs the TCPMSS clamp on the overlay dev —
@@ -236,10 +229,9 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 		dev = "neb1"
 	}
 	n.clampMSSOn(ctx, dev)
-	// W15-NM1: the double-encapsulation path also blackholes on the
+	// The double-encapsulation path also blackholes on the
 	// Cilium WireGuard dev — clamp it too whenever it exists.
 	n.clampMSSOn(ctx, "cilium_wg0")
-	n.checkCiliumWGMTUInvariant(ctx, dev)
 }
 
 // clampMSSOn idempotently installs the TCPMSS --clamp-mss-to-pmtu
@@ -313,7 +305,7 @@ func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string
 // skip the rewrite so the file's mtime tracks real changes.
 func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {
 	v := "0"
-	if n.state.Exists(hoststate.LatchNebulaMTUBlackhole) {
+	if n.state.Exists(latchdefs.LatchNebulaMTUBlackhole) {
 		v = "1"
 	}
 	st.mu.Lock()

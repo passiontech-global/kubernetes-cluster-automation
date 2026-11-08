@@ -140,7 +140,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.CtrTaskRoot != "/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("identity CtrTaskRoot=%q", cfg.CtrTaskRoot)
 	}
-	// W15-K2b: the writable-layer Warning threshold defaults to 5 GiB
+	// The writable-layer Warning threshold defaults to 5 GiB
 	// (via the env knob's default) and must stay independent of the
 	// W6.3 eviction threshold (15 GiB) — parity with the wave plan
 	// without altering eviction behavior. BloatPodThresholdBytes has

@@ -32,8 +32,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // Latches is the agent.Subsystem half of hostmetrics — the
@@ -105,21 +105,21 @@ func (l *Latches) refreshLatches() {
 	// BUG-H6: while a latch stays held keep its mtime fresh so the
 	// janitor's LatchMaxAge reap can't retire an active signal.
 	for _, name := range []string{
-		hoststate.LatchNodeOverloaded,
-		hoststate.LatchFilesystemReadonly,
-		hoststate.LatchNebulaCertExpiring,
-		hoststate.LatchKernelKeysPressure,
+		latchdefs.LatchNodeOverloaded,
+		latchdefs.LatchFilesystemReadonly,
+		latchdefs.LatchNebulaCertExpiring,
+		latchdefs.LatchKernelKeysPressure,
 		// W10 maintained latches — same reap protection.
-		hoststate.LatchFSReadonly,
-		hoststate.LatchPIDFDPressure,
-		hoststate.LatchClockSkew,
+		latchdefs.LatchFSReadonly,
+		latchdefs.LatchPIDFDPressure,
+		latchdefs.LatchClockSkew,
 		// Held latches minted elsewhere share the same reap
 		// exposure: kubeconfig-cert-expiring is controllerhygiene's
 		// signal and cpu-steal-pressure is the steal-guard's — a
 		// touch here costs one stat per tick and keeps an active
 		// episode from being reaped as stale.
-		hoststate.LatchKubeconfigCertExpiring,
-		hoststate.LatchCPUStealPressure,
+		latchdefs.LatchKubeconfigCertExpiring,
+		latchdefs.LatchCPUStealPressure,
 	} {
 		p := c.state.Path(name)
 		if _, err := os.Stat(p); err == nil {
@@ -176,11 +176,11 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 // event rule consumes.
 func (l *Latches) updateKernelKeysLatch(ratio float64) {
 	if ratio > kernelKeysPressureRatio {
-		l.c.state.Enter(hoststate.LatchKernelKeysPressure,
+		l.c.state.Enter(latchdefs.LatchKernelKeysPressure,
 			fmt.Sprintf("ratio=%.3f > %.2f", ratio, kernelKeysPressureRatio))
 		return
 	}
-	l.c.state.Exit(hoststate.LatchKernelKeysPressure, nil)
+	l.c.state.Exit(latchdefs.LatchKernelKeysPressure, nil)
 }
 
 var descKernelKeys = prometheus.NewDesc(

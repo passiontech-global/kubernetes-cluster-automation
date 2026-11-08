@@ -8,7 +8,7 @@
 // ctx for the timeout tests, and note the ctx deadline each call
 // ran under. FakeRunner is that fake.
 //
-// It deliberately does NOT import platform/converge (testutil stays
+// It deliberately does NOT import the converge package (testutil stays
 // leaf): Run's signature matches the interface structurally, so
 // `Runner: testutil.NewFakeRunner(...)` satisfies converge.Runner
 // without the dependency. Reusing FakeExec was rejected — its

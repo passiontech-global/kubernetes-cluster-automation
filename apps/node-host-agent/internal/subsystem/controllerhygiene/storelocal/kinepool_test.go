@@ -1,6 +1,6 @@
 // kinepool_test.go — kine postgres connection-pool runaway guard.
 
-package kine_test
+package storelocal_test
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"

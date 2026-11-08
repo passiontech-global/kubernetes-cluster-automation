@@ -9,7 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -152,16 +152,16 @@ func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 // streak still has a latch to recover from (vs the tmp+rename+fsync
 // a counter-file rewrite costs every cycle it keeps counting).
 func (p *Prober) staleLatched(dir string, b backend) bool {
-	_, err := os.Stat(dir + "/" + hoststate.LatchFilePrefix +
-		hoststate.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr))
+	_, err := os.Stat(dir + "/" + latchdefs.LatchFilePrefix +
+		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr))
 	return err == nil
 }
 
 // latchStale creates state-apiserver-backend-stale-<ip> — state_enter
 // semantics: create only if absent, content = current epoch.
 func (p *Prober) latchStale(dir string, b backend) {
-	f := dir + "/" + hoststate.LatchFilePrefix +
-		hoststate.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
+	f := dir + "/" + latchdefs.LatchFilePrefix +
+		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
 	if _, err := os.Stat(f); err == nil {
 		return
 	}
@@ -177,8 +177,8 @@ func (p *Prober) latchStale(dir string, b backend) {
 // only on a fully-fresh cycle (hysteresis: inconclusive cycles keep
 // whatever exists). not-exist is ignored.
 func (p *Prober) clearStale(dir string, b backend) {
-	f := dir + "/" + hoststate.LatchFilePrefix +
-		hoststate.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
+	f := dir + "/" + latchdefs.LatchFilePrefix +
+		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
 	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 		logger().Warn("watchdog stale latch remove failed",
 			"file", f, "backend", b.Name, "error", err,
@@ -211,10 +211,10 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 		switch {
 		case strings.HasPrefix(name, "apibe-gap-"):
 			suffix = strings.TrimPrefix(name, "apibe-gap-")
-		case strings.HasPrefix(name, hoststate.LatchFilePrefix+
-			hoststate.LatchAPIServerBackendStalePrefix):
-			suffix = strings.TrimPrefix(name, hoststate.LatchFilePrefix+
-				hoststate.LatchAPIServerBackendStalePrefix)
+		case strings.HasPrefix(name, latchdefs.LatchFilePrefix+
+			latchdefs.LatchAPIServerBackendStalePrefix):
+			suffix = strings.TrimPrefix(name, latchdefs.LatchFilePrefix+
+				latchdefs.LatchAPIServerBackendStalePrefix)
 		default:
 			continue
 		}

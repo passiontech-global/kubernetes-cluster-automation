@@ -17,7 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -176,20 +176,19 @@ func (c *StallCheck) Name() string { return wdeps.CheckStall }
 
 // Run executes one kubelet-stall round.
 func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckStall, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckStall) {
 		return
 	}
 	reason := ""
 	if hits := countMatchingLines(stallJournalRe, e.JournalOnce()); hits > journalHitsThresh {
-		reason = fmt.Sprintf("informer-zombie hits=%d/10min", hits)
+		reason = fmt.Sprintf(latchdefs.ReasonInformerZombie+" hits=%d/10min", hits)
 	}
 	if reason == "" {
 		if poddirs, ok := podDirCount(c.d); ok && poddirs >= PoddirThreshold {
 			if _, err := os.ReadDir(c.d.Cfg.CtrTaskRoot); err != nil {
-				reason = fmt.Sprintf("phantom-pods poddirs=%d ctr=unreachable", poddirs)
+				reason = fmt.Sprintf(latchdefs.ReasonPhantomPods+" poddirs=%d ctr=unreachable", poddirs)
 			} else if taskRecordCount(c.d) == 0 {
-				reason = fmt.Sprintf("phantom-pods poddirs=%d tasks=0", poddirs)
+				reason = fmt.Sprintf(latchdefs.ReasonPhantomPods+" poddirs=%d tasks=0", poddirs)
 			}
 		}
 	}
@@ -204,29 +203,26 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if reason == "" {
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchKubeletRuntimeStall, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckStall, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchKubeletRuntimeStall, nil)
+		c.d.CycleResult(wdeps.CheckStall, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s (check %d/%d)",
-			reason, c.Fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckStall, "ok").Inc()
+	if c.d.StreakPending(&c.Fails, fmt.Sprintf("suspect: %s", reason)) {
+		c.d.CycleResult(wdeps.CheckStall, "ok")
 		return
 	}
-	overloaded := c.d.State.Exists(hoststate.LatchNodeOverloaded)
-	if strings.HasPrefix(reason, "phantom-pods") || strings.HasPrefix(reason, "kubelet-10250-down") {
+	overloaded := c.d.State.Exists(latchdefs.LatchNodeOverloaded)
+	if strings.HasPrefix(reason, latchdefs.ReasonPhantomPods) || strings.HasPrefix(reason, "kubelet-10250-down") {
 		if !overloaded {
-			c.d.State.Enter(hoststate.LatchKubeletRuntimeStall, reason)
-		} else if !c.d.State.Exists(hoststate.LatchKubeletRuntimeStall) {
+			c.d.State.Enter(latchdefs.LatchKubeletRuntimeStall, reason)
+		} else if !c.d.State.Exists(latchdefs.LatchKubeletRuntimeStall) {
 			// Wedge under CPU starvation is a symptom, not a dead
 			// node — latching would kick NHC→SNR and dump 100% of
 			// load onto the survivors (amplifier). Log-only.
 			c.d.State.AppendLog("runtime-stall-suppressed-overloaded - " + reason)
 		}
 	} else {
-		c.d.State.Exit(hoststate.LatchKubeletRuntimeStall, nil)
+		c.d.State.Exit(latchdefs.LatchKubeletRuntimeStall, nil)
 	}
 	switch {
 	case overloaded:
@@ -240,8 +236,8 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf("ACTION: restarting k0sworker - %s (persisted %dx)",
-			reason, c.Fails))
+		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
+			" - %s (persisted %dx)", reason, c.Fails))
 		c.Fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
@@ -249,7 +245,7 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckStall, "restart").Inc()
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckStall, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckStall, "ok")
 }
 
 // --- Check: kubelet-watch-wedge (06-kubelet-watch-wedge.sh) ---
@@ -272,8 +268,7 @@ func (c *WatchWedgeCheck) Name() string { return wdeps.CheckWatch }
 
 // Run executes one watch-wedge round.
 func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckWatch) {
 		return
 	}
 	if spam := countMatchingLines(watchJournalRe, e.JournalOnce()); spam > journalHitsThresh {
@@ -284,10 +279,10 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Inconclusive — keep counters/latch exactly like the shell
 		// (a flapping API must not clear wedge evidence). Only log
 		// when there is something worth keeping.
-		if c.d.State.Exists(hoststate.LatchKubeletWatchWedge) || c.Fails > 0 {
+		if c.d.State.Exists(latchdefs.LatchKubeletWatchWedge) || c.Fails > 0 {
 			c.d.State.AppendLog("suspect: kubelet-watch-wedge pods query fail — inconclusive, keeping state")
 		}
-		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckWatch, "abort")
 		return
 	}
 	// Stat the pods ROOT once before the per-pod sweep: with the dir
@@ -303,7 +298,7 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet pods dir %s unstatable or not a directory (isdir=%v, err=%v) — watch-wedge inconclusive, keeping state",
 			c.d.Cfg.PodsDir, err == nil && st.IsDir(), err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckWatch, "abort")
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
@@ -326,26 +321,24 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if missing == 0 {
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchKubeletWatchWedge, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchKubeletWatchWedge, nil)
+		c.d.CycleResult(wdeps.CheckWatch, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-watch-wedge %d pod(s) assigned but no pod dir on node (check %d/%d)",
-			missing, c.Fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "ok").Inc()
+	if c.d.StreakPending(&c.Fails, fmt.Sprintf(
+		"suspect: kubelet-watch-wedge %d pod(s) assigned but no pod dir on node",
+		missing)) {
+		c.d.CycleResult(wdeps.CheckWatch, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchKubeletWatchWedge, fmt.Sprintf("unseen-pods=%d", missing))
+	c.d.State.Enter(latchdefs.LatchKubeletWatchWedge, fmt.Sprintf("unseen-pods=%d", missing))
 	// Upstream gate: EVERY apiserver backend stale → the unseen pods
 	// are stale-LIST fallout, not a kubelet wedge (sig14 latches the
 	// state-apiserver-backend-stale-<ip> files).
 	if len(c.d.Cfg.APIBackends) > 0 {
 		nstale := 0
 		for _, be := range c.d.Cfg.APIBackends {
-			if c.d.State.Exists(hoststate.LatchAPIServerBackendStalePrefix + dashedHost(be)) {
+			if c.d.State.Exists(latchdefs.LatchAPIServerBackendStalePrefix + dashedHost(be)) {
 				nstale++
 			}
 		}
@@ -353,12 +346,12 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: kubelet-watch-wedge unseen=%d but %d/%d api backend stale — upstream wedge, skip restart k0sworker",
 				missing, nstale, len(c.d.Cfg.APIBackends)))
-			c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "ok").Inc()
+			c.d.CycleResult(wdeps.CheckWatch, "ok")
 			return
 		}
 	}
 	switch {
-	case c.d.State.Exists(hoststate.LatchNodeOverloaded):
+	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - node overloaded, skip restart k0sworker", missing))
 	case !k0sWorkerSettled(c.d, ctx):
@@ -370,8 +363,8 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: restarting k0sworker - kubelet-watch-wedge unseen-pods=%d (persisted %dx)",
+		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
+			" - kubelet-watch-wedge unseen-pods=%d (persisted %dx)",
 			missing, c.Fails))
 		c.Fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
@@ -380,5 +373,5 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckWatch, "restart").Inc()
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckWatch, "ok")
 }

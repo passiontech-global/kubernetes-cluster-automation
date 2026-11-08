@@ -202,7 +202,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		// Wave-12 latch→condition surface.
 		"DiskSlowIO":            {"DiskIONormal", "disk write await and io PSI within normal bounds"},
 		"KernelNetShimDegraded": {"KernelNetShimNormal", "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds"},
-		// Wave-15 latch→condition surface.
+		// Clocksource latch→condition surface.
 		"ClocksourceUnstable": {"ClocksourceStable", "kernel clocksource stable (tsc/kvm-clock, no instability records)"},
 	}
 	conds := e.node(t).Status.Conditions

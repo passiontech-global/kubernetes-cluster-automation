@@ -62,7 +62,7 @@ type Config struct {
 	// pressure gauges.
 	FileNRFile   string
 	SockstatFile string
-	// MountinfoFile is /proc/1/mountinfo — the W15-R1c
+	// MountinfoFile is /proc/1/mountinfo — the
 	// mountinfo-entries gauge (line count).
 	MountinfoFile string
 	// LocalPortRangeFile is /proc/sys/net/ipv4/ip_local_port_range
@@ -123,7 +123,7 @@ type Config struct {
 	ARPTableFile      string
 	// ClocksourceCurrentFile is sysfs clocksource0's current_clocksource
 	// and ClocksourceAvailableFile its available_clocksource — the
-	// W15-K1 non-TSC drift gauge (and kvm-clock restore write) reads
+	// The non-TSC drift gauge (and kvm-clock restore write) reads
 	// both every cycle.
 	ClocksourceCurrentFile   string
 	ClocksourceAvailableFile string

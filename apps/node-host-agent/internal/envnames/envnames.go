@@ -21,10 +21,12 @@
 // needs wiring).
 package envnames
 
-// Enable gates — the tri-state (true/false/auto) knobs wired as
-// Descriptor.EnvFlag in cmd/agent/wiring.go. NODE_HOST_AGENT_
-// ENABLE_FEEDER is a controllerhygiene-private gate and lives in
-// envnames_controllerhygiene.go.
+// Enable gates — the NODE_HOST_AGENT_ENABLE_* knobs, declared
+// together so the envdoc generator's gates table sees every gate like
+// the others. Most are tri-state (true/false/auto) knobs wired as
+// Descriptor.EnvFlag in cmd/agent/wiring.go; EnvEnableFeeder is a
+// bool sub-gate controllerhygiene reads directly (no descriptor —
+// the generator renders its row with an empty subsystem/default).
 const (
 	EnvEnableSweeper           = "NODE_HOST_AGENT_ENABLE_SWEEPER"
 	EnvEnableConcourseCache    = "NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE"
@@ -37,6 +39,10 @@ const (
 	EnvEnableControllerhygiene = "NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE"
 	EnvEnableHostconfig        = "NODE_HOST_AGENT_ENABLE_HOSTCONFIG"
 	EnvEnableKinedb            = "NODE_HOST_AGENT_ENABLE_KINEDB"
+	// EnvEnableFeeder gates the standalone api-backend feeder
+	// inside controllerhygiene — read directly via envx.BoolKnob
+	// (it is NOT a Descriptor.EnvFlag in wiring.go).
+	EnvEnableFeeder = "NODE_HOST_AGENT_ENABLE_FEEDER"
 )
 
 // Core knobs — read by cmd/agent's entrypoint path (main.go,

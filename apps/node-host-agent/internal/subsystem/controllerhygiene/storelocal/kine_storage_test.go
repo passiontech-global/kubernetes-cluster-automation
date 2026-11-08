@@ -1,9 +1,9 @@
-package kine_test
+package storelocal_test
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdepstest"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/kine"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/storelocal"
 
 	"context"
 	"errors"
@@ -40,31 +40,31 @@ func setupKineStore(t *testing.T, e *env, dbSize, walSize int64) *int {
 	}
 	e.H.Cfg.K0sDir = k0s
 
-	oldMin := kine.WALCheckpointMinBytes
-	kine.WALCheckpointMinBytes = 100
-	t.Cleanup(func() { kine.WALCheckpointMinBytes = oldMin })
+	oldMin := storelocal.WALCheckpointMinBytes
+	storelocal.WALCheckpointMinBytes = 100
+	t.Cleanup(func() { storelocal.WALCheckpointMinBytes = oldMin })
 	oldTD := cdeps.TextfileDirOverride
 	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
 	t.Cleanup(func() { cdeps.TextfileDirOverride = oldTD })
 
 	calls := new(int)
-	oldFn := kine.CheckpointFn
-	kine.CheckpointFn = func(_ context.Context, dbPath string) error {
+	oldFn := storelocal.CheckpointFn
+	storelocal.CheckpointFn = func(_ context.Context, dbPath string) error {
 		*calls++
 		if dbPath != filepath.Join(dbDir, "state.db") {
 			t.Errorf("checkpoint db path %q", dbPath)
 		}
 		return nil
 	}
-	t.Cleanup(func() { kine.CheckpointFn = oldFn })
+	t.Cleanup(func() { storelocal.CheckpointFn = oldFn })
 	// Hermetic by default: the real sqlite3 CLI recovers (and can
 	// zero) a bogus state.db-wal, which would corrupt the fixture
 	// sizes across runs. Tests that exercise the scan override it.
-	oldLO := kine.LargeObjectsFn
-	kine.LargeObjectsFn = func(context.Context, string) ([]kine.KineLargeObject, error) {
+	oldLO := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(context.Context, string) ([]storelocal.KineLargeObject, error) {
 		return nil, nil
 	}
-	t.Cleanup(func() { kine.LargeObjectsFn = oldLO })
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldLO })
 	return calls
 }
 
@@ -72,7 +72,7 @@ func TestKineStorageHealthCheckpointGating(t *testing.T) {
 	e := fixture(t)
 	calls := setupKineStore(t, e, 50, 200) // wal 200 > 100 threshold
 
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 	if *calls != 1 {
 		t.Fatalf("checkpoint calls=%d want 1", *calls)
 	}
@@ -92,14 +92,14 @@ func TestKineStorageHealthCheckpointGating(t *testing.T) {
 	}
 
 	// Second run inside the 30m cooldown → no checkpoint.
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 	if *calls != 1 {
 		t.Fatalf("checkpoint calls=%d want 1 (cooldown)", *calls)
 	}
 
 	// Past the cooldown → checkpoint again.
 	e.Now = e.Now.Add(31 * time.Minute)
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 	if *calls != 2 {
 		t.Fatalf("checkpoint calls=%d want 2", *calls)
 	}
@@ -108,7 +108,7 @@ func TestKineStorageHealthCheckpointGating(t *testing.T) {
 func TestKineStorageHealthSmallWALNoCheckpoint(t *testing.T) {
 	e := fixture(t)
 	calls := setupKineStore(t, e, 50, 50) // wal 50 <= 100 threshold
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 	if *calls != 0 {
 		t.Fatalf("checkpoint fired on small WAL: calls=%d", *calls)
 	}
@@ -117,15 +117,15 @@ func TestKineStorageHealthSmallWALNoCheckpoint(t *testing.T) {
 func TestKineStorageHealthNoSQLite3KeepsCooldown(t *testing.T) {
 	e := fixture(t)
 	calls := setupKineStore(t, e, 50, 200)
-	oldFn := kine.CheckpointFn
-	kine.CheckpointFn = func(context.Context, string) error {
+	oldFn := storelocal.CheckpointFn
+	storelocal.CheckpointFn = func(context.Context, string) error {
 		*calls++
-		return kine.ErrNoSQLite3
+		return storelocal.ErrNoSQLite3
 	}
-	defer func() { kine.CheckpointFn = oldFn }()
+	defer func() { storelocal.CheckpointFn = oldFn }()
 
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 	if *calls != 2 {
 		t.Fatalf("no-sqlite3 should not spend cooldown: calls=%d want 2",
 			*calls)
@@ -140,7 +140,7 @@ func TestKineStorageHealthAbsentStore(t *testing.T) {
 	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
 	defer func() { cdeps.TextfileDirOverride = oldTD }()
 
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background()) // must not panic
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background()) // must not panic
 	prom, err := os.ReadFile(filepath.Join(
 		cdeps.TextfileDirOverride, "node-agent-kine-storage.prom"))
 	if err != nil {
@@ -151,12 +151,12 @@ func TestKineStorageHealthAbsentStore(t *testing.T) {
 	}
 }
 
-// --- W15-CP2a: kine large-object scan ---
+// --- Kine large-object scan ---
 
 // runStorage is the shared one-cycle runner for the StorageCheck.
 func runStorage(t *testing.T, e *env) {
 	t.Helper()
-	cdepstest.Check[*kine.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
+	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background())
 }
 
 // readProm reads the node-agent-kine-storage.prom textfile.
@@ -185,18 +185,18 @@ func TestKineStorageLargeObjectScan(t *testing.T) {
 	e := fixture(t)
 	setupKineStore(t, e, 50, 50) // small WAL — only the object scan runs
 	calls := new(int)
-	oldFn := kine.LargeObjectsFn
-	kine.LargeObjectsFn = func(_ context.Context, dbPath string) ([]kine.KineLargeObject, error) {
+	oldFn := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(_ context.Context, dbPath string) ([]storelocal.KineLargeObject, error) {
 		*calls++
 		if want := filepath.Join(e.H.Cfg.K0sDir, "db", "state.db"); dbPath != want {
 			t.Errorf("large-object db path %q want %q", dbPath, want)
 		}
-		return []kine.KineLargeObject{
+		return []storelocal.KineLargeObject{
 			{Name: "/registry/secrets/default/big", Bytes: 600000},
 			{Name: "/registry/configmaps/default/small", Bytes: 100},
 		}, nil
 	}
-	t.Cleanup(func() { kine.LargeObjectsFn = oldFn })
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldFn })
 
 	runStorage(t, e)
 	if *calls != 1 {
@@ -240,12 +240,12 @@ func TestKineStorageLargeObjectScanNoSQLite3KeepsCooldown(t *testing.T) {
 	e := fixture(t)
 	setupKineStore(t, e, 50, 50)
 	calls := new(int)
-	oldFn := kine.LargeObjectsFn
-	kine.LargeObjectsFn = func(context.Context, string) ([]kine.KineLargeObject, error) {
+	oldFn := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(context.Context, string) ([]storelocal.KineLargeObject, error) {
 		*calls++
-		return nil, kine.ErrNoSQLite3
+		return nil, storelocal.ErrNoSQLite3
 	}
-	t.Cleanup(func() { kine.LargeObjectsFn = oldFn })
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldFn })
 
 	runStorage(t, e)
 	runStorage(t, e)
@@ -260,12 +260,12 @@ func TestKineStorageLargeObjectScanFailureSpendsCooldown(t *testing.T) {
 	e := fixture(t)
 	setupKineStore(t, e, 50, 50)
 	calls := new(int)
-	oldFn := kine.LargeObjectsFn
-	kine.LargeObjectsFn = func(context.Context, string) ([]kine.KineLargeObject, error) {
+	oldFn := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(context.Context, string) ([]storelocal.KineLargeObject, error) {
 		*calls++
 		return nil, errors.New("disk I/O error")
 	}
-	t.Cleanup(func() { kine.LargeObjectsFn = oldFn })
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldFn })
 
 	runStorage(t, e)
 	if !strings.Contains(readWatchdogLog(t, e), "kine large-object scan failed") {
@@ -282,11 +282,11 @@ func TestKineStorageLargeObjectScanFailureSpendsCooldown(t *testing.T) {
 func TestKineStorageLargeObjectGaugeAbsentUntilScanned(t *testing.T) {
 	e := fixture(t)
 	setupKineStore(t, e, 50, 50)
-	oldFn := kine.LargeObjectsFn
-	kine.LargeObjectsFn = func(context.Context, string) ([]kine.KineLargeObject, error) {
-		return nil, kine.ErrNoSQLite3
+	oldFn := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(context.Context, string) ([]storelocal.KineLargeObject, error) {
+		return nil, storelocal.ErrNoSQLite3
 	}
-	t.Cleanup(func() { kine.LargeObjectsFn = oldFn })
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldFn })
 
 	runStorage(t, e)
 	prom := readProm(t)

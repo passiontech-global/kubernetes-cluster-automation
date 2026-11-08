@@ -4,15 +4,25 @@
 // ~8 packages, with the janitor keeping a hand-maintained copy of
 // the set for its known/unknown reap classification and
 // nodereporter another for its condition table. They live here now
-// — next to Store, the single implementation of the file contract —
-// so a new latch is registered once at the name's definition site
-// and every consumer (writers, readers, the reaper, the condition
-// mapper) shares it.
+// — internal/latchdefs, a pure data leaf — so a new latch is
+// registered once at the name's definition site and every consumer
+// (writers, readers, the reaper, the condition mapper) shares it.
+//
+// protocol.go extends this leaf with the watchdog-log LINE protocol
+// — the shared line prefixes, remediation/evidence tokens and the
+// derived matchers the filelog rules build from them — so emitter
+// wording and Event-rule wording can no longer drift apart.
+//
+// Layering: latchdefs is an app-level leaf below internal/platform.
+// The hoststate Store (which implements the on-disk file contract
+// for these names) imports this package for its shared-owner
+// validation, and every subsystem imports it for the Latch* name
+// constants — neither direction pulls anything but stdlib in here.
 //
 // On-disk contract: state-<name>, content = epoch of entry. The
 // names below are byte-identical to the literals they replace —
 // this is a code consolidation, not a contract change.
-package hoststate
+package latchdefs
 
 import "strings"
 
@@ -82,11 +92,11 @@ const (
 	LatchConntrackPressure   = "conntrack-pressure"    // H2
 	LatchNebulaPMTUBlackhole = "nebula-pmtu-blackhole" // W9-NM1
 	LatchNebulaMTUBlackhole  = "nebula-mtu-blackhole"  // routeguard NM4
-	// LatchClocksourceUnstable is the W15-K1 evidence latch — the
+	// LatchClocksourceUnstable is the clocksource evidence latch — the
 	// kernel marked its clocksource unstable (kmsg signature) or
 	// hostmetrics found the current clocksource drifted off tsc/
 	// kvm-clock (the collector's non-TSC gauge).
-	LatchClocksourceUnstable = "clocksource-unstable" // W15-K1
+	LatchClocksourceUnstable = "clocksource-unstable" // hostmetrics clocksource guard
 
 	// controllerhygiene — the control-plane guards.
 	LatchAPIServerCacheStale    = "apiserver-cache-stale"    // sig13
@@ -140,7 +150,7 @@ type LatchDef struct {
 	Prefix bool   // parameterized family — suffix minted per target
 	// Owners lists every producer id that may hold the latch
 	// simultaneously through Store.EnterFrom/Store.ExitFrom —
-	// non-nil only for shared latches. hoststate is the leaf both
+	// non-nil only for shared latches. latchdefs is the leaf both
 	// producers import, so the declared ids are the contract the
 	// calls must match (store.go's ExitFrom seeds a synthetic hold
 	// set from this list for owner-less legacy files).

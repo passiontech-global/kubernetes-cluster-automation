@@ -29,7 +29,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -168,22 +168,21 @@ func podSliceDirs(kubepods string) []string {
 
 // Run executes one cgroup-pod-throttle round.
 func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupThrottle, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCgroupThrottle) {
 		return
 	}
 	kubepods := filepath.Join(c.d.Cfg.Runtime.CgroupRoot, "kubepods.slice")
 	if _, err := os.Stat(kubepods); err != nil {
 		// cgroup v1 host or no kubepods on this node — the check
 		// is dormant (unreadable → abort, procfs-probe parity).
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupThrottle, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCgroupThrottle, "abort")
 		return
 	}
 	// The W2 node-wide thrash latch owns the signal while the WHOLE
 	// node is under memory pressure — pod-level throttle verdicts
 	// only mean anything when the node itself is quiet (a mis-sized
 	// memory.request, not a global event).
-	nodeThrashing := c.d.State.Exists(hoststate.LatchPSIMemoryThrash)
+	nodeThrashing := c.d.State.Exists(latchdefs.LatchPSIMemoryThrash)
 	if c.prevHigh == nil {
 		c.prevHigh = map[string]int64{}
 	}
@@ -244,5 +243,5 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	c.d.PodCgroupPIDsMaxUtilRatio = maxRatio
-	c.d.Cycles.WithLabelValues(wdeps.CheckCgroupThrottle, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCgroupThrottle, "ok")
 }

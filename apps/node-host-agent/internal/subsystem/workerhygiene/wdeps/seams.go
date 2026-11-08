@@ -248,7 +248,7 @@ type Cilium struct {
 	// the cilium-dbg endpoint list replacement (35). Seam.
 	UnixGet func(ctx context.Context, socket, path string) ([]byte, error)
 	// WGDump returns the raw `wg show cilium_wg0 dump` output —
-	// the W15-NM2 zombie-peer evidence source (TSV: one interface
+	// the zombie-peer evidence source (TSV: one interface
 	// line, then one 8-column line per peer). Seam (default execs
 	// wg through the systemd client).
 	WGDump func(ctx context.Context, sd *systemd.Client) (string, error)
@@ -283,7 +283,7 @@ type WGDumpPeer struct {
 }
 
 // WGDumpPeers returns the parsed cilium_wg0 dump peer rows — the
-// W15-NM2 zombie-peer read. Derived over the WGDump seam so tests
+// Zombie-peer read. Derived over the WGDump seam so tests
 // stub the one exec.
 func (s *Cilium) WGDumpPeers(ctx context.Context, sd *systemd.Client) ([]WGDumpPeer, error) {
 	out, err := s.WGDump(ctx, sd)
@@ -367,7 +367,10 @@ func (s *Probe) applyDefaults(c *Config) {
 		// Plain HTTP (no TLS) — the envoy admin stats page lives on
 		// loopback :9901. A non-200 is an error: the reject-delta
 		// verdict is unreadable, not "zero".
-		s.HTTPGetBody = probee.HTTPBody
+		s.HTTPGetBody = func(ctx context.Context, url string,
+			timeout time.Duration) ([]byte, error) {
+			return probee.HTTPBody(ctx, url, timeout)
+		}
 	}
 	if s.DNSProbe == nil {
 		s.DNSProbe = probee.DNSQuery
@@ -377,18 +380,29 @@ func (s *Probe) applyDefaults(c *Config) {
 		// own — a wedged cilium-agent :9879/healthz answering 500/503
 		// must read as DOWN. Only a 2xx is a pass; insecure TLS stays
 		// (kubelet cert SANs don't cover 127.0.0.1, curl -ks parity).
-		s.ProbeHTTP = probee.HTTPGet
+		// The closures adapt the seam types to the probees' variadic
+		// optional *http.Client (default package client, nil injected).
+		s.ProbeHTTP = func(ctx context.Context, url string,
+			timeout time.Duration) error {
+			return probee.HTTPGet(ctx, url, timeout)
+		}
 	}
 	if s.ProbeBodyOK == nil {
 		// kubelet :10248 contract (curl -s parity): the healthz port is
 		// unauthenticated plaintext and the body must be exactly "ok" —
 		// a wedged kubelet can still answer HTTP with a non-ok body.
-		s.ProbeBodyOK = probee.BodyOK
+		s.ProbeBodyOK = func(ctx context.Context, url string,
+			timeout time.Duration) bool {
+			return probee.BodyOK(ctx, url, timeout)
+		}
 	}
 	if s.ProbeHTTPStatus == nil {
 		// Same insecure-TLS transport as ProbeHTTP — the status code
 		// is the verdict (syncloop 500, envoy /ready 503).
-		s.ProbeHTTPStatus = probee.HTTPStatus
+		s.ProbeHTTPStatus = func(ctx context.Context, url, bearer string,
+			timeout time.Duration) (int, error) {
+			return probee.HTTPStatus(ctx, url, bearer, timeout)
+		}
 	}
 	if s.ProbeUnixSock == nil {
 		// A successful dial IS the verdict — a close error (e.g. the

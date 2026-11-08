@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -23,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // signJob is one cert request, mirroring sign.yaml's nebula_sign_jobs
@@ -54,9 +54,7 @@ type signConfig struct {
 // failure, 2 usage error — same contract as the other ops subcommands).
 func Cmd(ctx context.Context, args []string) int {
 	fs := opsx.FlagSet("nebula-sign")
-	varsDir := fs.String("vars-dir",
-		envx.String(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
-		"vars dir holding cluster.yaml/interdc_nodes.yaml; nebula-<name>.crt lands here")
+	varsDir := opsx.VarsDirFlag(fs)
 	caDir := fs.String("ca-dir", "",
 		"directory holding ca.crt + ca.key (required — backup/nebula-ca)")
 	only := fs.String("node", "",
@@ -167,7 +165,7 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 			continue
 		}
 		nv, _ := t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
@@ -195,7 +193,7 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 		subs := []string{ip + "/32"}
 		for _, r := range omList(om, "relay") {
 			var rip string
-			if rm, ok := r.(*topology.OMap); ok {
+			if rm, ok := r.(*jinja.OMap); ok {
 				rip = omStr(rm, "ip")
 			} else {
 				rip = jstr(r)
@@ -227,7 +225,7 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 			Hostname:  k,
 			Name:      name,
 			IPCIDR:    base + "." + octet + "/24",
-			Subnets:   strings.Join(uniqSortedStrings(subs), ","),
+			Subnets:   strings.Join(topology.UniqSorted(subs), ","),
 			Pub:       stripPubArmor(omStr(om, "nebula_key")),
 			IP:        ip,
 			SSHUser:   user,
@@ -321,19 +319,6 @@ func stripPubArmor(s string) string {
 	return b.String()
 }
 
-func uniqSortedStrings(in []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, x := range in {
-		if !seen[x] {
-			seen[x] = true
-			out = append(out, x)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 // --- jinja value helpers ---
 //
 // topology keeps its coercions unexported; hubsync carries the same
@@ -358,7 +343,7 @@ func jstr(v any) string {
 	return ""
 }
 
-func omStr(m *topology.OMap, key string) string {
+func omStr(m *jinja.OMap, key string) string {
 	v, ok := m.Get(key)
 	if !ok {
 		return ""
@@ -366,7 +351,7 @@ func omStr(m *topology.OMap, key string) string {
 	return jstr(v)
 }
 
-func omList(m *topology.OMap, key string) []any {
+func omList(m *jinja.OMap, key string) []any {
 	v, ok := m.Get(key)
 	if !ok {
 		return nil
@@ -374,7 +359,7 @@ func omList(m *topology.OMap, key string) []any {
 	switch t := v.(type) {
 	case []any:
 		return t
-	case *topology.List:
+	case *jinja.List:
 		return t.V
 	}
 	return nil
@@ -382,7 +367,7 @@ func omList(m *topology.OMap, key string) []any {
 
 func jstrMap(v any) map[string]string {
 	out := map[string]string{}
-	if om, ok := v.(*topology.OMap); ok && om != nil {
+	if om, ok := v.(*jinja.OMap); ok && om != nil {
 		for _, k := range om.Keys() {
 			vv, _ := om.Get(k)
 			out[k] = jstr(vv)

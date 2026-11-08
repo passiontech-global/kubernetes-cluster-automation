@@ -26,7 +26,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -85,13 +84,12 @@ func projectedTokenFiles(podDir string) []string {
 
 // Run executes one sa-token-ttl round.
 func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSATokenTTL, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckSATokenTTL) {
 		return
 	}
 	podDirs, err := os.ReadDir(c.d.Cfg.PodsDir)
 	if err != nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSATokenTTL, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckSATokenTTL, "abort")
 		return
 	}
 	podByUID := map[string]*corev1.Pod{}
@@ -132,7 +130,7 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	c.d.SATokenMinTTLSec = minTTL
-	c.d.Cycles.WithLabelValues(wdeps.CheckSATokenTTL, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckSATokenTTL, "ok")
 }
 
 // stall emits the SATokenRotationStalled event and stamps the
@@ -185,24 +183,15 @@ func (c *SATokenTTLCheck) stall(ctx context.Context, pod *corev1.Pod,
 // pod — events.v1 shape like the SystemOOMVictim emitter.
 func (c *SATokenTTLCheck) emitEvent(ctx context.Context, pod *corev1.Pod,
 	ttl int64) {
-	if c.d.Cfg.Client == nil {
-		return
-	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-			Namespace: pod.Namespace,
-		},
-		EventTime: metav1.NewMicroTime(now),
+	_ = c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
 		Reason:    "SATokenRotationStalled",
 		Note: fmt.Sprintf(
 			"projected service-account token ttl=%ds < %ds floor — kubelet volume rotation appears stalled, resync nudged",
 			ttl, c.d.Cfg.Runtime.SATokenMinTTLSec),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   c.d.Cfg.NodeName,
-		Action:              "SATokenRotationStalled",
+		When: now,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Pod",
@@ -210,11 +199,6 @@ func (c *SATokenTTLCheck) emitEvent(ctx context.Context, pod *corev1.Pod,
 			Name:       pod.Name,
 			UID:        pod.UID,
 		},
-	}
-	if _, err := c.d.Cfg.Client.EventsV1().Events(pod.Namespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: SATokenRotationStalled event create failed for %s/%s: %v",
-			pod.Namespace, pod.Name, err))
-	}
+		Owner: pod.Namespace + "/" + pod.Name,
+	})
 }

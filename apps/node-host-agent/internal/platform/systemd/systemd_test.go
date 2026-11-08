@@ -168,7 +168,7 @@ func TestActiveAge(t *testing.T) {
 	}
 	f.On("show -p ActiveEnterTimestampMonotonic --value k0sworker.service", "7000000000\n")
 	f.On("show -p ActiveEnterTimestampMonotonic --value dead.service", "0\n")
-	c := New(Config{HostRoot: "/", RunCmd: f.Run, ProcUptimeFile: uptime})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run}, WithProcUptimeFile(uptime))
 	ctx := context.Background()
 	age, err := c.ActiveAge(ctx, "k0sworker.service")
 	if err != nil {
@@ -192,8 +192,8 @@ func TestActiveAge(t *testing.T) {
 		t.Fatal("garbage timestamp want error")
 	}
 	// Unreadable /proc/uptime → error (never settle blind).
-	c2 := New(Config{HostRoot: "/", RunCmd: f.Run,
-		ProcUptimeFile: filepath.Join(t.TempDir(), "missing")})
+	c2 := New(Config{HostRoot: "/", RunCmd: f.Run},
+		WithProcUptimeFile(filepath.Join(t.TempDir(), "missing")))
 	if _, err := c2.ActiveAge(ctx, "k0sworker.service"); err == nil {
 		t.Fatal("missing uptime file want error")
 	}

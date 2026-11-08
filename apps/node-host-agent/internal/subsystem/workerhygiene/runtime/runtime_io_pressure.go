@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -165,13 +165,12 @@ func (c *IOPressureCheck) Name() string { return wdeps.CheckIOPressure }
 
 // Run executes one io-pressure round.
 func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckIOPressure) {
 		return
 	}
 	data, err := os.ReadFile(filepath.Join(c.d.Cfg.ProcRoot, "diskstats"))
 	if err != nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckIOPressure, "abort")
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
@@ -242,7 +241,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if maxAwait > diskWriteAwaitHighMs && psiOK && avg60 >= ioPSIFullHigh {
 		c.diskSlowFails++
 		if c.diskSlowFails >= diskSlowIOConsecNeeded {
-			c.d.State.Enter(hoststate.LatchDiskSlowIO, fmt.Sprintf(
+			c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
 				"max_await=%.1fms psi_avg60=%.1f fails=%d",
 				maxAwait, avg60, c.diskSlowFails))
 		} else {
@@ -252,12 +251,12 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		}
 	} else {
 		c.diskSlowFails = 0
-		c.d.State.Exit(hoststate.LatchDiskSlowIO, nil)
+		c.d.State.Exit(latchdefs.LatchDiskSlowIO, nil)
 	}
 	pressure := await > diskWriteAwaitHighMs ||
 		(psiOK && (avg300 > ioPSIFullHigh || avg60 > ioPSIFullHigh))
 	if !pressure {
-		c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckIOPressure, "ok")
 		return
 	}
 	if c.throttled == nil {
@@ -309,5 +308,5 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			pid, comm, await, avg60, avg300))
 		c.d.Actions.WithLabelValues(wdeps.CheckIOPressure, "throttle").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckIOPressure, "ok")
 }

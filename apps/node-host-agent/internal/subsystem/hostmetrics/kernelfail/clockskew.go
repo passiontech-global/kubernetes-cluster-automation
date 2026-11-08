@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -120,7 +120,7 @@ func (r *Runner) checkClockSkew() {
 		}
 	}
 	countPath := r.statePath(clockSkewCountFile)
-	latchPath := r.deps.Store.Path(hoststate.LatchClockSkew)
+	latchPath := r.deps.Store.Path(latchdefs.LatchClockSkew)
 	if math.Abs(off) > clockSkewLatchOffset {
 		n := int64(1)
 		if b, err := os.ReadFile(countPath); err == nil {
@@ -135,14 +135,14 @@ func (r *Runner) checkClockSkew() {
 				"path", countPath, "error", err)
 		}
 		if n >= clockSkewLatchNeeded {
-			r.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchClockSkew,
+			r.ensureStateLatch(latchPath, latchdefs.LatchFilePrefix+latchdefs.LatchClockSkew,
 				fmt.Sprintf("offset=%.3fs synced=%v", off, synced))
 		}
 		return
 	}
 	_ = os.Remove(countPath)
 	// Exit self-gates on the file existing and logs STATE-EXIT.
-	r.deps.Store.Exit(hoststate.LatchClockSkew, nil)
+	r.deps.Store.Exit(latchdefs.LatchClockSkew, nil)
 }
 
 // --- clock-warp: wall-clock jump detector (G5) ---
@@ -181,7 +181,8 @@ func (r *Runner) checkClockWarp() {
 			r.deps.Store.WriteEpochFile(
 				r.statePath(clockSteppedMarkerFile), now.Unix())
 			r.deps.Store.AppendLogWarn(fmt.Sprintf(
-				"ACTION clock-warp: delta=%.1fs tick=%s — VM pause / live-migration / NTP step suspected (events=%d)",
+				latchdefs.ActionEntryPrefix(latchdefs.ActionClockWarp)+
+					"delta=%.1fs tick=%s — VM pause / live-migration / NTP step suspected (events=%d)",
 				delta.Seconds(), r.deps.TickInterval, r.warp.events))
 		}
 	}
@@ -199,9 +200,9 @@ func (r *Runner) writeClockWarpProm() {
 	b.Line(fmt.Sprintf("node_agent_clock_warp_events_total %d",
 		r.warp.events))
 	dir := r.textfileDir()
-	if err := promfile.Write(dir, "node-agent-clockwarp.prom",
-		[]byte(b.String())); err != nil {
-		logger().Debug("hostmetrics: clock-warp textfile install failed",
-			"dir", dir, "error", err)
-	}
+	_ = promfile.WriteLogged(dir, "node-agent-clockwarp.prom",
+		[]byte(b.String()), func(dir, _ string, err error) {
+			logger().Warn("hostmetrics: clock-warp textfile install failed",
+				"dir", dir, "error", err)
+		})
 }

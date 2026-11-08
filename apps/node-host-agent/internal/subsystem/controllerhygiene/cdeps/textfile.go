@@ -40,9 +40,10 @@ func (d *Deps) textfilePromDir() string {
 // mount must not spam the watchdog tail every cycle.
 func (d *Deps) WriteTextfileProm(name, content string) {
 	dir := d.textfilePromDir()
-	if err := promfile.Write(dir, name, []byte(content)); err != nil {
-		d.State.SuspectLog("textfile-prom", fmt.Sprintf(
-			"textfile prom %s unwritable (dir=%s): %v", name, dir, err),
-			d.Cfg.SuspectLogCadence)
-	}
+	_ = promfile.WriteLogged(dir, name, []byte(content),
+		func(dir, name string, err error) {
+			d.State.SuspectLog("textfile-prom", fmt.Sprintf(
+				"textfile prom %s unwritable (dir=%s): %v", name, dir, err),
+				d.Cfg.SuspectLogCadence)
+		})
 }

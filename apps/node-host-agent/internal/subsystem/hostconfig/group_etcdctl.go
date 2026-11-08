@@ -5,10 +5,10 @@
 package hostconfig
 
 import (
-	"fmt"
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -43,46 +43,52 @@ func (c *cyc) groupEtcdctl() {
 }
 
 // etcdctlInstallBinary ports the nebula/coredns managed-binary
-// pattern: <bin> version probe -> sha256-pinned tarball (staged or
-// downloaded) -> untarInstall (tmp+rename).
+// pattern through installManagedBinary: <bin> version probe ->
+// sha256-pinned tarball (staged or downloaded) -> untarInstall
+// (tmp+rename).
 func (c *cyc) etcdctlInstallBinary() {
-	r, ctx := c.r, c.ctx
-	ver, sum, url := c.v("etcdctl_version"), c.v("etcdctl_tgz_sha256"), c.v("etcdctl_tgz_url")
+	ver := c.t.Vars.StrDef("etcdctl_version", "")
+	sum := c.t.Vars.StrDef("etcdctl_tgz_sha256", "")
+	url := c.t.Vars.StrDef("etcdctl_tgz_url", "")
 	tgz := defStr(c.v("etcdctl_tgz_file"), pathpkg.Base(url))
-	if ver == "" || ver == "None" || url == "" || url == "None" ||
-		sum == "" || sum == "None" {
+	if ver == "" || url == "" || sum == "" {
 		c.err("etcdctl: missing etcdctl_version+etcdctl_tgz_{url,sha256} pins — not converging")
 		return
 	}
 	bin := "/var/lib/k0s/bin/etcdctl"
-	if out, err := r.run(ctx, bin, "version"); err == nil &&
-		strings.Contains(out, ver) {
-		return
-	}
-	local := filepath2(r.cfg.DownloadDir, tgz)
-	if fileExistsNoRoot(local) {
+	c.installManagedBinary(managedBinarySpec{
+		name:     "etcdctl",
+		artifact: "tgz",
+		probe: func(c *cyc) bool {
+			out, err := c.r.run(c.ctx, bin, "version")
+			return err == nil && strings.Contains(out, ver)
+		},
+		url:    url,
+		sum:    sum,
+		staged: filepath.Join(c.r.cfg.DownloadDir, tgz),
 		// same contract as T5b/T9: verify the STAGED file every run —
 		// a corrupted/operator-swapped tarball must not install.
-		if !sha256FileOK(local, sum) {
-			c.err("etcdctl: staged tgz sha256 mismatch — not installing",
-				"file", local, "sha256", sum)
-			return
-		}
-	} else if err := r.download(ctx, url, local, sum); err != nil {
-		c.err("etcdctl: tgz download", "url", url, "file", local, "error", err)
-		return
-	}
-	// /var/lib/k0s/bin exists on every k0s host, but untarInstall does
-	// not create parents — keep the install self-contained.
-	if err := r.ensureDir("/var/lib/k0s/bin", 0o755); err != nil {
-		// ensureDir already counted the failure via noteErr — log
-		// context only, do not count the same fault twice.
-		logger().Error("etcdctl: ensure k0s bin dir", "error", err)
-		return
-	}
-	if err := untarInstall(local, "etcdctl", r.hp(bin), 0o755); err != nil {
-		c.err("etcdctl: install", "file", local, "dst", bin, "error", err)
-	}
+		refuseBadStaged: true,
+		downloadLine:    "etcdctl: tgz download",
+		prepare: func(c *cyc) bool {
+			// /var/lib/k0s/bin exists on every k0s host, but
+			// untarInstall does not create parents — keep the install
+			// self-contained.
+			if err := c.r.ensureDir("/var/lib/k0s/bin", 0o755); err != nil {
+				// ensureDir already counted the failure via noteErr —
+				// log context only, do not count the same fault twice.
+				logger().Error("etcdctl: ensure k0s bin dir", "error", err)
+				return false
+			}
+			return true
+		},
+		member: "etcdctl",
+		dest:   bin,
+		mode:   0o755,
+		installErr: func(c *cyc, local string, err error) {
+			c.err("etcdctl: install", "file", local, "dst", bin, "error", err)
+		},
+	})
 }
 
 // ---------- Phase 3: kine.service (split kine out of k0scontroller) ----------
@@ -103,7 +109,7 @@ func (c *cyc) etcdctlInstallBinary() {
 
 func (c *cyc) groupKineService() {
 	r, ctx := c.r, c.ctx
-	if !containsSS(c.vs("kine_service_hosts"), r.cfg.NodeName) {
+	if !slices.Contains(c.vs("kine_service_hosts"), r.cfg.NodeName) {
 		// NB: no rollback — unlisting a host only stops converge, a
 		// running unit keeps running (deliberate: never kill the
 		// apiserver datastore just because a host left the list).
@@ -114,14 +120,14 @@ func (c *cyc) groupKineService() {
 	// unit. A kine with no DSN falls back to sqlite on the unix socket
 	// the apiserver points at -> empty datastore (data loss). Fail
 	// closed: keep last-good, warn so the operator fixes the vars.
-	ep := c.v("kine_endpoint")
-	if ep == "" || ep == "None" {
+	ep := c.t.Vars.StrDef("kine_endpoint", "")
+	if ep == "" {
 		c.err("kine.service: kine_endpoint not configured — skipping converge")
 		return
 	}
 
 	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
-	// W15-CP1 fail-closed: a tcp:// listener on a NON-loopback host
+	// Fail-closed mTLS guard: a tcp:// listener on a NON-loopback host
 	// exposes the etcd3 API to the network — without full mTLS the
 	// datastore is wide open (read+write+delete) to anyone who can
 	// reach the port. All three cert vars must be configured AND
@@ -141,9 +147,9 @@ func (c *cyc) groupKineService() {
 			for _, name := range []string{
 				"kine_ca_file", "kine_server_cert_file", "kine_server_key_file",
 			} {
-				s := c.v(name)
+				s := c.t.Vars.StrDef(name, "")
 				switch {
-				case s == "" || s == "None":
+				case s == "":
 					missing = append(missing, name+" (not configured)")
 				case !r.fileExists(s):
 					missing = append(missing, name+" (missing on disk: "+s+")")
@@ -161,18 +167,29 @@ func (c *cyc) groupKineService() {
 	// closed even when the file already exists (never start a binary
 	// that cannot be verified).
 	binPath := "/usr/local/bin/kine"
-	url, sum := c.v("kine_bin_url"), c.v("kine_bin_sha256")
-	if url == "" || url == "None" || sum == "" || sum == "None" {
+	url := c.t.Vars.StrDef("kine_bin_url", "")
+	sum := c.t.Vars.StrDef("kine_bin_sha256", "")
+	if url == "" || sum == "" {
 		c.err("kine.service: missing kine_bin_url+kine_bin_sha256 pins — not converging")
 		return
 	}
-	binChanged := false
-	if !r.fileExists(binPath) || !sha256FileOK(r.hp(binPath), sum) {
-		if err := r.download(ctx, url, r.hp(binPath), sum); err != nil {
+	// The dest file itself is the staging slot: a copy matching the
+	// pin skips the download, anything else is (re)downloaded straight
+	// onto it — no separate staged tarball to refuse.
+	binChanged, binOK := c.installManagedBinary(managedBinarySpec{
+		name: "kine.service",
+		probe: func(c *cyc) bool {
+			return r.fileExists(binPath) && sha256FileOK(r.hp(binPath), sum)
+		},
+		url:    url,
+		sum:    sum,
+		staged: r.hp(binPath),
+		downloadErr: func(c *cyc, err error) {
 			c.err("kine.service: kine binary download", "url", url, "error", err)
-			return
-		}
-		binChanged = true
+		},
+	})
+	if !binOK {
+		return
 	}
 	// Enforce mode drift even when the hash already matches — a 0644
 	// binary cannot exec.
@@ -208,13 +225,13 @@ func (c *cyc) groupKineService() {
 	// etcd-client TLS flags — unset vars render no flag at all, so a
 	// plaintext-TCP or unix-socket deployment stays byte-identical.
 	tls := ""
-	if s := c.v("kine_ca_file"); s != "" && s != "None" {
+	if s := c.t.Vars.StrDef("kine_ca_file", ""); s != "" {
 		tls += " --ca-file=" + s
 	}
-	if s := c.v("kine_server_cert_file"); s != "" && s != "None" {
+	if s := c.t.Vars.StrDef("kine_server_cert_file", ""); s != "" {
 		tls += " --server-cert-file=" + s
 	}
-	if s := c.v("kine_server_key_file"); s != "" && s != "None" {
+	if s := c.t.Vars.StrDef("kine_server_key_file", ""); s != "" {
 		tls += " --server-key-file=" + s
 	}
 	// unix socket: /run is tmpfs — create the parent dir before start
@@ -245,38 +262,22 @@ func (c *cyc) groupKineService() {
 			") 2>/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; (echo > /dev/tcp/" +
 			strings.Replace(hp, ":", "/", 1) + ") 2>/dev/null'\n"
 	}
-	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: kine split out of k0scontroller.
-# SEPARATE cgroup boundary: a kine OOM does not drag apiserver into
-# the OOM loop (incident 2026-10-02). GOMEMLIMIT 1500MiB < MemoryMax 2G
-# so Go GC fires before hitting the cgroup limit; GOGC=50 slows heap
-# growth between cycles.
-[Unit]
-Description=kine (etcd3 API shim -> external datastore)
-Documentation=file:/etc/kine/kine.env
-After=network-online.target
-Wants=network-online.target
-# Storage must come up BEFORE k0scontroller — apiserver will not boot
-# with a dead endpoint.
-Before=k0scontroller.service
-
-[Service]
-Environment=GOMEMLIMIT=1500MiB
-Environment=GOGC=50
-# KINE_ENDPOINT lives in /etc/kine/kine.env (0600, holds DB password).
-EnvironmentFile=/etc/kine/kine.env
-%s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s%s
-MemoryMax=2G
-# OOMScoreAdjust negative: the kernel kills other processes before
-# kine (apiserver data-path); high CPUWeight protects kine under CPU
-# pressure.
-OOMScoreAdjust=-500
-CPUWeight=2000
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`, execPre, execPost, listen, metrics, tls)), 0o644)
+	// unit file rendered from templates/kine.service.j2 — the
+	// ExecStart line concatenates the optional ExecStartPre/Post
+	// wait-loops (each carries its own trailing newline) so the
+	// rendered bytes stay identical to the pre-template Sprintf.
+	rendered, err := r.render("kine.service.j2", map[string]any{
+		"exec_pre":  execPre,
+		"exec_post": execPost,
+		"listen":    listen,
+		"metrics":   metrics,
+		"tls":       tls,
+	})
+	if err != nil {
+		c.err("kine.service: render unit", "error", err)
+		return
+	}
+	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", rendered, 0o644)
 	if unitChanged {
 		r.daemonReload(ctx)
 	}

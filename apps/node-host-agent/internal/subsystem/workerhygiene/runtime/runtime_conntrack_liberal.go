@@ -25,15 +25,14 @@ func (c *ConntrackLiberalCheck) Name() string { return wdeps.CheckConntrackLiber
 
 // Run executes one conntrack-liberal round.
 func (c *ConntrackLiberalCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckConntrackLiberal) {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(
 		c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)); err != nil {
 		// No nebula iface — the asymmetric-path problem this guard
 		// exists for can't occur; leave the kernel default alone.
-		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckConntrackLiberal, "ok")
 		return
 	}
 	p := filepath.Join(c.d.Cfg.ProcRoot, "sys", "net", "netfilter",
@@ -41,22 +40,22 @@ func (c *ConntrackLiberalCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		// Module not loaded / sysctl absent — dormant, not an error.
-		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckConntrackLiberal, "abort")
 		return
 	}
 	if strings.TrimSpace(string(data)) != "0" {
-		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckConntrackLiberal, "ok")
 		return
 	}
 	if err := os.WriteFile(p, []byte("1\n"), 0o644); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: conntrack-tcp-liberal-guard write %s failed: %v", p, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckConntrackLiberal, "ok")
 		return
 	}
 	c.d.State.AppendLog(
 		"ACTION: conntrack-tcp-liberal-guard set nf_conntrack_tcp_be_liberal=1 (neb1 present)")
 	c.d.ConntrackLiberalFixes++
 	c.d.Actions.WithLabelValues(wdeps.CheckConntrackLiberal, "sysctl_write").Inc()
-	c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckConntrackLiberal, "ok")
 }

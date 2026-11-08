@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T6 watchdog (+ T15 systemd watchdog) ----------
@@ -138,15 +138,15 @@ func (c *cyc) apilbWatchdogVars() (probeBackends []string, lbServers, lbVIP stri
 	lbServers = c.v("apiserver_lb_servers")
 	lbVIP = c.v("apiserver_lb_vip")
 	needPB := len(probeBackends) == 0
-	needSrv := lbServers == "" || lbServers == "None"
-	needVip := lbVIP == "" || lbVIP == "None"
+	needSrv := c.t.Vars.StrDef("apiserver_lb_servers", "") == ""
+	needVip := c.t.Vars.StrDef("apiserver_lb_vip", "") == ""
 	if !needPB && !needSrv && !needVip {
 		return probeBackends, lbServers, lbVIP
 	}
 	var ctrl, srv []string
 	vip := lbVIP
 	for _, it := range c.vl("api_lb_backends") {
-		m, _ := it.(*topology.OMap)
+		m, _ := it.(*jinja.OMap)
 		if m == nil {
 			continue
 		}
@@ -196,8 +196,8 @@ func strListVar(c *cyc, name string) []string {
 		logger().Debug("watchdog: var list looked char-split — reparsing as scalar",
 			"var", name)
 	}
-	raw := c.v(name)
-	if raw == "" || raw == "None" {
+	raw := c.t.Vars.StrDef(name, "")
+	if raw == "" {
 		return nil
 	}
 	return strings.FieldsFunc(strings.Trim(raw, `[]'"`),
@@ -370,7 +370,7 @@ func (c *cyc) ctrlDropIn(varName, file string, render func(string) []byte) {
 	r := c.r
 	path := "/etc/systemd/system/k0scontroller.service.d/" + file
 	var val any
-	if om, ok := c.t.Vars.Get(varName).(*topology.OMap); ok {
+	if om, ok := c.t.Vars.Get(varName).(*jinja.OMap); ok {
 		val, _ = om.Get(c.r.cfg.NodeName)
 	}
 	if val == nil {

@@ -69,7 +69,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 			defaultConntrackStatFile),
 		envx.StringKnob(envnames.EnvArpTableFile, &cfg.ARPTableFile,
 			defaultARPTableFile),
-		// W15-K1 clocksource files.
+		// Clocksource files.
 		envx.StringKnob(envnames.EnvClocksourceCurrentFile,
 			&cfg.ClocksourceCurrentFile, defaultClocksourceCurrentFile),
 		envx.StringKnob(envnames.EnvClocksourceAvailableFile,

@@ -244,7 +244,7 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 	// nodelocaldns nft apply + host-internal-ports nft apply
 	// (W6.1, same groupNLD) + nodeip_cpu nebula drop-in. (coredns
 	// self-gates here: nebula disabled → derive() leaves no
-	// DNSResolvers.) The W15-K2a coredump drop-in's daemon-reload
+	// DNSResolvers.) The coredump drop-in's daemon-reload
 	// is deliberately best-effort (warn-only) so the base group
 	// stays "ok" on a clean cycle. A regression that counts a
 	// fault twice (or skips one) moves this number.

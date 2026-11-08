@@ -12,6 +12,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // PodHasPVC reports whether the pod mounts a persistentVolumeClaim —
@@ -55,7 +57,8 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 	// Log line is an NPD contract: ends in "force-delete pod ..." so
 	// the StuckPodForceDeleted filelog pattern still fires.
 	d.State.AppendLog(fmt.Sprintf(
-		"POD-TEARDOWN-FORCE-DELETE: force-delete pod %s/%s (uid %.8s) - Terminating %ds, zero live tasks",
+		"POD-TEARDOWN-FORCE-DELETE: "+latchdefs.ReasonForceDeletePod+
+			"%s/%s (uid %.8s) - Terminating %ds, zero live tasks",
 		p.Namespace, p.Name, string(p.UID),
 		int64(d.Cfg.Seams.Host.Clock.Now().Sub(p.DeletionTimestamp.Time).Seconds())))
 	return d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,

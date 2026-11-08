@@ -1,4 +1,4 @@
-// mountinfo_hygiene.go — the W15-R1b mountinfo-hygiene check: the
+// mountinfo_hygiene.go — the mountinfo-hygiene check: the
 // host /proc/1/mountinfo table bloat detector plus the orphaned
 // mount reaper for the two leak groups the node actually produces:
 //
@@ -6,7 +6,7 @@
 //     /run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/rootfs
 //     whose task/container <id> is gone from the ctr listing (neither
 //     the task root nor the sandbox-controller root carries the dir
-//     any more) — the teardown died between umount and rm (W15-R1a's
+//     any more) — the teardown died between umount and rm (the ctr task reaper's
 //     predecessor leak), confirmed stale >30m via a first-sighting
 //     marker (cni-netns-gc parity).
 //   - kubelet pod volume mounts /var/lib/k0s/kubelet/pods/<uid>/volumes/*
@@ -28,8 +28,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -51,7 +49,7 @@ const (
 	mountinfoBloatEventBudget = time.Hour
 )
 
-// MountinfoCheck is the W15-R1b mountinfo table hygiene check.
+// MountinfoCheck is the mountinfo table hygiene check.
 type MountinfoCheck struct{ d *wdeps.Deps }
 
 // NewMountinfo builds the mountinfo-hygiene check.
@@ -62,8 +60,7 @@ func (c *MountinfoCheck) Name() string { return wdeps.CheckMountinfo }
 
 // Run executes one mountinfo-hygiene round.
 func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckMountinfo, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckMountinfo) {
 		return
 	}
 	data, err := os.ReadFile(c.d.Cfg.MountinfoFile)
@@ -71,7 +68,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: mountinfo-hygiene read %s failed: %v — scan skipped",
 			c.d.Cfg.MountinfoFile, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckMountinfo, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
 		return
 	}
 	hostTaskRoot := strings.TrimPrefix(c.d.Cfg.CtrTaskRoot, "/host")
@@ -183,7 +180,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if n := countLines(data); n > mountinfoBloatLines {
 		c.emitBloatEvent(ctx, n)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckMountinfo, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckMountinfo, "ok")
 }
 
 // taskDirListed reports whether <root>/<id> still exists — the ctr
@@ -251,30 +248,20 @@ func (c *MountinfoCheck) emitBloatEvent(ctx context.Context, lines int) {
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.mountinfo-bloat.%x", c.d.Cfg.NodeName, now.UnixNano()),
-			Namespace: c.d.Cfg.Host.EventNamespace,
-		},
-		EventTime: metav1.NewMicroTime(now),
+	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      fmt.Sprintf("%s.mountinfo-bloat.%x", c.d.Cfg.NodeName, now.UnixNano()),
+		Namespace: c.d.Cfg.Host.EventNamespace,
 		Reason:    "MountinfoTableBloat",
 		Note: fmt.Sprintf(
 			"host mountinfo table holds %d entries (> %d) — leaked mounts are accumulating",
 			lines, mountinfoBloatLines),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   c.d.Cfg.NodeName,
-		Action:              "MountinfoTableBloat",
+		When: now,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Node",
 			Name:       c.d.Cfg.NodeName,
 		},
-	}
-	if _, err := c.d.Cfg.Client.EventsV1().Events(c.d.Cfg.Host.EventNamespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: MountinfoTableBloat event create failed: %v", err))
+	}); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

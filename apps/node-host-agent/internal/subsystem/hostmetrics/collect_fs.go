@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 const (
@@ -224,9 +224,9 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
 	switch {
 	case anyRO:
-		c.state.Enter(hoststate.LatchFilesystemReadonly,
+		c.state.Enter(latchdefs.LatchFilesystemReadonly,
 			"a probed mount reports ST_RDONLY")
 	case probed:
-		c.state.Exit(hoststate.LatchFilesystemReadonly, nil)
+		c.state.Exit(latchdefs.LatchFilesystemReadonly, nil)
 	}
 }

@@ -23,10 +23,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 		}
 	}
 	// T10 cpu protection.
-	w := c.v("critical_cpu_weight")
-	if w == "" || w == "None" {
-		w = "500"
-	}
+	w := c.t.Vars.StrDef("critical_cpu_weight", "500")
 	if c.worker() {
 		if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/30-cpu-weight.conf",
 			[]byte("# Managed by node-config-agent - T10 CPU starvation protection\n[Service]\nCPUWeight="+w+"\n"), 0o644); ch {
@@ -42,10 +39,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 	}
 	if c.t.Found {
 		_ = r.ensureDir("/etc/systemd/system/nebula@interdc.service.d", 0o755)
-		quota := c.v("interdc_nebula_cpu_quota")
-		if quota == "" || quota == "None" {
-			quota = "150%"
-		}
+		quota := c.t.Vars.StrDef("interdc_nebula_cpu_quota", "150%")
 		if ch, _ := r.writeManaged("/etc/systemd/system/nebula@interdc.service.d/10-cpu-quota.conf",
 			[]byte("# Managed by node-config-agent - T10 nebula CPU bound\n[Service]\nCPUQuota="+quota+"\n"), 0o644); ch {
 			r.daemonReload(ctx)

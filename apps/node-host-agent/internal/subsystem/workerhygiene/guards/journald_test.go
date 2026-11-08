@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -108,13 +108,13 @@ func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
 	// journalOnce snapshot + the A5 probe) — one cycle is a streak
 	// below Needed, three must have latched.
 	e.H.Cycle(context.Background())
-	if e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("latched before the streak reached Needed")
 	}
 	for i := 0; i < 2; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if !e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if !e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("state-journal-unreadable not latched after persistent read failures")
 	}
 	if n := strings.Count(e.LogLines(t), "suspect: journal-unreadable"); n != 1 {
@@ -136,13 +136,13 @@ func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
 	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if !e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if !e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("precondition: latch should be held")
 	}
 	e.JournalErr = nil
 	e.Journal = "Oct 01 node k0sworker: healthy line\n"
 	e.H.Cycle(context.Background())
-	if e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("latch not cleared on first healthy read")
 	}
 	if n := strings.Count(e.LogLines(t), "STATE-EXIT: journal-unreadable"); n != 1 {
@@ -160,7 +160,7 @@ func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
 	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded+2; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("latched without any journal storage — must not fire")
 	}
 	if n := strings.Count(e.LogLines(t), "suspect: journal-unreadable"); n != 0 {
@@ -176,7 +176,7 @@ func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
 	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if !e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if !e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("journald-wide silence should latch journal-unreadable")
 	}
 }
@@ -190,7 +190,7 @@ func TestJournalUnreadableQuietUnitNoFire(t *testing.T) {
 	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded+2; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("quiet unit on healthy journald must not latch")
 	}
 }
@@ -202,7 +202,7 @@ func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
 	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.H.Cycle(context.Background())
 	}
-	if !e.H.State.Exists(hoststate.LatchJournalUnreadable) {
+	if !e.H.State.Exists(latchdefs.LatchJournalUnreadable) {
 		t.Fatal("'No journal files' reads should latch journal-unreadable")
 	}
 }

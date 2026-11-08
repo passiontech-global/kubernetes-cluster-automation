@@ -362,7 +362,7 @@ kine_endpoint: "postgres://x"
 
 // kineTCPEnv stages a listed kine host with a verified binary and
 // the given extra cluster vars, then runs one groupKineService
-// converge — the W15-CP1 tcp/mTLS fixture. stage runs after the
+// converge — the tcp/mTLS fixture. stage runs after the
 // reconciler exists but before the converge (host-side file prep).
 func kineTCPEnv(t *testing.T, extra string, stage func(*Reconciler)) (*Reconciler, *testutil.FakeRunner) {
 	t.Helper()
@@ -388,7 +388,7 @@ kine_endpoint: "postgres://x"
 	return r, sr
 }
 
-// W15-CP1 fail-closed: a tcp:// listener on a routable (non-loopback)
+// Fail-closed mTLS guard: a tcp:// listener on a routable (non-loopback)
 // host without all three mTLS cert files must never converge the
 // unit — last-good is kept and nothing is enabled/started.
 func TestKineServiceTCPNonLoopbackWithoutCertsRefused(t *testing.T) {

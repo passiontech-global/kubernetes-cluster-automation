@@ -1,4 +1,4 @@
-package kine
+package storelocal
 
 import (
 	"log/slog"
