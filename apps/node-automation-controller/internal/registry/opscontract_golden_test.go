@@ -10,6 +10,10 @@
 package registry
 
 import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -356,10 +360,59 @@ func TestGoldenMetricFamilies(t *testing.T) {
 			t.Errorf("live metric family %q is not pinned in goldenMetricFamilies (empty-vec families are invisible to Gather, so the golden is the full static list)", n)
 		}
 	}
+	// The golden list must match the source declarations exactly —
+	// both directions — even for Vecs that hold no series in this
+	// binary and are invisible to Gather: without the source walk a
+	// renamed or deleted Name: opt would leave the stale golden
+	// green forever (mirrors internal/envdoc's source coverage).
+	declared := goldenMetricNamesFromSource(t)
+	for name, path := range declared {
+		if !golden[name] {
+			t.Errorf("%s declares metric %q not pinned in goldenMetricFamilies — update the golden consciously", path, name)
+		}
+	}
+	for _, n := range goldenMetricFamilies {
+		if _, ok := declared[n]; !ok {
+			t.Errorf("goldenMetricFamilies pins %q but no source declares it (renamed or deleted metric — update the golden consciously)", n)
+		}
+	}
 	// A total registration regression must not pass vacuously.
 	if len(first) == 0 {
 		t.Fatal("live metric registry gathered zero families after importing internal/registry")
 	}
+}
+
+// goldenMetricNamesFromSource collects every metric Name literal the
+// non-test sources declare, keyed by declaring file, so the golden
+// covers families that hold no series at gather time. Walks the
+// package parent (internal/) — the only tree that declares metrics.
+func goldenMetricNamesFromSource(t *testing.T) map[string]string {
+	t.Helper()
+	re := regexp.MustCompile(`Name:\s+"((?:node_automation|shell_operator)_[^"]+)"`)
+	found := map[string]string{}
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, m := range re.FindAllSubmatch(src, -1) {
+			name := string(m[1])
+			if _, dup := found[name]; !dup {
+				found[name] = path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("metric source walk failed: %v", err)
+	}
+	return found
 }
 
 func TestGoldenAnnoKeys(t *testing.T) {
