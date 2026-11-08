@@ -30,9 +30,15 @@ import (
 )
 
 // Defaults — containerized default is the DaemonSet host-root mount.
+// Exported as the single source: systemd.Config.applyDefaults
+// references these instead of carrying its own private copy of the
+// same two numbers (the copies drifted risk-free only by luck).
 const (
-	defaultHostRoot = "/host"
-	defaultTimeout  = 30 * time.Second
+	// DefaultHostRoot is where the DaemonSet mounts the host fs.
+	DefaultHostRoot = "/host"
+	// DefaultTimeout bounds every spawned command when Config.Timeout
+	// is unset.
+	DefaultTimeout = 30 * time.Second
 	// maxCmdOutputBytes caps the stdout retained per spawned command —
 	// a log storm (journalctl -10min snapshot on a sick node) must not
 	// push unbounded child output into the agent's heap. The rest is
@@ -95,6 +101,23 @@ var nsenterFlag = []struct {
 	{NSPID, "-p"},
 }
 
+// NSFlags renders ns as the nsenter namespace short flags in
+// declaration order (m, u, i, n, p) — the argv fragment that
+// follows `nsenter -t 1` and precedes `--`. Exported so converge's
+// NsenterRunner shares ONE flag list with the wrap applied here:
+// its prefix must stay flag-identical (the NSAll set) even though
+// it deliberately keeps its own timeout policy instead of stacking
+// Config.Timeout.
+func NSFlags(ns NS) []string {
+	var flags []string
+	for _, f := range nsenterFlag {
+		if ns&f.bit != 0 {
+			flags = append(flags, f.opt)
+		}
+	}
+	return flags
+}
+
 // Config carries the exec seam — all test-injectable.
 type Config struct {
 	// HostRoot is where the host filesystem is mounted. "/" means the
@@ -119,10 +142,10 @@ type Config struct {
 
 func (c *Config) applyDefaults() {
 	if c.HostRoot == "" {
-		c.HostRoot = defaultHostRoot
+		c.HostRoot = DefaultHostRoot
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = defaultTimeout
+		c.Timeout = DefaultTimeout
 	}
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
@@ -200,7 +223,7 @@ func New(cfg Config) *Runner {
 // stderr goes to the child's stderr. ctx is additionally bounded by
 // Config.Timeout.
 func (r *Runner) Exec(ctx context.Context, ns NS, name string, args ...string) (string, error) {
-	return r.ExecBounded(ctx, ns, r.cfg.Timeout, name, args...)
+	return r.execBounded(ctx, ns, 0, r.cfg.RunCmd, name, args...)
 }
 
 // ExecBounded is Exec with a per-call budget in place of
@@ -209,12 +232,7 @@ func (r *Runner) Exec(ctx context.Context, ns NS, name string, args ...string) (
 // `timeout 90 systemctl restart`). ctx still bounds the call from
 // above. budget <= 0 falls back to Config.Timeout.
 func (r *Runner) ExecBounded(ctx context.Context, ns NS, budget time.Duration, name string, args ...string) (string, error) {
-	if budget <= 0 {
-		budget = r.cfg.Timeout
-	}
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	return r.cfg.RunCmd(cctx, r.argv(ns, name, args))
+	return r.execBounded(ctx, ns, budget, r.cfg.RunCmd, name, args...)
 }
 
 // ExecCombined is Exec with the child's STDERR folded into the
@@ -224,18 +242,25 @@ func (r *Runner) ExecBounded(ctx context.Context, ns NS, budget time.Duration, n
 // code). Callers that only want stdout keep Exec — the signature
 // contract is unchanged.
 func (r *Runner) ExecCombined(ctx context.Context, ns NS, name string, args ...string) (string, error) {
-	return r.ExecCombinedBounded(ctx, ns, r.cfg.Timeout, name, args...)
+	return r.execBounded(ctx, ns, 0, r.cfg.RunCmdCombined, name, args...)
 }
 
 // ExecCombinedBounded is ExecBounded with stderr folded into the
 // returned output — the ExecCombined/ExecBounded pairing.
 func (r *Runner) ExecCombinedBounded(ctx context.Context, ns NS, budget time.Duration, name string, args ...string) (string, error) {
+	return r.execBounded(ctx, ns, budget, r.cfg.RunCmdCombined, name, args...)
+}
+
+// execBounded is the shared body of the Runner quartet: budget <= 0
+// falls back to Config.Timeout, ctx is additionally bounded by that
+// budget, and run picks the stdout-only vs stderr-combined seam.
+func (r *Runner) execBounded(ctx context.Context, ns NS, budget time.Duration, run func(context.Context, []string) (string, error), name string, args ...string) (string, error) {
 	if budget <= 0 {
 		budget = r.cfg.Timeout
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	return r.cfg.RunCmdCombined(cctx, r.argv(ns, name, args))
+	return run(cctx, r.argv(ns, name, args))
 }
 
 // argv applies the nsenter host-namespace wrap selected by ns —
@@ -246,12 +271,7 @@ func (r *Runner) argv(ns NS, name string, args []string) []string {
 	if r.cfg.HostRoot == "/" || ns == NSNone {
 		return argv
 	}
-	prefix := []string{"nsenter", "-t", "1"}
-	for _, f := range nsenterFlag {
-		if ns&f.bit != 0 {
-			prefix = append(prefix, f.opt)
-		}
-	}
+	prefix := append([]string{"nsenter", "-t", "1"}, NSFlags(ns)...)
 	return append(append(prefix, "--"), argv...)
 }
 

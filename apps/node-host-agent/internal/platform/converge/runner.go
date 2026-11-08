@@ -20,16 +20,19 @@ type Runner interface {
 
 // NsenterRunner enters PID 1 mount/uts/ipc/net/pid namespaces —
 // the same access community.docker.nsenter gave the ansible pod.
-// The flag set is hostexec.NSAll spelled out in argv: it is NOT
-// routed through hostexec.Runner because that would stack its own
-// Config.Timeout on top of the deadline RunBudget already applied
-// to ctx — only the exec plumbing (capped output, WaitDelay) is
-// shared, via hostexec.RunCombined.
+// The flag list is hostexec.NSFlags(hostexec.NSAll) — one shared
+// definition with the hostexec wrap (the flags cannot drift apart).
+// It is still NOT routed through hostexec.Runner: that would stack
+// its own Config.Timeout on top of the deadline RunBudget already
+// applied to ctx — only the exec plumbing (capped output,
+// WaitDelay) is shared, via hostexec.RunCombined.
 type NsenterRunner struct{}
 
 func (NsenterRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	argv := append([]string{"nsenter", "-t", "1",
-		"-m", "-u", "-i", "-n", "-p", "--", name}, args...)
+	argv := []string{"nsenter", "-t", "1"}
+	argv = append(argv, hostexec.NSFlags(hostexec.NSAll)...)
+	argv = append(argv, "--", name)
+	argv = append(argv, args...)
 	out, err := hostexec.RunCombined(ctx, argv...)
 	return strings.TrimRight(out, "\n"), err
 }

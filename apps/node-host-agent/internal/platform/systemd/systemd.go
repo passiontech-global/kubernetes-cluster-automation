@@ -34,9 +34,9 @@ import (
 )
 
 // Defaults — containerized default is the DaemonSet host-root mount.
+// HostRoot/Timeout come from hostexec's exported consts (single
+// source — this package used to carry a private copy of the pair).
 const (
-	defaultHostRoot = "/host"
-	defaultTimeout  = 30 * time.Second
 	// defaultProcUptimeFile: hostPID:true makes the pod's /proc the
 	// HOST /proc, so the plain path is right even when HostRoot is
 	// mounted at /host (the nsenter wrapping covers commands, not
@@ -71,10 +71,10 @@ type Config struct {
 
 func (c *Config) applyDefaults() {
 	if c.HostRoot == "" {
-		c.HostRoot = defaultHostRoot
+		c.HostRoot = hostexec.DefaultHostRoot
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = defaultTimeout
+		c.Timeout = hostexec.DefaultTimeout
 	}
 	if c.ProcUptimeFile == "" {
 		c.ProcUptimeFile = defaultProcUptimeFile
@@ -109,7 +109,7 @@ func New(cfg Config) *Client {
 // (fail2ban-client, ip) share the same nsenter path. ctx is
 // additionally bounded by Config.Timeout.
 func (c *Client) Exec(ctx context.Context, name string, args ...string) (string, error) {
-	return c.host.Exec(ctx, hostexec.NSAll, name, args...)
+	return c.exec(ctx, 0, false, name, args...)
 }
 
 // ExecCombined is Exec with the child's STDERR folded into the
@@ -119,7 +119,7 @@ func (c *Client) Exec(ctx context.Context, name string, args ...string) (string,
 // code). Callers that only want stdout keep Exec — the signature
 // contract is unchanged.
 func (c *Client) ExecCombined(ctx context.Context, name string, args ...string) (string, error) {
-	return c.host.ExecCombined(ctx, hostexec.NSAll, name, args...)
+	return c.exec(ctx, 0, true, name, args...)
 }
 
 // ExecBounded is Exec with a per-call budget replacing Config.Timeout
@@ -128,13 +128,24 @@ func (c *Client) ExecCombined(ctx context.Context, name string, args ...string) 
 // systemctl restart`). ctx still bounds the call from above;
 // budget <= 0 falls back to Config.Timeout.
 func (c *Client) ExecBounded(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
-	return c.host.ExecBounded(ctx, hostexec.NSAll, budget, name, args...)
+	return c.exec(ctx, budget, false, name, args...)
 }
 
 // ExecCombinedBounded is ExecBounded with stderr folded into the
 // returned output — the ExecCombined/ExecBounded pairing.
 func (c *Client) ExecCombinedBounded(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
-	return c.host.ExecCombinedBounded(ctx, hostexec.NSAll, budget, name, args...)
+	return c.exec(ctx, budget, true, name, args...)
+}
+
+// exec is the shared body of the Client quartet: every systemd
+// command enters NSAll, and the budget/combined pair selects which
+// hostexec seam runs it. budget <= 0 (the unbounded Exec/ExecCombined
+// pair) falls back to Config.Timeout inside hostexec.
+func (c *Client) exec(ctx context.Context, budget time.Duration, combined bool, name string, args ...string) (string, error) {
+	if combined {
+		return c.host.ExecCombinedBounded(ctx, hostexec.NSAll, budget, name, args...)
+	}
+	return c.host.ExecBounded(ctx, hostexec.NSAll, budget, name, args...)
 }
 
 func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) {

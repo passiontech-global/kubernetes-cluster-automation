@@ -7,10 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
@@ -53,49 +53,23 @@ func (h Host) WriteManaged(path string, content []byte, mode os.FileMode) (bool,
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fail(err)
 	}
-	tmp := dst + ".converge.tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
+	// The stage→write→fsync→rename sequence is hostutil.WriteAtomic —
+	// one implementation shared with WriteFileAtomic/promfile.Write.
+	// The staging name stays the FIXED ".converge.tmp" contract (a
+	// documented name tests and ops sweep, not a glob-avoidance
+	// shape); the mode is the caller's — or the existing file's —
+	// perm bits; AfterSync evicts the just-written pages so a staged
+	// binary's cache charge does not outlive the write (see pagecache
+	// doc; post-Sync the pages are clean, so DONTNEED drops them
+	// outright). DirSync failure now surfaces as an error (the shared
+	// core reports it; this verb used to swallow it).
+	if err := hostutil.WriteAtomic(dst, content, hostutil.AtomicOpts{
+		Stage:     hostutil.StageFixed(filepath.Base(dst) + ".converge.tmp"),
+		Mode:      mode,
+		AfterSync: pagecache.Drop,
+		DirSync:   true,
+	}); err != nil {
 		return fail(err)
-	}
-	// A short write is a failed write — n < len(content) means a
-	// truncated file would be promoted by the rename below.
-	if n, err := f.Write(content); err != nil || n < len(content) {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		if err == nil {
-			err = io.ErrShortWrite
-		}
-		return fail(err)
-	}
-	// fsync BEFORE rename — the content must be durable at the final
-	// name, so a crash after rename can never expose a zeroed file.
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	// Evict the just-written pages — a staged binary's cache charge
-	// outlives the write otherwise (see pagecache doc). After Sync
-	// the pages are clean, so DONTNEED drops them outright.
-	pagecache.Drop(f)
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	// Parent-dir fsync: the rename is only durable once the new
-	// directory entry is flushed.
-	if d, err := os.Open(filepath.Dir(dst)); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
 	}
 	logger().Info("converge: wrote managed file", "path", path)
 	return true, nil
