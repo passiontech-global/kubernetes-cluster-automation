@@ -3,6 +3,7 @@ package nodereporter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -837,4 +838,38 @@ func TestConditionsSyncBeforeMonitorWedge(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("zombie condition never reconciled — monitor wedge starved syncConditions")
+}
+
+// --- Name + EnterLatch + Run contracts ---
+
+func TestNameIdentifiesReporter(t *testing.T) {
+	if got := fixture(t).r.Name(); got != "nodereporter" {
+		t.Fatalf("Name()=%q want nodereporter", got)
+	}
+}
+
+func TestEnterLatchWritesStateFile(t *testing.T) {
+	e := fixture(t)
+	npdSink{e.r}.EnterLatch("test-kernel-lockup", "evidence=1")
+	data, err := os.ReadFile(filepath.Join(e.dir, "state-test-kernel-lockup"))
+	if err != nil {
+		t.Fatalf("latch state file missing: %v", err)
+	}
+	// The latch file carries the entry epoch (not the evidence — that
+	// goes to the watchdog log).
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", new(int64)); err != nil {
+		t.Fatalf("state file content=%q want epoch", data)
+	}
+}
+
+func TestRunSyncsOnceThenReturnsOnCancelledContext(t *testing.T) {
+	e := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cycle.Run executes one cycle, then sees ctx done
+	e.r.Run(ctx)
+	if got := e.cs.Actions(); len(got) == 0 {
+		// One cycle ran — syncConditions should have issued at least
+		// a node GET (actions are recorded even for reads).
+		t.Fatal("Run must execute one cycle before honouring cancellation")
+	}
 }

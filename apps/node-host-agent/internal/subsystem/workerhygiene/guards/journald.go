@@ -11,15 +11,11 @@ import (
 )
 
 const (
-	// journalWindow mirrors the runner's `journalctl -u k0sworker
-	// --since "-10 min"` shared snapshot.
+	// journaldVacuumAge is the --vacuum-time the A5 remedy passes.
+	journaldVacuumAge = "3d"
 	// journaldVacuumInterval bounds how often the A5 remedy runs —
 	// journalctl --rotate is cheap but --vacuum-time does real IO.
 	journaldVacuumInterval = 30 * time.Minute
-	// defaultJournalUnreadableNeeded is the consecutive-failed-read
-	// budget for the journal-unreadable blindness latch (cicd
-	// controller incident: broken journald left every journal-based
-	// check silently seeing "0 hits").
 )
 
 // --- Check: journald integrity (A5) ---
@@ -31,21 +27,115 @@ const (
 // journal-unreadable tracker owns that signal). The remedy is the
 // operator's rotate+vacuum, bounded by a rate budget.
 //
-// The same probes feed the journal-unreadable accounting: when
-// journald cannot answer at all (read error, "No journal files", or
-// a journald-wide empty unfiltered reply) for JournalUnreadableNeeded
-// consecutive reads AND journal storage exists, the
-// state-journal-unreadable latch marks the blindness — the
-// rotate+vacuum remedy only covers the CORRUPT subset, a dead or
-// mute journald needs surfacing, not vacuuming.
+// The classification + streak + budget + rotate pipeline lives in the
+// shared journalwatch.Integrity helper; this check wires its seams
+// (JournalFn/JournalAnyFn probes, Systemd remedy transport,
+// last-journald-vacuum budget, the State.AppendLog lines) and keeps
+// the journal-unreadable accounting bespoke — the same probes feed it
+// through noteJournalRead: when journald cannot answer at all (read
+// error, "No journal files", or a journald-wide empty unfiltered
+// reply) for JournalUnreadableNeeded consecutive reads AND journal
+// storage exists, the state-journal-unreadable latch marks the
+// blindness — the rotate+vacuum remedy only covers the CORRUPT
+// subset, a dead or mute journald needs surfacing, not vacuuming.
 
-// JournaldCheck is the A5 probe as a Check. It owns the
-// corrupt/empty streak (ex-Hygiene.journaldFails); the
-// journal-unreadable tracker stays on deps — Cycle's shared
-// journalOnce snapshot also feeds it through noteJournalRead.
+// JournaldCheck is the A5 probe as a Check. The corrupt/empty streak
+// lives inside the shared integrity helper (ex-c.fails).
 type JournaldCheck struct {
-	d     *wdeps.Deps
-	fails int // consecutive corrupt/empty cycles (ConsecNeeded → remedy)
+	d  *wdeps.Deps
+	ig *journalwatch.Integrity
+}
+
+// newJournaldIntegrity wires the shared pipeline to this check's
+// seams. The probe + disambiguation closures read the JournalFn /
+// JournalAnyFn seams at CALL time (tests re-stub them after New);
+// StreakNeeded and the remedy transport freeze at construction —
+// ApplyDefaults has already filled both by the time initChecks runs.
+func newJournaldIntegrity(d *wdeps.Deps) *journalwatch.Integrity {
+	var remedy func(ctx context.Context, args ...string) (string, error)
+	if d.Cfg.Systemd != nil {
+		sd := d.Cfg.Systemd
+		remedy = func(ctx context.Context, args ...string) (string, error) {
+			return sd.Exec(ctx, "journalctl", args...)
+		}
+	}
+	return journalwatch.NewIntegrity(journalwatch.IntegrityConfig{
+		// The runner's shared -10min k0sworker snapshot (05/06):
+		// `journalctl -u k0sworker.service --since "-10 min"
+		// --no-pager` with stderr folded in by the seam, so a
+		// corrupt-file notice survives even a non-zero exit and
+		// still counts here.
+		Probe: func(ctx context.Context) (string, error) {
+			return d.Cfg.Seams.Host.JournalFn(ctx)
+		},
+		// Only OUTPUT evidence counts as corruption: an exec-level
+		// error (nsenter/journalctl timeout, transient host exec
+		// failure) means journald never answered — that is
+		// journal-UNREADABLE, not corrupt. Lumping err into "corrupt"
+		// ran the rotate+vacuum remedy on every cooldown for a purely
+		// transient failure.
+		Markers: []string{"corrupt"},
+		// "No k0sworker lines in 10m" is ambiguous — a
+		// healthy-but-quiet unit hits the same branch as real
+		// corruption, and remediating it would rotate+vacuum every
+		// cooldown forever. Second probe: the UNFILTERED journal.
+		// Any answered line — including a "No journal files were
+		// found." notice — means journald is fine and the unit is
+		// just silent (EmptyQuiet): the pre-Integrity check cleared
+		// the empty window on exactly this condition (non-blank, no
+		// corrupt warning), so a files-gone notice stays a healthy
+		// read, not a fault. An error, a literally empty reply or a
+		// "corrupt" warning is journald-level anomaly (EmptyFault —
+		// only then remediate). The detail feeds the unreadable
+		// accounting below: the corrupt-warning case carries ""
+		// because journald ANSWERED.
+		DisambiguateEmpty: func(ctx context.Context) (journalwatch.EmptyClass, string) {
+			unfiltered, uerr := d.Cfg.Seams.Host.JournalAnyFn(ctx)
+			switch {
+			case uerr != nil:
+				return journalwatch.EmptyFault,
+					fmt.Sprintf("unfiltered probe failed: %v", uerr)
+			case strings.Contains(strings.ToLower(unfiltered), "corrupt"):
+				return journalwatch.EmptyFault, ""
+			case strings.TrimSpace(unfiltered) == "":
+				return journalwatch.EmptyFault, "journald-wide empty reply"
+			default:
+				return journalwatch.EmptyQuiet, ""
+			}
+		},
+		StreakNeeded: d.Cfg.ConsecNeeded,
+		VacuumAge:    journaldVacuumAge,
+		Remedy:       remedy,
+		// Atomic try-and-spend: a confirmed streak without budget is
+		// skipped (and logged) without burning a slot.
+		SpendBudget: func() bool {
+			return d.State.RateTrySpend("last-journald-vacuum", journaldVacuumInterval)
+		},
+		Sink: journalwatch.IntegritySink{
+			StreakPending: func(v journalwatch.Verdict, n, needed int) {
+				d.State.AppendLog(fmt.Sprintf(
+					"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
+					v.Corrupt, v.Empty, v.Err, n, needed))
+			},
+			BudgetSkipped: func() {
+				d.State.AppendLog("suspect: journald-integrity confirmed but vacuum " +
+					"cooldown active — skip")
+			},
+			Action: func(v journalwatch.Verdict) {
+				d.State.AppendLog(fmt.Sprintf(
+					"ACTION: journalctl --rotate --vacuum-time=%s - journal corrupt=%v empty=%v err=%v for active k0sworker",
+					journaldVacuumAge, v.Corrupt, v.Empty, v.Err))
+			},
+			RemedyFailed: func(out string, err error) {
+				d.State.AppendLog(fmt.Sprintf(
+					"suspect: journalctl --rotate --vacuum-time=%s failed: %v (%s)",
+					journaldVacuumAge, err, strings.TrimSpace(out)))
+			},
+			RemedyDone: func() {
+				d.Actions.WithLabelValues(wdeps.CheckJournald, "rotate_vacuum").Inc()
+			},
+		},
+	})
 }
 
 // Name returns the check label / WD_SIG key.
@@ -56,98 +146,40 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckJournald) {
 		return
 	}
-	out, err := c.d.Cfg.Seams.Host.JournalFn(ctx)
-	// Only OUTPUT evidence counts as corruption: an exec-level error
-	// (nsenter/journalctl timeout, transient host exec failure) means
-	// journald never answered — that is journal-UNREADABLE, not
-	// corrupt. Lumping err into "corrupt" ran the rotate+vacuum
-	// remedy on every cooldown for a purely transient failure.
-	// Journal() folds stderr in, so a corrupt-file notice survives
-	// even a non-zero exit and still counts here.
-	corrupt := strings.Contains(strings.ToLower(out), "corrupt")
-	empty := err == nil && strings.TrimSpace(out) == ""
-	var unfiltered string
-	var uerr error
-	if empty {
-		// "No k0sworker lines in 10m" is ambiguous — a
-		// healthy-but-quiet unit hits the same branch as real
-		// corruption, and remediating it would rotate+vacuum every
-		// cooldown forever. Second probe: the UNFILTERED journal.
-		// Any line means journald is fine and the unit is just
-		// silent; an error, an empty reply, or a "corrupt" warning
-		// is journald-level anomaly — only then remediate.
-		unfiltered, uerr = c.d.Cfg.Seams.Host.JournalAnyFn(ctx)
-		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
-			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
-			empty = false
-		}
-	}
+	v := c.ig.Classify(ctx)
 	// journal-unreadable accounting: a "corrupt" notice means
 	// journald ANSWERED (A5's remedy owns that path) — only a read
 	// that produced literally nothing while journald should be
-	// talking counts as blindness.
+	// talking counts as blindness. A stood empty read is blindness
+	// exactly when the disambiguation gave a reason (the "" detail is
+	// the corrupt-warning answer — journald talked, A5 owns it).
 	unreadable := false
 	udetail := ""
 	switch {
-	case err != nil:
-		unreadable, udetail = true, fmt.Sprintf("read failed: %v", err)
-	case journalwatch.FilesGone(out):
+	case v.Err != nil:
+		unreadable, udetail = true, fmt.Sprintf("read failed: %v", v.Err)
+	case journalwatch.FilesGone(v.Out):
 		unreadable, udetail = true, "journalctl reports no journal files"
-	case empty:
-		switch {
-		case uerr != nil:
-			unreadable, udetail = true,
-				fmt.Sprintf("unfiltered probe failed: %v", uerr)
-		case journalwatch.FilesGone(unfiltered):
-			unreadable, udetail = true,
-				"journalctl reports no journal files"
-		case strings.TrimSpace(unfiltered) == "":
-			unreadable, udetail = true, "journald-wide empty reply"
-		}
+	case v.Empty:
+		unreadable, udetail = v.Detail != "", v.Detail
 	}
 	c.d.NoteJournalRead(!unreadable, udetail)
-	switch {
-	case corrupt, empty:
-		if c.d.StreakPending(&c.fails, fmt.Sprintf(
-			"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active",
-			corrupt, empty, err)) {
-			c.d.CycleResult(wdeps.CheckJournald, "ok")
-			return
-		}
-	case err != nil:
+	switch c.ig.Act(ctx, v) {
+	case journalwatch.OutcomePending, journalwatch.OutcomeHealthy,
+		journalwatch.OutcomeBudget, journalwatch.OutcomeRemediated:
+		// Pending = streak still below ConsecNeeded (progress line
+		// logged by the sink); Budget = confirmed but in cooldown
+		// (skip line logged by the sink). Both report ok.
+		c.d.CycleResult(wdeps.CheckJournald, "ok")
+	case journalwatch.OutcomeInconclusive:
 		// Exec failure without corruption evidence — inconclusive
-		// (the unreadable tracker owns this signal): keep the fail
-		// streak intact but never grow it, and never vacuum.
+		// (the unreadable tracker owns this signal): the streak is
+		// held but never grown, and never vacuumed.
 		c.d.CycleResult(wdeps.CheckJournald, "abort")
-		return
-	default:
-		c.fails = 0
-		c.d.CycleResult(wdeps.CheckJournald, "ok")
-		return
-	}
-	if c.d.Cfg.Systemd == nil {
+	case journalwatch.OutcomeGated:
+		// Confirmed but no remedy transport wired (nil Systemd).
 		c.d.CycleResult(wdeps.CheckJournald, "gated")
-		return
 	}
-	if !c.d.State.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
-		c.d.State.AppendLog("suspect: journald-integrity confirmed but vacuum " +
-			"cooldown active — skip")
-		c.d.CycleResult(wdeps.CheckJournald, "ok")
-		return
-	}
-	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: journalctl --rotate --vacuum-time=3d - journal corrupt=%v empty=%v err=%v for active k0sworker",
-		corrupt, empty, err))
-	if jout, jerr := c.d.Cfg.Systemd.Exec(ctx,
-		"journalctl", "--rotate", "--vacuum-time=3d"); jerr != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: journalctl --rotate --vacuum-time=3d failed: %v (%s)",
-			jerr, strings.TrimSpace(jout)))
-	} else {
-		c.d.Actions.WithLabelValues(wdeps.CheckJournald, "rotate_vacuum").Inc()
-	}
-	c.fails = 0
-	c.d.CycleResult(wdeps.CheckJournald, "ok")
 }
 
 // --- Check: cilium-envoy readiness + agent healthz (2.5 & B1) ---

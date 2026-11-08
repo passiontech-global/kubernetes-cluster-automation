@@ -15,7 +15,7 @@
 //     envoy, B4 MTU, W5.6 WG peers, W7-H3 LRP DNS)
 //   - guards/  — dstate_scopes.go (A2 zombie, W7-H1 D-state, W7-H2
 //     scopes), psi_thrash.go (W2), journald.go (A5),
-//     spegel_calico_netns.go (W7-H4/H7, W9 netns)
+//     spegel.go / calico.go / cni_netns.go (W7-H4/H7, W9 netns)
 //   - runtime/ — runtime_<name>.go (the eight runtime-resource
 //     guards, one file each — see runtime_common.go for the family
 //     overview),

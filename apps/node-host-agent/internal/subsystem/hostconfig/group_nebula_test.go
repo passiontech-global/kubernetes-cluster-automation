@@ -228,3 +228,59 @@ func TestNebulaDisableRunsUnconditionalCleanup(t *testing.T) {
 		t.Fatal("refused marker_base not counted")
 	}
 }
+
+// ---------- nebula.yaml render ----------
+
+// TestNebulaConfigRendersSharedCtx — nebulaConfig renders
+// nebula.yaml.j2 through the shared tplCtx: the mesh identity (pki
+// paths, static_host_map underlay of the lighthouse, listen port/dev,
+// stats listener, lighthouse role) must come out of the vars for hub
+// and spoke alike.
+func TestNebulaConfigRendersSharedCtx(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	b, err := c.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	cfg := string(b)
+	for _, want := range []string{
+		"ca: /etc/nebula/interdc/ca.crt",
+		// node-a is the hub → am lighthouse, own marker+underlay in
+		// static_host_map (marker = base + last octet of 10.0.1.10).
+		"am_lighthouse: True",
+		`"172.29.0.10": ["10.0.1.10:45670"]`,
+		"port: 45670",
+		"dev: neb1",
+		"listen: 127.0.0.1:9800",
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Fatalf("hub config missing %q:\n%s", want, cfg)
+		}
+	}
+
+	// spoke: am_lighthouse flips and the hub marker lands in hosts.
+	r2, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := loadCyc(t, r2, vars, "node-b")
+	b2, err := c2.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render node-b: %v", err)
+	}
+	cfg2 := string(b2)
+	if !strings.Contains(cfg2, "am_lighthouse: False") {
+		t.Fatalf("spoke config must not be a lighthouse:\n%s", cfg2)
+	}
+	if !strings.Contains(cfg2, `- "172.29.0.10"`) {
+		t.Fatalf("spoke hosts missing the hub marker:\n%s", cfg2)
+	}
+}

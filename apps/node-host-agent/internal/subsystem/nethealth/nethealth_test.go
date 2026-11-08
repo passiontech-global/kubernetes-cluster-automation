@@ -239,3 +239,11 @@ func TestSignalDisabledSkipsCheck(t *testing.T) {
 		t.Fatal("nebula check ran despite WD_SIG disable")
 	}
 }
+
+// --- Name contract ---
+
+func TestNameIdentifiesNetHealth(t *testing.T) {
+	if got := fixture(t, nil).n.Name(); got != "nethealth" {
+		t.Fatalf("Name()=%q want nethealth", got)
+	}
+}

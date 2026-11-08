@@ -94,6 +94,11 @@ func (f *Feeder) Run(ctx context.Context) {
 
 	fails := 0
 	everOK := false
+	// Reusable cycle timer: Reset re-arms from end-of-work before each
+	// wait (time.After parity) instead of allocating a new timer per
+	// cycle; a Reset also supersedes any tick that fired mid-cycle.
+	timer := time.NewTimer(fcfg.Interval)
+	defer timer.Stop()
 	for {
 		// MainPID drift: readable-and-different → the instance we
 		// tracked ended. Re-arm grace like a fresh feeder unit
@@ -163,10 +168,11 @@ func (f *Feeder) Run(ctx context.Context) {
 			f.d.Feeding.Set(0)
 		}
 
+		timer.Reset(fcfg.Interval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(fcfg.Interval):
+		case <-timer.C:
 		}
 	}
 }
@@ -175,14 +181,17 @@ func (f *Feeder) Run(ctx context.Context) {
 // readable — the feeder start-time `exit 0 + Restart=always retry`
 // mapped into an in-process wait.
 func (f *Feeder) waitMainPID(ctx context.Context, unit string) string {
+	timer := time.NewTimer(f.d.Cfg.Feeder.Interval)
+	defer timer.Stop()
 	for {
 		if mp := f.unitProp(ctx, unit, "MainPID"); mp != "" && mp != "0" {
 			return mp
 		}
+		timer.Reset(f.d.Cfg.Feeder.Interval)
 		select {
 		case <-ctx.Done():
 			return ""
-		case <-time.After(f.d.Cfg.Feeder.Interval):
+		case <-timer.C:
 		}
 	}
 }

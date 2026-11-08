@@ -318,3 +318,97 @@ func TestIsEnabledAcceptsEnabledVocabulary(t *testing.T) {
 // platform/hostexec now — that package owns the default
 // exec.CommandContext runners, the capped output sink and the
 // pipe-close grace bound.
+
+// TestExecBoundedReplacesTimeout: ExecBounded swaps Config.Timeout
+// for the per-call budget (the apiserver wedge gate's `timeout 90
+// systemctl restart`), while budget <= 0 falls back to
+// Config.Timeout.
+func TestExecBoundedReplacesTimeout(t *testing.T) {
+	var deadline time.Duration
+	c := New(Config{
+		HostRoot: "/",
+		Timeout:  2 * time.Second,
+		RunCmd: func(ctx context.Context, argv []string) (string, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				return "", errors.New("ctx has no deadline — budget not applied")
+			}
+			deadline = time.Until(dl)
+			return "ok", nil
+		},
+	})
+
+	if _, err := c.ExecBounded(context.Background(), 90*time.Second,
+		"systemctl", "restart", "k0scontroller.service"); err != nil {
+		t.Fatal(err)
+	}
+	if deadline <= 0 || deadline > 90*time.Second {
+		t.Fatalf("budget deadline=%v want (0, 90s]", deadline)
+	}
+
+	// budget <= 0 → Config.Timeout (2s) — the unbounded-Exec default.
+	if _, err := c.ExecBounded(context.Background(), 0,
+		"systemctl", "daemon-reload"); err != nil {
+		t.Fatal(err)
+	}
+	if deadline <= 0 || deadline > 2*time.Second {
+		t.Fatalf("fallback deadline=%v want (0, 2s]", deadline)
+	}
+}
+
+// TestExecBoundedArgvKeepsNsenterWrap: the bounded path enters the
+// same NSAll namespace set as Exec — systemctl must reach the HOST
+// manager even under a remediation budget.
+func TestExecBoundedArgvKeepsNsenterWrap(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/host", RunCmd: f.Run})
+	if _, err := c.ExecBounded(context.Background(), 90*time.Second,
+		"systemctl", "restart", "k0scontroller.service"); err != nil {
+		t.Fatal(err)
+	}
+	want := "nsenter -t 1 -m -u -i -n -p -- systemctl restart k0scontroller.service"
+	if f.Count() != 1 || f.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", f.Joined(), want)
+	}
+}
+
+// TestExecCombinedBoundedFoldsStderr: the bounded+combined pairing —
+// stderr evidence must survive the per-call budget, which lands on
+// the child ctx exactly like ExecBounded.
+func TestExecCombinedBoundedFoldsStderr(t *testing.T) {
+	combined := newFake()
+	combined.On("journalctl -u k0sworker.service --since -10 min",
+		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n")
+	stdoutOnlyCalled := false
+	var deadline time.Duration
+	c := New(Config{
+		HostRoot: "/",
+		Timeout:  2 * time.Second,
+		RunCmd: func(context.Context, []string) (string, error) {
+			stdoutOnlyCalled = true
+			return "", nil
+		},
+		RunCmdCombined: func(ctx context.Context, argv []string) (string, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				return "", errors.New("ctx has no deadline — budget not applied")
+			}
+			deadline = time.Until(dl)
+			return combined.Run(ctx, argv)
+		},
+	})
+	out, err := c.ExecCombinedBounded(context.Background(), 45*time.Second,
+		"journalctl", "-u", "k0sworker.service", "--since", "-10 min", "--no-pager")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdoutOnlyCalled {
+		t.Fatal("ExecCombinedBounded must use the combined runner — stderr evidence is lost on Exec")
+	}
+	if !strings.Contains(out, "corrupt") {
+		t.Fatalf("out=%q want the stderr corruption notice", out)
+	}
+	if deadline <= 0 || deadline > 45*time.Second {
+		t.Fatalf("budget deadline=%v want (0, 45s]", deadline)
+	}
+}

@@ -5,6 +5,7 @@ package guards_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,6 +77,29 @@ func TestJournaldQuietUnitHealthyJournaldNoRotate(t *testing.T) {
 	}
 	if !e.SDRan("journalctl -n 1 --no-pager") {
 		t.Fatal("the unfiltered journald probe should have run for the empty case")
+	}
+}
+
+// TestJournaldFilesGoneUnfilteredHealthy is the parity pin: an
+// unfiltered probe answered "No journal files were found." is
+// journald ANSWERING — the pre-Integrity check cleared the empty
+// window on exactly this reply (healthy read: streak reset, no
+// rotate, no blindness-latch feed). Only probe errors, blank replies
+// and corrupt warnings are anomalies.
+func TestJournaldFilesGoneUnfilteredHealthy(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.Journal = "" // empty k0sworker window…
+	e.SDReply["journalctl -n 1"] = "No journal files were found."
+	for range 3 { // past ConsecNeeded=2 — a fault would rotate by cycle 2
+		e.H.Cycle(context.Background())
+	}
+	if e.SDRan("journalctl --rotate") {
+		t.Fatal("files-gone unfiltered answer must not trigger rotate")
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchJournalUnreadable)); !os.IsNotExist(err) {
+		t.Fatal("journal-unreadable latch must not fire on an answered probe")
 	}
 }
 

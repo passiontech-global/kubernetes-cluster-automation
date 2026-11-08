@@ -45,6 +45,11 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	// + error log every cycle; a run that outlived the
 	// current backoff counts as healthy and resets it.
 	backoff := 5 * time.Second
+	// Reusable backoff timer: Reset(wait) re-arms from end-of-work
+	// before each wait (time.After parity), so a run that outlives
+	// the current backoff can't let a stale tick skip the next one.
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
 	for {
 		began := time.Now()
 		up.Set(1)
@@ -76,10 +81,11 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		wait := backoff + time.Duration(rand.Float64()*2-1)*(backoff*3/20)
 		logger().Error("subsystem exited unexpectedly — restarting",
 			"subsystem", name, "backoff", backoff, "wait", wait)
+		timer.Reset(wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(wait):
+		case <-timer.C:
 		}
 		if backoff *= 2; backoff > 5*time.Minute {
 			backoff = 5 * time.Minute

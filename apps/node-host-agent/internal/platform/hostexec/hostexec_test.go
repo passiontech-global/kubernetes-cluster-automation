@@ -186,3 +186,164 @@ func TestWaitDelayUnsticksInheritedPipe(t *testing.T) {
 		t.Fatalf("combined took %v — pipe-close grace not enforced", took)
 	}
 }
+
+// TestExecBoundedBudgetReplacesTimeout: the per-call budget lands on
+// the child ctx in place of Config.Timeout (the apiserver wedge
+// gate's `timeout 90 systemctl restart`); budget <= 0 falls back to
+// Config.Timeout.
+func TestExecBoundedBudgetReplacesTimeout(t *testing.T) {
+	var deadline time.Duration
+	r := New(Config{
+		HostRoot: "/",
+		Timeout:  2 * time.Second,
+		RunCmd: func(ctx context.Context, _ []string) (string, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				return "", errors.New("ctx has no deadline — budget not applied")
+			}
+			deadline = time.Until(dl)
+			return "", nil
+		},
+	})
+	if _, err := r.ExecBounded(context.Background(), NSNone, 90*time.Second, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if deadline <= 0 || deadline > 90*time.Second {
+		t.Fatalf("budget deadline=%v want (0, 90s]", deadline)
+	}
+
+	if _, err := r.ExecBounded(context.Background(), NSNone, 0, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if deadline <= 0 || deadline > 2*time.Second {
+		t.Fatalf("fallback deadline=%v want (0, 2s]", deadline)
+	}
+}
+
+// TestExecCombinedBoundedUsesCombinedSeam: the bounded+combined
+// pairing — the combined seam carries the stderr evidence and the
+// per-call budget bounds it.
+func TestExecCombinedBoundedUsesCombinedSeam(t *testing.T) {
+	combined := newFake()
+	combined.On("journalctl -n 1 --no-pager",
+		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n")
+	stdoutOnlyCalled := false
+	var deadline time.Duration
+	r := New(Config{
+		HostRoot: "/",
+		Timeout:  2 * time.Second,
+		RunCmd: func(context.Context, []string) (string, error) {
+			stdoutOnlyCalled = true
+			return "", nil
+		},
+		RunCmdCombined: func(ctx context.Context, argv []string) (string, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				return "", errors.New("ctx has no deadline — budget not applied")
+			}
+			deadline = time.Until(dl)
+			return combined.Run(ctx, argv)
+		},
+	})
+	out, err := r.ExecCombinedBounded(context.Background(), NSNone,
+		45*time.Second, "journalctl", "-n", "1", "--no-pager")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdoutOnlyCalled {
+		t.Fatal("ExecCombinedBounded must use the combined runner — stderr evidence is lost on Exec")
+	}
+	if !strings.Contains(out, "corrupt") {
+		t.Fatalf("out=%q want the stderr corruption notice", out)
+	}
+	if deadline <= 0 || deadline > 45*time.Second {
+		t.Fatalf("budget deadline=%v want (0, 45s]", deadline)
+	}
+}
+
+// TestRunCombinedEnvReplacesEnvironment: the container-side combined
+// helper must REPLACE the child environ with env (the
+// NOTIFY_SOCKET/WATCHDOG_* scrub), inheriting only when env is nil.
+func TestRunCombinedEnvReplacesEnvironment(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+	t.Setenv("HOSTEXEC_SCRUB_PROBE", "inherited")
+
+	out, err := RunCombinedEnv(context.Background(),
+		[]string{"HOSTEXEC_SCRUB_PROBE=replaced"},
+		"sh", "-c", `echo "$HOSTEXEC_SCRUB_PROBE"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "replaced" {
+		t.Fatalf("out=%q want the replaced value — env must not merge", out)
+	}
+
+	out, err = RunCombinedEnv(context.Background(), nil,
+		"sh", "-c", `echo "$HOSTEXEC_SCRUB_PROBE"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "inherited" {
+		t.Fatalf("out=%q want the inherited value on nil env", out)
+	}
+
+	// Empty argv would index argv[0] — must error, not panic.
+	if _, err := RunCombinedEnv(context.Background(), nil); err == nil {
+		t.Fatal("empty argv want error")
+	}
+}
+
+// TestRunSeparatesStreamsAndFeedsStdin: the container-side Run keeps
+// stdout machine-clean (stderr in its own buffer) and feeds stdin —
+// the psql/etcdctl parser contract.
+func TestRunSeparatesStreamsAndFeedsStdin(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+	stdout, stderr, err := Run(context.Background(),
+		[]string{"sh", "-c", "echo out; echo err >&2"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(stdout) != "out" || strings.TrimSpace(stderr) != "err" {
+		t.Fatalf("stdout=%q stderr=%q — streams must stay separate", stdout, stderr)
+	}
+
+	stdout, stderr, err = Run(context.Background(), []string{"cat"}, "piped stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "piped stdin" || stderr != "" {
+		t.Fatalf("stdout=%q stderr=%q — stdin not fed", stdout, stderr)
+	}
+
+	if _, _, err := Run(context.Background(), nil, ""); err == nil {
+		t.Fatal("empty argv want error")
+	}
+}
+
+// TestRunEnvLayersOverInherited: RunEnv APPENDS env to the inherited
+// environ — the PGPASSWORD-to-docker-exec channel (a secret off the
+// argv, the rest of the daemon environment intact).
+func TestRunEnvLayersOverInherited(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+	t.Setenv("HOSTEXEC_BASE_PROBE", "kept")
+
+	stdout, _, err := RunEnv(context.Background(),
+		[]string{"HOSTEXEC_SECRET_PROBE=secret"},
+		[]string{"sh", "-c", `echo "$HOSTEXEC_BASE_PROBE $HOSTEXEC_SECRET_PROBE"`}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(stdout) != "kept secret" {
+		t.Fatalf("out=%q want inherited+layered values", stdout)
+	}
+
+	if _, _, err := RunEnv(context.Background(), nil, nil, ""); err == nil {
+		t.Fatal("empty argv want error")
+	}
+}

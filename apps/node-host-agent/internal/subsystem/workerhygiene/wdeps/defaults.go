@@ -109,7 +109,7 @@ const (
 	defaultCoredumpDir        = "/host/var/lib/systemd/coredump"
 
 	// guards domain (was dstate_scopes.go / psi_thrash.go /
-	// spegel_calico_netns.go / journald.go).
+	// spegel.go / calico.go / cni_netns.go / journald.go).
 	defaultDStateStormThreshold = 5
 	zombieStormThreshold        = 500 // <defunct> children of one parent = storm
 	defaultPSIFullAvg60         = 25.0

@@ -225,3 +225,17 @@ func TestRunCheckCustomSets(t *testing.T) {
 		t.Fatalf("default removed flag leaked:\n%s", got)
 	}
 }
+
+// TestSplitCSV: trimming + empty-element drop; empty input yields an
+// empty NON-nil slice — "flag provided empty" must be distinguishable
+// from "flag absent" (nil).
+func TestSplitCSV(t *testing.T) {
+	got := splitCSV(" a , b,,c ")
+	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("split=%v want [a b c]", got)
+	}
+	got = splitCSV("")
+	if got == nil || len(got) != 0 {
+		t.Fatalf("empty split=%#v want empty non-nil", got)
+	}
+}

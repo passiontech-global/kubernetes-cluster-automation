@@ -88,3 +88,68 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 		}
 	}
 }
+
+// ---------- controller tuning drop-ins (ctrlDropIn) ----------
+
+// TestCtrlDropInConvergesBothWays — a per-host map var renders the
+// drop-in for THIS node and daemon-reloads exactly once; an identical
+// re-render stays silent; an absent var converges a stale drop-in
+// away (reload only when a file actually came off disk); a map
+// without this node is a no-op.
+func TestCtrlDropInConvergesBothWays(t *testing.T) {
+	vars := writeVarsDir(t, `k0scontroller_memory_max_by_host:
+  node-a: 16Gi
+  node-b: 14Gi
+k0scontroller_cpu_weight_by_host:
+  node-a: 10000
+`)
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	render := func(v string) []byte { return []byte("[Service]\nMemoryMax=" + v + "\n") }
+	drop := "/etc/systemd/system/k0scontroller.service.d/50-memory-guard.conf"
+
+	// map hit → drop-in rendered for node-b + one daemon-reload
+	c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", render)
+	if got := hostRead(t, r, drop); !strings.Contains(got, "MemoryMax=14Gi") {
+		t.Fatalf("drop-in = %q, want node-b's 14Gi value", got)
+	}
+	if n := len(sr.CallsMatching("systemctl daemon-reload")); n != 1 {
+		t.Fatalf("daemon-reload calls = %d want 1 after the first converge", n)
+	}
+
+	// unchanged re-render → silent
+	sr.ClearLog()
+	c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", render)
+	if n := len(sr.CallsMatching("systemctl daemon-reload")); n != 0 {
+		t.Fatalf("daemon-reload fired %d times on an unchanged drop-in", n)
+	}
+
+	// stale file + absent var → removed + daemon-reload
+	stale := "/etc/systemd/system/k0scontroller.service.d/51-go-memlimit.conf"
+	hostWrite(t, r, stale, "[Service]\nEnvironment=GOMEMLIMIT=8Gi\n")
+	c.ctrlDropIn("k0scontroller_go_memlimit_by_host", "51-go-memlimit.conf", render)
+	if hostExists(r, stale) {
+		t.Fatal("stale drop-in not removed on an absent var")
+	}
+	if n := len(sr.CallsMatching("systemctl daemon-reload")); n != 1 {
+		t.Fatalf("daemon-reload calls = %d want 1 after the removal", n)
+	}
+
+	// map without this node → nothing on disk, nothing to reload
+	sr.ClearLog()
+	c.ctrlDropIn("k0scontroller_cpu_weight_by_host", "52-cpuweight.conf", render)
+	if hostExists(r, "/etc/systemd/system/k0scontroller.service.d/52-cpuweight.conf") {
+		t.Fatal("drop-in created from a map missing this node")
+	}
+	if n := len(sr.CallsMatching("systemctl daemon-reload")); n != 0 {
+		t.Fatalf("daemon-reload fired %d times on a no-op removal", n)
+	}
+	if c.errs != 0 {
+		t.Fatalf("errs = %d — converge-only paths must not count errors", c.errs)
+	}
+}
