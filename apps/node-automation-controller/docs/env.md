@@ -61,6 +61,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `CSR_APPROVER_ENABLED` | csr-watcher | off unless `"true"` | Sub-feature gate — approve mode. Off = detect/report pending CSRs only (module always registers). |
 | `NODE_LABELER_CONFIG_PATH` | node-labeler | `/etc/node-labeler/labels.txt` | Path to the labels.txt file the reconciler applies to nodes. |
 | `PARTITION_EVICT_NAMESPACES` | partition-pod-evictor | `flux-system` | Comma-separated namespace allow-list for partition eviction; unset/empty falls back to `flux-system`. Pods in any ns can opt in via `passiontech.dev/evict-on-partition`. |
+| `DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL` | dead-node-sweeper | off unless `"true"` | Sub-feature gate (W15-ST1) — authorizes fencing a branch-(b) dead node (no medik8s SNR CR) that holds an RWO VolumeAttachment or a StatefulSet pod; default skips the out-of-service taint (split-brain guard, `node_automation_dead_node_unfenced_stateful_skipped`). Without-SNR fences count on `node_automation_dead_node_fenced_without_snr_total`; re-read every sweep. |
 
 ## apiserver guards
 
@@ -69,6 +70,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `APISERVICE_GUARD_ENABLED` | apiservice-guard | on unless `"false"` | Registration gate — reaps broken APIService registrations. |
 | `WEBHOOK_CIRCUIT_BREAKER_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — C1 fail-closed-webhook circuit breaker; re-read every sweep so a flip takes effect on the next cycle. |
 | `UNMESHED_POD_REMEDIATION_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — allows deleting unmeshed pods once the injector webhook is provably healthy (the audit gauge is exported regardless); re-read every sweep. |
+| `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED` | admission-webhook-guard | off unless `"true"` | Sub-feature gate (W15-CP0) — auto-patch every fail-closed webhook whose namespaceSelector matches a critical self-healing namespace (kube-system, kube-node-lease, node-ops, medik8s) with the `kubernetes.io/metadata.name NotIn [...]` exclusion; allowlisted entries untouched. The audit gauges export regardless; re-read every sweep. |
 
 ## Janitors
 

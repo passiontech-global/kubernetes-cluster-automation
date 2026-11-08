@@ -150,6 +150,15 @@ func CronJobs(cs kubernetes.Interface, namespace string) PageFunc[batchv1.CronJo
 		func(l *batchv1.CronJobList) []batchv1.CronJob { return l.Items })
 }
 
+// ConfigMaps lists ConfigMaps in namespace.
+func ConfigMaps(cs kubernetes.Interface, namespace string) PageFunc[corev1.ConfigMap] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.ConfigMapList, error) {
+			return cs.CoreV1().ConfigMaps(namespace).List(ctx, o)
+		},
+		func(l *corev1.ConfigMapList) []corev1.ConfigMap { return l.Items })
+}
+
 // Secrets lists Secrets in namespace.
 func Secrets(cs kubernetes.Interface, namespace string) PageFunc[corev1.Secret] {
 	return typedPage(

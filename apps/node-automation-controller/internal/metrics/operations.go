@@ -117,6 +117,33 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Heal grants denied by the global heal budget (aggregate blast-radius cap).",
 })
 
+// ---------------------------------------------------------------------------
+// Wave 15 operations metrics (W15-ST1 dead-node-sweeper split-brain
+// gate).
+// ---------------------------------------------------------------------------
+
+// DeadNodeUnfencedStatefulSkipped marks (1) a confirmed-dead node the
+// sweeper REFUSED to fence (W15-ST1): branch (b) — no medik8s SNR CR —
+// while the node still holds an RWO VolumeAttachment or a StatefulSet
+// pod, so the out-of-service taint would risk a split-brain on its
+// volumes. Cleared when the node is eventually fenced or recovers.
+var DeadNodeUnfencedStatefulSkipped = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_dead_node_unfenced_stateful_skipped",
+	Help: "1 while the dead node holds stateful volumes/pods without a medik8s SNR CR — fencing skipped (fail closed against split-brain).",
+}, []string{"node"})
+
+// DeadNodeFencedWithoutSNRTotal counts out-of-service fences the
+// sweeper applied WITHOUT a medik8s SNR CR backing them (W15-ST1
+// branch (b): Ready=Unknown>30m + dead kubelet) — has_volumes records
+// whether the node held RWO volumes/StatefulSet pods at decision time
+// (those fences carried the DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL
+// override). A sustained rate means the sweeper is deciding node death
+// on its own evidence — watch it against the SNR controller.
+var DeadNodeFencedWithoutSNRTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_dead_node_fenced_without_snr_total",
+	Help: "Out-of-service fences applied without a medik8s SNR CR, by node and whether it held stateful volumes/pods.",
+}, []string{"node", "has_volumes"})
+
 // operationsCollectors lists every vector declared in this file, in
 // declaration order; the single init() below registers the table, so
 // registration order stays byte-stable and adding a metric touches
@@ -129,6 +156,7 @@ var operationsCollectors = []prometheus.Collector{
 	CronJobTooManyMissedStarts,
 	VolumeAttachmentFinalizersRemovedTotal,
 	CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal,
+	DeadNodeUnfencedStatefulSkipped, DeadNodeFencedWithoutSNRTotal,
 }
 
 func init() {

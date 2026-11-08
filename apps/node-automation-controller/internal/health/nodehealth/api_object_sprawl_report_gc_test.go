@@ -146,3 +146,73 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 		t.Fatalf("excess gauge = %v,%v want 3,true", v, ok)
 	}
 }
+
+// W15-CP2b — ConfigMap/Secret objects above the 512 KiB Kine row guard
+// emit node_automation_kine_large_object_bytes and fail the check;
+// objects at or below the threshold stay silent; shrinking (here:
+// deleting) the offenders prunes their series and lets the check pass
+// again — the emittedLargeObjects ledger reset.
+func TestSprawlGCKineLargeObjects(t *testing.T) {
+	blob := make([]byte, kineLargeObjectThreshold+1024)
+	bigCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "big-cm"},
+		BinaryData: map[string][]byte{"blob": blob},
+	}
+	smallCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "small-cm"},
+		Data:       map[string]string{"k": "v"},
+	}
+	bigSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "big-secret"},
+		Data:       map[string][]byte{"release": blob},
+		Type:       corev1.SecretTypeOpaque,
+	}
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "configmap", "apps", "big-cm")
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "secret", "apps", "big-secret")
+
+	cs := fake.NewSimpleClientset(bigCM, smallCM, bigSecret)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
+
+	res := chk.Run(ctx)
+	if res.Pass {
+		t.Fatalf("large objects must fail the check: %+v", res)
+	}
+	for _, want := range []struct{ kind, name string }{
+		{"configmap", "big-cm"}, {"secret", "big-secret"},
+	} {
+		v, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
+			map[string]string{"kind": want.kind, "namespace": "apps", "name": want.name})
+		if !ok || v <= kineLargeObjectThreshold {
+			t.Fatalf("%s %s gauge = %v,%v want >%d,true", want.kind, want.name, v, ok, kineLargeObjectThreshold)
+		}
+		if !strings.Contains(res.Why, want.name) {
+			t.Fatalf("why missing %s finding: %q", want.name, res.Why)
+		}
+	}
+	if _, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
+		map[string]string{"kind": "configmap", "namespace": "apps", "name": "small-cm"}); ok {
+		t.Fatal("small ConfigMap wrongly flagged as a large object")
+	}
+
+	// Ledger reset: once the large objects are gone the series prune
+	// and the check passes again.
+	if err := cs.CoreV1().ConfigMaps("apps").Delete(ctx, "big-cm", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.CoreV1().Secrets("apps").Delete(ctx, "big-secret", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	res2 := chk.Run(ctx)
+	if !res2.Pass {
+		t.Fatalf("check must pass once the large objects are gone: %+v", res2)
+	}
+	if _, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
+		map[string]string{"kind": "configmap", "namespace": "apps", "name": "big-cm"}); ok {
+		t.Fatal("resolved ConfigMap series not pruned by the ledger")
+	}
+	if _, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
+		map[string]string{"kind": "secret", "namespace": "apps", "name": "big-secret"}); ok {
+		t.Fatal("resolved Secret series not pruned by the ledger")
+	}
+}

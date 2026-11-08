@@ -56,12 +56,28 @@ var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.Counte
 
 // WebhookMissingCriticalNSExclusion marks (1) live admission sub-webhooks
 // with failurePolicy=Fail whose namespaceSelector still matches any of the
-// critical self-healing namespaces (kube-system, node-ops, medik8s) — catches
-// Helm/operator-installed webhooks invisible to static check-webhook-guard.sh (W12-CP-B).
+// critical self-healing namespaces (kube-system, kube-node-lease, node-ops,
+// medik8s) — catches Helm/operator-installed webhooks invisible to static
+// check-webhook-guard.sh (W12-CP-B; kube-node-lease added W15-CP0 — its
+// leases ARE the kubelet node heartbeat).
 var WebhookMissingCriticalNSExclusion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_webhook_missing_critical_ns_exclusion",
-	Help: "1 while the fail-closed sub-webhook's namespaceSelector matches kube-system, node-ops, or medik8s.",
+	Help: "1 while the fail-closed sub-webhook's namespaceSelector matches kube-system, kube-node-lease, node-ops, or medik8s.",
 }, []string{"kind", "name", "webhook"})
+
+// WebhookHeartbeatResourceExposed marks (1) per matched rule resource for
+// each live fail-closed admission sub-webhook whose rules[].resources
+// intercept a node/pod lifecycle heartbeat resource (nodes/status,
+// pods/status, pods/eviction, leases — or a wildcard covering them) while
+// its namespaceSelector still matches a critical self-healing namespace
+// (W15-CP0): the webhook's own outage then wedges node heartbeats and
+// every drain cluster-wide. The resource label carries the offending
+// rule literal (wildcards stay wildcards, matching the static guard's
+// blocked_resources grammar).
+var WebhookHeartbeatResourceExposed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_heartbeat_resource_exposed",
+	Help: "1 while the fail-closed webhook's rules intercept nodes/status, pods/status, pods/eviction, or leases and its namespaceSelector still matches the critical self-healing namespaces.",
+}, []string{"kind", "name", "webhook", "resource"})
 
 // ---------------------------------------------------------------------------
 // Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
@@ -111,7 +127,7 @@ var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 var apiserverCollectors = []prometheus.Collector{
 	apiBackendRVGap, apiBackendQuarantined, apiBackendJWKSKIDSkew,
 	WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
-	WebhookMissingCriticalNSExclusion,
+	WebhookMissingCriticalNSExclusion, WebhookHeartbeatResourceExposed,
 	APIServiceUnavailable,
 	UnmeshedPods, UnmeshedPodsRecreatedTotal,
 	APIServiceUnblockHealsTotal,
