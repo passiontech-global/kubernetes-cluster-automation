@@ -1151,3 +1151,87 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		t.Fatalf("responsive backend must never trip, got %q", got)
 	}
 }
+
+// A webhook deleted from the config while its patch keeps failing must
+// not pin its WebhookCircuitBroken series: the patch-failure
+// carry-forward re-asserts only the sub-webhooks still in the
+// config's snapshot views, so the sweep-end prune forgets the deleted
+// webhook's series while a still-present one survives.
+func TestWebhookCircuitBreakerCarryForwardSkipsDeletedWebhooks(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-carry"},
+		Webhooks: []admissionv1.MutatingWebhook{
+			{
+				Name:          "keep.example.com",
+				FailurePolicy: wgFP(admissionv1.Fail),
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: wgSvcRef("backend", "dead-svc"),
+				},
+			},
+			{
+				Name:          "gone.example.com",
+				FailurePolicy: wgFP(admissionv1.Fail),
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: wgSvcRef("backend", "dead-svc"),
+				},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	keepLV := []string{guardstate.KindMutating, "cb-carry", "keep.example.com"}
+	goneLV := []string{guardstate.KindMutating, "cb-carry", "gone.example.com"}
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(keepLV...)
+		metrics.WebhookCircuitBroken.DeleteLabelValues(goneLV...)
+	})
+	now := time.Unix(1_700_000_000, 0)
+	g, b := wgBreakerGuard(cs, &now)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(DeadThreshold + time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.WebhookCircuitBroken.WithLabelValues(keepLV...)); got != 1 {
+		t.Fatalf("keep series = %v, want both webhooks tripped", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.WebhookCircuitBroken.WithLabelValues(goneLV...)); got != 1 {
+		t.Fatalf("gone series = %v, want both webhooks tripped", got)
+	}
+
+	// A concurrent writer deletes gone.example.com from the config,
+	// then every patch starts failing — the trip state is now
+	// unverifiable and the carry-forward decides what survives.
+	live, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Get(ctx, "cb-carry", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live.Webhooks = live.Webhooks[:1] // drop gone.example.com
+	if err := cs.Tracker().Update(
+		admissionv1.SchemeGroupVersion.WithResource("mutatingwebhookconfigurations"),
+		live, ""); err != nil {
+		t.Fatal(err)
+	}
+	cs.PrependReactor("patch", "mutatingwebhookconfigurations",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	for sweep := 3; sweep <= 4; sweep++ {
+		now = now.Add(DeadThreshold + time.Minute)
+		if err := runBreaker(ctx, g, b); err == nil {
+			t.Fatal("expected the aggregated circuit breaker patch failure")
+		}
+		if got := ptestutil.ToFloat64(metrics.WebhookCircuitBroken.WithLabelValues(keepLV...)); got != 1 {
+			t.Fatalf("sweep %d: webhook still in the census must survive the failed patch, got %v", sweep, got)
+		}
+		if metrics.WebhookCircuitBroken.DeleteLabelValues(goneLV...) {
+			t.Fatalf("sweep %d: deleted webhook's series must be forgotten, not re-pinned", sweep)
+		}
+	}
+}

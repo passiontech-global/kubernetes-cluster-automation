@@ -3,7 +3,9 @@
 // (and the trips counter) are applied only after the config patch
 // landed, so a failed patch retries next sweep without
 // double-counting, the carry-forward re-asserts the last confirmed
-// tuples while the post-patch annotation is unverifiable, and the
+// tuples for the sub-webhooks still in the config's live views while
+// the post-patch annotation is unverifiable (a webhook deleted from
+// the config is forgotten, not re-pinned), and the
 // sweep-end ledger prune drops whatever was not re-seen instead of
 // pinning circuit_broken=1 forever.
 package circuitbreaker
@@ -44,11 +46,22 @@ func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string,
 // carry-forward the CRD conversion sweep runs on an unverifiable
 // read: a failed patch leaves the annotation (and the truth the
 // series reports) at its last confirmed state, so the sweep-end
-// prune must not flap a still-broken series off.
-func (b *Breaker) carryBrokenForward(kind, cfgName string) {
+// prune must not flap a still-broken series off. Liveness-aware:
+// only tuples whose sub-webhook is still in views — the config's
+// snapshot webhook list this sweep patched against — are re-asserted;
+// a webhook deleted from the config while patches keep failing would
+// otherwise pin its series until the orphan sweep prunes the whole
+// config. A dead tuple is simply not re-emitted, so the sweep-end
+// prune forgets its series via DeleteLabelValues and drops the
+// ledger entry.
+func (b *Breaker) carryBrokenForward(kind, cfgName string, views []hookView) {
+	live := make(map[string]bool, len(views))
+	for _, v := range views {
+		live[v.name] = true
+	}
 	prefix := kind + "/" + cfgName + "/"
 	for k, lv := range b.brokenEmitted.Last() {
-		if strings.HasPrefix(k, prefix) {
+		if strings.HasPrefix(k, prefix) && live[strings.TrimPrefix(k, prefix)] {
 			b.brokenEmitted.Emit(k, lv...)
 		}
 	}

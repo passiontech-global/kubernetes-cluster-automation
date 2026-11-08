@@ -78,7 +78,10 @@ type Breaker struct {
 	// config deleted, recreated without the annotation, entry pruned
 	// by the orphan sweep — gets its series deleted via
 	// DeleteLabelValues instead of pinning the alert forever (same
-	// seen-set hygiene as the cert drift auditor).
+	// seen-set hygiene as the cert drift auditor). A failed patch's
+	// carry-forward re-asserts only the sub-webhooks still in the
+	// config's snapshot views, so a webhook deleted from the config
+	// is forgotten too instead of being carried past its death.
 	brokenEmitted state.GaugeLedger[string]
 	// zeroThreshold / partitionZeroThreshold override the two trip
 	// windows — tests shrink them; a zero value falls back to
@@ -197,7 +200,11 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			// carry the config's last-emitted tuples forward so
 			// the sweep-end prune does not flap a still-broken
 			// series off (the annotation may well still list it).
-			b.carryBrokenForward(job.kind, job.name)
+			// Liveness-aware: a tuple whose sub-webhook is no
+			// longer in the config's snapshot views is not
+			// carried, so the sweep-end prune forgets its series
+			// instead of re-pinning it while patches keep failing.
+			b.carryBrokenForward(job.kind, job.name, job.views)
 			log.Error(err, "circuit breaker patch failed",
 				"kind", job.kind, "config", job.name)
 			failed = append(failed, job.name)
