@@ -220,6 +220,39 @@ func TestCPFreezeGatedByDeadPeer(t *testing.T) {
 	}
 }
 
+// TestCPFreezeSuspectPathKeepsLatchAndCounters is the file-split
+// regression: the healthz-dead-below-streak cycle must bare-return
+// the way the monolithic Run did — no "ok" outcome stacked on the
+// suspect counter and no STATE-EXIT clearing an episode's latch
+// (Enter's mtime refresh is the janitor-reap defence, so an early
+// Exit also weakens that).
+func TestCPFreezeSuspectPathKeepsLatchAndCounters(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return false }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	for range 3 {
+		e.H.Cycle(context.Background()) // streak reached → frozen + heal
+	}
+	if e.RstN() == 0 || !e.HasState("cp-component-frozen") {
+		t.Fatalf("episode not established: rst=%d latch=%v",
+			e.RstN(), e.HasState("cp-component-frozen"))
+	}
+	e.H.Cycle(context.Background()) // dead again, below streak → suspect
+	// Cycles 1, 2 and this one are suspect; cycle 3 was the heal.
+	if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "suspect")); v != 3 {
+		t.Fatalf("suspect counter=%v want 3", v)
+	}
+	if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "ok")); v != 1 {
+		t.Fatalf("ok counter=%v want 1 (heal cycle only — suspect must not stack ok)", v)
+	}
+	if !e.HasState("cp-component-frozen") {
+		t.Fatal("suspect cycle cleared the episode latch — bare-return lost")
+	}
+}
+
 func TestCPFreezeWorkqueueStalledPastGrace(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return true }

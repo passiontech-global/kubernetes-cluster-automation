@@ -11,36 +11,27 @@
 //	frozen → restart k0scontroller.service under the
 //	last-cp-restart budget.
 //
-// Also hosts the ungated-cycle dispatch slot: the W10-CP2
-// kine-storage and W10-CP5 kubeconfig-cert checks ride this
-// entry point (see cdeps.CheckCPFreeze), and so does the apiserver
-// APF (API Priority & Fairness) queue-starvation probe — a
-// read-only scrape of the local apiserver's /metrics that
-// mirrors apiserver_flowcontrol_rejected_requests_total and
-// apiserver_flowcontrol_current_inqueue_requests per
-// (flow_schema, priority_level) into the node-exporter
-// textfile channel and names the client group whose queue is
-// rejecting when the counters grow (see ProbeAPF).
+// This file owns the freeze-heal duty itself: the
+// KCMQueueSnapshot parse/stall predicate, the FreezeCheck
+// Check type and its Run phases. The APF queue-starvation
+// probe (probeAPF) and the konnectivity-server probe/heal
+// that used to live alongside them moved to apf_probe.go
+// and konnectivity_heal.go in this package. The ungated-
+// cycle dispatch slot still rides this entry point: the
+// W10-CP2 kine-storage and W10-CP5 kubeconfig-cert checks
+// (see cdeps.CheckCPFreeze) are dispatched from Run.
 package apiserver
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"math"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
-	"strings"
-	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -286,9 +277,10 @@ type FreezeCheck struct {
 	kcmQuietSince time.Time
 
 	// APFMetricsFn is the apiserver /metrics scrape seam behind
-	// ProbeAPF — nil → the mTLS GET over deps.ensureClient (the
-	// secure :6443 /metrics needs client credentials, so the
-	// insecure kcmMetricsFn probe client cannot serve it).
+	// ProbeAPF (apf_probe.go) — nil → the mTLS GET over
+	// deps.ensureClient (the secure :6443 /metrics needs client
+	// credentials, so the insecure kcmMetricsFn probe client cannot
+	// serve it).
 	APFMetricsFn func(ctx context.Context) (string, error)
 	// apfPrevRejected is the last scrape's
 	// apiserver_flowcontrol_rejected_requests_total per
@@ -299,8 +291,9 @@ type FreezeCheck struct {
 
 	// konnBadCycles is the konnectivity-server unhealthy streak —
 	// cycles where the UDS was missing or the :8091 scrape returned
-	// ready_backend_connections==0. In-memory like the other
-	// streaks: a restart just re-arms the 3-cycle debounce.
+	// ready_backend_connections==0 (konnectivity_heal.go). In-memory
+	// like the other streaks: a restart just re-arms the 3-cycle
+	// debounce.
 	konnBadCycles int
 }
 
@@ -311,23 +304,52 @@ func (c *FreezeCheck) Name() string { return cdeps.CheckCPFreeze }
 // for CPFreezeCycles consecutive cycles, or (b) a stalled KCM
 // workqueue (W10-FIX1 KCMQueueStalled) persisting past
 // CPFreezeQuietFor. The restart only fires while the peer apiserver
-// stays healthy and honors Sig13Mode.
+// stays healthy and honors Sig13Mode. The phases: runSlot (the
+// ungated-cycle dispatch riders), probeFreeze (healthz + workqueue
+// scrape), decideFreeze (streak/quiet bookkeeping → frozen+reason),
+// healFreeze (the gated restart).
 func (c *FreezeCheck) Run(ctx context.Context) {
-	// W10-CP2/W10-CP5 ride this ungated cycle slot: Cycle()
-	// dispatch lives in check.go, so those checks are invoked
-	// from the first W8-CP entry point — same pre-uptime-gate
-	// position, every cycle.
+	c.runSlot(ctx)
+	frozen, reason, suspect := c.decideFreeze(ctx)
+	if suspect {
+		// The healthz-dead-below-streak path bare-returns the way
+		// the monolithic Run did: no STATE-EXIT (an episode's
+		// latch stays until a healthy cycle clears it, and Enter's
+		// mtime refresh is the janitor-reap defence) and no "ok"
+		// outcome on top of the suspect counter.
+		return
+	}
+	if !frozen {
+		c.d.StateExit(cdeps.StateCPComponentFrozen)
+		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "ok").Inc()
+		return
+	}
+	c.healFreeze(ctx, reason)
+}
+
+// runSlot runs the ungated-cycle riders: W10-CP2/W10-CP5 ride
+// this slot (Cycle() dispatch lives in check.go, so those checks
+// are invoked from the first W8-CP entry point — same
+// pre-uptime-gate position, every cycle). The APF queue-starvation
+// probe (apf_probe.go) and the konnectivity-server probe + heal
+// (konnectivity_heal.go) ride the same slot — read-only scrape +
+// metric mirror and an independent child-process heal, both must
+// run every cycle including the early-return suspect paths.
+func (c *FreezeCheck) runSlot(ctx context.Context) {
 	c.Storage.Run(ctx)
 	c.KubeCert.Run(ctx)
-	// The APF queue-starvation probe rides the same ungated slot —
-	// read-only scrape + metric mirror, it must run every cycle
-	// including the early-return suspect paths below.
 	c.ProbeAPF(ctx)
-	// The konnectivity-server probe + heal rides the same slot —
-	// the child process lives independent of the KCM/scheduler
-	// freeze logic below and must be checked every cycle.
 	c.probeKonnectivityServer(ctx)
+}
 
+// decideFreeze probes healthz + the KCM workqueue and decides
+// whether the control-plane component is frozen. It mutates the
+// suspect-streak bookkeeping (FileCtrCPFreeze, kcmQuietSince) the
+// same way the monolithic Run did. The suspect flag reports the
+// monolithic Run's bare-return path (healthz dead below the streak):
+// Run must skip both the STATE-EXIT and the "ok" outcome for that
+// cycle, exactly as the early return used to.
+func (c *FreezeCheck) decideFreeze(ctx context.Context) (bool, string, bool) {
 	kcmOK := c.d.Cfg.CPHealthFn(ctx, c.d.Cfg.CPFreeze.KCMHealthURL)
 	schedOK := c.d.Cfg.CPHealthFn(ctx, c.d.Cfg.CPFreeze.SchedHealthURL)
 
@@ -342,7 +364,7 @@ func (c *FreezeCheck) Run(ctx context.Context) {
 				n, kcmOK, schedOK)
 		} else {
 			c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "suspect").Inc()
-			return
+			return false, "", true
 		}
 	default:
 		c.d.State.ResetCounter(cdeps.FileCtrCPFreeze)
@@ -380,12 +402,13 @@ func (c *FreezeCheck) Run(ctx context.Context) {
 			c.d.State.ResetCounter(cdeps.FileCtrKCMQuiet)
 		}
 	}
+	return frozen, reason, false
+}
 
-	if !frozen {
-		c.d.StateExit(cdeps.StateCPComponentFrozen)
-		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "ok").Inc()
-		return
-	}
+// healFreeze enters the state latch and restarts k0scontroller
+// under the last-cp-restart budget — gated on the peer apiserver
+// staying healthy and the restart cooldown, honoring Sig13Mode.
+func (c *FreezeCheck) healFreeze(ctx context.Context, reason string) {
 	c.d.State.Enter(cdeps.StateCPComponentFrozen, reason)
 	// Gate: the peer apiserver must still answer — otherwise the
 	// outage is bigger than a frozen component and the wedge guard
@@ -427,498 +450,4 @@ func (c *FreezeCheck) Run(ctx context.Context) {
 		c.d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "dryrun_restart").Inc()
 	}
 	c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "ok").Inc()
-}
-
-// ---------------------------------------------------------------------------
-// APF queue-starvation probe
-// ---------------------------------------------------------------------------
-//
-// The kube-apiserver's API Priority & Fairness layer sheds requests
-// with 429s when a flow schema's queues overflow — the mirror image
-// of the KCM workqueue stall above: instead of the controller's own
-// workqueue stalling, one client GROUP's queue saturates and its
-// requests are rejected while the rest of the apiserver stays
-// healthy. apiserver_flowcontrol_rejected_requests_total and
-// apiserver_flowcontrol_current_inqueue_requests carry
-// flow_schema + priority_level labels — the labels that name the
-// congesting client group — so the probe mirrors both into
-// node-agent-apiserver-apf.prom (node-exporter textfile channel:
-// the subsystem registry is owned by controllerhygiene.go's New(),
-// outside this file — see textfile_prom.go) and suspect-logs the
-// offending pairs whenever the reject counters grow between
-// consecutive scrapes.
-
-const (
-	// APFRejectedMetric mirrors the apiserver's cumulative reject
-	// counter per flow_schema+priority_level — increase() over it
-	// names the client group being 429'd.
-	APFRejectedMetric = "node_host_agent_apiserver_apf_rejected_total"
-	// apfInqueueMetric mirrors the live queue depth per
-	// flow_schema+priority_level — the leading edge before rejects.
-	apfInqueueMetric = "node_host_agent_apiserver_apf_inqueue_requests"
-	APFPromFile      = "node-agent-apiserver-apf.prom"
-	// terminatedWatchersMetric mirrors the apiserver's cumulative
-	// apiserver_terminated_watchers_total — the relist-storm 410-Gone
-	// relist-storm signature (watch clients relisting en masse).
-	terminatedWatchersMetric = "node_host_agent_apiserver_terminated_watchers"
-	// logKeyAPFStarve keys the suspectLog dedupe budget for the
-	// reject-growth lines — no dedicated latch, same role as
-	// cdeps.LogKeyDeadFallbk.
-	logKeyAPFStarve = "apf-starvation"
-	// apfOffenderSample caps the flow-schema list in one suspect
-	// line — the rest still land in the textfile series.
-	apfOffenderSample = 5
-)
-
-// APFSeriesKey identifies one APF series — the
-// (flow_schema, priority_level) label pair shared by the rejected
-// and inqueue families.
-type APFSeriesKey struct {
-	FlowSchema    string
-	PriorityLevel string
-}
-
-// apfOffender is one (flow_schema, priority_level) pair whose reject
-// counter grew since the previous scrape.
-type apfOffender struct {
-	key     APFSeriesKey
-	delta   float64
-	inqueue float64
-}
-
-var (
-	// apfSeriesRe matches the two apiserver_flowcontrol families the
-	// probe needs — same scrape-line grammar as kcmWorkqueueRe.
-	apfSeriesRe = regexp.MustCompile(
-		`(?m)^apiserver_flowcontrol_(rejected_requests_total|current_inqueue_requests)` +
-			`(\{[^}]*\})?\s+([0-9.eE+-]+)`)
-	apfFlowSchemaRe = regexp.MustCompile(`flow_schema="([^"]*)"`)
-	apfPriorityRe   = regexp.MustCompile(`priority_level="([^"]*)"`)
-	// terminatedWatchersRe extracts the apiserver's 410-Gone
-	// terminated-watch counter (all label variants summed).
-	terminatedWatchersRe = regexp.MustCompile(
-		`(?m)^apiserver_terminated_watchers_total(\{[^}]*\})?\s+([0-9.eE+-]+)`)
-)
-
-// apfLabel extracts one label value from a `{...}` label set — ""
-// when absent, which still groups consistently.
-func apfLabel(labels string, re *regexp.Regexp) string {
-	if m := re.FindStringSubmatch(labels); m != nil {
-		return m[1]
-	}
-	return ""
-}
-
-// ParseAPFMetrics extracts the rejected_requests_total counters and
-// current_inqueue_requests gauges, keyed by (flow_schema,
-// priority_level). Missing APF families (a scraped endpoint that
-// never served flowcontrol) yield empty maps — inconclusive, not a
-// failure.
-func ParseAPFMetrics(body string) (rejected, inqueue map[APFSeriesKey]float64) {
-	rejected = map[APFSeriesKey]float64{}
-	inqueue = map[APFSeriesKey]float64{}
-	for _, m := range apfSeriesRe.FindAllStringSubmatch(body, -1) {
-		v, err := strconv.ParseFloat(m[3], 64)
-		if err != nil {
-			continue
-		}
-		k := APFSeriesKey{
-			FlowSchema:    apfLabel(m[2], apfFlowSchemaRe),
-			PriorityLevel: apfLabel(m[2], apfPriorityRe),
-		}
-		switch m[1] {
-		case "rejected_requests_total":
-			rejected[k] += v
-		case "current_inqueue_requests":
-			inqueue[k] += v
-		}
-	}
-	return rejected, inqueue
-}
-
-// ParseTerminatedWatchers sums the apiserver's
-// apiserver_terminated_watchers_total counter across its label
-// sets — relist-storm relist-storm evidence. seen=false when the family
-// is absent (older apiserver / non-flowcontrol endpoint).
-func ParseTerminatedWatchers(body string) (total float64, seen bool) {
-	for _, m := range terminatedWatchersRe.FindAllStringSubmatch(body, -1) {
-		v, err := strconv.ParseFloat(m[2], 64)
-		if err != nil {
-			continue
-		}
-		total += v
-		seen = true
-	}
-	return total, seen
-}
-
-// apfKeysSorted returns the map keys in a stable order — the
-// textfile content stays byte-stable between scrapes.
-func apfKeysSorted(m map[APFSeriesKey]float64) []APFSeriesKey {
-	keys := make([]APFSeriesKey, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].FlowSchema != keys[j].FlowSchema {
-			return keys[i].FlowSchema < keys[j].FlowSchema
-		}
-		return keys[i].PriorityLevel < keys[j].PriorityLevel
-	})
-	return keys
-}
-
-// apfMetrics fetches the local apiserver /metrics body. The default
-// path reuses the mTLS client the rv probe already builds from the
-// admin credentials (the secure :6443 /metrics endpoint requires
-// client auth — the insecure healthz/metrics probe client would get
-// a 401). ensureClient()==nil is "not a controller / no creds" —
-// inconclusive, same posture as the hub check.
-func (c *FreezeCheck) apfMetrics(ctx context.Context) (string, error) {
-	if c.APFMetricsFn != nil {
-		return c.APFMetricsFn(ctx)
-	}
-	client := c.d.EnsureClient()
-	if client == nil {
-		return "", errors.New("no apiserver client credentials")
-	}
-	qctx, cancel := context.WithTimeout(ctx, c.d.Cfg.QueryTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
-		"https://"+c.d.Cfg.Hub.SelfEndpoint+"/metrics", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return "", fmt.Errorf("apiserver /metrics status %d", resp.StatusCode)
-	}
-	// The apiserver /metrics body is a few MiB on a healthy cluster —
-	// 16MiB bounds it like the journal capture cap.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
-}
-
-// ProbeAPF scrapes the local apiserver /metrics, mirrors the APF
-// rejected/inqueue series into the textfile, and suspect-logs the
-// (flow_schema, priority_level) pairs whose reject counter grew —
-// the observable signature of APF queue overflow (requests denied
-// with 429). A scrape failure degrades to headers-only emission so
-// the series goes absent rather than pinning a stale counter.
-func (c *FreezeCheck) ProbeAPF(ctx context.Context) {
-	body, err := c.apfMetrics(ctx)
-	if err != nil {
-		c.EmitAPFMetrics(nil, nil, 0, false)
-		logger().Debug("controllerhygiene: apf metrics scrape failed",
-			"error", err)
-		return
-	}
-	rejected, inqueue := ParseAPFMetrics(body)
-	tw, twOK := ParseTerminatedWatchers(body)
-	c.EmitAPFMetrics(rejected, inqueue, tw, twOK)
-
-	// Reject deltas vs the previous scrape — the APF counters are
-	// cumulative, so a growth window is what proves CURRENT
-	// congestion (same consecutive-scrape posture as
-	// KCMQueueStalled). No baseline → inconclusive.
-	var offenders []apfOffender
-	if c.apfPrevRejected != nil {
-		reset := false
-		for k, cur := range rejected {
-			prev, ok := c.apfPrevRejected[k]
-			if !ok {
-				continue
-			}
-			d := cur - prev
-			switch {
-			case d > 0:
-				offenders = append(offenders, apfOffender{
-					key: k, delta: d, inqueue: inqueue[k]})
-			case d < 0:
-				reset = true // counter reset — apiserver restarted
-			}
-		}
-		if reset {
-			logger().Debug("controllerhygiene: apf reject counters went backwards — apiserver restarted, re-baselining")
-		}
-	}
-	c.apfPrevRejected = rejected
-	if len(offenders) == 0 {
-		return
-	}
-	sort.Slice(offenders, func(i, j int) bool {
-		return offenders[i].delta > offenders[j].delta
-	})
-	if len(offenders) > apfOffenderSample {
-		offenders = offenders[:apfOffenderSample]
-	}
-	parts := make([]string, 0, len(offenders))
-	for _, o := range offenders {
-		parts = append(parts, fmt.Sprintf(
-			"flow_schema=%s priority_level=%s +%.0f rejects (inqueue %.0f)",
-			o.key.FlowSchema, o.key.PriorityLevel, o.delta, o.inqueue))
-	}
-	c.d.State.SuspectLog(logKeyAPFStarve,
-		"suspect: apiserver APF queue starvation — flow-schema queues rejecting requests: "+
-			strings.Join(parts, "; "), c.d.Cfg.SuspectLogCadence)
-}
-
-// EmitAPFMetrics renders node-agent-apiserver-apf.prom — the
-// rejected family as a mirrored counter (TYPE counter: the apiserver
-// series is cumulative), the inqueue family as a gauge. nil maps
-// emit headers only so a blind scrape drops the series instead of
-// leaving a stale reading live.
-func (c *FreezeCheck) EmitAPFMetrics(rejected, inqueue map[APFSeriesKey]float64,
-	terminatedWatchers float64, twSeen bool) {
-	var p promfile.Builder
-	p.HeaderType(APFRejectedMetric,
-		"apiserver_flowcontrol_rejected_requests_total mirrored from the "+
-			"local apiserver — APF queue-overflow rejects by flow_schema "+
-			"and priority_level.", "counter")
-	for _, k := range apfKeysSorted(rejected) {
-		p.Line(fmt.Sprintf("%s{flow_schema=\"%s\",priority_level=\"%s\"} %s",
-			APFRejectedMetric,
-			promfile.EscapeLabelValue(k.FlowSchema),
-			promfile.EscapeLabelValue(k.PriorityLevel),
-			strconv.FormatFloat(rejected[k], 'f', -1, 64)))
-	}
-	inqueueHelp := "apiserver_flowcontrol_current_inqueue_requests " +
-		"mirrored from the local apiserver — APF queue depth by " +
-		"flow_schema and priority_level."
-	if len(inqueue) == 0 {
-		p.Header(apfInqueueMetric, inqueueHelp)
-	}
-	for _, k := range apfKeysSorted(inqueue) {
-		p.GaugeLabels(apfInqueueMetric, inqueueHelp, fmt.Sprintf(
-			"flow_schema=\"%s\",priority_level=\"%s\"",
-			promfile.EscapeLabelValue(k.FlowSchema),
-			promfile.EscapeLabelValue(k.PriorityLevel)), inqueue[k])
-	}
-	// relist-storm: the terminated-watchers counter rides the same
-	// textfile — headers-only when the family wasn't in the
-	// scrape so a blind scrape drops the series rather than
-	// pinning a stale reading.
-	twHelp := "apiserver_terminated_watchers_total mirrored from the " +
-		"local apiserver — watches dropped with 410 Gone (relist-storm signal)."
-	if !twSeen {
-		p.HeaderType(terminatedWatchersMetric, twHelp, "counter")
-	} else {
-		p.HeaderType(terminatedWatchersMetric, twHelp, "counter")
-		p.Line(fmt.Sprintf("%s %s", terminatedWatchersMetric,
-			strconv.FormatFloat(terminatedWatchers, 'f', -1, 64)))
-		c.d.TerminatedWatchersVal.Store(math.Float64bits(terminatedWatchers))
-	}
-	c.d.WriteTextfileProm(APFPromFile, p.String())
-}
-
-// --- konnectivity-server probe + heal (G4) ---
-//
-// The k0s supervisor runs konnectivity-server as a CHILD of
-// k0scontroller — the only restart that does not bounce the whole
-// control plane is killing the child (the supervisor respawns it).
-// Each cycle the probe checks the :8091/metrics scrape for
-// konnectivity_network_proxy_server_ready_backend_connections (the
-// gauge mirrors the value, -1 on scrape failure), the :8092/healthz
-// liveness endpoint and the agent UDS the worker-side
-// konnectivity-agents dial. A missing UDS or a zero-backend reading
-// for konnBadCyclesNeeded consecutive cycles — while at least one
-// Ready worker exists to serve — kills the child under the
-// last-konnectivity-server-restart 30-minute budget and the shared
-// Sig13.Mode gate (off = state only, dry-run = log, enforce = kill).
-
-const (
-	konnMetricsURL    = "http://127.0.0.1:8091/metrics"
-	konnHealthURL     = "http://127.0.0.1:8092/healthz"
-	konnReadyMetric   = "konnectivity_network_proxy_server_ready_backend_connections"
-	konnUDSRel        = "konnectivity-server/konnectivity-server.sock"
-	konnBadCyclesNeed = 3
-	konnRestartBudget = 30 * time.Minute
-)
-
-// probeKonnectivityServer refreshes the ready-backends gauge and the
-// unhealthy streak, then heals when the streak and the ready-worker
-// evidence both hold.
-func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
-	d := c.d
-	backends, ok := c.konnReadyBackends(ctx)
-	if ok {
-		d.KonnReadyBackends.Set(backends)
-	} else {
-		d.KonnReadyBackends.Set(-1)
-	}
-	// The healthz endpoint is informational — an absent listener on
-	// an older konnectivity build is not evidence either way.
-	_ = d.Cfg.CPHealthFn(ctx, konnHealthURL)
-	sock := filepath.Join(d.Cfg.K0sRunDir, konnUDSRel)
-	_, sockErr := os.Stat(sock)
-	bad := sockErr != nil || (ok && backends == 0)
-	if bad {
-		c.konnBadCycles++
-	} else {
-		c.konnBadCycles = 0
-	}
-	if c.konnBadCycles < konnBadCyclesNeed {
-		return
-	}
-	if workers := c.readyWorkers(ctx); workers < 1 {
-		d.State.AppendLog(fmt.Sprintf(
-			"suspect: konnectivity-server unhealthy %d cycles "+
-				"(uds_ok=%v backends=%v) but no Ready workers — heal suppressed",
-			c.konnBadCycles, sockErr == nil, backends))
-		return
-	}
-	pid := c.konnectivityPID()
-	if pid == 0 {
-		d.State.AppendLog("suspect: konnectivity-server process not found — nothing to kill")
-		return
-	}
-	if !d.State.RateTrySpend(cdeps.FileRateKonnRestart, konnRestartBudget) {
-		return
-	}
-	switch d.Cfg.Sig13.Mode {
-	case cdeps.ModeEnforce:
-		if err := d.Cfg.KillFn(pid, syscall.SIGKILL); err != nil {
-			d.State.AppendLogWarn(fmt.Sprintf(
-				"suspect: konnectivity-server kill pid=%d failed: %v", pid, err))
-			return
-		}
-		d.State.AppendLog(fmt.Sprintf(
-			"ACTION: killed konnectivity-server pid=%d — uds_ok=%v "+
-				"ready_backends=%v bad_cycles=%d (k0s supervisor restarts it)",
-			pid, sockErr == nil, backends, c.konnBadCycles))
-		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "konn_server_kill").Inc()
-	case cdeps.ModeDryRun:
-		d.State.AppendLog(fmt.Sprintf(
-			"DRY-RUN: would kill konnectivity-server pid=%d — uds_ok=%v "+
-				"ready_backends=%v bad_cycles=%d",
-			pid, sockErr == nil, backends, c.konnBadCycles))
-		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "dryrun").Inc()
-	default:
-		// off — the streak + gauge still surface the degradation.
-	}
-}
-
-// konnReadyBackends scrapes the konnectivity-server metrics endpoint
-// and reads the ready-backend gauge. ok=false on a scrape or parse
-// failure — the series is exported as -1, never a fabricated 0.
-func (c *FreezeCheck) konnReadyBackends(ctx context.Context) (float64, bool) {
-	body, err := c.d.Cfg.KCMMetricsFn(ctx, konnMetricsURL)
-	if err != nil {
-		return 0, false
-	}
-	return ParseKonnectivityReadyBackends(body)
-}
-
-// ParseKonnectivityReadyBackends reads the
-// konnectivity_network_proxy_server_ready_backend_connections
-// sample out of a metrics body — the metric is unlabeled; comment
-// and HELP/TYPE lines never match. ok=false when the series is
-// absent (a build that exports no metric is inconclusive, not
-// "zero backends").
-func ParseKonnectivityReadyBackends(body string) (float64, bool) {
-	for _, ln := range strings.Split(body, "\n") {
-		ln = strings.TrimSpace(ln)
-		if strings.HasPrefix(ln, "#") || !strings.HasPrefix(ln, konnReadyMetric) {
-			continue
-		}
-		f := strings.Fields(ln)
-		if len(f) < 2 {
-			continue
-		}
-		if v, err := strconv.ParseFloat(f[len(f)-1], 64); err == nil {
-			return v, true
-		}
-	}
-	return 0, false
-}
-
-// konnectivityPID locates the supervisor's konnectivity-server child
-// — lowest pid whose cmdline basename is konnectivity-server. comm
-// would truncate at 15 chars ("konnectivity-se") so the cmdline is
-// the reliable name; a pod-side konnectivity-agent argv contains
-// "konnectivity-agent", never the server binary.
-func (c *FreezeCheck) konnectivityPID() int {
-	pids, err := c.d.Proc.PIDs()
-	if err != nil {
-		return 0
-	}
-	sort.Ints(pids)
-	for _, pid := range pids {
-		args := c.d.Proc.Cmdline(pid)
-		if len(args) == 0 {
-			continue
-		}
-		base := args[0]
-		if i := strings.LastIndex(base, "/"); i >= 0 {
-			base = base[i+1:]
-		}
-		if base == "konnectivity-server" {
-			return pid
-		}
-	}
-	return 0
-}
-
-// readyWorkers counts Ready, non-control-plane nodes via the
-// apiserver client — the heal only makes sense while a worker can
-// actually dial the tunnel; a zero count suppresses the kill (a
-// cluster-wide outage is not a konnectivity fault).
-func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
-	client := c.d.EnsureClient()
-	if client == nil {
-		return 0
-	}
-	endpoint := strings.TrimPrefix(c.d.Cfg.Hub.SelfAPI, "https://")
-	endpoint = strings.TrimPrefix(endpoint, "http://")
-	qctx, cancel := context.WithTimeout(ctx, c.d.Cfg.QueryTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
-		"https://"+endpoint+"/api/v1/nodes?limit=500", nil)
-	if err != nil {
-		return 0
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Labels map[string]string `json:"labels"`
-			} `json:"metadata"`
-			Status struct {
-				Conditions []struct {
-					Type   string `json:"type"`
-					Status string `json:"status"`
-				} `json:"conditions"`
-			} `json:"status"`
-		} `json:"items"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&list); err != nil {
-		return 0
-	}
-	n := 0
-	for _, item := range list.Items {
-		if _, cp := item.Metadata.Labels["node-role.kubernetes.io/control-plane"]; cp {
-			continue
-		}
-		if _, cp := item.Metadata.Labels["node-role.kubernetes.io/master"]; cp {
-			continue
-		}
-		for _, cond := range item.Status.Conditions {
-			if cond.Type == "Ready" && cond.Status == "True" {
-				n++
-			}
-		}
-	}
-	return n
 }
