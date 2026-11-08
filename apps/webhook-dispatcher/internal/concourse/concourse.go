@@ -296,6 +296,13 @@ func (c *Client) apiPath(p string) string {
 	return "/api/v1/teams/" + url.PathEscape(c.Team) + "/" + p
 }
 
+// maxJSONBody bounds how much of a 2xx ATC response getJSON will
+// decode — matched to the handler's 8 MiB inbound webhook body cap
+// (handler.maxBodyBytes). Real index/listing payloads are far
+// smaller, so a longer body means a wedged or hostile peer and the
+// decode must fail instead of buffering the stream whole.
+const maxJSONBody = 8 << 20 // 8 MiB
+
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimSuffix(c.BaseURL, "/")+path, nil)
@@ -314,7 +321,9 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	// Bound the decode: without LimitReader a 2xx body longer than
+	// maxJSONBody (an ATC streaming forever) would be buffered whole.
+	return json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
 }
 
 // sourceRepo pulls the repo identity out of a resource's source:

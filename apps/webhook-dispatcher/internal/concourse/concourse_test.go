@@ -581,6 +581,48 @@ func TestGetJSONNon2xx(t *testing.T) {
 	}
 }
 
+func TestGetJSONBodyOverCapFails(t *testing.T) {
+	// A 2xx body longer than maxJSONBody (a wedged ATC streaming
+	// forever) must fail the decode instead of being buffered whole.
+	// The stub writes a small chunk on repeat, so the test itself
+	// never holds more than one chunk in memory.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		chunk := []byte(strings.Repeat("a", 64<<10))
+		for written := 0; written <= maxJSONBody; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return // client stopped reading once the cap was hit
+			}
+		}
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+	var out []any
+	if err := c.getJSON(context.Background(), "/x", &out); err == nil {
+		t.Fatal("getJSON over-cap body want error")
+	}
+}
+
+func TestGetJSONDecodes2xxBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"n":2}`))
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+	var out struct {
+		OK bool `json:"ok"`
+		N  int  `json:"n"`
+	}
+	if err := c.getJSON(context.Background(), "/x", &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK || out.N != 2 {
+		t.Fatalf("decoded=%+v want {OK:true N:2}", out)
+	}
+}
+
 func TestSourceRepo(t *testing.T) {
 	if got := sourceRepo(map[string]any{"uri": "u", "repository": "r"}); got != "u" {
 		t.Fatalf("uri precedence=%q want u", got)

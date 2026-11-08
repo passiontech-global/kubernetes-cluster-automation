@@ -150,6 +150,10 @@ func main() {
 		// bounded by the per-target fan-out timeout) before exiting.
 		logger().Info("connections drained — waiting for in-flight fan-outs")
 		wh.Wait()
+		// Fan-outs are done — drop the keep-alive connections the ATC
+		// client pooled during dispatch so the process exits without
+		// lingering sockets.
+		client.HTTP.CloseIdleConnections()
 	}()
 
 	logger().Info("starting webhook-dispatcher",

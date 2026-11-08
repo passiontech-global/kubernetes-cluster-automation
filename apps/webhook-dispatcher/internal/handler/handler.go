@@ -35,6 +35,11 @@ const (
 	// fanoutTimeout caps each check-webhook POST so one wedged
 	// pipeline can't stall the rest of the fan-out.
 	fanoutTimeout = 15 * time.Second
+	// fanoutBudget bounds one whole dispatch — the semaphore queue
+	// included. A target's 15s timeout starts only after it takes a
+	// slot, so a target queued behind a full semaphore (16 slots held
+	// by slow POSTs) would otherwise wait forever.
+	fanoutBudget = 30 * time.Second
 )
 
 // Backend is the slice of the Concourse client the handler needs —
@@ -90,6 +95,10 @@ type Handler struct {
 	// graceful-shutdown path (Wait) can wait for the last check to
 	// land.
 	wg sync.WaitGroup
+	// budget bounds one dispatch — the semaphore queue included
+	// (fanoutBudget in production; tests shorten it so the budget
+	// path stays deterministic).
+	budget time.Duration
 }
 
 // New returns a Handler verifying signatures against secret and
@@ -99,6 +108,7 @@ func New(secret string, b Backend) *Handler {
 		secret:  secret,
 		backend: b,
 		sem:     make(chan struct{}, fanoutWorkers),
+		budget:  fanoutBudget,
 	}
 }
 
@@ -289,22 +299,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // dispatch POSTs every matched resource's check webhook on a detached
-// context — the request is already answered. The Handler-wide worker
-// semaphore bounds concurrency so a large match set (or several
-// deliveries at once) can't stampede the ATC; each target gets its
-// own timeout so one wedged pipeline can't stall the rest of the
-// fan-out.
+// context — the request is already answered. The whole fan-out runs
+// on a fixed budget (fanoutBudget, same 30s the request-path index
+// fetch gets): the Handler-wide worker semaphore bounds concurrency
+// so a large match set (or several deliveries at once) can't stampede
+// the ATC, and a target queued behind a full semaphore has no
+// per-target timeout yet — that starts only once a slot is taken —
+// so the budget is its escape hatch. Each admitted target then gets
+// its own 15s timeout so one wedged pipeline can't stall the rest of
+// the fan-out.
 func (h *Handler) dispatch(resources []concourse.Resource,
 	delivery, event, repo string) {
 	start := time.Now()
-	ctx := context.Background()
+	// Detached by construction (dispatch runs on its own goroutine
+	// outliving the request), but still bounded: nothing here may
+	// wait on the ATC without an exit path.
+	ctx, cancel := context.WithTimeout(context.Background(), h.budget)
+	defer cancel()
 	var wg sync.WaitGroup
 	var checked atomic.Int64
 	for _, res := range resources {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			h.sem <- struct{}{}
+			select {
+			case h.sem <- struct{}{}:
+			case <-ctx.Done():
+				// Budget spent queued — skip the POST and let the
+				// target go (Done above runs on this path too).
+				fanoutTotal.WithLabelValues("budget").Inc()
+				logger().Warn("check webhook skipped: fan-out budget expired while queued",
+					"pipeline", res.Pipeline, "resource", res.Name,
+					"repo", res.Repo, "delivery", delivery)
+				return
+			}
 			defer func() { <-h.sem }()
 			tctx, cancel := context.WithTimeout(ctx, fanoutTimeout)
 			defer cancel()

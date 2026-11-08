@@ -735,3 +735,47 @@ func TestWaitDrainsInFlightFanout(t *testing.T) {
 		t.Fatalf("check calls=%d want 2 after Wait", got)
 	}
 }
+
+// TestFanoutBudgetReleasesQueuedTargets: the semaphore must never be
+// a dead end. Every slot is held while a delivery fans out, so all
+// matched targets queue with no way in; the dispatch budget (shortened
+// here) has to let them give up, release the detached goroutine for
+// Wait/shutdown, and never fire the POSTs they never got a slot for.
+func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+	h.budget = 50 * time.Millisecond
+
+	// Hold every slot for the whole delivery — nothing can acquire one.
+	for range fanoutWorkers {
+		h.sem <- struct{}{}
+	}
+	defer func() {
+		for range fanoutWorkers {
+			<-h.sem
+		}
+	}()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202 (the response must not wait on the fan-out)", rec.Code)
+	}
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2 (push matches the 2 git resources)", s.ResourcesMatched)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		h.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return — queued targets have no escape from the semaphore")
+	}
+	if got := len(b.checkList()); got != 0 {
+		t.Fatalf("check calls=%d want 0 (budget-expired targets must not POST)", got)
+	}
+}
