@@ -155,7 +155,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		// the restart shape even when the replacement is already
 		// serving (it is the silent wedge seed, and the restart
 		// count alone never attributes the kill).
-		if linkerdProxyOOMKilled(pod) {
+		if linkerdProxyOOMKilled(pod, now) {
 			oomRep.Flag(linkerdProxyOOMKilledGauge, key, lv)
 			rep.Find(key + "(linkerd-proxy OOMKilled)")
 		}

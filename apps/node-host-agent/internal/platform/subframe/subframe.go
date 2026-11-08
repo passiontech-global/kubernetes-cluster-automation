@@ -81,14 +81,23 @@ func FromDeps(d hostctx.Deps) Base {
 }
 
 // StoreAt returns the shared watchdog-state Store over an explicit
-// dir/logFile pair — the single hoststate.New call shape every
-// subsystem's New used to repeat. Dir may name a subsystem-private
-// state dir (kinedb's GuardStateDir, hostconfig's HostRoot-joined
-// dir) or "" the log file out (nodereporter, hostconfig). clock may
+// dir/logFile pair — the single hoststate construction call shape
+// every subsystem's New repeats. The store is the PROCESS-WIDE
+// instance for the canonical dir (hoststate.Shared): workerhygiene
+// and controllerhygiene share the state-journal-unreadable latch
+// through ONE multi-owner registry, and every subsystem appending
+// the watchdog log shares one rotation mutex. Dir may name a
+// subsystem-private state dir (kinedb's GuardStateDir, hostconfig's
+// HostRoot-joined dir) — the key is the canonical dir, so a private
+// dir still gets its own instance. logFile "" on a later call
+// inherits whatever the first construction named (nodereporter/
+// hostconfig only READ the log via cfg — they pass ""). clock may
 // be nil (hoststate falls back to system time); pass the cell the
 // subsystem actually reads — the method value binds the cell
 // POINTER so a post-New Clock.Set is observed by the store
-// (hoststate.Store.Now contract).
+// (hoststate.Store.Now contract). The clock/logger of the FIRST
+// construction for a dir win — production wiring passes the one
+// shared hostctx cell everywhere.
 func StoreAt(dir, logFile string, clock *timex.Cell,
 	log func() *slog.Logger) *hoststate.Store {
 
@@ -96,7 +105,7 @@ func StoreAt(dir, logFile string, clock *timex.Cell,
 	if clock != nil {
 		now = clock.Now
 	}
-	return hoststate.New(dir, logFile, now, log)
+	return hoststate.Shared(dir, logFile, now, log)
 }
 
 // Store is StoreAt over the Base's own WatchdogStateDir +

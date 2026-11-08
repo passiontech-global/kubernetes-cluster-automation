@@ -24,6 +24,7 @@ tasks:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       # internal/envdoc TestEnvDocCoversSource reads docs/env.md — without
       # this input a docs-only PR never re-runs this test on CI.
       - 'docs/env.md'
@@ -32,11 +33,13 @@ tasks:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
 
   lint:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       # golangci-lint resolves its config by walking up to the repo root.
       - '/.golangci.yml'
 
@@ -54,6 +57,7 @@ tasks:
       - 'go.sum'
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
     outputs:
       - 'bin/node-automation-controller'
 
@@ -68,5 +72,6 @@ tasks:
       - '.ko.yaml'
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
     options:
       cache: false

@@ -2,16 +2,19 @@ package fluentbitroller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -407,5 +410,87 @@ func TestFluentBitRollerStatePatchError(t *testing.T) {
 	}
 	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
 		t.Fatal("rolled-config-hash written despite the failed patch")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Informer-cache secret read + direct-CS drift confirm (secretReader seam)
+// ---------------------------------------------------------------------------
+
+// cacheReader is a kube.CachedObjectReader stub playing the informer
+// cache for the one watched secret — independent of the fake
+// clientset that plays the live apiserver.
+type cacheReader struct{ sec *corev1.Secret }
+
+func (c *cacheReader) Get(_ context.Context, key client.ObjectKey,
+	obj client.Object, _ ...client.GetOption) error {
+	if key.Namespace == fluentNS && key.Name == pipelineName && c.sec != nil {
+		data, err := json.Marshal(c.sec)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(data, obj)
+	}
+	return apierrors.NewNotFound(
+		corev1.SchemeGroupVersion.WithResource("secrets").GroupResource(),
+		key.Name)
+}
+
+// A cache-served drift with an ALREADY-ROLLED live secret must not
+// restart the DaemonSet: the destructive path confirms the drift on
+// the direct clientset before acting — a stale informer never rolls
+// a workload the live object says is current.
+func TestFluentBitRollerCachedDriftConfirmSkipsSettled(t *testing.T) {
+	now := time.Now()
+	// Cache: drift (hash stamped, nothing rolled). Live: same hash
+	// already rolled — the secret event the cache missed.
+	stale := pipelineSecret(map[string]string{
+		kube.AnnoFluentConfigHash: "h1",
+	})
+	live := pipelineSecret(map[string]string{
+		kube.AnnoFluentConfigHash: "h1",
+		kube.AnnoRolledConfigHash: "h1",
+	})
+	cs := fake.NewSimpleClientset(live, fluentBitDS(1, 1, 1, 1),
+		testutil.Node("n1", corev1.ConditionTrue, nil))
+	var dsPatches int
+	cs.PrependReactor("patch", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			dsPatches++
+			return false, nil, nil
+		})
+	r := newRoller(cs)
+	r.secretReader = &cacheReader{sec: stale}
+	r.now = func() time.Time { return now }
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Minute {
+		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
+	}
+	if dsPatches != 0 {
+		t.Fatalf("restart patch fired off a stale cache read (%d attempts)", dsPatches)
+	}
+}
+
+// A cache-served drift confirmed on the live secret still rolls.
+func TestFluentBitRollerCachedDriftConfirmRolls(t *testing.T) {
+	now := time.Now()
+	stale := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"})
+	live := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"})
+	cs := fake.NewSimpleClientset(live, fluentBitDS(1, 1, 1, 1),
+		testutil.Node("n1", corev1.ConditionTrue, nil))
+	r := newRoller(cs)
+	r.secretReader = &cacheReader{sec: stale}
+	r.now = func() time.Time { return now }
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
+		t.Fatal("confirmed drift did not restart the DaemonSet")
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "h1" {
+		t.Fatalf("rolled-config-hash = %q, want h1", got)
 	}
 }

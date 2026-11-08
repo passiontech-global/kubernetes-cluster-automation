@@ -33,6 +33,21 @@ func TestSetupRegistersController(t *testing.T) {
 	}
 }
 
+// A gated-off module registers nothing: SetupNoConfig honors
+// Deps.Disabled before the builder ever runs — no controller, no
+// watch, no informer.
+func TestSetupDisabledRegistersNothing(t *testing.T) {
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{Name: "descheduler-storm-gate", Mgr: m,
+		CS: fake.NewSimpleClientset(), Dyn: testutil.StubDyn(),
+		Disabled: true}); err != nil {
+		t.Fatalf("disabled setup must return nil, got %v", err)
+	}
+	if len(m.Added) != 0 {
+		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
+	}
+}
+
 // The module's Node watch maps every node event onto its fixed sweep
 // key — a multi-node burst must set-collapse to a single queued
 // request. Drives the exact MapFunc the watch installs

@@ -10,10 +10,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"maps"
 	"net"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -50,6 +52,11 @@ const (
 	probeMaxPerSvc   = 2  // endpoint IPs dialed per service
 	probeMaxPodRefs  = 32 // backing-pod candidates kept per service
 	probeDefaultPort = 443
+
+	// probeWorkers bounds the brownout probe's concurrency — at most
+	// four TCP+TLS handshakes in flight per sweep, no matter how many
+	// webhook backends the cluster carries.
+	probeWorkers = 4
 )
 
 // EndpointCensus is the W5.5 dual ready-endpoint count: raw counts
@@ -164,23 +171,60 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 		return EndpointCensus{}, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
 	}
 	// W9-CP1 — TCP+TLS brownout probe, up to probeMaxPerSvc
-	// Ready endpoint IPs per webhook backend. Responsive is an
-	// ANY-success verdict: one answering endpoint means the Service
-	// is not brownout-hung even if siblings are.
+	// Ready endpoint IPs per webhook backend, fanned out through a
+	// bounded worker pool (probeWorkers dials at most four handshakes
+	// at once — a cluster with dozens of webhook backends must not
+	// open dozens of concurrent TLS connections every sweep).
+	// Responsive is an ANY-success verdict: one answering endpoint
+	// means the Service is not brownout-hung even if siblings are.
+	// A ctx cancellation stops the probe immediately and leaves the
+	// in-flight services UNRECORDED — Probed/Responsive stay unset so
+	// a cancelled sweep cannot read as "every webhook unresponsive"
+	// and stamp the brownout ledgers.
 	prober := g.EndpointProber
 	if prober == nil {
 		prober = tcpTLSEndpointProber
 	}
-	for key, ips := range ready.ProbeIPs {
-		ready.Probed[key] = true
-		ok := false
-		for _, ip := range ips {
-			if prober(ctx, ip, ready.ProbePort[key]) {
-				ok = true
-				break
+	probeKeys := slices.Sorted(maps.Keys(ready.ProbeIPs))
+	type probeVerdict struct {
+		key        string
+		responsive bool
+	}
+	workers := min(probeWorkers, len(probeKeys))
+	jobs := make(chan string)
+	results := make(chan probeVerdict, len(probeKeys))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range jobs {
+				ok := false
+				for _, ip := range ready.ProbeIPs[key] {
+					if prober(ctx, ip, ready.ProbePort[key]) {
+						ok = true
+						break
+					}
+				}
+				// The run's budget expired mid-probe: leave the
+				// service unrecorded — an aborted dial is not
+				// evidence of a hung webhook.
+				if ctx.Err() != nil {
+					continue
+				}
+				results <- probeVerdict{key: key, responsive: ok}
 			}
-		}
-		ready.Responsive[key] = ok
+		}()
+	}
+	for _, key := range probeKeys {
+		jobs <- key
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	for v := range results {
+		ready.Probed[v.key] = true
+		ready.Responsive[v.key] = v.responsive
 	}
 	return ready, nil
 }
@@ -388,19 +432,23 @@ func nodeUnhealthyForEndpoints(n *corev1.Node) bool {
 }
 
 // tcpTLSEndpointProber is the production EndpointProber: a 2s
-// TCP-connect + TLS handshake against ip:port. InsecureSkipVerify —
-// the probe answers "is the webhook port serving TLS at all", not
-// "is the certificate valid": a brownout pod fails the handshake
-// entirely, while a healthy one completes it regardless of SANs the
-// probe cannot vouch for.
+// TCP-connect + TLS handshake against ip:port, dialed through
+// tls.Dialer.DialContext so the caller's ctx cancels the handshake
+// itself (tls.DialWithDialer's legacy path could outlive it).
+// InsecureSkipVerify — the probe answers "is the webhook port serving
+// TLS at all", not "is the certificate valid": a brownout pod fails
+// the handshake entirely, while a healthy one completes it regardless
+// of SANs the probe cannot vouch for.
 func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 	if err := ctx.Err(); err != nil {
 		return false
 	}
-	d := &net.Dialer{Timeout: 2 * time.Second}
-	conn, err := tls.DialWithDialer(d, "tcp",
-		net.JoinHostPort(ip, strconv.Itoa(int(port))),
-		&tls.Config{InsecureSkipVerify: true}) // liveness probe only
+	d := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 2 * time.Second},
+		Config:    &tls.Config{InsecureSkipVerify: true}, // liveness probe only
+	}
+	conn, err := d.DialContext(ctx, "tcp",
+		net.JoinHostPort(ip, strconv.Itoa(int(port))))
 	if err != nil {
 		return false
 	}

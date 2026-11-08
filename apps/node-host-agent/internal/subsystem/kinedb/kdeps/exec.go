@@ -19,6 +19,13 @@ func (d *Deps) Exec(ctx context.Context, argv []string, stdin string) (string, e
 	return d.ExecEnv(ctx, nil, argv, stdin)
 }
 
+// ExecLong runs argv under the long maintenance budget — compact
+// sessions, VACUUM/REINDEX, pg_repack, the container→host cp of a
+// fresh backup dump.
+func (d *Deps) ExecLong(ctx context.Context, argv []string, stdin string) (string, error) {
+	return d.ExecLongEnv(ctx, nil, argv, stdin)
+}
+
 // ExecEnv is Exec with extra child environment — the only channel a
 // secret may take: it rides the child's env, never argv.
 func (d *Deps) ExecEnv(ctx context.Context, env, argv []string, stdin string) (string, error) {

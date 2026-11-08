@@ -1,6 +1,7 @@
 package hostexec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -387,5 +388,42 @@ func TestCtxExpiryKillsWholeProcessTree(t *testing.T) {
 			t.Fatalf("grandchild pid %s survived the group kill", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestCappedBufferKeepsHeadAcrossBoundary: the cap keeps the HEAD of
+// the stream — a Write straddling the cap boundary lands only its
+// fitting prefix (p[:rem]) and the rest is drained (reported as
+// written so the child never blocks), while a Write past the cap
+// adds nothing and never grows the buffer.
+func TestCappedBufferKeepsHeadAcrossBoundary(t *testing.T) {
+	var b cappedBuffer
+	first := bytes.Repeat([]byte("a"), maxCmdOutputBytes-10)
+	if n, err := b.Write(first); err != nil || n != len(first) {
+		t.Fatalf("first write n=%d err=%v", n, err)
+	}
+	// Straddling write: only 10 bytes fit; the remaining 5 are
+	// dropped but counted.
+	straddle := bytes.Repeat([]byte("b"), 15)
+	if n, err := b.Write(straddle); err != nil || n != len(straddle) {
+		t.Fatalf("straddle write n=%d err=%v (must report the full drain)", n, err)
+	}
+	got := b.String()
+	if len(got) != maxCmdOutputBytes {
+		t.Fatalf("buffer len=%d, want exactly the cap %d", len(got), maxCmdOutputBytes)
+	}
+	if !strings.HasPrefix(got, string(first)) {
+		t.Fatal("head prefix lost")
+	}
+	if !strings.HasSuffix(got, "bbbbbbbbbb") {
+		t.Fatal("straddling write must land its fitting head (p[:rem])")
+	}
+	// Past the cap: nothing added, buffer stable.
+	after := b.String()
+	if _, err := b.Write(bytes.Repeat([]byte("c"), 1000)); err != nil {
+		t.Fatalf("past-cap write err=%v", err)
+	}
+	if b.String() != after {
+		t.Fatal("past-cap write must not change the retained buffer")
 	}
 }

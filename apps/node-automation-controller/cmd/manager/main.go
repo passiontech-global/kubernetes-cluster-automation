@@ -164,8 +164,11 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		// standbys. ReleaseOnCancel hands the Lease over on graceful
 		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
 		// on crash (15s default; deployments pass 180s).
-		LeaderElection:                leaderElect,
-		LeaderElectionID:              "node-automation-controller.node-ops",
+		LeaderElection: leaderElect,
+		// Lease name follows the upstream election-id convention
+		// (<name>.<domain> — cf. e1f13584.medik8s.io); domain is the
+		// same passiontech.dev registry the annotations use.
+		LeaderElectionID:              "node-automation-controller.passiontech.dev",
 		LeaderElectionReleaseOnCancel: true,
 		Cache:                         buildCacheOptions(),
 	}
@@ -317,6 +320,36 @@ func main() {
 		os.Exit(1)
 	}
 
+	// SECOND client for the latency-sensitive probes (apiserver-
+	// endpoint-guard, kubelet-liveness-reaper, dead-node-sweeper —
+	// the Module.ProbeClients registry rows). The shared bucket above
+	// is sized for the whole fleet, and the janitors own its biggest
+	// bursts: an evicted-pod/failed-jobs sweep deleting hundreds of
+	// objects per cycle drains it and leaves a probe waiting on
+	// client-go's queue-delay exactly while a wedge is in progress —
+	// the moment its verdict latency matters most. probeCfg is a COPY
+	// of the direct config with a FRESH RateLimiter (rest.Config
+	// carries the limiter interface by reference through CopyConfig,
+	// so the field must be replaced, not left shared) and its own
+	// env-overridable ceiling. The per-request Timeout inherited from
+	// directCfg keeps the same hung-call posture; the informer WATCH
+	// streams stay on the manager's config, untouched.
+	probeCfg := rest.CopyConfig(directCfg)
+	probeCfg.QPS = float32(envx.GetenvInt("NODE_AUTOMATION_PROBE_CLIENT_QPS", 20))
+	probeCfg.Burst = envx.GetenvInt("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40)
+	probeCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
+		probeCfg.QPS, probeCfg.Burst)
+	probeCS, err := kubernetes.NewForConfig(probeCfg)
+	if err != nil {
+		log.Error(err, "unable to create probe clientset")
+		os.Exit(1)
+	}
+	probeDyn, err := dynamic.NewForConfig(probeCfg)
+	if err != nil {
+		log.Error(err, "unable to create probe dynamic client")
+		os.Exit(1)
+	}
+
 	// The global heal budget — the aggregate blast-radius cap every
 	// heal-gated module shares (platform/heal consults it inside
 	// AllowedV, so the per-target cooldowns keep working and only
@@ -329,7 +362,8 @@ func main() {
 		envx.GetenvDuration("NODE_AUTOMATION_HEAL_BUDGET_WINDOW", 5*time.Minute))
 	heal.SetBudgetExhaustedHook(metrics.HealBudgetExhaustedTotal.Inc)
 
-	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Log: ctrl.Log}
+	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn,
+		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}

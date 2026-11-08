@@ -244,6 +244,47 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// InodePressure split (plan Component 2)
+// ---------------------------------------------------------------------------
+
+// InodePressure is kubelet-native but stays in the precordon set
+// (nodecond.HangPreCordonNames) — a sustained inode storm starves the
+// node like any other latch. The condition-SWEEPER is the one gate
+// that must never touch it: kubelet conditions are outside
+// nodecond.HeartbeatSweptNames (see node_condition_sweeper_test.go).
+func TestNodeHangPreCordonInodePressureNotSwept(t *testing.T) {
+	found := false
+	for _, c := range nodeHangConds {
+		if c == "InodePressure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("InodePressure left the precordon set")
+	}
+	for _, c := range nodeCondSweptConds {
+		if c == "InodePressure" {
+			t.Fatal("InodePressure must not be swept — kubelet-owned")
+		}
+	}
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-inode", "InodePressure", 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("sustained InodePressure did not fail the check")
+	}
+	n, err := cs.CoreV1().Nodes().Get(ctx, "w-inode", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.Spec.Unschedulable ||
+		n.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+		t.Fatal("sustained InodePressure not cordoned+stamped")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Stale-heartbeat gate (2026-11-06 zombie-latch outage)
 // ---------------------------------------------------------------------------
 

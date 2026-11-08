@@ -16,8 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -37,6 +39,22 @@ func olmUnstructured(apiVersion, kind, ns, name string, status map[string]any) *
 		_ = unstructured.SetNestedField(obj.Object, v, "status", k)
 	}
 	return obj
+}
+
+// olmOperatorPod builds an olm-operator pod owned by its ReplicaSet
+// — the heal's candidate filter requires a controller owner (a
+// controller-less pod could not be recreated after a delete), and
+// the cooldown keys on that controller via kube.PodControllerKey.
+func olmOperatorPod(name, uid string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "olm", Name: name, UID: types.UID(uid),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name,
+				UID: types.UID("rs-" + uid), Controller: ptr.To(true)}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 }
 
 // Absent OLM CRDs read as "not installed" — the check stays quiet.
@@ -69,8 +87,7 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
 	})
 	base := time.Now()
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	opPod := olmOperatorPod("olm-operator-77dc", "o1")
 	cs := fake.NewSimpleClientset(opPod)
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
 		"operators", "rabbitmq.v1.2.3", map[string]any{"phase": "Installing"})
@@ -122,8 +139,7 @@ func TestCheckOLMHealthRestartResumeHeals(t *testing.T) {
 		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
 	})
 	base := time.Now()
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	opPod := olmOperatorPod("olm-operator-77dc", "o1")
 	cs := fake.NewSimpleClientset(opPod)
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
 		"operators", "rabbitmq.v1.2.3", map[string]any{"phase": "Installing"})
@@ -152,8 +168,7 @@ func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 			olmKindSubscription, "operators", "keda", olmReasonCatalogUnhealthy)
 	})
 	base := time.Now()
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	opPod := olmOperatorPod("olm-operator-77dc", "o1")
 	cs := fake.NewSimpleClientset(opPod)
 	sub := olmUnstructured("operators.coreos.com/v1alpha1", "Subscription",
 		"operators", "keda", map[string]any{
@@ -184,8 +199,7 @@ func TestCheckOLMHealthCertRotationOverdue(t *testing.T) {
 		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCertOverdue)
 	})
 	base := time.Now()
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	opPod := olmOperatorPod("olm-operator-77dc", "o1")
 	cs := fake.NewSimpleClientset(opPod)
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
 		"operators", "nhc.v1", map[string]any{
@@ -231,8 +245,7 @@ func TestCheckOLMHealthHealStampPersistedOnDeployment(t *testing.T) {
 		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
 	})
 	base := time.Now()
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	opPod := olmOperatorPod("olm-operator-77dc", "o1")
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "olm", Name: olmOperatorPodPrefix}}
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
@@ -262,8 +275,7 @@ func TestCheckOLMHealthHealStampPersistedOnDeployment(t *testing.T) {
 
 	// Restart: the same CSV still wedged, the same Deployment now
 	// carrying a fresh stamp — the annotation alone defers the bounce.
-	opPod2 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "olm", Name: "olm-operator-88de", UID: "o2"}}
+	opPod2 := olmOperatorPod("olm-operator-88de", "o2")
 	dep2 := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "olm", Name: olmOperatorPodPrefix,
 		Annotations: map[string]string{
@@ -381,4 +393,48 @@ func olmAnnoKeys(obj *unstructured.Unstructured) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// ---------------------------------------------------------------------------
+// W17 — the olm-operator heal budget.
+// ---------------------------------------------------------------------------
+
+// At most ONE olm-operator pod is deleted per cycle even when two
+// replicas exist, the pick is the deterministic lowest-name, and a
+// controller-less operator pod is never a candidate (nothing would
+// recreate it — the delete would be permanent loss, not a heal).
+func TestOLMOperatorHealOnePodPerCycle(t *testing.T) {
+	t.Cleanup(func() {
+		olmUnhealthyResourcesGauge.DeleteLabelValues(
+			olmKindCSV, "operators", "rabbitmq.v1.2.3", olmReasonCSVStuck)
+		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
+	})
+	base := time.Now()
+	first := olmOperatorPod("olm-operator-11aa", "o1")
+	second := olmOperatorPod("olm-operator-77dc", "o2")
+	solo := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "olm", Name: "olm-operator-solo", UID: "o3"}}
+	cs := fake.NewSimpleClientset(first, second, solo)
+	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
+		"operators", "rabbitmq.v1.2.3", map[string]any{"phase": "Installing"})
+	csv.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenOLMUnhealthy: `{"ClusterServiceVersion/operators/rabbitmq.v1.2.3/` +
+			olmReasonCSVStuck + `":"` +
+			base.Add(-21*time.Minute).UTC().Format(time.RFC3339) + `"}`})
+	p := testProberDyn(cs, probetest.OpDyn(csv))
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck CSV past the heal window must FAIL")
+	}
+	if _, err := cs.CoreV1().Pods("olm").
+		Get(ctx, "olm-operator-11aa", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the lowest-name owned operator pod must be deleted, err=%v", err)
+	}
+	for _, keep := range []string{"olm-operator-77dc", "olm-operator-solo"} {
+		if _, err := cs.CoreV1().Pods("olm").
+			Get(ctx, keep, metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s must survive one heal cycle: %v", keep, err)
+		}
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -16,6 +17,28 @@ import (
 )
 
 // ---------------- filters ----------------
+
+// errUnknownFilter marks an UNREGISTERED filter name. filterMap's
+// getAttr fallback keys on it via errors.Is, so a known filter's
+// runtime error (bad regex, bad JSON, divide by zero) surfaces
+// instead of being swallowed into an Undefined attribute read.
+var errUnknownFilter = errors.New("unsupported filter")
+
+// maxIndentWidth caps the |indent width — strings.Repeat with a
+// huge count allocates without bound (OOM). 10k spaces per line is
+// already far past any sane template.
+const maxIndentWidth = 10_000
+
+// floatToInt64 converts only finite, int64-range floats — Go's
+// int64() on NaN/±Inf or an out-of-range value yields platform
+// garbage (typically MinInt64), which |int must never return:
+// callers fall back to the filter's default instead.
+func floatToInt64(f float64) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < math.MinInt64 || f >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(f), true
+}
 
 func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (any, error) {
 	switch name {
@@ -168,7 +191,9 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		case int64:
 			return t, nil
 		case float64:
-			return int64(t), nil
+			if i, ok := floatToInt64(t); ok {
+				return i, nil
+			}
 		case bool:
 			if t {
 				return int64(1), nil
@@ -180,7 +205,12 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 				return i, nil
 			}
 			if f, err := strconv.ParseFloat(t, 64); err == nil {
-				return int64(f), nil
+				// NaN/±Inf/out-of-int64-range floats used to
+				// truncate into platform garbage (usually
+				// MinInt64) — the default is the honest answer.
+				if i, ok := floatToInt64(f); ok {
+					return i, nil
+				}
 			}
 		}
 		return def, nil
@@ -268,7 +298,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return nil, nil
 	case "to_json":
-		b, err := json.Marshal(jsonValue(v))
+		jv, err := jsonValue(v)
+		if err != nil {
+			return nil, err
+		}
+		b, err := json.Marshal(jv)
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +316,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "from_yaml":
 		return DecodeYAML([]byte(Stringify(v)))
 	case "to_yaml", "to_nice_yaml":
-		b, err := yaml3.Marshal(toPlain(v))
+		pv, err := toPlain(v)
+		if err != nil {
+			return nil, err
+		}
+		b, err := yaml3.Marshal(pv)
 		if err != nil {
 			return nil, err
 		}
@@ -334,6 +372,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		// count, so clamp instead of passing it through.
 		if n < 0 {
 			n = 0
+		}
+		// Same for a huge width: strings.Repeat would allocate
+		// width×lines bytes without bound (OOM) — cap it.
+		if n > maxIndentWidth {
+			n = maxIndentWidth
 		}
 		pad := strings.Repeat(" ", int(n))
 		return pad + strings.ReplaceAll(Stringify(v), "\n", "\n"+pad), nil
@@ -410,5 +453,5 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return v, nil
 	}
-	return nil, fmt.Errorf("unsupported filter %q", name)
+	return nil, fmt.Errorf("%w: %q", errUnknownFilter, name)
 }

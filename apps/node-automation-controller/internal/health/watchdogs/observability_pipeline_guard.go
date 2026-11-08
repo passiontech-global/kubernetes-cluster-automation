@@ -116,11 +116,18 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	var rep probefw.SweepReport
 	last := p.emitted.Last()
+	// The components judged degraded this sweep + whether every
+	// query answered: the evented set may only be pruned on a
+	// conclusive cycle, else a Prometheus flap would re-arm the
+	// deduped Warning Event and re-page the same episode.
+	degraded := map[string]bool{}
+	inconclusive := false
 
 	// Dead-Man's-Switch — the always-firing Watchdog alert.
 	series, err := p.PromQuery(ctx, obsWatchdogQuery)
 	switch {
 	case err != nil:
+		inconclusive = true
 		log.Info("WARN: watchdog heartbeat query failed — pipeline signal inconclusive",
 			"error", err)
 		rep.InfraErr(err)
@@ -128,6 +135,7 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 			rep.Carry("watchdog_heartbeat", lv)
 		}
 	case len(series) == 0 || series[0].Value < 1:
+		degraded["watchdog_heartbeat"] = true
 		p.degrade(ctx, log, &rep, "watchdog_heartbeat",
 			"always-firing Watchdog alert absent — alert evaluation or routing is wedged")
 	}
@@ -135,6 +143,7 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	for _, q := range obsPipelineCounters {
 		series, err := p.PromQuery(ctx, q.query)
 		if err != nil {
+			inconclusive = true
 			log.Info("WARN: pipeline counter query failed — stage inconclusive",
 				"component", q.component, "error", err)
 			rep.InfraErr(err)
@@ -146,7 +155,15 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		if len(series) == 0 {
 			continue
 		}
+		degraded[q.component] = true
 		p.degrade(ctx, log, &rep, q.component, q.desc)
+	}
+	// Recovery prune — a conclusive cycle in which a component is no
+	// longer degraded clears its episode marker so a later relapse
+	// emits a fresh Warning Event instead of being deduped against
+	// the stale one.
+	if !inconclusive {
+		p.evented.Prune(func(c string) bool { return degraded[c] })
 	}
 	return rep.Result(&p.emitted, obsPipelineDegradedGauge.DeleteLabelValues,
 		"observability pipeline degraded: ", ", ")

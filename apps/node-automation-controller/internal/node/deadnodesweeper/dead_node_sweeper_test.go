@@ -206,13 +206,19 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 		}
 	})
 
-	t.Run("Unknown>30m + probe transport-dead -> tainted", func(t *testing.T) {
+	t.Run("Unknown>30m + probe timeout + healthy canary -> tainted", func(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			unknownNode("w1", 45*time.Minute),
+			// The canary: a Ready node whose kubelet still answers —
+			// it certifies the proxy path for the suspect's verdict.
+			testutil.Node("cp1", corev1.ConditionTrue, nil),
 			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
 		dyn := deadNodeDynFake()
 		s := deadNodeSweeperFor(cs, dyn,
-			func(context.Context, string) (bool, error) {
+			func(_ context.Context, node string) (bool, error) {
+				if node == "cp1" {
+					return true, nil
+				}
 				// The shape rest.DoRaw surfaces when nothing answers
 				// the probe inside kubeletHealthzTimeout — dead
 				// evidence.
@@ -223,31 +229,94 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
-			t.Fatal("transport-dead probe (deadline, no answer) not treated as death evidence")
+			t.Fatal("probe timeout with a certifying canary not treated as death evidence")
 		}
 	})
 
-	t.Run("Unknown>30m + probe error inconclusive (apiserver answered) -> skipped", func(t *testing.T) {
+	t.Run("Unknown>30m + probe timeout + canary failing too -> skipped", func(t *testing.T) {
+		// A global konnectivity proxy outage fails every node the same
+		// way — the canary vetoes the fence.
 		cs := fake.NewSimpleClientset(
 			unknownNode("w1", 45*time.Minute),
 			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
 		dyn := deadNodeDynFake()
 		s := deadNodeSweeperFor(cs, dyn,
 			func(context.Context, string) (bool, error) {
-				// The proxy PATH failed — HTTP 500 from the
-				// apiserver, the one-way-partition shape where the
-				// kubelet may still be alive and posting status.
-				// No death certificate, no fence.
-				return false, apierrors.NewGenericServerResponse(500, "GET",
-					schema.GroupResource{Resource: "nodes"}, "w1",
-					"error trying to reach service", 0, true)
+				return false, context.DeadlineExceeded
 			})
 
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
-			t.Fatal("inconclusive probe error (proxy 5xx) must not fence the node")
+			t.Fatal("canary failing the same way must not fence the node")
+		}
+	})
+
+	t.Run("Unknown>30m + proxy 500 naming kubelet + healthy canary -> tainted", func(t *testing.T) {
+		// The apiserver answered AND named the kubelet hop — a death
+		// certificate, certified by a canary that still gets answers.
+		cs := fake.NewSimpleClientset(
+			unknownNode("w1", 45*time.Minute),
+			testutil.Node("cp1", corev1.ConditionTrue, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake()
+		s := deadNodeSweeperFor(cs, dyn,
+			func(_ context.Context, node string) (bool, error) {
+				if node == "cp1" {
+					return true, nil
+				}
+				return false, apierrors.NewGenericServerResponse(500, "GET",
+					schema.GroupResource{Resource: "nodes"}, "w1",
+					"error trying to reach service: dial tcp 10.0.0.7:10250: connect: connection refused", 0, true)
+			})
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("proxy 500 with unreachable-kubelet markers not treated as death evidence")
+		}
+	})
+
+	t.Run("Unknown>30m + markerless proxy 5xx -> skipped", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			unknownNode("w1", 45*time.Minute),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake()
+		s := deadNodeSweeperFor(cs, dyn,
+			func(context.Context, string) (bool, error) {
+				// The apiserver's own 5xx without an
+				// unreachable-kubelet marker says nothing about the
+				// kubelet — no death certificate, no fence.
+				return false, apierrors.NewServiceUnavailable("apiserver proxy busy")
+			})
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("inconclusive probe error (markerless proxy 5xx) must not fence the node")
+		}
+	})
+
+	t.Run("Unknown>30m + RBAC error -> skipped", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			unknownNode("w1", 45*time.Minute),
+			testutil.Node("cp1", corev1.ConditionTrue, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake()
+		s := deadNodeSweeperFor(cs, dyn,
+			func(context.Context, string) (bool, error) {
+				return false, apierrors.NewForbidden(
+					schema.GroupResource{Resource: "nodes"}, "w1", errors.New("proxy denied"))
+			})
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("RBAC error must not fence the node")
 		}
 	})
 
@@ -426,6 +495,58 @@ func TestDeadNodeSweeperVolumeAttachments(t *testing.T) {
 			t.Fatal("taint vetoed by a volumeattachment list failure")
 		}
 	})
+}
+
+// The VolumeAttachment census is fetched once per sweep: the
+// stateful-holder check and the fence's forensics log must share it —
+// previously the fence listed the whole cluster's attachments a second
+// time right after the holder check had just done so.
+func TestDeadNodeSweeperVolumeAttachmentListReused(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute),
+		// Non-RWO holders: the split-brain gate passes so the fence —
+		// and its forensics log — actually run.
+		pvWithModes("pv-rox", corev1.ReadWriteMany),
+		rwoVolumeAttachment("va-rox", "w1", "pv-rox"))
+	var vaLists int32
+	cs.PrependReactor("list", "volumeattachments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&vaLists, 1)
+			return false, nil, nil // fall through to the tracker
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("stateless dead node not fenced")
+	}
+	if got := atomic.LoadInt32(&vaLists); got != 1 {
+		t.Fatalf("volumeattachments listed %d times per sweep, want exactly 1", got)
+	}
+}
+
+// A VolumeAttachment list failure hits both census consumers with the
+// cached error, and each applies its own policy: the holder check
+// fails closed (no fence) while the forensics log stays signal-only.
+func TestDeadNodeSweeperVAListErrorFailsClosed(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute))
+	cs.PrependReactor("list", "volumeattachments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("va list boom")
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatalf("holder list failure must not fail the run: %v", err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("node fenced while the holder check was unverifiable")
+	}
 }
 
 func TestDeadNodeSweeperMissingNode(t *testing.T) {

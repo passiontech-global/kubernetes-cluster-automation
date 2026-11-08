@@ -142,6 +142,11 @@ type Config struct {
 	// bypasses the overlay (direct underlay). Nil → the default
 	// [22 6443 8132 9443 39901].
 	NebulaDirectTCPPorts []int
+	// TextfileDir is the node-exporter drop dir (NODE_HOST_AGENT_
+	// TEXTFILE_DIR via hostctx) — "" falls back to the HostRoot-
+	// derived dir the MTU blackhole gauge used before the env
+	// override existed.
+	TextfileDir string
 
 	// Seams — nil gets production defaults.
 	// runHostCmd executes a host binary (ip, ping): hostexec NSNet —
@@ -387,6 +392,11 @@ type NetHealth struct {
 	// crash-looping guard can't spawn-storm.
 	routeGuardRunning  atomic.Bool
 	routeGuardLastExit atomic.Int64 // unixnano of last guard exit
+	// routeGuardSetnsDead latches a terminal setns failure: the
+	// environment cannot enter the host netns, and every respawn
+	// would lock an OS thread + open two ns fds just to fail again —
+	// the guard stays dead (log line records it) until restart.
+	routeGuardSetnsDead atomic.Bool
 }
 
 // New returns a NetHealth and registers its metrics on reg.
@@ -502,15 +512,17 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 // stateExit removes state-<name> if present and logs the
 // transition — clears the NPD permanent condition — plus the
 // nethealth divergence, named on the Store:
-// Store.ExitClearAllSuspects drops the WHOLE last-suspect-* family
-// with the latch. The NON-latch keys (egress-probe-<ip>,
-// conntrack-parse, clock-adjtimex, ...) have no state-* twin to exit
-// with, so a cleared condition would otherwise suppress the first
-// line of a re-incident for up to suspectLogCadence — a latch exit
-// IS an incident boundary; a still-held condition pays at most one
-// early re-log line.
+// Store.ExitClearSuspect drops the latch's OWN last-suspect-<name>
+// file, and only when the latch actually exited (it returns false —
+// no clear — while another owner still holds a multi-owner latch).
+// The NON-latch keys (egress-probe-<ip>, conntrack-parse,
+// clock-adjtimex, ...) have no state-* twin to exit with, so a
+// cleared condition would otherwise suppress the first line of a
+// re-incident for up to suspectLogCadence — a latch exit IS an
+// incident boundary; a still-held condition pays at most one early
+// re-log line.
 func (n *NetHealth) stateExit(name string) {
-	n.state.ExitClearAllSuspects(name)
+	n.state.ExitClearSuspect(name)
 }
 
 // --- shared helpers ---

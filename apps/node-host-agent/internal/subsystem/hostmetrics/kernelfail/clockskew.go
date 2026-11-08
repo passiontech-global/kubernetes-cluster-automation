@@ -163,9 +163,12 @@ type clockWarpState struct {
 
 // checkClockWarp detects wall-clock jumps the NTP discipline never
 // reports: a hypervisor pause or live-migration freezes the vCPU so
-// the elapsed wall time between two latch ticks exceeds the
-// expected cadence. On a warp it stamps clock-stepped-at (the same
-// marker workerhygiene's clock-jump-session-healer correlates
+// the wall clock drifts ahead of the (equally frozen) monotonic
+// clock, and an NTP step moves wall while monotonic stands still —
+// the detector compares the two deltas per tick, so both shapes
+// surface as warp without the tick cadence ever entering the math.
+// On a warp it stamps clock-stepped-at (the same marker
+// workerhygiene's clock-jump-session-healer correlates
 // konnectivity 401/x509 bursts with), counts the event into
 // node_agent_clock_warp_events_total, and lands an
 // "ACTION clock-warp:" line in the watchdog log that nodereporter
@@ -175,7 +178,7 @@ func (r *Runner) checkClockWarp() {
 	prev := r.warp.prev
 	r.warp.prev = now
 	if !prev.IsZero() {
-		delta := now.Sub(prev) - r.deps.TickInterval
+		delta := r.deps.warpDelta(now, prev)
 		if math.Abs(float64(delta)) > float64(clockWarpThreshold) {
 			r.warp.events++
 			r.deps.Store.WriteEpochFile(
@@ -187,6 +190,23 @@ func (r *Runner) checkClockWarp() {
 		}
 	}
 	r.writeClockWarpProm()
+}
+
+// warpDelta is the wall-vs-monotonic gap between two tick stamps —
+// the warp the NTP discipline never reports. now.Sub(prev) rides the
+// monotonic reading when both stamps carry one — which freezes
+// through a VM pause/suspend exactly like the ticker does, so a
+// monotonic-only delta reads ~0 on the precise incident this
+// detector exists for. Round(0) strips the monotonic reading (pure
+// wall clock); the difference of the two deltas is the jump: a
+// paused/migrated vCPU (wall jumps forward on resume) or an NTP step
+// (wall ±step, monotonic untouched). When either stamp lacks a
+// monotonic reading (a synthetic test clock, a value that crossed a
+// serialization boundary) Sub falls back to wall for BOTH halves —
+// the gap collapses to 0: a clock with no monotonic readings reports
+// no warp rather than a false positive.
+func warpDelta(now, prev time.Time) time.Duration {
+	return now.Round(0).Sub(prev.Round(0)) - now.Sub(prev)
 }
 
 // writeClockWarpProm emits node_agent_clock_warp_events_total into

@@ -411,6 +411,74 @@ func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
 	}
 }
 
+// heal.Gate is only consulted AFTER the detection pass proves at
+// least one pod actually needs the delete: the mutex evaluation
+// costs API reads and the heal budget is a shared global allowance.
+// A node-list reactor that ERRORS makes the gate "unverifiable" (its
+// IncError + its node read are the observable trace) — with nothing
+// to heal the gate must never run (no node read, no IncError); with
+// a wedged pod it must (IncError fires, no delete lands).
+func TestWatchdogHealGateOnlyWithCandidates(t *testing.T) {
+	now := time.Now()
+	const queue = "cf-tunnel-proxy-watchdog-gate-test"
+
+	nodeLists := 0
+	nodeErr := func(a ktesting.Action) (bool, runtime.Object, error) {
+		if a.GetResource().Resource != "nodes" {
+			return false, nil, nil
+		}
+		nodeLists++
+		return true, nil, errors.New("gate probe")
+	}
+
+	t.Run("nothing to heal — gate never consulted", func(t *testing.T) {
+		before := testutil.QueueErrorCount(t, queue)
+		cs := fake.NewSimpleClientset(
+			proxyPod("proxy-ok", true),
+			proxyDeploy(nil))
+		cs.PrependReactor("*", "*", nodeErr)
+		w := &cfTunnelProxyWatchdog{cs: cs, dyn: testutil.NewDynamicClient(),
+			queue: queue, namespace: cfWatchdogTestNS,
+			now: func() time.Time { return now }}
+		if err := w.run(context.Background()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if nodeLists != 0 {
+			t.Fatalf("maintenance mutex evaluated with nothing to heal (%d node reads)", nodeLists)
+		}
+		if d := testutil.QueueErrorCount(t, queue) - before; d != 0 {
+			t.Fatalf("empty sweep counted %v gate errors", d)
+		}
+	})
+
+	t.Run("wedged pod — gate consulted, heal deferred unverifiable", func(t *testing.T) {
+		before := testutil.QueueErrorCount(t, queue)
+		cs := fake.NewSimpleClientset(
+			proxyPod("proxy-ok", true),
+			staleUnreadyProxyPod("proxy-wedged",
+				now.Add(-time.Hour), now.Add(-10*time.Minute)),
+			proxyDeploy(nil))
+		cs.PrependReactor("*", "*", nodeErr)
+		cs.PrependReactor("get", "pods", cfLogReactor(
+			"2026-11-20T00:00:00Z ERR Couldn't start tunnel: config file error\n"))
+		w := &cfTunnelProxyWatchdog{cs: cs, dyn: testutil.NewDynamicClient(),
+			queue: queue, namespace: cfWatchdogTestNS,
+			now: func() time.Time { return now }}
+		if err := w.run(context.Background()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if nodeLists == 0 {
+			t.Fatal("gate never evaluated although a pod needed the delete")
+		}
+		if d := testutil.QueueErrorCount(t, queue) - before; d == 0 {
+			t.Fatal("unverifiable mutex did not IncError the queue")
+		}
+		if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+			t.Fatal("pod deleted while the maintenance check was unverifiable — must defer fail-closed")
+		}
+	})
+}
+
 // The "increase receive buffer" line is the benign startup warning
 // cloudflared logs on every Linux node — a stale-unready pod whose
 // tail holds ONLY that warning must stay untouched (the false

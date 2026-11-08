@@ -101,19 +101,23 @@ type webhookGuard struct {
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
 // the autopilot-Plan signal of the maintenance mutex consulted by
-// the unmeshed-pod healer (W7-C1).
+// the unmeshed-pod healer (W7-C1). Gated through shared.SetupNoConfig:
+// a disabled module registers nothing — no runnable, no periodic
+// cluster LIST against the apiserver.
 func Setup(d shared.Deps) error {
-	logf.Log.WithName(d.Name).Info("registered",
-		"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
-		"unmeshedRemediation", unmeshed.RemediationEnabled())
-	// The bookkeeping ledgers inside the duty structs (deadSince,
-	// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
-	// criticalns' exclusionEmitted/heartbeatEmitted) are shared.*
-	// zero-value types — nothing to initialize here.
-	g := &webhookGuard{Guard: guardstate.Guard{
-		CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
-		NodeReader: d.Mgr.GetClient()}}
-	return shared.AddPeriodic(d.Mgr, g.Queue, 5*time.Minute, g.run)
+	return shared.SetupNoConfig(d, func() error {
+		logf.Log.WithName(d.Name).Info("registered",
+			"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
+			"unmeshedRemediation", unmeshed.RemediationEnabled())
+		// The bookkeeping ledgers inside the duty structs (deadSince,
+		// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
+		// criticalns' exclusionEmitted/heartbeatEmitted) are shared.*
+		// zero-value types — nothing to initialize here.
+		g := &webhookGuard{Guard: guardstate.Guard{
+			CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
+			NodeReader: d.Mgr.GetClient()}}
+		return shared.AddPeriodic(d.Mgr, g.Queue, 5*time.Minute, g.run)
+	})
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {

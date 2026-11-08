@@ -88,8 +88,10 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 	// passes the 5-byte PGDMP sniff, and newestDump would call it
 	// fresh (kine_db_backup_valid=1) for a whole BackupInterval.
 	// The .tmp suffix keeps partials invisible to the *.dump glob.
+	// Long budget: a multi-GB dump copy outlasts the 2-minute cap
+	// exactly like the pg_dump that produced it.
 	destTmp := dest + ".tmp"
-	if _, err := g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "cp",
+	if _, err := g.d.ExecLong(ctx, []string{g.d.Cfg.Runtime, "cp",
 		pg + ":" + tmp, destTmp}, ""); err != nil {
 		note(fmt.Sprintf("backup-cp-fail: %v", err))
 		_ = os.Remove(destTmp)

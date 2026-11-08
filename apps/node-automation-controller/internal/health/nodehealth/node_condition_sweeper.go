@@ -24,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // nodeCondSweepCheck is the zombie-condition sweeper — stateless,
@@ -37,13 +38,19 @@ func NewNodeConditionSweeperCheck(d *probefw.Deps) probefw.Check {
 
 const CheckNameNodeCondSweeper = "node-condition-sweeper"
 
-// nodeCondSweptConds is the sweeper's allowlist — every latch-backed
-// condition the node stack writes (the precordon hang set plus the
-// clock-skew set). Kubelet-owned types (Ready, *Pressure) are never
-// touched: the sweeper only reconciles conditions whose writer is a
-// node agent that re-stamps lastHeartbeatTime every ~2m while alive.
-var nodeCondSweptConds = append(append([]corev1.NodeConditionType{},
-	nodeHangConds...), nodeClockSkewConds...)
+// nodeCondSweptConds is the sweeper's allowlist — every condition
+// nodereporter owns and re-stamps lastHeartbeatTime on while alive
+// (nodecond.HeartbeatSweptNames in libs/hostkit, the single source of
+// truth shared with the agent: the 40 latch-backed conditions plus
+// the ReadonlyFilesystem mount monitor — a superset of the old
+// precordon-hang + clock-skew lists). Kubelet-owned types (Ready,
+// MemoryPressure/DiskPressure) are never touched, and InodePressure
+// is deliberately absent — kubelet-native, the sweeper must never
+// clear a kubelet condition — as is KernelDeadlock, the permanent
+// latch whose frozen heartbeat means nothing. The sweeper only
+// reconciles conditions whose writer is a node agent that re-stamps
+// lastHeartbeatTime every ~2m while alive.
+var nodeCondSweptConds = condTypes(nodecond.HeartbeatSweptNames)
 
 var nodeCondSweepsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_node_condition_sweeps_total",

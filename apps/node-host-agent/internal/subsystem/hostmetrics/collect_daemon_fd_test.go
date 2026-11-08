@@ -97,6 +97,65 @@ func TestCollectDaemonFDNoProcRoot(t *testing.T) {
 	}
 }
 
+// TestProcScanSharedAcrossCollectors: daemon-fd and the zombie/D-state
+// counters read ONE cached /proc walk — a pid added after the snapshot
+// shows in neither collector until the scan interval expires.
+func TestProcScanSharedAcrossCollectors(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	procFdFixture(t, cfg, "100", "containerd", "", 10,
+		"Limit                     Soft Limit           Hard Limit           Units\n"+
+			"Max open files            100                  1048576              files\n")
+
+	if _, ok := metricValue(t, c, "node_host_agent_daemon_fd_used_ratio",
+		map[string]string{"node": "node-a", "daemon": "containerd"}); !ok {
+		t.Fatal("daemon-fd series missing on the first snapshot")
+	}
+
+	// New pids after the snapshot: a zombie and a second containerd.
+	// Both collectors must still see ONLY the snapshot's world.
+	writeStat(t, cfg, "200", "Z")
+	procFdFixture(t, cfg, "201", "containerd", "", 99,
+		"Limit                     Soft Limit           Hard Limit           Units\n"+
+			"Max open files            100                  1048576              files\n")
+
+	got, ok := metricValue(t, c, "node_host_agent_processes_zombie_count",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0 {
+		t.Fatalf("zombies=%v ok=%v — stale snapshot must hide pid 200", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_daemon_fd_used_ratio",
+		map[string]string{"node": "node-a", "daemon": "containerd"})
+	if !ok || got != 0.1 {
+		t.Fatalf("containerd ratio=%v ok=%v — stale snapshot must keep 10/100", got, ok)
+	}
+
+	// Expire the cache stamp — the next snapshot picks both up.
+	c.proc.at = c.cfg.Clock.Now().Add(-2 * defaultProcScanInterval)
+	got, ok = metricValue(t, c, "node_host_agent_processes_zombie_count",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("zombies after expiry=%v ok=%v want 1", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_daemon_fd_used_ratio",
+		map[string]string{"node": "node-a", "daemon": "containerd"})
+	if !ok || got != 0.99 {
+		t.Fatalf("containerd ratio after expiry=%v ok=%v want 0.99 (worst pid)", got, ok)
+	}
+}
+
+// writeStat seeds a /proc/<pid>/stat whose state char (the FIRST
+// field after the last ')') is state — the zombie/D-state source.
+func writeStat(t *testing.T, cfg Config, pid, state string) {
+	t.Helper()
+	dir := filepath.Join(cfg.ProcRoot, pid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(dir, "stat"),
+		"1 (setup) "+state+" 0 0 0 0 -1 0 0 0 0 0 0 0 0 0\n")
+}
+
 func TestMatchDaemonK0sSplit(t *testing.T) {
 	if got := matchDaemon("k0s", "/usr/bin/k0s\x00worker\x00"); got != "k0sworker" {
 		t.Fatalf("k0s worker matched %q", got)

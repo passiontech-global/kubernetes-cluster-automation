@@ -185,3 +185,45 @@ func dragonflyPromServer(t *testing.T) *httptest.Server {
 	})
 	return srv
 }
+
+// W17 — a Prometheus outage must not leave the previous sweep's
+// gauge series or first-seen windows dangling: the early return
+// still prunes the seen ledger and reconciles the emitted ledger
+// against an empty set (a stale 1 leaks otherwise).
+func TestDragonflySyncStormPromOutageCleansLedgers(t *testing.T) {
+	srv := dragonflyPromServer(t)
+	base := time.Now()
+	replica := dragonflyMemberPod("dragonfly", "dragonfly-replica-1", "replica")
+	replica.Annotations = map[string]string{
+		kube.AnnoFirstSeenDragonflyLinkStorm: `{"link/dragonfly/dragonfly-replica-1":"` +
+			base.Add(-6*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	master := dragonflyMemberPod("dragonfly", "dragonfly-master-0", "master")
+	cs := fake.NewSimpleClientset(replica, master)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	chk := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("first sweep must flag the storm replica")
+	}
+	if m := probetest.FindMetric(t, "node_automation_dragonfly_replica_sync_storm",
+		map[string]string{"namespace": "dragonfly", "pod": "dragonfly-replica-1"}); m == nil {
+		t.Fatal("storm gauge must emit on the first sweep")
+	}
+
+	// Prometheus dies — the check goes inconclusive-but-clean.
+	p.Cfg.HTTPContent.URL = "http://127.0.0.1:1"
+	res := chk.Run(ctx)
+	if !res.Pass {
+		t.Fatalf("a dead Prometheus reads pass-with-clean-ledgers: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_dragonfly_replica_sync_storm",
+		map[string]string{"namespace": "dragonfly", "pod": "dragonfly-replica-1"}); m != nil {
+		t.Fatal("stale storm series must be deleted when the sweep cannot verify")
+	}
+	if keys := probetest.LedgerKeys(&chk.seen); len(keys) != 0 {
+		t.Fatalf("seen ledger must prune clean on the outage: %v", keys)
+	}
+}

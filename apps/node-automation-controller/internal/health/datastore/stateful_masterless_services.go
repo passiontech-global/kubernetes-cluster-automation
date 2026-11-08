@@ -228,9 +228,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	stsList, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.StatefulSets(p.CS, metav1.NamespaceAll))
+	stsList, err := p.AllStatefulSets(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list statefulsets: %w", err)}
 	}
@@ -307,7 +305,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		eps := ready[c.ns+"/"+c.svc]
 		// W12-SC2(i)/(ii) — the split-brain streak and the cross-DC
 		// pin accounting, one signature per file.
-		p.splitBrain.eval(c, key, len(eps), &rep, &multiRep)
+		p.splitBrain.eval(c, key, len(eps), &multiRep)
 		skew.evalMaster(c, key, eps, &rep)
 		if len(eps) > 0 {
 			// Master reachable — the signature resolved on a live
@@ -383,9 +381,27 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	return rep.Verdict(fmt.Sprintf(
+	// Zero-endpoints and split-brain are OPPOSITE signatures (0
+	// ready masters vs >1) — each renders under its own verdict
+	// wording instead of the split-brain findings hiding behind the
+	// "0 ready endpoints" prefix (W17 verdict-detail fix).
+	res := rep.Verdict(fmt.Sprintf(
 		"master-role services at 0 ready endpoints >=%s: ",
 		masterlessZeroMinAge), ", ")
+	if split := multiRep.Verdict(
+		"master-role services with multiple ready masters (split brain) "+
+			">=2 sweeps: ", ", "); split.Why != "" {
+		if res.Why != "" {
+			res.Why += " | " + split.Why
+		} else {
+			res.Why = split.Why
+			res.Pass = false
+		}
+		if res.Infra == nil {
+			res.Infra = split.Infra
+		}
+	}
+	return res
 }
 
 // podMasterRole reports whether the pod carries a master/primary/

@@ -79,8 +79,13 @@ type Config struct {
 	// kubelet + runtime read PodsDir, cilium + guards + runtime read
 	// SysClassNet, cilium + runtime read NebulaIface, pods + the
 	// textfile wiring read HostResolvConf).
-	CtrSocket      string // containerd grpc unix socket under /host/run
-	K0sDataDir     string // /var/lib/k0s — disk-high ingest-GC trigger
+	CtrSocket  string // containerd grpc unix socket under /host/run
+	K0sDataDir string // /var/lib/k0s — disk-high ingest-GC trigger
+	// TextfileDir is the node-exporter drop dir (NODE_HOST_AGENT_
+	// TEXTFILE_DIR via hostctx) — "" falls back to the K0sDataDir
+	// sibling derivation PromTextfileDir kept before the env
+	// override existed.
+	TextfileDir    string
 	PodsDir        string // host kubelet pod dirs (05/06)
 	SysClassNet    string // /sys/class/net — MTU reads (B4)
 	NebulaIface    string // overlay iface MTU baseline (neb1 = 1300)

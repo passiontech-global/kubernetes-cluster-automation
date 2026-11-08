@@ -65,9 +65,11 @@ type kubeletReaper struct {
 }
 
 func Setup(d shared.Deps) error {
-	r := &kubeletReaper{cs: d.CS, nodeReader: d.Mgr.GetClient(), queue: d.Name, now: shared.SystemClock}
-	r.probeFn = r.probe
-	return shared.AddPeriodic(d.Mgr, r.queue, 2*time.Minute, r.run)
+	return shared.SetupNoConfig(d, func() error {
+		r := &kubeletReaper{cs: d.CS, nodeReader: d.Mgr.GetClient(), queue: d.Name, now: shared.SystemClock}
+		r.probeFn = r.probe
+		return shared.AddPeriodic(d.Mgr, r.queue, 2*time.Minute, r.run)
+	})
 }
 
 func (r *kubeletReaper) run(ctx context.Context) error {

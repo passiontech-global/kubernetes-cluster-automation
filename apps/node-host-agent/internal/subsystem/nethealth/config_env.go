@@ -25,6 +25,10 @@ type EnvDeps struct {
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
 		Base: subframe.FromDeps(d.Deps),
+		// hostctx already resolved NODE_HOST_AGENT_TEXTFILE_DIR with
+		// the shared hostPath default — the MTU gauge must honor the
+		// same override, not re-derive the dir from HostRoot.
+		TextfileDir: d.TextfileDir,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

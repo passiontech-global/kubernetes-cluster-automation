@@ -238,11 +238,26 @@ func injectSharedCacheMount(configPath, source string) {
 
 	// Atomic swap — the script's `> config.json.tmp && mv`; tmp is
 	// removed on every failure so a crashed wrapper never leaves
-	// litter runc could trip on.
+	// litter runc could trip on. Chmod (WriteFile's mode rides the
+	// umask) + fsync before the rename (DownloadFile parity).
 	tmp := configPath + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: write %s: %v — passthrough\n",
+			tmp, err)
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: chmod %s: %v — passthrough\n",
+			tmp, err)
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := syncFile(tmp); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: fsync %s: %v — passthrough\n",
 			tmp, err)
 		_ = os.Remove(tmp)
 		return
@@ -253,4 +268,15 @@ func injectSharedCacheMount(configPath, source string) {
 			tmp, configPath, err)
 		_ = os.Remove(tmp)
 	}
+}
+
+// syncFile fsyncs an existing file so the rename that publishes it
+// lands durable bytes, not cache promises (DownloadFile parity).
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return f.Sync()
 }

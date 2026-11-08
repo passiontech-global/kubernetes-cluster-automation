@@ -45,6 +45,16 @@ func TestWriteFileAtomicHappyPath(t *testing.T) {
 	if got := testutil.ReadFile(t, path); got != "epoch=123\n" {
 		t.Fatalf("content = %q", got)
 	}
+	// The staged file's mode is FORCED to 0644 before sync+rename —
+	// CreateTemp stages 0600 and another user (node_exporter, the
+	// textfile scrape) must still read the promoted file.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("installed file mode = %v, want 0644", fi.Mode().Perm())
+	}
 	// tmp+rename contract: the .tmp-<base> staging file is gone.
 	for _, n := range dirNames(t, dir) {
 		if strings.HasPrefix(n, ".tmp-") {

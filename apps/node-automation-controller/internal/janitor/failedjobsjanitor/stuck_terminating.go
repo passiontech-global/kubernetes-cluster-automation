@@ -195,42 +195,49 @@ func (c *pvcCensus) claims() map[string]pvcUseProbe {
 // unstickPVCProtection strips the pvc-protection finalizer from a
 // stuck Terminating claim once a namespace pod scan proves nothing
 // references it. Any list failure fails closed — the claim stays
-// protected rather than risk an early unbind.
+// protected rather than risk an early unbind. The first (cached) scan
+// gates the strip; right before the patch a FRESH re-query of the
+// namespace's pods re-proves the claim unreferenced — the census
+// snapshot predates this run's deletes and the minutes the audit
+// waited, and stripping protection from a freshly-mounted claim is
+// the data-loss vector this whole duty exists to avoid.
+//
+// Metering: a namespace's failed pod scan is IncError'd ONCE, by
+// whoever fills the census cache — later cache hits (and the audit's
+// other PVCs in that namespace) log the fail-closed verdict without
+// re-counting the same broken list.
 func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	pvc *corev1.PersistentVolumeClaim, cache map[string]pvcUseProbe) {
 	log := logf.FromContext(ctx)
 	pr, ok := cache[pvc.Namespace]
 	if !ok {
-		pr = pvcUseProbe{claims: map[string]bool{}}
-		pods, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.Pods(j.cs, pvc.Namespace))
-		if err != nil {
-			pr.err = err
-		} else {
-			for i := range pods {
-				p := &pods[i]
-				if p.Status.Phase == corev1.PodSucceeded ||
-					p.Status.Phase == corev1.PodFailed {
-					continue
-				}
-				for _, v := range p.Spec.Volumes {
-					if v.PersistentVolumeClaim != nil {
-						pr.claims[v.PersistentVolumeClaim.ClaimName] = true
-					}
-				}
-			}
+		pr = pvcUseProbe{}
+		pr.claims, pr.err = j.claimedPVCNames(ctx, pvc.Namespace)
+		if pr.err != nil {
+			metrics.IncError(j.queue)
 		}
 		cache[pvc.Namespace] = pr
 	}
 	if pr.err != nil {
-		metrics.IncError(j.queue)
 		log.Error(pr.err, "pod list failed — keeping pvc-protection finalizer (fail closed)",
-			"pvc", pvc.Namespace+"/"+pvc.Name)
+			"pvc", pvc.Namespace+"/"+pvc.Name, "cached", ok)
 		return
 	}
 	if pr.claims[pvc.Name] {
 		return // still referenced — the finalizer is doing its job
+	}
+	// Fresh re-proof right before the destructive patch.
+	freshClaims, err := j.claimedPVCNames(ctx, pvc.Namespace)
+	if err != nil {
+		metrics.IncError(j.queue)
+		log.Error(err, "fresh pod re-query failed — keeping pvc-protection finalizer (fail closed)",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return
+	}
+	if freshClaims[pvc.Name] {
+		log.Info("SKIP: claim mounted since the audit scan — finalizer stays",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return
 	}
 	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
 		"pvc", pvc.Namespace+"/"+pvc.Name,

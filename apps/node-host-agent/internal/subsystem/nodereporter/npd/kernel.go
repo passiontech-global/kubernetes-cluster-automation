@@ -32,6 +32,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // kernelSoftLockupRe / kernelRCUStallRe are the
@@ -116,7 +117,7 @@ const (
 // The KernelDeadlock NodeCondition and its upstream strings
 // (kernel-monitor.json conditions[]).
 const (
-	condKernelDeadlock corev1.NodeConditionType = "KernelDeadlock"
+	condKernelDeadlock corev1.NodeConditionType = nodecond.KernelDeadlock
 
 	kernelDeadlockDefaultReason = "KernelHasNoDeadlock"
 	kernelDeadlockDefaultMsg    = "kernel has no deadlock"

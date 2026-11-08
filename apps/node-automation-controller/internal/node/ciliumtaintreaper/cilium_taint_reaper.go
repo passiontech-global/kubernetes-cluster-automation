@@ -48,6 +48,12 @@ type ciliumTaintReaper struct {
 	// already registers; UntaintNode still re-Gets on the direct
 	// clientset before acting.
 	nodeReader kube.CachedNodeReader
+	// podReader is the informer-backed cilium-pod read (same manager
+	// client as nodeReader — the Pod watch this reconciler registers
+	// keeps the cache fresh). Nil (test fixtures) falls back to the
+	// direct clientset list. The untaint WRITE never rides this:
+	// destructive actions confirm and patch on the direct clientset.
+	podReader kube.CachedNodeReader
 }
 
 // The watch wiring below installs these package-level units
@@ -101,7 +107,7 @@ func Setup(d shared.Deps) error {
 	// controller, no informer, no RequeueAfter loop. The manager
 	// cache's cilium-pod ByObject entry exists only for this module.
 	return shared.SetupNoConfig(d, func() error {
-		r := &ciliumTaintReaper{cs: cs, nodeReader: mgr.GetClient()}
+		r := &ciliumTaintReaper{cs: cs, nodeReader: mgr.GetClient(), podReader: mgr.GetClient()}
 		return ctrl.NewControllerManagedBy(mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -149,22 +155,40 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 		return res, nil
 	}
 
-	// ONE label-selected cluster list indexed by node — the old
-	// sweep issued a kube-system List per tainted node (an N+1 on
-	// the apiserver); indexing spec.nodeName in-code reproduces the
+	// ONE label-selected read indexed by node — through the informer
+	// cache when wired (the Pod watch this reconciler registers keeps
+	// it fresh: the manager cache's cilium-pod ByObject entry is
+	// scoped to kube-system + k8s-app=cilium, exactly this selector,
+	// so the verdict reads memory instead of paying an apiserver LIST
+	// per sweep), else the direct clientset (unwired test fixtures).
+	// The untaint below never rides the cache: kube.UntaintNode
+	// confirms and patches on the direct clientset, the only safe
+	// path for a destructive write.
+	var pods []corev1.Pod
+	if r.podReader != nil {
+		var cached corev1.PodList
+		if err := r.podReader.List(ctx, &cached, client.InNamespace("kube-system"),
+			client.MatchingLabels{"k8s-app": "cilium"}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("list cilium pods: %w", err)
+		}
+		pods = cached.Items
+	} else {
+		listed, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
+			LabelSelector: "k8s-app=cilium",
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("list cilium pods: %w", err)
+		}
+		pods = listed.Items
+	}
+	// The old sweep issued a kube-system List per tainted node (an N+1
+	// on the apiserver); indexing spec.nodeName in-code reproduces the
 	// per-node field-selector scoping exactly (a pod pinned to a
 	// different node lands under ITS key, an unscheduled one under
-	// ""). Reads stay on the direct clientset: the Pod informer
-	// exists for event triggers, not this verdict.
-	pods, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
-		LabelSelector: "k8s-app=cilium",
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("list cilium pods: %w", err)
-	}
+	// "").
 	podsByNode := make(map[string][]*corev1.Pod)
-	for i := range pods.Items {
-		p := &pods.Items[i]
+	for i := range pods {
+		p := &pods[i]
 		podsByNode[p.Spec.NodeName] = append(podsByNode[p.Spec.NodeName], p)
 	}
 

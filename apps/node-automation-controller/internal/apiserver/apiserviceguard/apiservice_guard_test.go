@@ -1,6 +1,7 @@
 package apiserviceguard
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -476,5 +477,90 @@ func TestAPIServiceGuardListErrorIsolated(t *testing.T) {
 		})
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when the apiservices list fails")
+	}
+}
+
+// The unblock cooldown ledger prunes on EVERY cycle — including the
+// apiservices-list-failure cycles that return before any heal: an API
+// flap must not keep a decommissioned APIService's expired stamp (and
+// its 15m suppression semantics with it) pinned forever.
+func TestAPIServiceGuardUnblockCooldownPrunesOnListError(t *testing.T) {
+	g := asgGuard(fake.NewSimpleClientset(), asgDynFake())
+	u := &unblockHealer{}
+	const key = "v1alpha1.dead.example.com"
+	t0 := time.Now().Add(-apiServiceUnblockCooldown - time.Minute)
+	u.unblocked.Stamp(key, t0)
+	snap := &apiServiceSnapshot{g: g, err: errors.New("list apiservices boom")}
+	if err := u.sweepUnblock(context.Background(), snap); err == nil {
+		t.Fatal("expected the apiservices list error to surface")
+	}
+	// CooledDown judged AT a point inside the (now-gone) stamp's window:
+	// true only if the expired stamp survived the prune.
+	if u.unblocked.CooledDown(key, apiServiceUnblockCooldown, t0.Add(30*time.Second)) {
+		t.Fatal("expired unblock stamp survived the error cycle — ledger not pruned")
+	}
+}
+
+// A backing pod already terminating is not a restart target: its
+// replacement carries the fix at admission, and a second delete buys
+// nothing but still burns a heal-budget grant. When EVERY backing pod
+// is terminating the heal is skipped before the heal preamble runs at
+// all — no cooldown stamp, no budget grant.
+func TestAPIServiceGuardUnblockTerminatingPodsSkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	objs := []runtime.Object{
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+	}
+	term := asgBackendPod("kube-system", "ms-term", "metrics-server")
+	termTime := metav1.NewTime(time.Now().Add(-time.Minute))
+	term.DeletionTimestamp = &termTime
+	objs = append(objs, term)
+	cs := fake.NewSimpleClientset(objs...)
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-term") {
+		t.Fatal("terminating backing pod deleted — must be skipped as a target")
+	}
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
+		t.Fatal("cooldown stamped although no live target existed — heal preamble must not have run")
+	}
+}
+
+// Mixed backing pods: the terminating one survives, the live one is
+// restarted, and the delivered heal stamps the cooldown.
+func TestAPIServiceGuardUnblockDeletesOnlyLivePods(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	term := asgBackendPod("kube-system", "ms-term", "metrics-server")
+	termTime := metav1.NewTime(time.Now().Add(-time.Minute))
+	term.DeletionTimestamp = &termTime
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+		term,
+		asgBackendPod("kube-system", "ms-live", "metrics-server"),
+	)
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-term") {
+		t.Fatal("terminating backing pod deleted — must be skipped as a target")
+	}
+	if asgPodExists(t, cs, "kube-system", "ms-live") {
+		t.Fatal("live backing pod not restarted")
+	}
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
+		t.Fatal("delivered heal did not stamp the cooldown")
 	}
 }

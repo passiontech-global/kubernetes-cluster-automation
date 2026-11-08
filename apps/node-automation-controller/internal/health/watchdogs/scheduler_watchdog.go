@@ -149,6 +149,11 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		pod := &pods[i]
 		if pod.Status.Phase != corev1.PodPending ||
 			pod.Spec.NodeName != "" ||
+			// SchedulingGates block placement BY DESIGN (a gated
+			// pod stays Pending until its gate controller removes
+			// the gate) — a frozen scheduler must not be inferred
+			// from pods the scheduler is forbidden to touch.
+			len(pod.Spec.SchedulingGates) > 0 ||
 			now.Sub(pod.CreationTimestamp.Time) < schedulerPendingMinAge {
 			continue
 		}

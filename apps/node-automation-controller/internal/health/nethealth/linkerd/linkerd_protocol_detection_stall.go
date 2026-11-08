@@ -88,12 +88,12 @@ func init() {
 //
 // Heal: patch config.linkerd.io/opaque-ports onto the owning
 // workload's pod template (Deployment/StatefulSet/DaemonSet/Job/
-// CronJob resolved through ownerReferences) AND the pod itself, then
-// delete the pod so the proxy restarts with the corrected config — a
-// running linkerd-proxy never re-reads its port annotations, so an
-// annotation-only patch cannot heal. The pod is only deleted when the
-// template patch succeeded (otherwise the replacement would inherit
-// the same violation); 30m per-pod cooldown, maintenance-gated.
+// CronJob resolved through ownerReferences). When the patch just
+// landed, the workload controller runs the rolling update — no
+// mass pod delete; a pod is deleted only when the template ALREADY
+// covered the ports but the running pod predates the annotation
+// (the restart is then the heal). The cooldown keys on the pod's
+// controller; maintenance-gated.
 func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()

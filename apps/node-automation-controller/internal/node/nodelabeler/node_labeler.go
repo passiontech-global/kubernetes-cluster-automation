@@ -149,6 +149,13 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			log.Info("WARN: cannot label worker role on node", "node", n.Name, "error", err)
 			continue
 		}
+		// Mirror the patch into the in-memory snapshot: the labels.txt
+		// sweep below consults byName for its already-applied check,
+		// and a stale map would re-patch what this patch just fixed.
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[workerRoleLabel] = ""
 		labeled++
 		log.Info("labeled worker role", "node", n.Name, "label", workerRoleLabel+"=")
 	}
@@ -159,8 +166,10 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	if err != nil {
 		// A missing file just means no ConfigMap is mounted on this
 		// cluster — anything else (permissions, dangling symlink,
-		// volume failure) silently disables file labels, so say so.
+		// volume failure) silently disables file labels, so say so
+		// and meter it like every other absorbed failure.
 		if !os.IsNotExist(err) {
+			metrics.IncError(r.queue)
 			log.Info("WARN: cannot read labels file — skipping file labels",
 				"path", r.configPath, "error", err)
 		}
@@ -215,6 +224,13 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				log.Info("WARN: cannot label node", "node", name, "label", label, "error", err)
 				continue
 			}
+			// Same in-memory mirror as the worker-role patch: a
+			// duplicate row naming this node must read as already
+			// applied, not re-patch.
+			if node.Labels == nil {
+				node.Labels = map[string]string{}
+			}
+			node.Labels[key] = val
 			labeled++
 			log.Info("labeled", "node", name, "label", label)
 		}

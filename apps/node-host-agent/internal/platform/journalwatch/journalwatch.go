@@ -20,12 +20,17 @@
 // a fault.
 //
 // The streak is RAM by default; callers that wire Counter +
-// CounterName persist it as a consecutive-* file in the watchdog
+// CounterName persist it as consecutive-* files in the watchdog
 // state dir (and bind LatchedSeed to their latch file's existence)
 // so an agent restart mid-episode resumes the count instead of
 // re-arming at zero — a restart during a broken-journald episode
 // used to silently reset the budget and delay the latch by another
-// full Needed streak.
+// full Needed streak. The files are OWNER-SCOPED (CounterName +
+// "-" + owner): two subsystems driving one shared latch episode each
+// keep their own streak, so one producer's healthy journal read can
+// never reset the other's failure count — the latch file itself
+// arbitrates the shared episode through the Store's multi-owner
+// EnterFrom/ExitFrom.
 //
 // json.go holds the package's second piece: the `journalctl -o
 // json` line decode + since-cursor fetch shared by the NPD
@@ -49,12 +54,14 @@ import (
 // is blindness.
 const DefaultNeeded = 5
 
-// Tracker accumulates consecutive journal-read failures and decides
-// when the blindness is persistent enough to surface. It owns ONLY
-// the counting + the journal-storage gate; the caller turns the
-// transitions into its own state-* latch and log lines (per-
-// subsystem conventions). Not goroutine-safe — one tracker per
-// cycle loop.
+// Tracker accumulates consecutive journal-read failures per OWNER and
+// decides when the blindness is persistent enough to surface. It
+// owns ONLY the counting + the journal-storage gate; the caller turns
+// the transitions into its own state-* latch and log lines (per-
+// subsystem conventions) and drives the shared latch FILE through the
+// Store's multi-owner EnterFrom/ExitFrom — the tracker never touches
+// the latch file itself. Not goroutine-safe — one tracker per cycle
+// loop.
 type Tracker struct {
 	// Needed is the consecutive-failure budget; <=0 → DefaultNeeded.
 	Needed int
@@ -67,22 +74,27 @@ type Tracker struct {
 	// Stat probes dir existence; nil → os.Stat (test seam).
 	Stat func(string) (os.FileInfo, error)
 
-	// Counter, when non-nil (and its Dir non-empty), persists the
-	// consecutive-failure streak to <dir>/<CounterName> — a
-	// consecutive-* file in the watchdog state dir — so an agent
-	// restart mid-episode resumes the count instead of re-arming at
-	// zero. RAM stays the fallback when a write fails (Incr's 0
-	// return): the file is the restart witness, RAM the fast path.
+	// Counter, when non-nil (and its Dir non-empty), persists each
+	// owner's consecutive-failure streak to
+	// <dir>/<CounterName>-<owner> — consecutive-* files in the
+	// watchdog state dir — so an agent restart mid-episode resumes
+	// the counts instead of re-arming at zero. Per-owner files: a
+	// sibling producer's healthy read resets ITS file only, never
+	// this owner's. RAM stays the fallback when a write fails (Incr's
+	// 0 return): the file is the restart witness, RAM the fast path.
 	Counter     *hoststate.Store
 	CounterName string
 	// LatchedSeed, when non-nil, is consulted ONCE before the first
-	// NoteRead — callers bind it to their latch file's existence so
-	// a restart while latched resumes latched: the first healthy
-	// read then exits and clears the stale state-* file instead of
-	// it lingering to the janitor's 24h reap.
+	// EnterFrom/ExitFrom — callers bind it to their latch file's
+	// existence so a restart while latched resumes latched: the first
+	// healthy read then releases through Store.ExitFrom and clears
+	// the stale state-* file instead of it lingering to the janitor's
+	// 24h reap. When nil, a non-empty latch name argument to
+	// EnterFrom/ExitFrom seeds from the wired Counter's Exists(name) —
+	// same contract for hand-built trackers that carry the store.
 	LatchedSeed func() bool
 
-	fails   int
+	streaks map[string]int // owner → consecutive failures (RAM fast path)
 	latched bool
 	seeded  bool
 }
@@ -103,30 +115,46 @@ func (t *Tracker) counterWired() bool {
 	return t.Counter != nil && t.Counter.Dir != "" && t.CounterName != ""
 }
 
-// seed loads the persisted state once, lazily on the first NoteRead:
-// the streak resumes from <dir>/<CounterName> and the latch from
-// LatchedSeed (bound by the caller to its state-* file's existence)
-// so an agent restart mid-episode continues where the previous
-// process left off. Fails()/Latched() deliberately do NOT seed —
-// they are pure accessors, and seeding-on-read would let a debug
-// peek consume the one-shot restore before the first real verdict.
-func (t *Tracker) seed() {
+// counterName is the per-owner streak file: <CounterName>-<owner>.
+// The suffix is what keeps workerhygiene's healthy read from
+// resetting controllerhygiene's persisted streak (and vice versa).
+func (t *Tracker) counterName(owner string) string {
+	return t.CounterName + "-" + owner
+}
+
+// seed loads the persisted state once, lazily on the first
+// EnterFrom/ExitFrom: the calling owner's streak resumes from
+// <dir>/<CounterName>-<owner> and the latch from LatchedSeed (or the
+// named latch file's existence when the seed func is absent) so an
+// agent restart mid-episode continues where the previous process
+// left off. The one PRE-owner-scoping shared streak file is dead
+// state after the split — swept once here so no orphan
+// consecutive-journal-unreadable lingers in the dir. Fails()/
+// Latched() deliberately do NOT seed — they are pure accessors, and
+// seeding-on-read would let a debug peek consume the one-shot
+// restore before the first real verdict.
+func (t *Tracker) seed(owner, name string) {
 	if t.seeded {
 		return
 	}
 	t.seeded = true
+	t.streaks = map[string]int{}
 	if t.counterWired() {
-		t.fails = t.Counter.Counter(t.CounterName)
+		t.streaks[owner] = t.Counter.Counter(t.counterName(owner))
+		t.Counter.ResetCounter(t.CounterName)
 	}
-	if t.LatchedSeed != nil {
+	switch {
+	case t.LatchedSeed != nil:
 		t.latched = t.LatchedSeed()
+	case name != "" && t.counterWired():
+		t.latched = t.Counter.Exists(name)
 	}
 }
 
 // Present reports whether any configured journal storage dir
 // exists — the "journald is installed" witness. With no dir the
-// host legitimately has no journald: reads failing is config, not a
-// fault, and the tracker must never fire.
+// host legitimately has no journald: reads failing is config, not
+// a fault, and the tracker must never fire.
 func (t *Tracker) Present() bool {
 	stat := t.Stat
 	if stat == nil {
@@ -140,60 +168,75 @@ func (t *Tracker) Present() bool {
 	return false
 }
 
-// NoteRead records one journal-read verdict and reports the latch
-// transitions:
-//
-//   - ok=false is a read that produced no usable journal data while
-//     journald should be answering: nonzero exit / killed journalctl,
-//     a "No journal files" notice, or a journald-wide empty reply
-//     (the caller disambiguates a legitimately-quiet unit — e.g. via
-//     an unfiltered `journalctl -n 1` probe — BEFORE reporting here).
-//   - enter=true fires exactly once per episode, when the streak
-//     reaches Needed AND journal storage exists — the caller latches
-//     state-journal-unreadable + logs once.
-//   - exit=true fires when a good read arrives while latched (or the
-//     journal storage vanished while latched — the config changed,
-//     not the blindness) — the caller clears the latch (STATE-EXIT).
-func (t *Tracker) NoteRead(ok bool) (enter, exit bool) {
-	t.seed()
-	if ok {
-		t.fails = 0
-		if t.counterWired() {
-			t.Counter.ResetCounter(t.CounterName)
-		}
-		if t.latched {
-			t.latched = false
-			return false, true
-		}
-		return false, false
-	}
-	t.fails++
+// EnterFrom records one FAILED journal read for owner and reports
+// the latch-ENTER edge: true exactly once per episode, when owner's
+// streak reaches Needed AND journal storage exists — the caller then
+// (re)asserts the latch through Store.EnterFrom(name, owner, …).
+// Every further failing read returns false while the tracker stays
+// latched; the caller must KEEP asserting the store hold (the store
+// registration + the latch mtime refresh ride those calls, and the
+// hold is what stops a sibling producer from deleting the episode).
+// name is the latch name the caller drives — used only to seed the
+// latched state when no LatchedSeed func is wired.
+func (t *Tracker) EnterFrom(owner, name string) bool {
+	t.seed(owner, name)
+	n := t.streaks[owner] + 1
+	t.streaks[owner] = n
 	if t.counterWired() {
 		// The file is authoritative — Incr returns the new on-disk
-		// value, so a sibling tracker sharing this counter moves
-		// this streak too. A 0 return means the write failed (dir
-		// gone, disk full): keep the RAM count, never invent a
-		// streak.
-		if n := t.Counter.Incr(t.CounterName); n > 0 {
-			t.fails = n
+		// value, so a restart-resumed streak wins over the RAM guess.
+		// A 0 return means the write failed (dir gone, disk full):
+		// keep the RAM count, never invent a streak.
+		if v := t.Counter.Incr(t.counterName(owner)); v > 0 {
+			n = v
+			t.streaks[owner] = n
 		}
 	}
 	if t.latched {
-		if !t.Present() {
-			t.latched = false
-			return false, true
-		}
-		return false, false
+		return false
 	}
-	if t.fails >= t.needed() && t.Present() {
+	if n >= t.needed() && t.Present() {
 		t.latched = true
-		return true, false
+		return true
 	}
-	return false, false
+	return false
 }
 
-// Fails reports the current consecutive-failure streak (tests/debug).
-func (t *Tracker) Fails() int { return t.fails }
+// ExitFrom records one SUCCESSFUL journal read for owner and reports
+// the latch-EXIT edge for this tracker: true when owner's episode
+// ends while latched (the caller then releases through
+// Store.ExitFrom(name, owner, …)), false when this tracker never
+// held the episode. Either way the owner's streak zeroes and its
+// persisted counter file goes — and the caller should release the
+// store hold REGARDLESS of the return: the store decides whether the
+// FILE may exit (a sibling owner still holding the episode keeps it
+// alive), so a producer that joined an episode without ever reaching
+// its own Needed streak must still be able to drop its hold.
+func (t *Tracker) ExitFrom(owner, name string) bool {
+	t.seed(owner, name)
+	delete(t.streaks, owner)
+	if t.counterWired() {
+		t.Counter.ResetCounter(t.counterName(owner))
+	}
+	if !t.latched {
+		return false
+	}
+	t.latched = false
+	return true
+}
+
+// Fails reports the highest per-owner consecutive-failure streak
+// (tests/debug — a tracker in production carries exactly one feeding
+// owner, so this is that owner's streak).
+func (t *Tracker) Fails() int {
+	best := 0
+	for _, n := range t.streaks {
+		if n > best {
+			best = n
+		}
+	}
+	return best
+}
 
 // Latched reports whether the tracker currently holds the latched
 // state (tests/debug — the on-disk latch is the caller's business).

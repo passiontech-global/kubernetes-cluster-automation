@@ -22,12 +22,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -93,9 +91,7 @@ func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	minAge := p.Cfg.Datastore.PVCResizeStallMinAge
 
-	pvcs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.PersistentVolumeClaims(p.CS, metav1.NamespaceAll))
+	pvcs, err := p.AllPVCs(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pvcs: %w", err)}
 	}

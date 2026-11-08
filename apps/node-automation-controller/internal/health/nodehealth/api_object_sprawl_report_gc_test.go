@@ -293,3 +293,44 @@ func TestSprawlGCKineLargeObjects(t *testing.T) {
 		t.Fatal("resolved Secret series not pruned by the ledger")
 	}
 }
+
+// The kine census reconciles its OWN GaugeScope (kineRep under
+// kineLargeObjectBytesGauge) — the counts ledger stays free of kine
+// tuples and the kine ledger free of census tuples, so one ledger's
+// stale keys can never cross-prune or cross-pollute the other gauge's
+// series.
+func TestSprawlGCKineGaugeScopeSeparate(t *testing.T) {
+	blob := make([]byte, kineLargeObjectThreshold+1024)
+	bigCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "big-cm"},
+		Data:       map[string]string{"blob": string(blob)},
+	}
+	// A live census object — the counts ledger must hold its
+	// "resource/ns" tuple next to the kine ledger's "kind/ns/name".
+	rep := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport",
+		"apps", "vr-census", 30*time.Minute, sprawlOwner("ReplicaSet", "rs-census"))
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "configmap", "apps", "big-cm")
+	testutil.CleanupMetric(t, apiObjectCountGauge, "vulnerabilityreports", "apps")
+
+	cs := fake.NewSimpleClientset(liveReplicaSet("apps", "rs-census"), bigCM)
+	p := testProberDyn(cs, sprawlDyn(rep))
+	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
+
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("large object must fail the check: %+v", res)
+	}
+	// Kine ledger: exactly the kine tuple, no census tuples leaked in.
+	if got := chk.emittedLargeObjects.Last(); len(got) != 1 {
+		t.Fatalf("kine ledger holds %v, want only the configmap tuple", got)
+	}
+	if _, ok := chk.emittedLargeObjects.Last()["configmap/apps/big-cm"]; !ok {
+		t.Fatal("kine large-object tuple missing from its own ledger")
+	}
+	// Counts ledger: exactly the census tuple, no kine keys leaked in.
+	if got := chk.emittedObjects.Last(); len(got) != 1 {
+		t.Fatalf("counts ledger holds %v, want only the census tuple", got)
+	}
+	if _, ok := chk.emittedObjects.Last()["vulnerabilityreports/apps"]; !ok {
+		t.Fatal("census tuple missing from the counts ledger")
+	}
+}

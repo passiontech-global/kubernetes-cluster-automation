@@ -148,6 +148,13 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		_ = os.Remove(tmp)
 		return fmt.Errorf("download %s: sha256 mismatch", url)
 	}
+	// Pin the archive mode before the rename: os.Create's 0666 rides
+	// the umask, so a 077-umask host would stage the shared artifact
+	// tree at 0600 and break the non-root consumers.
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		return err

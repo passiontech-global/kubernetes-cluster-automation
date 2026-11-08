@@ -2,6 +2,7 @@ package routewatch
 
 import (
 	"encoding/binary"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -121,8 +122,22 @@ func TestAttrs(t *testing.T) {
 // --- host-netns bind selection ---
 
 func TestSameNetnsSelfIsSelf(t *testing.T) {
-	if !SameNetns(SelfNetns, SelfNetns) {
-		t.Fatal("/proc/self/ns/net does not SameFile itself")
+	if !SameNetns(threadSelfNetns(), threadSelfNetns()) {
+		t.Fatal("the thread's own ns/net link does not SameFile itself")
+	}
+}
+
+// The thread-self resolver prefers /proc/thread-self (kernel ≥3.17)
+// and falls back to /proc/self/task/<tid> — either way the resolved
+// link must exist and name the calling thread's netns.
+func TestThreadSelfNetnsResolves(t *testing.T) {
+	p := threadSelfNetns()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("resolved self netns %s unreadable: %v", p, err)
+	}
+	if p != "/proc/thread-self/ns/net" &&
+		!strings.HasPrefix(p, "/proc/self/task/") {
+		t.Fatalf("unexpected self netns path %s", p)
 	}
 }
 
@@ -130,7 +145,7 @@ func TestSameNetnsSelfIsSelf(t *testing.T) {
 // netns → direct bind, hostRoot never consulted. Skips when the test
 // env runs pid 1 in a different netns (unusual containers).
 func TestBindDirectBindWhenHostNet(t *testing.T) {
-	if !SameNetns(SelfNetns, InitNetns) {
+	if !SameNetns(threadSelfNetns(), InitNetns) {
 		t.Skip("test env: pid 1 lives in a different netns")
 	}
 	// A bogus hostRoot proves the mounted-/proc path isn't touched —

@@ -59,9 +59,12 @@ var pullWaitingReasons = map[string]bool{
 
 // registryOutageMarkers are message substrings that flip a
 // pull failure from "one bad tag" to "the registry path is down" —
-// rate-limit, proxy and Harbor-cache signatures.
+// rate-limit and proxy signatures. The rate-limit markers are matched
+// as full phrases: a lone "429" would false-positive on any message
+// carrying the number, and "harbor" matched every URL of a healthy
+// self-hosted Harbor — installing Harbor is not a registry outage.
 var registryOutageMarkers = []string{
-	"toomanyrequests", "429", "proxyconnect tcp", "harbor",
+	"toomanyrequests", "429 too many requests", "proxyconnect tcp",
 }
 
 var (

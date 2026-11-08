@@ -72,6 +72,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 const (
@@ -86,32 +87,51 @@ const (
 	stormPreemptionMax    = 15
 )
 
-// stormConds mirrors STORM_CONDS (see package comment for sources).
+// stormConds mirrors STORM_CONDS (see package comment for sources) —
+// names come from nodecond.StormGateNames, the single source of truth
+// shared with the node-host-agent, so this list can no longer drift
+// from the names the agent actually emits (the agent's spellings
+// SystemdSessionBloat/ConntrackPressure/JournaldUnreadable/
+// ControlPlaneCertReloadStale replaced the controller's legacy
+// SystemdSessionLeak/ConntrackExhausted/JournaldWedged/
+// ControlPlaneFrozen, and CiliumBPFMapPressure joined the set).
 // NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
 // node-host-agent overlay conditions; KernelHungTasks,
 // KernelSlabLeak, KernelResourceExhaustion, CgroupDyingLeak,
 // MemoryPSIThrashing, ClockUnsynchronized, ClockSkewDetected
-// (W12-1.4 — chrony still synced but >2s offset), JournaldWedged,
-// SystemdSessionLeak, ConntrackExhausted, InodePressure,
-// KubeletPLEGUnhealthy, ControlPlaneFrozen, CalicoFelixDown,
-// CiliumIPAMExhausted and the remaining Cilium* latches are the
+// (W12-1.4 — chrony still synced but >2s offset), InodePressure,
+// KubeletPLEGUnhealthy, CalicoFelixDown, CiliumIPAMExhausted and the
+// remaining Cilium* latches are the
 // node-problem-detector/kubelet/CNI latches that make rebalancing
 // actively harmful — same posture as the existing network-problem
 // conditions.
-var stormConds = []corev1.NodeConditionType{
-	"KubeletRuntimeStall", "KubeletWatchWedge", "PodTeardownWedged",
-	"WatchdogStale", "HostNetworkProblems", "ClusterNetworkProblems",
-	"HostNetworkProblem", "ClusterNetworkProblem", "MemoryPressure",
-	"DiskPressure", "NetworkUnavailable", "FilesystemReadOnly",
-	"NebulaIsolated", "NebulaDegraded", "NebulaPMTUBlackhole",
-	"KernelHungTasks", "KernelSlabLeak", "ClockUnsynchronized",
-	"ClockSkewDetected", "CalicoFelixDown", "CiliumIPAMExhausted",
-	"InodePressure", "MemoryPSIThrashing", "CgroupDyingLeak",
-	"KernelResourceExhaustion", "KubeletPLEGUnhealthy",
-	"SystemdSessionLeak", "CiliumAgentDown", "CiliumInitStuck",
-	"CiliumEnvoyDown", "CiliumWGStale", "CiliumLRPDegraded",
-	"CiliumMTUDrift", "ConntrackExhausted", "JournaldWedged",
-	"ControlPlaneFrozen", "DiskSlowIO",
+var stormConds = condTypes(nodecond.StormGateNames)
+
+// condTypes converts a nodecond name list into the
+// corev1.NodeConditionType slice the verdict compares against —
+// nodecond keeps the names as untyped strings so libs/hostkit stays
+// stdlib-only.
+func condTypes(names []string) []corev1.NodeConditionType {
+	out := make([]corev1.NodeConditionType, len(names))
+	for i, name := range names {
+		out[i] = corev1.NodeConditionType(name)
+	}
+	return out
+}
+
+// stormCondHeartbeatMaxAge is how old a nodereporter-owned storm
+// condition's lastHeartbeatTime may be before its True stops gating
+// the verdict — the reporter re-stamps it every ~2m while alive, so a
+// frozen or absent stamp means the value is a zombie left by a dead
+// agent (same 10m convention as nodehealth's precordon gate).
+const stormCondHeartbeatMaxAge = 10 * time.Minute
+
+// condHeartbeatLive reports whether a condition's lastHeartbeatTime
+// is fresh enough to trust the value — mirror of nodehealth's
+// condHeartbeatLive.
+func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
+	return !c.LastHeartbeatTime.IsZero() &&
+		now.Sub(c.LastHeartbeatTime.Time) < stormCondHeartbeatMaxAge
 }
 
 // stormTaints mirrors STORM_TAINTS.
@@ -165,19 +185,24 @@ var stormSignalChanges = predicate.Funcs{
 }
 
 func Setup(d shared.Deps) error {
-	r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock}
-	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		// Watches with a single fixed workqueue key, not For(): the
-		// reconcile ignores req.Name and always sweeps the whole
-		// cluster, so per-node keys only produced N duplicate queued
-		// requests + N independent RequeueAfter timers per informer
-		// sync. One key collapses both to a single sweep (see
-		// shared.SweepRequests). Predicate semantics are unchanged.
-		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
-			builder.WithPredicates(stormSignalChanges)).
-		Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	// SetupNoConfig honors Deps.Disabled before the builder ever
+	// runs — a gated-off module registers no controller, no watch,
+	// no informer.
+	return shared.SetupNoConfig(d, func() error {
+		r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock}
+		return ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			// Watches with a single fixed workqueue key, not For(): the
+			// reconcile ignores req.Name and always sweeps the whole
+			// cluster, so per-node keys only produced N duplicate queued
+			// requests + N independent RequeueAfter timers per informer
+			// sync. One key collapses both to a single sweep (see
+			// shared.SweepRequests). Predicate semantics are unchanged.
+			Watches(&corev1.Node{},
+				handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+				builder.WithPredicates(stormSignalChanges)).
+			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	})
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -211,10 +236,23 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			cordoned = append(cordoned, n.Name)
 		}
 		for _, c := range n.Status.Conditions {
-			if c.Status == corev1.ConditionTrue &&
-				slices.Contains(stormConds, c.Type) {
-				bad = append(bad, n.Name+" "+string(c.Type))
+			if c.Status != corev1.ConditionTrue ||
+				!slices.Contains(stormConds, c.Type) {
+				continue
 			}
+			// A nodereporter-owned True with a frozen or absent
+			// heartbeat is a zombie — the wedged reporter cannot
+			// vouch for the condition anymore, so it must not hold
+			// the descheduler at 0 forever. Kubelet-native storm
+			// conditions (MemoryPressure/DiskPressure/
+			// NetworkUnavailable/InodePressure) and the foreign
+			// CiliumLRPDegraded spelling are not agent-managed and
+			// keep gating on status alone.
+			if nodecond.AgentHeartbeatManaged(string(c.Type)) &&
+				!condHeartbeatLive(&c, now) {
+				continue
+			}
+			bad = append(bad, n.Name+" "+string(c.Type))
 		}
 		for _, t := range n.Spec.Taints {
 			if slices.Contains(stormTaints, t.Key) {

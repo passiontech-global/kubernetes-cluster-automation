@@ -40,6 +40,13 @@ var konnectivityWantReq = corev1.ResourceList{
 
 type konnectivityPatcher struct {
 	cs kubernetes.Interface
+	// reader is the informer-cache client for the drift-detection Get
+	// — the manager's DaemonSet informer is field-scoped to exactly
+	// kube-system/konnectivity-agent (buildCacheOptions), so the
+	// cached read is watch-fresh for the one object this module pins.
+	// nil (tests, StubManager) falls back to the direct CS read;
+	// DaemonSetSpec's destructive patch confirms on CS either way.
+	reader kube.CachedObjectReader
 }
 
 // onlyKonnectivityDaemonSet is the exact predicate the For() watch
@@ -50,15 +57,24 @@ var onlyKonnectivityDaemonSet = pinnedworkload.OnlyNamespacedName("kube-system",
 // Setup reconciles only the konnectivity-agent
 // DaemonSet (the informer is already field-scoped to it via the
 // manager cache; the predicate is a cheap belt on top).
+// Registration is routed through shared.SetupNoConfig so the
+// Deps.Disabled gate is structural: the module has no GateEnv row
+// today (always enabled), but a future gate resolves through
+// setupModules into Disabled and this Setup needs no change.
 func Setup(d shared.Deps) error {
-	r := &konnectivityPatcher{cs: d.CS}
-	// CountReconcile owns the returned-error accounting — one
-	// IncError per non-nil Reconcile return; the reconcile body
-	// never IncErrors an error it returns.
-	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		For(&appsv1.DaemonSet{}, builder.WithPredicates(onlyKonnectivityDaemonSet)).
-		Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	return shared.SetupNoConfig(d, func() error {
+		r := &konnectivityPatcher{cs: d.CS}
+		if d.Mgr != nil {
+			r.reader = d.Mgr.GetClient()
+		}
+		// CountReconcile owns the returned-error accounting — one
+		// IncError per non-nil Reconcile return; the reconcile body
+		// never IncErrors an error it returns.
+		return ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			For(&appsv1.DaemonSet{}, builder.WithPredicates(onlyKonnectivityDaemonSet)).
+			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	})
 }
 
 // Reconcile delegates to the shared pinned-DaemonSet skeleton — this
@@ -67,6 +83,7 @@ func Setup(d shared.Deps) error {
 func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	return pinnedworkload.DaemonSetSpec{
 		CS:         r.cs,
+		Reader:     r.reader,
 		Namespace:  "kube-system",
 		Name:       "konnectivity-agent",
 		Container:  "konnectivity-agent",

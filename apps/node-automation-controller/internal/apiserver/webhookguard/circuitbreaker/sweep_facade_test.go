@@ -1267,3 +1267,89 @@ func TestWebhookCircuitBreakerCarryForwardSkipsDeletedWebhooks(t *testing.T) {
 		}
 	}
 }
+
+// The streak ledgers prune on EVERY cycle: a sweep that loses its
+// inputs (here: the node census fails before the jobs loop) still
+// prunes deadSince and recoverStreak so streaks cannot stay pinned to
+// entries nobody evaluates. brokenEmitted is exempt on purpose — its
+// Begin/Prune pairing is the carry-forward contract, so the aborted
+// sweep keeps the live series pinned.
+func TestWebhookCircuitBreakerAbortedSweepStillPrunesStreaks(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-abort"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("nodes unreachable")
+		})
+	g, b := wgBreakerGuard(cs, &t0)
+	key := guardstate.KindMutating + "/cb-abort/dead.example.com"
+	b.deadSince.Seed(key, t0.Add(-DeadThreshold-time.Minute))
+	b.recoverStreak.Hit(key)
+
+	if err := runBreaker(ctx, g, b); err == nil {
+		t.Fatal("expected the census failure to surface")
+	}
+	if _, seen := b.deadSince.Seen(key, t0); seen {
+		t.Fatal("deadSince streak survived the aborted sweep — prune must run every cycle")
+	}
+	if b.recoverStreak.Count(key) != 0 {
+		t.Fatal("recoverStreak survived the aborted sweep — prune must run every cycle")
+	}
+}
+
+// The stale-annotation drop releases its metric series only once the
+// patch LANDS — circuitPatch must not delete series for entries the
+// write may still carry (the annotation is the SSOT while the patch
+// fails).
+func TestWebhookCircuitBreakerStaleDropSeriesReleasedOnPatchSuccess(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cb-stale-series",
+			Annotations: map[string]string{
+				guardstate.CircuitBrokenAnno: "gone.example.com",
+			},
+		},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "still-dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Ignore),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	b := &Breaker{}
+	g := &guardstate.Guard{CS: cs, Dyn: wgDyn()}
+	metrics.WebhookCircuitBroken.WithLabelValues(
+		guardstate.KindMutating, "cb-stale-series", "gone.example.com").Set(1)
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			guardstate.KindMutating, "cb-stale-series", "gone.example.com")
+	})
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	// DeleteLabelValues doubles as the exists-probe.
+	if metrics.WebhookCircuitBroken.DeleteLabelValues(
+		guardstate.KindMutating, "cb-stale-series", "gone.example.com") {
+		t.Fatal("stale drop's series not released after the landed patch")
+	}
+}

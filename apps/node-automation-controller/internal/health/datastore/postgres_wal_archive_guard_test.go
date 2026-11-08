@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -340,5 +341,84 @@ func TestCNPGRecoveryPrunesSeries(t *testing.T) {
 	}
 	if cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-heal", "stuck_phase") {
 		t.Fatal("stuck_phase series kept after the cluster healed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W17 — bounded log read + cluster-scoped volume pressure.
+// ---------------------------------------------------------------------------
+
+// The pod-log read is bounded BOTH by TailLines and SinceSeconds —
+// a whole-lifetime tail would re-flag a crash that predates every
+// other signal in the sweep.
+func TestPostgresWALLogOptionsBounded(t *testing.T) {
+	opts := pgWALLogOptions("postgres")
+	if opts.Container != "postgres" {
+		t.Fatalf("container = %q, want postgres", opts.Container)
+	}
+	if opts.TailLines == nil || *opts.TailLines != probefw.DefaultTailLines {
+		t.Fatal("log read missing the tail bound")
+	}
+	if opts.SinceSeconds == nil ||
+		*opts.SinceSeconds != int64(pgWALLogSinceWindow.Seconds()) ||
+		*opts.SinceSeconds <= 0 {
+		t.Fatalf("log read missing a positive SinceSeconds bound: %v", opts.SinceSeconds)
+	}
+}
+
+// Volume pressure emits under the OPERATOR CLUSTER name, never the
+// PVC name — the gauge series are per-cluster and a PVC-named series
+// would match no alert label set.
+func TestPostgresWALVolumePressureEmitsClusterName(t *testing.T) {
+	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "wal_volume_pressure")
+	t.Cleanup(func() {
+		postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "wal_volume_pressure")
+	})
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "kubelet_volume_stats") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{
+					"namespace":             "db",
+					"persistentvolumeclaim": "pg-main-data-pg-main-0",
+				},
+				Value: 0.9,
+			}}
+		}
+		return nil
+	})
+	pod := pgPod("db", "pg-main-0", "pg-main")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name: "data",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: "pg-main-data-pg-main-0"}}}}
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"INFO archive-push ok\n", nil))
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("data volume past 60%% must fail: %+v", res)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_postgres_wal_archive_unhealthy",
+		map[string]string{"namespace": "db", "cluster": "pg-main",
+			"reason": "wal_volume_pressure"}); !ok || v != 1 {
+		t.Fatalf("wal_volume_pressure under cluster name = %v,%v want 1,true", v, ok)
+	}
+}
+
+// Component 3 — the per-pod probe fan-outs are bounded at 4.
+func TestPostgresWALWorkerPoolBound(t *testing.T) {
+	if postgresWALLogWorkers != 4 {
+		t.Fatalf("postgres log workers = %d, want 4", postgresWALLogWorkers)
+	}
+	if natsLogScanWorkers != 4 {
+		t.Fatalf("nats log workers = %d, want 4", natsLogScanWorkers)
+	}
+	if scyllaScrapeWorkers != 4 || scyllaStallLogWorkers != 4 {
+		t.Fatal("scylla scrape/log workers must be 4")
 	}
 }

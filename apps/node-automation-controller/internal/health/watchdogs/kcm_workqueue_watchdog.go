@@ -145,14 +145,16 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Pass: true}
 	}
 
-	dss, err := p.CS.AppsV1().DaemonSets(metav1.NamespaceSystem).
-		List(ctx, metav1.ListOptions{})
+	// kube-system workloads read through the sweep-wide snapshot —
+	// the cluster-wide DaemonSet/Deployment census memoized once,
+	// filtered client-side to the kube-system workloads the KCM
+	// signature set judges.
+	dss, err := p.AllDaemonSets(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list daemonsets in %s: %w",
 			metav1.NamespaceSystem, err)}
 	}
-	deps, err := p.CS.AppsV1().Deployments(metav1.NamespaceSystem).
-		List(ctx, metav1.ListOptions{})
+	deps, err := p.AllDeployments(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list deployments in %s: %w",
 			metav1.NamespaceSystem, err)}
@@ -161,8 +163,11 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	// Candidate signatures keyed "<reason>/<kind>/<name>" so each
 	// object's persistence window is tracked independently.
 	sigs := map[string]string{}
-	for i := range dss.Items {
-		ds := &dss.Items[i]
+	for i := range dss {
+		ds := &dss[i]
+		if ds.Namespace != metav1.NamespaceSystem {
+			continue
+		}
 		if ds.Status.DesiredNumberScheduled == 0 &&
 			(ds.Status.CurrentNumberScheduled+
 				ds.Status.UpdatedNumberScheduled+
@@ -174,8 +179,11 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			sigs[kcmReasonStaleGen+"/daemonset/"+ds.Name] = kcmReasonStaleGen
 		}
 	}
-	for i := range deps.Items {
-		dep := &deps.Items[i]
+	for i := range deps {
+		dep := &deps[i]
+		if dep.Namespace != metav1.NamespaceSystem {
+			continue
+		}
 		if dep.Status.ObservedGeneration < dep.Generation {
 			sigs[kcmReasonStaleGen+"/deployment/"+dep.Name] = kcmReasonStaleGen
 		}

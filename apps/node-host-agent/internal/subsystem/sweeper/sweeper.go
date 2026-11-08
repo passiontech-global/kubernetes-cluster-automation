@@ -256,8 +256,12 @@ func (s *Sweeper) mountPoints() ([]string, error) {
 
 // mountedInside reports whether any mount point in the parsed host
 // mount table sits at or inside dir — the rm --one-file-system
-// guard.
+// guard. dir is normalized first: a pod-mode SWEEP_BASE_DIR carries
+// the /host hostRoot prefix while /proc/1/mounts speaks HOST paths;
+// comparing them un-normalized makes the guard silently miss every
+// live mount (and rm straight through its contents).
 func mountedInside(dir string, mounts []string) bool {
+	dir = strings.TrimPrefix(dir, "/host")
 	for _, mp := range mounts {
 		if mp == dir || strings.HasPrefix(mp, dir+"/") {
 			return true

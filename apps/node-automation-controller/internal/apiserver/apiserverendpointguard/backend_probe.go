@@ -362,7 +362,7 @@ func expireQuarantine(log logr.Logger, backends map[string]*backendProbeState,
 
 // evaluateBackends probes every backend (active + quarantined) and
 // folds the outcome into the per-backend streaks (foldStreaks), prunes
-// state + metric series for IPs that left the controller set, runs the
+// streak state for IPs that left the controller set, runs the
 // JWKS skew census (jwksCensus), then expires quarantined IPs whose
 // backend is never coming back (expireQuarantine). Returns the per-IP
 // verdicts and the expired IPs; quarantinedIPs shrinks in place for
@@ -403,11 +403,21 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 	// ---- JWKS kid-set skew census (W12-CP4b) -------------------------
 	jwksCensus(log, allIPs, g.backends)
 
-	// Prune state + metric series for IPs that left the controller set.
+	// Prune streak STATE for IPs that left the controller set — the
+	// verdict-facing hygiene: a removed backend's wedge streaks must
+	// not resurface as stale evidence on re-add. The per-IP METRIC
+	// series deliberately stay: absence from one cycle's address
+	// snapshot is not proof of decommissioning — the endpoints
+	// reconciler rebuilds default/kubernetes every ~10s and drops a
+	// backend exactly when its lease lapses (the dead/wedged
+	// signature this guard exists to catch), so forgetting the series
+	// here would churn the ops evidence in and out mid-incident.
+	// Series retirement happens in expireQuarantine only, the path
+	// with actual decommission evidence (absence + endpointGuardExpireCyc
+	// probe-error cycles).
 	for ip := range g.backends {
 		if !slices.Contains(allIPs, ip) {
 			delete(g.backends, ip)
-			metrics.ForgetAPIBackend(ip)
 		}
 	}
 

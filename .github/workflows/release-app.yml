@@ -83,10 +83,26 @@ jobs:
           fi
           last_ver="${last_tag##*/}"
 
+          # Full semver (X.Y.Z with optional -prerelease / +build
+          # metadata). Git tags and GitHub release names may carry '+',
+          # but docker/ko image tags cannot (their charset is
+          # [A-Za-z0-9_.-]), so every version that reaches an image tag
+          # goes through the '+'-free REL_DOCKER_VERSION computed below.
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          # $1 = version, leading "v" optional; nonzero exit when $1 is
+          # not valid semver.
+          check_semver() {
+            grep -Eq "$semver_re" <<<"${1#v}"
+          }
+
           if [ -n "$version_in" ]; then
             # Accept both "v0.1.0" and "<app>/v0.1.0" spellings.
             rel_version="${version_in##*/}"
             case "$rel_version" in v*) ;; *) rel_version="v$rel_version" ;; esac
+            check_semver "$rel_version" || {
+              echo "::error::version input '$version_in' is not valid semver (expected vX.Y.Z[-pre][+build])" >&2
+              exit 1
+            }
           else
             # Anchor git-cliff explicitly at $last_tag..HEAD so a tag
             # created on a multi-commit push whose HEAD did not touch
@@ -96,7 +112,17 @@ jobs:
               --include-path "apps/$APP/**" \
               --include-path "libs/hostkit/**" \
               "$last_tag..HEAD")
-            rel_version="v$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' <<<"$bumped" | head -1)"
+            # --bumped-version prints exactly one bare version line
+            # ("0.2.0" / "0.2.0-rc.1+build.5"). Take it whole and parse
+            # it as semver — the old grep-anywhere extraction could
+            # match a version quoted inside a commit message.
+            cliff_ver="$(head -n 1 <<<"$bumped" | tr -d '[:space:]')"
+            cliff_ver="${cliff_ver#v}"
+            check_semver "v$cliff_ver" || {
+              echo "::error::git-cliff --bumped-version returned non-semver '$cliff_ver'" >&2
+              exit 1
+            }
+            rel_version="v$cliff_ver"
             # No new conventional commits since last tag -> git-cliff
             # echoes the same version; force a patch bump so the
             # release tag never collides.
@@ -105,10 +131,12 @@ jobs:
                 *-*)
                   # Last tag is a prerelease ("v0.1.0-rc.1") — this
                   # release IS its base version: strip the "-rc.N"
-                  # suffix (a prerelease sorts before its release,
-                  # so the base tag cannot exist yet). Bumping patch
-                  # here would skip v0.1.0 entirely.
-                  rel_version="${last_ver%%-*}"
+                  # suffix AND any "+build" metadata after it (a
+                  # prerelease sorts before its release, so the base
+                  # tag cannot exist yet). Bumping patch here would
+                  # skip v0.1.0 entirely.
+                  rel_version="${last_ver%%+*}"    # drop "+build" (if any)
+                  rel_version="${rel_version%%-*}" # drop "-rc.N"
                   ;;
                 *)
                   IFS=. read -r major minor patch <<<"${last_ver#v}"
@@ -122,6 +150,12 @@ jobs:
               esac
             fi
           fi
+          # Docker-safe image-tag variant of REL_VERSION: swap the
+          # semver '+' separator for '-' (v1.2.3+build.5 ->
+          # v1.2.3-build.5; plain releases and prereleases carry over
+          # unchanged). Used ONLY for the container image tag — the
+          # git/GitHub release tag keeps the canonical semver form.
+          rel_docker_version="${rel_version/+/-}"
           rel_tag="$APP/$rel_version"
 
           git-cliff --unreleased --tag "$rel_tag" \
@@ -138,6 +172,7 @@ jobs:
           cat notes.md
 
           echo "REL_VERSION=$rel_version" >>"$GITHUB_ENV"
+          echo "REL_DOCKER_VERSION=$rel_docker_version" >>"$GITHUB_ENV"
           echo "REL_TAG=$rel_tag" >>"$GITHUB_ENV"
           # Job outputs for callers that need the resolved tag (e.g.
           # the binary-attach job must not re-derive it from git —
@@ -171,7 +206,9 @@ jobs:
           VERSION: ${{ env.REL_VERSION }}
           # Prereleases get the version tag only — they must not move
           # the floating :latest pointer onto a non-stable build.
-          TAGS: "${{ env.REL_VERSION }}${{ inputs.prerelease == true && '' || ',latest' }}"
+          # REL_DOCKER_VERSION is REL_VERSION with '+' swapped for '-':
+          # docker/ko tags cannot contain '+'.
+          TAGS: "${{ env.REL_DOCKER_VERSION }}${{ inputs.prerelease == true && '' || ',latest' }}"
           KO_DOCKER_REPO: ${{ env.IMAGE }}
         run: |
           set -euo pipefail

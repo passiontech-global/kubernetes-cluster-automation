@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -328,5 +330,136 @@ func TestTCPTLSEndpointProber(t *testing.T) {
 	cancel()
 	if tcpTLSEndpointProber(ctx, host, port) {
 		t.Fatal("probe with cancelled context must fail")
+	}
+}
+
+// A cancelled sweep must stop probing immediately and leave the
+// in-flight services UNRECORDED: Probed/Responsive stay unset so the
+// breaker never reads a cancelled dial (run budget expired) as
+// "every probed IP failed the handshake" and stamps the brownout
+// ledgers with a false verdict.
+func TestProbeCancellationNotRecordedUnresponsive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prober := func(context.Context, string, int32) bool {
+		cancel() // the run budget expires mid-probe
+		return false
+	}
+	g := &Guard{CS: fake.NewSimpleClientset(gsInjSlice("ns", "svc", "")),
+		EndpointProber: prober}
+	snap := &Snapshot{
+		G:              g,
+		Ctx:            ctx,
+		MWC:            gsInjMWC("hook.example.com", nil, "ns", "svc", ""),
+		VWC:            &admissionv1.ValidatingWebhookConfigurationList{},
+		UnhealthyNodes: map[string]bool{},
+	}
+	ready, err := g.readyEndpointCounts(ctx, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready.ProbeIPs["ns/svc"]) == 0 {
+		t.Fatal("fixture must collect probe candidates")
+	}
+	if len(ready.Probed) != 0 {
+		t.Fatalf("cancelled sweep must not mark services probed: %v", ready.Probed)
+	}
+	if len(ready.Responsive) != 0 {
+		t.Fatalf("cancelled sweep must not record responsiveness: %v", ready.Responsive)
+	}
+}
+
+// The brownout probe fans out through a bounded worker pool: at most
+// probeWorkers TCP+TLS dials in flight per sweep no matter how many
+// webhook backends the cluster carries — and every service still gets
+// probed and recorded.
+func TestProbePoolBounded(t *testing.T) {
+	const services = 12
+	started := make(chan string, services)
+	release := make(chan struct{})
+	var inFlight, maxSeen atomic.Int32
+	prober := func(ctx context.Context, ip string, _ int32) bool {
+		cur := inFlight.Add(1)
+		for {
+			old := maxSeen.Load()
+			if cur <= old || maxSeen.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		started <- ip
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		inFlight.Add(-1)
+		return true
+	}
+	hooks := make([]admissionv1.MutatingWebhook, 0, services)
+	objs := make([]runtime.Object, 0, services)
+	for i := range services {
+		svc := fmt.Sprintf("svc%d", i)
+		hooks = append(hooks, admissionv1.MutatingWebhook{
+			Name: svc + ".example.com",
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: &admissionv1.ServiceReference{Namespace: "ns", Name: svc},
+			},
+		})
+		objs = append(objs, gsInjSlice("ns", svc, ""))
+	}
+	g := &Guard{
+		CS:             fake.NewSimpleClientset(objs...),
+		EndpointProber: prober,
+	}
+	snap := &Snapshot{
+		G:   g,
+		Ctx: context.Background(),
+		MWC: &admissionv1.MutatingWebhookConfigurationList{
+			Items: []admissionv1.MutatingWebhookConfiguration{{
+				ObjectMeta: metav1.ObjectMeta{Name: "pool-mwc"},
+				Webhooks:   hooks,
+			}},
+		},
+		VWC:            &admissionv1.ValidatingWebhookConfigurationList{},
+		UnhealthyNodes: map[string]bool{},
+	}
+	type outcome struct {
+		ready EndpointCensus
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		ready, err := g.readyEndpointCounts(snap.Ctx, snap)
+		done <- outcome{ready, err}
+	}()
+	// The pool's workers all pick up a dial and block on the release.
+	for range probeWorkers {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("probe pool never reached full concurrency")
+		}
+	}
+	// An unbounded pool would have started the remaining dials too.
+	select {
+	case ip := <-started:
+		t.Fatalf("more than probeWorkers concurrent probes: %s", ip)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if max := maxSeen.Load(); max != probeWorkers {
+		t.Fatalf("peak concurrent probes = %d, want exactly %d", max, probeWorkers)
+	}
+	if len(got.ready.ProbeIPs) != services {
+		t.Fatalf("probed %d services, want %d", len(got.ready.ProbeIPs), services)
+	}
+	for key := range got.ready.ProbeIPs {
+		if !got.ready.Probed[key] || !got.ready.Responsive[key] {
+			t.Fatalf("service %q not recorded probed+responsive: %v/%v",
+				key, got.ready.Probed[key], got.ready.Responsive[key])
+		}
 	}
 }

@@ -75,12 +75,16 @@ func (d *Deps) DiskUsageAboveWatermark(dir string) bool {
 var PromTextfileDirOverride string
 
 // PromTextfileDir resolves the node-exporter textfile drop dir —
-// <K0sDataDir's parent>/node-exporter/textfile, i.e.
-// <hostRoot>/var/lib/node-exporter/textfile in both pod and
-// standalone layouts (same derivation controllerhygiene uses).
+// NODE_HOST_AGENT_TEXTFILE_DIR (wired into Config.TextfileDir from
+// hostctx) when set, else <K0sDataDir's parent>/node-exporter/
+// textfile, i.e. <hostRoot>/var/lib/node-exporter/textfile in both
+// pod and standalone layouts.
 func (d *Deps) PromTextfileDir() string {
 	if PromTextfileDirOverride != "" {
 		return PromTextfileDirOverride
+	}
+	if d.Cfg.TextfileDir != "" {
+		return d.Cfg.TextfileDir
 	}
 	return filepath.Join(filepath.Dir(d.Cfg.K0sDataDir),
 		"node-exporter", "textfile")

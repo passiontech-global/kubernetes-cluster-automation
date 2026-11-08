@@ -22,9 +22,14 @@ const SuspectBudgetPrefix = "last-suspect-"
 // dedupe budget (last-suspect-<name>): the budget is spent under the
 // Store's own dir by SuspectLog, and a cleared condition must not
 // suppress the first line of a re-incident under a stale epoch from
-// the previous one.
+// the previous one. The budget only goes when Exit actually removed
+// the latch file (returned true) — a no-op exit (nothing on disk, or
+// a shared multi-owner latch still held by a sibling producer) must
+// leave the throttle untouched.
 func (s *Store) ExitClearSuspect(name string) {
-	s.Exit(name, func() { s.ClearSuspect(name) })
+	if s.Exit(name, nil) {
+		s.ClearSuspect(name)
+	}
 }
 
 // ExitClearAllSuspects is Exit plus removal of the WHOLE
@@ -33,9 +38,12 @@ func (s *Store) ExitClearSuspect(name string) {
 // state-* twin to exit with, so a cleared condition would otherwise
 // suppress the first line of a re-incident for up to the suspect
 // cadence. No clean per-key pairing exists; a still-held condition
-// pays at most one early re-log line.
+// pays at most one early re-log line. Gated on Exit's true return
+// like ExitClearSuspect.
 func (s *Store) ExitClearAllSuspects(name string) {
-	s.Exit(name, func() { s.ClearAllSuspects() })
+	if s.Exit(name, nil) {
+		s.ClearAllSuspects()
+	}
 }
 
 // ClearSuspect drops the last-suspect-<name> dedupe budget so the

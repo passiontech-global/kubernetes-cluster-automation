@@ -8,6 +8,7 @@ package pinnedworkload
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,13 +17,16 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -232,5 +236,114 @@ func TestDeploymentSpecAppliesPatch(t *testing.T) {
 	}
 	if res.RequeueAfter != 15*time.Minute {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Informer-cache read + direct-CS drift confirm (Reader seam)
+// ---------------------------------------------------------------------------
+
+// fakeCacheReader is a CachedObjectReader stub playing the informer
+// cache: it serves exactly the objects handed to it, independent of
+// the fake clientset that plays the live apiserver — the census/live
+// split the direct-CS confirm must resolve.
+type fakeCacheReader struct {
+	objs []client.Object
+}
+
+func (f *fakeCacheReader) Get(_ context.Context, key client.ObjectKey,
+	obj client.Object, _ ...client.GetOption) error {
+	for _, o := range f.objs {
+		if o.GetNamespace() == key.Namespace && o.GetName() == key.Name {
+			// Round-trip into the caller's object — the shape the
+			// cache client's Get delivers (fresh object, not alias).
+			data, err := json.Marshal(o)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(data, obj)
+		}
+	}
+	return apierrors.NewNotFound(
+		corev1.SchemeGroupVersion.WithResource("objects").GroupResource(),
+		key.Name)
+}
+
+// A drifted cache read with a SETTLED live object must not patch:
+// the destructive path confirms on the direct clientset before
+// acting — a stale informer never fires a patch the live object no
+// longer needs. Drifted keys on the container image so the cache
+// copy (image stripped) reads drifted and the live copy settled.
+func TestDeploymentSpecCachedReadConfirmSkipsSettled(t *testing.T) {
+	live := pinnedDeploy()
+	stale := pinnedDeploy()
+	stale.Spec.Template.Spec.Containers[0].Image = ""
+	cs := fake.NewSimpleClientset(live)
+	var patched bool
+	testutil.ForbidDeployPatch(cs, &patched)
+
+	s := baseDeploySpec(cs)
+	s.Reader = &fakeCacheReader{objs: []client.Object{stale}}
+	s.Drifted = func(d *appsv1.Deployment, _ int32) bool {
+		return kube.PodSpecHasContainer(&d.Spec.Template.Spec, "app") &&
+			d.Spec.Template.Spec.Containers[0].Image == ""
+	}
+	res, err := s.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+	if patched {
+		t.Fatal("patched off a stale cache read — the direct-CS confirm must veto")
+	}
+}
+
+// A drifted cache read with a drifted LIVE object still patches —
+// the confirm confirms real drift.
+func TestDeploymentSpecCachedReadConfirmPatchesDrift(t *testing.T) {
+	live := pinnedDeploy()
+	live.Spec.Template.Spec.Containers[0].Image = ""
+	stale := pinnedDeploy()
+	stale.Spec.Template.Spec.Containers[0].Image = ""
+	cs := fake.NewSimpleClientset(live)
+	// Count patch attempts and let the tracker apply the real merge —
+	// exactly one attempt proves the confirm kept the patch (and that
+	// the cache-read path didn't double-fire).
+	var patches int
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+
+	s := baseDeploySpec(cs)
+	s.Reader = &fakeCacheReader{objs: []client.Object{stale}}
+	if _, err := s.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patches != 1 {
+		t.Fatalf("confirmed drift patch attempts = %d, want 1", patches)
+	}
+}
+
+// A NotFound from the cache is the cluster-without-this-addon skip —
+// unchanged shape when the read rides the informer.
+func TestDeploymentSpecCachedReadNotFound(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	var patched bool
+	testutil.ForbidDeployPatch(cs, &patched)
+	s := baseDeploySpec(cs)
+	s.Reader = &fakeCacheReader{}
+	res, err := s.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+	if patched {
+		t.Fatal("patched on a cache NotFound")
 	}
 }

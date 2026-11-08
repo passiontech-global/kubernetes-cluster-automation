@@ -32,6 +32,15 @@ package shared
 //     called even when the gate is off (with Deps.Disabled set) so
 //     knob-parsing warnings still fire; the module must register
 //     nothing in that case.
+//   - ProbeClients opts the row's Setup into the latency-sensitive
+//     probe clients: when the boot Deps carry ProbeCS/ProbeDyn (own
+//     client-go rate limiter), SetupModules hands those to the
+//     module's Setup AS CS/Dyn, so the module's reads — and its low
+//     volume of quarantine/taint patches — draw from the probe
+//     bucket instead of contending with janitor delete bursts on the
+//     shared one. Wiring-only: the module code is unchanged (it
+//     still reads d.CS/d.Dyn); tests that build Deps literally (no
+//     ProbeCS) are unaffected.
 //   - CheckReg is the alternative to Setup for health-sweep check
 //     rows: the row contributes a check into the
 //     cluster-health-probes roster instead of registering
@@ -41,12 +50,13 @@ package shared
 //     Deps.CheckRegs for the sweep to consume; rows with CheckReg
 //     have Setup == nil and are never Setup-called.
 type Module struct {
-	Name      string
-	Group     string
-	GateEnv   string
-	DefaultOn bool
-	Setup     func(Deps) error
-	CheckReg  *CheckReg
+	Name         string
+	Group        string
+	GateEnv      string
+	DefaultOn    bool
+	ProbeClients bool
+	Setup        func(Deps) error
+	CheckReg     *CheckReg
 }
 
 // CheckReg is one health-sweep check contribution — what a

@@ -61,12 +61,17 @@ func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 // the names whose metric/ledger updates the caller must apply only
 // after the patch lands (stillBroken is also returned on the
 // nil-payload path — nothing needs writing, but the
-// annotation-verified series still re-asserts). Emitting any of
+// annotation-verified series still re-asserts). dropped carries the
+// stale-annotation names this evaluation removed — the caller owns
+// their WebhookCircuitBroken series deletion too, and equally only
+// AFTER the patch lands: deleting inside circuitPatch would release
+// the series even when the write fails and the annotation (the SSOT)
+// still lists the name. Emitting any of
 // them earlier would let a failed patch pin or drop a series the
 // annotation no longer justifies.
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
-	seen, recoverSeen map[string]bool) (payload []byte, trips, recovered, stillBroken []string) {
+	seen, recoverSeen map[string]bool) (payload []byte, trips, recovered, stillBroken, dropped []string) {
 
 	broken := guardstate.ParseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
@@ -209,17 +214,19 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 
 	// Stale annotation names (the sub-webhook itself is gone — e.g.
 	// removed by the orphan sweep) drop out so the record stays exact.
+	// Their metric series are NOT deleted here — the caller releases
+	// them only after the patch lands (see the dropped contract).
 	for name := range broken {
 		if !present[name] {
 			delete(broken, name)
-			metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, name)
+			dropped = append(dropped, name)
 			changed = true
 			log.Info("CIRCUIT-CLEAN: annotation entry has no live webhook — dropping",
 				"kind", kind, "config", cfgName, "webhook", name)
 		}
 	}
 	if !changed {
-		return nil, nil, nil, stillBroken
+		return nil, nil, nil, stillBroken, nil
 	}
 
 	anno := map[string]any{guardstate.CircuitBrokenAnno: nil} // merge-patch null deletes the key
@@ -244,9 +251,9 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		// metered so the dropped work is still counted.
 		metrics.IncError(queue)
 		log.Error(err, "marshal circuit breaker patch", "config", cfgName)
-		return nil, nil, nil, stillBroken
+		return nil, nil, nil, stillBroken, nil
 	}
-	return payload, trips, recovered, stillBroken
+	return payload, trips, recovered, stillBroken, dropped
 }
 
 // svcRefString renders a webhook's Service reference for log lines.

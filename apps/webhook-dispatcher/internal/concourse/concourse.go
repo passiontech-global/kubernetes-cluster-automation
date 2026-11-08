@@ -49,17 +49,37 @@ type Client struct {
 	index     []Resource
 	fetchedAt time.Time
 	// lastAttemptAt stamps the start of the most recent fetch attempt
-	// — success or failure — so a failed refresh backs off instead of
-	// letting every caller block on a fresh fetch against a dead ATC,
-	// and callers arriving mid-fetch are served the current index
-	// rather than queueing a second fetch.
+	// made by Resources — success or failure — so a failed fetch backs
+	// off instead of letting every caller block on a fresh fetch
+	// against a dead ATC, and callers arriving mid-fetch are served
+	// the current index rather than queueing a second fetch. It
+	// belongs to Resources alone: Refresh throttles on its own
+	// lastForceRefreshAt clock, so one entry point's attempt stamp
+	// never masks the other's.
 	lastAttemptAt time.Time
-	// fetching marks an in-flight index fetch (never held across the
-	// network wait without the mutex released — it is set under the
-	// lock before the fetch starts and cleared after it settles), so
-	// a caller with no index to serve fails fast instead of starting
-	// its own duplicate fetch.
-	fetching bool
+	// lastForceRefreshAt stamps the most recent forced Refresh
+	// attempt, throttling Refresh to MinRefreshInterval. It is kept
+	// separate from lastAttemptAt: a zero-match delivery's forced
+	// refresh must not be suppressed by an unrelated Resources cache
+	// miss that just stamped its own attempt, and a Refresh attempt
+	// must never double as Resources' backoff stamp.
+	lastForceRefreshAt time.Time
+	// flight is the in-flight index fetch, if any. Starting a fetch
+	// installs a fresh flight under the lock and closes its done
+	// channel — only when that fetch itself settles — so concurrent
+	// starters never clear each other's in-flight marker. Cold-start
+	// callers (no index to serve) capture the channel and wait on it,
+	// sharing the in-flight fetch's result instead of stampeding the
+	// ATC with duplicate full-index fetches.
+	flight *fetchFlight
+}
+
+// fetchFlight tracks one in-flight index fetch. done is closed by the
+// fetch that installed the flight, exactly once, when that fetch
+// settles — waiters that captured the channel are woken no matter how
+// many later fetches replace the flight pointer in the meantime.
+type fetchFlight struct {
+	done chan struct{}
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -94,96 +114,135 @@ func (c *Client) minRefreshInterval() time.Duration {
 // the lastAttemptAt stamp happen under the lock, the fetch runs
 // unlocked, and only a successful publish re-takes it. Callers that
 // arrive while a fetch is in flight are served the current index
-// immediately (stale is fine — the in-flight fetch will replace it),
-// so a slow or wedged ATC cannot serialize webhook deliveries behind
-// c.mu.
+// immediately when there is one (stale is fine — the in-flight fetch
+// will replace it). On a cold start there is nothing to serve, so the
+// caller instead waits on the in-flight fetch and shares its result:
+// concurrent first deliveries must not stampede the ATC with
+// duplicate full-index fetches. The wait is bounded by the caller's
+// context, so a wedged ATC still can't hang the handler forever.
 func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
-	c.mu.Lock()
-	if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
-		index := c.index
-		c.mu.Unlock()
-		return index, nil
-	}
-	// The last attempt failed inside the same TTL window — serve the
-	// stale index without re-fetching. Without this backoff every
-	// request re-takes the mutex and blocks on a doomed fetch.
-	if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
-		index := c.index
-		c.mu.Unlock()
-		return index, nil
-	}
-	// A fetch already in flight and no index to serve: fail fast —
-	// queueing this caller behind the in-flight fetch is exactly the
-	// serialization this method exists to avoid.
-	if c.index == nil && c.fetching {
-		c.mu.Unlock()
-		return nil, errors.New("resource index refresh already in progress")
-	}
-	// Stamp the attempt before starting the fetch: concurrent callers
-	// hitting the checks above while this fetch is in flight must see
-	// a fresh lastAttemptAt and be served the existing index instead
-	// of starting their own fetch behind this one.
-	c.lastAttemptAt = time.Now()
-	c.fetching = true
-	prev := append([]Resource(nil), c.index...)
-	c.mu.Unlock()
-
-	index, err := c.fetchIndex(ctx, prev)
-	c.mu.Lock()
-	c.fetching = false
-	if err != nil {
-		if c.index != nil {
-			logger().Warn("resource index refresh failed — serving stale",
-				"concourse_url", c.BaseURL, "team", c.Team,
-				"error", err)
+	for {
+		c.mu.Lock()
+		if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
+			index := c.index
 			c.mu.Unlock()
-			return c.index, nil
+			return index, nil
 		}
+		// The last attempt failed inside the same TTL window — serve the
+		// stale index without re-fetching. Without this backoff every
+		// request re-takes the mutex and blocks on a doomed fetch.
+		if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
+			index := c.index
+			c.mu.Unlock()
+			return index, nil
+		}
+		// A fetch is already in flight — never start a second one on
+		// top of it. With an index to serve (even a stale one) this
+		// caller is answered immediately; on a cold start it waits for
+		// the in-flight fetch to settle and re-runs the cache checks
+		// against whatever that fetch published.
+		if c.flight != nil {
+			done := c.flight.done
+			index := c.index
+			c.mu.Unlock()
+			if index != nil {
+				return index, nil
+			}
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		// Stamp the attempt before starting the fetch: concurrent callers
+		// hitting the checks above while this fetch is in flight must see
+		// a fresh lastAttemptAt and be served the existing index instead
+		// of starting their own fetch behind this one.
+		c.lastAttemptAt = time.Now()
+		flight := &fetchFlight{done: make(chan struct{})}
+		c.flight = flight
+		prev := append([]Resource(nil), c.index...)
 		c.mu.Unlock()
-		return nil, err
+		// The flight's done channel is closed exactly once, when this
+		// fetch settles (even if fetchIndex panics) — cold-start waiters
+		// rely on it. A later fetch may have replaced c.flight by then;
+		// only this fetch's own marker is this fetch's to clear.
+		defer func() {
+			c.mu.Lock()
+			if c.flight == flight {
+				c.flight = nil
+			}
+			close(flight.done)
+			c.mu.Unlock()
+		}()
+
+		index, err := c.fetchIndex(ctx, prev)
+
+		c.mu.Lock()
+		if err != nil {
+			if c.index != nil {
+				logger().Warn("resource index refresh failed — serving stale",
+					"concourse_url", c.BaseURL, "team", c.Team,
+					"error", err)
+				stale := c.index
+				c.mu.Unlock()
+				return stale, nil
+			}
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.index, c.fetchedAt = index, time.Now()
+		c.mu.Unlock()
+		return index, nil
 	}
-	c.index, c.fetchedAt = index, time.Now()
-	c.mu.Unlock()
-	return index, nil
 }
 
 // Refresh forces an index refetch, bypassing the TTL — used when a
 // delivery matched nothing, covering a pipeline set since the last
-// fetch. Calls are throttled to MinRefreshInterval: repos without a
-// pipeline zero-match every delivery, so an unthrottled refresh would
-// turn org-webhook volume into constant index rebuilds. A failed
-// refresh keeps the previous index.
+// fetch. Calls are throttled to MinRefreshInterval on the
+// Refresh-owned lastForceRefreshAt clock: repos without a pipeline
+// zero-match every delivery, so an unthrottled refresh would turn
+// org-webhook volume into constant index rebuilds. The clock is
+// deliberately separate from Resources' lastAttemptAt — a forced
+// refresh must not be suppressed by an unrelated cache miss that just
+// stamped its own attempt, and a failed forced refresh must not
+// silently extend Resources' backoff window. A failed refresh keeps
+// the previous index.
 //
-// The throttle watches lastAttemptAt, not just fetchedAt: fetchedAt
-// only moves on success, so during an ATC outage an unmatched
-// delivery would otherwise grab the mutex and block on a doomed
-// network fetch every time — stalling every other webhook behind
-// the HTTP timeout. The fetch itself runs outside the mutex, same
-// snapshot pattern as Resources.
+// The fetch runs outside the mutex, same snapshot pattern as
+// Resources; it installs its own flight, so cold-start Resources
+// callers arriving mid-refresh share this fetch's result instead of
+// starting a duplicate one.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 	c.mu.Lock()
-	// lastAttemptAt >= fetchedAt always (a success stamps both, a
-	// failure stamps only the attempt), so the attempt stamp alone
-	// covers both "recently fetched" and "recently failed".
-	if time.Since(c.lastAttemptAt) < c.minRefreshInterval() {
+	// The throttle watches lastForceRefreshAt only: lastAttemptAt
+	// belongs to Resources' backoff and must not gate the forced path.
+	if time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
 		index := c.index
 		c.mu.Unlock()
 		return index, nil
 	}
-	// Stamp the attempt before the fetch so concurrent Refresh callers
-	// take the throttle branch instead of queueing a second doomed
-	// fetch behind this one; a failure keeps that stamp so a later
-	// Resources call serves the stale index inside its backoff window
-	// instead of immediately re-fetching a just-failed ATC.
-	c.lastAttemptAt = time.Now()
-	c.fetching = true
+	// Stamp before the fetch so concurrent Refresh callers take the
+	// throttle branch instead of queueing a second doomed fetch behind
+	// this one; a failure keeps that stamp so the next forced refresh
+	// inside the throttle window still serves the cached index instead
+	// of immediately re-fetching a just-failed ATC.
+	c.lastForceRefreshAt = time.Now()
+	flight := &fetchFlight{done: make(chan struct{})}
+	c.flight = flight
 	prev := append([]Resource(nil), c.index...)
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.flight == flight {
+			c.flight = nil
+		}
+		close(flight.done)
+		c.mu.Unlock()
+	}()
 
 	index, err := c.fetchIndex(ctx, prev)
-	c.mu.Lock()
-	c.fetching = false
-	c.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +435,15 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	}
 	// Bound the decode: without LimitReader a 2xx body longer than
 	// maxJSONBody (an ATC streaming forever) would be buffered whole.
-	return json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
+	err = json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
+	// Drain whatever the decoder left before the body closes: a decode
+	// that finished before EOF (trailing newline, whitespace, extra
+	// documents) or one that failed at the maxJSONBody cap would
+	// otherwise strand the keep-alive connection, forcing every later
+	// call to re-dial. Bounded like the error path — an endless
+	// hostile stream is abandoned, not drained forever.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return err
 }
 
 // sourceRepo pulls the repo identity out of a resource's source:
@@ -395,6 +462,15 @@ func sourceRepo(source map[string]any) string {
 // (ssh://git@github.com[:port]/org/repo[.git],
 // https://github.com[:port]/org/repo[.git]) or bare "org/repo" — to
 // the lowercase "org/repo" form used for equality matching.
+//
+// The "github.com" prefix is stripped only where github.com can
+// actually be the host: at the start of the string, or immediately
+// after "://" (scheme separator) or "@" (scp user marker), AND only
+// when "/" or ":" follows (path or scp separator). Anywhere else —
+// "git.github.com", "notgithub.com", "github.com.evil.com", a mention
+// inside a path — the match is part of a longer hostname or of the
+// path, and the input must NOT collapse to "org/repo" or it would
+// match resources it has no business matching.
 func NormalizeRepo(s string) string {
 	// Lowercase and strip the trailing ".git" up front: the host
 	// match and the suffix strip are both case-sensitive, and an
@@ -402,38 +478,44 @@ func NormalizeRepo(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.TrimSuffix(s, "/")
 	s = strings.TrimSuffix(s, ".git")
-	// Strip the "github.com" host prefix from URL/scp-like forms. The
-	// boundary check keeps lookalike hosts (e.g. "notgithub.com")
-	// from being treated as github.com.
-	if i := strings.Index(s, "github.com"); i >= 0 &&
-		(i == 0 || strings.ContainsRune("/@.", rune(s[i-1]))) {
-		rest := s[i+len("github.com"):]
-		if rest != "" && rest[0] == ':' {
-			rest = rest[1:]
-			// What the colon means depends on the syntax around the
-			// host:
-			//   scheme://[user@]host:port/path — a :<digits>/ segment
-			//     is a TCP port to drop;
-			//   host:port/path with no user part — likewise a port;
-			//   user@host:path (scp-like, "git@github.com:…") — the
-			//     colon IS the path separator, so an all-numeric
-			//     first segment is an org, not a port.
-			// Scp-like = a user@ part ahead of the host with no "//"
-			// authority marker before it.
-			prefix := s[:i]
-			scpLike := strings.ContainsRune(prefix, '@') &&
-				!strings.Contains(prefix, "//")
-			if !scpLike {
-				j := 0
-				for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
-					j++
-				}
-				if j > 0 && j < len(rest) && rest[j] == '/' {
-					rest = rest[j:]
-				}
+	i := strings.Index(s, "github.com")
+	if i < 0 {
+		return s
+	}
+	// Host boundary: start of string, or right after the scheme
+	// separator or a user marker — and the host must be followed by
+	// the path separator ("/") or the scp separator (":"). A match
+	// failing either test is mid-string and stays untouched.
+	atHost := i == 0 ||
+		strings.HasSuffix(s[:i], "://") || strings.HasSuffix(s[:i], "@")
+	rest := s[i+len("github.com"):]
+	if !atHost || rest == "" || (rest[0] != '/' && rest[0] != ':') {
+		return s
+	}
+	if rest[0] == ':' {
+		rest = rest[1:]
+		// What the colon means depends on the syntax around the
+		// host:
+		//   scheme://[user@]host:port/path — a :<digits>/ segment
+		//     is a TCP port to drop;
+		//   host:port/path with no user part — likewise a port;
+		//   user@host:path (scp-like, "git@github.com:…") — the
+		//     colon IS the path separator, so an all-numeric
+		//     first segment is an org, not a port.
+		// Scp-like = a user@ part ahead of the host with no "//"
+		// authority marker before it.
+		prefix := s[:i]
+		scpLike := strings.ContainsRune(prefix, '@') &&
+			!strings.Contains(prefix, "//")
+		if !scpLike {
+			j := 0
+			for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+				j++
+			}
+			if j > 0 && j < len(rest) && rest[j] == '/' {
+				rest = rest[j:]
 			}
 		}
-		s = strings.TrimLeft(rest, "/")
 	}
-	return s
+	return strings.TrimLeft(rest, "/")
 }

@@ -247,8 +247,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		context.WithoutCancel(r.Context()), 30*time.Second)
 	defer cancel()
 
+	// Register with the WaitGroup BEFORE the index fetch: the fan-out
+	// may or may not spawn (the match set can be empty, the fetch can
+	// fail), but a concurrent Wait must already see this delivery
+	// counted. Otherwise the graceful-shutdown path could race:
+	// wh.Wait() observing an empty WaitGroup in the window between the
+	// fetch and wg.Add(1) would return while this delivery's fan-out
+	// was still starting, and the process could exit with check POSTs
+	// unlanded. Every exit below either spawns the goroutine (which
+	// Dones) or Dones explicitly.
+	h.wg.Add(1)
 	resources, err := h.backend.Resources(ctx)
 	if err != nil {
+		h.wg.Done() // fetch failed — no fan-out will start
 		// With no index (and no stale copy) nothing can be checked —
 		// a 502 lets GitHub redeliver once the ATC is back instead of
 		// silently dropping the delivery.
@@ -283,11 +294,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// redelivery would re-trigger every resource, not just the one).
 	deliveriesTotal.WithLabelValues(eventMetric, "dispatched").Inc()
 	if len(matched) > 0 {
-		h.wg.Add(1)
 		go func() {
 			defer h.wg.Done()
 			h.dispatch(matched, delivery, event, p.Repository.FullName)
 		}()
+	} else {
+		h.wg.Done() // nothing matched — no fan-out to wait for
 	}
 
 	logger().Info("webhook delivery accepted",

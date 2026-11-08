@@ -1,8 +1,10 @@
 package kube
 
 import (
+	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -67,7 +70,7 @@ func TestNodeCordonEvidenceFreshOnly(t *testing.T) {
 	fresh := maintenanceCordoned("w1", 10*time.Minute)
 	stale := maintenanceCordoned("w2", 2*time.Hour)
 	cs := fake.NewSimpleClientset(fresh, stale)
-	ev, err := nodeCordonEvidence(ctx, cs)
+	ev, err := nodeCordonEvidence(ctx, cs, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +86,43 @@ func TestNodeCordonEvidenceListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	if _, err := nodeCordonEvidence(ctx, cs); err == nil {
+	if _, err := nodeCordonEvidence(ctx, cs, time.Now()); err == nil {
 		t.Fatal("expected error when the node list fails")
+	}
+}
+
+// The injected clock decides the verdict: ONE fixture evaluated at
+// two `now`s flips fresh-evidence → static-cordon without racing
+// time.Now at the 45m boundary (the fake-clock plumbing
+// MaintenanceActiveWithClock exists for).
+func TestNodeCordonEvidenceUsesInjectedClock(t *testing.T) {
+	base := time.Now()
+	n := maintenanceCordoned("w1", 10*time.Minute) // TimeAdded = base-10m
+	cs := fake.NewSimpleClientset(n)
+	ev, err := nodeCordonEvidence(ctx, cs, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ev, []string{"node w1 actively cordoned"}) {
+		t.Fatalf("at base the cordon is fresh evidence, got %v", ev)
+	}
+	ev, err = nodeCordonEvidence(ctx, cs, base.Add(46*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ev) != 0 {
+		t.Fatalf("46m later the cordon must read static, got %v", ev)
+	}
+	// The clock-aware mutex plumbing reaches through to the cordon
+	// window identically (a dyn fake is required once the cordon
+	// stops answering — the short-circuit then reaches signal (c)).
+	held, why, err := MaintenanceActiveWithClock(ctx, cs, maintenanceDynFake(), base)
+	if err != nil || !held || why != "node w1 actively cordoned" {
+		t.Fatalf("WithClock(base): held=%v why=%q err=%v — want the cordon", held, why, err)
+	}
+	held, _, err = MaintenanceActiveWithClock(ctx, cs, maintenanceDynFake(), base.Add(46*time.Minute))
+	if err != nil || held {
+		t.Fatalf("WithClock(base+46m): held=%v err=%v — want static cordon (clear)", held, err)
 	}
 }
 
@@ -263,5 +301,131 @@ func TestMaintenanceActiveWhyIsFirstSignalEvidence(t *testing.T) {
 	}
 	if !held || why != "node w1 actively cordoned" {
 		t.Fatalf("held=%v why=%q, want the cordon evidence", held, why)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pagination — the evidence helpers walk ListAllUnstructured, so a
+// cluster whose objects exceed one page (Limit=DefaultListPageSize)
+// must contribute evidence from EVERY page via the Continue-token
+// walk, and the dynamic fake's single-page reply cannot prove that.
+// pagedDyn wraps the CRD-aware dynamic fake and serves each GVR's
+// objects in `per`-object pages, honoring Continue — the observable
+// difference between a real walk and a one-page List.
+// ---------------------------------------------------------------------------
+
+type pagedDyn struct {
+	dynamic.Interface
+	per   int
+	lists *int
+}
+
+func (p *pagedDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &pagedResource{nsable: p.Interface.Resource(gvr), per: p.per, lists: p.lists}
+}
+
+type pagedResource struct {
+	dynamic.NamespaceableResourceInterface
+	nsable dynamic.NamespaceableResourceInterface
+	per    int
+	lists  *int
+}
+
+func (p *pagedResource) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	*p.lists++
+	full, err := p.nsable.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	start := 0
+	if opts.Continue != "" {
+		if start, err = strconv.Atoi(opts.Continue); err != nil {
+			return nil, err
+		}
+	}
+	end := len(full.Items)
+	// The SERVER decides the page size: it serves `per` items per
+	// response no matter how large a Limit the client asked for —
+	// exactly the apiserver behavior the Continue walk exists for.
+	if p.per > 0 && start+p.per < end {
+		end = start + p.per
+	}
+	next := ""
+	if end < len(full.Items) {
+		next = strconv.Itoa(end)
+	}
+	out := &unstructured.UnstructuredList{Items: full.Items[start:end]}
+	if next != "" {
+		out.Object = map[string]any{
+			"metadata": map[string]any{"continue": next}}
+	}
+	return out, nil
+}
+
+// Signal (c) across pages: plans in a non-terminal state on page 1
+// AND page 2 both land as evidence, and the walk really continued
+// (more than one List issued).
+func TestAutopilotPlanEvidencePagesThroughPlans(t *testing.T) {
+	plans := []runtime.Object{
+		maintenancePlan("up1", "InProgress"),
+		maintenancePlan("done1", "Completed"),
+		maintenancePlan("up2", "Draining"),
+		maintenancePlan("done2", "Schedulable"),
+	}
+	var lists int
+	dyn := &pagedDyn{Interface: maintenanceDynFake(plans...), per: 2, lists: &lists}
+	ev, err := AutopilotPlanEvidence(ctx, dyn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lists != 2 {
+		t.Fatalf("lists=%d, want 2 — the walk must continue past page 1", lists)
+	}
+	if !slices.Equal(ev, []string{
+		"autopilot plan up1 state=InProgress",
+		"autopilot plan up2 state=Draining",
+	}) {
+		t.Fatalf("evidence = %v, want both non-terminal plans across pages", ev)
+	}
+}
+
+// Signal (d) across pages: live remediation objects past the first
+// page still hold the mutex (the first page holds only a finished
+// NodeMaintenance record).
+func TestMedik8sRemediationEvidencePagesThroughObjects(t *testing.T) {
+	rem := func(gvr schema.GroupVersionResource, kind, ns, name string) runtime.Object {
+		return testhelp.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name, nil)
+	}
+	objs := []runtime.Object{
+		rem(GVRNodeMaintenance, "NodeMaintenance", "", "done"),
+	}
+	// Give the finished record its Succeeded phase, then two live
+	// objects — the second deliberately beyond a 2-per-page boundary.
+	objs[0].(*unstructured.Unstructured).Object["status"] =
+		map[string]any{"phase": "Succeeded"}
+	live := []runtime.Object{
+		rem(GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr"),
+		rem(GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far"),
+	}
+	var lists int
+	dyn := &pagedDyn{
+		Interface: maintenanceDynFake(append(objs, live...)...),
+		per:       2, lists: &lists}
+	ev, err := Medik8sRemediationEvidence(ctx, dyn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One List per remediation GVR, each walked through its page(s).
+	if lists < 2 {
+		t.Fatalf("lists=%d, want ≥2 — evidence must page through", lists)
+	}
+	if len(ev) != 2 {
+		t.Fatalf("evidence = %v, want exactly the two live remediation objects "+
+			"(the Succeeded NodeMaintenance record is not live evidence)", ev)
+	}
+	for _, want := range []string{"w1-snr", "w1-far"} {
+		if !strings.Contains(strings.Join(ev, "; "), want) {
+			t.Fatalf("evidence %v missing live object %s — the walk dropped a page", ev, want)
+		}
 	}
 }

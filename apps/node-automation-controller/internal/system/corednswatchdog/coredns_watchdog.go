@@ -31,6 +31,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +53,16 @@ const (
 	corednsStreakMax   = 2 // consecutive flagged runs before action
 	corednsTSAnno      = kube.AnnoLastCoreDNSRestart
 	corednsMaxLogBytes = 256 * 1024
+	// corednsFQDNCacheTTL is how long a layer-2 probe target stays
+	// cached: the same 10m window the freshness logic uses (a Service
+	// <10m old proves a healthy watch), so a cached target cannot
+	// outlive the freshness argument it was picked on.
+	corednsFQDNCacheTTL = 10 * time.Minute
+	// probePoolSize bounds the per-pod fan-out of layer 2: each DNS
+	// probe dials UDP+TCP :53 with multi-second timeouts, and one
+	// goroutine per pod would let a wide CoreDNS fleet fan out
+	// unbounded.
+	probePoolSize = 4
 )
 
 type coreDNSWatchdog struct {
@@ -99,27 +110,78 @@ type coreDNSWatchdog struct {
 	// stale signature. nil → dnsExchange (real net.Resolver dial).
 	dnsExchangeFn func(ctx context.Context, network, podIP, fqdn string) ([]string, error)
 	panicsFn      func(ctx context.Context, podIP string) (float64, bool)
+	// fqdnMu guards the layer-2 probe-target cache below — runs are
+	// serialized by the periodic loop, but the probe seams make a
+	// concurrent caller possible and the guard is one mutex.
+	fqdnMu sync.Mutex
+	// cachedFQDN/cachedWant/cachedAt memoize the layer-2 probe target
+	// for corednsFQDNCacheTTL: picking one costs a LIST of every
+	// Service and EndpointSlice in the cluster, and re-paying that
+	// every 60s sweep is exactly the periodic apiserver load this
+	// watchdog was not built to add. TTL is the same 10m window the
+	// freshness argument runs on, so a cached target never outlives
+	// its "crossed a healthy watch" proof. Only a CONCLUSIVE pick
+	// (fqdn != "") is cached — an inconclusive one re-lists next run.
+	cachedFQDN string
+	cachedWant map[string]bool
+	cachedAt   time.Time
+}
+
+// probeFQDN returns the cached probe target while it is inside the
+// TTL, else re-picks one (probeFQDNUncached — the Service/EndpointSlice
+// lists) and caches it. An empty result is never cached: an
+// inconclusive pick must re-list on the next sweep instead of
+// latching "no target" for 10 minutes.
+func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]bool) {
+	w.fqdnMu.Lock()
+	fqdn, want, at := w.cachedFQDN, w.cachedWant, w.cachedAt
+	w.fqdnMu.Unlock()
+	if fqdn != "" && w.now.Now().Sub(at) < corednsFQDNCacheTTL {
+		return fqdn, want
+	}
+	fqdn, want = w.probeFQDNUncached(ctx)
+	if fqdn == "" {
+		return "", nil
+	}
+	w.fqdnMu.Lock()
+	w.cachedFQDN, w.cachedWant, w.cachedAt = fqdn, want, w.now.Now()
+	w.fqdnMu.Unlock()
+	return fqdn, want
 }
 
 func Setup(d shared.Deps) error {
-	w := &coreDNSWatchdog{
-		cs:    d.CS,
-		dyn:   d.Dyn,
-		http:  &http.Client{Timeout: 5 * time.Second},
-		queue: d.Name,
-		now:   shared.SystemClock,
-	}
-	w.logHitFn = w.logHit
-	w.dnsFn = w.dnsProbe
-	w.panicsFn = w.panics
-	return shared.AddPeriodic(d.Mgr, w.queue, time.Minute, w.run)
+	// No env knobs to parse — SetupNoConfig IS the Deps.Disabled gate,
+	// structural rather than comment-enforced: the module has no
+	// GateEnv row today (always enabled), but a future gate resolves
+	// through setupModules into Disabled and this Setup needs no
+	// change.
+	return shared.SetupNoConfig(d, func() error {
+		w := &coreDNSWatchdog{
+			cs:    d.CS,
+			dyn:   d.Dyn,
+			http:  &http.Client{Timeout: 5 * time.Second},
+			queue: d.Name,
+			now:   shared.SystemClock,
+		}
+		w.logHitFn = w.logHit
+		w.dnsFn = w.dnsProbe
+		w.panicsFn = w.panics
+		return shared.AddPeriodic(d.Mgr, w.queue, time.Minute, w.run)
+	})
 }
 
 func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	podList, err := w.cs.CoreV1().Pods(corednsNS).List(ctx,
-		metav1.ListOptions{LabelSelector: corednsPodSelector})
+	// Paged like every sweep list — kube-system's pod population is
+	// small today, but the selector-scoped List still gets the shared
+	// 500-per-page bound so it stays cheap at fleet scale.
+	podItems, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			LabelSelector: corednsPodSelector,
+			Limit:         kube.DefaultListPageSize,
+		},
+		kube.Pods(w.cs, corednsNS))
 	if err != nil {
 		// Inconclusive — the next minute's run re-evaluates; returning
 		// nil avoids an error/retry hot loop on API flaps.
@@ -131,14 +193,15 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// recover() deletes with a UID precondition so a same-named pod
 	// recreated mid-sweep is never killed.
 	podUID := map[string]types.UID{}
-	for _, p := range podList.Items {
+	for i := range podItems {
+		p := &podItems[i]
 		podIP[p.Name] = p.Status.PodIP
 		podUID[p.Name] = p.UID
 	}
 	// Only name->IP and name->UID feed the layers below — release
 	// the full PodList before the log streams, EndpointSlice lists
 	// and DNS probes run.
-	podList = nil
+	podItems = nil
 	// Prune streaks of pods that vanished (recreates change names).
 	w.streak.Prune(func(name string) bool {
 		_, ok := podIP[name]
@@ -181,20 +244,37 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		log.Info("dns: skip layer 2 — no service <10m old and no usable endpointslice (inconclusive)")
 	} else {
 		log.Info("dns: probing each coredns pod", "fqdn", fqdn, "wantIPs", len(wantIPs))
+		// Probe the pods through the bounded worker pool — each
+		// dnsFn dial can hold a multi-second timeout on UDP+TCP, so
+		// the pool bounds the sweep wall-clock without unbounded
+		// fan-out. Pods already proven stale by layer 1 and pods
+		// without a podIP never reach the pool (their DNS fn must
+		// never fire). Verdicts (streak hits/resets, fleet-wide
+		// abort) stay SEQUENTIAL below: one deterministic pass over
+		// the sorted results, no ledger writes from inside the pool.
+		names := make([]string, 0, len(podIP))
+		for name := range podIP {
+			if stale[name] || podIP[name] == "" {
+				continue
+			}
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		type dnsVerdict struct {
+			ips []string
+			err error
+		}
+		results := make([]dnsVerdict, len(names))
+		boundedForEach(names, func(i int) {
+			results[i].ips, results[i].err = w.dnsFn(ctx, podIP[names[i]], fqdn)
+		})
 		answered := 0
 		var failed []string
-		for name, ip := range podIP {
-			if stale[name] {
-				continue
-			}
-			if ip == "" {
-				log.Info("dns: no podIP — skipping layer 2", "pod", name)
-				continue
-			}
-			if ips, err := w.dnsFn(ctx, ip, fqdn); err == nil && dnsAnswerFresh(ips, wantIPs) {
+		for i, name := range names {
+			if err := results[i].err; err == nil && dnsAnswerFresh(results[i].ips, wantIPs) {
 				answered++
 				w.streak.Reset(name)
-				log.Info("dns: fresh", "pod", name, "answers", len(ips))
+				log.Info("dns: fresh", "pod", name, "answers", len(results[i].ips))
 			} else {
 				failed = append(failed, name)
 			}

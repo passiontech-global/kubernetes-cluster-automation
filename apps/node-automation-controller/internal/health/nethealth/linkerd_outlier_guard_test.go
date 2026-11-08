@@ -329,6 +329,39 @@ func TestLinkerdOutlierEvicted(t *testing.T) {
 	})
 }
 
+// An inconclusive sweep (Prometheus down) reconciles BOTH ledgers —
+// the persistence window resets, so the sweep after recovery starts
+// from zero evidence and must NOT evict on a single fresh sighting.
+func TestLinkerdOutlierInconclusiveSweepResetsPersistence(t *testing.T) {
+	base := time.Now()
+	bad, sib1, sib2 := outlierFixtures()
+	cs := fake.NewSimpleClientset(bad, sib1, sib2)
+	emulateEviction(cs)
+	p := testProber(cs)
+	p.Cfg.Linkerd.OutlierEvictEnabled = true
+	wireProm(t, p, outlierRPS(), outlierFails())
+	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
+	probetest.FreezeNow(p.Deps, base)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("first-seen outlier must fail (signature)")
+	}
+	// Inconclusive sweep — every Prom query fails; the ledgers prune.
+	wireProm(t, p, nil, nil)
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("a Prom outage is inconclusive, not healthy: %+v", res)
+	}
+	// Recovered sweep — one fresh sighting past the old window; the
+	// pruned persistence ledger must hold the evict back.
+	wireProm(t, p, outlierRPS(), outlierFails())
+	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("persisted-again outlier must still fail (signature)")
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
+		t.Fatalf("outlier evicted on a single post-reset sighting: %v", err)
+	}
+}
+
 // LINKERD_OUTLIER_EVICT_ENABLED=false gates only the actuation —
 // detection and the gauge run regardless.
 func TestLinkerdOutlierEvictDisabled(t *testing.T) {

@@ -175,17 +175,16 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	var objects, orphans, helmRep probefw.SweepReport
+	var objects, orphans, helmRep, kineRep probefw.SweepReport
 	orphanBudget := sprawlMaxOrphanDeletes
 	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
-		// Paged like every cluster-wide list — trivy emits one
-		// report per workload revision, so an unpaginated List is
-		// exactly the etcd-serializes-everything shape this check
-		// exists to fight.
-		items, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.DynamicPage(p.Dyn.Resource(rk.gvr)))
+		// The snapshot's per-GVR census: trivy emits one report per
+		// workload revision, so an unpaginated List is exactly the
+		// etcd-serializes-everything shape this check exists to
+		// fight. The raw apiserver error is memoized verbatim — the
+		// IsNotFound/NoMatch interpretation stays here.
+		items, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // report CRD absent on this cluster — no census, no GC
@@ -230,9 +229,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	// crosses the sprawl ceiling (retention knobs missing upstream).
 	ciTotal := 0
 	for _, rk := range sprawlCIKinds {
-		items, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.DynamicPage(p.Dyn.Resource(rk.gvr)))
+		items, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // CRD absent on this cluster — skip silently
@@ -289,17 +286,24 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
-	// Kine large-object census — cluster-wide ConfigMap/Secret size census. Same
-	// failed-read posture as the report census above: bail before any
-	// ledger Prune so live series are not dropped on a flap.
-	if err := p.auditKineLargeObjects(ctx, &objects); err != nil {
+	// Kine large-object census — cluster-wide ConfigMap/Secret size
+	// census on ITS OWN GaugeScope (kineRep): its tuples
+	// ("kind/ns/name") live on kineLargeObjectBytesGauge, a different
+	// gauge with different label values than the counts report's
+	// "resource/ns" tuples — reconciling one ledger against the
+	// other's report would cross-prune series and cross-pollute the
+	// keyspaces. Findings still land on the shared verdict via
+	// objects. Same failed-read posture as the report census above:
+	// bail before any ledger Prune so live series are not dropped on
+	// a flap.
+	if err := p.auditKineLargeObjects(ctx, &objects, &kineRep); err != nil {
 		return probefw.Result{Infra: err}
 	}
 
 	objects.Close(&p.emittedObjects, apiObjectCountGauge.DeleteLabelValues)
 	orphans.Close(&p.emittedOrphans, ephemeralReportsOrphanedGauge.DeleteLabelValues)
 	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
-	objects.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
+	kineRep.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
 	return objects.Verdict("api object sprawl: ", ", ")
 }
 

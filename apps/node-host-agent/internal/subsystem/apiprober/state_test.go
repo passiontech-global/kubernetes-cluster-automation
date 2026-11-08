@@ -12,10 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -343,5 +345,41 @@ func TestPruneStaleBackendsKeepsVIP(t *testing.T) {
 	}
 	if got := promtest.CollectAndCount(p.enabled); got != 2 {
 		t.Fatalf("enabled series=%d want 2 (ctrl + VIP)", got)
+	}
+}
+
+// TestLatchStaleRefreshesHeldMtime: re-latching an already-latched
+// backend refreshes the latch mtime (BUG-H6 — the janitor reaps
+// state-* files older than 24h and a multi-day wedged backend must
+// keep its latch) without rewriting the epoch content.
+func TestLatchStaleRefreshesHeldMtime(t *testing.T) {
+	dir := t.TempDir()
+	p := &Prober{}
+	b := backend{Name: "hub1", Addr: "10.0.0.1:6443"}
+
+	p.latchStale(dir, b)
+	f := dir + "/" + latchdefs.LatchFilePrefix +
+		latchdefs.LatchAPIServerBackendStalePrefix + "10-0-0-1"
+	if got, err := os.ReadFile(f); err != nil || len(got) == 0 {
+		t.Fatalf("latch not created: %v", err)
+	}
+	first := testutil.ReadFile(t, f)
+
+	// Age the latch 48h, then re-latch — mtime moves to ~now,
+	// content stays the entry epoch.
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(f, old, old); err != nil {
+		t.Fatal(err)
+	}
+	p.latchStale(dir, b)
+	fi, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().Before(time.Now().Add(-time.Minute)) {
+		t.Fatalf("held latch mtime = %v, want refreshed to ~now", fi.ModTime())
+	}
+	if got := testutil.ReadFile(t, f); got != first {
+		t.Fatalf("latch content changed on re-latch: %q → %q", first, got)
 	}
 }

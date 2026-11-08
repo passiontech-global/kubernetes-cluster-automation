@@ -48,11 +48,13 @@ const (
 // lock, no live Plan) is deliberate state, not maintenance: counting
 // it would freeze every deferring remediation forever (W8). A node
 // LIST failure is an error — "cannot verify" must never read as
-// "clear".
-func nodeCordonEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
+// "clear". now is the clock the 45m freshness window is evaluated on
+// — plumbed from Verdict.Active's own `now` so the window and the
+// verdict memo age on ONE clock (fake-clock tests pin both).
+func nodeCordonEvidence(ctx context.Context, cs kubernetes.Interface,
+	now time.Time) ([]string, error) {
 	// A node cordoned for longer than the active window with no
 	// other maintenance signal is a static cordon, not a drain.
-	now := time.Now()
 	nodes, err := ListNodes(ctx, cs)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes (maintenance mutex): %w", err)
@@ -99,26 +101,25 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 	if dyn == nil {
 		return nil, errors.New("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
 	}
-	plans, err := dyn.Resource(AutopilotPlanGVR).
-		List(ctx, metav1.ListOptions{})
+	plans, err := ListAllUnstructured(ctx, dyn.Resource(AutopilotPlanGVR),
+		metav1.ListOptions{Limit: DefaultListPageSize})
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// autopilot CRD not installed — no signal.
+		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
-	default:
-		var ev []string
-		for i := range plans.Items {
-			state, _, _ := unstructured.NestedString(
-				plans.Items[i].Object, "status", "state")
-			if state != "Schedulable" && state != "Completed" {
-				ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
-					plans.Items[i].GetName(), state))
-			}
-		}
-		return ev, nil
 	}
-	return nil, nil
+	var ev []string
+	for i := range plans.Items {
+		state, _, _ := unstructured.NestedString(
+			plans.Items[i].Object, "status", "state")
+		if state != "Schedulable" && state != "Completed" {
+			ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
+				plans.Items[i].GetName(), state))
+		}
+	}
+	return ev, nil
 }
 
 // Medik8sRemediationEvidence returns the evidence strings for mutex
@@ -140,7 +141,8 @@ func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]s
 	}
 	var ev []string
 	for _, gvr := range Medik8sRemediationGVRs {
-		items, err := dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		items, err := ListAllUnstructured(ctx, dyn.Resource(gvr),
+			metav1.ListOptions{Limit: DefaultListPageSize})
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // CRD absent on this cluster — no signal
@@ -196,13 +198,24 @@ func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]s
 // the later API reads. Signals evaluate in the canonical
 // a → b → c → d order and `why` is the first signal's first evidence.
 func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (bool, string, error) {
-	for _, signal := range []func(context.Context) ([]string, error){
-		func(ctx context.Context) ([]string, error) { return nodeCordonEvidence(ctx, cs) },
-		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
-		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
-		func(ctx context.Context) ([]string, error) { return Medik8sRemediationEvidence(ctx, dyn) },
+	return MaintenanceActiveWithClock(ctx, cs, dyn, time.Now())
+}
+
+// MaintenanceActiveWithClock is MaintenanceActive with the wall
+// clock injected: Verdict.Active plumbs its own `now` down so the
+// 45m cordon window and the verdict memo age on ONE clock, and
+// fake-clock tests can pin the freshness verdict instead of racing
+// time.Now (a cordoned node is only evidence for 45m — a test built
+// around wall-clock time.Now flakes at exactly that boundary).
+func MaintenanceActiveWithClock(ctx context.Context, cs kubernetes.Interface,
+	dyn dynamic.Interface, now time.Time) (bool, string, error) {
+	for _, signal := range []func() ([]string, error){
+		func() ([]string, error) { return nodeCordonEvidence(ctx, cs, now) },
+		func() ([]string, error) { return KuredLockEvidence(ctx, cs) },
+		func() ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
+		func() ([]string, error) { return Medik8sRemediationEvidence(ctx, dyn) },
 	} {
-		ev, err := signal(ctx)
+		ev, err := signal()
 		if err != nil {
 			return false, "", err
 		}
@@ -233,13 +246,15 @@ type Verdict struct {
 }
 
 // Active returns the maintenance verdict, evaluating
-// MaintenanceActive only when the memo is older than the verdict TTL.
+// MaintenanceActiveWithClock (with THIS call's `now` — the memo and
+// the cordon window age on one clock) only when the memo is older
+// than the verdict TTL.
 func (v *Verdict) Active(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, now time.Time) (bool, string, error) {
 	if now.Sub(v.at) < verdictTTL {
 		return v.held, v.why, v.err
 	}
-	v.held, v.why, v.err = MaintenanceActive(ctx, cs, dyn)
+	v.held, v.why, v.err = MaintenanceActiveWithClock(ctx, cs, dyn, now)
 	v.at = now
 	return v.held, v.why, v.err
 }

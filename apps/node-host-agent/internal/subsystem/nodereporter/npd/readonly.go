@@ -19,12 +19,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // The ReadonlyFilesystem NodeCondition and its upstream strings
 // (readonly-monitor.json conditions[]).
 const (
-	condReadonlyFS corev1.NodeConditionType = "ReadonlyFilesystem"
+	condReadonlyFS corev1.NodeConditionType = nodecond.ReadonlyFilesystem
 
 	readonlyDefaultReason = "FilesystemIsNotReadOnly"
 	readonlyDefaultMsg    = "Filesystem is not read-only"

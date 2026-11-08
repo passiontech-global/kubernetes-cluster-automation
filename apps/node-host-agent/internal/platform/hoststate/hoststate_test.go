@@ -377,6 +377,107 @@ func TestAppendLogRotates(t *testing.T) {
 	}
 }
 
+// TestSharedStorePerCanonicalDir: Shared returns ONE process-wide
+// Store per canonical dir — the multi-owner registry and the
+// rotation mutex are only cross-subsystem if every subsystem holds
+// the same handle. A later non-empty logFile fills an empty one
+// (readers-only callers pass ""); it never clobbers a named log.
+func TestSharedStorePerCanonicalDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wd")
+	logFile := filepath.Join(t.TempDir(), "node-watchdog.log")
+
+	a := Shared(dir, logFile, nil, nil)
+	b := Shared(filepath.Join(dir, "..", filepath.Base(dir)), logFile, nil, nil)
+	if a != b {
+		t.Fatal("Shared must collapse equivalent dir spellings onto one Store")
+	}
+	if a.LogFile != logFile {
+		t.Fatalf("shared LogFile = %q, want %q", a.LogFile, logFile)
+	}
+	// "" logFile inherits instead of clearing.
+	if c := Shared(dir, "", nil, nil); c != a || c.LogFile != logFile {
+		t.Fatal("empty logFile must inherit, not clear")
+	}
+	// A different dir is its own instance.
+	other := Shared(filepath.Join(t.TempDir(), "kinedb-guard"), "", nil, nil)
+	if other == a {
+		t.Fatal("a different dir must not share the instance")
+	}
+	if other.LogFile != "" {
+		t.Fatalf("other store LogFile = %q, want empty", other.LogFile)
+	}
+}
+
+// TestJournalLatchOwnerIsolationAcrossHygienes: the REAL shared
+// latch contract — workerhygiene's release must not delete the latch
+// controllerhygiene is still failing under, and vice versa; the file
+// leaves only when BOTH owners released (fresh or seeded holds), so
+// one hygiene's healthy journal read can never clear the other's
+// blindness episode. This is the Store-level mechanism
+// wdeps.NoteJournalRead and cdeps.noteJournalRead drive through
+// EnterFrom/ExitFrom with journalwatch's owner ids and the
+// latchdefs.Owners declaration for journal-unreadable.
+func TestJournalLatchOwnerIsolationAcrossHygienes(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	name := latchdefs.LatchJournalUnreadable
+
+	// controllerhygiene latches mid-episode (its journal blind).
+	s.EnterFrom(name, "controllerhygiene", "journald-wide empty reply")
+	// workerhygiene joins the episode with its own enter edge.
+	s.EnterFrom(name, "workerhygiene", "k0sworker snapshot empty")
+
+	// workerhygiene recovers first — the latch MUST survive for the
+	// still-blind controller.
+	s.ExitFrom(name, "workerhygiene", nil)
+	if !s.Exists(name) {
+		t.Fatal("worker's healthy read deleted controller's live episode")
+	}
+	if strings.Contains(testutil.ReadFile(t, logFile), "STATE-EXIT: "+name) {
+		t.Fatal("STATE-EXIT logged while controllerhygiene still holds")
+	}
+
+	// The surviving owner re-asserts its hold each blind read (mtime
+	// refresh path) — still no exit.
+	s.EnterFrom(name, "controllerhygiene", "still blind")
+	if !s.Exists(name) {
+		t.Fatal("re-assert lost the latch")
+	}
+
+	// Controller recovers — the last release exits exactly once.
+	s.ExitFrom(name, "controllerhygiene", nil)
+	if s.Exists(name) {
+		t.Fatal("latch stuck after the last owner released")
+	}
+	if n := strings.Count(testutil.ReadFile(t, logFile),
+		"STATE-EXIT: "+name); n != 1 {
+		t.Fatalf("STATE-EXIT logged %d times want 1", n)
+	}
+}
+
+// TestJournalLatchLegacyFileSeed: after an AGENT RESTART the latch
+// file exists with an empty owner registry — ExitFrom must seed the
+// declared owners so the FIRST releaser cannot clear a latch the
+// other hygiene may still be failing under (the pre-owner-scoping
+// bug this store contract exists to kill).
+func TestJournalLatchLegacyFileSeed(t *testing.T) {
+	s, _, _ := newTestStore(t)
+	name := latchdefs.LatchJournalUnreadable
+	s.Enter(name, "") // pre-restart file, no recorded owners
+
+	// Worker comes back healthy and releases first.
+	s.ExitFrom(name, "workerhygiene", nil)
+	if !s.Exists(name) {
+		t.Fatal("first post-restart release cleared the shared latch")
+	}
+	// Controller's next blind read re-asserts; its later release is
+	// the last one and exits.
+	s.EnterFrom(name, "controllerhygiene", "still blind")
+	s.ExitFrom(name, "controllerhygiene", nil)
+	if s.Exists(name) {
+		t.Fatal("latch stuck after every declared owner released")
+	}
+}
+
 func TestTmpNameStaysOutOfStateScan(t *testing.T) {
 	s, _, _ := newTestStore(t)
 	// A failed write must not strand a "state-x.tmp"-shaped file —

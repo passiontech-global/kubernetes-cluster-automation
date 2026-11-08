@@ -22,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // cpuStealTaintSyncCheck is the CPUStealPressure taint mirror.
@@ -57,9 +58,10 @@ const (
 	cpuStealMinHealthy  = 2
 
 	// cpuStealCond is the NodeCondition the node-agent latches while
-	// hypervisor steal time crosses its threshold — no corev1
-	// constant exists, same convention as the hang-latch literals.
-	cpuStealCond corev1.NodeConditionType = "CPUStealPressure"
+	// hypervisor steal time crosses its threshold — spelled by
+	// nodecond (libs/hostkit), the source of truth shared with the
+	// agent.
+	cpuStealCond corev1.NodeConditionType = nodecond.CPUStealPressure
 
 	// cpuStealTaintValue pairs with kube.TaintCPUSteal — the taint is
 	// PreferNoSchedule so it drains new placements without evicting
@@ -113,6 +115,14 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 		if c == nil || c.Status != corev1.ConditionTrue {
 			continue
 		}
+		// CPUStealPressure is nodereporter-owned: a frozen or absent
+		// heartbeat means the reporter is wedged and the True a
+		// zombie — never taint on it. The latch reads as cleared (the
+		// untaint path's own 10m clear window still applies before
+		// the taint lifts).
+		if !condHeartbeatLive(c, now) {
+			continue
+		}
 		condTrue[n.Name] = true
 		if c.LastTransitionTime.IsZero() ||
 			now.Sub(c.LastTransitionTime.Time) >= cpuStealCondMinAge {
@@ -154,7 +164,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			}
 			if age, ok := pressured[n.Name]; ok {
 				rep.Find(fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
-				if !tainted && p.stealHealthyWorkers(nodes, n.Name) >= cpuStealMinHealthy {
+				if !tainted && p.stealHealthyWorkers(nodes, n.Name, now) >= cpuStealMinHealthy {
 					if err := kube.TaintNode(ctx, p.CS, n.Name,
 						kube.TaintCPUSteal, cpuStealTaintValue,
 						corev1.TaintEffectPreferNoSchedule); err != nil {
@@ -213,7 +223,9 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 // stealHealthyWorkers counts the Ready, schedulable, unpressured,
 // steal-untainted workers excluding `exclude` — the fleet headroom
 // that must stay >=cpuStealMinHealthy before another taint is safe.
-func (p *cpuStealTaintSyncCheck) stealHealthyWorkers(nodes []corev1.Node, exclude string) int {
+// A zombie CPUStealPressure (frozen heartbeat) is NOT pressure
+// evidence and its node still counts as absorbable headroom.
+func (p *cpuStealTaintSyncCheck) stealHealthyWorkers(nodes []corev1.Node, exclude string, now time.Time) int {
 	n := 0
 	for i := range nodes {
 		w := &nodes[i]
@@ -223,7 +235,7 @@ func (p *cpuStealTaintSyncCheck) stealHealthyWorkers(nodes []corev1.Node, exclud
 			continue
 		}
 		if c := kube.NodeCondition(w, cpuStealCond); c != nil &&
-			c.Status == corev1.ConditionTrue {
+			c.Status == corev1.ConditionTrue && condHeartbeatLive(c, now) {
 			continue // pressured at any age is not healthy headroom
 		}
 		n++

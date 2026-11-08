@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -95,10 +93,14 @@ func init() {
 		workloadScaleFlappingGauge)
 }
 
-// scaleFlapEvent is one direction-tagged scaling observation.
+// scaleFlapEvent is one direction-tagged scaling observation. rs is
+// the ReplicaSet name the message references ("") for non-Deployment
+// reasons — the pair-exclusion key that tells one RollingUpdate's
+// alternating up/down cadence apart from a real tug-of-war.
 type scaleFlapEvent struct {
 	t  time.Time
 	up bool // true = scale up, false = scale down
+	rs string
 }
 
 // flapKey is the (namespace, kind, name) identity of the workload an
@@ -110,34 +112,51 @@ type flapKey struct {
 // Run scans corev1 Events carrying scale actions over the last hour
 // — Deployments flap on reason=ScalingReplicaSet, StatefulSets on
 // SuccessfulCreate/SuccessfulDelete (their controller never emits
-// ScalingReplicaSet). The server-side reason field selector does the
-// first cut per reason and the in-code re-check keeps the count
-// honest under clients that accept the selector silently (and under
-// the fake clientset). Per involvedObject the events sort by their
-// freshest timestamp (kube.EventTime's LAST-observed convention);
-// each transition from "Scaled up" to "Scaled down" — or create to
-// delete — counts one flip, and >=6 flips in the window emits the
-// gauge + FAILs the check.
+// ScalingReplicaSet). The events come from the sweep's shared census
+// (one cluster-wide LIST per run()), filtered client-side on the
+// reasons the old server-side field selector pre-cut — the in-code
+// re-check keeps the count honest under clients that accept the
+// selector silently (and under the fake clientset). Per
+// involvedObject the events sort by their freshest timestamp
+// (kube.EventTime's LAST-observed convention); each transition from
+// "Scaled up" to "Scaled down" — or create to delete — counts one
+// flip, EXCEPT the pairs a single rolling update produces (see
+// isRolloutPair / the STS mid-rollout gate), and >=6 flips in the
+// window emits the gauge + FAILs the check.
 func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	var events []corev1.Event
-	for _, reason := range []string{
-		scaleFlapReason, stsFlapCreateReason, stsFlapDeleteReason,
-		rolloutFlapUpReason, rolloutFlapDownReason} {
-		evs, err := kube.ListAll(ctx, metav1.ListOptions{
-			FieldSelector: "reason=" + reason,
-			Limit:         probefw.HealthListPageSize,
-		}, kube.Events(p.CS, metav1.NamespaceAll))
-		if err != nil {
-			return probefw.Result{Infra: fmt.Errorf("list scaling events: %w", err)}
+	census, err := p.AllEvents(ctx)
+	if err != nil {
+		return probefw.Result{Infra: fmt.Errorf("list scaling events: %w", err)}
+	}
+	// Mid-rollout StatefulSets: SuccessfulDelete/SuccessfulCreate
+	// pairs on a STS whose currentRevision != updateRevision are the
+	// UPDATE controller's pod churn, not scale tug-of-war. The
+	// shared STS census decides — a read failure aborts the check
+	// (an unreadable roll state must not silently re-enable the
+	// false-positive class this gate exists to kill).
+	stss, err := p.AllStatefulSets(ctx)
+	if err != nil {
+		return probefw.Result{Infra: fmt.Errorf("list statefulsets: %w", err)}
+	}
+	stsMidRollout := make(map[string]bool, len(stss))
+	for i := range stss {
+		sts := &stss[i]
+		if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
+			stsMidRollout[sts.Namespace+"/"+sts.Name] = true
 		}
-		events = append(events, evs...)
 	}
 
 	perWorkload := map[flapKey][]scaleFlapEvent{}
-	for i := range events {
-		e := &events[i]
+	for i := range census {
+		e := &census[i]
+		switch e.Reason {
+		case scaleFlapReason, stsFlapCreateReason, stsFlapDeleteReason,
+			rolloutFlapUpReason, rolloutFlapDownReason:
+		default:
+			continue
+		}
 		t := kube.EventTime(e)
 		if t.IsZero() || now.Sub(t) > scaleFlapWindow {
 			continue
@@ -151,10 +170,12 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		// reasons additionally key on kind+message so a Job's
 		// SuccessfulCreate ("Created pod: ...") can never count.
 		var up, down bool
+		rs := ""
 		switch e.Reason {
 		case scaleFlapReason:
 			up = strings.Contains(e.Message, "Scaled up")
 			down = strings.Contains(e.Message, "Scaled down")
+			rs = scalingRSName(e.Message)
 		case stsFlapCreateReason, stsFlapDeleteReason:
 			if e.InvolvedObject.Kind != "StatefulSet" ||
 				!strings.Contains(e.Message, "in StatefulSet ") {
@@ -185,9 +206,20 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		if io.Kind == "" || io.Name == "" {
 			continue // cannot attribute the flap
 		}
+		// A rolling update moving the STS from currentRevision to
+		// updateRevision deletes each old-revision pod and creates
+		// its new-revision twin — one create/delete pair PER POD,
+		// alternating directions, zero scale intent. Gate them out:
+		// only a settled STS (revisions equal) can show real
+		// scale-up/down tug-of-war through these reasons.
+		if (e.Reason == stsFlapCreateReason ||
+			e.Reason == stsFlapDeleteReason) &&
+			stsMidRollout[ns+"/"+io.Name] {
+			continue
+		}
 		k := flapKey{ns: ns, kind: io.Kind, name: io.Name}
 		perWorkload[k] = append(perWorkload[k],
-			scaleFlapEvent{t: t, up: up})
+			scaleFlapEvent{t: t, up: up, rs: rs})
 	}
 
 	var rep probefw.SweepReport
@@ -198,9 +230,21 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		sort.Slice(evs, func(i, j int) bool { return evs[i].t.Before(evs[j].t) })
 		flips := 0
 		for i := 1; i < len(evs); i++ {
-			if evs[i].up != evs[i-1].up {
-				flips++
+			if evs[i].up == evs[i-1].up {
+				continue
 			}
+			// One RollingUpdate on a Deployment scales the NEW
+			// ReplicaSet up and the OLD one down in an alternating
+			// up/down cadence — maxSurge makes it look exactly like
+			// tug-of-war. A direction change between two
+			// ScalingReplicaSet events naming DIFFERENT ReplicaSets
+			// is that rollout cadence, not a flap: only the same
+			// ReplicaSet scaling back and forth counts.
+			if evs[i].rs != "" && evs[i-1].rs != "" &&
+				evs[i].rs != evs[i-1].rs {
+				continue
+			}
+			flips++
 		}
 		if flips < scaleFlapMinFlips {
 			continue
@@ -215,4 +259,22 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 	}
 	return rep.Result(&p.emitted, workloadScaleFlappingGauge.DeleteLabelValues,
 		"workloads scale-flapping: ", ", ")
+}
+
+// scalingRSName extracts the ReplicaSet name a ScalingReplicaSet
+// message references — "Scaled up replica set web-5d8f7b9c4 to 3"
+// yields "web-5d8f7b9c4". "" when the message does not carry the
+// shape (the caller then counts the flip as before instead of
+// guessing).
+func scalingRSName(msg string) string {
+	const marker = "replica set "
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(marker):]
+	if j := strings.Index(rest, " to "); j >= 0 {
+		return rest[:j]
+	}
+	return ""
 }

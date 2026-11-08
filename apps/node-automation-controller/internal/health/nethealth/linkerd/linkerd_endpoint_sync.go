@@ -14,6 +14,7 @@ package linkerd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -355,8 +356,19 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 			p.linkerdSvcPatch(svc)) {
 			continue
 		}
+		// The detail string must carry the sub-branch trigger — a
+		// desync whose stale-EndpointSlice delete fired reads
+		// differently in the verdict than a pure pod-IP desync.
+		detail := k
+		if stale := staleSlices[k]; len(stale) > 0 {
+			names := make([]string, len(stale))
+			for i, sl := range stale {
+				names[i] = sl.ns + "/" + sl.name
+			}
+			detail = k + " (stale EndpointSlices: " + strings.Join(names, ", ") + ")"
+		}
 		rep.Emit(linkerdEndpointDesyncGauge, k,
-			[]string{svc.Namespace, svc.Name}, k)
+			[]string{svc.Namespace, svc.Name}, detail)
 		emitted = append(emitted, k)
 	}
 	rep.Close(&p.linkerdDesyncEmitted,

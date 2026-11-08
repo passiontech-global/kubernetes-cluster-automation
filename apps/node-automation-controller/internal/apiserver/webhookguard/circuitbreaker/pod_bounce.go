@@ -2,8 +2,9 @@
 // circuit breaker: a webhook backend whose Ready endpoints ALL fail
 // the TCP+TLS handshake has hung pods, not partitioned ones, so the
 // sweep deletes the oldest Ready backing pod for its controller to
-// recreate fresh — one bounce per service per BounceCooldown,
-// gated by the shared maintenance mutex (fail closed).
+// recreate fresh — one bounce per service per BounceCooldown, routed
+// through the shared heal preamble (per-service cooldown + the
+// maintenance mutex + the fleet-wide heal budget, all fail closed).
 package circuitbreaker
 
 import (
@@ -27,9 +28,12 @@ import (
 // failing TCP+TLS), delete the oldest Ready backing pod — its owner
 // controller (Deployment/ReplicaSet) recreates it fresh, which is
 // the rolling bounce a hung webhook process needs. One bounce per
-// service per BounceCooldown; the whole pass is gated by the
-// shared maintenance mutex and fails closed like every other pod
-// kill in this module.
+// service per BounceCooldown; every bounce runs the shared heal
+// preamble (heal.AllowedV) — the per-service cooldown on the shared
+// bounceAt ledger, the maintenance mutex (a cordon/drain/kured reboot
+// or an in-flight k0s upgrade defers the kill) and the fleet-wide
+// heal budget — and all three fail closed like every other pod kill
+// in this module.
 func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	snap *guardstate.Snapshot, ready guardstate.EndpointCensus) {
 	g := snap.G
@@ -51,9 +55,6 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 		if ready.Effective[key] <= 0 || !ready.Probed[key] || ready.Responsive[key] {
 			return // not brownout-hung — healthy, partitioned or unprobed
 		}
-		if b.bounceAt.CooledDown(key, BounceCooldown, now) {
-			return // inside the per-service cooldown
-		}
 		seen[key] = true
 		keys = append(keys, key)
 	}
@@ -65,36 +66,40 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	if len(keys) == 0 {
 		return
 	}
-
-	// The maintenance mutex gates the bounce (W7-C1 posture): a
-	// cordon/drain/kured reboot or in-flight k0s upgrade defers the
-	// pod kill, and "cannot verify" fails closed.
-	held, why, err := g.MaintenanceActive(ctx)
-	if err != nil {
-		metrics.IncError(g.Queue)
-		log.Info("WARN: maintenance check unverifiable — "+
-			"DEFER: webhook pod bounce skipped (fail closed)",
-			"error", err, "services", keys)
-		return
-	}
-	if held {
-		log.Info("DEFER: maintenance active — webhook pod bounce skipped",
-			"why", why, "services", keys)
-		return
-	}
+	// The bounce target is confirmed LIVE before the heal preamble
+	// runs: a stale census ref must not spend a budget grant or open
+	// the per-service cooldown on nothing. The mutex evaluation is
+	// memoized through the Guard verdict, so the pass pays ONE
+	// maintenance check no matter how many services bounce.
 	for _, key := range keys {
-		b.bounceOldestPod(ctx, snap, key, ready.BackingPods[key], now)
+		target := b.oldestLiveBackingPod(ctx, snap, key, ready.BackingPods[key], now)
+		if target == nil {
+			log.Info("webhook bounce: no live Ready backing pod found — endpoint refs are stale",
+				"service", key)
+			continue
+		}
+		proceed, unverifiable := heal.AllowedV(ctx, log, &g.Verdict,
+			g.CS, g.Dyn, &b.bounceAt, key, BounceCooldown, now)
+		if unverifiable {
+			metrics.IncError(g.Queue)
+			continue
+		}
+		if !proceed {
+			continue
+		}
+		b.deleteBouncePod(ctx, snap, key, target, now)
 	}
 }
 
-// bounceOldestPod deletes the oldest Ready, non-terminating backing
-// pod of an unresponsive webhook Service — "oldest" because the hung
-// process is usually the longest-lived replica, and one pod per
-// bounce keeps the rollout gentle. The delete carries the pod's UID
-// as a precondition so a same-named replacement admitted between the
-// census and the delete is never killed by mistake.
-func (b *Breaker) bounceOldestPod(ctx context.Context, snap *guardstate.Snapshot, svcKey string,
-	refs []guardstate.PodRef, now time.Time) {
+// oldestLiveBackingPod resolves the oldest Ready, non-terminating,
+// live backing pod of an unresponsive webhook Service — "oldest"
+// because the hung process is usually the longest-lived replica, and
+// one pod per bounce keeps the rollout gentle. Split from the delete
+// so the bounce paths can confirm a target BEFORE spending the heal
+// preamble's budget grant. Returns nil when nothing qualifies — the
+// caller logs "no target" in its own wording.
+func (b *Breaker) oldestLiveBackingPod(ctx context.Context, snap *guardstate.Snapshot,
+	svcKey string, refs []guardstate.PodRef, now time.Time) *corev1.Pod {
 	g := snap.G
 	log := logf.FromContext(ctx)
 	var oldest *corev1.Pod
@@ -119,21 +124,24 @@ func (b *Breaker) bounceOldestPod(ctx context.Context, snap *guardstate.Snapshot
 			oldest = p
 		}
 	}
-	if oldest == nil {
-		log.Info("webhook bounce: no Ready backing pod found — endpoint refs are stale",
-			"service", svcKey)
-		return
-	}
+	return oldest
+}
+
+// deleteBouncePod issues the UID-preconditioned delete of a
+// pre-resolved bounce target. heal.DeletePod stamps bounceAt on a
+// DELIVERED bounce only — a failed delete leaves the pod hung and the
+// next sweep retries.
+func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot,
+	svcKey string, target *corev1.Pod, now time.Time) {
+	g := snap.G
+	log := logf.FromContext(ctx)
 	log.Info("BOUNCE: deleting oldest Ready webhook pod — hung TCP+TLS handshake",
-		"service", svcKey, "pod", oldest.Namespace+"/"+oldest.Name,
-		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
-	// heal.DeletePod stamps bounceAt on a DELIVERED bounce only — a
-	// failed delete leaves the pod hung and the next sweep retries.
+		"service", svcKey, "pod", target.Namespace+"/"+target.Name,
+		"age", now.Sub(target.CreationTimestamp.Time).Truncate(time.Second))
 	if _, err := heal.DeletePod(ctx, g.CS, &b.bounceAt, svcKey,
-		oldest, now); err != nil {
+		target, now); err != nil {
 		metrics.IncError(g.Queue)
 		log.Error(err, "webhook pod bounce delete failed",
-			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
-		return
+			"pod", target.Namespace+"/"+target.Name, "service", svcKey)
 	}
 }

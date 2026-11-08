@@ -52,34 +52,22 @@ var (
 		[]string{"node"}, nil)
 )
 
-// collectZombies counts state Z processes under ProcRoot — the
-// state char sits right after the LAST ')' because comm can
-// contain spaces and parens (same trick as workerhygiene's
-// pidLive). Emits only when the proc root scans.
+// collectZombies counts state Z processes under ProcRoot — off the
+// shared procSnapshot (collect_procs_scan.go), so the daemon-fd
+// collector and this one cost ONE /proc walk per scan interval.
+// Emits only when the proc root scans.
 func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
-	entries, err := os.ReadDir(c.cfg.ProcRoot)
-	if err != nil {
+	procs, ok := c.procSnapshot()
+	if !ok {
 		return
 	}
 	var n, dstate float64
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot, e.Name(), "stat"))
-		if err != nil {
-			continue
-		}
-		s := string(data)
-		if i := strings.LastIndexByte(s, ')'); i >= 0 {
-			if f := strings.Fields(s[i+1:]); len(f) > 0 {
-				switch f[0] {
-				case "Z":
-					n++
-				case "D": // W7-H1: uninterruptible-sleep count, same scan
-					dstate++
-				}
-			}
+	for _, ps := range procs {
+		switch ps.state {
+		case 'Z':
+			n++
+		case 'D': // W7-H1: uninterruptible-sleep count, same scan
+			dstate++
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(descZombies,

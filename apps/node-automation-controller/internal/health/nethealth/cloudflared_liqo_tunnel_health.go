@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -311,7 +310,14 @@ func liqoDisconnectedFor(obj *unstructured.Unstructured, now time.Time) (time.Du
 			return 0, false // connected — healthy
 		}
 		if c.LastTransitionTime.IsZero() {
-			return 0, true // disconnected, age unverifiable — counts
+			// Zero condition time falls back to the object's
+			// creation age — the same read the virtual-node scan
+			// applies (a just-created object never reads as a
+			// 10m-dead peer; only a fully unverifiable clock counts).
+			if obj.GetCreationTimestamp().Time.IsZero() {
+				return liqoPeerDisconnectMinAge, true
+			}
+			return now.Sub(obj.GetCreationTimestamp().Time), true
 		}
 		return now.Sub(c.LastTransitionTime), true
 	}
@@ -358,12 +364,23 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		if c != nil && c.Status == corev1.ConditionTrue {
 			continue
 		}
+		// Age since the Ready flip; a zero LastTransitionTime falls
+		// back to the node's creation age (consistent with the CR
+		// path, where an unverifiable condition time counts) — a
+		// just-created virtual node never reads as a 10m-dead peer.
 		var age time.Duration
-		if c != nil && !c.LastTransitionTime.IsZero() {
+		switch {
+		case c != nil && !c.LastTransitionTime.IsZero():
 			age = now.Sub(c.LastTransitionTime.Time)
-			if age < liqoPeerDisconnectMinAge {
-				continue
-			}
+		case !n.CreationTimestamp.IsZero():
+			age = now.Sub(n.CreationTimestamp.Time)
+		default:
+			// No verifiable clock at all — counts (consistent with
+			// the CR path's unverifiable-condition posture).
+			age = liqoPeerDisconnectMinAge
+		}
+		if age < liqoPeerDisconnectMinAge {
+			continue
 		}
 		peer := n.Labels["liqo.io/remote-cluster-id"]
 		if peer == "" {
@@ -377,15 +394,18 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	// window. An absent CRD family means no liqo on this cluster and
 	// that family's scan is skipped, matching the report-GC posture.
 	for _, g := range liqoTunnelCRs {
-		items, lerr := p.Dyn.Resource(g.gvr).List(ctx, metav1.ListOptions{})
+		// The per-sweep unstructured snapshot memoizes one LIST per
+		// GVR; the raw error keeps the NoMatch/NotFound = "family
+		// absent on this cluster" interpretation.
+		items, lerr := p.AllUnstructured(ctx, g.gvr)
 		switch {
 		case apierrors.IsNotFound(lerr) || meta.IsNoMatchError(lerr):
 			continue
 		case lerr != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", g.gvr.Resource, lerr)}
 		}
-		for i := range items.Items {
-			obj := &items.Items[i]
+		for i := range items {
+			obj := &items[i]
 			age, disconnected := liqoDisconnectedFor(obj, now)
 			if !disconnected || age < liqoPeerDisconnectMinAge {
 				continue
@@ -427,8 +447,10 @@ var liqoTunnelCRs = []struct {
 // bounceLiqoGateways deletes one Running liqo-gateway pod per dead
 // peer — the wireguard endpoint whose restart forces a re-handshake.
 // The pod lives in the CR's namespace (tenant namespace); a
-// cluster-scoped virtual-node finding searches every namespace.
-// DeletePodHeal carries the cooldown + maintenance gate per peer.
+// cluster-scoped virtual-node finding matches by peer id (the
+// remote-cluster-id labels or the pod name) and refuses to bounce a
+// gateway it cannot tie to the failing peer. DeletePodHeal carries
+// the cooldown + maintenance gate per peer.
 func (p *liqoTunnelHealthCheck) bounceLiqoGateways(ctx context.Context,
 	log logr.Logger, found []liqoPeerFinding, now time.Time) error {
 
@@ -437,7 +459,11 @@ func (p *liqoTunnelHealthCheck) bounceLiqoGateways(ctx context.Context,
 		return fmt.Errorf("list pods for liqo gateway bounce: %w", err)
 	}
 	for _, f := range found {
-		var target *corev1.Pod
+		// Candidates: the gateway prefix, live, and (for CR findings)
+		// inside the CR's namespace. Peer scoping runs on top: a
+		// multi-peer liqo deployment runs one gateway pod per peer,
+		// so bouncing a HEALTHY peer's gateway heals nothing.
+		var nsCands, peerCands []*corev1.Pod
 		for i := range pods {
 			pod := &pods[i]
 			if pod.DeletionTimestamp != nil ||
@@ -448,16 +474,60 @@ func (p *liqoTunnelHealthCheck) bounceLiqoGateways(ctx context.Context,
 			if f.ns != "" && pod.Namespace != f.ns {
 				continue
 			}
-			target = pod
-			break
+			nsCands = append(nsCands, pod)
+			if liqoPodMatchesPeer(pod, f.peer) {
+				peerCands = append(peerCands, pod)
+			}
+		}
+		// Prefer the peer-matched gateway; a CR finding with no
+		// peer-matching pod in its namespace still bounces the
+		// namespace's gateway (the namespace IS the peer scope). A
+		// namespace-less virtual-node finding needs an explicit peer
+		// match — an unattributable bounce skips.
+		target := liqoOldestPod(peerCands)
+		if target == nil && f.ns != "" {
+			target = liqoOldestPod(nsCands)
 		}
 		if target == nil {
-			log.Info("no running liqo-gateway pod found for dead peer — bounce skipped",
-				"peer", f.peer, "reason", f.reason)
+			log.Info("no liqo-gateway pod matched the dead peer — bounce skipped",
+				"peer", f.peer, "reason", f.reason, "namespace", f.ns)
 			continue
 		}
 		p.DeletePodHeal(ctx, log, CheckNameLiqoTunnelHealth,
 			"peer/"+f.peer, target, liqoGatewayHealCool, now)
 	}
 	return nil
+}
+
+// liqoPodMatchesPeer reports whether the gateway pod carries the
+// failing peer's identity — one of the remote-cluster-id labels, or
+// the peer id inside the pod name (liqo names gateways
+// liqo-gateway-<peer-suffix>-<hash>).
+func liqoPodMatchesPeer(pod *corev1.Pod, peer string) bool {
+	if peer == "" {
+		return false
+	}
+	for _, key := range []string{
+		"networking.liqo.io/remote-cluster-id",
+		"discovery.liqo.io/cluster-id",
+		"liqo.io/remote-cluster-id",
+	} {
+		if pod.Labels[key] == peer {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(pod.Name), strings.ToLower(peer))
+}
+
+// liqoOldestPod returns the oldest candidate — the least-recently
+// restarted gateway takes the bounce.
+func liqoOldestPod(cands []*corev1.Pod) *corev1.Pod {
+	var oldest *corev1.Pod
+	for _, pod := range cands {
+		if oldest == nil ||
+			pod.CreationTimestamp.Before(&oldest.CreationTimestamp) {
+			oldest = pod
+		}
+	}
+	return oldest
 }

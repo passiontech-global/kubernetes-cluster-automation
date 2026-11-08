@@ -92,12 +92,27 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
+	// emptySweepClose is the ledger-hygiene tail for the early
+	// returns: with no series (or no pod census to judge them) the
+	// first-seen entries drop so the next real signal re-arms the
+	// FULL window, and the emitted ledger reconciles against an
+	// empty set so stale gauge series DeleteLabelValues instead of
+	// leaking a 1 past the incident.
+	emptySweepClose := func() probefw.Result {
+		p.seen.Prune(func(string) bool { return false })
+		var empty probefw.SweepReport
+		return empty.Result(&p.emitted,
+			dragonflyReplicaSyncStormGauge.DeleteLabelValues, "", ", ")
+	}
+
 	linkSeries, errL := p.PromQuery(ctx,
 		`(dragonfly_master_link_status == 0) or (redis_master_link_status == 0)`)
 	if errL != nil {
 		log.Info("WARN: dragonfly master-link query failed — check inconclusive",
 			"error", errL)
-		return probefw.Result{Pass: true}
+		res := emptySweepClose()
+		res.Pass = true
+		return res
 	}
 	stormSeries, errS := p.PromQuery(ctx,
 		`(increase(dragonfly_sync_full[15m]) >= 3) or (changes(redis_connected_slaves[15m]) >= 3)`)
@@ -144,7 +159,12 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	// Pod census for master-role + ownership checks.
 	pods, err := p.AllPods(ctx)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
+		// The link findings this far stay unjudged — but the ledger
+		// hygiene still runs so a stale gauge series does not
+		// outlive the sweep that could not verify it.
+		res := emptySweepClose()
+		res.Infra = fmt.Errorf("list pods: %w", err)
+		return res
 	}
 	podByKey := map[string]*corev1.Pod{}
 	for i := range pods {
@@ -205,8 +225,11 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 			(!stormGlobal && !stormNS[ns] && !stormPods[key]) {
 			continue // sustained link-down alone FAILs but doesn't restart
 		}
+		// The cooldown keys on the pod's CONTROLLER — the deleted
+		// replica is recreated under a fresh suffix, so a pod-name
+		// key never suppressed the re-heal of the same desync.
 		p.DeletePodHeal(ctx, log, CheckNameDragonflySyncStorm,
-			key, pod, dragonflySyncHealCool, now)
+			kube.PodControllerKey(pod), pod, dragonflySyncHealCool, now)
 	}
 	// A pod whose link signature went quiet drops its persisted stamp
 	// so the next drop re-arms the full window — a stale stamp would

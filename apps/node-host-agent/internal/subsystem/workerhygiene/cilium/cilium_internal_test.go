@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"syscall"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -209,5 +210,42 @@ func TestParseEnvoyXDSRejected(t *testing.T) {
 	}
 	if got := ParseEnvoyXDSRejected(nil); got != 0 {
 		t.Fatalf("empty body=%d want 0", got)
+	}
+}
+
+// The xDS bookkeeping must die with the envoy container: no
+// cilium-envoy task resets the streak AND the baseline, and a
+// successful killCiliumEnvoy does the same — the replacement envoy's
+// update_rejected counters start at zero, so a stale baseline would
+// misread its first pushes.
+func TestCiliumEnvoyXDSBookkeepingResets(t *testing.T) {
+	d, f := cDeps(t)
+	c := &CiliumEnvoyCheck{d: d}
+	c.fails, c.xdsFails, c.xdsInit, c.xdsLast = 3, 2, true, 42
+
+	// No cilium-envoy task in the fixture → Run's absent-envoy reset.
+	c.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if c.fails != 0 || c.xdsFails != 0 || c.xdsInit {
+		t.Fatalf("absent envoy did not reset: fails=%d xdsFails=%d xdsInit=%v",
+			c.fails, c.xdsFails, c.xdsInit)
+	}
+
+	// A successful kill resets the same fields.
+	c.fails, c.xdsFails, c.xdsInit, c.xdsLast = 3, 2, true, 42
+	c.killCiliumEnvoy([]wdeps.CtrTask{
+		{Name: "cilium-envoy", Live: true, PID: 555},
+	}, "test")
+	if c.fails != 0 || c.xdsFails != 0 || c.xdsInit {
+		t.Fatalf("kill did not reset: fails=%d xdsFails=%d xdsInit=%v",
+			c.fails, c.xdsFails, c.xdsInit)
+	}
+	killed := false
+	for _, k := range f.Kills {
+		if k.PID == 555 && k.Sig == syscall.SIGKILL {
+			killed = true
+		}
+	}
+	if !killed {
+		t.Fatalf("envoy pid not SIGKILLed: %+v", f.Kills)
 	}
 }

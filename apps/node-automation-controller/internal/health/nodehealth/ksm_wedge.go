@@ -47,13 +47,17 @@ const (
 // reports — ordered most-specific first so a reflector line whose
 // cause is a 401 still classifies as the auth wedge. "the server has
 // asked for the client to provide credentials" is client-go's
-// canonical expired-SA-token 401.
+// canonical expired-SA-token 401. The 401 spellings are matched as
+// full phrases ("401 unauthorized" / "status code 401") — a bare
+// "401" substring would false-positive on any log line that merely
+// carries the number (a metric value, a line number, a byte count).
 var ksmWedgeSignatures = []struct {
 	marker string
 	reason string
 }{
 	{"unauthorized", leaseReasonKSMUnauthorized},
-	{"401", leaseReasonKSMUnauthorized},
+	{"401 unauthorized", leaseReasonKSMUnauthorized},
+	{"status code 401", leaseReasonKSMUnauthorized},
 	{"provide credentials", leaseReasonKSMUnauthorized},
 	{"token expired", leaseReasonKSMUnauthorized},
 	{"failed to list", leaseReasonKSMReflectorErrors},
@@ -143,8 +147,22 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 		}
 		p.emitUnhealthy(rep, pod.Namespace, pod.Name, reason)
 		rep.Find(key + "(" + reason + ")")
+		// Only a pod with a controller owner is bouncable — the
+		// owner recreates it (fresh SA token mount). A lone,
+		// controller-less pod would be deleted PERMANENTLY, killing
+		// kube-state-metrics outright, so the heal skips it and the
+		// gauge alone carries the alert.
+		if metav1.GetControllerOf(pod) == nil {
+			log.Info("SKIP: wedged ksm pod has no controller owner — bounce would not be recreated",
+				"pod", key)
+			continue
+		}
+		// The heal cooldown keys on the pod's controller (the
+		// ReplicaSet/StatefulSet key survives pod replacement —
+		// kube.PodControllerKey), so the replacement pod the bounce
+		// spawns cannot re-arm a fresh heal window under a new name.
 		p.DeletePodHeal(ctx, log, CheckNameControllerLeaseGuard,
-			"ksm/"+key, pod, ksmPodHealCooldown, now)
+			kube.PodControllerKey(pod), pod, ksmPodHealCooldown, now)
 	}
 	p.wedgeSeen.Prune(func(k string) bool { return wedgeLive[k] })
 	return nil

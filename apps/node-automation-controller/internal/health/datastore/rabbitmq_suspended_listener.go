@@ -201,23 +201,21 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	}
 	p.rbSuspendedSince.Prune(func(k string) bool { return live[k] })
 
-	// Per-pod heal preamble — cooldown + maintenance mutex run by
-	// HealAllowed like every pod-delete heal in this sweep. The
-	// Deps-wide verdict memoizes the mutex evaluation, so the loop
-	// still pays a single set of API reads when several pods are
-	// due; "cannot verify" fails closed.
+	// Per-pod heal preamble — the quorum-safety read first, then
+	// cooldown + maintenance mutex via HealAllowed like every
+	// pod-delete heal in this sweep. The Deps-wide verdict memoizes
+	// the mutex evaluation, so the loop still pays a single set of
+	// API reads when several pods are due; "cannot verify" fails
+	// closed.
 	for i := range due {
 		pod := &due[i]
 		key := pod.Namespace + "/" + pod.Name
-		proceed, unverifiable := p.HealAllowed(ctx, log,
-			&p.rbHealed, key, rabbitHealCooldown, now)
-		if unverifiable {
-			metrics.IncError(p.Name)
-			continue
-		}
-		if !proceed {
-			continue
-		}
+		// Quorum FIRST, cooldown/mutex second: the quorum-safety read
+		// answers "may this pod ever be deleted" while the heal gate
+		// only answers "may it be deleted NOW" — a pod that would
+		// break the cluster must never consume the heal budget or
+		// the Deps-wide maintenance-mutex verdict slot, so the
+		// quorum guard runs before HealAllowed (W17).
 		safe, err := p.rabbitQuorumSafe(ctx, pod)
 		if err != nil {
 			metrics.IncError(p.Name)
@@ -228,6 +226,15 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		if !safe {
 			log.Info("quorum unsafe — suspended rabbitmq pod kept (peers not all Ready)",
 				"pod", key)
+			continue
+		}
+		proceed, unverifiable := p.HealAllowed(ctx, log,
+			&p.rbHealed, key, rabbitHealCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
+			continue
+		}
+		if !proceed {
 			continue
 		}
 		if _, err := heal.DeletePod(ctx, p.CS, &p.rbHealed, key, pod, now); err != nil {

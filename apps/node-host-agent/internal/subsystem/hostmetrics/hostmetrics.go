@@ -175,6 +175,7 @@ type Collector struct {
 	ino  inotifyCache      // collect_inotify.go — fdinfo sweep cache
 	lpv  localpvCache      // collect_localpv.go — du walk cache
 	ebpf ebpfCache         // collect_ebpf.go — prog/map id sweep cache
+	proc procScanCache     // collect_procs_scan.go — shared /proc walk (daemon-fd + zombies)
 	// kf is the W10 kernel deep-failure engine (kernelfail
 	// subpackage) — the kmsg tail session + the steal jiffie
 	// baseline live inside it. Owned by the Collector directly:

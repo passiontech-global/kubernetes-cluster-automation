@@ -28,3 +28,19 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	}
 	testutil.ExpectPeriodic(t, m, "failed-jobs-janitor", 60*time.Minute)
 }
+
+// A disabled module (GateEnv off → Deps.Disabled) must register
+// nothing — the gate rides shared.SetupNoConfig like every module.
+func TestSetupDisabledRegistersNothing(t *testing.T) {
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{Name: "failed-jobs-janitor",
+		Mgr:      m,
+		CS:       fake.NewSimpleClientset(),
+		Disabled: true,
+	}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if len(m.Added) != 0 {
+		t.Fatalf("disabled module registered %d runnables", len(m.Added))
+	}
+}

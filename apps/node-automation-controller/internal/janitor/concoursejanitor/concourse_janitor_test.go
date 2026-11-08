@@ -405,6 +405,53 @@ func TestConcourseJanitorNilDynFailsClosed(t *testing.T) {
 	}
 }
 
+// The maintenance mutex is re-checked before EACH worker, not only
+// once per run: a run replacing several workers takes up to hours
+// (drain + waitReady per pod), so a cordon/drain, reboot lock or
+// upgrade that starts mid-run must stop the remaining wipes. Here the
+// first worker's stats read cordons a node mid-run — the second
+// worker is deferred without its own stats read or delete.
+func TestConcourseJanitorMaintenanceRecheckedPerWorker(t *testing.T) {
+	var events []string
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(2),
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjWorkerPod("concourse-worker-1", "uid-1", "node-b", true, nil),
+		cjLocalUsers(),
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "w1"}})
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			// A drain starts while the first worker is in flight.
+			n, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
+			if err != nil {
+				return 0, 0, 0, err
+			}
+			n.Spec.Unschedulable = true // fail-closed cordon evidence
+			if _, err := cs.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{}); err != nil {
+				return 0, 0, 0, err
+			}
+			return 160 * gib, 200 * gib, 10 * gib, nil // would wipe worker-1
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// worker-1 was replaced before the cordon; worker-0 is untouched.
+	if got := cjPod(t, cs, "concourse-worker-1").UID; got != "uid-new-concourse-worker-1" {
+		t.Fatalf("worker-1 not replaced before the cordon: uid %s", got)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
+		t.Fatalf("worker-0 replaced although maintenance went active mid-run (uid %s)", got)
+	}
+	for _, e := range events {
+		if e == "stats:node-a" || e == "delete:concourse-worker-0" {
+			t.Fatalf("worker-0 processed after maintenance went active: %v", events)
+		}
+	}
+}
+
 // Workdir under cap AND nodefs under threshold → keep the cache, no
 // delete. No annotation → baseline estimated as imageFs + 32GiB:
 // 50-10-32 = 8GiB <= 100, nodefs 25% < 60%.
@@ -519,8 +566,10 @@ func TestConcourseJanitorNoFlyStillDeletes(t *testing.T) {
 }
 
 // Unreadable stats fail OPEN to a wipe — the cleanup must never be
-// lost to a broken metrics path — but the blind wipe IS metered:
-// IncError on the stats read and again on the wipe decision.
+// lost to a broken metrics path — and the blind wipe IS metered by
+// readStats itself, exactly once per unreadable read (the pre-decision
+// read and the post-wipe re-read; the wipe decision no longer adds a
+// duplicate count for the same broken fetch).
 func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	var events []string
 	cs := fake.NewSimpleClientset(
@@ -550,10 +599,11 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	if !found {
 		t.Fatalf("expected a delete in events %v", events)
 	}
-	// stats read error + blind-wipe decision + the post-wipe re-read
-	// all meter — at least the read + the wipe must count.
-	if got := testutil.QueueErrorCount(t, "concourse-workdir-janitor") - before; got < 2 {
-		t.Fatalf("fail-open wipe under-metered: error delta = %v, want >= 2", got)
+	// Exactly two unreadable reads happen (pre-decision + post-wipe
+	// re-read), each metered once by readStats — no third count from
+	// the wipe decision.
+	if got := testutil.QueueErrorCount(t, "concourse-workdir-janitor") - before; got != 2 {
+		t.Fatalf("fail-open wipe metered %v times, want exactly 2 (one per unreadable read)", got)
 	}
 }
 
@@ -641,8 +691,9 @@ func TestConcourseJanitorMissingSTS(t *testing.T) {
 // would only reset rm -rf progress. The guard lifts at readyTimeout.
 func TestConcourseJanitorSkipsYoungNotReadyPod(t *testing.T) {
 	var events []string
+	base := time.Now()
 	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
-	p.CreationTimestamp = metav1.NewTime(time.Now()) // younger than readyTimeout
+	p.CreationTimestamp = metav1.NewTime(base) // younger than readyTimeout
 	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
@@ -650,15 +701,16 @@ func TestConcourseJanitorSkipsYoungNotReadyPod(t *testing.T) {
 		}}
 	j := cjTestJanitor(cs, st,
 		&cjFakeATC{events: &events, states: map[string]string{}})
+	j.now = func() time.Time { return base.Add(10 * time.Millisecond) }
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
 		t.Fatalf("young not-Ready pod was replaced (uid %s)", got)
 	}
-	// stats still ran (they decide the keep/wipe side); no land,
-	// no delete — the guard fires right after the keep-cache check.
-	want := []string{"login:admin", "stats:node-a"}
+	// The mid-init-rm guard precedes readStats: no stats read, no
+	// land, no delete — login is the only side effect.
+	want := []string{"login:admin"}
 	if fmt.Sprint(events) != fmt.Sprint(want) {
 		t.Fatalf("events %v, want %v", events, want)
 	}

@@ -87,7 +87,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		switch {
 		case err == nil:
 			healed = true
-			p.InvalidateSweep(ctx) // slice census changed — drop the snapshot
+			p.InvalidateEndpointSlices(ctx) // slice census changed — drop the snapshot
 			log.Info("DELETE: stale EndpointSlice for endpoint desync — endpointslice-controller rebuild forced",
 				"endpointslice", sl.ns+"/"+sl.name, "service", svcKey)
 		case apierrors.IsNotFound(err):
@@ -130,9 +130,49 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 	if target != nil {
-		// The stamp is NOT the ledger's here — svcKey stamps once at
-		// the end when ANY heal action (slice or pod delete) landed.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", target, now); err != nil {
+		// A bounce that outlives the workload is a blackhole, not a
+		// heal — the destination must keep a genuinely Ready sibling
+		// (ReadySiblings discounts the target itself when it still
+		// reports Ready).
+		readyByOwner := probefw.ReadyByOwner(ptrDerefPods(pods))
+		if probefw.ReadySiblings(readyByOwner, target) < 1 {
+			log.Info("skip linkerd-destination bounce: no Ready sibling replica — bounce would blackhole the endpoint table",
+				"service", svcKey)
+			if healed {
+				// Slice deletes already landed — stamp them now or an
+				// unstamped sweep re-deletes the slices the
+				// endpointslice-controller just rebuilt.
+				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
+			}
+			return
+		}
+		// The shared bounce cooldown keys the DESTINATION component,
+		// not the service: two desynced services must not bounce the
+		// same singleton linkerd-destination Deployment back-to-back
+		// inside one sweep (the ladder tier scales it with the
+		// per-service cooldown).
+		ck := "linkerd/linkerd-destination"
+		proceed, unverifiable := p.HealAllowed(ctx, log,
+			&p.Heals, ck, linkerdDestHealEscalation[fails], now)
+		if unverifiable {
+			metrics.IncError(p.Name)
+			if healed {
+				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
+			}
+			return
+		}
+		if !proceed {
+			if healed {
+				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
+			}
+			return
+		}
+		// The svcKey stamp is NOT this ledger's — svcKey stamps once at
+		// the end when ANY heal action (slice or pod delete) landed;
+		// the shared key stamps here so the NEXT service's heal sees
+		// the destination bounce even though this sweep's stamp
+		// landed first.
+		if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, target, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "linkerd-destination delete failed",
 				"pod", target.Namespace+"/"+target.Name)
@@ -170,4 +210,15 @@ func (p *linkerdEndpointSyncCheck) stampLinkerdDestinationHeal(
 		log.Error(err, "persist linkerd endpoint heal stamp failed",
 			"service", svcKey)
 	}
+}
+
+// ptrDerefPods copies a []*corev1.Pod census into a []corev1.Pod —
+// the shape probefw.ReadyByOwner consumes (elements alias the
+// snapshot's pod structs; read-only).
+func ptrDerefPods(pods []*corev1.Pod) []corev1.Pod {
+	out := make([]corev1.Pod, len(pods))
+	for i := range pods {
+		out[i] = *pods[i]
+	}
+	return out
 }

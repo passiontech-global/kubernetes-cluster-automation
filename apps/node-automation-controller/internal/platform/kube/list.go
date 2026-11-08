@@ -252,6 +252,24 @@ func StatefulSets(cs kubernetes.Interface, namespace string) PageFunc[appsv1.Sta
 		func(l *appsv1.StatefulSetList) []appsv1.StatefulSet { return l.Items })
 }
 
+// Deployments lists Apps Deployments in namespace.
+func Deployments(cs kubernetes.Interface, namespace string) PageFunc[appsv1.Deployment] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*appsv1.DeploymentList, error) {
+			return cs.AppsV1().Deployments(namespace).List(ctx, o)
+		},
+		func(l *appsv1.DeploymentList) []appsv1.Deployment { return l.Items })
+}
+
+// DaemonSets lists Apps DaemonSets in namespace.
+func DaemonSets(cs kubernetes.Interface, namespace string) PageFunc[appsv1.DaemonSet] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*appsv1.DaemonSetList, error) {
+			return cs.AppsV1().DaemonSets(namespace).List(ctx, o)
+		},
+		func(l *appsv1.DaemonSetList) []appsv1.DaemonSet { return l.Items })
+}
+
 // PodDisruptionBudgets lists Policy PodDisruptionBudgets in namespace.
 func PodDisruptionBudgets(cs kubernetes.Interface, namespace string) PageFunc[policyv1.PodDisruptionBudget] {
 	return typedPage(

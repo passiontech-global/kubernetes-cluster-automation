@@ -354,6 +354,44 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	readyByOwner := probefw.ReadyByOwner(unlabeledPods)
 
+	// W17 heal budget — at most ONE member pod per RabbitmqCluster
+	// per sweep, and the Ready census is decremented the moment a
+	// delete lands: a later candidate in the SAME sweep must see the
+	// quorum the first delete actually left behind, not the census
+	// taken before it. The cooldown keys on the CLUSTER (the
+	// operator's app.kubernetes.io/name label), falling back to the
+	// pod's controller key for unlabeled members — a pod-name key
+	// dies with the pod, so a re-created member would re-heal every
+	// sweep. The Heals stamp only lands on a DELIVERED delete
+	// (heal.DeletePod's contract), so the missing→fresh stamp
+	// transition is how success reads.
+	healedCluster := map[string]bool{}
+	tryQuorumHeal := func(pod *corev1.Pod) {
+		ck := rabbitClusterKey(pod)
+		if ck == "" {
+			ck = kube.PodControllerKey(pod)
+		}
+		if healedCluster[ck] {
+			return // one pod per cluster per sweep
+		}
+		hk := probefw.SelfHealKey(CheckNameRabbitMQQuorum, ck)
+		before, _ := p.Heals.Last(hk)
+		p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
+			ck, pod, rabbitQuorumHealCool, now)
+		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
+			healedCluster[ck] = true
+			if rck := rabbitClusterKey(pod); rck != "" {
+				if readyByCluster[rck] > 0 {
+					readyByCluster[rck]--
+				}
+			} else if ref := metav1.GetControllerOf(pod); ref != nil {
+				if readyByOwner[ref.UID] > 0 {
+					readyByOwner[ref.UID]--
+				}
+			}
+		}
+	}
+
 	// Stuck-unready pod signature — independent of Prometheus.
 	seenKeep := map[string]bool{}
 	for _, pod := range memberPods {
@@ -378,8 +416,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		// SAME cluster Ready — the unready pod itself is never
 		// Ready, so the sibling count already excludes it.
 		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
-			p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
-				key, pod, rabbitQuorumHealCool, now)
+			tryQuorumHeal(pod)
 		}
 	}
 
@@ -418,8 +455,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		// cluster at 2/3 Ready approve a delete that drops it to
 		// 1/3 — Raft quorum loss (W12 P0-2b).
 		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
-			p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
-				key, pod, rabbitQuorumHealCool, now)
+			tryQuorumHeal(pod)
 		}
 	}
 	// A member pod whose signal went quiet drops its persisted stamp

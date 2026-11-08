@@ -81,14 +81,17 @@ type unblockHealer struct {
 func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapshot) error {
 	g := snap.g
 	log := logf.FromContext(ctx)
+	now := g.now.Now()
+	// PruneExpired runs BEFORE the error gate so the cooldown ledger
+	// is pruned on EVERY cycle — an apiservices list flap must not
+	// leave decommissioned backends' stamps accumulating forever.
+	// unblocked keys on APIService names that die with the resource —
+	// bound the map so decommissioned backends' stamps cannot
+	// accumulate in the first place.
+	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
 	if snap.err != nil {
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", snap.err)
 	}
-	now := g.now.Now()
-	// unblocked keys on APIService names that die with the resource —
-	// bound the map so decommissioned backends' stamps cannot
-	// accumulate forever.
-	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
 
 	// Candidate pass — cheap unstructured reads only; the namespace
 	// scan below is skipped entirely when nothing qualifies.
@@ -139,8 +142,25 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		if len(refs) == 0 {
 			continue
 		}
-		// Wedge proven — the heal deletes LIVE pods, so the shared
-		// preamble gates it: per-APIService cooldown first, then the
+		svcNs, svcName, _ := apiServiceBackend(c.svc)
+		// Confirm a live restart target BEFORE the heal preamble: the
+		// wedge evidence alone doesn't mean anything is left to
+		// restart, and AllowedV spends a fleet-wide budget grant on
+		// every proceed — a stale/empty backend must not burn one.
+		targets, err := u.backingPodTargets(ctx, g, svcNs, svcName)
+		if err != nil {
+			log.Error(err, "unblock heal target lookup failed",
+				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
+			metrics.IncError(g.queue)
+			continue
+		}
+		if len(targets) == 0 {
+			log.Info("unblock heal skipped — no live backing pod to restart",
+				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
+			continue
+		}
+		// Wedge proven AND a target exists — the shared preamble gates
+		// the heal: per-APIService cooldown first, then the
 		// maintenance mutex (a cordon/drain/kured reboot or an
 		// in-flight k0s upgrade defers the restart, and "cannot
 		// verify" fails closed AND IncErrors the queue). The
@@ -156,28 +176,21 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		case !proceed:
 			continue
 		}
-		svcNs, svcName, _ := apiServiceBackend(c.svc)
-		deleted, err := u.restartBackingPods(ctx, g, svcNs, svcName, now)
-		if err != nil {
-			log.Error(err, "unblock heal failed",
-				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
-			metrics.IncError(g.queue)
-			continue
-		}
-		// Stamp the cooldown only on a delivered heal — a pass that
-		// deleted nothing (backing Service selectorless, pods already
-		// terminating, NotFound races) must not open the suppression
-		// window or one empty run would defer the real heal 15m.
+		deleted := u.deleteBackingPods(ctx, g, targets, now)
+		// Stamp the cooldown, count the heal and log ACTION only on a
+		// DELIVERED heal — a pass that deleted nothing (NotFound
+		// races) must not open the suppression window or log an
+		// unblock that did not happen.
 		if deleted > 0 {
 			u.unblocked.Stamp(c.svc.GetName(), now)
 			metrics.APIServiceUnblockHealsTotal.
 				WithLabelValues(svcNs, "backing_pods_deleted").Inc()
+			healed++
+			log.Info("ACTION: unblocked dead APIService wedging namespace termination",
+				"apiservice", c.svc.GetName(), "group", c.group,
+				"service", svcNs+"/"+svcName,
+				"terminatingNamespaces", refs, "podsDeleted", deleted)
 		}
-		healed++
-		log.Info("ACTION: unblocked dead APIService wedging namespace termination",
-			"apiservice", c.svc.GetName(), "group", c.group,
-			"service", svcNs+"/"+svcName,
-			"terminatingNamespaces", refs, "podsDeleted", deleted)
 	}
 	return nil
 }
@@ -236,13 +249,15 @@ func (u *unblockHealer) stuckTerminatingNamespaces(ctx context.Context,
 	return out, nil
 }
 
-// restartBackingPods deletes the running pods selected by the
-// APIService's backing Service so their controllers recreate them —
-// the aggregated-apiserver restart that clears a wedged aggregation.
-// Capped per call; NotFound service/pod races are quiet no-ops.
-// Caller holds the maintenance-mutex verdict: these are LIVE pods.
-func (u *unblockHealer) restartBackingPods(ctx context.Context,
-	g *apiServiceGuard, svcNs, svcName string, now time.Time) (int, error) {
+// backingPodTargets resolves the Service-backed pods an unblock heal
+// may restart: the backing Service's selector pods that are alive and
+// non-terminating (a pod already going down does not need the heal —
+// deleting it again buys nothing and burns a budget grant). A gone
+// Service or an empty selector yields no targets — the caller skips
+// the candidate without touching the heal preamble. Caller has NOT
+// yet taken the maintenance-mutex verdict: this is read-only.
+func (u *unblockHealer) backingPodTargets(ctx context.Context,
+	g *apiServiceGuard, svcNs, svcName string) ([]corev1.Pod, error) {
 	log := logf.FromContext(ctx)
 	svc, err := g.cs.CoreV1().Services(svcNs).Get(ctx, svcName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -250,32 +265,50 @@ func (u *unblockHealer) restartBackingPods(ctx context.Context,
 		// impossible; the operator that owns it must recreate it.
 		log.Info("unblock heal skipped — backing service gone",
 			"service", svcNs+"/"+svcName)
-		return 0, nil
+		return nil, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("get backing service %s/%s: %w", svcNs, svcName, err)
+		return nil, fmt.Errorf("get backing service %s/%s: %w", svcNs, svcName, err)
 	}
 	if len(svc.Spec.Selector) == 0 {
 		log.Info("unblock heal skipped — backing service has no selector",
 			"service", svcNs+"/"+svcName)
-		return 0, nil
+		return nil, nil
 	}
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		Limit:         apiServiceListPageSize,
 	}, kube.Pods(g.cs, svcNs))
 	if err != nil {
-		return 0, fmt.Errorf("list backing pods %s: %w", svcNs, err)
+		return nil, fmt.Errorf("list backing pods %s: %w", svcNs, err)
 	}
-	deleted := 0
+	var targets []corev1.Pod
 	for i := range pods {
-		if deleted >= apiServiceUnblockPodCap {
-			break
-		}
 		p := &pods[i]
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
+		if p.DeletionTimestamp != nil {
+			continue // already terminating — its replacement carries the fix
+		}
+		targets = append(targets, *p)
+	}
+	return targets, nil
+}
+
+// deleteBackingPods deletes the pre-resolved restart targets, capped
+// per call. NotFound races are quiet no-ops; any other delete failure
+// is metered and logged with the pod's own context. Caller holds the
+// maintenance-mutex verdict: these are LIVE pods.
+func (u *unblockHealer) deleteBackingPods(ctx context.Context,
+	g *apiServiceGuard, targets []corev1.Pod, now time.Time) int {
+	log := logf.FromContext(ctx)
+	deleted := 0
+	for i := range targets {
+		if deleted >= apiServiceUnblockPodCap {
+			break
+		}
+		p := &targets[i]
 		// heal.DeletePod carries the UID precondition the module
 		// hand-rolled here before — a same-named pod recreated
 		// between the list and the delete is not ours to restart.
@@ -285,11 +318,12 @@ func (u *unblockHealer) restartBackingPods(ctx context.Context,
 			if apierrors.IsNotFound(err) {
 				continue
 			}
+			metrics.IncError(g.queue)
 			log.Error(err, "backing pod delete failed",
-				"pod", svcNs+"/"+p.Name)
+				"pod", p.Namespace+"/"+p.Name)
 			continue
 		}
 		deleted++
 	}
-	return deleted, nil
+	return deleted
 }

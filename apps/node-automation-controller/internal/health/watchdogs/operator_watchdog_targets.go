@@ -11,7 +11,6 @@ import (
 	"context"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -558,9 +557,8 @@ func cftOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if ns == "" {
 			ns = o.GetNamespace()
 		}
-		gw, err := p.Dyn.Resource(kube.GVRGateway).Namespace(ns).
-			Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
+		gw, ok := lookupGateway(ctx, p, ns, name)
+		if !ok {
 			continue
 		}
 		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")

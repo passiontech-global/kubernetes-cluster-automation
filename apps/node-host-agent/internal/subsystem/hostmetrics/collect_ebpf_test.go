@@ -64,6 +64,45 @@ func TestCollectEBPFAbsentSources(t *testing.T) {
 	}
 }
 
+// TestEBPFPinsWalkedWithoutOpen: the bpffs half is a WALK — every
+// non-dir entry counts as a pinned object even though nothing can be
+// opened (bpffs rejects readmode opens for whole object classes, and
+// a fake dir of regular files proves the walk is the source of
+// truth). Pins fold into the maps gauge; the fdinfo prog source is
+// unaffected.
+func TestEBPFPinsWalkedWithoutOpen(t *testing.T) {
+	cfg, _ := fixture(t)
+
+	// One prog id from the fdinfo source.
+	dir := filepath.Join(cfg.ProcRoot, "10", "fdinfo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(dir, "3"), "prog_id:\t42\n")
+	mkFdLink(t, cfg.ProcRoot, 10, 3, "anon_inode:bpf-prog")
+
+	bpf := filepath.Join(t.TempDir(), "bpf")
+	if err := os.MkdirAll(filepath.Join(bpf, "cilium", "globals"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(bpf, "tc_garbage"), "x")
+	testutil.WriteFile(t, filepath.Join(bpf, "cilium", "cyber_deadbeef"), "x")
+	testutil.WriteFile(t, filepath.Join(bpf, "cilium", "globals", "cyber_tail_1"), "x")
+	cfg.BpffsDir = bpf
+	c := New(cfg)
+
+	got, ok := metricValue(t, c, "node_host_agent_ebpf_programs_count",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("ebpf_programs=%v ok=%v want 1 (pins never inflate progs)", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_ebpf_maps_count",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 3 {
+		t.Fatalf("ebpf_maps=%v ok=%v want 3 (three walked pins, zero map ids)", got, ok)
+	}
+}
+
 func TestEBPFScanCache(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.BpffsDir = filepath.Join(t.TempDir(), "nope")

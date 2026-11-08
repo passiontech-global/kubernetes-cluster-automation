@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -50,9 +50,13 @@ func NewScyllaHealthCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	// W9-ST1 — scylla-cluster-health knobs.
-	CheckNameScyllaHealth    = "scylla-cluster-health"
-	scyllaDegradedMinAge     = 15 * time.Minute
-	scyllaSignatureMinAge    = 10 * time.Minute
+	CheckNameScyllaHealth = "scylla-cluster-health"
+	scyllaDegradedMinAge  = 15 * time.Minute
+	scyllaSignatureMinAge = 10 * time.Minute
+
+	// The per-pod stall log-fetch fan-out cap (Component 3 pool).
+	scyllaStallLogWorkers = 4
+
 	scyllaPodNameLabel       = "scylla.scylladb.com/pod-name"
 	scyllaClusterLabel       = "scylla.scylladb.com/cluster"
 	scyllaContainerName      = "scylla"
@@ -236,7 +240,7 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	emitted := map[string]scyllaFinding{} // "ns/cluster/reason" -> finding
 
 	// (a) degraded_condition — the CR's own condition clock.
-	crs, err := p.Dyn.Resource(scyllaClusterGVR).List(ctx, metav1.ListOptions{})
+	crs, err := p.AllUnstructured(ctx, scyllaClusterGVR)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// ScyllaDB stack not installed on this cluster — (b)/(c)
@@ -244,8 +248,8 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list scyllaclusters: %w", err)}
 	default:
-		for i := range crs.Items {
-			cr := &crs.Items[i]
+		for i := range crs {
+			cr := &crs[i]
 			for _, probe := range []struct{ typ, status string }{
 				{"Degraded", "True"},
 				{"Available", "False"},
@@ -326,26 +330,47 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// (c) gossip_or_raft_stall / tombstone_overload_stall — troubled
 	// member pods whose scylla log tail carries a stall signature.
+	// The fetches run through a bounded worker pool (max
+	// scyllaStallLogWorkers concurrent kubelet log streams); the
+	// findings apply serially below.
+	type stallScan struct {
+		pod    *corev1.Pod
+		reason string
+		err    error
+	}
+	var troubled []*corev1.Pod
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Labels[scyllaClusterLabel] == "" || !scyllaPodTroubled(pod) {
-			continue
+		if pod.Labels[scyllaClusterLabel] != "" && scyllaPodTroubled(pod) {
+			troubled = append(troubled, pod)
 		}
-		reason, err := p.scyllaStallLogHit(ctx, pod)
-		if err != nil {
+	}
+	scans := make([]stallScan, len(troubled))
+	g := errgroup.Group{}
+	g.SetLimit(scyllaStallLogWorkers)
+	for j, pod := range troubled {
+		g.Go(func() error {
+			reason, err := p.scyllaStallLogHit(ctx, pod)
+			scans[j] = stallScan{pod: pod, reason: reason, err: err}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	for _, s := range scans {
+		if s.err != nil {
 			// Inconclusive, not clean — a broken pod-log path must
 			// not silently read as "no stall".
 			log.Info("WARN: scylla log fetch failed — stall signature inconclusive",
-				"pod", pod.Namespace+"/"+pod.Name, "error", err)
+				"pod", s.pod.Namespace+"/"+s.pod.Name, "error", s.err)
 			continue
 		}
-		if reason == "" {
+		if s.reason == "" {
 			continue
 		}
-		pending["stall/"+pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)+"/"+reason] =
+		pending["stall/"+s.pod.Namespace+"/"+s.pod.Name+"/"+string(s.pod.UID)+"/"+s.reason] =
 			scyllaFinding{
-				ns: pod.Namespace, cluster: pod.Labels[scyllaClusterLabel],
-				reason: reason,
+				ns: s.pod.Namespace, cluster: s.pod.Labels[scyllaClusterLabel],
+				reason: s.reason,
 			}
 	}
 

@@ -103,12 +103,14 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	}
 	now := p.Now()
 
-	// Find the served HelmRelease version — try v2 then v2beta2.
+	// Find the served HelmRelease version — try v2 then v2beta2. The
+	// snapshot memoizes each GVR's RAW error, so a v2 NoMatch falls
+	// through to v2beta2 and both lists are paid once per sweep.
 	var gvr schema.GroupVersionResource
-	var hrs *unstructured.UnstructuredList
+	var hrs []unstructured.Unstructured
 	var listErr error
 	for _, g := range helmReleaseRetryGVRs {
-		l, err := p.Dyn.Resource(g).List(ctx, metav1.ListOptions{})
+		l, err := p.AllUnstructured(ctx, g)
 		if err == nil {
 			gvr, hrs = g, l
 			break
@@ -126,8 +128,8 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	var stuck []string
-	for i := range hrs.Items {
-		hr := &hrs.Items[i]
+	for i := range hrs {
+		hr := &hrs[i]
 		if suspended, _ := kube.NestedBool(
 			hr.Object, "spec", "suspend"); suspended {
 			continue

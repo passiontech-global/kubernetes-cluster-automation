@@ -107,7 +107,9 @@ func stampFirstSeen(ctx context.Context, obj metav1.Object,
 // patch failure is Warn-logged, never returned — signature
 // tracking must not fail the sweep; the ledger still counts the
 // window and the stamp retries next sweep while the signature
-// stays live. A nil patch degrades to in-RAM-only tracking.
+// stays live. A nil patch degrades to in-RAM-only tracking; a nil
+// fs degrades to annotation-only tracking (same nil posture
+// ClearPersistedFirstSeen honors).
 //
 // Returns true once the effective first-seen is >= minAge old —
 // including the first post-restart sweep when the annotation
@@ -120,7 +122,14 @@ func FirstSeenPersisted(ctx context.Context, log logr.Logger,
 	annoKey, key string, minAge time.Duration, now time.Time,
 	patch func(ctx context.Context, data []byte) error) bool {
 
-	first, tracked := fs.Observe(key, now)
+	// A nil ledger degrades to annotation-only tracking — the same
+	// nil posture ClearPersistedFirstSeen honors: the window lives
+	// entirely in the object's stamp, `first` starts at now (nothing
+	// tracked yet) and converges to the persisted stamp below.
+	first, tracked := now, false
+	if fs != nil {
+		first, tracked = fs.Observe(key, now)
+	}
 	m := firstSeenEntries(obj, annoKey)
 	annoT, annoOK := kube.ParseAnnoTime(m[key])
 	switch {
@@ -129,7 +138,9 @@ func FirstSeenPersisted(ctx context.Context, log logr.Logger,
 		// restart. Restore it into RAM (Seed only moves the stamp
 		// earlier) so the ledger and the annotation converge.
 		first = annoT
-		fs.Seed(key, annoT)
+		if fs != nil {
+			fs.Seed(key, annoT)
+		}
 	case annoOK:
 		// Annotation exists but is younger — the ledger's stamp is
 		// the wider window; fall through to the restamp check so

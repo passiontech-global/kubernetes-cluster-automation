@@ -93,7 +93,7 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	sos, err := p.Dyn.Resource(kube.GVRKedaScaledObject).List(ctx, metav1.ListOptions{})
+	sos, err := p.AllUnstructured(ctx, kube.GVRKedaScaledObject)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// KEDA absent — still reconcile the ledgers: a tuple/seen
@@ -111,8 +111,8 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	seenKeep := map[string]bool{}
-	for i := range sos.Items {
-		so := &sos.Items[i]
+	for i := range sos {
+		so := &sos[i]
 		key := so.GetNamespace() + "/" + so.GetName()
 		// annoPatch delivers this ScaledObject's first-seen merge
 		// patch — the durable half of the window below: the window
@@ -185,23 +185,43 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		rescue = 1
 	}
 
+	// The target resolves against the sweep's shared censuses —
+	// Deployment first, StatefulSet as the fallback kind, mirroring
+	// the old Get-then-Get shape (a census read failure is
+	// inconclusive, not "not at zero").
 	var annotations map[string]string
 	var replicas *int32
 	kind := ""
-	if dep, err := p.CS.AppsV1().Deployments(ns).Get(ctx, target, metav1.GetOptions{}); err == nil {
-		kind = "Deployment"
-		annotations = dep.Annotations
-		replicas = dep.Spec.Replicas
-	} else if apierrors.IsNotFound(err) {
-		if sts, serr := p.CS.AppsV1().StatefulSets(ns).Get(ctx, target, metav1.GetOptions{}); serr == nil {
-			kind = "StatefulSet"
-			annotations = sts.Annotations
-			replicas = sts.Spec.Replicas
-		} else {
-			return // target unresolvable this sweep — inconclusive
+	deps, err := p.AllDeployments(ctx)
+	switch {
+	case err != nil:
+		return // census unreadable — inconclusive, retry next sweep
+	default:
+		for i := range deps {
+			if deps[i].Namespace == ns && deps[i].Name == target {
+				kind = "Deployment"
+				annotations = deps[i].Annotations
+				replicas = deps[i].Spec.Replicas
+				break
+			}
 		}
-	} else {
-		return // lookup failed — inconclusive, retry next sweep
+	}
+	if kind == "" {
+		stss, serr := p.AllStatefulSets(ctx)
+		if serr != nil {
+			return // census unreadable — inconclusive
+		}
+		for i := range stss {
+			if stss[i].Namespace == ns && stss[i].Name == target {
+				kind = "StatefulSet"
+				annotations = stss[i].Annotations
+				replicas = stss[i].Spec.Replicas
+				break
+			}
+		}
+	}
+	if kind == "" {
+		return // target unresolvable this sweep — inconclusive
 	}
 	if replicas == nil || *replicas != 0 {
 		return // not wedged at zero — nothing to rescue

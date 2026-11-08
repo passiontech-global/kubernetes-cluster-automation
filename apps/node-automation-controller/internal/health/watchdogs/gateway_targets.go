@@ -13,7 +13,6 @@ import (
 	"context"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -123,16 +122,14 @@ func gatewayClassStuck(o *unstructured.Unstructured) bool {
 func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, class string) (string, bool) {
 	cached, at := p.gwClassCtlr, p.gwClassAt
 	if cached == nil || p.Now().Sub(at) > time.Minute {
-		list, err := p.Dyn.Resource(kube.GVRGatewayClass).
-			List(ctx, metav1.ListOptions{})
+		list, err := p.AllUnstructured(ctx, kube.GVRGatewayClass)
 		if err != nil {
 			return "", false
 		}
 		m := map[string]string{}
-		for i := range list.Items {
-			ctlr, _ := kube.NestedString(
-				list.Items[i].Object, "spec", "controllerName")
-			m[list.Items[i].GetName()] = ctlr
+		for i := range list {
+			ctlr, _ := kube.NestedString(list[i].Object, "spec", "controllerName")
+			m[list[i].GetName()] = ctlr
 		}
 		p.gwClassCtlr, p.gwClassAt = m, p.Now()
 		cached = m
@@ -168,6 +165,24 @@ func ciliumOwnsGatewayClass(_ context.Context, _ *operatorWorkqueueCheck,
 	return ctlr == "" || ctlr == ciliumGatewayController
 }
 
+// lookupGateway resolves one Gateway by namespace/name through the
+// sweep-wide snapshot (Deps.AllUnstructured) — client-side pick from
+// the memoized cluster-wide LIST instead of a per-parent GET. ok=false
+// when the Gateway doesn't resolve (absent or a memoized read error).
+func lookupGateway(ctx context.Context, p *operatorWorkqueueCheck,
+	ns, name string) (*unstructured.Unstructured, bool) {
+	gws, err := p.AllUnstructured(ctx, kube.GVRGateway)
+	if err != nil {
+		return nil, false
+	}
+	for i := range gws {
+		if gws[i].GetNamespace() == ns && gws[i].GetName() == name {
+			return &gws[i], true
+		}
+	}
+	return nil, false
+}
+
 // ciliumOwnsRouteParent is the same filter for the route kinds: it
 // resolves each spec.parentRefs[] entry to its Gateway and reports
 // whether any parent's class is cilium's. Objects with no Gateway
@@ -201,9 +216,8 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if ns == "" {
 			ns = o.GetNamespace()
 		}
-		gw, err := p.Dyn.Resource(kube.GVRGateway).Namespace(ns).
-			Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
+		gw, ok := lookupGateway(ctx, p, ns, name)
+		if !ok {
 			continue
 		}
 		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")

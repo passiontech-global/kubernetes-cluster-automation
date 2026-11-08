@@ -57,41 +57,17 @@ func init() {
 
 // healOperatorLeader deletes the stuck operator's leader pod to force
 // re-election — the same unsticking nudge a manual
-// `kubectl delete pod` applies. Gates, in order: the 1h cooldown
-// (wider of in-RAM ledger and the persisted Lease stamp), the
-// maintenance mutex (never kill a leader mid-drain/upgrade), and a
-// resolvable leader pod (holderIdentity "<pod>_<uuid>" first, then
-// the label selector in the Lease's namespace). Every guard refusal
-// is quiet — the frozen gauge + FAIL series already carry the alert.
+// `kubectl delete pod` applies. Gates, in order: a resolvable
+// candidate leader pod (holderIdentity "<pod>_<uuid>" first, then the
+// label selector in the Lease's namespace — Running, not terminating,
+// and only deleted when a controller owner will recreate it), then
+// the 1h cooldown (wider of in-RAM ledger keyed by
+// kube.PodControllerKey and the persisted Lease stamp), then the
+// maintenance mutex (never kill a leader mid-drain/upgrade). Every
+// guard refusal is quiet — the frozen gauge + FAIL series already
+// carry the alert.
 func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log logr.Logger,
 	op operatorTarget, lease *coordinationv1.Lease, reasons []string, now time.Time) {
-
-	// The preamble is the shared persisted-cooldown shape
-	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the 1h
-	// cooldown is the wider of the in-RAM ledger and the persisted
-	// Lease stamp — the ledger covers a heal whose anno patch never
-	// landed, the annotation survives an operator restart — and only
-	// after it clears do the maintenance mutex + global heal budget
-	// evaluate, fail closed (an unverifiable drain state IncErrors
-	// the queue). A nil lease (leaseOptional operators healing
-	// through the pod fallback) collapses the gate to the ledger
-	// half + mutex. The mutex verdict rides the Deps-wide memo: the
-	// first check to need it this sweep pays the API reads, every
-	// later caller within the Verdict TTL reuses the verdict.
-	var leaseObj metav1.Object
-	if lease != nil {
-		leaseObj = lease
-	}
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
-		&p.opHealed, leaseObj, operatorHealAnno,
-		op.name, operatorHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
 
 	pods, err := p.leaderPods(ctx, op, lease)
 	if err != nil {
@@ -105,10 +81,51 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 			"operator", op.name)
 		return
 	}
+	// The cooldown ledger is keyed by the pod's CONTROLLER
+	// (kube.PodControllerKey) — a re-created leader pod carries a
+	// fresh name, so a "<ns>/<pod>" key would let the same failure
+	// re-fire every sweep. The preamble is the shared
+	// persisted-cooldown shape (Deps.HealAllowedPersisted →
+	// heal.AllowedVPersisted): the 1h cooldown is the wider of the
+	// in-RAM ledger and the persisted Lease stamp — the ledger
+	// covers a heal whose anno patch never landed, the annotation
+	// survives an operator restart — and only after it clears does
+	// the maintenance mutex + global heal budget evaluate, fail
+	// closed (an unverifiable drain state IncErrors the queue). A
+	// nil lease (leaseOptional operators healing through the pod
+	// fallback) collapses the gate to the ledger half + mutex. The
+	// mutex verdict rides the Deps-wide memo: the first check to
+	// need it this sweep pays the API reads, every later caller
+	// within the Verdict TTL reuses the verdict.
+	podKey := kube.PodControllerKey(&pods[0])
+	var leaseObj metav1.Object
+	if lease != nil {
+		leaseObj = lease
+	}
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.opHealed, leaseObj, operatorHealAnno,
+		podKey, operatorHealCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
+		return
+	}
 
 	deleted := false
 	for i := range pods {
 		pod := &pods[i]
+		// A pod with no controller owner reference would NOT be
+		// recreated after the delete — deleting a lone operator
+		// pod that nothing restarts turns a stuck operator into a
+		// missing one. Only a controller-owned pod (Deployment /
+		// StatefulSet / DaemonSet managed) is a safe delete.
+		if metav1.GetControllerOf(pod) == nil {
+			log.Info("operator pod has no controller owner — delete skipped",
+				"operator", op.name, "pod", pod.Namespace+"/"+pod.Name)
+			continue
+		}
 		// The UID precondition inside heal.DeletePod closes the
 		// list→delete TOCTOU: a same-named replacement pod is not
 		// ours to reap.
@@ -134,7 +151,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	// unconditionally so a failed anno patch cannot un-suppress a
 	// delivered heal (StampPersisted's delivered-only contract is
 	// for the annotation stamp, not the heal itself).
-	p.opHealed.Stamp(op.name, now)
+	p.opHealed.Stamp(podKey, now)
 	// Persist the stamp on the Lease — the durable half of the
 	// cooldown. A nil lease (leaseOptional operators healing through
 	// the pod fallback) has nowhere to stamp; the in-RAM half is all
@@ -187,9 +204,16 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 			case err != nil:
 				return nil, fmt.Errorf("get leader pod %s/%s: %w",
 					podNS, name, err)
-			default:
-				return []corev1.Pod{*pod}, nil
 			}
+			// Only a live candidate is deletable: a pod already
+			// terminating (someone else is re-rolling it) or not
+			// Running is not the leader to bounce — fall through
+			// to the selector fallback.
+			if pod.DeletionTimestamp != nil ||
+				pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			return []corev1.Pod{*pod}, nil
 		}
 	}
 	pods, err := p.PodsMatching(ctx, podNS, op.podSelector)
@@ -197,6 +221,17 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 		return nil, fmt.Errorf("list operator pods in %s (selector %q): %w",
 			podNS, op.podSelector, err)
 	}
+	// Candidate filter — terminating pods are already going away and
+	// non-Running pods are not the elected holder; neither is a
+	// leader-pod-delete target.
+	live := pods[:0]
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil &&
+			pod.Status.Phase == corev1.PodRunning {
+			live = append(live, pod)
+		}
+	}
+	pods = live
 	// The selector fallback cannot tell the leader from its
 	// standbys — deleting every matched replica wedges the operator
 	// outright (the 2026-11-04 cilium-operator triple-delete). Cap

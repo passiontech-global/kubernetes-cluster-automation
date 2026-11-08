@@ -136,6 +136,26 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// Service — bound the map so stale stamps cannot accumulate.
 	b.bounceAt.PruneExpired(now, BounceCooldown)
 
+	// seen marks the deadSince keys still under evaluation — streaks
+	// for entries gone since the last sweep are pruned below.
+	seen := map[string]bool{}
+	// recoverSeen marks the recover-confirmation streaks Hit this
+	// sweep — the prune's keep set (Hit and defer land together, so
+	// every live streak key appears here each sweep).
+	recoverSeen := map[string]bool{}
+	// The two streak ledgers prune on EVERY cycle — declared up front
+	// so the defers also fire on the census/config-list failures that
+	// early-return below: a sweep that lost its inputs must not leave
+	// streaks pinned to entries it can no longer evaluate. An empty
+	// keep-set wipes the streaks, which only ever DELAYS a
+	// trip/recover — the conservative direction. brokenEmitted's
+	// prune is deliberately NOT deferred: its Begin/Prune pairing IS
+	// the carry-forward contract — an aborted sweep re-asserts
+	// nothing, so pruning it would flap live circuit_broken=1 series
+	// off during an API outage.
+	defer b.deadSince.Prune(func(k string) bool { return seen[k] })
+	defer b.recoverStreak.Prune(func(k string) bool { return recoverSeen[k] })
+
 	ready, err := snap.ReadyCounts()
 	if err != nil {
 		return err
@@ -148,13 +168,6 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	}
 	mwcs, vwcs := snap.MWC, snap.VWC
 
-	// seen marks the deadSince keys still under evaluation — streaks
-	// for entries gone since the last sweep are pruned below.
-	seen := map[string]bool{}
-	// recoverSeen marks the recover-confirmation streaks Hit this
-	// sweep — the prune's keep set (Hit and defer land together, so
-	// every live streak key appears here each sweep).
-	recoverSeen := map[string]bool{}
 	var failed []string
 
 	// cfgJob is one webhook configuration's per-sweep work: the
@@ -209,7 +222,7 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		})
 	}
 	for _, job := range jobs {
-		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
+		payload, trips, recovered, stillBroken, dropped := b.circuitPatch(log, g.Queue,
 			job.kind, job.name, job.anno, job.views, ready, now, seen, recoverSeen)
 		if payload == nil {
 			// Nothing to write — the still-broken re-asserts read
@@ -234,6 +247,12 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			failed = append(failed, job.name)
 			continue
 		}
+		// The patch landed — the stale-annotation drops are durable,
+		// so their series are released only here (a failed patch
+		// keeps the annotation, the SSOT, listing those names).
+		for _, name := range dropped {
+			metrics.WebhookCircuitBroken.DeleteLabelValues(job.kind, job.name, name)
+		}
 		circuitMetrics(&b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
 	}
 
@@ -250,19 +269,9 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// entry removed must not pin circuit_broken=1 forever.
 	b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues)
 
-	// Same prune for the dead-backend streaks: keys not re-evaluated
-	// this sweep (Service recovered, entry flipped to Ignore) re-arm
-	// their window.
-	b.deadSince.Prune(func(k string) bool { return seen[k] })
-
-	// And the recover-confirmation streaks: a Hit lands only in the
-	// defer branch (recoverSeen marks it there), so every streak key
-	// a sweep serves reappears in recoverSeen — a key missing from
-	// it lost its evaluation (webhook removed from the config) and
-	// must re-arm from zero on reappearance. Still-dead and
-	// confirmed-recover sweeps Reset their keys in-place inside
-	// circuitPatch.
-	b.recoverStreak.Prune(func(k string) bool { return recoverSeen[k] })
+	// The deadSince and recoverStreak prunes run via defer (declared
+	// beside their keep-sets above) so they fire on every cycle,
+	// including the early-return census failures.
 	if len(failed) > 0 {
 		return fmt.Errorf("circuit breaker patches failed for: %s",
 			strings.Join(failed, ", "))

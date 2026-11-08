@@ -285,3 +285,75 @@ func TestNodeLabelerLabelsFilePatchErrorContinues(t *testing.T) {
 		t.Fatalf("workload label on w1 despite the failing patch: %q", got)
 	}
 }
+
+// A successful patch must be mirrored into the in-memory byName
+// snapshot: duplicate rows (and a worker-role row after the worker
+// sweep) consult the same map for their already-applied check, and a
+// stale map re-patches what the sweep just fixed.
+func TestNodeLabelerInMemoryLabelsUpdated(t *testing.T) {
+	t.Run("duplicate labels.txt row for the same node", func(t *testing.T) {
+		cfg := writeLabelsFile(t,
+			"passiontech.dev/workload=app w1\npassiontech.dev/workload=app w1\n")
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
+		r := &nodeLabeler{cs: cs, configPath: cfg}
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		// The patch budget is the observable: the duplicate row must
+		// read its own patch out of memory, not re-patch.
+		if n := nodePatchActions(cs); n != 1 {
+			t.Fatalf("expected 1 node patch for a duplicated row, got %d", n)
+		}
+	})
+
+	t.Run("labels.txt row repeating the worker-role patch", func(t *testing.T) {
+		cfg := writeLabelsFile(t, "node-role.kubernetes.io/worker= w1\n")
+		cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil))
+		r := &nodeLabeler{cs: cs, configPath: cfg}
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		// Worker sweep patches first, mirrors into the snapshot; the
+		// file row then sees the label already applied.
+		if n := nodePatchActions(cs); n != 1 {
+			t.Fatalf("expected 1 node patch (worker role), got %d", n)
+		}
+	})
+
+	t.Run("changed value on a duplicated row still re-patches", func(t *testing.T) {
+		cfg := writeLabelsFile(t,
+			"passiontech.dev/tier=db w1\npassiontech.dev/tier=cache w1\n")
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
+		r := &nodeLabeler{cs: cs, configPath: cfg}
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if n := nodePatchActions(cs); n != 2 {
+			t.Fatalf("expected 2 node patches for two distinct values, got %d", n)
+		}
+		if got := testutil.GetNode(t, cs, "w1").Labels["passiontech.dev/tier"]; got != "cache" {
+			t.Fatalf("final tier value = %q, want cache", got)
+		}
+	})
+}
+
+// A labels.txt read failure that is NOT a missing file (permissions,
+// dangling symlink, volume trouble) silently disables file labels —
+// it must be metered like every other absorbed failure.
+func TestNodeLabelerReadFileErrorMetered(t *testing.T) {
+	// A directory path: os.ReadFile fails with EISDIR, not NotExist.
+	cfg := t.TempDir()
+	cs := fake.NewSimpleClientset(
+		testutil.Node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
+	r := &nodeLabeler{cs: cs, queue: "node-labeler", configPath: cfg}
+	before := testutil.QueueErrorCount(t, "node-labeler")
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("read failure must not error the reconcile: %v", err)
+	}
+	if got := testutil.QueueErrorCount(t, "node-labeler") - before; got != 1 {
+		t.Fatalf("labels.txt read failure not IncError'd, delta %v", got)
+	}
+}

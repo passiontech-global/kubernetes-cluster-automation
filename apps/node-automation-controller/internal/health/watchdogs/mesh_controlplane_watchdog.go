@@ -25,6 +25,11 @@ import (
 // cilium-operator / linkerd control-plane pod heals.
 type meshControlPlaneCheck struct {
 	*probefw.Deps
+
+	// gateEvals counts HealAllowed evaluations this process made —
+	// exactly one per heal attempt: healComponentPod no longer
+	// pre-gates, healNamedPod is the single gate owner.
+	gateEvals int
 }
 
 // newMeshControlPlaneCheck builds the W8-NM2/NM3 watchdog —
@@ -153,19 +158,12 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 }
 
 // healComponentPod deletes one pod matching prefix in ns — the
-// generic W8-NM2 shape: same cooldown bookkeeping as every pod-delete
-// heal in this sweep.
+// generic W8-NM2 shape. The cooldown/maintenance gate lives ONLY in
+// healNamedPod (one HealAllowed evaluation per heal attempt — the
+// old pre-gate here double-evaluated the same verdict back-to-back);
+// this helper just resolves the target and hands it over.
 func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.Logger,
 	component, ns, prefix string, cooldown time.Duration, now time.Time) {
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, component, cooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
 	pods, err := p.PodsIn(ctx, ns)
 	if err != nil {
 		metrics.IncError(p.Name)
@@ -187,16 +185,15 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 		target, cooldown, now)
 }
 
-// healNamedPod deletes the pod after the caller's cooldown decision —
-// recording the ledger entry and counting the heal. The maintenance
-// mutex is re-checked here (not just in healComponentPod) because
-// checkMeshControlPlane calls this directly for the wedged linkerd
-// pods — every pod-delete heal defers while a drain/upgrade is in
-// flight, and "cannot verify" fails closed. The check rides the
-// shared Deps verdict, so the re-check costs no extra API reads when
-// it runs back-to-back with healComponentPod's own gate.
+// healNamedPod is the SOLE heal gate for this check — every pod
+// delete (the generic healComponentPod target and the direct
+// wedged-linkerd path) passes through exactly one HealAllowed
+// evaluation here. The maintenance mutex re-check rides the shared
+// Deps verdict: every pod-delete heal defers while a drain/upgrade
+// is in flight, and "cannot verify" fails closed.
 func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logger,
 	component, key string, pod *corev1.Pod, cooldown time.Duration, now time.Time) {
+	p.gateEvals++
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, component, cooldown, now)
 	if unverifiable {

@@ -61,7 +61,7 @@ func TestImagePullStormMultiNamespaceIsOutage(t *testing.T) {
 }
 
 func TestImagePullStormRegistryMarkerIsOutage(t *testing.T) {
-	// Single namespace but a 429 marker flips it to outage.
+	// Single namespace but a rate-limit marker flips it to outage.
 	pod := imagePullWaitingPod("team-a", "web-1", "ImagePullBackOff",
 		"failed to pull: 429 Too Many Requests", 15*time.Minute)
 	cs := fake.NewSimpleClientset(pod)
@@ -77,6 +77,67 @@ func TestImagePullStormRegistryMarkerIsOutage(t *testing.T) {
 	}
 	if !strings.Contains(res.Why, "cluster_registry_pull_outage") {
 		t.Fatalf("why missing outage detail: %q", res.Why)
+	}
+}
+
+// Marker precision: a healthy Harbor URL or a bare "429" inside an
+// unrelated message must NOT flip the cluster outage — installing
+// Harbor is not an outage and a lone number is not rate-limit
+// evidence; the precise markers (toomanyrequests / "429 too many
+// requests" / proxyconnect tcp) still are.
+func TestImagePullStormMarkerPrecision(t *testing.T) {
+	quietMessages := []string{
+		`back-off pulling image "harbor.example.com/team/app:v1": not found`,
+		`pull failed: unexpected 429-byte response body`,
+	}
+	for _, msg := range quietMessages {
+		t.Run(msg, func(t *testing.T) {
+			pod := imagePullWaitingPod("team-a", "web-1",
+				"ImagePullBackOff", msg, 15*time.Minute)
+			cs := fake.NewSimpleClientset(pod)
+			p := testProber(cs)
+			base := time.Now()
+			p.Now = func() time.Time { return base }
+			probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			base = base.Add(11 * time.Minute)
+			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			if res.Pass {
+				t.Fatalf("single-namespace pull failure must still fail: %+v", res)
+			}
+			if strings.Contains(res.Why, "cluster_registry_pull_outage") {
+				t.Fatalf("quiet message %q flipped the cluster outage: %q", msg, res.Why)
+			}
+			if m := probetest.FindMetric(t, "node_automation_registry_pull_outage",
+				map[string]string{}); m != nil && m.GetGauge().GetValue() == 1 {
+				t.Fatalf("quiet message %q set the outage gauge", msg)
+			}
+			t.Cleanup(func() {
+				registryPullOutageGauge.Set(0)
+			})
+		})
+	}
+	loudMessages := []string{
+		"toomanyrequests: You have reached your pull rate limit",
+		"Get \"https://proxy\": proxyconnect tcp: dial tcp: connection refused",
+	}
+	for _, msg := range loudMessages {
+		t.Run(msg, func(t *testing.T) {
+			pod := imagePullWaitingPod("team-a", "web-1",
+				"ImagePullBackOff", msg, 15*time.Minute)
+			cs := fake.NewSimpleClientset(pod)
+			p := testProber(cs)
+			base := time.Now()
+			p.Now = func() time.Time { return base }
+			probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			base = base.Add(11 * time.Minute)
+			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			if !strings.Contains(res.Why, "cluster_registry_pull_outage") {
+				t.Fatalf("outage marker %q missed: %q", msg, res.Why)
+			}
+			t.Cleanup(func() {
+				registryPullOutageGauge.Set(0)
+			})
+		})
 	}
 }
 

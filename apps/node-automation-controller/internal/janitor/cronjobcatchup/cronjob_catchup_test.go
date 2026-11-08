@@ -299,25 +299,34 @@ func TestCronJobCatchupInvalidScheduleSkips(t *testing.T) {
 	}
 }
 
-// A jobs list failure inside deduped() degrades to "not deduped" —
-// a missed catch-up is worse than one extra idempotent Job.
-func TestCronJobCatchupDedupeListErrorStillCreates(t *testing.T) {
+// A jobs list failure leaves the dedupe state UNVERIFIABLE — deduped()
+// fails CLOSED (the catch-up is deferred, the next sweep retries) and
+// meters the failure once. Double-firing a workload is the worse side
+// of the bet.
+func TestCronJobCatchupDedupeListErrorFailsClosed(t *testing.T) {
 	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
+	// The sweep performs exactly one jobs list — fail that one; the
+	// assertion's own list afterwards falls through.
 	var failed atomic.Bool
 	cs.PrependReactor("list", "jobs",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			if failed.CompareAndSwap(false, true) {
-				return true, nil, errors.New("jobs list boom") // dedupe call only
+				return true, nil, errors.New("jobs list boom")
 			}
 			return false, nil, nil
 		})
 	c := newCatchup(cs)
+	c.queue = "cronjob-catchup" // the IncError label the assertion reads
+	before := testutil.QueueErrorCount(t, "cronjob-catchup")
 	if err := c.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n := ccJobCount(t, cs, "ops"); n != 1 {
-		t.Fatalf("catch-up job not created when dedupe list failed (%d jobs)", n)
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("catch-up spawned although the dedupe list failed (%d jobs)", n)
+	}
+	if got := testutil.QueueErrorCount(t, "cronjob-catchup") - before; got != 1 {
+		t.Fatalf("dedupe list failure metered %v times, want 1 (once per sweep)", got)
 	}
 }
 
@@ -761,5 +770,106 @@ func TestCronJobCatchupDedupeIndexesJobsOncePerSweep(t *testing.T) {
 	}
 	if n := ccJobCount(t, cs, "team"); n != 1 {
 		t.Fatalf("team jobs = %d, want the pre-existing labeled job only", n)
+	}
+}
+
+// The CronJob's OWN status.active list dedupes by itself — the
+// controller's record of in-flight runs counts even when no matching
+// Job object is visible in the snapshot.
+func TestCronJobCatchupCronJobActiveRefsSkip(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+	cj.Status.Active = []corev1.ObjectReference{{
+		Kind: "Job", Namespace: "ops", Name: "nightly-29381234",
+	}}
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("catch-up spawned although the cronjob reports active refs (%d jobs)", n)
+	}
+}
+
+// A freshly-created owned Job has not written status yet (no active
+// pods, no Complete/Failed condition) — it still dedupes, or a replay
+// on top of the just-scheduled run would double-fire the workload.
+func TestCronJobCatchupFreshOwnedJobSkips(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+	fresh := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ops", Name: "nightly-29381234",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1", Kind: "CronJob",
+				Name: "nightly", Controller: ptr.To(true),
+			}},
+		},
+		// zero Status: the Job controller has not reconciled it yet.
+	}
+	cs := fake.NewSimpleClientset(cj, fresh)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 1 {
+		t.Fatalf("catch-up spawned although the fresh owned job is still active (%d jobs)", n)
+	}
+}
+
+// A TERMINAL owned job no longer dedupes — a completed/failed run is
+// exactly the shape the catch-up is allowed to replay.
+func TestCronJobCatchupCompletedOwnedJobReplays(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+	done := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ops", Name: "nightly-29381234",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1", Kind: "CronJob",
+				Name: "nightly", Controller: ptr.To(true),
+			}},
+		},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}}},
+	}
+	cs := fake.NewSimpleClientset(cj, done)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 2 {
+		t.Fatalf("completed job deduped the replay: %d jobs, want 2", n)
+	}
+}
+
+// An impossible schedule (`0 0 31 2 *` — Feb 31 never exists) makes
+// cron.Next return the zero time: missedOver100 must stop iterating
+// on it (not spin) and report no missed ticks.
+func TestMissedOver100ZeroNextTerminates(t *testing.T) {
+	never, err := cron.ParseStandard("0 0 31 2 *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if next := never.Next(anchor); !next.IsZero() {
+		t.Fatalf("impossible schedule returned %v, want the zero time", next)
+	}
+	if missedOver100(never, anchor, anchor.Add(1000*time.Hour)) {
+		t.Fatal("a schedule with no next tick cannot owe misses")
+	}
+}
+
+// The same impossible schedule never reads as stale — the zero Next
+// is not a missed tick in the past, so no catch-up spawns and the
+// sweep terminates instead of spinning.
+func TestCronJobCatchupImpossibleScheduleNotStale(t *testing.T) {
+	cj := ccCronJob("ops", "never", "0 0 31 2 *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("catch-up spawned for a schedule that can never fire (%d jobs)", n)
 	}
 }

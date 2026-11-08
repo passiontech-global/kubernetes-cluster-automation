@@ -475,3 +475,77 @@ func TestJournaldUnreadableEvent(t *testing.T) {
 		t.Fatalf("JournaldUnreadable events = %d, want 1", n)
 	}
 }
+
+// appendRawTo appends bytes verbatim to an ARBITRARY watchdog-log
+// generation path (the .1 rotation-tail test drives the rotated file
+// directly).
+func (e *env) appendRawTo(t *testing.T, path, data string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(data)
+}
+
+// TestRotationDrainsDotOneTail: the watchdog store rotates by rename
+// (live → .1); lines appended to the old generation AFTER the last
+// read live on in .1. On the shrink the reader must drain that tail
+// FIRST and then the fresh file from offset 0 — the events it maps
+// onto are neither lost nor reordered, the fresh lines still land,
+// and the offset restarts at the fresh file's own coordinates (the
+// drained tail's length must not shift it).
+func TestRotationDrainsDotOneTail(t *testing.T) {
+	e := fixture(t)
+	e.appendLog(t, "ACTION: restarting k0sworker - pre-rotation")
+	e.cycle()
+	if got := e.counter("K0sworkerRestarted"); got != 1 {
+		t.Fatalf("pre-rotation counter = %v, want 1", got)
+	}
+	// Advance the offset without a match — the tail that follows must
+	// NOT re-deliver this filler.
+	e.appendLog(t, "unmatched filler line")
+	e.cycle()
+
+	// Rotate exactly like the store: live → .1, then the old
+	// generation grows one more line (the pre-rename append the
+	// reader has not seen), then the fresh live file starts.
+	if err := os.Rename(e.log, e.log+".1"); err != nil {
+		t.Fatal(err)
+	}
+	e.appendRawTo(t, e.log+".1",
+		e.now.Format(time.RFC3339)+" ACTION: restarting k0sworker - tail-of-old-generation\n")
+	e.appendLog(t, "ACTION: restarting k0sworker - post-rotation")
+
+	e.cycle()
+
+	if got := e.counter("K0sworkerRestarted"); got != 3 {
+		t.Fatalf("counter = %v, want 3 (tail + post-rotation both counted)", got)
+	}
+	evs := eventsByReason(t, e, "K0sworkerRestarted")
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3", len(evs))
+	}
+	if !strings.Contains(evs[1].Note, "tail-of-old-generation") ||
+		!strings.Contains(evs[2].Note, "post-rotation") {
+		t.Fatalf("tail lines out of order: %q then %q",
+			evs[1].Note, evs[2].Note)
+	}
+	// The offset must sit at the FRESH file's end — the .1 tail's
+	// bytes must not have shifted it (a shifted offset would skip a
+	// window of the new file every cycle).
+	fi, err := os.Stat(e.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.r.logOffset != fi.Size() {
+		t.Fatalf("logOffset = %d, want the fresh file size %d",
+			e.r.logOffset, fi.Size())
+	}
+	// The next cycle must not re-emit the drained lines.
+	e.cycle()
+	if got := e.counter("K0sworkerRestarted"); got != 3 {
+		t.Fatalf("counter after re-cycle = %v, want 3 (no re-delivery)", got)
+	}
+}

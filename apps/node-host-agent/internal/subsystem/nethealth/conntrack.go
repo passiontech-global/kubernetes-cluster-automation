@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
@@ -136,11 +137,18 @@ func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
 	if !seen || sum <= prev || sum-prev <= conntrackDropSpike {
 		return
 	}
-	n.state.AppendLog(fmt.Sprintf(
-		"ACTION: conntrack insert_failed+drop spiked +%d in one cycle (> %d) — flushing stale UDP conntrack entries",
-		sum-prev, conntrackDropSpike))
+	n.state.SuspectLog(checkCT, fmt.Sprintf(
+		"suspect: conntrack insert_failed+drop spiked +%d in one cycle (> %d) — flushing stale UDP conntrack entries (budget last-conntrack-flush)",
+		sum-prev, conntrackDropSpike), suspectLogCadence)
 	n.flushStaleUDPConntrackAll(ctx, checkCT)
 }
+
+// conntrackFlushCooldown — one conntrack -D per window: the flush is
+// a blunt instrument (every live UDP flow re-tracks on its next
+// packet; WireGuard/Nebula re-handshake; CoreDNS clients see a
+// one-off reply loss), so a sustained insert_failed spike or a burst
+// of DNS-path transitions must not re-run it every cycle.
+const conntrackFlushCooldown = 15 * time.Minute
 
 // flushStaleUDPConntrackAll drops EVERY udp conntrack entry — the
 // coarse remedy for an insert_failed/drop spike, where the wedged
@@ -150,6 +158,16 @@ func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
 // best-effort contract as flushStaleUDPConntrack: runMountCmd seam,
 // a missing conntrack binary logs and moves on.
 func (n *NetHealth) flushStaleUDPConntrackAll(ctx context.Context, check string) {
+	if !n.state.RateTrySpend("last-conntrack-flush", conntrackFlushCooldown) {
+		logger().Debug("conntrack udp flush skipped — cooldown (last-conntrack-flush <" +
+			conntrackFlushCooldown.String() + ")")
+		return
+	}
+	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
+	// joins the host NET namespace, so `conntrack` would resolve
+	// against the container image (which does not ship
+	// conntrack-tools). The host mount ns reaches the host binary;
+	// the host net ns operates on the real conntrack table.
 	out, err := n.cfg.runMountCmd(ctx,
 		[]string{"conntrack", "-D", "-p", "udp"})
 	if err != nil {
@@ -228,6 +246,11 @@ func nebulaPeerUnderlayIPs(wd *watchdogconf.Config) []string {
 // logs and moves on, it never fails the cycle. check attributes the
 // flush to the calling check.
 func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
+	if !n.state.RateTrySpend("last-conntrack-flush", conntrackFlushCooldown) {
+		logger().Debug("conntrack udp/53 flush skipped — cooldown (last-conntrack-flush <" +
+			conntrackFlushCooldown.String() + ")")
+		return
+	}
 	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
 	// joins the host NET namespace, so `conntrack` would resolve
 	// against the container image (which does not ship

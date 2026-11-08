@@ -200,7 +200,7 @@ func TestSATokenTTLStalled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Annotations["node-ops.passiontech.io/token-resync-at"] == "" {
+	if got.Annotations["passiontech.dev/token-resync-at"] == "" {
 		t.Fatal("token-resync-at annotation missing after stall")
 	}
 	// Second cycle within the nudge cooldown → no second patch.

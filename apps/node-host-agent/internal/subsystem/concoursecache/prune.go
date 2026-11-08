@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -103,7 +104,12 @@ func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge 
 		}
 		if err := os.Remove(path); err == nil {
 			n++
-			bytes += info.Size()
+			// st.Blocks*512, not Size(): the freed-bytes gauge is
+			// "what the disk actually got back" — a sparse or
+			// tail-packed file's logical Size() can wildly exceed
+			// (sparse) or fall short of (block tail padding) its
+			// footprint.
+			bytes += info.Sys().(*syscall.Stat_t).Blocks * 512
 		} else {
 			failed++
 			lastErr = err

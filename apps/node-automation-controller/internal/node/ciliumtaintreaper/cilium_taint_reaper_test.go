@@ -3,6 +3,7 @@ package ciliumtaintreaper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -10,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -252,5 +254,88 @@ func TestCiliumTaintReaperUntaintError(t *testing.T) {
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed despite the rejected patch")
+	}
+}
+
+// stubPodReader is the informer-cache seam stand-in: serves pods from
+// a fixed slice and records the List options so tests can pin the
+// cache-scope contract (kube-system + k8s-app=cilium — the manager
+// cache's ByObject shape; a read outside it would silently miss).
+type stubPodReader struct {
+	pods    []corev1.Pod
+	err     error
+	lists   int
+	lastNS  string
+	lastSel string
+}
+
+func (s *stubPodReader) List(_ context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	s.lists++
+	lo := &client.ListOptions{}
+	for _, opt := range opts {
+		opt.ApplyToList(lo)
+	}
+	s.lastNS = lo.Namespace
+	if lo.LabelSelector != nil {
+		s.lastSel = lo.LabelSelector.String()
+	}
+	if s.err != nil {
+		return s.err
+	}
+	pl, ok := list.(*corev1.PodList)
+	if !ok {
+		return fmt.Errorf("stubPodReader: unsupported list type %T", list)
+	}
+	pl.Items = append(pl.Items, s.pods...)
+	return nil
+}
+
+// The verdict reads cilium pods through the informer cache when the
+// manager client is wired — the Pod watch this reconciler registers
+// keeps it fresh — never a per-sweep apiserver LIST. The untaint
+// WRITE still lands on the direct clientset.
+func TestCiliumTaintReaperPodReadViaInformerCache(t *testing.T) {
+	healthy := *ciliumPod("n1", corev1.PodRunning, true)
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
+	// The direct path must never be consulted while the cache seam is
+	// wired: any pod list against the clientset is a bug.
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("direct pod list must not run when the cache seam is wired")
+		})
+	pr := &stubPodReader{pods: []corev1.Pod{healthy}}
+	r := &ciliumTaintReaper{cs: cs, podReader: pr}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if pr.lists != 1 {
+		t.Fatalf("cache read issued %d times, want 1", pr.lists)
+	}
+	if pr.lastNS != "kube-system" || pr.lastSel != "k8s-app=cilium" {
+		t.Fatalf("cache List scope = %s/%s, want kube-system + k8s-app=cilium (the informer's ByObject shape)",
+			pr.lastNS, pr.lastSel)
+	}
+	// The destructive write went through the direct clientset: the
+	// stale taint is gone from the fake's node.
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		t.Fatal("stale taint not reaped through the direct clientset")
+	}
+}
+
+// A cache read failure is a real error — an empty snapshot must not
+// read as "no cilium pod on the node" and keep (or drop) a taint on
+// unreadable state.
+func TestCiliumTaintReaperCachePodError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
+	r := &ciliumTaintReaper{cs: cs,
+		podReader: &stubPodReader{err: errors.New("cache boom")}}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the informer-cache pod read fails")
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		t.Fatal("taint must survive a failed pod read")
 	}
 }

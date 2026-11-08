@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -265,10 +266,13 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 			"namespace", w.namespace, "notReadyPods", len(unready), "pods", unready)
 		return 0, nil
 	}
-	epsList, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).List(ctx,
-		metav1.ListOptions{
-			LabelSelector: discoveryv1.LabelServiceName + "=" + cfTunnelProxySliceService,
-		})
+	// Paged like every sweep list — the headless Service usually owns
+	// a handful of slices, but the selector-scoped List still gets
+	// the shared 500-per-page bound.
+	epsItems, err := kube.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: discoveryv1.LabelServiceName + "=" + cfTunnelProxySliceService,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.EndpointSlices(w.cs, w.namespace))
 	if err != nil {
 		return 0, fmt.Errorf("list proxy endpointslices in %s: %w", w.namespace, err)
 	}
@@ -282,12 +286,12 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	if err != nil {
 		return 0, fmt.Errorf("marshal resync patch: %w", err)
 	}
-	for i := range epsList.Items {
+	for i := range epsItems {
 		if _, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).Patch(ctx,
-			epsList.Items[i].Name, types.MergePatchType,
+			epsItems[i].Name, types.MergePatchType,
 			patch, metav1.PatchOptions{}); err != nil {
 			return 0, fmt.Errorf("resync patch endpointslice/%s: %w",
-				epsList.Items[i].Name, err)
+				epsItems[i].Name, err)
 		}
 	}
 	// Delivered-only: the pacing stamp lands after every slice took
@@ -296,8 +300,8 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	w.lastResync.Stamp(cfTunnelProxySliceService, now)
 	log.Info("ACTION: forced proxy config resync",
 		"namespace", w.namespace, "notReadyPods", len(unready),
-		"pods", unready, "slices", len(epsList.Items))
-	return len(epsList.Items), nil
+		"pods", unready, "slices", len(epsItems))
+	return len(epsItems), nil
 }
 
 // clearStaleStall is check 2: drop a lingering
@@ -370,6 +374,12 @@ func (w *cfTunnelProxyWatchdog) connectorTargets() []cfTunnelConnectorTarget {
 // when EVERY running replica of a target is unready >= 5m, delete
 // the single oldest one (10m cooldown) so the Deployment recreates
 // it instead of skipping forever. Returns pods deleted.
+//
+// The maintenance mutex + global heal budget (heal.Gate) are only
+// consulted AFTER at least one pod provably needs the delete: the
+// mutex evaluation costs API reads and the budget is a shared global
+// allowance, so spending either on a sweep that found nothing to
+// heal burns 12-heals-per-hour windows for no effect.
 func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
 	now := w.now.Now()
@@ -377,13 +387,29 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// but die with their Deployments — bound the map so decommissioned
 	// workloads' stamps cannot accumulate forever.
 	w.lastHeal.PruneExpired(now, cfTunnelHealCooldown)
+
+	// Detection pass (read-only): which pods across every target
+	// provably need the delete this sweep? Log tails are read here —
+	// a read failure skips that pod exactly like before.
+	var candidates []cfTunnelWedge
+	for _, tgt := range w.connectorTargets() {
+		found, err := w.scanConnectorTarget(ctx, tgt, now, log)
+		if err != nil {
+			return 0, err
+		}
+		candidates = append(candidates, found...)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
 	// Maintenance mutex + global heal budget — the deletes below kill
 	// LIVE pods, so they defer while a cordon/drain/kured reboot or a
 	// k0s upgrade is in flight, and "cannot verify" fails closed.
 	// heal.Gate runs the nil-heals-ledger preamble: this module's
-	// pacing is the per-controller lastHeal cooldown checked per pod
-	// inside healConnectorTarget — only the mutex and budget gates
-	// apply here, shared via w.verdict so the sweep pays one
+	// pacing is the per-controller lastHeal cooldown already checked
+	// per pod inside scanConnectorTarget — only the mutex and budget
+	// gates apply here, shared via w.verdict so the sweep pays one
 	// evaluation.
 	if w.dyn != nil {
 		proceed, unverifiable := heal.Gate(ctx, log, &w.verdict,
@@ -397,12 +423,15 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 		}
 	}
 	healed := 0
-	for _, tgt := range w.connectorTargets() {
-		n, err := w.healConnectorTarget(ctx, tgt, now)
-		if err != nil {
-			return healed, err
+	for _, c := range candidates {
+		if err := w.deleteConnectorPod(ctx, c.pod, c.reason); err != nil {
+			log.Error(err, "delete wedged connector pod failed",
+				"pod", c.pod.Namespace+"/"+c.pod.Name)
+			continue
 		}
-		healed += n
+		w.lastHeal.Stamp(kube.PodControllerKey(c.pod), now)
+		w.stampHealPersisted(ctx, c.pod, now)
+		healed++
 	}
 	if healed > 0 {
 		log.Info("ACTION: deleted wedged cloudflared pod(s)", "deleted", healed)
@@ -410,18 +439,30 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	return healed, nil
 }
 
-// healConnectorTarget scans one pod population. Only Running pods
-// are candidates; Ready=True pods are never touched. Unready pods
-// younger than cfTunnelUnreadyMinAge are left alone — rollout
-// startup churn must not trigger deletes.
-func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
-	tgt cfTunnelConnectorTarget, now time.Time) (int, error) {
+// cfTunnelWedge is one pod the detection pass proved needs the
+// delete — the only shape healCloudflaredWedges acts on.
+type cfTunnelWedge struct {
+	pod    *corev1.Pod
+	reason string
+}
+
+// scanConnectorTarget is the detection half of the old
+// healConnectorTarget: it scans one pod population and returns the
+// pods this sweep would delete WITHOUT deleting them. Only Running
+// pods are candidates; Ready=True pods are never touched. Unready
+// pods younger than cfTunnelUnreadyMinAge are left alone — rollout
+// startup churn must not trigger deletes. The per-target
+// cfTunnelMaxHealsPerTarget bound applies here, so the gate only
+// ever sees the same deletes the old code would have issued.
+func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
+	tgt cfTunnelConnectorTarget, now time.Time, log logr.Logger,
+) ([]cfTunnelWedge, error) {
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: tgt.selector,
 		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(w.cs, tgt.namespace))
 	if err != nil {
-		return 0, fmt.Errorf("list connector pods in %s: %w",
+		return nil, fmt.Errorf("list connector pods in %s: %w",
 			tgt.namespace, err)
 	}
 	var running []*corev1.Pod
@@ -442,15 +483,14 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 		}
 	}
 	if len(running) == 0 || len(unreadyStale) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	log := logf.FromContext(ctx)
-	healed := 0
+	var wedges []cfTunnelWedge
 	// Fatal-signature pods: unready >= 5m AND wedged logs — doomed
 	// pods a config resync cannot revive. Bounded per target per
 	// sweep so a mass-wedge cannot delete the whole fleet at once.
 	for _, p := range unreadyStale {
-		if healed >= cfTunnelMaxHealsPerTarget {
+		if len(wedges) >= cfTunnelMaxHealsPerTarget {
 			break
 		}
 		wedged, err := w.podLogWedged(ctx, p)
@@ -465,20 +505,13 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 		if !wedged || w.healCooledDown(ctx, p, now) {
 			continue
 		}
-		if err := w.deleteConnectorPod(ctx, p, "fatal_logs"); err != nil {
-			log.Error(err, "delete wedged connector pod failed",
-				"pod", p.Namespace+"/"+p.Name)
-			continue
-		}
-		w.lastHeal.Stamp(kube.PodControllerKey(p), now)
-		w.stampHealPersisted(ctx, p, now)
-		healed++
+		wedges = append(wedges, cfTunnelWedge{pod: p, reason: "fatal_logs"})
 	}
 	// readyCount==0 deadlock: every running replica unready — the
 	// resync loop can never converge. Delete the single OLDEST
 	// stale-unready pod (10m cooldown) so its Deployment recreates
 	// it; one per sweep bounds churn during a genuine outage.
-	if ready == 0 && healed < cfTunnelMaxHealsPerTarget {
+	if ready == 0 && len(wedges) < cfTunnelMaxHealsPerTarget {
 		oldest := unreadyStale[0]
 		for _, p := range unreadyStale[1:] {
 			if p.CreationTimestamp.Before(&oldest.CreationTimestamp) {
@@ -486,18 +519,10 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 			}
 		}
 		if !w.healCooledDown(ctx, oldest, now) {
-			if err := w.deleteConnectorPod(ctx, oldest,
-				"all_unready_oldest"); err != nil {
-				log.Error(err, "delete oldest unready connector pod failed",
-					"pod", oldest.Namespace+"/"+oldest.Name)
-			} else {
-				w.lastHeal.Stamp(kube.PodControllerKey(oldest), now)
-				w.stampHealPersisted(ctx, oldest, now)
-				healed++
-			}
+			wedges = append(wedges, cfTunnelWedge{pod: oldest, reason: "all_unready_oldest"})
 		}
 	}
-	return healed, nil
+	return wedges, nil
 }
 
 // healCooledDown reports whether this pod's controller is inside

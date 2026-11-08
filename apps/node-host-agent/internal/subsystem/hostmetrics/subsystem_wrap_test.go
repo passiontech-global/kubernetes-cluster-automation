@@ -2,7 +2,6 @@ package hostmetrics
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -78,16 +77,5 @@ func TestCPUDeliveredSetSink(t *testing.T) {
 	defer p.mu.Unlock()
 	if p.sink != 42 {
 		t.Fatalf("sink=%d want 42", p.sink)
-	}
-}
-
-// TestSelfFdinfoDir: the agent's own fdinfo dir rides ProcRoot so
-// tests can point it at a fixture.
-func TestSelfFdinfoDir(t *testing.T) {
-	cfg, dirs := fixture(t)
-	c := New(cfg)
-	want := filepath.Join(dirs["proc"], "self", "fdinfo")
-	if got := c.selfFdinfoDir(); got != want {
-		t.Fatalf("selfFdinfoDir=%q want %q", got, want)
 	}
 }

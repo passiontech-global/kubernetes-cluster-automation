@@ -1,7 +1,10 @@
 package watchdogs
 
 import (
+	"errors"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,4 +125,79 @@ func TestOnePasswordConnectSyncProbe(t *testing.T) {
 		map[string]string{"namespace": "onepassword", "pod": "onepassword-connect-bbb"}) != nil {
 		t.Fatal("healthy pod flagged unhealthy")
 	}
+}
+
+// Recovery prune: a degraded episode emits the Warning Event once;
+// when the component recovers (a conclusive healthy cycle) the
+// episode marker is pruned so a LATER relapse emits a fresh Event —
+// a Prometheus flap mid-recovery must not re-arm it, though.
+func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(false)
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if !strings.Contains(query, "Watchdog") {
+			return nil // counters quiet in every cycle
+		}
+		if healthy.Load() {
+			return []probetest.PromTestSample{{Labels: map[string]string{}, Value: 1}}
+		}
+		return nil // heartbeat absent — degraded
+	})
+	cs := fake.NewSimpleClientset()
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+	// Episode 1 — degraded: one Warning Event, marker armed.
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("degraded pipeline must fail")
+	}
+	if !chk.evented.Has("watchdog_heartbeat") {
+		t.Fatal("episode marker not armed after the first emission")
+	}
+	// Inconclusive cycle (query error) — the marker must NOT be
+	// pruned (a flap must not re-page the same episode).
+	p.HTTPClient = failingHTTPClient(t)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("inconclusive cycle must not pass")
+	}
+	if !chk.evented.Has("watchdog_heartbeat") {
+		t.Fatal("episode marker pruned on an inconclusive cycle")
+	}
+	p.HTTPClient = srv.Client()
+	// Recovery — conclusive healthy cycle prunes the marker.
+	healthy.Store(true)
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("healthy pipeline must pass: %+v", res)
+	}
+	if chk.evented.Has("watchdog_heartbeat") {
+		t.Fatal("episode marker not pruned after recovery")
+	}
+	// Relapse — a FRESH event is emitted (marker re-armed).
+	healthy.Store(false)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("relapsed pipeline must fail")
+	}
+	evs, err := cs.EventsV1().Events(obsPipelineEventNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 2 {
+		t.Fatalf("warning events = %d, want 2 (episode + relapse)", len(evs.Items))
+	}
+}
+
+// failingHTTPClient returns an HTTP client whose transport always
+// errors — the Prometheus-unreachable posture for the inconclusive
+// cycle in the recovery-prune test.
+func failingHTTPClient(t *testing.T) *http.Client {
+	t.Helper()
+	return &http.Client{Transport: failingRoundTripper{}}
+}
+
+type failingRoundTripper struct{}
+
+func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("prometheus unreachable")
 }

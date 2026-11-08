@@ -10,7 +10,7 @@
 // decodes each JWT's exp claim WITHOUT logging token contents,
 // exports node_agent_sa_token_min_ttl_seconds, and for a Running
 // pod under the floor emits SATokenRotationStalled + touches the
-// node-ops.passiontech.io/token-resync-at pod annotation so the
+// passiontech.dev/token-resync-at pod annotation so the
 // kubelet remount/reconcile loop re-syncs the volume.
 package runtime
 
@@ -35,7 +35,7 @@ import (
 // saTokenResyncAnnotation is the nudge the check stamps on the pod —
 // kubelet's volumeManager observes pod updates and re-syncs the
 // projected volume, remounting a freshly-issued token.
-const saTokenResyncAnnotation = "node-ops.passiontech.io/token-resync-at"
+const saTokenResyncAnnotation = "passiontech.dev/token-resync-at"
 
 // saTokenNudgeCooldown is the per-pod re-nudge budget — the
 // annotation's own timestamp is the dedupe (a resync that landed

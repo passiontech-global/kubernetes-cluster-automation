@@ -44,3 +44,5 @@ tasks:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      # golangci-lint resolves its config by walking up to the repo root.
+      - '/.golangci.yml'

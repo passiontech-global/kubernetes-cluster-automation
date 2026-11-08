@@ -174,6 +174,11 @@ type Config struct {
 	// UDS probe reads <K0sRunDir>/konnectivity-server/*.sock.
 	// "" → /host/run/k0s (DaemonSet host mount).
 	K0sRunDir string
+	// TextfileDir is the node-exporter drop dir (NODE_HOST_AGENT_
+	// TEXTFILE_DIR via hostctx) — "" falls back to the K0sDir
+	// sibling derivation textfilePromDir kept before the env
+	// override existed.
+	TextfileDir string
 	// AdminKubeconfig is the k0s admin.conf (embedded client creds);
 	// AdminCert/AdminKey/AdminCA are the fallback client-cert triple.
 	AdminKubeconfig string

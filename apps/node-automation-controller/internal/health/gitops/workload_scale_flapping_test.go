@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -226,5 +227,178 @@ func TestScaleFlappingRolloutSteadyUp(t *testing.T) {
 
 	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("steady one-direction Rollout scaling must pass: %+v", res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ONE RollingUpdate exclusions — rollout cadence must not read as flap
+// ---------------------------------------------------------------------------
+
+// scaleRSEvent builds a ScalingReplicaSet event on a Deployment whose
+// message names an explicit ReplicaSet — the pair-exclusion key.
+func scaleRSEvent(ns, name, rs string, up bool, when time.Time) *corev1.Event {
+	dir := "down"
+	if up {
+		dir = "up"
+	}
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      fmt.Sprintf("%s-%s-%d", rs, dir, when.UnixNano()),
+			UID:       types.UID(fmt.Sprintf("%s-%s-%d", rs, dir, when.UnixNano())),
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: "Deployment", Namespace: ns, Name: name,
+		},
+		Reason:        "ScalingReplicaSet",
+		Message:       fmt.Sprintf("Scaled %s replica set %s to 2", dir, rs),
+		LastTimestamp: metav1.NewTime(when),
+	}
+}
+
+// One RollingUpdate's maxSurge cadence scales the NEW ReplicaSet up
+// and the OLD one down in an alternating up/down rhythm — pairs that
+// name two different ReplicaSets of the same Deployment are rollout
+// churn, not tug-of-war, and must not flip.
+func TestScaleFlappingRolloutPairsExcluded(t *testing.T) {
+	// TestScaleFlappingDetected leaves its series in the shared
+	// registry — clear it so the absence assertion below is real.
+	workloadScaleFlappingGauge.DeleteLabelValues("apps", "Deployment", "web")
+	base := time.Now()
+	cs := fake.NewSimpleClientset()
+	up := true
+	for i := range 12 {
+		rs := "web-5d8f7b9c4" // the new RS the rollout scales up
+		if !up {
+			rs = "web-6c9d8f7b5" // the old RS it drains
+		}
+		e := scaleRSEvent("apps", "web", rs, up,
+			base.Add(-time.Duration(12-i)*2*time.Minute))
+		if _, err := cs.CoreV1().Events("apps").Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		up = !up
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("a single rolling update must not flag flapping: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_workload_scale_flapping",
+		map[string]string{"namespace": "apps", "kind": "Deployment", "name": "web"}); m != nil {
+		t.Fatal("rollout cadence must not emit the flapping gauge")
+	}
+}
+
+// The exclusion only filters cross-ReplicaSet pairs: a workload whose
+// SAME ReplicaSet keeps being scaled back and forth still flags, even
+// when a rollout's churn is interleaved before it.
+func TestScaleFlappingSameRSFlipsStillFlags(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset()
+	mk := func(rs string, up bool, off time.Duration) {
+		e := scaleRSEvent("apps", "web", rs, up, base.Add(-off))
+		if _, err := cs.CoreV1().Events("apps").Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A rollout's tail (cross-RS pairs — no flips), then a real
+	// tug-of-war on the surviving RS: up/down ×3 = 6 flips.
+	off := 60 * time.Minute
+	mk("web-oldrs", false, off)
+	mk("web-newrs", true, off-2*time.Minute)
+	off -= 4 * time.Minute
+	mk("web-newrs", false, off)
+	for i := range 7 {
+		off -= 2 * time.Minute
+		mk("web-newrs", i%2 == 1, off)
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("same-RS reversal must still flag: %+v", res)
+	}
+}
+
+// stsScaleEvent builds the StatefulSet controller's pod create/delete
+// event — create is a scale-up signal, delete a scale-down one.
+func stsScaleEvent(ns, name string, del bool, when time.Time) *corev1.Event {
+	verb, reason := "create", "SuccessfulCreate"
+	if del {
+		verb, reason = "delete", "SuccessfulDelete"
+	}
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      fmt.Sprintf("%s-%s-%d", name, verb, when.UnixNano()),
+			UID:       types.UID(fmt.Sprintf("%s-%s-%d", name, verb, when.UnixNano())),
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: "StatefulSet", Namespace: ns, Name: name,
+		},
+		Reason: reason,
+		Message: fmt.Sprintf("%s Pod %s-%d in StatefulSet %s successful",
+			verb, name, when.UnixNano(), name),
+		LastTimestamp: metav1.NewTime(when),
+	}
+}
+
+// stsMidRollout seeds a StatefulSet whose revisions either differ
+// (mid-rollout) or match (settled).
+func stsMidRollout(ns, name, current, update string) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Status: appsv1.StatefulSetStatus{
+			CurrentRevision: current, UpdateRevision: update,
+		},
+	}
+}
+
+// A StatefulSet mid rolling update (currentRevision != updateRevision)
+// delete/creates one pod pair per revision step — alternating
+// directions that are the UPDATE controller's churn, not scaling.
+// They must not flip.
+func TestScaleFlappingSTSMidRolloutExcluded(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(stsMidRollout("apps", "db", "db-1", "db-2"))
+	del := false
+	for i := range 12 {
+		e := stsScaleEvent("apps", "db", del,
+			base.Add(-time.Duration(12-i)*2*time.Minute))
+		if _, err := cs.CoreV1().Events("apps").Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		del = !del
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("a mid-rollout StatefulSet must not flag flapping: %+v", res)
+	}
+}
+
+// The same event cadence on a SETTLED StatefulSet (revisions equal —
+// no rollout in flight) IS scale tug-of-war and must flag.
+func TestScaleFlappingSTSSettledStillFlags(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(stsMidRollout("apps", "db", "db-2", "db-2"))
+	del := false
+	for i := range 7 {
+		e := stsScaleEvent("apps", "db", del,
+			base.Add(-time.Duration(7-i)*2*time.Minute))
+		if _, err := cs.CoreV1().Events("apps").Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		del = !del
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("settled-StatefulSet create/delete churn must flag")
 	}
 }

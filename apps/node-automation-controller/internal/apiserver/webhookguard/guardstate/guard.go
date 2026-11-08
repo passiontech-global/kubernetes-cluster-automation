@@ -171,6 +171,11 @@ func (s *Snapshot) SetVWC(cfg *admissionv1.ValidatingWebhookConfiguration) {
 // check both draw from the same result, including the same error.
 func (s *Snapshot) ReadyCounts() (EndpointCensus, error) {
 	s.readyOnce.Do(func() {
+		if s.Ctx == nil {
+			// Literally-built test fixtures carry no ctx — the probe
+			// pool reads ctx.Err(), which would nil-deref otherwise.
+			s.Ctx = context.Background()
+		}
 		s.ready, s.readyErr = s.G.readyEndpointCounts(s.Ctx, s)
 	})
 	return s.ready, s.readyErr

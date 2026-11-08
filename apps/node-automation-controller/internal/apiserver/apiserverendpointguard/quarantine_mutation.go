@@ -146,8 +146,16 @@ func unionIPs(a []string, b map[string]bool) []string {
 }
 
 // removeEndpointIP drops ip from every subset's Addresses AND
-// NotReadyAddresses; a subset left with zero addresses is dropped so
-// the object never serializes an empty-addresses subset.
+// notReadyAddresses. A subset left with zero addresses usually drops —
+// EXCEPT when it still carries ports: the port shell survives the
+// quarantine so addEndpointIP can restore the recovered IP onto the
+// ORIGINAL ports instead of inventing a default subset (the object's
+// ports may be anything — the apiserver's reconciler writes
+// https/443 on some planes, 6443 on others — and kube-proxy reads
+// the endpoint port back). A ports-only subset (no addresses) is a
+// legal Endpoints shape: it represents "no endpoints on these ports",
+// exactly the quarantined state the guard just created. A subset with
+// neither addresses nor ports is pure garbage shell and drops.
 func removeEndpointIP(ep *unstructured.Unstructured, ip string) {
 	subs, found := kube.NestedSlice(ep.Object, "subsets")
 	if !found {
@@ -167,6 +175,15 @@ func removeEndpointIP(ep *unstructured.Unstructured, ip string) {
 			}
 		}
 		if !empty {
+			out = append(out, m)
+			continue
+		}
+		// Emptied of addresses: keep the subset as a ports-only shell
+		// when ports survive, else drop it. The now-empty address
+		// lists are deleted outright so the object serializes clean.
+		if ports := nestedMaps(m, "ports"); len(ports) > 0 {
+			delete(m, "addresses")
+			delete(m, "notReadyAddresses")
 			out = append(out, m)
 		}
 	}
@@ -307,7 +324,11 @@ func removeSliceIP(eps *discoveryv1.EndpointSlice, ip string) bool {
 
 // addSliceIP appends a ready endpoint carrying ip unless the slice
 // already lists it (the apiserver's own endpoints reconciler may have
-// re-added it first — never duplicate).
+// re-added it first — never duplicate). The slice's own Ports are
+// untouched: EndpointSlice ports are slice-level, so both the removal
+// and this restore preserve them by construction (unlike Endpoints,
+// where the subset port shell must be kept alive — see
+// removeEndpointIP).
 func addSliceIP(eps *discoveryv1.EndpointSlice, ip string) bool {
 	for _, e := range eps.Endpoints {
 		if slices.Contains(e.Addresses, ip) {

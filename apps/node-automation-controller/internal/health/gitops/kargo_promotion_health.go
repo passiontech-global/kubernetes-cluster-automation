@@ -113,17 +113,18 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	var promRep, whRep, arRep probefw.SweepReport
 
-	// Promotions — Running/Pending past the hour.
-	promotions, err := p.Dyn.Resource(kube.GVRKargoPromotion).
-		List(ctx, metav1.ListOptions{})
+	// Promotions — Running/Pending past the hour. Each family reads
+	// the snapshot's per-GVR census; the RAW error memoizes and the
+	// NotFound/NoMatch tolerance stays per family.
+	promotions, err := p.AllUnstructured(ctx, kube.GVRKargoPromotion)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — Kargo not installed; the family skips.
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list kargo promotions: %w", err)}
 	default:
-		for i := range promotions.Items {
-			pr := &promotions.Items[i]
+		for i := range promotions {
+			pr := &promotions[i]
 			phase, _ := kube.NestedString(pr.Object, "status", "phase")
 			if !kargoPhaseStuck(phase) {
 				continue
@@ -143,15 +144,14 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	// Warehouses — Ready=False past the half hour; each qualifying
 	// object also gets the refresh nudge under the persisted
 	// cooldown.
-	warehouses, err := p.Dyn.Resource(kube.GVRKargoWarehouse).
-		List(ctx, metav1.ListOptions{})
+	warehouses, err := p.AllUnstructured(ctx, kube.GVRKargoWarehouse)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list kargo warehouses: %w", err)}
 	default:
-		for i := range warehouses.Items {
-			wh := &warehouses.Items[i]
+		for i := range warehouses {
+			wh := &warehouses[i]
 			c, ok := kube.ConditionOf(wh.Object, "Ready")
 			if !ok || c.Status != "False" {
 				continue
@@ -174,15 +174,14 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// AnalysisRuns — Running past the hour. Same lifetime-clock
 	// reasoning as Promotions.
-	analysisRuns, err := p.Dyn.Resource(kube.GVRArgoAnalysisRun).
-		List(ctx, metav1.ListOptions{})
+	analysisRuns, err := p.AllUnstructured(ctx, kube.GVRArgoAnalysisRun)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list argo analysisruns: %w", err)}
 	default:
-		for i := range analysisRuns.Items {
-			ar := &analysisRuns.Items[i]
+		for i := range analysisRuns {
+			ar := &analysisRuns[i]
 			phase, _ := kube.NestedString(ar.Object, "status", "phase")
 			if !strings.EqualFold(phase, "Running") {
 				continue

@@ -134,9 +134,11 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	if !exists {
 		if _, err := r.run(ctx, "fallocate", "-l", fmt.Sprintf("%dM", mb), path); err != nil {
 			// Best-effort primary path — dd below is the fallback;
-			// only its failure counts.
+			// only its failure counts. runLong: writing gigabytes of
+			// /dev/zero on a slow disk outlives the short command
+			// budget (the same budget class as apt/docker work).
 			logger().Warn("swap: fallocate failed — dd fallback", "path", path, "error", err)
-			if _, derr := r.run(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M",
+			if _, derr := r.runLong(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M",
 				fmt.Sprintf("count=%d", mb), "status=none"); derr != nil {
 				c.err("swap: dd create failed", "path", path, "error", derr)
 				return

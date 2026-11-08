@@ -54,8 +54,10 @@ type Check interface {
 // (LookupHost, HTTPClient, Now). It also owns the state that outlives
 // any single check: Heals, the shared self-heal cooldown ledger every
 // pod-delete heal stamps, and Prom, the Prometheus instant-query
-// client the metrics-backed checks share. The sweep runs serially
-// inside one shared.Periodic goroutine — nothing locks.
+// client the metrics-backed checks share. The sweep drives checks
+// serially inside one shared.Periodic goroutine; per-check bodies may
+// fan out into bounded worker pools, which is why the sweep snapshot
+// carries a per-kind mutex per memoized read (see snapshot.go).
 type Deps struct {
 	// Name is the module's ops/queue name — shared.Deps.Name stamped
 	// by the module registry; it labels the run-error counters and

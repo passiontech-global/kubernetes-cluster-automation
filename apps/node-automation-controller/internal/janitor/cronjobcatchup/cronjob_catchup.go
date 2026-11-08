@@ -33,6 +33,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -103,11 +104,15 @@ type cronJobCatchup struct {
 	missedEmitted state.GaugeLedger[string]
 }
 
-// Setup registers the 15-minute sweep.
+// Setup registers the 15-minute sweep. The gate rides
+// shared.SetupNoConfig like every module: Deps.Disabled registers
+// nothing (no knobs to parse — SetupNoConfig is the module's shape).
 func Setup(d shared.Deps) error {
-	c := &cronJobCatchup{cs: d.CS, queue: d.Name, now: shared.SystemClock,
-		lastCatchup: map[string]string{}}
-	return shared.AddPeriodic(d.Mgr, c.queue, 15*time.Minute, c.run)
+	return shared.SetupNoConfig(d, func() error {
+		c := &cronJobCatchup{cs: d.CS, queue: d.Name, now: shared.SystemClock,
+			lastCatchup: map[string]string{}}
+		return shared.AddPeriodic(d.Mgr, c.queue, 15*time.Minute, c.run)
+	})
 }
 
 func (c *cronJobCatchup) run(ctx context.Context) error {
@@ -254,6 +259,13 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 	}
 	missed := sched.Next(anchor)
 	now := c.now.Now()
+	if missed.IsZero() {
+		// An impossible schedule (`0 0 31 2 *` — Feb 31 does not
+		// exist) has no next tick at all: nothing is owed, so it can
+		// never be stale. Treating the zero time as a missed tick in
+		// the past would replay the workload every sweep.
+		return false, true
+	}
 	if !missed.Before(now) {
 		return false, true
 	}
@@ -278,9 +290,13 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 // which the CronJob is permanently skipped while
 // spec.startingDeadlineSeconds is unset. The loop is self-bounding:
 // it returns on the 101st missed tick regardless of the gap's size.
+// A zero Next return (an impossible spec like `0 0 31 2 *` — Feb 31
+// does not exist) ends the iteration immediately: zero compares
+// Before(now) forever, so advancing on it would spin the loop (and
+// the periodic sweep's goroutine) indefinitely.
 func missedOver100(sched cron.Schedule, anchor, now time.Time) bool {
 	missed := 0
-	for t := sched.Next(anchor); t.Before(now); t = sched.Next(t) {
+	for t := sched.Next(anchor); !t.IsZero() && t.Before(now); t = sched.Next(t) {
 		missed++
 		if missed > missedStartsLimit {
 			return true
@@ -345,6 +361,22 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
 	idx *jobDedupeIndex) bool {
 	key := cj.Namespace + "/" + cj.Name
+	// Fail CLOSED: an unverifiable dedupe must skip the replay —
+	// double-firing the workload is strictly worse than a missed
+	// catch-up the next 15m sweep retries.
+	if idx.failed {
+		log.Info("skip: jobs list failed — dedupe unverifiable (fail closed)",
+			"cronjob", key)
+		return true
+	}
+	// The CronJob's own status.active list is proof #0 — the
+	// controller's record of runs still in flight counts even when
+	// the Jobs snapshot lags behind it.
+	if len(cj.Status.Active) > 0 {
+		log.Info("skip: cronjob still reports active jobs",
+			"cronjob", key, "active", len(cj.Status.Active))
+		return true
+	}
 	if job, ok := idx.labeled[key]; ok {
 		log.Info("skip: a catch-up job already exists",
 			"cronjob", key, "job", job)
@@ -363,20 +395,49 @@ func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
 // old per-namespace List could match — so a same-named CronJob in
 // another namespace cannot collide and every verdict is unchanged.
 type jobDedupeIndex struct {
+	// failed: the cluster-wide Jobs list errored — no proof could be
+	// collected, so deduped() must fail CLOSED (skip the replay) and
+	// the caller retries on the next sweep. The sentinel is non-nil
+	// so run()'s lazy build pays the failed list (and its IncError)
+	// exactly once per sweep.
+	failed bool
 	// labeled: the catch-up label's VALUE is the CronJob name —
 	// "ns/cronjob" → the name of a labeled Job younger than
 	// catchupDedupeAge (first in list order wins; any hit dedupes).
 	labeled map[string]string
 	// activeOwner: "ns/cronjob" → the name of a Job whose controller
-	// ownerRef points at that CronJob with Status.Active > 0.
+	// ownerRef points at that CronJob and which is still active.
 	activeOwner map[string]string
 }
 
+// jobStillActive reports whether a CronJob-owned Job counts as an
+// active run for dedupe: it has active pods, or it is freshly created
+// and simply has not run anything yet — a Job with no
+// DeletionTimestamp and no Complete/Failed condition has not finished
+// (the status write that would mark it terminal has not happened), so
+// a replay on top of it would double-fire the workload.
+func jobStillActive(j *batchv1.Job) bool {
+	if j.Status.Active > 0 {
+		return true
+	}
+	if j.DeletionTimestamp != nil {
+		return false
+	}
+	for _, c := range j.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) &&
+			c.Status == corev1.ConditionTrue {
+			return false
+		}
+	}
+	return true
+}
+
 // buildJobDedupeIndex lists Jobs cluster-wide once per sweep and
-// indexes the two dedupe proofs. A list failure yields EMPTY maps —
-// the same fail-open the per-namespace List had (a missed catch-up
-// is worse than one extra idempotent Job), metered once instead of
-// once per CronJob.
+// indexes the two dedupe proofs. A list failure yields the FAILED
+// sentinel — deduped() then fails CLOSED (the old per-namespace List
+// failed open, betting one extra idempotent Job against a missed
+// catch-up; double-firing a workload is the worse side, and the
+// sweep retries in 15m), metered once instead of once per CronJob.
 func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 	log logr.Logger) *jobDedupeIndex {
 	jobs, err := kube.ListAll(ctx,
@@ -384,11 +445,9 @@ func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 		kube.Jobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		metrics.IncError(c.queue)
-		log.Info("WARN: list jobs failed — skipping dedupe", "error", err)
-		return &jobDedupeIndex{
-			labeled:     map[string]string{},
-			activeOwner: map[string]string{},
-		}
+		log.Info("WARN: list jobs failed — dedupe unverifiable, catch-up deferred (fail closed)",
+			"error", err)
+		return &jobDedupeIndex{failed: true}
 	}
 	now := c.now.Now()
 	idx := &jobDedupeIndex{
@@ -404,7 +463,7 @@ func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 				idx.labeled[key] = j.Name
 			}
 		}
-		if j.Status.Active > 0 {
+		if jobStillActive(j) {
 			if owner := metav1.GetControllerOf(j); owner != nil &&
 				owner.Kind == "CronJob" {
 				key := j.Namespace + "/" + owner.Name

@@ -205,6 +205,9 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KernelNetShimDegraded": {"KernelNetShimNormal", "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds"},
 		// Clocksource latch→condition surface.
 		"ClocksourceUnstable": {"ClocksourceStable", "kernel clocksource stable (tsc/kvm-clock, no instability records)"},
+		// workerhygiene cilium latch→condition surface.
+		"CiliumMTUDrift": {"CiliumMTUAligned", "cilium datapath MTU matches nebula overlay (no drift)"},
+		"CiliumWGStale":  {"CiliumWGPeersOk", "cilium_wg0 live peers match expected encryption peers (no stale state)"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

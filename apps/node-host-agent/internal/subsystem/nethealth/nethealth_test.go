@@ -164,17 +164,26 @@ func TestStateExitDropsSuspectBudgets(t *testing.T) {
 
 	e.n.stateExit("conntrack-pressure")
 
+	// The latch and its OWN dedupe budget go — a cleared condition
+	// must not suppress the first line of a re-incident.
 	for _, f := range []string{
 		"state-conntrack-pressure",
 		"last-suspect-conntrack-pressure",
-		"last-suspect-egress-probe-8.8.8.8",
 	} {
 		if _, err := os.Stat(filepath.Join(e.state, f)); !os.IsNotExist(err) {
 			t.Fatalf("%s kept after latch exit", f)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "last-nebula-restart")); err != nil {
-		t.Fatal("action budget removed by the suspect-budget prune")
+	// Other keys' budgets stay: ExitClearSuspect is per-name (the
+	// egress probe's dedupe window has nothing to do with this
+	// latch), and action budgets are never suspect keys.
+	for _, f := range []string{
+		"last-suspect-egress-probe-8.8.8.8",
+		"last-nebula-restart",
+	} {
+		if _, err := os.Stat(filepath.Join(e.state, f)); err != nil {
+			t.Fatalf("%s removed by stateExit: %v", f, err)
+		}
 	}
 }
 

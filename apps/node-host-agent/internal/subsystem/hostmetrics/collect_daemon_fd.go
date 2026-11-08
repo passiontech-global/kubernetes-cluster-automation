@@ -97,45 +97,29 @@ func procLimitsSoftFD(path string) (uint64, bool) {
 }
 
 // collectDaemonFD emits the worst (highest) open-fd/soft-limit ratio
-// per watched daemon in one ProcRoot pass. Several procs share a
-// comm (postgres workers, pgbouncer) — the max ratio is the
-// exhaustion signal, so per-daemon series report it rather than an
-// arbitrary pid's value.
+// per watched daemon off the shared procSnapshot
+// (collect_procs_scan.go — one /proc walk per scan interval serves
+// this and the zombie/D-state counters). Only the matched pids pay
+// the limits read. Several procs share a comm (postgres workers,
+// pgbouncer) — the max ratio is the exhaustion signal, so per-daemon
+// series report it rather than an arbitrary pid's value.
 func (c *Collector) collectDaemonFD(ch chan<- prometheus.Metric) {
-	entries, err := os.ReadDir(c.cfg.ProcRoot)
-	if err != nil {
+	procs, ok := c.procSnapshot()
+	if !ok {
 		return
 	}
 	worst := map[string]float64{}
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
+	for pid, ps := range procs {
+		daemon := matchDaemon(ps.comm, ps.cmdline)
+		if daemon == "" || ps.fds < 0 {
 			continue
 		}
-		dir := filepath.Join(c.cfg.ProcRoot, e.Name())
-		commB, err := os.ReadFile(filepath.Join(dir, "comm"))
-		if err != nil {
-			continue
-		}
-		comm := strings.TrimSpace(string(commB))
-		var cmdline string
-		if comm == "k0s" {
-			if b, rerr := os.ReadFile(filepath.Join(dir, "cmdline")); rerr == nil {
-				cmdline = string(b)
-			}
-		}
-		daemon := matchDaemon(comm, cmdline)
-		if daemon == "" {
-			continue
-		}
-		soft, ok := procLimitsSoftFD(filepath.Join(dir, "limits"))
+		soft, ok := procLimitsSoftFD(filepath.Join(
+			c.cfg.ProcRoot, pid, "limits"))
 		if !ok {
 			continue
 		}
-		fds, err := os.ReadDir(filepath.Join(dir, "fd"))
-		if err != nil {
-			continue
-		}
-		if r := float64(len(fds)) / float64(soft); r > worst[daemon] {
+		if r := float64(ps.fds) / float64(soft); r > worst[daemon] {
 			worst[daemon] = r
 		}
 	}

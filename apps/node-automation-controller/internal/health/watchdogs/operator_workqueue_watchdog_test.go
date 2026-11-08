@@ -109,9 +109,11 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 	base := time.Now()
 	leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "flux-system", Name: "source-controller-7d9f",
-		UID:    types.UID("sc-uid-1"),
-		Labels: map[string]string{"app": "source-controller"},
-	}}
+		UID:             types.UID("sc-uid-1"),
+		Labels:          map[string]string{"app": "source-controller"},
+		OwnerReferences: shCtlrOwned("source-controller-7d9f"),
+	},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
 	cs := fake.NewSimpleClientset(
 		shLease("flux-system", "source-controller-leader-election",
 			"source-controller-7d9f_3f2a1", 2*time.Second, base),
@@ -121,7 +123,7 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("source-controller/gitrepositories/apps/repo", base.Add(-time.Hour))
+		Observe("source-controller/gitrepositories/apps/repo/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
@@ -149,7 +151,7 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("cert-manager/certificates/apps/tls", base.Add(-time.Hour))
+		Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
@@ -172,7 +174,8 @@ func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
 	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
 		"apps", "tls", 1, 0)
 	stuck.SetAnnotations(map[string]string{
-		kube.AnnoFirstSeenOperatorWorkqueue: `{"cert-manager/certificates/apps/tls":"` +
+		kube.AnnoFirstSeenOperatorWorkqueue: `{"cert-manager/certificates/apps/tls/` +
+			opReasonNoConditions + `":"` +
 			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`,
 	})
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
@@ -201,7 +204,7 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("shipwright-operator/shipwrightbuilds//build-1", base.Add(-time.Hour))
+		Observe("shipwright-operator/shipwrightbuilds//build-1/"+opReasonNoConditions, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled ShipwrightBuild must FAIL")
@@ -218,34 +221,39 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 type limitRecordingDyn struct {
 	dynamic.Interface
 	listOpts []metav1.ListOptions
+	listGvrs []schema.GroupVersionResource
 }
 
 func (d *limitRecordingDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
-	return &limitRecordingRI{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d}
+	return &limitRecordingRI{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d, gvr: gvr}
 }
 
 type limitRecordingRI struct {
 	dynamic.NamespaceableResourceInterface
-	d *limitRecordingDyn
+	d   *limitRecordingDyn
+	gvr schema.GroupVersionResource
 }
 
 func (r *limitRecordingRI) Namespace(ns string) dynamic.ResourceInterface {
 	return &limitRecordingNS{
-		ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), d: r.d}
+		ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), d: r.d, gvr: r.gvr}
 }
 
 type limitRecordingNS struct {
 	dynamic.ResourceInterface
-	d *limitRecordingDyn
+	d   *limitRecordingDyn
+	gvr schema.GroupVersionResource
 }
 
 func (r *limitRecordingRI) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
 	r.d.listOpts = append(r.d.listOpts, opts)
+	r.d.listGvrs = append(r.d.listGvrs, r.gvr)
 	return r.NamespaceableResourceInterface.List(ctx, opts)
 }
 
 func (r *limitRecordingNS) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
 	r.d.listOpts = append(r.d.listOpts, opts)
+	r.d.listGvrs = append(r.d.listGvrs, r.gvr)
 	return r.ResourceInterface.List(ctx, opts)
 }
 
@@ -270,7 +278,11 @@ func TestOperatorCRScanPagesListRequests(t *testing.T) {
 	}
 	chk := probetest.MustCheck[*operatorWorkqueueCheck](t, p)
 	var rep probefw.SweepReport
-	scan := chk.scanOperatorResources(ctx, logf.FromContext(ctx), certTarget, base, &rep)
+	// The CR scan reads through the sweep-wide snapshot (Deps.
+	// AllUnstructured) — the test runs under a sweep ctx so the
+	// memo is live and both signature rows share one paged List.
+	scanCtx := probefw.WithSweepSnapshot(ctx)
+	scan := chk.scanOperatorResources(scanCtx, logf.FromContext(ctx), certTarget, base, &rep)
 	if scan.evalFailed {
 		t.Fatal("paged CR scan reported an infra failure")
 	}
@@ -281,7 +293,9 @@ func TestOperatorCRScanPagesListRequests(t *testing.T) {
 		t.Fatalf("List Limit = %d, want DefaultListPageSize (%d)",
 			dyn.listOpts[0].Limit, kube.DefaultListPageSize)
 	}
-	if !scan.live["cert-manager/certificates/apps/tls"] {
-		t.Fatalf("stuck Certificate not judged live: %v", scan.live)
+	for _, reason := range []string{opReasonNoConditions, kcmReasonStaleGen} {
+		if !scan.live["cert-manager/certificates/apps/tls/"+reason] {
+			t.Fatalf("stuck Certificate not judged live under %q: %v", reason, scan.live)
+		}
 	}
 }

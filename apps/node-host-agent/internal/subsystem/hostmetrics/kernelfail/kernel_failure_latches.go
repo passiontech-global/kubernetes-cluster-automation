@@ -31,10 +31,18 @@ func (r *Runner) statePath(name string) string {
 // ensureStateLatch installs a state latch when absent (epoch
 // content, written through the Store's atomic WriteEpochFile —
 // concurrent ticker/scrape writers share no fixed .tmp-<name>
-// staging file) and logs the transition once; BUG-H6's refresh
-// loop owns the mtime while held.
+// staging file) and logs the transition once. An EXISTING latch gets
+// its mtime refreshed (BUG-H6) — the kmsg signatures recur for as
+// long as the kernel condition does, and the janitor's 24h reap keys
+// on mtime, so a live episode must not age out between the refresh
+// loop's touches.
 func (r *Runner) ensureStateLatch(path, name, evidence string) {
 	if _, err := os.Stat(path); err == nil {
+		now := r.deps.Clock.Now()
+		if cerr := os.Chtimes(path, now, now); cerr != nil {
+			logger().Debug("hostmetrics: latch touch failed",
+				"path", path, "error", cerr)
+		}
 		return
 	}
 	if !r.deps.Store.WriteEpochFile(path, r.deps.Clock.Now().Unix()) {

@@ -25,6 +25,15 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	testutil.ExpectPeriodic(t, m, "kubelet-liveness-reaper", 2*time.Minute)
 }
 
+// Disabled registers nothing — the SetupNoConfig gate (structural,
+// not comment-enforced).
+func TestSetupDisabled(t *testing.T) {
+	testutil.DisabledNoop(t, Setup, shared.Deps{
+		Name: "kubelet-liveness-reaper",
+		CS:   fake.NewSimpleClientset(),
+	})
+}
+
 // A manager.Add failure must propagate through AddPeriodic so cmd/
 // can abort boot instead of silently losing a module.
 func TestSetupAddErrorPropagates(t *testing.T) {

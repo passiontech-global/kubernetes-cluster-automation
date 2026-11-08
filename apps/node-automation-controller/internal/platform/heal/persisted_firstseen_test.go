@@ -190,3 +190,40 @@ func TestClearPersistedFirstSeenEdge(t *testing.T) {
 		t.Fatal("empty map did not remove the annotation")
 	}
 }
+
+// A NIL ledger must not panic — the nil posture ClearPersistedFirstSeen
+// already honors (callers without an in-RAM ledger, e.g. ad-hoc
+// verdict sites): the window lives entirely in the annotation, the
+// first sight stamps now and reports inside-the-window, and a
+// persisted stamp older than minAge reports elapsed on the first call.
+func TestFirstSeenPersistedNilLedger(t *testing.T) {
+	now := time.Now()
+
+	// First sight with no ledger: false, and the stamp lands on the
+	// object so a restart (or a later ledger-bearing caller) resumes.
+	obj := &corev1.Pod{}
+	if FirstSeenPersisted(ctx, logr.Discard(), nil, obj,
+		testAnnoKey, "k", time.Minute, now, applyPatch(obj)) {
+		t.Fatal("nil ledger first sight reported past the window")
+	}
+	if obj.Annotations[testAnnoKey] == "" {
+		t.Fatal("nil ledger first sight did not stamp the annotation")
+	}
+
+	// Persisted window already proven — no ledger needed to see it.
+	old := now.Add(-15 * time.Minute)
+	obj = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		testAnnoKey: `{"k":"` + old.UTC().Format(time.RFC3339) + `"}`}}}
+	if !FirstSeenPersisted(ctx, logr.Discard(), nil, obj,
+		testAnnoKey, "k", 10*time.Minute, now, applyPatch(obj)) {
+		t.Fatal("nil ledger dropped a persisted window")
+	}
+	// The nil ledger must not have re-stamped the older window with now.
+	var m map[string]string
+	if err := json.Unmarshal([]byte(obj.Annotations[testAnnoKey]), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["k"] != old.UTC().Format(time.RFC3339) {
+		t.Fatalf("nil ledger rejuvenated the persisted stamp: %q", m["k"])
+	}
+}

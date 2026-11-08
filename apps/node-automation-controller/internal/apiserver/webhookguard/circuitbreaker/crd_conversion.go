@@ -228,6 +228,15 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		return nil
 	}
 	for _, svcKey := range hung {
+		// Confirm a live bounce target BEFORE the heal preamble: a
+		// stale census ref must not spend a budget grant (or open the
+		// per-service cooldown) on a pod that no longer exists.
+		target := b.oldestLiveBackingPod(ctx, snap, svcKey, ready.BackingPods[svcKey], now)
+		if target == nil {
+			log.Info("conversion bounce: no live Ready backing pod found — endpoint refs are stale",
+				"service", svcKey)
+			continue
+		}
 		// heal.AllowedV folds the BounceCooldown per-service cooldown AND the
 		// maintenance mutex into one fail-closed preamble; &g.Verdict
 		// memoizes the mutex across services (and shares it with the
@@ -242,7 +251,7 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		if !proceed {
 			continue
 		}
-		b.bounceOldestPod(ctx, snap, svcKey, ready.BackingPods[svcKey], now)
+		b.deleteBouncePod(ctx, snap, svcKey, target, now)
 	}
 	return nil
 }

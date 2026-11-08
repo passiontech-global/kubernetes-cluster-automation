@@ -3,9 +3,13 @@ package nodereporter
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // condEvalFor returns the evaluated condEval for a condition Type.
@@ -156,5 +160,102 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 				t.Fatalf("message=%q want %q", got.message, wantMsg)
 			}
 		})
+	}
+}
+
+// TestCiliumLatchConditions covers the newest tail entries: the
+// workerhygiene cilium MTU-drift (B4) and WireGuard peer-wipe (W5.6)
+// latches map 1:1 to the CiliumMTUDrift and CiliumWGStale conditions
+// appended at the tail of conditionDefs — the defs carry the exact
+// latch keys, a present latch flips the condition True with the
+// problem reason, and a removed latch flips it back to False.
+func TestCiliumLatchConditions(t *testing.T) {
+	if len(conditionDefs) != 40 {
+		t.Fatalf("conditionDefs has %d defs, want 40 (38 ported + CiliumMTUDrift + CiliumWGStale)",
+			len(conditionDefs))
+	}
+	tail := conditionDefs[len(conditionDefs)-2:]
+	if tail[0].typ != nodecond.CiliumMTUDrift || tail[0].stateKey != latchdefs.LatchCiliumMTUDrift {
+		t.Fatalf("tail def 0 = %s/state-%s, want CiliumMTUDrift/state-%s",
+			tail[0].typ, tail[0].stateKey, latchdefs.LatchCiliumMTUDrift)
+	}
+	if tail[1].typ != nodecond.CiliumWGStale || tail[1].stateKey != latchdefs.LatchCiliumWGPeerWipe {
+		t.Fatalf("tail def 1 = %s/state-%s, want CiliumWGStale/state-%s",
+			tail[1].typ, tail[1].stateKey, latchdefs.LatchCiliumWGPeerWipe)
+	}
+	e := fixture(t)
+	state := func(key string) {
+		if err := os.WriteFile(filepath.Join(e.dir, "state-"+key),
+			[]byte("1700000000\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, typ := range []string{nodecond.CiliumMTUDrift, nodecond.CiliumWGStale} {
+		if got := condEvalFor(t, e.r, typ); got.status != corev1.ConditionFalse {
+			t.Fatalf("%s baseline status=%v want False", typ, got.status)
+		}
+	}
+	state("cilium-mtu-drift")
+	got := condEvalFor(t, e.r, nodecond.CiliumMTUDrift)
+	if got.status != corev1.ConditionTrue || got.reason != "CiliumMTUDriftDetected" {
+		t.Fatalf("CiliumMTUDrift=%v/%s want True/CiliumMTUDriftDetected",
+			got.status, got.reason)
+	}
+	if wantMsg := "watchdog state cilium-mtu-drift active since 1700000000"; got.message != wantMsg {
+		t.Fatalf("CiliumMTUDrift message=%q want %q", got.message, wantMsg)
+	}
+	state("cilium-wg-peer-wipe")
+	if got := condEvalFor(t, e.r, nodecond.CiliumWGStale); got.status != corev1.ConditionTrue ||
+		got.reason != "CiliumWGStaleDetected" {
+		t.Fatalf("CiliumWGStale=%v/%s want True/CiliumWGStaleDetected",
+			got.status, got.reason)
+	}
+	_ = os.Remove(filepath.Join(e.dir, "state-cilium-mtu-drift"))
+	_ = os.Remove(filepath.Join(e.dir, "state-cilium-wg-peer-wipe"))
+	for _, typ := range []string{nodecond.CiliumMTUDrift, nodecond.CiliumWGStale} {
+		if got := condEvalFor(t, e.r, typ); got.status != corev1.ConditionFalse {
+			t.Fatalf("%s stuck True after latch removal", typ)
+		}
+	}
+}
+
+// TestNoRawConditionNameLiterals is the nodecond single-source-of-
+// truth guard: the condition-name surfaces in this package — the
+// conditionDefs typ fields, the logRules event reasons that exactly
+// duplicate a nodecond name, and the npd monitor condition
+// constants — must be spelled as nodecond constants, never raw
+// string literals. The scan is source-level over the production
+// files (tests are excluded — they legitimately match on names) and
+// errors on any quoted literal equal to a nodecond-defined name in
+// those surfaces.
+func TestNoRawConditionNameLiterals(t *testing.T) {
+	names := map[string]bool{}
+	for _, list := range [][]string{
+		nodecond.HeartbeatSweptNames, nodecond.HangPreCordonNames,
+		nodecond.ClockSkewPreCordonNames, nodecond.StormGateNames,
+		nodecond.PartitionNames,
+	} {
+		for _, n := range list {
+			names[n] = true
+		}
+	}
+	names[nodecond.KernelDeadlock] = true // permanent latch — in no list
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`typ:\s+"([A-Za-z0-9]+)"`),              // conditionDefs typ fields
+		regexp.MustCompile(`(?m)^\t\{"([A-Za-z0-9]+)",`),           // logRules event reasons
+		regexp.MustCompile(`NodeConditionType = "([A-Za-z0-9]+)"`), // npd monitor consts
+	}
+	for _, f := range []string{"conditions.go", "events.go", "npd/kernel.go", "npd/readonly.go"} {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, re := range patterns {
+			for _, m := range re.FindAllStringSubmatch(string(data), -1) {
+				if names[m[1]] {
+					t.Errorf("%s: raw condition-name literal %q — use the nodecond constant", f, m[1])
+				}
+			}
+		}
 	}
 }

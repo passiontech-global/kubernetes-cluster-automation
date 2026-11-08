@@ -24,8 +24,9 @@
 // runs hostNetwork + hostPID and mounts individual hostPaths only —
 // there is NO /host/proc mount, so <hostRoot>/proc/1/ns/net is not
 // reachable on workers. Instead: hostNetwork makes the pod's own
-// netns the host's — /proc/self/ns/net and /proc/1/ns/net are the
-// same inode, so the guard binds directly with no setns at all. On a
+// netns the host's — the calling thread's netns (/proc/thread-self/
+// ns/net) and /proc/1/ns/net are the same inode, so the guard binds
+// directly with no setns at all. On a
 // non-hostNetwork hostPID pod /proc/1/ns/net is still host init's
 // netns → setns into it for the socket creation (a socket keeps the
 // netns it was created in). Only when pid-1's entry can't be used at
@@ -69,6 +70,7 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -148,6 +150,12 @@ func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
 	// Run calls spawnRouteGuard every tick, so a dead prober
 	// re-arms exactly like the guard itself. Single-flight inside.
 	n.spawnMTUProber(ctx)
+	if n.routeGuardSetnsDead.Load() {
+		// Terminal setns failure (no host-netns entry from this
+		// environment) — respawning would churn OS threads forever.
+		// The routeGuard open-error log line keeps it visible.
+		return
+	}
 	if last := n.routeGuardLastExit.Load(); last != 0 &&
 		time.Since(time.Unix(0, last)) < routeGuardRespawnBackoff {
 		return
@@ -200,6 +208,22 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 		}
 		fd, err := open()
 		if err != nil {
+			if errors.Is(err, routewatch.ErrSetns) {
+				// setns into the host netns failed — a permanent
+				// environment property (missing CAP_SYS_ADMIN /
+				// no pid-1 netns reachable), not a transient. The
+				// retry loop would lock an OS thread and open two
+				// ns fds every routeGuardRetry forever, so exit
+				// and latch the spawn gate instead. The daemon
+				// keeps running: everything else nethealth owns
+				// (DNS, conntrack, MTU probes) still works.
+				n.routeGuardSetnsDead.Store(true)
+				n.state.AppendLog(fmt.Sprintf(
+					"route-guard: setns into the host netns failed — "+
+						"guard stopped (setns is unavailable here): %v", err))
+				n.cycles.WithLabelValues(checkRouteGuard, "setns_dead").Inc()
+				return
+			}
 			openFails++
 			n.cycles.WithLabelValues(checkRouteGuard, "open_error").Inc()
 			// Log the first failure, then every Nth — a permanently

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -55,6 +56,22 @@ func TestNormalizeRepo(t *testing.T) {
 		// A lookalike host must not collapse to "org/repo" — the
 		// boundary check keeps it from matching a real resource.
 		{"https://notgithub.com/org/repo", "https://notgithub.com/org/repo"},
+		// Mid-string matches are part of a longer hostname or of a
+		// path — never stripped, whatever surrounds them.
+		{"https://git.github.com/org/repo", "https://git.github.com/org/repo"},
+		{"https://mygithub.com:8443/org/repo", "https://mygithub.com:8443/org/repo"},
+		{"https://example.com/github.com/org/repo", "https://example.com/github.com/org/repo"},
+		{"org/github.com", "org/github.com"},
+		{"github.comorg/repo", "github.comorg/repo"},
+		// The host must be followed by "/" or ":" — a different next
+		// byte means the match is not the host (spoofed or bare host).
+		{"https://github.com.evil.com/org/repo", "https://github.com.evil.com/org/repo"},
+		{"git@github.com.evil.com:org/repo", "git@github.com.evil.com:org/repo"},
+		{"github.com", "github.com"},
+		// ":owner" scp forms strip the host from every legal position.
+		{"github.com:owner/repo", "owner/repo"},
+		{"ssh://github.com:owner/repo", "owner/repo"},
+		{"GIT@GitHub.COM:Owner/Repo.Git", "owner/repo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -336,9 +353,8 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	stub.setRoute("/api/v1/teams/main/pipelines/p2/resources",
 		`[{"name":"new","type":"git","source":{"uri":"org/new"}}]`)
 	// Past the forced-refresh throttle window — it keys on
-	// lastAttemptAt now, so age both stamps.
-	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
-	c.lastAttemptAt = c.fetchedAt
+	// lastForceRefreshAt, Refresh's own clock.
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 
 	fresh, err := c.Refresh(context.Background())
 	if err != nil {
@@ -355,14 +371,72 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	}
 
 	// A failed refresh keeps the previous index.
-	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
-	c.lastAttemptAt = c.fetchedAt
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if _, err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh(500) want error")
 	}
 	if cached, _ := c.Resources(context.Background()); len(cached) != len(fresh) {
 		t.Fatalf("index after failed refresh=%d want %d", len(cached), len(fresh))
+	}
+}
+
+func TestRefreshThrottleOwnsItsClock(t *testing.T) {
+	// Refresh's throttle keys on lastForceRefreshAt, not lastAttemptAt:
+	// a failed Resources refetch that just stamped its own backoff
+	// attempt must not suppress a forced refresh — a zero-match
+	// delivery needs the network, not the cached index.
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}
+
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Age the cache and break the ATC: the next Resources refetches,
+	// fails, stamps lastAttemptAt, and falls back to the stale index.
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.mu.Unlock()
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatalf("stale fallback err=%v want nil", err)
+	}
+
+	// lastForceRefreshAt is still zero — long past any throttle
+	// window — so Refresh must attempt its own fetch and surface the
+	// ATC failure instead of silently serving the cached index.
+	if _, err := c.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh err=nil want error (throttled by Resources' attempt stamp)")
+	}
+}
+
+func TestResourcesBackoffOwnsItsClock(t *testing.T) {
+	// Symmetric: Resources' backoff keys on lastAttemptAt — a forced
+	// Refresh stamping lastForceRefreshAt must not double as
+	// Resources' backoff, or a recovering ATC would stay hidden behind
+	// Refresh's stamp for a whole extra TTL window.
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
+
+	// Warm through Refresh: lastForceRefreshAt is fresh, lastAttemptAt
+	// stays zero.
+	if _, err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Age the cache and break the ATC; Resources must attempt its own
+	// (doomed) fetch rather than treat Refresh's stamp as its backoff.
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.mu.Unlock()
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	hits := stub.hitCount("/api/v1/teams/main/pipelines")
+	index, err := c.Resources(context.Background())
+	if err != nil || len(index) != 4 {
+		t.Fatalf("stale fallback index=%v err=%v want 4, nil", index, err)
+	}
+	if got := stub.hitCount("/api/v1/teams/main/pipelines"); got != hits+1 {
+		t.Fatalf("pipeline-list hits=%d want %d (Resources must attempt its own fetch)",
+			got, hits+1)
 	}
 }
 
@@ -444,23 +518,24 @@ func TestRefreshFailedAttemptBacksOff(t *testing.T) {
 	stub := newATCStub(t, stubRoutes())
 	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
 
-	// Warm the index, then age the last attempt out of the throttle
-	// window and break the ATC: the next Refresh hits the network,
-	// fails, and stamps lastAttemptAt.
+	// Warm the index, then age the last forced-refresh attempt out of
+	// the throttle window and break the ATC: the next Refresh hits the
+	// network, fails, and stamps lastForceRefreshAt.
 	if _, err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	c.lastAttemptAt = time.Now().Add(-c.minRefreshInterval())
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if _, err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh(500) want error")
 	}
 	hits := stub.hitCount("/api/v1/teams/main/pipelines")
 
-	// Refreshes inside the backoff window must serve the cached
+	// Refreshes inside the throttle window must serve the cached
 	// index without another doomed network call — fetchedAt only
-	// moves on success, so without the lastAttemptAt throttle every
-	// zero-match webhook would take c.mu and block on the dead ATC.
+	// moves on success, so without the lastForceRefreshAt throttle
+	// every zero-match webhook would fire a doomed fetch at the dead
+	// ATC and stall behind the HTTP timeout.
 	for i := 0; i < 3; i++ {
 		index, err := c.Refresh(context.Background())
 		if err != nil || len(index) != 4 {
@@ -645,13 +720,15 @@ func TestSourceRepo(t *testing.T) {
 // caller would serialize behind it. inFlight counts requests currently inside the blocked pipelines
 // handler; blockFrom is the pipelines hit number the block starts at
 // (2 = only refetches block, the warm-up passes; 1 = cold-start block).
+// pipelinesHits counts every pipelines-list request the client made.
 func slowATC(t *testing.T, release chan struct{},
-	blockFrom int) (*httptest.Server, *atomic.Int64) {
+	blockFrom int) (*httptest.Server, *atomic.Int64, *atomic.Int64) {
 	var inFlight atomic.Int64
 	var pipelinesHits atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/teams/main/pipelines", func(w http.ResponseWriter, r *http.Request) {
-		if pipelinesHits.Add(1) >= int64(blockFrom) {
+		hits := pipelinesHits.Add(1)
+		if hits >= int64(blockFrom) {
 			inFlight.Add(1)
 			defer inFlight.Add(-1)
 			<-release
@@ -670,7 +747,7 @@ func slowATC(t *testing.T, release chan struct{},
 	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, &inFlight
+	return srv, &inFlight, &pipelinesHits
 }
 
 func TestResourcesConcurrentCallerServedStaleMidFetch(t *testing.T) {
@@ -679,7 +756,7 @@ func TestResourcesConcurrentCallerServedStaleMidFetch(t *testing.T) {
 	// the slow ATC handler blocking t.Cleanup(srv.Close).
 	closeRelease := sync.OnceFunc(func() { close(release) })
 	defer closeRelease()
-	srv, inFlight := slowATC(t, release, 2)
+	srv, inFlight, _ := slowATC(t, release, 2)
 	c := &Client{BaseURL: srv.URL, Team: "main", IndexTTL: time.Hour}
 
 	// Warm index, then age the stamps so the next Resources must
@@ -730,40 +807,84 @@ func TestResourcesConcurrentCallerServedStaleMidFetch(t *testing.T) {
 	}
 }
 
-func TestResourcesColdStartConcurrentCallerErrorsNotBlocks(t *testing.T) {
+func TestResourcesColdStartCallersShareOneFetch(t *testing.T) {
+	// Cold start: every concurrent Resources caller must share the
+	// single in-flight fetch — no caller may stampede the ATC with a
+	// duplicate full-index fetch, and none may error out while the
+	// answer is one shared fetch away.
 	release := make(chan struct{})
-	defer close(release) // never leave the slow ATC blocking cleanup
-	srv, inFlight := slowATC(t, release, 1)
+	// Closed exactly once, on every exit path: an early t.Fatal must
+	// not leave the slow ATC handler blocking t.Cleanup(srv.Close).
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease()
+	srv, inFlight, pipelinesHits := slowATC(t, release, 1)
 	c := &Client{BaseURL: srv.URL, Team: "main"}
 
-	// No index yet: the first caller's fetch is in flight; a second
-	// caller has nothing stale to serve and must get the error
-	// immediately instead of waiting on the slow fetch.
-	go func() {
-		_, _ = c.Resources(context.Background())
-	}()
+	const callers = 8
+	errs := make(chan error, callers)
+	sizes := make(chan int, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			index, err := c.Resources(context.Background())
+			errs <- err
+			sizes <- len(index)
+		}()
+	}
+	waitInFlight(t, inFlight)
+	// All callers are parked on (or heading into) the one in-flight
+	// fetch; give the stampede window a beat before releasing it.
+	time.Sleep(20 * time.Millisecond)
+	closeRelease()
+	wg.Wait()
+	close(errs)
+	close(sizes)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("cold-start Resources err=%v want nil (shared fetch)", err)
+		}
+	}
+	for size := range sizes {
+		if size != 4 {
+			t.Fatalf("cold-start Resources index=%d resources want 4", size)
+		}
+	}
+	if got := pipelinesHits.Load(); got != 1 {
+		t.Fatalf("pipelines-list hits=%d want 1 (cold start must not stampede)", got)
+	}
+	// The published cache now serves later callers.
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := pipelinesHits.Load(); got != 1 {
+		t.Fatalf("pipelines-list hits=%d want 1 (cache hit)", got)
+	}
+}
+
+func TestResourcesColdStartWaitRespectsContext(t *testing.T) {
+	// A cold-start caller waiting on the in-flight fetch must bail out
+	// when its own context dies, not hang behind a wedged ATC.
+	release := make(chan struct{})
+	defer close(release)
+	srv, inFlight, _ := slowATC(t, release, 1)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	go func() { _, _ = c.Resources(context.Background()) }()
 	waitInFlight(t, inFlight)
 
-	concErr := make(chan error, 1)
-	go func() {
-		_, err := c.Resources(context.Background())
-		concErr <- err
-	}()
-	select {
-	case err := <-concErr:
-		if err == nil {
-			t.Fatal("cold-start concurrent Resources err=nil want error")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("cold-start concurrent Resources blocked behind in-flight fetch")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Resources(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cold-start wait err=%v want context.Canceled", err)
 	}
-
 }
 
 func TestRefreshConcurrentCallerThrottledMidFetch(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release) // never leave the slow ATC blocking cleanup
-	srv, inFlight := slowATC(t, release, 1)
+	srv, inFlight, _ := slowATC(t, release, 1)
 	c := &Client{BaseURL: srv.URL, Team: "main"}
 
 	go func() {
@@ -820,5 +941,50 @@ func TestFetchIndexUsesCallerSnapshotForCarryover(t *testing.T) {
 	}
 	if len(index) != 4 {
 		t.Fatalf("index=%d resources want 4 (p1 carried over)", len(index))
+	}
+}
+
+func TestGetJSONDrainsBodyForKeepAliveReuse(t *testing.T) {
+	// A 2xx body the decoder does not consume to EOF must be drained
+	// before the body closes — leftover bytes make http.Transport drop
+	// the keep-alive connection, so every later call re-dials.
+	// The payload is written in two flushes: the JSON value first
+	// (larger than the decoder's initial buffer, so it must refill),
+	// and the trailing newline only after the decode has finished —
+	// bytes that only the post-decode drain can pick up.
+	var conns atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/x", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("p", 700) + `"}`))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(50 * time.Millisecond) // let the decode finish the value
+		_, _ = w.Write([]byte("\n"))      // trailing bytes past the JSON value
+	})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.ConnState = func(_ net.Conn, cs http.ConnState) {
+		if cs == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+	for range 3 {
+		var out struct {
+			Pad string `json:"pad"`
+		}
+		if err := c.getJSON(context.Background(), "/x", &out); err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Pad) != 700 {
+			t.Fatalf("decoded pad=%d bytes want 700", len(out.Pad))
+		}
+	}
+	if got := conns.Load(); got != 1 {
+		t.Fatalf("TCP connections=%d want 1 (keep-alive reuse requires the body drained)", got)
 	}
 }

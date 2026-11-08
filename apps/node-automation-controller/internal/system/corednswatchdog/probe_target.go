@@ -19,9 +19,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// probeFQDN picks the layer-2 probe target: the newest Service <10m
-// old having an EndpointSlice with a ready endpoint — its delta
-// certainly crossed a healthy watch — returning its
+// probeFQDNUncached picks the layer-2 probe target: the newest
+// Service <10m old having an EndpointSlice with a ready endpoint —
+// its delta certainly crossed a healthy watch — returning its
 // <name>.<ns>.svc.cluster.local FQDN plus nil wantIPs (any answer
 // proves freshness).
 //
@@ -33,7 +33,7 @@ import (
 // Service's clusterIPs, or — for a headless service — the ready
 // endpoint pod IPs. A pod answering with anything else is serving a
 // frozen cache. Returns ("", nil) when nothing qualifies.
-func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]bool) {
+func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[string]bool) {
 	log := logf.FromContext(ctx)
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page

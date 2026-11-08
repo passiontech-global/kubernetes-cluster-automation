@@ -132,3 +132,22 @@ func TestCheckSchedulerPreemptionListError(t *testing.T) {
 		t.Fatalf("events list failure must surface as Infra: %+v", res)
 	}
 }
+
+// A Pending pod parked behind SchedulingGates is NOT freeze evidence:
+// the scheduler is forbidden from touching it by design — a gated pod
+// must never raise the frozen gauge on an otherwise healthy cluster.
+func TestCheckSchedulerFrozenIgnoresSchedulingGates(t *testing.T) {
+	gated := probetest.PendingUnscheduledPod("apps", "gated-1", 10*time.Minute, false)
+	gated.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example.com/hold"}}
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		gated)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("scheduling-gated pod misread as frozen scheduler: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_scheduler_frozen", map[string]string{})
+	if m != nil && m.GetGauge().GetValue() != 0 {
+		t.Fatalf("scheduler_frozen=%v, want 0 for a gated pod", m.GetGauge().GetValue())
+	}
+}

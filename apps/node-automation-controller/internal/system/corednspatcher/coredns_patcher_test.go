@@ -632,6 +632,36 @@ func TestCorefileDenialCapParser(t *testing.T) {
 		{"two cache directives",
 			".:53 {\n    cache 30\n}\ncluster.local:53 {\n    cache 60 {\n        denial 9984 5\n    }\n}\n",
 			true, "cache 30 {\n        success 9984 30\n        denial 9984 5\n    }"},
+		// --- comment-aware brace counting (#... stripped per line) ---
+		// A `}` inside a trailing comment must NOT close the block:
+		// `cache 30 { # note }` still opens a multi-line block whose
+		// real close is the bare `}` below (the old depth counter read
+		// the commented `}` and mis-tracked the block).
+		{"brace inside trailing comment does not close",
+			".:53 {\n    cache 30 { # note with a } brace\n        success 9984 30\n    }\n}\n",
+			true, "denial 9984 5"},
+		// A `# }` line inside the block must not close it either — the
+		// block keeps scanning to the real close.
+		{"comment-only close brace ignored",
+			".:53 {\n    cache 30 {\n        # }\n        success 9984 30\n    }\n}\n",
+			true, "denial 9984 5"},
+		// A commented-out denial does not satisfy the check (already
+		// covered above), and a `}` in that comment must not close.
+		{"commented denial with brace ignored",
+			".:53 {\n    cache 30 {\n        # denial 9984 5 }\n        success 9984 30\n    }\n}\n",
+			true, "denial 9984 5"},
+		// A bare cache directive with a trailing comment: the rewrite
+		// keeps the note INSIDE the braces (after the `{` it would be
+		// commented out of the Corefile entirely).
+		{"bare cache with trailing comment",
+			".:53 {\n    cache 30 # k0s default\n}\n",
+			true, "cache 30 { # k0s default"},
+		// An inline block whose trailing comment hides a `}`: the
+		// injection targets the REAL closing brace, and the comment
+		// text survives after it.
+		{"inline injection with trailing comment",
+			".:53 {\n    cache 30 { success 9984 30 } # tuned\n}\n",
+			true, "} # tuned"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, changed := corefileDenialCap(tc.in)

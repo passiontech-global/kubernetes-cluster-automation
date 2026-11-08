@@ -124,15 +124,19 @@ var Modules = []shared.Module{
 	{Name: "cilium-taint-reaper", Group: groupNode, GateEnv: "CILIUM_TAINT_REAPER_ENABLED", Setup: ciliumtaintreaper.Setup},
 	{Name: "descheduler-storm-gate", Group: groupNode, Setup: deschedulerstormgate.Setup},
 	{Name: "node-labeler", Group: groupNode, Setup: nodelabeler.Setup},
-	{Name: "kubelet-liveness-reaper", Group: groupNode, Setup: kubeletreaper.Setup},
+	// The three latency-sensitive probes draw from their own client-go
+	// rate limiter (ProbeClients → SetupModules hands ProbeCS/ProbeDyn
+	// as CS/Dyn): a janitor delete burst draining the shared bucket
+	// must not queue-delay the probes behind it.
+	{Name: "kubelet-liveness-reaper", Group: groupNode, ProbeClients: true, Setup: kubeletreaper.Setup},
 	{Name: "partition-pod-evictor", Group: groupNode, Setup: partitionevictor.Setup},
-	{Name: "dead-node-sweeper", Group: groupNode, Setup: deadnodesweeper.Setup},
+	{Name: "dead-node-sweeper", Group: groupNode, ProbeClients: true, Setup: deadnodesweeper.Setup},
 	{Name: "csr-watcher", Group: groupNode, Setup: csrwatcher.Setup},
 	{Name: "pdb-deadlock-watchdog", Group: groupNode, GateEnv: "PDB_WATCHDOG_ENABLED", DefaultOn: true, Setup: pdbdeadlockwatchdog.Setup},
 
 	// apiserver integrity guards.
 	{Name: "admission-webhook-guard", Group: groupAPIServer, Setup: webhookguard.Setup},
-	{Name: "apiserver-endpoint-guard", Group: groupAPIServer, Setup: apiserverendpointguard.Setup},
+	{Name: "apiserver-endpoint-guard", Group: groupAPIServer, ProbeClients: true, Setup: apiserverendpointguard.Setup},
 	{Name: "apiservice-guard", Group: groupAPIServer, GateEnv: "APISERVICE_GUARD_ENABLED", DefaultOn: true, Setup: apiserviceguard.Setup},
 
 	// Resource cleanup sweeps.
@@ -379,6 +383,21 @@ func SetupModules(deps shared.Deps, mods []shared.Module) error {
 		d := deps
 		d.Name = m.Name
 		d.CheckRegs = regs
+		// Latency-sensitive probe rows swap in the probe-rate-limited
+		// clients before Setup ever runs — the module code still reads
+		// d.CS/d.Dyn, it just draws from the probe token bucket (own
+		// QPS/Burst in cmd/manager main.go) so janitor delete bursts
+		// on the shared bucket cannot queue-delay it. Nil ProbeCS
+		// (literal test Deps, StubManager wiring) leaves the shared
+		// clients in place.
+		if m.ProbeClients {
+			if deps.ProbeCS != nil {
+				d.CS = deps.ProbeCS
+			}
+			if deps.ProbeDyn != nil {
+				d.Dyn = deps.ProbeDyn
+			}
+		}
 		if gatedOff[m.Name] {
 			d.Disabled = true
 			d.Log.WithName(m.Name).Info("disabled — module not registered", "gate", m.GateEnv)

@@ -19,6 +19,38 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
+// volumeAttachmentCache memoizes the once-per-sweep VolumeAttachment
+// listing — nodeHasStatefulHolders and logVolumeAttachments consume
+// the same census (previously two full cluster lists per fence). The
+// list error is cached too, and each consumer applies its own policy
+// to it: the holder check fails closed, the forensics log is
+// signal-only — both stay consistent across the sweep instead of
+// re-hammering a flapping API per node (same shape as
+// verdict.go's remediationCache).
+type volumeAttachmentCache struct {
+	fetched bool
+	items   []storagev1.VolumeAttachment
+	err     error
+}
+
+// volumeAttachments returns the cluster's VolumeAttachments, listing
+// at most once per cache instance.
+func (s *deadNodeSweeper) volumeAttachments(ctx context.Context,
+	vac *volumeAttachmentCache) ([]storagev1.VolumeAttachment, error) {
+	if vac.fetched {
+		return vac.items, vac.err
+	}
+	vac.fetched = true
+	vac.err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.VolumeAttachments(s.cs),
+		func(items []storagev1.VolumeAttachment) error {
+			vac.items = append(vac.items, items...)
+			return nil
+		})
+	return vac.items, vac.err
+}
+
 // nodeHasStatefulHolders reports whether the node holds
 // anything that makes force-detaching its volumes dangerous: a
 // VolumeAttachment whose volume carries a ReadWriteOnce access mode
@@ -26,7 +58,8 @@ import (
 // loudly), or a Pod owned by a StatefulSet (its identity is
 // volume-bound even when the current spec lost the claim). A list
 // failure is an error — the caller fails closed.
-func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string) (bool, error) {
+func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string,
+	vac *volumeAttachmentCache) (bool, error) {
 	// One PV census for the whole check: PV-referenced attachments
 	// carry only the volume NAME — the access modes live on the PV
 	// object itself (inline CSI specs carry their own). PVs are
@@ -46,19 +79,14 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 		return false, fmt.Errorf("list persistentvolumes: %w", err)
 	}
 	hasRWO := false
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(s.cs),
-		func(items []storagev1.VolumeAttachment) error {
-			for i := range items {
-				if items[i].Spec.NodeName == nodeName && volumeAttachmentRWO(&items[i], pvModes) {
-					hasRWO = true
-				}
-			}
-			return nil
-		})
+	attachments, err := s.volumeAttachments(ctx, vac)
 	if err != nil {
 		return false, fmt.Errorf("list volumeattachments: %w", err)
+	}
+	for i := range attachments {
+		if attachments[i].Spec.NodeName == nodeName && volumeAttachmentRWO(&attachments[i], pvModes) {
+			hasRWO = true
+		}
 	}
 	if hasRWO {
 		return true, nil
@@ -117,29 +145,25 @@ func volumeAttachmentRWO(va *storagev1.VolumeAttachment,
 	return false
 }
 
-// logVolumeAttachments lists VolumeAttachments bound to the node as a
-// forensics signal (these are what the taint will force-detach).
-// Never fatal, never vetoes a decision.
-func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName string) {
+// logVolumeAttachments reads the sweep's VolumeAttachment census (the
+// cache nodeHasStatefulHolders already filled — never a second list)
+// and logs the attachments bound to the node as a forensics signal
+// (these are what the taint will force-detach). Never fatal, never
+// vetoes a decision.
+func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName string,
+	vac *volumeAttachmentCache) {
 	log := logf.FromContext(ctx)
-	// Paged like the pod list above — VolumeAttachments are
-	// cluster-scoped and unbounded, and this read is signal-only.
-	var names []string
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(s.cs),
-		func(items []storagev1.VolumeAttachment) error {
-			for i := range items {
-				if items[i].Spec.NodeName == nodeName {
-					names = append(names, items[i].Name)
-				}
-			}
-			return nil
-		})
+	attachments, err := s.volumeAttachments(ctx, vac)
 	if err != nil {
 		log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
 		metrics.IncError(s.queue)
 		return
+	}
+	var names []string
+	for i := range attachments {
+		if attachments[i].Spec.NodeName == nodeName {
+			names = append(names, attachments[i].Name)
+		}
 	}
 	if len(names) > 0 {
 		log.Info("node holds volumeattachments — taint will force-detach",
@@ -148,21 +172,21 @@ func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName str
 }
 
 // fenceNode applies the out-of-service taint to a confirmed-dead node
-// and books the split-brain accounting: the signal-only attachment log,
-// the TaintNode patch (a failure is logged + IncError'd here and
-// returns so the caller skips the node — fail closed, not failed
-// sweep), the without-SNR fence counter with its has_volumes label,
-// and the stale skip-flag clear (the fence resolves the hold). A
-// fence without a SNR CR is a judgment call even with the override,
-// so alerting sees every fence the sweeper decided on its own
-// evidence.
+// and books the split-brain accounting: the signal-only attachment log
+// (fed from the sweep's shared VolumeAttachment census), the
+// TaintNode patch (a failure is logged + IncError'd here and returns
+// so the caller skips the node — fail closed, not failed sweep), the
+// without-SNR fence counter with its has_volumes label, and the stale
+// skip-flag clear (the fence resolves the hold). A fence without a
+// SNR CR is a judgment call even with the override, so alerting sees
+// every fence the sweeper decided on its own evidence.
 func (s *deadNodeSweeper) fenceNode(ctx context.Context, nodeName string,
-	count int, viaSNR, hasVolumes bool, reason string) error {
+	count int, viaSNR, hasVolumes bool, reason string, vac *volumeAttachmentCache) error {
 	log := logf.FromContext(ctx)
 
 	// Signal only: which volumes will the taint force-detach.
 	// Failure here must not veto the taint decision.
-	s.logVolumeAttachments(ctx, nodeName)
+	s.logVolumeAttachments(ctx, nodeName, vac)
 
 	if err := kube.TaintNode(ctx, s.cs, nodeName, outOfServiceTaintKey,
 		outOfServiceTaintValue, corev1.TaintEffectNoExecute); err != nil {
