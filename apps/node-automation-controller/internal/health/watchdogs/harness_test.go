@@ -10,22 +10,27 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
 var ctx = context.Background()
 
+// harnessChecks is this package's check roster in sweep order — both
+// wrappers below pass the same slice through probetest.NewCheckProber.
+var harnessChecks = []func(*probefw.Deps) probefw.Check{
+	NewKcmWorkqueueCheck,
+	NewOperatorWorkqueueCheck,
+	NewSchedulerWatchdogCheck,
+	NewMeshControlPlaneCheck,
+	NewObservabilityPipelineGuardCheck,
+	NewOnePasswordConnectSyncCheck,
+}
+
 func testProber(cs *fake.Clientset) *probetest.Prober {
-	return testProberDyn(cs, probetest.OpDyn())
+	return probetest.NewCheckProber(cs, nil, harnessChecks...)
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {
-	return probetest.NewProber(cs, dyn,
-		NewKcmWorkqueueCheck,
-		NewOperatorWorkqueueCheck,
-		NewSchedulerWatchdogCheck,
-		NewMeshControlPlaneCheck,
-		NewObservabilityPipelineGuardCheck,
-		NewOnePasswordConnectSyncCheck,
-	)
+	return probetest.NewCheckProber(cs, dyn, harnessChecks...)
 }

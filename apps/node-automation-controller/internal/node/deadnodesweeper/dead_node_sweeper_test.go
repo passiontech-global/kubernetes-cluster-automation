@@ -22,6 +22,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
+// ctx is the sweep context every test in the package shares.
+var ctx = context.Background()
+
 // outOfServiceTaint is the taint the sweeper applies to confirmed-dead
 // nodes; node controller then force-deletes pods + detaches volumes.
 var outOfServiceTaint = corev1.Taint{

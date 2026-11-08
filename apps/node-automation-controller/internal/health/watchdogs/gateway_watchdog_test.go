@@ -535,10 +535,7 @@ func TestGatewayClassControllerCache(t *testing.T) {
 // no gauge, and — most importantly — a heal would never bounce
 // cilium's leader over someone else's queue.
 func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cilium-operator", opReasonStaleGWStatus)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
@@ -565,10 +562,7 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 // IS tracked — first-seen lands under the
 // "cilium-operator/httproutes/<ns>/<name>" signature key.
 func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cilium-operator", opReasonStaleGWStatus)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
@@ -602,10 +596,7 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 // enter the stuck set: proven foreign ownership applies to the class
 // kind exactly as it does to Gateways and routes.
 func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cilium-operator", opReasonStaleGWStatus)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
@@ -636,10 +627,7 @@ func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
 // check and lifts the stale_gateway_status gauge — the real signal
 // the signature exists for.
 func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cilium-operator", opReasonStaleGWStatus)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
@@ -665,10 +653,7 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 // The healthy mirror: a class Accepted at its current generation is
 // not even tracked — no first-seen, no gauge.
 func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cilium-operator", opReasonStaleGWStatus)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",

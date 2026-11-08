@@ -2,6 +2,7 @@ package orphanendpointslicecleaner
 
 import (
 	"errors"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -59,10 +60,7 @@ func oescStreakKey(s *discoveryv1.EndpointSlice) string {
 // first sighting and is reaped on the second consecutive one —
 // re-confirmed by a live Get first.
 func TestOrphanEndpointSliceTwoCycleReap(t *testing.T) {
-	metrics.OrphanEndpointSlicesCleanedTotal.DeleteLabelValues("apps")
-	t.Cleanup(func() {
-		metrics.OrphanEndpointSlicesCleanedTotal.DeleteLabelValues("apps")
-	})
+	testutil.CleanupMetric(t, metrics.OrphanEndpointSlicesCleanedTotal, "apps")
 
 	cs := fake.NewSimpleClientset(
 		oescService("default", "kubernetes"),

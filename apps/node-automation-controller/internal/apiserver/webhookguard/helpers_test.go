@@ -17,15 +17,12 @@ import (
 var ctx = context.Background()
 
 // wgDyn builds the dynamic fake the guard's tests share — the stock
-// testutil.NewDynamicClient covers every CRD in the shared table but
-// NOT CustomResourceDefinition itself (the snapshot lists CRDs for
-// the conversion-webhook checks), so the list kind is merged in
-// here. Without it the fake panics on a List whose <Kind>List is
-// unregistered.
+// testutil table covers every CRD the modules read but NOT
+// CustomResourceDefinition itself (the snapshot lists CRDs for the
+// conversion-webhook checks), so the tests opt into the shared
+// CRD-extended fake.
 func wgDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	kinds := testutil.DynListKinds()
-	kinds[guardstate.CustomResourceDefinitionGVR] = "CustomResourceDefinitionList"
-	return testutil.NewFakeDyn(kinds, objs...)
+	return testutil.NewDynWithCRDs(objs...)
 }
 
 // wgCRDConversion builds a CustomResourceDefinition whose

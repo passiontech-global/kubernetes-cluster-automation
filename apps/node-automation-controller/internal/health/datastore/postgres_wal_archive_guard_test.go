@@ -91,12 +91,8 @@ func TestPostgresHealthyClusterPasses(t *testing.T) {
 // retained byte count, alongside the existing inactive_slot reason
 // on the unhealthy gauge.
 func TestPostgresInactiveSlotWALBloat(t *testing.T) {
-	postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "replica1")
-	postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
-	t.Cleanup(func() {
-		postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "replica1")
-		postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
-	})
+	testutil.CleanupMetric(t, postgresInactiveSlotWALGauge, "db", "pg-main", "replica1")
+	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "inactive_slot")
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		if strings.Contains(query, "pg_replication_slots_retained_bytes") {
 			return []probetest.PromTestSample{{
@@ -140,12 +136,8 @@ func TestPostgresInactiveSlotWALBloat(t *testing.T) {
 // to a >5GiB lsn diff — flags 1 on the bloat gauge (that family
 // returns value-0 samples, no byte count to carry).
 func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
-	postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "stale-slot")
-	postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
-	t.Cleanup(func() {
-		postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "stale-slot")
-		postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
-	})
+	testutil.CleanupMetric(t, postgresInactiveSlotWALGauge, "db", "pg-main", "stale-slot")
+	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "inactive_slot")
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		if strings.Contains(query, "pg_replication_slots_active") {
 			return []probetest.PromTestSample{{
@@ -209,10 +201,7 @@ func cnpgSeries(t *testing.T, ns, name, reason string) (float64, bool) {
 // 15m window flags stuck_phase on the first sweep — the operator's
 // own transition stamp is the honest clock.
 func TestCNPGStuckPhaseTimestampFlags(t *testing.T) {
-	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-fo", "stuck_phase")
-	t.Cleanup(func() {
-		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-fo", "stuck_phase")
-	})
+	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge, "db", "pg-fo", "stuck_phase")
 	cr := cnpgClusterHealth("db", "pg-fo", "Failing over",
 		20*time.Minute, 3, 1)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
@@ -229,10 +218,7 @@ func TestCNPGStuckPhaseTimestampFlags(t *testing.T) {
 // first sight arms the clock, a second sweep past the window flags —
 // and the CamelCase enum spelling matches the spaced CRD value.
 func TestCNPGStuckPhaseLedgerPath(t *testing.T) {
-	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-wait", "stuck_phase")
-	t.Cleanup(func() {
-		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-wait", "stuck_phase")
-	})
+	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge, "db", "pg-wait", "stuck_phase")
 	now := time.Now()
 	cr := cnpgClusterHealth("db", "pg-wait",
 		"WaitingForInstancesToBecomeActive", -1, 3, 0)
@@ -258,10 +244,7 @@ func TestCNPGStuckPhaseLedgerPath(t *testing.T) {
 // readyInstances short of instances for two consecutive sweeps past
 // the window flags under_replicated.
 func TestCNPGUnderReplicatedFlags(t *testing.T) {
-	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-short", "under_replicated")
-	t.Cleanup(func() {
-		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-short", "under_replicated")
-	})
+	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge, "db", "pg-short", "under_replicated")
 	now := time.Now()
 	cr := cnpgClusterHealth("db", "pg-short", "Healthy", -1, 3, 1)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
@@ -286,10 +269,7 @@ func TestCNPGUnderReplicatedFlags(t *testing.T) {
 // gauge — and still rides the WAL archive_condition reason (the
 // cnpgCluster fixture's transition is an hour old).
 func TestCNPGArchivingDisabledFlags(t *testing.T) {
-	cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-main", "archiving_disabled")
-	t.Cleanup(func() {
-		cnpgClusterUnhealthyGauge.DeleteLabelValues("db", "pg-main", "archiving_disabled")
-	})
+	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge, "db", "pg-main", "archiving_disabled")
 	cr := cnpgCluster("db", "pg-main", time.Hour)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
 	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)

@@ -10,6 +10,7 @@
 package watchdogs
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -77,12 +78,7 @@ func TestPerconaUnpausedStaleGen(t *testing.T) {
 // outlives the window (the brake is scoped, not a blanket disable
 // of the perconaxtradbclusters entry).
 func TestCheckOperatorWorkqueuesPausedPerconaIgnored(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues(
-		"percona-xtradb-cluster-operator", kcmReasonStaleGen)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues(
-			"percona-xtradb-cluster-operator", kcmReasonStaleGen)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "percona-xtradb-cluster-operator", kcmReasonStaleGen)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("everest", "percona-xtradb-cluster-operator-lock",

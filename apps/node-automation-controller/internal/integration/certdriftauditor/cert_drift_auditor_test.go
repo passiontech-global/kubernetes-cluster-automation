@@ -625,10 +625,7 @@ func driftGauge(ns, name, src string) float64 {
 // The drift latch: a single-scan mismatch is the replicator mid-sync
 // — only the SECOND consecutive mismatch sets the gauge.
 func TestReplicatedDriftLatchesAfterTwoScans(t *testing.T) {
-	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	t.Cleanup(func() {
-		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	})
+	testutil.CleanupMetric(t, metrics.ReplicatedSecretDrift, "apps", "tls-copy", "sec/tls-src")
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v2"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
@@ -651,10 +648,7 @@ func TestReplicatedDriftLatchesAfterTwoScans(t *testing.T) {
 // A matching copy resets the streak AND prunes the held series —
 // recovered drift must not park a 1 in /metrics.
 func TestReplicatedDriftClearsOnResync(t *testing.T) {
-	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	t.Cleanup(func() {
-		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	})
+	testutil.CleanupMetric(t, metrics.ReplicatedSecretDrift, "apps", "tls-copy", "sec/tls-src")
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v1"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-old"))
@@ -688,10 +682,7 @@ func TestReplicatedDriftClearsOnResync(t *testing.T) {
 // A source that is NOT a TLS secret resolves via the direct-Get
 // fallback, not the tlsData sweep map.
 func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
-	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	t.Cleanup(func() {
-		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
-	})
+	testutil.CleanupMetric(t, metrics.ReplicatedSecretDrift, "apps", "tls-copy", "sec/tls-src")
 	src := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "sec", Name: "tls-src"},
 		Type:       corev1.SecretTypeOpaque,

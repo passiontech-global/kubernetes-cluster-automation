@@ -297,10 +297,7 @@ func zoneNode(name, zone string) *corev1.Node {
 // split-brain — but only after two consecutive sweeps (a relabeling
 // flap settles inside one).
 func TestMasterlessMultipleMastersSplitBrain(t *testing.T) {
-	statefulServiceMultipleMastersGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	t.Cleanup(func() {
-		statefulServiceMultipleMastersGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	})
+	testutil.CleanupMetric(t, statefulServiceMultipleMastersGauge, "db", "dragonfly-master", "dragonfly")
 	sts := shSTS("db", "dragonfly", 2,
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
 	svc := shMasterSvc("db", "dragonfly-master",
@@ -328,10 +325,7 @@ func TestMasterlessMultipleMastersSplitBrain(t *testing.T) {
 // STS still serves a Ready replica in datahub — reads/writes pay
 // the inter-DC RTT.
 func TestMasterlessSiteSkewTriggerA(t *testing.T) {
-	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly", "lanit")
-	t.Cleanup(func() {
-		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly", "lanit")
-	})
+	testutil.CleanupMetric(t, statefulMasterSiteSkewGauge, "db", "dragonfly-master", "dragonfly", "lanit")
 	sts := shSTS("db", "dragonfly", 2,
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
 	svc := shMasterSvc("db", "dragonfly-master",
@@ -363,12 +357,8 @@ func TestMasterlessSiteSkewTriggerA(t *testing.T) {
 // (100% >= 80%) is a cluster-level skew event — each pinned master
 // gets the gauge even without a same-STS datahub replica.
 func TestMasterlessSiteSkewPinRatio(t *testing.T) {
-	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m1", "sts-a", "lanit")
-	statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m2", "sts-b", "lanit")
-	t.Cleanup(func() {
-		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m1", "sts-a", "lanit")
-		statefulMasterSiteSkewGauge.DeleteLabelValues("db", "m2", "sts-b", "lanit")
-	})
+	testutil.CleanupMetric(t, statefulMasterSiteSkewGauge, "db", "m1", "sts-a", "lanit")
+	testutil.CleanupMetric(t, statefulMasterSiteSkewGauge, "db", "m2", "sts-b", "lanit")
 	stsA := shSTS("db", "sts-a", 2, map[string]string{"app": "a"})
 	stsB := shSTS("db", "sts-b", 2, map[string]string{"app": "b"})
 	svcA := shMasterSvc("db", "m1", map[string]string{"app": "a", "role": "master"})

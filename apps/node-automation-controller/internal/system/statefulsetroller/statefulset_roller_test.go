@@ -149,10 +149,7 @@ func srNodes(n int) []runtime.Object {
 // highest-ordinal stale pod is deleted and counted; the new-revision
 // pod and the lower-ordinal stale pod stay.
 func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
-	metrics.StatefulSetOnDeletePodsRolledTotal.DeleteLabelValues("apps", "db")
-	t.Cleanup(func() {
-		metrics.StatefulSetOnDeletePodsRolledTotal.DeleteLabelValues("apps", "db")
-	})
+	natestutil.CleanupMetric(t, metrics.StatefulSetOnDeletePodsRolledTotal, "apps", "db")
 
 	t0 := time.Now()
 	sts := srSTS("apps", "db", true)

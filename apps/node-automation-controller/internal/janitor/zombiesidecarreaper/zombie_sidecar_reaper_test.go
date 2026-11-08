@@ -102,8 +102,7 @@ func zsrReaper(cs *fake.Clientset, probe *zsrShutdownProbe) *zombieSidecarReaper
 // The two-step reap: cycle 1 POSTs /shutdown and keeps the pod;
 // a pod still qualifying next cycle is deleted and counted.
 func TestZombieSidecarGraceThenDelete(t *testing.T) {
-	metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-	t.Cleanup(func() { metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs") })
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 
 	cs := fake.NewSimpleClientset(zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0))
 	probe := &zsrShutdownProbe{}
@@ -137,8 +136,7 @@ func TestZombieSidecarGraceThenDelete(t *testing.T) {
 // A failed /shutdown call deletes immediately — graceful is
 // unreachable so there is nothing to wait a cycle for.
 func TestZombieSidecarShutdownFailureDeletesNow(t *testing.T) {
-	metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-	t.Cleanup(func() { metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs") })
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 
 	cs := fake.NewSimpleClientset(zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0))
 	probe := &zsrShutdownProbe{err: errors.New("connection refused")}
@@ -440,8 +438,7 @@ func TestZombieSidecarNonZeroExitReaped(t *testing.T) {
 // (one graceful cycle) instead of deleted on the spot, and the next
 // cycle still reaps it when it keeps qualifying.
 func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
-	metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-	t.Cleanup(func() { metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs") })
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 
 	pod := zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0)
 	cs := fake.NewSimpleClientset(pod)
@@ -523,10 +520,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 	}
 
 	t.Run("graceful-then-reap", func(t *testing.T) {
-		metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-		t.Cleanup(func() {
-			metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-		})
+		testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 		cs := fake.NewSimpleClientset(
 			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
 		r := zsrReaper(cs, &zsrShutdownProbe{})
@@ -545,10 +539,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 	})
 
 	t.Run("failed-shutdown-prior-cycle", func(t *testing.T) {
-		metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-		t.Cleanup(func() {
-			metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
-		})
+		testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 		cs := fake.NewSimpleClientset(
 			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
 		r := zsrReaper(cs, &zsrShutdownProbe{err: errors.New("refused")})

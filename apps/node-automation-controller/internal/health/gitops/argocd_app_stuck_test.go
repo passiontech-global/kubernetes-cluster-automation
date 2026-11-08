@@ -166,10 +166,7 @@ func TestArgoCDAppStuckPersistedFirstSeenResume(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
 	probetest.FreezeNow(p.Deps, base)
-	argoCDAppStuckGauge.DeleteLabelValues("argocd", "resume-app", "progressing>45m0s")
-	t.Cleanup(func() {
-		argoCDAppStuckGauge.DeleteLabelValues("argocd", "resume-app", "progressing>45m0s")
-	})
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "resume-app", "progressing>45m0s")
 
 	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
 	if res.Pass {

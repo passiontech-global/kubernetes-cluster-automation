@@ -15,6 +15,7 @@
 package watchdogs
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"strings"
 	"testing"
 	"time"
@@ -120,10 +121,7 @@ func TestHelmRepoStaleGenOCI(t *testing.T) {
 // right beside it still freezes past the window — the carve-out is
 // scoped to OCI, not a blanket disable of the helmrepositories entry.
 func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "source-controller", kcmReasonStaleGen)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("flux-system", "source-controller-leader-election",
@@ -219,10 +217,7 @@ func TestLeaderPodsSelectorFallbackCapsAtOne(t *testing.T) {
 // unresolvable holderIdentity deletes ONE operator replica — the
 // oldest — and the heals counter moves by 1. Two replicas survive.
 func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "scylla-operator", kcmReasonStaleGen)
 	base := time.Now()
 	labels := map[string]string{"app.kubernetes.io/name": "scylla-operator"}
 	oldest := shOpPod("scylla-operator", "scylla-operator-0", labels, base.Add(-3*time.Hour))

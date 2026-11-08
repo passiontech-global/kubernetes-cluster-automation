@@ -63,10 +63,7 @@ func pgMember(ns, name, cluster string) *corev1.Pod {
 // tracks first-seen; past the window the degraded gauge fires and
 // the check fails.
 func TestPerconaDegradedQuorumPersists(t *testing.T) {
-	perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	t.Cleanup(func() {
-		perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	})
+	testutil.CleanupMetric(t, perconaClusterDegradedGauge, "PerconaXtraDBCluster", "db", "pxc-main")
 	base := time.Now()
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(pxcCluster("db", "pxc-main", 2, 3)))
@@ -125,10 +122,7 @@ func TestPerconaSmallClusterSkipsDegraded(t *testing.T) {
 // whole 30m window fails the check and reports on the gauge under
 // PerconaXtraDBCluster — wsrep only exists for Galera.
 func TestPerconaWsrepDonorDesyncedFails(t *testing.T) {
-	perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	t.Cleanup(func() {
-		perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	})
+	testutil.CleanupMetric(t, perconaClusterDegradedGauge, "PerconaXtraDBCluster", "db", "pxc-main")
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		if strings.Contains(query, "wsrep_local_state") {
 			return []probetest.PromTestSample{{
@@ -164,10 +158,7 @@ func TestPerconaWsrepDonorDesyncedFails(t *testing.T) {
 // while a member pod still Runs — tracked first, FAIL + gauge past
 // the 10m window.
 func TestPerconaPatroniLeaderLock(t *testing.T) {
-	perconaClusterDegradedGauge.DeleteLabelValues("PerconaPGCluster", "db", "pg-main")
-	t.Cleanup(func() {
-		perconaClusterDegradedGauge.DeleteLabelValues("PerconaPGCluster", "db", "pg-main")
-	})
+	testutil.CleanupMetric(t, perconaClusterDegradedGauge, "PerconaPGCluster", "db", "pg-main")
 	base := time.Now()
 	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"))
 	// No <cr>-leader Lease or Endpoints — both DCS surfaces vacant.

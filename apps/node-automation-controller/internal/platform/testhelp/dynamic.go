@@ -316,3 +316,22 @@ func DynListKinds() map[schema.GroupVersionResource]string {
 	}
 	return m
 }
+
+// CRDGVR is the apiextensions CustomResourceDefinition GVR — the one
+// CRD kind deliberately absent from dynCRDGVKs because baking it into
+// the shared table would widen the default fake for every test that
+// must NOT see CRDs (and would silence the panic-on-unregistered-List
+// guard those tests rely on). Tests that genuinely List CRDs opt in
+// via NewDynWithCRDs instead.
+var CRDGVR = schema.GroupVersionResource{
+	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+
+// NewDynWithCRDs returns a dynamic fake with the full shared table
+// PLUS the CustomResourceDefinition list kind — the merge shim the
+// webhookguard snapshot and certdriftauditor conversion tests both
+// hand-rolled.
+func NewDynWithCRDs(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	kinds := DynListKinds()
+	kinds[CRDGVR] = "CustomResourceDefinitionList"
+	return NewFakeDyn(kinds, objs...)
+}

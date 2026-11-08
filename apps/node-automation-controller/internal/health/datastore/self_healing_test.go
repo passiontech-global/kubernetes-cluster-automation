@@ -5,6 +5,7 @@
 package datastore
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"strings"
 	"testing"
 	"time"
@@ -70,10 +71,7 @@ func shStatefulZeroGauge(t *testing.T, ns, svc, sts string) (float64, bool) {
 // first, gauge at 3m — and because the STS is Dragonfly-owned the
 // operator leader gets bounced at 5m to force re-election.
 func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "dragonfly-master", "dragonfly")
 	base := time.Now()
 	sts := shSTS("db", "dragonfly", 3,
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
@@ -128,10 +126,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 // the FIRST post-restart sweep — the in-RAM ledger is empty but the
 // annotation proves the zero-endpoint streak held.
 func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "dragonfly-master", "dragonfly")
 	base := time.Now()
 	sts := shSTS("db", "dragonfly", 3,
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
@@ -161,10 +156,7 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 // A masterless non-Dragonfly service fires the gauge but never
 // touches any operator pod.
 func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("cache", "redis-master", "redis")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("cache", "redis-master", "redis")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "cache", "redis-master", "redis")
 	base := time.Now()
 	sts := shSTS("cache", "redis", 2, map[string]string{"app": "redis"})
 	// Role key on the Service LABELS this time — selector stays the
