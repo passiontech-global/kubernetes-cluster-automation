@@ -18,8 +18,13 @@ type CtrConfig struct {
 	IngestDir          string        // containerd content ingest dir (39)
 	IngestMaxAge       time.Duration // ingest dir mtime older than → stale (3h)
 	IngestScanInterval time.Duration // periodic rescan even under disk WM (6h)
-	MaxTaskClean       int           // wedged ctr task dir cap per cycle (31)
-	MaxShimKill        int           // orphan shim kill cap per cycle (31)
+	// IngestStaleAge is the orphan-lease age gate — a containerd
+	// lease carrying no containerd.io/gc.expire label that is older
+	// than this is a leaked pin on content blobs and gets reaped
+	// before the store-wide prune runs (2h).
+	IngestStaleAge time.Duration
+	MaxTaskClean   int // wedged ctr task dir cap per cycle (31)
+	MaxShimKill    int // orphan shim kill cap per cycle (31)
 	// MetaJournalFn is the KR3 journal probe — `journalctl
 	// -u k0sworker -u containerd --since "3 minutes ago"`. nil →
 	// Systemd.ExecCombined default; a nil Systemd leaves the journal
@@ -36,6 +41,9 @@ func (g *CtrConfig) applyDefaults() {
 	}
 	if g.IngestScanInterval <= 0 {
 		g.IngestScanInterval = ctrIngestScanInterval
+	}
+	if g.IngestStaleAge <= 0 {
+		g.IngestStaleAge = ctrIngestStaleAge
 	}
 	if g.MaxTaskClean <= 0 {
 		g.MaxTaskClean = defaultMaxCtrTaskClean

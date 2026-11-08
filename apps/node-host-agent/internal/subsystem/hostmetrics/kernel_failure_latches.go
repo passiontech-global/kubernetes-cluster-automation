@@ -67,6 +67,7 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		OpenEBSLocalDir:  c.cfg.OpenEBSLocalDir,
 		Store:            c.state,
 		Clock:            c.cfg.Clock,
+		TickInterval:     c.cfg.LatchInterval,
 		Adjtimex: func(tx *unix.Timex) (int, error) {
 			return c.cfg.adjtimexFn(tx)
 		},

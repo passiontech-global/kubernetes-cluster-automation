@@ -57,6 +57,7 @@ const (
 	CheckCgroupThrottle    = "cgroup-pod-throttle"         // W12-KR1 pod memory.high + pids.max
 	CheckSubprocOOM        = "container-subproc-oom"       // subproc-oom living-dead OOM detector
 	CheckSATokenTTL        = "sa-token-ttl"                // sa-token-ttl projected SA token expiry guard
+	CheckKernelNetShim     = "kernel-net-shim-hygiene"     // kernel drops + containerd shim RSS guard
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

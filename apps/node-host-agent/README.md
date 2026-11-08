@@ -26,7 +26,11 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
   (`node_host_agent_pki_cert_days_left{path}` for `/var/lib/k0s/pki`,
   `/var/lib/k0s/pki/etcd`, `/var/lib/k0s/kubelet/pki/kubelet-client-current.pem`,
   `/etc/kine/pki`), and MTU drift
-  (`node_host_agent_mtu_drift` — `cilium_net` vs `neb1`). All
+  (`node_host_agent_mtu_drift` — `cilium_net` vs `neb1`), and a
+  clock-warp detector that compares each latch tick's elapsed
+  wall-clock against the expected cadence (>2.0s delta →
+  `clock-stepped-at` marker + `node_agent_clock_warp_events_total` +
+  `ACTION clock-warp:` → `NodeClockWarpDetected` K8s Event). All
   descriptors are also registered for the standalone textfile
   (`*.prom`) mode used on VM-only targets.
 - `workerhygiene` — worker watchdog checks (pod-teardown, konnectivity
@@ -35,7 +39,10 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
   `containerd.sock` ping (`state-kubelet-syncloop-down`,
   `state-containerd-sock-down`), `39-ctr-ingest-gc` stale ingest GC
   (`mtime >3h`, triggered at >75% `/var/lib/k0s` or every 6h,
-  `node_host_agent_workerhygiene_ctr_ingests_cleaned_total`),
+  `node_host_agent_workerhygiene_ctr_ingests_cleaned_total`) whose
+  store-prune now also reaps orphan containerd leases (no
+  `containerd.io/gc.expire` label, older than 2h) that pin content
+  blobs,
   `journald-integrity` auto-rotate (`journalctl --rotate
 --vacuum-time=3d` on corrupt/empty journal while the unit is
   active), zombie-storm detection (>500 `<defunct>` per container for
@@ -43,8 +50,17 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
   `cilium-envoy` readiness (`127.0.0.1:9964/ready`, ≥2 bad cycles or a
   `cilium-agent` SIGKILL → `SIGKILL` `cilium-envoy`,
   `state-cilium-envoy-down`), `/run/cilium/cilium.sock` datapath
-  health, and MTU drift checks (`state-cilium-mtu-drift` →
-  `CiliumMTUExceedsOverlay` event).
+  health, `kernel-net-shim-hygiene` (TcpExt `ListenDrops` +
+  `softnet_stat` drop/`time_squeeze` rising ≥2 cycles or a
+  `containerd-shim-runc-v2` over 200MiB / 1.5GiB total →
+  `state-kernel-net-shim-degraded`, exporting
+  `node_agent_kernel_listen_drops_total`,
+  `node_agent_kernel_softnet_drops_total`,
+  `node_agent_kernel_softnet_time_squeeze_total`,
+  `node_agent_containerd_shim_max_rss_bytes`,
+  `node_agent_containerd_shim_total_rss_bytes`), and MTU drift
+  checks (`state-cilium-mtu-drift` → `CiliumMTUExceedsOverlay`
+  event).
 - `nethealth` — DNS fallback (managed `/etc/hosts` block),
   coredns-stub, overlay egress relays, nebula health, fail2ban,
   clock-sync, conntrack pressure; flushes stale Nebula UDP `:45670`
@@ -57,13 +73,24 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
   reasons.
 - `controllerhygiene` (`auto` when `k0scontroller.service` exists) —
   apiserver wedge + kine TTL/pool guards, OOM-loop shield, sd_notify
-  watchdog feeder.
+  watchdog feeder, a verified pre-maintenance `etcdctl snapshot save`
+  (hourly budget, into `EtcdBackupDir`) ahead of the etcdquota
+  compact+defrag, and the konnectivity-server probe/heal (`:8091`
+  metrics → `node_host_agent_controllerhygiene_konnectivity_ready_backends`,
+  `-1` on scrape failure; missing UDS or zero backends ≥3 cycles with
+  a Ready worker → SIGKILL the child under a 30-minute budget).
 - `kinedb` — kine wire/auth/pool/horizon probes, advisory-lock
   compact-guard, daily reindex/repack.
 - `hostconfig` (`auto` when the vars dir holds `defaults.yaml`) —
   declarative host converger (17 groups: sysctl, systemd drop-ins,
   resolved DNS, nftables, nebula mesh, coredns stub, api-local-lb,
-  fail2ban, sshd, etcdctl…) replacing the ansible `node-config-agent`
+  fail2ban, sshd, etcdctl…). The base group sizes the
+  `nf_conntrack` hash table to `max(conntrack_max/4, 65536)` buckets
+  (`/etc/modprobe.d/nf_conntrack.conf` + live hashsize grow), and the
+  kine group renders mTLS flags (`kine_ca_file`,
+  `kine_server_cert_file`, `kine_server_key_file`) plus a 30s TCP
+  `ExecStartPost` readiness wait when `kine_listen_address` is
+  `tcp://host:port`. Replacing the ansible `node-config-agent`
   DaemonSet + `hub-converge` CronJob. A clean cycle updates
   `node_host_agent_hostconfig_last_success_seconds` +
   `node_host_agent_hostconfig_cycles_total{result="ok"}`; `converge-once`

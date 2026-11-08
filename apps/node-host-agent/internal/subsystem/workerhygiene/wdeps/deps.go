@@ -82,6 +82,15 @@ type Series struct {
 	MemoryCompactionRuns   int64
 	RunTmpfsUsedRatio      float64
 	RunTmpfsCleanups       int64
+	// The kernel-net-shim-hygiene family: kernel socket/softnet drop
+	// counters from /proc/net/{netstat,softnet_stat} (accumulating
+	// kernel counters, not deltas) plus the containerd-shim RSS
+	// measurements.
+	KernelListenDrops           int64 // TcpExt ListenDrops
+	KernelSoftnetDrops          int64 // softnet_stat dropped, all CPUs
+	KernelSoftnetTimeSqueeze    int64 // softnet_stat time_squeeze, all CPUs
+	ContainerdShimMaxRSSBytes   int64 // worst containerd-shim-runc-v2 RSS
+	ContainerdShimTotalRSSBytes int64 // sum across all shims
 }
 
 // Deps is the shared state every Check consumes — the split's

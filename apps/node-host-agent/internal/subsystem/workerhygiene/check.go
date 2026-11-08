@@ -89,6 +89,10 @@ func (h *Hygiene) initChecks() {
 	add(runtime.NewCgroupThrottle(d))    // wdeps.CheckCgroupThrottle
 	add(runtime.NewSubprocOOM(d))        // wdeps.CheckSubprocOOM
 	add(runtime.NewSATokenTTL(d))        // wdeps.CheckSATokenTTL
+	// kernel-net-shim-hygiene — kernel socket/softnet drop growth +
+	// containerd shim RSS; last in the runtime-resource group (it
+	// reads the shared per-cycle pid snapshot).
+	add(runtime.NewKernelNetShim(d)) // wdeps.CheckKernelNetShim
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

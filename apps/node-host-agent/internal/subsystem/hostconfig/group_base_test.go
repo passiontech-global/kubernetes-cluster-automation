@@ -248,6 +248,66 @@ func TestHostsPinHostnameFieldExact(t *testing.T) {
 	}
 }
 
+// TestConntrackHashsizeConverge — conntrack_max=524288 must persist
+// hashsize=131072 (max(max/4, 65536)) in modprobe.d AND grow the
+// live table when the running hashsize is smaller. A live value at
+// or above the want is left alone (kernel shrinks are refused).
+func TestConntrackHashsizeConverge(t *testing.T) {
+	vars := writeVarsDir(t, "conntrack_max: \"524288\"\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr, Standalone: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	// Live table below the want -> must be grown in place.
+	hostWrite(t, r, "/sys/module/nf_conntrack/parameters/hashsize", "16384\n")
+
+	c := loadCyc(t, r, vars, "node-b")
+	c.conntrackHashsize()
+
+	conf := hostRead(t, r, "/etc/modprobe.d/nf_conntrack.conf")
+	if !strings.Contains(conf, "options nf_conntrack hashsize=131072") {
+		t.Fatalf("modprobe.d hashsize not persisted:\n%s", conf)
+	}
+	if got := hostRead(t, r, "/sys/module/nf_conntrack/parameters/hashsize"); strings.TrimSpace(got) != "131072" {
+		t.Fatalf("live hashsize = %q, want 131072", got)
+	}
+
+	// A live table already at/above the want is never shrunk.
+	hostWrite(t, r, "/sys/module/nf_conntrack/parameters/hashsize", "262144\n")
+	c.conntrackHashsize()
+	if got := hostRead(t, r, "/sys/module/nf_conntrack/parameters/hashsize"); strings.TrimSpace(got) != "262144" {
+		t.Fatalf("live hashsize shrunk to %q, want 262144", got)
+	}
+}
+
+// TestConntrackHashsizeDefault — no conntrack_max var keeps the
+// 262144 table default, giving wantBuckets 65536 (the floor).
+func TestConntrackHashsizeDefault(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr, Standalone: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	hostWrite(t, r, "/sys/module/nf_conntrack/parameters/hashsize", "16384\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.conntrackHashsize()
+	conf := hostRead(t, r, "/etc/modprobe.d/nf_conntrack.conf")
+	if !strings.Contains(conf, "hashsize=65536") {
+		t.Fatalf("default hashsize want 65536:\n%s", conf)
+	}
+	if got := hostRead(t, r, "/sys/module/nf_conntrack/parameters/hashsize"); strings.TrimSpace(got) != "65536" {
+		t.Fatalf("live hashsize = %q, want 65536", got)
+	}
+}
+
 // On chrony hosts systemd-timesyncd is installed but INACTIVE —
 // the conf drop-in still lands but the service must NOT be
 // restarted (a second NTP daemon would fight chrony for adjtimex).

@@ -70,6 +70,10 @@ func (c *cyc) groupBase() {
 				"error", err)
 		}
 	}
+	// G1: size the nf_conntrack hash table to the table itself — a
+	// small default hashsize leaves long bucket chains that spin
+	// ksoftirqd on every lookup under conntrack pressure.
+	c.conntrackHashsize()
 	// A4 assert: effective == expected (informational fail like
 	// ansible) — best-effort verify; the apply failures above are
 	// what count the group error.
@@ -432,7 +436,8 @@ func (c *cyc) t16Pairs() [][2]string {
 	}
 	if c.r.fileExists("/proc/sys/net/netfilter/nf_conntrack_max") ||
 		fileExistsNoRoot("/proc/sys/net/netfilter/nf_conntrack_max") {
-		p = append(p, [2]string{"net.netfilter.nf_conntrack_max", "262144"})
+		p = append(p, [2]string{"net.netfilter.nf_conntrack_max",
+			strconv.FormatInt(c.conntrackMax(), 10)})
 	}
 	// W8-KR2: shrink dead-flow occupancy of the conntrack table —
 	// TIME_WAIT/CLOSE_WAIT pileups ate the table on WAN flaps.
@@ -465,6 +470,77 @@ func (c *cyc) t16Pairs() [][2]string {
 		p = append(p, v6...)
 	}
 	return p
+}
+
+// conntrackMax returns the conntrack table size the cluster vars
+// pin — the nf_conntrack_max value conntrackHashsize sizes the hash
+// table against. Empty/"None" keeps the 262144 default.
+func (c *cyc) conntrackMax() int64 {
+	// c.t is nil in the bare-cyc unit tests (no topology loaded) —
+	// the var then counts as unset and the default applies.
+	s := ""
+	if c.t != nil {
+		s = strings.TrimSpace(c.v("conntrack_max"))
+	}
+	if s == "" || s == "None" {
+		return 262144
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+		return n
+	}
+	return 262144
+}
+
+// conntrackHashsize sizes the nf_conntrack HASH table to the table
+// max (G1 — the ksoftirqd storm post-mortem): conntrack_max=524288
+// with the kernel's default 16384-bucket hash table leaves ~32-entry
+// chains, and every packet lookup walks a chain under
+// ksoftirqd — the CPU storm shows as softirq time, not a dropped-
+// packet counter. wantBuckets = max(conntrack_max/4, 65536) keeps
+// chains ≤4 entries (131072 buckets at the 524288 max). The
+// modprobe.d options file persists the sizing across reboot/module
+// reloads; a runtime write to the module parameter grows the live
+// table immediately (shrink-on-write is refused by the kernel, so
+// only a smaller live value is bumped).
+func (c *cyc) conntrackHashsize() {
+	r := c.r
+	want := c.conntrackMax() / 4
+	if want < 65536 {
+		want = 65536
+	}
+	content := []byte(fmt.Sprintf(
+		"# Managed by node-config-agent - conntrack hash bucket sizing\n"+
+			"# wantBuckets = max(conntrack_max/4, 65536) — long bucket\n"+
+			"# chains spin ksoftirqd on every conntrack lookup (G1).\n"+
+			"options nf_conntrack hashsize=%d\n", want))
+	if ch, err := r.writeManaged("/etc/modprobe.d/nf_conntrack.conf",
+		content, 0o644); err == nil && ch {
+		logger().Info("base: nf_conntrack hashsize persisted via modprobe.d",
+			"hashsize", want)
+	}
+	// Live-bump the running table — the modprobe.d file only takes
+	// effect on the next module load, and unloading nf_conntrack on
+	// a live node is not an option. Writing hashsize grows the table
+	// in place (the kernel refuses a shrink below the current value,
+	// so a larger live value is left alone).
+	p := "/sys/module/nf_conntrack/parameters/hashsize"
+	data, err := os.ReadFile(r.hp(p))
+	if err != nil {
+		return // module not loaded / param absent — nothing to grow
+	}
+	cur, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || cur >= want {
+		return
+	}
+	if err := os.WriteFile(r.hp(p),
+		[]byte(strconv.FormatInt(want, 10)+"\n"), 0o644); err != nil {
+		c.err("base: nf_conntrack live hashsize grow failed",
+			"path", p, "hashsize", want, "error", err)
+		return
+	}
+	r.actions.WithLabelValues("nf_conntrack hashsize").Inc()
+	logger().Info("base: nf_conntrack live hashsize grown",
+		"from", cur, "to", want)
 }
 
 // ---------- gomemlimit-sum: k0scontroller GOMEMLIMIT sum guard ----------

@@ -80,3 +80,9 @@ func NewSubprocOOM(d *wdeps.Deps) *SubprocOOMCheck {
 func NewSATokenTTL(d *wdeps.Deps) *SATokenTTLCheck {
 	return &SATokenTTLCheck{d: d}
 }
+
+// NewKernelNetShim returns the kernel drop + containerd shim RSS
+// guard.
+func NewKernelNetShim(d *wdeps.Deps) *KernelNetShimCheck {
+	return &KernelNetShimCheck{d: d}
+}

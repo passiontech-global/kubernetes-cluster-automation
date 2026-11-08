@@ -80,6 +80,11 @@ type Deps struct {
 	// provisioner roots the ro-mount evidence scans.
 	OpenEBSLocalDir string
 
+	// TickInterval is the latch ticker's expected cadence — the
+	// clock-warp detector compares each tick's elapsed wall-clock
+	// against it. <=0 → defaultTickInterval.
+	TickInterval time.Duration
+
 	// Store is the shared watchdog-state contract handle — the
 	// state-* latches, last-* rate budgets, counter files and
 	// STATE-ENTER watchdog-log appends all go through it so the
@@ -119,7 +124,13 @@ type Runner struct {
 	deps  Deps
 	kscan kernelScanState // kmsg.go — tail session + OOM pairing
 	steal stealDelta      // steal_entropy.go — jiffie baseline
+	warp  clockWarpState  // clockskew.go — wall-clock jump detector
 }
+
+// defaultTickInterval is the latch ticker cadence the warp detector
+// assumes when Deps.TickInterval is unset — the parent wires the
+// real LatchInterval; the constant only covers bare-New tests.
+const defaultTickInterval = 30 * time.Second
 
 // New applies the seam defaults and returns the engine.
 func New(d Deps) *Runner {
@@ -128,6 +139,9 @@ func New(d Deps) *Runner {
 	}
 	if d.KmsgDevicePaths == nil {
 		d.KmsgDevicePaths = defaultKmsgDevicePaths
+	}
+	if d.TickInterval <= 0 {
+		d.TickInterval = defaultTickInterval
 	}
 	return &Runner{deps: d}
 }
@@ -144,6 +158,7 @@ func (r *Runner) Refresh() {
 	r.updatePidFDPressure()
 	r.updateStealEntropy()
 	r.checkClockSkew()
+	r.checkClockWarp()
 	r.updateFSReadonlyEvidence()
 }
 

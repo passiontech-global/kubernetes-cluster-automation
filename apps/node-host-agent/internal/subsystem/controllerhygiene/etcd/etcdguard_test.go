@@ -44,6 +44,16 @@ func (g *etcdGuardFake) ctl(_ context.Context, args ...string) ([]byte, error) {
 		return []byte(g.status), nil
 	case strings.Contains(j, "alarm list"):
 		return []byte(g.alarms), nil
+	case strings.Contains(j, "snapshot save"):
+		// The real seam lands a non-empty file at the argv path —
+		// mirror it so the guard's post-save verify sees one.
+		if err := os.WriteFile(args[len(args)-1],
+			[]byte("fake-snapshot"), 0o600); err != nil {
+			return nil, err
+		}
+		return []byte(`{"hash":1,"revision":1,"totalKey":1,"totalSize":16384}`), nil
+	case strings.Contains(j, "snapshot status"):
+		return []byte(`{"hash":1,"revision":1,"totalKey":1,"totalSize":16384}`), nil
 	}
 	return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
 }
@@ -60,10 +70,13 @@ func (e *env) mkEtcdHost(t *testing.T) string {
 }
 
 // wireEtcdGuard points cfg.K0sDir at the fabricated host tree and
-// installs the scripted seams.
+// installs the scripted seams. EtcdBackupDir gets a writable tempdir
+// — the pre-maintenance snapshot gate runs before every remediation
+// and would otherwise try /var/backups/etcd on the test host.
 func (e *env) wireEtcdGuard(t *testing.T, g *etcdGuardFake) {
 	t.Helper()
 	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdBackupDir = filepath.Join(filepath.Dir(e.State), "etcd-backups")
 	e.H.Cfg.EtcdctlFn = g.ctl
 	e.H.Cfg.EvpurgeRunFn = func(_ context.Context, _ eventpurge.Config,
 		cutoff time.Time, _ io.Writer) error {
@@ -211,12 +224,18 @@ func TestEtcdGuardSizeTriggers(t *testing.T) {
 		t.Fatal("rescue ran without OnlineOnly")
 	}
 	// dbSize already decided the trigger — the alarm-list probe is
-	// skipped, so only `endpoint status` ran (hung-etcd probe
-	// halving).
-	if len(g.ctlCalls) != 1 ||
+	// skipped (hung-etcd probe halving). The remediation's
+	// pre-maintenance snapshot pair (save + status) is expected on
+	// top of the endpoint-status probe; the alarm probe must not
+	// appear.
+	for _, call := range g.ctlCalls {
+		if strings.Contains(strings.Join(call, " "), "alarm list") {
+			t.Fatalf("alarm probe ran despite decided trigger: %v", g.ctlCalls)
+		}
+	}
+	if len(g.ctlCalls) != 3 ||
 		!strings.Contains(strings.Join(g.ctlCalls[0], " "), "endpoint status") {
-		t.Fatalf("etcdctl calls=%v want status only (alarm probe skipped)",
-			g.ctlCalls)
+		t.Fatalf("etcdctl calls=%v want status + snapshot save/status", g.ctlCalls)
 	}
 }
 
@@ -323,6 +342,7 @@ func TestEtcdGuardRunCtxBounded(t *testing.T) {
 		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
 	}
 	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdBackupDir = filepath.Join(filepath.Dir(e.State), "etcd-backups")
 	e.H.Cfg.EtcdctlFn = g.ctl
 	var purgeDL, rescueDL time.Time
 	e.H.Cfg.EvpurgeRunFn = func(ctx context.Context, _ eventpurge.Config,
@@ -368,6 +388,7 @@ func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
 		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
 	}
 	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdBackupDir = filepath.Join(filepath.Dir(e.State), "etcd-backups")
 	e.H.Cfg.EtcdctlFn = g.ctl
 	e.H.Cfg.EvpurgeRunFn = func(ctx context.Context, _ eventpurge.Config,
 		_ time.Time, _ io.Writer) error {
@@ -397,6 +418,108 @@ func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
 	if log := e.LogLines(); !strings.Contains(log, "budget") ||
 		!strings.Contains(log, "deferred") {
 		t.Fatalf("exhausted budget not logged clearly:\n%s", log)
+	}
+}
+
+// --- pre-maintenance snapshot (1.5) ---
+
+func TestEtcdGuardPreMaintSnapshot(t *testing.T) {
+	e := fixture(t)
+	snapDir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = snapDir
+	snapSaved := false
+	var order []string
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "snapshot save"):
+			// The real seam lands a file at the argv path — mirror it
+			// so the verify sees a non-empty artifact.
+			path := args[len(args)-1]
+			if err := os.WriteFile(path, []byte("fake-snapshot"), 0o600); err != nil {
+				return nil, err
+			}
+			snapSaved = true
+			order = append(order, "snapshot")
+			return []byte(`{"hash":1,"revision":1,"totalKey":1,"totalSize":16384}`), nil
+		case strings.Contains(j, "snapshot status"):
+			return []byte(`{"hash":1,"revision":1,"totalKey":1,"totalSize":16384}`), nil
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cfg.EvpurgeRunFn = func(context.Context, eventpurge.Config,
+		time.Time, io.Writer) error {
+		order = append(order, "evpurge")
+		return nil
+	}
+	e.H.Cfg.EtcdRescueFn = func(context.Context,
+		etcdmaint.Config, io.Writer) error {
+		order = append(order, "rescue")
+		return nil
+	}
+	e.H.Cycle(context.Background())
+	if !snapSaved {
+		t.Fatal("pre-maintenance snapshot not saved")
+	}
+	if len(order) != 3 || order[0] != "snapshot" || order[1] != "evpurge" || order[2] != "rescue" {
+		t.Fatalf("remediation order = %v want [snapshot evpurge rescue]", order)
+	}
+	ents, _ := os.ReadDir(snapDir)
+	if len(ents) != 1 || !strings.HasPrefix(ents[0].Name(), "premaint-") {
+		t.Fatalf("snapshot file not in EtcdBackupDir: %v", ents)
+	}
+	// Second cycle inside the guard cooldown: no second snapshot
+	// call and no remediation — the guard budget was spent.
+	e.H.Cycle(context.Background())
+	if got := len(order); got != 3 {
+		t.Fatalf("cooldown re-ran remediation steps: %v", order)
+	}
+}
+
+func TestEtcdGuardSnapshotInvalidAbortsRescue(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.EtcdBackupDir = t.TempDir()
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "snapshot save"):
+			// Save "succeeds" but lands a zero-byte artifact — the
+			// verify must fail and the destructive half must NOT run.
+			return []byte(""), nil
+		case strings.Contains(j, "snapshot status"):
+			return nil, errors.New("invalid snapshot")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cfg.EvpurgeRunFn = func(context.Context, eventpurge.Config,
+		time.Time, io.Writer) error {
+		g.purges++
+		return nil
+	}
+	e.H.Cfg.EtcdRescueFn = func(context.Context,
+		etcdmaint.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdmaint.Config{})
+		return nil
+	}
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran without a verified snapshot: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
 	}
 }
 

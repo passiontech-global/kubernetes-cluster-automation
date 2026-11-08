@@ -216,6 +216,24 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_agent_run_tmpfs_cleanups_total",
 		"journal vacuum + orphan .tmp sweeps run by the /run tmpfs guard — run-tmpfs.",
 		d.Series.RunTmpfsCleanups)
+	// kernel-net-shim-hygiene series — kernel socket/softnet drop
+	// counters (raw accumulating values straight out of /proc) and
+	// the containerd shim RSS measurements.
+	counter("node_agent_kernel_listen_drops_total",
+		"TcpExt ListenDrops — accept-queue overflows on kernel sockets — kernel-net-shim-hygiene.",
+		d.Series.KernelListenDrops)
+	counter("node_agent_kernel_softnet_drops_total",
+		"Sum of per-CPU softnet_stat dropped columns — kernel-net-shim-hygiene.",
+		d.Series.KernelSoftnetDrops)
+	counter("node_agent_kernel_softnet_time_squeeze_total",
+		"Sum of per-CPU softnet_stat time_squeeze columns — kernel-net-shim-hygiene.",
+		d.Series.KernelSoftnetTimeSqueeze)
+	b.Gauge("node_agent_containerd_shim_max_rss_bytes",
+		"Largest containerd-shim-runc-v2 VmRSS on the node — kernel-net-shim-hygiene.",
+		float64(d.Series.ContainerdShimMaxRSSBytes))
+	b.Gauge("node_agent_containerd_shim_total_rss_bytes",
+		"Total containerd-shim-runc-v2 VmRSS on the node — kernel-net-shim-hygiene.",
+		float64(d.Series.ContainerdShimTotalRSSBytes))
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

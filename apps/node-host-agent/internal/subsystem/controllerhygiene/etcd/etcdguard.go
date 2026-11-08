@@ -132,6 +132,17 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	gctx, gcancel := context.WithTimeout(ctx, cdeps.DefaultEtcdGuardBudget)
 	defer gcancel()
 
+	// Pre-maintenance snapshot: the online compact+defrag rewrites
+	// the backend db — without a verified fresh snapshot in
+	// EtcdBackupDir a defrag fault is unrecoverable on a
+	// single-member etcd. Rate-limited to once per hour; a failed
+	// save or an invalid snapshot aborts the whole remediation —
+	// keep last-good, retry at the next guard window.
+	if !c.savePreMaintSnapshot(gctx) {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error").Inc()
+		return
+	}
+
 	// Stale apiserver events are the classic quota-filler after a
 	// control-plane outage — purge first so the rescue's compaction
 	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
@@ -194,6 +205,77 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	} else {
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "remediate_error").Inc()
 	}
+}
+
+// etcdPreMaintSnapInterval caps the pre-maintenance snapshot cadence
+// — one `etcdctl snapshot save` per hour (the guard itself is
+// hourly, so this usually bounds one save per remediation window).
+const etcdPreMaintSnapInterval = time.Hour
+
+// savePreMaintSnapshot captures a verified etcd snapshot into
+// EtcdBackupDir BEFORE the guard's online compact+defrag: the defrag
+// rewrites the backend db, so a failed/empty snapshot means no
+// rollback point on a single-member etcd and the remediation must
+// NOT proceed. true when a fresh valid snapshot exists (either just
+// saved this window or saved inside the hourly budget already).
+// The budget spends on the ATTEMPT — a failing save retries no more
+// than once per window, and a still-fresh previous snapshot counts
+// as a valid fallback (the verify below checks the newest file).
+func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
+	d := c.d
+	if err := os.MkdirAll(d.Cfg.EtcdBackupDir, 0o700); err != nil {
+		d.State.AppendLogWarn(fmt.Sprintf(
+			"etcdguard: pre-maintenance snapshot dir %s: %v — compact+defrag aborted",
+			d.Cfg.EtcdBackupDir, err))
+		return false
+	}
+	if d.State.RateOK(cdeps.FileRateEtcdPreMaintSnap, etcdPreMaintSnapInterval) {
+		name := filepath.Join(d.Cfg.EtcdBackupDir, fmt.Sprintf(
+			"premaint-%d.db", d.Cfg.Clock.Now().Unix()))
+		d.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
+		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "save", name); err != nil {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"etcdguard: pre-maintenance snapshot save failed: %v — compact+defrag aborted", err))
+			return false
+		}
+		// Verify what was actually written — etcdctl can exit 0 on a
+		// truncated stream. `snapshot status` parses the file; the
+		// size check catches a zero-byte artifact either way.
+		if fi, err := os.Stat(name); err != nil || fi.Size() == 0 {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"etcdguard: pre-maintenance snapshot %s missing/empty — compact+defrag aborted", name))
+			return false
+		}
+		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "status", name); err != nil {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"etcdguard: pre-maintenance snapshot %s failed verification: %v — compact+defrag aborted",
+				name, err))
+			return false
+		}
+		d.State.AppendLog(
+			"ACTION: etcdguard pre-maintenance snapshot saved to " + name)
+		d.Actions.WithLabelValues(cdeps.CheckEtcd, "premaint_snapshot").Inc()
+		return true
+	}
+	// Inside the hourly budget — a snapshot from the current window
+	// is fresh enough; confirm SOME non-empty file still sits in the
+	// dir before letting the destructive half run (a concurrent
+	// cleaner could have wiped it).
+	ents, err := os.ReadDir(d.Cfg.EtcdBackupDir)
+	if err != nil {
+		d.State.AppendLogWarn(fmt.Sprintf(
+			"etcdguard: pre-maintenance snapshot dir unreadable: %v — compact+defrag aborted", err))
+		return false
+	}
+	for _, e := range ents {
+		if fi, err := e.Info(); err == nil && !e.IsDir() && fi.Size() > 0 {
+			return true
+		}
+	}
+	d.State.AppendLogWarn(
+		"etcdguard: no non-empty snapshot under " + d.Cfg.EtcdBackupDir +
+			" — compact+defrag aborted")
+	return false
 }
 
 // VerifySnapshots is the backup-health embedded-etcd backup check: the

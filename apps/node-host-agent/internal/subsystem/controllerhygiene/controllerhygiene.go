@@ -233,12 +233,17 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Help: "Age of the newest etcd snapshot under the snapshot " +
 			"dirs (embedded-etcd controllers only, backup-health).",
 	})
+	d.KonnReadyBackends = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_konnectivity_ready_backends",
+		Help: "konnectivity-server ready backend connections " +
+			"(-1 when the :8091 metrics scrape fails).",
+	})
 
 	h := &Hygiene{Deps: d}
 	if err := subframe.RegisterAll(reg,
 		d.Cycles, d.Actions, d.RVGap, d.KineConns, d.OOMWindow, d.Feeding,
 		d.EtcdDBSize, d.EtcdDBUse, d.EtcdNospace,
-		d.TerminatedWatchers, d.EtcdSnapAge); err != nil {
+		d.TerminatedWatchers, d.EtcdSnapAge, d.KonnReadyBackends); err != nil {
 		return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
 	}
 	h.initChecks()

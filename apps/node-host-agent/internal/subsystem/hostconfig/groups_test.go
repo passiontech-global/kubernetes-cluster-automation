@@ -6,6 +6,8 @@ package hostconfig
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,6 +140,51 @@ func hostRead(t *testing.T, r *Reconciler, path string) string {
 func hostExists(r *Reconciler, path string) bool {
 	_, err := os.Stat(filepath.Join(r.cfg.HostRoot, path))
 	return err == nil
+}
+
+// TestKineServiceTLSAndTCPReadiness — the Phase-3 mTLS cutover:
+// tcp:// listen renders the cert flags plus an ExecStartPost that
+// waits for the TCP port to accept before Before= is satisfied.
+func TestKineServiceTLSAndTCPReadiness(t *testing.T) {
+	bin := []byte("#!/bin/sh\n# fake kine\n")
+	sum := sha256.Sum256(bin)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bin)
+	}))
+	t.Cleanup(srv.Close)
+	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "%s/kine"
+kine_bin_sha256: "%x"
+kine_endpoint: "postgres://x"
+kine_listen_address: "tcp://127.0.0.1:2379"
+kine_ca_file: "/var/lib/k0s/pki/etcd/ca.crt"
+kine_server_cert_file: "/var/lib/k0s/pki/apiserver-etcd-client.crt"
+kine_server_key_file: "/var/lib/k0s/pki/apiserver-etcd-client.key"
+`, srv.URL, sum))
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	unit := hostRead(t, r, "/etc/systemd/system/kine.service")
+	for _, want := range []string{
+		"--ca-file=/var/lib/k0s/pki/etcd/ca.crt",
+		"--server-cert-file=/var/lib/k0s/pki/apiserver-etcd-client.crt",
+		"--server-key-file=/var/lib/k0s/pki/apiserver-etcd-client.key",
+		"--listen-address=tcp://127.0.0.1:2379",
+		"/dev/tcp/127.0.0.1/2379",
+		"[ $i -lt 30 ]",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("kine.service missing %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, "/run/k0s/kine.sock") {
+		t.Fatal("unix socket rendered on a tcp:// listen")
+	}
 }
 
 // ---------- CycleWithErrors / per-group error accounting (2.6) ----------

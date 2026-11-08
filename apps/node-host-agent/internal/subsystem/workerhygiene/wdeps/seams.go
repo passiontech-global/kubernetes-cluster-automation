@@ -20,6 +20,7 @@ package wdeps
 import (
 	"context"
 	"errors"
+	"strings"
 	"syscall"
 	"time"
 
@@ -136,6 +137,10 @@ type Ctr struct {
 	// nil Systemd client errors the same "no systemd client wired".
 	// Seam.
 	Exec func(ctx context.Context, argv ...string) error
+	// ExecOut is Exec for the `k0s ctr` READS that need stdout back
+	// (lease listing) — the same transport, output returned. nil →
+	// Systemd.Exec default. Seam.
+	ExecOut func(ctx context.Context, argv ...string) (string, error)
 }
 
 // RmImage removes one image from the k8s.io containerd namespace —
@@ -160,6 +165,76 @@ func (s *Ctr) RmIngest(ctx context.Context, ref string) error {
 func (s *Ctr) PruneContent(ctx context.Context) error {
 	return s.Exec(ctx,
 		"k0s", "ctr", "-n", "k8s.io", "content", "prune")
+}
+
+// CtrLease is one `k0s ctr -n k8s.io leases ls` row — the lease id,
+// its created-at stamp and whether it carries a gc.expire label
+// (containerd's own "may GC after T" annotation — a lease WITHOUT
+// the label is orphaned forever unless a caller deletes it).
+type CtrLease struct {
+	ID       string
+	Created  time.Time
+	HasGCExp bool
+}
+
+// Leases lists the containerd leases — `k0s ctr -n k8s.io leases ls`
+// over the ExecOut seam, ParseCtrLeases'd. The orphan-lease reaper's
+// derived read: stubbing the one exec covers the parser for real.
+func (s *Ctr) Leases(ctx context.Context) ([]CtrLease, error) {
+	out, err := s.ExecOut(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "leases", "ls")
+	if err != nil {
+		return nil, err
+	}
+	return ParseCtrLeases(out), nil
+}
+
+// RmLease removes one lease — `k0s ctr -n k8s.io leases rm <id>`
+// over the Exec seam (no output needed).
+func (s *Ctr) RmLease(ctx context.Context, id string) error {
+	return s.Exec(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "leases", "rm", id)
+}
+
+// ParseCtrLeases parses `ctr leases ls` table output: a header row,
+// then one lease per line — "ID CREATED-AT-STAMP LABELS" where the
+// stamp is Go's time.String form ("2006-01-02 15:04:05.999999999
+// +0000 UTC") and LABELS is the trailing key=value blob (possibly
+// empty). Unparseable rows are skipped — a garbled line is never
+// lease evidence.
+func ParseCtrLeases(out string) []CtrLease {
+	var leases []CtrLease
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "ID") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		var l CtrLease
+		l.ID = f[0]
+		l.HasGCExp = strings.Contains(line, "containerd.io/gc.expire")
+		// The created-at stamp is the first "YYYY-MM-DD" field plus
+		// the time field that follows it; fractional seconds and the
+		// trailing zone fields are optional noise.
+		for i := 1; i+1 < len(f); i++ {
+			if len(f[i]) != 10 || f[i][4] != '-' || f[i][7] != '-' {
+				continue
+			}
+			ts := f[i] + " " + f[i+1]
+			if j := strings.Index(ts, "+"); j > 0 {
+				ts = strings.TrimSpace(ts[:j])
+			}
+			if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, time.UTC); err == nil {
+				l.Created = t
+			}
+			break
+		}
+		leases = append(leases, l)
+	}
+	return leases
 }
 
 // Cilium holds the ONE cilium seam — the unix-socket GET every
@@ -372,6 +447,15 @@ func (s *Ctr) applyDefaults(c *Config) {
 			}
 			_, err := sd.Exec(ctx, argv[0], argv[1:]...)
 			return err
+		}
+	}
+	if s.ExecOut == nil {
+		sd := c.Systemd
+		s.ExecOut = func(ctx context.Context, argv ...string) (string, error) {
+			if sd == nil {
+				return "", errors.New("no systemd client wired")
+			}
+			return sd.Exec(ctx, argv[0], argv[1:]...)
 		}
 	}
 }
