@@ -32,6 +32,9 @@ import (
 // runaway target.
 const (
 	diskBloatEvictInterval = 15 * time.Minute // last-disk-bloat-evict budget
+	// coredumpMinAge keeps an in-progress core write from being
+	// swept the same cycle the watermark trip fires (W15-K2).
+	coredumpMinAge = 15 * time.Minute
 	// defaultPodLogsDir is the /var/log/pods host mount — the
 	// BUG-H8 pod-log attribution walk scans it.
 )
@@ -197,6 +200,10 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// decide, independent of the /var/lib/k0s bloat watermark.
 	c.runTmpfsGuard(ctx)
 	c.localPVQuota(ctx, e)
+	// W15-K2: stale coredump sweep (watermark-gated) and the
+	// bounded writable-layer runaway scan (interval-budgeted).
+	c.coredumpGC()
+	c.writableLayerScan(ctx, e)
 	var st unix.Statfs_t
 	used := -1.0
 	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
@@ -568,6 +575,195 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 			used*100, removed))
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "run_tmpfs_clean").Inc()
 	}
+}
+
+// --- W15-K2: coredump-storm guard + overlayfs writable-layer scan ---
+
+// coredumpGC sweeps stale core dumps under CoredumpDir once the
+// filesystem holding it crosses the disk-bloat warn watermark (the
+// same evidence source the W6.3 walk gates on). The W15-K2a
+// Storage=none drop-in keeps a converged host's store empty; this is
+// the backstop for nodes the drop-in has not reached yet. Files
+// younger than coredumpMinAge survive one cycle so an in-progress
+// core write is never truncated mid-sweep.
+func (c *DiskBloatCheck) coredumpGC() {
+	dir := c.d.Cfg.Disk.CoredumpDir
+	if dir == "" {
+		return
+	}
+	var st unix.Statfs_t
+	if err := c.d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil ||
+		st.Blocks <= 0 || st.Bavail > st.Blocks {
+		return // inconclusive — never sweep on garbage statfs
+	}
+	used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
+	if used <= c.d.Cfg.Disk.BloatWatermark {
+		return
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	removed := 0
+	for _, ent := range ents {
+		if !ent.Type().IsRegular() {
+			continue
+		}
+		fi, err := ent.Info()
+		if err != nil || now.Sub(fi.ModTime()) < coredumpMinAge {
+			continue
+		}
+		p := filepath.Join(dir, ent.Name())
+		if err := os.Remove(p); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: disk-bloat coredump rm %s failed: %v", p, err))
+			continue
+		}
+		removed++
+	}
+	if removed == 0 {
+		return
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: disk-bloat coredump sweep — removed %d stale core files from %s (used %.1f%%)",
+		removed, dir, used*100))
+	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "coredump_rm").Inc()
+}
+
+// podDeclaresEphemeralStorage reports whether ANY container of the
+// pod (init + regular) pins a limits.ephemeral-storage value — the
+// pods the writable-layer scan may legitimately leave alone (their
+// writable layers are already bounded by the kubelet eviction chain).
+func podDeclaresEphemeralStorage(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for i := range pod.Spec.InitContainers {
+		if _, ok := pod.Spec.InitContainers[i].Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			return true
+		}
+	}
+	for i := range pod.Spec.Containers {
+		if _, ok := pod.Spec.Containers[i].Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// writableLayerScan is the W15-K2b runaway writable-layer detector:
+// a container WITHOUT a limits.ephemeral-storage bound can grow its
+// overlayfs upperdir until the node falls into DiskPressure — the
+// one write surface the kubelet's eviction chain never measures.
+// The scan walks (a) the active overlayfs snapshotter's <id>/fs
+// upperdirs and (b) the kubelet pod volume dirs of pods lacking the
+// limit; any writable layer past WLayerBloatThresholdBytes (5 GiB —
+// deliberately tighter than the W6.3 eviction threshold) raises a
+// ContainerWritableLayerBloat Warning event (on the owning pod when
+// the snapshot/pod dir resolves, else node-scoped). It is
+// interval-budgeted (BloatScanInterval) because the size walk is IO
+// on the very disk that is filling.
+func (c *DiskBloatCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEnv) {
+	if !e.APIOK || c.d.Cfg.Client == nil {
+		return // pod attribution needs the apiserver
+	}
+	if !c.d.State.RateTrySpend("last-wlayer-scan",
+		c.d.Cfg.Disk.BloatScanInterval) {
+		return
+	}
+	threshold := c.d.Cfg.Disk.WLayerBloatThresholdBytes
+	podByUID := map[string]*corev1.Pod{}
+	for i := range e.Pods {
+		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
+	}
+	// (a) overlayfs snapshot upperdirs — the CRI plugin keys the
+	// snapshot by container id and snapshotPodUID resolves it back
+	// through the task dirs' pod-uid annotation.
+	for _, snap := range readDirNames(c.d.Cfg.Disk.WLayerSnapshotsDir) {
+		fsDir := filepath.Join(snap, "fs")
+		size, _ := c.d.WalkBytes(fsDir)
+		if size <= threshold {
+			continue
+		}
+		var pod *corev1.Pod
+		if uid := c.snapshotPodUID(filepath.Base(snap)); uid != "" {
+			pod = podByUID[uid]
+		}
+		if podDeclaresEphemeralStorage(pod) {
+			continue
+		}
+		c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
+	}
+	// (b) kubelet pod volume dirs of pods without the limit — the
+	// emptyDir/hostPath write surface the snapshot key can't see.
+	for _, uidDir := range readDirNames(c.d.Cfg.PodsDir) {
+		pod := podByUID[filepath.Base(uidDir)]
+		if podDeclaresEphemeralStorage(pod) {
+			continue
+		}
+		volRoot := filepath.Join(uidDir, "volumes")
+		size, _ := c.d.WalkBytes(volRoot)
+		if size <= threshold {
+			continue
+		}
+		c.emitWLayerBloatEvent(ctx, pod, volRoot, size)
+	}
+}
+
+// emitWLayerBloatEvent raises the ContainerWritableLayerBloat
+// Warning event — pod-scoped when the writable layer resolves back
+// to a pod on this node, else node-scoped in the event namespace.
+func (c *DiskBloatCheck) emitWLayerBloatEvent(ctx context.Context,
+	pod *corev1.Pod, dir string, size int64) {
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	ns := c.d.Cfg.Host.EventNamespace
+	regarding := corev1.ObjectReference{
+		APIVersion: "v1",
+		Kind:       "Node",
+		Name:       c.d.Cfg.NodeName,
+	}
+	name := fmt.Sprintf("%s.wlayer.%x", c.d.Cfg.NodeName, now.UnixNano())
+	owner := "node " + c.d.Cfg.NodeName
+	if pod != nil {
+		ns = pod.Namespace
+		regarding = corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Namespace:  pod.Namespace,
+			Name:       pod.Name,
+			UID:        pod.UID,
+		}
+		name = fmt.Sprintf("%s.wlayer.%x", pod.Name, now.UnixNano())
+		owner = "pod " + pod.Namespace + "/" + pod.Name
+	}
+	ev := &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+		EventTime: metav1.NewMicroTime(now),
+		Reason:    "ContainerWritableLayerBloat",
+		Note: fmt.Sprintf(
+			"writable layer %s holds %d bytes > threshold %d and the container declares no limits.ephemeral-storage — DiskPressure risk",
+			dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes),
+		Type:                corev1.EventTypeWarning,
+		ReportingController: "node-host-agent",
+		ReportingInstance:   c.d.Cfg.NodeName,
+		Action:              "ContainerWritableLayerBloat",
+		Regarding:           regarding,
+	}
+	if _, err := c.d.Cfg.Client.EventsV1().Events(ns).
+		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: ContainerWritableLayerBloat event create failed for %s: %v",
+			owner, err))
+		return
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: ContainerWritableLayerBloat — %s dir=%s bytes=%d threshold=%d",
+		owner, dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes))
+	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "wlayer_detect").Inc()
 }
 
 // --- Check: d-state-storm (W7-H1) ---

@@ -8,6 +8,7 @@ package wdeps
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -24,6 +25,33 @@ func ParseWGAllowedIPs(out string) int {
 		n++
 	}
 	return n
+}
+
+// ParseWGDump parses `wg show <iface> dump` TSV output: line 1 is
+// the interface row (4 columns), every following row is one peer
+// with 8 tab-separated columns — pub, preshared-key, endpoint,
+// allowed-ips, latest-handshake (unix seconds, 0 = never), rx bytes,
+// tx bytes, persistent-keepalive. Garbled rows are skipped — a
+// malformed line is never peer evidence (ParseCtrLeases parity).
+func ParseWGDump(out string) []WGDumpPeer {
+	var peers []WGDumpPeer
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) != 8 || f[0] == "" {
+			continue
+		}
+		handshake, _ := strconv.ParseInt(f[4], 10, 64)
+		rx, _ := strconv.ParseInt(f[5], 10, 64)
+		tx, _ := strconv.ParseInt(f[6], 10, 64)
+		peers = append(peers, WGDumpPeer{
+			Pub:        f[0],
+			AllowedIPs: f[3],
+			Handshake:  handshake,
+			RX:         rx,
+			TX:         tx,
+		})
+	}
+	return peers
 }
 
 // ParseCiliumHealthNodes counts remote cluster members in the

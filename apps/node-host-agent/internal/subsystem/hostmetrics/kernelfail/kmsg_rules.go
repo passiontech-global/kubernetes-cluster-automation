@@ -39,6 +39,13 @@ var (
 	// the fragmentation signature workerhygiene defragments via
 	// vm.compact_memory.
 	pageAllocFailRe = regexp.MustCompile(`page allocation failure: order:[1-9]`)
+	// W15-K1: the kernel giving up on a clocksource —
+	// "Marking clocksource 'tsc' as unstable" or the
+	// "clocksource: ... unstable" family line. After this the kernel
+	// falls back to a slower clocksource (hpet/acpi_pm) and every
+	// vDSO clock read degrades.
+	clocksourceUnstableRe = regexp.MustCompile(
+		`Marking clocksource '.*' as unstable|clocksource:.*unstable`)
 )
 
 // oomKillCtx is the pending constraint-line state — the kernel prints
@@ -64,6 +71,8 @@ func (r *Runner) classifyKernelLine(msg string, st *kernelScanState) {
 		r.noteConntrackFull()
 	case pageAllocFailRe.MatchString(msg):
 		r.notePageAllocFailure(msg)
+	case clocksourceUnstableRe.MatchString(msg):
+		r.noteClocksourceUnstable(msg)
 	}
 }
 

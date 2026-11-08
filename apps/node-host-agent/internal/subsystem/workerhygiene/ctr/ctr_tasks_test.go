@@ -33,6 +33,56 @@ import (
 
 // --- check 6: ctr-tasks (31) ---
 
+// TestCtrTasksUmountsRootfsBeforeRemove (W15-R1a): a wedged task
+// bundle whose rootfs is still a mount must be lazily unmounted in
+// the HOST mount namespace BEFORE the dir removal — RemoveAll would
+// hit EBUSY and leak the mountpoint into the mountinfo table.
+func TestCtrTasksUmountsRootfsBeforeRemove(t *testing.T) {
+	e := fixture(t)
+	dir := filepath.Join(e.CtrDir, "rootfsy"+strings.Repeat("f", 57))
+	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "77777")
+	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
+	wdepstest.WriteFile(t, filepath.Join(dir, "log.json"), "{}\n")
+	// The still-mounted rootfs — contents on the leaked mount.
+	wdepstest.WriteFile(t, filepath.Join(dir, "rootfs", "bin", "sh"), "#!/bin/sh\n")
+	e.SDReply["umount"] = ""
+
+	e.H.Cycle(context.Background()) // marker only
+	if e.SDRan("umount") {
+		t.Fatal("umount ran before the wedged-dir confirmation window")
+	}
+	e.Now = e.Now.Add(6 * time.Minute)
+	e.H.Cycle(context.Background()) // confirm + clean
+	if !e.SDRan("umount -l " + filepath.Join(dir, "rootfs")) {
+		t.Fatalf("no lazy umount of the task rootfs; sdcmds=%v", e.SDCmds)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("wedged dir not removed after umount")
+	}
+	if !strings.Contains(e.LogLines(t), "umount -l rootfs of task") {
+		t.Fatalf("missing umount ACTION line:\n%s", e.LogLines(t))
+	}
+
+	// A task dir WITHOUT a rootfs subtree (already unmounted) must
+	// not fire a umount.
+	dir2 := filepath.Join(e.CtrDir, "norsidf"+strings.Repeat("0", 57))
+	wdepstest.WriteFile(t, filepath.Join(dir2, "init.pid"), "77778")
+	wdepstest.WriteFile(t, filepath.Join(dir2, "config.json"), `{"annotations":{}}`)
+	wdepstest.WriteFile(t, filepath.Join(dir2, "log.json"), "{}\n")
+	e.H.Cycle(context.Background())
+	e.Now = e.Now.Add(6 * time.Minute)
+	n := 0
+	for _, c := range e.SDCmds {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "umount") && strings.Contains(joined, dir2) {
+			n++
+		}
+	}
+	if n != 0 {
+		t.Fatalf("umount fired for a dir without rootfs: %d", n)
+	}
+}
+
 func TestCtrTasksWedgedDirTwoPhase(t *testing.T) {
 	e := fixture(t)
 	// Dead-init task dir (init.pid points at nothing live).

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -114,6 +115,75 @@ func readyNodeCount(d *wdeps.Deps, ctx context.Context) int {
 type CiliumWGCheck struct {
 	d     *wdeps.Deps
 	Fails int
+	// peerStats — the W15-NM2 per-peer state held across Run
+	// cycles: last transfer counters, when tx first flowed with a
+	// zero handshake, and the consecutive stalled-cycle streak.
+	peerStats map[string]wgPeerSample
+}
+
+// W15-NM2 zombie-peer thresholds.
+const (
+	// wgZombieHandshakeStale — a peer whose latest handshake is
+	// older than this while its tx grows but rx never does.
+	wgZombieHandshakeStale = 10 * time.Minute
+	// wgZombieZeroFlowMin — with handshake==0, tx must have been
+	// flowing at least this long to classify the peer.
+	wgZombieZeroFlowMin = 5 * time.Minute
+	// wgZombieConsecNeeded — consecutive stalled cycles (tx up,
+	// rx flat) before a peer classifies as a zombie.
+	wgZombieConsecNeeded = 3
+)
+
+// wgPeerSample is one peer's cross-cycle state.
+type wgPeerSample struct {
+	txBytes, rxBytes     int64
+	firstZeroHandshakeAt time.Time
+	stalledCycles        int
+	seen                 bool // sampled at least once before
+}
+
+// peerSample merges one dump row into the cross-cycle state and
+// returns whether the peer is a zombie: tx increased AND rx stayed
+// flat for ConsecNeeded consecutive cycles, AND the handshake is
+// stale (>10m) or has never happened while tx has been flowing
+// >5m. State for peers that vanished is pruned by the caller.
+func (c *CiliumWGCheck) peerSample(p wdeps.WGDumpPeer, now time.Time) bool {
+	if c.peerStats == nil {
+		c.peerStats = make(map[string]wgPeerSample)
+	}
+	st := c.peerStats[p.Pub]
+	seen := st.seen
+	txUp := seen && p.TX > st.txBytes
+	rxFlat := seen && p.RX == st.rxBytes
+	if txUp && rxFlat {
+		st.stalledCycles++
+	} else {
+		st.stalledCycles = 0
+	}
+	if p.Handshake == 0 && p.TX > 0 {
+		if st.firstZeroHandshakeAt.IsZero() {
+			st.firstZeroHandshakeAt = now
+		}
+	} else {
+		st.firstZeroHandshakeAt = time.Time{}
+	}
+	st.txBytes, st.rxBytes = p.TX, p.RX
+	st.seen = true
+	c.peerStats[p.Pub] = st
+	stale := p.Handshake > 0 &&
+		now.Sub(time.Unix(p.Handshake, 0)) > wgZombieHandshakeStale
+	never := p.Handshake == 0 && !st.firstZeroHandshakeAt.IsZero() &&
+		now.Sub(st.firstZeroHandshakeAt) > wgZombieZeroFlowMin
+	return st.stalledCycles >= wgZombieConsecNeeded && (stale || never)
+}
+
+// prunePeers drops state for peers no longer in the dump.
+func (c *CiliumWGCheck) prunePeers(seen map[string]bool) {
+	for k := range c.peerStats {
+		if !seen[k] {
+			delete(c.peerStats, k)
+		}
+	}
 }
 
 // Name returns the check label / WD_SIG key.
@@ -133,8 +203,10 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_wg0")); err != nil {
 		// No WireGuard datapath on this node (calico, tunnel mode,
-		// hub) — nothing to heal; drop stale evidence.
+		// hub) — nothing to heal; drop stale evidence (incl. the
+		// W15-NM2 per-peer zombie state).
 		c.Fails = 0
+		c.peerStats = nil
 		c.d.State.Exit(hoststate.LatchCiliumWGPeerWipe, nil)
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
 		return
@@ -158,7 +230,39 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
 		return
 	}
-	actual, err := c.d.Cfg.Seams.Cilium.WGAllowedIPs(ctx, c.d.Cfg.Systemd)
+	// W15-NM2: prefer the full `wg show cilium_wg0 dump` evidence —
+	// it carries per-peer transfer counters and handshakes, so
+	// zombie peers (tx flowing, rx dead, stale/no handshake) can be
+	// excluded from the healthy count. The dump exec failing keeps
+	// the W5.6 allowed-ips count path (backward compatibility).
+	peers, dumpErr := c.d.Cfg.Seams.Cilium.WGDumpPeers(ctx, c.d.Cfg.Systemd)
+	if dumpErr != nil {
+		peers = nil
+	}
+	actual, err := 0, error(nil)
+	if peers != nil {
+		now := c.d.Cfg.Seams.Cilium.MonotonicNow()
+		seen := make(map[string]bool, len(peers))
+		actual = 0
+		for _, p := range peers {
+			seen[p.Pub] = true
+			// Wiped peers are the original peer-wipe signal — the
+			// zombie state machine only classifies live peers.
+			if p.AllowedIPs == "(none)" || p.AllowedIPs == "" {
+				continue
+			}
+			if c.peerSample(p, now) {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: cilium-wg-peers zombie peer %.16s… tx=%d rx=%d handshake=%d — excluded from healthy count",
+					p.Pub, p.TX, p.RX, p.Handshake))
+				continue
+			}
+			actual++
+		}
+		c.prunePeers(seen)
+	} else {
+		actual, err = c.d.Cfg.Seams.Cilium.WGAllowedIPs(ctx, c.d.Cfg.Systemd)
+	}
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))

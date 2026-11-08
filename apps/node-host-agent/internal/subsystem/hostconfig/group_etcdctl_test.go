@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // ---------- etcdctl (embedded-etcd controllers) ----------
@@ -355,5 +357,125 @@ kine_endpoint: "postgres://x"
 	c.groupKineService()
 	if !hostExists(r, "/etc/systemd/system/kine.service") {
 		t.Fatal("unit not written on a listed host")
+	}
+}
+
+// kineTCPEnv stages a listed kine host with a verified binary and
+// the given extra cluster vars, then runs one groupKineService
+// converge — the W15-CP1 tcp/mTLS fixture. stage runs after the
+// reconciler exists but before the converge (host-side file prep).
+func kineTCPEnv(t *testing.T, extra string, stage func(*Reconciler)) (*Reconciler, *testutil.FakeRunner) {
+	t.Helper()
+	bin := []byte("fake-kine-binary")
+	sum := sha256.Sum256(bin)
+	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "http://127.0.0.1:1/never-used"
+kine_bin_sha256: "%x"
+kine_endpoint: "postgres://x"
+%s`, sum, extra))
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/usr/local/bin/kine", "fake-kine-binary")
+	if stage != nil {
+		stage(r)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	return r, sr
+}
+
+// W15-CP1 fail-closed: a tcp:// listener on a routable (non-loopback)
+// host without all three mTLS cert files must never converge the
+// unit — last-good is kept and nothing is enabled/started.
+func TestKineServiceTCPNonLoopbackWithoutCertsRefused(t *testing.T) {
+	r, sr := kineTCPEnv(t, `kine_listen_address: "tcp://10.0.0.5:2379"
+`, nil)
+	if hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit written for a non-loopback tcp listener without mTLS certs")
+	}
+	if hostExists(r, "/etc/kine/kine.env") {
+		t.Fatal("kine.env written despite refused converge")
+	}
+	for _, call := range sr.Calls() {
+		if strings.Contains(call, "systemctl enable kine") ||
+			strings.Contains(call, "systemctl start kine") {
+			t.Fatalf("kine.service started despite refused converge: %s", call)
+		}
+	}
+}
+
+// A partial TLS config (one cert file configured but absent on disk)
+// fails closed just like a fully-unset one.
+func TestKineServiceTCPNonLoopbackMissingCertOnDiskRefused(t *testing.T) {
+	r, sr := kineTCPEnv(t, `kine_listen_address: "tcp://kine.internal:2379"
+kine_ca_file: "/etc/kine/pki/ca.crt"
+kine_server_cert_file: "/etc/kine/pki/server.crt"
+kine_server_key_file: "/etc/kine/pki/missing.key"
+`, nil)
+	if hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit written while a cert file is missing on disk")
+	}
+	for _, call := range sr.Calls() {
+		if strings.Contains(call, "systemctl enable kine") ||
+			strings.Contains(call, "systemctl start kine") {
+			t.Fatalf("kine.service started with incomplete mTLS: %s", call)
+		}
+	}
+}
+
+// All three cert files configured AND present on disk → the converge
+// proceeds and the unit carries the full mTLS flag set.
+func TestKineServiceTCPNonLoopbackWithCertsConverges(t *testing.T) {
+	r, sr := kineTCPEnv(t, `kine_listen_address: "tcp://kine.internal:2379"
+kine_ca_file: "/etc/kine/pki/ca.crt"
+kine_server_cert_file: "/etc/kine/pki/server.crt"
+kine_server_key_file: "/etc/kine/pki/server.key"
+`, func(r *Reconciler) {
+		for _, p := range []string{
+			"/etc/kine/pki/ca.crt", "/etc/kine/pki/server.crt", "/etc/kine/pki/server.key",
+		} {
+			hostWrite(t, r, p, "cert")
+		}
+	})
+	unit := hostRead(t, r, "/etc/systemd/system/kine.service")
+	for _, want := range []string{
+		"--ca-file=/etc/kine/pki/ca.crt",
+		"--server-cert-file=/etc/kine/pki/server.crt",
+		"--server-key-file=/etc/kine/pki/server.key",
+		"--listen-address=tcp://kine.internal:2379",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("kine.service missing %q:\n%s", want, unit)
+		}
+	}
+	if len(sr.CallsMatching("systemctl enable kine.service")) == 0 ||
+		len(sr.CallsMatching("systemctl start kine.service")) == 0 {
+		t.Fatal("kine.service not enabled+started with full mTLS")
+	}
+}
+
+// Loopback tcp listeners stay unrestricted: no cert requirement, and
+// no TLS flags are rendered when the vars are unset.
+func TestKineServiceTCPLoopbackNoCertRequirement(t *testing.T) {
+	r, sr := kineTCPEnv(t, `kine_listen_address: "tcp://127.0.0.1:2379"
+`, nil)
+	if !hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit not written for a loopback tcp listener without certs")
+	}
+	unit := hostRead(t, r, "/etc/systemd/system/kine.service")
+	if strings.Contains(unit, "--ca-file") ||
+		strings.Contains(unit, "--server-cert-file") ||
+		strings.Contains(unit, "--server-key-file") {
+		t.Fatalf("TLS flags rendered on a loopback listener without certs:\n%s", unit)
+	}
+	if !strings.Contains(unit, "--listen-address=tcp://127.0.0.1:2379") {
+		t.Fatalf("loopback listen address not rendered:\n%s", unit)
+	}
+	if len(sr.CallsMatching("systemctl enable kine.service")) == 0 {
+		t.Fatal("kine.service not enabled on loopback listener")
 	}
 }

@@ -124,6 +124,10 @@ var logRules = []logRule{
 	{"Fail2banDown", stateEnterRe(hoststate.LatchFail2banDown)},
 	{"KernelKeysPressure", stateEnterRe(hoststate.LatchKernelKeysPressure)},
 	{"ControlPlaneCertReloadStale", stateEnterRe(hoststate.LatchCPCertReloadStale)},
+	// W15-K1: the kernel clocksource-unstable evidence latch —
+	// STATE-ENTER only (one Event per latch entry, like the other
+	// Wave-8 latch→event rules).
+	{"ClocksourceUnstable", stateEnterRe(hoststate.LatchClocksourceUnstable)},
 	// W2: workerhygiene's psi-memory-thrash latch-entry line —
 	// "ACTION psi-memory-thrash: avg60=... free=...".
 	{"NodeMemoryPSIThrashing", regexp.MustCompile(`ACTION:? *psi-memory-thrash:`)},

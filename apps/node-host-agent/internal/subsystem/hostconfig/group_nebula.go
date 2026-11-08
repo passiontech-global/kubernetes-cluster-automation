@@ -438,6 +438,32 @@ func (c *cyc) nebulaRouting() {
 	}
 	rs.WriteString(`ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main` + "\n")
 
+	// W15-NM1 proactive TCP MSS clamp: double encapsulation
+	// (nebula + cilium-wg/liqo) silently blackholes TCP when a
+	// SYN carries an MSS larger than the innermost path MTU. Add
+	// idempotent mangle TCPMSS clamp rules for both POSTROUTING and
+	// FORWARD scoped per outgoing interface — neb1, cilium_wg0
+	// (gated on dev existence so dormant meshes skip), and the liqo+
+	// wildcard (probed via /sys/class/net; iptables matches the name
+	// pattern directly).
+	for _, chain := range []string{"POSTROUTING", "FORWARD"} {
+		for _, dev := range []string{"neb1", "cilium_wg0"} {
+			fmt.Fprintf(&rs,
+				`if ip link show dev %s >/dev/null 2>&1; then `+
+					`iptables -t mangle -C %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
+					`iptables -t mangle -A %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; fi`+"\n",
+				dev, chain, dev, chain, dev)
+		}
+		// liqo interfaces are numbered (liqo-*, liqo0, …) — probe the
+		// class dir with the glob instead of a wildcard dev name, then
+		// match traffic with the iptables `liqo+` pattern.
+		fmt.Fprintf(&rs,
+			`ls /sys/class/net | grep -q '^liqo' && { `+
+				`iptables -t mangle -C %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
+				`iptables -t mangle -A %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; }; true`+"\n",
+			chain, chain)
+	}
+
 	// Populate overlay tables ALWAYS (warm standby even when
 	// overlay=tinc). pub table src = public ip; marker table src =
 	// NODE_IP only when it is a marker-base IP, else flush. The

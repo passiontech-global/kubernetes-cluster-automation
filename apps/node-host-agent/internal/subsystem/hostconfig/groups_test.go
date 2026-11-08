@@ -240,15 +240,17 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 	// failing it is a command error attributed to that group only.
 	sr.FailOn("systemctl daemon-reload", nil)
 	got := r.CycleWithErrors(context.Background())
-	// EXACT count — one noteErr per daemonReload invocation:
+	// EXACT count — one noteErr per counted invocation:
 	// nodelocaldns nft apply + host-internal-ports nft apply
 	// (W6.1, same groupNLD) + nodeip_cpu nebula drop-in. (coredns
 	// self-gates here: nebula disabled → derive() leaves no
-	// DNSResolvers.) A regression that counts a fault twice (or
-	// skips one) moves this number.
+	// DNSResolvers.) The W15-K2a coredump drop-in's daemon-reload
+	// is deliberately best-effort (warn-only) so the base group
+	// stays "ok" on a clean cycle. A regression that counts a
+	// fault twice (or skips one) moves this number.
 	if got != 3 {
 		t.Fatalf("cycle returned %d errors, want exactly 3 "+
-			"(daemon-reload x nodelocaldns/host-ports-guard/nodeip_cpu)", got)
+			"(nodelocaldns/host-ports-guard/nodeip_cpu)", got)
 	}
 	if got := promtestutil.ToFloat64(r.cycles.WithLabelValues("nodelocaldns", "error")); got != 1 {
 		t.Fatalf("cycles{nodelocaldns,error} = %v want 1", got)

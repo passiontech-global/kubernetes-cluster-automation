@@ -48,3 +48,16 @@ func TestKmsgPageAllocLatch(t *testing.T) {
 		t.Fatal("state-page-alloc-failure latch missing")
 	}
 }
+
+func TestKmsgClocksourceUnstableLatch(t *testing.T) {
+	f := kfixture(t)
+	kmsgFixture(t, f.deps,
+		"kernel: Marking clocksource 'tsc' as unstable because Watchdog caught update",
+		"clocksource: timekeeping watchdog on CPU0: Marking clocksource 'tsc' as unstable",
+		"clocksource: Switched to clocksource hpet")
+	latch := filepath.Join(f.deps.StateDir, "state-clocksource-unstable")
+	f.r.checkKernelDmesg()
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("state-clocksource-unstable latch missing")
+	}
+}

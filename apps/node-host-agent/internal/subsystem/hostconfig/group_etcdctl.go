@@ -120,6 +120,43 @@ func (c *cyc) groupKineService() {
 		return
 	}
 
+	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
+	// W15-CP1 fail-closed: a tcp:// listener on a NON-loopback host
+	// exposes the etcd3 API to the network — without full mTLS the
+	// datastore is wide open (read+write+delete) to anyone who can
+	// reach the port. All three cert vars must be configured AND
+	// exist on disk before the unit may converge; otherwise keep
+	// last-good and refuse (loopback/unix listeners stay
+	// unrestricted — the socket never leaves the host). Gate runs
+	// BEFORE anything is written: a refused converge leaves both the
+	// env file and the unit untouched.
+	if hp := strings.TrimPrefix(listen, "tcp://"); hp != listen {
+		host := hp
+		if i := strings.LastIndex(host, ":"); i >= 0 {
+			host = host[:i]
+		}
+		host = strings.Trim(host, "[]")
+		if host != "127.0.0.1" && host != "localhost" {
+			missing := make([]string, 0, 3)
+			for _, name := range []string{
+				"kine_ca_file", "kine_server_cert_file", "kine_server_key_file",
+			} {
+				s := c.v(name)
+				switch {
+				case s == "" || s == "None":
+					missing = append(missing, name+" (not configured)")
+				case !r.fileExists(s):
+					missing = append(missing, name+" (missing on disk: "+s+")")
+				}
+			}
+			if len(missing) > 0 {
+				c.err("kine.service: tcp listener on non-loopback host requires full mTLS — refusing to converge (an unencrypted Kine datastore must never listen on the network)",
+					"listen", listen, "missing", strings.Join(missing, ", "))
+				return
+			}
+		}
+	}
+
 	// /usr/local/bin/kine is sha256-pinned — a missing pin fails
 	// closed even when the file already exists (never start a binary
 	// that cannot be verified).
@@ -165,7 +202,6 @@ func (c *cyc) groupKineService() {
 	// Defaults mirror the invocation k0s uses for embedded kine:
 	// --listen-address=unix://<KineSocketPath> + --metrics-bind-address
 	// =:2380 (HUBMETRICS whitelist + hub-kine-metrics ServiceMonitor).
-	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
 	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
 	// Phase-3 mTLS cutover (spec.storage.etcd.externalCluster over
 	// TCP :2379): when the cert vars are declared they become kine's

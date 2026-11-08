@@ -85,6 +85,32 @@ func (c *cyc) groupBase() {
 			"got", out, "want", strings.Join(want, " "))
 	}
 
+	// W15-K2a: disable host coredump storage — a crashing daemon
+	// (or k0s child) dropping multi-hundred-MB cores into
+	// /var/lib/systemd/coredump is the classic slow disk-filler;
+	// Storage=none + ProcessSizeMax=0 keeps cores unprocessed and
+	// unstored. A drop-in change needs the systemd daemon reload to
+	// be visible to journald/coredumpctl.
+	_ = r.ensureDir("/etc/systemd/coredump.conf.d", 0o755)
+	if ch, _ := r.writeManaged("/etc/systemd/coredump.conf.d/99-node-ops.conf",
+		[]byte(`# Managed by node-config-agent - W15-K2 coredump storm guard.
+# Core dumps are neither stored nor processed; the disk-bloat
+# guard no longer has to sweep /var/lib/systemd/coredump.
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+`), 0o644); ch {
+		// Best-effort reload — coredump.conf.d is read by
+		// systemd-coredump on demand, so a failed reload must not
+		// fail the whole base group (T10 set-property parity: warn
+		// only, the declared state is already on disk).
+		r.actions.WithLabelValues("daemon-reload").Inc()
+		if err := r.sysd().DaemonReload(ctx); err != nil {
+			logger().Warn("base: coredump.conf.d daemon-reload failed",
+				"error", err)
+		}
+	}
+
 	// T2 k0sworker limits drop-in.
 	if c.worker() {
 		_ = c.r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
