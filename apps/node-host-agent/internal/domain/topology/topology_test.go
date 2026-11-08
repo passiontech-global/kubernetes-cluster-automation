@@ -426,3 +426,256 @@ node-b:
 		t.Fatalf("empty remote-relay ip not reported: %v", topo.Errors)
 	}
 }
+
+// Golden-shape test locking the full derive() output surface for a
+// multi-site registry: legacy markers, relay map + per-entry modes/
+// sites/weights, self relay ips + selfwin, site peers, probe
+// targets/markers, slowpath markers (far_sites), DNS fallback +
+// resolvers (own-site-first hub walk), lighthouses, unsafe routes,
+// cert subnets and the T11 bw-audit target list.
+func TestDeriveGoldenShape(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"interdc_nodes.yaml": `hub1:
+  name: h1
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+  relay_mode: always
+  relay_sites: [s2]
+  relay:
+    - ip: 203.0.113.1
+edge:
+  name: e1
+  ip: 10.0.2.20
+  site: s2
+  overlay: tinc
+  relay:
+    - ip: 203.0.113.1
+      weight: 5
+    - ip: 203.0.113.2
+      mode: fallback
+      probe: "9443"
+hub2:
+  name: h2
+  ip: 10.0.3.30
+  site: s1
+  hub: true
+peer1:
+  name: p1
+  ip: 10.0.2.40
+  site: s2
+`,
+		"defaults.yaml": `interdc_nebula_enabled: true
+interdc_marker_base: "172.29.0"
+interdc_marker_base_legacy: "172.30.0"
+interdc_far_sites: [s3]
+cp_endpoint: api.x
+`,
+	}
+	files["cluster.yaml"] = "placeholder: true\n"
+	for n, c := range files {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	topo, err := Load(Config{VarsDir: dir, NodeName: "edge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topo.Overlay != "tinc" || !topo.Found || topo.MeshName != "e1" {
+		t.Fatalf("identity: overlay=%s found=%v mesh=%s", topo.Overlay, topo.Found, topo.MeshName)
+	}
+	wantMarkers := map[string]string{
+		"h1": "172.29.0.10", "e1": "172.29.0.20", "h2": "172.29.0.30", "p1": "172.29.0.40",
+	}
+	for n, m := range wantMarkers {
+		if topo.Markers[n] != m {
+			t.Fatalf("marker %s=%s want %s", n, topo.Markers[n], m)
+		}
+	}
+	wantLegacy := map[string]string{
+		"h1": "172.30.0.10", "e1": "172.30.0.20", "h2": "172.30.0.30", "p1": "172.30.0.40",
+	}
+	for n, m := range wantLegacy {
+		if topo.MarkersLegacy[n] != m {
+			t.Fatalf("legacy marker %s=%s want %s", n, topo.MarkersLegacy[n], m)
+		}
+	}
+	if len(topo.RelayMap["h1"]) != 1 {
+		t.Fatalf("h1 relays=%+v", topo.RelayMap["h1"])
+	}
+	r := topo.RelayMap["h1"][0]
+	if r.IP != "203.0.113.1" || r.Mode != "always" || len(r.Sites) != 1 || r.Sites[0] != "s2" || r.Weight != 0 {
+		t.Fatalf("h1 relay=%+v — node-level defaults not applied", r)
+	}
+	if len(topo.RelayMap["e1"]) != 2 || topo.RelayMap["e1"][1].Mode != "fallback" ||
+		topo.RelayMap["e1"][1].Probe != "9443" {
+		t.Fatalf("e1 relays=%+v", topo.RelayMap["e1"])
+	}
+	if len(topo.SelfRelayIPs) != 2 || topo.SelfRelayIPs[0] != "203.0.113.1" {
+		t.Fatalf("selfRelayIPs=%v", topo.SelfRelayIPs)
+	}
+	// e1's weight-5 beats h1's unset (10) on 203.0.113.1; .2 is e1-only.
+	if len(topo.SelfWinRelays) != 2 || topo.SelfWinRelays[0] != "203.0.113.1" ||
+		topo.SelfWinRelays[1] != "203.0.113.2" {
+		t.Fatalf("selfWinRelays=%v", topo.SelfWinRelays)
+	}
+	if len(topo.SitePeers) != 1 || topo.SitePeers[0] != "p1" {
+		t.Fatalf("sitePeers=%v", topo.SitePeers)
+	}
+	wantTargets := []string{"10.0.1.10", "10.0.3.30"}
+	for i, w := range wantTargets {
+		if len(topo.Targets) != len(wantTargets) || topo.Targets[i] != w {
+			t.Fatalf("targets=%v want %v", topo.Targets, wantTargets)
+		}
+		if topo.ProbeTargets[i] != w {
+			t.Fatalf("probeTargets=%v want %v", topo.ProbeTargets, wantTargets)
+		}
+	}
+	// h1's always-relay .1 is a target candidate but selfwin excludes it;
+	// no remote fallback relays → empty egress.
+	if len(topo.EgressRelays) != 0 || len(topo.EgressProbes) != 0 {
+		t.Fatalf("egress=%v probes=%v", topo.EgressRelays, topo.EgressProbes)
+	}
+	if len(topo.ProbeMarkers) != 2 || topo.ProbeMarkers[0] != "172.29.0.10" ||
+		topo.ProbeMarkers[1] != "172.29.0.30" {
+		t.Fatalf("probeMarkers=%v", topo.ProbeMarkers)
+	}
+	// s2 is not a far site and neither remote site s1 is → both slow.
+	if len(topo.SlowpathMkrs) != 2 || topo.SlowpathMkrs[1] != "172.29.0.30" {
+		t.Fatalf("slowpathMkrs=%v", topo.SlowpathMkrs)
+	}
+	if len(topo.SiteMarkers) != 1 || topo.SiteMarkers[0] != "172.29.0.40" {
+		t.Fatalf("siteMarkers=%v", topo.SiteMarkers)
+	}
+	// No own-site hubs → fallback ips come from the other-site pass only.
+	want := "api.x:6443=10.0.1.10,10.0.3.30,172.29.0.10,172.29.0.30"
+	if topo.DNSFallbackMap != want {
+		t.Fatalf("fallbackMap=%q want %q", topo.DNSFallbackMap, want)
+	}
+	if len(topo.DNSResolvers) != 2 || topo.DNSResolvers[0] != "172.29.0.10" ||
+		topo.DNSResolvers[1] != "172.29.0.30" {
+		t.Fatalf("resolvers=%v", topo.DNSResolvers)
+	}
+	if len(topo.Lighthouses) != 2 || topo.Lighthouses[0].Name != "h1" ||
+		topo.Lighthouses[1].Marker != "172.29.0.30" || topo.AmLighthouse {
+		t.Fatalf("lighthouses=%+v am=%v", topo.Lighthouses, topo.AmLighthouse)
+	}
+	wantRoutes := []UnsafeRoute{
+		{"10.0.1.10/32", "172.29.0.10", 100},
+		{"10.0.3.30/32", "172.29.0.30", 100},
+	}
+	if len(topo.UnsafeRoutes) != 2 || topo.UnsafeRoutes[0] != wantRoutes[0] ||
+		topo.UnsafeRoutes[1] != wantRoutes[1] {
+		t.Fatalf("unsafeRoutes=%+v — h1's selfwin relay must be excluded", topo.UnsafeRoutes)
+	}
+	wantSubnets := []string{"10.0.2.20/32", "203.0.113.1/32", "203.0.113.2/32"}
+	if len(topo.CertSubnets) != 3 {
+		t.Fatalf("certSubnets=%v want %v", topo.CertSubnets, wantSubnets)
+	}
+	for i, s := range wantSubnets {
+		if topo.CertSubnets[i] != s {
+			t.Fatalf("certSubnets=%v want %v", topo.CertSubnets, wantSubnets)
+		}
+	}
+	wantAudit := []AuditTarget{
+		{"h1", "10.0.1.10"}, {"h1-marker", "172.29.0.10"},
+		{"relay-203.0.113.1", "203.0.113.1"},
+		{"h2", "10.0.3.30"}, {"h2-marker", "172.29.0.30"},
+		{"p1", "10.0.2.40"}, {"p1-marker", "172.29.0.40"},
+	}
+	if len(topo.BwAuditTargets) != len(wantAudit) {
+		t.Fatalf("bwAudit=%+v want %+v", topo.BwAuditTargets, wantAudit)
+	}
+	for i, a := range wantAudit {
+		if topo.BwAuditTargets[i] != a {
+			t.Fatalf("bwAudit[%d]=%+v want %+v", i, topo.BwAuditTargets[i], a)
+		}
+	}
+	if len(topo.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", topo.Errors)
+	}
+}
+
+// TestDeriveAmLighthouseAndRelayMetric pins the two derive surfaces
+// the golden fixture can't see from a non-hub self node: the self
+// node's "hub" flag (AmLighthouse — nebula derive parity: hub IS the
+// am-lighthouse decision) and the unsafe-route METRIC of a remote
+// relay (explicit weight beats the default 10).
+func TestDeriveAmLighthouseAndRelayMetric(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"interdc_nodes.yaml": `hub1:
+  name: h1
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+  relay_mode: always
+  relay:
+    - ip: 198.51.100.7
+hub2:
+  name: h2
+  ip: 10.0.3.30
+  site: s3
+  hub: true
+  relay_mode: always
+  relay:
+    - ip: 198.51.100.9
+      weight: 7
+edge:
+  name: e1
+  ip: 10.0.2.20
+  site: s2
+`,
+		"defaults.yaml": `interdc_nebula_enabled: true
+interdc_marker_base: "172.29.0"
+cp_endpoint: api.x
+`,
+	}
+	files["cluster.yaml"] = "placeholder: true\n"
+	for n, c := range files {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Self = hub: AmLighthouse true; the OTHER hub's relay keeps its
+	// explicit weight 7 on the unsafe-route metric (its own relay is
+	// self and excluded, h1's is selfwin).
+	topo, err := Load(Config{VarsDir: dir, NodeName: "hub1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !topo.AmLighthouse {
+		t.Fatal("hub self node did not set AmLighthouse")
+	}
+	wantRelay := UnsafeRoute{"198.51.100.9/32", "172.29.0.30", 7}
+	found := false
+	for _, r := range topo.UnsafeRoutes {
+		if r == wantRelay {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unsafeRoutes=%+v — want explicit relay weight %v", topo.UnsafeRoutes, wantRelay)
+	}
+	// Self = edge: not a hub; the default-10 relay weight shows on the
+	// same metric path.
+	edge, err := Load(Config{VarsDir: dir, NodeName: "edge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edge.AmLighthouse {
+		t.Fatal("non-hub self node set AmLighthouse")
+	}
+	wantDefault := UnsafeRoute{"198.51.100.7/32", "172.29.0.10", 10}
+	found = false
+	for _, r := range edge.UnsafeRoutes {
+		if r == wantDefault {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("edge unsafeRoutes=%+v — want default relay weight %v", edge.UnsafeRoutes, wantDefault)
+	}
+}
