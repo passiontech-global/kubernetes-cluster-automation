@@ -867,3 +867,120 @@ func TestATCClientNon2xx(t *testing.T) {
 		t.Fatalf("expected status error on land, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Mid-run 401 → one re-login → one retry (token expiry survival)
+// ---------------------------------------------------------------------------
+
+// cjExpiryServer plays a Dex token endpoint minting tok-1, tok-2, ...
+// and a workers endpoint that 401s the FIRST bearer token only — the
+// "login at run start, token expires an hour in" shape of a 190m run.
+type cjExpiryServer struct {
+	tokenPOSTs  int
+	workerCalls []string // Authorization header per workers call
+	workersCode int      // 0 → 401 tok-1 only; 401 → always 401
+	tokenCode   int      // 0 → always 200; else the code from the 2nd token POST on
+}
+
+func (s *cjExpiryServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/sky/issuer/token":
+			s.tokenPOSTs++
+			if s.tokenCode != 0 && s.tokenPOSTs > 1 {
+				w.WriteHeader(s.tokenCode)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"access_token":"tok-%d","token_type":"Bearer"}`, s.tokenPOSTs)
+		case "/api/v1/workers":
+			auth := req.Header.Get("Authorization")
+			s.workerCalls = append(s.workerCalls, auth)
+			if s.workersCode == http.StatusUnauthorized {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if auth == "Bearer tok-1" {
+				w.WriteHeader(http.StatusUnauthorized) // token expired mid-run
+				return
+			}
+			_, _ = w.Write([]byte(`[{"name":"w1","state":"landed"}]`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+}
+
+// A mid-run 401 re-logins with the stored credentials and retries the
+// request exactly once — the drain verdict then reads the real worker
+// state instead of misreading the auth failure as a land failure and
+// deleting the pod undrained.
+func TestATCClient401ReLoginsOnceAndRetries(t *testing.T) {
+	s := &cjExpiryServer{}
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+	c := newATCClient(srv.URL, srv.Client())
+	if err := c.login(ctx, "admin", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.workerState(ctx, "w1")
+	if err != nil || st != "landed" {
+		t.Fatalf("workerState after re-login = %q, %v; want landed", st, err)
+	}
+	// One re-login — no loop.
+	if s.tokenPOSTs != 2 {
+		t.Fatalf("token POSTs = %d, want 2 (initial login + one re-login)", s.tokenPOSTs)
+	}
+	// The retry carried the FRESH token.
+	if len(s.workerCalls) != 2 ||
+		s.workerCalls[0] != "Bearer tok-1" || s.workerCalls[1] != "Bearer tok-2" {
+		t.Fatalf("workers calls = %v, want [tok-1 401, tok-2 200]", s.workerCalls)
+	}
+	// The fresh token keeps working — no further re-login.
+	if _, err := c.workerState(ctx, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if s.tokenPOSTs != 2 {
+		t.Fatalf("token POSTs after follow-up = %d, want 2", s.tokenPOSTs)
+	}
+}
+
+// A 401 that SURVIVES the re-login is the error it is — one retry,
+// then out (no loop).
+func TestATCClientSecond401ErrorsWithoutLoop(t *testing.T) {
+	s := &cjExpiryServer{workersCode: http.StatusUnauthorized}
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+	c := newATCClient(srv.URL, srv.Client())
+	if err := c.login(ctx, "u", "p"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.workerState(ctx, "w1")
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected 401 error after the retried request, got %v", err)
+	}
+	if s.tokenPOSTs != 2 || len(s.workerCalls) != 2 {
+		t.Fatalf("token POSTs = %d, worker calls = %d; want 2/2 (exactly one retry)",
+			s.tokenPOSTs, len(s.workerCalls))
+	}
+}
+
+// A failed re-login surfaces as an error carrying the re-login
+// context — same fail shape as before the fix.
+func TestATCClientReLoginFailureErrors(t *testing.T) {
+	s := &cjExpiryServer{tokenCode: http.StatusInternalServerError}
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+	c := newATCClient(srv.URL, srv.Client())
+	if err := c.login(ctx, "u", "p"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.workerState(ctx, "w1")
+	if err == nil || !strings.Contains(err.Error(), "re-login") {
+		t.Fatalf("expected re-login failure error, got %v", err)
+	}
+	if s.tokenPOSTs != 2 || len(s.workerCalls) != 1 {
+		t.Fatalf("token POSTs = %d, worker calls = %d; want 2/1 (no retry after failed re-login)",
+			s.tokenPOSTs, len(s.workerCalls))
+	}
+}

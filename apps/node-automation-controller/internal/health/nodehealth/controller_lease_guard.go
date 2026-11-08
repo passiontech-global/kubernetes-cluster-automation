@@ -207,6 +207,12 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
 			continue
 		}
+		// podsNSFailed gates the per-namespace pods-list error
+		// reporting: every stale lease of the namespace shares the
+		// one memoized list (and its error), so the InfraErr and
+		// the carry-forward fire ONCE per namespace, not once per
+		// lease that never got its pods evaluated.
+		podsNSFailed := false
 		for i := range leases.Items {
 			lease := &leases.Items[i]
 			key := ns + "/" + lease.Name
@@ -228,8 +234,11 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			}
 			pods, err := podsInNS(ns)
 			if err != nil {
-				rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
-				p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
+				if !podsNSFailed {
+					podsNSFailed = true
+					rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
+					p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
+				}
 				continue
 			}
 			targets := controllerRunningPods(lease, pods)

@@ -381,7 +381,8 @@ func stsAutoRollOptedIn(sts *appsv1.StatefulSet) bool {
 // ownedPods lists the pods the StatefulSet controls — the apiserver
 // pre-filters by the STS's own spec.selector (without it every STS
 // would drag the whole namespace's pod list across the wire per
-// sweep), then the controller ownerReference decides (name+kind, not
+// sweep, paged at DefaultListPageSize so the read stays cheap at
+// fleet scale), then the controller ownerReference decides (name+kind, not
 // UID: fake clients and hand-built fixtures rarely carry matching
 // UIDs). A selector that fails to parse fails CLOSED — an error
 // skips this STS rather than rolling it on an unfiltered pod list.
@@ -398,14 +399,16 @@ func (r *statefulSetOnDeleteRoller) ownedPods(ctx context.Context,
 		return nil, fmt.Errorf("parse selector of statefulset %s/%s: %w",
 			sts.Namespace, sts.Name, err)
 	}
-	list, err := r.cs.CoreV1().Pods(sts.Namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: sel.String()})
+	list, err := kube.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: sel.String(),
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(r.cs, sts.Namespace))
 	if err != nil {
 		return nil, fmt.Errorf("list pods in %s: %w", sts.Namespace, err)
 	}
 	var out []*corev1.Pod
-	for i := range list.Items {
-		p := &list.Items[i]
+	for i := range list {
+		p := &list[i]
 		if !p.DeletionTimestamp.IsZero() {
 			continue
 		}

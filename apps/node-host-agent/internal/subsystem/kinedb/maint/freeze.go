@@ -33,42 +33,37 @@ const (
 	repackGlob = `ls /usr/pgsql-*/bin/pg_repack /usr/lib/postgresql/*/bin/pg_repack 2>/dev/null | head -1`
 )
 
-// xidFreezeCheck is the maint-cycle half of the wraparound item: the
+// readXidAge is the maint-cycle half of the wraparound item: the
 // probe owns the kine_db_xid_age_transactions series (2-minute
-// freshness); the freeze remediation runs here where the daily
-// cadence already serialises the heavy reindex/repack work — a
+// freshness); the freeze remediation runs inside the maint heavy
+// block's advisory-locked psql session (buildHeavyScript) where the
+// daily cadence already serialises the heavy reindex/repack work — a
 // FREEZE vacuum is a full-table rewrite freeze storm, not a
-// probe-time action.
-func (m *Maint) xidFreezeCheck(ctx context.Context, pg, user, pass string,
-	res *Result, note func(string)) {
+// probe-time action. Returns true when the age crossed xidFreezeAge
+// (the locked session then carries the VACUUM (FREEZE, ANALYZE)).
+func (m *Maint) readXidAge(ctx context.Context, pg, user, pass string,
+	res *Result, note func(string)) bool {
 	out, err := m.d.PsqlQuery(ctx, pg, user, pass,
 		"SELECT COALESCE(MAX(age(datfrozenxid)),0) FROM pg_database")
 	if err != nil {
 		note(fmt.Sprintf("xid-age-fail: %v", err))
-		return
+		return false
 	}
 	age, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
 	if perr != nil {
 		note(fmt.Sprintf("xid-age-unparsed: %v", perr))
-		return
+		return false
 	}
 	res.xidAge, res.xidSeen = age, true
 	res.freezeState = "skipped"
 	m.d.M.XidAge.Set(float64(age))
 	if age <= xidFreezeAge {
-		return
+		return false
 	}
 	note(fmt.Sprintf("xid-age=%d>%d — VACUUM (FREEZE, ANALYZE)", age, xidFreezeAge))
 	logger().Warn("kinedb: XID age past freeze threshold — VACUUM (FREEZE, ANALYZE)",
 		"xid_age", age, "threshold", xidFreezeAge)
-	if _, verr := m.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), m.d.PsqlArgs(pg, user, false,
-		"-qc", "VACUUM (FREEZE, ANALYZE) "+kdeps.SQLIdent(m.d.Cfg.Table)), ""); verr != nil {
-		res.okFreeze = false
-		res.freezeState = "fail"
-		note(fmt.Sprintf("freeze-vacuum-fail: %v", verr))
-		return
-	}
-	res.freezeState = "done"
+	return true
 }
 
 // repackHeadroom checks whether the postgres data filesystem has

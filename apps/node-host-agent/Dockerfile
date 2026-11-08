@@ -10,7 +10,7 @@
 # go.mod `replace ../../libs/hostkit` target resolves inside the
 # context at /src/libs/hostkit. No go.work is copied, so the build
 # runs in plain module mode (the release path).
-FROM golang:1.27 AS build
+FROM golang:1.27.3 AS build
 WORKDIR /src
 # Dep manifests first so `go mod download` is a cacheable layer that only
 # busts when go.mod/go.sum (or the hostkit replace target's go.mod) change —

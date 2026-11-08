@@ -1,6 +1,7 @@
 package partitionevictor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -829,5 +831,114 @@ func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 	}
 	if pePodExists(t, cs, "flux-system", "victim") {
 		t.Fatal("pod not evicted off a PMTU-blackholed node")
+	}
+}
+
+// peStaleCacheReader stands in for a lagging informer cache: it
+// answers List with the snapshot it was built with, never consulting
+// the live clientset — the exact shape a watch backlog produces.
+type peStaleCacheReader struct{ snapshot []runtime.Object }
+
+func (r peStaleCacheReader) List(_ context.Context, l client.ObjectList,
+	_ ...client.ListOption) error {
+	nl, ok := l.(*corev1.NodeList)
+	if !ok {
+		return fmt.Errorf("peStaleCacheReader: unexpected list type %T", l)
+	}
+	nl.Items = nil
+	for _, o := range r.snapshot {
+		nl.Items = append(nl.Items, *o.(*corev1.Node).DeepCopy())
+	}
+	return nil
+}
+
+// Live re-confirmation (the census rides the informer cache, which
+// can lag the apiserver by minutes): a node the cache still shows
+// partitioned but the LIVE API shows healthy must keep its pods and
+// must not be tainted — the lag window must not cost a live pod.
+func TestPartitionEvictorStaleCacheHealedNodeNotEvicted(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	stale := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute)
+	live := testutil.Node("p1", corev1.ConditionTrue, nil) // healed: ready, no partition condition
+	objs := append([]runtime.Object{live, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: append([]runtime.Object{stale}, peHealthyNodes("h", 2)...)},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted off a node whose partition healed inside the cache lag window")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("stale-flagged node tainted without live confirmation")
+	}
+}
+
+// A live-healed node that still carries the previous run's partition
+// taint loses it through the existing recovery path: the live Get
+// removes it from the flagged set, so the pre-exit untaint sweep
+// treats it as recovered.
+func TestPartitionEvictorStaleCacheHealedNodeUntainted(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	stale := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint)
+	live := testutil.Node("p1", corev1.ConditionTrue, nil, partitionTaint) // healed, taint left by the previous run
+	objs := append([]runtime.Object{live, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: append([]runtime.Object{stale}, peHealthyNodes("h", 2)...)},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("live-healed node kept its stale partition taint")
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted off a node whose partition healed")
+	}
+}
+
+// A failed LIVE Get is fail-closed: the node is skipped for this
+// sweep — no taint patch, no eviction — even though the cached census
+// flags it, and the run itself succeeds (the next sweep retries).
+func TestPartitionEvictorLiveGetFailClosedSkipsNode(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	stale := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute)
+	live := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute) // really partitioned, but unverifiable here
+	objs := append([]runtime.Object{live, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("get", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("live get boom")
+		})
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: append([]runtime.Object{stale}, peHealthyNodes("h", 2)...)},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("one unconfirmable node must not fail the sweep: %v", err)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
+			t.Fatal("node patched (taint/untaint) without live confirmation")
+		}
+		if a.GetResource().Resource == "pods" && a.GetVerb() == "delete" {
+			t.Fatal("pod evicted without live confirmation of the partition")
+		}
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted though the live Get failed")
 	}
 }

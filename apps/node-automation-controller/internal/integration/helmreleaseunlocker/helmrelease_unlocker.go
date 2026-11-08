@@ -471,6 +471,14 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		// the sweep is best-effort residue cleanup riding a heal,
 		// and the periodic wrapper already counts the run error.
 		OnError: func(log logr.Logger, j *batchv1.Job, err error) {
+			if apierrors.IsNotFound(err) {
+				// Raced with the Job's own cleanup — nothing left to
+				// reap, nothing went wrong (cilium-identity janitor
+				// parity: a benign race is a skip, not an error).
+				log.Info("SKIP: helm-hook Job already gone — raced with its own cleanup",
+					"ns", ns, "job", j.Name)
+				return
+			}
 			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
 		},
 	})

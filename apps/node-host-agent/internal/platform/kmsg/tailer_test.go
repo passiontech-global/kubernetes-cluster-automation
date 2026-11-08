@@ -234,3 +234,71 @@ func TestTailerCloseDropsCarry(t *testing.T) {
 		t.Fatalf("pending appeared on failed read: %q", tail.pending)
 	}
 }
+
+// TestTailerSaturatedPendingStillProgresses: with DrainIncludesPending
+// and an UNBOUNDED carry (PendingCap <= 0), a pending line at exactly
+// DrainCap zeroes the drain budget — before the clamp, Drain(<=0)
+// returned caught-up with no data every tick and the tail wedged
+// forever (pending can never shrink below the cap it saturates).
+// Each Read must now drain at least one fresh byte until the
+// terminator arrives and the carry resolves into a complete line.
+func TestTailerSaturatedPendingStillProgresses(t *testing.T) {
+	_, dev := tailerFixture(t, "aaaaaaaaaa") // exactly DrainCap bytes, no '\n'
+	tail := tailerFor(dev, TailerOptions{
+		DrainCap:             10,
+		DrainIncludesPending: true,
+		PendingCap:           0, // unbounded — the saturation case
+	})
+	defer tail.Close()
+
+	lines, _, err := tail.Read()
+	if err != nil || len(lines) != 0 {
+		t.Fatalf("first read: lines=%v err=%v, want empty carry seed", lines, err)
+	}
+	if string(tail.pending) != "aaaaaaaaaa" {
+		t.Fatalf("carry = %q, want the full 10-byte line", tail.pending)
+	}
+	appendDev(t, dev, "b\n")
+
+	// The stuck pre-fix behavior: budget 10-10 = 0 → Drain returns
+	// (nil,false,nil) forever. The clamp drains one byte per Read,
+	// so the line must complete within a few ticks.
+	for tick := 2; ; tick++ {
+		if tick > 6 {
+			t.Fatalf("carry never resolved — tail wedged at %q", tail.pending)
+		}
+		lines, _, err := tail.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) == 1 && string(lines[0]) == "aaaaaaaaaab" &&
+			len(tail.pending) == 0 {
+			break
+		}
+	}
+}
+
+// TestTailerNewTailerClampsPendingCap: the constructor normalizes the
+// PendingCap >= DrainCap misuse (carry counts against the budget) —
+// the carry is clamped to leave one fresh byte per drain, so a
+// saturated carry can never zero the budget either.
+func TestTailerNewTailerClampsPendingCap(t *testing.T) {
+	_, dev := tailerFixture(t, "0123456789ab\n")
+	tail := NewTailer(TailerOptions{
+		Paths:                func() []string { return []string{dev} },
+		DrainCap:             10,
+		DrainIncludesPending: true,
+		PendingCap:           10, // == DrainCap — would zero the budget
+	})
+	defer tail.Close()
+	if tail.opts.PendingCap != 9 {
+		t.Fatalf("PendingCap = %d, want clamped to DrainCap-1", tail.opts.PendingCap)
+	}
+	lines, _, err := tail.Read()
+	if err != nil || len(lines) != 1 || string(lines[0]) != "0123456789ab" {
+		t.Fatalf("lines=%v err=%v — clamped cap must not wedge the first read", lines, err)
+	}
+	if len(tail.pending) != 0 {
+		t.Fatalf("carry = %q, want empty", tail.pending)
+	}
+}

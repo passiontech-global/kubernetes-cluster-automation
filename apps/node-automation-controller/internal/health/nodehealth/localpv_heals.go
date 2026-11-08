@@ -14,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -93,14 +94,33 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 // pod(s) — the same re-sync nudge every operator heal here applies.
 // Pending hostpath claims while Ready workers exist mean the
 // provisioner missed a watch event; a restart makes it re-list and
-// provision. 1h cooldown (in-RAM — the pod itself is the heal
-// target, nothing else can carry the stamp), maintenance-gated via
-// the shared HealAllowed preamble.
+// provision. The cooldown is the wider of the in-RAM ledger and the
+// passiontech.dev/last-localpv-provisioner-heal stamp persisted on
+// the provisioner Deployment (survives operator restarts) — a
+// Deployment read failure defers fail-closed, an absent Deployment
+// degrades to the ledger-only gate — then the shared HealAllowed
+// maintenance gate. 1h cooldown, maintenance-gated.
 func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.pvcProvHealed, openebsProvisionerName,
+	// The durable cooldown half rides the provisioner's own
+	// Deployment — the one object whose lifetime spans the heal
+	// window.
+	var obj metav1.Object
+	dep, err := p.CS.AppsV1().Deployments(openebsProvisionerNS).
+		Get(ctx, openebsProvisionerName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		obj = dep
+	case apierrors.IsNotFound(err):
+	default:
+		metrics.IncError(p.Name)
+		log.Info("WARN: read localpv provisioner deployment failed — heal deferred",
+			"error", err)
+		return
+	}
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.pvcProvHealed, obj, pvcProvHealAnno, openebsProvisionerName,
 		pvcProvisionerHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
@@ -139,4 +159,20 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	}
 	pvcProvisionerHealsTotal.
 		WithLabelValues(openebsProvisionerName).Inc()
+	// Persist the stamp on the Deployment — the durable half of the
+	// cooldown. A patch failure leaves the in-RAM half (the delivered
+	// delete already stamped pvcProvHealed) holding; nil ledger
+	// because the in-RAM key is shared with DeletePod's own stamps.
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().Deployments(openebsProvisionerNS).
+				Patch(ctx, openebsProvisionerName, types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		pvcProvHealAnno, nil, "", now); err != nil {
+		metrics.IncError(p.Name)
+		log.Error(err, "persist localpv provisioner heal stamp failed",
+			"deployment", openebsProvisionerNS+"/"+openebsProvisionerName)
+	}
 }

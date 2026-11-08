@@ -2,9 +2,15 @@ name: CI
 
 # PR gate: runs format/vet/test/build only for moon projects affected
 # by the change (`moon ci` compares against the PR base).
+#
+# Main gate: push to main runs an unconditional lint/vet pass — moon ci
+# only sees PR deltas, so without this a change merging without an up
+# to date PR check would drift lint on main.
 
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 permissions:
@@ -16,6 +22,7 @@ concurrency:
 
 jobs:
   checks:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       # committed go.work is for local dev; CI resolves deps per-module
@@ -33,3 +40,26 @@ jobs:
 
       - name: Run affected tasks
         run: moon ci :format :vet :lint :lint-dockerfile :test :build
+
+  lint-main:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: lint-main-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # committed go.work is for local dev; CI resolves deps per-module
+      GOWORK: off
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain (go + moon pinned in mise.toml)
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint and vet main
+        run: moon run :lint :vet

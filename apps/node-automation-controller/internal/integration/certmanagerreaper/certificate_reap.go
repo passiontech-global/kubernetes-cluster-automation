@@ -54,6 +54,82 @@ func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
 	return false
 }
 
+// orderIndex is the cached outcome of one namespace's ACME Order
+// List, attributed to their owning Certificates: byCert maps cert
+// name → that cert's Orders in list order (the same first-match order
+// the per-cert scan always used). Built once per sweep per namespace
+// — an N-candidate sweep previously paid one Order List per cert.
+type orderIndex struct {
+	byCert map[string][]unstructured.Unstructured
+	err    error
+}
+
+// listOrdersForCert returns the cert's attributed Orders for ns,
+// building the namespace's index on first use and caching it for the
+// whole sweep (mirrors listCRs). A failed Order or CR List returns
+// (nil, err) — attribution is impossible, fail closed.
+func (r *certManagerReaper) listOrdersForCert(ctx context.Context,
+	ns, certName string) ([]unstructured.Unstructured, error) {
+	idx, ok := r.orderCache[ns]
+	if !ok {
+		idx = r.buildOrderIndex(ctx, ns)
+		r.orderCache[ns] = idx
+	}
+	if idx.err != nil {
+		return nil, idx.err
+	}
+	return idx.byCert[certName], nil
+}
+
+// buildOrderIndex lists the namespace's Orders once and attributes
+// each through the Order→CR→Certificate owner chain (the same
+// first-resolving-CR-ownerRef rule orderOwnedByCert enforced when the
+// walk was per-cert). An Order whose CR ownerRef resolves to nothing
+// — or whose CR names no cert — lands under no cert and is never
+// reapable.
+func (r *certManagerReaper) buildOrderIndex(ctx context.Context,
+	ns string) *orderIndex {
+	idx := &orderIndex{byCert: map[string][]unstructured.Unstructured{}}
+	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(r.queue)
+		idx.err = err
+		return idx
+	}
+	// Attribute orders through the owner chain — an Order's ownerRef
+	// names its CertificateRequest and the CR's ownerRef names the
+	// Certificate (cert-manager also stamps the
+	// cert-manager.io/certificate-name ref on the CR). Picking the
+	// first pending order in the NAMESPACE would reap another cert's
+	// order while charging the reset budget to this cert. A failed
+	// CR list makes attribution impossible — fail closed.
+	crs, err := r.listCRs(ctx, ns)
+	if err != nil {
+		idx.err = err
+		return idx
+	}
+	crToCert := make(map[string]string, len(crs.Items))
+	for i := range crs.Items {
+		if certName, ok := certNameForCR(&crs.Items[i]); ok {
+			crToCert[crs.Items[i].GetName()] = certName
+		}
+	}
+	for i := range orders.Items {
+		o := orders.Items[i]
+		for _, or := range o.GetOwnerReferences() {
+			if or.Kind != "CertificateRequest" {
+				continue
+			}
+			if certName, ok := crToCert[or.Name]; ok {
+				idx.byCert[certName] = append(idx.byCert[certName], o)
+				break
+			}
+		}
+	}
+	return idx
+}
+
 // reapCert finds the cert's stuck pending Order, verifies a Challenge
 // is genuinely wedged (not just slow), applies the reset budget, then
 // deletes the Order so cert-manager recreates it. Reports whether an
@@ -64,39 +140,15 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	key := ns + "/" + name
 	now := r.now.Now()
 
-	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
-		List(ctx, metav1.ListOptions{})
+	orders, err := r.listOrdersForCert(ctx, ns, name)
 	if err != nil {
-		metrics.IncError(r.queue)
-		log.Error(err, "order list failed", "cert", key)
+		log.Error(err, "order attribution failed", "cert", key)
 		return false
-	}
-
-	// Attribute orders to THIS cert through the owner chain — an
-	// Order's ownerRef names its CertificateRequest and the CR's
-	// ownerRef names the Certificate (cert-manager also stamps the
-	// cert-manager.io/certificate-name ref on the CR). Picking the
-	// first pending order in the NAMESPACE would reap another cert's
-	// order while charging the reset budget to this cert. A failed
-	// CR list makes attribution impossible — fail closed.
-	crs, err := r.listCRs(ctx, ns)
-	if err != nil {
-		log.Error(err, "certificaterequest list failed", "cert", key)
-		return false
-	}
-	crToCert := make(map[string]string, len(crs.Items))
-	for i := range crs.Items {
-		if certName, ok := certNameForCR(&crs.Items[i]); ok {
-			crToCert[crs.Items[i].GetName()] = certName
-		}
 	}
 
 	var stuck *unstructured.Unstructured
-	for i := range orders.Items {
-		o := &orders.Items[i]
-		if !orderOwnedByCert(o, name, crToCert) {
-			continue // not this cert's order — never ours to reap
-		}
+	for i := range orders {
+		o := &orders[i]
 		if st, _ := kube.NestedString(o.Object, "status", "state"); st != "pending" {
 			continue
 		}

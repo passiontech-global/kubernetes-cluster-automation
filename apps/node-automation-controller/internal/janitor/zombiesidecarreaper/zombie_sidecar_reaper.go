@@ -42,6 +42,10 @@
 // spec.containers or in spec.initContainers as a native sidecar
 // (restartPolicy: Always, the shape istio's native-sidecar mode and
 // newer linkerd injection use).
+// The graceful attempts are capped per cycle (zombieShutdownCapPerCycle):
+// each is two sequential network hops with 2s timeouts — a large
+// zombie backlog must not block the tick for minutes — so pods past
+// the cap defer their shutdown to the next 5-minute sweep.
 // Pods are read through the direct clientset — the manager cache is
 // list/watch-locked to kube-system cilium pods.
 package zombiesidecarreaper
@@ -66,6 +70,14 @@ import (
 
 const (
 	zombieSidecarReaperInterval = 5 * time.Minute
+
+	// zombieShutdownCapPerCycle bounds the graceful sidecar shutdown
+	// attempts per sweep: each attempt is up to two sequential
+	// network hops with 2s timeouts (the direct pod-IP dial, then
+	// the apiserver proxy), so a 50-zombie backlog would otherwise
+	// block the tick for 200-400s. Pods past the cap are deferred —
+	// not dropped: the next 5-minute sweep gives them their attempt.
+	zombieShutdownCapPerCycle = 10
 )
 
 type zombieSidecarReaper struct {
@@ -155,6 +167,11 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		attempted bool
 	}
 	var targets []zombieTarget
+	// shutdownAttempts counts graceful sidecar shutdown calls this
+	// cycle — the cap keeps the tick's wall time bounded (each call
+	// is two sequential 2s-timeout hops). The poked branch makes no
+	// network call and never counts.
+	shutdownAttempts, shutdownSkipped := 0, 0
 	for i := range pods {
 		p := &pods[i]
 		sidecar := r.zombiePod(p, now)
@@ -173,6 +190,13 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 				reason: "still stuck after sidecar shutdown", attempted: true})
 			continue
 		}
+		if shutdownAttempts >= zombieShutdownCapPerCycle {
+			// Past the cap: no dial, no tried-stamp — the pod keeps
+			// its graceful cycle for the next sweep, unmodified.
+			shutdownSkipped++
+			continue
+		}
+		shutdownAttempts++
 		// Graceful path: direct pod-IP admin call, then the apiserver
 		// pods/<name>:<port>/proxy fallback when the direct dial is
 		// unreachable (netpol) or the pod has no IP (W10-FIX3). A pod
@@ -255,6 +279,10 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		if !seen[k] {
 			delete(r.tried, k)
 		}
+	}
+	if shutdownSkipped > 0 {
+		log.Info("SKIP: shutdown attempt cap reached — zombies deferred to next cycle",
+			"skipped", shutdownSkipped, "cap", zombieShutdownCapPerCycle)
 	}
 	log.Info("sweep done", "zombies", len(seen), "deleted", deleted)
 	return nil

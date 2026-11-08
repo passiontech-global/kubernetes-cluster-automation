@@ -429,6 +429,63 @@ func TestCertDriftAuditorTLSPrunesDeletedSecret(t *testing.T) {
 	}
 }
 
+// Cardinality gate: only Secrets inside the 30d emit window open a
+// series. A far-future cert is invisible; one that rotates into the
+// window opens its series on the next sweep; one rotated back out
+// (same name, new long-lived cert) gets its stale series pruned —
+// while the boundary (exactly 30d) and expired (negative) certs keep
+// emitting exactly as the <30d alert budget expects.
+func TestCertDriftAuditorTLSCardinalityGate(t *testing.T) {
+	fixedNow := time.Now().Truncate(time.Second) // x509 serializes cert times at second precision
+	cs := fake.NewSimpleClientset(
+		tlsSecret(t, "app", "tls-far", fixedNow.Add(90*24*time.Hour)),
+		tlsSecret(t, "app", "tls-boundary", fixedNow.Add(30*24*time.Hour)),
+		tlsSecret(t, "app", "tls-expired", fixedNow.Add(-48*time.Hour)))
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.TLSSecretDaysToExpiry.DeleteLabelValues("app", "tls-far") {
+		t.Fatal("far-future cert opened a series — cardinality gate failed")
+	}
+	if got := promtestutil.ToFloat64(
+		metrics.TLSSecretDaysToExpiry.WithLabelValues("app", "tls-boundary")); got != 30 {
+		t.Fatalf("boundary cert days=%v, want 30", got)
+	}
+	if got := promtestutil.ToFloat64(
+		metrics.TLSSecretDaysToExpiry.WithLabelValues("app", "tls-expired")); got != -2 {
+		t.Fatalf("expired cert days=%v, want -2 (expired certs stay visible)", got)
+	}
+
+	// Rotating tls-far into the window opens its series on the next sweep.
+	fresh := tlsSecret(t, "app", "tls-far", fixedNow.Add(10*24*time.Hour))
+	if _, err := cs.CoreV1().Secrets("app").Update(ctx, fresh, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := promtestutil.ToFloat64(
+		metrics.TLSSecretDaysToExpiry.WithLabelValues("app", "tls-far")); got != 10 {
+		t.Fatalf("rotated-into-window cert days=%v, want 10", got)
+	}
+
+	// A re-rotation back past the window must not leave the stale
+	// pre-rotation value behind — the ledger prunes what it no longer
+	// re-asserts.
+	out := tlsSecret(t, "app", "tls-far", fixedNow.Add(90*24*time.Hour))
+	if _, err := cs.CoreV1().Secrets("app").Update(ctx, out, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.TLSSecretDaysToExpiry.DeleteLabelValues("app", "tls-far") {
+		t.Fatal("series kept after the cert rotated back past the window")
+	}
+}
+
 // A TLS-secret list failure propagates as the run's error — the
 // periodic wrapper owns the IncError for it.
 func TestCertDriftAuditorTLSListError(t *testing.T) {
@@ -702,6 +759,34 @@ func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 	}
 	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 1 {
 		t.Fatalf("opaque-source drift not detected: %v, want 1", got)
+	}
+}
+
+// The resync cooldown ledger gets the same leak bound as the drift
+// streaks, pruned at the same complete-sweep point: a stamp past the
+// 1h window can never suppress a future strip, so it is evicted —
+// including one for a destination that has since been decommissioned
+// — while a live stamp keeps cooling down.
+func TestReplicatedResyncCooldownsPruneExpired(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	fixedNow := time.Now()
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+	a.resyncHeals.Stamp("apps/live/sec/tls-src", fixedNow.Add(-time.Minute))
+	a.resyncHeals.Stamp("apps/dead/sec/tls-src", fixedNow.Add(-2*time.Hour))
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.resyncHeals.Last("apps/dead/sec/tls-src"); ok {
+		t.Fatal("expired resync stamp survived the complete-sweep prune")
+	}
+	if _, ok := a.resyncHeals.Last("apps/live/sec/tls-src"); !ok {
+		t.Fatal("live resync stamp was evicted")
+	}
+	// A zero-value ledger must survive the prune on sweeps that never
+	// saw a strip at all.
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

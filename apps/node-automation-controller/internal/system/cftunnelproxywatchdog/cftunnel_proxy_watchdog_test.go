@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -150,6 +151,88 @@ func TestWatchdogPendingPodNoResync(t *testing.T) {
 	}
 }
 
+// The forced resync is PACED: one annotated sweep per cooldown
+// window, the sweeps in between only count the unready pods — and
+// the stamp VALUE churns again once the window clears (each real
+// resync stamps >= the cooldown apart, so the EndpointSlice always
+// sees a new value and emits its event).
+func TestWatchdogResyncCooldownPacesSweeps(t *testing.T) {
+	now := time.Now()
+	clock := now
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-1", true),
+		proxyPod("proxy-2", false), // stuck "no config loaded"
+		proxySlice("proxy-headless-abc"),
+		proxyDeploy(nil))
+	var patches int
+	cs.PrependReactor("patch", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil // fall through — the tracker applies it
+		})
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+		now: func() time.Time { return clock }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	first := getSlice(t, cs, "proxy-headless-abc").Annotations[cfTunnelResyncAnno]
+	if first == "" {
+		t.Fatal("first sweep must annotate the slice")
+	}
+	if patches != 1 {
+		t.Fatalf("first sweep patched %d times, want 1", patches)
+	}
+
+	// +5m: still inside the 10m window — count-only, no patch.
+	clock = now.Add(5 * time.Minute)
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("gated run: %v", err)
+	}
+	if patches != 1 {
+		t.Fatalf("gated sweep patched %d times, want 0", patches-1)
+	}
+	if got := getSlice(t, cs, "proxy-headless-abc").Annotations[cfTunnelResyncAnno]; got != first {
+		t.Fatal("gated sweep re-annotated the slice")
+	}
+
+	// +10m+1s: the window cleared — the resync fires again and the
+	// value churns (a repeated value would emit no event).
+	clock = now.Add(cfTunnelResyncCooldown + time.Second)
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("post-cooldown run: %v", err)
+	}
+	if patches != 2 {
+		t.Fatalf("post-cooldown sweep patched %d times total, want 2", patches)
+	}
+	second := getSlice(t, cs, "proxy-headless-abc").Annotations[cfTunnelResyncAnno]
+	if second == first {
+		t.Fatal("resync stamp value did not churn — no event would fire")
+	}
+}
+
+// A failed slice patch must not arm the pacing cooldown — the next
+// sweep retries ungated (delivered-only stamping).
+func TestWatchdogResyncCooldownNotStampedOnPatchFailure(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-1", true),
+		proxyPod("proxy-2", false),
+		proxySlice("proxy-headless-abc"),
+		proxyDeploy(nil))
+	cs.PrependReactor("patch", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+		now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err == nil {
+		t.Fatal("expected the patch failure to surface")
+	}
+	if _, ok := w.lastResync.Last(cfTunnelProxySliceService); ok {
+		t.Fatal("cooldown stamped although no slice patch was delivered")
+	}
+}
+
 // A stale Progressing/ProgressDeadlineExceeded condition is removed
 // via a status-subresource JSONPatch — same call the shell made with
 // `kubectl patch --subresource=status --type=json`, plus a "test" op
@@ -260,6 +343,31 @@ func connectorPod(name string, created, unreadyFor time.Time) *corev1.Pod {
 	return p
 }
 
+// rsOwnedPod is staleUnreadyProxyPod carrying a controller
+// OwnerReference to the ReplicaSet named rs — the object the heal
+// cooldown persists on (healCooledDown/stampHealPersisted).
+func rsOwnedPod(name, rs string, created, unreadyFor time.Time) *corev1.Pod {
+	p := staleUnreadyProxyPod(name, created, unreadyFor)
+	p.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "ReplicaSet",
+		Name:       rs,
+		UID:        types.UID("rs-uid-" + rs),
+		Controller: ptr.To(true),
+	}}
+	return p
+}
+
+// healRs builds the ReplicaSet object rsOwnedPod points at, with the
+// given heal annotation (nil = none).
+func healRs(name string, annos map[string]string) *appsv1.ReplicaSet {
+	return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name:        name,
+		Namespace:   cfWatchdogTestNS,
+		Annotations: annos,
+	}}
+}
+
 // cfLogReactor answers pod log reads in cfWatchdogTestNS (the fake
 // GetLogs action carries no pod name, so the body is shared across
 // pods in a namespace).
@@ -289,7 +397,7 @@ func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
 			now.Add(-time.Hour), now.Add(-10*time.Minute)),
 		proxyDeploy(nil))
 	cs.PrependReactor("get", "pods", cfLogReactor(
-		"2026-11-20T00:00:00Z ERR Failed to sufficiently increase receive buffer size\n"))
+		"2026-11-20T00:00:00Z ERR Couldn't start tunnel: config file error\n"))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
 	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -299,6 +407,56 @@ func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
 	}
 	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-ok") {
 		t.Fatal("ready pod deleted")
+	}
+}
+
+// The "increase receive buffer" line is the benign startup warning
+// cloudflared logs on every Linux node — a stale-unready pod whose
+// tail holds ONLY that warning must stay untouched (the false
+// positive this guard exists for), and the ready sibling stays
+// untouched with it.
+func TestWatchdogBufferWarningPodUntouched(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		staleUnreadyProxyPod("proxy-buffer-warn",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR Failed to sufficiently increase receive buffer size\n"+
+			"INF Registered tunnel connection\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-buffer-warn") {
+		t.Fatal("pod deleted on the benign receive-buffer startup warning")
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-ok") {
+		t.Fatal("ready pod deleted")
+	}
+}
+
+// Three buffer warnings (or the warning mixed into a real edge-error
+// loop) clear the >=3 weighted-line bar — the warning is weight-1
+// noise, fatal only by accumulation.
+func TestWatchdogBufferWarningLoopDeleted(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		staleUnreadyProxyPod("proxy-wedged",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"ERR Failed to sufficiently increase receive buffer size\n"+
+			"ERR Failed to sufficiently increase receive buffer size\n"+
+			"ERR Failed to sufficiently increase receive buffer size\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+		t.Fatal("sustained buffer-warning loop pod not deleted")
 	}
 }
 
@@ -390,6 +548,101 @@ func TestWatchdogHealsIngressControllerNamespace(t *testing.T) {
 	}
 }
 
+// A delivered heal stamps the RFC3339 cooldown annotation on the
+// pod's owning ReplicaSet AND the in-RAM ledger — the durable half
+// that survives an operator restart.
+func TestWatchdogHealStampsReplicaSetAnnotation(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		rsOwnedPod("proxy-wedged", "proxy-rs",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		healRs("proxy-rs", nil),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"ERR Couldn't start tunnel: config file error\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+		t.Fatal("wedged pod not deleted")
+	}
+	got, err := cs.AppsV1().ReplicaSets(cfWatchdogTestNS).
+		Get(context.Background(), "proxy-rs", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get replicaset: %v", err)
+	}
+	stamp, err := time.Parse(time.RFC3339, got.Annotations[cfTunnelHealAnno])
+	if err != nil {
+		t.Fatalf("heal annotation %q is not RFC3339: %v",
+			got.Annotations[cfTunnelHealAnno], err)
+	}
+	if d := stamp.Sub(now); d < -2*time.Second || d > 2*time.Second {
+		t.Fatalf("heal stamp = %v, want ~%v", stamp, now)
+	}
+	if _, ok := w.lastHeal.Last(cfWatchdogTestNS + "/proxy-rs"); !ok {
+		t.Fatal("in-RAM ledger not stamped on the delivered heal")
+	}
+}
+
+// The persisted annotation cools the heal across an operator restart:
+// a FRESH watchdog (empty lastHeal) must still skip a controller
+// whose ReplicaSet carries a stamp inside the cooldown window.
+func TestWatchdogHealCooledDownByPersistedStamp(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		rsOwnedPod("proxy-wedged", "proxy-rs",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		healRs("proxy-rs", map[string]string{
+			cfTunnelHealAnno: now.Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		}),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"ERR Couldn't start tunnel: config file error\n"))
+	// Empty lastHeal — the operator just restarted and forgot.
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+		t.Fatal("pod deleted inside the persisted-annotation cooldown")
+	}
+	if _, ok := w.lastHeal.Last(cfWatchdogTestNS + "/proxy-rs"); ok {
+		t.Fatal("ledger stamped while the heal was skipped")
+	}
+}
+
+// A failed ReplicaSet annotation patch must not undo the delivered
+// delete — the in-RAM ledger stamp holds (the same
+// annotation-fails-but-heal-stands shape dragonfly_heals uses).
+func TestWatchdogHealSurvivesStampPatchFailure(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		rsOwnedPod("proxy-wedged", "proxy-rs",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		healRs("proxy-rs", nil),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"ERR Couldn't start tunnel: config file error\n"))
+	cs.PrependReactor("patch", "replicasets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run must not fail over the stamp patch: %v", err)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+		t.Fatal("wedged pod not deleted although only the stamp patch failed")
+	}
+	if _, ok := w.lastHeal.Last(cfWatchdogTestNS + "/proxy-rs"); !ok {
+		t.Fatal("in-RAM ledger not stamped on the delivered delete")
+	}
+}
+
 // cloudflaredLogsWedged signature table — the fatal strings match
 // case-insensitively; the edge-error loop needs >=3 error lines.
 func TestCloudflaredLogsWedged(t *testing.T) {
@@ -400,7 +653,15 @@ func TestCloudflaredLogsWedged(t *testing.T) {
 	}{
 		{"clean", "INF Registered tunnel connection\nINF metrics server started\n", false},
 		{"couldnt start", "ERR Couldn't start tunnel\n", true},
-		{"recv buffer", "ERR Failed to sufficiently increase receive buffer size\n", true},
+		{"recv buffer", "ERR Failed to sufficiently increase receive buffer size\n", false},
+		{"recv buffer loop",
+			"ERR Failed to sufficiently increase receive buffer size\n" +
+				"ERR Failed to sufficiently increase receive buffer size\n" +
+				"ERR Failed to sufficiently increase receive buffer size\n", true},
+		{"recv buffer mixed into an edge loop",
+			"ERR Failed to sufficiently increase receive buffer size\n" +
+				"ERR connection with edge closed\n" +
+				"ERR connection with edge reset\n", true},
 		{"serve tunnel", "ERR Serve tunnel error error=\"dial tcp: timeout\"\n", true},
 		{"edge loop", "ERR connection with edge closed\n" +
 			"ERR connection with edge closed\n" +

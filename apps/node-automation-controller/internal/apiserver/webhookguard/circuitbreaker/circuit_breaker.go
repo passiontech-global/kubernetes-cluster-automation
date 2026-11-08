@@ -47,6 +47,15 @@ const (
 	// Service is one bounce per cooldown regardless of which duty
 	// noticed it.
 	BounceCooldown = 15 * time.Minute
+
+	// RecoverConfirmSweeps is how many CONSECUTIVE healthy sweeps an
+	// annotation-broken entry needs before its recover patch fires.
+	// ONE healthy sweep is not a recovery: a backend flapping
+	// 0↔1 Ready endpoint would trip and recover in alternating
+	// sweeps, patching the WebhookConfiguration twice a cycle. The
+	// annotation stays the SSOT for "broken" — the gate only delays
+	// the Fail restore.
+	RecoverConfirmSweeps = 2
 )
 
 // ---------------------------------------------------------------------------
@@ -99,6 +108,17 @@ type Breaker struct {
 	// stale ones (CRD gone, backend healthy, reason changed) pruned
 	// via DeleteLabelValues.
 	crdUnhealthyEmitted state.GaugeLedger[crdConversionKey]
+	// recoverStreak counts, per kind/config/sub-webhook key, how
+	// many consecutive healthy sweeps a broken entry has served —
+	// the recover-confirm gate of RecoverConfirmSweeps. Hit in the
+	// healthy branch (alongside its recoverSeen mark), Reset on
+	// every disproving path (still-dead sweep, confirmed recover),
+	// pruned at sweep end for keys no longer under evaluation so a
+	// webhook removed from its config cannot inherit a stale streak
+	// when it reappears. In-RAM only: an operator restart restarts
+	// confirmation from one sweep — acceptable, the annotation
+	// still holds the entry broken meanwhile.
+	recoverStreak state.StreakLedger
 }
 
 // Sweep trips fail-closed sub-webhooks whose backend
@@ -131,6 +151,10 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// seen marks the deadSince keys still under evaluation — streaks
 	// for entries gone since the last sweep are pruned below.
 	seen := map[string]bool{}
+	// recoverSeen marks the recover-confirmation streaks Hit this
+	// sweep — the prune's keep set (Hit and defer land together, so
+	// every live streak key appears here each sweep).
+	recoverSeen := map[string]bool{}
 	var failed []string
 
 	// cfgJob is one webhook configuration's per-sweep work: the
@@ -186,7 +210,7 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	}
 	for _, job := range jobs {
 		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
-			job.kind, job.name, job.anno, job.views, ready, now, seen)
+			job.kind, job.name, job.anno, job.views, ready, now, seen, recoverSeen)
 		if payload == nil {
 			// Nothing to write — the still-broken re-asserts read
 			// verified live state (the annotation already lists
@@ -230,11 +254,34 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// this sweep (Service recovered, entry flipped to Ignore) re-arm
 	// their window.
 	b.deadSince.Prune(func(k string) bool { return seen[k] })
+
+	// And the recover-confirmation streaks: a Hit lands only in the
+	// defer branch (recoverSeen marks it there), so every streak key
+	// a sweep serves reappears in recoverSeen — a key missing from
+	// it lost its evaluation (webhook removed from the config) and
+	// must re-arm from zero on reappearance. Still-dead and
+	// confirmed-recover sweeps Reset their keys in-place inside
+	// circuitPatch.
+	b.recoverStreak.Prune(func(k string) bool { return recoverSeen[k] })
 	if len(failed) > 0 {
 		return fmt.Errorf("circuit breaker patches failed for: %s",
 			strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// markHealthyStreak advances key's consecutive-healthy-sweep count
+// and returns it — the recover-confirm gate compares the return
+// against RecoverConfirmSweeps.
+func (b *Breaker) markHealthyStreak(key string) int {
+	return b.recoverStreak.Hit(key)
+}
+
+// clearHealthyStreak drops key's healthy streak — the streak is
+// CONSECUTIVE, so any disproving sweep (backend dead again, recover
+// confirmed) re-arms the gate from zero.
+func (b *Breaker) clearHealthyStreak(key string) {
+	b.recoverStreak.Reset(key)
 }
 
 // hookView is the breaker's uniform projection over MutatingWebhook /

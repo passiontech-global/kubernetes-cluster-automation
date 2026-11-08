@@ -12,6 +12,30 @@ import (
 	"time"
 )
 
+const (
+	// superviseBackoffInitial is the first restart wait — 5s, the
+	// original supervisor constant.
+	superviseBackoffInitial = 5 * time.Second
+	// superviseBackoffMax caps the exponential ladder — 5m, the
+	// breathing room a permanently sick subsystem gets between
+	// restart attempts.
+	superviseBackoffMax = 5 * time.Minute
+)
+
+// superviseHealthyRun reports whether a run that lasted elapsed
+// counts as healthy enough to reset the exponential restart ladder
+// to its initial backoff. The bar is deliberately ABSOLUTE — a run
+// must outlive twice the CURRENT backoff, or 5 minutes flat, to
+// count. Measuring "outlived the current backoff" (the original rule)
+// let a crash-loop whose runs die just past the backoff reset the
+// ladder every round: run 5.1s → backoff was 5s → reset → crash 5.1s
+// → reset … the subsystem stayed pinned at a 5s restart cadence
+// forever, never climbing toward the 5m cap that buys a sick node
+// breathing room.
+func superviseHealthyRun(elapsed, backoff time.Duration) bool {
+	return elapsed >= backoff*2 || elapsed >= superviseBackoffMax
+}
+
 // supervise launches the supervisor goroutine for every configured
 // subsystem and returns immediately. Run calls it before binding
 // the listeners so subsystem startup never blocks serving — and a
@@ -40,11 +64,15 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	logger().Info("subsystem started", "name", name)
 	up := a.subUp.WithLabelValues(name)
 	restarts := a.restarts.WithLabelValues(name)
-	// Restart backoff doubles per early exit (5s → 5m cap) so
-	// a subsystem that returns instantly can't spam a restart
-	// + error log every cycle; a run that outlived the
-	// current backoff counts as healthy and resets it.
-	backoff := 5 * time.Second
+	// Restart backoff doubles per early exit (5s → 5m cap) so a
+	// subsystem that returns instantly can't spam a restart + error
+	// log every cycle. The reset to the initial backoff is gated by
+	// superviseHealthyRun: only a run that outlived twice the
+	// current backoff (or 5 minutes flat) counts as healthy — the
+	// original "outlived the current backoff" rule let a crash-loop
+	// with 5.1s runs reset the ladder every round and stay pinned
+	// at a 5s restart cadence forever.
+	backoff := superviseBackoffInitial
 	// Reusable backoff timer: Reset(wait) re-arms from end-of-work
 	// before each wait (time.After parity), so a run that outlives
 	// the current backoff can't let a stale tick skip the next one.
@@ -67,8 +95,8 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 			return
 		}
 		restarts.Inc()
-		if time.Since(began) >= backoff {
-			backoff = 5 * time.Second
+		if superviseHealthyRun(time.Since(began), backoff) {
+			backoff = superviseBackoffInitial
 		}
 		// Run returned while ctx is live (panic recovered, or
 		// a silent early return) — restart after backoff
@@ -87,8 +115,8 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 			return
 		case <-timer.C:
 		}
-		if backoff *= 2; backoff > 5*time.Minute {
-			backoff = 5 * time.Minute
+		if backoff *= 2; backoff > superviseBackoffMax {
+			backoff = superviseBackoffMax
 		}
 	}
 }

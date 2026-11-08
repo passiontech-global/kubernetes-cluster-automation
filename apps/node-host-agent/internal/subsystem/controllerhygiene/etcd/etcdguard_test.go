@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -523,7 +524,180 @@ func TestEtcdGuardSnapshotInvalidAbortsRescue(t *testing.T) {
 	}
 }
 
-// --- backup-health: etcd snapshot verifier ---
+// The pre-maintenance snapshot refuses to write onto a backup fs
+// without headroom (kine backup-gate parity) — with a previous
+// premaint snapshot pinning the byte estimate, free < 1.1x its size
+// aborts; parity with the ratio gate otherwise.
+func TestEtcdGuardSnapshotHeadroom(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		free, total int64
+		seed        int64 // byte size of a seeded premaint-*.db, 0 = none
+		wantSave    bool
+	}{
+		{"ratio-gate-blocks-no-prev", 10, 1000, 0, false},
+		{"byte-gate-blocks-prev", 1099, 1 << 30, 1000, false},
+		{"byte-gate-passes-prev", 1100, 1 << 30, 1000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.EtcdBackupDir = t.TempDir()
+			if tc.seed > 0 {
+				if err := os.WriteFile(
+					filepath.Join(e.H.Cfg.EtcdBackupDir, "premaint-100.db"),
+					make([]byte, tc.seed), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			g := &etcdGuardFake{
+				status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+			}
+			e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+			e.H.Cfg.EtcdctlFn = g.ctl
+			e.H.Cfg.StatFSFn = func(string) (int64, int64, error) {
+				return tc.free, tc.total, nil
+			}
+			e.H.Cycle(context.Background())
+			saved := false
+			for _, c := range g.ctlCalls {
+				if strings.Contains(strings.Join(c, " "), "snapshot save") {
+					saved = true
+				}
+			}
+			if saved != tc.wantSave {
+				t.Fatalf("snapshot save ran=%v want %v (calls=%v)",
+					saved, tc.wantSave, g.ctlCalls)
+			}
+			if !tc.wantSave && len(g.rescues) != 0 {
+				t.Fatalf("rescue ran without headroom: %d", len(g.rescues))
+			}
+		})
+	}
+}
+
+// A successful save prunes premaint-*.db down to the newest two —
+// the fresh dump plus the previous window's.
+func TestEtcdGuardSnapshotRetention(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = dir
+	for _, n := range []string{"premaint-1.db", "premaint-2.db", "premaint-3.db"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("snap"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
+	e.H.Cycle(context.Background())
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, f := range ents {
+		names = append(names, f.Name())
+	}
+	slices.Sort(names)
+	if len(names) != 2 {
+		t.Fatalf("retention kept %v want 2 files", names)
+	}
+	for _, gone := range []string{"premaint-1.db", "premaint-2.db"} {
+		if slices.Contains(names, gone) {
+			t.Fatalf("retention kept %s: %v", gone, names)
+		}
+	}
+	if !slices.Contains(names, "premaint-3.db") {
+		t.Fatalf("retention dropped the surviving premaint-3.db: %v", names)
+	}
+	if !strings.Contains(e.LogLines(), "pruned") {
+		t.Fatalf("prune not logged:\n%s", e.LogLines())
+	}
+}
+
+// Inside the hourly snapshot budget the fallback must verify the
+// NEWEST premaint-*.db with `snapshot status` — remediation proceeds.
+func TestEtcdGuardSnapshotFallbackVerifiesNewest(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = dir
+	if err := os.WriteFile(filepath.Join(dir, "premaint-100.db"),
+		[]byte("snap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
+	e.H.Cfg.EvpurgeRunFn = func(context.Context, eventpurge.Config,
+		time.Time, io.Writer) error {
+		return nil
+	}
+	e.H.Cfg.EtcdRescueFn = func(context.Context,
+		etcdmaint.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdmaint.Config{})
+		return nil
+	}
+	e.H.Cycle(context.Background())
+	verified := false
+	saved := false
+	for _, c := range g.ctlCalls {
+		j := strings.Join(c, " ")
+		switch {
+		case strings.Contains(j, "snapshot status") && strings.Contains(j, "premaint"):
+			verified = true
+		case strings.Contains(j, "snapshot save"):
+			saved = true
+		}
+	}
+	if saved {
+		t.Fatal("budgeted cycle attempted a second save")
+	}
+	if !verified {
+		t.Fatalf("fallback did not snapshot-status the premaint file: %v", g.ctlCalls)
+	}
+	if len(g.rescues) != 1 {
+		t.Fatalf("verified fallback must let the rescue run: %d", len(g.rescues))
+	}
+}
+
+// A non-premaint file under EtcdBackupDir is NOT a valid fallback —
+// the destructive half must abort.
+func TestEtcdGuardSnapshotFallbackRejectsNonPremaint(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = dir
+	if err := os.WriteFile(filepath.Join(dir, "some-other-backup.db"),
+		[]byte("not-an-etcd-snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
+	e.H.Cycle(context.Background())
+	for _, c := range g.ctlCalls {
+		if strings.Contains(strings.Join(c, " "), "snapshot status") {
+			t.Fatalf("snapshot status ran against a non-premaint dir: %v", g.ctlCalls)
+		}
+	}
+	if len(g.rescues) != 0 || g.purges != 0 {
+		t.Fatalf("remediation ran without a verified snapshot: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+}
 
 func TestVerifySnapshots(t *testing.T) {
 	e := fixture(t)

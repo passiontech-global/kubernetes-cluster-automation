@@ -90,8 +90,12 @@ func (c *cyc) hostnamePin() {
 	hn := c.r.cfg.NodeName
 	// The separator must be a non-newline whitespace — bare `\s`
 	// could eat the newline after a value-less `127.0.1.1` line and
-	// let the match swallow the NEXT line on replace.
-	re := regexp.MustCompile(`(?m)^\s*127\.0\.1\.1[ \t].*$`)
+	// let the match swallow the NEXT line on replace. Capture the
+	// prefix (leading space + IP + separator) and the trailing
+	// aliases so a re-pin swaps ONLY the hostname field — ansible
+	// lineinfile parity keeps `127.0.1.1 <hn> alias1 alias2`'s
+	// aliases alive across converges.
+	re := regexp.MustCompile(`(?m)^([ \t]*127\.0\.1\.1[ \t]+)\S+(.*)$`)
 	line := "127.0.1.1 " + hn
 	if m := re.Find(hosts); m != nil {
 		// The pin must carry THIS hostname as a whole field — a
@@ -105,7 +109,21 @@ func (c *cyc) hostnamePin() {
 			}
 		}
 		if !pinned {
-			if nh := re.ReplaceAll(hosts, []byte(line)); string(nh) != string(hosts) {
+			nh := re.ReplaceAllFunc(hosts, func(l []byte) []byte {
+				sub := re.FindSubmatch(l)
+				// Copy — sub slices share hosts' backing array, and
+				// appending into it would corrupt later matches.
+				out := append([]byte{}, sub[1]...)
+				out = append(out, []byte(hn)...)
+				// Trailing empty submatches are truncated in
+				// FindSubmatch's result — the no-alias line has no
+				// group 2.
+				if len(sub) > 2 {
+					out = append(out, sub[2]...)
+				}
+				return out
+			})
+			if string(nh) != string(hosts) {
 				_, _ = r.writeManaged("/etc/hosts", nh, 0o644)
 			}
 		}

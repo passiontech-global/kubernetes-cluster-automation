@@ -447,6 +447,29 @@ func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
 		wgEndpointSlice("backend", "dead-svc", 1, 0), metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update slice: %v", err)
 	}
+	// First healthy sweep DEFERS: one healthy sweep is not a
+	// recovery (a 0↔1 flapping backend would trip and recover in
+	// alternating sweeps, churning the WebhookConfiguration). The
+	// entry stays broken — policy re-asserted Ignore, series still
+	// held, annotation still listing the entry.
+	now = now.Add(time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgValidatingFP(t, cs, "cb-vwc", "dead.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("first healthy sweep must defer the recover, got %q", got)
+	}
+	if anno, ok := wgValidatingAnno(t, cs, "cb-vwc"); !ok {
+		t.Fatal("deferred recover must keep the circuit-broken annotation")
+	} else if len(anno) == 0 {
+		t.Fatalf("deferred recover must keep a non-empty annotation, got %q", anno)
+	}
+	if !metrics.WebhookCircuitBroken.DeleteLabelValues(
+		guardstate.KindValidating, "cb-vwc", "dead.example.com") {
+		t.Fatal("deferred recover must keep the WebhookCircuitBroken series held")
+	}
+	// Second CONSECUTIVE healthy sweep confirms: Fail restored,
+	// annotation cleared, series deleted.
 	now = now.Add(time.Minute)
 	if err := runBreaker(ctx, g, b); err != nil {
 		t.Fatal(err)
@@ -1098,9 +1121,18 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 		t.Fatalf("15m bounce cooldown must protect the surviving pod: %v", err)
 	}
 
-	// The pod came back healthy — the next probe answers and the
-	// declared Fail policy is restored.
+	// The pod came back healthy — the next probe answers. The FIRST
+	// responsive sweep only DEFERS (the recover-confirm gate — one
+	// healthy sweep is not a recovery); the SECOND confirms the
+	// declared Fail policy.
 	g.EndpointProber = func(context.Context, string, int32) bool { return true }
+	now = now.Add(time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "brownout", "hung.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("first responsive sweep must defer the recover, got %q", got)
+	}
 	now = now.Add(time.Minute)
 	if err := runBreaker(ctx, g, b); err != nil {
 		t.Fatal(err)

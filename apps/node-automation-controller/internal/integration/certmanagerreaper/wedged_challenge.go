@@ -3,9 +3,8 @@
 // it (ownerReference or the acme.cert-manager.io/order-name
 // label/annotation) shows the self-check-retry-forever signature —
 // presented+processing with no state transition past
-// orderPendingMinAge. orderOwnedByCert is the Order→Certificate
-// attribution that gates the whole reap: an unattributable Order is
-// never ours to delete.
+// orderPendingMinAge. Order→Certificate attribution lives in
+// certificate_reap.go's per-namespace orderIndex.
 package certmanagerreaper
 
 import (
@@ -15,24 +14,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
-
-// orderOwnedByCert reports whether the Order's CertificateRequest
-// ownerRef resolves — through the namespace's CR→Certificate map — to
-// THIS cert. An Order with no ownerRef, or whose owning CR names a
-// different cert (or resolves to nothing), is unattributable: it must
-// never be reaped on this cert's candidacy or budget.
-func orderOwnedByCert(o *unstructured.Unstructured, certName string,
-	crToCert map[string]string) bool {
-	for _, or := range o.GetOwnerReferences() {
-		if or.Kind != "CertificateRequest" {
-			continue
-		}
-		if owner, ok := crToCert[or.Name]; ok {
-			return owner == certName
-		}
-	}
-	return false
-}
 
 // stuckChallengeForOrder reports whether any Challenge in the
 // namespace is both wedged and attributable to this order. Only

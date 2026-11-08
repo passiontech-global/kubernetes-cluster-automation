@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // Check names — the exact HealthCheck metadata.name values the
@@ -66,6 +67,11 @@ func (p *dnsStatusCheck) Run(ctx context.Context) probefw.Result {
 	return probefw.Result{Pass: true}
 }
 
+// httpBodyReadCap bounds how much of a 200 response body the content
+// check reads before matching — a body that fills the cap without
+// containing the expected string is inconclusive, not failed.
+const httpBodyReadCap = 1 << 20
+
 // probeHTTPContent ports http-content-check: GET must return 200 and
 // a body containing the expected string (live check: prometheus
 // /-/healthy answers "Prometheus Server is Healthy.", expected
@@ -93,11 +99,21 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: status %d, want 200",
 			p.Cfg.HTTPContent.URL, resp.StatusCode)}
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, httpBodyReadCap))
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("read body: %v", err)}
 	}
 	if !strings.Contains(string(body), p.Cfg.HTTPContent.Expected) {
+		// The read is capped: a match miss at exactly the cap is
+		// inconclusive, not a clean FAIL — the expected string may
+		// sit past the byte cap, and reading further is not an
+		// option. Report infra so a huge healthy body never reads
+		// as a false content failure.
+		if len(body) == httpBodyReadCap {
+			return probefw.Result{Infra: fmt.Errorf(
+				"body truncated at cap (%d bytes), match inconclusive",
+				httpBodyReadCap)}
+		}
 		return probefw.Result{Why: fmt.Sprintf("body missing %q",
 			p.Cfg.HTTPContent.Expected)}
 	}
@@ -190,14 +206,15 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 // THRESHOLD=0.9 — strictly greater, so exactly-at-threshold passes).
 // A resource absent from Status.Used counts as 0.
 func (p *resourceQuotaCheck) Run(ctx context.Context) probefw.Result {
-	quotas, err := p.CS.CoreV1().ResourceQuotas(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	quotas, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.ResourceQuotas(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list resourcequotas: %w", err)}
 	}
 	var over []string
-	for i := range quotas.Items {
-		q := &quotas.Items[i]
+	for i := range quotas {
+		q := &quotas[i]
 		for name, hard := range q.Status.Hard {
 			used, ok := q.Status.Used[name]
 			if !ok {

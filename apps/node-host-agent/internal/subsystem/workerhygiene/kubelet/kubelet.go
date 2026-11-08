@@ -207,7 +207,7 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckStall, "ok")
 		return
 	}
-	if c.d.StreakPending(&c.Fails, fmt.Sprintf("suspect: %s", reason)) {
+	if c.d.StreakPending(&c.Fails, "suspect: "+reason) {
 		c.d.CycleResult(wdeps.CheckStall, "ok")
 		return
 	}

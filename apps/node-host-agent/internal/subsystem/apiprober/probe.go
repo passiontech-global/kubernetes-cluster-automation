@@ -60,6 +60,15 @@ const (
 	failParse   failClass = "parse"         // bad JSON / non-numeric resourceVersion
 )
 
+// maxProbeBody is the safety bound on how much of an apiserver LIST
+// body the probe ever reads — the streaming rv decode stops at
+// metadata (before items), so this only bites a pathological payload.
+const maxProbeBody = 1 << 20
+
+// errBadPayload marks structurally invalid LIST JSON — a parse class,
+// never a body-read fault.
+var errBadPayload = errors.New("bad LIST payload")
+
 // probeSide reports whether c is a fault of the PROBE rather than the
 // apiserver — a credential, trust or request-build failure carries
 // zero evidence about apiserver health, so a cycle whose failures
@@ -147,10 +156,14 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	if err != nil {
 		return 0, failRequest, err
 	}
-	// Ask for object metadata only — both probe paths are nodes LISTs,
-	// and with resourceVersion=0 the watch-cache ignores limit=1, so
-	// without this header every cycle decodes the entire NodeList
-	// (and truncates at the read cap once it exceeds 1 MiB).
+	// Ask for object metadata only — both probe paths are nodes LISTs.
+	// resourceVersion=0 on the cache path is the architecture's
+	// wedged-vs-etcd discriminator (the watch-cache serves it) and
+	// stays, even though the watch-cache ignores limit for rv=0: the
+	// body is never buffered whole (see the decode below), so a
+	// large cluster can no longer truncate the payload into a
+	// failParse — which is classified apiserver-side and would drain
+	// a healthy backend.
 	req.Header.Set("Accept",
 		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
 	// Token re-read per query — see func doc. An injected HTTPClient
@@ -169,14 +182,6 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 		return 0, classifyTransport(err), err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// A metadata-only list is a few hundred bytes — the 1 MiB cap is
-	// a safety bound only. Drain any tail to EOF so keep-alive can
-	// reuse the connection.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, failBody, err
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		fc := failStatus
 		if resp.StatusCode == http.StatusUnauthorized ||
@@ -185,14 +190,33 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 		}
 		return 0, fc, fmt.Errorf("HTTP %d from apiserver", resp.StatusCode)
 	}
+	// Stream-decode and stop as soon as metadata.resourceVersion
+	// lands — the List JSON serializes metadata BEFORE items, so the
+	// items array is never read, whatever the watch-cache's limit
+	// handling returned. The 1 MiB LimitReader stays as a safety
+	// bound against a pathological payload. Truncating a buffered
+	// read here used to turn large clusters into failParse →
+	// apiserver-side → DEAD drain of healthy backends.
 	var list struct {
 		Metadata struct {
 			ResourceVersion string `json:"resourceVersion"`
 		} `json:"metadata"`
 	}
-	if err := json.Unmarshal(body, &list); err != nil {
-		return 0, failParse, err
+	dec := json.NewDecoder(io.LimitReader(resp.Body, maxProbeBody))
+	if err := decodeListRV(dec, &list.Metadata.ResourceVersion); err != nil {
+		// A syntax/EOF fault is a parse; anything else inside the
+		// token walk is the body stream itself failing.
+		var syn *json.SyntaxError
+		if errors.As(err, &syn) || errors.Is(err, io.EOF) ||
+			errors.Is(err, errBadPayload) {
+			return 0, failParse, err
+		}
+		return 0, failBody, err
 	}
+	// Drain the rest of the body to EOF (uncapped) so keep-alive can
+	// reuse the connection; the remainder of a big items array is
+	// discarded, never buffered.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	rv, err = strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
 	if err != nil {
 		return 0, failParse,
@@ -200,4 +224,49 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 				list.Metadata.ResourceVersion, err)
 	}
 	return rv, failNone, nil
+}
+
+// decodeListRV token-walks a List JSON just deep enough to surface
+// top-level metadata.resourceVersion, then returns — the caller stops
+// reading. depth==1 is the top-level object (its opening '{' counted).
+func decodeListRV(dec *json.Decoder, rv *string) error {
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := t.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("%w: unexpected JSON start %v", errBadPayload, t)
+	}
+	depth := 1
+	for {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := t.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			default:
+				depth--
+			}
+			continue
+		}
+		if depth == 1 {
+			if s, ok := t.(string); ok && s == "metadata" {
+				var m struct {
+					ResourceVersion string `json:"resourceVersion"`
+				}
+				if err := dec.Decode(&m); err != nil {
+					return err
+				}
+				if m.ResourceVersion == "" {
+					return fmt.Errorf("%w: empty metadata.resourceVersion",
+						errBadPayload)
+				}
+				*rv = m.ResourceVersion
+				return nil
+			}
+		}
+	}
 }

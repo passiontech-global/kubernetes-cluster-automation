@@ -7,7 +7,8 @@ package nodehealth
 
 import (
 	"context"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,12 +17,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // leaseGuardProber builds the prober carrying ONLY this check — the
@@ -316,5 +320,68 @@ func TestLeaseGuardKSMWedgeRestartResume(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("monitoring").
 		Get(ctx, "kube-state-metrics-6cc5c9d9b4-x2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("wedged ksm pod was not bounced on the resumed window: %v", err)
+	}
+}
+
+// A pods-list failure in one namespace infra-fails the sweep with ONE
+// grouped error + carry-forward per namespace — not once per stale
+// lease sharing the same memoized failed list — and namespaces whose
+// pod lists still work keep judging their leases: the flux-system
+// transitions jump still lands as flapping on the following sweep.
+func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		cpLease("kube-system", "op-a", "op-a-x_1", 20*time.Minute, 0, base),
+		cpLease("kube-system", "op-b", "op-b-x_2", 20*time.Minute, 0, base),
+		cpLease("flux-system", "flux-op", "flux-op-x_3", time.Minute, 0, base),
+	)
+	podLists := 0
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			// Count only kube-system — the KSM wedge sub-check
+			// lists other namespaces and is not what this pins.
+			if la, ok := a.(ktesting.ListAction); ok && la.GetNamespace() == "kube-system" {
+				podLists++
+			}
+			return true, nil, errors.New("api down")
+		})
+	p, ch := leaseGuardProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+
+	res := ch.Run(ctx)
+	if res.Pass || res.Infra == nil {
+		t.Fatalf("pods list failure must infra-fail the sweep: %+v", res)
+	}
+	if !strings.Contains(res.Infra.Error(), "list pods in kube-system") {
+		t.Fatalf("Infra = %v, want the kube-system pods list error", res.Infra)
+	}
+	if podLists != 1 {
+		t.Fatalf("kube-system pods listed %d times in one sweep, want 1 — the failed list is memoized across the namespace's stale leases", podLists)
+	}
+
+	// kube-system's stale leases are skipped (no pods to judge the
+	// expired signature against) but stay live in the ledger; a
+	// namespace with working lists keeps being judged — the flux
+	// lease's transitions jump lands as flapping next sweep.
+	l, err := cs.CoordinationV1().Leases("flux-system").
+		Get(ctx, "flux-op", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*l.Spec.LeaseTransitions = 7
+	if _, err := cs.CoordinationV1().Leases("flux-system").
+		Update(ctx, l, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
+
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("flux-system flap must still fail the sweep")
+	}
+	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
+		map[string]string{"namespace": "flux-system",
+			"lease": "flux-op", "reason": leaseReasonFlapping})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("flux-system flap series = %v, want 1", m)
 	}
 }

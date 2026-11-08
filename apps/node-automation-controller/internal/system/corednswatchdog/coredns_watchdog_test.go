@@ -118,15 +118,28 @@ func TestCoreDNSWatchdogLayer1LogHit(t *testing.T) {
 		}
 		return ""
 	}
+	// First hit: suspect only — streak 1, no recovery action.
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Instant catch: streak is forced straight to max, no 2-run wait.
-	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
-		t.Fatalf("streak=%d, want %d", got, corednsStreakMax)
+	if got := w.logStreak.Count("cdns-a"); got != 1 {
+		t.Fatalf("first run streak=%d, want 1", got)
 	}
-	if got := w.streak.Count("cdns-b"); got != 0 {
+	if got := w.logStreak.Count("cdns-b"); got != 0 {
 		t.Fatal("clean pod got a streak")
+	}
+	if !cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("pod deleted on the FIRST log hit — one blip must not restart")
+	}
+	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
+		t.Fatal("cooldown annotation set before any recovery")
+	}
+	// Second consecutive hit: stale -> subset recovery deletes it.
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.logStreak.Count("cdns-a"); got != corednsStreakMax {
+		t.Fatalf("second run streak=%d, want %d", got, corednsStreakMax)
 	}
 	// 1 of 2 stale -> subset recovery deletes only that pod.
 	if cdnsPodExists(t, cs, "cdns-a") {
@@ -137,6 +150,63 @@ func TestCoreDNSWatchdogLayer1LogHit(t *testing.T) {
 	}
 	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {
 		t.Fatal("cooldown annotation not stamped")
+	}
+}
+
+// A layer-1 blip (hit on one run, gone the next) resets the log
+// streak — only hits on two CONSECUTIVE runs make a pod stale.
+func TestCoreDNSWatchdogLayer1BlipResets(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		cdnsPod("cdns-a", "10.0.0.1"),
+		cdnsPod("cdns-b", "10.0.0.2"),
+		cdnsDeployment(2, 2, nil))
+	w := newCDNSWatchdog(cs)
+	hit := false
+	w.logHitFn = func(_ context.Context, pod string) string {
+		if pod == "cdns-a" && hit {
+			return "Failed to watch *v1.Endpoints: Unauthorized"
+		}
+		return ""
+	}
+	// Run 1: hit -> streak 1, no action.
+	hit = true
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.logStreak.Count("cdns-a"); got != 1 {
+		t.Fatalf("after first hit streak=%d, want 1", got)
+	}
+	if !cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("pod deleted on a single log hit")
+	}
+	// Run 2: no signature in the window -> the streak resets.
+	hit = false
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.logStreak.Count("cdns-a"); got != 0 {
+		t.Fatalf("clean run left streak=%d, want 0 (reset)", got)
+	}
+	// Run 3: a fresh single hit rides a RESET streak -> still only 1.
+	hit = true
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.logStreak.Count("cdns-a"); got != 1 {
+		t.Fatalf("fresh hit after reset streak=%d, want 1", got)
+	}
+	if !cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("pod deleted on non-consecutive hits")
+	}
+	// Run 4: second consecutive hit -> stale -> deleted.
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("pod not deleted after two consecutive log hits")
+	}
+	if !cdnsPodExists(t, cs, "cdns-b") {
+		t.Fatal("healthy pod deleted")
 	}
 }
 
@@ -185,6 +255,29 @@ func TestCoreDNSProbeFQDN(t *testing.T) {
 		w := newCDNSWatchdog(fake.NewSimpleClientset())
 		if got, _ := w.probeFQDN(ctx); got != "" {
 			t.Fatalf("probeFQDN=%q, want empty", got)
+		}
+	})
+
+	// The <10m age filter reads the watchdog's clock seam, not
+	// time.Since — a pinned clock decides the window.
+	t.Run("age filter follows the clock seam", func(t *testing.T) {
+		pinned := time.Unix(1700000000, 0)
+		mk := func(name string, created time.Time) (*corev1.Service, *discoveryv1.EndpointSlice) {
+			svc, es := cdnsProbeService(name, "app-ns", 0, &readyTrue)
+			svc.CreationTimestamp = metav1.NewTime(created)
+			return svc, es
+		}
+		freshSvc, freshES := mk("seam-fresh", pinned.Add(-5*time.Minute))
+		w := newCDNSWatchdog(fake.NewSimpleClientset(freshSvc, freshES))
+		w.now = func() time.Time { return pinned }
+		if got, _ := w.probeFQDN(ctx); got != "seam-fresh.app-ns.svc.cluster.local" {
+			t.Fatalf("5m-old service skipped under the pinned clock: %q", got)
+		}
+		oldSvc, oldES := mk("seam-old", pinned.Add(-11*time.Minute))
+		w = newCDNSWatchdog(fake.NewSimpleClientset(oldSvc, oldES))
+		w.now = func() time.Time { return pinned }
+		if got, _ := w.probeFQDN(ctx); got != "" {
+			t.Fatalf("11m-old service accepted under the pinned clock: %q", got)
 		}
 	})
 }
@@ -462,6 +555,9 @@ func TestCoreDNSWatchdogLayer2Skips(t *testing.T) {
 		cdnsDeployment(2, 2, nil),
 		svc, es)
 	w := newCDNSWatchdog(cs)
+	// One prior log hit: this run's hit is the second CONSECUTIVE
+	// one, so cdns-a is layer-1-stale without another full run.
+	w.logStreak.Set("cdns-a", 1)
 	w.logHitFn = func(_ context.Context, pod string) string {
 		if pod == "cdns-a" {
 			return "Failed to watch *v1.Endpoints: Unauthorized"

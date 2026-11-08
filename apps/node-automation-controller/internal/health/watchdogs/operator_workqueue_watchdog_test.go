@@ -4,6 +4,8 @@
 package watchdogs
 
 import (
+	"context"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
@@ -12,9 +14,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -200,5 +206,80 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 	}
 	if v, _ := shOpFrozenGauge(t, "shipwright-operator", opReasonNoConditions); v != 1 {
 		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// limitRecordingDyn records the List options reaching the dynamic
+// interface — the fake's ROOT list action strips Limit/Continue
+// (client-go's NewRootListActionWithOptions keeps only the
+// selectors), so the requested page bound is only observable here.
+type limitRecordingDyn struct {
+	dynamic.Interface
+	listOpts []metav1.ListOptions
+}
+
+func (d *limitRecordingDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &limitRecordingRI{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d}
+}
+
+type limitRecordingRI struct {
+	dynamic.NamespaceableResourceInterface
+	d *limitRecordingDyn
+}
+
+func (r *limitRecordingRI) Namespace(ns string) dynamic.ResourceInterface {
+	return &limitRecordingNS{
+		ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), d: r.d}
+}
+
+type limitRecordingNS struct {
+	dynamic.ResourceInterface
+	d *limitRecordingDyn
+}
+
+func (r *limitRecordingRI) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	r.d.listOpts = append(r.d.listOpts, opts)
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func (r *limitRecordingNS) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	r.d.listOpts = append(r.d.listOpts, opts)
+	return r.ResourceInterface.List(ctx, opts)
+}
+
+// The CR scan pages its cluster-wide Lists: the first page request
+// carries the shared Limit (an unpaged List would read whole CRDs on
+// every 5m sweep), and sibling rows watching the same GVR (BUG-C5)
+// still reuse one fetch — cert-manager watches certificates under
+// two signatures, so exactly ONE paged List must fire while both
+// signatures evaluate the objects.
+func TestOperatorCRScanPagesListRequests(t *testing.T) {
+	base := time.Now()
+	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
+		"apps", "tls", 1, 0)
+	dyn := &limitRecordingDyn{Interface: probetest.OpDyn(stuck)}
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	var certTarget operatorTarget
+	for _, op := range operatorTargets {
+		if op.name == "cert-manager" {
+			certTarget = op
+			break
+		}
+	}
+	chk := probetest.MustCheck[*operatorWorkqueueCheck](t, p)
+	var rep probefw.SweepReport
+	scan := chk.scanOperatorResources(ctx, logf.FromContext(ctx), certTarget, base, &rep)
+	if scan.evalFailed {
+		t.Fatal("paged CR scan reported an infra failure")
+	}
+	if len(dyn.listOpts) != 1 {
+		t.Fatalf("certificate List requests = %d, want 1 (one fetch shared by both signatures)", len(dyn.listOpts))
+	}
+	if dyn.listOpts[0].Limit != kube.DefaultListPageSize {
+		t.Fatalf("List Limit = %d, want DefaultListPageSize (%d)",
+			dyn.listOpts[0].Limit, kube.DefaultListPageSize)
+	}
+	if !scan.live["cert-manager/certificates/apps/tls"] {
+		t.Fatalf("stuck Certificate not judged live: %v", scan.live)
 	}
 }

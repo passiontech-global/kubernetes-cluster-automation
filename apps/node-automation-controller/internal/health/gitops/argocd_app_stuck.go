@@ -50,6 +50,14 @@ type argoCDAppStuckCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1.
 	emitted state.GaugeLedger[string]
+	// downscaledSeen memoizes one sweep's downscale verdicts: an
+	// Application's status.resources lists each workload once, but N
+	// stuck apps sharing a workload (or one app re-evaluated across
+	// signatures) would Get the same Deployment/StatefulSet once per
+	// (app, resource) pair — the N+1 Get storm the map collapses to
+	// one lookup per distinct workload. Reset at the top of every
+	// Run (ownerSeen's shape in api-object-sprawl-report-gc).
+	downscaledSeen map[string]bool
 }
 
 // newArgoCDAppStuckCheck builds the W10-CP6 check — its state is the
@@ -117,6 +125,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	seenKeep := map[string]bool{}
 	var rep probefw.SweepReport
 	comparisonErrors := 0
+	p.downscaledSeen = map[string]bool{} // per-sweep memo, reset each Run
 	for i := range apps.Items {
 		app := &apps.Items[i]
 		ns, name := app.GetNamespace(), app.GetName()
@@ -282,32 +291,54 @@ func (p *argoCDAppStuckCheck) argocdAppOnlyDownscaled(ctx context.Context,
 // argocdWorkloadDownscaled resolves one Application resource-tree
 // entry to its live workload and asks the shared verdict — anything
 // that is not a Deployment/StatefulSet pinned at replicas:0 with
-// downscaler/* annotations counts as real stuck evidence.
+// downscaler/* annotations counts as real stuck evidence. Verdicts
+// memoize per sweep on downscaledSeen (kind/ns/name → verdict) so a
+// workload shared by several Applications pays one Get, not one per
+// app; the memo never changes a verdict, only its lookup count.
 func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	kind, ns, name string) bool {
+	key := kind + "/" + ns + "/" + name
+	if v, memo := p.downscaledSeen[key]; memo {
+		return v // same workload already resolved this sweep
+	}
+	var v bool
 	switch kind {
 	case "Deployment":
 		d, err := p.CS.AppsV1().Deployments(ns).
 			Get(ctx, name, metav1.GetOptions{})
-		return err == nil &&
+		v = err == nil &&
 			kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas)
 	case "StatefulSet":
 		s, err := p.CS.AppsV1().StatefulSets(ns).
 			Get(ctx, name, metav1.GetOptions{})
-		return err == nil &&
+		v = err == nil &&
 			kube.IsIntentionallyDownscaled(s.Annotations, s.Spec.Replicas)
 	}
-	return false
+	if p.downscaledSeen == nil {
+		p.downscaledSeen = map[string]bool{} // lazy init — Run seeds it
+	}
+	p.downscaledSeen[key] = v
+	return v
 }
 
 // refreshArgoCDApp patches argocd.argoproj.io/refresh=hard on a
-// stuck Application — 30m per-app cooldown on the shared ledger.
+// stuck Application — the shared heal preamble gates it like every
+// other heal: 30m per-app cooldown on the shared ledger, then the
+// maintenance mutex + global heal budget (a refresh patch during a
+// drain re-triggers reconciliation churn exactly like a pod delete;
+// "cannot verify" fails closed).
 func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	log logr.Logger, app *unstructured.Unstructured, now time.Time) {
 
 	ck := probefw.SelfHealKey(CheckNameArgoCDAppStuck,
 		"refresh/"+app.GetNamespace()+"/"+app.GetName())
-	if p.Heals.CooledDown(ck, argocdRefreshCooldown, now) {
+	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals, ck,
+		argocdRefreshCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 	payload, err := kube.MergePatchAnnos(map[string]any{

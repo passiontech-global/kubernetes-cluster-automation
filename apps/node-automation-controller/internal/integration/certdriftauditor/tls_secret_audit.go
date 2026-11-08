@@ -79,8 +79,19 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 				key := secretMetricKey{s.Namespace, s.Name}
 				// Days, not seconds — the alert budget this feeds ("fires
 				// <30d, pages <7d") thinks in days; negatives mean expired.
-				days := cert.NotAfter.Sub(a.now.Now()).Hours() / 24
-				a.seenSecrets.Set(metrics.TLSSecretDaysToExpiry, days,
+				untilExpiry := cert.NotAfter.Sub(a.now.Now())
+				// Cardinality gate: only Secrets inside the alert window
+				// (or already expired) emit — every far-future cert would
+				// otherwise open one series per TLS Secret cluster-wide.
+				// A Secret rotated back out of the window is simply not
+				// re-asserted here, so the Prune below deletes its stale
+				// series; the metric name, labels and <30d alert budget
+				// are unchanged.
+				if untilExpiry > tlsExpiryEmitWindow {
+					continue
+				}
+				a.seenSecrets.Set(metrics.TLSSecretDaysToExpiry,
+					untilExpiry.Hours()/24,
 					key, s.Namespace, s.Name)
 			}
 			return nil

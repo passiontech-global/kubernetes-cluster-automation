@@ -49,6 +49,24 @@ func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.localPVThrottled == nil {
 		c.localPVThrottled = map[string]bool{}
 	}
+	// Disk-first ordering (sweeper parity): the pvc-* dirs decide
+	// whether there is anything to measure — no candidates means the
+	// cluster-wide PV/PVC lists would be pure API waste.
+	var candidates []string
+	for _, root := range c.localPVScanRoots() {
+		ents, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, ent := range ents {
+			if ent.IsDir() && strings.HasPrefix(ent.Name(), "pvc-") {
+				candidates = append(candidates, filepath.Join(root, ent.Name()))
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return // nothing on disk can match a PV — skip the API entirely
+	}
 	pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -87,39 +105,30 @@ func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 	}
-	for _, root := range c.localPVScanRoots() {
-		ents, err := os.ReadDir(root)
-		if err != nil {
+	for _, dir := range candidates {
+		name := filepath.Base(dir)
+		cap, ok := pvCap[name]
+		if !ok || cap <= 0 || c.localPVThrottled[dir] {
 			continue
 		}
-		for _, ent := range ents {
-			if !ent.IsDir() || !strings.HasPrefix(ent.Name(), "pvc-") {
-				continue
-			}
-			dir := filepath.Join(root, ent.Name())
-			cap, ok := pvCap[ent.Name()]
-			if !ok || cap <= 0 || c.localPVThrottled[dir] {
-				continue
-			}
-			size, _ := c.d.WalkBytes(dir)
-			if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
-				continue
-			}
-			// The quota only bites under real disk pressure —
-			// over-request-but-plenty-free is a sizing problem,
-			// not a node emergency.
-			if !c.d.DiskUsageAboveWatermark(root) {
-				continue
-			}
-			pod := podByPV[ent.Name()]
-			if pod == nil {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: localpv-quota %s %dB > %.0fx PV cap (%dB) but no owning pod on this node",
-					dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap))
-				continue
-			}
-			c.throttlePVTasks(ctx, e, pod, dir, size, cap)
+		size, _ := c.d.WalkBytes(dir)
+		if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
+			continue
 		}
+		// The quota only bites under real disk pressure —
+		// over-request-but-plenty-free is a sizing problem,
+		// not a node emergency.
+		if !c.d.DiskUsageAboveWatermark(filepath.Dir(dir)) {
+			continue
+		}
+		pod := podByPV[name]
+		if pod == nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: localpv-quota %s %dB > %.0fx PV cap (%dB) but no owning pod on this node",
+				dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap))
+			continue
+		}
+		c.throttlePVTasks(ctx, e, pod, dir, size, cap)
 	}
 }
 

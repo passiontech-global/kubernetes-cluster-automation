@@ -21,6 +21,19 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
+// maxArtifactBytes bounds the bytes ONE DownloadFile download (and
+// one UntarInstall member) may produce — a compromised mirror or a
+// misrouted URL must not be able to fill the node's disk through the
+// converge path. Var, not const: the tests shrink it instead of
+// serving 256MiB fixtures.
+var maxArtifactBytes = int64(256) << 20
+
+// maxErrorBodyDrain bounds the non-200 body read — draining a
+// bounded slice of the error body lets the keep-alive connection be
+// reused for the next artifact; beyond the cap the connection is
+// forfeited rather than read forever.
+const maxErrorBodyDrain = 64 << 10
+
 // LineInFile is ansible lineinfile parity: replace the LAST line
 // matching re with line; when absent insert after the last line
 // matching insAfter (or append at EOF).
@@ -75,8 +88,10 @@ func Sha256FileOK(path, wantHex string) bool {
 }
 
 // DownloadFile streams url to dst under the timeout client deadline,
-// atomically: tmp file + sha256 verify + fsync + rename, partial tmp
-// swept on every failure path.
+// atomically: tmp file + sha256 verify + fsync + rename + dir fsync,
+// partial tmp swept on every failure path. The response is capped at
+// maxArtifactBytes — a body that crosses the cap fails the download
+// and is never staged to disk beyond the one probing byte.
 func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -88,6 +103,11 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		// Drain (a bounded slice of) the error body so the
+		// keep-alive connection survives for the next artifact;
+		// oversize error pages forfeit reuse instead of blocking
+		// the drain.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyDrain))
 		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -99,7 +119,14 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		return err
 	}
 	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
+	// One byte past the cap: n > max means the artifact is over the
+	// budget (the extra byte is discarded with the swept tmp, never
+	// renamed into place).
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxArtifactBytes+1))
+	if err == nil && n > maxArtifactBytes {
+		err = fmt.Errorf("download %s: artifact exceeds the %d MiB cap",
+			url, maxArtifactBytes>>20)
+	}
 	if err == nil {
 		// fsync before rename — the staged artifact must be durable;
 		// Close's error counts too (NFS/delayed-write failures only
@@ -125,11 +152,25 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		_ = os.Remove(tmp)
 		return err
 	}
+	// Dir fsync after the rename (hostutil.WriteAtomic DirSync
+	// parity): the directory entry itself must be durable, or a
+	// crash between rename and sync can lose the installed file.
+	// Open failure (ENOENT — dir vanished) is tolerated; a Sync
+	// failure is reported.
+	if d, derr := os.Open(filepath.Dir(dst)); derr == nil {
+		if serr := d.Sync(); serr != nil {
+			_ = d.Close()
+			return serr
+		}
+		_ = d.Close()
+	}
 	return nil
 }
 
 // UntarInstall extracts member name from a .tar.gz and atomically
-// installs to dst.
+// installs to dst. The member stream is capped at maxArtifactBytes —
+// a hostile archive can't balloon one member past the artifact
+// budget.
 func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 	f, err := os.Open(tgz)
 	if err != nil {
@@ -150,39 +191,71 @@ func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 			return fmt.Errorf("%s not found in %s", member, tgz)
 		}
 		if filepath.Base(hd.Name) == member {
-			tmp := dst + ".tmp"
-			out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-			if err != nil {
-				return err
-			}
-			_, err = io.Copy(out, tr)
-			if err == nil {
-				// fsync before rename (WriteManaged parity) — a
-				// crash after rename must never expose a zeroed
-				// binary at the install path. Then drop the staged
-				// pages: a freshly installed binary's cache charge
-				// belongs to whoever execs it, not to this pod's
-				// working set.
-				if err = out.Sync(); err == nil {
-					pagecache.Drop(out)
-				}
-			}
-			// Close's error counts too — delayed-write failures only
-			// surface there.
-			if cerr := out.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				// sweep the partial tmp — a truncated member must not
-				// linger next to the live binary.
-				_ = os.Remove(tmp)
-				return err
-			}
-			if err := os.Rename(tmp, dst); err != nil {
-				_ = os.Remove(tmp)
-				return err
-			}
-			return nil
+			return installMember(tr, dst, mode)
 		}
 	}
+}
+
+// installMember stages one tar member to dst atomically: CreateTemp
+// staging under the target dir (hostutil StageTempPattern parity — a
+// unique "base.tmp-*" name, so a crashed install's stage can never
+// collide with the next attempt's), payload fsync + rename + dir
+// fsync, the stage swept on EVERY failure path. The member stream is
+// capped at maxArtifactBytes.
+func installMember(r io.Reader, dst string, mode os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	staged := tmp.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(staged)
+		}
+	}()
+	// One byte past the cap: n > max means the member is over the
+	// budget.
+	n, err := io.Copy(tmp, io.LimitReader(r, maxArtifactBytes+1))
+	if err == nil && n > maxArtifactBytes {
+		err = fmt.Errorf("%s: member exceeds the %d MiB extract cap",
+			dst, maxArtifactBytes>>20)
+	}
+	if err == nil {
+		// fsync before rename (WriteManaged parity) — a crash after
+		// rename must never expose a zeroed binary at the install
+		// path. Then drop the staged pages: a freshly installed
+		// binary's cache charge belongs to whoever execs it, not to
+		// this pod's working set.
+		if err = tmp.Sync(); err == nil {
+			pagecache.Drop(tmp)
+		}
+	}
+	// Close's error counts too — delayed-write failures only
+	// surface there.
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err // defer sweeps the partial stage
+	}
+	// CreateTemp stages 0600 — force the caller's mode onto the
+	// stage before the rename (hostutil AtomicOpts.Mode parity).
+	if err = os.Chmod(staged, mode); err != nil {
+		return err
+	}
+	if err = os.Rename(staged, dst); err != nil {
+		return err
+	}
+	renamed = true // the stage is gone; nothing left to sweep
+	// Dir fsync after the rename (hostutil.WriteAtomic DirSync
+	// parity). Open failure tolerated, Sync failure reported.
+	if d, derr := os.Open(filepath.Dir(dst)); derr == nil {
+		if serr := d.Sync(); serr != nil {
+			_ = d.Close()
+			return serr
+		}
+		_ = d.Close()
+	}
+	return nil
 }

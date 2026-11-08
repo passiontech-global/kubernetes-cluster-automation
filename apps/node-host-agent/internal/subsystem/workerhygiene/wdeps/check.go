@@ -77,6 +77,11 @@ type CycleEnv struct {
 	TasksOnce    func() (map[string][]CtrTask, bool)
 	PidsOnce     func() []int
 	JournalOnce  func() string
+	// WalkOnce memoizes WalkBytes per cycle — the disk-bloat scan
+	// and the writable-layer scan walk the same snapshot/pod-volume
+	// dirs in one cycle; the cache makes the IO-bounded walk run at
+	// most once per path per cycle. Nil in tests → direct walks.
+	WalkOnce func(root string) (total int64, truncated bool)
 }
 
 // Check is one hygiene probe+remedy pair. Name() is the prometheus

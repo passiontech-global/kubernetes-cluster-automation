@@ -150,6 +150,20 @@ func TestPodsPageFunc(t *testing.T) {
 	}
 }
 
+func TestResourceQuotasPageFunc(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "q1", Namespace: "ns"}},
+		&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "q2", Namespace: "other"}},
+	)
+	quotas, err := ListAll(ctx, metav1.ListOptions{}, ResourceQuotas(cs, "ns"))
+	if err != nil {
+		t.Fatalf("ListAll ResourceQuotas: %v", err)
+	}
+	if len(quotas) != 1 || quotas[0].Name != "q1" {
+		t.Fatalf("quotas = %+v", quotas)
+	}
+}
+
 func TestVolumeAttachmentsPageFunc(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		&storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "va-1"}},

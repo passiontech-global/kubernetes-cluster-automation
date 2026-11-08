@@ -4,11 +4,13 @@
 package ported
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +95,39 @@ func TestProbeHTTPContentNon200(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("expected FAIL on non-200")
+	}
+}
+
+// A body that fills the 1MiB read cap WITHOUT containing the expected
+// string is inconclusive, not a clean FAIL — the expected substring
+// may sit past the cap — so it reports Infra instead. A match inside
+// the capped window still passes however big the body behind it is.
+func TestProbeHTTPContentBodyCapInconclusive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), httpBodyReadCap+1))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := testProber(fake.NewSimpleClientset())
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	res := probetest.MustCheck[*httpContentCheck](t, p).Run(ctx)
+	if res.Pass || res.Why != "" || res.Infra == nil {
+		t.Fatalf("cap-filling body must read inconclusive, got %+v", res)
+	}
+	if !strings.Contains(res.Infra.Error(), "truncated") {
+		t.Fatalf("Infra = %v, want the truncation notice", res.Infra)
+	}
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), httpBodyReadCap-8))
+		_, _ = fmt.Fprint(w, "Healthy")
+		_, _ = w.Write(bytes.Repeat([]byte("x"), httpBodyReadCap))
+	}))
+	t.Cleanup(srv2.Close)
+	p.Cfg.HTTPContent.URL = srv2.URL
+	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("match within the capped window must pass, got %+v", res)
 	}
 }
 

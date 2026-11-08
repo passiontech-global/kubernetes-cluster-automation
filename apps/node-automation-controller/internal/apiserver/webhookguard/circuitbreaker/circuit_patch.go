@@ -52,7 +52,11 @@ func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 // ...} — the webhooks list is patchMergeKey=name + patchStrategy=merge
 // (+listType=map), so only the touched element's failurePolicy is
 // rewritten and a concurrent writer's sibling entries survive instead
-// of being reverted by a whole-array reserialize. Returns nil
+// of being reverted by a whole-array reserialize. A recover only
+// fires after RecoverConfirmSweeps CONSECUTIVE healthy sweeps
+// (recoverHealthy counters + recoverSeen mark the live streaks);
+// before that the entry stays broken (Ignore re-asserted, stillBroken
+// returned). Returns nil
 // payload when nothing changed; trips, recovered and stillBroken are
 // the names whose metric/ledger updates the caller must apply only
 // after the patch lands (stillBroken is also returned on the
@@ -62,7 +66,7 @@ func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 // annotation no longer justifies.
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
-	seen map[string]bool) (payload []byte, trips, recovered, stillBroken []string) {
+	seen, recoverSeen map[string]bool) (payload []byte, trips, recovered, stillBroken []string) {
 
 	broken := guardstate.ParseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
@@ -108,14 +112,38 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		}
 		switch {
 		case isBroken && svcEffective != 0 && !unresponsive:
-			// RECOVER — the Service has >= 1 reachable Ready endpoint
-			// again, or the entry was repointed off its Service
-			// entirely (svcEffective < 0): the breaker cannot measure
-			// a URL, so it hands back the declared Fail and steps
-			// out. Endpoints on partitioned nodes do NOT count —
-			// they still fail every apiserver call — and neither do
-			// endpoints whose pods are still failing the handshake
-			// (W9-CP1): "Ready" in the EndpointSlice is not "serving".
+			// The Service has >= 1 reachable Ready endpoint again (or
+			// the entry was repointed off its Service entirely —
+			// svcEffective < 0, which the breaker cannot measure and
+			// always hands back), but ONE healthy sweep is not a
+			// recovery: a Service flapping 0↔1 endpoint would trip
+			// and recover in alternating sweeps, patching the
+			// WebhookConfiguration twice a cycle. The annotation
+			// stays the SSOT for "broken"; the counter only gates
+			// WHEN the recover patch fires.
+			streak := b.markHealthyStreak(key)
+			if streak < RecoverConfirmSweeps {
+				recoverSeen[key] = true
+				// Not confirmed yet — the entry stays broken:
+				// re-assert Ignore if the policy was flipped back
+				// externally, and re-assert the series.
+				if h.fp == nil || *h.fp != admissionv1.Ignore {
+					flip(h, admissionv1.Ignore)
+					changed = true
+				}
+				stillBroken = append(stillBroken, h.name)
+				log.Info("CIRCUIT-RECOVER-DEFER: healthy again — confirming next sweep",
+					"kind", kind, "config", cfgName, "webhook", h.name,
+					"service", svcRefString(h.svc),
+					"healthySweeps", streak, "required", RecoverConfirmSweeps)
+				break
+			}
+			// RECOVER confirmed — Endpoints on partitioned nodes did
+			// NOT count toward the streak (they still fail every
+			// apiserver call), and neither did endpoints whose pods
+			// are still failing the handshake (W9-CP1): "Ready" in
+			// the EndpointSlice is not "serving".
+			b.clearHealthyStreak(key)
 			flip(h, admissionv1.Fail)
 			delete(broken, h.name)
 			recovered = append(recovered, h.name)
@@ -130,6 +158,7 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 			// patch leaves the annotation unverifiable, so marking
 			// it emitted here would let the prune keep (or drop)
 			// the wrong set.
+			b.clearHealthyStreak(key) // the healthy streak must be CONSECUTIVE
 			if h.fp == nil || *h.fp != admissionv1.Ignore {
 				flip(h, admissionv1.Ignore)
 				changed = true

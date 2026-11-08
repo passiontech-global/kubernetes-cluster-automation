@@ -119,6 +119,48 @@ func TestMountinfoTaskRootfsOrphanConfirmedThenReaped(t *testing.T) {
 	}
 }
 
+// mountinfoCapTestOrphans drives the reap-cap test past the
+// production cap (10 — the check's internal mountinfoMaxReapPerCycle).
+const mountinfoCapTestOrphans = 12
+
+// --- reap cap: one suspect line per cycle, cap umounts ---
+
+func TestMountinfoReapCapLogsOncePerCycle(t *testing.T) {
+	e := fixture(t)
+	const orphans = mountinfoCapTestOrphans // > mountinfoMaxReapPerCycle
+	var lines []string
+	for i := range orphans {
+		id := fmt.Sprintf("%064x", i)
+		lines = append(lines, miLine(filepath.Join(e.CtrDir, id, "rootfs")))
+	}
+	writeMountinfo(t, e, lines)
+	e.SDReply["umount"] = ""
+
+	miCycle(e) // arm the confirmation markers
+	for i := range orphans {
+		id := fmt.Sprintf("%064x", i)
+		if _, err := os.Stat(filepath.Join(e.StateDir, "mi-task-seen-"+id)); err != nil {
+			t.Fatalf("marker %d not armed: %v", i, err)
+		}
+	}
+	e.Now = e.Now.Add(31 * time.Minute)
+	miCycle(e)
+
+	umounts := 0
+	for _, c := range e.SDCmds {
+		if strings.Contains(strings.Join(c, " "), "umount -l") {
+			umounts++
+		}
+	}
+	if umounts != 10 {
+		t.Fatalf("umounts=%d want cap 10", umounts)
+	}
+	if n := strings.Count(e.LogLines(t), "reap cap"); n != 1 {
+		t.Fatalf("reap-cap suspect lines=%d want exactly 1:\n%s",
+			n, e.LogLines(t))
+	}
+}
+
 func TestMountinfoTaskRootfsLiveTaskKept(t *testing.T) {
 	e := fixture(t)
 	// Task dir still listed → the ctr-tasks check owns it, the

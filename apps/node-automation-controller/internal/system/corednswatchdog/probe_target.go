@@ -67,7 +67,7 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 		})
 	}
 	for _, svc := range cands {
-		if time.Since(svc.created) >= corednsLogSinceS*time.Second {
+		if w.now.Now().Sub(svc.created) >= corednsLogSinceS*time.Second {
 			continue
 		}
 		eps, err := w.cs.DiscoveryV1().EndpointSlices(svc.ns).List(ctx,

@@ -3,9 +3,11 @@ package zombiesidecarreaper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -633,5 +635,64 @@ func TestZombieSidecarShutdownTargets(t *testing.T) {
 	}
 	if gotSidecar != "istio-proxy" {
 		t.Fatalf("shutdown called with sidecar %q, want istio-proxy", gotSidecar)
+	}
+}
+
+// The graceful-shutdown cap: only zombieShutdownCapPerCycle dials per
+// cycle — the rest defer untouched (no tried/poked stamp) and get
+// their attempt on the next sweep, while the already-poked pods flow
+// to the delete step without spending a dial.
+func TestZombieSidecarShutdownCapPerCycle(t *testing.T) {
+	var objs []runtime.Object
+	for i := 0; i < zombieShutdownCapPerCycle+2; i++ {
+		objs = append(objs, zsrPod("jobs",
+			fmt.Sprintf("job-cap-%02d-abcde", i), 10*time.Minute, 0))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	probe := &zsrShutdownProbe{}
+	r := zsrReaper(cs, probe)
+
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.calls) != zombieShutdownCapPerCycle {
+		t.Fatalf("shutdown calls = %d, want cap %d",
+			len(probe.calls), zombieShutdownCapPerCycle)
+	}
+	// Every attempted pod was poked; the two deferred pods carry no
+	// ledger stamp at all — their graceful cycle is intact.
+	if len(r.poked) != zombieShutdownCapPerCycle {
+		t.Fatalf("poked ledger = %d, want cap %d", len(r.poked), zombieShutdownCapPerCycle)
+	}
+	if len(r.tried) != zombieShutdownCapPerCycle {
+		t.Fatalf("tried ledger = %d, want cap %d", len(r.tried), zombieShutdownCapPerCycle)
+	}
+	deferred := 0
+	for _, p := range objs {
+		name := p.(*corev1.Pod).Name
+		poked := false
+		for k := range r.poked {
+			if strings.Contains(k, "/"+name+"/") {
+				poked = true
+				break
+			}
+		}
+		if !poked {
+			deferred++
+		}
+	}
+	if deferred != 2 {
+		t.Fatalf("deferred pods = %d, want 2", deferred)
+	}
+
+	// Next cycle: the poked pods go straight to the delete step (no
+	// dial — the Job object is absent, so jobAllowsReap approves),
+	// and only the two deferred pods spend the cap's dials.
+	calls := len(probe.calls)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(probe.calls) - calls; got != 2 {
+		t.Fatalf("second-cycle shutdown calls = %d, want 2 (deferred only)", got)
 	}
 }

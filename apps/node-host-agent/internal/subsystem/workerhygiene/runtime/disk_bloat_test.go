@@ -6,6 +6,7 @@ package runtime_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,65 @@ func TestCoredumpGCSweepsStaleCoresAboveWatermark(t *testing.T) {
 	e2.H.Cycle(context.Background())
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatal("core removed below the watermark")
+	}
+}
+
+// TestCoredumpGCSweepCappedOldestFirst — a storm drains at the
+// sweep cap per cycle, oldest mtime first, remainder next cycle.
+func TestCoredumpGCSweepCappedOldestFirst(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.Disk.CoredumpDir = dir
+	const total = 74 // > the 64-per-cycle sweep cap
+	for i := range total {
+		p := filepath.Join(dir, fmt.Sprintf("core.node.1000.%04d", i))
+		wdepstest.WriteFile(t, p, "ELF...")
+		old := e.Now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.DiskUsed = 0.90
+	e.H.Cycle(context.Background())
+
+	removed, remaining := 0, 0
+	oldestGone := true
+	newestKept := true
+	for i := range total {
+		p := filepath.Join(dir, fmt.Sprintf("core.node.1000.%04d", i))
+		_, err := os.Stat(p)
+		gone := os.IsNotExist(err)
+		if gone {
+			removed++
+		} else {
+			remaining++
+		}
+		if i < 64 && !gone {
+			oldestGone = false
+		}
+		if i >= 64 && gone {
+			newestKept = false
+		}
+	}
+	if removed != 64 || remaining != 10 {
+		t.Fatalf("removed=%d remaining=%d, want 64/10", removed, remaining)
+	}
+	if !oldestGone || !newestKept {
+		t.Fatalf("cap not drained oldest-first: oldestGone=%v newestKept=%v",
+			oldestGone, newestKept)
+	}
+	if !strings.Contains(e.LogLines(t), "cap 64 reached, 10 remaining drain next cycle") {
+		t.Fatalf("missing drain-next-cycle note:\n%s", e.LogLines(t))
+	}
+
+	// Next cycle drains the remainder.
+	e.DiskUsed = 0.90
+	e.H.Cycle(context.Background())
+	for i := 64; i < total; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("core.node.1000.%04d", i))
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("core %d not drained the next cycle", i)
+		}
 	}
 }
 

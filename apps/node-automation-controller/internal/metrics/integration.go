@@ -39,10 +39,13 @@ var WebhookCABundleMismatch = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"kind", "name", "webhook"})
 
 // TLSSecretDaysToExpiry exposes days until the tls.crt in each
-// kubernetes.io/tls Secret expires (C5).
+// kubernetes.io/tls Secret expires (C5). Series open only for
+// Secrets inside the 30d alert window (or already expired) — the
+// cert-drift-auditor emit gate bounds the metric's cardinality while
+// keeping the <30d dashboards/alerts byte-identical.
 var TLSSecretDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_tls_secret_days_to_expiry",
-	Help: "Days until the tls.crt certificate in the Secret expires.",
+	Help: "Days until the tls.crt certificate in the Secret expires; only Secrets within the 30d alert window emit a series.",
 }, []string{"namespace", "secret"})
 
 // ---------------------------------------------------------------------------

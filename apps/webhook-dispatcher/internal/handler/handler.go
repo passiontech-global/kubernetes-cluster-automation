@@ -316,52 +316,70 @@ func (h *Handler) dispatch(resources []concourse.Resource,
 	// wait on the ATC without an exit path.
 	ctx, cancel := context.WithTimeout(context.Background(), h.budget)
 	defer cancel()
+	// Fixed worker pool instead of one goroutine per resource: a
+	// pathological match set must not spawn hundreds of goroutines
+	// all parked on the semaphore. Workers pull from a channel; the
+	// Handler-wide semaphore (h.sem) still bounds concurrent POSTs
+	// across ALL in-flight fan-outs.
+	workers := fanoutWorkers
+	if len(resources) < workers {
+		workers = len(resources)
+	}
+	jobs := make(chan concourse.Resource)
 	var wg sync.WaitGroup
 	var checked atomic.Int64
-	for _, res := range resources {
+	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			select {
-			case h.sem <- struct{}{}:
-			case <-ctx.Done():
-				// Budget spent queued — skip the POST and let the
-				// target go (Done above runs on this path too).
-				fanoutTotal.WithLabelValues("budget").Inc()
-				logger().Warn("check webhook skipped: fan-out budget expired while queued",
-					"pipeline", res.Pipeline, "resource", res.Name,
-					"repo", res.Repo, "delivery", delivery)
-				return
-			}
-			defer func() { <-h.sem }()
-			tctx, cancel := context.WithTimeout(ctx, fanoutTimeout)
-			defer cancel()
-			status, err := h.backend.CheckWebhook(tctx, res)
-			switch {
-			case err != nil:
-				fanoutTotal.WithLabelValues("error").Inc()
-				logger().Error("check webhook request failed",
-					"pipeline", res.Pipeline, "resource", res.Name,
-					"repo", res.Repo, "delivery", delivery, "error", err)
-			case status/100 == 2:
-				fanoutTotal.WithLabelValues("ok").Inc()
-				checked.Add(1)
-				logger().Info("check webhook dispatched",
-					"pipeline", res.Pipeline, "resource", res.Name,
-					"repo", res.Repo, "delivery", delivery, "status", status)
-			case status == http.StatusUnauthorized || status == http.StatusNotFound:
-				fanoutTotal.WithLabelValues("rejected").Inc()
-				logger().Warn("check webhook rejected",
-					"pipeline", res.Pipeline, "resource", res.Name,
-					"repo", res.Repo, "delivery", delivery, "status", status)
-			default:
-				fanoutTotal.WithLabelValues("error").Inc()
-				logger().Error("check webhook unexpected status",
-					"pipeline", res.Pipeline, "resource", res.Name,
-					"repo", res.Repo, "delivery", delivery, "status", status)
+			for res := range jobs {
+				select {
+				case h.sem <- struct{}{}:
+				case <-ctx.Done():
+					// Budget spent queued — skip the POST and let
+					// the target go.
+					fanoutTotal.WithLabelValues("budget").Inc()
+					logger().Warn("check webhook skipped: fan-out budget expired while queued",
+						"pipeline", res.Pipeline, "resource", res.Name,
+						"repo", res.Repo, "delivery", delivery)
+					continue
+				}
+				func() {
+					defer func() { <-h.sem }()
+					tctx, cancel := context.WithTimeout(ctx, fanoutTimeout)
+					defer cancel()
+					status, err := h.backend.CheckWebhook(tctx, res)
+					switch {
+					case err != nil:
+						fanoutTotal.WithLabelValues("error").Inc()
+						logger().Error("check webhook request failed",
+							"pipeline", res.Pipeline, "resource", res.Name,
+							"repo", res.Repo, "delivery", delivery, "error", err)
+					case status/100 == 2:
+						fanoutTotal.WithLabelValues("ok").Inc()
+						checked.Add(1)
+						logger().Info("check webhook dispatched",
+							"pipeline", res.Pipeline, "resource", res.Name,
+							"repo", res.Repo, "delivery", delivery, "status", status)
+					case status == http.StatusUnauthorized || status == http.StatusNotFound:
+						fanoutTotal.WithLabelValues("rejected").Inc()
+						logger().Warn("check webhook rejected",
+							"pipeline", res.Pipeline, "resource", res.Name,
+							"repo", res.Repo, "delivery", delivery, "status", status)
+					default:
+						fanoutTotal.WithLabelValues("error").Inc()
+						logger().Error("check webhook unexpected status",
+							"pipeline", res.Pipeline, "resource", res.Name,
+							"repo", res.Repo, "delivery", delivery, "status", status)
+					}
+				}()
 			}
 		}()
 	}
+	for _, res := range resources {
+		jobs <- res
+	}
+	close(jobs)
 	wg.Wait()
 	fanoutDuration.Observe(time.Since(start).Seconds())
 	logger().Info("webhook fan-out complete",

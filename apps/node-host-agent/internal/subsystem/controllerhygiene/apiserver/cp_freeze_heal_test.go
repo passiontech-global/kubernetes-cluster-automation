@@ -665,3 +665,49 @@ func TestKonnectivityNoWorkerSuppressesHeal(t *testing.T) {
 		t.Fatalf("scrape-failed gauge=%v want -1", v)
 	}
 }
+
+// Off and dry-run modes must not burn the 30-minute konn restart
+// budget — the spend happens atomically inside the enforce branch.
+func TestKonnectivityBudgetNotSpentOffOrDryRun(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		wantLog string
+	}{
+		{"dryrun", cdeps.ModeDryRun, "DRY-RUN: would kill konnectivity-server"},
+		{"off", cdeps.ModeOff, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad signal
+			e.H.Cfg.Sig13.Mode = tc.mode
+			e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+				if url == "http://127.0.0.1:8091/metrics" {
+					return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+				}
+				return "", errors.New("unexpected scrape " + url)
+			}
+			e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+			e.MkProc(t, 4242, "konnectivity-se",
+				[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+			for range 4 {
+				e.H.Cycle(context.Background())
+			}
+			if len(e.Kills) != 0 {
+				t.Fatalf("%s mode killed: %v", tc.name, e.Kills)
+			}
+			if h := e.H.State.Epoch(filepath.Join(e.State,
+				cdeps.FileRateKonnRestart)); h != 0 {
+				t.Fatalf("%s mode burned the restart budget (epoch=%d)", tc.name, h)
+			}
+			log := e.LogLines()
+			if tc.wantLog == "" {
+				if strings.Contains(log, "DRY-RUN") {
+					t.Fatalf("off mode logged a dry-run action:\n%s", log)
+				}
+			} else if !strings.Contains(log, tc.wantLog) {
+				t.Fatalf("dry-run not logged:\n%s", log)
+			}
+		})
+	}
+}

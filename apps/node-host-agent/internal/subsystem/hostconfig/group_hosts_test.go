@@ -73,3 +73,57 @@ func TestBlockInHostsCreatesWhenMissing(t *testing.T) {
 		t.Fatalf("hosts = %q, want just the managed block", got)
 	}
 }
+
+// ---------- hostnamePin alias preservation ----------
+
+// TestHostnamePinPreservesAliases — a re-pin swaps ONLY the hostname
+// field of the 127.0.1.1 line; trailing aliases must survive
+// (lineinfile parity), and a wrong-hostname line must be rewritten
+// (not appended) without dropping its aliases.
+func TestHostnamePinPreservesAliases(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+
+	// Wrong hostname WITH aliases → rewrite the field, keep aliases.
+	hostWrite(t, r, "/etc/hosts",
+		"127.0.0.1 localhost\n127.0.1.1 old-host alias1 alias2\n")
+	c.hostnamePin()
+	hosts := hostRead(t, r, "/etc/hosts")
+	if !strings.Contains(hosts, "127.0.1.1 node-b alias1 alias2\n") {
+		t.Fatalf("aliases lost on re-pin:\n%s", hosts)
+	}
+	if strings.Contains(hosts, "old-host") {
+		t.Fatalf("stale hostname survived:\n%s", hosts)
+	}
+
+	// Already correctly pinned → no duplicate pin appended.
+	c.hostnamePin()
+	hosts = hostRead(t, r, "/etc/hosts")
+	if strings.Count(hosts, "127.0.1.1 node-b") != 1 {
+		t.Fatalf("pin duplicated on converge:\n%s", hosts)
+	}
+
+	// Prefix must be matched whole-field: "node-b2" is NOT this
+	// node — the pin replaces its field and keeps "node-b2" alias.
+	hostWrite(t, r, "/etc/hosts",
+		"127.0.0.1 localhost\n127.0.1.1 node-b2 node-b2.alias\n")
+	c.hostnamePin()
+	hosts = hostRead(t, r, "/etc/hosts")
+	if !strings.Contains(hosts, "127.0.1.1 node-b node-b2.alias\n") {
+		t.Fatalf("node-b2 line not re-pinned correctly:\n%s", hosts)
+	}
+
+	// No pin line at all → appended exactly as before.
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c.hostnamePin()
+	hosts = hostRead(t, r, "/etc/hosts")
+	if !strings.Contains(hosts, "127.0.0.1 localhost\n127.0.1.1 node-b\n") {
+		t.Fatalf("fresh pin not appended:\n%s", hosts)
+	}
+}

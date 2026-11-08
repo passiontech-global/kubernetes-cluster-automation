@@ -274,3 +274,66 @@ func TestDialKeyErrorPrecedesNetwork(t *testing.T) {
 		t.Fatalf("dial err = %v, want key error", err)
 	}
 }
+
+// TestHostKeyPinCallback: a HostKeyFingerprint pin turns the tolerant
+// callback into a constant-time fingerprint match — the pinned key
+// passes (in the canonical `SHA256:...` form ssh prints AND in
+// bare/padded variants), any other key is rejected with a mismatch
+// error, and the pin takes precedence over the Log audit trail.
+func TestHostKeyPinCallback(t *testing.T) {
+	signer, _ := testSigner(t)
+	other, _ := testSigner(t)
+	pin := ssh.FingerprintSHA256(signer.PublicKey())
+
+	for _, form := range []string{pin, pin[len("SHA256:"):], pin + "=="} {
+		cfg := (Config{HostKeyFingerprint: form}).ClientConfig("ops", signer)
+		if err := cfg.HostKeyCallback("h:22", nil, signer.PublicKey()); err != nil {
+			t.Fatalf("pin form %q rejected the matching key: %v", form, err)
+		}
+	}
+	cfg := (Config{HostKeyFingerprint: pin}).ClientConfig("ops", signer)
+	err := cfg.HostKeyCallback("h:22", nil, other.PublicKey())
+	if err == nil || !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("foreign key err = %v, want fingerprint mismatch", err)
+	}
+	// The mismatch is loud even when only the pin is set (no Log) —
+	// a silent reject is the hang-nobody-can-diagnose class.
+	cfg = (Config{HostKeyFingerprint: pin, Log: slog.Default()}).ClientConfig("ops", signer)
+	if err := cfg.HostKeyCallback("h:22", nil, signer.PublicKey()); err != nil {
+		t.Fatalf("pinned key rejected: %v", err)
+	}
+}
+
+// TestDialWithPinnedHostKey: the pin accepted end-to-end against a
+// real handshake — the pin computed the canonical way
+// (ssh.FingerprintSHA256 of the server's public key) dials through.
+func TestDialWithPinnedHostKey(t *testing.T) {
+	addr, hostKey := startTestSSHServerHostKey(t)
+	cfg := dialTestConfig(t, nil)
+	cfg.HostKeyFingerprint = ssh.FingerprintSHA256(hostKey)
+
+	_, client := dialTestClient(t, addr, cfg)
+	_ = client.Close()
+}
+
+// TestDialWithWrongHostKeyPinRejected: a stale/wrong pin rejects the
+// handshake before auth completes — the MITM/torn-rebuild answer the
+// pin exists for.
+func TestDialWithWrongHostKeyPinRejected(t *testing.T) {
+	addr, _ := startTestSSHServerHostKey(t)
+	cfg := dialTestConfig(t, nil)
+	cfg.HostKeyFingerprint = "SHA256:" + strings.Repeat("A", 43)
+
+	signer, err := cfg.LoadSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = cfg.DialTCP(context.Background(), addr,
+		cfg.ClientConfig("root", signer))
+	if err == nil {
+		t.Fatal("a wrong host-key pin must reject the dial")
+	}
+	if !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("dial err = %v, want fingerprint mismatch", err)
+	}
+}

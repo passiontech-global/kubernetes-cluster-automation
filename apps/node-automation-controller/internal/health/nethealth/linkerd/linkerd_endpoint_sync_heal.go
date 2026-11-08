@@ -32,23 +32,46 @@ import (
 //     turns EndpointSlices into proxy endpoint state, so restarting
 //     it forces a full resync from the (now corrected) slices.
 //
-// Gates: the 1h in-RAM cooldown keyed on the desynced service (the
-// heal targets are the slices + pod — nothing else can carry the
-// stamp; one stamp covers BOTH actions so a 5m sweep cannot churn
-// slice deletes inside the pod-bounce cooldown) and the maintenance
+// Gates: the escalating per-service cooldown (linkerdDestHealEscalation
+// — the wider of the in-RAM linkerdDesyncHealed ledger and the
+// passiontech.dev/last-linkerd-endpoint-sync-heal stamp persisted on
+// the Service, so it survives operator restarts) and the maintenance
 // mutex, same shape as every pod-delete heal in this sweep. The
-// cooldown stamps when ANY heal action succeeded — a failed delete
-// retries next sweep instead of burning the hour.
+// ladder counts CONSECUTIVE INEFFECTIVE bounces: each delivered heal
+// lands a streak hit, the prune in Run resets it wherever a sweep
+// sees the desync converge, and a third failed bounce in a row stops
+// the bouncing (the divergence may be caused by a slice the
+// managed-by delete never reaps — bouncing forever fixes nothing).
+// One stamp covers BOTH actions so a 5m sweep cannot churn slice
+// deletes inside the pod-bounce cooldown; the cooldown stamps when
+// ANY heal action succeeded — a failed delete retries next sweep
+// instead of burning the hour.
 func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
-	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
+	log logr.Logger, svc *corev1.Service, svcKey string,
+	now time.Time, stale []linkerdSliceRef) {
 
 	// linkerdDesyncHealed keys "ns/svc" — Services can be
 	// decommissioned, so bound the map so their stamps cannot
-	// accumulate.
-	p.linkerdDesyncHealed.PruneExpired(now, linkerdDestHealCooldown)
+	// accumulate. The bound is the LONGEST cooldown the escalation
+	// ladder serves (24h), not the base 1h.
+	p.linkerdDesyncHealed.PruneExpired(now, linkerdDestHealCooldownMax)
 
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
+	// Escalation — the current streak sizes this attempt's cooldown;
+	// at the ladder's end the bouncing stops and the gauge + FAIL
+	// series carry the alert. The streak counts DELIVERED bounces
+	// (Hit after a landed heal), so a failed delete never advances
+	// the ladder.
+	fails := p.linkerdDesyncBounceFails.Count(svcKey)
+	if fails >= len(linkerdDestHealEscalation) {
+		log.Info("skip heal: linkerd endpoint desync survived three consecutive "+
+			"bounces — escalation exhausted, leaving the alert to converge it",
+			"service", svcKey, "bounces", fails)
+		return
+	}
+
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.linkerdDesyncHealed, svc, linkerdDestHealAnno, svcKey,
+		linkerdDestHealEscalation[fails], now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -86,7 +109,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 			// Slice deletes already landed — stamp them now or an
 			// unstamped sweep re-deletes the slices the
 			// endpointslice-controller just rebuilt.
-			p.linkerdDesyncHealed.Stamp(svcKey, now)
+			p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
 		}
 		return
 	}
@@ -122,6 +145,29 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 	if healed {
-		p.linkerdDesyncHealed.Stamp(svcKey, now)
+		p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
+	}
+}
+
+// stampLinkerdDestinationHeal lands the cooldown halves after a
+// delivered heal: the in-RAM ledger stamp, the
+// passiontech.dev/last-linkerd-endpoint-sync-heal annotation on the
+// desynced Service (the durable half — a patch failure leaves the
+// in-RAM half holding), and the ineffective-bounce streak hit whose
+// next-sweep convergence check decides whether this bounce advances
+// the escalation ladder.
+func (p *linkerdEndpointSyncCheck) stampLinkerdDestinationHeal(
+	ctx context.Context, log logr.Logger, svc *corev1.Service,
+	svcKey string, now time.Time) {
+
+	p.linkerdDesyncHealed.Stamp(svcKey, now)
+	p.linkerdDesyncBounceFails.Hit(svcKey)
+	// The Service already carries the first-seen stamp through the
+	// same patch closure — reuse it for the heal stamp.
+	if err := heal.StampPersisted(ctx, p.linkerdSvcPatch(svc),
+		linkerdDestHealAnno, nil, "", now); err != nil {
+		metrics.IncError(p.Name)
+		log.Error(err, "persist linkerd endpoint heal stamp failed",
+			"service", svcKey)
 	}
 }

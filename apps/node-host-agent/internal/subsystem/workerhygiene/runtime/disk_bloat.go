@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ const (
 	// coredumpMinAge keeps an in-progress core write from being
 	// swept the same cycle the watermark trip fires.
 	coredumpMinAge = 15 * time.Minute
+	// coredumpSweepMax bounds one cycle's stale-core removal blast
+	// radius (runTmpfsSweepMax parity — a storm drains at a fixed
+	// rate across cycles).
+	coredumpSweepMax = 64
 	// defaultPodLogsDir is the /var/log/pods host mount — the
 	// BUG-H8 pod-log attribution walk scans it.
 )
@@ -80,7 +85,18 @@ func podLogDirUID(base string) string {
 // snapshot pins space no volume path accounts for). Over-threshold
 // dirs return as hits; podTotals/podByUID feed the
 // critical-watermark eviction decision.
-func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
+// walkBytes sizes one dir through the per-cycle WalkOnce cache when
+// the cycle provides it (scanBloat and writableLayerScan walk the
+// same snapshot/pod-volume dirs in one cycle — the walk runs once),
+// falling back to a direct bounded walk otherwise.
+func (c *DiskBloatCheck) walkBytes(e *wdeps.CycleEnv, root string) (int64, bool) {
+	if e != nil && e.WalkOnce != nil {
+		return e.WalkOnce(root)
+	}
+	return c.d.WalkBytes(root)
+}
+
+func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits []bloatHit,
 	podTotals map[string]int64, podByUID map[string]*corev1.Pod) {
 	podByUID = map[string]*corev1.Pod{}
 	podTotals = map[string]int64{}
@@ -98,7 +114,7 @@ func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
-			size, _ := c.d.WalkBytes(vol)
+			size, _ := c.walkBytes(e, vol)
 			podTotals[uid] += size
 			if size > threshold {
 				label := "pod-uid " + uid
@@ -121,7 +137,7 @@ func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
 	for _, snap := range readDirNames(snapRoot) {
 		id := filepath.Base(snap)
-		size, _ := c.d.WalkBytes(filepath.Join(snap, "fs"))
+		size, _ := c.walkBytes(e, filepath.Join(snap, "fs"))
 		if size <= 0 {
 			continue
 		}
@@ -140,7 +156,7 @@ func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	for _, logDir := range readDirNames(c.d.Cfg.Disk.PodLogsDir) {
 		base := filepath.Base(logDir)
 		uid := podLogDirUID(base)
-		size, _ := c.d.WalkBytes(logDir)
+		size, _ := c.walkBytes(e, logDir)
 		if uid != "" {
 			podTotals[uid] += size
 		}
@@ -227,7 +243,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-	hits, podTotals, podByUID := c.scanBloat(e.Pods)
+	hits, podTotals, podByUID := c.scanBloat(e, e.Pods)
 	if len(hits) == 0 {
 		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
@@ -405,7 +421,11 @@ func (c *DiskBloatCheck) coredumpGC() {
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	removed := 0
+	type coreFile struct {
+		path string
+		mod  time.Time
+	}
+	var stale []coreFile
 	for _, ent := range ents {
 		if !ent.Type().IsRegular() {
 			continue
@@ -414,10 +434,22 @@ func (c *DiskBloatCheck) coredumpGC() {
 		if err != nil || now.Sub(fi.ModTime()) < coredumpMinAge {
 			continue
 		}
-		p := filepath.Join(dir, ent.Name())
-		if err := os.Remove(p); err != nil {
+		stale = append(stale, coreFile{
+			path: filepath.Join(dir, ent.Name()),
+			mod:  fi.ModTime(),
+		})
+	}
+	// Oldest first — a capped sweep drains the oldest evidence
+	// deterministically instead of ReadDir-order.
+	sort.Slice(stale, func(i, j int) bool { return stale[i].mod.Before(stale[j].mod) })
+	removed := 0
+	for _, f := range stale {
+		if removed >= coredumpSweepMax {
+			break // bound one cycle's blast radius — parity with runTmpfsSweepMax
+		}
+		if err := os.Remove(f.path); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: disk-bloat coredump rm %s failed: %v", p, err))
+				"suspect: disk-bloat coredump rm %s failed: %v", f.path, err))
 			continue
 		}
 		removed++
@@ -425,9 +457,14 @@ func (c *DiskBloatCheck) coredumpGC() {
 	if removed == 0 {
 		return
 	}
-	c.d.State.AppendLog(fmt.Sprintf(
+	line := fmt.Sprintf(
 		"ACTION: disk-bloat coredump sweep — removed %d stale core files from %s (used %.1f%%)",
-		removed, dir, used*100))
+		removed, dir, used*100)
+	if drained := len(stale) - removed; drained > 0 {
+		line += fmt.Sprintf(" — cap %d reached, %d remaining drain next cycle",
+			coredumpSweepMax, drained)
+	}
+	c.d.State.AppendLog(line)
 	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "coredump_rm").Inc()
 }
 
@@ -482,7 +519,7 @@ func (c *DiskBloatCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEn
 	// through the task dirs' pod-uid annotation.
 	for _, snap := range readDirNames(c.d.Cfg.Disk.WLayerSnapshotsDir) {
 		fsDir := filepath.Join(snap, "fs")
-		size, _ := c.d.WalkBytes(fsDir)
+		size, _ := c.walkBytes(e, fsDir)
 		if size <= threshold {
 			continue
 		}
@@ -503,7 +540,7 @@ func (c *DiskBloatCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEn
 			continue
 		}
 		volRoot := filepath.Join(uidDir, "volumes")
-		size, _ := c.d.WalkBytes(volRoot)
+		size, _ := c.walkBytes(e, volRoot)
 		if size <= threshold {
 			continue
 		}

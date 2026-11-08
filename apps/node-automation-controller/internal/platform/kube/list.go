@@ -177,6 +177,16 @@ func Services(cs kubernetes.Interface, namespace string) PageFunc[corev1.Service
 		func(l *corev1.ServiceList) []corev1.Service { return l.Items })
 }
 
+// ResourceQuotas lists ResourceQuotas in namespace
+// (resource-quota-check).
+func ResourceQuotas(cs kubernetes.Interface, namespace string) PageFunc[corev1.ResourceQuota] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.ResourceQuotaList, error) {
+			return cs.CoreV1().ResourceQuotas(namespace).List(ctx, o)
+		},
+		func(l *corev1.ResourceQuotaList) []corev1.ResourceQuota { return l.Items })
+}
+
 // EndpointSlices lists discovery EndpointSlices in namespace.
 func EndpointSlices(cs kubernetes.Interface, namespace string) PageFunc[discoveryv1.EndpointSlice] {
 	return typedPage(

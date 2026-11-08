@@ -33,10 +33,14 @@
 package sshclient
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -60,6 +64,19 @@ type Config struct {
 	// host key's fingerprint is audit-logged (hubsync parity);
 	// nil → bare ssh.InsecureIgnoreHostKey (nebulasign parity).
 	Log *slog.Logger
+	// HostKeyFingerprint pins the expected host key: a SHA256 base64
+	// fingerprint of the key's wire form, as `ssh -o
+	// FingerprintHash=sha256` and ssh.FingerprintSHA256 print it —
+	// "SHA256:<base64>" (the prefix and any base64 padding are
+	// accepted and stripped). When set, the HostKeyCallback rejects
+	// any key whose fingerprint does not match the pin in constant
+	// time — the bastion hop rides the same Config (see Dial), so one
+	// pin covers the jump target too. Default "" keeps the tolerant
+	// no-pin behavior: targets are infra VMs whose host keys rotate
+	// on rebuild and the keypair (plus, for hubsync, the lease) is
+	// the authentication boundary — the pin is the opt-in
+	// tightening for callers that can distribute one.
+	HostKeyFingerprint string
 }
 
 // port resolves the effective SSH port — the <=0 fallback exists so
@@ -104,14 +121,36 @@ func (c Config) LoadSigner() (ssh.Signer, error) {
 // HostKeyCallback accepts any host key — StrictHostKeyChecking=no
 // parity with the ansible converge: targets are infra VMs whose
 // host keys rotate on rebuild, so the keypair (and, for hubsync,
-// the lease) is the authentication boundary. With Log set, the
-// negotiated fingerprint is audit-logged so a rotated/spoofed key
-// leaves a trail instead of passing silently (hubsync parity); a
-// nil Log is the silent InsecureIgnoreHostKey the nebulasign fetch
-// used.
+// the lease) is the authentication boundary. A HostKeyFingerprint
+// pin replaces the tolerance with a constant-time fingerprint match
+// (see the Config field). With Log set, the negotiated fingerprint
+// is audit-logged so a rotated/spoofed key leaves a trail instead of
+// passing silently (hubsync parity); a nil Log is the silent
+// InsecureIgnoreHostKey the nebulasign fetch used.
 func (c Config) ClientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
 	cb := ssh.InsecureIgnoreHostKey() // documented parity above
-	if c.Log != nil {
+	switch {
+	case c.HostKeyFingerprint != "":
+		cb = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			remoteAddr := "<nil>"
+			if remote != nil {
+				remoteAddr = remote.String()
+			}
+			if err := checkHostKeyFingerprint(c.HostKeyFingerprint, key); err != nil {
+				c.log().Warn("sshclient: host key fingerprint mismatch — rejecting",
+					"addr", hostname, "remote", remoteAddr,
+					"expected", c.HostKeyFingerprint,
+					"got", ssh.FingerprintSHA256(key))
+				return err
+			}
+			if c.Log != nil {
+				c.Log.Info("sshclient: pinned ssh host key verified",
+					"addr", hostname, "remote", remoteAddr,
+					"fingerprint", ssh.FingerprintSHA256(key))
+			}
+			return nil
+		}
+	case c.Log != nil:
 		log := c.Log
 		cb = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			log.Info("sshclient: ssh host key accepted (no strict check)",
@@ -126,4 +165,23 @@ func (c Config) ClientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
 		HostKeyCallback: cb,
 		Timeout:         c.Timeout,
 	}
+}
+
+// checkHostKeyFingerprint pins a host key by its SHA256 fingerprint —
+// the wire-format key bytes (ssh.PublicKey.Marshal) hashed and
+// base64'd exactly as ssh.FingerprintSHA256 / `ssh -o
+// FingerprintHash=sha256` print them. The pin may carry the
+// "SHA256:" prefix and trailing '=' padding; both are stripped
+// before a constant-time compare, so a mismatch reveals nothing
+// about how close the presented key was to the pin.
+func checkHostKeyFingerprint(pin string, key ssh.PublicKey) error {
+	sum := sha256.Sum256(key.Marshal())
+	got := base64.RawStdEncoding.EncodeToString(sum[:])
+	want := strings.TrimPrefix(strings.TrimSpace(pin), "SHA256:")
+	want = strings.TrimRight(want, "=")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		return fmt.Errorf("sshclient: host key fingerprint mismatch: got SHA256:%s, want pinned %s",
+			got, pin)
+	}
+	return nil
 }

@@ -104,14 +104,18 @@ func Deploy(ctx context.Context, o FileOps, path string, content []byte, mode os
 // hold a validated ruleset, or a broken render would persist where
 // the oneshot unit loads it at boot. The returned error is Deploy's
 // (ErrManagedWrite-wrapped on staging failures); the unit-file write
-// and systemctl verbs report through the Ops impl itself.
+// failure surfaces the same way, and the systemctl verbs are skipped
+// on it — daemon-reload/enable/start against a stale or missing unit
+// would apply a ruleset whose boot unit never landed. The verbs
+// themselves stay fire-and-forget (the Ops interface reports them
+// through the impl's own cycle attribution).
 func NftUnit(ctx context.Context, o Ops, name, path string, content []byte, desc string) error {
 	ch, err := Deploy(ctx, o, path, content, 0o644, "nft", "-c", "-f")
 	if err != nil {
 		return err
 	}
 	unitPath := "/etc/systemd/system/" + name + ".service"
-	uch, _ := o.WriteManaged(unitPath, []byte(fmt.Sprintf(`[Unit]
+	uch, werr := o.WriteManaged(unitPath, []byte(fmt.Sprintf(`[Unit]
 Description=%s
 After=network-pre.target
 Wants=network-pre.target
@@ -125,6 +129,14 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 `, desc, path)), 0o644)
+	if werr != nil {
+		// The Ops impl already attributed the write failure to the
+		// active cycle (ErrManagedWrite contract) — wrap for the
+		// callers' errors.Is skip so it isn't counted twice, and
+		// fail the cycle without touching systemd. The next cycle
+		// retries the unit write.
+		return fmt.Errorf("%w: %s: %s", ErrManagedWrite, unitPath, werr)
+	}
 	if ch || uch {
 		o.DaemonReload(ctx)
 	}

@@ -48,10 +48,18 @@ type Client struct {
 	mu        sync.Mutex
 	index     []Resource
 	fetchedAt time.Time
-	// lastAttemptAt stamps the most recent fetch attempt — success or
-	// failure — so a failed refresh backs off instead of letting every
-	// caller block on a fresh fetch against a dead ATC.
+	// lastAttemptAt stamps the start of the most recent fetch attempt
+	// — success or failure — so a failed refresh backs off instead of
+	// letting every caller block on a fresh fetch against a dead ATC,
+	// and callers arriving mid-fetch are served the current index
+	// rather than queueing a second fetch.
 	lastAttemptAt time.Time
+	// fetching marks an in-flight index fetch (never held across the
+	// network wait without the mutex released — it is set under the
+	// lock before the fetch starts and cleared after it settles), so
+	// a caller with no index to serve fails fast instead of starting
+	// its own duplicate fetch.
+	fetching bool
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -81,31 +89,61 @@ func (c *Client) minRefreshInterval() time.Duration {
 // inside the TTL window keep serving it — lastAttemptAt backs the
 // fetch off so an ATC outage doesn't serialize every webhook request
 // behind the HTTP timeout.
+//
+// The mutex is never held across the network fetch: the decision and
+// the lastAttemptAt stamp happen under the lock, the fetch runs
+// unlocked, and only a successful publish re-takes it. Callers that
+// arrive while a fetch is in flight are served the current index
+// immediately (stale is fine — the in-flight fetch will replace it),
+// so a slow or wedged ATC cannot serialize webhook deliveries behind
+// c.mu.
 func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
-		return c.index, nil
+		index := c.index
+		c.mu.Unlock()
+		return index, nil
 	}
 	// The last attempt failed inside the same TTL window — serve the
 	// stale index without re-fetching. Without this backoff every
 	// request re-takes the mutex and blocks on a doomed fetch.
 	if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
-		return c.index, nil
+		index := c.index
+		c.mu.Unlock()
+		return index, nil
 	}
-	index, err := c.fetchIndex(ctx)
+	// A fetch already in flight and no index to serve: fail fast —
+	// queueing this caller behind the in-flight fetch is exactly the
+	// serialization this method exists to avoid.
+	if c.index == nil && c.fetching {
+		c.mu.Unlock()
+		return nil, errors.New("resource index refresh already in progress")
+	}
+	// Stamp the attempt before starting the fetch: concurrent callers
+	// hitting the checks above while this fetch is in flight must see
+	// a fresh lastAttemptAt and be served the existing index instead
+	// of starting their own fetch behind this one.
 	c.lastAttemptAt = time.Now()
+	c.fetching = true
+	prev := append([]Resource(nil), c.index...)
+	c.mu.Unlock()
+
+	index, err := c.fetchIndex(ctx, prev)
+	c.mu.Lock()
+	c.fetching = false
 	if err != nil {
 		if c.index != nil {
 			logger().Warn("resource index refresh failed — serving stale",
 				"concourse_url", c.BaseURL, "team", c.Team,
 				"error", err)
+			c.mu.Unlock()
 			return c.index, nil
 		}
+		c.mu.Unlock()
 		return nil, err
 	}
-	c.index, c.fetchedAt = index, c.lastAttemptAt
+	c.index, c.fetchedAt = index, time.Now()
+	c.mu.Unlock()
 	return index, nil
 }
 
@@ -120,26 +158,38 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 // only moves on success, so during an ATC outage an unmatched
 // delivery would otherwise grab the mutex and block on a doomed
 // network fetch every time — stalling every other webhook behind
-// the HTTP timeout.
+// the HTTP timeout. The fetch itself runs outside the mutex, same
+// snapshot pattern as Resources.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// lastAttemptAt >= fetchedAt always (a success stamps both, a
 	// failure stamps only the attempt), so the attempt stamp alone
 	// covers both "recently fetched" and "recently failed".
 	if time.Since(c.lastAttemptAt) < c.minRefreshInterval() {
-		return c.index, nil
+		index := c.index
+		c.mu.Unlock()
+		return index, nil
 	}
-	index, err := c.fetchIndex(ctx)
-	// Stamp the attempt even on failure so a later Resources call
-	// serves the stale index inside its backoff window instead of
-	// immediately re-fetching a just-failed ATC.
+	// Stamp the attempt before the fetch so concurrent Refresh callers
+	// take the throttle branch instead of queueing a second doomed
+	// fetch behind this one; a failure keeps that stamp so a later
+	// Resources call serves the stale index inside its backoff window
+	// instead of immediately re-fetching a just-failed ATC.
 	c.lastAttemptAt = time.Now()
+	c.fetching = true
+	prev := append([]Resource(nil), c.index...)
+	c.mu.Unlock()
+
+	index, err := c.fetchIndex(ctx, prev)
+	c.mu.Lock()
+	c.fetching = false
+	c.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	c.index, c.fetchedAt = index, c.lastAttemptAt
+	c.mu.Lock()
+	c.index, c.fetchedAt = index, time.Now()
+	c.mu.Unlock()
 	return index, nil
 }
 
@@ -151,10 +201,12 @@ const fetchIndexWorkers = 8
 
 // fetchIndex lists the team's pipelines, then each pipeline's
 // resources, keeping only resources whose source points at a repo.
-// The per-pipeline listings run in parallel (bounded by
-// fetchIndexWorkers); results stay in pipeline order so the index is
-// deterministic.
-func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
+// prev is the caller's snapshot of the current index, taken under
+// c.mu before the fetch started. The per-pipeline listings run in
+// parallel (bounded by fetchIndexWorkers); results stay in pipeline
+// order so the index is deterministic.
+func (c *Client) fetchIndex(ctx context.Context,
+	prev []Resource) ([]Resource, error) {
 	start := time.Now()
 	var pipelines []struct {
 		Name string `json:"name"`
@@ -167,11 +219,12 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 	// per-pipeline listing failure below must carry its last-known
 	// resources into the new index rather than silently unregistering
 	// them — err stays nil, so a partial result would otherwise
-	// overwrite c.index with a silently smaller view. (Only called
-	// under c.mu, so reading c.index here is safe.)
-	prev := make(map[string][]Resource)
-	for _, r := range c.index {
-		prev[r.Pipeline] = append(prev[r.Pipeline], r)
+	// overwrite c.index with a silently smaller view. (Copied from
+	// c.index under c.mu by the caller before this fetch started, so
+	// no lock is needed here.)
+	prevByPipeline := make(map[string][]Resource)
+	for _, r := range prev {
+		prevByPipeline[r.Pipeline] = append(prevByPipeline[r.Pipeline], r)
 	}
 
 	results := make([][]Resource, len(pipelines))
@@ -201,8 +254,8 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 				// pipeline still exists — only its listing failed).
 				// Pipelines truly gone drop out via the pipeline list
 				// itself, not through this path.
-				results[i] = append(results[i], prev[p.Name]...)
-				if len(prev[p.Name]) == 0 {
+				results[i] = append(results[i], prevByPipeline[p.Name]...)
+				if len(prevByPipeline[p.Name]) == 0 {
 					// Nothing to carry over — the new index would
 					// silently lack this pipeline's resources.
 					lost[i] = p.Name

@@ -60,6 +60,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
+// walkResult is one memoized WalkBytes call in the per-cycle cache.
+type walkResult struct {
+	total     int64
+	truncated bool
+}
+
 // Hygiene runs the worker checks on one ticker. It is the
 // orchestrator only: everything the checks consume (config, procfs
 // view, state store, journal tracker, metric vecs, cross-check
@@ -374,6 +380,20 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// starve the "disabled" count of a kill-switched check.
 	// WD_SIG_<NAME>=off counts cycles{check,"disabled"} exactly
 	// like the old run gate.
+	// WalkBytes results memoize per cycle too — the disk-bloat scan
+	// and the writable-layer scan walk the same overlayfs snapshot
+	// and pod-volume dirs; the cache halves the IO on the disk that
+	// is already full. Lazy like the other once-snapshots: an idle
+	// cycle never walks anything.
+	walkCache := map[string]walkResult{}
+	walkOnce := func(root string) (int64, bool) {
+		if r, ok := walkCache[root]; ok {
+			return r.total, r.truncated
+		}
+		total, truncated := h.WalkBytes(root)
+		walkCache[root] = walkResult{total: total, truncated: truncated}
+		return total, truncated
+	}
 	*h.envCell = wdeps.CycleEnv{
 		Pods:         pods,
 		APIOK:        apiOK,
@@ -381,6 +401,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		TasksOnce:    tasksOnce,
 		PidsOnce:     pidsOnce,
 		JournalOnce:  journalOnce,
+		WalkOnce:     walkOnce,
 	}
 	checks.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// W10 node_agent_* gauges — one textfile per cycle carrying the

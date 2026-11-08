@@ -333,3 +333,37 @@ func TestClockWarpDetection(t *testing.T) {
 		t.Fatalf("early-tick warp not counted: events=%d want 2", f.r.warp.events)
 	}
 }
+
+// TestKmsgEmptyFirstOpenWritesNoCursor — a first-ever open onto an
+// EMPTY ring (or one with no parseable record) has no tail to park
+// at: writing the cursor at seq=0 would make the post-restart open
+// RESUME from 0 instead of re-priming the backlog gate on the then-
+// populated ring. The cursor is persisted only once a parsed record
+// anchors it; until then the session stays First-gated.
+func TestKmsgEmptyFirstOpenWritesNoCursor(t *testing.T) {
+	f := kfixture(t)
+	bootDir := filepath.Join(f.deps.ProcRoot, "sys", "kernel", "random")
+	_ = os.MkdirAll(bootDir, 0o755)
+	testutil.WriteFile(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
+	dev := f.deps.KmsgDevicePaths(f.deps.HostRoot)[0]
+	_ = os.MkdirAll(filepath.Dir(dev), 0o755)
+	// Ring holds only an UNPARSEABLE line — no cursor-eligible seq.
+	testutil.WriteFile(t, dev, "not-a-kmsg-record\n")
+	f.r.checkKernelDmesg()
+	if _, err := os.Stat(filepath.Join(f.deps.StateDir,
+		kmsgCursorFile)); !os.IsNotExist(err) {
+		t.Fatal("cursor written despite no parsed record on first open")
+	}
+	// The same session's next drain must still gate nothing: a fresh
+	// record arriving after the empty first open IS news.
+	testutil.WriteFile(t, dev, "not-a-kmsg-record\n6,7,2000,0;"+
+		"Out of memory: Killed process 7 (kubelet) total-vm:2kB\n")
+	f.r.checkKernelDmesg()
+	b, err := os.ReadFile(filepath.Join(f.deps.StateDir, kmsgCursorFile))
+	if err != nil {
+		t.Fatalf("cursor never anchored after parsed record: %v", err)
+	}
+	if !strings.Contains(string(b), "kmsg testboot 7 ") {
+		t.Fatalf("cursor=%q want seq 7", b)
+	}
+}

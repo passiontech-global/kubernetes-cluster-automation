@@ -250,9 +250,15 @@ func (r *Runner) drainKmsg(st *kernelScanState) bool {
 		// the position at the tail so only NEW records classify.
 		// (A valid resume cursor skips by seq instead — those old
 		// records were already processed pre-restart.)
+		// The cursor is only persisted once a parsed record anchors
+		// it (maxSeq>0): an empty ring on the first open has no tail
+		// to park at — writing seq=0 there would resume-from-0 after
+		// a restart instead of re-priming the (then-populated) ring.
 		sess.seq = maxSeq
-		r.writeKmsgCursor(&kmsgCursor{
-			mode: "kmsg", bootID: bootID, seq: sess.seq, usec: maxUsec})
+		if maxSeq > 0 {
+			r.writeKmsgCursor(&kmsgCursor{
+				mode: "kmsg", bootID: bootID, seq: sess.seq, usec: maxUsec})
+		}
 		return true
 	}
 	for _, rec := range recs {

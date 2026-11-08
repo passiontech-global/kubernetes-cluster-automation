@@ -43,8 +43,11 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 		res.backupAge = g.d.Cfg.Clock.Now().Unix() - mtime
 		res.backupValid = dumpValidMagic(newest)
 	}
-	if res.backupSeen && res.backupAge < int64(g.d.Cfg.BackupInterval.Seconds()) {
-		return // fresh enough — nothing to create
+	// A fresh-but-invalid dump (failed magic sniff) must not ride its
+	// age to the next interval — recreate now.
+	if res.backupSeen && res.backupAge < int64(g.d.Cfg.BackupInterval.Seconds()) &&
+		res.backupValid {
+		return // fresh and valid — nothing to create
 	}
 	if err := os.MkdirAll(g.d.Cfg.BackupDir, 0o750); err != nil {
 		note(fmt.Sprintf("backup-mkdir-fail: %v", err))

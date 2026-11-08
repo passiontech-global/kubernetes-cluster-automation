@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -133,18 +134,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
-			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			// WaitDelay bounds the post-exit/kill wait for I/O. It
-			// only works on goroutine-copied pipes (an io.Writer
-			// sink) — a StdoutPipe fd is only closed INSIDE Wait,
-			// which a blocked pre-Wait ReadAll never reaches. So
-			// stdout goes through the same capped sink as the
-			// combined runner: a daemonized grandchild inheriting
-			// the pipe holds EOF open after CommandContext kills
-			// the child, and WaitDelay forces the pipe closed so
-			// Run returns (ErrWaitDelay) instead of hanging past
+			// newCmd carries the group-kill Cancel and WaitDelay.
+			// WaitDelay only works on goroutine-copied pipes (an
+			// io.Writer sink) — a StdoutPipe fd is only closed
+			// INSIDE Wait, which a blocked pre-Wait ReadAll never
+			// reaches. So stdout goes through the same capped sink
+			// as the combined runner: a daemonized grandchild
+			// inheriting the pipe holds EOF open after the group
+			// kill, and WaitDelay forces the pipe closed so Run
+			// returns (ErrWaitDelay) instead of hanging past
 			// Config.Timeout.
-			cmd.WaitDelay = cmdWaitDelay
+			cmd := newCmd(ctx, argv)
 			var buf cappedBuffer
 			cmd.Stdout = &buf
 			// Run waits for the copy goroutine — buf is complete
@@ -269,6 +269,37 @@ func (r *Runner) argv(ns NS, name string, args []string) []string {
 // would index argv[0] on an empty slice and panic.
 var errEmptyArgv = errors.New("hostexec: empty argv")
 
+// newCmd is the package's one spawn shape: CommandContext (kill at
+// ctx expiry), the child in its OWN process group, and a Cancel that
+// SIGKILLs the whole group. CommandContext's default cancel kills
+// only the direct child — a grandchild (`sh -c 'sleep 30 & wait'`,
+// anything a probed script daemonizes) survives and keeps holding any
+// inherited pipe until WaitDelay expires, or forever if it detached.
+// Setpgid is applied by the fork before Start (no separate setpgid
+// dance), so the negative-pid kill is race-free. linux-only by
+// construction — this agent only builds for linux.
+func newCmd(ctx context.Context, argv []string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		// Negative pid = the process group. ESRCH means the group
+		// is already gone — report done so Wait surfaces ctx.Err()
+		// instead of the kill error.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
+			errors.Is(err, syscall.ESRCH) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = cmdWaitDelay
+	return cmd
+}
+
 // --- container-side package-level helpers ---
 //
 // Config.RunCmd/RunCmdCombined stay the seam for commands that want
@@ -315,11 +346,10 @@ func runCombined(ctx context.Context, env []string, argv []string) (string, erro
 	if len(argv) == 0 {
 		return "", errEmptyArgv
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := newCmd(ctx, argv)
 	if env != nil {
 		cmd.Env = env
 	}
-	cmd.WaitDelay = cmdWaitDelay
 	var buf cappedBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -350,14 +380,13 @@ func RunEnv(ctx context.Context, env []string, argv []string, stdin string) (std
 	if len(argv) == 0 {
 		return "", "", errEmptyArgv
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := newCmd(ctx, argv)
 	if env != nil {
 		cmd.Env = append(os.Environ(), env...)
 	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
-	cmd.WaitDelay = cmdWaitDelay
 	var out, serr cappedBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = &serr

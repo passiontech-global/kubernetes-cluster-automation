@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +98,35 @@ func TestClearSuspect(t *testing.T) {
 	s.ClearSuspect("conntrack-parse")
 	if !s.RateOK(SuspectBudgetPrefix+"conntrack-parse", time.Hour) {
 		t.Fatal("cleared budget must read as unspent")
+	}
+}
+
+// TestSuspectLogAtomicCheckSpend: SuspectLog's check+spend must be
+// one atomic step (RateTrySpend) — goroutines racing the same key in
+// one cadence window must not all pass the check-then-spend gap and
+// each emit a line. Exactly ONE line lands; the budget is spent once.
+func TestSuspectLogAtomicCheckSpend(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+
+	const racers = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s.SuspectLog("conntrack-parse", "deduped line", time.Hour)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := strings.Count(testutil.ReadFile(t, logFile), "deduped line"); got != 1 {
+		t.Fatalf("SuspectLog emitted %d lines under the race, want exactly 1", got)
+	}
+	if _, err := os.Stat(suspectBudgetPath(s, "conntrack-parse")); err != nil {
+		t.Fatalf("the single spend must leave the budget stamped: %v", err)
 	}
 }
 

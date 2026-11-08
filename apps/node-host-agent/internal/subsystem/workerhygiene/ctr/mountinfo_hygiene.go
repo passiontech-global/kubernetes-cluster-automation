@@ -94,6 +94,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 	seen := map[string]bool{} // marker ids still candidates
 	reaped := 0               // per-cycle umount blast radius
+	capLogged := false        // the reap-cap suspect line logs once per cycle
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 
 	for _, ln := range strings.Split(string(data), "\n") {
@@ -133,9 +134,13 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue // inside the 30m confirmation window
 			}
 			if reaped >= mountinfoMaxReapPerCycle {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: mountinfo-hygiene reap cap %d reached — remaining orphans drain next cycle",
-					mountinfoMaxReapPerCycle))
+				if !capLogged {
+					capLogged = true
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: mountinfo-hygiene reap cap %d reached — remaining orphans drain next cycle",
+						mountinfoMaxReapPerCycle))
+				}
+				continue // skip the pointless stat/glob/marker work
 			} else if c.umountOrphan(ctx, mount) {
 				reaped++
 				_ = os.Remove(filepath.Join(
@@ -165,9 +170,12 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue
 			}
 			if reaped >= mountinfoMaxReapPerCycle {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: mountinfo-hygiene reap cap %d reached — remaining orphans drain next cycle",
-					mountinfoMaxReapPerCycle))
+				if !capLogged {
+					capLogged = true
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: mountinfo-hygiene reap cap %d reached — remaining orphans drain next cycle",
+						mountinfoMaxReapPerCycle))
+				}
 				continue
 			}
 			if c.umountOrphan(ctx, mount) {

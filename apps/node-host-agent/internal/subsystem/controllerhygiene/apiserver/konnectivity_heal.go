@@ -81,11 +81,13 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 		d.State.AppendLog("suspect: konnectivity-server process not found — nothing to kill")
 		return
 	}
-	if !d.State.RateTrySpend(cdeps.FileRateKonnRestart, konnRestartBudget) {
-		return
-	}
 	switch d.Cfg.Sig13.Mode {
 	case cdeps.ModeEnforce:
+		// Check+spend atomically right before the action — off and
+		// dry-run modes must not burn the 30-minute restart budget.
+		if !d.State.RateTrySpend(cdeps.FileRateKonnRestart, konnRestartBudget) {
+			return
+		}
 		if err := d.Cfg.KillFn(pid, syscall.SIGKILL); err != nil {
 			d.State.AppendLogWarn(fmt.Sprintf(
 				"suspect: konnectivity-server kill pid=%d failed: %v", pid, err))

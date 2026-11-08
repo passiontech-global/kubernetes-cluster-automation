@@ -40,6 +40,16 @@ func (s *Store) appendFile(msg string) {
 	if s.LogFile == "" {
 		return
 	}
+	// The rotate decision + rename run under s.mu: two concurrent
+	// appends that both stat an oversized log can otherwise BOTH
+	// rename — the second rename throwing away the fresh file the
+	// first rotation just started (and its early lines) by replacing
+	// the .1 generation wholesale. The append itself stays outside
+	// the lock — O_APPEND makes each write atomic, and an append
+	// whose open raced the rename simply follows its fd into the
+	// rotated .1 file (no loss, one stray line in the old
+	// generation).
+	s.mu.Lock()
 	if fi, err := os.Stat(s.LogFile); err == nil &&
 		fi.Size() >= watchdogLogMaxBytes {
 		// Single-file rotation: <log> → <log>.1, then append to a
@@ -50,6 +60,7 @@ func (s *Store) appendFile(msg string) {
 				"file", s.LogFile, "error", rerr)
 		}
 	}
+	s.mu.Unlock()
 	f, err := os.OpenFile(s.LogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

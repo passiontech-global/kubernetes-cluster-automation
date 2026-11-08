@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -635,5 +636,189 @@ func TestSourceRepo(t *testing.T) {
 	}
 	if got := sourceRepo(nil); got != "" {
 		t.Fatalf("nil=%q want empty", got)
+	}
+}
+
+// slowATC serves stubRoutes() except the pipelines listing, which
+// blocks until release is closed — simulating an ATC that answers
+// slowly enough that, under the old lock-held fetch, every concurrent
+// caller would serialize behind it. inFlight counts requests currently inside the blocked pipelines
+// handler; blockFrom is the pipelines hit number the block starts at
+// (2 = only refetches block, the warm-up passes; 1 = cold-start block).
+func slowATC(t *testing.T, release chan struct{},
+	blockFrom int) (*httptest.Server, *atomic.Int64) {
+	var inFlight atomic.Int64
+	var pipelinesHits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/teams/main/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		if pipelinesHits.Add(1) >= int64(blockFrom) {
+			inFlight.Add(1)
+			defer inFlight.Add(-1)
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, pipelinesBody)
+	})
+	for path, body := range stubRoutes() {
+		if path == "/api/v1/teams/main/pipelines" {
+			continue
+		}
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, body)
+		})
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &inFlight
+}
+
+func TestResourcesConcurrentCallerServedStaleMidFetch(t *testing.T) {
+	release := make(chan struct{})
+	// Closed exactly once, on every exit path: t.Fatal must not leave
+	// the slow ATC handler blocking t.Cleanup(srv.Close).
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease()
+	srv, inFlight := slowATC(t, release, 2)
+	c := &Client{BaseURL: srv.URL, Team: "main", IndexTTL: time.Hour}
+
+	// Warm index, then age the stamps so the next Resources must
+	// refetch (TTL expired) but the fetch itself blocks at the ATC.
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.lastAttemptAt = c.fetchedAt
+	c.mu.Unlock()
+
+	// Start the slow refetch in the background.
+	bgRes := make(chan error, 1)
+	go func() {
+		_, err := c.Resources(context.Background())
+		bgRes <- err
+	}()
+	waitInFlight(t, inFlight)
+
+	// A concurrent caller must be served the stale index immediately —
+	// it must not block behind the in-flight fetch.
+	concIdx := make(chan int, 1)
+	concErr := make(chan error, 1)
+	go func() {
+		index, err := c.Resources(context.Background())
+		concIdx <- len(index)
+		concErr <- err
+	}()
+	select {
+	case n := <-concIdx:
+		if err := <-concErr; err != nil || n != 4 {
+			t.Fatalf("concurrent Resources index=%d err=%v want 4, nil", n, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Resources blocked behind in-flight fetch")
+	}
+
+	closeRelease() // unblock the background fetch before waiting on it
+	if err := <-bgRes; err != nil {
+		t.Fatalf("background Resources err=%v want nil", err)
+	}
+	c.mu.Lock()
+	got := len(c.index)
+	c.mu.Unlock()
+	if got != 4 {
+		t.Fatalf("published index=%d resources want 4", got)
+	}
+}
+
+func TestResourcesColdStartConcurrentCallerErrorsNotBlocks(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release) // never leave the slow ATC blocking cleanup
+	srv, inFlight := slowATC(t, release, 1)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	// No index yet: the first caller's fetch is in flight; a second
+	// caller has nothing stale to serve and must get the error
+	// immediately instead of waiting on the slow fetch.
+	go func() {
+		_, _ = c.Resources(context.Background())
+	}()
+	waitInFlight(t, inFlight)
+
+	concErr := make(chan error, 1)
+	go func() {
+		_, err := c.Resources(context.Background())
+		concErr <- err
+	}()
+	select {
+	case err := <-concErr:
+		if err == nil {
+			t.Fatal("cold-start concurrent Resources err=nil want error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cold-start concurrent Resources blocked behind in-flight fetch")
+	}
+
+}
+
+func TestRefreshConcurrentCallerThrottledMidFetch(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release) // never leave the slow ATC blocking cleanup
+	srv, inFlight := slowATC(t, release, 1)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	go func() {
+		_, _ = c.Refresh(context.Background())
+	}()
+	waitInFlight(t, inFlight)
+
+	// Throttled by the in-flight attempt stamp — returns immediately
+	// without its own fetch.
+	concErr := make(chan error, 1)
+	go func() {
+		_, err := c.Refresh(context.Background())
+		concErr <- err
+	}()
+	select {
+	case err := <-concErr:
+		if err != nil {
+			t.Fatalf("throttled Refresh err=%v want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Refresh blocked behind in-flight fetch (throttle missed)")
+	}
+
+}
+
+// waitInFlight blocks until a request is inside the slow ATC handler.
+func waitInFlight(t *testing.T, inFlight *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for inFlight.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if inFlight.Load() == 0 {
+		t.Fatal("fetch never reached the ATC")
+	}
+}
+
+func TestFetchIndexUsesCallerSnapshotForCarryover(t *testing.T) {
+	// fetchIndex must carry over failed pipelines' resources from the
+	// snapshot passed in, not from live client state — it now runs
+	// outside the mutex.
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stub.fail("/api/v1/teams/main/pipelines/p1/resources", 500)
+	c.mu.Lock()
+	snap := append([]Resource(nil), c.index...)
+	c.mu.Unlock()
+	index, err := c.fetchIndex(context.Background(), snap)
+	if err != nil {
+		t.Fatalf("fetchIndex err=%v want nil (carryover)", err)
+	}
+	if len(index) != 4 {
+		t.Fatalf("index=%d resources want 4 (p1 carried over)", len(index))
 	}
 }

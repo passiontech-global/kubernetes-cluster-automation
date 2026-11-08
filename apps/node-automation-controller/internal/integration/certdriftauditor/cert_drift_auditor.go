@@ -89,6 +89,16 @@ const (
 	// kubernetes-replicator to resync the copy (W8-NM2).
 	replicatedFromVersionAnno = "replicator.v1.mittwald.de/replicated-from-version"
 	replicationResyncCooldown = time.Hour
+	// tlsExpiryEmitWindow bounds TLSSecretDaysToExpiry cardinality:
+	// the gauge only opens a series for Secrets whose tls.crt expires
+	// within this window (or is already expired) — the same budget the
+	// downstream alert runs on ("fires <30d, pages <7d"). Far-future
+	// certs (the bulk of a cluster's TLS Secrets, and the churners in
+	// rotate-name setups) never open a series; one that rotates into
+	// the window starts one on the next sweep, and a re-rotation that
+	// pushes a tracked Secret back past the window lets the ledger
+	// prune its series again.
+	tlsExpiryEmitWindow = 30 * 24 * time.Hour
 	// linkerd-identity-issuer fingerprint tracking (W8-NM2): the
 	// issuer cert's SerialNumber is the fingerprint — a change means
 	// cert-manager rotated the issuer and linkerd-identity must
