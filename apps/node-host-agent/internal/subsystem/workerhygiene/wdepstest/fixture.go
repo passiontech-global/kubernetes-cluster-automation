@@ -252,6 +252,13 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		return nil
 	}
 	d.Cfg.Seams.Host.Clock.Set(func() time.Time { return f.Now })
+	// W15-NM2 seams: the wg dump exec is canned as an error (tests
+	// stub it with synthetic dump output) and the zombie clock rides
+	// the same fake time as the host clock.
+	d.Cfg.Seams.Cilium.WGDump = func(_ context.Context, _ *systemd.Client) (string, error) {
+		return "", fmt.Errorf("wdepstest: wg dump not stubbed")
+	}
+	d.Cfg.Seams.Cilium.MonotonicNow = func() time.Time { return f.Now }
 	d.Cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
 	d.Cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
 	d.Cfg.Seams.Probe.ProbeHTTP = func(_ context.Context, url string, _ time.Duration) error {

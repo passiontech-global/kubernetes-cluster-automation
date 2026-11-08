@@ -50,6 +50,20 @@ type DiskConfig struct {
 	// nsenter -m wrapped, so container-side /host paths would not
 	// resolve.
 	JournalVacuumDir string
+	// W15-K2b: WLayerSnapshotsDir is the ACTIVE overlayfs snapshotter
+	// root the writable-layer runaway scan walks (<id>/fs is the
+	// container's writable upperdir); CoredumpDir is the host
+	// systemd coredump store the W15-K2 coredump-storm guard sweeps
+	// once its filesystem crosses BloatWatermark. Both are /host-
+	// prefixed agent views like the wiring block.
+	WLayerSnapshotsDir string
+	CoredumpDir        string
+	// WLayerBloatThresholdBytes is the W15-K2b writable-layer scan's
+	// Warning threshold (default 5 GiB) — deliberately separate from
+	// BloatPodThresholdBytes, which stays the W6.3 eviction path's
+	// threshold so the plan's parity does not alter eviction
+	// behavior.
+	WLayerBloatThresholdBytes int64
 }
 
 func (d *DiskConfig) applyDefaults() {
@@ -92,6 +106,15 @@ func (d *DiskConfig) applyDefaults() {
 	if d.JournalVacuumDir == "" {
 		d.JournalVacuumDir = defaultJournalVacuumDir
 	}
+	if d.WLayerSnapshotsDir == "" {
+		d.WLayerSnapshotsDir = defaultWLayerSnapshotsDir
+	}
+	if d.CoredumpDir == "" {
+		d.CoredumpDir = defaultCoredumpDir
+	}
+	if d.WLayerBloatThresholdBytes <= 0 {
+		d.WLayerBloatThresholdBytes = wlayerBloatThresholdBytes
+	}
 }
 
 // envKnobs returns the disk-guard env rows — hostPath defaults
@@ -101,5 +124,11 @@ func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 		envx.StringKnob(envnames.EnvLocalPVQuotaDir, &d.LocalPVQuotaDir, ""),
 		envx.StringKnob(envnames.EnvHostRunDir, &d.HostRunDir,
 			hostPath("/run")),
+		envx.StringKnob(envnames.EnvWLayerSnapshotsDir, &d.WLayerSnapshotsDir,
+			hostPath("/run/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots")),
+		envx.StringKnob(envnames.EnvCoredumpDir, &d.CoredumpDir,
+			hostPath("/var/lib/systemd/coredump")),
+		envx.Int64Knob(envnames.EnvWLayerBloatThresholdBytes,
+			&d.WLayerBloatThresholdBytes, wlayerBloatThresholdBytes),
 	}
 }

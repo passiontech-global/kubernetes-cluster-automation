@@ -58,6 +58,10 @@ const (
 	// mtuDFCount/Wait — ping -c 2 -W 2 parity with the plan.
 	mtuDFCount = "2"
 	mtuDFWait  = "2"
+	// mtuCiliumWGMTUInvariant — W15-NM1: max MTU(cilium_wg0)
+	// relative to MTU(neb1); WireGuard overhead is 60B, keep 80B
+	// headroom per the plan's invariant.
+	mtuCiliumWGOverhead = 80
 	// mtuClampEvery rate-limits the iptables MSS clamp while
 	// latched — the -C check makes repeats harmless but each exec
 	// still costs a host fork.
@@ -231,6 +235,16 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 	if dev == "" {
 		dev = "neb1"
 	}
+	n.clampMSSOn(ctx, dev)
+	// W15-NM1: the double-encapsulation path also blackholes on the
+	// Cilium WireGuard dev — clamp it too whenever it exists.
+	n.clampMSSOn(ctx, "cilium_wg0")
+	n.checkCiliumWGMTUInvariant(ctx, dev)
+}
+
+// clampMSSOn idempotently installs the TCPMSS --clamp-mss-to-pmtu
+// rule on one interface (the -C existence probe keeps it idempotent).
+func (n *NetHealth) clampMSSOn(ctx context.Context, dev string) {
 	args := []string{"-t", "mangle", "-C", "POSTROUTING",
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
@@ -252,6 +266,45 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 	}
 	n.actions.WithLabelValues(mtuCheckName, "mss_clamp").Inc()
 	n.state.AppendLog("ACTION: nebula-mtu-blackhole clamped TCP MSS to PMTU on " + dev)
+}
+
+// sysfsMTU reads the MTU of one interface through the host sysfs
+// (HostRoot-parity with the other proc/sys reads in this package).
+func (n *NetHealth) sysfsMTU(dev string) (int, error) {
+	b, err := os.ReadFile(filepath.Join(n.cfg.HostRoot,
+		"sys", "class", "net", dev, "mtu"))
+	if err != nil {
+		return 0, err
+	}
+	var mtu int
+	if _, err := fmt.Sscanf(string(b), "%d", &mtu); err != nil {
+		return 0, err
+	}
+	return mtu, nil
+}
+
+// checkCiliumWGMTUInvariant enforces MTU(cilium_wg0) <= MTU(neb1)-80:
+// the WireGuard header costs ~60B on top of nebula's ~80B, so a
+// cilium_wg0 MTU sized against the underlay instead of the nebula
+// overlay blackholes every large inner packet. On violation it
+// clamps MSS on cilium_wg0 and warns (the plan's "warn + force the
+// MTU/MSS correction").
+func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string) {
+	cilMTU, err := n.sysfsMTU("cilium_wg0")
+	if err != nil {
+		return // no cilium_wg0 — nothing to check.
+	}
+	nebMTU, err := n.sysfsMTU(nebDev)
+	if err != nil {
+		return
+	}
+	if cilMTU <= nebMTU-mtuCiliumWGOverhead {
+		return
+	}
+	n.state.AppendLog(fmt.Sprintf(
+		"warn: cilium_wg0 MTU %d exceeds nebula invariant (nebula %s MTU %d, max %d) — clamping TCP MSS on cilium_wg0",
+		cilMTU, nebDev, nebMTU, nebMTU-mtuCiliumWGOverhead))
+	n.clampMSSOn(ctx, "cilium_wg0")
 }
 
 // writeMTUBHMetric emits node_agent_nebula_mtu_blackhole (0/1) to

@@ -62,6 +62,9 @@ type Config struct {
 	// pressure gauges.
 	FileNRFile   string
 	SockstatFile string
+	// MountinfoFile is /proc/1/mountinfo — the W15-R1c
+	// mountinfo-entries gauge (line count).
+	MountinfoFile string
 	// LocalPortRangeFile is /proc/sys/net/ipv4/ip_local_port_range
 	// — the ephemeral source-port pool width the W12-KR3 sockstat
 	// saturation ratio divides by; ProcNetTCP/ProcNetTCP6 are the
@@ -118,6 +121,12 @@ type Config struct {
 	// gauge.
 	ConntrackStatFile string
 	ARPTableFile      string
+	// ClocksourceCurrentFile is sysfs clocksource0's current_clocksource
+	// and ClocksourceAvailableFile its available_clocksource — the
+	// W15-K1 non-TSC drift gauge (and kvm-clock restore write) reads
+	// both every cycle.
+	ClocksourceCurrentFile   string
+	ClocksourceAvailableFile string
 	// CgroupMemUnits are the system.slice unit names whose
 	// memory.events feed the W7-H6 high/oom_kill counters.
 	CgroupMemUnits []string
@@ -230,6 +239,9 @@ func (c *Config) applyDefaults() {
 	if c.SockstatFile == "" {
 		c.SockstatFile = defaultSockstatFile
 	}
+	if c.MountinfoFile == "" {
+		c.MountinfoFile = defaultMountinfoFile
+	}
 	if c.LocalPortRangeFile == "" {
 		c.LocalPortRangeFile = defaultLocalPortRangeFile
 	}
@@ -306,6 +318,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ARPTableFile == "" {
 		c.ARPTableFile = defaultARPTableFile
+	}
+	if c.ClocksourceCurrentFile == "" {
+		c.ClocksourceCurrentFile = defaultClocksourceCurrentFile
+	}
+	if c.ClocksourceAvailableFile == "" {
+		c.ClocksourceAvailableFile = defaultClocksourceAvailableFile
 	}
 	if len(c.CgroupMemUnits) == 0 {
 		c.CgroupMemUnits = defaultCgroupMemUnits

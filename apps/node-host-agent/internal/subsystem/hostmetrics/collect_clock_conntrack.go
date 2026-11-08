@@ -21,6 +21,9 @@ const (
 	// W7 sources: H5 conntrack per-CPU stats + ARP table.
 	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
 	defaultARPTableFile      = "/proc/net/arp"
+	// W15-K1 clocksource sources (sysfs clocksource0).
+	defaultClocksourceCurrentFile   = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+	defaultClocksourceAvailableFile = "/sys/devices/system/clocksource/clocksource0/available_clocksource"
 )
 
 // --- H1: clock sync (adjtimex) ---
@@ -55,6 +58,82 @@ func (c *Collector) collectClock(ch chan<- prometheus.Metric) {
 	// Timex.Esterror is microseconds — export seconds.
 	ch <- prometheus.MustNewConstMetric(descClockEstErr,
 		prometheus.GaugeValue, float64(tx.Esterror)/1e6, c.cfg.NodeName)
+}
+
+// --- W15-K1: clocksource health ---
+
+var descClocksourceNonTSC = prometheus.NewDesc(
+	"node_host_agent_clocksource_non_tsc",
+	"Kernel clocksource drifted off a fast vDSO-capable clock (1 = current is not tsc/kvm-clock despite one being available, or a slow fallback like hpet/acpi_pm/jiffies is active).",
+	[]string{"node", "clocksource"}, nil)
+
+// slowClocksources are the known-degraded fallback clocks — active
+// use of one when a fast clock exists (or even when available
+// unreadable) is the gray-failure signal. jiffies is listed because
+// an active jiffies clocksource means the kernel never probed any
+// hardware clock at all.
+var slowClocksources = map[string]bool{
+	"hpet": true, "acpi_pm": true, "jiffies": true,
+}
+
+// fastClocksources are the healthy vDSO-capable clocks — tsc on bare
+// metal, kvm-clock on KVM guests. The drift gauge stays 0 only while
+// one of these is active.
+var fastClocksources = map[string]bool{
+	"tsc": true, "kvm-clock": true,
+}
+
+// collectClocksource emits node_host_agent_clocksource_non_tsc and,
+// when drifted, restores kvm-clock (W15-K1): on kernels where the
+// hypervisor offers kvm-clock, an hpet/acpi_pm current_clocksource
+// means the pvclock vDSO mapping was lost (host suspend/migration)
+// — writing "kvm-clock" back re-arms the fast vDSO path. Idempotent:
+// the write happens only when the drift condition holds.
+func (c *Collector) collectClocksource(ch chan<- prometheus.Metric) {
+	curB, err := os.ReadFile(c.cfg.ClocksourceCurrentFile)
+	if err != nil {
+		return // inconclusive — absent series, no fake 0
+	}
+	current := strings.TrimSpace(string(curB))
+	availB, availErr := os.ReadFile(c.cfg.ClocksourceAvailableFile)
+
+	var degraded bool
+	if availErr == nil {
+		available := map[string]bool{}
+		for _, f := range strings.Fields(string(availB)) {
+			available[f] = true
+		}
+		// Degraded only when a fast clock the hardware COULD offer
+		// is not the active one — an arch without tsc/kvm-clock in
+		// available (bare metal without invariant TSC, some ARM)
+		// stays 0, never a false positive, and an active kvm-clock
+		// (the desired clock on KVM guests) is healthy too.
+		degraded = !fastClocksources[current] &&
+			(available["tsc"] || available["kvm-clock"])
+		// Restore path: a slow fallback with kvm-clock available is
+		// exactly the lost-pvclock-vDSO drift — write it back.
+		if slowClocksources[current] && available["kvm-clock"] {
+			if err := os.WriteFile(c.cfg.ClocksourceCurrentFile,
+				[]byte("kvm-clock\n"), 0o644); err != nil {
+				logger().Warn("hostmetrics: clocksource kvm-clock restore write failed",
+					"path", c.cfg.ClocksourceCurrentFile, "error", err)
+			} else {
+				logger().Warn("hostmetrics: clocksource drifted to "+current+
+					" — restored kvm-clock", "path", c.cfg.ClocksourceCurrentFile)
+			}
+		}
+	} else {
+		// available unreadable: fall back to the current-clock name
+		// alone — an active hpet/acpi_pm/jiffies is degraded; tsc or
+		// anything unknown stays 0.
+		degraded = slowClocksources[current]
+	}
+	v := 0.0
+	if degraded {
+		v = 1
+	}
+	ch <- prometheus.MustNewConstMetric(descClocksourceNonTSC,
+		prometheus.GaugeValue, v, c.cfg.NodeName, current)
 }
 
 // --- H2: conntrack table pressure ---
@@ -96,6 +175,18 @@ var (
 		"node_nf_conntrack_stat_drop_total",
 		"Sum of the drop + early_drop columns across all CPU rows of /proc/net/stat/nf_conntrack.",
 		[]string{"node"}, nil)
+	// W15-K3: search_restart grows when a conntrack lookup has to
+	// restart because the entry moved between buckets (hash-chain
+	// contention under NAT-heavy workloads); invalid counts protocol
+	// checks that rejected a packet's conntrack state.
+	descCtSearchRestarts = prometheus.NewDesc(
+		"node_host_agent_conntrack_search_restarts_total",
+		"Sum of the search_restart column across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
+	descCtInvalid = prometheus.NewDesc(
+		"node_host_agent_conntrack_invalid_total",
+		"Sum of the invalid column across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
 )
 
 // collectConntrack emits entries/limit each only when its own file
@@ -123,7 +214,7 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 	// table fills; drop counts the packets conntrack refused. Both
 	// are cumulative kernel counters → CounterValue.
 	if st, ok := conntrackStatCounters(c.cfg.ConntrackStatFile,
-		"insert_failed", "drop", "early_drop"); ok {
+		"insert_failed", "drop", "early_drop", "search_restart", "invalid"); ok {
 		if v, found := st["insert_failed"]; found {
 			ch <- prometheus.MustNewConstMetric(descCtInsertFail,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
@@ -144,6 +235,17 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 		if dropOK {
 			ch <- prometheus.MustNewConstMetric(descCtStatDrop,
 				prometheus.CounterValue, float64(drops), c.cfg.NodeName)
+		}
+		// W15-K3: hash-chain contention and invalid-state counters —
+		// each emitted only when its own column exists (an older
+		// kernel missing the column → absent series, no fake 0).
+		if v, found := st["search_restart"]; found {
+			ch <- prometheus.MustNewConstMetric(descCtSearchRestarts,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+		if v, found := st["invalid"]; found {
+			ch <- prometheus.MustNewConstMetric(descCtInvalid,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
 		}
 	}
 }

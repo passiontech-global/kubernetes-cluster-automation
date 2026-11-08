@@ -13,6 +13,43 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
+// ---------- W15-K2a: coredump.conf.d disable drop-in ----------
+
+func TestGroupBaseCoredumpDropInConverges(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+	jd := hostRead(t, r, "/etc/systemd/coredump.conf.d/99-node-ops.conf")
+	if !strings.Contains(jd, "[Coredump]") ||
+		!strings.Contains(jd, "Storage=none") ||
+		!strings.Contains(jd, "ProcessSizeMax=0") {
+		t.Fatalf("bad coredump drop-in:\n%s", jd)
+	}
+	if len(sr.CallsMatching("systemctl daemon-reload")) != 1 {
+		t.Fatalf("daemon-reloads = %d, want 1 (drop-in changed)",
+			len(sr.CallsMatching("systemctl daemon-reload")))
+	}
+	// Second cycle: content identical → no rewrite, no reload.
+	c.groupBase()
+	if len(sr.CallsMatching("systemctl daemon-reload")) != 1 {
+		t.Fatalf("daemon-reload re-run despite identical drop-in")
+	}
+	if fi, err := os.Stat(filepath.Join(r.cfg.HostRoot,
+		"/etc/systemd/coredump.conf.d/99-node-ops.conf")); err != nil ||
+		fi.Mode().Perm() != 0o644 {
+		t.Fatalf("drop-in mode = %v want 0644", fi.Mode())
+	}
+}
+
 // ---------- self-stage /usr/local/bin/node-host-agent ----------
 
 func TestSelfStageBinaryCopiesAndIsIdempotent(t *testing.T) {

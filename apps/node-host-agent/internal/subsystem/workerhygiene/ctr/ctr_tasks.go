@@ -249,6 +249,13 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 		c.d.State.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
+		// W15-R1a: runc create mounts the bundle rootfs (overlay on
+		// the snapshot) before exec — RemoveAll on a wedged task dir
+		// then hits EBUSY and leaves the mountpoint leaking in the
+		// host mountinfo table. Lazily unmount it in the HOST mount
+		// namespace (systemd nsenter wrapper) first; failure is
+		// logged and the removal is still attempted (best effort).
+		c.lazyUnmountRootfs(ctx, d, id)
 		if err := os.RemoveAll(d); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
 		}
@@ -263,4 +270,34 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			wdeps.CheckCtrTasks, nil)
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "ok").Inc()
+}
+
+// lazyUnmountRootfs lazily unmounts <d>/rootfs in the HOST mount
+// namespace when it exists (W15-R1a) — the systemd exec seam runs
+// nsenter -m wrapped, so the umount path must be the host-side view
+// (the /host DaemonSet prefix stripped; fixture paths carry no
+// prefix and pass through verbatim). No systemd client → log-only,
+// the caller's RemoveAll still runs best-effort.
+func (c *CtrTasksCheck) lazyUnmountRootfs(ctx context.Context, d, id string) {
+	rootfs := filepath.Join(d, "rootfs")
+	if _, err := os.Stat(rootfs); err != nil {
+		return // not mounted (or already gone) — nothing to unmount
+	}
+	host := strings.TrimPrefix(rootfs, "/host")
+	if c.d.Cfg.Systemd == nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: ctr-tasks rootfs %s of task %.12s still mounted but no systemd client — skip umount",
+			host, id))
+		return
+	}
+	out, err := c.d.Cfg.Systemd.Exec(ctx, "umount", "-l", host)
+	if err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: ctr-tasks umount -l %s failed: %v (%s)",
+			host, err, strings.TrimSpace(out)))
+		return
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: umount -l rootfs of task %.12s - stale mount cleared before rm", id))
+	c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "umount_rootfs").Inc()
 }

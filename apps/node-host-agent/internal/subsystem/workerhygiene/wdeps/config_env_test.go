@@ -140,6 +140,24 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.CtrTaskRoot != "/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("identity CtrTaskRoot=%q", cfg.CtrTaskRoot)
 	}
+	// W15-K2b: the writable-layer Warning threshold defaults to 5 GiB
+	// (via the env knob's default) and must stay independent of the
+	// W6.3 eviction threshold (15 GiB) — parity with the wave plan
+	// without altering eviction behavior. BloatPodThresholdBytes has
+	// no env row; ApplyDefaults fills it exactly like New does.
+	if cfg.Disk.WLayerBloatThresholdBytes != int64(5)<<30 {
+		t.Fatalf("WLayerBloatThresholdBytes=%d want 5 GiB",
+			cfg.Disk.WLayerBloatThresholdBytes)
+	}
+	cfg.ApplyDefaults()
+	if cfg.Disk.BloatPodThresholdBytes != int64(15)<<30 {
+		t.Fatalf("BloatPodThresholdBytes=%d want 15 GiB",
+			cfg.Disk.BloatPodThresholdBytes)
+	}
+	if cfg.Disk.WLayerBloatThresholdBytes != int64(5)<<30 {
+		t.Fatalf("ApplyDefaults clobbered WLayerBloatThresholdBytes=%d",
+			cfg.Disk.WLayerBloatThresholdBytes)
+	}
 	if cfg.Runtime.CgroupRoot != "/sys/fs/cgroup" ||
 		cfg.Runtime.SessionsDir != "/run/systemd/sessions" {
 		t.Fatalf("identity Runtime paths: %+v", cfg.Runtime)

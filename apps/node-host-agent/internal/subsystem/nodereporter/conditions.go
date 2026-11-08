@@ -410,6 +410,19 @@ var conditionDefs = []conditionDef{
 		problemReason:  "KernelNetShimDegradedDetected",
 		stateKey:       hoststate.LatchKernelNetShim,
 	},
+	// --- Wave-15 latch→condition surface ---
+	{
+		// hostmetrics' W15-K1 clocksource guard — the kernel marked
+		// its clocksource unstable (kmsg evidence latch) or the
+		// collector found the current clocksource drifted off
+		// tsc/kvm-clock. A demoted clocksource degrades every vDSO
+		// clock_gettime and produces clock-skew false positives.
+		typ:            "ClocksourceUnstable",
+		defaultReason:  "ClocksourceStable",
+		defaultMessage: "kernel clocksource stable (tsc/kvm-clock, no instability records)",
+		problemReason:  "ClocksourceUnstableDetected",
+		stateKey:       hoststate.LatchClocksourceUnstable,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

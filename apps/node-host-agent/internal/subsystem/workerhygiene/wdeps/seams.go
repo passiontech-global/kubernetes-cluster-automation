@@ -247,6 +247,14 @@ type Cilium struct {
 	// UnixGet GETs path over a unix socket and returns the body —
 	// the cilium-dbg endpoint list replacement (35). Seam.
 	UnixGet func(ctx context.Context, socket, path string) ([]byte, error)
+	// WGDump returns the raw `wg show cilium_wg0 dump` output —
+	// the W15-NM2 zombie-peer evidence source (TSV: one interface
+	// line, then one 8-column line per peer). Seam (default execs
+	// wg through the systemd client).
+	WGDump func(ctx context.Context, sd *systemd.Client) (string, error)
+	// MonotonicNow supplies "now" to the per-peer zombie state
+	// machine — seam so tests drive cycles (default time.Now).
+	MonotonicNow func() time.Time
 }
 
 // WGAllowedIPs returns how many cilium_wg0 peers carry a real
@@ -263,6 +271,26 @@ func (s *Cilium) WGAllowedIPs(ctx context.Context, sd *systemd.Client) (int, err
 		return 0, err
 	}
 	return ParseWGAllowedIPs(out), nil
+}
+
+// WGDumpPeer is one parsed `wg show <dev> dump` peer row.
+type WGDumpPeer struct {
+	Pub        string // peer public key
+	AllowedIPs string // "(none)" when wiped
+	Handshake  int64  // latest handshake, unix seconds (0 = never)
+	RX         int64  // received bytes
+	TX         int64  // sent bytes
+}
+
+// WGDumpPeers returns the parsed cilium_wg0 dump peer rows — the
+// W15-NM2 zombie-peer read. Derived over the WGDump seam so tests
+// stub the one exec.
+func (s *Cilium) WGDumpPeers(ctx context.Context, sd *systemd.Client) ([]WGDumpPeer, error) {
+	out, err := s.WGDump(ctx, sd)
+	if err != nil {
+		return nil, err
+	}
+	return ParseWGDump(out), nil
 }
 
 // EncryptPeers returns the expected WG peer count — the agent's
@@ -467,5 +495,16 @@ func (s *Ctr) applyDefaults(c *Config) {
 func (s *Cilium) applyDefaults(_ *Config) {
 	if s.UnixGet == nil {
 		s.UnixGet = probee.UnixGet
+	}
+	if s.WGDump == nil {
+		s.WGDump = func(ctx context.Context, sd *systemd.Client) (string, error) {
+			if sd == nil {
+				return "", errors.New("no systemd client wired")
+			}
+			return sd.Exec(ctx, "wg", "show", "cilium_wg0", "dump")
+		}
+	}
+	if s.MonotonicNow == nil {
+		s.MonotonicNow = time.Now
 	}
 }

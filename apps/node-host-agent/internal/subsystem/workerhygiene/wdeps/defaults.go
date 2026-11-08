@@ -82,6 +82,12 @@ const (
 	k0sDiskBloatCriticalWatermark = 0.92
 	diskBloatPodThresholdBytes    = int64(15) << 30 // 15 GiB
 	diskBloatScanInterval         = 15 * time.Minute
+	// wlayerBloatThresholdBytes is the W15-K2b writable-layer
+	// Warning threshold, deliberately tighter than the W6.3
+	// eviction threshold above: the scan only raises a
+	// ContainerWritableLayerBloat event, so it can afford to fire
+	// before the node approaches DiskPressure.
+	wlayerBloatThresholdBytes = int64(5) << 30 // 5 GiB
 	// defaultPodLogsDir is the /var/log/pods host mount — the
 	// BUG-H8 pod-log attribution walk scans it.
 	defaultPodLogsDir = "/host/var/log/pods"
@@ -94,6 +100,13 @@ const (
 	localPVQuotaRatio       = 1.5
 	defaultHostRunDir       = "/run"
 	defaultJournalVacuumDir = "/run/log/journal"
+	// W15-K2 defaults: the active overlayfs snapshotter root the
+	// writable-layer scan walks (plan-mandated /run path — the env
+	// knob relocates it where a cluster keeps its snapshots), and
+	// the host systemd coredump store (both /host-prefixed agent
+	// views).
+	defaultWLayerSnapshotsDir = "/host/run/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots"
+	defaultCoredumpDir        = "/host/var/lib/systemd/coredump"
 
 	// guards domain (was dstate_scopes.go / psi_thrash.go /
 	// spegel_calico_netns.go / journald.go).

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,17 @@ var (
 	// CheckpointFn runs `PRAGMA wal_checkpoint(TRUNCATE)` —
 	// package seam (same role Config.xxxFn seams play elsewhere).
 	CheckpointFn = sqlite3WALCheckpoint
+	// LargeObjectsCooldown throttles the kine-table size scan —
+	// length(value) over live rows is a full-ish table read, keep it
+	// off the hot cycle path (last-kine-large-objects budget).
+	LargeObjectsCooldown = 15 * time.Minute
+	// LargeObjectWarnBytes is the per-key warn threshold: a single
+	// object above this is usually a ConfigMap/Secret sprawl accident
+	// and drags every watch that decodes it.
+	LargeObjectWarnBytes = int64(512 << 10) // 512 KiB
+	// LargeObjectsFn runs the top-N value-size query against the
+	// kine SQLite DB — package seam (same role CheckpointFn plays).
+	LargeObjectsFn = sqlite3KineLargeObjects
 )
 
 // ErrNoSQLite3 marks "host has no sqlite3 binary" — distinct
@@ -46,7 +58,20 @@ const (
 	// NodeKubeconfigCertExpiringSoon) key on these exact series.
 	kineDBBytesMetric  = "node_agent_kine_db_bytes"
 	kineWALBytesMetric = "node_agent_kine_wal_bytes"
+	// kineMaxObjectBytesMetric is the W15-CP2a gauge — the largest
+	// live (deleted=0) kine value in bytes (top-1 by length(value)).
+	kineMaxObjectBytesMetric = "node_agent_kine_max_object_bytes"
+
+	// KineLargeObjectsRateFile keys the 15m large-object scan
+	// cooldown under WatchdogStateDir.
+	KineLargeObjectsRateFile = "last-kine-large-objects"
 )
+
+// KineLargeObject is one row of the kine value-size scan.
+type KineLargeObject struct {
+	Name  string
+	Bytes int64
+}
 
 // StorageCheck is the W10-CP2 Kine store health check as a Check
 // — stateless: the checkpoint cadence lives in the
@@ -54,6 +79,11 @@ const (
 // entry: it rides cpFreezeCheck's ungated slot (check.go).
 type StorageCheck struct {
 	d *cdeps.Deps
+	// maxObjBytes/maxObjSeen cache the last successful large-object
+	// scan so the gauge persists in the textfile across the 15m
+	// cooldown windows (the textfile is rewritten every cycle).
+	maxObjBytes float64
+	maxObjSeen  bool
 }
 
 // Name returns the check label / log context.
@@ -77,6 +107,12 @@ func (c *StorageCheck) Run(ctx context.Context) {
 		c.emitKineStorageTextfile(0, 0, false)
 		c.d.Cycles.WithLabelValues(cdeps.CheckKineStorage, "absent").Inc()
 		return
+	}
+	// W15-CP2a: scan the kine table for oversized live values —
+	// SQLite backend only (the query targets the kine table),
+	// cooldown-throttled so it stays off the hot cycle path.
+	if _, err := os.Stat(c.kineDBPath()); err == nil {
+		c.runLargeObjectScan(ctx)
 	}
 	c.emitKineStorageTextfile(dbBytes, walBytes, true)
 	if walBytes <= WALCheckpointMinBytes {
@@ -199,8 +235,85 @@ func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
 	return nil
 }
 
-// emitKineStorageTextfile writes the two kine gauges — present=false
+// runLargeObjectScan runs the top-N kine value-size query under the
+// LargeObjectsCooldown budget. A successful scan refreshes the cached
+// gauge value and spends the cooldown; a failure spends it too (same
+// contract as the checkpoint path) EXCEPT ErrNoSQLite3, which leaves
+// the cooldown unspent so a later install still gets the scan. Every
+// key above LargeObjectWarnBytes is named in a warning log.
+func (c *StorageCheck) runLargeObjectScan(ctx context.Context) {
+	if !c.d.State.RateOK(KineLargeObjectsRateFile, LargeObjectsCooldown) {
+		return
+	}
+	rows, err := LargeObjectsFn(ctx, c.kineDBPath())
+	switch {
+	case errors.Is(err, ErrNoSQLite3):
+		return // cooldown unspent — retry once sqlite3 exists
+	case err != nil:
+		c.d.State.RateSpend(KineLargeObjectsRateFile)
+		c.d.State.AppendLogWarn(fmt.Sprintf(
+			"suspect: kine large-object scan failed: %v", err))
+		return
+	}
+	c.d.State.RateSpend(KineLargeObjectsRateFile)
+	if len(rows) > 0 {
+		c.maxObjBytes = float64(rows[0].Bytes) // rows are DESC by length
+	} else {
+		c.maxObjBytes = 0
+	}
+	c.maxObjSeen = true
+	for _, row := range rows {
+		if row.Bytes > LargeObjectWarnBytes {
+			c.d.State.AppendLogWarn(fmt.Sprintf(
+				"kine large object %.0fKiB > %dKiB: %s",
+				float64(row.Bytes)/(1<<10),
+				LargeObjectWarnBytes>>10, row.Name))
+		}
+	}
+}
+
+// sqlite3KineLargeObjects is the default LargeObjectsFn: run the
+// top-N value-size query through the host sqlite3 CLI.
+// busy_timeout=2000 caps lock waits at 2s — a busy DB just errors
+// out and retries after the cooldown. ErrNoSQLite3 when the binary
+// is absent so the caller skips without spending the cooldown.
+func sqlite3KineLargeObjects(ctx context.Context, dbPath string) ([]KineLargeObject, error) {
+	bin, err := exec.LookPath("sqlite3")
+	if err != nil {
+		return nil, ErrNoSQLite3
+	}
+	cctx, cancel := context.WithTimeout(ctx, kineCheckpointBudget)
+	defer cancel()
+	// Same env-scrub contract as sqlite3WALCheckpoint.
+	out, err := hostexec.RunCombinedEnv(cctx, cdeps.ScrubSystemdEnv(os.Environ()),
+		bin, dbPath, "PRAGMA busy_timeout=2000; SELECT name, length(value) "+
+			"FROM kine WHERE deleted = 0 ORDER BY length(value) DESC LIMIT 10;")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite3 kine large objects: %w: %s",
+			err, strings.TrimSpace(out))
+	}
+	var rows []KineLargeObject
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		name, size, ok := strings.Cut(line, "|")
+		if !ok {
+			continue
+		}
+		b, perr := strconv.ParseInt(strings.TrimSpace(size), 10, 64)
+		if perr != nil {
+			continue
+		}
+		rows = append(rows, KineLargeObject{Name: name, Bytes: b})
+	}
+	return rows, nil
+}
+
+// emitKineStorageTextfile writes the kine gauges — present=false
 // emits headers only so the series goes absent rather than stale.
+// The max-object gauge re-uses the value cached by the last
+// successful scan so it persists across the cooldown windows.
 func (c *StorageCheck) emitKineStorageTextfile(dbBytes, walBytes int64, present bool) {
 	var p promfile.Builder
 	if present {
@@ -219,6 +332,16 @@ func (c *StorageCheck) emitKineStorageTextfile(dbBytes, walBytes int64, present 
 		p.Header(kineWALBytesMetric,
 			"Size in bytes of the Kine SQLite WAL (state.db-wal); "+
 				"absent on non-SQLite backends.")
+	}
+	if present && c.maxObjSeen {
+		p.Gauge(kineMaxObjectBytesMetric,
+			"Largest live (deleted=0) Kine object value in bytes "+
+				"(top-1 by length(value)).",
+			c.maxObjBytes)
+	} else {
+		p.Header(kineMaxObjectBytesMetric,
+			"Largest live (deleted=0) Kine object value in bytes "+
+				"(top-1 by length(value)).")
 	}
 	c.d.WriteTextfileProm("node-agent-kine-storage.prom", p.String())
 }

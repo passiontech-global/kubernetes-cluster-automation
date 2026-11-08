@@ -8,6 +8,7 @@
 package wdeps
 
 import (
+	"path/filepath"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -69,6 +70,10 @@ type Config struct {
 	CtrTaskRoot       string // containerd runtime-v2 task dirs
 	SandboxCtlRoot    string // sandbox-controller shim dirs
 	K0sWorkerUnitFile string // presence gates all checks
+	// MountinfoFile is the HOST /proc/1/mountinfo the W15-R1b
+	// mountinfo-hygiene check reads — ProcRoot is the host /proc
+	// (hostPID), so the default derives from it.
+	MountinfoFile string
 	// Promoted wiring paths/ifaces — read by ≥2 domain packages
 	// (ctr + kubelet read CtrSocket, ctr + runtime read K0sDataDir,
 	// kubelet + runtime read PodsDir, cilium + guards + runtime read
@@ -154,6 +159,9 @@ func (c *Config) applyWiringDefaults() {
 	if c.ProcRoot == "" {
 		c.ProcRoot = defaultProcRoot
 	}
+	if c.MountinfoFile == "" {
+		c.MountinfoFile = filepath.Join(c.ProcRoot, "1", "mountinfo")
+	}
 	if c.CtrTaskRoot == "" {
 		c.CtrTaskRoot = defaultCtrTaskRoot
 	}
@@ -210,6 +218,8 @@ func (c *Config) wiringEnvKnobs(hostPath func(string) string) []envx.Knob {
 			hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
 		envx.StringKnob(envnames.EnvK0sWorkerUnit, &c.K0sWorkerUnitFile,
 			hostPath("/etc/systemd/system/k0sworker.service")),
+		envx.StringKnob(envnames.EnvMountinfoFile, &c.MountinfoFile,
+			hostPath("/proc/1/mountinfo")),
 		envx.StringKnob(envnames.EnvContainerdSocket, &c.CtrSocket,
 			hostPath("/run/k0s/containerd.sock")),
 		envx.StringKnob(envnames.EnvKubeletPodsDir, &c.PodsDir,

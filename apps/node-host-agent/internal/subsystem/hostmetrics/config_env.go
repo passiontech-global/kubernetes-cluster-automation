@@ -69,6 +69,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 			defaultConntrackStatFile),
 		envx.StringKnob(envnames.EnvArpTableFile, &cfg.ARPTableFile,
 			defaultARPTableFile),
+		// W15-K1 clocksource files.
+		envx.StringKnob(envnames.EnvClocksourceCurrentFile,
+			&cfg.ClocksourceCurrentFile, defaultClocksourceCurrentFile),
+		envx.StringKnob(envnames.EnvClocksourceAvailableFile,
+			&cfg.ClocksourceAvailableFile, defaultClocksourceAvailableFile),
 		envx.ListKnob(envnames.EnvCgroupMemUnits, &cfg.CgroupMemUnits),
 		// envList → default-closure: a set env wins verbatim (even an
 		// empty-looking parse is nil → defaults); unset falls back to

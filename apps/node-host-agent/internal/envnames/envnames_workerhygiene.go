@@ -51,4 +51,13 @@ const (
 	EnvSATokenMinTTLSec = "NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S"
 	EnvLocalPVQuotaDir  = "NODE_HOST_AGENT_LOCALPV_QUOTA_DIR"
 	EnvHostRunDir       = "NODE_HOST_AGENT_HOST_RUN_DIR"
+
+	// W15 rows: the mountinfo-hygiene check's /proc/1/mountinfo view,
+	// the W15-K2 writable-layer snapshot root and coredump dir, and
+	// the W15-K2b writable-layer Warning threshold (5 GiB default —
+	// separate from the 15 GiB W6.3 eviction threshold).
+	EnvMountinfoFile             = "NODE_HOST_AGENT_MOUNTINFO_FILE"
+	EnvWLayerSnapshotsDir        = "NODE_HOST_AGENT_WLAYER_SNAPSHOTS_DIR"
+	EnvCoredumpDir               = "NODE_HOST_AGENT_COREDUMP_DIR"
+	EnvWLayerBloatThresholdBytes = "NODE_HOST_AGENT_WLAYER_BLOAT_THRESHOLD_BYTES"
 )

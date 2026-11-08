@@ -82,6 +82,11 @@ const (
 	LatchConntrackPressure   = "conntrack-pressure"    // H2
 	LatchNebulaPMTUBlackhole = "nebula-pmtu-blackhole" // W9-NM1
 	LatchNebulaMTUBlackhole  = "nebula-mtu-blackhole"  // routeguard NM4
+	// LatchClocksourceUnstable is the W15-K1 evidence latch — the
+	// kernel marked its clocksource unstable (kmsg signature) or
+	// hostmetrics found the current clocksource drifted off tsc/
+	// kvm-clock (the collector's non-TSC gauge).
+	LatchClocksourceUnstable = "clocksource-unstable" // W15-K1
 
 	// controllerhygiene — the control-plane guards.
 	LatchAPIServerCacheStale    = "apiserver-cache-stale"    // sig13
@@ -247,6 +252,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchClockSkew, Owner: "hostmetrics"},
 	{Name: LatchCPUStealPressure, Owner: "hostmetrics"},
 	{Name: LatchPageAllocFailure, Owner: "hostmetrics"},
+	{Name: LatchClocksourceUnstable, Owner: "hostmetrics"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

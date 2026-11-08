@@ -384,6 +384,23 @@ func (r *Runner) notePageAllocFailure(msg string) {
 		"page allocation failure: "+detail)
 }
 
+// noteClocksourceUnstable latches state-clocksource-unstable on a
+// kernel clocksource-unstable kmsg record (W15-K1) — the kernel
+// demoted its clock (typically tsc) to a slower fallback, so every
+// vDSO clock_gettime degrades and clock-skew false positives follow.
+// Like the nodereporter soft-lockup evidence latches this is a
+// permanent-class latch: Enter is idempotent (repeat records only
+// refresh the mtime) and only the janitor's max-age reaper clears it
+// once the signature stops recurring.
+func (r *Runner) noteClocksourceUnstable(msg string) {
+	detail := msg
+	if len(detail) > 200 {
+		detail = detail[:200]
+	}
+	r.deps.Store.Enter(hoststate.LatchClocksourceUnstable,
+		"clocksource unstable: "+detail)
+}
+
 // noteConntrackFull counts table-full records and — bounded by
 // the rate budget + ceiling — doubles nf_conntrack_max so the table
 // stops dropping packets. A failed sysctl write is a Warn, never

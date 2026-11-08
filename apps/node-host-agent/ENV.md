@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them with the
-source location of the first reference (128 knobs referenced
+source location of the first reference (134 knobs referenced
 across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -134,10 +134,12 @@ subsystem has no env gate.
 ### `internal/subsystem/hostmetrics`
 
 - `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:70`
-- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:72`
+- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:77`
+- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:75`
+- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:73`
 - `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:68`
 - `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:65`
-- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:77`
+- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:82`
 - `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:55`
 - `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:56`
 - `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:63`
@@ -202,31 +204,35 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
 - `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
 - `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
-- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:213`
-- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:207`
+- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:223`
+- `NODE_HOST_AGENT_COREDUMP_DIR` — `config_disk.go:129`
+- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:215`
 - `NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD` — `config_pressure.go:44`
-- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:217`
-- `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:102`
-- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:227`
-- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:205`
-- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:204`
+- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:227`
+- `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:125`
+- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:237`
+- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:213`
+- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:212`
 - `NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE` — `config_teardown.go:38`
-- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:228`
+- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:238`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE` — `config_teardown.go:36`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE` — `config_teardown.go:37`
-- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:211`
-- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:215`
+- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:219`
+- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:225`
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
 - `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101`
 - `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `env.go:93`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
-- `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:101`
-- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:206`
-- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:209`
+- `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:124`
+- `NODE_HOST_AGENT_MOUNTINFO_FILE` — `config.go:221`
+- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:214`
+- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:217`
 - `NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S` — `config_runtime.go:57`
 - `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:55`
+- `NODE_HOST_AGENT_WLAYER_BLOAT_THRESHOLD_BYTES` — `config_disk.go:131`
+- `NODE_HOST_AGENT_WLAYER_SNAPSHOTS_DIR` — `config_disk.go:127`
 
 ## Contract envs (not `NODE_HOST_AGENT_*`)
 

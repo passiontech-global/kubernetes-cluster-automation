@@ -58,6 +58,7 @@ const (
 	CheckSubprocOOM        = "container-subproc-oom"       // subproc-oom living-dead OOM detector
 	CheckSATokenTTL        = "sa-token-ttl"                // sa-token-ttl projected SA token expiry guard
 	CheckKernelNetShim     = "kernel-net-shim-hygiene"     // kernel drops + containerd shim RSS guard
+	CheckMountinfo         = "mountinfo-hygiene"           // W15-R1 mountinfo bloat + orphan mount reaper
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

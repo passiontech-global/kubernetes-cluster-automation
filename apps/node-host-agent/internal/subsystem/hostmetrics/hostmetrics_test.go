@@ -55,9 +55,13 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		ConntrackMaxFile:   filepath.Join(root, "nf_conntrack_max"),
 		FileNRFile:         filepath.Join(root, "file-nr"),
 		SockstatFile:       filepath.Join(root, "sockstat"),
-		NetstatFile:        filepath.Join(root, "netstat"),
-		SNMPFile:           filepath.Join(root, "snmp"),
-		FilesystemTargets:  []string{"/fake/etc", "/fake/k0s"},
+		// Deliberately nonexistent (real /proc/1/mountinfo would leak
+		// live mount counts into the filefd-family scrapes); the
+		// W15-R1c test writes its own fake under root.
+		MountinfoFile:     filepath.Join(root, "mountinfo"),
+		NetstatFile:       filepath.Join(root, "netstat"),
+		SNMPFile:          filepath.Join(root, "snmp"),
+		FilesystemTargets: []string{"/fake/etc", "/fake/k0s"},
 		// Wave-2 sources under root — never the real /proc or /sys:
 		// an fdinfo/zombie sweep of the live host would leak real
 		// series into the scrape assertions.
@@ -221,8 +225,11 @@ func TestDescribe(t *testing.T) {
 	// + 6 guard descs (daemon fd ratio, containerd meta.db,
 	//   k0scontroller children RSS, fs bytes used ratio, eBPF
 	//   programs/maps counts).
-	if got := len(ch); got != 68 {
-		t.Fatalf("Describe emitted %d descs want 68", got)
+	// + 3 W15 descs (clocksource_non_tsc, conntrack
+	//   search_restarts/invalid counters).
+	// + 1 W15-R1c desc (mountinfo entries count).
+	if got := len(ch); got != 72 {
+		t.Fatalf("Describe emitted %d descs want 72", got)
 	}
 }
 

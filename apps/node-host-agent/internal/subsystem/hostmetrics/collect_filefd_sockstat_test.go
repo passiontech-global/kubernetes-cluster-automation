@@ -12,6 +12,27 @@ import (
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
 
+// --- W15-R1c: mountinfo entries gauge ---
+
+func TestMountinfoEntriesCount(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	// Absent file → no series (the collectFileFD rule: no fake 0).
+	if _, ok := metricValue(t, c,
+		"node_host_agent_mountinfo_entries_count", node); ok {
+		t.Fatal("mountinfo gauge emitted without the file")
+	}
+	testutil.WriteFile(t, cfg.MountinfoFile,
+		"36 35 98:0 / / rw - overlay x\n\n"+
+			"37 35 98:1 / /proc rw - proc x\n"+
+			"38 35 98:2 / /sys rw - sysfs x\n")
+	if v, ok := metricValue(t, c,
+		"node_host_agent_mountinfo_entries_count", node); !ok || v != 3 {
+		t.Fatalf("mountinfo entries=%v ok=%v want 3 (blank lines skipped)", v, ok)
+	}
+}
+
 func TestFileFDMetrics(t *testing.T) {
 	cfg, _ := fixture(t)
 	testutil.WriteFile(t, cfg.FileNRFile, "12345\t0\t9999999\n")

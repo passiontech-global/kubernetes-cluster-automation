@@ -53,6 +53,7 @@ func (h *Hygiene) initChecks() {
 	add(kubelet.NewSyncloop(d))   // wdeps.CheckSyncloop
 	add(kubelet.NewCtrsock(d))    // wdeps.CheckCtrSock
 	add(ctr.NewCtrTasks(d))       // wdeps.CheckCtrTasks
+	add(ctr.NewMountinfo(d))      // wdeps.CheckMountinfo
 	add(ctr.NewIngestGC(d))       // wdeps.CheckIngestGC
 	add(cilium.NewCilium(d))      // wdeps.CheckCilium
 	add(cilium.NewCiliumInit(d))  // wdeps.CheckCiliumInit

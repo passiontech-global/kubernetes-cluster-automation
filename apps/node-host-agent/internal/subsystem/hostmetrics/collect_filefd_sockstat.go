@@ -16,6 +16,10 @@ const (
 	// H6 fd/socket sources.
 	defaultFileNRFile   = "/proc/sys/fs/file-nr"
 	defaultSockstatFile = "/proc/1/net/sockstat"
+	// defaultMountinfoFile is the host mountinfo table the W15-R1c
+	// entries gauge counts (init-pid proc — hostPID makes it the
+	// host view).
+	defaultMountinfoFile = "/proc/1/mountinfo"
 	// Tcp-level grey-failure sources — the kernel TCP/IP stack
 	// counters node_exporter's netstat collector exposes. Read via
 	// /proc/1/net (host netns through the init pid — same path
@@ -88,6 +92,12 @@ var (
 		"node_tcp_close_wait_sockets",
 		"Sockets in TCP_CLOSE_WAIT (state 08) across /proc/1/net/tcp and /proc/1/net/tcp6.",
 		[]string{"node"}, nil)
+	// W15-R1c: the host mountinfo table size — a growing count is
+	// leaked mounts accumulating (task rootfs / pod volume leaks).
+	descMountinfoEntries = prometheus.NewDesc(
+		"node_host_agent_mountinfo_entries_count",
+		"Line count of /proc/1/mountinfo — host mount table entries.",
+		[]string{"node"}, nil)
 	// Kernel TCP/IP stack counters (netstat TcpExt + snmp Ip/Udp) —
 	// listen-queue overflows/drops present as accept flakes,
 	// syn-retrans and timeouts as connect flakes, reassembly fails
@@ -120,8 +130,22 @@ var (
 
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
 // max" (fields 0 and 2; the middle "unused" field is always ~0 on
-// modern kernels). Absent/malformed → no series.
+// modern kernels). Absent/malformed → no series. The W15-R1c
+// mountinfo line count rides the same family — emitted only when
+// the file reads (no fake 0 on an unreadable /proc view).
 func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
+	if f, err := os.Open(c.cfg.MountinfoFile); err == nil {
+		entries := 0.0
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			if strings.TrimSpace(sc.Text()) != "" {
+				entries++
+			}
+		}
+		_ = f.Close()
+		ch <- prometheus.MustNewConstMetric(descMountinfoEntries,
+			prometheus.GaugeValue, entries, c.cfg.NodeName)
+	}
 	data, err := os.ReadFile(c.cfg.FileNRFile)
 	if err != nil {
 		return
