@@ -65,6 +65,13 @@ const (
 	esStormMinFailing     = 5
 	esConnectHealMinAge   = 15 * time.Minute
 	esConnectHealCooldown = time.Hour
+	// esConnectSyncContainer is the sync-plane container inside the
+	// 1Password Connect pods — connect-api keeps answering reads from
+	// its local SQLite cache while a wedged connect-sync stops
+	// refreshing it, so pod-level readiness stays green on stale
+	// data. esConnectSyncRestartMax is the crashloop ceiling.
+	esConnectSyncContainer  = "connect-sync"
+	esConnectSyncRestartMax = 3
 )
 
 // esConnectNamespaces are where the 1Password Connect pod can live —
@@ -134,6 +141,16 @@ type externalSecretNudge struct {
 	// and the skeleton reaper re-reads the same Secret for a stuck
 	// ES, so identical ns/name lookups collapse to one Get each.
 	secretReads map[string]secretRead
+	// syncDegradedSince: "ns/pod" of a connect pod whose connect-sync
+	// container is degraded → first sweep it was observed — the
+	// persistence clock for the connect-sync auto-heal trigger (a
+	// pod back to healthy or gone re-arms the window).
+	syncDegradedSince state.FirstSeenLedger
+	// syncUnhealthyEmitted is the emitted-gauge ledger for
+	// node_automation_onepassword_connect_sync_unhealthy — a pod
+	// that recovers (or is replaced) gets its series deleted rather
+	// than pinning a stale "unhealthy" flag.
+	syncUnhealthyEmitted state.GaugeLedger[string]
 }
 
 // secretRead is one memoized Secrets().Get result — errors included

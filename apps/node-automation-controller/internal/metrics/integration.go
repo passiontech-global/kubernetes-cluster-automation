@@ -164,6 +164,17 @@ var ExternalSecretEmptyKey = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the named key of the ExternalSecret's target Secret is missing/empty/whitespace-only.",
 }, []string{"namespace", "name", "key"})
 
+// OnePasswordConnectSyncUnhealthy marks (1) each onepassword-connect
+// pod whose connect-sync container is unready or crashlooping while
+// connect-api keeps serving its stale SQLite cache — the stalled
+// sync plane externalsecret-nudge's connect auto-heal and the
+// onepassword-connect-sync-probe check both flag. Labels: pod
+// namespace + name.
+var OnePasswordConnectSyncUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_onepassword_connect_sync_unhealthy",
+	Help: "1 while the connect-sync container of this onepassword-connect pod is unready or crashlooping.",
+}, []string{"namespace", "pod"})
+
 // VeleroBackupStuck marks (1) each velero.io Backup wedged
 // InProgress or Deleting for over 6h (W10-ST6). Labels: namespace +
 // backup name.
@@ -216,6 +227,7 @@ func init() {
 		VeleroBSLUnavailable,
 		HelmSecretsPrunedTotal, DBBackupUnhealthy,
 		ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
+		OnePasswordConnectSyncUnhealthy,
 		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
 		VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy)
 }

@@ -91,6 +91,29 @@ var sprawlReportKinds = []struct {
 	{kube.GVRPolicyReport, "policyreport", "policyreports"},
 }
 
+// sprawlCIKinds is the census-only half: CI/CD CRs that pile up when
+// their operators run without retention (Tekton prune keep cap
+// unset, Shipwright succeededLimit/failedLimit absent). Counted into
+// the same api-object census but NEVER orphan-GC'd — these are owned
+// pipeline records, not per-revision reports, so reportOwnerGone
+// does not apply. An absent CRD (a cluster without Tekton or
+// Shipwright) skips silently.
+var sprawlCIKinds = []struct {
+	gvr      schema.GroupVersionResource
+	kind     string
+	resource string
+}{
+	{kube.GVRTektonPipelineRun, "pipelinerun", "pipelineruns"},
+	{kube.GVRTektonTaskRun, "taskrun", "taskruns"},
+	{kube.GVRShipwrightBuildRun, "buildrun", "buildruns"},
+}
+
+// sprawlCIMax is the CI/CD sprawl ceiling: past it the cluster's
+// build-system CR population alone is apiserver/Kine bloat — the
+// retention knobs (TektonConfig keep, Build succeededLimit/
+// failedLimit) are missing or too loose.
+const sprawlCIMax = 1000
+
 var (
 	// Per-namespace object count of the sprawl-prone resources.
 	apiObjectCountGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -197,6 +220,36 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		if orphaned > 0 {
 			objects.Find(fmt.Sprintf("%d orphaned %s", orphaned, rk.resource))
 		}
+	}
+
+	// CI/CD CR census — same per-namespace emission, no GC: the
+	// finding fires when the combined build-system CR population
+	// crosses the sprawl ceiling (retention knobs missing upstream).
+	ciTotal := 0
+	for _, rk := range sprawlCIKinds {
+		items, err := kube.ListAll(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.DynamicPage(p.Dyn.Resource(rk.gvr)))
+		switch {
+		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			continue // CRD absent on this cluster — skip silently
+		case err != nil:
+			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.resource, err)}
+		}
+		perNS := map[string]int{}
+		for i := range items {
+			perNS[items[i].GetNamespace()]++
+			ciTotal++
+		}
+		for ns, count := range perNS {
+			objects.Set(apiObjectCountGauge, float64(count),
+				rk.resource+"/"+ns, []string{rk.resource, ns})
+		}
+	}
+	if ciTotal > sprawlCIMax {
+		objects.Find(fmt.Sprintf(
+			"%d CI/CD CRs cluster-wide (>%d — Tekton/Shipwright retention missing)",
+			ciTotal, sprawlCIMax))
 	}
 
 	if err := p.pruneHelmSecrets(ctx, log, &objects, &helmRep); err != nil {

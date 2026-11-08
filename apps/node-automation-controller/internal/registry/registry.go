@@ -218,6 +218,10 @@ var Modules = []shared.Module{
 	{Name: "endpointslice-zone-starvation", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck}},
 	{Name: "linkerd-outlier-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck}},
 	{Name: "node-condition-sweeper", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck}},
+	{Name: "onepassword-connect-sync-probe", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameOnePasswordConnectSync, New: watchdogs.NewOnePasswordConnectSyncCheck}},
+	{Name: "linkerd-sidecar-oom-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdSidecarOOMGuard, New: nethealth.NewLinkerdSidecarOOMGuardCheck}},
+	{Name: "cilium-datapath-map-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumDatapathMapGuard, New: nethealth.NewCiliumDatapathMapGuardCheck}},
+	{Name: "observability-pipeline-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck}},
 	// The gated gitops check rows carry the section's only per-check
 	// registration gates; they close out the roster — the sweep
 	// order contract puts them after the always-on block.

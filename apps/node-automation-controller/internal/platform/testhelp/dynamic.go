@@ -125,6 +125,7 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "remediation.medik8s.io", Version: "v1alpha1", Kind: "NodeHealthCheck"},
 	{Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Kind: "SelfNodeRemediation"},
 	{Group: "fence-agents-remediation.medik8s.io", Version: "v1alpha1", Kind: "FenceAgentsRemediation"},
+	{Group: "nodemaintenance.medik8s.io", Version: "v1beta1", Kind: "NodeMaintenance"},
 
 	// tekton + shipwright (failedjobsjanitor buildruns,
 	// clusterhealthprobes' builds/shipwrightbuilds scans). The

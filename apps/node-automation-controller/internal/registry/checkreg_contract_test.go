@@ -108,6 +108,10 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"endpointslice-zone-starvation",
 		"linkerd-outlier-guard",
 		"node-condition-sweeper",
+		"onepassword-connect-sync-probe",
+		"linkerd-sidecar-oom-guard",
+		"cilium-datapath-map-guard",
+		"observability-pipeline-guard",
 		// The three gated gitops rows close out the roster —
 		// they landed after the always-on sequence when checks first
 		// became registry rows, so they stay last.

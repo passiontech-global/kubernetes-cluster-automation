@@ -144,6 +144,18 @@ var (
 		Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Resource: "selfnoderemediations"}
 	GVRFenceAgentsRemediation = schema.GroupVersionResource{
 		Group: "fence-agents-remediation.medik8s.io", Version: "v1alpha1", Resource: "fenceagentsremediations"}
+	// GVRNodeMaintenance is the nodemaintenance.medik8s.io/v1beta1
+	// NodeMaintenance CR (NMO) — the object a remediation requester
+	// creates to cordon+drain a node; it lives for exactly as long as
+	// the maintenance it requests (deleted on completion).
+	GVRNodeMaintenance = schema.GroupVersionResource{
+		Group: "nodemaintenance.medik8s.io", Version: "v1beta1", Resource: "nodemaintenances"}
+	// Medik8sRemediationGVRs is the maintenance-mutex's medik8s sweep
+	// set — a live SelfNodeRemediation/FenceAgentsRemediation means a
+	// fencing remediation is in flight on a node, a live
+	// NodeMaintenance means an operator-requested cordon+drain is.
+	Medik8sRemediationGVRs = []schema.GroupVersionResource{
+		GVRSelfNodeRemediation, GVRFenceAgentsRemediation, GVRNodeMaintenance}
 
 	// ---------------------------------------------------------------
 	// k0s autopilot (kube.MaintenanceActive, concourse-workdir-

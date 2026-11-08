@@ -55,6 +55,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -118,6 +119,12 @@ type volumeAttachmentCleaner struct {
 	// node that gets fenced after a long outage does not start a
 	// fresh 15m window — its death clock was already running.
 	nodeNotReadySince state.FirstSeenLedger
+	// stuckReadyFirstSeen: va name → first cycle the VA sat stuck
+	// Terminating on a Ready node with the volume provably unused
+	// (the fast-reboot leak — the node came back before the fencing
+	// taint ever landed). Two consecutive sightings are required to
+	// strip — same conservative convention as orphanFirstSeen.
+	stuckReadyFirstSeen state.FirstSeenLedger
 }
 
 // Setup registers the 5-minute sweep. The
@@ -198,6 +205,15 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// fenced node would re-issue the same failing List and each
 	// bump IncError.
 	livePods := map[string]podProbe{}
+	// nodePods caches the full per-node pod LIST for the Ready-node
+	// unused-volume gate (a pod's volumes — not just its count —
+	// must be inspected). pvcPVs/pvNames memoize the per-cycle PVC
+	// bound-volume and PV unique-name resolutions the gate's lookups
+	// make; every cache carries its error (fail closed) and meters
+	// it at most once.
+	nodePods := map[string]podListProbe{}
+	pvcPVs := map[string]pvcProbe{}
+	pvNames := map[string]pvProbe{}
 
 	// seenPrior records which of this cycle's missing-node sightings
 	// were already tracked BEFORE the pre-pass stamped them —
@@ -205,6 +221,14 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// previous cycle, not the stamp the pre-pass just wrote
 	// (Observe's 'seen' return is exactly that distinction).
 	seenPrior := map[string]bool{}
+
+	// stuckReadyNow/stuckReadyPrior mirror orphanNow/seenPrior for
+	// the Ready-node unused-volume gate: the sightings must be
+	// recorded BEFORE the sweep runs so a VA past the delete cap
+	// keeps its two-cycle window instead of re-arming every capped
+	// cycle.
+	stuckReadyNow := map[string]bool{}
+	stuckReadyPrior := map[string]bool{}
 
 	// Pre-pass: record this cycle's missing-node sightings for EVERY
 	// listed VA before any delete runs — a VA past the delete cap
@@ -247,6 +271,16 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			// audit's surface (C3b), untouched here.
 			if now.Sub(va.DeletionTimestamp.Time) >= vaStuckTerminatingAge {
 				targets = append(targets, &vaTarget{va: va, strip: true})
+				// Ready-node unused-volume sighting — recorded for
+				// every stuck VA (including capped ones) so the
+				// two-cycle window measures consecutive CYCLES, not
+				// consecutive confirmations.
+				if c.stuckReadyUnused(ctx, va, nodeByName, nodePods,
+					pvcPVs, pvNames, log) {
+					stuckReadyNow[va.Name] = true
+					_, stuckReadyPrior[va.Name] =
+						c.stuckReadyFirstSeen.Observe(va.Name, now)
+				}
 			}
 			continue
 		}
@@ -266,7 +300,8 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			if t.strip {
 				// The W4 wedged-detach gate — fails closed inside
 				// (a pod-list failure keeps the finalizers).
-				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName, livePods, now), nil
+				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName,
+					livePods, stuckReadyPrior, now), nil
 			}
 			if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
 				// missing_node: the node object is gone — the VA can
@@ -325,6 +360,12 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		log.Info("orphan sighting cleared — node reappeared or VA gone", "va", name)
 		return false
 	})
+	// Same re-arm for the Ready-node window — the gate stopped
+	// holding (pod rebound, volume re-attached, node unReady or the
+	// VA resolved) resets the two-cycle count.
+	c.stuckReadyFirstSeen.Prune(func(name string) bool {
+		return stuckReadyNow[name]
+	})
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", vaDeleteCap)
 	}
@@ -340,13 +381,24 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 // closed (the mount may still be real).
 func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
-	livePods map[string]podProbe, now time.Time) bool {
+	livePods map[string]podProbe, stuckReadyPrior map[string]bool,
+	now time.Time) bool {
 	log := logf.FromContext(ctx)
 	node, ok := nodeByName[va.Spec.NodeName]
 	if !ok {
 		return true // node object gone — nothing left to detach from
 	}
 	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+		// Ready-node unused-volume branch: the node rebooted back
+		// to Ready before attach-detach finished the detach, so the
+		// fencing taint never landed and the fenced gate below can
+		// never see it. The unused-volume gate itself was evaluated
+		// in the pre-pass — strip only after it held for >=2
+		// consecutive cycles (stuckReadyPrior), never on first
+		// sight.
+		if kube.NodeReady(node) && stuckReadyPrior[va.Name] {
+			return true
+		}
 		return false
 	}
 	if kube.NodeReady(node) {
@@ -527,4 +579,247 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 	}
 	cache[node] = podProbe{count: live}
 	return live, nil
+}
+
+// ---------------------------------------------------------------------------
+// Ready-node unused-volume gate (dangling VA after a fast reboot)
+// ---------------------------------------------------------------------------
+//
+// The stuck-terminating shapes above cover a node that is gone or
+// fenced; a THIRD shape survives both: the node force-rebooted and
+// came back Ready before attach-detach finished the detach — no
+// out-of-service taint ever landed, the VA still carries its
+// DeletionTimestamp, and the external-attacher's finalizer never
+// drains because the volume is already unmounted. Strip it only
+// when EVERY proof holds: the node is Ready and taint-free, no
+// non-terminal pod on the node mounts the PV (through any of its
+// claim volumes), and the volume is absent from BOTH
+// node.Status.VolumesInUse and node.Status.VolumesAttached — the
+// kubelet's own ledger saying the mount is gone. Every unverifiable
+// read fails closed.
+
+// podListProbe caches one node's full pod LIST for the cycle —
+// several VAs share a node and the ready-node gate inspects pod
+// volumes, not just counts. reported marks an already-metered err.
+type podListProbe struct {
+	pods     []corev1.Pod
+	err      error
+	reported bool
+}
+
+// pvcProbe caches one PVC's bound spec.volumeName for the cycle —
+// err is the GET failure (a NotFound caches volume="" — a claim
+// that does not exist cannot hold a mount).
+type pvcProbe struct {
+	volume   string
+	err      error
+	reported bool
+}
+
+// pvProbe caches one PV's resolved kubelet unique volume name for
+// the cycle: ok=false means the PV shape cannot be resolved to a
+// VolumesInUse entry (fail closed); unique=="" with ok=true means
+// the PV object itself is gone — provably unattached.
+type pvProbe struct {
+	unique   string
+	ok       bool
+	err      error
+	reported bool
+}
+
+// stuckReadyUnused reports whether a stuck-Terminating VA on a Ready
+// node provably holds a volume nothing uses — the fast-reboot leak
+// the fenced gate cannot see. True only when ALL hold: the node is
+// Ready and unfenced, no non-terminal pod on the node mounts the PV,
+// and the volume is absent from VolumesInUse AND VolumesAttached.
+func (c *volumeAttachmentCleaner) stuckReadyUnused(ctx context.Context,
+	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
+	nodePods map[string]podListProbe, pvcPVs map[string]pvcProbe,
+	pvNames map[string]pvProbe, log logr.Logger) bool {
+
+	node, ok := nodeByName[va.Spec.NodeName]
+	if !ok || !kube.NodeReady(node) ||
+		kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+		return false
+	}
+	pvName := ptr.Deref(va.Spec.Source.PersistentVolumeName, "")
+	if pvName == "" {
+		return false // inline volume source — unresolvable, keep
+	}
+	using, err := c.podsUsingVolume(ctx, nodePods, pvcPVs,
+		node.Name, pvName, log)
+	if err != nil || using > 0 {
+		return false
+	}
+	inUse, verifiable := c.volumeOnNode(ctx, pvNames, node, pvName, log)
+	return verifiable && !inUse
+}
+
+// podsUsingVolume counts the non-terminal pods on node that mount a
+// volume bound to pvName — via a PVC claim, a generic ephemeral
+// volume's generated claim, or a direct CSI volume whose driver and
+// volumeHandle match the PV's. Any lookup failure fails closed.
+func (c *volumeAttachmentCleaner) podsUsingVolume(ctx context.Context,
+	nodePods map[string]podListProbe, pvcPVs map[string]pvcProbe,
+	node, pvName string, log logr.Logger) (int, error) {
+
+	pr, ok := nodePods[node]
+	if !ok {
+		pods, err := kube.ListAll(ctx, metav1.ListOptions{
+			FieldSelector: "spec.nodeName=" + node,
+			Limit:         kube.DefaultListPageSize,
+		}, kube.Pods(c.cs, metav1.NamespaceAll))
+		if err != nil {
+			err = fmt.Errorf("list pods on %s: %w", node, err)
+		}
+		pr = podListProbe{pods: pods, err: err}
+		nodePods[node] = pr
+	}
+	if pr.err != nil {
+		if !pr.reported {
+			pr.reported = true
+			nodePods[node] = pr
+			metrics.IncError(c.queue)
+		}
+		log.Error(pr.err, "pod list failed — keeping stuck VA finalizers (fail closed)",
+			"node", node)
+		return 0, pr.err
+	}
+	using := 0
+	for i := range pr.pods {
+		p := &pr.pods[i]
+		if p.Spec.NodeName != node {
+			continue // fake clientsets ignore field selectors
+		}
+		if p.Status.Phase == corev1.PodSucceeded ||
+			p.Status.Phase == corev1.PodFailed {
+			continue // terminal — nobody is writing through it
+		}
+		for _, v := range p.Spec.Volumes {
+			claim := ""
+			switch {
+			case v.PersistentVolumeClaim != nil:
+				claim = v.PersistentVolumeClaim.ClaimName
+			case v.Ephemeral != nil:
+				// Generic ephemeral volumes materialize a PVC named
+				// <pod>-<volume> owned by the pod.
+				claim = p.Name + "-" + v.Name
+			}
+			if claim == "" {
+				continue
+			}
+			vol, err := c.pvcBoundVolume(ctx, pvcPVs,
+				p.Namespace, claim, log)
+			if err != nil {
+				return 0, err
+			}
+			if vol == pvName {
+				using++
+			}
+		}
+	}
+	return using, nil
+}
+
+// pvcBoundVolume resolves a PVC's spec.volumeName, memoized per
+// cycle. A NotFound reads as "" — the claim cannot hold a mount it
+// does not have; any other failure is fail-closed.
+func (c *volumeAttachmentCleaner) pvcBoundVolume(ctx context.Context,
+	pvcPVs map[string]pvcProbe, ns, name string,
+	log logr.Logger) (string, error) {
+
+	key := ns + "/" + name
+	pr, ok := pvcPVs[key]
+	if !ok {
+		pvc, err := c.cs.CoreV1().PersistentVolumeClaims(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			pr = pvcProbe{}
+		case err != nil:
+			pr = pvcProbe{err: fmt.Errorf("get pvc %s: %w", key, err)}
+		default:
+			pr = pvcProbe{volume: pvc.Spec.VolumeName}
+		}
+		pvcPVs[key] = pr
+	}
+	if pr.err != nil {
+		if !pr.reported {
+			pr.reported = true
+			pvcPVs[key] = pr
+			metrics.IncError(c.queue)
+		}
+		log.Error(pr.err, "pvc lookup failed — keeping stuck VA finalizers (fail closed)",
+			"pvc", key)
+		return "", pr.err
+	}
+	return pr.volume, nil
+}
+
+// volumeOnNode reports whether the PV's kubelet unique volume name
+// still appears in node.Status.VolumesInUse or VolumesAttached —
+// the kubelet's own confirmation the mount is gone. verifiable=false
+// means the PV cannot be resolved to a unique name (fail closed).
+func (c *volumeAttachmentCleaner) volumeOnNode(ctx context.Context,
+	pvNames map[string]pvProbe, node *corev1.Node, pvName string,
+	log logr.Logger) (inUse, verifiable bool) {
+
+	pr, ok := pvNames[pvName]
+	if !ok {
+		pv, err := c.cs.CoreV1().PersistentVolumes().
+			Get(ctx, pvName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			pr = pvProbe{ok: true} // PV gone — nothing can mount it
+		case err != nil:
+			pr = pvProbe{err: fmt.Errorf("get pv %s: %w", pvName, err)}
+		default:
+			unique, resolved := uniqueVolumeName(pv)
+			pr = pvProbe{unique: unique, ok: resolved}
+		}
+		pvNames[pvName] = pr
+	}
+	switch {
+	case pr.err != nil:
+		if !pr.reported {
+			pr.reported = true
+			pvNames[pvName] = pr
+			metrics.IncError(c.queue)
+		}
+		log.Error(pr.err, "pv lookup failed — keeping stuck VA finalizers (fail closed)",
+			"pv", pvName)
+		return false, false
+	case !pr.ok:
+		return false, false // unresolvable shape — cannot prove unused
+	case pr.unique == "":
+		return false, true // PV object gone — provably absent
+	}
+	for _, v := range node.Status.VolumesInUse {
+		if string(v) == pr.unique {
+			return true, true
+		}
+	}
+	for _, v := range node.Status.VolumesAttached {
+		if string(v.Name) == pr.unique {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// uniqueVolumeName computes the kubelet unique volume name attach-
+// detach records in node.Status.VolumesInUse / VolumesAttached: CSI
+// volumes are "kubernetes.io/csi/<driver>^<volumeHandle>", local
+// volumes "kubernetes.io/local-volume/<pv name>". ok=false means the
+// PV is a shape whose name cannot be computed here — the caller
+// fails closed rather than guess at a mount it cannot see.
+func uniqueVolumeName(pv *corev1.PersistentVolume) (string, bool) {
+	if csi := pv.Spec.PersistentVolumeSource.CSI; csi != nil {
+		return "kubernetes.io/csi/" + csi.Driver + "^" +
+			csi.VolumeHandle, true
+	}
+	if pv.Spec.PersistentVolumeSource.Local != nil {
+		return "kubernetes.io/local-volume/" + pv.Name, true
+	}
+	return "", false
 }

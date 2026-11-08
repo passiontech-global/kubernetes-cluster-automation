@@ -918,3 +918,107 @@ func TestExternalSecretSkeletonSecretKept(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// connect-sync stall detection + auto-heal
+// ---------------------------------------------------------------------------
+
+// connectPod builds a Running onepassword-connect pod declaring the
+// connect-api + connect-sync pair; syncReady/restarts shape the
+// connect-sync container status.
+func connectPod(ns, name string, age time.Duration,
+	syncReady bool, restarts int32) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "connect-api"}, {Name: "connect-sync"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "connect-api", Ready: true},
+				{Name: "connect-sync", Ready: syncReady,
+					RestartCount: restarts},
+			},
+		},
+	}
+}
+
+// A connect-sync container stuck !Ready (or crashlooping) while
+// connect-api stays Ready is a stalled sync plane: once the degraded
+// state persists >=15m the oldest connect pod is bounced — under the
+// same 1h cooldown — and the unhealthy gauge flags the pod meanwhile.
+func TestConnectPodHealOnSyncContainerUnhealthy(t *testing.T) {
+	oldPod := connectPod("external-secrets", "onepassword-connect-aaa",
+		48*time.Hour, false, 0)
+	newPod := connectPod("external-secrets", "onepassword-connect-bbb",
+		time.Hour, true, 0)
+	cs := kfake.NewSimpleClientset(oldPod, newPod)
+	dyn := esNudgeDynFake(cssObj("store", "True"))
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs:         cs,
+		dyn:        dyn,
+		storeReady: map[string]bool{},
+	}
+
+	// First sight: the pod is flagged unhealthy but NOT deleted —
+	// the persistence clock only starts now.
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-aaa", metav1.GetOptions{}); err != nil {
+		t.Fatalf("transient connect-sync degradation must not delete the pod: %v", err)
+	}
+	if !metrics.OnePasswordConnectSyncUnhealthy.
+		DeleteLabelValues("external-secrets", "onepassword-connect-aaa") {
+		t.Fatal("unhealthy gauge not emitted for the degraded pod")
+	}
+	metrics.OnePasswordConnectSyncUnhealthy.
+		WithLabelValues("external-secrets", "onepassword-connect-aaa").Set(1)
+
+	// The degradation has actually persisted past the 15m window —
+	// seed the ledger with the original sighting and re-run.
+	n.syncDegradedSince.Seed("external-secrets/onepassword-connect-aaa",
+		time.Now().Add(-20*time.Minute))
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-aaa", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("oldest degraded connect pod must be deleted, get err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-bbb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy connect pod must survive, get err=%v", err)
+	}
+}
+
+// A crashlooping connect-sync (RestartCount >= 3) is the same
+// degraded signature even when its Ready flag still reads true.
+func TestConnectSyncCrashloopCountsDegraded(t *testing.T) {
+	pod := connectPod("onepassword", "onepassword-connect-xyz",
+		time.Hour, true, esConnectSyncRestartMax)
+	if why, bad := connectSyncDegraded(pod); !bad {
+		t.Fatal("crashlooping connect-sync not flagged degraded")
+	} else if why != "connect-sync container crashlooping" {
+		t.Fatalf("why=%q", why)
+	}
+	// Healthy pair — not degraded.
+	ok := connectPod("onepassword", "onepassword-connect-ok",
+		time.Hour, true, 0)
+	if _, bad := connectSyncDegraded(ok); bad {
+		t.Fatal("healthy connect-sync flagged degraded")
+	}
+	// A pod without a connect-sync container is not ours to judge.
+	alien := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "connect-api"}}},
+	}
+	if _, bad := connectSyncDegraded(alien); bad {
+		t.Fatal("pod without connect-sync flagged degraded")
+	}
+}

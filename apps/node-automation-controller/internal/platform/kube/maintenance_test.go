@@ -3,6 +3,7 @@ package kube
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -162,6 +164,60 @@ func TestMaintenanceActiveShortCircuitsOnCordon(t *testing.T) {
 	}
 	if !held || why != "node w1 actively cordoned" {
 		t.Fatalf("held=%v why=%q, want the cordon evidence", held, why)
+	}
+}
+
+// Signal (d): live medik8s remediation objects hold the mutex — a
+// SelfNodeRemediation/FenceAgentsRemediation exists only while its
+// fencing is in flight and a non-Succeeded NodeMaintenance is a live
+// NMO cordon+drain. Succeeded NodeMaintenance records and absent
+// CRDs are no evidence; a nil dyn stays unverifiable.
+func TestMaintenanceActiveMedik8sRemediation(t *testing.T) {
+	remObj := func(gvr schema.GroupVersionResource, kind, ns, name, phase string) *unstructured.Unstructured {
+		u := testhelp.Unstructured(
+			gvr.GroupVersion().WithKind(kind), ns, name, nil)
+		if phase != "" {
+			u.Object["status"] = map[string]any{"phase": phase}
+		}
+		return u
+	}
+
+	if _, err := Medik8sRemediationEvidence(ctx, nil); err == nil {
+		t.Fatal("expected error when dyn is nil")
+	}
+	// No remediation objects — no signal, and MaintenanceActive
+	// stays clear through the whole signal chain.
+	cs := fake.NewSimpleClientset()
+	if held, why, err := MaintenanceActive(ctx, cs, maintenanceDynFake()); err != nil || held {
+		t.Fatalf("empty cluster: held=%v why=%q err=%v", held, why, err)
+	}
+	for _, tc := range []struct {
+		name string
+		objs []runtime.Object
+		held bool
+	}{
+		{"self-node-remediation", []runtime.Object{remObj(
+			GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr", "")}, true},
+		{"fence-agents-remediation", []runtime.Object{remObj(
+			GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far", "")}, true},
+		{"node-maintenance running", []runtime.Object{remObj(
+			GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Running")}, true},
+		{"node-maintenance succeeded", []runtime.Object{remObj(
+			GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Succeeded")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			held, why, err := MaintenanceActive(ctx, cs,
+				maintenanceDynFake(tc.objs...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held != tc.held {
+				t.Fatalf("held=%v (why %q), want %v", held, why, tc.held)
+			}
+			if tc.held && !strings.Contains(why, "medik8s remediation") {
+				t.Fatalf("why=%q, want medik8s remediation evidence", why)
+			}
+		})
 	}
 }
 
