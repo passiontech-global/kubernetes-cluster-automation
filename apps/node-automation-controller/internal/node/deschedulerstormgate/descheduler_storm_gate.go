@@ -337,13 +337,14 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 // ---------------------------------------------------------------------------
 
 // maintenanceEvidence returns the human-readable evidence strings for
-// maintenance-mutex signals (b) kured lock and (c) active autopilot
-// Plan — an empty slice means "no maintenance in flight". The checks
-// themselves are the shared mutex helpers (one implementation for
-// every deferring module): a missing kured DaemonSet or an absent
-// autopilot CRD is not evidence; real API failures — including a nil
-// dynamic client — are errors, so a "clear" verdict is never
-// computed on blind data.
+// maintenance-mutex signals (b) kured lock, (c) active autopilot
+// Plan and (d) in-flight medik8s remediations (SNR/FAR/
+// NodeMaintenance) — an empty slice means "no maintenance in
+// flight". The checks themselves are the shared mutex helpers (one
+// implementation for every deferring module): a missing kured
+// DaemonSet or an absent autopilot/medik8s CRD is not evidence;
+// real API failures — including a nil dynamic client — are errors,
+// so a "clear" verdict is never computed on blind data.
 func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]string, error) {
 	kured, err := kube.KuredLockEvidence(ctx, r.cs)
 	if err != nil {
@@ -353,7 +354,11 @@ func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	return append(kured, plans...), nil
+	remediations, err := kube.Medik8sRemediationEvidence(ctx, r.dyn)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(kured, plans...), remediations...), nil
 }
 
 // condStatusMap is the jqFilter projection: condition type -> status,

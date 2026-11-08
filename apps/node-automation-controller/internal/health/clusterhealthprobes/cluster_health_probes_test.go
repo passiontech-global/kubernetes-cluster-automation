@@ -57,7 +57,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 }
 
 // fleetCheckRegs mirrors the health section of registry.Modules —
-// the full 48-check roster in sweep order, which is what
+// the full 52-check roster in sweep order, which is what
 // SetupModules collects into Deps.CheckRegs on a default boot.
 // clusterhealthprobes may not import internal/registry (depguard:
 // domains never import the wiring layer — and a test-internal
@@ -112,6 +112,10 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck},
 		{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck},
 		{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck},
+		{Name: watchdogs.CheckNameOnePasswordConnectSync, New: watchdogs.NewOnePasswordConnectSyncCheck},
+		{Name: nethealth.CheckNameLinkerdSidecarOOMGuard, New: nethealth.NewLinkerdSidecarOOMGuardCheck},
+		{Name: nethealth.CheckNameCiliumDatapathMapGuard, New: nethealth.NewCiliumDatapathMapGuardCheck},
+		{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck},
 		// The three gated gitops rows close out the roster —
 		// the sweep-order contract keeps them after the always-on
 		// sequence.
@@ -233,13 +237,17 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// controller-lease-guard (KSM wedge scan), plus
 	// endpointslice-zone-starvation (zone-starvation) AND
 	// imagepull-secret-auditor (pullsecret-audit — its pull-secret census
-	// starts at AllPods) -> nineteen total.
+	// starts at AllPods), plus four more checks added since:
+	// onepassword-connect-sync-probe and linkerd-sidecar-oom-guard
+	// (pod censuses), cilium-datapath-map-guard and
+	// observability-pipeline-guard (their Prometheus queries die on
+	// the health-text stub) -> twenty-three total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and
 	// linkerd-outlier-guard bails on the failed Prometheus query
 	// before ever listing pods.)
-	if got := errCount() - before; got != 19 {
-		t.Fatalf("run errors delta = %v, want 19", got)
+	if got := errCount() - before; got != 23 {
+		t.Fatalf("run errors delta = %v, want 23", got)
 	}
 }
 

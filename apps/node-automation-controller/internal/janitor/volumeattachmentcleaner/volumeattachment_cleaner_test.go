@@ -574,3 +574,139 @@ func TestVACleanerStuckTerminatingTooYoung(t *testing.T) {
 		t.Fatal("finalizers stripped inside the grace window")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Ready-node unused-volume branch (fast-reboot dangling VA)
+// ---------------------------------------------------------------------------
+
+// vacPV builds a CSI PersistentVolume — its kubelet unique name is
+// "kubernetes.io/csi/<driver>^<handle>".
+func vacPV(name, driver, handle string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver: driver, VolumeHandle: handle}}}}
+}
+
+// vacClaim builds a PVC bound to volume.
+func vacClaim(ns, name, volume string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: volume}}
+}
+
+// vacPVCUser builds a Running pod on node that mounts claim.
+func vacPVCUser(ns, name, node, claim string) *corev1.Pod {
+	p := vacPod(ns, name, node, corev1.PodRunning)
+	p.Spec.Volumes = []corev1.Volume{{
+		Name: "data",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: claim}}}}
+	return p
+}
+
+// A VA stuck Terminating >=15m on a node that rebooted back to Ready
+// (no out-of-service taint) gets its finalizers stripped — but only
+// when the unused-volume proof held in TWO consecutive cycles: no
+// non-terminal pod mounts the PV and the volume is absent from
+// VolumesInUse/VolumesAttached.
+func TestVolumeAttachmentCleanerStuckReadyNodeUnused(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-stuck-ready", "w1", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	va.Spec.Source.PersistentVolumeName = ptr.To("pv-data")
+	node := vacNode("w1", corev1.ConditionTrue)
+	// The kubelet no longer reports the volume anywhere.
+	cs := fake.NewSimpleClientset(va, node, vacPV("pv-data", "csi.test", "vol-1"),
+		vacPod("infra", "agent", "w1", corev1.PodRunning))
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-stuck-ready", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizers stripped on the first sighting — needs 2 cycles")
+	}
+	if _, ok := c.stuckReadyFirstSeen.Seen("va-stuck-ready", time.Now()); !ok {
+		t.Fatal("ready-node sighting not recorded")
+	}
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err = cs.StorageV1().VolumeAttachments().Get(ctx, "va-stuck-ready", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) != 0 {
+		t.Fatalf("stuck finalizers not stripped on second sighting: %v", got.Finalizers)
+	}
+}
+
+// A non-terminal pod still mounting the PV (through its PVC) blocks
+// the strip — the mount may still be real.
+func TestVolumeAttachmentCleanerStuckReadyPodBlocks(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-blocked", "w1", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	va.Spec.Source.PersistentVolumeName = ptr.To("pv-data")
+	cs := fake.NewSimpleClientset(va, vacNode("w1", corev1.ConditionTrue),
+		vacPV("pv-data", "csi.test", "vol-1"),
+		vacClaim("data", "claim-a", "pv-data"),
+		vacPVCUser("data", "writer", "w1", "claim-a"))
+	c := newVACleaner(cs, func() time.Time { return now })
+	for i := 0; i < 3; i++ {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-blocked", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizers stripped while a pod still mounts the PV")
+	}
+}
+
+// A volume still present in node.Status.VolumesInUse blocks the
+// strip — the kubelet's own ledger says the mount may still exist.
+func TestVolumeAttachmentCleanerStuckReadyVolumeInUseBlocks(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-inuse", "w1", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	va.Spec.Source.PersistentVolumeName = ptr.To("pv-data")
+	node := vacNode("w1", corev1.ConditionTrue)
+	node.Status.VolumesInUse = []corev1.UniqueVolumeName{
+		"kubernetes.io/csi/csi.test^vol-1"}
+	node.Status.VolumesAttached = []corev1.AttachedVolume{{
+		Name: "kubernetes.io/csi/csi.test^vol-1", DevicePath: "/var/x"}}
+	cs := fake.NewSimpleClientset(va, node,
+		vacPV("pv-data", "csi.test", "vol-1"))
+	c := newVACleaner(cs, func() time.Time { return now })
+	for i := 0; i < 3; i++ {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-inuse", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizers stripped while the volume is still in-use on the node")
+	}
+}

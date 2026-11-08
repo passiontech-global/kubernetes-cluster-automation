@@ -121,6 +121,54 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 	return nil, nil
 }
 
+// Medik8sRemediationEvidence returns the evidence strings for mutex
+// signal (d) — "medik8s remediation <kind> <ns>/<name>" for every
+// SelfNodeRemediation, FenceAgentsRemediation and NodeMaintenance
+// object still live on the cluster. The remediation CRs are created
+// when a fencing/cordon+drain starts and deleted when it completes,
+// so any live object is a remediation actively working a node —
+// rebooting or rebalancing on top of an in-flight medik8s remediation
+// double-books the node (the same overlap class the kured lock
+// covers). Absent CRDs are not evidence; a NodeMaintenance whose
+// status.phase already reads Succeeded is a finished (soon-deleted)
+// record, not a live one. A real list failure is an error, and a nil
+// dynamic client is unverifiable — the mutex never reads "cannot
+// verify" as "clear".
+func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]string, error) {
+	if dyn == nil {
+		return nil, errors.New("no dynamic client — medik8s remediation check unverifiable (maintenance mutex)")
+	}
+	var ev []string
+	for _, gvr := range Medik8sRemediationGVRs {
+		items, err := dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		switch {
+		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			continue // CRD absent on this cluster — no signal
+		case err != nil:
+			return nil, fmt.Errorf("list %s (maintenance mutex): %w", gvr.Resource, err)
+		}
+		for i := range items.Items {
+			obj := &items.Items[i]
+			// A NodeMaintenance reporting Succeeded is the completed
+			// record awaiting deletion — the cordon+drain already
+			// finished, so it is not live evidence.
+			if gvr == GVRNodeMaintenance {
+				if phase, _, _ := unstructured.NestedString(
+					obj.Object, "status", "phase"); phase == "Succeeded" {
+					continue
+				}
+			}
+			kind := obj.GetKind()
+			if kind == "" {
+				kind = gvr.Resource
+			}
+			ev = append(ev, fmt.Sprintf("medik8s remediation %s %s in flight",
+				kind, obj.GetNamespace()+"/"+obj.GetName()))
+		}
+	}
+	return ev, nil
+}
+
 // MaintenanceActive reports whether deliberate cluster maintenance is
 // in flight — destructive remediation (pod deletes, leader kills)
 // defers while any signal holds:
@@ -132,23 +180,27 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 //	   deferring remediation forever (W8).
 //	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
 //	c) an autopilot Plan whose status.state is neither Schedulable
-//	   nor Completed — a k0s upgrade in flight.
+//	   nor Completed — a k0s upgrade in flight;
+//	d) a live medik8s remediation object — SelfNodeRemediation,
+//	   FenceAgentsRemediation or a non-Succeeded NodeMaintenance —
+//	   a fencing/cordon+drain already in flight.
 //
 // Returns (held, human-readable why, error). A missing kured
-// DaemonSet or absent autopilot CRD is not evidence; real API
+// DaemonSet or absent autopilot/medik8s CRD is not evidence; real API
 // failures are errors — "cannot verify" must never read as "clear".
-// A nil dynamic client makes the Plan check unverifiable and is
-// reported as an error, never silently skipped.
+// A nil dynamic client makes the Plan and remediation checks
+// unverifiable and is reported as an error, never silently skipped.
 //
 // The historical contract is the SHORT-CIRCUIT — the first held
 // signal answers the verdict without paying for (or failing on)
 // the later API reads. Signals evaluate in the canonical
-// a → b → c order and `why` is the first signal's first evidence.
+// a → b → c → d order and `why` is the first signal's first evidence.
 func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (bool, string, error) {
 	for _, signal := range []func(context.Context) ([]string, error){
 		func(ctx context.Context) ([]string, error) { return nodeCordonEvidence(ctx, cs) },
 		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
 		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
+		func(ctx context.Context) ([]string, error) { return Medik8sRemediationEvidence(ctx, dyn) },
 	} {
 		ev, err := signal(ctx)
 		if err != nil {
