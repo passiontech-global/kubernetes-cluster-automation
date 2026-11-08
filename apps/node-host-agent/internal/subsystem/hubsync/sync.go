@@ -33,12 +33,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	if err != nil {
 		s.cfg.Log.Error("hubsync: target aggregation failed", "error", err)
 		s.cycles.WithLabelValues("all", "parse_error").Inc()
-		// Nothing converged this cycle — every last-known target
-		// reads down until a good parse runs again, otherwise
-		// target_up{...}=1 stays stale forever.
-		for _, name := range s.lastTargets {
-			s.targetUp.WithLabelValues(name).Set(0)
-		}
+		s.markAllKnownDown()
 		return
 	}
 	if len(notes) > 0 {
@@ -94,13 +89,38 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		s.cfg.Log.Error("hubsync: local binary hash failed — cycle aborted",
 			"path", s.cfg.LocalBinary, "error", err)
 		s.cycles.WithLabelValues("all", "error").Inc()
-		for _, name := range s.lastTargets {
-			s.targetUp.WithLabelValues(name).Set(0)
-		}
+		s.markAllKnownDown()
 		return
 	}
 
-	var converged, skipped, failed int
+	converged, skipped, failed, complete := s.convergeTargets(ctx, targets, token, ca, localSum, guardOK)
+	if complete {
+		s.cfg.Log.Info("hubsync: converge cycle complete",
+			"targets", len(targets), "converged", converged,
+			"skipped", skipped, "failed", failed)
+	}
+}
+
+// markAllKnownDown reads every last-known target DOWN — the shared
+// abort path (parse failure, local-binary-hash failure): nothing
+// converged this cycle, so every last-known target must read down
+// until a good cycle runs again, otherwise target_up{...}=1 stays
+// stale forever.
+func (s *Syncer) markAllKnownDown() {
+	for _, name := range s.lastTargets {
+		s.targetUp.WithLabelValues(name).Set(0)
+	}
+}
+
+// convergeTargets runs syncTarget across the cycle's targets
+// serially — hub_converge used serial:1 — with the per-target
+// bookkeeping: the lease re-check (split-brain guard), the api-lb
+// skip when the guard credentials are unavailable, and the
+// up/last_success/counter updates. It reports the tally and whether
+// the loop ran to the end; a mid-cycle ctx cancellation or lost
+// lease aborts silently — no summary line, same as before the split.
+func (s *Syncer) convergeTargets(ctx context.Context, targets []Target,
+	token, ca []byte, localSum string, guardOK bool) (converged, skipped, failed int, complete bool) {
 	for i, t := range targets {
 		if ctx.Err() != nil {
 			return
@@ -137,9 +157,8 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		s.cfg.Log.Info("hubsync: target converged", "target", t.Name, "ip", t.IP)
 		converged++
 	}
-	s.cfg.Log.Info("hubsync: converge cycle complete",
-		"targets", len(targets), "converged", converged,
-		"skipped", skipped, "failed", failed)
+	complete = true
+	return
 }
 
 // pruneStaleTargets drops the metric series of targets no longer in
@@ -202,6 +221,94 @@ func (s *Syncer) guardCreds(ctx context.Context) (token, ca []byte, err error) {
 	return token, ca, nil
 }
 
+// remoteDir is one remote directory a role's preamble prepares:
+// mkdir -p, then a separate chmod when mode is set — the conn
+// prepends `sudo -n` to the raw string, so a `mkdir && chmod`
+// compound would only escalate mkdir (the chmod would fail EPERM for
+// a non-root ssh_user).
+type remoteDir struct {
+	path string
+	mode string // "" — mkdir only
+}
+
+// dirMirror is one local→remote config mirror — the syncDir argument
+// set for a role's extra source beyond the shared vars mirror.
+type dirMirror struct {
+	local  string
+	remote string
+	mode   string
+	keep   func(string) bool
+}
+
+// roleProfile is one target role's delta against the shared converge
+// script. hub_converge branched per role group inside one big play
+// (interdc vs api-lb); the deltas are data here, so syncTarget stays
+// a linear list of steps with no per-role branching.
+type roleProfile struct {
+	// dirs are the role's extra remote dirs, created after the
+	// shared vars dir — interdc-then-api-lb order, the branch order
+	// the shell module ran.
+	dirs []remoteDir
+	// mirrors are the role's extra local→remote mirrors, pushed
+	// after the shared vars mirror.
+	mirrors []dirMirror
+	// guard marks the api-lb role: the converge carries the
+	// api-backend-guard credentials into GuardDir.
+	guard bool
+}
+
+// roleProfileFor derives target t's converge profile: interdc nodes
+// additionally mirror the nebula certs (cert/key material only) into
+// RemoteCertsDir; api-lb nodes additionally prepare the 0700 guard
+// dir that will hold token+ca.crt.
+func roleProfileFor(cfg Config, t Target) roleProfile {
+	var p roleProfile
+	if t.InterDC {
+		p.dirs = append(p.dirs, remoteDir{path: cfg.RemoteCertsDir})
+		p.mirrors = append(p.mirrors, dirMirror{
+			local:  cfg.NebulaCertsDir,
+			remote: cfg.RemoteCertsDir,
+			mode:   "0644",
+			keep:   isCertArtifact,
+		})
+	}
+	if t.APILB {
+		p.dirs = append(p.dirs, remoteDir{path: cfg.GuardDir, mode: "0700"})
+		p.guard = true
+	}
+	return p
+}
+
+// prepareHost runs the converge preamble every target needs: the
+// passwordless-sudo gate, the shared vars dir, then the role's extra
+// dirs in profile order.
+func prepareHost(ctx context.Context, c Conn, cfg Config, t Target, p roleProfile) error {
+	// Passwordless-sudo gate first: hub_converge ran become:true, so
+	// a non-root ssh_user needs `sudo -n` for EVERY remote op (the
+	// conn wraps them) — fail fast with a clear error instead of a
+	// confusing mkdir/upload failure downstream.
+	if needsSudo(t.SSHUser) {
+		if _, err := c.Run(ctx, "true"); err != nil {
+			return fmt.Errorf("ssh user %q: sudo -n (passwordless sudo) required "+
+				"but unavailable: %w", t.SSHUser, err)
+		}
+	}
+	if _, err := c.Run(ctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteVarsDir)); err != nil {
+		return err
+	}
+	for _, d := range p.dirs {
+		if _, err := c.Run(ctx, "mkdir -p "+hostutil.ShellQuote(d.path)); err != nil {
+			return err
+		}
+		if d.mode != "" {
+			if _, err := c.Run(ctx, "chmod "+d.mode+" "+hostutil.ShellQuote(d.path)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // syncTarget converges one host over SSH: binary, vars (+ nebula
 // certs on interdc nodes), api-lb credentials, then the systemd unit
 // and its enable/restart action. localSum is the caller's hash of
@@ -218,35 +325,9 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Passwordless-sudo gate first: hub_converge ran become:true, so
-	// a non-root ssh_user needs `sudo -n` for EVERY remote op (the
-	// conn wraps them) — fail fast with a clear error instead of a
-	// confusing mkdir/upload failure downstream.
-	if needsSudo(t.SSHUser) {
-		if _, err := conn.Run(tctx, "true"); err != nil {
-			return fmt.Errorf("ssh user %q: sudo -n (passwordless sudo) required "+
-				"but unavailable: %w", t.SSHUser, err)
-		}
-	}
-
-	if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteVarsDir)); err != nil {
+	prof := roleProfileFor(cfg, t)
+	if err := prepareHost(tctx, conn, cfg, t, prof); err != nil {
 		return err
-	}
-	if t.InterDC {
-		if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteCertsDir)); err != nil {
-			return err
-		}
-	}
-	if t.APILB {
-		// Two separate runs: the conn prepends `sudo -n` to the raw
-		// string, so a `mkdir && chmod` compound would only escalate
-		// mkdir — the chmod would fail EPERM for non-root ssh_user.
-		if _, err := conn.Run(tctx, "mkdir -p "+hostutil.ShellQuote(cfg.GuardDir)); err != nil {
-			return err
-		}
-		if _, err := conn.Run(tctx, "chmod 0700 "+hostutil.ShellQuote(cfg.GuardDir)); err != nil {
-			return err
-		}
 	}
 
 	// a. binary — sha256 compare, stage + chmod + atomic mv on drift.
@@ -279,18 +360,20 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 			"target", t.Name, "path", cfg.RemoteBinary)
 	}
 
-	// b. config dirs — per-file sha256 gating, atomic writes.
+	// b. config dirs — per-file sha256 gating, atomic writes; the
+	// role's extra mirrors (interdc certs) follow the shared vars
+	// mirror, in profile order.
 	if err := s.syncDir(tctx, conn, cfg.VarsDir, cfg.RemoteVarsDir, "0644", nil); err != nil {
 		return err
 	}
-	if t.InterDC {
-		if err := s.syncDir(tctx, conn, cfg.NebulaCertsDir, cfg.RemoteCertsDir, "0644", isCertArtifact); err != nil {
+	for _, m := range prof.mirrors {
+		if err := s.syncDir(tctx, conn, m.local, m.remote, m.mode, m.keep); err != nil {
 			return err
 		}
 	}
 
 	// c. api-lb guard credentials.
-	if t.APILB && len(token) > 0 {
+	if prof.guard && len(token) > 0 {
 		if err := s.putIfChanged(tctx, conn, path.Join(cfg.GuardDir, "token"), token, "0600"); err != nil {
 			return err
 		}
