@@ -112,11 +112,15 @@ jobs:
               --include-path "apps/$APP/**" \
               --include-path "libs/hostkit/**" \
               "$last_tag..HEAD")
-            # --bumped-version prints exactly one bare version line
-            # ("0.2.0" / "0.2.0-rc.1+build.5"). Take it whole and parse
-            # it as semver — the old grep-anywhere extraction could
-            # match a version quoted inside a commit message.
+            # --bumped-version prints exactly one version line, but
+            # git-cliff >= 2.10 echoes it in the matched tag's shape:
+            # with "<app>/vX.Y.Z" tags that means
+            # "node-automation-controller/v0.33.0", not "0.33.0".
+            # Strip the tag prefix and leading "v", then parse the
+            # remainder as semver — the old grep-anywhere extraction
+            # could match a version quoted inside a commit message.
             cliff_ver="$(head -n 1 <<<"$bumped" | tr -d '[:space:]')"
+            cliff_ver="${cliff_ver##*/}"
             cliff_ver="${cliff_ver#v}"
             check_semver "v$cliff_ver" || {
               echo "::error::git-cliff --bumped-version returned non-semver '$cliff_ver'" >&2
