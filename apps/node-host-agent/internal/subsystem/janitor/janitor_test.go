@@ -492,3 +492,26 @@ func TestClockKernelNebulaLatchesAreKnown(t *testing.T) {
 		}
 	}
 }
+
+// --- Name + Run contracts ---
+
+func TestNameIdentifiesJanitor(t *testing.T) {
+	if got := jfixture(t).j.Name(); got != "janitor" {
+		t.Fatalf("Name()=%q want janitor", got)
+	}
+}
+
+func TestRunSweepsOnceThenReturnsOnCancelledContext(t *testing.T) {
+	e := jfixture(t)
+	// One stale latch past LatchMaxAge — the sweep must reap it.
+	latch := filepath.Join(e.state, "state-tinc-route-lost")
+	testutil.WriteFile(t, latch, "1\n")
+	ageFile(t, latch, 48*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cycle.Run executes the sweep once, then sees ctx done
+	e.j.Run(ctx)
+	if fileExists(latch) {
+		t.Fatal("Run must execute one sweep before honouring cancellation")
+	}
+}

@@ -274,14 +274,17 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		}
 	}
 	// wait_for parity: haproxy creates the socket at start.
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
 	for i := 0; i < 60; i++ {
 		if r.fileExists(socket) {
 			return
 		}
+		timer.Reset(500 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
 	c.err("api-lb-vm: haproxy admin socket did not appear in 30s — guard drains will fail",

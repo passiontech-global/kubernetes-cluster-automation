@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -304,5 +306,82 @@ func TestRunStartsWatcherOnce(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let a buggy second Poll start
 	if got := w.polls.Load(); got != 1 {
 		t.Fatalf("Poll started %d times, want 1", got)
+	}
+}
+
+// ---------- Reconciler identity + systemd verb wrappers ----------
+
+// TestReconcilerName — the supervisor registry key.
+func TestReconcilerName(t *testing.T) {
+	r := newTestReconciler(t, t.TempDir())
+	if got := r.Name(); got != "hostconfig" {
+		t.Fatalf("Name() = %q want hostconfig", got)
+	}
+}
+
+// TestIsActiveProbesAndFoldsProbeFailure — isActive reads
+// `systemctl is-active`: a clean "active" answer is true, and a
+// failing probe (dbus down, systemctl missing) folds to false —
+// unknown is not active.
+func TestIsActiveProbesAndFoldsProbeFailure(t *testing.T) {
+	sr := newScripted(map[string]string{
+		"systemctl is-active k0sworker.service": "active\n",
+	}, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: writeVarsDir(t, ""), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.isActive(context.Background(), "k0sworker.service") {
+		t.Fatal("is-active=active must read active")
+	}
+	sr.FailOn("systemctl is-active", nil)
+	if r.isActive(context.Background(), "k0sworker.service") {
+		t.Fatal("a failed probe must fold to inactive")
+	}
+}
+
+// TestStopReloadServiceActionsAndErrorAttribution — stop/reload run
+// their systemctl verb and count the action; a failed verb counts the
+// active cycle via noteErr, and a clean verb counts nothing.
+func TestStopReloadServiceActionsAndErrorAttribution(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	unit := "nebula@interdc.service"
+
+	r.stopService(context.Background(), unit)
+	r.reloadService(context.Background(), unit)
+	if len(sr.CallsMatching("systemctl stop "+unit)) != 1 {
+		t.Fatalf("stop verb not run: %v", sr.CallsMatching("systemctl"))
+	}
+	if len(sr.CallsMatching("systemctl reload "+unit)) != 1 {
+		t.Fatalf("reload verb not run: %v", sr.CallsMatching("systemctl"))
+	}
+	if got := promtestutil.ToFloat64(r.actions.WithLabelValues("stop:" + unit)); got != 1 {
+		t.Fatalf("actions{stop:%s} = %v want 1", unit, got)
+	}
+	if got := promtestutil.ToFloat64(r.actions.WithLabelValues("reload:" + unit)); got != 1 {
+		t.Fatalf("actions{reload:%s} = %v want 1", unit, got)
+	}
+	if c.errs != 0 {
+		t.Fatalf("errs = %d after clean verbs", c.errs)
+	}
+
+	// failed verbs still count their action AND the cycle error.
+	sr.FailOn("systemctl stop", nil)
+	sr.FailOn("systemctl reload", nil)
+	r.stopService(context.Background(), unit)
+	r.reloadService(context.Background(), unit)
+	if got := promtestutil.ToFloat64(r.actions.WithLabelValues("stop:" + unit)); got != 2 {
+		t.Fatalf("actions{stop:%s} = %v want 2 (failure must still count)", unit, got)
+	}
+	if c.errs != 2 {
+		t.Fatalf("errs = %d want 2 — failed verbs must count the cycle", c.errs)
 	}
 }

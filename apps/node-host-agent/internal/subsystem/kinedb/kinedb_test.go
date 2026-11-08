@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // fixture builds a KineDB with temp paths, a fake runner and a frozen
@@ -177,5 +179,109 @@ func TestDiscoverContainer(t *testing.T) {
 	pgb := k.PGBContainerName(context.Background())
 	if pgb != "kine-pgbouncer" {
 		t.Fatalf("pgb=%q want kine-pgbouncer", pgb)
+	}
+}
+
+func TestName(t *testing.T) {
+	k, _, _ := fixture(t, nil)
+	if k.Name() != "kinedb" {
+		t.Fatalf("Name=%q", k.Name())
+	}
+}
+
+func TestNewRegistrationConflict(t *testing.T) {
+	// A pre-registered duplicate gauge name must fail New via the
+	// RegisterAll rollback, not panic on duplicate registration.
+	cfg, _, _ := kdepstest.Config(t, nil)
+	reg := prometheus.NewRegistry()
+	if err := reg.Register(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_db_head_revision",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg, reg); err == nil {
+		t.Fatal("expected duplicate-registration error")
+	}
+}
+
+func TestRunLoopsRunUntilCancel(t *testing.T) {
+	cfg, fr, _ := kdepstest.Config(t, kdepstest.ProbeOKRules)
+	// Tiny cadences so every loop lands at least one cycle before the
+	// bounded wait elapses.
+	cfg.ProbeInterval = 5 * time.Millisecond
+	cfg.GuardInterval = 5 * time.Millisecond
+	cfg.MaintInterval = 5 * time.Millisecond
+	k, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { k.Run(ctx); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && fr.Count() == 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+	if fr.Count() == 0 {
+		t.Fatal("no cycle ran")
+	}
+	// The guard/maint cycles also fire — their runners share the fake.
+	if !fr.Ran("MAX(id)") && !fr.Ran("SHOW POOLS") {
+		t.Fatalf("unexpected commands: %s", fr.Joined())
+	}
+}
+
+func TestRunCountsPanics(t *testing.T) {
+	cfg, _, _ := kdepstest.Config(t, kdepstest.ProbeOKRules)
+	cfg.ProbeInterval = 5 * time.Millisecond
+	cfg.GuardInterval = 5 * time.Millisecond
+	cfg.MaintInterval = 5 * time.Millisecond
+	// A panicking runner must be recovered: cycles{loop,"panic"}
+	// increments and the loop keeps ticking until ctx is cancelled.
+	cfg.Run = func(context.Context, []string, []string, string) (string, error) {
+		panic("boom")
+	}
+	reg := prometheus.NewRegistry()
+	k, err := New(cfg, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { k.Run(ctx); close(done) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	panics := 0.0
+	for _, f := range fams {
+		if f.GetName() != "node_host_agent_kinedb_cycles_total" {
+			continue
+		}
+		for _, mf := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range mf.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["result"] == "panic" {
+				panics += mf.GetCounter().GetValue()
+			}
+		}
+	}
+	if panics == 0 {
+		t.Fatalf("no panic cycles counted (%v)", fams)
 	}
 }

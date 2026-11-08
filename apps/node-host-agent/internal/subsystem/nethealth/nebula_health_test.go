@@ -353,3 +353,20 @@ func TestTimesyncdLatchRestartGatedOnLiveUnit(t *testing.T) {
 		t.Fatal("enabled timesyncd not restarted under clock latch")
 	}
 }
+
+// --- minRTT parser ---
+
+func TestMinRTTKeepsSmallestSample(t *testing.T) {
+	out := "64 bytes from peer: icmp_seq=1 ttl=64 time=42.5 ms\n" +
+		"64 bytes from peer: icmp_seq=2 ttl=64 time=13.2 ms\n" +
+		"64 bytes from peer: icmp_seq=3 ttl=64 time=9.75 ms\n"
+	if got := minRTT(out); got != 9.75 {
+		t.Fatalf("minRTT=%v want 9.75", got)
+	}
+	if got := minRTT("no samples here"); got != -1.0 {
+		t.Fatalf("minRTT on no samples=%v want -1", got)
+	}
+	if got := minRTT("time=notanumber"); got != -1.0 {
+		t.Fatalf("minRTT on garbage sample=%v want -1", got)
+	}
+}

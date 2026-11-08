@@ -30,7 +30,10 @@
 // json.go holds the package's second piece: the `journalctl -o
 // json` line decode + since-cursor fetch shared by the NPD
 // journald-plugin ports (nodereporter's kubelet-stale monitor and
-// `journalctl -k` kernel fallback).
+// `journalctl -k` kernel fallback). integrity.go is the third: the
+// shared corrupt/empty probe + rotate/vacuum remedy behind the A5
+// journald-integrity checks (workerhygiene's JournaldCheck,
+// hostconfig's journaldIntegrity), parameterized per site.
 package journalwatch
 
 import (

@@ -19,8 +19,9 @@ import (
 // --- Guard d: feeder + remediate ---
 
 // runFeederSteps drives the feeder for n probe iterations. The real
-// loop uses time.After — tests step it through runFeederOnce-style
-// control: we expose the body via a context cancelled after n feeds.
+// loop waits on a hoisted Timer reset at end-of-work — tests step it
+// through runFeederOnce-style control: we expose the body via a
+// context cancelled after n feeds.
 func TestFeederGraceThenFail(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.Feeder.Enabled = true

@@ -151,6 +151,8 @@ WantedBy=multi-user.target
 		// must not leave the hub DNS-less (retries, like ansible until).
 		ok := false
 		var lastErr error
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
 		for i := 0; i < 15; i++ {
 			out, err := r.run(ctx, "dig", "@127.0.0.1", "ns1."+zone, "+short", "+time=3", "+tries=1")
 			lastErr = err
@@ -158,10 +160,11 @@ WantedBy=multi-user.target
 				ok = true
 				break
 			}
+			timer.Reset(2 * time.Second)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(2 * time.Second):
+			case <-timer.C:
 			}
 		}
 		if !ok {

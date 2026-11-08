@@ -89,6 +89,51 @@ func TestWriteCreatesDir(t *testing.T) {
 	}
 }
 
+// TestWriteLogged: the one logged writer every textfile emitter
+// routes through — success stays quiet, a failure reports exactly
+// once through the caller's channel AND still returns the error, and
+// a nil onFail degrades to plain Write.
+func TestWriteLogged(t *testing.T) {
+	dir := t.TempDir()
+	var fails []string
+	onFail := func(d, name string, err error) {
+		fails = append(fails, d+"/"+name+": "+err.Error())
+	}
+
+	if err := WriteLogged(dir, "kine-db.prom", []byte("m 1\n"), onFail); err != nil {
+		t.Fatal(err)
+	}
+	if len(fails) != 0 {
+		t.Fatalf("successful install must stay quiet: %v", fails)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "kine-db.prom")); err != nil ||
+		string(data) != "m 1\n" {
+		t.Fatalf("content=%q err=%v", data, err)
+	}
+
+	// A dir that is an existing FILE → MkdirAll fails → one report +
+	// the error propagates.
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := WriteLogged(notADir, "y.prom", []byte("m 2\n"), onFail)
+	if err == nil {
+		t.Fatal("unwritable dir want error")
+	}
+	if len(fails) != 1 || !strings.Contains(fails[0], notADir+"/y.prom") {
+		t.Fatalf("failure not reported exactly once: %v", fails)
+	}
+	if !strings.Contains(fails[0], err.Error()) {
+		t.Fatalf("reported failure %q must carry the returned error %v", fails[0], err)
+	}
+
+	// nil onFail degrades to plain Write (same error, no panic).
+	if err := WriteLogged(notADir, "z.prom", []byte("m 3\n"), nil); err == nil {
+		t.Fatal("nil onFail must still return the error")
+	}
+}
+
 func TestStagingNameEscapesPromGlob(t *testing.T) {
 	// node_exporter ingests every file matching *.prom — the
 	// staging name must never match, or a partially-written file

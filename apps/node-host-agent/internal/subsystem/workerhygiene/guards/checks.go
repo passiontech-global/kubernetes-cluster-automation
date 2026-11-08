@@ -1,7 +1,7 @@
 // checks.go — the guards-domain check constructors: the leak/storm
 // detectors (dstate_scopes.go), the PSI memory-thrash evictor
 // (psi_thrash.go), the journald-integrity probe (journald.go) and
-// the network datapath guards (spegel_calico_netns.go). The parent
+// the network datapath guards (spegel.go, calico.go, cni_netns.go). The parent
 // workerhygiene package wires them into its ordered dispatch list.
 package guards
 
@@ -27,7 +27,7 @@ func NewPSIThrash(d *wdeps.Deps) *PSIThrashCheck {
 
 // NewJournald returns the A5 journald-integrity probe.
 func NewJournald(d *wdeps.Deps) *JournaldCheck {
-	return &JournaldCheck{d: d}
+	return &JournaldCheck{d: d, ig: newJournaldIntegrity(d)}
 }
 
 // NewSpegel returns the W7-H4 spegel-mirror guard.

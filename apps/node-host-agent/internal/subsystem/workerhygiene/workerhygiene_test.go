@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
@@ -434,5 +435,36 @@ func TestPidsOnceErrorNotCached(t *testing.T) {
 		if len(p) != 1 || p[0] != 4242 {
 			t.Fatalf("pidsOnce after recovery = %v, want [4242]", p)
 		}
+	}
+}
+
+// --- ConfigFromEnv forwarding + Feeder accessor ---
+
+func TestConfigFromEnvForwardsToWdeps(t *testing.T) {
+	d := wdeps.EnvDeps{}
+	d.NodeName = "node-fwd"
+	d.WatchdogStateDir = "/tmp/fwd-watchdog"
+	d.JournalDirs = []string{"/var/log/journal"}
+	cs := k8sfake.NewSimpleClientset()
+	d.Client = cs
+	cfg := ConfigFromEnv(d)
+	if cfg.NodeName != "node-fwd" {
+		t.Fatalf("NodeName=%q want node-fwd", cfg.NodeName)
+	}
+	if cfg.Client != cs {
+		t.Fatal("Client not forwarded")
+	}
+	if cfg.Base.WatchdogStateDir != "/tmp/fwd-watchdog" {
+		t.Fatalf("Base.WatchdogStateDir=%q want /tmp/fwd-watchdog", cfg.Base.WatchdogStateDir)
+	}
+	if len(cfg.Journal.Dirs) != 1 || cfg.Journal.Dirs[0] != "/var/log/journal" {
+		t.Fatalf("Journal.Dirs=%v want [/var/log/journal]", cfg.Journal.Dirs)
+	}
+}
+
+func TestFeederAccessorReturnsWiredFeeder(t *testing.T) {
+	e := fixture(t)
+	if e.H.Feeder() == nil {
+		t.Fatal("Feeder() must return the wired kubelet watchdog feeder")
 	}
 }
