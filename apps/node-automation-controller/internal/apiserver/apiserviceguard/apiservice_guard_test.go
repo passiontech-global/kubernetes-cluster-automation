@@ -62,6 +62,23 @@ func asgExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, name string) bo
 	return err == nil
 }
 
+// asgUnblockCS seeds the unblock-sweep fixture: the protected
+// namespace, the Terminating namespace naming `group` (stuck for
+// nsAge), and the APIService backend Service plus one Pod per
+// podNames entry — every identity an explicit parameter so each
+// test shows which object it varies.
+func asgUnblockCS(ns, group, svcName, svcShort string, nsAge time.Duration, podNames ...string) *fake.Clientset {
+	objs := []runtime.Object{
+		testutil.Namespace(ns),
+		asgStuckNS("dying-ns", nsAge, group),
+		asgBackendSvc(ns, svcName, svcShort),
+	}
+	for _, name := range podNames {
+		objs = append(objs, asgBackendPod(ns, name, svcShort))
+	}
+	return fake.NewSimpleClientset(objs...)
+}
+
 func asgGuard(cs *fake.Clientset, dyn *dynamicfake.FakeDynamicClient) *apiServiceGuard {
 	return &apiServiceGuard{cs: cs, dyn: dyn, now: time.Now}
 }
@@ -164,12 +181,7 @@ func TestAPIServiceGuardUnavailableGauge(t *testing.T) {
 	dyn := asgDynFake(old, fresh, healthy)
 	g := asgGuard(cs, dyn)
 
-	metrics.APIServiceUnavailable.DeleteLabelValues(
-		"v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
-	t.Cleanup(func() {
-		metrics.APIServiceUnavailable.DeleteLabelValues(
-			"v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
-	})
+	testutil.CleanupMetric(t, metrics.APIServiceUnavailable, "v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -359,12 +371,7 @@ func asgPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
 	asgUnavailable(apiSvc, 30*time.Minute)
-	cs := fake.NewSimpleClientset(
-		testutil.Namespace("kube-system"),
-		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
-		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
-		asgBackendPod("kube-system", "ms-0", "metrics-server"),
-		asgBackendPod("kube-system", "ms-1", "metrics-server"))
+	cs := asgUnblockCS("kube-system", "metrics.k8s.io", "metrics-server", "metrics-server", 20*time.Minute, "ms-0", "ms-1")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -386,11 +393,7 @@ func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
 	asgUnavailable(apiSvc, 30*time.Minute)
-	cs := fake.NewSimpleClientset(
-		testutil.Namespace("kube-system"),
-		asgStuckNS("dying-ns", 5*time.Minute, "metrics.k8s.io"),
-		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
-		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	cs := asgUnblockCS("kube-system", "metrics.k8s.io", "metrics-server", "metrics-server", 5*time.Minute, "ms-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -407,11 +410,7 @@ func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
 	asgUnavailable(apiSvc, 30*time.Minute)
-	cs := fake.NewSimpleClientset(
-		testutil.Namespace("kube-system"),
-		asgStuckNS("dying-ns", 20*time.Minute, "other.example.com"),
-		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
-		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	cs := asgUnblockCS("kube-system", "other.example.com", "metrics-server", "metrics-server", 20*time.Minute, "ms-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -429,11 +428,7 @@ func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 func TestAPIServiceGuardUnblockNonProtectedSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.custom.example.com", "custom-ns", "custom-apiserver")
 	asgUnavailable(apiSvc, 30*time.Minute)
-	cs := fake.NewSimpleClientset(
-		testutil.Namespace("custom-ns"),
-		asgStuckNS("dying-ns", 20*time.Minute, "custom.example.com"),
-		asgBackendSvc("custom-ns", "custom-apiserver", "custom"),
-		asgBackendPod("custom-ns", "custom-0", "custom"))
+	cs := asgUnblockCS("custom-ns", "custom.example.com", "custom-apiserver", "custom", 20*time.Minute, "custom-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -450,11 +445,7 @@ func TestAPIServiceGuardUnblockNonProtectedSkipped(t *testing.T) {
 func TestAPIServiceGuardUnblockHealthySkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
 	asgUnavailable(apiSvc, 2*time.Minute) // under the 15m unblock gate
-	cs := fake.NewSimpleClientset(
-		testutil.Namespace("kube-system"),
-		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
-		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
-		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	cs := asgUnblockCS("kube-system", "metrics.k8s.io", "metrics-server", "metrics-server", 20*time.Minute, "ms-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 

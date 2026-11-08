@@ -10,6 +10,7 @@
 package datastore
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -46,10 +47,7 @@ func dbOpPod(ns, name string, created time.Time) *corev1.Pod {
 // the operator's oldest Running pod — the Deployment it was created
 // from spelled the short chart alias.
 func TestDBOperatorHealBouncesOperatorPod(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "pxc-master", "pxc-cluster")
 	base := time.Now()
 	sts := dbOpSTS("db", "pxc-cluster", "pxc-operator", 3)
 	svc := shMasterSvc("db", "pxc-master",
@@ -76,10 +74,7 @@ func TestDBOperatorHealBouncesOperatorPod(t *testing.T) {
 // matched spelling alone would find no pod. The alias group must
 // cover both directions.
 func TestDBOperatorHealFindsAliasedPodNames(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "pxc-master", "pxc-cluster")
 	base := time.Now()
 	sts := dbOpSTS("db", "pxc-cluster", "percona-xtradb-cluster-operator", 3)
 	svc := shMasterSvc("db", "pxc-master",
@@ -109,10 +104,7 @@ func TestDBOperatorHealFindsAliasedPodNames(t *testing.T) {
 // check still FAILs (detection is independent of remediation) but
 // the replacement operator pod lives.
 func TestDBOperatorHealCooldownSuppressesRepeat(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "pxc-master", "pxc-cluster")
 	base := time.Now()
 	sts := dbOpSTS("db", "pxc-cluster", "pxc-operator", 3)
 	svc := shMasterSvc("db", "pxc-master",
@@ -142,10 +134,7 @@ func TestDBOperatorHealCooldownSuppressesRepeat(t *testing.T) {
 // (deleting nothing is the safe posture: the operator may simply
 // be down, which is a different failure class than a wedged one).
 func TestDBOperatorHealNoRunningPodDefers(t *testing.T) {
-	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	t.Cleanup(func() {
-		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "pxc-master", "pxc-cluster")
-	})
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "pxc-master", "pxc-cluster")
 	base := time.Now()
 	sts := dbOpSTS("db", "pxc-cluster", "pxc-operator", 3)
 	svc := shMasterSvc("db", "pxc-master",

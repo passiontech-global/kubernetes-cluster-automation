@@ -7,6 +7,7 @@
 package datastore
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"strings"
 	"testing"
 	"time"
@@ -21,10 +22,7 @@ import (
 // series; when the wsrep evidence clears but the degraded quorum
 // still holds, the series must survive the ledger prune.
 func TestPerconaDegradedGaugeSurvivesPartialSignatureRecovery(t *testing.T) {
-	perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	t.Cleanup(func() {
-		perconaClusterDegradedGauge.DeleteLabelValues("PerconaXtraDBCluster", "db", "pxc-main")
-	})
+	testutil.CleanupMetric(t, perconaClusterDegradedGauge, "PerconaXtraDBCluster", "db", "pxc-main")
 	base := time.Now()
 
 	// wsrep evidence starts ABSENT: it emits on first sight (no

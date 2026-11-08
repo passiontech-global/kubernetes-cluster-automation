@@ -96,10 +96,7 @@ func TestScyllaUniformVersionsPass(t *testing.T) {
 // shard-average idles (~0.43) is the hot-partition skew: tracked on
 // first sight, gauge + FAIL past the 10m window.
 func TestScyllaShardImbalancePersists(t *testing.T) {
-	scyllaShardImbalanceGauge.DeleteLabelValues("scylla", "scylla-dc1-0")
-	t.Cleanup(func() {
-		scyllaShardImbalanceGauge.DeleteLabelValues("scylla", "scylla-dc1-0")
-	})
+	testutil.CleanupMetric(t, scyllaShardImbalanceGauge, "scylla", "scylla-dc1-0")
 	base := time.Now()
 	pod := scyllaMember("scylla", "scylla-dc1-0", "dc1", "10.0.0.1")
 	cs := fake.NewSimpleClientset(pod)
@@ -155,12 +152,7 @@ func TestScyllaUniformHotShardsNoSkew(t *testing.T) {
 // overload stall: first scrape only stores the baseline, second
 // scrape with +12 read timeouts emits the delta.
 func TestScyllaOverloadStallDelta(t *testing.T) {
-	scyllaOverloadStallGauge.DeleteLabelValues("scylla", "scylla-dc1-0",
-		scyllaOverloadReasonReadTimeouts)
-	t.Cleanup(func() {
-		scyllaOverloadStallGauge.DeleteLabelValues("scylla", "scylla-dc1-0",
-			scyllaOverloadReasonReadTimeouts)
-	})
+	testutil.CleanupMetric(t, scyllaOverloadStallGauge, "scylla", "scylla-dc1-0", scyllaOverloadReasonReadTimeouts)
 	pod := scyllaMember("scylla", "scylla-dc1-0", "dc1", "10.0.0.1")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)

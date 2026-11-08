@@ -5,6 +5,7 @@
 package nethealth
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -194,10 +195,7 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	linkerdEndpointDesyncGauge.DeleteLabelValues("app", "resume-svc")
-	t.Cleanup(func() {
-		linkerdEndpointDesyncGauge.DeleteLabelValues("app", "resume-svc")
-	})
+	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "resume-svc")
 
 	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("persisted desync must fail on the first post-restart sweep")

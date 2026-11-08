@@ -10,6 +10,18 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// CleanupMetric pre-deletes and registers a t.Cleanup re-deleting
+// labelValues off collector — the verbatim immediate
+// DeleteLabelValues + t.Cleanup pair every gauge-emitting test
+// hand-rolled, so a series leaked by one test never bleeds into
+// another's registry read.
+func CleanupMetric(t *testing.T, c interface {
+	DeleteLabelValues(labelValues ...string) bool
+}, labelValues ...string) {
+	c.DeleteLabelValues(labelValues...)
+	t.Cleanup(func() { c.DeleteLabelValues(labelValues...) })
+}
+
 // ReconcileErrorCount reads the native error counter for module `name`
 // off the controller-runtime registry (the one internal/metrics.init
 // registers into) — end-to-end proof an error path calls IncError.

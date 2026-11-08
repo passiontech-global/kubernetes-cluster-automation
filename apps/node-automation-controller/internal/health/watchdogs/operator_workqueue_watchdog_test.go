@@ -4,6 +4,7 @@
 package watchdogs
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -96,10 +97,7 @@ func TestOperatorStuckPredicateShapes(t *testing.T) {
 // Lease while a GitRepository sits unreconciled past the window →
 // frozen gauge + leader pod deleted.
 func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "source-controller", kcmReasonStaleGen)
 	base := time.Now()
 	leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "flux-system", Name: "source-controller-7d9f",
@@ -132,10 +130,7 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 // A cert-manager Certificate never reconciled (no status.conditions)
 // freezes under the no_status_conditions reason.
 func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cert-manager", opReasonNoConditions)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		// cert-manager elects leaders in kube-system (helm chart
@@ -161,10 +156,7 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 // the in-RAM ledger is empty (operator restarted) but the annotation
 // proves the signature held continuously.
 func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cert-manager", opReasonNoConditions)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cert-manager-controller",
@@ -191,10 +183,7 @@ func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
 // this exercises the operator.shipwright.io GVR row end-to-end so the
 // shOpDyn registration cannot silently drift from production again.
 func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
-	operatorWorkqueueFrozenGauge.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
-	t.Cleanup(func() {
-		operatorWorkqueueFrozenGauge.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
-	})
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "shipwright-operator", opReasonNoConditions)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("operators", "01a9b2d1.shipwright.io",

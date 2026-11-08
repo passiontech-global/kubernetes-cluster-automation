@@ -25,6 +25,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
+// ctx is the sweep context every test in the package shares.
+var ctx = context.Background()
+
 // ---------------------------------------------------------------------------
 // apiserver-endpoint-guard
 // ---------------------------------------------------------------------------

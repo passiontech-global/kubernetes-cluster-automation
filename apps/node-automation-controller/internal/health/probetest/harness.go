@@ -25,12 +25,17 @@ type Prober struct {
 	Checks []probefw.Check
 }
 
-// NewProber builds the shared Deps via NewDeps, then constructs one
-// check per factory against them — the same func(*Deps) Check shape
-// the registry's CheckReg rows carry, so each domain package passes
-// its own NewXxxCheck constructors verbatim.
-func NewProber(cs kubernetes.Interface, dyn dynamic.Interface,
+// NewCheckProber builds the shared Deps (via NewDeps, with a nil dyn
+// defaulting to the OpDyn fake — the shape testProber always
+// hand-rolled), then constructs one check per factory against them —
+// the same func(*Deps) Check shape the registry's CheckReg rows
+// carry, so each domain package passes its own NewXxxCheck
+// constructors verbatim.
+func NewCheckProber(cs kubernetes.Interface, dyn dynamic.Interface,
 	factories ...func(*probefw.Deps) probefw.Check) *Prober {
+	if dyn == nil {
+		dyn = OpDyn()
+	}
 	d := NewDeps(cs, dyn)
 	p := &Prober{Deps: d}
 	for _, f := range factories {

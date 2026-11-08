@@ -100,6 +100,21 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 	return err == nil
 }
 
+// upSeed builds the audit-sweep clientset: the baseline kube-system
+// (unlabeled) and meshed (inject=enabled) namespaces, then thirdNS
+// (nil omits it) and the scenario objects the test varies — each
+// seed stays explicit about what it changes.
+func upSeed(thirdNS *corev1.Namespace, extra ...runtime.Object) *fake.Clientset {
+	objs := []runtime.Object{
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+	}
+	if thirdNS != nil {
+		objs = append(objs, thirdNS)
+	}
+	return fake.NewSimpleClientset(append(objs, extra...)...)
+}
+
 func upGuard(cs *fake.Clientset) (*Auditor, *guardstate.Guard) {
 	return &Auditor{},
 		&guardstate.Guard{CS: cs, Dyn: wgDyn(), Now: time.Now}
@@ -113,12 +128,9 @@ func upGuard(cs *fake.Clientset) (*Auditor, *guardstate.Guard) {
 // exports the gauge; ns-level opt-in fires even when the pod carries
 // no annotation at all.
 func TestUnmeshedAuditFlagsUnmeshedPod(t *testing.T) {
-	metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-abc")
-	t.Cleanup(func() { metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-abc") })
+	testutil.CleanupMetric(t, metrics.UnmeshedPods, "meshed", "web-abc")
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("plain", ""),
 		upPod("meshed", "web-abc"),
 		upPod("plain", "other-abc"))
@@ -157,9 +169,8 @@ func TestUnmeshedAuditSkips(t *testing.T) {
 	initMeshed := upPod("meshed", "init-meshed")
 	initMeshed.Spec.InitContainers = []corev1.Container{{Name: kube.LinkerdProxyContainer}}
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
+		nil,
 		hostNet, jobPod, optedOut, meshed, initMeshed)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
@@ -178,14 +189,9 @@ func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
 	nsEnabledPodDisabled := upPod("meshed", "ns-enabled-pod-disabled")
 	nsEnabledPodDisabled.Annotations = map[string]string{kube.LinkerdInjectKey: "disabled"}
 
-	metrics.UnmeshedPods.DeleteLabelValues("plain", "pod-enabled")
-	t.Cleanup(func() {
-		metrics.UnmeshedPods.DeleteLabelValues("plain", "pod-enabled")
-	})
+	testutil.CleanupMetric(t, metrics.UnmeshedPods, "plain", "pod-enabled")
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("plain", ""),
 		podEnabled, nsEnabledPodDisabled)
 	a, g := upGuard(cs)
@@ -205,9 +211,8 @@ func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
 func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 	pending := upPod("meshed", "pending")
 	pending.Status.Phase = corev1.PodPending
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
+		nil,
 		pending)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
@@ -225,14 +230,9 @@ func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 // Healthy injector + remediation on: unmeshed, owned, old pods are
 // evicted — capped at 2 per cycle — and counted.
 func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
-	metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
-	t.Cleanup(func() {
-		metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
-	})
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
@@ -265,9 +265,7 @@ func TestUnmeshedRemediationSkipsCircuitBrokenInjector(t *testing.T) {
 	broken := upInjectorCfg() // failurePolicy stays Fail
 	broken.Annotations = map[string]string{
 		guardstate.CircuitBrokenAnno: "linkerd-proxy-injector.linkerd.io"}
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		broken, upReadySlice(),
 		upPod("meshed", "web-a"))
@@ -287,9 +285,7 @@ func TestUnmeshedRemediationSkipsCircuitBrokenInjector(t *testing.T) {
 func TestUnmeshedRemediationSkipsIgnorePolicyInjector(t *testing.T) {
 	failOpen := upInjectorCfg()
 	failOpen.Webhooks[0].FailurePolicy = ptr.To(admissionv1.Ignore)
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		failOpen, upReadySlice(),
 		upPod("meshed", "web-a"))
@@ -305,9 +301,7 @@ func TestUnmeshedRemediationSkipsIgnorePolicyInjector(t *testing.T) {
 // Zero Ready endpoints behind the injector Service — the webhook is
 // not provably healthy, so nothing is deleted.
 func TestUnmeshedRemediationSkipsDeadEndpoints(t *testing.T) {
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), // no EndpointSlice at all
 		upPod("meshed", "web-a"))
@@ -325,9 +319,7 @@ func TestUnmeshedRemediationSkipsDeadEndpoints(t *testing.T) {
 func TestUnmeshedInjectorHealthRequiresExactName(t *testing.T) {
 	lookalike := upInjectorCfg()
 	lookalike.Webhooks[0].Name = "acme-linkerd-proxy-injector.example.com"
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		lookalike, upReadySlice(),
 		upPod("meshed", "web-a"))
@@ -344,9 +336,7 @@ func TestUnmeshedInjectorHealthRequiresExactName(t *testing.T) {
 // gauge-only even with a healthy injector.
 func TestUnmeshedRemediationDisabledByEnv(t *testing.T) {
 	t.Setenv("UNMESHED_POD_REMEDIATION_ENABLED", "false")
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
@@ -372,9 +362,7 @@ func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
 	bareOwner.OwnerReferences = []metav1.OwnerReference{
 		{Kind: "ReplicaSet", Name: "rs-x"}} // controller flag unset
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		fresh, orphan, bareOwner)
@@ -405,9 +393,7 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 	mirror.OwnerReferences = []metav1.OwnerReference{{
 		Kind: "Node", Name: "worker-1", Controller: ptr.To(true)}}
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		terminating, mirror)
@@ -429,12 +415,10 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 // token: a first page that hands back Continue is followed until the
 // server stops continuing — pods on a later page are still audited.
 func TestUnmeshedAuditPaginatesPodList(t *testing.T) {
-	metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-a")
-	t.Cleanup(func() { metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-a") })
+	testutil.CleanupMetric(t, metrics.UnmeshedPods, "meshed", "web-a")
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
+		nil,
 		upPod("meshed", "web-a"))
 	calls := 0
 	cs.PrependReactor("list", "pods",
@@ -466,9 +450,7 @@ func TestUnmeshedAuditPaginatesPodList(t *testing.T) {
 // snapshot and the evict (admitted after the injector recovered) is
 // not the pod this sweep vetted.
 func TestUnmeshedRemediationDeleteUIDPrecondition(t *testing.T) {
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
@@ -544,14 +526,9 @@ func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 // deferral, not a failure: the pod is kept, no error counts, and the
 // sweep moves on to the next candidate — which still evicts.
 func TestUnmeshedRemediationPDBRefusalDefers(t *testing.T) {
-	metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
-	t.Cleanup(func() {
-		metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
-	})
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
 
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"), upPod("meshed", "web-b"))
@@ -703,9 +680,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", "upgrade-1", nil)
 	_ = unstructured.SetNestedField(plan.Object, "Running", "status", "state")
 	dyn := wgDyn(plan)
-	cs := fake.NewSimpleClientset(
-		upNamespace("kube-system", ""),
-		upNamespace("meshed", "enabled"),
+	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))

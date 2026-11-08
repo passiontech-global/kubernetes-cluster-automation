@@ -7,6 +7,7 @@ package nodehealth
 
 import (
 	"context"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 // package's shared testProber list stays untouched while the check
 // still rides the standard Deps/OpDyn wiring.
 func leaseGuardProber(cs *fake.Clientset) (*probetest.Prober, *controllerLeaseGuardCheck) {
-	p := probetest.NewProber(cs, probetest.OpDyn(), NewControllerLeaseGuardCheck)
+	p := probetest.NewCheckProber(cs, probetest.OpDyn(), NewControllerLeaseGuardCheck)
 	return p, p.Checks[0].(*controllerLeaseGuardCheck)
 }
 
@@ -177,10 +178,7 @@ func TestLeaseGuardExpiredLeaseMaintenanceGate(t *testing.T) {
 // dedicated gauge fires and the check fails, but below the flap
 // threshold (5/15m) no unhealthy flapping series appears.
 func TestLeaseGuardThrashing(t *testing.T) {
-	controllerLeaseThrashingGauge.DeleteLabelValues("kube-system", "thrash-op")
-	t.Cleanup(func() {
-		controllerLeaseThrashingGauge.DeleteLabelValues("kube-system", "thrash-op")
-	})
+	testutil.CleanupMetric(t, controllerLeaseThrashingGauge, "kube-system", "thrash-op")
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		cpLease("kube-system", "thrash-op", "a_1", time.Minute, 0, base))

@@ -30,4 +30,11 @@ var (
 	// Unstructured builds a bare CR fixture (apiVersion/kind/ns/name +
 	// top-level fields) — the one-liner for hand-rolled literals.
 	Unstructured = testhelp.Unstructured
+	// CRDGVR is the apiextensions CustomResourceDefinition GVR — the
+	// shared constant for tests that read CRDs through dyn.
+	CRDGVR = testhelp.CRDGVR
+	// NewDynWithCRDs returns a dynamic fake with the shared table plus
+	// the CustomResourceDefinition list kind (explicit opt-in so the
+	// default table stays CRD-free).
+	NewDynWithCRDs = testhelp.NewDynWithCRDs
 )

@@ -12,12 +12,9 @@ import (
 var ctx = context.Background()
 
 // cdaDyn builds the dynamic fake the audit's tests share — the stock
-// testutil.NewDynamicClient covers every CRD in the shared table but
-// NOT CustomResourceDefinition itself (the audit reads spec.conversion
-// through dyn), so the CRD list kind is merged in here. Without it the
-// fake panics on a List whose <Kind>List is unregistered.
+// testutil table covers every CRD the modules read but NOT
+// CustomResourceDefinition itself (Check A reads spec.conversion
+// through dyn), so the tests opt into the shared CRD-extended fake.
 func cdaDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	kinds := testutil.DynListKinds()
-	kinds[customResourceDefinitionGVR] = "CustomResourceDefinitionList"
-	return testutil.NewFakeDyn(kinds, objs...)
+	return testutil.NewDynWithCRDs(objs...)
 }

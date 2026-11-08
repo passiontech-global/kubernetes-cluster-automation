@@ -16,28 +16,31 @@ import (
 
 var ctx = context.Background()
 
+// harnessChecks is this package's check roster in sweep order.
+var harnessChecks = []func(*probefw.Deps) probefw.Check{
+	NewCoreDNSUpstreamCheck,
+	NewLinkerdEndpointSyncCheck,
+	NewLinkerdProtocolDetectionStallCheck,
+	NewCiliumBPFMapPressureCheck,
+	NewCiliumNodeIPAMExhaustionCheck,
+	NewCiliumMissingEndpointsCheck,
+	NewLinkerdH2StreamGuardCheck,
+	NewCloudflaredTunnelHealthCheck,
+	NewLiqoTunnelHealthCheck,
+	NewKonnectivityTunnelHealthCheck,
+	NewGatewayRouteHealthCheck,
+	NewEndpointSliceZoneStarvationCheck,
+	NewLinkerdOutlierGuardCheck,
+	NewLinkerdSidecarOOMGuardCheck,
+	NewCiliumDatapathMapGuardCheck,
+}
+
 func testProber(cs *fake.Clientset) *probetest.Prober {
-	return testProberDyn(cs, probetest.OpDyn())
+	return testProberDyn(cs, nil) // nil dyn = the OpDyn default
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {
-	p := probetest.NewProber(cs, dyn,
-		NewCoreDNSUpstreamCheck,
-		NewLinkerdEndpointSyncCheck,
-		NewLinkerdProtocolDetectionStallCheck,
-		NewCiliumBPFMapPressureCheck,
-		NewCiliumNodeIPAMExhaustionCheck,
-		NewCiliumMissingEndpointsCheck,
-		NewLinkerdH2StreamGuardCheck,
-		NewCloudflaredTunnelHealthCheck,
-		NewLiqoTunnelHealthCheck,
-		NewKonnectivityTunnelHealthCheck,
-		NewGatewayRouteHealthCheck,
-		NewEndpointSliceZoneStarvationCheck,
-		NewLinkerdOutlierGuardCheck,
-		NewLinkerdSidecarOOMGuardCheck,
-		NewCiliumDatapathMapGuardCheck,
-	)
+	p := probetest.NewCheckProber(cs, dyn, harnessChecks...)
 	// The production sweep resolves the CILIUM_* knobs into
 	// Cfg.Cilium once at Setup (CiliumConfigFromEnv —
 	// clusterhealthprobes wiring); NewDeps leaves it zero, so the
