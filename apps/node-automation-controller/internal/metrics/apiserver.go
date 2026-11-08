@@ -58,7 +58,7 @@ var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.Counte
 // with failurePolicy=Fail whose namespaceSelector still matches any of the
 // critical self-healing namespaces (kube-system, kube-node-lease, node-ops,
 // medik8s) — catches Helm/operator-installed webhooks invisible to static
-// check-webhook-guard.sh (W12-CP-B; kube-node-lease added W15-CP0 — its
+// check-webhook-guard.sh (W12-CP-B; kube-node-lease added later — its
 // leases ARE the kubelet node heartbeat).
 var WebhookMissingCriticalNSExclusion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_webhook_missing_critical_ns_exclusion",
@@ -70,7 +70,7 @@ var WebhookMissingCriticalNSExclusion = prometheus.NewGaugeVec(prometheus.GaugeO
 // intercept a node/pod lifecycle heartbeat resource (nodes/status,
 // pods/status, pods/eviction, leases — or a wildcard covering them) while
 // its namespaceSelector still matches a critical self-healing namespace
-// (W15-CP0): the webhook's own outage then wedges node heartbeats and
+// On a match: the webhook's own outage then wedges node heartbeats and
 // every drain cluster-wide. The resource label carries the offending
 // rule literal (wildcards stay wildcards, matching the static guard's
 // blocked_resources grammar).

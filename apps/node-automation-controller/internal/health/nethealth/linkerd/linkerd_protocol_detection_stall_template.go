@@ -5,7 +5,7 @@
 // ports into the pod template — carrying the durable patch stamp and
 // the GitOps-drift guard that refuses the re-patch fight when
 // Flux/ArgoCD provably reverted it.
-package nethealth
+package linkerd
 
 import (
 	"context"

@@ -129,64 +129,81 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// for entries gone since the last sweep are pruned below.
 	seen := map[string]bool{}
 	var failed []string
+
+	// cfgJob is one webhook configuration's per-sweep work: the
+	// kind-independent fields the breaker evaluates plus the
+	// kind-specific patch-and-refresh closure (the only true MWC/VWC
+	// difference — the evaluation loop below is shared by both kinds,
+	// so a kind-specific edit lands in exactly one place).
+	type cfgJob struct {
+		kind  string
+		name  string
+		anno  string
+		views []hookView
+		patch func(context.Context, []byte) error
+	}
+	patchMutating := func(cfg *admissionv1.MutatingWebhookConfiguration) func(context.Context, []byte) error {
+		return func(ctx context.Context, payload []byte) error {
+			patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
+				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
+			if err != nil {
+				return err
+			}
+			snap.SetMWC(patched)
+			return nil
+		}
+	}
+	patchValidating := func(cfg *admissionv1.ValidatingWebhookConfiguration) func(context.Context, []byte) error {
+		return func(ctx context.Context, payload []byte) error {
+			patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
+			if err != nil {
+				return err
+			}
+			snap.SetVWC(patched)
+			return nil
+		}
+	}
+	jobs := make([]cfgJob, 0, len(mwcs.Items)+len(vwcs.Items))
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
+		jobs = append(jobs, cfgJob{
+			kind: guardstate.KindMutating, name: cfg.Name,
+			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
+			views: mutHookViews(cfg.Webhooks), patch: patchMutating(cfg),
+		})
+	}
+	for i := range vwcs.Items {
+		cfg := &vwcs.Items[i]
+		jobs = append(jobs, cfgJob{
+			kind: guardstate.KindValidating, name: cfg.Name,
+			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
+			views: valHookViews(cfg.Webhooks), patch: patchValidating(cfg),
+		})
+	}
+	for _, job := range jobs {
 		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
-			guardstate.KindMutating, cfg.Name,
-			cfg.Annotations[guardstate.CircuitBrokenAnno],
-			mutHookViews(cfg.Webhooks), ready, now, seen)
+			job.kind, job.name, job.anno, job.views, ready, now, seen)
 		if payload == nil {
 			// Nothing to write — the still-broken re-asserts read
 			// verified live state (the annotation already lists
 			// them, the policy is already Ignore), so the series
 			// emits without a landed patch.
-			circuitMetrics(&b.brokenEmitted, guardstate.KindMutating,
-				cfg.Name, nil, nil, stillBroken)
+			circuitMetrics(&b.brokenEmitted, job.kind, job.name, nil, nil, stillBroken)
 			continue
 		}
-		patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-		if err != nil {
+		if err := job.patch(ctx, payload); err != nil {
 			// The post-patch annotation state is unverifiable —
 			// carry the config's last-emitted tuples forward so
 			// the sweep-end prune does not flap a still-broken
 			// series off (the annotation may well still list it).
-			b.carryBrokenForward(guardstate.KindMutating, cfg.Name)
+			b.carryBrokenForward(job.kind, job.name)
 			log.Error(err, "circuit breaker patch failed",
-				"kind", guardstate.KindMutating, "config", cfg.Name)
-			failed = append(failed, cfg.Name)
+				"kind", job.kind, "config", job.name)
+			failed = append(failed, job.name)
 			continue
 		}
-		// Write the landed object back into the shared snapshot —
-		// the unmeshed audit's injector-health read must see the
-		// new failurePolicy/annotation state, not the stale list.
-		snap.SetMWC(patched)
-		circuitMetrics(&b.brokenEmitted, guardstate.KindMutating,
-			cfg.Name, trips, recovered, stillBroken)
-	}
-	for i := range vwcs.Items {
-		cfg := &vwcs.Items[i]
-		payload, trips, recovered, stillBroken := b.circuitPatch(log, g.Queue,
-			guardstate.KindValidating, cfg.Name,
-			cfg.Annotations[guardstate.CircuitBrokenAnno],
-			valHookViews(cfg.Webhooks), ready, now, seen)
-		if payload == nil {
-			circuitMetrics(&b.brokenEmitted, guardstate.KindValidating,
-				cfg.Name, nil, nil, stillBroken)
-			continue
-		}
-		patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-		if err != nil {
-			b.carryBrokenForward(guardstate.KindValidating, cfg.Name)
-			log.Error(err, "circuit breaker patch failed",
-				"kind", guardstate.KindValidating, "config", cfg.Name)
-			failed = append(failed, cfg.Name)
-			continue
-		}
-		snap.SetVWC(patched)
-		circuitMetrics(&b.brokenEmitted, guardstate.KindValidating,
-			cfg.Name, trips, recovered, stillBroken)
+		circuitMetrics(&b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
 	}
 
 	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
@@ -238,6 +255,25 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 		out[i] = hookView{
 			name: ws[i].Name, fp: ws[i].FailurePolicy,
 			svc: ws[i].ClientConfig.Service,
+		}
+	}
+	return out
+}
+
+// allHookViews projects the snapshot's mutating then validating
+// configs — one pass over both kinds for consumers that read the same
+// fields off every webhook (the pod-bounce key collector). A nil
+// webhook-config list (its list failed) contributes nothing.
+func allHookViews(snap *guardstate.Snapshot) [][]hookView {
+	var out [][]hookView
+	if snap.MWC != nil {
+		for i := range snap.MWC.Items {
+			out = append(out, mutHookViews(snap.MWC.Items[i].Webhooks))
+		}
+	}
+	if snap.VWC != nil {
+		for i := range snap.VWC.Items {
+			out = append(out, valHookViews(snap.VWC.Items[i].Webhooks))
 		}
 	}
 	return out

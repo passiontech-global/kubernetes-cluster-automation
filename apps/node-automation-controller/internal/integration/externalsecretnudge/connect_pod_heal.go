@@ -90,12 +90,16 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		return
 	}
 
-	// Same fail-closed maintenance gate as every pod kill in this
-	// module, via the shared preamble — cordon/drain/kured or an
-	// in-flight upgrade defers the bounce, and "cannot verify"
-	// (unverifiable) skips it AND IncErrors the queue.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &n.verdict, n.cs, n.dyn,
-		&n.connectHeals, esConnectPodPrefix, esConnectHealCooldown, now)
+	// Same fail-closed gate as every pod kill in this module, via
+	// the shared persisted-cooldown preamble: nil obj + empty
+	// annoKey (this heal stamps no annotation on any object — the
+	// ledger check above is the whole cooldown) collapses
+	// AllowedVPersisted to the maintenance-mutex + heal-budget gate.
+	// Cordon/drain/kured or an in-flight upgrade defers the bounce,
+	// and "cannot verify" (unverifiable) skips it AND IncErrors the
+	// queue.
+	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, &n.verdict, n.cs, n.dyn,
+		&n.connectHeals, nil, "", esConnectPodPrefix, esConnectHealCooldown, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(n.queue)

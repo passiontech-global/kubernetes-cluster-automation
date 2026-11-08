@@ -613,7 +613,7 @@ func TestDeadNodeSweeperDynamicListError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W15-ST1 — the branch-(b) stateful split-brain gate.
+// The branch-(b) stateful split-brain gate.
 // ---------------------------------------------------------------------------
 
 // stsOwnedTerminatingPod is a stuck pod owned by a StatefulSet.
@@ -818,5 +818,53 @@ func TestDeadNodeSweeperHolderListErrorFailsClosed(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("node fenced while the holder check was unverifiable")
+	}
+}
+
+// The skip gauge is ledger-managed: a node Set(1)'d by the split-brain
+// gate keeps its series while it stays skipped, and the recovery
+// untaint (same path that removes the taint) deletes the stale series
+// instead of leaving a resolved node flagged unfenced-dead forever.
+func TestDeadNodeSweeperSkipGaugeClearedOnRecovery(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute),
+		pvWithModes("pv-rwo", corev1.ReadWriteOnce),
+		rwoVolumeAttachment("va-rwo", "w1", "pv-rwo"))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	// Sweep 1: the node is branch-(b) dead holding a StatefulSet pod
+	// + RWO volume — skipped, gauge armed.
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge = %v, want 1", got)
+	}
+
+	// Sweep 2: the node came back Ready while still carrying the
+	// out-of-service taint.
+	n := testutil.GetNode(t, cs, "w1")
+	for i := range n.Status.Conditions {
+		if n.Status.Conditions[i].Type == corev1.NodeReady {
+			n.Status.Conditions[i].Status = corev1.ConditionTrue
+		}
+	}
+	if _, err := cs.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("recovered node still carries out-of-service taint")
+	}
+	if got := ptestutil.CollectAndCount(metrics.DeadNodeUnfencedStatefulSkipped); got != 0 {
+		t.Fatalf("skip gauge still exposes %d series after recovery, want 0", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 0 {
+		t.Fatalf("skip gauge = %v after recovery, want 0 (series deleted)", got)
 	}
 }

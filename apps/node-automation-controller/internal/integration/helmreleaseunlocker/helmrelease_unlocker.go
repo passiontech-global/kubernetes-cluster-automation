@@ -119,6 +119,17 @@ type helmReleaseUnlocker struct {
 	// windows and the 24h cooldowns are deterministic. nil →
 	// time.Now.
 	now shared.Clock
+
+	// One sub-struct per healer duty so run() prunes/resets each
+	// duty's ledgers as one block. Every ledger type is zero-value
+	// ready, so literal-constructed fixtures keep working unchanged.
+	pending      pendingState
+	stall        stallState
+	immutableJob immutableJobState
+}
+
+// pendingState carries the pending-secret unlock duty's ledgers.
+type pendingState struct {
 	// firstSeen: ns/name → first tick that saw the HR stuck on
 	// "in progress". Pruned when the HR recovers; an operator restart
 	// re-arms it, biasing conservative.
@@ -135,33 +146,33 @@ type helmReleaseUnlocker struct {
 	// 24h (~144 increments/day). Pruned alongside unlocked so a new
 	// cooldown window alerts afresh.
 	alerted state.SeenSet
-	// stallEnabled gates the stalled-rollout surge unwedge —
-	// HELM_STALL_UNWEDGE_ENABLED. Opt-in because the remediation
-	// scales workload ReplicaSets (brief availability dip) and needs
-	// apps/replicasets RBAC the base ClusterRole does not carry.
-	stallEnabled bool
-	// stallFirstSeen / unwedged / stallAlerted mirror the ledgers
-	// above for the stalled-rollout signature: first-seen tracking
-	// for the 30m window, the 24h remediation cooldown (also
-	// persisted via passiontech.dev/last-helm-stall-unwedge), and the
-	// once-per-cooldown alert dedup shared by "re-stalled after
-	// unwedge" and "signature matched but a guard refused".
-	// CooldownSets are zero-value ready and deliberately unbounded:
-	// stamps past the window read uncooled and entries for
-	// vanished HRs are dead weight.
-	stallFirstSeen state.FirstSeenLedger
-	unwedged       state.CooldownSet
-	stallAlerted   state.CooldownSet
-	// stallAttempts caps the stall-unwedge retry cycle per
-	// lastAttemptedRevision (W8-GO2): at most 2 attempts for one
-	// revision, each at least 6h apart — a revision that could not
-	// be freed twice is a human problem, not a retry loop.
-	stallAttempts map[string]*stallAttempt
-	// immutableJobHealed: Kustomization ns/name → last failed-immutable-
-	// Job delete (W8-GO1) — the 30m in-RAM half of the cooldown; the
-	// durable half is passiontech.dev/last-immutable-job-heal on the
-	// Kustomization itself.
-	immutableJobHealed state.CooldownSet
+}
+
+// stallState mirrors pendingState for the stalled-rollout signature:
+// enabled is the HELM_STALL_UNWEDGE_ENABLED opt-in (the remediation
+// scales workload ReplicaSets — brief availability dip — and needs
+// apps/replicasets RBAC the base ClusterRole does not carry);
+// firstSeen tracks the 30m window, unwedged the 24h remediation
+// cooldown (also persisted via passiontech.dev/last-helm-stall-unwedge),
+// alerted the once-per-cooldown alert dedup shared by "re-stalled
+// after unwedge" and "signature matched but a guard refused", and
+// attempts the W8-GO2 retry-cycle cap. CooldownSets are zero-value
+// ready and deliberately unbounded: stamps past the window read
+// uncooled and entries for vanished HRs are dead weight.
+type stallState struct {
+	enabled   bool
+	firstSeen state.FirstSeenLedger
+	unwedged  state.CooldownSet
+	alerted   state.CooldownSet
+	attempts  map[string]*stallAttempt
+}
+
+// immutableJobState carries the W8-GO1 immutable-Job heal ledger:
+// Kustomization ns/name → last failed-immutable-Job delete — the 30m
+// in-RAM half of the cooldown; the durable half is
+// passiontech.dev/last-immutable-job-heal on the Kustomization itself.
+type immutableJobState struct {
+	healed state.CooldownSet
 }
 
 // stallAttempt counts unwedge tries against one lastAttemptedRevision.
@@ -180,13 +191,13 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, stallEnabledFromEnv,
 		func(stallEnabled bool) error {
 			u := &helmReleaseUnlocker{
-				cs:            d.CS,
-				dyn:           d.Dyn,
-				queue:         d.Name,
-				now:           shared.SystemClock,
-				stallEnabled:  stallEnabled,
-				stallAttempts: map[string]*stallAttempt{},
+				cs:    d.CS,
+				dyn:   d.Dyn,
+				queue: d.Name,
+				now:   shared.SystemClock,
 			}
+			u.stall.enabled = stallEnabled
+			u.stall.attempts = map[string]*stallAttempt{}
 			return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
 		})
 }
@@ -206,8 +217,8 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// always initializes, but a fixture must not panic on a nil map.
 	// The FirstSeenLedger, SeenSet and CooldownSet fields are
 	// zero-value ready — no arm needed.
-	if u.stallAttempts == nil {
-		u.stallAttempts = map[string]*stallAttempt{}
+	if u.stall.attempts == nil {
+		u.stall.attempts = map[string]*stallAttempt{}
 	}
 
 	list, gvr, err := u.listHelmReleases(ctx)
@@ -225,25 +236,25 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		present[key] = true
 		if hrStuckInProgress(hr) {
 			stuck[key] = hr
-			if _, tracked := u.firstSeen.Observe(key, now); !tracked {
+			if _, tracked := u.pending.firstSeen.Observe(key, now); !tracked {
 				log.Info("HR shows 'in progress' — tracking first-seen", "hr", key)
 			}
 			continue // the pending-op signature claims it — no double-tracking
 		}
-		if u.stallEnabled && hrStalledRollout(hr) {
+		if u.stall.enabled && hrStalledRollout(hr) {
 			stalled[key] = hr
-			if _, tracked := u.stallFirstSeen.Observe(key, now); !tracked {
+			if _, tracked := u.stall.firstSeen.Observe(key, now); !tracked {
 				log.Info("HR shows stalled-rollout signature — tracking first-seen", "hr", key)
 			}
 		}
 	}
 	// Prune HRs that recovered (or vanished) so a later stall re-arms
 	// the 30m window from scratch.
-	u.firstSeen.Prune(func(key string) bool {
+	u.pending.firstSeen.Prune(func(key string) bool {
 		_, ok := stuck[key]
 		return ok
 	})
-	u.stallFirstSeen.Prune(func(key string) bool {
+	u.stall.firstSeen.Prune(func(key string) bool {
 		_, ok := stalled[key]
 		return ok
 	})
@@ -251,10 +262,10 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// needs it (a stale stamp reads uncooled on its own) but to keep
 	// the alerted dedup paired: a vanished or aged-out entry must
 	// release its alert key so a NEW cooldown window alerts afresh.
-	u.unlocked.Prune(func(key string, last time.Time) bool {
+	u.pending.unlocked.Prune(func(key string, last time.Time) bool {
 		keep := present[key] && now.Sub(last) < helmUnlockCooldown
 		if !keep {
-			u.alerted.Forget(key)
+			u.pending.alerted.Forget(key)
 		}
 		return keep
 	})
@@ -264,20 +275,20 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// it serves so dead names cannot accumulate forever (a stamp
 	// inside the window always reads cooled, so maxAge IS the
 	// window).
-	u.unwedged.PruneExpired(now, helmUnlockCooldown)
-	u.stallAlerted.PruneExpired(now, helmUnlockCooldown)
-	u.immutableJobHealed.PruneExpired(now, immutableJobCooldown)
+	u.stall.unwedged.PruneExpired(now, helmUnlockCooldown)
+	u.stall.alerted.PruneExpired(now, helmUnlockCooldown)
+	u.immutableJob.healed.PruneExpired(now, immutableJobCooldown)
 
 	var due []string
 	for key := range stuck {
-		if stuckFor, _ := u.firstSeen.Seen(key, now); stuckFor >= helmStuckThreshold {
+		if stuckFor, _ := u.pending.firstSeen.Seen(key, now); stuckFor >= helmStuckThreshold {
 			due = append(due, key)
 		}
 	}
 	sort.Strings(due)
 	var stallDue []string
 	for key := range stalled {
-		if stalledFor, _ := u.stallFirstSeen.Seen(key, now); stalledFor >= helmStuckThreshold {
+		if stalledFor, _ := u.stall.firstSeen.Seen(key, now); stalledFor >= helmStuckThreshold {
 			stallDue = append(stallDue, key)
 		}
 	}
@@ -362,12 +373,8 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 // it so no single response hauls the whole resource across the wire.
 func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
-	items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(ri))
-	if err != nil {
-		return nil, err
-	}
-	return &unstructured.UnstructuredList{Items: items}, nil
+	return kube.ListAllUnstructured(ctx, ri,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 }
 
 // helmControllerDown reports whether any helm-controller pod is

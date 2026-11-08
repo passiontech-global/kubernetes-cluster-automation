@@ -33,10 +33,10 @@ import (
 // requests into the existing "konnectivity-agent" container by name.
 var konnectivityPatch = []byte(`{"spec":{"template":{"spec":{"priorityClassName":"system-node-critical","containers":[{"name":"konnectivity-agent","resources":{"requests":{"cpu":"25m","memory":"32Mi"}}}]}}}}`)
 
-var (
-	konnectivityWantCPU = resource.MustParse("25m")
-	konnectivityWantMem = resource.MustParse("32Mi")
-)
+var konnectivityWantReq = corev1.ResourceList{
+	corev1.ResourceCPU:    resource.MustParse("25m"),
+	corev1.ResourceMemory: resource.MustParse("32Mi"),
+}
 
 type konnectivityPatcher struct {
 	cs kubernetes.Interface
@@ -85,12 +85,12 @@ func konnectivityDrifted(ds *appsv1.DaemonSet) bool {
 	if ds.Spec.Template.Spec.PriorityClassName != "system-node-critical" {
 		return true
 	}
-	for _, c := range ds.Spec.Template.Spec.Containers {
+	for i := range ds.Spec.Template.Spec.Containers {
+		c := &ds.Spec.Template.Spec.Containers[i]
 		if c.Name == "konnectivity-agent" {
-			cpu := c.Resources.Requests[corev1.ResourceCPU]
-			mem := c.Resources.Requests[corev1.ResourceMemory]
-			return cpu.Cmp(konnectivityWantCPU) != 0 ||
-				mem.Cmp(konnectivityWantMem) != 0
+			// konnectivity pins requests only — the nil limits half
+			// of ResourcesDrifted is skipped.
+			return pinnedworkload.ResourcesDrifted(c, konnectivityWantReq, nil)
 		}
 	}
 	return true

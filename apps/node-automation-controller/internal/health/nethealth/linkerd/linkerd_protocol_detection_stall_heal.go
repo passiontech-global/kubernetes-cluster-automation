@@ -5,7 +5,7 @@
 // replacement proxy starts with the corrected config — and patch
 // the pod's own annotation as bookkeeping once the delete is
 // delivered.
-package nethealth
+package linkerd
 
 import (
 	"context"

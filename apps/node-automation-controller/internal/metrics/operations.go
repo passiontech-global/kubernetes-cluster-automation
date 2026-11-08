@@ -118,12 +118,12 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 })
 
 // ---------------------------------------------------------------------------
-// Wave 15 operations metrics (W15-ST1 dead-node-sweeper split-brain
+// Dead-node-sweeper operations metrics (the branch-(b) split-brain
 // gate).
 // ---------------------------------------------------------------------------
 
 // DeadNodeUnfencedStatefulSkipped marks (1) a confirmed-dead node the
-// sweeper REFUSED to fence (W15-ST1): branch (b) — no medik8s SNR CR —
+// sweeper REFUSED to fence: branch (b) — no medik8s SNR CR —
 // while the node still holds an RWO VolumeAttachment or a StatefulSet
 // pod, so the out-of-service taint would risk a split-brain on its
 // volumes. Cleared when the node is eventually fenced or recovers.
@@ -133,8 +133,8 @@ var DeadNodeUnfencedStatefulSkipped = prometheus.NewGaugeVec(prometheus.GaugeOpt
 }, []string{"node"})
 
 // DeadNodeFencedWithoutSNRTotal counts out-of-service fences the
-// sweeper applied WITHOUT a medik8s SNR CR backing them (W15-ST1
-// branch (b): Ready=Unknown>30m + dead kubelet) — has_volumes records
+// sweeper applied WITHOUT a medik8s SNR CR backing them (branch (b):
+// Ready=Unknown>30m + dead kubelet) — has_volumes records
 // whether the node held RWO volumes/StatefulSet pods at decision time
 // (those fences carried the DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL
 // override). A sustained rate means the sweeper is deciding node death

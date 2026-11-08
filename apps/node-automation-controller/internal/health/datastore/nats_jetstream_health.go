@@ -62,9 +62,6 @@ const (
 	natsWedgeMinAge      = 10 * time.Minute
 	natsLogScanMinPodAge = 5 * time.Minute
 	natsHealCool         = 30 * time.Minute
-	natsLogTailLines     = int64(200)
-	natsLogMaxBytes      = int64(256 * 1024)
-	natsLogTimeout       = 8 * time.Second
 )
 
 // The reason values node_automation_nats_jetstream_unhealthy
@@ -247,7 +244,7 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		reason := ""
 		hit, lerr := probefw.PodLogTail(ctx, p.CS, pod, "",
-			natsLogTailLines, natsLogMaxBytes, natsLogTimeout,
+			probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
 			func(line string) bool {
 				if r := natsLogReason(line); r != "" {
 					reason = r // the first marker wins

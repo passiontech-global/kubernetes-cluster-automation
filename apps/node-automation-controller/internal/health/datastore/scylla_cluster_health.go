@@ -53,8 +53,6 @@ const (
 	CheckNameScyllaHealth    = "scylla-cluster-health"
 	scyllaDegradedMinAge     = 15 * time.Minute
 	scyllaSignatureMinAge    = 10 * time.Minute
-	scyllaGossipTailLines    = int64(200)
-	scyllaGossipLogMaxBytes  = 256 * 1024
 	scyllaPodNameLabel       = "scylla.scylladb.com/pod-name"
 	scyllaClusterLabel       = "scylla.scylladb.com/cluster"
 	scyllaContainerName      = "scylla"
@@ -167,18 +165,19 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 	return false
 }
 
-// scyllaStallLogHit fetches the last scyllaGossipTailLines of the
+// scyllaStallLogHit fetches the last probefw.DefaultTailLines of the
 // pod's "scylla" container and returns the reason label of the first
 // matching stall signature — scyllaReasonGossipStall for the gossip/
 // raft patterns, scyllaReasonTombstoneStall for the W12-ST3
-// tombstone/overload set. Bounded to 8s / scyllaGossipLogMaxBytes
-// (same posture as the coredns watchdog's log probe); a stream/read
-// failure is inconclusive — PodLogTail returns it as an error so the
-// caller logs it rather than reading "no match" as "healthy".
+// tombstone/overload set. Bounded to probefw.LogTimeout /
+// probefw.LogMaxBytes (same posture as the coredns watchdog's log
+// probe); a stream/read failure is inconclusive — PodLogTail returns
+// it as an error so the caller logs it rather than reading "no
+// match" as "healthy".
 func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.Pod) (string, error) {
 	var reason string
 	hit, err := probefw.PodLogTail(ctx, p.CS, pod, scyllaContainerName,
-		scyllaGossipTailLines, scyllaGossipLogMaxBytes, 8*time.Second,
+		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
 		func(line string) bool {
 			for _, re := range scyllaGossipPatterns {
 				if re.MatchString(line) {

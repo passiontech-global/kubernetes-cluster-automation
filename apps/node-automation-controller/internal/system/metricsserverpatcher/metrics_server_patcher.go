@@ -55,10 +55,14 @@ import (
 var metricsServerPatch = []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=30s","--kubelet-request-timeout=25s"],"livenessProbe":{"timeoutSeconds":5},"readinessProbe":{"timeoutSeconds":5},"resources":{"requests":{"cpu":"20m","memory":"96Mi"},"limits":{"cpu":"200m","memory":"384Mi"}}}],"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"k8s-app":"metrics-server"}}},{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"k8s-app":"metrics-server"}}}],"affinity":null,"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"},{"key":"node-role.kubernetes.io/master","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/disk-pressure","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/memory-pressure","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/pid-pressure","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/network-unavailable","operator":"Exists","effect":"NoSchedule"},{"key":"weave.works/kured-node-reboot","operator":"Exists","effect":"PreferNoSchedule"},{"key":"CriticalAddonsOnly","operator":"Exists"}]}}}}`)
 
 var (
-	metricsServerWantReqCPU = resource.MustParse("20m")
-	metricsServerWantReqMem = resource.MustParse("96Mi")
-	metricsServerWantLimCPU = resource.MustParse("200m")
-	metricsServerWantLimMem = resource.MustParse("384Mi")
+	metricsServerWantReq = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("20m"),
+		corev1.ResourceMemory: resource.MustParse("96Mi"),
+	}
+	metricsServerWantLim = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("200m"),
+		corev1.ResourceMemory: resource.MustParse("384Mi"),
+	}
 )
 
 // metricsServerWantArgs is the exact args list the patch installs —
@@ -193,8 +197,7 @@ func metricsServerNeedsPatch(d *appsv1.Deployment, wantReplicas int32) bool {
 	// Replica drift only counts when the pin is enabled — a nil
 	// .spec.replicas defaults to 1 at the API but still means "we
 	// never pinned it", so it counts as drifted too.
-	if wantReplicas > 0 &&
-		(d.Spec.Replicas == nil || *d.Spec.Replicas != wantReplicas) {
+	if pinnedworkload.ReplicaDrifted(d, wantReplicas) {
 		return true
 	}
 	ps := d.Spec.Template.Spec
@@ -206,21 +209,11 @@ func metricsServerNeedsPatch(d *appsv1.Deployment, wantReplicas int32) bool {
 		if metricsServerArgsDrifted(c.Args) {
 			return true
 		}
-		if c.LivenessProbe == nil || c.LivenessProbe.TimeoutSeconds != 5 ||
-			c.ReadinessProbe == nil || c.ReadinessProbe.TimeoutSeconds != 5 {
+		if pinnedworkload.ProbeTimeoutsDrifted(c) ||
+			pinnedworkload.ResourcesDrifted(c, metricsServerWantReq, metricsServerWantLim) {
 			return true
 		}
-		reqCPU := c.Resources.Requests[corev1.ResourceCPU]
-		reqMem := c.Resources.Requests[corev1.ResourceMemory]
-		limCPU := c.Resources.Limits[corev1.ResourceCPU]
-		limMem := c.Resources.Limits[corev1.ResourceMemory]
-		if reqCPU.Cmp(metricsServerWantReqCPU) != 0 ||
-			reqMem.Cmp(metricsServerWantReqMem) != 0 ||
-			limCPU.Cmp(metricsServerWantLimCPU) != 0 ||
-			limMem.Cmp(metricsServerWantLimMem) != 0 {
-			return true
-		}
-		if ps.Affinity != nil {
+		if pinnedworkload.AffinitySet(ps) {
 			return true
 		}
 		if metricsServerTolerationsDrifted(ps.Tolerations) {

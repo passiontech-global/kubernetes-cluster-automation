@@ -2,7 +2,7 @@
 // linkerd-protocol-detection-stall check (W10-NM3): opaque-ports
 // heal patch + pod re-roll, skip-inbound coverage, port-set
 // parsing.
-package nethealth
+package linkerd
 
 import (
 	"strings"

@@ -7,8 +7,8 @@
 // linkerd-proxy sidecar.
 //
 // The duties live in leaf subpackages — guardstate (shared deps,
-// run snapshot, endpoint census), orphansweep, circuitbreaker and
-// unmeshed — while this package keeps the registry-facing Setup and
-// the errors.Join sweep orchestration behind the single
-// "admission-webhook-guard" periodic.
+// run snapshot, endpoint census), orphansweep, circuitbreaker,
+// criticalns and unmeshed — while this package keeps the
+// registry-facing Setup and the errors.Join sweep orchestration
+// behind the single "admission-webhook-guard" periodic.
 package webhookguard

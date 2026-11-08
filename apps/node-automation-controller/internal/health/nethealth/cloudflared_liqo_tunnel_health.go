@@ -66,8 +66,6 @@ const (
 	cfTunnelHealCool       = 30 * time.Minute
 	cfTunnelMetricsPort    = 2000
 	cfTunnelHTTPTimeout    = 8 * time.Second
-	cfTunnelTailLines      = int64(200)
-	cfTunnelLogMaxByte     = int64(256 * 1024)
 	cfTunnelMetricsMaxByte = int64(1 << 20)
 )
 
@@ -144,7 +142,7 @@ func (p *cloudflaredTunnelHealthCheck) cfTunnelLogQUICStorm(ctx context.Context,
 	pod *corev1.Pod) (bool, error) {
 
 	return probefw.PodLogTail(ctx, p.CS, pod, "",
-		cfTunnelTailLines, cfTunnelLogMaxByte, cfTunnelHTTPTimeout,
+		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
 		func(line string) bool {
 			l := strings.ToLower(line)
 			for _, marker := range cfTunnelQUICMarkers {
@@ -215,22 +213,13 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	rep.Close(&p.emitted, cloudflaredTunnelDegradedGauge.DeleteLabelValues)
 
 	for _, pod := range degraded {
-		key := pod.Namespace + "/" + pod.Name
-		ref := metav1.GetControllerOf(pod)
-		if ref == nil {
-			log.Info("skip heal: unowned cloudflared pod", "pod", key)
-			continue
-		}
 		// The degraded pod can still report Ready (the gray-failure
-		// shape) — ReadySiblings discounts it so the guard requires
-		// a GENUINELY separate sibling.
-		if probefw.ReadySiblings(readyByOwner, pod) < 1 {
-			log.Info("skip heal: no healthy cloudflared sibling — edge outage vs wedge unverifiable",
-				"pod", key)
-			continue
-		}
-		p.DeletePodHeal(ctx, log, CheckNameCloudflaredTunnelHealth,
-			key, pod, cfTunnelHealCool, now)
+		// shape) — the SafePodDelete gate uses ReadySiblings, which
+		// discounts the pod itself so the guard requires a GENUINELY
+		// separate sibling (an edge outage vs a wedge unverifiable
+		// without one); the cooldown keys on the pod's controller.
+		p.SafePodDelete(ctx, log, CheckNameCloudflaredTunnelHealth,
+			pod, readyByOwner, 1, cfTunnelHealCool, now)
 	}
 	return rep.Verdict("cloudflared pods with a dead tunnel across "+
 		strconv.Itoa(cfTunnelMinStreak)+" sweeps: ", ", ")

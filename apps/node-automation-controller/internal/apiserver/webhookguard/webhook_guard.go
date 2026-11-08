@@ -62,9 +62,10 @@
 // kept and the next candidate is tried.
 //
 // The package is split into leaf subpackages — guardstate (shared
-// deps + run snapshot + endpoint census), orphansweep, circuitbreaker
-// and unmeshed — each owning one duty; this facade keeps only the
-// registry-facing Setup and the errors.Join sweep orchestration.
+// deps + run snapshot + endpoint census), orphansweep, circuitbreaker,
+// criticalns and unmeshed — each owning one duty; this facade keeps
+// only the registry-facing Setup and the errors.Join sweep
+// orchestration.
 package webhookguard
 
 import (
@@ -75,6 +76,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/criticalns"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/orphansweep"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/unmeshed"
@@ -92,8 +94,9 @@ import (
 // errors.Join error accounting) is unchanged by the split.
 type webhookGuard struct {
 	guardstate.Guard
-	breaker circuitbreaker.Breaker
-	auditor unmeshed.Auditor
+	breaker  circuitbreaker.Breaker
+	critical criticalns.Sweeper
+	auditor  unmeshed.Auditor
 }
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
@@ -105,8 +108,8 @@ func Setup(d shared.Deps) error {
 		"unmeshedRemediation", unmeshed.RemediationEnabled())
 	// The bookkeeping ledgers inside the duty structs (deadSince,
 	// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
-	// criticalNSExclusionEmitted) are shared.* zero-value types —
-	// nothing to initialize here.
+	// criticalns' exclusionEmitted/heartbeatEmitted) are shared.*
+	// zero-value types — nothing to initialize here.
 	g := &webhookGuard{Guard: guardstate.Guard{
 		CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
 		NodeReader: d.Mgr.GetClient()}}
@@ -115,14 +118,16 @@ func Setup(d shared.Deps) error {
 
 func (g *webhookGuard) run(ctx context.Context) error {
 	// The orphan sweep, the circuit breaker, the CRD conversion-
-	// backend check and the unmeshed-pod auditor are independent
-	// duties — a failure in one must never skip the others, so all
-	// run and their errors join (nils → nil). All four read the same
-	// cluster state, so the shared snapshot is listed once up front
-	// instead of once per consumer. The two ops levers
-	// (WEBHOOK_CIRCUIT_BREAKER_ENABLED, UNMESHED_POD_REMEDIATION_ENABLED)
-	// are read fresh on every sweep — the sanctioned hot-reload
-	// exception to the resolve-at-Setup env rule.
+	// backend check, the critical-NS audits and the unmeshed-pod
+	// auditor are independent duties — a failure in one must never
+	// skip the others, so all run and their errors join (nils → nil).
+	// All read the same cluster state, so the shared snapshot is
+	// listed once up front instead of once per consumer. The ops
+	// levers (WEBHOOK_CIRCUIT_BREAKER_ENABLED,
+	// UNMESHED_POD_REMEDIATION_ENABLED,
+	// WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED — the last inside
+	// critical.Sweep) are read fresh on every sweep — the sanctioned
+	// hot-reload exception to the resolve-at-Setup env rule.
 	snap := g.TakeSnapshot(ctx)
 	orphanErr := orphansweep.Sweep(ctx, snap)
 	var breakerErr error
@@ -130,6 +135,10 @@ func (g *webhookGuard) run(ctx context.Context) error {
 		breakerErr = g.breaker.Sweep(ctx, snap)
 	}
 	conversionErr := g.breaker.SweepCRDConversionBackends(ctx, snap)
+	// The critical-ns audits run here — where they sat at the top of
+	// the unmeshed sweep before the duty moved to its own leaf
+	// subpackage — so they read post-breaker webhook state.
+	g.critical.Sweep(snap)
 	unmeshedErr := g.auditor.Sweep(ctx, snap)
 	return errors.Join(orphanErr, breakerErr, conversionErr, unmeshedErr)
 }

@@ -5,10 +5,11 @@
 package guardstate
 
 import (
-	"strings"
+	"fmt"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -33,13 +34,7 @@ const CircuitBrokenAnno = kube.AnnoCircuitBrokenWebhooks
 // into a name set. Webhook names are DNS-1123 subdomains — commas can
 // never appear in them, so the plain split is unambiguous.
 func ParseCircuitAnnotation(v string) map[string]bool {
-	out := map[string]bool{}
-	for _, n := range strings.Split(v, ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			out[n] = true
-		}
-	}
-	return out
+	return kube.ParseCommaSet(v)
 }
 
 // FailClosed reports whether the entry currently fails closed. A nil
@@ -47,6 +42,56 @@ func ParseCircuitAnnotation(v string) map[string]bool {
 // Ignore is treated as fail-closed.
 func FailClosed(fp *admissionv1.FailurePolicyType) bool {
 	return fp == nil || *fp != admissionv1.Ignore
+}
+
+// InjectorHealthy reports whether the linkerd-proxy-injector mutating
+// webhook is fully back: not circuit-broken, failurePolicy still Fail
+// (a tripped breaker leaves Ignore behind), and >= 1 Ready endpoint
+// behind its backend Service. Any measurement failure is a real error
+// — the caller treats "cannot verify" as "not healthy". Its one
+// consumer is the unmeshed-pod remediation, which runs only when
+// unmeshed candidates exist, so the census + config-list inputs are
+// drawn from the shared run snapshot (the census is computed lazily on
+// first use — see Snapshot).
+func InjectorHealthy(snap *Snapshot) (bool, error) {
+	ready, err := snap.ReadyCounts()
+	if err != nil {
+		return false, err
+	}
+	if snap.MWCErr != nil {
+		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", snap.MWCErr)
+	}
+	mwcs := snap.MWC
+	found := false
+	for i := range mwcs.Items {
+		cfg := &mwcs.Items[i]
+		broken := ParseCircuitAnnotation(cfg.Annotations[CircuitBrokenAnno])
+		for _, w := range cfg.Webhooks {
+			if w.Name != kube.LinkerdInjectorWebhook {
+				continue // exact match — a lookalike name is not the injector
+			}
+			found = true
+			if broken[w.Name] || !FailClosed(w.FailurePolicy) {
+				continue // circuit-broken (or manually set to Ignore)
+			}
+			if w.ClientConfig.Service == nil {
+				continue
+			}
+			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
+			// W9-CP1 brownout guard: an effective-ready endpoint set
+			// that was probed AND failed every TCP+TLS handshake is
+			// hung, not healthy — evicting unmeshed pods now would
+			// only recreate them unmeshed again. A service that was
+			// never probed gets the benefit of the doubt.
+			if ready.Effective[svc] > 0 && (!ready.Probed[svc] || ready.Responsive[svc]) {
+				return true, nil
+			}
+		}
+	}
+	if !found {
+		logf.FromContext(snap.Ctx).Info("injector health: no linkerd-proxy-injector webhook found")
+	}
+	return false, nil
 }
 
 // CRDConversionServiceKey extracts the "namespace/name" Service key a

@@ -25,13 +25,17 @@ byte-stable with the shell-operator alerts).
 - `internal/registry` — the single `[]shared.Module` registration
   table + `-modules` allowlist resolution + the boot wiring loop.
   Adding a module = one import + one row here.
-- `internal/platform/*` — leaf libraries: `kube` (paged lists,
-  node/pod/patch helpers, the GVR registry, annotation keys +
-  timestamp stamps, maintenance mutex),
+- `internal/platform/*` — leaf libraries: `kube` (paged lists —
+  `ListAllUnstructured` for the dynamic client — node/pod/patch
+  helpers incl. `RestartTemplatePatch`, comma-set parsing, the GVR
+  registry, annotation keys + timestamp stamps, maintenance mutex,
+  the Flux artifact-stale signature `fluxconditions.go`),
   `state` (Cooldown/FirstSeen/Seen/Streak/Gauge ledgers),
   `heal` (cooldown → maintenance-mutex → UID-delete → stamp;
   `PersistedCooledDown`/`StampPersisted` for the wider-of
-  in-RAM+annotation cooldown), `reap` (the janitor
+  in-RAM+annotation cooldown; `AllowedVPersisted` folding that
+  cooldown into the AllowedV preamble for sites that heal against
+  a persisted stamp), `reap` (the janitor
   collect-cap-confirm-UID-delete sweep skeleton),
   `testhelp` (leaf-level k8s fakes — importable by platform tests,
   which `internal/testutil` cannot reach).
@@ -47,9 +51,18 @@ byte-stable with the shell-operator alerts).
   whose collection order into `Deps.CheckRegs` IS the sweep order
   (ops contract — the check rows' relative order must not change).
   `apiserver/webhookguard` is the one module with subpackages —
-  `circuitbreaker`, `guardstate`, `orphansweep`, `unmeshed` are leaf
-  duties the facade's single `Setup`/sweep orchestrates (one
-  registry row, `errors.Join` of the four duty errors).
+  `circuitbreaker`, `criticalns`, `guardstate`, `orphansweep`,
+  `unmeshed` are leaf duties the facade's single `Setup`/sweep
+  orchestrates (one registry row, `errors.Join` of the duty
+  errors); `health/nethealth/linkerd` is the analogous check-side
+  subpackage (the three linkerd checks + their shared markers
+  behind one facade with three `NewX` constructors — registry rows
+  point there, duty logic stays out of the nethealth root).
+  Cross-TREE topology identifiers (linkerd control-plane names,
+  dragonfly operator namespace) live once, in
+  `internal/platform/kube/domains.go` — the platform sharing layer
+  both health and integration import; single-package constants stay
+  beside their consumer, ops-contract strings never live there.
 - `internal/testutil` — shared fakes (StubManager, `PeriodicContract`
   setup assertions) plus re-export shims over `platform/testhelp`
   (probe clientset, CRD-aware dynamic fake, `Unstructured`). Domain
@@ -107,10 +120,16 @@ byte-stable with the shell-operator alerts).
   `shared.SetupWithConfig`, modules without use
   `shared.SetupNoConfig`, so parse warnings fire even when gated
   off and no module hand-rolls `if d.Disabled`. Reading env inside
-  a run/sweep is a bug — the ONE sanctioned
-  exception is webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED` /
-  `UNMESHED_POD_REMEDIATION_ENABLED`, deliberately hot-reloaded per
-  sweep as an ops lever. `os.Getenv`/`os.LookupEnv` is depguard-denied
+  a run/sweep is a bug — the FOUR sanctioned
+  exceptions, all deliberately hot-reloaded per sweep as ops levers,
+  are, per module: webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED` /
+  `UNMESHED_POD_REMEDIATION_ENABLED` and
+  `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED`
+  (apiserver/webhookguard/unmeshed/unmeshed_audit.go), and
+  deadnodesweeper's `DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL`
+  (internal/node/deadnodesweeper — read every cycle by
+  fenceUnfencedStateful).
+ `os.Getenv`/`os.LookupEnv` is depguard-denied
   under `internal/` (envdoc also scans for it). `docs/env.md` must
   document every knob (envdoc test enforces).
 - Test seams: `now shared.Clock` (alias of `libs/hostkit/timex.Clock`;

@@ -15,8 +15,8 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
 
@@ -93,47 +93,33 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 // (the caller guarantees the >=5m zero-endpoint streak and
 // sts.Status.ReadyReplicas > 0; the check itself only reaches here
 // for ready STS). 30m per-operator cooldown on the in-RAM ledger.
+//
+// probefw.BounceOperatorPod carries the whole preamble (per-operator
+// cooldown + maintenance mutex fail-closed, cluster-wide paged list —
+// the operator pod's namespace is not fixed across installs — and the
+// UID-preconditioned delete + census invalidate + heal count under
+// the operator name); the pick keeps the oldest-Running-target choice
+// and the W10-FIX4 alias-prefix match local.
 func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, operator string, now time.Time) {
 	const dbOperatorHealCooldown = 30 * time.Minute
-	proceed, unverifiable := p.HealAllowed(ctx, log,
+	deleted := p.BounceOperatorPod(ctx, log, operator, "",
+		func(pods []corev1.Pod) []*corev1.Pod {
+			// The Percona operators answer to two Deployment
+			// spellings (W10-FIX4) — every alias prefix is tried so
+			// a short-name match still finds the long-named pods.
+			target := heal.OldestRunningPod(pods,
+				dbOperatorPodPrefixes(operator)...)
+			if target == nil {
+				return nil
+			}
+			return []*corev1.Pod{target}
+		},
 		&p.Heals, operator, dbOperatorHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
+	if deleted == 0 {
 		return
 	}
-	if !proceed {
-		return
-	}
-	// Cluster-wide but paged — the operator pod's namespace is not
-	// fixed across installs, so no selector can narrow the read.
-	pods, err := p.AllPods(ctx)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list pods failed — db operator heal deferred", "error", err)
-		return
-	}
-	// Find the oldest Running pod of the operator — its namespace is
-	// not fixed across installs, so the prefix match runs
-	// cluster-wide and the blast radius is capped at one pod. The
-	// Percona operators answer to two Deployment spellings (W10-FIX4)
-	// — every alias prefix is tried so a short-name match still finds
-	// the long-named pods.
-	target := heal.OldestRunningPod(pods, dbOperatorPodPrefixes(operator)...)
-	if target == nil {
-		log.Info("no running pod found for db operator — heal deferred",
-			"operator", operator)
-		return
-	}
-	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, operator, target, now); err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "db operator pod delete failed",
-			"pod", target.Namespace+"/"+target.Name, "operator", operator)
-		return
-	}
-	p.InvalidatePods(ctx) // pod gone — drop the census
-	metrics.ControlPlanePodHealsTotal.WithLabelValues(operator).Inc()
 	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
-		"operator", operator, "pod", target.Namespace+"/"+target.Name,
-		"service", sig.ns+"/"+sig.svc, "statefulset", sig.sts.Name)
+		"operator", operator, "service", sig.ns+"/"+sig.svc,
+		"statefulset", sig.sts.Name)
 }

@@ -3,7 +3,7 @@
 // vs Ready-pod-IP set-divergence test, the controller-owned-slice
 // staleness pick, the pod-Ready-since fuse clock, and the
 // audited-Service filter.
-package nethealth
+package linkerd
 
 import (
 	corev1 "k8s.io/api/core/v1"

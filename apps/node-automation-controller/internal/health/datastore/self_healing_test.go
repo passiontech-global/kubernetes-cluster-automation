@@ -20,7 +20,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -78,7 +77,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	svc := shMasterSvc("db", "dragonfly-master",
 		map[string]string{"app": "dragonfly", "role": "master"})
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: probefw.DragonflyOperatorNS,
+		Namespace: kube.DragonflyOperatorNS,
 		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
 		UID:       types.UID("dr-op-1"),
 	}}
@@ -104,7 +103,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	if v, _ := shStatefulZeroGauge(t, "db", "dragonfly-master", "dragonfly"); v != 1 {
 		t.Fatalf("zero-endpoints gauge = %v, want 1", v)
 	}
-	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("operator pod deleted before the 5m heal window")
 	}
@@ -115,9 +114,44 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("still masterless — must keep FAILING")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("dragonfly operator pod must be deleted past 5m, err=%v", err)
+	}
+}
+
+// Deliberate maintenance (a cordoned node) defers the STEP-1
+// dragonfly-operator bounce too — AllowedVPersisted's mutex half
+// fails closed even though the zero-endpoint streak and the cooldown
+// both cleared (mirrors certdriftauditor's
+// TestLinkerdIssuerRolloutDeferredByMaintenanceMutex).
+func TestDragonflyOperatorHealMaintenanceDefers(t *testing.T) {
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "dragonfly-master", "dragonfly")
+	base := time.Now()
+	cordoned := testutil.Node("w1", corev1.ConditionTrue, nil)
+	cordoned.Spec.Unschedulable = true
+	sts := shSTS("db", "dragonfly", 3,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: kube.DragonflyOperatorNS,
+		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
+		UID:       types.UID("dr-op-1"),
+	}}
+	cs := fake.NewSimpleClientset(cordoned, sts, svc, opPod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	// Seed the streak, then sweep past the 5m heal window.
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	p.Now = func() time.Time { return base.Add(6 * time.Minute) }
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("masterless under maintenance must still FAIL")
+	}
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+		Get(ctx, opPod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("operator pod deleted during maintenance")
 	}
 }
 
@@ -136,7 +170,7 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 	svc := shMasterSvc("db", "dragonfly-master",
 		map[string]string{"app": "dragonfly", "role": "master"})
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: probefw.DragonflyOperatorNS,
+		Namespace: kube.DragonflyOperatorNS,
 		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
 		UID:       types.UID("dr-op-1"),
 	}}
@@ -147,7 +181,7 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("persisted masterless window must FAIL on the first sweep")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("resumed window past 5m must bounce the operator, err=%v", err)
 	}
@@ -164,7 +198,7 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	svc := shMasterSvc("cache", "redis-master", map[string]string{"app": "redis"})
 	svc.Labels = map[string]string{"app.kubernetes.io/role": "master"}
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: probefw.DragonflyOperatorNS,
+		Namespace: kube.DragonflyOperatorNS,
 		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
 	}}
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
@@ -179,7 +213,7 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	if v, _ := shStatefulZeroGauge(t, "cache", "redis-master", "redis"); v != 1 {
 		t.Fatalf("zero-endpoints gauge = %v, want 1", v)
 	}
-	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("non-dragonfly STS must not bounce the dragonfly operator")
 	}

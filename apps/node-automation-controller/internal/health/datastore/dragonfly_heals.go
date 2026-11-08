@@ -20,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -52,27 +51,20 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// drHealed keys on controller names that die with their
 	// Deployments — bound the map so stale stamps cannot accumulate.
 	p.drHealed.PruneExpired(now, dragonflyHealCooldown)
-	// The cheap persisted-stamp cooldown runs BEFORE the mutex —
-	// same ordering healDragonflyReplicaDeadlock carries: a stamp
-	// inside the window skips the three-signal API reads entirely.
-	// Nil ledger — this heal's per-pod drHealed keys are checked
-	// inside the delete loop, not here, so the annotation half is
-	// all the preamble reads.
-	if heal.PersistedCooledDown(nil, sig.sts, dragonflyHealAnno, "",
-		dragonflyHealCooldown, now) {
-		log.Info("skip heal: persisted stamp inside cooldown",
-			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name)
-		return
-	}
-	// Maintenance mutex — never kill an operator mid-drain/upgrade;
-	// "cannot verify" fails closed like healOperatorLeader (W5.8).
-	// HealAllowed gets a nil ledger here: this heal's cooldown is the
-	// wider of the persisted STS stamp and the per-pod drHealed
-	// entries, not a single CooldownSet key, so only its mutex gate
-	// applies — shared via the Deps-wide verdict so the whole sweep
-	// pays one evaluation.
+	// Persisted stamp → maintenance mutex in ONE call
+	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the
+	// persisted passiontech.dev/last-dragonfly-operator-heal stamp is
+	// the cooldown's cheap half and defers before the mutex ever
+	// reads — a stamp inside the window skips the three-signal API
+	// reads entirely. The in-RAM half stays nil: this heal's per-pod
+	// drHealed keys are checked inside the delete loop, not here, so
+	// only the annotation half of the cooldown applies. Never kill an
+	// operator mid-drain/upgrade — "cannot verify" fails closed like
+	// healOperatorLeader (W5.8).
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
-	proceed, unverifiable := p.HealAllowed(ctx, log, nil, stsKey, 0, now)
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		nil, sig.sts, dragonflyHealAnno, stsKey,
+		dragonflyHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -80,7 +72,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	pods, err := p.CS.CoreV1().Pods(kube.DragonflyOperatorNS).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
 		metrics.IncError(p.Name)
@@ -111,12 +103,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			continue
 		}
 		p.InvalidatePods(ctx) // pod gone — drop the census
-		if now.After(p.drOpHealAt[stsKey]) {
-			if p.drOpHealAt == nil {
-				p.drOpHealAt = map[string]time.Time{}
-			}
-			p.drOpHealAt[stsKey] = now
-		}
+		p.drOpHealed.Stamp(stsKey, now)
 		deleted = true
 		log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
 			"pod", pod.Namespace+"/"+pod.Name, "service", sig.ns+"/"+sig.svc,
@@ -146,11 +133,12 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 // dragonflyOperatorHealedAt returns the most recent moment a
 // dragonfly-operator leader pod was deleted by step 1 — the wider
 // of the persisted passiontech.dev/last-dragonfly-operator-heal stamp on
-// this STS and the in-RAM drOpHealAt stamp (which survives an STS
-// patch failure). ok=false means no heal has landed yet: the
-// dual-replica heal must not skip ahead of step 1.
+// this STS and the in-RAM drOpHealed stamp (which survives an STS
+// patch failure; CooldownSet.Last reports the stamp back, which a
+// plain CooledDown gate cannot). ok=false means no heal has landed
+// yet: the dual-replica heal must not skip ahead of step 1.
 func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
-	latest := p.drOpHealAt[sig.sts.Namespace+"/"+sig.sts.Name]
+	latest, _ := p.drOpHealed.Last(sig.sts.Namespace + "/" + sig.sts.Name)
 	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok && t.After(latest) {
 		latest = t
 	}
@@ -268,18 +256,14 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		return
 	}
 
-	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted via
-	// PersistedCooledDown), then the maintenance mutex: HealAllowed
-	// runs with a nil ledger as the mutex-only gate (shared Deps
-	// verdict): never kill a stateful pod mid-drain/upgrade;
-	// "cannot verify" fails closed like every other caller.
-	if heal.PersistedCooledDown(&p.drPodHealed, sig.sts,
-		dragonflyPodHealAnno, stsKey, dragonflyPodHealCooldown, now) {
-		log.Info("skip heal: dragonfly pod inside cooldown",
-			"statefulset", stsKey)
-		return
-	}
-	proceed, unverifiable := p.HealAllowed(ctx, log, nil, stsKey, 0, now)
+	// Gate 3 — persisted stamp → maintenance mutex in ONE call
+	// (Deps.HealAllowedPersisted folds the 30m wider-of in-RAM+
+	// persisted cooldown with the mutex, on the Deps-wide memoized
+	// verdict): never kill a stateful pod mid-drain/upgrade; "cannot
+	// verify" fails closed like every other caller.
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.drPodHealed, sig.sts, dragonflyPodHealAnno,
+		stsKey, dragonflyPodHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

@@ -32,9 +32,11 @@ const (
 	// counts as wedged — a single retry burst is self-healing.
 	ksmWedgeMinAge     = 10 * time.Minute
 	ksmPodHealCooldown = 30 * time.Minute
-	ksmLogTailLines    = int64(200)
-	ksmLogMaxBytes     = int64(256 * 1024)
-	ksmLogTimeout      = 8 * time.Second
+	// Log-tail bounds reuse the shared probefw tail defaults (200
+	// lines / 256 KiB / 8s) — same shape as every pod-log probe.
+	ksmLogTailLines = probefw.DefaultTailLines
+	ksmLogMaxBytes  = probefw.LogMaxBytes
+	ksmLogTimeout   = probefw.LogTimeout
 
 	// node_automation_controller_lease_unhealthy reason labels.
 	leaseReasonKSMUnauthorized    = "ksm_unauthorized"

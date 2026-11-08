@@ -182,8 +182,8 @@ func TestKonnectivityPatcherPriorityClassDriftOnly(t *testing.T) {
 			got.Spec.Template.Spec.PriorityClassName)
 	}
 	c := konnectivityContainer(t, got)
-	if c.Resources.Requests.Cpu().Cmp(konnectivityWantCPU) != 0 ||
-		c.Resources.Requests.Memory().Cmp(konnectivityWantMem) != 0 {
+	if c.Resources.Requests.Cpu().Cmp(konnectivityWantReq[corev1.ResourceCPU]) != 0 ||
+		c.Resources.Requests.Memory().Cmp(konnectivityWantReq[corev1.ResourceMemory]) != 0 {
 		t.Fatalf("correct requests were mangled: %+v", c.Resources.Requests)
 	}
 }
@@ -199,8 +199,8 @@ func TestKonnectivityPatcherRequestsDriftOnly(t *testing.T) {
 	}
 	got := getKonnectivityDS(t, cs)
 	c := konnectivityContainer(t, got)
-	if c.Resources.Requests.Cpu().Cmp(konnectivityWantCPU) != 0 ||
-		c.Resources.Requests.Memory().Cmp(konnectivityWantMem) != 0 {
+	if c.Resources.Requests.Cpu().Cmp(konnectivityWantReq[corev1.ResourceCPU]) != 0 ||
+		c.Resources.Requests.Memory().Cmp(konnectivityWantReq[corev1.ResourceMemory]) != 0 {
 		t.Fatalf("requests not patched back: %+v", c.Resources.Requests)
 	}
 }

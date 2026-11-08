@@ -267,3 +267,109 @@ func TestFluxKustHealthGaugeEmitted(t *testing.T) {
 		t.Fatalf("stuck gauge missing: %v", m)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// double-remediation guard — consumer defers while the source nudge
+// (helmrelease-unlocker's last-source-nudge) is fresh
+// ---------------------------------------------------------------------------
+
+// shKustSourced builds a stuck ArtifactFailed Kustomization carrying
+// a spec.sourceRef, plus its GitRepository source with the given
+// last-source-nudge stamp (nil → none).
+func shKustSourced(base time.Time, stamp *time.Time) (*unstructured.Unstructured, *unstructured.Unstructured) {
+	k := shKust("flux-system", "apps", "False", "ArtifactFailed",
+		base.Add(-20*time.Minute))
+	_ = unstructured.SetNestedMap(k.Object, map[string]any{
+		"kind": "GitRepository", "name": "repo",
+	}, "spec", "sourceRef")
+	repo := probetest.UnstructuredObj("source.toolkit.fluxcd.io/v1", "GitRepository",
+		"flux-system", "repo", 1, 1)
+	if stamp != nil {
+		repo.SetAnnotations(map[string]string{
+			kube.AnnoLastSourceNudge: stamp.UTC().Format(time.RFC3339)})
+	}
+	return k, repo
+}
+
+// (b) The artifact-fail signature with a FRESH last-source-nudge on
+// the source: the consumer defers — detection still FAILs, but no
+// requestedAt lands on the Kustomization.
+func TestFluxKustHealthDefersOnFreshSourceNudge(t *testing.T) {
+	base := time.Now()
+	k, repo := shKustSourced(base, ptrTime(base.Add(-5*time.Minute)))
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, repo))
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("deferred Kustomization must still FAIL detection")
+	}
+	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); found {
+		t.Fatal("consumer nudged while the source nudge is fresh — must defer")
+	}
+}
+
+// The artifact-fail signature with a STALE (or absent) source nudge:
+// the consumer nudges as before.
+func TestFluxKustHealthNudgesWhenSourceNudgeStale(t *testing.T) {
+	base := time.Now()
+	for name, stamp := range map[string]*time.Time{
+		"no stamp":    nil,
+		"stale stamp": ptrTime(base.Add(-45 * time.Minute)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			k, repo := shKustSourced(base, stamp)
+			p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, repo))
+			p.Now = func() time.Time { return base }
+
+			if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+				t.Fatal("stuck Kustomization must FAIL")
+			}
+			got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+				Get(ctx, "apps", metav1.GetOptions{})
+			if _, found, _ := unstructured.NestedString(
+				got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); !found {
+				t.Fatal("consumer must nudge when the source nudge is not fresh")
+			}
+		})
+	}
+}
+
+// (c) Non-artifact reasons are never deferred by a fresh source
+// nudge — HealthCheckFailed with provably-Ready workloads still gets
+// the consumer-side requestedAt nudge even when the source carries a
+// fresh last-source-nudge stamp.
+func TestFluxKustHealthNonArtifactReasonIgnoresSourceNudge(t *testing.T) {
+	base := time.Now()
+	k := shKust("flux-system", "apps", "False", "HealthCheckFailed",
+		base.Add(-20*time.Minute))
+	_ = unstructured.SetNestedSlice(k.Object, []any{
+		map[string]any{"id": "apps_web_apps_Deployment", "v": "v1"},
+	}, "status", "inventory", "entries")
+	_ = unstructured.SetNestedMap(k.Object, map[string]any{
+		"kind": "GitRepository", "name": "repo",
+	}, "spec", "sourceRef")
+	repo := probetest.UnstructuredObj("source.toolkit.fluxcd.io/v1", "GitRepository",
+		"flux-system", "repo", 1, 1)
+	repo.SetAnnotations(map[string]string{
+		kube.AnnoLastSourceNudge: base.Add(-5 * time.Minute).UTC().Format(time.RFC3339)})
+
+	p := testProberDyn(
+		fake.NewSimpleClientset(readyDeploy("apps", "web", 2, 2)),
+		probetest.OpDyn(k, repo))
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck Kustomization must FAIL")
+	}
+	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); !found {
+		t.Fatal("non-artifact reason must keep nudging despite a fresh source nudge")
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }

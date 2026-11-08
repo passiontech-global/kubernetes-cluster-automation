@@ -95,6 +95,19 @@ func envHelpersFromSource(t *testing.T) map[string]bool {
 				"family must anchor the derived set (got %v)", want, helpers)
 		}
 	}
+	// Frozen floor: the derived set must stay at least this large.
+	// The whole derivation hangs on envx's first-param-name convention
+	// (string `key`/`name`) — if a future refactor renames those
+	// params, helpers silently drops out of the set and with it every
+	// docs/env.md row that helper's call sites fed. This makes the
+	// shrink fail loudly instead. Bump ONLY when envx legitimately
+	// loses helpers; grow is always safe.
+	const minEnvHelpers = 32 // 20 key-getters + 12 name-Knob constructors today
+	if len(helpers) < minEnvHelpers {
+		t.Fatalf("envx helper set derived %d helpers, want >= %d — a "+
+			"first-param rename in envx.go is silently shrinking the "+
+			"envdoc scan (got %v)", len(helpers), minEnvHelpers, helpers)
+	}
 	return helpers
 }
 

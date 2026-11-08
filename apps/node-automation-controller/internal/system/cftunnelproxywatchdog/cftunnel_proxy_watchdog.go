@@ -172,17 +172,18 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 // resync annotation (0 when every proxy pod is already ready).
 func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
-	pods, err := w.cs.CoreV1().Pods(w.namespace).List(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: cfTunnelProxyPodSelector,
-	})
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(w.cs, w.namespace))
 	if err != nil {
 		return 0, fmt.Errorf("list proxy pods in %s: %w", w.namespace, err)
 	}
 	var unready []string
-	for i := range pods.Items {
-		if pods.Items[i].Status.Phase == corev1.PodRunning &&
-			!kube.PodReadyCond(&pods.Items[i]) {
-			unready = append(unready, pods.Items[i].Name)
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning &&
+			!kube.PodReadyCond(&pods[i]) {
+			unready = append(unready, pods[i].Name)
 		}
 	}
 	if len(unready) == 0 {
@@ -335,8 +336,10 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 // startup churn must not trigger deletes.
 func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 	tgt cfTunnelConnectorTarget, now time.Time) (int, error) {
-	pods, err := w.cs.CoreV1().Pods(tgt.namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: tgt.selector})
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: tgt.selector,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(w.cs, tgt.namespace))
 	if err != nil {
 		return 0, fmt.Errorf("list connector pods in %s: %w",
 			tgt.namespace, err)
@@ -344,8 +347,8 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 	var running []*corev1.Pod
 	var unreadyStale []*corev1.Pod
 	ready := 0
-	for i := range pods.Items {
-		p := &pods.Items[i]
+	for i := range pods {
+		p := &pods[i]
 		if p.Status.Phase != corev1.PodRunning {
 			continue
 		}

@@ -25,6 +25,14 @@ import (
 // Check E — kubernetes-replicator sync drift (W7-C6)
 // ---------------------------------------------------------------------------
 
+// replStreakKey flattens the replicationMetricKey tuple into the
+// StreakLedger's string key space (the gauge ledger keeps the struct
+// key; StreakLedger is string-keyed — a slash inside the source VALUE
+// is unambiguous, same contract as the metric labels).
+func replStreakKey(k replicationMetricKey) string {
+	return k.namespace + "/" + k.name + "/" + k.source
+}
+
 // auditReplicatedSecrets diffs each replicated TLS secret's tls.crt
 // against its source. The comparison is bytes — the replicator
 // copies data verbatim, so ANY byte difference is drift (a rotated
@@ -75,22 +83,21 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 		}
 		a.seenReplication.Emit(k, k.namespace, k.name, k.source)
 		if bytes.Equal(d.dest, src) {
-			delete(a.replicationMismatch, k)
+			a.replicationMismatch.Reset(replStreakKey(k))
 			if _, ok := a.seenReplication.Last()[k]; ok {
 				metrics.ReplicatedSecretDrift.
 					DeleteLabelValues(k.namespace, k.name, k.source)
 			}
 			continue
 		}
-		a.replicationMismatch[k]++
-		if a.replicationMismatch[k] < replicationDriftScans {
+		if streak := a.replicationMismatch.Hit(replStreakKey(k)); streak < replicationDriftScans {
 			continue // first mismatch — the replicator may be mid-sync
 		}
 		a.seenReplication.Set(metrics.ReplicatedSecretDrift, 1,
 			k, k.namespace, k.name, k.source)
 		log.Info("replicated tls secret drifted from source across scans",
 			"secret", d.namespace+"/"+d.name, "source", d.source,
-			"consecutiveScans", a.replicationMismatch[k])
+			"consecutiveScans", a.replicationMismatch.Count(replStreakKey(k)))
 		// W8-NM2: a confirmed drift means the replicator missed the
 		// update — stripping the replicated-from-version stamp
 		// makes it resync on its next reconcile (1h cooldown).
@@ -100,25 +107,24 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 	// Prune series + streaks for replicas gone (or sources no longer
 	// comparable) since the last sweep.
 	a.seenReplication.Prune(metrics.ReplicatedSecretDrift.DeleteLabelValues)
-	for k := range a.replicationMismatch {
-		if _, ok := a.seenReplication.Last()[k]; !ok {
-			delete(a.replicationMismatch, k)
-		}
+	live := map[string]bool{}
+	for k := range a.seenReplication.Last() {
+		live[replStreakKey(k)] = true
 	}
+	a.replicationMismatch.Prune(func(key string) bool { return live[key] })
 }
 
 // forceReplicationResync strips the replicated-from-version
 // annotation on a drifted destination so kubernetes-replicator copies
 // the source fresh on its next pass — rate-limited to once per
-// destination per hour (in-RAM: the annotation removal is the heal).
+// destination per hour (in-RAM: the annotation removal is the heal;
+// CooldownSet arms itself lazily for literal-constructed fixtures).
 func (a *certDriftAuditor) forceReplicationResync(ctx context.Context,
 	d replicatedSecretRef, k replicationMetricKey) {
 	log := logf.FromContext(ctx)
-	if a.resyncNudged == nil {
-		a.resyncNudged = map[replicationMetricKey]time.Time{} // literal-constructed auditors (tests)
-	}
 	now := a.now.Now()
-	if last, ok := a.resyncNudged[k]; ok && now.Sub(last) < replicationResyncCooldown {
+	if last, ok := a.resyncHeals.Last(replStreakKey(k)); ok &&
+		now.Sub(last) < replicationResyncCooldown {
 		log.Info("skip resync: replicated secret inside cooldown",
 			"secret", d.namespace+"/"+d.name,
 			"ago", now.Sub(last).Truncate(time.Minute))
@@ -139,7 +145,7 @@ func (a *certDriftAuditor) forceReplicationResync(ctx context.Context,
 			"secret", d.namespace+"/"+d.name)
 		return
 	}
-	a.resyncNudged[k] = now
+	a.resyncHeals.Stamp(replStreakKey(k), now)
 	log.Info("ACTION: stripped replicated-from-version — forcing kubernetes-replicator resync",
 		"secret", d.namespace+"/"+d.name, "source", d.source)
 }

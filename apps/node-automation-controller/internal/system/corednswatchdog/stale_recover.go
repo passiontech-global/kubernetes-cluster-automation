@@ -92,20 +92,19 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		// not roll pods).
 		log.Info("ACTION: rollout restart deploy/coredns",
 			"suspects", len(suspects), "total", nPods)
-		patch, err := json.Marshal(map[string]any{
-			"metadata": map[string]any{
-				"annotations": map[string]string{corednsTSAnno: stamp},
-			},
-			"spec": map[string]any{
-				"template": map[string]any{
-					"metadata": map[string]any{
-						"annotations": map[string]string{
-							"kubectl.kubernetes.io/restartedAt": stamp,
-						},
-					},
-				},
-			},
-		})
+		// The pod-template restartedAt half comes from the shared
+		// kube.RestartTemplatePatch builder (the same doc fluentbit
+		// roller patches with); the Deployment-level cooldown stamp
+		// merges into the SAME doc so both stamps land in one write
+		// (metadata-only — it does not roll pods).
+		var doc map[string]any
+		if err := json.Unmarshal(kube.RestartTemplatePatch(w.now.Now()), &doc); err != nil {
+			return fmt.Errorf("render restart patch: %w", err)
+		}
+		doc["metadata"] = map[string]any{
+			"annotations": map[string]string{corednsTSAnno: stamp},
+		}
+		patch, err := json.Marshal(doc)
 		if err != nil {
 			return err
 		}

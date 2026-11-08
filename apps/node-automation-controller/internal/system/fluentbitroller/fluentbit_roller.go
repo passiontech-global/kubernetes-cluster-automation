@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -28,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -37,12 +37,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 type fluentBitRoller struct {
 	cs kubernetes.Interface
+	// dyn feeds the maintenance mutex's autopilot-Plan signal — the
+	// DS rollout restart defers while a drain/k0s upgrade is in
+	// flight.
+	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the controller name and every IncError label
 	// come from one place.
@@ -50,6 +55,10 @@ type fluentBitRoller struct {
 	// now is the clock seam — tests pin it so the rollout-restart
 	// timestamp is deterministic. nil → time.Now.
 	now shared.Clock
+	// verdict memoizes the maintenance-mutex evaluation for this
+	// reconcile (AllowedV stamps the result into the field so a
+	// retry within the run pays no extra API reads).
+	verdict kube.Verdict
 }
 
 // onlyPipelineSecret is the exact predicate the For() watch below
@@ -68,7 +77,7 @@ var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool 
 // registration entirely.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		r := &fluentBitRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
@@ -144,22 +153,31 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 
 	// kubectl rollout restart equivalent. The stamp must land on the
 	// POD TEMPLATE — kube.MergePatchAnnos only covers top-level
-	// metadata.annotations, so the nested doc is marshalled by hand
-	// (same shape stale_recover.go builds for its restart stamp).
-	restartPatch, err := json.Marshal(map[string]any{
-		"spec": map[string]any{
-			"template": map[string]any{
-				"metadata": map[string]any{
-					"annotations": map[string]any{
-						"kubectl.kubernetes.io/restartedAt": r.now.Now().UTC().Format(time.RFC3339),
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("render restart patch: %w", err)
+	// metadata.annotations, so kube.RestartTemplatePatch renders the
+	// nested doc (same shared builder stale_recover.go uses).
+	//
+	// Maintenance mutex — a LIVE-workload mutation (rolling every
+	// fluent-bit pod), so per AGENTS.md it gates on the
+	// cordon/kured/autopilot signal the NotReady storm check above
+	// does not cover. heal.AllowedV with a nil heals ledger — this
+	// module's pacing is the config-hash drift, not a CooldownSet —
+	// sharing r.verdict. Unverifiable fails closed: IncError the
+	// queue and skip; the drift clears on the next reconcile once
+	// maintenance is verifiable again.
+	proceed, unverifiable := heal.AllowedV(ctx, log, &r.verdict,
+		r.cs, r.dyn, nil, "fluent-system/fluent-bit", 0, r.now.Now())
+	if unverifiable {
+		metrics.IncError(r.queue)
+		log.Info("SKIP roll: maintenance mutex unverifiable",
+			"daemonset", "fluent-system/fluent-bit")
+		return res, nil
 	}
+	if !proceed {
+		log.Info("SKIP roll: maintenance active (cordon/kured/autopilot)",
+			"daemonset", "fluent-system/fluent-bit")
+		return res, nil
+	}
+	restartPatch := kube.RestartTemplatePatch(r.now.Now())
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)

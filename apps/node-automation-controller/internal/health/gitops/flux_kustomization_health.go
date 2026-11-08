@@ -72,6 +72,11 @@ const (
 	// fluxKustHealCooldown bounds requestedAt patches to one per
 	// Kustomization per 30m.
 	fluxKustHealCooldown = 30 * time.Minute
+	// sourceNudgeFreshWindow mirrors helmrelease-unlocker's per-source
+	// last-source-nudge cooldown: while the stamp is younger, the
+	// source-side artifact fix is in flight and the consumer-side
+	// nudge defers.
+	sourceNudgeFreshWindow = 30 * time.Minute
 )
 
 // fluxKustomizationGVR is the kustomize.toolkit.fluxcd.io/v1
@@ -188,12 +193,33 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	if !nudgeable {
 		return
 	}
-	ck := probefw.SelfHealKey(CheckNameFluxKustomizationHealth, key)
-	if heal.PersistedCooledDown(&p.reconcileHealed, kust,
-		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now) {
-		return
+	// Double-remediation guard: on the artifact-fail signature, the
+	// SOURCE object is the primary remediation target
+	// (helmrelease-unlocker's artifact healer). When that healer
+	// already stamped a fresh passiontech.dev/last-source-nudge on
+	// the consumer's source, the source-controller refetch is in
+	// flight — nudging the consumer here would churn its backoff on
+	// top of the source fix, so this check defers. Non-artifact
+	// reasons (HealthCheckFailed with provably-Ready workloads) keep
+	// the current consumer-side behavior.
+	if fluxKustNudgeReasons[reason] ||
+		kube.FluxArtifactStale(kust, now, fluxKustStuckMinAge) {
+		if p.fluxSourceNudgeFresh(ctx, kust, now) {
+			log.V(1).Info("skip: consumer nudge deferred — source nudge fresh",
+				"kustomization", key, "reason", reason)
+			return
+		}
 	}
-	proceed, unverifiable := p.HealAllowed(ctx, log, nil, ck, 0, now)
+	ck := probefw.SelfHealKey(CheckNameFluxKustomizationHealth, key)
+	// The preamble is the shared persisted-cooldown shape
+	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the
+	// cooldown is the wider of the in-RAM ledger and the requestedAt
+	// stamp a previous patch — ours or `flux reconcile`'s — left; only
+	// after it clears do the maintenance mutex + global heal budget
+	// evaluate (fail closed), on the Deps-wide memoized verdict.
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.reconcileHealed, kust,
+		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -222,6 +248,35 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	}
 	log.Info("PATCH: flux kustomization reconcile requestedAt",
 		"kustomization", key, "reason", reason)
+}
+
+// fluxSourceNudgeFresh reports whether the Kustomization's Flux
+// source object already carries a fresh passiontech.dev/last-source-nudge
+// stamp (helmrelease-unlocker's 30m cooldown) — the signal that the
+// source-side artifact fix is in flight and the consumer-side nudge
+// must defer. Any lookup failure (absent source, unknown kind,
+// unreadable dynamic response) fails OPEN: the gitops nudge keeps its
+// current behavior rather than losing remediation to a read error.
+func (p *fluxKustomizationHealthCheck) fluxSourceNudgeFresh(ctx context.Context,
+	kust *unstructured.Unstructured, now time.Time) bool {
+
+	kind, ns, name, ok := kube.FluxConsumerSourceRef(kust)
+	if !ok {
+		return false
+	}
+	gvr, ok := kube.FluxSourceGVR(kind)
+	if !ok {
+		return false
+	}
+	src, err := p.Dyn.Resource(gvr).Namespace(ns).
+		Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info(
+			"source nudge lookup failed — deferral guard fails open",
+			"kind", kind, "source", ns+"/"+name, "error", err)
+		return false
+	}
+	return kube.FluxSourceNudgeFresh(src, now, sourceNudgeFreshWindow)
 }
 
 // fluxKustDepsReady reports whether every spec.dependsOn entry of the

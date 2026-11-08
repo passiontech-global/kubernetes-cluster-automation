@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -149,7 +148,7 @@ var operatorTargets = []operatorTarget{
 	},
 	{
 		name:          "dragonfly-operator",
-		leaseNS:       probefw.DragonflyOperatorNS,
+		leaseNS:       kube.DragonflyOperatorNS,
 		leaseNames:    []string{"7898635c.dragonflydb.io"},
 		podSelector:   "control-plane=controller-manager",
 		leaseOptional: true,

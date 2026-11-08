@@ -14,7 +14,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -66,4 +69,47 @@ func StampPersisted(ctx context.Context,
 		ledger.Stamp(ledgerKey, now)
 	}
 	return nil
+}
+
+// AllowedVPersisted is AllowedV with the cooldown gate widened to
+// the persisted stamp — the preamble the "persisted cooldown →
+// mutex → act → stamp" heals hand-roll (watchdogs'
+// healOperatorLeader, datastore's dragonfly heals, gitops'
+// kustomization nudge, externalsecretnudge's connect bounce): the
+// cooldown is the wider of the in-RAM ledger stamp AND the object's
+// persisted annotation (PersistedCooledDown), and only after it
+// clears does the maintenance mutex + heal budget evaluate.
+//
+// A nil obj (or empty annoKey — nothing to read off the object)
+// collapses to plain AllowedV: the ledger-only cooldown plus the
+// mutex, byte-identical verdicts. This is the leaseOptional
+// operator's shape — no Lease object means no annotation half, so
+// the gate degrades to the in-RAM ledger without changing the
+// mutex contract.
+//
+// obj must be a literal nil or a non-nil metav1.Object — a typed nil
+// pointer (*appsv1.StatefulSet)(nil) wrapped in the interface would
+// panic inside AnnoTime, same as every PersistedCooledDown caller
+// today. Callers with an optionally-absent object keep the
+// `var obj metav1.Object; if x != nil { obj = x }` fold
+// healOperatorLeader uses.
+//
+// v, cs, dyn, heals, key, cooldown and now carry AllowedV's contract
+// unchanged (nil heals skips the in-RAM half, nil v means no
+// memoization, unverifiable=true is fail-closed and the CALLER
+// IncErrors its queue).
+func AllowedVPersisted(ctx context.Context, log logr.Logger,
+	v *kube.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	if obj == nil || annoKey == "" {
+		return AllowedV(ctx, log, v, cs, dyn, heals, key, cooldown, now)
+	}
+	if PersistedCooledDown(heals, obj, annoKey, key, cooldown, now) {
+		log.Info("skip heal: persisted stamp inside cooldown", "target", key)
+		return false, false
+	}
+	// The ledger half is already checked — pass a nil heals so
+	// AllowedV runs only its mutex + budget gates.
+	return AllowedV(ctx, log, v, cs, dyn, nil, key, cooldown, now)
 }

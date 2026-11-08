@@ -24,6 +24,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 func TestSelfHealKey(t *testing.T) {
@@ -126,7 +127,7 @@ func TestPodFromList(t *testing.T) {
 func TestLinkerdPodMatchesComponent(t *testing.T) {
 	mk := func(name string, labels map[string]string) *corev1.Pod {
 		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Namespace: LinkerdNS, Name: name, Labels: labels}}
+			Namespace: "linkerd", Name: name, Labels: labels}}
 	}
 	cases := []struct {
 		name      string
@@ -135,31 +136,31 @@ func TestLinkerdPodMatchesComponent(t *testing.T) {
 		want      bool
 	}{
 		{"exact deployment name",
-			mk("linkerd-destination", nil), LinkerdDestinationName, true},
+			mk("linkerd-destination", nil), "linkerd-destination", true},
 		{"replicaset pod prefix",
 			mk("linkerd-destination-7d8f9b-x2abc", nil),
-			LinkerdDestinationName, true},
+			"linkerd-destination", true},
 		{"prefix without dash does not match",
 			mk("linkerd-destinationextra", nil),
-			LinkerdDestinationName, false},
+			"linkerd-destination", false},
 		{"other component pod",
 			mk("linkerd-identity-abc12", nil),
-			LinkerdDestinationName, false},
+			"linkerd-destination", false},
 		{"control-plane-component label short name",
 			mk("pod-1", map[string]string{
 				"linkerd.io/control-plane-component": "destination"}),
-			LinkerdDestinationName, true},
+			"linkerd-destination", true},
 		{"label for a different component",
 			mk("pod-2", map[string]string{
 				"linkerd.io/control-plane-component": "identity"}),
-			LinkerdDestinationName, false},
+			"linkerd-destination", false},
 		{"identity by label",
 			mk("pod-3", map[string]string{
 				"linkerd.io/control-plane-component": "identity"}),
-			LinkerdIdentityName, true},
+			"linkerd-identity", true},
 		{"unrelated pod",
 			mk("web-1", map[string]string{"app": "web"}),
-			LinkerdDestinationName, false},
+			"linkerd-destination", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,8 +176,10 @@ func TestPromEndpoint(t *testing.T) {
 	t.Run("env override wins verbatim", func(t *testing.T) {
 		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL",
 			"http://prom.internal:9090/api/v1/query")
-		d := &Deps{Cfg: Config{HTTPContent: HTTPContentConfig{
-			URL: "http://ignored/path"}}}
+		// The override is captured at NewDeps — the env freeze the
+		// construction-time resolution exists to guarantee.
+		d := NewDeps(shared.Deps{}, Config{HTTPContent: HTTPContentConfig{
+			URL: "http://ignored/path"}})
 		got, err := d.PromEndpoint()
 		if err != nil || got != "http://prom.internal:9090/api/v1/query" {
 			t.Fatalf("PromEndpoint = (%q,%v)", got, err)
@@ -215,7 +218,11 @@ func TestPromQuery(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", srv.URL+"/api/v1/query")
 
-	d := &Deps{HTTPClient: srv.Client()}
+	// Built through NewDeps so the env override lands in the frozen
+	// field; the HTTPClient seam swaps post-construction as in prod.
+	d := NewDeps(shared.Deps{}, Config{})
+	d.HTTPClient = srv.Client()
+	d.Prom.HTTP = d.HTTPClient
 	samples, err := d.PromQuery(context.Background(), `up{job="x"}`)
 	if err != nil {
 		t.Fatalf("PromQuery: %v", err)
@@ -232,6 +239,30 @@ func TestPromQueryUnresolvableEndpoint(t *testing.T) {
 		HTTPContent: HTTPContentConfig{URL: "no-scheme"}}}
 	if _, err := d.PromQuery(context.Background(), "up"); err == nil {
 		t.Fatal("PromQuery with unresolvable endpoint = nil error")
+	}
+}
+
+// NewDeps resolves the HEALTH_PROMETHEUS_QUERY_URL override ONCE at
+// construction — env churn mid-run (what per-call re-reads allowed)
+// can no longer flip the endpoint under a running sweep. The
+// Cfg.HTTPContent.URL fallback stays live (config, not env), so
+// tests re-pointing Cfg keep working. Literally-constructed Deps
+// carry no override and fall through to the derivation
+// (TestPromEndpoint covers that fold).
+func TestPromEndpointResolvedOnceAtConstruction(t *testing.T) {
+	t.Setenv("HEALTH_PROMETHEUS_QUERY_URL",
+		"http://prom.internal:9090/api/v1/query")
+	d := NewDeps(shared.Deps{}, Config{HTTPContent: HTTPContentConfig{
+		URL: "http://ignored/path"}})
+
+	if got, err := d.PromEndpoint(); err != nil ||
+		got != "http://prom.internal:9090/api/v1/query" {
+		t.Fatalf("NewDeps PromEndpoint = (%q,%v)", got, err)
+	}
+	t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "http://other:9090/api/v1/query")
+	if got, err := d.PromEndpoint(); err != nil ||
+		got != "http://prom.internal:9090/api/v1/query" {
+		t.Fatalf("endpoint re-resolved after construction = (%q,%v)", got, err)
 	}
 }
 

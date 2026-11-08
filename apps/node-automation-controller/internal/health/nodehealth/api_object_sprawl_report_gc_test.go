@@ -147,7 +147,7 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	}
 }
 
-// W15-CP2b — ConfigMap/Secret objects above the 512 KiB Kine row guard
+// Kine large-object census — ConfigMap/Secret objects above the 512 KiB Kine row guard
 // emit node_automation_kine_large_object_bytes and fail the check;
 // objects at or below the threshold stay silent; shrinking (here:
 // deleting) the offenders prunes their series and lets the check pass

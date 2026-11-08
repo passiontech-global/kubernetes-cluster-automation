@@ -61,13 +61,9 @@ func (g *apiServerEndpointGuard) applySliceQuarantine(ctx context.Context, log l
 	// The primary always carries the annotation — persist it even
 	// when its endpoint set itself was unchanged this cycle.
 	writeQuarantineAnnotation(copies[0], quarantinedIPs)
-	for i, s := range copies {
-		if i > 0 && !dirty[i] {
-			continue
-		}
-		if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-			Update(ctx, s, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("update endpointslice/%s: %w", s.Name, err)
+	for _, err := range g.updateDirtySlices(ctx, copies, dirty, true) {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -121,19 +117,44 @@ func (g *apiServerEndpointGuard) applyEndpointsQuarantine(ctx context.Context, l
 	// above against the actual slice contents — reaching this
 	// block on drift alone repairs the slice without touching
 	// the Endpoints object at all.
-	for i, s := range sliceCopies {
-		if !sliceDirty[i] {
+	for i, err := range g.updateDirtySlices(ctx, sliceCopies, sliceDirty, false) {
+		if err == nil {
+			continue
+		}
+		// Logged/metered, not returned: Endpoints already
+		// persisted the decision and the next cycle re-applies
+		// the slice diff.
+		metrics.IncError(g.queue)
+		log.Error(err, "EndpointSlice update failed — retries next cycle",
+			"slice", sliceCopies[i].Name)
+	}
+	return nil
+}
+
+// updateDirtySlices Updates every dirty slice copy — plus the primary
+// (copies[0]) when updatePrimary, because only the primary carries the
+// quarantine annotation even when its endpoint set was untouched. The
+// per-slice errors are returned aligned with copies (nil = skipped or
+// succeeded): the EndpointSlice-SSOT path STOPS at the first failure —
+// a failed primary (annotation-carrier) update must persist nothing,
+// so the next cycle retries the whole decision — while the
+// Endpoints-mirror convergence path logs and meters each one and
+// keeps converging the remaining slices (different error contracts by
+// design).
+func (g *apiServerEndpointGuard) updateDirtySlices(ctx context.Context,
+	copies []*discoveryv1.EndpointSlice, dirty []bool, updatePrimary bool) []error {
+	errs := make([]error, len(copies))
+	for i, s := range copies {
+		if !dirty[i] && !(updatePrimary && i == 0) {
 			continue
 		}
 		if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
 			Update(ctx, s, metav1.UpdateOptions{}); err != nil {
-			// Logged/metered, not returned: Endpoints already
-			// persisted the decision and the next cycle re-applies
-			// the slice diff.
-			metrics.IncError(g.queue)
-			log.Error(err, "EndpointSlice update failed — retries next cycle",
-				"slice", s.Name)
+			errs[i] = fmt.Errorf("update endpointslice/%s: %w", s.Name, err)
+			if updatePrimary {
+				return errs
+			}
 		}
 	}
-	return nil
+	return errs
 }

@@ -16,7 +16,7 @@
 // same Ready-sibling-gated pod delete. The sweep also reports
 // linkerd-proxy OOM kills on
 // node_automation_linkerd_proxy_oomkilled.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -26,7 +26,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -60,22 +59,14 @@ type linkerdH2StreamGuardCheck struct {
 	balancerSeen    state.FirstSeenLedger
 }
 
-// NewLinkerdH2StreamGuardCheck builds the h2 guard — its only state
-// is the emitted-gauge ledgers; pod-delete cooldowns ride the shared
-// Deps.Heals set.
-func NewLinkerdH2StreamGuardCheck(d *probefw.Deps) probefw.Check {
-	return &linkerdH2StreamGuardCheck{Deps: d}
-}
+// The constructor lives in the package facade (linkerd.go).
 
 const (
 	CheckNameLinkerdH2StreamGuard = "linkerd-h2-stream-guard"
 
 	// linkerd-h2-stream-guard knobs.
-	linkerdH2PodMinAge  = 5 * time.Minute
-	linkerdH2HealCool   = 30 * time.Minute
-	linkerdH2LogTimeout = 8 * time.Second
-	linkerdH2TailLines  = int64(200)
-	linkerdH2LogMaxByte = int64(256 * 1024)
+	linkerdH2PodMinAge = 5 * time.Minute
+	linkerdH2HealCool  = 30 * time.Minute
 	// linkerdH2LogWorkers bounds the parallel proxy-log tails —
 	// the kubelet log path is the sweep's slowest read, so the
 	// scan runs on a small pool instead of serially.
@@ -211,48 +202,31 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		if !storm && !identity {
 			continue
 		}
-		ref := metav1.GetControllerOf(pod)
 		if storm {
 			rep.Flag(linkerdH2StreamStalledGauge, key, lv)
 			rep.Find(key)
-			if ref == nil {
-				log.Info("skip heal: unowned pod — no sibling can absorb traffic",
-					"pod", key)
-			} else if probefw.ReadySiblings(readyByOwner, pod) < 1 {
-				// The storming pod itself counts toward its owner's
-				// Ready total when it is Ready — a h2 wedge does not
-				// break the HTTP/1.1 probe. ReadySiblings subtracts
-				// self so the guard requires a GENUINELY separate
-				// sibling.
-				log.Info("skip heal: no Ready sibling replica — delete would blackhole the workload",
-					"pod", key)
-			} else {
-				p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-					kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
-			}
+			// The storming pod itself counts toward its owner's
+			// Ready total when it is Ready — a h2 wedge does not
+			// break the HTTP/1.1 probe. SafePodDelete's gate uses
+			// ReadySiblings, which subtracts self so the guard
+			// requires a GENUINELY separate sibling.
+			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
+				pod, readyByOwner, 1, linkerdH2HealCool, now)
 		}
 		if identity {
 			identityRep.Flag(linkerdProxyIdentityStalledGauge, key, lv)
 			if !storm {
 				rep.Find(key)
 			}
-			// The safe-evict gate needs TWO Ready pods under the
-			// same controller: the stalled pod may still report
+			// The safe-evict gate: the stalled pod may still report
 			// Ready (a leaf-cert lapse does not break the HTTP/1.1
-			// probe), so >=2 guarantees a genuinely separate replica
-			// absorbs the traffic while the replacement is issued a
-			// fresh leaf cert. Same 30m cooldown key as the storm
-			// path — one delete heals both signatures.
-			if ref == nil {
-				log.Info("skip identity heal: unowned pod — no sibling can absorb traffic",
-					"pod", key)
-			} else if readyByOwner[ref.UID] < 2 {
-				log.Info("skip identity heal: fewer than 2 Ready pods under the controller — evict would blackhole the workload",
-					"pod", key)
-			} else {
-				p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-					kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
-			}
+			// probe), so one genuinely separate Ready sibling under
+			// the same controller means TWO Ready pods absorb the
+			// traffic while the replacement is issued a fresh leaf
+			// cert. Same 30m cooldown key as the storm path — one
+			// delete heals both signatures.
+			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
+				pod, readyByOwner, 1, linkerdH2HealCool, now)
 		}
 	}
 	rep.Close(&p.emitted, linkerdH2StreamStalledGauge.DeleteLabelValues)

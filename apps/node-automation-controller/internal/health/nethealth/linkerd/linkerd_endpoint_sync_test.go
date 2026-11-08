@@ -2,7 +2,7 @@
 // linkerd-endpoint-sync check (W9-NM2/W10-FIX7): healthy/desync
 // census, oldest-destination bounce, gauge cleanup, and the
 // stale-EndpointSlice delete selection.
-package nethealth
+package linkerd
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -67,16 +67,16 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	base := time.Now()
 	older := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         probefw.LinkerdNS,
-			Name:              probefw.LinkerdDestinationName + "-old-111",
+			Namespace:         kube.LinkerdNS,
+			Name:              kube.LinkerdDestinationName + "-old-111",
 			UID:               types.UID("u-old"),
 			CreationTimestamp: metav1.NewTime(base.Add(-2 * time.Hour)),
 		},
 	}
 	newer := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         probefw.LinkerdNS,
-			Name:              probefw.LinkerdDestinationName + "-new-222",
+			Namespace:         kube.LinkerdNS,
+			Name:              kube.LinkerdDestinationName + "-new-222",
 			UID:               types.UID("u-new"),
 			CreationTimestamp: metav1.NewTime(base.Add(-time.Hour)),
 		},
@@ -113,11 +113,11 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("desync gauge = %v, want 1", m)
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, older.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("oldest linkerd-destination pod not bounced")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, newer.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("newer linkerd-destination pod bounced — not oldest-first")
 	}
@@ -128,7 +128,7 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("persisted desync stopped failing inside cooldown")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, newer.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("linkerd-destination bounced inside the 1h cooldown")
 	}
@@ -183,7 +183,7 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 		kube.AnnoFirstSeenLinkerdEndpointSync: `{"app/resume-svc":"` +
 			base.Add(-20*time.Minute).UTC().Format(time.RFC3339) + `"}`,
 	}
-	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-old-111", 2*time.Hour)
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-old-111", 2*time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("app"),
 		svc,
@@ -205,7 +205,7 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("desync gauge = %v, want 1", m)
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("linkerd-destination pod not bounced on the resumed window")
 	}
@@ -272,7 +272,7 @@ func TestStaleLinkerdSlices(t *testing.T) {
 func TestLinkerdEndpointSyncDeletesSliceMissingReadyIP(t *testing.T) {
 	base := time.Now()
 	slice := managedEndpointSlice("desyncapp", "desync-svc") // empty — misses the Ready pod IP
-	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-aaa-111", 2*time.Hour)
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-aaa-111", 2*time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("desyncapp"),
 		probetest.HeadlessService("desyncapp", "desync-svc", map[string]string{"desyncapp": "x"}),
@@ -288,7 +288,7 @@ func TestLinkerdEndpointSyncDeletesSliceMissingReadyIP(t *testing.T) {
 		Get(ctx, slice.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("stale EndpointSlice missing a Ready pod IP not deleted")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("linkerd-destination pod not bounced alongside slice delete")
 	}
@@ -301,7 +301,7 @@ func TestLinkerdEndpointSyncDeletesSliceWithDeadIP(t *testing.T) {
 	base := time.Now()
 	slice := managedEndpointSlice("desyncapp", "desync-svc",
 		"10.244.0.5", "10.244.0.9") // .9 belongs to a pod that no longer exists
-	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-bbb-222", 2*time.Hour)
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-bbb-222", 2*time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("desyncapp"),
 		probetest.HeadlessService("desyncapp", "desync-svc", map[string]string{"desyncapp": "x"}),
@@ -350,7 +350,7 @@ func TestLinkerdEndpointSyncKeepsHealthySlice(t *testing.T) {
 func TestLinkerdEndpointSyncKeepsSliceInsideReadyFuse(t *testing.T) {
 	base := time.Now()
 	slice := managedEndpointSlice("desyncapp", "desync-svc", "10.244.0.5")
-	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-ccc-333", 2*time.Hour)
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-ccc-333", 2*time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("desyncapp"),
 		probetest.HeadlessService("desyncapp", "desync-svc", map[string]string{"desyncapp": "x"}),
@@ -373,7 +373,7 @@ func TestLinkerdEndpointSyncKeepsSliceInsideReadyFuse(t *testing.T) {
 		Get(ctx, slice.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("slice deleted for a pod still inside the Ready fuse")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("linkerd-destination pod not bounced")
 	}
@@ -385,7 +385,7 @@ func TestLinkerdEndpointSyncKeepsSliceInsideReadyFuse(t *testing.T) {
 func TestLinkerdEndpointSyncKeepsNonManagedSlice(t *testing.T) {
 	base := time.Now()
 	slice := probetest.EndpointSliceForService("desyncapp", "desync-svc", "10.244.0.9") // stale, no managed-by
-	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-ddd-444", 2*time.Hour)
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-ddd-444", 2*time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("desyncapp"),
 		probetest.HeadlessService("desyncapp", "desync-svc", map[string]string{"desyncapp": "x"}),
@@ -401,7 +401,7 @@ func TestLinkerdEndpointSyncKeepsNonManagedSlice(t *testing.T) {
 		Get(ctx, slice.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("non-managed EndpointSlice deleted — not ours to reap")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("linkerd-destination pod not bounced")
 	}
@@ -550,7 +550,7 @@ func managedEndpointSlice(ns, svc string, addrs ...string) *discoveryv1.Endpoint
 // the heal picks (oldest match wins; one per test suffices).
 func linkerdDestinationPod(name string, age time.Duration) *corev1.Pod {
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace:         probefw.LinkerdNS,
+		Namespace:         kube.LinkerdNS,
 		Name:              name,
 		UID:               types.UID("uid-" + name),
 		CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
@@ -586,7 +586,7 @@ func ciliumConfig(data map[string]string) *corev1.ConfigMap {
 // presence means the mesh is installed.
 func linkerdNamespace() *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name: probefw.LinkerdNS}}
+		Name: kube.LinkerdNS}}
 }
 
 // bpf-lb-sock on Linkerd with NEITHER compatibility knob fails the

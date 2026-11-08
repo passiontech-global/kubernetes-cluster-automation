@@ -118,6 +118,10 @@ const (
 	// opaque-ports to force/selfHeal must not trigger a 30m
 	// patch-vs-revert fight (6h cooldown).
 	AnnoLastLinkerdOpaquePatch = "passiontech.dev/last-linkerd-opaque-patch"
+	// AnnoLastLinkerdIssuerRollout is cert-drift-auditor's durable
+	// linkerd-identity issuer-rotation rollout stamp — the persisted
+	// half of the 30m re-roll cooldown (survives operator restarts).
+	AnnoLastLinkerdIssuerRollout = "passiontech.dev/last-linkerd-issuer-rollout"
 	// AnnoLastKargoRefresh is kargo-promotion-health's persisted
 	// cooldown for its warehouse-refresh merge-patches.
 	AnnoLastKargoRefresh = "passiontech.dev/last-kargo-refresh"
