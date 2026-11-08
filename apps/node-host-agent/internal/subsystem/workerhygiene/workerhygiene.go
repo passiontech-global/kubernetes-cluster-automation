@@ -209,7 +209,28 @@ func (h *Hygiene) Run(ctx context.Context) {
 	stop := cycle.Spawn(ctx, "workerhygiene kubelet watchdog feeder",
 		func(fctx context.Context) { h.feeder.Run(fctx) })
 	defer stop()
-	cycle.Every("workerhygiene", h.Cfg.Interval, h.Cycle).Run(ctx)
+	cycle.Every("workerhygiene", h.Cfg.Interval, h.runCycle).Run(ctx)
+}
+
+// runCycle executes one Cycle under the per-cycle deadline
+// (Config.CycleTimeout). Run drives Cycle synchronously inside the
+// ticker loop (controllerhygiene runCycle parity), so without the
+// bound a single hung child — a wedged systemd.Active, a stalled
+// pod LIST, a containerd task-map walk on a dead runtime — would
+// starve every later check for as long as it hangs. Every spawned
+// command and HTTP probe is CommandContext/request-ctx aware, so
+// cancellation actually interrupts the stall. Hitting the deadline
+// is a degraded cycle, not a failure — it is logged so a
+// silently-starved guard shows up in the watchdog tail.
+func (h *Hygiene) runCycle(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, h.Cfg.CycleTimeout)
+	defer cancel()
+	h.Cycle(cctx)
+	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		h.State.AppendLogWarn(fmt.Sprintf(
+			"workerhygiene: cycle deadline %s exceeded — "+
+				"stalled check(s) aborted", h.Cfg.CycleTimeout))
+	}
 }
 
 // Cycle runs one round of every check in the ordered dispatch
@@ -256,12 +277,25 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// ReadDir sweeps were 3-5 full walks of a several-thousand-entry
 	// dir. Lazy like the task map: most cycles never need it.
 	var pids []int
+	pidsLogged := false
 	pidsOnce := func() []int {
 		if pids == nil {
-			// ReadDir-order pids, error swallowed like the old
-			// procPIDs — a nil result retries the scan on the
-			// next pidsOnce call (same as before).
-			pids, _ = h.Proc.PIDs()
+			// ReadDir-order pids. Same retry shape as the old
+			// procPIDs closure: an error leaves the cache nil,
+			// so the same cycle's later pidsOnce calls retry
+			// the read. The delta is observability only — the
+			// first failure per cycle warns, where the old
+			// code swept zero pids silently (indistinguishable
+			// from a genuinely empty /proc).
+			if p, err := h.Proc.PIDs(); err != nil {
+				if !pidsLogged {
+					h.State.AppendLogWarn(fmt.Sprintf(
+						"proc pid listing failed — process scans skipped this pass: %v", err))
+					pidsLogged = true
+				}
+			} else {
+				pids = p
+			}
 		}
 		return pids
 	}
