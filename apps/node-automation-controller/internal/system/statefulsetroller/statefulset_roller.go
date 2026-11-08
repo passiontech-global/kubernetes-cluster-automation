@@ -250,7 +250,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// collapsing the set one delete after another.
 	newest := pods[0]
 	for _, p := range pods {
-		if !podReadySince(p, now, 0) {
+		if _, ready := kube.PodReadySince(p); !ready {
 			log.Info("skip: owned pod not Ready",
 				"statefulset", sts.Namespace+"/"+sts.Name,
 				"pod", p.Name)
@@ -260,7 +260,8 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 			newest = p
 		}
 	}
-	if !podReadySince(newest, now, stsOnDeleteStableMin) {
+	since, ready := kube.PodReadySince(newest)
+	if !ready || now.Sub(since) < stsOnDeleteStableMin {
 		log.Info("skip: newest pod not yet stable",
 			"statefulset", sts.Namespace+"/"+sts.Name,
 			"pod", newest.Name,
@@ -324,15 +325,15 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// signal gate 1 does not cover (a static-cordon-tolerant Ready
 	// check vs. the fail-closed maintenance signals): a drain or k0s
 	// upgrade in flight must not race a live-pod eviction.
-	// heal.AllowedV runs with a nil heals ledger — this module's
+	// heal.Gate runs the nil-heals-ledger preamble — this module's
 	// pacing is the 30m drift window, not a CooldownSet — and shares
 	// r.verdict so the sweep pays one mutex evaluation.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &r.verdict,
-		r.cs, r.dyn, nil, sts.Namespace+"/"+sts.Name, 0, now)
+	// Unverifiable fails closed: a defer, not a returned run error,
+	// so IncError the queue here (same shape as every other
+	// unverifiable-mutex skip — never evict blind).
+	proceed, unverifiable := heal.Gate(ctx, log, &r.verdict,
+		r.cs, r.dyn, sts.Namespace+"/"+sts.Name, now)
 	if unverifiable {
-		// The check itself failed — a defer, not a returned run
-		// error, so count it here (same shape as every other
-		// unverifiable-mutex skip: fail closed, never evict blind).
 		metrics.IncError(r.queue)
 		return false, nil
 	}
@@ -427,20 +428,4 @@ func podOrdinal(stsName, podName string) (int, bool) {
 		return 0, false
 	}
 	return n, true
-}
-
-// podReadySince reports whether the pod's Ready condition is True AND
-// has been so for at least minAge. A missing or timestamp-less Ready
-// condition reports false — an unverifiable age is not a settled pod.
-func podReadySince(p *corev1.Pod, now time.Time, minAge time.Duration) bool {
-	for _, c := range p.Status.Conditions {
-		if c.Type != corev1.PodReady {
-			continue
-		}
-		if c.Status != corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
-			return false
-		}
-		return now.Sub(c.LastTransitionTime.Time) >= minAge
-	}
-	return false
 }

@@ -282,12 +282,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		// re-arm the full 10m while the signature still held.
 		if !heal.FirstSeenPersisted(ctx, log, &p.seen, pod,
 			kube.AnnoFirstSeenRabbitQuorum, sig, rabbitUnreadyMinAge,
-			now, func(ctx context.Context, data []byte) error {
-				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
-					pod.Name, types.MergePatchType, data,
-					metav1.PatchOptions{})
-				return err
-			}) {
+			now, kube.PodMergePatcher(p.CS, pod)) {
 			continue
 		}
 		// disk_watermark_alarm is deliberately non-healable (W12
@@ -321,12 +316,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		if err := heal.ClearPersistedFirstSeen(ctx, log, &p.seen, pod,
 			kube.AnnoFirstSeenRabbitQuorum, "prom/"+key,
-			func(ctx context.Context, data []byte) error {
-				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
-					pod.Name, types.MergePatchType, data,
-					metav1.PatchOptions{})
-				return err
-			}); err != nil {
+			kube.PodMergePatcher(p.CS, pod)); err != nil {
 			log.Info("WARN: rabbitmq quorum first-seen clear failed",
 				"pod", key, "error", err)
 		}

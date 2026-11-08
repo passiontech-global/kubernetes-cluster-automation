@@ -385,8 +385,8 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// Unverifiable fails closed and IncErrors the queue like every
 	// other tolerated sub-failure.
 	if e.dyn != nil {
-		proceed, unverifiable := heal.AllowedV(ctx, log, &e.verdict,
-			e.cs, e.dyn, nil, "partition-evictor", 0, now)
+		proceed, unverifiable := heal.Gate(ctx, log, &e.verdict,
+			e.cs, e.dyn, "partition-evictor", now)
 		if unverifiable {
 			metrics.IncError(e.queue)
 			return nil

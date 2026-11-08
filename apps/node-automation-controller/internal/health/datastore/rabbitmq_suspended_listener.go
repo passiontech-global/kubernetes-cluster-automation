@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -181,12 +180,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		// window; a clear failure is tolerated (Warn only) — the
 		// ledger Forget already landed, the durable half retries
 		// next sweep.
-		patch := func(ctx context.Context, data []byte) error {
-			_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
-				pod.Name, types.MergePatchType, data,
-				metav1.PatchOptions{})
-			return err
-		}
+		patch := kube.PodMergePatcher(p.CS, pod)
 		if !rabbitSuspended(pod) {
 			if err := heal.ClearPersistedFirstSeen(ctx, log,
 				&p.rbSuspendedSince, pod,

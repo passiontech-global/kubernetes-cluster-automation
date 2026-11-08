@@ -340,24 +340,12 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 	splitRep.Close(&p.emittedSplit, scyllaSchemaSplitGauge.DeleteLabelValues)
 	shardRep.Close(&p.emittedShard, scyllaShardImbalanceGauge.DeleteLabelValues)
 	overloadRep.Close(&p.emittedOverload, scyllaOverloadStallGauge.DeleteLabelValues)
-	var parts []string
-	if findings := backlogRep.Sorted(); len(findings) > 0 {
-		parts = append(parts, fmt.Sprintf("compaction backlog >%d: %s",
-			scyllaCompactionBacklogMax, strings.Join(findings, ", ")))
-	}
-	if findings := splitRep.Sorted(); len(findings) > 0 {
-		parts = append(parts, "schema splits: "+strings.Join(findings, ", "))
-	}
-	if findings := shardRep.Sorted(); len(findings) > 0 {
-		parts = append(parts, "shard imbalance: "+strings.Join(findings, ", "))
-	}
-	if findings := overloadRep.Sorted(); len(findings) > 0 {
-		parts = append(parts, "overload stalls: "+strings.Join(findings, ", "))
-	}
-	if len(parts) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: strings.Join(parts, " | ")}
+	return probefw.WhyFold(
+		probefw.Section("compaction backlog >%d: %s",
+			backlogRep.Sorted(), scyllaCompactionBacklogMax),
+		probefw.Section("schema splits: %s", splitRep.Sorted()),
+		probefw.Section("shard imbalance: %s", shardRep.Sorted()),
+		probefw.Section("overload stalls: %s", overloadRep.Sorted()))
 }
 
 // shardSkew folds a pod's per-shard reactor utilization into

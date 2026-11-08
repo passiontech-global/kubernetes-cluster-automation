@@ -200,23 +200,13 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	promRep.Close(&p.emittedPromotions, kargoPromotionStuckGauge.DeleteLabelValues)
 	whRep.Close(&p.emittedWarehouses, kargoWarehouseUnhealthyGauge.DeleteLabelValues)
 	arRep.Close(&p.emittedAnalysisRuns, argoAnalysisRunStuckGauge.DeleteLabelValues)
-	var parts []string
-	if f := promRep.Sorted(); len(f) > 0 {
-		parts = append(parts, fmt.Sprintf("promotions running/pending >=%s: %s",
-			kargoPromotionStuckMinAge, strings.Join(f, ", ")))
-	}
-	if f := whRep.Sorted(); len(f) > 0 {
-		parts = append(parts, fmt.Sprintf("warehouses not ready >=%s: %s",
-			kargoWarehouseUnhealthyAge, strings.Join(f, ", ")))
-	}
-	if f := arRep.Sorted(); len(f) > 0 {
-		parts = append(parts, fmt.Sprintf("analysisruns running >=%s: %s",
-			argoAnalysisRunStuckMinAge, strings.Join(f, ", ")))
-	}
-	if len(parts) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: strings.Join(parts, " | ")}
+	return probefw.WhyFold(
+		probefw.Section("promotions running/pending >=%s: %s",
+			promRep.Sorted(), kargoPromotionStuckMinAge),
+		probefw.Section("warehouses not ready >=%s: %s",
+			whRep.Sorted(), kargoWarehouseUnhealthyAge),
+		probefw.Section("analysisruns running >=%s: %s",
+			arRep.Sorted(), argoAnalysisRunStuckMinAge))
 }
 
 // kargoPhaseStuck reports whether a Promotion phase is one of the

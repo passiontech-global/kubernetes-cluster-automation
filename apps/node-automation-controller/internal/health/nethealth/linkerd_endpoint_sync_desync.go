@@ -6,8 +6,6 @@
 package nethealth
 
 import (
-	"time"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -42,22 +40,6 @@ type linkerdSliceRef struct {
 	ns, name string
 	uid      types.UID
 	addrs    map[string]bool
-}
-
-// podReadySince returns the pod's PodReady=True LastTransitionTime —
-// the clock for the EndpointSlice heal's missing-IP fuse. ok=false
-// when the pod is not Ready (mirrors kube.PodReadyCond, which
-// returns on the first PodReady-typed condition).
-func podReadySince(pod *corev1.Pod) (since time.Time, ok bool) {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			if c.Status != corev1.ConditionTrue {
-				return time.Time{}, false
-			}
-			return c.LastTransitionTime.Time, true
-		}
-	}
-	return time.Time{}, false
 }
 
 // staleLinkerdSlices picks the controller-owned EndpointSlices of a

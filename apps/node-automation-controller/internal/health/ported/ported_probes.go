@@ -135,11 +135,8 @@ func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-	if len(offenders) > 0 {
-		return probefw.Result{Why: fmt.Sprintf("restarts>%d: %s",
-			p.Cfg.Pods.MaxRestarts, strings.Join(offenders, ", "))}
-	}
-	return probefw.Result{Pass: true}
+	return probefw.WhyFold(probefw.Section("restarts>%d: %s",
+		offenders, p.Cfg.Pods.MaxRestarts))
 }
 
 // podRestartRecentWindow bounds how far back the last termination may
@@ -184,11 +181,8 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 			bad = append(bad, fmt.Sprintf("%s=%s", pod.Name, pod.Status.Phase))
 		}
 	}
-	if len(bad) > 0 {
-		return probefw.Result{Why: fmt.Sprintf("non-Running pods in %s: %s",
-			p.Cfg.Pods.Namespace, strings.Join(bad, ", "))}
-	}
-	return probefw.Result{Pass: true}
+	return probefw.WhyFold(probefw.Section("non-Running pods in %s: %s",
+		bad, p.Cfg.Pods.Namespace))
 }
 
 // probeResourceQuota ports resource-quota-check: FAIL when any quota
@@ -219,9 +213,6 @@ func (p *resourceQuotaCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-	if len(over) > 0 {
-		return probefw.Result{Why: fmt.Sprintf("quota used/hard>%.2g: %s",
-			p.Cfg.Quota.Threshold, strings.Join(over, ", "))}
-	}
-	return probefw.Result{Pass: true}
+	return probefw.WhyFold(probefw.Section("quota used/hard>%.2g: %s",
+		over, p.Cfg.Quota.Threshold))
 }

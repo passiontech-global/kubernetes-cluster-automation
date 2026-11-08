@@ -305,8 +305,8 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// apply here, shared via w.verdict so the sweep pays one
 	// evaluation.
 	if w.dyn != nil {
-		proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
-			w.cs, w.dyn, nil, "cloudflared-wedges", 0, now)
+		proceed, unverifiable := heal.Gate(ctx, log, &w.verdict,
+			w.cs, w.dyn, "cloudflared-wedges", now)
 		if unverifiable {
 			metrics.IncError(w.queue)
 			return 0, nil
@@ -354,7 +354,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 			ready++
 			continue
 		}
-		if age, ok := podUnreadyFor(p, now); ok && age >= cfTunnelUnreadyMinAge {
+		if age, ok := kube.PodUnreadyFor(p, now); ok && age >= cfTunnelUnreadyMinAge {
 			unreadyStale = append(unreadyStale, p)
 		}
 	}
@@ -461,22 +461,6 @@ func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
 		return false, err
 	}
 	return cloudflaredLogsWedged(string(data)), nil
-}
-
-// podUnreadyFor reports how long the pod's Ready condition has been
-// non-True. Missing/zero transition time or a Ready=True condition
-// both fail closed (not counted as stale-unready).
-func podUnreadyFor(p *corev1.Pod, now time.Time) (time.Duration, bool) {
-	for _, c := range p.Status.Conditions {
-		if c.Type != corev1.PodReady {
-			continue
-		}
-		if c.Status == corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
-			return 0, false
-		}
-		return now.Sub(c.LastTransitionTime.Time), true
-	}
-	return 0, false
 }
 
 // cloudflaredLogsWedged matches the observed cloudflared failure
