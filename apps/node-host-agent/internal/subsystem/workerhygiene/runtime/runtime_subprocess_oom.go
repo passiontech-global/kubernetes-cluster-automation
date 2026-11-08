@@ -87,6 +87,39 @@ func cgroupInitPID(scopeDir string) (int, bool) {
 	return 0, false
 }
 
+// oomMemStatMiB reads memory.stat of the container cgroup at OOM
+// confirmation time and formats the W16-KR1 tmpfs breakdown
+// "anon=XMiB shmem=YMiB file=ZMiB" (bytes / 1024 / 1024, rounded
+// to nearest). A big `shmem` is the tmpfs/emptyDir{medium:Memory}
+// fingerprint — the page cache `file` is reclaimable, anon+shmem
+// is what the kill actually had to shoot. "" on any read/parse
+// failure — the event keeps working without the breakdown.
+func oomMemStatMiB(scopeDir string) string {
+	data, err := os.ReadFile(filepath.Join(scopeDir, "memory.stat"))
+	if err != nil {
+		return ""
+	}
+	vals := map[string]uint64{}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if v, err := strconv.ParseUint(f[1], 10, 64); err == nil {
+			vals[f[0]] = v
+		}
+	}
+	if len(vals) == 0 {
+		return ""
+	}
+	const miB = 1024 * 1024
+	mib := func(key string) string {
+		return strconv.FormatUint((vals[key]+miB/2)/miB, 10)
+	}
+	return fmt.Sprintf("anon=%sMiB shmem=%sMiB file=%sMiB",
+		mib("anon"), mib("shmem"), mib("file"))
+}
+
 // Run executes one subproc-oom round.
 func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckSubprocOOM) {
@@ -158,7 +191,8 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				kill > st.reported {
 				st.reported = kill
 				st.pendingAt = time.Time{}
-				c.report(ctx, uid, podByUID[uid], scope, kill, pid1)
+				c.report(ctx, uid, podByUID[uid], scope, kill, pid1,
+					oomMemStatMiB(scope))
 			} else if pidOK && pid1 != st.pid1 {
 				// init pid changed while pending — the container
 				// DID restart; the kill was legitimate.
@@ -177,15 +211,20 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 // report emits the ContainerSubprocessOOMKilled Warning event on
 // the owning Pod and bumps the counter — events.v1 shape like the
-// SystemOOMVictim emitter.
+// SystemOOMVictim emitter. memStat carries the W16-KR1 memory.stat
+// breakdown ("anon=XMiB shmem=YMiB file=ZMiB"), appended to both
+// the event note and the log lines when non-empty.
 func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
-	pod *corev1.Pod, scope string, kill int64, pid1 int) {
+	pod *corev1.Pod, scope string, kill int64, pid1 int, memStat string) {
 	c.d.ContainerSubprocessOOM++
 	base := filepath.Base(scope)
+	if memStat != "" {
+		memStat = " mem_stat=" + memStat
+	}
 	if pod == nil || c.d.Cfg.Client == nil {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: container-subproc-oom scope=%s pod uid=%s oom_kill=%d pid1=%d — pod unresolvable, event skipped",
-			base, uid, kill, pid1))
+			"suspect: container-subproc-oom scope=%s pod uid=%s oom_kill=%d pid1=%d%s — pod unresolvable, event skipped",
+			base, uid, kill, pid1, memStat))
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
@@ -194,8 +233,8 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 		Namespace: pod.Namespace,
 		Reason:    "ContainerSubprocessOOMKilled",
 		Note: fmt.Sprintf(
-			"container %s hit memcg oom_kill (total %d) but PID 1 (%d) survived %s — subprocess kill, container left running (living dead)",
-			base, kill, pid1, subprocOOMConfirm),
+			"container %s hit memcg oom_kill (total %d) but PID 1 (%d) survived %s — subprocess kill, container left running (living dead)%s",
+			base, kill, pid1, subprocOOMConfirm, memStat),
 		When: now,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -209,7 +248,7 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: ContainerSubprocessOOMKilled — pod %s/%s scope=%s oom_kill=%d pid1=%d unchanged after %s",
-		pod.Namespace, pod.Name, base, kill, pid1, subprocOOMConfirm))
+		"ACTION: ContainerSubprocessOOMKilled — pod %s/%s scope=%s oom_kill=%d pid1=%d%s unchanged after %s",
+		pod.Namespace, pod.Name, base, kill, pid1, memStat, subprocOOMConfirm))
 	c.d.Actions.WithLabelValues(wdeps.CheckSubprocOOM, "event").Inc()
 }

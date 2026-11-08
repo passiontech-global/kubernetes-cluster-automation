@@ -72,6 +72,11 @@ const (
 	natsReasonNoMetaLeader       = "no_meta_leader"
 	natsReasonRaftLostLeadership = "raft_lost_leadership"
 	natsReasonConsumerAckFloor   = "consumer_ack_floor"
+	// W16-ST2 — a JetStream stream (or its raft group) lost its
+	// leader: replicas report the stream-leader gauge but none holds
+	// leadership, so publishes to the stream stall while the server
+	// itself stays Ready.
+	natsReasonStreamLeaderless = "stream_leaderless"
 )
 
 // natsHealableReasons is the whitelist of pod-local wedges that
@@ -83,6 +88,10 @@ var natsHealableReasons = map[string]bool{
 	natsReasonJetStreamDisabled:  true,
 	natsReasonNoMetaLeader:       true,
 	natsReasonRaftLostLeadership: true,
+	// W16-ST2 — a member that lost its stream leaders recovers them
+	// by rejoining the raft groups on a fresh start. Still gated on
+	// the >=2-Ready-siblings quorum census below.
+	natsReasonStreamLeaderless: true,
 }
 
 // natsLogMarkers are the log signatures of a wedged JetStream member
@@ -91,6 +100,11 @@ var natsLogMarkers = []struct{ marker, reason string }{
 	{"jetstream not enabled", natsReasonJetStreamDisabled},
 	{"no meta leader", natsReasonNoMetaLeader},
 	{"raft: lost leadership", natsReasonRaftLostLeadership},
+	// W16-ST2 — stream-level leader loss: the server keeps serving
+	// core NATS while every replica of a stream group reports no
+	// leader.
+	{"stream has no leader", natsReasonStreamLeaderless},
+	{"group has no leader", natsReasonStreamLeaderless},
 }
 
 var (
@@ -100,7 +114,7 @@ var (
 	// series cannot resolve.
 	natsJetstreamUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_nats_jetstream_unhealthy",
-		Help: "1 while a NATS JetStream pod/cluster reports a wedge signature (jetstream_disabled, meta_leaderless, no_meta_leader, raft_lost_leadership, consumer_ack_floor) — W12-ST1.",
+		Help: "1 while a NATS JetStream pod/cluster reports a wedge signature (jetstream_disabled, meta_leaderless, stream_leaderless, no_meta_leader, raft_lost_leadership, consumer_ack_floor) — W12-ST1/W16-ST2.",
 	}, []string{"namespace", "pod", "reason"})
 )
 
@@ -418,7 +432,66 @@ func (p *natsJetstreamHealthCheck) natsPromSignals(ctx context.Context,
 		}
 	}
 
-	// (c) Consumer ack-floor stall: num_ack_pending pinned at a
+	// (b2) W16-ST2 — stream leader loss: members publish the
+	// per-stream nats_jetstream_stream_leader gauge; a namespace
+	// whose series exist but sum to 0 has lost the leader of every
+	// tracked stream group. Diffed client-side across the same two
+	// instant queries as the meta check (the literal `and` form
+	// never matches: a ==0 comparison produces an empty vector on
+	// the leader side, and PromQL `and` intersects it away).
+	// Pod-resolvable findings join the windowed/healable pod-local
+	// path (bounce only under the >=2-Ready-siblings quorum guard);
+	// series whose pod cannot be resolved emit at namespace scope —
+	// a namespace-scope Raft verdict has no single culprit pod.
+	streamCounts, errSC := p.PromQuery(ctx,
+		`nats_jetstream_stream_leader`)
+	streamSums, errSS := p.PromQuery(ctx,
+		`sum by (namespace) (nats_jetstream_stream_leader)`)
+	if errSC != nil || errSS != nil {
+		log.Info("WARN: nats stream-leader queries failed — stream-leaderless signal skipped",
+			"countErr", errSC, "sumErr", errSS)
+	} else {
+		sumByNS := map[string]float64{}
+		for _, s := range streamSums {
+			sumByNS[s.Label("namespace")] = s.Value
+		}
+		podsByNS := map[string][]string{}
+		for _, s := range streamCounts {
+			ns := s.Label("namespace")
+			if ns == "" {
+				continue
+			}
+			if _, seen := podsByNS[ns]; !seen {
+				podsByNS[ns] = nil // registered even without pod labels
+			}
+			if pod := s.Label("pod", "pod_name"); pod != "" {
+				podsByNS[ns] = append(podsByNS[ns], pod)
+			}
+		}
+		for ns, podNames := range podsByNS {
+			if !natsNamespaces[ns] || sumByNS[ns] != 0 {
+				continue // a stream leader exists — healthy, or not a NATS namespace
+			}
+			resolved := false
+			for _, podName := range podNames {
+				pod := resolvePod(ns, podName)
+				if pod == nil || pod.DeletionTimestamp != nil {
+					continue // stale series or a non-member — not ours
+				}
+				addReason(pod.Namespace+"/"+pod.Name,
+					natsReasonStreamLeaderless, true)
+				resolved = true
+			}
+			if !resolved {
+				rep.Emit(natsJetstreamUnhealthyGauge,
+					ns+"/"+natsReasonStreamLeaderless,
+					[]string{ns, "", natsReasonStreamLeaderless},
+					fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, sum 0)",
+						ns, len(podNames)))
+			}
+		}
+	}
+
 	// positive max_ack_pending — every consumer flow-control stops
 	// while nothing crashes. Joined client-side on the consumer
 	// identity labels both counters share.

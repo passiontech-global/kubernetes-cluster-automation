@@ -11,8 +11,10 @@
 //     itself is the wedge → `runtime restart kine-pgbouncer`
 //     under the GuardStateDir last-pgb-restart budget (15m).
 //     W12-CP1 rides the same check: a starved wait queue
-//     (maxwait > 10s, or cl_waiting > 0 with sv_active == 0)
-//     while the backend runs FEWER active queries than the
+//     (maxwait > 10s, cl_waiting with sv_active == 0, or — W16-CP3 —
+//     cl_waiting with sv_active > 0 while the backend runs zero
+//     queries) while
+//     the backend runs FEWER active queries than the
 //     pool holds server conns means stalled half-open conns →
 //     `RECONNECT` on the admin console (restart fallback),
 //     2 consecutive probes, same 15m budget.
@@ -130,6 +132,35 @@ func (p *Probe) activeBackendQueries(ctx context.Context, pg, user, pass string,
 	return v, true
 }
 
+// pgbStarveShape classifies the pool-side starvation shapes — pure
+// for tests. classic: the wait queue is too old (maxwait > 10s) or
+// clients wait with NO active server conn at all (W12-CP1).
+// halfOpen (W16-CP3): clients wait while server conns exist AND
+// appear active — but the backend runs zero queries, the
+// PgBouncer-side sv_active bookkeeping being half-open on a wedged
+// socket. Either shape plus the backend query evidence below is
+// starvation evidence.
+func pgbStarveShape(maxWaitSec, clWaiting, svActive int64) (classic, halfOpen bool) {
+	classic = maxWaitSec > pgbMaxWaitStarveSecs ||
+		(clWaiting > 0 && svActive == 0)
+	halfOpen = clWaiting > 0 && svActive > 0
+	return classic, halfOpen
+}
+
+// starveVerdict combines the pool shape with the pg_stat_activity
+// evidence — pure for tests. classic needs "fewer active queries
+// than the pool holds server conns"; halfOpen needs the stricter
+// "zero active queries" (W16-CP3's half-open sv_active starvation).
+func starveVerdict(classic, halfOpen bool, activeQueries, serverConns int64) bool {
+	switch {
+	case classic:
+		return activeQueries < serverConns
+	case halfOpen:
+		return activeQueries == 0
+	}
+	return false
+}
+
 // checkPGBWedge remediates the pooler on saturation/auth wedge —
 // W8-CP2 item 2 + W12-CP1 starvation. Fire conditions:
 //   - cl_waiting > WaitMax this cycle (hard saturation) → restart;
@@ -137,7 +168,10 @@ func (p *Probe) activeBackendQueries(ctx context.Context, pg, user, pass string,
 //     login (backend_env) is still ok — postgres itself is healthy,
 //     so the wedge lives in pgbouncer → restart;
 //   - W12-CP1: the wait queue starved (maxwait > 10s, or cl_waiting
-//     > 0 with sv_active == 0) for 2 consecutive probes while
+//     > 0 with sv_active == 0; W16-CP3 adds cl_waiting > 0 with
+//     sv_active > 0 while the backend runs ZERO queries — the
+//     half-open sv_active bookkeeping shape) for 2 consecutive
+//     probes while
 //     backend_env == 1 and pg_stat_activity runs fewer active
 //     queries than the pool holds open server conns — the conns are
 //     stalled half-open, not busy → RECONNECT on the admin console
@@ -159,20 +193,23 @@ func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	authWedge := res.Checks[CheckE2EAuth] == 0 &&
 		res.Checks[CheckBackendEnv] == 1
 
-	// W12-CP1: server-pool starvation evaluation. The backend-env
-	// gate is required like the auth wedge's — a broken postgres
-	// can legitimately starve the queue and RECONNECT cannot fix
-	// it. The active-query count is only asked for once the SHOW
-	// POOLS pre-conditions hold (a failed read is inconclusive →
-	// resets the streak, never evidence). Evaluated before the
-	// state files below so the ReadOnly path reports it too.
+	// W12-CP1 + W16-CP3: server-pool starvation evaluation. The
+	// backend-env gate is required like the auth wedge's — a broken
+	// postgres can legitimately starve the queue and RECONNECT
+	// cannot fix it. The active-query count is only asked for once
+	// the SHOW POOLS pre-conditions hold (a failed read is
+	// inconclusive → resets the streak, never evidence). Evaluated
+	// before the state files below so the ReadOnly path reports it
+	// too.
 	starved := false
 	if res.poolSeen && res.Checks[CheckBackendEnv] == 1 &&
-		res.pool.serverConns > 0 &&
-		(res.pool.maxWaitSec > pgbMaxWaitStarveSecs ||
-			(res.pool.clWaiting > 0 && res.pool.svActive == 0)) {
-		if n, ok := p.activeBackendQueries(ctx, pg, user, pass, note); ok {
-			starved = n < res.pool.serverConns
+		res.pool.serverConns > 0 {
+		classic, halfOpen := pgbStarveShape(
+			res.pool.maxWaitSec, res.pool.clWaiting, res.pool.svActive)
+		if classic || halfOpen {
+			if n, ok := p.activeBackendQueries(ctx, pg, user, pass, note); ok {
+				starved = starveVerdict(classic, halfOpen, n, res.pool.serverConns)
+			}
 		}
 	}
 

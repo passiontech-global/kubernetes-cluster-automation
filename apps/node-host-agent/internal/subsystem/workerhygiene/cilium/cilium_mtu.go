@@ -52,6 +52,11 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
 	wg, wgOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
+	// W16-NM4: pod lxc* veths. A pod created before the MTU change
+	// keeps its stale MTU on its host-side veth even when every
+	// cilium_* datapath iface is aligned — the same FRAG_NEEDED
+	// blackhole, so the pod veth MAX votes on the same latch.
+	lxcMax, lxcOK := hostutil.MaxPodLxcMTU(c.d.Cfg.SysClassNet)
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.
@@ -66,6 +71,8 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	case wgOK && wg > neb-wgEncapOverheadBytes:
 		driftWhy = fmt.Sprintf("cilium_wg0=%d nebula=%d (wg overhead %d)",
 			wg, neb, wgEncapOverheadBytes)
+	case lxcOK && lxcMax > neb:
+		driftWhy = fmt.Sprintf("pod lxc*=%d nebula=%d", lxcMax, neb)
 	}
 	if driftWhy != "" {
 		if !c.d.State.Exists(latchdefs.LatchCiliumMTUDrift) {

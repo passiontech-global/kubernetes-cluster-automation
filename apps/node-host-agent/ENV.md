@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them with the
-source location of the first reference (134 knobs referenced
+source location of the first reference (135 knobs referenced
 across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -51,7 +51,7 @@ subsystem has no env gate.
 
 ### `internal/ops/nebulasign`
 
-- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:63`
+- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:64`
 
 ### `internal/ops/opsx`
 
@@ -168,6 +168,8 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `env.go:44`
 - `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `env.go:46`
 - `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `env.go:36`
+- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `config.go:327`
+- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `env.go:51`
 - `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `env.go:38`
 - `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `env.go:42`
 

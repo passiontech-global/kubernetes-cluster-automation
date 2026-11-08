@@ -203,6 +203,28 @@ var (
 	// kargo-promotion-health zombie guard scans (Rollouts analysis).
 	GVRArgoAnalysisRun = schema.GroupVersionResource{
 		Group: "argoproj.io", Version: "v1alpha1", Resource: "analysisruns"}
+	// GVRArgoRollout / GVRArgoExperiment are the argoproj.io/v1alpha1
+	// Rollouts CRs: a first-class workload kind (not a Deployment) that
+	// workload watchdogs, scale-flapping, Linkerd outlier sampling,
+	// opaque-ports patching and the sprawl GC must all recognise.
+	GVRArgoRollout = schema.GroupVersionResource{
+		Group: "argoproj.io", Version: "v1alpha1", Resource: "rollouts"}
+	GVRArgoExperiment = schema.GroupVersionResource{
+		Group: "argoproj.io", Version: "v1alpha1", Resource: "experiments"}
+
+	// ---------------------------------------------------------------
+	// CloudNativePG backup audit + Velero data movement (in-flight
+	// DataUpload / DataDownload objects Velero uses for pod-volume and
+	// data-mover transfers; GVRCNPGCluster already exists below).
+	// ---------------------------------------------------------------
+	GVRCNPGScheduledBackup = schema.GroupVersionResource{
+		Group: "postgresql.cnpg.io", Version: "v1", Resource: "scheduledbackups"}
+	GVRCNPGBackup = schema.GroupVersionResource{
+		Group: "postgresql.cnpg.io", Version: "v1", Resource: "backups"}
+	GVRVeleroDataUpload = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	GVRVeleroDataDownload = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
 
 	// ---------------------------------------------------------------
 	// Shipwright (failed-jobs-janitor BuildRuns; cluster-health-probes

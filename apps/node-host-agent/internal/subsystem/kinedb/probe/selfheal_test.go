@@ -186,3 +186,80 @@ func TestPGBStarveReconnectFallsBackToRestart(t *testing.T) {
 		t.Fatalf("restart fallback missing after RECONNECT failure:\n%s", j)
 	}
 }
+
+// W16-CP3: the starvation shape/verdict matrix — including the
+// half-open sv_active shape (clients queued, servers "active",
+// Postgres running zero queries).
+func TestPGBStarveShapeVerdictMatrix(t *testing.T) {
+	cases := []struct {
+		name                         string
+		maxWait, clWaiting, svActive int64
+		activeQueries, serverConns   int64
+		want                         bool
+	}{
+		{"quiet pool", 0, 0, 3, 3, 7, false},
+		{"old queue, backend busy", 12, 2, 3, 10, 10, false},
+		{"old queue, backend idle", 12, 2, 3, 1, 10, true},
+		{"queue, no active server", 0, 5, 0, 2, 10, true},
+		// Half-open: clients wait on "active" servers but Postgres
+		// runs nothing → starved even with a fresh maxwait.
+		{"half-open, zero queries", 0, 5, 4, 0, 7, true},
+		// Half-open shape but the backend IS running queries →
+		// real work, not a wedge.
+		{"half-open but busy", 0, 5, 4, 3, 7, false},
+		// No queue → neither shape.
+		{"no queue", 0, 0, 4, 0, 7, false},
+	}
+	for _, c := range cases {
+		classic, halfOpen := pgbStarveShape(c.maxWait, c.clWaiting, c.svActive)
+		if got := starveVerdict(classic, halfOpen, c.activeQueries, c.serverConns); got != c.want {
+			t.Fatalf("%s: got %v want %v (classic=%v halfOpen=%v)",
+				c.name, got, c.want, classic, halfOpen)
+		}
+	}
+}
+
+// halfOpenPoolsOut is the W16-CP3 shape: clients queued
+// (cl_waiting=5, under WaitMax), server conns held AND sv_active>0,
+// maxwait fresh — the pool LOOKS healthy while the backend runs
+// nothing (the fixture answers 0 active queries).
+const halfOpenPoolsOut = `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
+postgres|postgres|4|5|4|3|0|0|0|0|0|transaction
+pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
+`
+
+// W16-CP3 end-to-end: the half-open shape sustains 2 consecutive
+// probes → RECONNECT; a backend running queries vetoes it.
+func TestPGBStarveHalfOpenSvActive(t *testing.T) {
+	k, fr, dir := starveFixture(t, halfOpenPoolsOut)
+
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if fr.Ran("RECONNECT") {
+		t.Fatalf("RECONNECT fired on the FIRST half-open probe:\n%s", fr.Joined())
+	}
+	k.Cycle(context.Background())
+	if !strings.Contains(fr.Joined(), "-d pgbouncer -Aqc RECONNECT") {
+		t.Fatalf("RECONNECT did not fire on the second half-open probe:\n%s", fr.Joined())
+	}
+	if v, err := kdeps.ReadIntFile(filepath.Join(
+		k.d.Cfg.GuardStateDir, pgbStarveFile)); err != nil || v != 2 {
+		t.Fatalf("starve streak=%d err=%v want 2", v, err)
+	}
+
+	// The same shape with a genuinely busy backend (3 active
+	// queries) is real work → never counted.
+	k, fr, _ = starveFixture(t, halfOpenPoolsOut)
+	fr.On("pid <> pg_backend_pid", "3\n")
+	k.Cycle(context.Background())
+	k.Cycle(context.Background())
+	if strings.Contains(fr.Joined(), "RECONNECT") {
+		t.Fatalf("RECONNECT fired on a busy backend:\n%s", fr.Joined())
+	}
+	if v, _ := kdeps.ReadIntFile(filepath.Join(
+		dir, pgbStarveFile)); v != 0 {
+		t.Fatalf("busy-backend starve streak=%d want 0", v)
+	}
+}

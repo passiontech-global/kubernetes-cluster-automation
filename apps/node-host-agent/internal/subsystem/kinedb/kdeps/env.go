@@ -45,6 +45,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 			d.PathJoin(defaultBackupDir)),
 		envx.DurationKnob(envnames.EnvKinedbBackupInterval,
 			&cfg.BackupInterval, defaultBackupInterval),
+		// W16-CP1: the compact-guard step cap — 0/unset = disabled
+		// (the unbounded head-Tail step); ApplyDefaults re-applies
+		// the same rule for a directly-constructed Config.
+		envx.Int64Knob(envnames.EnvKinedbGuardMaxStepRevisions,
+			&cfg.MaxStepRevisions, 0),
 	})
 	return cfg
 }

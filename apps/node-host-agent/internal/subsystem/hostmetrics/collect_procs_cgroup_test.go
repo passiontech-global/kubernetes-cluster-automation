@@ -169,3 +169,53 @@ func TestMTUDriftWG0AbsentNoVote(t *testing.T) {
 		t.Fatal("series emitted with nebula but zero datapath MTUs")
 	}
 }
+
+// --- W16-NM4: pod lxc* veth MTU drift ---
+
+// TestMTUDriftPodLxc: a stale pod veth (lxc<hex>, MTU 1500) drifts
+// against neb1 1300 even with every cilium_* datapath iface aligned;
+// lxc_health never votes.
+func TestMTUDriftPodLxc(t *testing.T) {
+	cfg, dirs := fixture(t)
+	for _, n := range []string{"neb1", "lxc1f", "lxc_health"} {
+		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "lxc1f", "mtu"), "1500\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "lxc_health", "mtu"), "1500\n")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("stale lxc veth: drift=%v ok=%v want 1", got, ok)
+	}
+	// Pod veths re-created at the new MTU → aligned again.
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "lxc1f", "mtu"), "1300\n")
+	got, ok = metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0 {
+		t.Fatalf("aligned lxc veth: drift=%v ok=%v want 0", got, ok)
+	}
+}
+
+// TestMTUDriftLxcOnlySource: with NO datapath MTU resolvable but a
+// drifted pod veth, the series still emits 1 — the pod veth vote
+// alone is sufficient evidence (absent ifaces still don't vote).
+func TestMTUDriftLxcOnlySource(t *testing.T) {
+	cfg, dirs := fixture(t)
+	for _, n := range []string{"neb1", "lxc9a"} {
+		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "lxc9a", "mtu"), "1500\n")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("lxc-only source: drift=%v ok=%v want 1", got, ok)
+	}
+}

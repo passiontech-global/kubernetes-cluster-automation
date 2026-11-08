@@ -108,11 +108,14 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"onepassword-connect-sync-probe", "health"},
 	{"linkerd-sidecar-oom-guard", "health"},
 	{"cilium-datapath-map-guard", "health"},
+	{"cilium-l2-lease-guard", "health"},
 	{"observability-pipeline-guard", "health"},
 	{"flux-kustomization-health", "health"},
 	{"workload-scale-flapping", "health"},
 	{"imagepull-secret-auditor", "health"},
 	{"cluster-health-probes", "health"},
+	// W16-G3 — argocd-agent spin healer, last row (see registry.go).
+	{"argocd-agent-spin", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -133,12 +136,14 @@ var goldenMetricFamilies = []string{
 	"node_automation_apiservice_unavailable",
 	"node_automation_apiservice_unblock_heals_total",
 	"node_automation_argocd_app_stuck",
+	"node_automation_cftunnel_gateway_sync_error",
 	"node_automation_cftunnel_wedge_pods_deleted_total",
 	"node_automation_cilium_active_identities",
 	"node_automation_cilium_bpf_map_pressure",
 	"node_automation_cilium_datapath_degraded",
 	"node_automation_cilium_identities_collected_total",
 	"node_automation_cilium_ipam_free_ratio",
+	"node_automation_cilium_l2_stale_lease",
 	"node_automation_cilium_linkerd_socklb_conflict",
 	"node_automation_cilium_missing_cep_pods",
 	"node_automation_cloudflared_tunnel_degraded",
@@ -179,6 +184,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_linkerd_endpoint_desync",
 	"node_automation_linkerd_gitops_opaque_drift",
 	"node_automation_linkerd_h2_stream_stalled",
+	"node_automation_linkerd_init_deadlock_pods",
 	"node_automation_linkerd_opaque_port_missing",
 	"node_automation_linkerd_outbound_balancer_wedged",
 	"node_automation_linkerd_outlier_pods",
@@ -234,6 +240,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_velero_backup_empty_or_errored",
 	"node_automation_velero_backup_stuck",
 	"node_automation_velero_bsl_unavailable",
+	"node_automation_velero_data_movement_wedged",
 	"node_automation_velero_podvolumebackup_wedged",
 	"node_automation_velero_repo_unhealthy",
 	"node_automation_velero_schedule_paused",
@@ -248,6 +255,8 @@ var goldenMetricFamilies = []string{
 	"node_automation_webhook_missing_critical_ns_exclusion",
 	"node_automation_workload_scale_flapping",
 	"node_automation_zombie_sidecar_pods_reaped_total",
+	// W16-G3 — argocd-agent spin gauge (not alphabetical, new row).
+	"node_automation_argocd_agent_spin",
 	"shell_operator_hook_run_errors_total",
 }
 

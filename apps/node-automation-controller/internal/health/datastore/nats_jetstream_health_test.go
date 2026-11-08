@@ -289,3 +289,147 @@ func TestNatsLogReason(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W16-ST2 — stream leaderless
+// ---------------------------------------------------------------------------
+
+// The W16-ST2 stream markers map to stream_leaderless — pure table,
+// no log stream needed.
+func TestNatsLogReasonStreamLeaderless(t *testing.T) {
+	for _, tc := range []struct{ line, want string }{
+		{"[WRN] stream has no leader: events > A", "stream_leaderless"},
+		{"[ERR] group has no leader", "stream_leaderless"},
+		{"[INF] stream events has leader nats-0", ""},
+	} {
+		if got := natsLogReason(tc.line); got != tc.want {
+			t.Fatalf("natsLogReason(%q) = %q, want %q", tc.line, got, tc.want)
+		}
+	}
+}
+
+// Prometheus stream-leader loss resolves to member pods: the gauge
+// emits immediately (the metric IS the state), and once the window
+// lapses the wedged member bounces under the >=2-Ready-siblings
+// quorum guard.
+func TestNatsJetstreamStreamLeaderlessEmitsThenHeals(t *testing.T) {
+	base := time.Now()
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "sum by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		case strings.Contains(query, "stream_leader"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "nats-0"},
+				Value:  0}}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset(natsFixture()...)
+	p := natsProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
+	res := check.Run(ctx)
+	if res.Pass {
+		t.Fatal("stream_leaderless member must FAIL the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_nats_jetstream_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "nats-0",
+			"reason": "stream_leaderless"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("stream_leaderless gauge must emit immediately")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("the bounce must wait out the persistence window")
+	}
+
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res = check.Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted stream_leaderless must still FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-0", metav1.GetOptions{}); err == nil {
+		t.Fatal("persisted wedge with quorum intact must bounce the member")
+	}
+	for _, name := range []string{"nats-1", "nats-2"} {
+		if _, err := cs.CoreV1().Pods("mq").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("healthy members must survive: %v", err)
+		}
+	}
+}
+
+// The quorum guard holds for the stream-leaderless reason too: at
+// 2/3 Ready the wedge holder's own Ready status is discounted, so
+// only ONE other member is Ready and the delete would break Raft
+// quorum — skipped.
+func TestNatsJetstreamStreamLeaderlessQuorumGuard(t *testing.T) {
+	base := time.Now()
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "sum by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		case strings.Contains(query, "stream_leader"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "nats-0"},
+				Value:  0}}
+		}
+		return nil
+	})
+	objs := natsFixture()
+	objs[3] = natsMemberPod("mq", "nats", "nats-2", false) // 2/3 Ready
+	cs := fake.NewSimpleClientset(objs...)
+	p := natsProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
+	_ = check.Run(ctx)
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("persisted wedge must still FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("otherReady=1 — the delete would break Raft quorum")
+	}
+}
+
+// Series without pod labels (aggregate exporters) emit at namespace
+// scope — no single culprit pod, so no bounce ever fires.
+func TestNatsJetstreamStreamLeaderlessNamespaceScope(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "sum by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		case strings.Contains(query, "stream_leader"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset(natsFixture()...)
+	p := natsProber(cs, srv)
+
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("namespace-scope stream leader loss must FAIL the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_nats_jetstream_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "",
+			"reason": "stream_leaderless"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("stream_leaderless gauge must emit at namespace scope")
+	}
+	for _, name := range []string{"nats-0", "nats-1", "nats-2"} {
+		if _, err := cs.CoreV1().Pods("mq").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("namespace-scope verdict must not bounce pods: %v", err)
+		}
+	}
+}

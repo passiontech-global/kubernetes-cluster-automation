@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 const (
@@ -37,6 +39,19 @@ const (
 	// the sysctl itself can't be read (hostconfig widens it to
 	// 10240-65535 = 55296).
 	defaultEphemeralPortWidth = 28232
+	// W16-KR4 AIO sources — the kernel aio table the DB nodes'
+	// io_uring/aio engines exhaust (EAGAIN masquerading as slow
+	// storage). Path seam vars (not Config fields) so tests can
+	// point them at fixture files without touching config.go.
+	defaultAIONrFile  = "/proc/sys/fs/aio-nr"
+	defaultAIOMaxFile = "/proc/sys/fs/aio-max-nr"
+)
+
+// W16-KR4 AIO path seams — package vars overridden per-test
+// (fixtureSeams precedent), never per-node config.
+var (
+	aioNrFile  = defaultAIONrFile
+	aioMaxFile = defaultAIOMaxFile
 )
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
@@ -126,6 +141,21 @@ var (
 		"node_host_agent_snmp_udp_rcvbuf_errors_total",
 		"Udp RcvbufErrors — UDP datagrams dropped on a full receive buffer.",
 		[]string{"node"}, nil)
+	// W16-KR4: kernel AIO table pressure — aio-nr climbing against
+	// aio-max-nr ends in EAGAIN from io_setup/io_submit, which
+	// applications report as generic slow-storage errors.
+	descAIOAllocated = prometheus.NewDesc(
+		"node_host_agent_aio_allocated",
+		"/proc/sys/fs/aio-nr — AIO requests currently in flight.",
+		[]string{"node"}, nil)
+	descAIOMaximum = prometheus.NewDesc(
+		"node_host_agent_aio_maximum",
+		"/proc/sys/fs/aio-max-nr — AIO table limit (hostconfig pins 1048576).",
+		[]string{"node"}, nil)
+	descAIORatio = prometheus.NewDesc(
+		"node_host_agent_aio_used_ratio",
+		"aio-nr / aio-max-nr (0 when the max reads 0; emitted only when both parse).",
+		[]string{"node"}, nil)
 )
 
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
@@ -134,6 +164,10 @@ var (
 // line count rides the same family — emitted only when
 // the file reads (no fake 0 on an unreadable /proc view).
 func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
+	// W16-KR4 AIO gauges ride this domain — emitted before the
+	// file-nr early return below (a node with no file-nr view must
+	// still export its AIO table).
+	c.collectAIO(ch)
 	if f, err := os.Open(c.cfg.MountinfoFile); err == nil {
 		entries := 0.0
 		sc := bufio.NewScanner(f)
@@ -166,6 +200,30 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 	if maxFD > 0 {
 		ch <- prometheus.MustNewConstMetric(descFileFDRatio,
 			prometheus.GaugeValue, alloc/maxFD, c.cfg.NodeName)
+	}
+}
+
+// collectAIO reads /proc/sys/fs/aio-nr and /proc/sys/fs/aio-max-nr
+// (W16-KR4). Each gauge emits only when its own file parses; the
+// used ratio emits 0 when the max is 0 rather than divide by zero.
+func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
+	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
+	mx, mxOK := hostutil.ReadUintFile(aioMaxFile)
+	if nrOK {
+		ch <- prometheus.MustNewConstMetric(descAIOAllocated,
+			prometheus.GaugeValue, float64(nr), c.cfg.NodeName)
+	}
+	if mxOK {
+		ch <- prometheus.MustNewConstMetric(descAIOMaximum,
+			prometheus.GaugeValue, float64(mx), c.cfg.NodeName)
+	}
+	if nrOK && mxOK {
+		ratio := 0.0
+		if mx > 0 {
+			ratio = float64(nr) / float64(mx)
+		}
+		ch <- prometheus.MustNewConstMetric(descAIORatio,
+			prometheus.GaugeValue, ratio, c.cfg.NodeName)
 	}
 }
 

@@ -427,6 +427,40 @@ func TestApplyDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+// W16-CP1: the compact step-cap env (NODE_HOST_AGENT_KINEDB_GUARD_MAX_
+// STEP_REVISIONS) — set to a positive integer it becomes the compact
+// step cap; unset/0/garbage stays disabled.
+func TestMaxStepRevisionsEnv(t *testing.T) {
+	var absent Config
+	if err := absent.ApplyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if absent.MaxStepRevisions != 0 {
+		t.Fatalf("absent env: MaxStepRevisions=%d want 0 (disabled)", absent.MaxStepRevisions)
+	}
+
+	t.Setenv(envnames.EnvKinedbGuardMaxStepRevisions, "250000")
+	var set Config
+	if err := set.ApplyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if set.MaxStepRevisions != 250000 {
+		t.Fatalf("set env: MaxStepRevisions=%d want 250000", set.MaxStepRevisions)
+	}
+	if viaEnv := ConfigFromEnv(EnvDeps{}).MaxStepRevisions; viaEnv != 250000 {
+		t.Fatalf("ConfigFromEnv: MaxStepRevisions=%d want 250000", viaEnv)
+	}
+
+	t.Setenv(envnames.EnvKinedbGuardMaxStepRevisions, "garbage")
+	var junk Config
+	if err := junk.ApplyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if junk.MaxStepRevisions != 0 {
+		t.Fatalf("garbage env: MaxStepRevisions=%d want 0 (disabled)", junk.MaxStepRevisions)
+	}
+}
+
 func TestStatFSFree(t *testing.T) {
 	ratio, err := statfsFree("/tmp")
 	if err != nil || ratio <= 0 || ratio > 1 {

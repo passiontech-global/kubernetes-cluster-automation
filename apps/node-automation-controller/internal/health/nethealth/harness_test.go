@@ -36,6 +36,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewLinkerdOutlierGuardCheck,
 	NewLinkerdSidecarOOMGuardCheck,
 	NewCiliumDatapathMapGuardCheck,
+	NewCiliumL2LeaseGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

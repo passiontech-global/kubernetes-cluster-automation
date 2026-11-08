@@ -160,3 +160,71 @@ func TestScaleFlappingQuiet(t *testing.T) {
 		t.Fatalf("empty event stream must pass: %+v", res)
 	}
 }
+
+// rolloutScaleEvent builds a Rollouts-controller scale event — the
+// direction rides the reason (RolloutScaledUp/RolloutScaledDown), the
+// involved object is the parent Rollout.
+func rolloutScaleEvent(ns, name string, up bool, when time.Time) *corev1.Event {
+	reason := "RolloutScaledDown"
+	dir := "down"
+	if up {
+		reason = "RolloutScaledUp"
+		dir = "up"
+	}
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      fmt.Sprintf("%s-%s-%d", name, dir, when.UnixNano()),
+			UID:       types.UID(fmt.Sprintf("%s-%s-%d", name, dir, when.UnixNano())),
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: "Rollout", Namespace: ns, Name: name,
+		},
+		Reason:        reason,
+		Message:       fmt.Sprintf("Scaled %s replica set %s-abc to 2", dir, name),
+		LastTimestamp: metav1.NewTime(when),
+	}
+}
+
+// W16-G1 — a Rollout whose scale direction flipped >=6 times inside
+// the window (GitOps vs downscaler vs KEDA on spec.replicas) is the
+// same tug-of-war the Deployment path flags.
+func TestScaleFlappingRollout(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset()
+	up := true
+	for i := range 7 {
+		e := rolloutScaleEvent("apps", "canary-api", up,
+			base.Add(-time.Duration(6-i)*2*time.Minute))
+		if _, err := cs.CoreV1().Events(e.Namespace).Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		up = !up
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("Rollout flapping must FAIL")
+	}
+}
+
+// A steady one-directional Rollout scale-up series (no flips) passes.
+func TestScaleFlappingRolloutSteadyUp(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset()
+	for i := range 9 {
+		e := rolloutScaleEvent("apps", "steady-api", true,
+			base.Add(-time.Duration(8-i)*2*time.Minute))
+		if _, err := cs.CoreV1().Events(e.Namespace).Create(ctx, e, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("steady one-direction Rollout scaling must pass: %+v", res)
+	}
+}

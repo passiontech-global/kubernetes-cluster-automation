@@ -69,6 +69,16 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.ipv4.neigh.default.gc_thresh2", "32768"},
 		{"net.ipv4.neigh.default.gc_thresh3", "65536"},
 	}
+	// W16-KR4: AIO table headroom — io_uring/native-aio DB engines
+	// exhaust the stock aio-max-nr and surface EAGAIN as generic
+	// "storage slow" grey failures. Only when the kernel exposes
+	// aio (compiled out leaves no sysctl node; an unconditional key
+	// would fail sysctl --system) — same gating as the conntrack
+	// pairs above.
+	if c.r.fileExists("/proc/sys/fs/aio-max-nr") ||
+		fileExistsNoRoot("/proc/sys/fs/aio-max-nr") {
+		p = append(p, [2]string{"fs.aio-max-nr", "1048576"})
+	}
 	// W8-KR2: keyring quota headroom — a full keyring fails
 	// keyctl/add_key silently for new sessions.
 	if c.r.fileExists("/proc/sys/kernel/keys/root_maxkeys") ||

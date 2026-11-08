@@ -11,7 +11,11 @@
 // controller reconciling an attachment or a Service mid-rollout
 // flaps through these states routinely, so only a stuck condition
 // is a page. The dedicated zero-endpoints gauge fires at 5m — the
-// earlier, less noisy edge of the same blackhole signal.
+// earlier, less noisy edge of the same blackhole signal. When the
+// blackhole is VIP-wide (every backend of an L2-announced Service
+// dark at once), cilium-l2-lease-guard (W16-NM1) watches the other
+// end: a stale cilium-l2announce Lease holder announcing the VIP
+// from a node that cannot answer ARP.
 package nethealth
 
 import (

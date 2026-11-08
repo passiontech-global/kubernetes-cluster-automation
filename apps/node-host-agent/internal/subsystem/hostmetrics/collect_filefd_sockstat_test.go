@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -337,5 +338,56 @@ func TestNetstatSNMPMissingAndMalformedSections(t *testing.T) {
 	if _, ok := metricValue(t, c,
 		"node_host_agent_snmp_udp_rcvbuf_errors_total", node); ok {
 		t.Fatal("rcvbuf_errors emitted for a malformed values line")
+	}
+}
+
+// --- W16-KR4: kernel AIO table gauges ---
+
+// TestCollectAIO: aio-nr/aio-max-nr gauges plus the used ratio; the
+// ratio is 0 when the max reads 0 (never a division by zero) and
+// the series stay absent when the files don't parse.
+func TestCollectAIO(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	nrFile := filepath.Join(root, "aio-nr")
+	maxFile := filepath.Join(root, "aio-max-nr")
+	oldNr, oldMax := aioNrFile, aioMaxFile
+	aioNrFile, aioMaxFile = nrFile, maxFile
+	t.Cleanup(func() { aioNrFile, aioMaxFile = oldNr, oldMax })
+
+	testutil.WriteFile(t, nrFile, "314572\n")
+	testutil.WriteFile(t, maxFile, "1048576\n")
+	c := New(cfg)
+	if got, ok := metricValue(t, c, "node_host_agent_aio_allocated",
+		map[string]string{"node": "node-a"}); !ok || got != 314572 {
+		t.Fatalf("aio_allocated=%v ok=%v want 314572", got, ok)
+	}
+	if got, ok := metricValue(t, c, "node_host_agent_aio_maximum",
+		map[string]string{"node": "node-a"}); !ok || got != 1048576 {
+		t.Fatalf("aio_maximum=%v ok=%v want 1048576", got, ok)
+	}
+	if got, ok := metricValue(t, c, "node_host_agent_aio_used_ratio",
+		map[string]string{"node": "node-a"}); !ok || got != 314572.0/1048576.0 {
+		t.Fatalf("aio_used_ratio=%v ok=%v want %v", got, ok, 314572.0/1048576.0)
+	}
+	// max 0 → ratio 0, never NaN.
+	testutil.WriteFile(t, maxFile, "0\n")
+	if got, ok := metricValue(t, c, "node_host_agent_aio_used_ratio",
+		map[string]string{"node": "node-a"}); !ok || got != 0 {
+		t.Fatalf("aio_used_ratio with max 0 =%v ok=%v want 0", got, ok)
+	}
+	// Unreadable sources → no series at all.
+	testutil.WriteFile(t, nrFile, "garbage\n")
+	if err := os.Remove(maxFile); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"node_host_agent_aio_allocated",
+		"node_host_agent_aio_maximum",
+		"node_host_agent_aio_used_ratio",
+	} {
+		if _, ok := metricValue(t, c, name, map[string]string{"node": "node-a"}); ok {
+			t.Fatalf("%s emitted with unparseable sources", name)
+		}
 	}
 }
