@@ -1,6 +1,7 @@
 // circuit_metrics_test.go — coverage for the emitted-series bookkeeping:
-// the carry-forward that re-asserts a failed patch's still-broken
-// tuples, and the CRD conversion-backend sweep's verdicts.
+// the carry-forward that re-asserts a failed patch's still-present
+// tuples (forgetting webhooks deleted from the config), and the CRD
+// conversion-backend sweep's verdicts.
 package circuitbreaker
 
 import (
@@ -28,38 +29,52 @@ func TestCarryBrokenForward(t *testing.T) {
 	b := &Breaker{}
 	kind, cfg := guardstate.KindMutating, "mwc-carry"
 	hookKey := kind + "/" + cfg + "/hook.example.com"
+	deadKey := kind + "/" + cfg + "/gone.example.com"
 	otherKey := guardstate.KindValidating + "/vwc-x/hook.example.com"
 
-	// Last sweep emitted both tuples; the gauge series exist.
+	// Last sweep emitted all three tuples; the gauge series exist.
 	b.brokenEmitted.Emit(hookKey, kind, cfg, "hook.example.com")
+	b.brokenEmitted.Emit(deadKey, kind, cfg, "gone.example.com")
 	b.brokenEmitted.Emit(otherKey, guardstate.KindValidating, "vwc-x", "hook.example.com")
 	metrics.WebhookCircuitBroken.WithLabelValues(kind, cfg, "hook.example.com").Set(1)
+	metrics.WebhookCircuitBroken.WithLabelValues(kind, cfg, "gone.example.com").Set(1)
 	metrics.WebhookCircuitBroken.WithLabelValues(guardstate.KindValidating, "vwc-x", "hook.example.com").Set(1)
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfg, "hook.example.com")
+		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfg, "gone.example.com")
 		metrics.WebhookCircuitBroken.DeleteLabelValues(guardstate.KindValidating, "vwc-x", "hook.example.com")
 	})
 	if n := b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues); n != 0 {
 		t.Fatalf("first prune deleted %d live series, want 0", n)
 	}
 
-	// This sweep's patch failed — carry only this config's tuples
-	// forward, then prune: the other kind's stale tuple must be
-	// deleted, the carried one must survive.
+	// This sweep's patch failed and gone.example.com left the config —
+	// carry only this config's tuples whose webhook is still in the
+	// config's live views, then prune: the other kind's stale tuple
+	// and the deleted webhook's tuple must be deleted, the carried
+	// one must survive.
 	b.brokenEmitted.Begin()
-	b.carryBrokenForward(kind, cfg)
-	if n := b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues); n != 1 {
-		t.Fatalf("prune deleted %d series, want exactly the non-matching stale one", n)
+	b.carryBrokenForward(kind, cfg, []hookView{{name: "hook.example.com"}})
+	if n := b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues); n != 2 {
+		t.Fatalf("prune deleted %d series, want the foreign tuple and the deleted webhook's", n)
 	}
 	last := b.brokenEmitted.Last()
 	if _, ok := last[hookKey]; !ok {
 		t.Fatalf("carried tuple %q missing from ledger: %v", hookKey, last)
+	}
+	if _, ok := last[deadKey]; ok {
+		t.Fatalf("deleted webhook's tuple survived the carry-forward prune: %v", last)
 	}
 	if _, ok := last[otherKey]; ok {
 		t.Fatalf("foreign tuple %q survived the carry-forward prune: %v", otherKey, last)
 	}
 	if got := ptestutil.ToFloat64(metrics.WebhookCircuitBroken.WithLabelValues(kind, cfg, "hook.example.com")); got != 1 {
 		t.Fatalf("carried series value = %v, want 1", got)
+	}
+	// The deleted webhook's series is forgotten, not re-emitted —
+	// DeleteLabelValues doubles as the exists-probe.
+	if metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfg, "gone.example.com") {
+		t.Fatal("deleted webhook's series must be forgotten, not re-emitted")
 	}
 }
 
@@ -214,6 +229,48 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		}
 		if seriesCount(t) != 1 {
 			t.Fatalf("unverifiable sweep must carry the series forward, got %d", seriesCount(t))
+		}
+	})
+
+	t.Run("census failure carries only live crds", func(t *testing.T) {
+		cleanup(t)
+		g, b := cbFixture(t)
+		// Last sweep's verdicts: one for the CRD still in the
+		// cluster, one for a CRD since retired from it.
+		liveK := crdConversionKey{crd: crdName, service: svcKey, reason: CRDReasonZeroEndpoints}
+		deadK := crdConversionKey{crd: "retired.example.com", service: "backend/old-svc", reason: CRDReasonZeroEndpoints}
+		for _, k := range []crdConversionKey{liveK, deadK} {
+			b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1, k,
+				k.crd, k.service, k.reason)
+		}
+		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+
+		// The CRD list succeeded (snap.CRDs carries the live CRD) but
+		// the node census failed: carry-forward keeps the live CRD's
+		// series and forgets the retired CRD's instead of re-pinning
+		// it while the census keeps failing.
+		snap := &guardstate.Snapshot{
+			G:              g,
+			Ctx:            ctx,
+			CRDs:           []unstructured.Unstructured{*cbConversionCRD()},
+			NodesErr:       errors.New("nodes boom"),
+			UnhealthyNodes: map[string]bool{},
+		}
+		t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "true")
+		if err := b.SweepCRDConversionBackends(ctx, snap); err != nil {
+			t.Fatalf("enabled breaker absorbs the census failure: %v", err)
+		}
+		if n := seriesCount(t); n != 1 {
+			t.Fatalf("want only the live CRD's series, got %d", n)
+		}
+		if got := seriesFor(t, CRDReasonZeroEndpoints); got != 1 {
+			t.Fatalf("live CRD series must carry forward, got %v", got)
+		}
+		if CRDConversionWebhookUnhealthy.DeleteLabelValues("retired.example.com", "backend/old-svc", CRDReasonZeroEndpoints) {
+			t.Fatal("retired CRD series must be forgotten, not carried")
+		}
+		if _, ok := b.crdUnhealthyEmitted.Last()[deadK]; ok {
+			t.Fatal("retired CRD tuple must leave the ledger")
 		}
 	})
 

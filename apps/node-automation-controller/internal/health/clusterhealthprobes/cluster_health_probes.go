@@ -147,7 +147,10 @@ type clusterHealthProber struct {
 	// seconds_since_success gauge — it holds REAL passes only; a
 	// check with no entry yet counts staleness from p.boot (see
 	// report), so a check that never passed still reports a growing
-	// staleness.
+	// staleness. run() prunes names the swept roster no longer
+	// carries, so a future dynamic roster cannot strand entries for
+	// retired checks (bounded by construction today — the roster is
+	// built once at boot).
 	lastPass map[string]time.Time
 
 	// checks is the run() roster — built once at construction from
@@ -248,7 +251,13 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	// that outlive the object (pod/controller names) — bound the
 	// shared ledger once per sweep at the widest cooldown it serves.
 	p.Heals.PruneExpired(p.Now(), sharedHealsMaxAge)
+	// lastPass is keyed by check name, so record the names this pass
+	// actually sweeps — the prune after the loop needs the roster's
+	// live set (the stateful-masterless pattern: prune the ledger
+	// against the pass's seen keys).
+	seen := make(map[string]bool, len(p.checks))
 	for _, c := range p.checks {
+		seen[c.name] = true
 		// Bound one check's share of the serial sweep — a hung
 		// apiserver call used to stretch the whole cycle. The child
 		// deadline cancels the in-flight client call; the check's own
@@ -280,6 +289,14 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 				"check", c.name)
 		} else if !res.Pass {
 			log.Info("health check FAIL", "check", c.name, "reason", res.Why)
+		}
+	}
+	// Drop lastPass entries for checks the pass did not sweep — a
+	// cancelled sweep bailed above without pruning, so only a full
+	// pass shrinks the ledger.
+	for name := range p.lastPass {
+		if !seen[name] {
+			delete(p.lastPass, name)
 		}
 	}
 	return nil

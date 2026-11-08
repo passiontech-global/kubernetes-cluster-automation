@@ -51,6 +51,10 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// drHealed keys on controller names that die with their
 	// Deployments — bound the map so stale stamps cannot accumulate.
 	p.drHealed.PruneExpired(now, dragonflyHealCooldown)
+	// drOpHealed keys on StatefulSets that may be decommissioned —
+	// bound the map so their stamps cannot accumulate. It mirrors
+	// the drHealed stamps, so it prunes on the same cooldown.
+	p.drOpHealed.PruneExpired(now, dragonflyHealCooldown)
 	// Persisted stamp → maintenance mutex in ONE call
 	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the
 	// persisted passiontech.dev/last-dragonfly-operator-heal stamp is

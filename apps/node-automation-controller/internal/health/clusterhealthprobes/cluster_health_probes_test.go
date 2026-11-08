@@ -357,3 +357,46 @@ func TestHealthEnvKnobsClampBadValues(t *testing.T) {
 		t.Fatalf("HEALTH_RESOURCE_QUOTA_THRESHOLD=banana → %v, want 0.9", got)
 	}
 }
+
+// A roster that shrinks between passes must not strand lastPass
+// entries for checks it no longer sweeps: the pass after the shrink
+// prunes the dropped check's entry while keeping the survivors — a
+// failed survivor keeps its seeded stamp (no pass, no re-stamp), a
+// passing survivor is re-stamped as usual. The roster is boot-time
+// today, so this only guards a future dynamic roster.
+func TestRunShrunkRosterPrunesLastPass(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset())
+	// Seed entries as if an earlier pass had recorded passes — the
+	// TestRunFailGrowsStaleness seeding convention. HTTP content
+	// fails on the dead default URL, DNS passes on the fake resolver.
+	seeded := time.Now().Add(-time.Hour)
+	for _, name := range []string{
+		ported.CheckNameDNS, ported.CheckNameHTTPContent,
+		gitops.CheckNameImagePullSecretAuditor,
+	} {
+		p.lastPass[name] = seeded
+	}
+
+	if err := p.run(context.Background()); err != nil {
+		t.Fatalf("full-roster run: %v", err)
+	}
+	if _, ok := p.lastPass[gitops.CheckNameImagePullSecretAuditor]; !ok {
+		t.Fatalf("full-roster pass lost %q before the shrink", gitops.CheckNameImagePullSecretAuditor)
+	}
+
+	// Shrink the roster the way a future dynamic registry would:
+	// only the first two checks (DNS, HTTP content) survive.
+	p.checks = p.checks[:2]
+	if err := p.run(context.Background()); err != nil {
+		t.Fatalf("shrunk-roster run: %v", err)
+	}
+	if _, ok := p.lastPass[gitops.CheckNameImagePullSecretAuditor]; ok {
+		t.Fatalf("shrunk roster kept stale lastPass entry for %q", gitops.CheckNameImagePullSecretAuditor)
+	}
+	if got := p.lastPass[ported.CheckNameHTTPContent]; !got.Equal(seeded) {
+		t.Fatalf("failing survivor's lastPass = %v, want seeded %v untouched", got, seeded)
+	}
+	if got, ok := p.lastPass[ported.CheckNameDNS]; !ok || got.Equal(seeded) {
+		t.Fatalf("passing survivor's lastPass = %v,%v, want re-stamped past %v", got, ok, seeded)
+	}
+}

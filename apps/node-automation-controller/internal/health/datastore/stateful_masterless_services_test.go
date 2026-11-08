@@ -231,6 +231,49 @@ func TestDeadlockHealCooldown(t *testing.T) {
 	}
 }
 
+// The step-1 ledger is bounded every sweep — a drOpHealed stamp past
+// the 30m heal cooldown (a decommissioned STS) leaves RAM, so the
+// stale "step 1 landed" record cannot keep feeding the settle gate.
+func TestDeadlockOperatorHealLedgerPruned(t *testing.T) {
+	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	t.Cleanup(func() {
+		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	})
+	base := time.Now()
+	sts := shSTS("db", "dragonfly", 2,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	cs := fake.NewSimpleClientset(sts, svc,
+		dragonflyRolePod("db", "dragonfly-0", "replica", true),
+		dragonflyRolePod("db", "dragonfly-1", "replica", true))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
+	// Both stamps sit on keys OUTSIDE this sweep ("db/retired" is a
+	// decommissioned STS) so the settle gate reads neither: the sweep
+	// may not resurrect a step-1 record for itself.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).
+		drOpHealed.Stamp("db/retired", base.Add(-dragonflyHealCooldown-time.Minute))
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).
+		drOpHealed.Stamp("db/other", base.Add(-4*time.Minute))
+
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).
+		drOpHealed.Last("db/retired"); ok {
+		t.Fatal("drOpHealed stamp past the 30m heal cooldown must be pruned")
+	}
+	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).
+		drOpHealed.Last("db/other"); !ok {
+		t.Fatal("live drOpHealed stamp must survive the prune")
+	}
+	if _, err := cs.CoreV1().Pods("db").
+		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("pod deleted without a step-1 record for this STS")
+	}
+}
+
 // A StatefulSet the go-kube-downscaler parked at spec.replicas:0 —
 // 0 ready endpoints on its master Service is sleep, never a
 // masterless signature. (ReadyReplicas=1 proves the downscaler

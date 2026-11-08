@@ -101,9 +101,18 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 	// backends too — same once-per-sweep bound as Sweep.
 	b.bounceAt.PruneExpired(now, BounceCooldown)
 
-	carryForward := func() {
+	// carryForward re-asserts last sweep's tuples when this sweep
+	// cannot measure the surface. Liveness-aware when the CRD list
+	// succeeded: live holds the CRD names snap.CRDs carries, so a
+	// tuple whose CRD left the list is NOT re-asserted — the Prune
+	// below forgets its series instead of re-pinning it while
+	// reads keep failing. nil live (the CRD list itself failed)
+	// carries everything — no liveness evidence exists to filter on.
+	carryForward := func(live map[string]bool) {
 		for k, lv := range b.crdUnhealthyEmitted.Last() {
-			b.crdUnhealthyEmitted.Emit(k, lv...)
+			if live == nil || live[k.crd] {
+				b.crdUnhealthyEmitted.Emit(k, lv...)
+			}
 		}
 		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
 	}
@@ -111,7 +120,7 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 	if snap.CRDErr != nil {
 		// API flap — "can't read the surface" fails closed: carry
 		// the series forward and surface the error.
-		carryForward()
+		carryForward(nil)
 		return fmt.Errorf("list customresourcedefinitions — conversion webhook health skipped: %w", snap.CRDErr)
 	}
 	ready, err := snap.ReadyCounts()
@@ -121,7 +130,14 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		// keep the last verdict alive — UNLESS the breaker is
 		// levered off this cycle, in which case nobody else reports
 		// it and the failure would be invisible.
-		carryForward()
+		//
+		// The CRD list DID succeed here, so snap.CRDs is live
+		// evidence: only its CRDs' tuples carry forward.
+		live := make(map[string]bool, len(snap.CRDs))
+		for i := range snap.CRDs {
+			live[snap.CRDs[i].GetName()] = true
+		}
+		carryForward(live)
 		if !Enabled() {
 			return fmt.Errorf("endpoint/node census — conversion webhook health skipped: %w", err)
 		}
