@@ -299,7 +299,7 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// Maintenance mutex + global heal budget — the deletes below kill
 	// LIVE pods, so they defer while a cordon/drain/kured reboot or a
 	// k0s upgrade is in flight, and "cannot verify" fails closed.
-	// heal.AllowedV runs with a nil heals ledger: this module's
+	// heal.Gate runs the nil-heals-ledger preamble: this module's
 	// pacing is the per-controller lastHeal cooldown checked per pod
 	// inside healConnectorTarget — only the mutex and budget gates
 	// apply here, shared via w.verdict so the sweep pays one

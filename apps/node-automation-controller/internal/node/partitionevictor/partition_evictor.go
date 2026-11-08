@@ -378,8 +378,8 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// Maintenance mutex + global heal budget — evictions kill LIVE
 	// pods, so they defer while a cordon/drain/kured reboot or a k0s
 	// upgrade is in flight (the taints above still fence the flagged
-	// nodes — fencing is not destructive). heal.AllowedV runs with a
-	// nil heals ledger: this module's pacing is partitionEvictCap,
+	// nodes — fencing is not destructive). heal.Gate runs the
+	// nil-heals-ledger preamble: this module's pacing is partitionEvictCap,
 	// not a CooldownSet — its mutex and budget gates are what apply,
 	// shared via e.verdict so the sweep pays one evaluation.
 	// Unverifiable fails closed and IncErrors the queue like every

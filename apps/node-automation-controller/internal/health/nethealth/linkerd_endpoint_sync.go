@@ -247,12 +247,20 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 					continue
 				}
 				liveIPs[pod.Status.PodIP] = true
-				if since, ok := kube.PodReadySince(pod); ok {
+				// W10-FIX7: kube.PodReadySince fails closed on a
+				// zero LastTransitionTime, but the desync read
+				// treats a zero stamp as maximally aged — restore
+				// the lenient read for Ready pods (zero →
+				// since=zero → the age fuse below always trips).
+				since, ready := kube.PodReadySince(pod)
+				if !ready && kube.PodReadyCond(pod) {
+					since, ready = time.Time{}, true
+				}
+				if ready {
 					readyIPs[pod.Status.PodIP] = true
 					// W10-FIX7 fuse — only a pod Ready past
 					// linkerdSliceHealMinAge counts as "missing"
-					// from the slices; a zero LastTransitionTime
-					// reads as maximally aged.
+					// from the slices.
 					if now.Sub(since) >= linkerdSliceHealMinAge {
 						readyAgedIPs[pod.Status.PodIP] = true
 					}

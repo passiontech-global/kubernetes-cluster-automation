@@ -250,7 +250,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// collapsing the set one delete after another.
 	newest := pods[0]
 	for _, p := range pods {
-		if _, ready := kube.PodReadySince(p); !ready {
+		if since, ready := kube.PodReadySince(p); !ready || since.After(now) {
 			log.Info("skip: owned pod not Ready",
 				"statefulset", sts.Namespace+"/"+sts.Name,
 				"pod", p.Name)
