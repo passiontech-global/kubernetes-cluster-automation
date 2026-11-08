@@ -212,3 +212,36 @@ func TestPerconaPatroniNoPodsNoLock(t *testing.T) {
 		t.Fatalf("no running pods must not read as a patroni lock: %+v", res)
 	}
 }
+
+// corev1EndpointsVacant — an Endpoints object routes nothing when
+// every subset is address-less (notReadyAddresses still count as
+// vacant: a not-ready backend serves no traffic).
+func TestCorev1EndpointsVacant(t *testing.T) {
+	ready := corev1.Endpoints{Subsets: []corev1.EndpointSubset{{
+		Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+	}}}
+	notReadyOnly := corev1.Endpoints{Subsets: []corev1.EndpointSubset{{
+		NotReadyAddresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}},
+	}}}
+	mixed := corev1.Endpoints{Subsets: []corev1.EndpointSubset{
+		{NotReadyAddresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}}},
+		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}}},
+	}}
+	for _, tc := range []struct {
+		name string
+		ep   *corev1.Endpoints
+		want bool
+	}{
+		{"no subsets", &corev1.Endpoints{}, true},
+		{"empty subsets", &corev1.Endpoints{Subsets: []corev1.EndpointSubset{{}}}, true},
+		{"routable address", &ready, false},
+		{"not-ready only", &notReadyOnly, true},
+		{"one routable among subsets", &mixed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := corev1EndpointsVacant(tc.ep); got != tc.want {
+				t.Fatalf("corev1EndpointsVacant = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

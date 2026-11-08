@@ -3,7 +3,11 @@
 package kube
 
 import (
+	"context"
 	"testing"
+	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -128,5 +132,106 @@ func TestPodControllerKey(t *testing.T) {
 	}
 	if got := PodControllerKey(nonCtrl); got != "apps/orphan" {
 		t.Fatalf("non-controller-owned pod keyed %q, want apps/orphan", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PodSpecHasContainer / PodReadySince / PodUnreadyFor / PodMergePatcher.
+// ---------------------------------------------------------------------------
+
+func TestPodSpecHasContainer(t *testing.T) {
+	ps := &corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}}}
+	if !PodSpecHasContainer(ps, "app") {
+		t.Fatal("present container reported missing")
+	}
+	if PodSpecHasContainer(ps, "proxy") {
+		t.Fatal("absent container reported present")
+	}
+	if PodSpecHasContainer(&corev1.PodSpec{}, "app") {
+		t.Fatal("empty spec reported present")
+	}
+}
+
+func readyPod(since metav1.Time) *corev1.Pod {
+	return &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: since},
+	}}}
+}
+
+func TestPodReadySince(t *testing.T) {
+	ts := metav1.NewTime(time.Unix(1700000000, 0))
+	t.Run("ready with transition time", func(t *testing.T) {
+		got, ok := PodReadySince(readyPod(ts))
+		if !ok || !got.Equal(ts.Time) {
+			t.Fatalf("got (%v, %v), want (%v, true)", got, ok, ts.Time)
+		}
+	})
+	t.Run("not ready fails closed", func(t *testing.T) {
+		p := readyPod(ts)
+		p.Status.Conditions[0].Status = corev1.ConditionFalse
+		if since, ok := PodReadySince(p); ok || !since.IsZero() {
+			t.Fatalf("unready pod reported ready since (%v, %v)", since, ok)
+		}
+	})
+	t.Run("zero transition time fails closed", func(t *testing.T) {
+		p := readyPod(metav1.Time{})
+		if _, ok := PodReadySince(p); ok {
+			t.Fatal("zero transition time treated as verifiable")
+		}
+	})
+	t.Run("missing Ready condition", func(t *testing.T) {
+		if _, ok := PodReadySince(&corev1.Pod{}); ok {
+			t.Fatal("conditionless pod reported ready")
+		}
+	})
+}
+
+func TestPodUnreadyFor(t *testing.T) {
+	since := metav1.NewTime(time.Unix(1000, 0))
+	now := time.Unix(1300, 0)
+	t.Run("unready counts", func(t *testing.T) {
+		p := readyPod(since)
+		p.Status.Conditions[0].Status = corev1.ConditionFalse
+		d, ok := PodUnreadyFor(p, now)
+		if !ok || d != 300*time.Second {
+			t.Fatalf("got (%v, %v), want (300s, true)", d, ok)
+		}
+	})
+	t.Run("ready fails closed", func(t *testing.T) {
+		if d, ok := PodUnreadyFor(readyPod(since), now); ok || d != 0 {
+			t.Fatalf("ready pod counted unready (%v, %v)", d, ok)
+		}
+	})
+	t.Run("zero transition time fails closed", func(t *testing.T) {
+		p := readyPod(metav1.Time{})
+		p.Status.Conditions[0].Status = corev1.ConditionFalse
+		if d, ok := PodUnreadyFor(p, now); ok || d != 0 {
+			t.Fatalf("zero transition counted (%v, %v)", d, ok)
+		}
+	})
+	t.Run("missing condition fails closed", func(t *testing.T) {
+		if d, ok := PodUnreadyFor(&corev1.Pod{}, now); ok || d != 0 {
+			t.Fatalf("conditionless pod counted (%v, %v)", d, ok)
+		}
+	})
+}
+
+func TestPodMergePatcher(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}}
+	cs := fake.NewSimpleClientset(pod)
+	patch := PodMergePatcher(cs, pod)
+	data := []byte(`{"metadata":{"annotations":{"k":"v"}}}`)
+	if err := patch(context.Background(), data); err != nil {
+		t.Fatalf("patch failed: %v", err)
+	}
+	got, err := cs.CoreV1().Pods("ns").Get(context.Background(), "web", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get after patch: %v", err)
+	}
+	if got.Annotations["k"] != "v" {
+		t.Fatalf("annotation not applied: %v", got.Annotations)
+	}
+	if err := patch(context.Background(), []byte(`not json`)); err == nil {
+		t.Fatal("invalid patch data accepted")
 	}
 }

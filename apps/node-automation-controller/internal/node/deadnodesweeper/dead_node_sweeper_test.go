@@ -868,3 +868,51 @@ func TestDeadNodeSweeperSkipGaugeClearedOnRecovery(t *testing.T) {
 		t.Fatalf("skip gauge = %v after recovery, want 0 (series deleted)", got)
 	}
 }
+
+// The without-SNR fence counter must not leak {node,has_volumes}
+// series on node churn: the fence books its tuple into the
+// carry-forward ledger, later sweeps keep the series while the node
+// is still listed, and the sweep that first sees the node gone
+// deletes it (same lifecycle as the DeadNodeUnfencedStatefulSkipped
+// gauge sibling).
+func TestDeadNodeSweeperFencedWithoutSNRSeriesPrunedOnNodeGone(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	// Sweep 1 — the branch-(b) fence Inc's the counter.
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "false")); got != 1 {
+		t.Fatalf("fence counter(has_volumes=false) = %v, want 1", got)
+	}
+
+	// Sweep 2 — w1 still listed, nothing stuck anymore: the
+	// early-exit prune must carry the series forward, not retire it.
+	if err := cs.CoreV1().Pods("web").Delete(ctx, "web-abc", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "false")); got != 1 {
+		t.Fatalf("fence counter series pruned while its node is still listed: %v", got)
+	}
+
+	// Sweep 3 — w1 left the cluster: the prune must delete the
+	// series. CollectAndCount is the proof (WithLabelValues would
+	// silently re-create the series at 0).
+	if err := cs.CoreV1().Nodes().Delete(ctx, "w1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.CollectAndCount(metrics.DeadNodeFencedWithoutSNRTotal); got != 0 {
+		t.Fatalf("fence counter series survived its node: %d series left", got)
+	}
+}

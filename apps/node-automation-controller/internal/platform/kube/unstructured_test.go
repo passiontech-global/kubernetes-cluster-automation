@@ -188,3 +188,63 @@ func TestFindConditionAndConditionOf(t *testing.T) {
 		t.Fatal("ConditionOf found a condition that does not exist")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// NestedMap / NestedStringMap / NestedStringSlice — copy semantics and
+// strict type reads.
+// ---------------------------------------------------------------------------
+
+func TestNestedMap(t *testing.T) {
+	obj := map[string]any{"status": map[string]any{"limits": map[string]any{"cpu": "2"}}}
+	m, ok := NestedMap(obj, "status", "limits")
+	if !ok || m["cpu"] != "2" {
+		t.Fatalf("got (%v, %v)", m, ok)
+	}
+	m["cpu"] = "4"
+	if obj["status"].(map[string]any)["limits"].(map[string]any)["cpu"] != "2" {
+		t.Fatal("returned map aliases the object")
+	}
+	if _, ok := NestedMap(obj, "status", "absent"); ok {
+		t.Fatal("absent path reported found")
+	}
+	if _, ok := NestedMap(obj, "status", "limits", "cpu"); ok {
+		t.Fatal("non-map at leaf reported found")
+	}
+}
+
+func TestNestedStringMap(t *testing.T) {
+	obj := map[string]any{"labels": map[string]any{"a": "1", "b": "2"}}
+	m, ok := NestedStringMap(obj, "labels")
+	if !ok || m["a"] != "1" || len(m) != 2 {
+		t.Fatalf("got (%v, %v)", m, ok)
+	}
+	m["a"] = "9"
+	if obj["labels"].(map[string]any)["a"] != "1" {
+		t.Fatal("returned map aliases the object")
+	}
+	obj2 := map[string]any{"labels": map[string]any{"a": "1", "b": 2}}
+	if _, ok := NestedStringMap(obj2, "labels"); ok {
+		t.Fatal("non-string leaf tolerated")
+	}
+	if _, ok := NestedStringMap(obj2, "missing"); ok {
+		t.Fatal("absent path reported found")
+	}
+}
+
+func TestNestedStringSlice(t *testing.T) {
+	obj := map[string]any{"names": []any{"a", "b"}}
+	s, ok := NestedStringSlice(obj, "names")
+	if !ok || len(s) != 2 || s[1] != "b" {
+		t.Fatalf("got (%v, %v)", s, ok)
+	}
+	s[0] = "z"
+	if obj["names"].([]any)[0] != "a" {
+		t.Fatal("returned slice aliases the object")
+	}
+	if _, ok := NestedStringSlice(map[string]any{"names": []any{"a", 3}}, "names"); ok {
+		t.Fatal("non-string element tolerated")
+	}
+	if _, ok := NestedStringSlice(map[string]any{}, "names"); ok {
+		t.Fatal("absent path reported found")
+	}
+}

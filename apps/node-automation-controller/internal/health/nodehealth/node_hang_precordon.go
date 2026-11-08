@@ -25,12 +25,79 @@ import (
 )
 
 // nodeHangCheck is the node-hang pre-cordon watchdog.
-type nodeHangCheck struct{ *probefw.Deps }
+type nodeHangCheck struct {
+	*probefw.Deps
+	// hangCounters is the {node} counter-series bookkeeping for the
+	// cordon/uncordon vecs — see hangCounterLedger.
+	hangCounters hangCounterLedger
+}
 
-// newNodeHangCheck builds the W8-ST2 watchdog — stateless, it reads
-// only Deps.
+// newNodeHangCheck builds the W8-ST2 watchdog — it reads only Deps;
+// hangCounters arms lazily on the first cordon/uncordon Inc (zero
+// value ready, the platform/state convention).
 func NewNodeHangCheck(d *probefw.Deps) probefw.Check {
 	return &nodeHangCheck{Deps: d}
+}
+
+// hangCounterLedger tracks which {node} series the check has emitted
+// into nodeHangCordonsTotal / nodeHangUncordonsTotal so node churn
+// (pool rotation deleting the node object) cannot grow the two vecs
+// monotonically — a counter Inc is never undone by the code path that
+// created it, so only this sweep-side ledger can retire the series.
+// The check lists every node each sweep, so the retire rule is
+// census-based carry-forward: a node missing from one complete sweep
+// is carried in missed rather than deleted (a list that just missed a
+// node must not erase evidence), and a node missing from two
+// consecutive sweeps has both its series deleted — the vecs share the
+// single {node} label, so one delete call each retires the node
+// entirely. Plain maps, deliberately not state.GaugeLedger/
+// StreakLedger: counter series are never re-emitted per sweep, and
+// the delete-on-second-miss rule needs the one-generation carry this
+// shape gives.
+type hangCounterLedger struct {
+	live   map[string]struct{} // nodes carrying at least one series
+	missed map[string]struct{} // live nodes absent from the previous complete sweep
+}
+
+// mark books node as carrying counter series — the Inc sites call it
+// right after WithLabelValues(...).Inc(). Seeing the node again
+// restarts its absence streak.
+func (h *hangCounterLedger) mark(node string) {
+	if h.live == nil {
+		h.live = map[string]struct{}{}
+	}
+	h.live[node] = struct{}{}
+	delete(h.missed, node)
+}
+
+// reconcile folds one complete sweep's node census into the ledger:
+// seen nodes re-arm, a first absence is carried into missed, and a
+// second consecutive absence deletes the node's series through del.
+// Returns the number of nodes retired. Call exactly once per complete
+// sweep, after the sweep's patch loops — a failed node list must skip
+// it (the ledger cannot tell "node gone" from "sweep never ran"), the
+// same incomplete-sweep contract as the platform ledgers' Prune.
+func (h *hangCounterLedger) reconcile(present map[string]bool,
+	del func(labelValues ...string) bool) int {
+	retired := 0
+	for node := range h.live {
+		if present[node] {
+			delete(h.missed, node)
+			continue
+		}
+		if _, missedBefore := h.missed[node]; missedBefore {
+			del(node)
+			retired++
+			delete(h.live, node)
+			delete(h.missed, node)
+			continue
+		}
+		if h.missed == nil {
+			h.missed = map[string]struct{}{}
+		}
+		h.missed[node] = struct{}{}
+	}
+	return retired
 }
 
 const (
@@ -228,8 +295,13 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	workers, cordoned := 0, 0
 	var rep probefw.SweepReport
 	var uncordon, staleStamp []string
+	// The full node census backs the counter-series carry-forward —
+	// control-plane nodes are skipped by the check logic but still
+	// count as "exists" for the retire rule.
+	present := make(map[string]bool, len(nodes))
 	for i := range nodes {
 		n := &nodes[i]
+		present[n.Name] = true
 		if kube.IsControlPlane(n) {
 			continue
 		}
@@ -291,6 +363,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
 		cordoned--
 		nodeHangUncordonsTotal.WithLabelValues(name).Inc()
+		p.hangCounters.mark(name)
 		log.Info("UNCORDON: node hang condition cleared",
 			"node", name)
 	}
@@ -359,8 +432,16 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
 		cordoned++
 		nodeHangCordonsTotal.WithLabelValues(name).Inc()
+		p.hangCounters.mark(name)
 		log.Info("CORDON: node carrying a sustained hang latch — unschedulable before NHC/SNR reboots it",
 			"node", name, "condition", entry)
 	}
+	// Complete sweep — retire cordon/uncordon series whose node has
+	// now missed two consecutive censuses (the churn guard; see
+	// hangCounterLedger).
+	p.hangCounters.reconcile(present, func(lv ...string) bool {
+		nodeHangCordonsTotal.DeleteLabelValues(lv[0])
+		return nodeHangUncordonsTotal.DeleteLabelValues(lv[0])
+	})
 	return rep.Verdict("nodes hanging with a pre-reboot latch: ", ", ")
 }

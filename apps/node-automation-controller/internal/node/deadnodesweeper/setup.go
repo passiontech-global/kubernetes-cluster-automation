@@ -45,6 +45,15 @@ type deadNodeSweeper struct {
 	// last verified it. Zero value ready (same lazy-arm convention as
 	// the now seam).
 	statefulSkipEmitted state.GaugeLedger[string]
+	// fencedWithoutSNREmitted is the same carry-forward ledger for
+	// the DeadNodeFencedWithoutSNRTotal counter (key
+	// node\x00has_volumes): fenceNode Emits the tuple it Inc'd, each
+	// sweep re-emits the tuples whose node the census still lists,
+	// and the sweep's Prune retires the series once the node is gone
+	// — a counter Inc is never undone by its own code path, so
+	// without this the vec grows monotonically on node-pool rotation.
+	// Zero value ready.
+	fencedWithoutSNREmitted state.GaugeLedger[string]
 }
 
 // Setup registers the 5-minute sweep.

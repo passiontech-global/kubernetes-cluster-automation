@@ -182,3 +182,41 @@ func TestCooldownSetLast(t *testing.T) {
 		t.Fatal("Last still reports a forgotten stamp")
 	}
 }
+
+func TestFirstSeenLedgerObserveAndSeenForgetPrune(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	l := &FirstSeenLedger{}
+	if _, seen := l.Observe("k", t0); seen {
+		t.Fatal("first observe reported seen")
+	}
+	first, seen := l.Observe("k", t0.Add(30*time.Second))
+	if !seen || !first.Equal(t0) {
+		t.Fatalf("repeat observe got (%v, %v), want (%v, true)", first, seen, t0)
+	}
+	age, ok := l.Seen("k", t0.Add(time.Minute))
+	if !ok || age != time.Minute {
+		t.Fatalf("Seen got (%v, %v), want (1m, true)", age, ok)
+	}
+	if _, ok := l.Seen("absent", t0); ok || age != time.Minute {
+		t.Fatalf("untracked key reported tracked: (%v, %v)", 0, ok)
+	}
+	l.Forget("k")
+	if _, ok := l.Seen("k", t0); ok {
+		t.Fatal("forgotten key still tracked")
+	}
+	if _, seen := l.Observe("k", t0.Add(2*time.Minute)); seen {
+		t.Fatal("forgotten key did not re-arm")
+	}
+	l.Seed("a", t0)
+	l.Seed("b", t0)
+	dropped := l.Prune(func(key string) bool { return key == "a" })
+	if dropped != 2 {
+		t.Fatalf("Prune dropped %d, want 2 (a kept; b and re-armed k dropped)", dropped)
+	}
+	if _, ok := l.Seen("a", t0); !ok {
+		t.Fatal("kept key pruned")
+	}
+	if _, ok := l.Seen("b", t0); ok {
+		t.Fatal("dropped key retained")
+	}
+}

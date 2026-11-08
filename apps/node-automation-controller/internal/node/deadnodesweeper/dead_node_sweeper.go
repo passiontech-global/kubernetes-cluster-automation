@@ -36,6 +36,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// Drop any aborted sweep's leftover emissions so this sweep's
 	// ledger state reflects only what THIS run measured.
 	s.statefulSkipEmitted.Begin()
+	s.fencedWithoutSNREmitted.Begin()
 
 	nodes, err := kube.ListNodesCached(ctx, s.nodeReader, s.cs)
 	if err != nil {
@@ -43,6 +44,17 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	}
 	nodeByName, nodeNames, hasNotReady, untainted :=
 		s.reconcileRecoveredNodes(ctx, nodes)
+
+	// Carry-forward: a without-SNR fence counter series stays alive
+	// while its node still exists — re-emit every tracked tuple whose
+	// node this census listed so the end-of-sweep Prune keeps it.
+	// "Node absent" is the only resolve signal a fence counter has,
+	// and only a sweep that actually listed the cluster may claim it.
+	for key, lv := range s.fencedWithoutSNREmitted.Last() {
+		if nodeNames[lv[0]] {
+			s.fencedWithoutSNREmitted.Emit(key, lv...)
+		}
+	}
 
 	// Every node Ready = nothing can be fenced this cycle, so skip
 	// the cluster-wide pod list entirely: it is by far the biggest
@@ -52,6 +64,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	if !hasNotReady {
 		log.Info("sweep done — all nodes Ready", "untainted", untainted)
 		s.statefulSkipEmitted.Prune(metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues)
+		s.fencedWithoutSNREmitted.Prune(metrics.DeadNodeFencedWithoutSNRTotal.DeleteLabelValues)
 		return nil
 	}
 
@@ -66,6 +79,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	if len(stuck) == 0 {
 		log.Info("sweep done — no stuck Terminating pods", "untainted", untainted)
 		s.statefulSkipEmitted.Prune(metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues)
+		s.fencedWithoutSNREmitted.Prune(metrics.DeadNodeFencedWithoutSNRTotal.DeleteLabelValues)
 		return nil
 	}
 
@@ -149,8 +163,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	log.Info("sweep done", "tainted", tainted, "untainted", untainted,
 		"stuckNodes", len(stuck))
 	// Full sweep, every suspect evaluated — stale skip tuples that no
-	// node re-asserted are resolved, not carried.
+	// node re-asserted are resolved, not carried; fence counter
+	// tuples whose node the census no longer lists are deleted.
 	s.statefulSkipEmitted.Prune(metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues)
+	s.fencedWithoutSNREmitted.Prune(metrics.DeadNodeFencedWithoutSNRTotal.DeleteLabelValues)
 	return nil
 }
 
