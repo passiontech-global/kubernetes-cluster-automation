@@ -17,7 +17,6 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -26,8 +25,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -69,15 +66,6 @@ type operatorWorkqueueCheck struct {
 // first resolve).
 func NewOperatorWorkqueueCheck(d *probefw.Deps) probefw.Check {
 	return &operatorWorkqueueCheck{Deps: d}
-}
-
-// opResolvedObj is one CR evaluated non-stuck this sweep, held for
-// the post-scan persisted first-seen clear — see the resolved map
-// in Run for why the clear is deferred (shared-GVR sibling
-// signatures under BUG-C5).
-type opResolvedObj struct {
-	o   *unstructured.Unstructured
-	gvr schema.GroupVersionResource
 }
 
 // W5.8 — operator-workqueue-watchdog knobs. The signature-side
@@ -141,118 +129,22 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	for _, op := range operatorTargets {
-		lease, lerr := p.operatorLease(ctx, op)
+		// Leader-election precondition — infra failures carry the
+		// held tuples forward, "no leader to judge" resets the
+		// operator's in-RAM first-seen.
+		lease, carry, reset := p.operatorLiveness(ctx, op, now, &rep)
 		switch {
-		case lerr != nil:
-			rep.InfraErr(lerr)
+		case carry:
 			// Never evaluated — carry the held tuples forward.
 			p.carryFrozen(&rep, op.name)
 			continue
-		case lease == nil && op.leaseOptional:
-			// No candidate Lease by design (replicas:1 or
-			// leader-elect patched out) — a Running pod under the
-			// selector is the liveness proof a renewing Lease
-			// provides elsewhere. lease stays nil:
-			// healOperatorLeader/leaderPods both tolerate it
-			// (selector fallback, no stamp persist).
-			alive, aerr := p.operatorPodRunning(ctx, op)
-			switch {
-			case aerr != nil:
-				rep.InfraErr(fmt.Errorf("list pods %s selector %q (%s): %w",
-					targetPodNS(op), op.podSelector, op.name, aerr))
-				// Never evaluated — carry the held tuples forward.
-				p.carryFrozen(&rep, op.name)
-				continue
-			case !alive:
-				p.resetOperator(op.name)
-				continue
-			}
-		case lease == nil:
-			// No leader Lease — no elected operator to judge.
-			p.resetOperator(op.name)
-			continue
-		case lease.Spec.RenewTime == nil ||
-			now.Sub(lease.Spec.RenewTime.Time) > operatorLeaseMaxAge:
-			// Stale renewTime = the holder is gone — a dead
-			// operator, not a frozen one. Stay quiet.
+		case reset:
 			p.resetOperator(op.name)
 			continue
 		}
 
-		// Collect this operator's live stuck signatures — keyed
-		// "operator/<gvr>/<ns>/<name>" so each object's persistence
-		// window is tracked independently. The list cache shares
-		// one List across the resource entries that watch the same
-		// GVR for different signatures (no_status_conditions +
-		// stale_observed_generation, BUG-C5).
-		live := map[string]bool{}
-		// resolved collects objects evaluated non-stuck under a
-		// watched predicate for the persisted first-seen clear that
-		// runs AFTER the resource loop: two resource rows can watch
-		// the SAME GVR under different predicates (BUG-C5) and
-		// share one first-seen key, so a not-stuck verdict under
-		// one predicate must not wipe the stamp while its sibling
-		// signature still reads stuck — the clear only fires for
-		// keys no row marked live.
-		resolved := map[string]opResolvedObj{}
-		reasonsFrozen := map[string]bool{}
-		evalFailed := false
-		lists := map[schema.GroupVersionResource]*unstructured.UnstructuredList{}
-		for _, res := range op.resources {
-			list, listed := lists[res.gvr]
-			if !listed {
-				l, err := p.Dyn.Resource(res.gvr).List(ctx, metav1.ListOptions{})
-				switch {
-				case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-					lists[res.gvr] = &unstructured.UnstructuredList{}
-					list = lists[res.gvr]
-				case err != nil:
-					evalFailed = true
-					rep.InfraErr(fmt.Errorf("list %s (%s): %w",
-						res.gvr.Resource, op.name, err))
-					lists[res.gvr] = &unstructured.UnstructuredList{}
-					list = lists[res.gvr]
-				default:
-					lists[res.gvr] = l
-					list = l
-				}
-			}
-			for i := range list.Items {
-				o := &list.Items[i]
-				key := op.name + "/" + res.gvr.Resource + "/" +
-					o.GetNamespace() + "/" + o.GetName()
-				if !res.stuck(o) {
-					if _, ok := resolved[key]; !ok {
-						resolved[key] = opResolvedObj{o: o, gvr: res.gvr}
-					}
-					continue
-				}
-				// Shared-resource types: skip objects provably owned
-				// by a different controller so the signature — and
-				// the heal — lands on the right operator only. A
-				// stuck-but-foreign object keeps any stamp it
-				// carries: it evaluated stuck, not resolved — the
-				// window should resume intact if ownership ever
-				// flips back.
-				if res.owns != nil && !res.owns(ctx, p, o) {
-					continue
-				}
-				live[key] = true
-				// The window gates healOperatorLeader's leader-pod
-				// delete — an operator restart must not re-arm it
-				// from zero, so the first-seen rides the stuck CR
-				// itself as a durable annotation (wider of ledger
-				// vs annotation).
-				if heal.FirstSeenPersisted(ctx, log,
-					&p.opFirstSeen, o,
-					kube.AnnoFirstSeenOperatorWorkqueue, key,
-					op.stuckMinAge, now,
-					p.opCRPatch(res.gvr, o)) {
-					reasonsFrozen[res.reason] = true
-				}
-			}
-		}
-		if evalFailed {
+		scan := p.scanOperatorResources(ctx, log, op, now, &rep)
+		if scan.evalFailed {
 			// An incomplete scan must not prune first-seen nor
 			// clear held series or persisted stamps — carry this
 			// operator's held tuples forward so the sweep-end
@@ -262,36 +154,11 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 
-		p.opFirstSeen.Prune(func(k string) bool {
-			return !strings.HasPrefix(k, op.name+"/") || live[k]
-		})
-		// Resolution clears — objects healthy under EVERY watched
-		// signature drop the persisted stamp (both clocks) so a
-		// later stall re-arms the full window. Tolerated
-		// sub-failure: a clear whose patch never lands is Warn'd
-		// and absorbed (the ledger half was already Forgotten);
-		// the stamp retries next sweep.
-		for k, ro := range resolved {
-			if live[k] {
-				continue
-			}
-			if err := heal.ClearPersistedFirstSeen(ctx, log,
-				&p.opFirstSeen, ro.o,
-				kube.AnnoFirstSeenOperatorWorkqueue, k,
-				p.opCRPatch(ro.gvr, ro.o)); err != nil {
-				log.Info("WARN: persisted first-seen clear failed — "+
-					"a stale stamp could fast-trip the next stall",
-					"key", k, "error", err)
-			}
-		}
-		for r := range reasonsFrozen {
-			rep.Emit(operatorWorkqueueFrozenGauge, op.name+"/"+r,
-				[]string{op.name, r}, op.name+"/"+r)
-		}
+		p.settleOperatorWindows(ctx, log, op, &scan, &rep)
 
-		if len(reasonsFrozen) > 0 {
-			reasons := make([]string, 0, len(reasonsFrozen))
-			for r := range reasonsFrozen {
+		if len(scan.reasonsFrozen) > 0 {
+			reasons := make([]string, 0, len(scan.reasonsFrozen))
+			for r := range scan.reasonsFrozen {
 				reasons = append(reasons, r)
 			}
 			sort.Strings(reasons)
