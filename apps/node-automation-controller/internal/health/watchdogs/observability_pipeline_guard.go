@@ -55,9 +55,9 @@ const (
 	// byte-stable reason the alert runbook references.
 	obsPipelineEventReason = "ObservabilityPipelineDegraded"
 	// obsPipelineEventNS/Obj anchor the event where operators look:
-	// the monitoring namespace's kube-prometheus-stack deployment
-	// reporting on its own pipeline.
-	obsPipelineEventNS = "monitoring"
+	// the prometheus-operator namespace's kube-prometheus-stack
+	// deployment reporting on its own pipeline.
+	obsPipelineEventNS = "prometheus-operator"
 )
 
 // obsWatchdogQuery is the Dead-Man's-Switch: the kube-prometheus-stack

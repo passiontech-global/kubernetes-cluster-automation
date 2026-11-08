@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -17,7 +18,9 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -606,5 +609,214 @@ func TestDeadNodeSweeperDynamicListError(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("node tainted though the fencing check itself errored")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W15-ST1 — the branch-(b) stateful split-brain gate.
+// ---------------------------------------------------------------------------
+
+// stsOwnedTerminatingPod is a stuck pod owned by a StatefulSet.
+func stsOwnedTerminatingPod(ns, name, nodeName string, age time.Duration) *corev1.Pod {
+	p := stuckTerminatingPod(ns, name, nodeName, age)
+	p.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "StatefulSet", Name: "pg", Controller: ptr.To(true)}}
+	return p
+}
+
+// rwoVolumeAttachment is a PV-referenced attachment; pair it with
+// rwoPV so the access modes resolve off the PV census.
+func rwoVolumeAttachment(name, nodeName, pvName string) *storagev1.VolumeAttachment {
+	return &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: nodeName,
+			Attacher: "csi.test",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: ptr.To(pvName),
+			},
+		},
+	}
+}
+
+func pvWithModes(name string, modes ...corev1.PersistentVolumeAccessMode) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       corev1.PersistentVolumeSpec{AccessModes: modes},
+	}
+}
+
+// deadProbe is the kubelet /healthz stub for branch (b): kubelet does
+// not answer.
+func deadProbe(context.Context, string) (bool, error) { return false, nil }
+
+// A confirmed-dead branch-(b) node (no SNR CR) holding a StatefulSet
+// pod is refused: no taint, the skip gauge fires, the fence counter
+// stays silent.
+func TestDeadNodeSweeperUnfencedStatefulSkipsSTS(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "true")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("stateful-holding node fenced without a SNR CR or the override")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge = %v, want 1", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "true")); got != 0 {
+		t.Fatalf("fence counter(has_volumes=true) incremented on a skipped node: %v", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "false")); got != 0 {
+		t.Fatalf("fence counter(has_volumes=false) incremented on a skipped node: %v", got)
+	}
+}
+
+// An RWO PV-backed VolumeAttachment alone holds the gate even with a
+// plain (ReplicaSet-shaped) pod population.
+func TestDeadNodeSweeperUnfencedStatefulSkipsRWOAttachment(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute),
+		pvWithModes("pv-rwo", corev1.ReadWriteOnce),
+		rwoVolumeAttachment("va-rwo", "w1", "pv-rwo"))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("RWO-attachment node fenced without a SNR CR or the override")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge = %v, want 1", got)
+	}
+}
+
+// A branch-(b) node with only stateless holders (plain pod, ROX
+// volume) fences as before and the without-SNR counter fires with
+// has_volumes=false.
+func TestDeadNodeSweeperStatelessBranchBFences(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute),
+		// ReadWriteMany does not hold the gate — multi-writer safe.
+		pvWithModes("pv-rox", corev1.ReadWriteMany),
+		rwoVolumeAttachment("va-rox", "w1", "pv-rox"))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("stateless dead node not fenced")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "false")); got != 1 {
+		t.Fatalf("fence counter(has_volumes=false) = %v, want 1", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 0 {
+		t.Fatalf("skip gauge set on a fenced node: %v", got)
+	}
+}
+
+// The DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL=true override fences
+// through the gate — counted with has_volumes=true — and clears any
+// stale skip flag from earlier cycles.
+func TestDeadNodeSweeperOverrideForcesStatefulFence(t *testing.T) {
+	t.Setenv("DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL", "true")
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "true")
+	// A stale skip flag from a previous gate-off cycle.
+	metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1").Set(1)
+
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute),
+		pvWithModes("pv-rwo", corev1.ReadWriteOnce),
+		rwoVolumeAttachment("va-rwo", "w1", "pv-rwo"))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("override did not force the fence")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "true")); got != 1 {
+		t.Fatalf("fence counter(has_volumes=true) = %v, want 1", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 0 {
+		t.Fatalf("stale skip gauge survived the fence: %v", got)
+	}
+}
+
+// Branch (a) is untouched: a node with a medik8s SNR CR fences even
+// while holding StatefulSet pods and RWO volumes — the fencer certified
+// the death, so no split-brain window remains — and no without-SNR
+// counter fires.
+func TestDeadNodeSweeperViaSNRIgnoresStatefulGate(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "true")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+
+	cs := fake.NewSimpleClientset(
+		testutil.Node("w1", corev1.ConditionFalse, nil),
+		stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute),
+		pvWithModes("pv-rwo", corev1.ReadWriteOnce),
+		rwoVolumeAttachment("va-rwo", "w1", "pv-rwo"))
+	dyn := deadNodeDynFake(selfNodeRemediation("medik8s", "w1"))
+	probeCalled := false
+	s := deadNodeSweeperFor(cs, dyn, func(context.Context, string) (bool, error) {
+		probeCalled = true
+		return false, nil
+	})
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("SNR-backed node refused fencing by the stateful gate")
+	}
+	if probeCalled {
+		t.Fatal("kubelet probe ran for an SNR-certified node")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "true")); got != 0 {
+		t.Fatalf("without-SNR counter incremented on an SNR-backed fence: %v", got)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues("w1", "false")); got != 0 {
+		t.Fatalf("without-SNR counter incremented on an SNR-backed fence: %v", got)
+	}
+}
+
+// A stateful-holder list failure fails closed: no taint, the run still
+// succeeds (per-node error, same tolerance as the remediation list).
+func TestDeadNodeSweeperHolderListErrorFailsClosed(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute))
+	cs.PrependReactor("list", "persistentvolumes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("pv list boom")
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatalf("holder list failure must not fail the run: %v", err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("node fenced while the holder check was unverifiable")
 	}
 }

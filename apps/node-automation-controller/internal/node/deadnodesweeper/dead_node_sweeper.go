@@ -26,6 +26,17 @@
 //	    the apiserver proxy fails — kubelet is unreachable AND the
 //	    node-controller gave up on its lease long ago.
 //
+// W15-ST1 hardens branch (b) further: that evidence is one-sided
+// (we cannot hear the node — the node may not hear US), so a node
+// holding an RWO VolumeAttachment or a StatefulSet pod is NOT
+// tainted. The out-of-service taint on a partitioned-but-alive node
+// is a split-brain on its volumes. The skip is exported as
+// node_automation_dead_node_unfenced_stateful_skipped; fencing such a
+// node requires a medik8s CR or the explicit
+// DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL=true override, and every
+// fence applied without a CR is counted by
+// node_automation_dead_node_fenced_without_snr_total.
+//
 // A node that is merely NotReady (Ready=False) with no remediation CR
 // and a fresh-enough heartbeat window is left alone — that is the
 // host-watchdog / NHC layer's job. Pods on Ready nodes are skipped
@@ -41,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +70,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 const (
@@ -147,6 +160,9 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 				continue
 			}
 			untainted++
+			// W15-ST1 — a recovered node's stale skip flag reads as
+			// an unfenced dead node forever; clear it with the taint.
+			metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(n.Name)
 			log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 		}
 	}
@@ -251,7 +267,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			continue
 		}
 
-		dead, err := s.confirmedDead(ctx, n, remCache, nodeNames)
+		dead, viaSNR, reason, err := s.confirmedDead(ctx, n, remCache, nodeNames)
 		if err != nil {
 			log.Error(err, "death check failed — node skipped (fail closed)",
 				"node", nodeName, "stuckPods", count)
@@ -262,6 +278,32 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			log.Info("SKIP: no fencing evidence — fail closed",
 				"node", nodeName, "stuckPods", count)
 			continue
+		}
+
+		// W15-ST1 — branch (b) (dead without a medik8s SNR CR): the
+		// evidence is one-sided — we cannot hear the node, but the
+		// node may simply not hear US. A node holding an RWO
+		// VolumeAttachment or a StatefulSet pod could come back and
+		// write over its re-bound volumes: exactly the split-brain a
+		// fencer CR exists to rule out. Fail closed and leave the
+		// decision to medik8s unless the operator's override says
+		// otherwise.
+		hasVolumes := false
+		if !viaSNR {
+			holds, holdsErr := s.nodeHasStatefulHolders(ctx, nodeName)
+			if holdsErr != nil {
+				log.Error(holdsErr, "stateful-holder check failed — node skipped (fail closed)",
+					"node", nodeName, "stuckPods", count)
+				metrics.IncError(s.queue)
+				continue
+			}
+			hasVolumes = holds
+			if holds && !fenceUnfencedStateful() {
+				metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues(nodeName).Set(1)
+				log.Info("SKIP: dead node holds stateful volumes/pods without medik8s SNR CR — fail closed against split-brain",
+					"node", nodeName, "stuckPods", count)
+				continue
+			}
 		}
 
 		// Signal only: which volumes will the taint force-detach.
@@ -276,29 +318,44 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			continue
 		}
 		tainted++
+		// W15-ST1 — a fence without a SNR CR is a judgment call even
+		// with the override: count it per node (and clear any stale
+		// skip flag — the fence resolves the hold) so alerting sees
+		// every fence the sweeper decided on its own evidence.
+		if !viaSNR {
+			metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues(
+				nodeName, strconv.FormatBool(hasVolumes)).Inc()
+			metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(nodeName)
+		}
 		log.Info("TAINT: node confirmed dead -> out-of-service=nodeshutdown:NoExecute "+
 			"(pods force-deleted, volumes detached by node controller)",
-			"node", nodeName, "stuckPods", count)
+			"node", nodeName, "stuckPods", count,
+			"evidence", reason, "viaSNR", viaSNR)
 	}
 	log.Info("sweep done", "tainted", tainted, "untainted", untainted,
 		"stuckNodes", len(stuck))
 	return nil
 }
 
-// confirmedDead is the safety gate — true only with independent
-// fencing evidence (medik8s CR, or Ready=Unknown>30m + dead probe).
+// confirmedDead is the safety gate — dead only with independent
+// fencing evidence: (a) a medik8s remediation CR (viaSNR=true), or
+// (b) Ready=Unknown>30m + a dead kubelet probe (viaSNR=false — no
+// fencer has certified the death, so the caller owes the node the
+// W15-ST1 stateful split-brain gate before tainting). reason carries
+// the evidence for the caller's logs; a dead=false result leaves it
+// empty.
 func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
-	rem *remediationCache, nodeNames map[string]bool) (bool, error) {
+	rem *remediationCache, nodeNames map[string]bool) (dead, viaSNR bool, reason string, err error) {
 	log := logf.FromContext(ctx)
 
 	// Path (a): a fencer CR exists for the node.
 	fenced, err := s.hasRemediationCR(ctx, n.Name, rem, nodeNames)
 	if err != nil {
-		return false, err
+		return false, false, "", err
 	}
 	if fenced {
 		log.Info("fencing evidence: medik8s remediation CR", "node", n.Name)
-		return true, nil
+		return true, true, "medik8s remediation CR", nil
 	}
 
 	// Path (b): Ready=Unknown held for >30m (the node controller
@@ -306,11 +363,11 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
 	// answer /healthz through the apiserver proxy.
 	c := kube.NodeCondition(n, corev1.NodeReady)
 	if c == nil || c.Status != corev1.ConditionUnknown {
-		return false, nil // NotReady/False alone is not a death certificate
+		return false, false, "", nil // NotReady/False alone is not a death certificate
 	}
 	if c.LastTransitionTime.IsZero() ||
 		s.now.Now().Sub(c.LastTransitionTime.Time) <= deadNodeUnknownAge {
-		return false, nil
+		return false, false, "", nil
 	}
 	ok, err := s.probeFn(ctx, n.Name)
 	if err != nil {
@@ -319,13 +376,120 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
 		// DoRaw error). Logged for forensics, not counted as a
 		// module failure.
 		log.Error(err, "kubelet healthz probe errored — counts as failed", "node", n.Name)
-		return true, nil
+		return true, false, "Ready=Unknown>30m + kubelet probe failed", nil
 	}
 	if !ok {
 		log.Info("fencing evidence: Ready=Unknown>30m + kubelet probe failed", "node", n.Name)
+		return true, false, "Ready=Unknown>30m + kubelet probe failed", nil
+	}
+	return false, false, "", nil
+}
+
+// fenceUnfencedStateful reads the split-brain override EVERY cycle —
+// the same hot-reload ops-lever convention as the webhookguard gates.
+// Opt-in (exactly "true"), default off: it authorizes fencing a
+// branch-(b) node that holds stateful volumes/pods without a medik8s
+// SNR CR, an operator's explicit "I know the node is really dead".
+func fenceUnfencedStateful() bool {
+	return envx.Gate("DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL", false)
+}
+
+// nodeHasStatefulHolders (W15-ST1) reports whether the node holds
+// anything that makes force-detaching its volumes dangerous: a
+// VolumeAttachment whose volume carries a ReadWriteOnce access mode
+// (RWO is the single-writer contract a not-really-dead node breaks
+// loudly), or a Pod owned by a StatefulSet (its identity is
+// volume-bound even when the current spec lost the claim). A list
+// failure is an error — the caller fails closed.
+func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string) (bool, error) {
+	// One PV census for the whole check: PV-referenced attachments
+	// carry only the volume NAME — the access modes live on the PV
+	// object itself (inline CSI specs carry their own). PVs are
+	// cluster-scoped and number in the dozens, so one paged list is
+	// the cheap shape.
+	pvModes := map[string][]corev1.PersistentVolumeAccessMode{}
+	err := kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.PersistentVolumes(s.cs),
+		func(items []corev1.PersistentVolume) error {
+			for i := range items {
+				pvModes[items[i].Name] = items[i].Spec.AccessModes
+			}
+			return nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("list persistentvolumes: %w", err)
+	}
+	hasRWO := false
+	err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.VolumeAttachments(s.cs),
+		func(items []storagev1.VolumeAttachment) error {
+			for i := range items {
+				if items[i].Spec.NodeName == nodeName && volumeAttachmentRWO(&items[i], pvModes) {
+					hasRWO = true
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("list volumeattachments: %w", err)
+	}
+	if hasRWO {
 		return true, nil
 	}
-	return false, nil
+
+	// Server-side node filter with the in-code check kept — fake
+	// clientsets ignore field selectors (the belt every paged pod
+	// list in this codebase wears).
+	stsPod := false
+	err = kube.ListEach(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(s.cs, metav1.NamespaceAll),
+		func(items []corev1.Pod) error {
+			for i := range items {
+				p := &items[i]
+				if p.Spec.NodeName != nodeName {
+					continue
+				}
+				for _, ref := range p.OwnerReferences {
+					if ref.Kind == "StatefulSet" {
+						stsPod = true
+					}
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("list pods: %w", err)
+	}
+	return stsPod, nil
+}
+
+// volumeAttachmentRWO reports whether the attachment's volume carries
+// a ReadWriteOnce access mode: inline CSI specs resolve off their own
+// spec, PV-referenced ones off the pvModes census. A volume with no
+// modes anywhere (attachment still in flight, PV since deleted)
+// cannot prove multi-writer safety either way and reads as NOT RWO —
+// logVolumeAttachments still names it for forensics.
+func volumeAttachmentRWO(va *storagev1.VolumeAttachment,
+	pvModes map[string][]corev1.PersistentVolumeAccessMode) bool {
+	if va.Spec.Source.InlineVolumeSpec != nil {
+		for _, mode := range va.Spec.Source.InlineVolumeSpec.AccessModes {
+			if mode == corev1.ReadWriteOnce {
+				return true
+			}
+		}
+	}
+	if name := va.Spec.Source.PersistentVolumeName; name != nil {
+		for _, mode := range pvModes[*name] {
+			if mode == corev1.ReadWriteOnce {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // remediationNodeNameAnno is the annotation medik8s NHC (>= v0.6)

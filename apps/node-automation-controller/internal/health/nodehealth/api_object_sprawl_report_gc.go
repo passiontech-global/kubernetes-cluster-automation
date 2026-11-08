@@ -7,6 +7,7 @@ package nodehealth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -41,6 +42,10 @@ type apiObjectSprawlReportGCCheck struct {
 	emittedObjects state.GaugeLedger[string]
 	emittedOrphans state.GaugeLedger[string]
 	emittedHelm    state.GaugeLedger[string]
+	// emittedLargeObjects tracks the W15-CP2b kine large-object series
+	// ("kind/namespace/name") — objects that shrink or vanish get
+	// their series pruned next sweep.
+	emittedLargeObjects state.GaugeLedger[string]
 
 	// ownerSeen memoizes one sweep's owner-existence probes: a pod
 	// with N containers produces N identical reports per kind, all
@@ -72,6 +77,15 @@ const (
 	// reports helm release secrets under (they are core Secrets, so
 	// no GVR of their own exists to reuse).
 	sprawlHelmSecretsResource = "helm_release_secrets"
+
+	// kineLargeObjectThreshold (W15-CP2b) is the Kine row-size guard:
+	// the serialized object size past which a ConfigMap/Secret is a
+	// large-object risk for the datastore (512 KiB — the same bound
+	// the host agent's kine-storage top-10 census logs). A
+	// multi-hundred-KiB row dominates compaction time and the
+	// apiserver's watch-cache serialization budget no matter which
+	// Kine backend backs it.
+	kineLargeObjectThreshold = 524288
 )
 
 // sprawlReportKinds is the census + orphan-GC table: the report CRDs
@@ -144,6 +158,15 @@ var (
 		Name: "node_automation_helm_release_secrets_pruned_total",
 		Help: "Superseded helm release secrets pruned by the sprawl GC, by namespace.",
 	}, []string{"namespace"})
+
+	// Serialized size of each ConfigMap/Secret past the Kine
+	// large-object guard (W15-CP2b) — the bloat census for the
+	// datastore row itself, whatever backs kine (SQLite or
+	// PostgreSQL).
+	kineLargeObjectBytesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_kine_large_object_bytes",
+		Help: "Serialized bytes of ConfigMap/Secret objects above the 512 KiB Kine large-object guard.",
+	}, []string{"kind", "namespace", "name"})
 )
 
 func init() {
@@ -152,7 +175,8 @@ func init() {
 		ephemeralReportsOrphanedGauge,
 		ephemeralReportsDeletedTotal,
 		helmSecretsExcessGauge,
-		helmSecretsPrunedTotal)
+		helmSecretsPrunedTotal,
+		kineLargeObjectBytesGauge)
 }
 
 // checkAPIObjectSprawlReportGC runs the sprawl sweep: census the
@@ -256,10 +280,74 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
+	// W15-CP2b — cluster-wide ConfigMap/Secret size census. Same
+	// failed-read posture as the report census above: bail before any
+	// ledger Prune so live series are not dropped on a flap.
+	if err := p.auditKineLargeObjects(ctx, &objects); err != nil {
+		return probefw.Result{Infra: err}
+	}
+
 	objects.Close(&p.emittedObjects, apiObjectCountGauge.DeleteLabelValues)
 	orphans.Close(&p.emittedOrphans, ephemeralReportsOrphanedGauge.DeleteLabelValues)
 	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
+	objects.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
 	return objects.Verdict("api object sprawl: ", ", ")
+}
+
+// auditKineLargeObjects (W15-CP2b) pages ConfigMaps and Secrets
+// cluster-wide and flags every object whose serialized size exceeds
+// kineLargeObjectThreshold — the large-object census for the kine
+// datastore row itself, whatever backs it (SQLite or PostgreSQL). The
+// gauge carries the byte size; each hit is also a sweep finding so the
+// check fails while the bloat is live.
+func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context,
+	objects *probefw.SweepReport) error {
+
+	cms, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.ConfigMaps(p.CS, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list configmaps: %w", err)
+	}
+	for i := range cms {
+		p.recordKineLargeObject(ctx, objects, "configmap",
+			cms[i].Namespace, cms[i].Name, &cms[i])
+	}
+	secrets, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.Secrets(p.CS, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list secrets: %w", err)
+	}
+	for i := range secrets {
+		p.recordKineLargeObject(ctx, objects, "secret",
+			secrets[i].Namespace, secrets[i].Name, &secrets[i])
+	}
+	return nil
+}
+
+// recordKineLargeObject measures obj's serialized size — the bytes the
+// datastore row actually stores, so Data/BinaryData payloads AND
+// metadata (a runaway last-applied-configuration annotation counts —
+// it historically duplicated whole manifests) — and past the
+// threshold emits the gauge tuple plus a finding. A marshal failure is
+// unmeasurable, not large: logged and skipped.
+func (p *apiObjectSprawlReportGCCheck) recordKineLargeObject(ctx context.Context,
+	objects *probefw.SweepReport, kind, ns, name string, obj any) {
+
+	b, err := json.Marshal(obj)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "marshal object for kine size audit",
+			"kind", kind, "object", ns+"/"+name)
+		return
+	}
+	if len(b) <= kineLargeObjectThreshold {
+		return
+	}
+	p.emittedLargeObjects.Set(kineLargeObjectBytesGauge, float64(len(b)),
+		kind+"/"+ns+"/"+name, kind, ns, name)
+	objects.Find(fmt.Sprintf("%s %s/%s carries %d bytes (Kine row guard %d)",
+		kind, ns, name, len(b), kineLargeObjectThreshold))
 }
 
 // reportOwnerGone reports whether the report's controller owner is a

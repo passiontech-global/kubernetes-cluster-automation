@@ -44,7 +44,7 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 		if obsPipelineDegradedGauge.DeleteLabelValues("prometheus_tsdb_wal") {
 			t.Fatal("quiet counter flagged degraded")
 		}
-		evs, err := cs.EventsV1().Events("monitoring").List(ctx, metav1.ListOptions{})
+		evs, err := cs.EventsV1().Events("prometheus-operator").List(ctx, metav1.ListOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
