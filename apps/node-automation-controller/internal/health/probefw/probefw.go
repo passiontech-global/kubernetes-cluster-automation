@@ -22,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // HealthListPageSize bounds the cluster-wide EndpointSlice list the
@@ -97,6 +98,14 @@ type Deps struct {
 	// metrics-backed checks run through PromQuery; Timeout bounds
 	// each query below the check's own deadline.
 	Prom promq.Client
+
+	// promEndpointOverride is the HEALTH_PROMETHEUS_QUERY_URL env
+	// knob resolved ONCE in NewDeps — reading env inside a run is a
+	// bug, so the override freezes at construction. The endpoint
+	// itself still derives per call from Cfg.HTTPContent.URL (plain
+	// resolved config, mutated by no production path) when no
+	// override was set; "" means no override.
+	promEndpointOverride string
 }
 
 // NewDeps builds the production-wired shared dependencies from the
@@ -108,10 +117,14 @@ type Deps struct {
 // leaves it nil, the documented fall-back-to-ListNodes posture.
 //
 // Prom deliberately shares the HTTPClient POINTER: tests swap
-// d.HTTPClient post-construction and PromQuery re-reads the field per
+// d.HTTPClient post-construction and PromQuery re-read the field per
 // call, so the one seam serves both the plain-HTTP checks and the
 // PromQL-backed ones. Timeout bounds each query by the check timeout
-// — the posture the retired promInstantQuery encoded inline.
+// — the posture the retired promInstantQuery encoded inline. The
+// HEALTH_PROMETHEUS_QUERY_URL env override resolves ONCE here —
+// reading env inside a run is a bug; the fallback derivation from
+// Cfg.HTTPContent.URL stays live because Cfg is resolved config,
+// not env.
 func NewDeps(d shared.Deps, cfg Config) *Deps {
 	deps := &Deps{
 		Name:       d.Name,
@@ -126,6 +139,7 @@ func NewDeps(d shared.Deps, cfg Config) *Deps {
 		deps.NodeReader = d.Mgr.GetClient()
 	}
 	deps.Prom = promq.Client{HTTP: deps.HTTPClient, Timeout: cfg.Timeouts.Check}
+	deps.promEndpointOverride = envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", "")
 	return deps
 }
 

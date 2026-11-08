@@ -2,7 +2,7 @@
 // linkerd-h2-stream-guard check: storm-signature delete with a
 // Ready sibling, the no-sibling skip, the W12-NM3 outbound balancer
 // lockout and proxy OOM detection.
-package nethealth
+package linkerd
 
 import (
 	"strings"

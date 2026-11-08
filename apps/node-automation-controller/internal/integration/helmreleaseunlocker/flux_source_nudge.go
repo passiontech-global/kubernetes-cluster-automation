@@ -9,16 +9,17 @@ package helmreleaseunlocker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -37,26 +38,6 @@ const (
 // healer scans (kustomize-controller owns the same stale-artifact
 // failure class as helm-controller).
 var fluxKustomizationGVR = kube.GVRFluxKustomization
-
-// fluxSourceGVRs maps the sourceRef kinds flux consumers carry to
-// their source.toolkit.fluxcd.io/v1 GVRs — the objects a stale-
-// artifact nudge actually lands on.
-var fluxSourceGVRs = map[string]schema.GroupVersionResource{
-	"HelmChart":      kube.GVRFluxHelmChart,
-	"GitRepository":  kube.GVRFluxGitRepository,
-	"HelmRepository": kube.GVRFluxHelmRepository,
-	"OCIRepository":  kube.GVRFluxOCIRepository,
-	// Bucket is a first-class v1 source kind — a Kustomization or HR
-	// sourcing artifacts from an S3/GCS bucket needs the same nudge.
-	"Bucket": kube.GVRFluxBucket,
-}
-
-// artifactFailMsgs are the Ready=False message fragments marking a
-// stale artifact on the SOURCE side — refetching the source is the
-// fix, not churning the consumer's own backoff.
-var artifactFailMsgs = []string{
-	"artifact not found", "failed to fetch", "chart pull error", "failed to untar",
-}
 
 // fluxSourceRef is a resolved source object coordinates tuple.
 type fluxSourceRef struct{ kind, namespace, name string }
@@ -80,7 +61,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	seen := map[fluxSourceRef]bool{}
 	for i := range hrs.Items {
 		hr := &hrs.Items[i]
-		if !fluxArtifactStale(hr, now) {
+		if !kube.FluxArtifactStale(hr, now, artifactStuckMinAge) {
 			continue
 		}
 		if ref, ok := hrSourceRef(hr); ok &&
@@ -95,7 +76,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	if kustomizations != nil {
 		for i := range kustomizations.Items {
 			k := &kustomizations.Items[i]
-			if !fluxArtifactStale(k, now) {
+			if !kube.FluxArtifactStale(k, now, artifactStuckMinAge) {
 				continue
 			}
 			if ref, ok := ksSourceRef(k); ok &&
@@ -107,57 +88,14 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	log.Info("flux artifact-source sweep done", "sourcesNudged", nudged)
 }
 
-// fluxArtifactStale is the stale-artifact signature: a non-suspended
-// consumer Ready=False continuously for >=15m (measured against now)
-// with a message pointing at the source's artifact (not the
-// consumer's own logic).
-func fluxArtifactStale(o *unstructured.Unstructured, now time.Time) bool {
-	if suspended, _ := kube.NestedBool(o.Object, "spec", "suspend"); suspended {
-		return false // suspended objects are parked, not broken
-	}
-	c, _ := kube.ConditionOf(o.Object, "Ready")
-	if c.Status != "False" {
-		return false
-	}
-	lower := strings.ToLower(c.Message)
-	hit := false
-	for _, s := range artifactFailMsgs {
-		if strings.Contains(lower, s) {
-			hit = true
-			break
-		}
-	}
-	if !hit {
-		return false
-	}
-	since := c.LastTransitionTime
-	if since.IsZero() {
-		since = o.GetCreationTimestamp().Time
-	}
-	return now.Sub(since) >= artifactStuckMinAge
-}
-
 // hrSourceRef resolves the source a HelmRelease pulls its artifact
 // from: spec.chartRef (v2 — HelmChart/OCIRepository) or the legacy
 // spec.chart.spec.sourceRef (HelmRepository/GitRepository). The
 // namespace defaults to the HR's own (flux convention).
 func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _ := kube.NestedString(hr.Object, "spec", "chartRef", "kind")
-	name, _ := kube.NestedString(hr.Object, "spec", "chartRef", "name")
-	ns, _ := kube.NestedString(hr.Object, "spec", "chartRef", "namespace")
-	if kind == "" || name == "" {
-		kind, _ = kube.NestedString(
-			hr.Object, "spec", "chart", "spec", "sourceRef", "kind")
-		name, _ = kube.NestedString(
-			hr.Object, "spec", "chart", "spec", "sourceRef", "name")
-		ns, _ = kube.NestedString(
-			hr.Object, "spec", "chart", "spec", "sourceRef", "namespace")
-	}
-	if kind == "" || name == "" {
+	kind, ns, name, ok := kube.FluxConsumerSourceRef(hr)
+	if !ok {
 		return fluxSourceRef{}, false
-	}
-	if ns == "" {
-		ns = hr.GetNamespace()
 	}
 	return fluxSourceRef{kind: kind, namespace: ns, name: name}, true
 }
@@ -181,14 +119,9 @@ func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // ksSourceRef is spec.sourceRef on a Kustomization — same flux
 // convention (namespace defaults to the object's own).
 func ksSourceRef(k *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _ := kube.NestedString(k.Object, "spec", "sourceRef", "kind")
-	name, _ := kube.NestedString(k.Object, "spec", "sourceRef", "name")
-	ns, _ := kube.NestedString(k.Object, "spec", "sourceRef", "namespace")
-	if kind == "" || name == "" {
+	kind, ns, name, ok := kube.FluxConsumerSourceRef(k)
+	if !ok {
 		return fluxSourceRef{}, false
-	}
-	if ns == "" {
-		ns = k.GetNamespace()
 	}
 	return fluxSourceRef{kind: kind, namespace: ns, name: name}, true
 }
@@ -200,7 +133,11 @@ func consumerID(kind string, o *unstructured.Unstructured) string {
 
 // nudgeSource stamps reconcile.fluxcd.io/requestedAt + the
 // passiontech.dev/last-source-nudge cooldown onto a Flux source object.
-// Failures are per-source: IncError + false, never an aborted sweep.
+// The write is gated through heal.AllowedVPersisted: the persisted
+// last-source-nudge annotation is the cooldown, then the maintenance
+// mutex + global heal budget admit the patch (fail closed; an
+// unverifiable check IncErrors the queue). Failures are per-source:
+// IncError + false, never an aborted sweep.
 // seen dedupes within the sweep: the first consumer to name a source
 // claims its one Get+patch — a shared source is never fetched twice
 // (and a failed Get is not retried for every other consumer).
@@ -208,7 +145,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	ref fluxSourceRef, consumer string, seen map[fluxSourceRef]bool) bool {
 	log := logf.FromContext(ctx)
 	key := ref.namespace + "/" + ref.name
-	gvr, ok := fluxSourceGVRs[ref.kind]
+	gvr, ok := kube.FluxSourceGVR(ref.kind)
 	if !ok {
 		log.Info("skip: source kind is not a nudgeable Flux source",
 			"kind", ref.kind, "consumer", consumer)
@@ -232,11 +169,24 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 		return false
 	}
 	now := u.now.Now()
-	if t, ok := kube.AnnoTime(src, fluxLastNudgeAnno); ok &&
-		now.Sub(t) < sourceNudgeCooldown {
-		log.Info("skip: source nudged inside cooldown",
-			"kind", ref.kind, "source", key,
-			"ago", now.Sub(t).Truncate(time.Minute))
+	// The mutex-aligned gate: the persisted last-source-nudge
+	// annotation is the cooldown (the wider of it and no in-RAM
+	// ledger — this healer stamps the source object itself), then
+	// the maintenance mutex + global heal budget evaluate fail-
+	// closed, the same posture every annotation nudge runs under.
+	// Unverifiable IncErrors the queue — the signal must reach the
+	// alert path.
+	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, nil,
+		u.cs, u.dyn, nil, src, fluxLastNudgeAnno, key,
+		sourceNudgeCooldown, now)
+	if unverifiable {
+		metrics.IncError(u.queue)
+		log.Error(errors.New("maintenance check unverifiable"),
+			"flux source nudge deferred — mutex unverifiable (fail closed)",
+			"kind", ref.kind, "source", key)
+		return false
+	}
+	if !proceed {
 		return false
 	}
 	stamp := now.UTC().Format(time.RFC3339)

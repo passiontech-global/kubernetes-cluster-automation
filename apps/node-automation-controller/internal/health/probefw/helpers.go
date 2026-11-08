@@ -5,18 +5,22 @@
 //     (fail closed), UID-preconditioned delete — and the
 //     "selfheal/<check>/<target>" ledger key it stamps. Thin wrapper
 //     over the platform heal package this file was the reference for.
-//   - HealAllowed: the shared heal preamble every check's heal gate
-//     runs — per-target cooldown + maintenance mutex + heal budget,
+//   - HealAllowed / HealAllowedPersisted: the shared heal preamble
+//     every check's heal gate runs — per-target cooldown (plain or
+//     persisted-stamp-widened) + maintenance mutex + heal budget,
 //     memoized on the Deps-wide verdict.
 //   - RequireDyn: the "no dynamic client" preamble every CR-scanning
 //     check opens with.
 //   - PodUnreadySince / PodFromList: pod readiness helpers.
 //   - PromEndpoint / PromQuery: the Prometheus instant-query seam
-//     every metrics-backed check shares, backed by internal/promq.
-//   - LinkerdPodMatchesComponent plus the LinkerdNS /
-//     LinkerdDestinationName / LinkerdIdentityName control-plane
-//     identifiers the mesh watchdog and the endpoint-sync check both
-//     match linkerd pods against.
+//     every metrics-backed check shares, backed by internal/promq —
+//     the HEALTH_PROMETHEUS_QUERY_URL override resolves ONCE at Deps
+//     construction, never inside a run.
+//   - LinkerdPodMatchesComponent: the generic Deployment-prefix/
+//     label matcher. The linkerd identifiers it matches against and
+//     the dragonfly operator namespace are domain consts — they live
+//     in internal/platform/kube/domains.go (the cross-tree sharing
+//     layer), not in the check-agnostic framework.
 //
 // The first-seen streak and emitted-gauge bookkeeping these checks
 // used to share on deps.ledger lives per check as
@@ -40,33 +44,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// The linkerd control-plane identifiers two domain checks both key
-// on: the mesh-controlplane watchdog (watchdogs) bounces wedged pods
-// in this namespace, and the linkerd-endpoint-sync check (nethealth)
-// picks its heal target the same way.
-const (
-	LinkerdNS              = "linkerd"
-	LinkerdDestinationName = "linkerd-destination"
-	LinkerdIdentityName    = "linkerd-identity"
-)
+// The linkerd control-plane identifiers and the dragonfly operator
+// namespace moved OUT of the framework — the framework must stay
+// check-agnostic: they are cross-tree topology identifiers and live
+// in internal/platform/kube/domains.go, imported by every consumer
+// (health check subpackages AND integration auditors).
+// LinkerdPodMatchesComponent stays: it is the generic
+// Deployment-prefix/label matcher, not a domain identifier.
 
-// DragonflyOperatorNS is the dragonfly operator's namespace: the
-// operator-workqueue watchdog (watchdogs) reads its leader Lease there
-// and the stateful-masterless check (datastore) bounces operator pods
-// in it.
-const DragonflyOperatorNS = "dragonfly-operator-system"
-
-// PromEndpoint resolves the Prometheus /api/v1/query URL for this
-// call: HEALTH_PROMETHEUS_QUERY_URL (a full query URL) wins, else the
-// endpoint is derived from the http-content-check target's
-// scheme://host — the same Prometheus that check health-probes. The
-// env var is re-read per call (tests Setenv mid-test).
+// PromEndpoint resolves the Prometheus /api/v1/query URL:
+// HEALTH_PROMETHEUS_QUERY_URL (a full query URL) wins — the override
+// was resolved ONCE at Deps construction (NewDeps), so mid-run env
+// churn cannot flip it — else the endpoint derives from the
+// http-content-check target's scheme://host, the same Prometheus
+// that check health-probes. The derivation reads Cfg, not env, so a
+// caller re-pointing Cfg (tests) keeps working.
 func (d *Deps) PromEndpoint() (string, error) {
 	return promq.ResolveEndpoint(
-		envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""), d.Cfg.HTTPContent.URL)
+		d.promEndpointOverride, d.Cfg.HTTPContent.URL)
 }
 
 // PromQuery runs an instant PromQL query against the resolved
@@ -128,6 +125,20 @@ func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 	now time.Time) (proceed, unverifiable bool) {
 	return heal.AllowedV(ctx, log, &d.verdict, d.CS, d.Dyn,
 		heals, key, cooldown, now)
+}
+
+// HealAllowedPersisted is HealAllowed with the cooldown widened to
+// the target's persisted stamp: heal.AllowedVPersisted running on the
+// Deps-wide memoized verdict — same cooldown → mutex → budget order,
+// the wider-of in-RAM+annotation window, and one maintenance-mutex
+// evaluation per Verdict TTL across the whole sweep (never per
+// target). The caller stamps the annotation itself, only after a
+// delivered action; a nil obj/empty annoKey collapses to HealAllowed.
+func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	return heal.AllowedVPersisted(ctx, log, &d.verdict, d.CS, d.Dyn,
+		heals, obj, annoKey, key, cooldown, now)
 }
 
 // DeletePodHeal is the pod-delete heal shape the self-healing checks

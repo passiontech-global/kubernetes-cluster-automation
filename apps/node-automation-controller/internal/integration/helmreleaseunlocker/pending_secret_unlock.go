@@ -58,18 +58,18 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 		// releases the alerted dedup only when the ledger entry ages
 		// out, so an anno-only stamp must live in the ledger too.
 		if t, hasAnno := helmLastUnlock(hr); hasAnno {
-			if last, _ := u.unlocked.Last(key); t.After(last) {
-				u.unlocked.Stamp(key, t)
+			if last, _ := u.pending.unlocked.Last(key); t.After(last) {
+				u.pending.unlocked.Stamp(key, t)
 			}
 		}
-		if heal.PersistedCooledDown(&u.unlocked, hr, helmLastUnlockAnno,
+		if heal.PersistedCooledDown(&u.pending.unlocked, hr, helmLastUnlockAnno,
 			key, helmUnlockCooldown, now) {
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
 			// secrets every tick. The alert itself fires once per
 			// cooldown window (alerted ledger), not per sweep.
-			if u.alerted.Add(key) {
-				last, _ := u.unlocked.Last(key)
+			if u.pending.alerted.Add(key) {
+				last, _ := u.pending.unlocked.Last(key)
 				metrics.IncError(u.queue)
 				log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
 					"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
@@ -92,7 +92,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			// "still stuck after unlock" errors for a refusal.
 			continue
 		}
-		u.unlocked.Stamp(key, now)
+		u.pending.unlocked.Stamp(key, now)
 		unlocked++
 	}
 	return unlocked

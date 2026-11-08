@@ -24,7 +24,8 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	linkerdNS            = "linkerd"
+	// linkerdTrustRootsCM/Key name the trust surface; the namespace
+	// is the shared kube.kube.LinkerdNS topology identifier.
 	linkerdTrustRootsCM  = "linkerd-identity-trust-roots"
 	linkerdTrustRootsKey = "ca-bundle.crt"
 )
@@ -41,11 +42,11 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 	a.seenTrustBundles.Begin() // drop any aborted sweep's leftover emissions
 	// The trust-roots ConfigMap is optional — clusters without
 	// linkerd (or a differently-named install) simply skip.
-	cm, err := a.cs.CoreV1().ConfigMaps(linkerdNS).
+	cm, err := a.cs.CoreV1().ConfigMaps(kube.LinkerdNS).
 		Get(ctx, linkerdTrustRootsCM, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		a.emitTrustBundle(ctx, linkerdNS, linkerdTrustRootsCM,
+		a.emitTrustBundle(ctx, kube.LinkerdNS, linkerdTrustRootsCM,
 			[]byte(cm.Data[linkerdTrustRootsKey]))
 	case !apierrors.IsNotFound(err):
 		return fmt.Errorf("get linkerd trust-roots configmap: %w", err)
@@ -53,7 +54,7 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 
 	secrets, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Secrets(a.cs, linkerdNS))
+		kube.Secrets(a.cs, kube.LinkerdNS))
 	if err != nil {
 		return fmt.Errorf("list linkerd secrets: %w", err)
 	}

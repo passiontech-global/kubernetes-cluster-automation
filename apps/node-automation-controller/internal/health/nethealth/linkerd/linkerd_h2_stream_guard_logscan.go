@@ -3,7 +3,7 @@
 // the single bounded log-tail fetch that matches both families, and
 // the Prometheus suspect prefilter that narrows which pods get
 // tailed.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -50,7 +50,7 @@ var linkerdIdentityStallMarkers = []string{
 // linkerdH2LogSignals fetches the linkerd-proxy container's log tail
 // once and reports which signature families it carries — the storm
 // and identity-stall scans share the single bounded fetch
-// (linkerdH2LogTimeout / linkerdH2LogMaxByte, same posture as the
+// (probefw.LogTimeout / probefw.LogMaxBytes, same posture as the
 // scylla gossip probe) so a flagged pod costs one apiserver read.
 // The match closure only COLLECTS; it returns true early solely
 // when both families are already proven, so PodLogTail can stop
@@ -59,7 +59,7 @@ func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 	pod *corev1.Pod) (storm, identity bool, err error) {
 
 	_, err = probefw.PodLogTail(ctx, p.CS, pod, kube.LinkerdProxyContainer,
-		linkerdH2TailLines, linkerdH2LogMaxByte, linkerdH2LogTimeout,
+		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
 		func(line string) bool {
 			l := strings.ToLower(line)
 			for _, marker := range linkerdH2StormMarkers {

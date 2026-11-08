@@ -66,27 +66,25 @@ func init() {
 func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log logr.Logger,
 	op operatorTarget, lease *coordinationv1.Lease, reasons []string, now time.Time) {
 
-	// The 1h cooldown is the wider of the in-RAM ledger and the
-	// persisted Lease stamp — the ledger covers a heal whose anno
-	// patch never landed, the annotation survives an operator
-	// restart. A nil lease (leaseOptional operators healing through
-	// the pod fallback) collapses the check to the ledger half.
+	// The preamble is the shared persisted-cooldown shape
+	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the 1h
+	// cooldown is the wider of the in-RAM ledger and the persisted
+	// Lease stamp — the ledger covers a heal whose anno patch never
+	// landed, the annotation survives an operator restart — and only
+	// after it clears do the maintenance mutex + global heal budget
+	// evaluate, fail closed (an unverifiable drain state IncErrors
+	// the queue). A nil lease (leaseOptional operators healing
+	// through the pod fallback) collapses the gate to the ledger
+	// half + mutex. The mutex verdict rides the Deps-wide memo: the
+	// first check to need it this sweep pays the API reads, every
+	// later caller within the Verdict TTL reuses the verdict.
 	var leaseObj metav1.Object
 	if lease != nil {
 		leaseObj = lease
 	}
-	if heal.PersistedCooledDown(&p.opHealed, leaseObj, operatorHealAnno,
-		op.name, operatorHealCooldown, now) {
-		log.Info("skip heal: inside cooldown", "operator", op.name)
-		return
-	}
-	// Maintenance mutex — "cannot verify" fails closed like every
-	// other caller: an unverifiable drain state defers the heal.
-	// HealAllowed runs with a nil ledger — the cooldown above is
-	// the wider-of-both PersistedCooledDown, not a single key, so
-	// only its mutex gate applies — shared via the Deps-wide verdict
-	// so a sweep of stuck operators pays one evaluation.
-	proceed, unverifiable := p.HealAllowed(ctx, log, nil, op.name, 0, now)
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.opHealed, leaseObj, operatorHealAnno,
+		op.name, operatorHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

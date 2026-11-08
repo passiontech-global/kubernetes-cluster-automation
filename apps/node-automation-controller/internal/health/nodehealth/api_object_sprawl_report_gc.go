@@ -7,15 +7,11 @@ package nodehealth
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"sort"
-	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,7 +38,7 @@ type apiObjectSprawlReportGCCheck struct {
 	emittedObjects state.GaugeLedger[string]
 	emittedOrphans state.GaugeLedger[string]
 	emittedHelm    state.GaugeLedger[string]
-	// emittedLargeObjects tracks the W15-CP2b kine large-object series
+	// emittedLargeObjects tracks the kine large-object series
 	// ("kind/namespace/name") — objects that shrink or vanish get
 	// their series pruned next sweep.
 	emittedLargeObjects state.GaugeLedger[string]
@@ -68,24 +64,6 @@ const (
 	// api-object-sprawl-report-gc knobs.
 	sprawlOrphanMinAge     = 2 * time.Hour
 	sprawlMaxOrphanDeletes = 50
-	sprawlMaxSuperseded    = 10
-
-	// sprawlHelmSecretType is the Secret type helm writes per
-	// revision — same literal helmrelease-unlocker selects on.
-	sprawlHelmSecretType = "helm.sh/release.v1"
-	// sprawlHelmSecretsResource is the resource label the census
-	// reports helm release secrets under (they are core Secrets, so
-	// no GVR of their own exists to reuse).
-	sprawlHelmSecretsResource = "helm_release_secrets"
-
-	// kineLargeObjectThreshold (W15-CP2b) is the Kine row-size guard:
-	// the serialized object size past which a ConfigMap/Secret is a
-	// large-object risk for the datastore (512 KiB — the same bound
-	// the host agent's kine-storage top-10 census logs). A
-	// multi-hundred-KiB row dominates compaction time and the
-	// apiserver's watch-cache serialization budget no matter which
-	// Kine backend backs it.
-	kineLargeObjectThreshold = 524288
 )
 
 // sprawlReportKinds is the census + orphan-GC table: the report CRDs
@@ -146,37 +124,13 @@ var (
 		Name: "node_automation_ephemeral_reports_deleted_total",
 		Help: "Dead-owner report CRs deleted by the sprawl GC, by report kind.",
 	}, []string{"kind"})
-
-	// Superseded helm revision secrets above the keep cap, per release.
-	helmSecretsExcessGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "node_automation_helm_release_secrets_excess",
-		Help: "Superseded helm release secrets beyond the per-release keep cap.",
-	}, []string{"namespace", "release"})
-
-	// Superseded helm revision secrets pruned by this check.
-	helmSecretsPrunedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "node_automation_helm_release_secrets_pruned_total",
-		Help: "Superseded helm release secrets pruned by the sprawl GC, by namespace.",
-	}, []string{"namespace"})
-
-	// Serialized size of each ConfigMap/Secret past the Kine
-	// large-object guard (W15-CP2b) — the bloat census for the
-	// datastore row itself, whatever backs kine (SQLite or
-	// PostgreSQL).
-	kineLargeObjectBytesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "node_automation_kine_large_object_bytes",
-		Help: "Serialized bytes of ConfigMap/Secret objects above the 512 KiB Kine large-object guard.",
-	}, []string{"kind", "namespace", "name"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		apiObjectCountGauge,
 		ephemeralReportsOrphanedGauge,
-		ephemeralReportsDeletedTotal,
-		helmSecretsExcessGauge,
-		helmSecretsPrunedTotal,
-		kineLargeObjectBytesGauge)
+		ephemeralReportsDeletedTotal)
 }
 
 // checkAPIObjectSprawlReportGC runs the sprawl sweep: census the
@@ -280,7 +234,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
-	// W15-CP2b — cluster-wide ConfigMap/Secret size census. Same
+	// Kine large-object census — cluster-wide ConfigMap/Secret size census. Same
 	// failed-read posture as the report census above: bail before any
 	// ledger Prune so live series are not dropped on a flap.
 	if err := p.auditKineLargeObjects(ctx, &objects); err != nil {
@@ -292,62 +246,6 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
 	objects.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
 	return objects.Verdict("api object sprawl: ", ", ")
-}
-
-// auditKineLargeObjects (W15-CP2b) pages ConfigMaps and Secrets
-// cluster-wide and flags every object whose serialized size exceeds
-// kineLargeObjectThreshold — the large-object census for the kine
-// datastore row itself, whatever backs it (SQLite or PostgreSQL). The
-// gauge carries the byte size; each hit is also a sweep finding so the
-// check fails while the bloat is live.
-func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context,
-	objects *probefw.SweepReport) error {
-
-	cms, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.ConfigMaps(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list configmaps: %w", err)
-	}
-	for i := range cms {
-		p.recordKineLargeObject(ctx, objects, "configmap",
-			cms[i].Namespace, cms[i].Name, &cms[i])
-	}
-	secrets, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.Secrets(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list secrets: %w", err)
-	}
-	for i := range secrets {
-		p.recordKineLargeObject(ctx, objects, "secret",
-			secrets[i].Namespace, secrets[i].Name, &secrets[i])
-	}
-	return nil
-}
-
-// recordKineLargeObject measures obj's serialized size — the bytes the
-// datastore row actually stores, so Data/BinaryData payloads AND
-// metadata (a runaway last-applied-configuration annotation counts —
-// it historically duplicated whole manifests) — and past the
-// threshold emits the gauge tuple plus a finding. A marshal failure is
-// unmeasurable, not large: logged and skipped.
-func (p *apiObjectSprawlReportGCCheck) recordKineLargeObject(ctx context.Context,
-	objects *probefw.SweepReport, kind, ns, name string, obj any) {
-
-	b, err := json.Marshal(obj)
-	if err != nil {
-		logf.FromContext(ctx).Error(err, "marshal object for kine size audit",
-			"kind", kind, "object", ns+"/"+name)
-		return
-	}
-	if len(b) <= kineLargeObjectThreshold {
-		return
-	}
-	p.emittedLargeObjects.Set(kineLargeObjectBytesGauge, float64(len(b)),
-		kind+"/"+ns+"/"+name, kind, ns, name)
-	objects.Find(fmt.Sprintf("%s %s/%s carries %d bytes (Kine row guard %d)",
-		kind, ns, name, len(b), kineLargeObjectThreshold))
 }
 
 // reportOwnerGone reports whether the report's controller owner is a
@@ -421,112 +319,4 @@ func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
 			"kind", rk.kind, "object", obj.GetNamespace()+"/"+obj.GetName())
 		return false
 	}
-}
-
-// pruneHelmSecrets counts helm release secrets into the census and
-// caps superseded revisions per release. This is parallel logic to
-// helmrelease-unlocker's pruneSupersededSecrets — that one is a
-// method on the unlocker's private type and cannot be imported, so
-// the parity contract is kept verbatim here: group by namespace +
-// `name` label, only `status=superseded` secrets with a valid integer
-// `version` label are prune candidates, the oldest beyond the cap are
-// deleted with a UID precondition, and the highest-version secret of
-// the release is NEVER touched (it stays the newest rollback point
-// even when itself superseded). Findings for the check's why string
-// and the helm-excess gauge tuples are recorded on the reports.
-func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
-	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
-
-	// owner=helm,status=superseded server-side: every superseded
-	// revision carries that label pair (helm v3 convention — the same
-	// labels pruneSupersededSecrets and the test fixtures use), so
-	// the live deployed/pending/failed revisions never cross the wire.
-	// The census below therefore counts the superseded population —
-	// the actual bloat the helm_release_secrets series exists to
-	// track. The per-release "highest" guard still protects the
-	// newest superseded revision (the rollback point), and a
-	// non-superseded current revision was never a candidate anyway.
-	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: "owner=helm,status=superseded",
-		Limit:         probefw.HealthListPageSize},
-		kube.Secrets(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list helm release secrets: %w", err)
-	}
-	type relKey struct{ ns, release string }
-	byRelease := map[relKey][]*corev1.Secret{}
-	perNS := map[string]int{}
-	for i := range secrets {
-		s := &secrets[i]
-		if s.Type != corev1.SecretType(sprawlHelmSecretType) {
-			continue
-		}
-		perNS[s.Namespace]++
-		release := s.Labels["name"]
-		if release == "" {
-			continue
-		}
-		k := relKey{s.Namespace, release}
-		byRelease[k] = append(byRelease[k], s)
-	}
-	for ns, count := range perNS {
-		objects.Set(apiObjectCountGauge, float64(count),
-			sprawlHelmSecretsResource+"/"+ns,
-			[]string{sprawlHelmSecretsResource, ns})
-	}
-
-	type supersededSecret struct {
-		s *corev1.Secret
-		v int
-	}
-	for k, relSecrets := range byRelease {
-		highest := -1
-		var superseded []supersededSecret
-		for _, s := range relSecrets {
-			v, verr := strconv.Atoi(s.Labels["version"])
-			if verr != nil {
-				continue // unversioned — never ours to judge
-			}
-			if v > highest {
-				highest = v
-			}
-			if s.Labels["status"] == "superseded" {
-				superseded = append(superseded, supersededSecret{s, v})
-			}
-		}
-		excess := len(superseded) - sprawlMaxSuperseded
-		if excess <= 0 {
-			continue
-		}
-		helmRep.Set(helmSecretsExcessGauge, float64(excess),
-			k.ns+"/"+k.release, []string{k.ns, k.release})
-		objects.Find(fmt.Sprintf(
-			"release %s/%s holds %d superseded secrets (cap %d)",
-			k.ns, k.release, len(superseded), sprawlMaxSuperseded))
-		sort.Slice(superseded, func(i, j int) bool {
-			return superseded[i].v < superseded[j].v
-		})
-		toDelete := excess
-		for _, cand := range superseded {
-			if toDelete <= 0 {
-				break
-			}
-			if cand.v == highest {
-				continue // never touch the newest rollback point
-			}
-			if err := p.CS.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
-				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, "")); err != nil {
-				metrics.IncError(p.Name)
-				log.Error(err, "superseded helm secret delete failed",
-					"secret", cand.s.Namespace+"/"+cand.s.Name)
-				continue // try the next-oldest instead of giving up
-			}
-			helmSecretsPrunedTotal.WithLabelValues(cand.s.Namespace).Inc()
-			log.Info("DELETE: superseded helm release secret above keep cap",
-				"release", k.ns+"/"+k.release, "secret", cand.s.Name,
-				"version", cand.v)
-			toDelete--
-		}
-	}
-	return nil
 }

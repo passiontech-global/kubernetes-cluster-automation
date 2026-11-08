@@ -65,10 +65,14 @@ import (
 )
 
 var (
-	corednsWantReqCPU = resource.MustParse("25m")
-	corednsWantReqMem = resource.MustParse("64Mi")
-	corednsWantLimCPU = resource.MustParse("1000m")
-	corednsWantLimMem = resource.MustParse("256Mi")
+	corednsWantReq = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("25m"),
+		corev1.ResourceMemory: resource.MustParse("64Mi"),
+	}
+	corednsWantLim = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("1000m"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
+	}
 )
 
 type corednsPatcher struct {
@@ -214,8 +218,7 @@ func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wa
 	// Replica drift only counts when the pin is enabled — a nil
 	// .spec.replicas defaults to 1 at the API but still means "we
 	// never pinned it", so it counts as drifted too.
-	if wantReplicas > 0 &&
-		(d.Spec.Replicas == nil || *d.Spec.Replicas != wantReplicas) {
+	if pinnedworkload.ReplicaDrifted(d, wantReplicas) {
 		return true
 	}
 	ps := d.Spec.Template.Spec
@@ -224,21 +227,11 @@ func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wa
 		if c.Name != "coredns" {
 			continue
 		}
-		if c.LivenessProbe == nil || c.LivenessProbe.TimeoutSeconds != 5 ||
-			c.ReadinessProbe == nil || c.ReadinessProbe.TimeoutSeconds != 5 {
+		if pinnedworkload.ProbeTimeoutsDrifted(c) ||
+			pinnedworkload.ResourcesDrifted(c, corednsWantReq, corednsWantLim) {
 			return true
 		}
-		reqCPU := c.Resources.Requests[corev1.ResourceCPU]
-		reqMem := c.Resources.Requests[corev1.ResourceMemory]
-		limCPU := c.Resources.Limits[corev1.ResourceCPU]
-		limMem := c.Resources.Limits[corev1.ResourceMemory]
-		if reqCPU.Cmp(corednsWantReqCPU) != 0 ||
-			reqMem.Cmp(corednsWantReqMem) != 0 ||
-			limCPU.Cmp(corednsWantLimCPU) != 0 ||
-			limMem.Cmp(corednsWantLimMem) != 0 {
-			return true
-		}
-		if ps.Affinity != nil {
+		if pinnedworkload.AffinitySet(ps) {
 			return true
 		}
 		return !corednsTopologyOK(ps.TopologySpreadConstraints, zoneWhen, minDomains)

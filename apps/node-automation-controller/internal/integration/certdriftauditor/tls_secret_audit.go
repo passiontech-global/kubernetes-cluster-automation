@@ -21,6 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -130,15 +131,51 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 		return
 	}
 	now := a.now.Now()
-	if now.Sub(a.linkerdIssuerHealed) < linkerdIssuerCooldown {
+	// The restart touches a LIVE workload (a Deployment rollout), so
+	// it passes the same gates as every pod heal: first the WIDER of
+	// the in-RAM ledger and the persisted rollout stamp (the
+	// annotation survives an operator restart — an in-RAM-only
+	// cooldown refunds the window and double-restarts linkerd-identity),
+	// then the fail-closed maintenance mutex (cordon/drain/kured
+	// defers the restart; "cannot verify" skips AND IncErrors the
+	// queue).
+	deploy, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).
+		Get(ctx, kube.LinkerdIdentityName, metav1.GetOptions{})
+	if err != nil {
+		metrics.IncError(a.queue)
+		log.Error(err, "linkerd-identity get failed")
+		return
+	}
+	if heal.PersistedCooledDown(&a.linkerdIssuerHeals, deploy,
+		kube.AnnoLastLinkerdIssuerRollout, kube.LinkerdIdentityName,
+		linkerdIssuerCooldown, now) {
 		// Deliberately NOT latching the serial here: sealing the new
 		// fingerprint before the rollout is delivered means the next
 		// sweep reads serial == linkerdIssuerSerial and returns early
 		// — a cooldown-window or transient patch failure would drop
 		// the re-roll forever. The fingerprint is stored only after
 		// the Patch below succeeds.
+		last := now.Add(-linkerdIssuerCooldown) // keep "ago" sane if both clocks somehow read empty
+		if t, ok := a.linkerdIssuerHeals.Last(kube.LinkerdIdentityName); ok && t.After(last) {
+			last = t
+		}
+		if t, ok := kube.AnnoTime(deploy, kube.AnnoLastLinkerdIssuerRollout); ok && t.After(last) {
+			last = t
+		}
 		log.Info("skip issuer rollout: inside cooldown",
-			"ago", now.Sub(a.linkerdIssuerHealed).Truncate(time.Minute))
+			"ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	// Fail-closed maintenance mutex — the shared preamble with no
+	// additional ledger cooldown (PersistedCooledDown already ran the
+	// wider-of check above).
+	proceed, unverifiable := heal.Gate(ctx, log, &a.verdict, a.cs, a.dyn,
+		kube.LinkerdIdentityName, now)
+	switch {
+	case unverifiable:
+		metrics.IncError(a.queue)
+		return
+	case !proceed:
 		return
 	}
 	payload, err := json.Marshal(map[string]any{
@@ -151,14 +188,32 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	if err != nil {
 		return
 	}
-	if _, err := a.cs.AppsV1().Deployments(linkerdNS).Patch(ctx, linkerdIssuerDeploy,
+	if _, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx, kube.LinkerdIdentityName,
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
 		metrics.IncError(a.queue)
 		log.Error(err, "linkerd-identity rollout stamp failed")
 		return
 	}
+	// The rollout is delivered — latch the new fingerprint and the
+	// in-RAM half of the cooldown NOW (a failed persisted stamp must
+	// not let the next 15m sweep re-roll the Deployment), then stamp
+	// the persisted annotation so the window survives an operator
+	// restart. StampPersisted only stamps the ledger when its patch
+	// lands, so a failed stamp leaves the RAM clock as the sole guard.
 	a.linkerdIssuerSerial = serial
-	a.linkerdIssuerHealed = now
-	metrics.ControlPlanePodHealsTotal.WithLabelValues(linkerdIssuerDeploy).Inc()
+	a.linkerdIssuerHeals.Stamp(kube.LinkerdIdentityName, now)
+	metrics.ControlPlanePodHealsTotal.WithLabelValues(kube.LinkerdIdentityName).Inc()
 	log.Info("ACTION: issuer cert rotated (serial changed) — stamped rollout annotation on linkerd-identity")
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx,
+				kube.LinkerdIdentityName, types.StrategicMergePatchType,
+				data, metav1.PatchOptions{})
+			return err
+		},
+		kube.AnnoLastLinkerdIssuerRollout, &a.linkerdIssuerHeals,
+		kube.LinkerdIdentityName, now); err != nil {
+		metrics.IncError(a.queue)
+		log.Error(err, "linkerd-identity persisted cooldown stamp failed")
+	}
 }

@@ -4,7 +4,7 @@
 // before linkerd-init's iptables rules can steer into the proxy,
 // silently killing SO_ORIGINAL_DST/mTLS; reported on
 // node_automation_cilium_linkerd_socklb_conflict.
-package nethealth
+package linkerd
 
 import (
 	"context"

@@ -179,7 +179,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// No ledger fold needed here: unlike the unlock ledger the
 		// unwedged set is never pruned (stamps self-expire), so an
 		// anno-only cooldown needs no in-RAM mirror.
-		if heal.PersistedCooledDown(&u.unwedged, hr, helmLastStallUnwedgeAnno,
+		if heal.PersistedCooledDown(&u.stall.unwedged, hr, helmLastStallUnwedgeAnno,
 			key, helmUnlockCooldown, now) {
 			u.alertStallOnce(ctx, key, now,
 				fmt.Sprintf("HR re-stalled inside the %s unwedge cooldown — previous unwedge did not fix it",
@@ -193,10 +193,10 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// the new revision has not had its window yet.
 		revision, _ := kube.NestedString(
 			hr.Object, "status", "lastAttemptedRevision")
-		att := u.stallAttempts[key]
+		att := u.stall.attempts[key]
 		if att == nil || att.revision != revision {
 			att = &stallAttempt{revision: revision}
-			u.stallAttempts[key] = att
+			u.stall.attempts[key] = att
 		}
 		if att.count >= stallMaxAttemptsPerRevision {
 			u.alertStallOnce(ctx, key, now, fmt.Sprintf(
@@ -228,7 +228,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 			u.alertStallOnce(ctx, key, now,
 				"stalled HR is not the surge-deadlock shape — refusing to scale: "+refuse)
 		case acted:
-			u.unwedged.Stamp(key, now)
+			u.stall.unwedged.Stamp(key, now)
 			unwedged++
 		}
 	}
@@ -240,11 +240,11 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 // permanently refused signature would otherwise bump the error
 // counter every 10-minute sweep.
 func (u *helmReleaseUnlocker) alertStallOnce(ctx context.Context, key string, now time.Time, msg string) {
-	if u.stallAlerted.CooledDown(key, helmUnlockCooldown, now) {
+	if u.stall.alerted.CooledDown(key, helmUnlockCooldown, now) {
 		return
 	}
 	metrics.IncError(u.queue)
-	u.stallAlerted.Stamp(key, now)
+	u.stall.alerted.Stamp(key, now)
 	logf.FromContext(ctx).Info("ALERT: "+msg, "hr", key)
 }
 

@@ -15,6 +15,7 @@ import (
 
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,6 +26,7 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -674,8 +676,9 @@ func TestReplicatedDriftClearsOnResync(t *testing.T) {
 	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 0 {
 		t.Fatalf("drift series still held after re-sync: %v", got)
 	}
-	if len(a.replicationMismatch) != 0 {
-		t.Fatalf("mismatch streak not reset: %v", a.replicationMismatch)
+	if a.replicationMismatch.Count(replStreakKey(replicationMetricKey{
+		namespace: "apps", name: "tls-copy", source: "sec/tls-src"})) != 0 {
+		t.Fatal("mismatch streak not reset")
 	}
 }
 
@@ -711,8 +714,9 @@ func TestReplicatedDriftMissingSourceQuiet(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(a.replicationMismatch) != 0 {
-		t.Fatalf("missing source counted as drift: %v", a.replicationMismatch)
+	if a.replicationMismatch.Count(replStreakKey(replicationMetricKey{
+		namespace: "apps", name: "tls-copy", source: "sec/tls-src"})) != 0 {
+		t.Fatal("missing source counted as drift")
 	}
 }
 
@@ -907,4 +911,156 @@ func TestCertDriftAuditorCRDListError(t *testing.T) {
 	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "hook.example.com"); got != 1 {
 		t.Fatalf("webhook audit skipped after CRD failure — mismatch=%v, want 1", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Linkerd issuer rollout — maintenance-mutex gate + persisted cooldown
+// ---------------------------------------------------------------------------
+
+// issuerSecret builds the linkerd-identity-issuer Secret with a fresh
+// cert (a fresh serial) per call — two calls simulate a cert-manager
+// rotation across sweeps.
+func issuerSecret(t *testing.T) *corev1.Secret {
+	t.Helper()
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kube.LinkerdNS, Name: linkerdIssuerSecret},
+		Data: map[string][]byte{"crt.pem": makeCertPEM(t, time.Now().Add(24*time.Hour))},
+	}
+}
+
+// linkerdIdentityDeploy builds the (empty-pod-template) Deployment the
+// rollout stamp lands on; annos go on the top-level metadata where the
+// persisted cooldown stamp lives.
+func linkerdIdentityDeploy(annos map[string]string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kube.LinkerdNS, Name: kube.LinkerdIdentityName, Annotations: annos},
+	}
+}
+
+// rolloutAnno reads the restartedAt stamp off the live Deployment —
+// empty means no restart was stamped.
+func rolloutAnno(t *testing.T, cs kubernetes.Interface) string {
+	t.Helper()
+	d, err := cs.AppsV1().Deployments(kube.LinkerdNS).
+		Get(ctx, kube.LinkerdIdentityName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.Spec.Template.Annotations[linkerdIssuerRolloutAnno]
+}
+
+// cordonedNode builds a node with a timestamp-less unschedulable taint
+// — the fail-closed shape: the cordon age is unverifiable, so the
+// maintenance mutex MUST read as held.
+func cordonedNode(name string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key: kube.UnschedulableTaintKey,
+			}},
+		},
+	}
+}
+
+// rotateIssuer updates the issuer Secret in the fake with a new
+// cert/serial — the fingerprint change that triggers the re-roll.
+func rotateIssuer(t *testing.T, cs kubernetes.Interface) {
+	t.Helper()
+	if _, err := cs.CoreV1().Secrets(kube.LinkerdNS).
+		Update(ctx, issuerSecret(t), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The rollout restart is a LIVE-workload mutation: with the
+// maintenance mutex reading HELD (a fail-closed cordon), the serial
+// change must defer — no restartedAt patch, no persisted stamp, and
+// the fingerprint stays unlatched so the next sweep retries.
+func TestLinkerdIssuerRolloutDeferredByMaintenanceMutex(t *testing.T) {
+	fixedNow := time.Now()
+	cs := fake.NewSimpleClientset(
+		issuerSecret(t),
+		linkerdIdentityDeploy(nil),
+		cordonedNode("worker-0"))
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+
+	if err := a.run(ctx); err != nil { // first sweep seeds the fingerprint
+		t.Fatal(err)
+	}
+	seeded := a.linkerdIssuerSerial
+	rotateIssuer(t, cs)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := rolloutAnno(t, cs); got != "" {
+		t.Fatalf("restart stamped despite held maintenance mutex: %q", got)
+	}
+	if a.linkerdIssuerSerial != seeded {
+		t.Fatal("fingerprint latched on a deferred rollout — " +
+			"a transient defer would drop the re-roll forever")
+	}
+	if seeded == "" {
+		t.Fatal("seed fingerprint missing")
+	}
+}
+
+// A FRESH auditor instance (simulating an operator restart — the
+// in-RAM ledger is empty) must still honor the persisted
+// passiontech.dev/last-linkerd-issuer-rollout annotation: inside the
+// 30m window the re-roll is skipped, past it the re-roll lands and
+// re-stamps the annotation.
+func TestLinkerdIssuerRolloutHonorsPersistedCooldown(t *testing.T) {
+	fixedNow := time.Now()
+
+	t.Run("inside window skips", func(t *testing.T) {
+		deploy := linkerdIdentityDeploy(map[string]string{
+			kube.AnnoLastLinkerdIssuerRollout: fixedNow.Add(-10 * time.Minute).
+				UTC().Format(time.RFC3339)})
+		cs := fake.NewSimpleClientset(issuerSecret(t), deploy)
+		a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rotateIssuer(t, cs)
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := rolloutAnno(t, cs); got != "" {
+			t.Fatalf("restart re-rolled inside the persisted cooldown: %q", got)
+		}
+	})
+
+	t.Run("expired window re-rolls and re-stamps", func(t *testing.T) {
+		deploy := linkerdIdentityDeploy(map[string]string{
+			kube.AnnoLastLinkerdIssuerRollout: fixedNow.Add(-31 * time.Minute).
+				UTC().Format(time.RFC3339)})
+		cs := fake.NewSimpleClientset(issuerSecret(t), deploy)
+		a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rotateIssuer(t, cs)
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := rolloutAnno(t, cs); got == "" {
+			t.Fatal("expired persisted cooldown did not re-roll")
+		}
+		d, err := cs.AppsV1().Deployments(kube.LinkerdNS).
+			Get(ctx, kube.LinkerdIdentityName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stamp, ok := kube.AnnoTime(d, kube.AnnoLastLinkerdIssuerRollout)
+		if !ok {
+			t.Fatal("persisted cooldown annotation not re-stamped")
+		}
+		if fixedNow.Sub(stamp) > time.Minute {
+			t.Fatalf("persisted stamp stale: %v", stamp)
+		}
+	})
 }

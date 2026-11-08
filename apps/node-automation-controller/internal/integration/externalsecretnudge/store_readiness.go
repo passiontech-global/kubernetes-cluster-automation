@@ -22,11 +22,10 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	var lastErr error
 	for _, gvr := range gvrs {
-		items, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.DynamicPage(n.dyn.Resource(gvr)))
+		list, err := kube.ListAllUnstructured(ctx, n.dyn.Resource(gvr),
+			metav1.ListOptions{Limit: kube.DefaultListPageSize})
 		if err == nil {
-			return &unstructured.UnstructuredList{Items: items}, nil
+			return list, nil
 		}
 		lastErr = err
 	}
@@ -38,11 +37,10 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	var lastErr error
 	for _, gvr := range externalSecretGVRs {
-		items, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.DynamicPage(n.dyn.Resource(gvr)))
+		list, err := kube.ListAllUnstructured(ctx, n.dyn.Resource(gvr),
+			metav1.ListOptions{Limit: kube.DefaultListPageSize})
 		if err == nil {
-			return &unstructured.UnstructuredList{Items: items}, gvr, nil
+			return list, gvr, nil
 		}
 		lastErr = err
 	}

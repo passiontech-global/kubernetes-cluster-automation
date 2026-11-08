@@ -98,8 +98,8 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	// pod names carry a "<component>-<rs-hash>-<pod-hash>" suffix (or
 	// the linkerd.io/control-plane-component label); exact-name match is
 	// kept alongside prefix/label match for unit-test fixtures.
-	if pods, err := p.PodsIn(ctx, probefw.LinkerdNS); err == nil {
-		for _, component := range []string{probefw.LinkerdDestinationName, probefw.LinkerdIdentityName} {
+	if pods, err := p.PodsIn(ctx, kube.LinkerdNS); err == nil {
+		for _, component := range []string{kube.LinkerdDestinationName, kube.LinkerdIdentityName} {
 			for i := range pods {
 				pod := pods[i]
 				if !probefw.LinkerdPodMatchesComponent(pod, component) || !linkerdPodWedged(pod, now) {

@@ -20,8 +20,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -208,55 +206,36 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 // IP-exhausted node (capped) so kubelet releases their sandboxes and
 // pod IPs — once per node per cooldown, maintenance-gated. Terminal
 // pods hold no traffic; the delete is the safe existing shape (same
-// as the evicted-pod janitor, scoped to the exhausted node).
+// as the evicted-pod janitor, scoped to the exhausted node). The
+// node/terminal/cap pick rides BounceOperatorPod: the shared gate
+// runs once per node key and each delivered delete invalidates the
+// pod census and stamps the cooldown ledger.
 func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Context,
 	log logr.Logger, node string, now time.Time) {
 
-	ck := probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node)
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, ck, ciliumIPAMNodeCool, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	pods, err := p.AllPods(ctx)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list node pods failed — ipam reap deferred",
-			"node", node, "error", err)
-		return
-	}
-	reaped := 0
-	for i := range pods {
-		if reaped >= ciliumIPAMMaxReaps {
-			break
-		}
-		pod := &pods[i]
-		if pod.Spec.NodeName != node {
-			continue // the old spec.nodeName FieldSelector, client-side
-		}
-		if pod.DeletionTimestamp != nil ||
-			(pod.Status.Phase != corev1.PodSucceeded &&
-				pod.Status.Phase != corev1.PodFailed) {
-			continue
-		}
-		// One stamp per node per sweep — the ledger is stamped by
-		// hand below only when at least one reap landed, so the
-		// delete runs with a nil heals ledger.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "ipam terminal-pod reap failed",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the census
-		reaped++
-	}
+	reaped := p.BounceOperatorPod(ctx, log, CheckNameCiliumNodeIPAM, "",
+		func(pods []corev1.Pod) []*corev1.Pod {
+			var targets []*corev1.Pod
+			for i := range pods {
+				pod := &pods[i]
+				if pod.Spec.NodeName != node {
+					continue // the old spec.nodeName FieldSelector, client-side
+				}
+				if pod.DeletionTimestamp != nil ||
+					(pod.Status.Phase != corev1.PodSucceeded &&
+						pod.Status.Phase != corev1.PodFailed) {
+					continue
+				}
+				if len(targets) >= ciliumIPAMMaxReaps {
+					break
+				}
+				targets = append(targets, pod)
+			}
+			return targets
+		},
+		&p.Heals, probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node),
+		ciliumIPAMNodeCool, now)
 	if reaped > 0 {
-		p.Heals.Stamp(ck, now)
 		log.Info("REAP: deleted terminal pods on IP-exhausted node",
 			"node", node, "count", reaped)
 	}

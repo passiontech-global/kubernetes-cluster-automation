@@ -12,12 +12,11 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -169,48 +168,28 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 // healOLMOperator deletes the olm-operator pod(s) — a wedged
 // operator stops reconciling CSVs and stops rotating the webhook
 // certificates it owns, so a restart forces both queues to re-list.
-// Gates: the 1h in-RAM cooldown (the pod is the heal target —
-// nothing else can carry the stamp) and the maintenance mutex, run
-// together by HealAllowed like every pod-delete heal in this sweep.
+// probefw.BounceOperatorPod carries the gates (the 1h in-RAM
+// cooldown — the pod is the heal target, nothing else can carry the
+// stamp — and the maintenance mutex, fail closed) plus the
+// ns-scoped prefix-filtered list, the UID-preconditioned deletes and
+// the census invalidate; the per-reason heal counters key on the
+// delivered-delete count.
 func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	log logr.Logger, reasons []string, now time.Time) {
 
-	proceed, unverifiable := p.HealAllowed(ctx, log,
+	deleted := p.BounceOperatorPod(ctx, log, olmOperatorPodPrefix,
+		olmOperatorNS,
+		func(pods []corev1.Pod) []*corev1.Pod {
+			var targets []*corev1.Pod
+			for i := range pods {
+				if strings.HasPrefix(pods[i].Name, olmOperatorPodPrefix) {
+					targets = append(targets, &pods[i])
+				}
+			}
+			return targets
+		},
 		&p.olmHealed, olmOperatorPodPrefix, olmHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	pods, err := p.PodsIn(ctx, olmOperatorNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list olm-operator pods failed — heal deferred",
-			"error", err)
-		return
-	}
-	deleted := false
-	for i := range pods {
-		pod := pods[i]
-		if !strings.HasPrefix(pod.Name, olmOperatorPodPrefix) {
-			continue
-		}
-		if _, err := heal.DeletePod(ctx, p.CS, &p.olmHealed,
-			olmOperatorPodPrefix, pod, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "olm-operator delete failed",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the census
-		deleted = true
-		log.Info("DELETE: wedged olm-operator — stuck CSV/cert-rotation queues need a resync",
-			"pod", pod.Namespace+"/"+pod.Name,
-			"reasons", strings.Join(reasons, ","))
-	}
-	if !deleted {
+	if deleted == 0 {
 		return
 	}
 	for _, r := range reasons {

@@ -3,7 +3,7 @@
 // endpointslice-controller-owned slices, then bounce the oldest
 // linkerd-destination pod so its endpoint table rebuilds — 1h
 // per-service cooldown, maintenance-gated, UID-preconditioned.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -77,7 +77,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 
-	pods, err := p.PodsIn(ctx, probefw.LinkerdNS)
+	pods, err := p.PodsIn(ctx, kube.LinkerdNS)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list linkerd pods failed — heal deferred",
@@ -98,7 +98,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	for i := range pods {
 		pod := pods[i]
 		if pod.DeletionTimestamp != nil ||
-			!probefw.LinkerdPodMatchesComponent(pod, probefw.LinkerdDestinationName) {
+			!probefw.LinkerdPodMatchesComponent(pod, kube.LinkerdDestinationName) {
 			continue
 		}
 		if target == nil ||
@@ -116,7 +116,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		} else {
 			healed = true
 			p.InvalidatePods(ctx) // pod gone — drop the census
-			metrics.ControlPlanePodHealsTotal.WithLabelValues(probefw.LinkerdDestinationName).Inc()
+			metrics.ControlPlanePodHealsTotal.WithLabelValues(kube.LinkerdDestinationName).Inc()
 			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
 				"pod", target.Namespace+"/"+target.Name, "service", svcKey)
 		}

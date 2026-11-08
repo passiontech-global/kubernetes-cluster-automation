@@ -113,13 +113,8 @@ const veleroRepoMaintenanceMaxAge = 7 * 24 * time.Hour
 // cluster-wide).
 func (a *veleroBackupAuditor) veleroList(ctx context.Context,
 	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
-	items, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(a.dyn.Resource(gvr)))
-	if err != nil {
-		return nil, err
-	}
-	return &unstructured.UnstructuredList{Items: items}, nil
+	return kube.ListAllUnstructured(ctx, a.dyn.Resource(gvr),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 }
 
 // veleroMissingBackupMaxAge is the W10-FIX6 zero-backup threshold:

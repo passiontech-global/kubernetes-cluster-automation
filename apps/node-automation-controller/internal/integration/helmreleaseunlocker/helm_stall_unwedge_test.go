@@ -184,17 +184,17 @@ func stallFixture() (*unstructured.Unstructured, []runtime.Object) {
 }
 
 // newStallUnlocker mirrors newUnlocker for the stall signature: the
-// opt-in gate on and the stallFirstSeen ledger pre-aged past the 30m
+// opt-in gate on and the stall.firstSeen ledger pre-aged past the 30m
 // window for key.
 func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 	stuckFor time.Duration, key string) *helmReleaseUnlocker {
 	u := &helmReleaseUnlocker{queue: "helmrelease-unlocker",
-		cs:           cs,
-		dyn:          dyn,
-		stallEnabled: true,
+		cs:    cs,
+		dyn:   dyn,
+		stall: stallState{enabled: true},
 	}
 	if key != "" {
-		u.stallFirstSeen.Observe(key, time.Now().Add(-stuckFor))
+		u.stall.firstSeen.Observe(key, time.Now().Add(-stuckFor))
 	}
 	return u
 }
@@ -246,7 +246,7 @@ func TestHelmStallUnwedgeHappyPath(t *testing.T) {
 			t.Fatalf("annotation %s = %q, want the shared token %q", anno, got, token)
 		}
 	}
-	if !u.unwedged.CooledDown("ops/connect", helmUnlockCooldown, time.Now()) {
+	if !u.stall.unwedged.CooledDown("ops/connect", helmUnlockCooldown, time.Now()) {
 		t.Fatal("HR not recorded in the unwedged ledger")
 	}
 	if got := promtestutil.ToFloat64(
@@ -386,7 +386,7 @@ func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {
 		dyn := newDynFake(hr)
 		cs := kfake.NewSimpleClientset(objs...)
 		u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
-		u.unwedged.Stamp("ops/connect", time.Now().Add(-time.Hour))
+		u.stall.unwedged.Stamp("ops/connect", time.Now().Add(-time.Hour))
 
 		before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 		if err := u.run(ctx); err != nil {
@@ -429,7 +429,7 @@ func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {
 		dyn := newDynFake(hr)
 		cs := kfake.NewSimpleClientset(objs...)
 		u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
-		u.unwedged.Stamp("ops/connect", time.Now().Add(-25*time.Hour))
+		u.stall.unwedged.Stamp("ops/connect", time.Now().Add(-25*time.Hour))
 
 		if err := u.run(ctx); err != nil {
 			t.Fatal(err)
@@ -452,14 +452,14 @@ func TestHelmStallUnwedgeFirstSeenGate(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.stallFirstSeen.Seen("ops/connect", time.Now()); !ok {
-		t.Fatal("stalled HR not tracked in stallFirstSeen")
+	if _, ok := u.stall.firstSeen.Seen("ops/connect", time.Now()); !ok {
+		t.Fatal("stalled HR not tracked in stall.firstSeen")
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
 		t.Fatalf("acted before the 30m window: %d, want 2", got)
 	}
-	u.stallFirstSeen.Forget("ops/connect")
-	u.stallFirstSeen.Observe("ops/connect", time.Now().Add(-helmStuckThreshold-time.Minute))
+	u.stall.firstSeen.Forget("ops/connect")
+	u.stall.firstSeen.Observe("ops/connect", time.Now().Add(-helmStuckThreshold-time.Minute))
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -476,12 +476,12 @@ func TestHelmStallUnwedgeDisabledGate(t *testing.T) {
 	dyn := newDynFake(hr)
 	cs := kfake.NewSimpleClientset(objs...)
 	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
-	u.stallEnabled = false
+	u.stall.enabled = false
 
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.stallFirstSeen.Seen("ops/connect", time.Now()); ok {
+	if _, ok := u.stall.firstSeen.Seen("ops/connect", time.Now()); ok {
 		t.Fatal("disabled module tracked the stalled HR")
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
@@ -538,7 +538,7 @@ func TestHelmStallUnwedgeRefusalConsumesAttempt(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	att := u.stallAttempts["ops/connect"]
+	att := u.stall.attempts["ops/connect"]
 	if att == nil || att.count != 1 {
 		t.Fatalf("refusal did not consume an attempt: %+v", att)
 	}

@@ -9,7 +9,7 @@
 // before linkerd-init's iptables rules can steer into the proxy,
 // silently killing SO_ORIGINAL_DST/mTLS — reported on
 // node_automation_cilium_linkerd_socklb_conflict.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -56,13 +56,7 @@ type linkerdEndpointSyncCheck struct {
 	linkerdDesyncHealed  state.CooldownSet
 }
 
-// newLinkerdEndpointSyncCheck builds the W9-NM2 check — every
-// ledger is zero-value ready, so the constructor carries no
-// initialization (the state-map literals retired with the monolithic
-// newClusterHealthProber).
-func NewLinkerdEndpointSyncCheck(d *probefw.Deps) probefw.Check {
-	return &linkerdEndpointSyncCheck{Deps: d}
-}
+// The constructor lives in the package facade (linkerd.go).
 
 const (
 	// W9-NM2 — linkerd-endpoint-sync knobs.
@@ -145,7 +139,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		if nsList[i].Labels[kube.LinkerdInjectKey] == "enabled" {
 			injected[nsList[i].Name] = true
 		}
-		if nsList[i].Name == probefw.LinkerdNS {
+		if nsList[i].Name == kube.LinkerdNS {
 			linkerdInstalled = true
 		}
 	}

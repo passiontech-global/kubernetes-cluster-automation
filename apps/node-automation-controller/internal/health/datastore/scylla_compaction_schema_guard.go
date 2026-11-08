@@ -45,6 +45,11 @@ type scyllaCompactionSchemaGuardCheck struct {
 	// overloadLast is the per-pod counter baseline —
 	// "ns/pod" → last sweep's stall counters; an increase between
 	// sweeps is a live stall, a reset means the pod restarted.
+	// A plain map, NOT state.CooldownSet: the value is a
+	// scyllaOverloadSample (three counter readings to diff against),
+	// and CooldownSet.Last carries only a time.Time — there is no
+	// cooldown semantics here at all (the entry is read every sweep,
+	// never suppressed), so the ledger types don't fit.
 	emittedBacklog     state.GaugeLedger[string]
 	emittedSplit       state.GaugeLedger[string]
 	emittedShard       state.GaugeLedger[string]

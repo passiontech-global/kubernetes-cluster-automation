@@ -113,13 +113,7 @@ func routableEndpointIPs(ep *unstructured.Unstructured) map[string]bool {
 // whichever object is the SSOT this cluster (Endpoints <1.33,
 // EndpointSlice >=1.33).
 func parseQuarantineAnnotation(obj metav1.Object) map[string]bool {
-	set := map[string]bool{}
-	for _, ip := range strings.Split(obj.GetAnnotations()[endpointGuardAnno], ",") {
-		if ip = strings.TrimSpace(ip); ip != "" {
-			set[ip] = true
-		}
-	}
-	return set
+	return kube.ParseCommaSet(obj.GetAnnotations()[endpointGuardAnno])
 }
 
 func writeQuarantineAnnotation(obj metav1.Object, set map[string]bool) {

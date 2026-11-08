@@ -19,6 +19,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
@@ -187,12 +188,12 @@ var Modules = []shared.Module{
 	{Name: "scheduler-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameSchedulerWatchdog, New: watchdogs.NewSchedulerWatchdogCheck}},
 	{Name: "mesh-controlplane-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameMeshWatchdog, New: watchdogs.NewMeshControlPlaneCheck}},
 	{Name: "node-hang-precordon", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNodeHang, New: nodehealth.NewNodeHangCheck}},
-	{Name: "linkerd-endpoint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdEndpointSync, New: nethealth.NewLinkerdEndpointSyncCheck}},
+	{Name: "linkerd-endpoint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdEndpointSync, New: linkerd.NewLinkerdEndpointSyncCheck}},
 	{Name: "scylla-cluster-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameScyllaHealth, New: datastore.NewScyllaHealthCheck}},
 	{Name: "flux-helmrelease-retries", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameFluxHRRetries, New: gitops.NewFluxHRRetriesCheck}},
 	{Name: "percona-cluster-quorum", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNamePerconaQuorum, New: datastore.NewPerconaQuorumCheck}},
 	{Name: "cilium-bpf-map-pressure", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumBPFMapPressure, New: nethealth.NewCiliumBPFMapPressureCheck}},
-	{Name: "linkerd-protocol-detection-stall", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdOpaqueStall, New: nethealth.NewLinkerdProtocolDetectionStallCheck}},
+	{Name: "linkerd-protocol-detection-stall", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdOpaqueStall, New: linkerd.NewLinkerdProtocolDetectionStallCheck}},
 	{Name: "coredns-upstream", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCoreDNSUpstream, New: nethealth.NewCoreDNSUpstreamCheck}},
 	{Name: "cilium-node-ipam-exhaustion", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumNodeIPAM, New: nethealth.NewCiliumNodeIPAMExhaustionCheck}},
 	{Name: "namespace-terminating-wedged", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNamespaceWedged, New: nodehealth.NewNamespaceTerminatingWedgedCheck}},
@@ -204,7 +205,7 @@ var Modules = []shared.Module{
 	{Name: "api-object-sprawl-report-gc", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameAPIObjectSprawlReportGC, New: nodehealth.NewAPIObjectSprawlReportGCCheck}},
 	{Name: "cpu-steal-taint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameCPUStealTaintSync, New: nodehealth.NewCPUStealTaintSyncCheck}},
 	{Name: "cilium-missing-endpoint", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumMissingEndpoints, New: nethealth.NewCiliumMissingEndpointsCheck}},
-	{Name: "linkerd-h2-stream-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdH2StreamGuard, New: nethealth.NewLinkerdH2StreamGuardCheck}},
+	{Name: "linkerd-h2-stream-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdH2StreamGuard, New: linkerd.NewLinkerdH2StreamGuardCheck}},
 	{Name: "cloudflared-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCloudflaredTunnelHealth, New: nethealth.NewCloudflaredTunnelHealthCheck}},
 	{Name: "liqo-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLiqoTunnelHealth, New: nethealth.NewLiqoTunnelHealthCheck}},
 	{Name: "konnectivity-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameKonnectivityTunnelHealth, New: nethealth.NewKonnectivityTunnelHealthCheck}},

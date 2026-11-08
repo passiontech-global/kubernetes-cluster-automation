@@ -151,3 +151,34 @@ func TestCooldownSetPruneExpired(t *testing.T) {
 		t.Fatalf("zero-value PruneExpired = %d, want 0", n)
 	}
 }
+
+// Last is the single-key read for "when did this one fire": it
+// reports the exact stamp without copying the ledger, ok=false on an
+// unstamped key (and on the zero-value ledger), and it must observe
+// Forget — the delivered-delete diagnostics in coredns_upstream read
+// the stamp before/after a heal through it.
+func TestCooldownSetLast(t *testing.T) {
+	var c CooldownSet
+	now := time.Now()
+
+	if _, ok := c.Last("k"); ok {
+		t.Fatal("zero-value Last reported a stamp")
+	}
+	stamp := now.Add(-time.Minute)
+	c.Stamp("k", stamp)
+	got, ok := c.Last("k")
+	if !ok || !got.Equal(stamp) {
+		t.Fatalf("Last = (%v,%v), want (%v,true)", got, ok, stamp)
+	}
+	// Entries copies; Last must keep reading the live map — stamping
+	// another key must not disturb k's read.
+	c.Stamp("other", now)
+	if got, ok = c.Last("k"); !ok || !got.Equal(stamp) {
+		t.Fatalf("Last after second stamp = (%v,%v), want (%v,true)",
+			got, ok, stamp)
+	}
+	c.Forget("k")
+	if _, ok = c.Last("k"); ok {
+		t.Fatal("Last still reports a forgotten stamp")
+	}
+}

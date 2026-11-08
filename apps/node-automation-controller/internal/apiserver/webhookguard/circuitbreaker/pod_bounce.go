@@ -57,18 +57,9 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 		seen[key] = true
 		keys = append(keys, key)
 	}
-	if snap.MWC != nil {
-		for i := range snap.MWC.Items {
-			for _, h := range mutHookViews(snap.MWC.Items[i].Webhooks) {
-				add(h.svc)
-			}
-		}
-	}
-	if snap.VWC != nil {
-		for i := range snap.VWC.Items {
-			for _, h := range valHookViews(snap.VWC.Items[i].Webhooks) {
-				add(h.svc)
-			}
+	for _, views := range allHookViews(snap) {
+		for _, h := range views {
+			add(h.svc)
 		}
 	}
 	if len(keys) == 0 {

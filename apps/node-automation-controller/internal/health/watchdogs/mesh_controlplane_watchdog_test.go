@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -23,10 +22,10 @@ import (
 // deleted to force a re-roll, matching Deployment-suffixed pod names.
 func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	started := true
-	podName := probefw.LinkerdDestinationName + "-7f8b9c6d4-abcde"
+	podName := kube.LinkerdDestinationName + "-7f8b9c6d4-abcde"
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: probefw.LinkerdNS, Name: podName,
+			Namespace: kube.LinkerdNS, Name: podName,
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
 			UID:               types.UID("u-dest"),
 			Labels: map[string]string{
@@ -44,7 +43,7 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("wedged linkerd pod passed")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, podName, metav1.GetOptions{}); err == nil {
 		t.Fatal("wedged linkerd pod not deleted")
 	}
@@ -60,8 +59,8 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         probefw.LinkerdNS,
-			Name:              probefw.LinkerdDestinationName + "-aaa-111",
+			Namespace:         kube.LinkerdNS,
+			Name:              kube.LinkerdDestinationName + "-aaa-111",
 			UID:               types.UID("u-dest"),
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
 		},
@@ -74,9 +73,9 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), kured, pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
+	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted during maintenance — heal must defer")
 	}
@@ -86,17 +85,17 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         probefw.LinkerdNS,
-			Name:              probefw.LinkerdDestinationName + "-bbb-222",
+			Namespace:         kube.LinkerdNS,
+			Name:              kube.LinkerdDestinationName + "-bbb-222",
 			UID:               types.UID("u-dest2"),
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
 		},
 	}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
+	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
-	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("pod not deleted outside maintenance")
 	}

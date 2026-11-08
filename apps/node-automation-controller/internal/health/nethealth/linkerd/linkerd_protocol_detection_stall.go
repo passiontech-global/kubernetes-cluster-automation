@@ -13,7 +13,7 @@
 // re-patching (an infinite 30m rollout fight) and emits
 // node_automation_linkerd_gitops_opaque_drift instead so the fix
 // lands in Git, not in a revert loop.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -46,12 +46,7 @@ type linkerdProtocolDetectionStallCheck struct {
 	driftEmitted state.GaugeLedger[string]
 }
 
-// newLinkerdProtocolDetectionStallCheck builds the W10-NM3 check —
-// its only state is the emitted-gauge ledger; heal cooldowns ride
-// the shared Deps.Heals set.
-func NewLinkerdProtocolDetectionStallCheck(d *probefw.Deps) probefw.Check {
-	return &linkerdProtocolDetectionStallCheck{Deps: d}
-}
+// The constructor lives in the package facade (linkerd.go).
 
 const (
 	CheckNameLinkerdOpaqueStall = "linkerd-protocol-detection-stall"

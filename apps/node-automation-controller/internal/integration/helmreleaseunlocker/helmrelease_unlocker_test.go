@@ -20,6 +20,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -95,7 +96,7 @@ func newUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient, stuckFor time
 		dyn: dyn,
 	}
 	if key != "" {
-		u.firstSeen.Observe(key, time.Now().Add(-stuckFor))
+		u.pending.firstSeen.Observe(key, time.Now().Add(-stuckFor))
 	}
 	return u
 }
@@ -177,7 +178,7 @@ func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
-	u.unlocked.Stamp("apps/myapp", time.Now().Add(-time.Hour)) // unlocked 1h ago
+	u.pending.unlocked.Stamp("apps/myapp", time.Now().Add(-time.Hour)) // unlocked 1h ago
 
 	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
@@ -204,7 +205,7 @@ func TestHelmReleaseUnlockerCooldownExpired(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-rollback"))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
-	u.unlocked.Stamp("apps/myapp", time.Now().Add(-25*time.Hour))
+	u.pending.unlocked.Stamp("apps/myapp", time.Now().Add(-25*time.Hour))
 
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
@@ -261,7 +262,7 @@ func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); !ok {
+	if _, ok := u.pending.firstSeen.Seen("apps/myapp", time.Now()); !ok {
 		t.Fatal("stuck HR not tracked in firstSeen")
 	}
 	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
@@ -278,8 +279,8 @@ func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 
 	// Window elapsed → act. Forget+Observe re-seeds the first-seen
 	// stamp unconditionally (Observe alone only stamps absent keys).
-	u.firstSeen.Forget("apps/myapp")
-	u.firstSeen.Observe("apps/myapp", time.Now().Add(-helmStuckThreshold-time.Minute))
+	u.pending.firstSeen.Forget("apps/myapp")
+	u.pending.firstSeen.Observe("apps/myapp", time.Now().Add(-helmStuckThreshold-time.Minute))
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +301,7 @@ func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); !ok {
+	if _, ok := u.pending.firstSeen.Seen("apps/myapp", time.Now()); !ok {
 		t.Fatal("stuck HR not tracked")
 	}
 
@@ -313,7 +314,7 @@ func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); ok {
+	if _, ok := u.pending.firstSeen.Seen("apps/myapp", time.Now()); ok {
 		t.Fatal("recovered HR not pruned from firstSeen")
 	}
 }
@@ -403,7 +404,7 @@ func TestHelmReleaseUnlockerSecretsListError(t *testing.T) {
 	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret deleted despite the failed list")
 	}
-	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although unlock never ran")
 	}
 }
@@ -450,7 +451,7 @@ func TestHelmReleaseUnlockerPendingDeleteError(t *testing.T) {
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
 		t.Fatal("HR annotated although the pending secret still exists")
 	}
-	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although unlock failed")
 	}
 }
@@ -494,7 +495,7 @@ func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret kept although its delete succeeded")
 	}
-	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although the annotate failed")
 	}
 }
@@ -669,21 +670,21 @@ func TestHelmReleaseUnlockerPrunesUnlockedLedger(t *testing.T) {
 	hrReady(old, "True", "Reconciliation finished")
 	dyn := newDynFake(live, old)
 	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
-	u.unlocked.Stamp("apps/myapp", time.Now()) // live HR inside cooldown → keep
-	u.unlocked.Stamp("apps/gone", time.Now())  // HR vanished → prune
+	u.pending.unlocked.Stamp("apps/myapp", time.Now()) // live HR inside cooldown → keep
+	u.pending.unlocked.Stamp("apps/gone", time.Now())  // HR vanished → prune
 	// Live HR past the cooldown → pruned by age, not absence.
-	u.unlocked.Stamp("apps/oldrel", time.Now().Add(-helmUnlockCooldown-time.Minute))
+	u.pending.unlocked.Stamp("apps/oldrel", time.Now().Add(-helmUnlockCooldown-time.Minute))
 
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.unlocked.Entries()["apps/gone"]; ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/gone"]; ok {
 		t.Fatal("unlocked entry for a deleted HR not pruned")
 	}
-	if _, ok := u.unlocked.Entries()["apps/oldrel"]; ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/oldrel"]; ok {
 		t.Fatal("live HR's unlocked entry past the cooldown not pruned")
 	}
-	if _, ok := u.unlocked.Entries()["apps/myapp"]; !ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; !ok {
 		t.Fatal("live HR inside the cooldown lost its unlock-ledger entry")
 	}
 }
@@ -813,7 +814,7 @@ func TestHelmReleaseUnlockerHookJobListErrorKeepsUnlock(t *testing.T) {
 	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret kept although the unlock ran")
 	}
-	if _, ok := u.unlocked.Entries()["apps/myapp"]; !ok {
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; !ok {
 		t.Fatal("HR not marked unlocked — hook cleanup failure undid the unlock")
 	}
 }
@@ -968,15 +969,15 @@ func TestFluxSourceHealerHelmRelease(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-myapp", fluxReconcileAnno); got == "" {
 		t.Fatal("HelmChart source not stamped with requestedAt")
 	}
-	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-myapp", fluxLastNudgeAnno); got == "" {
 		t.Fatal("HelmChart source not stamped with last-source-nudge")
 	}
-	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-fresh", fluxReconcileAnno); got != "" {
 		t.Fatal("fresh artifact failure nudged its source — 15m gate broken")
 	}
@@ -1001,7 +1002,7 @@ func TestFluxSourceHealerKustomization(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	stamp := hrAnnotation(t, dyn, fluxSourceGVRs["GitRepository"], "apps",
+	stamp := hrAnnotation(t, dyn, kube.FluxSourceGVRs["GitRepository"], "apps",
 		"flux-system", fluxReconcileAnno)
 	if stamp == "" {
 		t.Fatal("GitRepository source not stamped")
@@ -1010,7 +1011,7 @@ func TestFluxSourceHealerKustomization(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := hrAnnotation(t, dyn, fluxSourceGVRs["GitRepository"], "apps",
+	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["GitRepository"], "apps",
 		"flux-system", fluxReconcileAnno); got != stamp {
 		t.Fatal("source re-nudged inside the 30m per-source cooldown")
 	}

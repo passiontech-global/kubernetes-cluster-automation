@@ -4,7 +4,7 @@
 // parser ("6379,8000-8010" ranges included), and the
 // missingBinaryPorts audit across opaque-ports / skip-inbound-ports /
 // skip-outbound-ports.
-package nethealth
+package linkerd
 
 import (
 	"sort"

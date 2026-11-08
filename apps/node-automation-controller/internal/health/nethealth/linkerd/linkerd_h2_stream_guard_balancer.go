@@ -4,7 +4,7 @@
 // long after the destination recovered) and the proxy-OOMKilled wedge
 // seed — Prometheus signals cross-checked against live EndpointSlices,
 // healed by the shared Ready-sibling-gated pod delete.
-package nethealth
+package linkerd
 
 import (
 	"context"
@@ -218,16 +218,13 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		balancerRep.Flag(linkerdOutboundBalancerWedgedGauge, podKey, lv)
 		rep.Find(podKey + "(outbound balancer wedged: " + target + ")")
 		pod := podByKey[podKey]
-		switch {
-		case pod == nil || pod.DeletionTimestamp != nil:
-			// Gone or going — nothing to bounce; the replacement
-			// proxy rebuilds its balancer view anyway.
-		case probefw.ReadySiblings(readyByOwner, pod) < 1:
-			log.Info("skip balancer-wedge heal: no Ready sibling replica — delete would blackhole the workload",
-				"pod", podKey)
-		default:
-			p.DeletePodHeal(ctx, log, CheckNameLinkerdH2StreamGuard,
-				kube.PodControllerKey(pod), pod, linkerdH2HealCool, now)
+		if pod != nil {
+			// Gone or going is nothing to bounce — SafePodDelete
+			// skips a terminating pod (the replacement proxy
+			// rebuilds its balancer view anyway) and fails closed
+			// on the sibling gate before the delete.
+			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
+				pod, readyByOwner, 1, linkerdH2HealCool, now)
 		}
 	}
 	p.balancerSeen.Prune(func(k string) bool { return keep[k] })

@@ -76,7 +76,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		}
 		key := k.GetNamespace() + "/" + k.GetName()
 		// Cooldown: wider of the in-RAM ledger and the persisted stamp.
-		if heal.PersistedCooledDown(&u.immutableJobHealed, k,
+		if heal.PersistedCooledDown(&u.immutableJob.healed, k,
 			immutableJobHealAnno, key, immutableJobCooldown, now) {
 			continue
 		}
@@ -118,7 +118,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		// The in-RAM stamp lands WITH the heal — the Job is already
 		// deleted, so a failed annotation write below must not refund
 		// the cooldown (the annotation is only the restart-proof half).
-		u.immutableJobHealed.Stamp(key, now)
+		u.immutableJob.healed.Stamp(key, now)
 		// Persist the stamp — the durable half of the 30m cooldown.
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			immutableJobHealAnno: now.UTC().Format(time.RFC3339),

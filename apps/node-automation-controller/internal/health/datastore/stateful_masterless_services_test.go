@@ -109,7 +109,7 @@ func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-4 * time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
 	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("deadlocked masterless service must FAIL")
@@ -151,7 +151,7 @@ func TestDeadlockWaitsForOperatorSettle(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-time.Minute))
 
 	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
@@ -197,7 +197,7 @@ func TestDeadlockSkipsWhenMasterPresent(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-4 * time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
 	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
@@ -220,7 +220,7 @@ func TestDeadlockHealCooldown(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-4 * time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drPodHealed.
 		Stamp("db/dragonfly", base.Add(-10*time.Minute))
 
@@ -249,7 +249,7 @@ func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-4 * time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
 	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("downscaled statefulset must pass: %+v", res)
@@ -415,7 +415,7 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = map[string]time.Time{"db/dragonfly": base.Add(-4 * time.Minute)}
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
 	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").

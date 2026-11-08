@@ -5,7 +5,7 @@
 // sweep ONE of them recovered — Reconcile pruned the vanished
 // target's key and DeleteLabelValues(ns, pod) took the still-wedged
 // sibling target's metric down with it.
-package nethealth
+package linkerd
 
 import (
 	"strings"

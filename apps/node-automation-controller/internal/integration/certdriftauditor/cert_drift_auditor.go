@@ -92,9 +92,11 @@ const (
 	// linkerd-identity-issuer fingerprint tracking (W8-NM2): the
 	// issuer cert's SerialNumber is the fingerprint — a change means
 	// cert-manager rotated the issuer and linkerd-identity must
-	// re-roll to pick the new bundle up.
+	// re-roll to pick the new bundle up. linkerdIssuerSecret names
+	// this module's audit target; the namespace and the Deployment
+	// come from the shared kube topology identifiers (LinkerdNS,
+	// LinkerdIdentityName).
 	linkerdIssuerSecret      = "linkerd-identity-issuer"
-	linkerdIssuerDeploy      = "linkerd-identity"
 	linkerdIssuerRolloutAnno = "kubectl.kubernetes.io/restartedAt"
 	linkerdIssuerCooldown    = 30 * time.Minute
 )
@@ -169,20 +171,32 @@ type certDriftAuditor struct {
 	// replicationMismatch counts consecutive scans where a
 	// replicated secret's tls.crt differed from its source — drift
 	// fires only at replicationDriftScans, so a replicator mid-sync
-	// never raises a false alert (W7-C6).
-	replicationMismatch map[replicationMetricKey]int
+	// never raises a false alert (W7-C6). StreakLedger arms itself
+	// lazily, so literal-constructed fixtures need no nil dance.
+	replicationMismatch state.StreakLedger
 	// seenReplication: series ledger for ReplicatedSecretDrift —
 	// re-synced or gone replicas get DeleteLabelValues, never a
 	// parked 1.
 	seenReplication state.GaugeLedger[replicationMetricKey]
-	// resyncNudged: replicationMetricKey → last replicated-from-
+	// resyncHeals: replicationMetricKey → last replicated-from-
 	// version annotation strip (1h cooldown, in-RAM only).
-	resyncNudged map[replicationMetricKey]time.Time
-	// linkerdIssuerSerial / linkerdIssuerHealed: the tracked issuer
-	// fingerprint and the last rollout-stamp moment (30m cooldown).
+	resyncHeals state.CooldownSet
+	// linkerdIssuerSerial: the tracked issuer fingerprint;
+	// linkerdIssuerHeals is the last rollout-stamp moment — the
+	// WIDER of the in-RAM stamp and the
+	// passiontech.dev/last-linkerd-issuer-rollout annotation on the
+	// Deployment (the annotation survives an operator restart, the
+	// ledger survives a failed patch) plus the maintenance-mutex
+	// verdict memoized for the sweep.
 	linkerdIssuerSerial  string
-	linkerdIssuerHealed  time.Time
+	linkerdIssuerHeals   state.CooldownSet
 	linkerdIssuerTracked bool
+	// verdict memoizes the maintenance-mutex evaluation across
+	// AllowedV calls within the 1m Verdict TTL. This module gates a
+	// single target (the linkerd-identity Deployment) once per 15m
+	// sweep, so the memo never serves a second call — kept for
+	// parity with the per-target heal loops, not for load.
+	verdict kube.Verdict
 }
 
 // Setup registers the 15m sweep — or nothing when the
@@ -193,24 +207,16 @@ func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
 	return shared.SetupNoConfig(d, func() error {
 		a := &certDriftAuditor{
-			cs:                  cs,
-			dyn:                 dyn,
-			queue:               d.Name,
-			now:                 shared.SystemClock,
-			replicationMismatch: map[replicationMetricKey]int{},
-			resyncNudged:        map[replicationMetricKey]time.Time{},
+			cs:    cs,
+			dyn:   dyn,
+			queue: d.Name,
+			now:   shared.SystemClock,
 		}
 		return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 	})
 }
 
 func (a *certDriftAuditor) run(ctx context.Context) error {
-	// Lazily arm the zero-value struct — unit tests construct the
-	// auditor literally without the Setup path.
-	if a.replicationMismatch == nil {
-		a.replicationMismatch = map[replicationMetricKey]int{}
-	}
-
 	// The audits are independent duties: a broken webhook list must
 	// not blind the TLS-expiry gauge (and vice versa), so all three
 	// run and their errors join (nil+nil+nil → nil). The periodic

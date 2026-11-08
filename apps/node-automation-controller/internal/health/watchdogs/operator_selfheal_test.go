@@ -15,8 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -468,7 +468,7 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 	base := time.Now()
 	opPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: probefw.DragonflyOperatorNS,
+			Namespace: kube.DragonflyOperatorNS,
 			Name:      "dragonfly-operator-controller-manager-6f8bc-xy",
 			UID:       types.UID("dr-op-1"),
 			Labels:    map[string]string{"control-plane": "controller-manager"},
@@ -488,7 +488,7 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 	if res.Pass {
 		t.Fatal("stuck dragonfly with live pod must FAIL (leaseOptional)")
 	}
-	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("selector-fallback heal must delete the pod, err=%v", err)
 	}

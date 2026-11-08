@@ -14,6 +14,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -86,7 +87,7 @@ func rolledHash(s *corev1.Secret) string {
 // No pipeline secret on this cluster — NotFound is a clean no-op.
 func TestFluentBitRollerSecretAbsent(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +106,7 @@ func TestFluentBitRollerNoDrift(t *testing.T) {
 		}),
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +133,7 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				testutil.Node("n2", corev1.ConditionTrue, nil),
 				fluentBitDS(2, 2, 3, 3))
-			r := &fluentBitRoller{cs: cs}
+			r := newRoller(cs)
 			res, err := r.Reconcile(context.Background(), reconcile.Request{})
 			if err != nil {
 				t.Fatal(err)
@@ -168,12 +169,50 @@ func TestFluentBitRollerSkipsOnNotReadyNode(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		testutil.Node("n2", corev1.ConditionFalse, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
 		t.Fatal("roller restarted the DS during a node outage")
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
+		t.Fatal("rolled-config-hash written although the roll was skipped")
+	}
+}
+
+// cordonedRollerNode builds a node with a timestamp-less unschedulable
+// taint — the fail-closed shape: the cordon age is unverifiable, so
+// the maintenance mutex MUST read as held (same fixture the
+// cert-drift-auditor tests use).
+func cordonedRollerNode(name string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key: kube.UnschedulableTaintKey,
+			}},
+		},
+	}
+}
+
+// The DS rollout restart is a LIVE-workload mutation: with the
+// maintenance mutex reading HELD (all nodes Ready — the NotReady
+// storm pre-gate above does not cover it), the roll must defer — no
+// restartedAt patch, rolled-config-hash untouched so the drift
+// retries once maintenance lifts.
+func TestFluentBitRollerSkipsDuringMaintenance(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		pipelineSecret(map[string]string{"fluent.io/config-hash": "h1"}),
+		cordonedRollerNode("n1"),
+		fluentBitDS(2, 2, 3, 3))
+	r := newRoller(cs)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
+		t.Fatalf("roller restarted the DS while maintenance was active: %q", got)
 	}
 	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
 		t.Fatal("rolled-config-hash written although the roll was skipped")
@@ -191,7 +230,7 @@ func TestFluentBitRollerSkipsWhileDSUnsettled(t *testing.T) {
 				pipelineSecret(map[string]string{"fluent.io/config-hash": "h1"}),
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				ds)
-			r := &fluentBitRoller{cs: cs}
+			r := newRoller(cs)
 			if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 				t.Fatal(err)
 			}
@@ -218,7 +257,7 @@ func TestFluentBitRollerResourceVersionFallback(t *testing.T) {
 		sec,
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +284,7 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 		sec,
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +323,14 @@ func driftedFixture() *fake.Clientset {
 		fluentBitDS(2, 2, 3, 3))
 }
 
+// newRoller builds the reconciler with the dynamic fake the
+// maintenance mutex reads its autopilot signal through — a nil dyn
+// fails closed (mutex unverifiable), so every non-mutex test needs
+// the real seam.
+func newRoller(cs *fake.Clientset) *fluentBitRoller {
+	return &fluentBitRoller{cs: cs, dyn: testutil.NewDynWithCRDs()}
+}
+
 // A secret GET that is not NotFound is a real error — only NotFound
 // is the "no pipeline on this cluster" no-op.
 func TestFluentBitRollerSecretGetError(t *testing.T) {
@@ -292,7 +339,7 @@ func TestFluentBitRollerSecretGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("etcd wedged")
 		})
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the secret get fails")
 	}
@@ -305,7 +352,7 @@ func TestFluentBitRollerNodeListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
@@ -318,7 +365,7 @@ func TestFluentBitRollerDSGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
@@ -333,7 +380,7 @@ func TestFluentBitRollerRestartPatchErrorKeepsDriftMarker(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the restart patch fails")
 	}
@@ -351,7 +398,7 @@ func TestFluentBitRollerStatePatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("secret patch rejected")
 		})
-	r := &fluentBitRoller{cs: cs}
+	r := newRoller(cs)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the state patch fails")
 	}
