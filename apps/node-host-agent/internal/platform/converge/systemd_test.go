@@ -65,6 +65,7 @@ func TestIsActive(t *testing.T) {
 		{"inactive output", "inactive\n", nil, false},
 		{"failed state", "failed\n", nil, false},
 		{"exec error counts inactive", "", errors.New("boom"), false},
+		{"state word beats exit code", "inactive\n", errors.New("boom"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &stubRunner{out: tc.out, err: tc.err}
@@ -74,6 +75,41 @@ func TestIsActive(t *testing.T) {
 			want := []string{"systemctl", "is-active", "u.service"}
 			if !slices.Equal(r.cmds[0], want) {
 				t.Fatalf("argv = %v, want %v", r.cmds[0], want)
+			}
+		})
+	}
+}
+
+// TestActive pins the error-aware contract IsActive folds away: a
+// recognized ActiveState word answers the question even when
+// systemctl exits non-zero (every non-active state exits non-zero),
+// while an error with empty/unexpected output is the probe failing,
+// not the unit being down.
+func TestActive(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		out     string
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{"active output", "active\n", nil, true, false},
+		{"inactive state word", "inactive\n", nil, false, false},
+		{"failed state word", "failed\n", nil, false, false},
+		{"activating state word", "activating\n", errors.New("boom"), false, false},
+		{"unknown state word", "unknown\n", errors.New("boom"), false, false},
+		{"probe error empty output", "", errors.New("dbus down"), false, true},
+		{"probe error garbage output", "zzz\n", errors.New("dbus down"), false, true},
+		{"garbage output no error", "zzz\n", nil, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &stubRunner{out: tc.out, err: tc.err}
+			got, err := (Systemd{Runner: r}).Active(context.Background(), "u.service")
+			if got != tc.want {
+				t.Fatalf("Active = %v, want %v", got, tc.want)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Active err = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
 	}

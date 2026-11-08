@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,6 +30,129 @@ var RenameFile = os.Rename
 // would spam the log).
 var renameFallbackLogged sync.Map
 
+// AtomicOpts tunes WriteAtomic — the shared staging→fsync→rename
+// core behind WriteFileAtomic, promfile.Write and converge's
+// Host.WriteManaged. The knobs that legitimately differ between
+// consumers are the staging name shape and the page-cache hook; the
+// durability contract (payload fsync before rename, dir fsync after)
+// is uniform — see DirSync for the one alignment this unify forced.
+type AtomicOpts struct {
+	// Stage opens the staging file the rename will promote to path.
+	// It must create the file in the dir it is handed (the target's
+	// parent — same filesystem is what makes the rename atomic).
+	// Two shapes are in use:
+	//
+	//   - StageTempPattern: CreateTemp with a "*" pattern — a
+	//     private random staging name per concurrent writer (the
+	//     state files workerhygiene / controllerhygiene / nethealth /
+	//     hostmetrics all stamp, and promfile's glob-avoidance
+	//     ".<name>.*" shape).
+	//   - StageFixed: one fixed staging name (converge's
+	//     ".converge.tmp" — a documented name tests and ops sweep).
+	Stage func(dir string) (*os.File, error)
+	// Mode is forced onto the staging file before sync+rename —
+	// CreateTemp stages 0600 and an OpenFile create-mode is
+	// umask-masked, but every consumer of these files (node_exporter,
+	// systemd units, hubsync renders) reads them as another user.
+	Mode os.FileMode
+	// DirSync fsyncs the target's parent directory after a
+	// successful rename, so the directory entry itself is durable.
+	// BEHAVIOR CHANGE (unification): WriteFileAtomic historically
+	// skipped the dir fsync while promfile.Write/WriteManaged had
+	// it — the decision aligned everyone UP to the stronger
+	// contract. Without it a crash after the rename can lose the
+	// file entirely (old name already unlinked, new entry not yet
+	// flushed). The directory open is best-effort (a dir that
+	// vanished between rename and sync must not fail an
+	// already-installed write); a Sync failure IS reported — the
+	// promfile.Write contract, the strictest of the three merged
+	// copies (WriteManaged used to swallow it).
+	DirSync bool
+	// AfterSync, when set, runs after the payload fsync and before
+	// Close — converge passes pagecache.Drop so a staged binary's
+	// cache charge does not outlive the write (post-Sync the pages
+	// are clean, so DONTNEED drops them outright).
+	AfterSync func(f *os.File)
+}
+
+// StageTempPattern returns a Stage that CreateTemps a uniquely
+// named staging file in dir — pattern keeps the "*" placeholder
+// (CreateTemp replaces it with a random suffix).
+func StageTempPattern(pattern string) func(string) (*os.File, error) {
+	return func(dir string) (*os.File, error) { return os.CreateTemp(dir, pattern) }
+}
+
+// StageFixed returns a Stage that opens one fixed staging name in
+// dir — for consumers whose staging path is a documented name
+// (swept by tests/ops), not a glob-avoidance concern.
+func StageFixed(name string) func(string) (*os.File, error) {
+	return func(dir string) (*os.File, error) {
+		return os.OpenFile(filepath.Join(dir, name),
+			os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	}
+}
+
+// WriteAtomic installs content at path via a same-dir staging file
+// + rename — the one atomic-write implementation for the agent
+// (promfile and converge route through it with their own
+// AtomicOpts). The payload fsync BEFORE the rename closes the crash
+// window where the rename lands but the bytes were never flushed; a
+// positive DirSync makes the rename itself durable. Every failure
+// path sweeps the staging file; a short write is a failed write.
+func WriteAtomic(path string, content []byte, opts AtomicOpts) error {
+	dir := filepath.Dir(path)
+	tmp, err := opts.Stage(dir)
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// From here on every failure path must remove the staging file;
+	// a leaked staging file would sit in the state dir forever.
+	fail := func(err error) error {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// Force the final mode before sync+rename (see AtomicOpts.Mode).
+	if err := tmp.Chmod(opts.Mode); err != nil {
+		return fail(err)
+	}
+	// A short write is a failed write — n < len(content) means a
+	// truncated file would be promoted by the rename below.
+	if n, werr := tmp.Write(content); werr != nil || n < len(content) {
+		if werr == nil {
+			werr = io.ErrShortWrite
+		}
+		return fail(werr)
+	}
+	// fsync the payload before the rename — without it a crash can
+	// leave a renamed-but-empty file behind.
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if opts.AfterSync != nil {
+		opts.AfterSync(tmp)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := RenameFile(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if opts.DirSync {
+		if d, err := os.Open(dir); err == nil {
+			err = d.Sync()
+			_ = d.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // WriteFileAtomic writes content via a tmp file in the same dir +
 // rename — the atomic-copy contract the watchdog state/prom files
 // rely on (no torn reads mid-write). The tmp name uses the
@@ -39,9 +163,8 @@ var renameFallbackLogged sync.Map
 // / controllerhygiene / nethealth / hostmetrics all stamp the same
 // last-run/latch files) a private staging file instead of clobbering
 // one shared ".tmp-<base>" (truncated or ENOENT-renamed payloads).
-// The fsync before rename closes the crash window where the rename
-// lands but the payload was never flushed — a power loss otherwise
-// leaves a 0-byte or partial state file behind.
+// The payload is fsynced before the rename and the parent dir after
+// it (see AtomicOpts.DirSync for the durability-alignment note).
 //
 // rename(2) has one blind spot that matters here: the TARGET of a
 // file-level bind mount cannot be renamed over — the kernel returns
@@ -51,39 +174,14 @@ var renameFallbackLogged sync.Map
 // write+fsync on the target: the crash-atomicity is lost but the
 // write actually lands — strictly better than never writing at all.
 func WriteFileAtomic(path, content string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path),
-		".tmp-"+filepath.Base(path)+"-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// From here on every failure path must remove the staging file;
-	// a leaked .tmp-* would sit in the state dir forever.
-	fail := func(err error) error {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	// CreateTemp files are 0600 — the state/prom files this writes
-	// are world-readable contract (node_exporter, other readers).
-	if err := tmp.Chmod(0o644); err != nil {
-		return fail(err)
-	}
-	if _, err := tmp.WriteString(content); err != nil {
-		return fail(err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	err = RenameFile(tmpName, path)
+	err := WriteAtomic(path, []byte(content), AtomicOpts{
+		Stage:   StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
+		Mode:    0o644,
+		DirSync: true,
+	})
 	if err == nil {
 		return nil
 	}
-	defer func() { _ = os.Remove(tmpName) }()
 	if !errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.EXDEV) {
 		return err
 	}

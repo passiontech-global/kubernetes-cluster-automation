@@ -31,6 +31,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // Builder accumulates HELP/TYPE/sample lines for one textfile.
@@ -107,49 +109,21 @@ func EscapeLabelValue(v string) string {
 // match ANY name ending in .prom (the * swallows a leading dot).
 func stagingPattern(name string) string { return "." + name + ".*" }
 
-// Write atomically installs content as <dir>/<name>: MkdirAll,
-// CreateTemp staging, fsync the payload, rename, fsync the
-// directory — the textfile collector rejects partially-written
+// Write atomically installs content as <dir>/<name>: MkdirAll, then
+// hostutil.WriteAtomic (CreateTemp staging, payload fsync, rename,
+// dir fsync) — the textfile collector rejects partially-written
 // files, and without the fsyncs a crash can leave a
-// renamed-but-empty file behind (or lose the rename itself).
+// renamed-but-empty file behind (or lose the rename itself). The
+// staging shape stays promfile's own: see stagingPattern — sharing
+// hostutil's ".tmp-" convention here would put scrapeable
+// ".*.prom" names in the collector's glob.
 func Write(dir, name string, content []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, stagingPattern(name))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	// CreateTemp stages 0600 — the file lands as <name>.prom via the
-	// rename below, and node_exporter's textfile collector runs as
-	// its own user: a 0600 prom file is unreadable to it, so the
-	// staged file must carry the final mode before sync+rename.
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(content); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	// fsync the payload before the rename — without it a crash can
-	// leave a renamed-but-empty file behind.
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), filepath.Join(dir, name)); err != nil {
-		return err
-	}
-	// fsync the directory so the rename itself is durable.
-	if d, err := os.Open(dir); err == nil {
-		err = d.Sync()
-		_ = d.Close()
-		return err
-	}
-	return nil
+	return hostutil.WriteAtomic(filepath.Join(dir, name), content, hostutil.AtomicOpts{
+		Stage:   hostutil.StageTempPattern(stagingPattern(name)),
+		Mode:    0o644,
+		DirSync: true,
+	})
 }
