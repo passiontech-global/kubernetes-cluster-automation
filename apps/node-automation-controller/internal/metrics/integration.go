@@ -211,23 +211,28 @@ var VeleroRepoUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while a velero.io BackupRepository is not Ready or its maintenance is >7d stale.",
 }, []string{"namespace", "name", "reason"})
 
-// init registers exactly the vectors declared in this file — the
-// per-domain init() split means adding an integration-domain metric
-// touches only this file, not a central registry list. Order
-// follows declaration order.
+// integrationCollectors lists every vector declared in this file, in
+// declaration order; the single init() below registers the table, so
+// registration order stays byte-stable and adding a metric touches
+// only this file.
+var integrationCollectors = []prometheus.Collector{
+	CiliumIdentitiesCollectedTotal,
+	HelmHookJobsCleanedTotal,
+	WebhookCABundleMismatch, TLSSecretDaysToExpiry,
+	WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
+	FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
+	VeleroSchedulePaused, VeleroBackupEmptyOrErrored,
+	ReplicatedSecretDrift,
+	VeleroBSLUnavailable,
+	HelmSecretsPrunedTotal, DBBackupUnhealthy,
+	ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
+	OnePasswordConnectSyncUnhealthy,
+	VeleroBackupStuck, VeleroPodVolumeBackupWedged,
+	VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy,
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(
-		CiliumIdentitiesCollectedTotal,
-		HelmHookJobsCleanedTotal,
-		WebhookCABundleMismatch, TLSSecretDaysToExpiry,
-		WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
-		FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
-		VeleroSchedulePaused, VeleroBackupEmptyOrErrored,
-		ReplicatedSecretDrift,
-		VeleroBSLUnavailable,
-		HelmSecretsPrunedTotal, DBBackupUnhealthy,
-		ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
-		OnePasswordConnectSyncUnhealthy,
-		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
-		VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy)
+	for _, c := range integrationCollectors {
+		ctrlmetrics.Registry.MustRegister(c)
+	}
 }

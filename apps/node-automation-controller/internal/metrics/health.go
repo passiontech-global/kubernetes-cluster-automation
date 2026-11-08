@@ -45,14 +45,17 @@ var ControlPlanePodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Control-plane/operator pods deleted to force re-election or resync, by component.",
 }, []string{"component"})
 
-// init registers exactly the vectors declared in this file — the
-// per-domain init() split means adding a health-domain metric
-// touches only this file, not a central registry list. Order
-// follows declaration order.
+// healthCollectors lists every vector declared in this file, in
+// declaration order; the single init() below registers the table.
+var healthCollectors = []prometheus.Collector{
+	healthCheckStatus, healthCheckSecondsSinceSuccess,
+	ControlPlanePodHealsTotal,
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(
-		healthCheckStatus, healthCheckSecondsSinceSuccess,
-		ControlPlanePodHealsTotal)
+	for _, c := range healthCollectors {
+		ctrlmetrics.Registry.MustRegister(c)
+	}
 }
 
 // ObserveHealthCheck records one result of a ported kuberhealthy check

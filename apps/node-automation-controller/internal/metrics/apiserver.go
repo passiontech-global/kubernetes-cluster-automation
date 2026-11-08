@@ -104,18 +104,23 @@ var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 	Help: "APIService heals forced past the skip-namespace gate, by namespace and reason.",
 }, []string{"namespace", "reason"})
 
-// init registers exactly the vectors declared in this file — the
-// per-domain init() split means adding an apiserver-domain metric
-// touches only this file, not a central registry list. Order
-// follows declaration order.
+// apiserverCollectors lists every vector declared in this file, in
+// declaration order; the single init() below registers the table, so
+// registration order stays byte-stable and adding a metric touches
+// only this file.
+var apiserverCollectors = []prometheus.Collector{
+	apiBackendRVGap, apiBackendQuarantined, apiBackendJWKSKIDSkew,
+	WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
+	WebhookMissingCriticalNSExclusion,
+	APIServiceUnavailable,
+	UnmeshedPods, UnmeshedPodsRecreatedTotal,
+	APIServiceUnblockHealsTotal,
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(
-		apiBackendRVGap, apiBackendQuarantined, apiBackendJWKSKIDSkew,
-		WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
-		WebhookMissingCriticalNSExclusion,
-		APIServiceUnavailable,
-		UnmeshedPods, UnmeshedPodsRecreatedTotal,
-		APIServiceUnblockHealsTotal)
+	for _, c := range apiserverCollectors {
+		ctrlmetrics.Registry.MustRegister(c)
+	}
 }
 
 // ObserveAPIBackend records one probe cycle of the
