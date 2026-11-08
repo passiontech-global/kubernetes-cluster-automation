@@ -156,6 +156,7 @@ var logRules = []logRule{
 	// previously entered without ever emitting an Event.
 	{"KubeletPLEGUnhealthy", stateEnterRe(hoststate.LatchKubeletPLEGUnhealthy)},
 	{"DiskSlowIO", stateEnterRe(hoststate.LatchDiskSlowIO)},
+	{"KernelNetShimDegraded", stateEnterRe(hoststate.LatchKernelNetShim)},
 	// hostmetrics' clock-warp detector line —
 	// "ACTION clock-warp: delta=... tick=... (events=N)".
 	{"NodeClockWarpDetected", regexp.MustCompile(`ACTION:? *clock-warp:`)},

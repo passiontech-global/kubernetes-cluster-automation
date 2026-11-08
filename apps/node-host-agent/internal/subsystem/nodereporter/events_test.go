@@ -368,6 +368,7 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"STATE-ENTER: cpu-steal-pressure steal_ratio=0.41 fails=3", "CPUStealPressure"},
 		{"STATE-ENTER: cgroup-dying-leak nr_dying_descendants=6200", "CgroupDyingLeak"},
 		{"STATE-ENTER: systemd-session-bloat abandoned=24 dbus_latency=3.2s", "SystemdSessionBloat"},
+		{"STATE-ENTER: kernel-net-shim-degraded shim-rss-high pid=777 rss=250MiB", "KernelNetShimDegraded"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

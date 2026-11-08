@@ -200,7 +200,8 @@ func TestAllConditionDefaults(t *testing.T) {
 		"SystemdSessionBloat":    {"SystemdSessionsNormal", "logind session count and D-Bus latency healthy"},
 		"KubeletPLEGUnhealthy":   {"KubeletPLEGHealthy", "kubelet PLEG relist latency and last-seen lag healthy"},
 		// Wave-12 latch→condition surface.
-		"DiskSlowIO": {"DiskIONormal", "disk write await and io PSI within normal bounds"},
+		"DiskSlowIO":            {"DiskIONormal", "disk write await and io PSI within normal bounds"},
+		"KernelNetShimDegraded": {"KernelNetShimNormal", "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

@@ -400,6 +400,16 @@ var conditionDefs = []conditionDef{
 		problemReason:  "DiskSlowIODetected",
 		stateKey:       hoststate.LatchDiskSlowIO,
 	},
+	{
+		// workerhygiene's kernel-net-shim-hygiene guard — sustained
+		// kernel socket/softnet drop growth or a containerd-shim RSS
+		// breach (individual >=200MiB or total >=1.5GiB).
+		typ:            "KernelNetShimDegraded",
+		defaultReason:  "KernelNetShimNormal",
+		defaultMessage: "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds",
+		problemReason:  "KernelNetShimDegradedDetected",
+		stateKey:       hoststate.LatchKernelNetShim,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.
