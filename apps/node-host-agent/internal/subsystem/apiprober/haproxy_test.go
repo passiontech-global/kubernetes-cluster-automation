@@ -4,6 +4,7 @@
 package apiprober
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -462,5 +463,45 @@ func TestDiscoverEmptyAddrWithoutStaticSkips(t *testing.T) {
 	}
 	if len(backends) != 0 {
 		t.Fatalf("backends=%v want none (unresolvable row skipped)", backends)
+	}
+}
+
+// TestSocketCmdCapsReplyRead: one admin reply is capped at
+// haproxyReplyMaxBytes — a wedged HAProxy streaming garbage forever
+// must not slurp unbounded bytes into the agent's heap. The read
+// still returns what arrived under the cap (parse then fails loudly
+// downstream, never hangs).
+func TestSocketCmdCapsReplyRead(t *testing.T) {
+	p := &Prober{cfg: Config{TCPTimeout: 2 * time.Second}}
+	p.eff.socket = "unused"
+	p.cfg.DialSocket = func(_ context.Context, _ string) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			defer func() { _ = c2.Close() }()
+			buf := make([]byte, 256)
+			_, _ = c2.Read(buf) // consume the command — pipe is synchronous
+			flood := bytes.Repeat([]byte("x\n"), haproxyReplyMaxBytes)
+			for len(flood) > 0 {
+				n, err := c2.Write(flood)
+				if err != nil {
+					return // reader stopped at the cap — done
+				}
+				flood = flood[n:]
+			}
+		}()
+		return c1, nil
+	}
+	out, err := p.socketCmd(context.Background(), "show stat")
+	if err != nil {
+		// The cap closes the read side; a concurrent-write error is
+		// acceptable — the bound still held if nothing above the cap
+		// was retained.
+		if len(out) > haproxyReplyMaxBytes {
+			t.Fatalf("reply = %d bytes, over the cap", len(out))
+		}
+		return
+	}
+	if len(out) > haproxyReplyMaxBytes {
+		t.Fatalf("reply = %d bytes, over the cap", len(out))
 	}
 }

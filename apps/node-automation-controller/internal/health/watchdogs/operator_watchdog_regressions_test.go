@@ -52,15 +52,27 @@ func shHelmRepo(name string, gen, og int64, typ string, suspend bool) *unstructu
 
 // shOpPod builds an operator replica pod with a fixed
 // creationTimestamp — distinct ages are how the oldest-first cap in
-// the selector fallback is exercised.
+// the selector fallback is exercised. The pod is Running and
+// ReplicaSet-owned: healOperatorLeader only deletes Running pods with
+// a controller owner (something recreates them), so fixtures must
+// carry that shape.
 func shOpPod(ns, name string, labels map[string]string, created time.Time) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace:         ns,
-		Name:              name,
-		UID:               types.UID("uid-" + name),
-		Labels:            labels,
-		CreationTimestamp: metav1.NewTime(created),
-	}}
+	ctlr := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			UID:               types.UID("uid-" + name),
+			Labels:            labels,
+			CreationTimestamp: metav1.NewTime(created),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: name + "-rs", UID: types.UID("uid-" + name + "-rs"),
+				Controller: &ctlr,
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 }
 
 // shScyllaTarget returns the live scylla-operator entry so the
@@ -147,7 +159,7 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	p2 := testProberDyn(cs, probetest.OpDyn(ociRepo, stale))
 	p2.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
-		Observe("source-controller/helmrepositories/flux-system/http-repo",
+		Observe("source-controller/helmrepositories/flux-system/http-repo/"+kcmReasonStaleGen,
 			base.Add(-time.Hour))
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
 		t.Fatal("stale type=default HelmRepository must still FAIL")
@@ -234,7 +246,7 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
+		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {

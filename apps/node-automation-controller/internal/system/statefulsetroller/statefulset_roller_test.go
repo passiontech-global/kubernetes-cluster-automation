@@ -28,6 +28,11 @@ func srTrackedCount(l *state.FirstSeenLedger) int {
 	return n
 }
 
+// srDBDriftKey is the revision-qualified ledger key the roller uses
+// for the srSTS fixture — ns/name@<updateRevision>, updateRevision
+// "rev-new" per srSTS.
+const srDBDriftKey = "apps/db@rev-new"
+
 // ---------------------------------------------------------------------------
 // Builders (sr-prefixed to stay unique across sibling test files)
 // ---------------------------------------------------------------------------
@@ -260,7 +265,7 @@ func TestStatefulSetRollerCordonedNodeGate(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour)) // pre-aged drift
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour)) // pre-aged drift
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +296,7 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +343,7 @@ func TestStatefulSetRollerPDBEmptySelectorGate(t *testing.T) {
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +368,7 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +400,7 @@ func TestStatefulSetRollerTerminatingPodBlocksRoll(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +425,7 @@ func TestStatefulSetRollerPodTemplateAnnotationOptIn(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +447,7 @@ func TestStatefulSetRollerNewestPodStabilityGate(t *testing.T) {
 		fresh)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +469,7 @@ func TestStatefulSetRollerAllReadyGate(t *testing.T) {
 		broken)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +491,7 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.driftSince.Seen("apps/db", time.Now()); !ok {
+	if _, ok := r.driftSince.Seen(srDBDriftKey, time.Now()); !ok {
 		t.Fatal("drift not tracked on first sighting")
 	}
 
@@ -503,7 +508,7 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.driftSince.Seen("apps/db", time.Now()); ok {
+	if _, ok := r.driftSince.Seen(srDBDriftKey, time.Now()); ok {
 		t.Fatal("settled drift still tracked")
 	}
 	if !srPodExists(t, cs, "apps", "db-0") {
@@ -564,5 +569,87 @@ func TestStatefulSetRollerListError(t *testing.T) {
 	r := srRoller(cs, time.Now())
 	if err := r.run(ctx); err == nil {
 		t.Fatal("expected error when the statefulset list fails")
+	}
+}
+
+// The 30m drift clock is keyed per (StatefulSet, updateRevision): a
+// NEW revision landing mid-window opens a fresh continuity window —
+// drift elapsed on the old revision must not carry a new template
+// straight to a delete.
+func TestStatefulSetRollerNewRevisionResetsDriftClock(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true) // updateRevision rev-new
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	// rev-new drift observed a full window ago — under the old
+	// name-only key this sweep would roll immediately.
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+
+	// The workload ships a new template mid-window: updateRevision
+	// becomes rev-newer.
+	got, err := cs.AppsV1().StatefulSets("apps").Get(ctx, "db", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Status.UpdateRevision = "rev-newer"
+	if _, err := cs.AppsV1().StatefulSets("apps").
+		UpdateStatus(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even well past 30m from the OLD revision's first sighting, the
+	// new revision's clock just started — no roll, and only the fresh
+	// key is tracked.
+	r.now = func() time.Time { return t0.Add(45 * time.Minute) }
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod rolled on a revision whose drift window just opened")
+	}
+	if _, ok := r.driftSince.Seen("apps/db@rev-newer", t0.Add(45*time.Minute)); !ok {
+		t.Fatal("new revision not tracked under its own key")
+	}
+	if _, ok := r.driftSince.Seen(srDBDriftKey, t0.Add(45*time.Minute)); ok {
+		t.Fatal("stale revision key not pruned from the ledger")
+	}
+
+	// 30m of CONTINUOUS drift on rev-newer: the roll proceeds.
+	r.now = func() time.Time { return t0.Add(76 * time.Minute) }
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod not rolled after 30m of drift on the new revision")
+	}
+}
+
+// Gate 3 checks Ready stability on EVERY pod of the set, not just
+// the newest-CreationTimestamp one: a lower-ordinal member that
+// flipped Ready a minute ago (kubelet restart, transient NotReady)
+// vetoes the roll even though the youngest pod has been up for hours.
+func TestStatefulSetRollerStaleUnreadyBlocksRoll(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 2)
+	// db-1 is the NEWEST pod (created 30m ago) and long-settled;
+	// db-0 only went Ready 2m ago.
+	recent := srPod("db", 0, "rev-old", 2*time.Minute)
+	recent.CreationTimestamp = metav1.NewTime(t0.Add(-30 * time.Minute))
+	objs := srNodes(1)
+	objs = append(objs, sts, recent)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod rolled while a non-newest member was still settling")
 	}
 }

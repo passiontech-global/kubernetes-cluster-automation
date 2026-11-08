@@ -62,4 +62,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lint and vet main
-        run: moon run :lint :vet
+        run: moon run :format :vet :lint :lint-dockerfile

@@ -4,44 +4,66 @@
 package jinja
 
 import (
+	"fmt"
 	"sort"
 )
 
 // ---------------- conversions ----------------
 
-func jsonValue(v any) any { return jsonValueAt(v, 0) }
+func jsonValue(v any) (any, error) {
+	steps := 0
+	return jsonValueAt(v, 0, &steps)
+}
 
-// jsonValueAt converts under the walkMaxDepth recursion budget —
-// a cyclic value can't be marshaled anyway, so past the cap a
-// "[...]" string placeholder stands in (marshal-safe).
-func jsonValueAt(v any, depth int) any {
+// jsonValueAt converts under the walkMaxDepth recursion budget AND
+// the walkMaxSteps total-step budget — a cyclic value can't be
+// marshaled anyway, so past the depth cap a "[...]" string
+// placeholder stands in (marshal-safe), while an exponentially
+// BRANCHING structure (a list holding two copies of itself) stays
+// shallow and instead burns the shared step budget, which errors.
+func jsonValueAt(v any, depth int, steps *int) (any, error) {
 	if depth > walkMaxDepth {
-		return "[...]"
+		return "[...]", nil
+	}
+	if stepBudgetExhausted(steps) {
+		return nil, fmt.Errorf("json: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
 	}
 	switch t := v.(type) {
 	case *OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			m[k] = jsonValueAt(vv, depth+1)
+			cv, err := jsonValueAt(vv, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = cv
 		}
-		return m
+		return m, nil
 	case *List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
-			out[i] = jsonValueAt(x, depth+1)
+			cv, err := jsonValueAt(x, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = cv
 		}
-		return out
+		return out, nil
 	case []any:
 		out := make([]any, len(t))
 		for i, x := range t {
-			out[i] = jsonValueAt(x, depth+1)
+			cv, err := jsonValueAt(x, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = cv
 		}
-		return out
+		return out, nil
 	case Undefined:
-		return nil
+		return nil, nil
 	default:
-		return v
+		return v, nil
 	}
 }
 
@@ -74,38 +96,58 @@ func fromJSON(v any) any {
 	}
 }
 
-func toPlain(v any) any { return toPlainAt(v, 0) }
+func toPlain(v any) (any, error) {
+	steps := 0
+	return toPlainAt(v, 0, &steps)
+}
 
-// toPlainAt converts under the walkMaxDepth recursion budget —
-// same cyclic-input guard as jsonValueAt; past the cap a "[...]"
-// placeholder keeps the yaml.Marshal fed and acyclic.
-func toPlainAt(v any, depth int) any {
+// toPlainAt converts under the walkMaxDepth recursion budget AND
+// the walkMaxSteps total-step budget — same guards as jsonValueAt:
+// past the depth cap a "[...]" placeholder keeps the yaml.Marshal
+// fed and acyclic, while an exponentially branching structure
+// errors instead of exploding the walk.
+func toPlainAt(v any, depth int, steps *int) (any, error) {
 	if depth > walkMaxDepth {
-		return "[...]"
+		return "[...]", nil
+	}
+	if stepBudgetExhausted(steps) {
+		return nil, fmt.Errorf("yaml: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
 	}
 	switch t := v.(type) {
 	case *OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			m[k] = toPlainAt(vv, depth+1)
+			pv, err := toPlainAt(vv, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = pv
 		}
-		return m
+		return m, nil
 	case *List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
-			out[i] = toPlainAt(x, depth+1)
+			pv, err := toPlainAt(x, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = pv
 		}
-		return out
+		return out, nil
 	case []any:
 		out := make([]any, len(t))
 		for i, x := range t {
-			out[i] = toPlainAt(x, depth+1)
+			pv, err := toPlainAt(x, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = pv
 		}
-		return out
+		return out, nil
 	case Undefined:
-		return nil
+		return nil, nil
 	default:
-		return v
+		return v, nil
 	}
 }

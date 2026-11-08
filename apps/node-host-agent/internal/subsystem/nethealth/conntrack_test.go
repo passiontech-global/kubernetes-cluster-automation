@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -314,5 +315,37 @@ func TestConntrackDropSpikeMissingFileIdles(t *testing.T) {
 	e.n.Cycle(context.Background()) // re-seeds the baseline only
 	if ranExactCmd(e, "conntrack -D -p udp") {
 		t.Fatal("UDP flush fired on a re-appearing baseline read")
+	}
+}
+
+// The udp flush is a blunt instrument (live UDP flows re-track,
+// WireGuard re-handshakes) — two triggers inside the cooldown must
+// collapse into one conntrack -D, and the budget re-arms after it.
+func TestConntrackFlushRateLimited(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.2"}},
+		},
+	})
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.2:6443"] = true
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background()) // pin + first flush
+	if !e.host.Ran("conntrack -D -p udp --dport 53") {
+		t.Fatal("first flush missing")
+	}
+	n := strings.Count(e.host.Joined(), "--dport 53")
+	// A second trigger inside the cooldown must not re-exec.
+	e.n.flushStaleUDPConntrack(context.Background(), checkDNSFB)
+	if got := strings.Count(e.host.Joined(), "--dport 53"); got != n {
+		t.Fatalf("flush re-ran inside cooldown (%d → %d)", n, got)
+	}
+	// Past the budget a fresh flush is allowed (the fixture clock
+	// closure reads e.now live).
+	e.now = e.now.Add(conntrackFlushCooldown + time.Minute)
+	e.n.flushStaleUDPConntrack(context.Background(), checkDNSFB)
+	if got := strings.Count(e.host.Joined(), "--dport 53"); got != n+1 {
+		t.Fatalf("flush not re-armed past cooldown (%d → %d)", n, got)
 	}
 }

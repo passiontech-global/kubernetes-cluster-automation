@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -291,9 +293,7 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 		cdnsDeployment(2, 2, nil),
 		svc, es)
 	w := newCDNSWatchdog(cs)
-	var gotFQDN string
-	w.dnsFn = func(_ context.Context, podIP, fqdn string) ([]string, error) {
-		gotFQDN = fqdn
+	w.dnsFn = func(_ context.Context, podIP, _ string) ([]string, error) {
 		if podIP == "10.0.0.1" {
 			return nil, nil // only cdns-a fails to resolve
 		}
@@ -304,8 +304,11 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if gotFQDN != "fresh-svc.app-ns.svc.cluster.local" {
-		t.Fatalf("probe fqdn=%q", gotFQDN)
+	// The layer-2 cache now holds the picked target — the fqdn every
+	// probe saw (the dnsFn stub must stay race-free, so the capture
+	// moved here).
+	if got := w.cachedFQDN; got != "fresh-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("probe fqdn=%q", got)
 	}
 	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("first run streak=%d, want 1", got)
@@ -689,5 +692,257 @@ func TestCoreDNSWatchdogStreakBookkeeping(t *testing.T) {
 	}
 	if got := w.streak.Count("cdns-a"); got != 0 {
 		t.Fatal("streak for freshly-answering pod not reset")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Layer-2 probe-target cache — TTL hit/miss, conclusive-only
+// ---------------------------------------------------------------------------
+
+// svcListCounter counts Service list API calls through a reactor —
+// the observable cost the FQDN cache exists to save.
+func svcListCounter(cs *fake.Clientset) *int {
+	n := 0
+	cs.PrependReactor("list", "services",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			n++
+			return false, nil, nil
+		})
+	return &n
+}
+
+func TestCoreDNSProbeFQDNCacheTTL(t *testing.T) {
+	ready := true
+	pinned := time.Unix(1700000000, 0)
+	// The freshness oracle decays with the clock (both windows are
+	// 10m), so the probe Service is stamped close to the LATEST
+	// pinned time — it stays "<10m old" across the whole timeline and
+	// every conclusive pick lands on the same fqdn.
+	svc, es := cdnsProbeService("fresh-svc", "app-ns", 0, &ready)
+	svc.CreationTimestamp = metav1.NewTime(pinned.Add(10 * time.Minute))
+	clock := pinned
+	w := newCDNSWatchdog(fake.NewSimpleClientset(svc, es))
+	w.now = func() time.Time { return clock }
+	lists := svcListCounter(w.cs.(*fake.Clientset))
+
+	fqdn, _ := w.probeFQDN(ctx)
+	if fqdn != "fresh-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("first pick fqdn=%q", fqdn)
+	}
+	if got := *lists; got != 1 {
+		t.Fatalf("first pick made %d service lists, want 1", got)
+	}
+
+	// Inside the TTL: a cache HIT — the Service/EndpointSlice lists
+	// are never re-issued, which was the whole point (a 60s sweep
+	// must not LIST the cluster's Services every run).
+	clock = pinned.Add(5 * time.Minute)
+	if fqdn2, _ := w.probeFQDN(ctx); fqdn2 != fqdn {
+		t.Fatalf("cached pick changed: %q != %q", fqdn2, fqdn)
+	}
+	if got := *lists; got != 1 {
+		t.Fatalf("TTL hit re-listed services (%d lists, want 1)", got)
+	}
+
+	// Past the TTL: a MISS — exactly one re-list, and the refreshed
+	// answer re-arms the cache.
+	clock = pinned.Add(corednsFQDNCacheTTL + time.Minute)
+	if fqdn3, _ := w.probeFQDN(ctx); fqdn3 != fqdn {
+		t.Fatalf("post-TTL pick changed: %q != %q", fqdn3, fqdn)
+	}
+	if got := *lists; got != 2 {
+		t.Fatalf("TTL expiry did not re-list (%d lists, want 2)", got)
+	}
+	clock = clock.Add(time.Minute)
+	if _, _ = w.probeFQDN(ctx); *lists != 2 {
+		t.Fatal("refreshed answer not re-cached")
+	}
+}
+
+// An INCONCLUSIVE pick ("", nil) is never cached — otherwise one
+// empty cluster read would latch "no target" for the full TTL and
+// layer 2 would go blind instead of re-listing on the next sweep.
+func TestCoreDNSProbeFQDNCacheSkipsInconclusive(t *testing.T) {
+	w := newCDNSWatchdog(fake.NewSimpleClientset()) // nothing qualifies
+	lists := svcListCounter(w.cs.(*fake.Clientset))
+	for i := 0; i < 2; i++ {
+		if fqdn, _ := w.probeFQDN(ctx); fqdn != "" {
+			t.Fatalf("empty cluster returned %q", fqdn)
+		}
+	}
+	if got := *lists; got != 2 {
+		t.Fatalf("inconclusive pick cached — %d lists across 2 runs, want 2", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Worker pool — the layer-2 fan-out bound
+// ---------------------------------------------------------------------------
+
+// boundedForEach must never exceed probePoolSize goroutines in
+// flight, must run every index exactly once, and must block until
+// all of them finish.
+func TestBoundedForEachBound(t *testing.T) {
+	const items = 32 // 8x the bound — a serial loop would still pass, an unbounded fan-out would not
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	seen := make([]bool, items)
+	done := make(chan struct{})
+	go func() {
+		boundedForEach(make([]string, items), func(i int) {
+			mu.Lock()
+			inFlight++
+			if inFlight > maxInFlight {
+				maxInFlight = inFlight
+			}
+			if seen[i] {
+				t.Errorf("index %d visited twice", i)
+			}
+			seen[i] = true
+			mu.Unlock()
+			time.Sleep(time.Millisecond) // widen the race window
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("boundedForEach did not return — pool deadlocked")
+	}
+	if maxInFlight == 0 || maxInFlight > probePoolSize {
+		t.Fatalf("max in-flight probes = %d, want 1..%d", maxInFlight, probePoolSize)
+	}
+	for i, ok := range seen {
+		if !ok {
+			t.Fatalf("index %d never visited", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// recover() — legitimate skips never count as run errors
+// ---------------------------------------------------------------------------
+
+// queueErrDelta reads the IncError counter for the watchdog's queue
+// around fn — the observable for "a legitimate skip must not count
+// as a run error".
+func queueErrDelta(t *testing.T, queue string, fn func()) float64 {
+	t.Helper()
+	before := testutil.QueueErrorCount(t, queue)
+	fn()
+	return testutil.QueueErrorCount(t, queue) - before
+}
+
+func TestCoreDNSRecoverLegitSkipsNotCounted(t *testing.T) {
+	const queue = "coredns-stale-watchdog-test"
+
+	t.Run("cooldown skip", func(t *testing.T) {
+		cooldown := map[string]string{corednsTSAnno: strconv.FormatInt(time.Now().Unix(), 10)}
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, cooldown))
+		w := newCDNSWatchdog(cs)
+		w.queue = queue
+		if d := queueErrDelta(t, queue, func() {
+			if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+				t.Fatal(err)
+			}
+		}); d != 0 {
+			t.Fatalf("cooldown skip counted %v run errors", d)
+		}
+	})
+
+	t.Run("NotReady-node storm skip", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			testutil.Node("n1", corev1.ConditionFalse, nil),
+			cdnsPod("cdns-a", "10.0.0.1"),
+			cdnsDeployment(1, 1, nil))
+		w := newCDNSWatchdog(cs)
+		w.queue = queue
+		if d := queueErrDelta(t, queue, func() {
+			if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+				t.Fatal(err)
+			}
+		}); d != 0 {
+			t.Fatalf("storm skip counted %v run errors", d)
+		}
+	})
+
+	t.Run("rollout-in-progress skip", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"),
+			cdnsDeployment(2, 1, nil)) // 2 desired, only 1 ready
+		w := newCDNSWatchdog(cs)
+		w.queue = queue
+		if d := queueErrDelta(t, queue, func() {
+			if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+				t.Fatal(err)
+			}
+		}); d != 0 {
+			t.Fatalf("rollout skip counted %v run errors", d)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// recover() — delete NotFound tolerance + delivered-only cooldown stamp
+// ---------------------------------------------------------------------------
+
+// A suspect already gone (NotFound on delete) is tolerated — the
+// fleet is exactly where recovery wanted it — and the cooldown is
+// stamped only when at least one delete was DELIVERED.
+func TestCoreDNSRecoverNotFoundDelete(t *testing.T) {
+	t.Run("mixed: live suspect deleted, ghost tolerated, cooldown stamped", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		// "ghost" has no pod in the fake — its delete answers NotFound.
+		// nPods=3 keeps len(suspects)=2 on the surgical-delete path.
+		if err := w.recover(ctx, []string{"cdns-a", "ghost"}, nil, 3); err != nil {
+			t.Fatalf("NotFound delete must not error: %v", err)
+		}
+		if cdnsPodExists(t, cs, "cdns-a") {
+			t.Fatal("live suspect not deleted")
+		}
+		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {
+			t.Fatal("cooldown not stamped although one delete was delivered")
+		}
+	})
+
+	t.Run("all gone: no error, cooldown NOT stamped", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"ghost-a", "ghost-b"}, nil, 3); err != nil {
+			t.Fatalf("all-NotFound recovery must not error: %v", err)
+		}
+		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
+			t.Fatal("cooldown stamped for a recovery that deleted nothing")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Setup — Disabled gate
+// ---------------------------------------------------------------------------
+
+// Setup must register nothing when Deps.Disabled is set — routed
+// through shared.SetupNoConfig so the gate is structural, not
+// comment-enforced (the module has no GateEnv row today; the test
+// pins the gate the helper enforces for the day one lands).
+func TestSetupCoreDNSWatchdogDisabled(t *testing.T) {
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{Name: "coredns-stale-watchdog", Mgr: m,
+		CS: fake.NewSimpleClientset(), Dyn: testutil.StubDyn(),
+		Disabled: true}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if got := len(m.Added); got != 0 {
+		t.Fatalf("disabled module registered %d runnables, want 0", got)
 	}
 }

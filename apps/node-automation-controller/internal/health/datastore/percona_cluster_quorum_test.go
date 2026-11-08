@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -153,15 +154,19 @@ func TestPerconaWsrepDonorDesyncedFails(t *testing.T) {
 	}
 }
 
-// Patroni failover lock: a PerconaPGCluster with no <cr>-leader
-// Lease and no <cr>-leader Endpoints (both DCS surfaces vacant)
-// while a member pod still Runs — tracked first, FAIL + gauge past
-// the 10m window.
+// Patroni failover lock: a PerconaPGCluster whose leader Lease
+// EXISTS with an empty holder (leader absent) while a member pod
+// still Runs — tracked first, FAIL + gauge past the 10m window.
 func TestPerconaPatroniLeaderLock(t *testing.T) {
 	testutil.CleanupMetric(t, perconaClusterDegradedGauge, "PerconaPGCluster", "db", "pg-main")
 	base := time.Now()
-	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"))
-	// No <cr>-leader Lease or Endpoints — both DCS surfaces vacant.
+	holderLease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "pg-main-leader"},
+		Spec:       coordinationv1.LeaseSpec{HolderIdentity: ptr.To("")},
+	}
+	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"), holderLease)
+	// No <cr>-leader Endpoints — the endpoints DCS surface is absent
+	// (vacant-by-default), the Lease's empty holder is the evidence.
 	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
 	probetest.FreezeNow(p.Deps, base)
 
@@ -178,6 +183,21 @@ func TestPerconaPatroniLeaderLock(t *testing.T) {
 			"namespace": "db", "name": "pg-main"})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("patroni lock gauge = %v, want 1", m)
+	}
+}
+
+// W17 — a 404 on BOTH the leader Lease and the leader Endpoints is
+// absence of evidence, NOT leader loss: the CR could be mid-
+// bootstrap with no DCS surface written yet. No lock, pass.
+func TestPerconaPatroniBothSurfacesAbsentNoLock(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"))
+	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
+	probetest.FreezeNow(p.Deps, base)
+	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	probetest.FreezeNow(p.Deps, base.Add(perconaPatroniLockMinAge+time.Minute))
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("404 on both DCS surfaces must not read as leader loss: %+v", res)
 	}
 }
 

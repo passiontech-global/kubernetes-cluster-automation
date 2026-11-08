@@ -39,6 +39,13 @@ func cepObj(ns, name string, identityID int64) *unstructured.Unstructured {
 func TestCiliumMissingCEPDeletesPodAfterPersistence(t *testing.T) {
 	pod := probetest.PodWithPhase("apps", "app-1", corev1.PodRunning, true, time.Hour)
 	pod.Spec.NodeName = "w1"
+	// A lone-pod delete needs a controller owner — ownerless pods
+	// are never recreated, so the check refuses to delete one.
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "app-1-rs", UID: "rs-uid", Controller: new(bool),
+	}}
+	*pod.OwnerReferences[0].Controller = true
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs) // no CEP seeded -> missing endpoint
 	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
@@ -51,6 +58,23 @@ func TestCiliumMissingCEPDeletesPodAfterPersistence(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "app-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("pod without CEP should be deleted, err=%v", err)
+	}
+}
+
+// An ownerless pod (no controller ownerRef) is never deleted — a
+// delete would be destruction, not healing, since nothing recreates it.
+func TestCiliumMissingCEPOwnerlessPodSurvives(t *testing.T) {
+	pod := probetest.PodWithPhase("apps", "app-bare", corev1.PodRunning, true, time.Hour)
+	pod.Spec.NodeName = "w1"
+	cs := fake.NewSimpleClientset(pod)
+	p := testProber(cs) // no CEP seeded -> missing endpoint
+	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+	chk.Run(ctx)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("persistent missing CEP must still fail (signature)")
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "app-bare", metav1.GetOptions{}); err != nil {
+		t.Fatalf("ownerless pod must survive the CEP-missing heal: %v", err)
 	}
 }
 

@@ -23,6 +23,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -56,6 +58,9 @@ func NewNatsJetstreamHealthCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	CheckNameNatsJetstreamHealth = "nats-jetstream-health"
+
+	// The per-pod log-scan fan-out cap (Component 3 worker pool).
+	natsLogScanWorkers = 4
 
 	// W12-ST1 — nats-jetstream-health knobs.
 	natsAppLabelValue    = "nats" // app.kubernetes.io/name
@@ -166,14 +171,19 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 	// Discover the NATS StatefulSets — the app.kubernetes.io/name=nats
 	// label is the canonical helm marker. Absence means no NATS
 	// deployed: tolerate, pass clean, and (importantly) never pay
-	// the pods List on clusters without it.
-	stss, err := p.CS.AppsV1().StatefulSets(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: "app.kubernetes.io/name=" + natsAppLabelValue})
+	// the pods List on clusters without it. The snapshot returns the
+	// cluster-wide list; the label filter applies client-side.
+	allSTS, err := p.AllStatefulSets(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nats statefulsets: %w", err)}
 	}
-	if len(stss.Items) == 0 {
+	var stss []appsv1.StatefulSet
+	for i := range allSTS {
+		if allSTS[i].Labels["app.kubernetes.io/name"] == natsAppLabelValue {
+			stss = append(stss, allSTS[i])
+		}
+	}
+	if len(stss) == 0 {
 		// No NATS on this cluster — still reconcile the ledgers: a
 		// tuple emitted while NATS existed (or a removed deployment
 		// that left wedge evidence behind) must DeleteLabelValues,
@@ -185,8 +195,8 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 			"nats jetstream wedge signatures: ", ", ")
 	}
 	natsNamespaces := map[string]bool{}
-	for i := range stss.Items {
-		natsNamespaces[stss.Items[i].Namespace] = true
+	for i := range stss {
+		natsNamespaces[stss[i].Namespace] = true
 	}
 
 	// Member pods: the same canonical label, one cluster-wide read
@@ -250,29 +260,55 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// Log-marker scan on Running members old enough for their
 	// JetStream startup to have settled — a fetch/read failure is
-	// inconclusive, not healthy (warn + skip).
+	// inconclusive, not healthy (warn + skip). The fetches run
+	// through a bounded worker pool (max natsLogScanWorkers
+	// concurrent kubelet log streams); results apply serially below.
+	type logScan struct {
+		key    string
+		reason string
+		err    error
+	}
+	scanKeys := make([]string, 0, len(memberByName))
 	for key, pod := range memberByName {
 		if pod.Status.Phase != corev1.PodRunning ||
 			now.Sub(pod.CreationTimestamp.Time) < natsLogScanMinPodAge {
 			continue
 		}
-		reason := ""
-		hit, lerr := probefw.PodLogTail(ctx, p.CS, pod, "",
-			probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-			func(line string) bool {
-				if r := natsLogReason(line); r != "" {
-					reason = r // the first marker wins
-					return true
-				}
-				return false
-			})
-		if lerr != nil {
+		scanKeys = append(scanKeys, key)
+	}
+	sort.Strings(scanKeys)
+	scans := make([]logScan, len(scanKeys))
+	g := errgroup.Group{}
+	g.SetLimit(natsLogScanWorkers)
+	for j, key := range scanKeys {
+		pod := memberByName[key]
+		g.Go(func() error {
+			reason := ""
+			hit, lerr := probefw.PodLogTail(ctx, p.CS, pod, "",
+				probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
+				func(line string) bool {
+					if r := natsLogReason(line); r != "" {
+						reason = r // the first marker wins
+						return true
+					}
+					return false
+				})
+			if lerr == nil && !hit {
+				reason = "" // clean tail — no marker
+			}
+			scans[j] = logScan{key: key, reason: reason, err: lerr}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	for _, s := range scans {
+		if s.err != nil {
 			log.Info("WARN: nats pod log tail failed — wedge evidence inconclusive",
-				"pod", key, "error", lerr)
+				"pod", s.key, "error", s.err)
 			continue
 		}
-		if hit {
-			addReason(key, reason, false)
+		if s.reason != "" {
+			addReason(s.key, s.reason, false)
 		}
 	}
 

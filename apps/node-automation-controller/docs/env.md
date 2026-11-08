@@ -26,6 +26,8 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `NODE_AUTOMATION_KUBE_CLIENT_QPS` | manager | `50` | client-go QPS on the shared rest.Config every module sweeps/reconciles through (client-go's `5` was far under this fleet's aggregate rate). All three clients (manager, clientset, dynamic) share one token bucket installed on the config. |
 | `NODE_AUTOMATION_KUBE_CLIENT_BURST` | manager | `100` | client-go burst paired with the QPS knob above. |
 | `NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT` | manager | `30s` | Per-request timeout on the direct (uncached) typed/dynamic clients the sweep loops use — bounds a hung apiserver call. NOT applied to the manager's client, where it would cut informer watch streams. |
+| `NODE_AUTOMATION_PROBE_CLIENT_QPS` | manager | `20` | client-go QPS on the SECOND rest.Config built for the latency-sensitive probe modules (apiserver-endpoint-guard, kubelet-liveness-reaper, dead-node-sweeper — the `Module.ProbeClients` registry rows): their own token bucket, so janitor delete bursts draining the shared `NODE_AUTOMATION_KUBE_CLIENT_*` bucket cannot queue-delay a probe verdict mid-incident. |
+| `NODE_AUTOMATION_PROBE_CLIENT_BURST` | manager | `40` | client-go burst paired with the probe QPS knob above; shares the per-request timeout inherited from the direct clients. |
 
 ## Global heal budget
 

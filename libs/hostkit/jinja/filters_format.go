@@ -88,6 +88,10 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 			b.WriteString(fmt.Sprintf("%"+spec+string(conv), fv))
 		case 'c':
+			// %c takes flags/width only — no precision.
+			if !validFmtSpec(spec, false) {
+				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
+			}
 			if iv, ok := ToInt(a); ok {
 				b.WriteString(string(rune(iv)))
 			} else if sv := Stringify(a); sv != "" {
@@ -99,6 +103,12 @@ func pyFormat(format string, args []any) (string, error) {
 				}
 			}
 		case 's', 'v', 'r':
+			// Same flags→width→.precision order as the numeric
+			// conversions — "%5-2s" used to slip through and
+			// render Go's %!s(BAD) noise.
+			if !validFmtSpec(spec, true) {
+				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
+			}
 			sv := Stringify(a)
 			// %.Ns truncates the string form (python precision
 			// semantics on %s).

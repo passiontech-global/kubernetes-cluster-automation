@@ -77,6 +77,18 @@ func pendingPodForPVC(ns, name, pvcName string, age time.Duration, at time.Time)
 	}
 }
 
+// stalledHostpathPVC builds a Pending openebs-hostpath PVC the
+// provisioner already selected a node for — the
+// volume.kubernetes.io/selected-node annotation the stalled branch
+// requires (a claim without it was never selected and is not wedge
+// evidence).
+func stalledHostpathPVC(ns, name string) *corev1.PersistentVolumeClaim {
+	pvc := testPVC(ns, name, "", "openebs-hostpath", corev1.ClaimPending)
+	pvc.Annotations = map[string]string{
+		kube.AnnoVolumeSelectedNode: "node-w1"}
+	return pvc
+}
+
 // A concourse-worker stranded on a MISSING node past 10m: gauge
 // fires AND the disposable PVC+pod are reaped so the STS rebinds.
 func TestLocalPVStrandedConcourseHeals(t *testing.T) {
@@ -333,7 +345,7 @@ func TestPVCStalledProvisionerHeals(t *testing.T) {
 		Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1"}}
 	cs := fake.NewSimpleClientset(worker, provPod,
 		pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
-		testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
+		stalledHostpathPVC("apps", "data-x"))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
@@ -372,6 +384,34 @@ func TestPVCStalledNeedsAWorker(t *testing.T) {
 	}
 }
 
+// A Pending openebs-hostpath claim the provisioner never SELECTED a
+// node for (no volume.kubernetes.io/selected-node annotation) is not
+// wedge evidence even past the window with workers available — it
+// could be fresh, queued, or waiting on scheduler gating.
+func TestPVCStalledWithoutSelectedNodeIsQuiet(t *testing.T) {
+	base := time.Now()
+	worker := testutil.Node("w1", corev1.ConditionTrue, nil)
+	provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1"}}
+	cs := fake.NewSimpleClientset(worker, provPod,
+		pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
+		testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("unselected pending claim must pass quietly: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_pvc_provisioning_stalled",
+		map[string]string{"namespace": "apps", "pvc": "data-x", "storageclass": "openebs-hostpath"}); m != nil {
+		t.Fatal("claim without a selected node must not fire the stalled gauge")
+	}
+	if _, err := cs.CoreV1().Pods("openebs").
+		Get(ctx, "openebs-localpv-provisioner-abc", metav1.GetOptions{}); err != nil {
+		t.Fatal("provisioner deleted over an unselected claim")
+	}
+}
+
 // The provisioner heal stamps
 // passiontech.dev/last-localpv-provisioner-heal on the provisioner
 // Deployment, and a fresh post-restart process reads it back: a
@@ -394,7 +434,7 @@ func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
 		cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil),
 			provPod, dep,
 			pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
-			testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
+			stalledHostpathPVC("apps", "data-x"))
 		p := testProberDyn(cs, probetest.OpDyn())
 		p.Now = func() time.Time { return base }
 		return cs, p

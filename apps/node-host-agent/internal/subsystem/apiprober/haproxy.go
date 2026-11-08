@@ -19,6 +19,12 @@ func (p *Prober) dial(ctx context.Context) (net.Conn, error) {
 	return d.DialContext(ctx, "unix", p.eff.socket)
 }
 
+// haproxyReplyMaxBytes caps one admin-socket reply read — `show
+// stat` CSV is the big one but still megabyte-scale, and a wedged
+// HAProxy answering garbage forever must not slurp unbounded bytes
+// into the agent's heap (hostexec's capped-runner parity).
+const haproxyReplyMaxBytes = 4 << 20
+
 // socketCmd sends one admin command and returns the response body.
 // HAProxy runtime commands are newline-terminated and the server
 // closes the connection after answering.
@@ -33,7 +39,7 @@ func (p *Prober) socketCmd(ctx context.Context, cmd string) (string, error) {
 	if _, err := io.WriteString(conn, cmd+"\n"); err != nil {
 		return "", err
 	}
-	out, err := io.ReadAll(conn)
+	out, err := io.ReadAll(io.LimitReader(conn, haproxyReplyMaxBytes))
 	if err != nil {
 		return "", err
 	}

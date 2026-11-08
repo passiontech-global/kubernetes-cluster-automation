@@ -11,21 +11,24 @@
 // DaemonSet runs hostNetwork + hostPID and mounts individual
 // hostPaths only — there is NO /host/proc mount, so
 // <hostRoot>/proc/1/ns/net is not reachable on workers. Instead:
-// hostNetwork makes the pod's own netns the host's —
-// /proc/self/ns/net and /proc/1/ns/net are the same inode, so
-// Bind binds directly with no setns at all. On a non-hostNetwork
-// hostPID pod /proc/1/ns/net is still host init's netns → setns
-// into it for the socket creation (a socket keeps the netns it
-// was created in). Only when pid-1's entry can't be used at all
-// does Bind fall back to a mounted host /proc under
+// hostNetwork makes the pod's own netns the host's — the calling
+// thread's netns (threadSelfNetns: /proc/thread-self/ns/net, elder
+// kernels /proc/self/task/<tid>/ns/net) and /proc/1/ns/net are the
+// same inode, so Bind binds directly with no setns at all. On a
+// non-hostNetwork hostPID pod /proc/1/ns/net is still host init's
+// netns → setns into it for the socket creation (a socket keeps the
+// netns it was created in). Only when pid-1's entry can't be used at
+// all does Bind fall back to a mounted host /proc under
 // <hostRoot>/proc/1/ns/net.
 package routewatch
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -35,9 +38,28 @@ import (
 // bind selection below reads it).
 var InitNetns = "/proc/1/ns/net"
 
-// SelfNetns is always the real own-netns link — it is also the
-// setns restore target inside BindInNetns.
-const SelfNetns = "/proc/self/ns/net"
+// threadSelfNetns resolves the calling THREAD's netns link:
+// /proc/thread-self/ns/net (kernel ≥3.17) with the
+// /proc/self/task/<tid>/ns/net fallback for older kernels. NOT
+// /proc/self/ns/net: that link shows the thread-GROUP leader's
+// netns, and setns(CLONE_NEWNET) is per-thread — the bind must
+// snapshot the netns the thread actually runs in, or a goroutine
+// scheduled on a moved thread would be "restored" into the wrong
+// namespace (the bind fd keeps the host netns while the thread
+// resumes serving probes in it).
+func threadSelfNetns() string {
+	const p = "/proc/thread-self/ns/net"
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return "/proc/self/task/" + strconv.Itoa(unix.Gettid()) + "/ns/net"
+}
+
+// ErrSetns marks a setns(2) failure inside BindInNetns — the route
+// guard stops re-arming on it: each retry locks an OS thread and
+// opens two ns fds, and a persistent failure (missing CAP_SYS_ADMIN,
+// no pid-1 netns reachable) would churn the respawn loop forever.
+var ErrSetns = errors.New("setns")
 
 // --- netlink socket (host netns) ---
 
@@ -92,7 +114,7 @@ func SameNetns(a, b string) bool {
 //   - <hostRoot>/proc/1/ns/net: last fallback for a pod with neither
 //     flag but a mounted host /proc.
 func Bind(hostRoot string) (int, error) {
-	if SameNetns(SelfNetns, InitNetns) {
+	if SameNetns(threadSelfNetns(), InitNetns) {
 		return bindRouteSocket()
 	}
 	fd, err := BindInNetns(InitNetns)
@@ -122,7 +144,7 @@ func Bind(hostRoot string) (int, error) {
 // runtime destroy the thread instead of reusing it (the safe setns
 // pattern). The goroutine's defers still run (the ns fds close).
 func BindInNetns(nsPath string) (int, error) {
-	self, err := unix.Open(SelfNetns, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	self, err := unix.Open(threadSelfNetns(), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, fmt.Errorf("self netns: %w", err)
 	}
@@ -135,7 +157,7 @@ func BindInNetns(nsPath string) (int, error) {
 	runtime.LockOSThread()
 	if err := unix.Setns(host, unix.CLONE_NEWNET); err != nil {
 		runtime.UnlockOSThread()
-		return -1, fmt.Errorf("setns %s: %w", nsPath, err)
+		return -1, fmt.Errorf("%w: setns %s: %v", ErrSetns, nsPath, err)
 	}
 	fd, serr := bindRouteSocket()
 	if rerr := unix.Setns(self, unix.CLONE_NEWNET); rerr != nil {

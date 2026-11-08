@@ -1,7 +1,8 @@
 // daemonset.go — DaemonSetSpec: the shared reconcile skeleton for the
-// pinned-DaemonSet patchers (konnectivity-agent): Get → NotFound skip
-// → Drifted → missing-container guard → Settled rollout gate →
-// strategic-merge Patch → 15m requeue. Same shape as DeploymentSpec
+// pinned-DaemonSet patchers (konnectivity-agent): cached-or-direct
+// Get → NotFound skip → Drifted → direct-CS drift confirm (when the
+// cache served the Get) → missing-container guard → Settled rollout
+// gate → strategic-merge Patch → 15m requeue. Same shape as DeploymentSpec
 // minus the replica pin, plus the Settled gate a DaemonSet needs —
 // patching mid-rollout would stack a second rolling restart (the
 // double flap the bash hook avoided). Returned errors are counted
@@ -26,9 +27,17 @@ import (
 
 // DaemonSetSpec is one pinned DaemonSet the framework reconciles.
 type DaemonSetSpec struct {
-	// CS is the direct (uncached) clientset — module reads go through
-	// it, not the manager cache.
+	// CS is the direct (uncached) clientset — destructive paths
+	// (the drift-confirm re-Get and the Patch) go through it.
 	CS kubernetes.Interface
+	// Reader is the optional informer-cache reader (mgr.GetClient()
+	// at module Setup) for the initial drift-detection Get. Only
+	// valid while the manager's DaemonSet informer can see the object
+	// (buildCacheOptions scopes it to kube-system/konnectivity-agent
+	// today); nil falls back to a direct CS Get. The destructive
+	// patch still confirms on CS when Reader is set — see
+	// DeploymentSpec.Reader for the full contract.
+	Reader kube.CachedObjectReader
 	// Namespace/Name locate the pinned DaemonSet — they also fill the
 	// "daemonset" log key and every wrapped error string.
 	Namespace string
@@ -67,8 +76,7 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	res := ctrl.Result{RequeueAfter: RequeueInterval}
 	ref := s.Namespace + "/" + s.Name
 
-	ds, err := s.CS.AppsV1().DaemonSets(s.Namespace).
-		Get(ctx, s.Name, metav1.GetOptions{})
+	ds, err := kube.GetDaemonSetCached(ctx, s.Reader, s.CS, s.Namespace, s.Name)
 	if apierrors.IsNotFound(err) {
 		// DS may not exist (cluster without the addon)
 		log.Info("SKIP: daemonset not found", "daemonset", ref)
@@ -81,6 +89,23 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	if !s.Drifted(ds) {
 		log.Info(s.NoDriftLog, "daemonset", ref)
 		return res, nil
+	}
+	// Confirm the cache-served drift verdict on the direct clientset
+	// before the patch — same contract as DeploymentSpec.Reader.
+	if s.Reader != nil {
+		ds, err = s.CS.AppsV1().DaemonSets(s.Namespace).
+			Get(ctx, s.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			log.Info("SKIP: daemonset gone between cache read and confirm", "daemonset", ref)
+			return res, nil
+		}
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("confirm daemonset %s on direct client: %w", ref, err)
+		}
+		if !s.Drifted(ds) {
+			log.Info(s.NoDriftLog+" (confirmed on direct client)", "daemonset", ref)
+			return res, nil
+		}
 	}
 	// A missing container reads as drift, but the strategic-merge
 	// patch merges containers BY NAME — applied to a spec without it,

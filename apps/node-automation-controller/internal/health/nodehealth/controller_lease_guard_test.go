@@ -36,6 +36,16 @@ func leaseGuardProber(cs *fake.Clientset) (*probetest.Prober, *controllerLeaseGu
 	return p, p.Checks[0].(*controllerLeaseGuardCheck)
 }
 
+// ksmOwnerRef builds the ReplicaSet controller ownerRef a real
+// kube-state-metrics pod carries — the bounce heal refuses a
+// controller-less pod (deleting it would never be recreated).
+func ksmOwnerRef(rsName string) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: rsName, UID: types.UID("rs-" + rsName), Controller: ptr.To(true),
+	}}
+}
+
 // cpLease builds a control-plane Lease whose renewTime is renewAge
 // old (relative to at), holder is the holderIdentity ("" leaves it
 // unset) and transitions the spec.leaseTransitions counter.
@@ -266,10 +276,11 @@ func TestLeaseGuardLongStaleLeaseIgnored(t *testing.T) {
 // and the gauge reports the wedge.
 func TestLeaseGuardKSMWedgeBounce(t *testing.T) {
 	base := time.Now()
-	cs := fake.NewSimpleClientset(
-		probetest.ReadyPodWithIP("monitoring",
-			"kube-state-metrics-6cc5c9d9b4-x1", "10.0.0.7",
-			map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}))
+	pod := probetest.ReadyPodWithIP("monitoring",
+		"kube-state-metrics-6cc5c9d9b4-x1", "10.0.0.7",
+		map[string]string{"app.kubernetes.io/name": "kube-state-metrics"})
+	pod.OwnerReferences = ksmOwnerRef("kube-state-metrics-6cc5c9d9b4")
+	cs := fake.NewSimpleClientset(pod)
 	p, ch := leaseGuardProber(cs)
 	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
 		return leaseReasonKSMUnauthorized, nil
@@ -304,6 +315,7 @@ func TestLeaseGuardKSMWedgeRestartResume(t *testing.T) {
 	pod := probetest.ReadyPodWithIP("monitoring",
 		"kube-state-metrics-6cc5c9d9b4-x2", "10.0.0.8",
 		map[string]string{"app.kubernetes.io/name": "kube-state-metrics"})
+	pod.OwnerReferences = ksmOwnerRef("kube-state-metrics-6cc5c9d9b4")
 	pod.Annotations = map[string]string{
 		kube.AnnoFirstSeenKSMWedge: `{"monitoring/kube-state-metrics-6cc5c9d9b4-x2":"` +
 			time.Now().Add(-(ksmWedgeMinAge + time.Minute)).
@@ -338,11 +350,9 @@ func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
 	podLists := 0
 	cs.PrependReactor("list", "pods",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
-			// Count only kube-system — the KSM wedge sub-check
-			// lists other namespaces and is not what this pins.
-			if la, ok := a.(ktesting.ListAction); ok && la.GetNamespace() == "kube-system" {
-				podLists++
-			}
+			// The lease-side census lists cluster-wide (the snapshot
+			// census shape) — count every pod LIST the sweep pays.
+			podLists++
 			return true, nil, errors.New("api down")
 		})
 	p, ch := leaseGuardProber(cs)
@@ -355,8 +365,8 @@ func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
 	if !strings.Contains(res.Infra.Error(), "list pods in kube-system") {
 		t.Fatalf("Infra = %v, want the kube-system pods list error", res.Infra)
 	}
-	if podLists != 1 {
-		t.Fatalf("kube-system pods listed %d times in one sweep, want 1 — the failed list is memoized across the namespace's stale leases", podLists)
+	if podLists != 2 {
+		t.Fatalf("pods listed %d times in one sweep, want 2 — one census for the lease loop (memoized across kube-system's stale leases) and one for the KSM wedge scan", podLists)
 	}
 
 	// kube-system's stale leases are skipped (no pods to judge the

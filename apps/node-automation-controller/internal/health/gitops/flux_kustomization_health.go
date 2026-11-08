@@ -129,7 +129,10 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 	// accumulate (pruned every sweep, not only on a stuck hit).
 	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
 	var rep probefw.SweepReport
-	kusts, err := p.Dyn.Resource(fluxKustomizationGVR).List(ctx, metav1.ListOptions{})
+	// The snapshot's per-GVR census memoizes the RAW error — the
+	// IsNotFound/NoMatch "Flux not installed" interpretation stays
+	// here.
+	kusts, err := p.AllUnstructured(ctx, fluxKustomizationGVR)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — Flux not installed. The sweep IS complete
@@ -142,8 +145,8 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list kustomizations: %w", err)}
 	}
 
-	for i := range kusts.Items {
-		kust := &kusts.Items[i]
+	for i := range kusts {
+		kust := &kusts[i]
 		if suspended, _ := kube.NestedBool(
 			kust.Object, "spec", "suspend"); suspended {
 			continue
@@ -373,24 +376,43 @@ func parseFluxInventoryID(id string) (ns, name, kind string) {
 }
 
 // fluxDeploymentReady reports whether the Deployment's ready replicas
-// cover its desired count — a replicas:0 downscale reads ready.
+// cover its desired count — resolved from the sweep's shared
+// Deployment census (absent or unreadable is not ready: fail closed).
+// A replicas:0 downscale reads ready.
 func (p *fluxKustomizationHealthCheck) fluxDeploymentReady(ctx context.Context,
 	ns, name string) bool {
-	d, err := p.CS.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+
+	deps, err := p.AllDeployments(ctx)
 	if err != nil {
 		return false
 	}
-	return d.Status.ReadyReplicas >= desiredReplicas(d.Spec.Replicas)
+	for i := range deps {
+		d := &deps[i]
+		if d.Namespace != ns || d.Name != name {
+			continue
+		}
+		return d.Status.ReadyReplicas >= desiredReplicas(d.Spec.Replicas)
+	}
+	return false
 }
 
-// fluxStatefulSetReady is the StatefulSet twin.
+// fluxStatefulSetReady is the StatefulSet twin over the shared
+// StatefulSet census.
 func (p *fluxKustomizationHealthCheck) fluxStatefulSetReady(ctx context.Context,
 	ns, name string) bool {
-	s, err := p.CS.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
+
+	stss, err := p.AllStatefulSets(ctx)
 	if err != nil {
 		return false
 	}
-	return s.Status.ReadyReplicas >= desiredReplicas(s.Spec.Replicas)
+	for i := range stss {
+		s := &stss[i]
+		if s.Namespace != ns || s.Name != name {
+			continue
+		}
+		return s.Status.ReadyReplicas >= desiredReplicas(s.Spec.Replicas)
+	}
+	return false
 }
 
 // desiredReplicas dereferences the workload replica pointer — a nil

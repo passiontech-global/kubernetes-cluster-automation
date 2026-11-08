@@ -4,16 +4,20 @@
 package jinja
 
 import (
+	"errors"
 	"strings"
 )
 
 func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
-	// map(attribute='x'[, default=y])
+	// map(attribute='x'[, default=y]) — presence decides, not
+	// nil-ness: default=none maps missing attributes to a literal
+	// None, which the old kw["default"] != nil check dropped.
 	if attr, ok := kw["attribute"]; ok {
+		_, hasDefault := kw["default"]
 		var out []any
 		for _, it := range ToIter(v) {
 			got := selectAttrKey(it, Stringify(attr))
-			if _, u := got.(Undefined); u && kw["default"] != nil {
+			if _, u := got.(Undefined); u && hasDefault {
 				got = kw["default"]
 			}
 			out = append(out, got)
@@ -24,13 +28,21 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 		return &List{ToIter(v)}, nil
 	}
 	name := Stringify(args[0])
-	// map('basename') / map('regex_replace', p, r) — filter by name
+	// map('basename') / map('regex_replace', p, r) — filter by name.
+	// kw travels with the call so keyword-taking filters (e.g.
+	// map('default', x, default=none)) keep working. Only an
+	// UNKNOWN filter falls back to the attribute/method read: a
+	// runtime error inside a known filter (bad regex, bad JSON,
+	// divide by zero) must surface, not degrade to Undefined.
 	var out []any
 	for _, it := range ToIter(v) {
-		fv, err := applyFilter(name, it, args[1:], nil, s)
+		fv, err := applyFilter(name, it, args[1:], kw, s)
 		if err != nil {
-			out = append(out, getAttr(it, name))
-			continue
+			if errors.Is(err, errUnknownFilter) {
+				out = append(out, getAttr(it, name))
+				continue
+			}
+			return nil, err
 		}
 		out = append(out, fv)
 	}

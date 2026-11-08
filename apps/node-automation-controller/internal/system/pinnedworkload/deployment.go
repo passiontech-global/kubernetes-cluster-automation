@@ -1,7 +1,8 @@
 // deployment.go — DeploymentSpec: the shared reconcile skeleton for
 // the pinned-Deployment patchers (coredns, metrics-server):
-// Get → NotFound skip → proportional wantReplicas → Drifted →
-// missing-container guard → PatchBody → strategic-merge Patch →
+// cached-or-direct Get → NotFound skip → proportional wantReplicas →
+// Drifted → direct-CS drift confirm (when the cache served the Get)
+// → missing-container guard → PatchBody → strategic-merge Patch →
 // 15m requeue. The module supplies the ops surface — drift check,
 // patch body, the drift-free log line; this file owns the flow and
 // the fixed error shape every error path shares. Returned errors are
@@ -34,9 +35,19 @@ const RequeueInterval = 15 * time.Minute
 // the coredns/metrics-server modules build it per Reconcile call from
 // their env-resolved knobs.
 type DeploymentSpec struct {
-	// CS is the direct (uncached) clientset — module reads go through
-	// it, not the manager cache.
+	// CS is the direct (uncached) clientset — destructive paths
+	// (the drift-confirm re-Get and the Patch) go through it.
 	CS kubernetes.Interface
+	// Reader is the optional informer-cache reader (mgr.GetClient()
+	// at module Setup) for the initial drift-detection Get — the
+	// reconcile rides the Deployment watch the module already
+	// registers instead of an apiserver GET per event. nil (tests,
+	// StubManager) falls back to a direct CS Get. The destructive
+	// patch still confirms on CS: when Reader is set and drift was
+	// detected on the cached object, the skeleton re-Gets on CS and
+	// re-evaluates Drifted before patching — a stale cache must not
+	// fire a patch the live object no longer needs.
+	Reader kube.CachedObjectReader
 	// NodeReader is the optional informer-backed node census for the
 	// replica pin (mgr.GetClient() at module Setup); nil falls back
 	// to a direct ListNodes — the zero value keeps tests on the
@@ -79,8 +90,7 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	res := ctrl.Result{RequeueAfter: RequeueInterval}
 	ref := s.Namespace + "/" + s.Name
 
-	d, err := s.CS.AppsV1().Deployments(s.Namespace).
-		Get(ctx, s.Name, metav1.GetOptions{})
+	d, err := kube.GetDeploymentCached(ctx, s.Reader, s.CS, s.Namespace, s.Name)
 	if apierrors.IsNotFound(err) {
 		// cluster without this k0s addon
 		log.Info("SKIP: deployment not found", "deployment", ref)
@@ -101,6 +111,28 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	if !s.Drifted(d, wantReplicas) {
 		log.Info(s.NoDriftLog, "deployment", ref, "wantReplicas", wantReplicas)
 		return res, nil
+	}
+	// The drift verdict came off the informer cache when Reader is
+	// wired — milliseconds stale is fine for detection, not for a
+	// patch: confirm on the direct clientset (the k0s stack applier
+	// may have re-applied the pinned spec between the watch event and
+	// this reconcile). A confirmed-fresh object skips; a confirmed
+	// drift patches against the live spec.
+	if s.Reader != nil {
+		d, err = s.CS.AppsV1().Deployments(s.Namespace).
+			Get(ctx, s.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			log.Info("SKIP: deployment gone between cache read and confirm", "deployment", ref)
+			return res, nil
+		}
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("confirm deployment %s on direct client: %w", ref, err)
+		}
+		if !s.Drifted(d, wantReplicas) {
+			log.Info(s.NoDriftLog+" (confirmed on direct client)",
+				"deployment", ref, "wantReplicas", wantReplicas)
+			return res, nil
+		}
 	}
 	// A missing container reads as drift, but the strategic-merge
 	// patch merges containers BY NAME — applied to a spec without it,

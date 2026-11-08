@@ -240,10 +240,13 @@ func ephemeralLocalPV(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) bool {
 //	   gets swept by the node-host-agent. Database volumes are
 //	   NEVER touched — alerting only.
 //	b) STALLED — a Pending pod waits on a Pending openebs-hostpath
-//	   PVC while Ready+schedulable workers exist: the localpv
-//	   provisioner wedged. pvc_provisioning_stalled=1 fires and —
-//	   outside maintenance, past the 1h cooldown — the provisioner
-//	   pod is deleted to force a resync.
+//	   PVC the provisioner already selected a node for
+//	   (volume.kubernetes.io/selected-node) while Ready+schedulable
+//	   workers exist: the localpv provisioner wedged mid-provision.
+//	   A claim without the annotation was never selected — no
+//	   pvc_provisioning_stalled signal. =1 fires and — outside
+//	   maintenance, past the 1h cooldown — the provisioner pod is
+//	   deleted to force a resync.
 func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -342,17 +345,12 @@ func (p *localPVStrandedCheck) collectLocalPVSnapshot(ctx context.Context) (*loc
 		return nil, fmt.Errorf("list persistentvolumes: %w", err)
 	}
 	snap.pvcsByKey = map[string]*corev1.PersistentVolumeClaim{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.PersistentVolumeClaims(p.CS, metav1.NamespaceAll),
-		func(items []corev1.PersistentVolumeClaim) error {
-			for i := range items {
-				snap.pvcsByKey[items[i].Namespace+"/"+items[i].Name] = &items[i]
-			}
-			return nil
-		})
+	pvcs, err := p.AllPVCs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
+	}
+	for i := range pvcs {
+		snap.pvcsByKey[pvcs[i].Namespace+"/"+pvcs[i].Name] = &pvcs[i]
 	}
 
 	// Pending pods only — the old status.phase=Pending FieldSelector,
@@ -437,11 +435,17 @@ func scanStrandedPods(snap *localPVSnapshot, now time.Time,
 				}
 			}
 			// Branch B — claim still Pending on the hostpath
-			// provisioner while schedulable workers exist.
+			// provisioner while schedulable workers exist AND the
+			// provisioner already picked a node for it
+			// (volume.kubernetes.io/selected-node): the annotation
+			// is the provisioner's own scheduling decision, so a
+			// claim past the window WITHOUT it was never selected —
+			// a fresh or queued claim, not wedge evidence.
 			if pvc.Status.Phase == corev1.ClaimPending &&
 				snap.hasSchedulableWorker &&
 				pvc.Spec.StorageClassName != nil &&
 				*pvc.Spec.StorageClassName == openebsHostpathSC &&
+				pvc.Annotations[kube.AnnoVolumeSelectedNode] != "" &&
 				age >= pvcStalledMinAge {
 				key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
 				stalledRep.Flag(pvcProvisioningStalledGauge, key,

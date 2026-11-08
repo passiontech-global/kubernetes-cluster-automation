@@ -78,6 +78,7 @@ var (
 type corednsPatcher struct {
 	cs              kubernetes.Interface
 	nodeReader      kube.CachedNodeReader
+	reader          kube.CachedObjectReader
 	zoneWhen        string
 	minDomains      int
 	minReplicas     int
@@ -137,6 +138,9 @@ func Setup(d shared.Deps) error {
 		}.WatchNodes(b, "coredns-patcher-sweep")
 		r := &corednsPatcher{cs: d.CS, nodeReader: d.Mgr.GetClient(), zoneWhen: cfg.zoneWhen,
 			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
+		if d.Mgr != nil {
+			r.reader = d.Mgr.GetClient()
+		}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
 		// never IncErrors an error it returns.
@@ -176,6 +180,7 @@ func configFromEnv() corednsPatcherConfig {
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	res, err := pinnedworkload.DeploymentSpec{
 		CS:         r.cs,
+		Reader:     r.reader,
 		NodeReader: r.nodeReader,
 		Namespace:  "kube-system",
 		Name:       "coredns",
@@ -403,6 +408,13 @@ func (r *corednsPatcher) reconcileCorefile(ctx context.Context) error {
 // only directive the rewrite touches, brace depth tracks the block
 // it opens, and comment lines (#…) can never satisfy or break the
 // denial check.
+//
+// Comments are stripped BEFORE any brace counting or slicing: a `#`
+// inside a Corefile line comments out the rest of the line, so a
+// brace (or a whole directive) inside a comment must never open,
+// close, or depth-count a block — `cache 30 { # ops note }` opens a
+// MULTI-line block (the `}` lives in the comment), and `# }` in a
+// block body must not close it.
 func corefileDenialCap(corefile string) (string, bool) {
 	lines := strings.Split(corefile, "\n")
 	changed := false
@@ -413,38 +425,55 @@ func corefileDenialCap(corefile string) (string, bool) {
 			continue
 		}
 		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
-		open := strings.Index(trimmed, "{")
+		// Code-only view of the line: everything up to the first `#`.
+		// A prefix of the original line, so indices into it index the
+		// original too.
+		code := strings.TrimSpace(stripCorefileComment(trimmed))
+		open := strings.Index(code, "{")
 		switch {
 		case open < 0:
 			// Bare form: `cache 30 [zones...]` → replace with the
 			// braced success+denial block, keeping the args and the
-			// line's own indentation.
-			lines[i] = indent + trimmed + " {\n" +
+			// line's own indentation. A trailing comment is carried
+			// INSIDE the braces — appended after the `{` it would be
+			// commented out of the Corefile entirely.
+			comment := ""
+			if hash := strings.Index(lines[i], "#"); hash >= 0 {
+				if c := strings.TrimSpace(lines[i][hash:]); c != "" {
+					comment = " " + c
+				}
+			}
+			lines[i] = indent + code + " {" + comment + "\n" +
 				indent + "    " + corefileSuccessLine + "\n" +
 				indent + "    " + corefileDenialDirective + "\n" +
 				indent + "}"
 			changed = true
-		case strings.LastIndex(trimmed, "}") > open:
+		case strings.LastIndex(code, "}") > open:
 			// Inline single-line block `cache 30 { denial 9984 5 }`:
 			// a denial inside already satisfies; without one, inject
-			// before the closing brace.
-			inner := trimmed[open+1 : strings.LastIndex(trimmed, "}")]
+			// before the closing brace. `code` is a prefix of
+			// `lines[i]` minus the indent, so code indices shift by
+			// len(indent) onto the original line — and a `}` inside a
+			// trailing comment is never the injection point.
+			inner := code[open+1 : strings.LastIndex(code, "}")]
 			if !corefileBlockHasDenial(inner) {
-				last := strings.LastIndex(lines[i], "}")
-				lines[i] = lines[i][:last] + " " + corefileDenialDirective + " }"
+				last := len(indent) + strings.LastIndex(code, "}")
+				lines[i] = lines[i][:last] + " " + corefileDenialDirective + " }" +
+					lines[i][last+len("}"):]
 				changed = true
 			}
 		default:
 			// Braced multi-line block: find the matching close and
-			// inject denial before it when absent.
-			depth := strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+			// inject denial before it when absent. Depth counts
+			// comment-stripped braces only — `# }` never closes, and a
+			// `{` or `}` inside a trailing comment never nests.
+			depth := strings.Count(code, "{") - strings.Count(code, "}")
 			hasDenial := false
 			closeIdx := -1
 			for j := i + 1; j < len(lines) && depth > 0; j++ {
-				t := strings.TrimSpace(lines[j])
+				t := strings.TrimSpace(stripCorefileComment(lines[j]))
 				depth += strings.Count(t, "{") - strings.Count(t, "}")
-				if t != "" && !strings.HasPrefix(t, "#") &&
-					strings.Fields(t)[0] == "denial" {
+				if t != "" && strings.Fields(t)[0] == "denial" {
 					hasDenial = true
 				}
 				if depth == 0 {
@@ -465,6 +494,16 @@ func corefileDenialCap(corefile string) (string, bool) {
 		return corefile, false
 	}
 	return strings.Join(lines, "\n"), true
+}
+
+// stripCorefileComment cuts a Corefile line at its first `#` —
+// everything from there on is a comment (coredns has no escape for a
+// literal # in directive syntax, so the cut is unconditional).
+func stripCorefileComment(line string) string {
+	if i := strings.Index(line, "#"); i >= 0 {
+		return line[:i]
+	}
+	return line
 }
 
 // corefileBlockHasDenial reports whether an inline cache block body

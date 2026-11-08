@@ -221,7 +221,16 @@ var LatchDefs = []LatchDef{
 	{Name: LatchKubeletPLEGUnhealthy, Owner: "workerhygiene"},
 	{Name: LatchDiskSlowIO, Owner: "workerhygiene"},
 	{Name: LatchKernelNetShim, Owner: "workerhygiene"},
-	{Name: LatchJournalUnreadable, Owner: "workerhygiene+controllerhygiene"},
+	// workerhygiene + controllerhygiene drive the SAME blindness
+	// episode through Store.EnterFrom/ExitFrom: each failing journal
+	// read registers its subsystem's hold, so one hygiene's healthy
+	// read can never delete the latch the other is still failing
+	// under. The ids must byte-match the owner consts the two wiring
+	// files pass (journalwatch.OwnerWorkerHygiene /
+	// journalwatch.OwnerControllerHygiene) — pinned by a journalwatch
+	// test.
+	{Name: LatchJournalUnreadable, Owner: "workerhygiene+controllerhygiene",
+		Owners: []string{"workerhygiene", "controllerhygiene"}},
 	{Name: LatchCiliumIPAMPrefix, Owner: "workerhygiene", Prefix: true},
 
 	// nethealth

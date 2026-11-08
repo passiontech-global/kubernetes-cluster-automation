@@ -39,7 +39,7 @@ import (
 // hit EBUSY and leak the mountpoint into the mountinfo table.
 func TestCtrTasksUmountsRootfsBeforeRemove(t *testing.T) {
 	e := fixture(t)
-	dir := filepath.Join(e.CtrDir, "rootfsy"+strings.Repeat("f", 57))
+	dir := filepath.Join(e.CtrDir, "ef0ce17"+strings.Repeat("f", 57))
 	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "77777")
 	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
 	wdepstest.WriteFile(t, filepath.Join(dir, "log.json"), "{}\n")
@@ -65,7 +65,7 @@ func TestCtrTasksUmountsRootfsBeforeRemove(t *testing.T) {
 
 	// A task dir WITHOUT a rootfs subtree (already unmounted) must
 	// not fire a umount.
-	dir2 := filepath.Join(e.CtrDir, "norsidf"+strings.Repeat("0", 57))
+	dir2 := filepath.Join(e.CtrDir, "deadc0d"+strings.Repeat("0", 57))
 	wdepstest.WriteFile(t, filepath.Join(dir2, "init.pid"), "77778")
 	wdepstest.WriteFile(t, filepath.Join(dir2, "config.json"), `{"annotations":{}}`)
 	wdepstest.WriteFile(t, filepath.Join(dir2, "log.json"), "{}\n")
@@ -142,7 +142,7 @@ func TestCtrTasksLiveAndSandboxSkipped(t *testing.T) {
 
 func TestCtrTasksMissingLogJSONKillsInit(t *testing.T) {
 	e := fixture(t)
-	dir := filepath.Join(e.CtrDir, "nologger"+strings.Repeat("d", 57))
+	dir := filepath.Join(e.CtrDir, "0fa11ce"+strings.Repeat("d", 57))
 	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "9102")
 	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
 	// No log.json + LIVE init on a container task → dead wedge.
@@ -315,9 +315,10 @@ func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.Ctr.MaxTaskClean = 2
 	// 4 confirmed-wedged dirs (dead init: no init.pid at all), each
-	// with a marker already past the 5m confirm window.
-	for i := 0; i < 4; i++ {
-		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+	// with a marker already past the 5m confirm window. Hex64 ids —
+	// the wedge scan gates on CRI id shape before pid-scanning.
+	for i := range 4 {
+		id := fmt.Sprintf("%02x%s", i, strings.Repeat("d", 62))
 		if err := os.MkdirAll(filepath.Join(e.CtrDir, id), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -326,8 +327,8 @@ func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 	}
 	e.H.Cycle(context.Background())
 	// First two (ReadDir order) cleaned, markers consumed.
-	for i := 0; i < 2; i++ {
-		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+	for i := range 2 {
+		id := fmt.Sprintf("%02x%s", i, strings.Repeat("d", 62))
 		if _, err := os.Stat(filepath.Join(e.CtrDir, id)); !os.IsNotExist(err) {
 			t.Fatalf("in-cap wedged dir %s not removed", id)
 		}
@@ -335,7 +336,7 @@ func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 	// The capped two keep BOTH dir and marker — confirmed state
 	// survives so next cycle cleans them without a new 5m wait.
 	for i := 2; i < 4; i++ {
-		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+		id := fmt.Sprintf("%02x%s", i, strings.Repeat("d", 62))
 		if _, err := os.Stat(filepath.Join(e.StateDir, "wedged-seen-"+id)); err != nil {
 			t.Fatalf("over-cap marker %s dropped — dir would re-confirm forever", id)
 		}
@@ -1006,5 +1007,27 @@ func TestCtrTasksSandboxWithShimOrTaskKept(t *testing.T) {
 	}
 	if _, err := os.Stat(taskDir); err != nil {
 		t.Fatal("sandbox dir with a live task dir removed")
+	}
+}
+
+// A non-hex64 dir name is not a CRI task id: the wedge scan must
+// neither create a confirm marker for it nor pid-scan/SIGKILL on its
+// name (the cleanup is pkill -f shaped — a dir named "kubelet" would
+// otherwise spear the kubelet).
+func TestCtrTasksNonHexIDNeverScanned(t *testing.T) {
+	e := fixture(t)
+	dir := filepath.Join(e.CtrDir, "kubelet")
+	wdepstest.WriteFile(t, filepath.Join(dir, "garbage"), "")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "wedged-seen-kubelet"),
+		fmt.Sprintf("%d\n", e.Now.Add(-10*time.Minute).Unix()))
+	e.H.Cycle(context.Background())
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("non-hex dir removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "wedged-seen-kubelet")); err != nil {
+		t.Fatal("marker for non-hex id consumed")
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("SIGKILL fired for the non-hex id: %+v", e.Kills)
 	}
 }

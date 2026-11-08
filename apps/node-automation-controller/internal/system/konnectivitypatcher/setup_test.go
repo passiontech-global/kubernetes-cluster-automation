@@ -28,6 +28,22 @@ func TestSetupRegistersController(t *testing.T) {
 	}
 }
 
+// Setup must register nothing when Deps.Disabled is set — routed
+// through shared.SetupNoConfig so the gate is structural, not
+// comment-enforced (the module has no GateEnv row today; the test
+// pins the gate the helper enforces for the day one lands).
+func TestSetupKonnectivityPatcherDisabled(t *testing.T) {
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{Name: "konnectivity-patcher", Mgr: m,
+		CS: fake.NewSimpleClientset(), Dyn: testutil.StubDyn(),
+		Disabled: true}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if len(m.Added) != 0 {
+		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
+	}
+}
+
 // The konnectivity-patcher predicate pins ns/name on top of the
 // field-selected informer — belt-and-suspenders against cache misses.
 // onlyKonnectivityDaemonSet is the exact predicate the For() watch

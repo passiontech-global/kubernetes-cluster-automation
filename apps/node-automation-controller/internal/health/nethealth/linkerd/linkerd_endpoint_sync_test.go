@@ -65,22 +65,8 @@ func TestCheckLinkerdEndpointSyncSkipsUninjected(t *testing.T) {
 // pod is bounced.
 func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	base := time.Now()
-	older := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         kube.LinkerdNS,
-			Name:              kube.LinkerdDestinationName + "-old-111",
-			UID:               types.UID("u-old"),
-			CreationTimestamp: metav1.NewTime(base.Add(-2 * time.Hour)),
-		},
-	}
-	newer := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         kube.LinkerdNS,
-			Name:              kube.LinkerdDestinationName + "-new-222",
-			UID:               types.UID("u-new"),
-			CreationTimestamp: metav1.NewTime(base.Add(-time.Hour)),
-		},
-	}
+	older := linkerdDestinationPod(kube.LinkerdDestinationName+"-old-111", 2*time.Hour)
+	newer := linkerdDestinationPod(kube.LinkerdDestinationName+"-new-222", time.Hour)
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("app"),
 		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
@@ -171,6 +157,35 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 	}
 }
 
+// A single linkerd-destination replica is never bounced — the
+// Ready-sibling gate refuses the delete (bouncing the last replica
+// blackholes the endpoint table it is supposed to rebuild).
+func TestLinkerdEndpointSyncBounceRefusedWithoutSibling(t *testing.T) {
+	base := time.Now()
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-lone-111", 2*time.Hour)
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		probetest.HeadlessService("app", "lone-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.EndpointSliceForService("app", "lone-svc", "10.244.0.9"),
+		dest,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	p.Now = func() time.Time { return base.Add(5 * time.Minute) }
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted desync must still fail past the window")
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, dest.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("lone linkerd-destination pod bounced without a Ready sibling")
+	}
+}
+
 // Restart-resume: a Service carrying a persisted first-seen stamp
 // older than the desync window trips it on the FIRST sweep — the
 // in-RAM ledger is empty (operator restarted) but the annotation
@@ -192,6 +207,9 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 		// EndpointSlice holds a stale IP — the Ready pod IP is missing.
 		probetest.EndpointSliceForService("app", "resume-svc", "10.244.0.9"),
 		dest,
+		// Ready sibling — the bounce gate requires one surviving
+		// Ready replica under the destination's controller.
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
@@ -308,13 +326,14 @@ func TestCheckLinkerdEndpointSyncConvergeResetsLadder(t *testing.T) {
 	base := time.Now()
 	destA := linkerdDestinationPod(kube.LinkerdDestinationName+"-a-111", 2*time.Hour)
 	destB := linkerdDestinationPod(kube.LinkerdDestinationName+"-b-222", time.Hour)
+	destC := linkerdDestinationPod(kube.LinkerdDestinationName+"-c-333", 30*time.Minute)
 	stale := probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9")
 	cs := fake.NewSimpleClientset(
 		linkerdInjectedNamespace("app"),
 		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
 		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
 			map[string]string{"app": "x"}),
-		stale, destA, destB,
+		stale, destA, destB, destC,
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	run := func(at time.Time) probefw.Result {
@@ -383,6 +402,7 @@ func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
 			map[string]string{"app": "x"}),
 		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"), // stale
 		destA,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-a-222", time.Hour), // Ready sibling for the bounce gate
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
@@ -421,6 +441,7 @@ func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
 			map[string]string{"app": "x"}),
 		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"), // stale
 		destB,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-b-333", 30*time.Minute), // Ready sibling for the bounce gate
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p2 := testProberDyn(cs2, probetest.OpDyn())
 	p2.Now = func() time.Time { return at.Add(30 * time.Minute) }
@@ -511,6 +532,7 @@ func TestLinkerdEndpointSyncDeletesSliceMissingReadyIP(t *testing.T) {
 		readyPodIPSince("desyncapp", "pod-0", "10.244.0.5",
 			map[string]string{"desyncapp": "x"}, base.Add(-10*time.Minute)),
 		slice, dest,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := driveEndpointDesync(t, p, base); res.Pass {
@@ -540,6 +562,7 @@ func TestLinkerdEndpointSyncDeletesSliceWithDeadIP(t *testing.T) {
 		readyPodIPSince("desyncapp", "pod-0", "10.244.0.5",
 			map[string]string{"desyncapp": "x"}, base.Add(-10*time.Minute)),
 		slice, dest,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := driveEndpointDesync(t, p, base); res.Pass {
@@ -596,6 +619,7 @@ func TestLinkerdEndpointSyncKeepsSliceInsideReadyFuse(t *testing.T) {
 		readyPodIPSince("desyncapp", "pod-new", "10.244.0.6",
 			map[string]string{"desyncapp": "x"}, base.Add(9*time.Minute)),
 		slice, dest,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := driveEndpointDesync(t, p, base); res.Pass {
@@ -624,6 +648,7 @@ func TestLinkerdEndpointSyncKeepsNonManagedSlice(t *testing.T) {
 		readyPodIPSince("desyncapp", "pod-0", "10.244.0.5",
 			map[string]string{"desyncapp": "x"}, base.Add(-10*time.Minute)),
 		slice, dest,
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := driveEndpointDesync(t, p, base); res.Pass {
@@ -778,15 +803,33 @@ func managedEndpointSlice(ns, svc string, addrs ...string) *discoveryv1.Endpoint
 	return s
 }
 
-// linkerdDestinationPod builds a linkerd-destination pod — the bounce target
-// the heal picks (oldest match wins; one per test suffices).
+// linkerdDestinationPod builds a Running+Ready linkerd-destination
+// pod under one shared controller owner (UID "dest-ctrl") — the
+// bounce target the heal picks (oldest match wins), and the shape the
+// Ready-sibling bounce gate reads: any two of these pods are
+// each other's Ready siblings.
 func linkerdDestinationPod(name string, age time.Duration) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace:         kube.LinkerdNS,
-		Name:              name,
-		UID:               types.UID("uid-" + name),
-		CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
-	}}
+	ctrl := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         kube.LinkerdNS,
+			Name:              name,
+			UID:               types.UID("uid-" + name),
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "linkerd-destination-rs", UID: "dest-ctrl",
+				Controller: &ctrl,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
 }
 
 // driveEndpointDesync runs the check at base, inside the window, and

@@ -20,6 +20,29 @@ func suspectBudgetPath(s *Store, key string) string {
 	return filepath.Join(s.Dir, SuspectBudgetPrefix+key)
 }
 
+// TestExitClearSuspectGatedOnExit: the budget only goes when Exit
+// actually removed the latch — a no-op exit (nothing on disk) must
+// leave the throttle untouched. (Multi-owner latches never ride this
+// wrapper: the journal wiring releases through Store.ExitFrom with a
+// cleanup hook, whose owner-gated exit is pinned in hoststate_test.)
+func TestExitClearSuspectGatedOnExit(t *testing.T) {
+	s, _, _ := newTestStore(t)
+
+	// No latch on disk → Exit false → the budget survives.
+	s.SuspectLog("blind", "still blind", time.Hour)
+	s.ExitClearSuspect("blind")
+	if _, err := os.Stat(suspectBudgetPath(s, "blind")); err != nil {
+		t.Fatalf("no-op exit must not clear the budget: %v", err)
+	}
+
+	// A real exit clears the budget with it.
+	s.Enter("blind", "")
+	s.ExitClearSuspect("blind")
+	if _, err := os.Stat(suspectBudgetPath(s, "blind")); !os.IsNotExist(err) {
+		t.Fatalf("true exit must clear the budget: %v", err)
+	}
+}
+
 // TestExitClearSuspect: the wrapper is Exit plus removal of THIS
 // latch's dedupe budget — a cleared condition must not suppress the
 // first line of a re-incident under a stale epoch.

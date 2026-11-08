@@ -39,6 +39,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -49,6 +50,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 const (
@@ -94,14 +96,36 @@ var partitionNodePinnedStorageClasses = map[string]bool{
 // the Nebula mesh is pod-unreachable from other sites in exactly the
 // way this evictor exists for — and NebulaPMTUBlackhole, the
 // node-host-agent's PMTU-blackhole latch (overlay path up but large
-// packets dropped — same unreachable-from-peers shape).
-var partitionCondTypes = []corev1.NodeConditionType{
-	"HostNetworkProblems",
-	"ClusterNetworkProblems",
-	"HostNetworkProblem",
-	"ClusterNetworkProblem",
-	"NebulaIsolated",
-	"NebulaPMTUBlackhole",
+// packets dropped — same unreachable-from-peers shape). The names
+// come from nodecond.PartitionNames, the source of truth shared with
+// the node-host-agent so the two apps cannot drift.
+var partitionCondTypes = condTypes(nodecond.PartitionNames)
+
+// condTypes converts a nodecond name list into the
+// corev1.NodeConditionType slice the detection loop compares —
+// nodecond keeps the names as untyped strings so libs/hostkit stays
+// stdlib-only.
+func condTypes(names []string) []corev1.NodeConditionType {
+	out := make([]corev1.NodeConditionType, len(names))
+	for i, name := range names {
+		out[i] = corev1.NodeConditionType(name)
+	}
+	return out
+}
+
+// partitionCondHeartbeatMaxAge is how old an agent-emitted partition
+// latch's lastHeartbeatTime may be before its True stops flagging the
+// node — the reporter re-stamps it every ~2m while alive, so a frozen
+// or absent stamp means the value is a zombie left by a dead agent
+// (same 10m convention as nodehealth's precordon gate).
+const partitionCondHeartbeatMaxAge = 10 * time.Minute
+
+// condHeartbeatLive reports whether a condition's lastHeartbeatTime
+// is fresh enough to trust the value — mirror of nodehealth's
+// condHeartbeatLive.
+func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
+	return !c.LastHeartbeatTime.IsZero() &&
+		now.Sub(c.LastHeartbeatTime.Time) < partitionCondHeartbeatMaxAge
 }
 
 type partitionEvictor struct {
@@ -178,15 +202,25 @@ func (e *partitionEvictor) evictNamespaces() map[string]struct{} {
 // nodePartitioned reports whether any NWPD network condition has been
 // True for longer than partitionMinAge measured against `now`. A
 // missing/empty timestamp (bash's `[ -n "$ts" ]` guard) does NOT flag
-// the node.
+// the node. The agent-emitted overlay latches (NebulaIsolated,
+// NebulaPMTUBlackhole — nodecond.AgentHeartbeatManaged) additionally
+// need a live lastHeartbeatTime: a frozen stamp means the wedged
+// nodereporter can no longer vouch for the True, and evicting live
+// pods on a zombie partition is exactly the churn this evictor exists
+// to avoid. The NWPD monitor spellings are not agent-managed and keep
+// the age-only gate.
 func nodePartitioned(n *corev1.Node, now time.Time) bool {
 	for _, t := range partitionCondTypes {
 		c := kube.NodeCondition(n, t)
-		if c != nil && c.Status == corev1.ConditionTrue &&
-			!c.LastTransitionTime.IsZero() &&
-			now.Sub(c.LastTransitionTime.Time) > partitionMinAge {
-			return true
+		if c == nil || c.Status != corev1.ConditionTrue ||
+			c.LastTransitionTime.IsZero() ||
+			now.Sub(c.LastTransitionTime.Time) <= partitionMinAge {
+			continue
 		}
+		if nodecond.AgentHeartbeatManaged(string(t)) && !condHeartbeatLive(c, now) {
+			continue // zombie latch — the reporter cannot vouch for it
+		}
+		return true
 	}
 	return false
 }
@@ -266,20 +300,23 @@ func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struc
 	return out, nil
 }
 
-// podOnNodePinnedPVC reports whether any of the pod's volumes mounts
-// a PVC in the pinned set — such a pod is bound to its current node
-// by the volume's node affinity and cannot be usefully evicted.
+// podOnNodePinnedPVC reports whether any of the pod's volumes pins it
+// to its current node — a PVC whose storage class is node-pinned (see
+// partitionNodePinnedStorageClasses; the volume's node affinity means
+// the pod can only ever run on the node holding the data), a generic
+// ephemeral volume (its PVC is provisioned on the node running the
+// pod and dies with it), or a hostPath volume (the path only exists
+// on this node). Such a pod is bound to its node and cannot be
+// usefully evicted.
 func podOnNodePinnedPVC(p *corev1.Pod, pinned map[string]struct{}) bool {
-	if len(pinned) == 0 {
-		return false
-	}
 	for _, v := range p.Spec.Volumes {
-		pvc := v.PersistentVolumeClaim
-		if pvc == nil {
-			continue
-		}
-		if _, ok := pinned[p.Namespace+"/"+pvc.ClaimName]; ok {
+		if v.Ephemeral != nil || v.HostPath != nil {
 			return true
+		}
+		if pvc := v.PersistentVolumeClaim; pvc != nil {
+			if _, ok := pinned[p.Namespace+"/"+pvc.ClaimName]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -482,9 +519,11 @@ loop:
 				"pod", p.Namespace+"/"+p.Name, "node", name)
 			// UID precondition: the listed pod could be replaced by a
 			// same-named fresh pod before the delete lands — never
-			// kill the replacement.
+			// kill the replacement. NotFound is already the goal
+			// state (another actor finished the eviction first) —
+			// tolerated, no error accounting.
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-				kube.UIDDeleteOptions(p.UID, "")); err != nil {
+				kube.UIDDeleteOptions(p.UID, "")); err != nil && !apierrors.IsNotFound(err) {
 				metrics.IncError(e.queue)
 				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)

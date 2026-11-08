@@ -65,15 +65,19 @@ type failedJobsJanitor struct {
 // Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
 // carries the dynamic client the W9-GO2/W12-GO2 completed-run TTL
 // sweep and the CRD half of the workspace-PVC reaper need — pass nil
-// only in tests that never exercise them.
+// only in tests that never exercise them. The gate rides
+// shared.SetupNoConfig like every module: Deps.Disabled registers
+// nothing (no knobs to parse — SetupNoConfig is the module's shape).
 func Setup(d shared.Deps) error {
-	j := &failedJobsJanitor{
-		cs:    d.CS,
-		dyn:   d.Dyn,
-		queue: d.Name,
-		now:   shared.SystemClock,
-	}
-	return shared.AddPeriodic(d.Mgr, j.queue, 60*time.Minute, j.run)
+	return shared.SetupNoConfig(d, func() error {
+		j := &failedJobsJanitor{
+			cs:    d.CS,
+			dyn:   d.Dyn,
+			queue: d.Name,
+			now:   shared.SystemClock,
+		}
+		return shared.AddPeriodic(d.Mgr, j.queue, 60*time.Minute, j.run)
+	})
 }
 
 func (j *failedJobsJanitor) run(ctx context.Context) error {

@@ -83,11 +83,15 @@ func DecodeYAML(data []byte) (any, error) {
 	if err := dec.Decode(&node); err != nil {
 		return nil, err
 	}
+	// One shared step budget for the whole decode — alias
+	// re-expansion (billion laughs) multiplies node visits without
+	// adding depth, so only a total counter catches it.
+	steps := 0
 	for {
 		var extra yaml3.Node
 		switch err := dec.Decode(&extra); err {
 		case nil:
-			v, verr := yamlNodeToValue(&extra)
+			v, verr := yamlNodeToValue(&extra, &steps)
 			if verr != nil {
 				return nil, verr
 			}
@@ -96,7 +100,7 @@ func DecodeYAML(data []byte) (any, error) {
 			}
 			// nil-decoding doc (bare `---`) — keep scanning.
 		case io.EOF:
-			return yamlNodeToValue(&node)
+			return yamlNodeToValue(&node, &steps)
 		default:
 			return nil, err
 		}
@@ -108,27 +112,35 @@ func DecodeYAML(data []byte) (any, error) {
 // otherwise recurse until the stack burst.
 const yamlMaxDepth = 100
 
-func yamlNodeToValue(n *yaml3.Node) (any, error) { return yamlNodeAt(n, 0) }
+func yamlNodeToValue(n *yaml3.Node, steps *int) (any, error) {
+	return yamlNodeAt(n, 0, steps)
+}
 
-func yamlNodeAt(n *yaml3.Node, depth int) (any, error) {
+func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	if n == nil {
 		return nil, nil
 	}
 	if depth > yamlMaxDepth {
 		return nil, fmt.Errorf("yaml: nesting exceeds %d levels (anchor cycle?)", yamlMaxDepth)
 	}
+	if stepBudgetExhausted(steps) {
+		// Depth alone can't catch billion-laughs: every alias
+		// re-walks its target, multiplying visits per level while
+		// staying shallow. The shared counter errors the decode.
+		return nil, fmt.Errorf("yaml: decode exceeds %d node steps (billion-laughs alias expansion?)", walkMaxSteps)
+	}
 	if n.Kind == yaml3.DocumentNode {
 		if len(n.Content) == 0 {
 			return nil, nil
 		}
-		return yamlNodeAt(n.Content[0], depth+1)
+		return yamlNodeAt(n.Content[0], depth+1, steps)
 	}
 	switch n.Kind {
 	case yaml3.MappingNode:
 		m := NewOMap()
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			kn, vn := n.Content[i], n.Content[i+1]
-			v, err := yamlNodeAt(vn, depth+1)
+			v, err := yamlNodeAt(vn, depth+1, steps)
 			if err != nil {
 				return nil, err
 			}
@@ -138,7 +150,7 @@ func yamlNodeAt(n *yaml3.Node, depth int) (any, error) {
 	case yaml3.SequenceNode:
 		out := make([]any, 0, len(n.Content))
 		for _, c := range n.Content {
-			v, err := yamlNodeAt(c, depth+1)
+			v, err := yamlNodeAt(c, depth+1, steps)
 			if err != nil {
 				return nil, err
 			}
@@ -168,7 +180,7 @@ func yamlNodeAt(n *yaml3.Node, depth int) (any, error) {
 			return n.Value, nil
 		}
 	case yaml3.AliasNode:
-		return yamlNodeAt(n.Alias, depth+1)
+		return yamlNodeAt(n.Alias, depth+1, steps)
 	default:
 		return nil, fmt.Errorf("unsupported yaml node kind %v", n.Kind)
 	}

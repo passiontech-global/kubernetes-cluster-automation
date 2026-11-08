@@ -87,6 +87,14 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// sweep — lazily on the first death check — and shared by every
 	// suspect node (previously one List pair PER node).
 	remCache := &remediationCache{}
+	// The VolumeAttachment census is likewise fetched once per sweep
+	// and shared by the stateful-holder check and the fence's
+	// forensics log (previously two full cluster lists per fence).
+	vaCache := &volumeAttachmentCache{}
+	// One canary for the whole sweep: the Ready=True node that
+	// transport-level probe verdicts must be certified against ("" —
+	// every node Unknown — itself smells like a global proxy outage).
+	canary := healthyCanaryName(nodes)
 	tainted := 0
 	for _, nodeName := range names {
 		count := stuck[nodeName]
@@ -115,7 +123,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			continue
 		}
 
-		dead, viaSNR, reason, err := s.confirmedDead(ctx, n, remCache, nodeNames)
+		dead, viaSNR, reason, err := s.confirmedDead(ctx, n, remCache, nodeNames, canary)
 		if err != nil {
 			log.Error(err, "death check failed — node skipped (fail closed)",
 				"node", nodeName, "stuckPods", count)
@@ -138,7 +146,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		// otherwise.
 		hasVolumes := false
 		if !viaSNR {
-			holds, holdsErr := s.nodeHasStatefulHolders(ctx, nodeName)
+			holds, holdsErr := s.nodeHasStatefulHolders(ctx, nodeName, vaCache)
 			if holdsErr != nil {
 				log.Error(holdsErr, "stateful-holder check failed — node skipped (fail closed)",
 					"node", nodeName, "stuckPods", count)
@@ -155,7 +163,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			}
 		}
 
-		if err := s.fenceNode(ctx, nodeName, count, viaSNR, hasVolumes, reason); err != nil {
+		if err := s.fenceNode(ctx, nodeName, count, viaSNR, hasVolumes, reason, vaCache); err != nil {
 			continue // logged + IncError'd inside
 		}
 		tainted++

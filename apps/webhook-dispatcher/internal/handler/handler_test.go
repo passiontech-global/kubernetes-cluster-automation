@@ -736,6 +736,94 @@ func TestWaitDrainsInFlightFanout(t *testing.T) {
 	}
 }
 
+// gateBackend parks Resources on a channel so a test can hold the
+// handler inside the index fetch — the exact window where a Wait
+// racing wg.Add used to slip through.
+type gateBackend struct {
+	resources   []concourse.Resource
+	inResources chan struct{} // signalled when Resources is entered
+	release     chan struct{} // closed to let Resources return
+	status      int
+
+	mu     sync.Mutex
+	checks int
+}
+
+func (g *gateBackend) Resources(context.Context) ([]concourse.Resource, error) {
+	g.inResources <- struct{}{}
+	<-g.release
+	return g.resources, nil
+}
+
+func (g *gateBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+	return g.resources, nil
+}
+
+func (g *gateBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
+	g.mu.Lock()
+	g.checks++
+	g.mu.Unlock()
+	return g.status, nil
+}
+
+func (g *gateBackend) checkCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.checks
+}
+
+func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
+	// wg.Add must run BEFORE the index fetch: otherwise a Wait()
+	// entering while a delivery sits inside Resources sees an empty
+	// WaitGroup, returns immediately — and the fan-out started
+	// afterwards runs unwaited, so shutdown could exit the process
+	// while check POSTs are still in flight. The race window is
+	// exercised directly: Wait is started while the request is parked
+	// inside the fetch, every iteration, under -race.
+	for i := range 50 {
+		b := &gateBackend{
+			resources:   testIndex(),
+			inResources: make(chan struct{}, 1),
+			release:     make(chan struct{}),
+			status:      http.StatusCreated,
+		}
+		h := New(testSecret, b)
+		reqDone := make(chan struct{})
+		go func() {
+			defer close(reqDone)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+			if rec.Code != http.StatusAccepted {
+				t.Errorf("iteration %d: status=%d want 202", i, rec.Code)
+			}
+		}()
+		<-b.inResources // request parked inside the index fetch
+
+		waitDone := make(chan struct{})
+		go func() {
+			h.Wait()
+			close(waitDone)
+		}()
+		// The fan-out is already registered (Add ran before the
+		// fetch), so Wait must still be blocked here. Give a racy
+		// Wait every scheduling chance to (wrongly) observe an empty
+		// WaitGroup before releasing the fetch.
+		time.Sleep(2 * time.Millisecond)
+		select {
+		case <-waitDone:
+			t.Fatalf("iteration %d: Wait returned before the fan-out completed", i)
+		default:
+		}
+
+		close(b.release)
+		<-reqDone
+		<-waitDone // must finish once the fan-out lands
+		if got := b.checkCount(); got != 2 {
+			t.Fatalf("iteration %d: check calls=%d want 2", i, got)
+		}
+	}
+}
+
 // TestFanoutBudgetReleasesQueuedTargets: the semaphore must never be
 // a dead end. Every slot is held while a delivery fans out, so all
 // matched targets queue with no way in; the dispatch budget (shortened

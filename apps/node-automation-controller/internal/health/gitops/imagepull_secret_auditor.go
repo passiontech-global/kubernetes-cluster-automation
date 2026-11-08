@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -179,15 +178,7 @@ func (p *imagePullSecretAuditorCheck) collectPullSecretRefs(ctx context.Context)
 		add(sas[i].Namespace, sas[i].ImagePullSecrets)
 	}
 
-	deps, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		func(ctx context.Context, o metav1.ListOptions) ([]appsv1.Deployment, string, error) {
-			page, err := p.CS.AppsV1().Deployments(metav1.NamespaceAll).List(ctx, o)
-			if err != nil {
-				return nil, "", err
-			}
-			return page.Items, page.Continue, nil
-		})
+	deps, err := p.AllDeployments(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list deployments: %w", err)
 	}
@@ -195,9 +186,7 @@ func (p *imagePullSecretAuditorCheck) collectPullSecretRefs(ctx context.Context)
 		add(deps[i].Namespace, deps[i].Spec.Template.Spec.ImagePullSecrets)
 	}
 
-	stss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.StatefulSets(p.CS, metav1.NamespaceAll))
+	stss, err := p.AllStatefulSets(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list statefulsets: %w", err)
 	}
@@ -205,15 +194,7 @@ func (p *imagePullSecretAuditorCheck) collectPullSecretRefs(ctx context.Context)
 		add(stss[i].Namespace, stss[i].Spec.Template.Spec.ImagePullSecrets)
 	}
 
-	dss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		func(ctx context.Context, o metav1.ListOptions) ([]appsv1.DaemonSet, string, error) {
-			page, err := p.CS.AppsV1().DaemonSets(metav1.NamespaceAll).List(ctx, o)
-			if err != nil {
-				return nil, "", err
-			}
-			return page.Items, page.Continue, nil
-		})
+	dss, err := p.AllDaemonSets(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list daemonsets: %w", err)
 	}

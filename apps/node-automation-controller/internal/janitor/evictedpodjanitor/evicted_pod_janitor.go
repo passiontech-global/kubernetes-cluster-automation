@@ -67,10 +67,14 @@ type evictedPodJanitor struct {
 	now shared.Clock
 }
 
-// Setup registers the 10-minute sweep.
+// Setup registers the 10-minute sweep. The gate rides
+// shared.SetupNoConfig like every module: Deps.Disabled registers
+// nothing (no knobs to parse — SetupNoConfig is the module's shape).
 func Setup(d shared.Deps) error {
-	j := &evictedPodJanitor{cs: d.CS, queue: d.Name, now: shared.SystemClock}
-	return shared.AddPeriodic(d.Mgr, j.queue, 10*time.Minute, j.run)
+	return shared.SetupNoConfig(d, func() error {
+		j := &evictedPodJanitor{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+		return shared.AddPeriodic(d.Mgr, j.queue, 10*time.Minute, j.run)
+	})
 }
 
 func (j *evictedPodJanitor) run(ctx context.Context) error {

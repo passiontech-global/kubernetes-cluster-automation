@@ -136,3 +136,59 @@ func TestCheckMeshLinkerdPodListInfraCounted(t *testing.T) {
 		t.Fatalf("hook_run_errors delta = %v, want 1 — the skipped scan must count its list error", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W8 — one HealAllowed evaluation per heal attempt
+// ---------------------------------------------------------------------------
+
+// healComponentPod no longer pre-gates: the cooldown/maintenance
+// gate lives solely in healNamedPod, so one heal attempt (here the
+// cilium-operator IPAM shape) evaluates the gate exactly ONCE and
+// still deletes the wedged pod.
+func TestMeshHealComponentPodSingleGateEval(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: ciliumOperatorPrefix + "6f9d8-abcde",
+			UID:    types.UID("u-cilium-op"),
+			Labels: map[string]string{"io.cilium/app": "operator"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	chk.healComponentPod(ctx, logr.Discard(), "cilium-operator",
+		ciliumOperatorNS, ciliumOperatorPrefix, ciliumOpHealCooldown, time.Now())
+	if chk.gateEvals != 1 {
+		t.Fatalf("gate evaluations = %d, want exactly 1 per heal attempt", chk.gateEvals)
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("wedged cilium-operator pod not deleted")
+	}
+}
+
+// The cooldown is honored on the healComponentPod path too — the
+// single gate in healNamedPod refuses inside the cooldown window and
+// the target survives.
+func TestMeshHealComponentPodRespectsCooldown(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: ciliumOperatorPrefix + "6f9d8-abcde",
+			UID:    types.UID("u-cilium-op"),
+			Labels: map[string]string{"io.cilium/app": "operator"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	now := time.Now()
+	chk.Heals.Stamp("cilium-operator", now.Add(-time.Minute)) // inside the 1h cooldown
+	chk.healComponentPod(ctx, logr.Discard(), "cilium-operator",
+		ciliumOperatorNS, ciliumOperatorPrefix, ciliumOpHealCooldown, now)
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("pod deleted inside the heal cooldown — gate refused too late")
+	}
+}

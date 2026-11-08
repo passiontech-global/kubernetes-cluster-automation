@@ -48,6 +48,14 @@ type fluentBitRoller struct {
 	// DS rollout restart defers while a drain/k0s upgrade is in
 	// flight.
 	dyn dynamic.Interface
+	// secretReader is the informer-cache client for the drift-signal
+	// Get: the manager's Secret informer is field-scoped to exactly
+	// passiontech-pipeline (buildCacheOptions) and this module's
+	// Secret watch keeps it warm, so the reconcile reads its trigger
+	// object from the cache instead of an apiserver GET per event.
+	// nil (tests, StubManager) falls back to the direct CS read; the
+	// destructive restart still confirms the drift on CS either way.
+	secretReader kube.CachedObjectReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the controller name and every IncError label
 	// come from one place.
@@ -78,6 +86,9 @@ var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool 
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+		if d.Mgr != nil {
+			r.secretReader = d.Mgr.GetClient()
+		}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
@@ -91,7 +102,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// rolled-config-hash annotation even without a secret event.
 	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
 
-	sec, err := r.cs.CoreV1().Secrets("fluent-system").Get(ctx, "passiontech-pipeline", metav1.GetOptions{})
+	sec, err := kube.GetSecretCached(ctx, r.secretReader, r.cs, "fluent-system", "passiontech-pipeline")
 	if apierrors.IsNotFound(err) {
 		// Enabled cluster but no pipeline secret — bash's set -e made
 		// this an error+metric; surface it the same way.
@@ -103,18 +114,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("get secret fluent-system/passiontech-pipeline: %w", err)
 	}
-	hash := sec.Annotations[kube.AnnoFluentConfigHash]
-	if hash == "" {
-		// Older operators lack config-hash. resourceVersion is NOT a
-		// usable fallback here: the rolled-config-hash stamp below is
-		// itself a secret write, so it bumps the RV — the stamped RV
-		// never equals the RV we read, drift never clears, and the DS
-		// restarts on every ~30m requeue forever. Hash the secret
-		// DATA instead: stable across stamp/annotation writes, still
-		// moves when the generated config actually changes.
-		hash = secretDataHash(sec)
-	}
-	cur := sec.Annotations[kube.AnnoRolledConfigHash]
+	hash, cur := pipelineDrift(sec)
 	if hash == cur {
 		log.Info("config already rolled — nothing to do",
 			"secret", "fluent-system/passiontech-pipeline", "hash", hash)
@@ -122,6 +122,31 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	log.Info("config drift",
 		"secret", "fluent-system/passiontech-pipeline", "hash", hash, "rolled", cur)
+
+	// The drift verdict came off the informer cache when
+	// secretReader is wired — milliseconds stale is fine for
+	// detection, not for a live-workload restart: confirm on the
+	// direct clientset before the destructive path. The stamp is the
+	// second half of that write pair (the DS restart patch and the
+	// secret state patch), so a stale phantom drift must not roll the
+	// DaemonSet.
+	if r.secretReader != nil {
+		live, err := r.cs.CoreV1().Secrets("fluent-system").
+			Get(ctx, "passiontech-pipeline", metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			log.Info("WARN: pipeline secret gone between cache read and confirm — skipping roll")
+			return res, nil
+		}
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"confirm secret fluent-system/passiontech-pipeline on direct client: %w", err)
+		}
+		if liveHash, liveCur := pipelineDrift(live); liveHash == liveCur {
+			log.Info("config already rolled (confirmed on direct client) — nothing to do",
+				"secret", "fluent-system/passiontech-pipeline", "hash", liveHash)
+			return res, nil
+		}
+	}
 
 	// Storm gate: never restart the DS while nodes are down — adds
 	// churn; positionDB guarantees resume once stable.
@@ -135,6 +160,10 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		return res, nil
 	}
 
+	// The DaemonSet read stays on the direct clientset: the manager's
+	// DaemonSet informer is field-scoped to konnectivity-agent
+	// (buildCacheOptions), so a cache Get of fluent-system/fluent-bit
+	// would come back NotFound-from-cache.
 	ds, err := r.cs.AppsV1().DaemonSets("fluent-system").Get(ctx, "fluent-bit", metav1.GetOptions{})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("get daemonset fluent-system/fluent-bit: %w", err)
@@ -195,6 +224,23 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	log.Info("ROLL: restarted fluent-bit for config",
 		"daemonset", "fluent-system/fluent-bit", "hash", hash)
 	return res, nil
+}
+
+// pipelineDrift extracts the drift pair from one read of the
+// pipeline secret: the live config hash and the rolled-config stamp
+// it is compared against. Older operators lack fluent.io/config-hash;
+// resourceVersion is NOT a usable fallback: the rolled-config-hash
+// stamp is itself a secret write, so it bumps the RV — the stamped RV
+// never equals the RV we read, drift never clears, and the DS would
+// restart on every ~30m requeue forever. The secret DATA is hashed
+// instead: stable across stamp/annotation writes, still moves when
+// the generated config actually changes.
+func pipelineDrift(sec *corev1.Secret) (hash, rolled string) {
+	hash = sec.Annotations[kube.AnnoFluentConfigHash]
+	if hash == "" {
+		hash = secretDataHash(sec)
+	}
+	return hash, sec.Annotations[kube.AnnoRolledConfigHash]
 }
 
 // secretDataHash is the drift signal for secrets whose operator never

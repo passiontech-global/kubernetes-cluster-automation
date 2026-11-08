@@ -187,13 +187,19 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 			}
 			gvr := schema.GroupVersionResource{
 				Group: gv.Group, Version: gv.Version, Resource: r.Name}
-			items, err := p.Dyn.Resource(gvr).Namespace(nsName).
-				List(ctx, metav1.ListOptions{})
+			// The sweep census reads the snapshot's per-GVR census
+			// cluster-wide and filters client-side — one paged LIST
+			// per GVR per sweep no matter how many namespaces are
+			// wedged; the raw error is memoized with it.
+			items, err := p.AllUnstructured(ctx, gvr)
 			if err != nil {
 				continue // no permission / absent — not evidence
 			}
-			for i := range items.Items {
-				obj := &items.Items[i]
+			for i := range items {
+				obj := &items[i]
+				if obj.GetNamespace() != nsName {
+					continue // other namespace's object
+				}
 				if obj.GetDeletionTimestamp() == nil ||
 					len(obj.GetFinalizers()) == 0 {
 					continue

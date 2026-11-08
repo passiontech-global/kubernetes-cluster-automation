@@ -17,10 +17,12 @@
 // Per 10m sweep, for each opted-in StatefulSet:
 //
 //   - Track when status.updateRevision != status.currentRevision
-//     began in an in-memory ledger; act only after >= 30m of
-//     CONTINUOUS drift (a flux apply that reverts itself, a
-//     mid-rollout status flap, or an operator restart all re-arm
-//     the window — the conservative side is intentional).
+//     began in an in-memory ledger keyed per (StatefulSet, revision);
+//     act only after >= 30m of CONTINUOUS drift on the SAME update
+//     revision — a new revision mid-window resets the clock, and a
+//     flux apply that reverts itself, a mid-rollout status flap, or
+//     an operator restart all re-arm the window (the conservative
+//     side is intentional).
 //   - Safety gates, ALL required before any delete:
 //     1. every Node Ready=True and none spec.unschedulable;
 //     2. every PodDisruptionBudget in the namespace matching the
@@ -28,10 +30,10 @@
 //     (eviction would refuse the disruption anyway — a 0 means
 //     the workload is already mid-maintenance or misconfigured,
 //     so hands off);
-//     3. every Pod the StatefulSet owns is Ready=True and the
-//     newest pod has been Ready continuously for >= 5m (a fresh
-//     replacement that just came up must settle before the next
-//     member goes down).
+//     3. every Pod the StatefulSet owns is Ready=True and has been
+//     Ready continuously for >= 5m (any member — not just the newest
+//     — that just settled must stay settled before the next member
+//     goes down).
 //   - Then delete exactly ONE pod: the highest ordinal still
 //     carrying the OLD controller-revision-hash — ordinal order
 //     mirrors StatefulSet's own update order (highest first) and
@@ -77,8 +79,8 @@ const (
 	// acts — a self-correcting apply or a slow-but-working rollout
 	// never triggers a pod delete.
 	stsOnDeleteDriftMin = 30 * time.Minute
-	// stsOnDeleteStableMin: the newest pod must have held
-	// Ready=True this long before the next member may go down —
+	// stsOnDeleteStableMin: every pod of the StatefulSet must have
+	// held Ready=True this long before the next member may go down —
 	// the post-replacement settle window.
 	stsOnDeleteStableMin = 5 * time.Minute
 	// stsRevisionHashLabel is the pod label the StatefulSet
@@ -103,11 +105,15 @@ type statefulSetOnDeleteRoller struct {
 	// of several due StatefulSets pays one set of API reads instead
 	// of three per target.
 	verdict kube.Verdict
-	// driftSince records when each "ns/name" StatefulSet's
-	// updateRevision != currentRevision drift was FIRST observed —
-	// any cycle where the revisions agree, the set leaves, or the
-	// opt-in annotation drops prunes the entry, restarting the 30m
-	// window (same first-seen convention as pdb-deadlock-watchdog).
+	// driftSince records when each "ns/name@<updateRevision>"
+	// StatefulSet's updateRevision != currentRevision drift was FIRST
+	// observed — the key carries the REVISION so a new rollout (k0s/
+	// Flux ships a fresh template mid-window) resets the 30m clock
+	// instead of inheriting the old revision's elapsed drift: the
+	// settle time that matters is per revision, not per object. Any
+	// cycle where the revisions agree, the set leaves, or the opt-in
+	// annotation drops prunes the entry, restarting the 30m window
+	// (same first-seen convention as pdb-deadlock-watchdog).
 	driftSince state.FirstSeenLedger
 }
 
@@ -148,7 +154,13 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	var due []candidate
 	for i := range stsItems {
 		sts := &stsItems[i]
-		key := sts.Namespace + "/" + sts.Name
+		// The ledger key carries the updateRevision: a new revision
+		// mid-window lands on a FRESH key, so Observe opens a new
+		// continuity window and the 30m settle clock restarts —
+		// drift elapsed on the old template says nothing about how
+		// long the new one has been drifting. The stale old-revision
+		// key falls out of driftSince via the prune below.
+		key := sts.Namespace + "/" + sts.Name + "@" + sts.Status.UpdateRevision
 		if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
 			!stsAutoRollOptedIn(sts) ||
 			sts.Status.UpdateRevision == "" ||
@@ -245,28 +257,29 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		return false, nil
 	}
 
-	// Gate 3: every owned pod Ready, the newest one stable >= 5m —
-	// the settle window that keeps a slow-Ready replacement from
-	// collapsing the set one delete after another.
-	newest := pods[0]
+	// Gate 3: every owned pod Ready AND every pod holding that Ready
+	// for >= 5m — the settle window that keeps a slow-Ready
+	// replacement from collapsing the set one delete after another.
+	// Checking ALL pods (not just the newest CreationTimestamp one)
+	// is the point: a NEWEST member that has been up for hours says
+	// nothing about a lower-ordinal pod that flipped Ready a minute
+	// ago (kubelet restart, transient NotReady, rescheduled member) —
+	// the set is still settling no matter which pod is youngest.
 	for _, p := range pods {
-		if since, ready := kube.PodReadySince(p); !ready || since.After(now) {
+		since, ready := kube.PodReadySince(p)
+		if !ready || since.After(now) {
 			log.Info("skip: owned pod not Ready",
 				"statefulset", sts.Namespace+"/"+sts.Name,
 				"pod", p.Name)
 			return false, nil
 		}
-		if p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
-			newest = p
+		if stable := now.Sub(since); stable < stsOnDeleteStableMin {
+			log.Info("skip: owned pod not yet stable",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", p.Name,
+				"stableFor", stable, "required", stsOnDeleteStableMin)
+			return false, nil
 		}
-	}
-	since, ready := kube.PodReadySince(newest)
-	if !ready || now.Sub(since) < stsOnDeleteStableMin {
-		log.Info("skip: newest pod not yet stable",
-			"statefulset", sts.Namespace+"/"+sts.Name,
-			"pod", newest.Name,
-			"stableFor", stsOnDeleteStableMin)
-		return false, nil
 	}
 
 	// Find the highest-ordinal pod still on the OLD revision — the

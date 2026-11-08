@@ -181,20 +181,57 @@ func matcher(snap *guardstate.Snapshot) (matches func(*metav1.LabelSelector) boo
 	}, true
 }
 
-// mergeExclusion is the matchExpressions block the critical-NS auto-patch
-// injects into a webhook's namespaceSelector — the exact NotIn shape
-// check-webhook-guard.sh demands statically. Strategic merge keeps the
-// selector's matchLabels (opt-in selectors keep working: matchLabels
-// AND the new expression) and replaces any partial NotIn with the full
-// four-namespace list.
-func mergeExclusion() map[string]any {
-	return map[string]any{
-		"matchExpressions": []map[string]any{{
-			"key":      "kubernetes.io/metadata.name",
+// mergeExclusion is the namespaceSelector patch the critical-NS
+// auto-patch injects into a webhook — the exact NotIn shape
+// check-webhook-guard.sh demands statically, MERGED into the
+// webhook's EXISTING selector. metav1.LabelSelector.MatchExpressions
+// is a plain list with no patchStrategy:"merge" in the Kubernetes
+// API, so a patch carrying only the exclusion rule would REPLACE
+// every expression the webhook already had — silently widening, say,
+// a tier=prod-restricted webhook to the whole cluster. The payload
+// therefore sends the full union: the existing matchLabels (strategic
+// merge keeps map entries anyway, but stating them keeps the patch
+// self-describing), every existing matchExpressions element, with
+// missing critical namespaces merged into an existing
+// kubernetes.io/metadata.name NotIn rule's values — or that rule
+// appended after the preserved expressions when no such rule exists.
+func mergeExclusion(sel *metav1.LabelSelector) map[string]any {
+	var cur metav1.LabelSelector // nil selector (match-all) contributes nothing
+	if sel != nil {
+		cur = *sel
+	}
+	const nameKey = "kubernetes.io/metadata.name"
+	patch := map[string]any{}
+	if len(cur.MatchLabels) > 0 {
+		ml := make(map[string]string, len(cur.MatchLabels))
+		maps.Copy(ml, cur.MatchLabels)
+		patch["matchLabels"] = ml
+	}
+	exprs := make([]map[string]any, 0, len(cur.MatchExpressions)+1)
+	merged := false
+	for _, e := range cur.MatchExpressions {
+		vals := slices.Clone(e.Values)
+		if e.Key == nameKey && e.Operator == metav1.LabelSelectorOpNotIn {
+			for _, ns := range criticalSelfHealingNamespaces {
+				if !slices.Contains(vals, ns) {
+					vals = append(vals, ns)
+				}
+			}
+			merged = true
+		}
+		exprs = append(exprs, map[string]any{
+			"key": e.Key, "operator": string(e.Operator), "values": vals,
+		})
+	}
+	if !merged {
+		exprs = append(exprs, map[string]any{
+			"key":      nameKey,
 			"operator": string(metav1.LabelSelectorOpNotIn),
 			"values":   slices.Clone(criticalSelfHealingNamespaces),
-		}},
+		})
 	}
+	patch["matchExpressions"] = exprs
+	return patch
 }
 
 // auditExclusions (W12-CP-B) audits live Mutating/Validating admission
@@ -207,10 +244,13 @@ func mergeExclusion() map[string]any {
 //
 // auditExclusions adds the optional auto-patch (WEBHOOK_CRITICAL_NS_ENFORCE_
 // ENABLED=true): each flagged webhook outside the allowlist gets the
-// NotIn exclusion injected by strategic-merge patch — one patch per
-// config carrying every missing entry, keyed by merge-key name so a
-// concurrent writer's sibling entries survive. The ledger re-verifies
-// next sweep, so a failed patch only delays the exclusion instead of
+// NotIn exclusion merged into its namespaceSelector by strategic-merge
+// patch — one patch per config carrying every missing entry, keyed by
+// merge-key name so a concurrent writer's sibling entries survive.
+// Under the auto-patch the series only reports webhooks the patch does
+// NOT cover (lever off, allowlisted) or a FAILED patch — a landed
+// patch means the exclusion exists, and the ledger re-verifies next
+// sweep, so a failed patch only delays the exclusion instead of
 // pinning a stale series.
 func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	s.exclusionEmitted.Begin() // drop any aborted sweep's leftover emissions
@@ -227,7 +267,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	// webhooks list, snapshot kept current for the later duties). The
 	// mutating flag only selects the typed clientset call — the only
 	// true MWC/VWC difference.
-	patchExclusion := func(kind string, mutating bool, cfgName string, merges []map[string]any) {
+	patchExclusion := func(kind string, mutating bool, cfgName string, merges []map[string]any, onFail func()) {
 		if len(merges) == 0 {
 			return
 		}
@@ -237,6 +277,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 			// metered so the dropped work is still counted.
 			metrics.IncError(g.Queue)
 			log.Error(err, "marshal critical-ns exclusion patch", "config", cfgName)
+			onFail()
 			return
 		}
 		names := make([]string, 0, len(merges))
@@ -270,23 +311,38 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 			metrics.IncError(g.Queue)
 			log.Error(patchErr, "critical-ns exclusion patch failed — webhook left fail-closed against critical namespaces",
 				"kind", kind, "config", cfgName)
+			onFail()
 		}
 	}
 
 	forEachConfig(snap, func(kind, cfgName string, hooks []hookView) {
 		var merges []map[string]any
+		var queued []hookView // webhooks whose exclusion the patch carries
 		for _, w := range hooks {
 			if !guardstate.FailClosed(w.fp) || !matchesCriticalNS(w.sel) {
 				continue
 			}
-			s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
-				kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
-			if enforce && !criticalNSPatchAllowlist[cfgName+"/"+w.name] {
-				merges = append(merges, map[string]any{
-					"name": w.name, "namespaceSelector": mergeExclusion()})
+			if !enforce || criticalNSPatchAllowlist[cfgName+"/"+w.name] {
+				// No patch will cover this webhook (lever off, or the
+				// allowlist deliberately keeps it exposed) — the
+				// missing-exclusion series stays live.
+				s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
+					kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
+				continue
 			}
+			merges = append(merges, map[string]any{
+				"name": w.name, "namespaceSelector": mergeExclusion(w.sel)})
+			queued = append(queued, w)
 		}
-		patchExclusion(kind, kind == guardstate.KindMutating, cfgName, merges)
+		// An auto-enforced webhook emits the series only when its
+		// patch FAILED — a landed patch means the exclusion exists
+		// and the ledger re-verifies (and re-emits) next sweep.
+		patchExclusion(kind, kind == guardstate.KindMutating, cfgName, merges, func() {
+			for _, w := range queued {
+				s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
+					kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
+			}
+		})
 	})
 	s.exclusionEmitted.Prune(metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues)
 }

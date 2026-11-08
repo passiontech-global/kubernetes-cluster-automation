@@ -269,23 +269,33 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Result(&p.emitted, linkerdOutlierPodsGauge.DeleteLabelValues,
 			why, ", ")
 	}
+	// doneFresh is the early-exit tail — an inconclusive sweep (Prom
+	// outage) or an empty candidate list still reconciles BOTH
+	// ledgers: the emitted gauge closes and the persistence window
+	// drops its holds, so a recovered sweep never inherits a phantom
+	// series or a stale 5m persistence stamp. (Pruning all of seen is
+	// the safe direction: the next sweep re-arms from zero evidence.)
+	doneFresh := func() probefw.Result {
+		p.seen.Prune(func(string) bool { return false })
+		return done()
+	}
 
 	if _, err := p.PromEndpoint(); err != nil {
-		return done()
+		return doneFresh()
 	}
 	rpsSeries, err := p.PromQuery(ctx,
 		`sum by (namespace, deployment, pod) (rate(response_total{direction="inbound"}[5m]))`)
 	if err != nil {
 		log.Info("WARN: linkerd outlier rps query failed — check inconclusive",
 			"error", err)
-		return done()
+		return doneFresh()
 	}
 	failSeries, err := p.PromQuery(ctx,
 		`sum by (namespace, deployment, pod) (rate(response_total{direction="inbound",classification="failure"}[5m]))`)
 	if err != nil {
 		log.Info("WARN: linkerd outlier failure-ratio query failed — check inconclusive",
 			"error", err)
-		return done()
+		return doneFresh()
 	}
 	rps := linkerdOutlierSamples(rpsSeries)
 	fails := linkerdOutlierSamples(failSeries)
@@ -316,7 +326,7 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 		cands = append(cands, cand{s, er})
 	}
 	if len(cands) == 0 {
-		return done()
+		return doneFresh()
 	}
 
 	pods, err := p.AllPods(ctx)
@@ -395,23 +405,11 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 			"pod", podKey)
 		return
 	}
-	// Gates 3+5 — the controller-scoped 30m cooldown, the
-	// maintenance mutex and the global heal budget ride one
-	// AllowedV call (fail closed: unverifiable counts as held and
-	// IncErrors the queue).
-	ck := probefw.SelfHealKey(CheckNameLinkerdOutlierGuard,
-		kube.PodControllerKey(pod))
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, ck, linkerdOutlierHealCool, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	// Gate 4 — the PDB pre-check (every matching PDB must allow a
-	// disruption) then the policy/v1 Eviction, which re-enforces the
+	// Gate 4 FIRST — the PDB pre-check (every matching PDB must allow
+	// a disruption) runs BEFORE the cooldown/mutex/budget preamble:
+	// a workload at its replica floor must not burn a heal-budget
+	// token (nor consume its 30m cooldown) on an evict the budget
+	// would refuse anyway. The policy/v1 Eviction re-enforces the
 	// budget atomically server-side; the UID precondition closes the
 	// TOCTOU between the census and the kill — a same-named recreate
 	// is not ours to evict.
@@ -425,6 +423,21 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 	if !allowed {
 		log.Info("skip outlier evict: matching PDB allows no disruption",
 			"pod", podKey)
+		return
+	}
+	// Gates 3+5 — the controller-scoped 30m cooldown, the
+	// maintenance mutex and the global heal budget ride one
+	// AllowedV call (fail closed: unverifiable counts as held and
+	// IncErrors the queue).
+	ck := probefw.SelfHealKey(CheckNameLinkerdOutlierGuard,
+		kube.PodControllerKey(pod))
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, linkerdOutlierHealCool, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 	deleteOpts := kube.UIDDeleteOptions(pod.UID, "")

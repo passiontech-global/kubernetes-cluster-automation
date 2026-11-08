@@ -25,13 +25,17 @@ import (
 // ---------------------------------------------------------------------------
 
 // pePartitionedNode builds a node whose given NWPD condition has been
-// True for `age` (already exceeds partitionMinAge when age > 10m).
+// True for `age` (already exceeds partitionMinAge when age > 10m),
+// carrying a fresh lastHeartbeatTime — the agent re-stamps it every
+// ~2m while alive, so a sustained latch on a live agent always does
+// (the zombie variants override it).
 func pePartitionedNode(name string, condType corev1.NodeConditionType, age time.Duration, taints ...corev1.Taint) *corev1.Node {
 	n := testutil.Node(name, corev1.ConditionTrue, nil, taints...)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               condType,
 		Status:             corev1.ConditionTrue,
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
 	})
 	return n
 }
@@ -438,6 +442,30 @@ func TestPartitionEvictorPodDeleteErrorTolerated(t *testing.T) {
 	}
 }
 
+// A NotFound pod delete is already the goal state (another actor
+// finished the eviction first) — tolerated without error accounting,
+// the run continues and the taint still lands.
+func TestPartitionEvictorNotFoundDeleteTolerated(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePod("flux-system", "p1", "already-gone"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				corev1.Resource("pods"), "already-gone")
+		})
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("a NotFound pod delete must not error the run: %v", err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("flagged node not tainted")
+	}
+}
+
 // A failed recovery-untaint is logged and the sweep continues —
 // per-node errors are never fatal (same as bash).
 func TestPartitionEvictorUntaintErrorTolerated(t *testing.T) {
@@ -787,6 +815,47 @@ func TestPartitionEvictorPinnedPVCBeatsAnnotation(t *testing.T) {
 	}
 }
 
+// Generic-ephemeral and hostPath volumes pin a pod to its node just
+// like a local-path PVC: the ephemeral PVC is provisioned on the node
+// running the pod (and dies with it), and a hostPath only exists on
+// this node — the replacement cannot land anywhere useful, so
+// evicting is pure churn.
+func TestPartitionEvictorSkipsEphemeralAndHostPathPods(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	ephemeral := pePod("flux-system", "p1", "eph-vol")
+	ephemeral.Spec.Volumes = []corev1.Volume{{
+		Name: "scratch",
+		VolumeSource: corev1.VolumeSource{
+			Ephemeral: &corev1.EphemeralVolumeSource{},
+		},
+	}}
+	hostpath := pePod("flux-system", "p1", "hp-vol")
+	hostpath.Spec.Volumes = []corev1.Volume{{
+		Name: "host",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/data"},
+		},
+	}}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		ephemeral, hostpath,
+		pePod("flux-system", "p1", "movable"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"eph-vol", "hp-vol"} {
+		if !pePodExists(t, cs, "flux-system", name) {
+			t.Fatalf("volume-pinned pod %s evicted — its volumes cannot follow it", name)
+		}
+	}
+	if pePodExists(t, cs, "flux-system", "movable") {
+		t.Fatal("volume-less pod not evicted — pinned-volume skip leaked")
+	}
+}
+
 // A PVC list failure fails the eviction pass closed: taints still
 // land (they fence scheduling) but no pod is deleted on an
 // unverifiable volume view.
@@ -831,6 +900,47 @@ func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 	}
 	if pePodExists(t, cs, "flux-system", "victim") {
 		t.Fatal("pod not evicted off a PMTU-blackholed node")
+	}
+}
+
+// A NebulaIsolated latch whose heartbeat froze is a zombie — the
+// wedged nodereporter cannot vouch for the partition anymore, so the
+// node is neither tainted nor its pods evicted. The NWPD monitor
+// spellings are not agent-managed: a frozen heartbeat on
+// HostNetworkProblems still flags the node.
+func TestPartitionEvictorZombieHeartbeatNotFlagged(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	stale := pePartitionedNode("p1", "NebulaIsolated", 20*time.Minute)
+	for i := range stale.Status.Conditions {
+		if stale.Status.Conditions[i].Type == "NebulaIsolated" {
+			stale.Status.Conditions[i].LastHeartbeatTime =
+				metav1.NewTime(time.Now().Add(-2 * partitionCondHeartbeatMaxAge))
+		}
+	}
+	// Same fleet, NWPD spelling with NO heartbeat at all — still flags.
+	nwpd := pePartitionedNode("p2", "HostNetworkProblems", 20*time.Minute)
+	nwpd.Status.Conditions[1].LastHeartbeatTime = metav1.Time{}
+	objs := append([]runtime.Object{
+		stale, nwpd,
+		pePod("flux-system", "p1", "zombie-victim"),
+		pePod("flux-system", "p2", "nwpd-victim"),
+	}, peHealthyNodes("h", 4)...) // 2/6 flagged < 50%
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("zombie overlay latch tainted the node")
+	}
+	if !pePodExists(t, cs, "flux-system", "zombie-victim") {
+		t.Fatal("pod evicted on a zombie partition latch")
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p2").Spec.Taints, partitionTaintKey) {
+		t.Fatal("NWPD condition (not agent-managed) stopped flagging on a missing heartbeat")
+	}
+	if pePodExists(t, cs, "flux-system", "nwpd-victim") {
+		t.Fatal("pod not evicted off a NWPD-partitioned node")
 	}
 }
 

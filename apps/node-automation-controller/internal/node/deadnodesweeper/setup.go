@@ -58,8 +58,10 @@ type deadNodeSweeper struct {
 
 // Setup registers the 5-minute sweep.
 func Setup(d shared.Deps) error {
-	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-		nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
-	s.probeFn = s.probe
-	return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
+	return shared.SetupNoConfig(d, func() error {
+		s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
+		s.probeFn = s.probe
+		return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
+	})
 }

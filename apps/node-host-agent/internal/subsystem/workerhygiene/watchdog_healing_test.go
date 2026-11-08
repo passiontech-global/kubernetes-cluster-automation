@@ -270,9 +270,8 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
-	if len(wdepstest.DeleteActions(e.CS)) != 1 {
-		t.Fatalf("deletes = %v, want the log-bloating pod",
-			wdepstest.DeleteActions(e.CS))
+	if got := wdepstest.EvictActions(e.CS); len(got) != 1 || got[0] != "logger" {
+		t.Fatalf("evictions = %v, want the log-bloating pod", got)
 	}
 	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("disk-bloat latch not set")
@@ -312,9 +311,8 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
-	if len(wdepstest.DeleteActions(e.CS)) != 1 {
-		t.Fatalf("deletes = %v, want the snapshot-owning pod",
-			wdepstest.DeleteActions(e.CS))
+	if got := wdepstest.EvictActions(e.CS); len(got) != 1 || got[0] != "layerhog" {
+		t.Fatalf("evictions = %v, want the snapshot-owning pod", got)
 	}
 }
 

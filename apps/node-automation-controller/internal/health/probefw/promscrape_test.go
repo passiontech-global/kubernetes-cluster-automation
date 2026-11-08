@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -118,4 +119,20 @@ func TestFetchPodMetrics(t *testing.T) {
 			t.Fatalf("FetchPodMetrics = (%q,%v), want capped 5 bytes", body, err)
 		}
 	})
+}
+
+// Prometheus text exposition can spell the sample value NaN, +Inf or
+// -Inf; strconv.ParseFloat accepts all three and the parse path must
+// not reject them — interpretation of the value belongs to the
+// consuming check, not the scraper.
+func TestParseMetricValuePassesNaNInf(t *testing.T) {
+	if v, ok := ParseMetricValue("ha_connections NaN", "ha_connections"); !ok || !math.IsNaN(v) {
+		t.Fatalf("NaN not passed through: (%v,%v)", v, ok)
+	}
+	if v, ok := ParseMetricValue("ha_connections +Inf", "ha_connections"); !ok || !math.IsInf(v, 1) {
+		t.Fatalf("+Inf not passed through: (%v,%v)", v, ok)
+	}
+	if v, ok := ParseMetricValue("ha_connections -Inf", "ha_connections"); !ok || !math.IsInf(v, -1) {
+		t.Fatalf("-Inf not passed through: (%v,%v)", v, ok)
+	}
 }

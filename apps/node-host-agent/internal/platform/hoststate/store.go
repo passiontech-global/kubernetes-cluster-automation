@@ -44,8 +44,13 @@ type Store struct {
 	// RateTrySpend (the feeder remediate path and Cycle compete on
 	// the shared last-restart budget: without it a feeder "ok" and
 	// a Cycle check "ok" could both pass in the same window and
-	// double-spend a restart) and Incr's check-then-write counter
-	// bump (the shared consecutive-journal-unreadable streak).
+	// double-spend a restart), Incr's check-then-write counter
+	// bump (the shared consecutive-journal streaks), and Enter/Exit's
+	// stat→(touch|create|remove) latch half (the shared per-Dir
+	// instance funnels several subsystem goroutines through one
+	// store). The AppendLog halves stay OUTSIDE the lock — appendFile
+	// re-enters s.mu for the rotation decision and sync.Mutex is not
+	// reentrant.
 	mu sync.Mutex
 	// owners is the RAM-side registry behind EnterFrom/ExitFrom:
 	// latch name → the set of owner ids currently holding it. A
@@ -64,6 +69,59 @@ func New(dir, logFile string, now timex.Clock,
 		now = timex.SystemClock
 	}
 	return &Store{Dir: dir, LogFile: logFile, Now: now, Log: log}
+}
+
+// sharedMu guards the process-wide per-Dir registry below.
+var (
+	sharedMu     sync.Mutex
+	sharedStores = map[string]*Store{}
+)
+
+// Shared returns the PROCESS-WIDE Store for the canonical dir — every
+// subsystem in this process that stamps the same state dir must hold
+// THE SAME instance, not sibling New() copies:
+//
+//   - the multi-owner latch registry (EnterFrom/ExitFrom) lives on
+//     the Store. workerhygiene and controllerhygiene share the
+//     state-journal-unreadable latch — sibling instances would each
+//     keep a private owner set and each believe itself the last
+//     holder, deleting the latch out from under the other;
+//   - the mu that serializes Enter/Exit/Incr/rotation also lives on
+//     the Store — with sibling copies, two subsystems appending to
+//     one watchdog log or writing one latch file race unserialized.
+//
+// New stays for hand-built stores (tests, one-off dirs); production
+// wiring resolves stores through Shared (subframe.StoreAt).
+//
+// The canonical key is filepath.Clean(dir), so callers may pass
+// already-joined or suffixed spellings of one dir freely. logFile
+// follows first-construction with one lenient upgrade: a later
+// non-empty logFile fills an empty one (nodereporter/hostconfig
+// construct their dir handle with LogFile "" — they only READ the
+// log via cfg — while an appending subsystem names it; whichever
+// constructs first, the shared handle must end up with the real
+// log). now and log come from the first construction: production
+// wiring passes the one shared hostctx clock cell and per-package
+// logger funcs resolve per call anyway.
+func Shared(dir, logFile string, now timex.Clock,
+	log func() *slog.Logger) *Store {
+
+	key := filepath.Clean(dir)
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	if s, ok := sharedStores[key]; ok {
+		if logFile != "" {
+			s.mu.Lock()
+			if s.LogFile == "" {
+				s.LogFile = logFile
+			}
+			s.mu.Unlock()
+		}
+		return s
+	}
+	s := New(dir, logFile, now, log)
+	sharedStores[key] = s
+	return s
 }
 
 func (s *Store) log() *slog.Logger {
@@ -93,18 +151,27 @@ func (s *Store) Exists(name string) bool {
 // existing latch gets its mtime refreshed (BUG-H6): the janitor reaps
 // state-* files older than 24h, so a latch maintained for days by an
 // owner still evaluating the condition would otherwise be reaped
-// mid-episode.
+// mid-episode. The stat→(touch|write) half runs under s.mu — the
+// shared per-Dir instance (Shared) funnels several subsystem
+// goroutines through one store, and two of them racing one latch
+// file must serialize — while the AppendLog stays outside it
+// (appendFile re-enters s.mu for the rotation decision; sync.Mutex
+// is not reentrant).
 func (s *Store) Enter(name, extra string) {
 	p := s.Path(name)
+	s.mu.Lock()
 	if _, err := os.Stat(p); err == nil {
 		now := s.Now()
 		if cerr := os.Chtimes(p, now, now); cerr != nil {
 			s.log().Debug("state latch touch failed",
 				"state", name, "path", p, "error", cerr)
 		}
+		s.mu.Unlock()
 		return
 	}
-	if !s.WriteEpochFile(p, s.Now().Unix()) {
+	written := s.WriteEpochFile(p, s.Now().Unix())
+	s.mu.Unlock()
+	if !written {
 		return
 	}
 	if extra != "" {
@@ -115,27 +182,34 @@ func (s *Store) Enter(name, extra string) {
 }
 
 // Exit removes state-<name> if present and logs the transition —
-// clears the NPD permanent condition. cleanup, when non-nil, runs
-// after the removal and before the log line: subsystems drop their
-// per-latch dedupe budgets there. The two shared suspect-budget
-// divergences have named wrappers — ExitClearSuspect (drop only
-// last-suspect-<name>; controllerhygiene) and ExitClearAllSuspects
-// (drop the whole last-suspect-* family; nethealth) — workerhygiene
-// and everyone else pass nil.
-func (s *Store) Exit(name string, cleanup func()) {
+// clears the NPD permanent condition. The return reports whether the
+// latch file actually went: true only when it existed and was
+// removed — the ExitClearSuspect/ExitClearAllSuspects gating keys on
+// it so a suspect budget survives a no-op exit (a sibling owner may
+// still hold the episode). cleanup, when non-nil, runs after the
+// removal and before the log line: subsystems drop their per-latch
+// dedupe budgets there; workerhygiene and everyone else pass nil.
+// The stat+remove runs under s.mu for the same cross-subsystem
+// serialization as Enter (cleanup + AppendLog stay outside).
+func (s *Store) Exit(name string, cleanup func()) bool {
 	p := s.Path(name)
+	s.mu.Lock()
 	if _, err := os.Stat(p); err != nil {
-		return
+		s.mu.Unlock()
+		return false
 	}
 	if err := os.Remove(p); err != nil {
+		s.mu.Unlock()
 		s.log().Warn("state latch remove failed",
 			"state", name, "path", p, "error", err)
-		return
+		return false
 	}
+	s.mu.Unlock()
 	if cleanup != nil {
 		cleanup()
 	}
 	s.AppendLog(latchdefs.StateExitPrefix + name)
+	return true
 }
 
 // EnterFrom is Enter for a latch shared by several producers: the

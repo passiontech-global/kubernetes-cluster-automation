@@ -179,9 +179,11 @@ func TestCheckDiskBloatEvicts(t *testing.T) {
 	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}
-	if _, err := e.CS.CoreV1().Pods("app").Get(
-		context.Background(), "hog", metav1.GetOptions{}); err == nil {
-		t.Fatal("bloated pod still exists — expected eviction")
+	// policy/v1 Eviction — the fake records the subresource create;
+	// the pod object itself stays in the store (the apiserver does
+	// the removal in production).
+	if got := wdepstest.EvictActions(e.CS); len(got) != 1 || got[0] != "hog" {
+		t.Fatalf("evictions = %v, want hog", got)
 	}
 	logData, _ := os.ReadFile(e.H.Cfg.WatchdogLogFile)
 	if !strings.Contains(string(logData), "ACTION disk-bloat: target=") {
@@ -209,8 +211,7 @@ func TestCheckDiskBloatSystemPodSafe(t *testing.T) {
 	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}
-	if _, err := e.CS.CoreV1().Pods("kube-system").Get(
-		context.Background(), "sys-hog", metav1.GetOptions{}); err != nil {
-		t.Fatal("kube-system pod deleted — system pods are never evicted")
+	if got := wdepstest.EvictActions(e.CS); len(got) != 0 {
+		t.Fatalf("kube-system pod evicted — protected namespaces are never touched: %v", got)
 	}
 }

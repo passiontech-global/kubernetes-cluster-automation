@@ -105,19 +105,24 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 
 	// The durable cooldown half rides the provisioner's own
 	// Deployment — the one object whose lifetime spans the heal
-	// window.
+	// window. Resolved from the sweep's shared Deployment census
+	// (cluster-wide read, client-side name filter); absent degrades
+	// to the ledger-only gate, an unreadable census defers
+	// fail-closed.
 	var obj metav1.Object
-	dep, err := p.CS.AppsV1().Deployments(openebsProvisionerNS).
-		Get(ctx, openebsProvisionerName, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		obj = dep
-	case apierrors.IsNotFound(err):
-	default:
+	deps, err := p.AllDeployments(ctx)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: read localpv provisioner deployment failed — heal deferred",
 			"error", err)
 		return
+	}
+	for i := range deps {
+		if deps[i].Namespace == openebsProvisionerNS &&
+			deps[i].Name == openebsProvisionerName {
+			obj = &deps[i]
+			break
+		}
 	}
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 		&p.pvcProvHealed, obj, pvcProvHealAnno, openebsProvisionerName,

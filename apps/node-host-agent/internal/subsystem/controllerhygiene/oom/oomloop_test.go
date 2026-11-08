@@ -153,3 +153,33 @@ func TestOOMShieldSkippedWhenLatchUnwritable(t *testing.T) {
 		}
 	}
 }
+
+// reassertShields must re-pin BOTH processes every enforce cycle:
+// a respawned kine boots at oom_score_adj=0, and skipping its +500
+// would leave it fully killable while the loop latch stands — the
+// exact crash spiral the shield exists to break.
+func TestOOMShieldReassertsKineAfterRespawn(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 2001, "kube-apiserver", []string{"kube-apiserver"}, 5000)
+	e.MkProc(t, 2002, "kine", []string{"kine"}, 5000)
+	writeEvents(t, e, 0)
+	e.H.Cycle(context.Background())
+	writeEvents(t, e, 3)
+	e.H.Cycle(context.Background()) // latched + shielded
+	if v := readAdj(t, e, 2002); v != "500" {
+		t.Fatalf("precondition: kine adj=%s want 500", v)
+	}
+	// kine respawns: old pid 2002 gone, new pid 3002 at adj=0.
+	if err := os.RemoveAll(filepath.Join(e.Proc, "2002")); err != nil {
+		t.Fatal(err)
+	}
+	e.MkProc(t, 3002, "kine", []string{"kine"}, 5000)
+	writeEvents(t, e, 4) // still latched (in-window kill)
+	e.H.Cycle(context.Background())
+	if v := readAdj(t, e, 3002); v != "500" {
+		t.Fatalf("respawned kine not re-shielded: adj=%s want 500", v)
+	}
+	if v := readAdj(t, e, 2001); v != "-800" {
+		t.Fatalf("apiserver shield lost across respawn: adj=%s", v)
+	}
+}

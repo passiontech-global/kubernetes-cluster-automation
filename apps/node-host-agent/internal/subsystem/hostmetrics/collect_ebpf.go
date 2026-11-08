@@ -37,11 +37,11 @@ type ebpfCache struct {
 var (
 	descEBPFProgs = prometheus.NewDesc(
 		"node_host_agent_ebpf_programs_count",
-		"Unique eBPF prog_id referenced by /proc/<pid>/fdinfo plus objects pinned in bpffs.",
+		"Unique eBPF prog_id referenced by /proc/<pid>/fdinfo.",
 		[]string{"node"}, nil)
 	descEBPFMaps = prometheus.NewDesc(
 		"node_host_agent_ebpf_maps_count",
-		"Unique eBPF map_id referenced by /proc/<pid>/fdinfo plus objects pinned in bpffs.",
+		"Unique eBPF map_id referenced by /proc/<pid>/fdinfo plus objects pinned in bpffs (a pin bpffs refuses to open counts once — the leak-audit signal).",
 		[]string{"node"}, nil)
 )
 
@@ -74,11 +74,14 @@ const ebpfFDTarget = "anon_inode:bpf-"
 
 // sweepEBPF counts unique eBPF prog/map ids: every prog_id:/map_id:
 // line in the fdinfo of fds whose /proc/<pid>/fd link target names
-// a bpf object, plus pinned objects under BpffsDir — a pinned
-// object no process fd references (the leak signature) resolves by
-// OPENING it and reading the fresh fd's own fdinfo. scanned=false
-// when neither source read.
-func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, scanned bool) {
+// a bpf object, plus the pinned objects under BpffsDir. The bpffs
+// half is a WALK, not an open: bpffs rejects readmode open(2) for
+// whole object classes (map pins need O_RDWR by kernel policy,
+// programs are not readable at all), so an open-based id harvest
+// silently produced NOTHING for the very pins the leak audit cares
+// about. Every walked non-dir entry IS a pinned object — it counts
+// even unopened. scanned=false when neither source read.
+func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, pins int, scanned bool) {
 	progs, maps = map[uint64]bool{}, map[uint64]bool{}
 	if pids, err := os.ReadDir(c.cfg.ProcRoot); err == nil {
 		scanned = true
@@ -115,34 +118,17 @@ func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, scanned bool) {
 				if err != nil || d.IsDir() {
 					return nil //nolint:nilerr // unreadable entries are skipped, never fatal
 				}
-				// Opening the pin yields a real bpf-object fd —
-				// its own fdinfo names the prog/map id (the only
-				// id source for an unreferenced pin).
-				f, err := os.Open(path)
-				if err != nil {
-					return nil //nolint:nilerr // unreadable pins are skipped, never fatal
-				}
-				data, err := os.ReadFile(filepath.Join(c.selfFdinfoDir(),
-					strconv.FormatUint(uint64(f.Fd()), 10)))
-				_ = f.Close()
-				if err == nil {
-					scanBPFIDLines(data, progs, maps)
-				}
+				pins++
 				return nil
 			})
 	}
-	return progs, maps, scanned
-}
-
-// selfFdinfoDir is the agent's own fdinfo dir — ProcRoot-joined so
-// tests point it at the fixture (a fake root simply yields
-// unreadable fdinfo; entries skip, never fail the sweep).
-func (c *Collector) selfFdinfoDir() string {
-	return filepath.Join(c.cfg.ProcRoot, "self", "fdinfo")
+	return progs, maps, pins, scanned
 }
 
 // ebpfSnapshot returns the cached sweep, re-walking at most once per
-// EBPFScanInterval.
+// EBPFScanInterval. Unresolved pins fold into the maps count — the
+// leak-audit headline (a cilium map-pin leak grows that series even
+// when bpffs refuses the opens an id harvest would need).
 func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
 	c.ebpf.mu.Lock()
 	if c.cfg.Clock.Now().Sub(c.ebpf.at) < c.cfg.EBPFScanInterval && c.ebpf.scanned {
@@ -154,12 +140,12 @@ func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
 
 	// Sweep unlocked — two scrapes may walk in parallel; the later
 	// store wins, harmless for a cache (inotifySnapshot parity).
-	ps, ms, ok := c.sweepEBPF()
+	ps, ms, pins, ok := c.sweepEBPF()
 	c.ebpf.mu.Lock()
 	c.ebpf.at = c.cfg.Clock.Now()
-	c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned = len(ps), len(ms), ok
+	c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned = len(ps), len(ms)+pins, ok
 	c.ebpf.mu.Unlock()
-	return len(ps), len(ms), ok
+	return len(ps), len(ms) + pins, ok
 }
 
 // collectEBPF emits the unique-id counts — 0 is real data (a node

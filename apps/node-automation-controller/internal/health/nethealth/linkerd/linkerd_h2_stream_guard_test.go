@@ -220,8 +220,9 @@ func oomKilledPod(ns, name string, owner types.UID) *corev1.Pod {
 		Name: kube.LinkerdProxyContainer,
 		LastTerminationState: corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
-				Reason:   "OOMKilled",
-				ExitCode: 137,
+				Reason:     "OOMKilled",
+				ExitCode:   137,
+				FinishedAt: metav1.NewTime(time.Now().Add(-time.Minute)),
 			},
 		},
 	}}
@@ -248,6 +249,62 @@ func TestLinkerdProxyOOMKilledFlagged(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("OOMKilled pod must NOT be deleted (proxy already restarted): %v", err)
+	}
+	t.Cleanup(func() {
+		linkerdProxyOOMKilledGauge.DeleteLabelValues("apps", "web-1")
+	})
+}
+
+// An OOMKilled termination OLDER than the 30m window is not the wedge
+// seed — the proxy already restarted clean and re-learned its
+// balancer view; the gauge must stay silent.
+func TestLinkerdProxyOOMKilledStaleWindowNotFlagged(t *testing.T) {
+	pod := meshedPod("apps", "web-1", true, types.UID("rs-1"))
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: kube.LinkerdProxyContainer,
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:     "OOMKilled",
+				ExitCode:   137,
+				FinishedAt: metav1.NewTime(time.Now().Add(-45 * time.Minute)),
+			},
+		},
+	}}
+	cs := fake.NewSimpleClientset(pod)
+	p := testProber(cs)
+	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("a 45m-old OOM kill is not a wedge seed: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_oomkilled",
+		map[string]string{"namespace": "apps", "pod": "web-1"}); m != nil {
+		t.Fatal("stale OOM kill must not raise the oomkilled gauge")
+	}
+	t.Cleanup(func() {
+		linkerdProxyOOMKilledGauge.DeleteLabelValues("apps", "web-1")
+	})
+}
+
+// An OOMKilled linkerd-proxy INIT container (mesh-before-app shapes)
+// reads the same wedge seed — the init statuses are inspected too.
+func TestLinkerdProxyInitOOMKilledFlagged(t *testing.T) {
+	pod := meshedPod("apps", "web-1", true, types.UID("rs-1"))
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: kube.LinkerdProxyContainer,
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:     "OOMKilled",
+				ExitCode:   137,
+				FinishedAt: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+			},
+		},
+	}}
+	cs := fake.NewSimpleClientset(pod)
+	p := testProber(cs)
+	probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(ctx)
+	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_oomkilled",
+		map[string]string{"namespace": "apps", "pod": "web-1"}); m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("init-container OOM kill must raise the oomkilled gauge")
 	}
 	t.Cleanup(func() {
 		linkerdProxyOOMKilledGauge.DeleteLabelValues("apps", "web-1")

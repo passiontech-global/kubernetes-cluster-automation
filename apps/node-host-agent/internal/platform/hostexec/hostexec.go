@@ -178,7 +178,18 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.buf.Len() < maxCmdOutputBytes {
-		b.buf.Write(p)
+		// Keep only the head that fits under the cap — the FIRST
+		// bytes of the stream are the useful prefix (an error banner,
+		// the first journal lines), not the last. Writing the whole p
+		// past the boundary would grow the buffer unbounded; dropping
+		// all of it would lose the final usable chunk. len(p) is
+		// always returned: the excess is drained (swallowed) so the
+		// child never blocks on a full pipe.
+		rem := maxCmdOutputBytes - b.buf.Len()
+		if rem > len(p) {
+			rem = len(p)
+		}
+		b.buf.Write(p[:rem])
 	}
 	return len(p), nil
 }

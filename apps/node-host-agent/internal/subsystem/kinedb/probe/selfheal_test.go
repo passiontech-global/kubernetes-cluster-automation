@@ -263,3 +263,24 @@ func TestPGBStarveHalfOpenSvActive(t *testing.T) {
 		t.Fatalf("busy-backend starve streak=%d want 0", v)
 	}
 }
+
+// The reaper's exemption filter must carry the maintenance-tool
+// application_name list AND the query ILIKE guards — a pg_repack /
+// pg_dump mid-copy (or our own maint block's statements) must never
+// be terminated, or the bloat remediation reaps itself.
+func TestStuckSessionPredicateExemptions(t *testing.T) {
+	for _, want := range []string{
+		"application_name NOT IN ('pg_repack', 'pg_dump', 'node_host_agent_maint')",
+		"query NOT ILIKE '%VACUUM%'",
+		"query NOT ILIKE '%REINDEX%'",
+		"query NOT ILIKE '%pg_repack%'",
+		"query NOT ILIKE '%repack.%'",
+		"query NOT ILIKE '%ANALYZE%'",
+		"query NOT ILIKE '%DROP INDEX%'",
+	} {
+		if !strings.Contains(stuckSessionPredicate, want) {
+			t.Fatalf("stuckSessionPredicate missing %q:\n%s", want,
+				stuckSessionPredicate)
+		}
+	}
+}

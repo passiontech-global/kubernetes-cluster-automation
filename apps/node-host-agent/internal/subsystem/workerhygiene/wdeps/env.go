@@ -47,6 +47,10 @@ func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
 		Base:     subframe.FromDeps(d.Deps),
 		NodeName: d.NodeName,
+		// hostctx already resolved NODE_HOST_AGENT_TEXTFILE_DIR with
+		// the shared hostPath default — the prom writers must honor
+		// the same override, not re-derive the dir.
+		TextfileDir: d.TextfileDir,
 		Journal: JournalConfig{
 			Dirs:             d.JournalDirs,
 			UnreadableNeeded: d.JournalUnreadableNeeded,

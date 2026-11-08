@@ -79,6 +79,14 @@ type mtuProbeState struct {
 	mtuFails  int
 	lastClamp time.Time
 	lastGauge string // last written gauge value — skip identical writes
+	// wgClampKnown records that the cilium_wg0 TCPMSS clamp was
+	// confirmed installed (or already present). The MTU invariant
+	// that installs it is CONFIG DRIFT — until the MTU is fixed the
+	// condition stays true, so without this bit the invariant check
+	// would warn + fork `iptables -C` every probe cycle for the
+	// node's lifetime. The bit dies with the process, and an
+	// operator-flushed rule is re-installed on agent restart.
+	wgClampKnown bool
 }
 
 // mtuState returns this instance's prober state.
@@ -144,11 +152,30 @@ func (n *NetHealth) mtuProbeLoop(ctx context.Context, st *mtuProbeState) {
 func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 	st *mtuProbeState) {
 	wd := n.watchdogConf()
+	dev := "neb1"
+	if wd != nil && wd.NebulaDev != "" {
+		dev = wd.NebulaDev
+	}
 	reset := func() {
 		st.mu.Lock()
 		st.mtuFails = 0
 		st.mu.Unlock()
+		// Recovery: drop the latch AND its remediation — the TCPMSS
+		// clamp exists only while the blackhole latch holds. A rule
+		// left behind keeps forcing --clamp-mss-to-pmtu on every
+		// overlay flow long after the fault cleared: a silent,
+		// permanent performance regression. Gated on the latch
+		// actually being held so the steady-state reset paths
+		// (dormant mesh, no peer, small ping ok) don't fork
+		// iptables every probe cycle.
+		if !n.state.Exists(latchdefs.LatchNebulaMTUBlackhole) {
+			return
+		}
 		n.stateExit(latchdefs.LatchNebulaMTUBlackhole)
+		n.unclampMSSOn(ctx, dev)
+		st.mu.Lock()
+		st.lastClamp = time.Time{} // a re-latch clamps immediately
+		st.mu.Unlock()
 	}
 	if wd == nil || wd.NebulaNet == "" ||
 		!n.unitEnabledActive(ctx, "nebula@"+wd.NebulaNet) ||
@@ -160,11 +187,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 	// not a blackhole symptom — enforce it every probe cycle,
 	// independent of this cycle's DF ping verdict (a healthy neb1
 	// must still catch cilium_wg0 sized against the underlay).
-	dev := wd.NebulaDev
-	if dev == "" {
-		dev = "neb1"
-	}
-	n.checkCiliumWGMTUInvariant(ctx, dev)
+	n.checkCiliumWGMTUInvariant(ctx, dev, st)
 	// Peer fanout: the overlay probe sets are the known nebula
 	// endpoints — same source checkNebulaHealth pings. The first
 	// peer answering the SMALL ping is this cycle's DF target, so
@@ -207,7 +230,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 	}
 	st.mtuFails = 0
 	st.mu.Unlock()
-	n.stateExit(latchdefs.LatchNebulaMTUBlackhole)
+	reset()
 }
 
 // maybeClampNebulaMSS installs the TCPMSS clamp on the overlay dev —
@@ -276,6 +299,33 @@ func (n *NetHealth) clampMSSOn(ctx context.Context, dev string) error {
 	return nil
 }
 
+// unclampMSSOn removes the TCPMSS --clamp-mss-to-pmtu rule one
+// interface carries — the blackhole-recovery half of clampMSSOn.
+// The -C probe keeps it idempotent (a rule never installed, or
+// already removed, is a silent no-op — cilium_wg0 legitimately
+// carries no rule when the invariant is satisfied).
+func (n *NetHealth) unclampMSSOn(ctx context.Context, dev string) {
+	args := []string{"-t", "mangle", "-C", "POSTROUTING",
+		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
+	if _, err := n.cfg.runMountCmd(ctx,
+		append([]string{"iptables"}, args...)); err != nil {
+		return // rule absent (or uncheckable) — nothing to remove
+	}
+	if out, err := n.cfg.runMountCmd(ctx,
+		[]string{"iptables", "-t", "mangle", "-D",
+			"POSTROUTING", "-o", dev, "-p", "tcp",
+			"--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS", "--clamp-mss-to-pmtu"}); err != nil {
+		n.state.AppendLog(fmt.Sprintf(
+			"suspect: nebula-mtu-blackhole MSS unclamp failed on %s: %v (%s)",
+			dev, err, trimRunErr(out)))
+		return
+	}
+	n.actions.WithLabelValues(mtuCheckName, "mss_unclamp").Inc()
+	n.state.AppendLog("ACTION: nebula-mtu-blackhole removed the TCP MSS clamp on " + dev)
+}
+
 // sysfsMTU reads the MTU of one interface through the host sysfs
 // (HostRoot-parity with the other proc/sys reads in this package).
 func (n *NetHealth) sysfsMTU(dev string) (int, error) {
@@ -295,9 +345,19 @@ func (n *NetHealth) sysfsMTU(dev string) (int, error) {
 // the WireGuard header costs ~60B on top of nebula's ~80B, so a
 // cilium_wg0 MTU sized against the underlay instead of the nebula
 // overlay blackholes every large inner packet. On violation it
-// clamps MSS on cilium_wg0 and warns (the plan's "warn + force the
-// MTU/MSS correction").
-func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string) {
+// clamps MSS on cilium_wg0 and warns — ONCE per rule install: the
+// violating MTU outlives the clamp (iptables can't fix sysfs), so
+// re-checking the invariant every probe cycle would warn and fork
+// `iptables -C` for the node's lifetime while the clamp rule sits
+// there already doing its job (wgClampKnown, reset by process
+// restart or a blackhole recovery's unclamp).
+func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string, st *mtuProbeState) {
+	st.mu.Lock()
+	known := st.wgClampKnown
+	st.mu.Unlock()
+	if known {
+		return
+	}
 	cilMTU, err := n.sysfsMTU("cilium_wg0")
 	if err != nil {
 		return // no cilium_wg0 — nothing to check.
@@ -313,8 +373,14 @@ func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string
 		"warn: cilium_wg0 MTU %d exceeds nebula invariant (nebula %s MTU %d, max %d) — clamping TCP MSS on cilium_wg0",
 		cilMTU, nebDev, nebMTU, nebMTU-mtuCiliumWGOverhead))
 	if err := n.clampMSSOn(ctx, "cilium_wg0"); err != nil {
+		// Unclamped drift keeps blackholing WG traffic — the next
+		// probe cycle retries (wgClampKnown stays false).
 		n.state.AppendLog("warn: cilium_wg0 MSS clamp failed: " + err.Error())
+		return
 	}
+	st.mu.Lock()
+	st.wgClampKnown = true
+	st.mu.Unlock()
 }
 
 // writeMTUBHMetric emits node_agent_nebula_mtu_blackhole (0/1) to
@@ -333,8 +399,14 @@ func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {
 	}
 	st.lastGauge = v
 	st.mu.Unlock()
-	dir := filepath.Join(n.cfg.HostRoot,
-		"var", "lib", "node-exporter", "textfile")
+	// NODE_HOST_AGENT_TEXTFILE_DIR (Config.TextfileDir) wins — the
+	// HostRoot derivation only covers configs built without the
+	// hostctx bundle (tests, hand-rolled Configs).
+	dir := n.cfg.TextfileDir
+	if dir == "" {
+		dir = filepath.Join(n.cfg.HostRoot,
+			"var", "lib", "node-exporter", "textfile")
+	}
 	if textfileDirOverride != "" {
 		dir = textfileDirOverride
 	}

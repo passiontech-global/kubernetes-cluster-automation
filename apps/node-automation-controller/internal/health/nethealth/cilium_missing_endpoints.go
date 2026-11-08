@@ -113,11 +113,10 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	// Paged like every cluster-wide list — an unpaginated CEP list
-	// forces etcd to serialize every endpoint into one response.
-	ceps, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(p.Dyn.Resource(kube.GVRCiliumEndpoint)))
+	// Paged like every cluster-wide list — the CEP census rides the
+	// per-sweep unstructured snapshot (one memoized LIST per sweep,
+	// raw error kept for the NoMatch/NotFound interpretation below).
+	ceps, err := p.AllUnstructured(ctx, kube.GVRCiliumEndpoint)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// No Cilium on this cluster — still reconcile the ledgers:
@@ -191,8 +190,19 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		if agentHealed[pod.Spec.NodeName] {
 			continue // the node agent restart covers this pod
 		}
+		// A lone pod delete needs a controller owner: an ownerless
+		// pod is never recreated, so deleting it is destruction, not
+		// healing — skip (the finding/gauge still reported it).
+		if metav1.GetControllerOf(pod) == nil {
+			log.Info("skip CEP-missing pod delete: no controller owner — the pod would not be recreated",
+				"pod", pod.Namespace+"/"+pod.Name)
+			continue
+		}
+		// The cooldown keys on the pod's controller — the recreated
+		// pod carries a fresh suffix, so a "<ns>/<pod>" key lets the
+		// same workload's re-heal fire every sweep.
 		p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
-			pod.Namespace+"/"+pod.Name, pod, ciliumCEPHealCool, now)
+			kube.PodControllerKey(pod), pod, ciliumCEPHealCool, now)
 	}
 	for _, pod := range confirmed {
 		rep.Find(pod.Namespace + "/" + pod.Name + "@" + pod.Spec.NodeName)

@@ -16,8 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -247,8 +249,10 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 
 	older := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
 	older.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	older.OwnerReferences = repoServerOwnerRef("argocd-repo-server-0")
 	newer := probetest.PodWithPhase("argocd", "argocd-repo-server-1", corev1.PodRunning, true, time.Hour)
 	newer.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	newer.OwnerReferences = repoServerOwnerRef("argocd-repo-server-1")
 	cs := fake.NewSimpleClientset(older, newer)
 	p := testProberDyn(cs, dyn)
 
@@ -261,6 +265,86 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("newer repo-server pod must survive: %v", err)
+	}
+}
+
+// repoServerOwnerRef builds the ReplicaSet controller ownerRef a
+// real repo-server pod carries — the restart heal refuses a
+// controller-less pod (deleting it would not be recreated).
+func repoServerOwnerRef(rsName string) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: rsName, UID: types.UID("rs-" + rsName), Controller: ptr.To(true),
+	}}
+}
+
+// A repo-server pod with NO controller owner is never deleted — the
+// restart could not recreate it, so the heal skips it (the two stuck
+// apps still FAIL the check through their findings).
+func TestArgoCDRepoServerUnownedPodNotDeleted(t *testing.T) {
+	cond := func() map[string]any {
+		return map[string]any{
+			"type":               "ComparisonError",
+			"lastTransitionTime": time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	}
+	appA := argoCDApplication("argocd", "app-a", "", cond())
+	appB := argoCDApplication("argocd", "app-b", "", cond())
+	lone := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
+	lone.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	cs := fake.NewSimpleClientset(lone)
+	p := testProberDyn(cs, testutil.NewDynamicClient(appA, appB))
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("two ComparisonErrors must still fail: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("controller-less repo-server pod must not be deleted: %v", err)
+	}
+}
+
+// CRD absence is a COMPLETE sweep (no Application can exist): the
+// ledgers still close — held seen keys drop and emitted series are
+// DeleteLabelValues'd instead of leaking a pinned 1 forever.
+func TestArgoCDAppStuckCRDAbsentPrunesLedgers(t *testing.T) {
+	base := time.Now()
+	app := argoCDApplication("argocd", "gone-app", "Progressing")
+	app.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/gone-app":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`})
+	dyn := testutil.NewDynamicClient(app)
+	cs := fake.NewSimpleClientset()
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	chk := probetest.MustCheck[*argoCDAppStuckCheck](t, p)
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "gone-app", "progressing>45m0s")
+
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("precondition: stuck app must FAIL: %+v", res)
+	}
+
+	// ArgoCD uninstalled — the Application list goes NotFound.
+	crdGone := false
+	dyn.PrependReactor("list", "applications",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if !crdGone {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{Group: "argoproj.io", Resource: "applications"}, "")
+		})
+	crdGone = true
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("absent CRD must pass: %+v", res)
+	}
+	if keys := probetest.LedgerKeys(&chk.seen); len(keys) != 0 {
+		t.Fatalf("seen ledger keys survived CRD absence: %v", keys)
+	}
+	if m := probetest.FindMetric(t, "node_automation_argocd_app_stuck",
+		map[string]string{"namespace": "argocd", "name": "gone-app",
+			"reason": "progressing>45m0s"}); m != nil {
+		t.Fatal("emitted series survived CRD absence — must be pruned")
 	}
 }
 
@@ -298,8 +382,10 @@ func TestArgoCDRefreshDefersUnderMaintenance(t *testing.T) {
 }
 
 // Two stuck Applications sharing one downscaled Deployment pay ONE
-// workload Get per sweep — the per-app×resource lookups memoize on
+// workload census per sweep — the per-app×resource lookups memoize on
 // downscaledSeen (ownerSeen's shape) without changing any verdict.
+// The census itself is the sweep snapshot's cluster-wide Deployment
+// LIST, so the pin counts "list" actions, not "get".
 func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
 	base := time.Now()
 	resources := func() []any {
@@ -329,10 +415,10 @@ func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
 		Spec: appsv1.DeploymentSpec{Replicas: &zero},
 	}
 	cs := fake.NewSimpleClientset(dep)
-	gets := 0
-	cs.PrependReactor("get", "deployments",
+	lists := 0
+	cs.PrependReactor("list", "deployments",
 		func(action ktesting.Action) (bool, runtime.Object, error) {
-			gets++
+			lists++
 			return false, nil, nil
 		})
 	p := testProberDyn(cs, dyn)
@@ -342,8 +428,8 @@ func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
 	if !res.Pass {
 		t.Fatalf("downscaled-only apps must pass: %+v", res)
 	}
-	if gets != 1 {
-		t.Fatalf("deployment Gets = %d, want 1 — the per-sweep memo collapsed the N+1", gets)
+	if lists != 1 {
+		t.Fatalf("deployment lists = %d, want 1 — the per-sweep memo collapsed the N+1", lists)
 	}
 }
 

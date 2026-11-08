@@ -14,14 +14,15 @@ package datastore
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -70,6 +71,9 @@ const (
 	pgArchiveCondMinAge = 30 * time.Minute
 	pgWALSlotRetainMax  = int64(5 << 30) // 5GiB
 	pgWALVolumeRatio    = 0.6
+
+	// The per-pod log-fetch fan-out cap (Component 3 worker pool).
+	postgresWALLogWorkers = 4
 )
 
 // postgresClusterLabels are the pod labels that bind a pod to its
@@ -168,11 +172,20 @@ func pgWALLogReason(line string) string {
 	return ""
 }
 
-// pgWALLogHit fetches the postgres container's log tail and returns
-// the first matching WAL signature — bounded like the scylla gossip
-// probe; a fetch failure is inconclusive, not healthy. The matched
-// reason rides out through the match closure (PodLogTail reports
-// only hit/miss).
+// pgWALLogSinceWindow bounds the log read: the disk-full/archiver
+// signatures only matter while recent (an unbounded tail can span
+// the pod's whole lifetime and re-flag a crash that predates every
+// other signal in this sweep), so the fetch passes SinceSeconds
+// alongside the tail bound — the apiserver ANDs the two.
+const pgWALLogSinceWindow = 30 * time.Minute
+
+// pgWALLogHit fetches the postgres container's log tail (bounded by
+// TailLines AND SinceSeconds) and returns the first matching WAL
+// signature — a fetch failure is inconclusive, not healthy. The
+// matched reason rides out through the match closure. This mirrors
+// probefw.PodLogTail with the extra SinceSeconds option the shared
+// helper does not carry (its other consumers scan whole-lifetime
+// signatures by design).
 func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	pod *corev1.Pod) (string, error) {
 
@@ -184,20 +197,40 @@ func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	} else {
 		return "", nil // no unambiguous postgres container — skip
 	}
-	var reason string
-	hit, err := probefw.PodLogTail(ctx, p.CS, pod, container,
-		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-		func(line string) bool {
-			if r := pgWALLogReason(line); r != "" {
-				reason = r
-				return true
-			}
-			return false
-		})
-	if err != nil || !hit {
+	opts := pgWALLogOptions(container)
+	lctx, cancel := context.WithTimeout(ctx, probefw.LogTimeout)
+	defer cancel()
+	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
+		opts).Stream(lctx)
+	if err != nil {
 		return "", err
 	}
+	defer func() { _ = stream.Close() }()
+	data, err := io.ReadAll(io.LimitReader(stream, probefw.LogMaxBytes))
+	if err != nil {
+		return "", err
+	}
+	var reason string
+	for _, line := range strings.Split(string(data), "\n") {
+		if r := pgWALLogReason(line); r != "" {
+			reason = r
+			break
+		}
+	}
 	return reason, nil
+}
+
+// pgWALLogOptions builds the bounded pod-log read: the tail bound
+// AND the SinceSeconds bound (separate for tests — the fake
+// clientset reactor cannot surface the options).
+func pgWALLogOptions(container string) *corev1.PodLogOptions {
+	tail := probefw.DefaultTailLines
+	since := int64(pgWALLogSinceWindow.Seconds())
+	return &corev1.PodLogOptions{
+		Container:    container,
+		TailLines:    &tail,
+		SinceSeconds: &since,
+	}
 }
 
 // postgresClusterOf returns the operator cluster a postgres pod
@@ -241,15 +274,15 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	// (a) CR conditions — the operator's own archive/backup verdicts.
 	var cnpgClusters []*unstructured.Unstructured
 	for _, rk := range postgresCRKinds {
-		items, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
+		items, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue
 		case err != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.gvr.Resource, err)}
 		}
-		for i := range items.Items {
-			cr := &items.Items[i]
+		for i := range items {
+			cr := &items[i]
 			// cnpg-health — CNPG clusters get the dedicated cluster-health
 			// pass below on top of the archive-condition scan.
 			if rk.gvr == kube.GVRCNPGCluster {
@@ -264,11 +297,16 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	// (b) pod logs — crash/stall evidence the CR status cannot see.
+	// The fetches run through a bounded worker pool (max
+	// postgresWALLogWorkers concurrent kubelet log streams) so a
+	// fleet of postgres pods cannot stampede the apiserver's log
+	// proxy; the results are applied serially below.
 	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	pgPVCs := map[string]bool{} // "ns/pvc" mounted by a postgres pod
+	pgPVCs := map[string]string{} // "ns/pvc" -> owning operator cluster
+	var scanIdx []int
 	for i := range pods {
 		pod := &pods[i]
 		cluster := postgresClusterOf(pod)
@@ -276,21 +314,42 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		for _, v := range pod.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil {
-				pgPVCs[pod.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] = true
+			if v.PersistentVolumeClaim != nil &&
+				pgPVCs[pod.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] == "" {
+				pgPVCs[pod.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] = cluster
 			}
 		}
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
-		reason, lerr := p.pgWALLogHit(ctx, pod)
-		if lerr != nil {
+		scanIdx = append(scanIdx, i)
+	}
+	type logScan struct {
+		reason string
+		err    error
+	}
+	scans := make([]logScan, len(scanIdx))
+	g := errgroup.Group{}
+	g.SetLimit(postgresWALLogWorkers)
+	for j, i := range scanIdx {
+		pod := pods[i]
+		g.Go(func() error {
+			reason, lerr := p.pgWALLogHit(ctx, &pod)
+			scans[j] = logScan{reason: reason, err: lerr}
+			return nil // tolerated sub-failure — applied below
+		})
+	}
+	_ = g.Wait()
+	for j, i := range scanIdx {
+		pod := &pods[i]
+		key := pod.Namespace + "/" + pod.Name
+		if scans[j].err != nil {
 			log.Info("WARN: postgres log fetch failed — WAL signature inconclusive",
-				"pod", pod.Namespace+"/"+pod.Name, "error", lerr)
+				"pod", key, "error", scans[j].err)
 			continue
 		}
-		if reason != "" {
-			emit(pod.Namespace, cluster, reason)
+		if scans[j].reason != "" {
+			emit(pod.Namespace, postgresClusterOf(pod), scans[j].reason)
 		}
 	}
 
@@ -353,8 +412,13 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		for _, s := range series {
 			ns := s.Label("namespace")
 			pvc := s.Label("persistentvolumeclaim")
-			if pgPVCs[ns+"/"+pvc] {
-				emit(ns, pvc, "wal_volume_pressure")
+			// The finding's entity is the CLUSTER, not the PVC —
+			// the gauge series are per operator cluster, and the
+			// claim name is an implementation detail of the
+			// operator's volume layout (W17: emitting the PVC name
+			// produced series that match no alert label set).
+			if cluster := pgPVCs[ns+"/"+pvc]; cluster != "" {
+				emit(ns, cluster, "wal_volume_pressure")
 			}
 		}
 	}

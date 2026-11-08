@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -72,6 +73,9 @@ const (
 	scyllaCompactionBacklogMax = 100
 	scyllaMetricsPort          = 9180
 	scyllaMetricsTimeout       = 8 * time.Second
+
+	// The per-pod metrics-scrape fan-out cap (Component 3 pool).
+	scyllaScrapeWorkers = 4
 
 	// W12-ST3 — shard-imbalance signature: a Scylla pod's busiest
 	// shard saturated while the average shard idles is the
@@ -259,16 +263,35 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 	var backlogRep, shardRep, overloadRep probefw.SweepReport
 	scrapedLive := map[string]bool{} // "ns/pod" successfully scraped — the baselines' keep set
 	shardLive := map[string]bool{}   // "ns/pod" showing the skew THIS sweep — the imbalance ledger's
+	// Candidate pods scrape through a bounded worker pool (max
+	// scyllaScrapeWorkers concurrent :9180 fetches); the signatures
+	// apply serially below.
+	var members []*corev1.Pod
 	for i := range pods {
 		pod := &pods[i]
-		cluster := pod.Labels[scyllaClusterLabel]
-		if cluster == "" || pod.DeletionTimestamp != nil ||
+		if pod.Labels[scyllaClusterLabel] == "" || pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
 			!kube.PodReadyCond(pod) {
 			continue
 		}
-		sc, ok := p.scyllaPodMetrics(ctx, pod)
-		if !ok {
+		members = append(members, pod)
+	}
+	scrapes := make([]*scyllaScrape, len(members))
+	g := errgroup.Group{}
+	g.SetLimit(scyllaScrapeWorkers)
+	for j, pod := range members {
+		g.Go(func() error {
+			sc, ok := p.scyllaPodMetrics(ctx, pod)
+			if ok {
+				scrapes[j] = sc
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	for j, pod := range members {
+		sc := scrapes[j]
+		if sc == nil {
 			// A dead metrics endpoint is inconclusive — the pod may
 			// be mid-restart; never read as healthy OR sick.
 			log.Info("WARN: scylla pod metrics fetch failed — compaction/schema evidence inconclusive",
@@ -301,7 +324,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		// scrape is a stall in progress; a drop means the pod
 		// restarted its counters, not evidence either way.
 		p.scyllaOverloadDelta(&overloadRep, pod, sc.overload)
-		ck := pod.Namespace + "/" + cluster
+		ck := pod.Namespace + "/" + pod.Labels[scyllaClusterLabel]
 		set := clusterVersions[ck]
 		if set == nil {
 			set = map[string]map[float64]bool{}

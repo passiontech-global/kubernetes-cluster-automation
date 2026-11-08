@@ -28,7 +28,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -140,15 +139,18 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 	live := map[string][]string{}    // "kind/ns/name/reason" → label tuple
 	zeroNow := map[string][]string{} // "kind/ns/name/svcns/svc" → zero gauge tuple
 	for _, rk := range routeKinds {
-		routes, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
+		// The per-sweep unstructured snapshot memoizes one LIST per
+		// GVR; the raw error keeps the NoMatch/NotFound = "gateway-api
+		// flavor not installed" interpretation.
+		routes, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // gateway-api flavor not installed on this cluster
 		case err != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.gvr.Resource, err)}
 		}
-		for i := range routes.Items {
-			p.scanRoute(ctx, log, census, &routes.Items[i], rk.kind, live, zeroNow)
+		for i := range routes {
+			p.scanRoute(ctx, log, census, &routes[i], rk.kind, live, zeroNow)
 		}
 	}
 

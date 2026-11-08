@@ -27,7 +27,10 @@ import (
 // W10-NM3 — linkerd-protocol-detection-stall
 // ---------------------------------------------------------------------------
 
-func TestLinkerdOpaquePortsHealPatchesTemplateAndDeletesPod(t *testing.T) {
+// The heal patches the workload template and leaves the pod running —
+// the workload controller's rolling update replaces every pod with the
+// corrected config itself; no mass pod delete.
+func TestLinkerdOpaquePortsHealPatchesTemplateAndRolls(t *testing.T) {
 	sts := emptyStatefulSet("apps", "cache")
 	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379, 8080}, "", "")
 	setPodOwnerStatefulSet(pod, "cache")
@@ -49,12 +52,34 @@ func TestLinkerdOpaquePortsHealPatchesTemplateAndDeletesPod(t *testing.T) {
 		t.Fatalf("template opaque-ports = %q, want 6379",
 			got.Spec.Template.Annotations["config.linkerd.io/opaque-ports"])
 	}
-	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "cache-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("pod should be deleted after template patch, err=%v", err)
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "cache-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod must NOT be mass-deleted — the controller rolls it: %v", err)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_opaque_port_missing",
 		map[string]string{"namespace": "apps", "pod": "cache-0", "port": "6379"}); m == nil {
 		t.Fatal("opaque-port-missing gauge absent")
+	}
+}
+
+// A template that ALREADY covers the ports (patched earlier, pre-rollout
+// pod still running) deletes the pod — the restart is the heal, and the
+// bookkeeping annotation lands only once the delete is delivered.
+func TestLinkerdOpaquePortsCoveredTemplateDeletesPod(t *testing.T) {
+	sts := emptyStatefulSet("apps", "cache")
+	sts.Spec.Template.Annotations = map[string]string{
+		"config.linkerd.io/opaque-ports": "6379",
+	}
+	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379, 8080}, "", "")
+	setPodOwnerStatefulSet(pod, "cache")
+	cs := fake.NewSimpleClientset(sts, pod)
+	p := testProber(cs)
+
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("stale pre-rollout pod must still fail: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "cache-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("covered-template pod should be re-rolled, err=%v", err)
 	}
 }
 

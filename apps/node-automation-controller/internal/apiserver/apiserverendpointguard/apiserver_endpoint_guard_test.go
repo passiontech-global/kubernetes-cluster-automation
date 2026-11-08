@@ -524,17 +524,42 @@ func TestUnionIPs(t *testing.T) {
 	}
 }
 
-// A subset emptied by the removal is dropped entirely — the object
-// must never serialize an empty-addresses subset.
+// A subset emptied by the removal drops its empty address lists and
+// keeps its PORT shell: addEndpointIP must be able to restore the
+// recovered backend onto the ORIGINAL ports (kube-proxy reads the
+// endpoint port back; the object's ports may be 443 on one plane and
+// 6443 on another). A subset with neither addresses nor ports left
+// drops entirely.
 func TestRemoveEndpointIPDropsEmptySubset(t *testing.T) {
-	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil)
+	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil) // ports + address
 	appendSubset(ep, map[string]any{
-		"addresses": []any{map[string]any{"ip": "10.0.0.2"}},
+		"addresses": []any{map[string]any{"ip": "10.0.0.2"}}, // no ports
 	})
 	removeEndpointIP(ep, "10.0.0.1")
 	subs := endpointSubsets(ep)
-	if len(subs) != 1 || subsetAddrs(ep, 0, "addresses")[0]["ip"] != "10.0.0.2" {
-		t.Fatalf("emptied subset not dropped: %+v", subs)
+	// subs[0] is the surviving port shell; subs[1] is the untouched
+	// ports-less subset still carrying 10.0.0.2.
+	if len(subs) != 2 {
+		t.Fatalf("want the port shell plus the untouched subset: %+v", subs)
+	}
+	if _, found := subs[0]["addresses"]; found {
+		t.Fatal("emptied subset must not serialize an empty addresses list")
+	}
+	if _, found := subs[0]["notReadyAddresses"]; found {
+		t.Fatal("emptied subset must not serialize an empty notReadyAddresses list")
+	}
+	ports := nestedMaps(subs[0], "ports")
+	if len(ports) != 1 || num64(ports[0]["port"]) != 443 {
+		t.Fatalf("port shell lost by the removal: %+v", ports)
+	}
+	if got := subsetAddrs(ep, 1, "addresses"); len(got) != 1 || got[0]["ip"] != "10.0.0.2" {
+		t.Fatalf("untouched subset changed: %+v", got)
+	}
+	// The restore lands the recovered IP back onto the shell's ports.
+	addEndpointIP(ep, "10.0.0.1")
+	subs = endpointSubsets(ep)
+	if len(subs) != 2 || len(subsetAddrs(ep, 0, "addresses")) != 1 {
+		t.Fatalf("re-add must land in the surviving port shell: %+v", subs)
 	}
 }
 
@@ -1622,5 +1647,37 @@ func TestEndpointGuardJWKSTieNeverFlags(t *testing.T) {
 		if got := g.backends[ip].kidSkewStreak; got != 0 {
 			t.Fatalf("tied backend %s kidSkewStreak = %d, want 0", ip, got)
 		}
+	}
+}
+
+// runCycle contains a panicking sweep: a panic anywhere in the run
+// path (here: the version-probe seam) is recovered, metered and
+// logged, and the Start loop keeps its cadence — a wedged dependency
+// or a malformed unstructured object must not kill the whole
+// controller process. (This runnable bypasses shared.Periodic, which
+// is where every other module's panic recovery lives.)
+func TestEndpointGuardCycleRecoversPanics(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient()
+	g := newEndpointGuard(cs, dyn, probeTable{})
+	g.serverMinorFn = func() (int, error) { panic("version probe exploded") }
+	if got := g.runCycle(ctx, logr.Discard(), endpointGuardInterval); got != endpointGuardInterval {
+		t.Fatalf("cadence after a panicking sweep = %v, want the passed-in interval", got)
+	}
+	// The recover must not wedge the loop: the passed-in cadence is
+	// retained through panicking cycles too.
+	if got := g.runCycle(ctx, logr.Discard(), endpointGuardQuarantineInterval); got != endpointGuardQuarantineInterval {
+		t.Fatalf("cadence after the recovered cycle = %v, want the passed-in quarantine interval", got)
+	}
+	// And a healthy cycle still applies the quarantine fast-cadence
+	// switch.
+	g.serverMinorFn = nil
+	g.quarantineActive = true
+	if got := g.runCycle(ctx, logr.Discard(), endpointGuardInterval); got != endpointGuardQuarantineInterval {
+		t.Fatalf("healthy sweep after recovery = %v, want the quarantine fast cadence", got)
+	}
+	g.quarantineActive = false
+	if got := g.runCycle(ctx, logr.Discard(), endpointGuardQuarantineInterval); got != endpointGuardInterval {
+		t.Fatalf("healthy sweep with quarantine disarmed = %v, want the steady interval", got)
 	}
 }

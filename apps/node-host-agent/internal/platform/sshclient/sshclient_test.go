@@ -117,6 +117,32 @@ func TestBoundOpCtxFallbackTimeout(t *testing.T) {
 	clear()
 }
 
+// TestBoundOpMinDeadlineWins: the per-op bound is
+// min(ctx deadline, now+fallback) — a ctx budget TIGHTER than the
+// op fallback must win, so an op never outlives the ctx that owns it
+// (the opDeadline contract hubsync/nebulasign ride).
+func TestBoundOpMinDeadlineWins(t *testing.T) {
+	nc := &dlConn{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	want := time.Now().Add(3 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), want)
+	defer cancel()
+	clear := BoundOp(ctx, log, nc, time.Minute)
+	if len(nc.dls) != 1 || !nc.dls[0].Equal(want) {
+		t.Fatalf("deadline = %v, want the tighter ctx deadline %v", nc.dls, want)
+	}
+	clear() // dls[1] = the zero clear
+
+	// And the fallback direction: no ctx deadline → now+timeout.
+	before := time.Now().Add(time.Minute)
+	clear = BoundOp(context.Background(), log, nc, time.Minute)
+	after := time.Now().Add(time.Minute)
+	if len(nc.dls) != 3 || nc.dls[2].Before(before) || nc.dls[2].After(after) {
+		t.Fatalf("fallback deadline = %v, want ~now+1m", nc.dls)
+	}
+	clear()
+}
+
 // TestBoundOpCtxUnsupportedIsLoud: same rejected-SetDeadline
 // contract as BoundOp — an unbounded body must warn.
 func TestBoundOpCtxUnsupportedIsLoud(t *testing.T) {

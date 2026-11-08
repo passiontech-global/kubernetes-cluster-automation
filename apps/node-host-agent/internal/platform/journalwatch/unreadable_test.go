@@ -21,8 +21,9 @@ func TestNewUnreadableTrackerWiring(t *testing.T) {
 
 	tr := NewUnreadableTracker(state, []string{dir}, 3)
 
-	// The shared streak name BOTH hygienes bump — pin the literal so
-	// a rename of the const can't silently split the shared episode.
+	// The shared streak base name — each owner persists to
+	// <base>-<owner>; pin the literal so a rename of the const can't
+	// silently split the shared episode.
 	if tr.CounterName != UnreadableCounter {
 		t.Fatalf("CounterName=%q want the const", tr.CounterName)
 	}
@@ -56,36 +57,37 @@ func TestNewUnreadableTrackerWiring(t *testing.T) {
 
 // TestNewUnreadableTrackerPersistenceAndDefaultNeeded: needed <= 0 →
 // DefaultNeeded (5), the streak persists through the wired Counter
-// across "restarts" (fresh constructor calls on one state dir), and
-// recovery exits + resets the streak file.
+// across "restarts" (fresh constructor calls on one state dir) into
+// the per-owner file, and recovery exits + resets that file.
 func TestNewUnreadableTrackerPersistenceAndDefaultNeeded(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := t.TempDir()
 	state := hoststate.New(stateDir, "", nil, nil)
 
 	a := NewUnreadableTracker(state, []string{dir}, 0)
-	for i := 1; i <= 4; i++ {
-		if enter, _ := a.NoteRead(false); enter {
-			t.Fatalf("failure %d entered before DefaultNeeded", i)
+	for range 4 {
+		if a.EnterFrom(OwnerWorkerHygiene, latchdefs.LatchJournalUnreadable) {
+			t.Fatal("failure entered before DefaultNeeded")
 		}
 	}
 
 	// "Restart": a freshly wired tracker must resume the on-disk
 	// streak, not re-arm at zero.
 	b := NewUnreadableTracker(state, []string{dir}, 0)
-	enter, exit := b.NoteRead(false)
-	if !enter || exit {
-		t.Fatalf("5th (persisted) failure: enter=%v exit=%v, want enter", enter, exit)
+	if !b.EnterFrom(OwnerWorkerHygiene, latchdefs.LatchJournalUnreadable) {
+		t.Fatal("5th (persisted) failure must enter")
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, UnreadableCounter)); err != nil {
-		t.Fatalf("streak file missing: %v", err)
+	if _, err := os.Stat(filepath.Join(stateDir,
+		UnreadableCounter+"-"+OwnerWorkerHygiene)); err != nil {
+		t.Fatalf("per-owner streak file missing: %v", err)
 	}
 
-	// A good read while latched exits and resets the streak file.
-	if _, exit := b.NoteRead(true); !exit {
-		t.Fatal("good read while latched must exit")
+	// A good read while latched exits and resets the owner's file.
+	if !b.ExitFrom(OwnerWorkerHygiene, latchdefs.LatchJournalUnreadable) {
+		t.Fatal("good read while latched must report the exit edge")
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, UnreadableCounter)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(stateDir,
+		UnreadableCounter+"-"+OwnerWorkerHygiene)); !os.IsNotExist(err) {
 		t.Fatalf("good read must remove the streak file, stat err=%v", err)
 	}
 }

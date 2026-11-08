@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -50,6 +51,17 @@ const (
 	// modules must agree on where the connect pod lives.
 	esConnectSyncContainer  = "connect-sync"
 	esConnectSyncRestartMax = 3
+	// esConnectCrashloopWindow bounds the "recently terminated" half
+	// of the crashloop signature: a high RestartCount only counts
+	// while the container is in CrashLoopBackOff NOW or its last
+	// termination finished inside this window — a pod that crash-
+	// looped an hour ago and has been stable since is healthy.
+	esConnectCrashloopWindow = 15 * time.Minute
+	// esConnectStartGrace exempts freshly started pods from the
+	// whole degraded judgment: a just-scheduled pod is legitimately
+	// !Ready and its restart counter may tick during init churn
+	// before the first stable run.
+	esConnectStartGrace = 5 * time.Minute
 )
 
 var (
@@ -78,7 +90,7 @@ func (p *onePasswordConnectSyncCheck) Run(ctx context.Context) probefw.Result {
 				!strings.HasPrefix(pod.Name, esConnectPodPrefix) {
 				continue
 			}
-			why, bad := connectSyncDegraded(pod)
+			why, bad := connectSyncDegraded(pod, p.Now())
 			if !bad {
 				continue
 			}
@@ -97,9 +109,17 @@ func (p *onePasswordConnectSyncCheck) Run(ctx context.Context) probefw.Result {
 // connectSyncDegraded reports whether the pod's connect-sync
 // container is unhealthy — mirrors the externalsecret-nudge
 // predicate: !Ready, status missing while the container is declared,
-// or past the crashloop ceiling. Pods declaring no connect-sync
-// container are skipped (a different connect variant).
-func connectSyncDegraded(pod *corev1.Pod) (why string, bad bool) {
+// or past the crashloop ceiling. The crashloop half only fires while
+// the container sits in CrashLoopBackOff or its last termination
+// finished inside esConnectCrashloopWindow; pods younger than
+// esConnectStartGrace get a grace pass (a just-started pod is
+// legitimately !Ready while its restart counter ticks through init).
+// Pods declaring no connect-sync container are skipped (a different
+// connect variant).
+func connectSyncDegraded(pod *corev1.Pod, now time.Time) (why string, bad bool) {
+	if now.Sub(pod.CreationTimestamp.Time) < esConnectStartGrace {
+		return "", false
+	}
 	declared := false
 	for _, c := range pod.Spec.Containers {
 		if c.Name == esConnectSyncContainer {
@@ -118,7 +138,14 @@ func connectSyncDegraded(pod *corev1.Pod) (why string, bad bool) {
 		case !cs.Ready:
 			return "connect-sync container not Ready", true
 		case cs.RestartCount >= esConnectSyncRestartMax:
-			return "connect-sync container crashlooping", true
+			inBackoff := cs.State.Waiting != nil &&
+				cs.State.Waiting.Reason == "CrashLoopBackOff"
+			finishedRecently := cs.LastTerminationState.Terminated != nil &&
+				!cs.LastTerminationState.Terminated.FinishedAt.IsZero() &&
+				now.Sub(cs.LastTerminationState.Terminated.FinishedAt.Time) <= esConnectCrashloopWindow
+			if inBackoff || finishedRecently {
+				return "connect-sync container crashlooping", true
+			}
 		}
 		return "", false
 	}

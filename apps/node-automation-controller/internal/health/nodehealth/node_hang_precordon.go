@@ -22,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // nodeHangCheck is the node-hang pre-cordon watchdog.
@@ -137,36 +138,41 @@ const (
 
 // nodeHangConds are the NPD/node-agent latches that precede a node
 // reboot — patching unschedulable early keeps new pods off the dying
-// node. All are custom NodeConditionTypes written by the node stack
-// (FilesystemReadOnly/KernelHungTasks/KernelSlabLeak/
+// node. The set lives in nodecond.HangPreCordonNames (libs/hostkit) —
+// the single source of truth shared with the node-host-agent, so the
+// controller can no longer drift from the names the agent actually
+// emits. All members are custom NodeConditionTypes written by the
+// node stack (FilesystemReadOnly/KernelHungTasks/KernelSlabLeak/
 // KernelResourceExhaustion/CgroupDyingLeak by hostmetrics+workerhygiene,
 // KubeletRuntimeStall/KubeletWatchWedge/PodTeardownWedged by
 // nodereporter, MemoryPSIThrashing by the PSI monitor;
-// InodePressure is kubelet-native — nodefs/imagefs inode
-// exhaustion, no agent latch involved; the Cilium*/CalicoFelixDown
+// InodePressure is the one kubelet-native member — nodefs/imagefs
+// inode exhaustion, no agent latch involved; the Cilium*/CalicoFelixDown
 // latches are the CNI death signals a pre-reboot node carries;
 // NebulaIsolated is the overlay partition latch;
 // KubeletPLEGUnhealthy — W12-1.4 — is the PLEG relist stall that
-// precedes the kubelet dying outright). There is
-// no corev1 constant for any of them — string literals are the
-// convention here (same as nodeClockSkewConds below).
+// precedes the kubelet dying outright).
 // The clock conditions are deliberately NOT here: they carry their
 // own longer fuse (nodeClockSkewCordonAge) and are checked
 // separately.
-var nodeHangConds = []corev1.NodeConditionType{
-	"KernelHungTasks", "FilesystemReadOnly", "KubeletRuntimeStall",
-	"KubeletWatchWedge", "PodTeardownWedged", "InodePressure",
-	"MemoryPSIThrashing", "KernelSlabLeak", "KernelResourceExhaustion",
-	"CgroupDyingLeak", "CiliumAgentDown", "CiliumInitStuck",
-	"CiliumEnvoyDown", "CalicoFelixDown", "NebulaIsolated",
-	"KubeletPLEGUnhealthy", "DiskSlowIO",
-}
+var nodeHangConds = condTypes(nodecond.HangPreCordonNames)
 
 // nodeClockSkewConds are the clock-health latches on the longer
-// fuse — ClockUnsynchronized (no sync source) and
-// ClockSkewDetected (synchronized but >2s offset, W12-1.4).
-var nodeClockSkewConds = []corev1.NodeConditionType{
-	"ClockUnsynchronized", "ClockSkewDetected",
+// fuse (nodecond.ClockSkewPreCordonNames) — ClockUnsynchronized
+// (no sync source) and ClockSkewDetected (synchronized but >2s
+// offset, W12-1.4).
+var nodeClockSkewConds = condTypes(nodecond.ClockSkewPreCordonNames)
+
+// condTypes converts a nodecond name list into the
+// corev1.NodeConditionType slices the check loops compare —
+// nodecond keeps the names as untyped strings so libs/hostkit stays
+// stdlib-only.
+func condTypes(names []string) []corev1.NodeConditionType {
+	out := make([]corev1.NodeConditionType, len(names))
+	for i, name := range names {
+		out[i] = corev1.NodeConditionType(name)
+	}
+	return out
 }
 
 var (

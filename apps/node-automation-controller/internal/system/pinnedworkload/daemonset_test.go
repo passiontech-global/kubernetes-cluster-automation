@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // pinnedDS is a kube-system/agent DaemonSet carrying the "agent"
@@ -218,5 +219,65 @@ func TestDaemonSetSpecPatchError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "patch daemonset kube-system/agent") {
 		t.Fatalf("error missing the wrapped ref: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Informer-cache read + direct-CS drift confirm (Reader seam)
+// ---------------------------------------------------------------------------
+
+// A drifted cache read with a settled LIVE object must not patch —
+// the destructive path confirms on the direct clientset. Drifted
+// keys on the priorityClassName: the cache copy carries it (drifted),
+// the live copy does not.
+func TestDaemonSetSpecCachedReadConfirmSkipsSettled(t *testing.T) {
+	live := pinnedDS()
+	stale := pinnedDS()
+	stale.Spec.Template.Spec.PriorityClassName = "system-node-critical" // drifted per the hook
+	cs := fake.NewSimpleClientset(live)
+	var patched bool
+	forbidDSPatch(cs, &patched)
+
+	s := baseDSSpec(cs)
+	s.Reader = &fakeCacheReader{objs: []client.Object{stale}}
+	s.Drifted = func(ds *appsv1.DaemonSet) bool {
+		return ds.Spec.Template.Spec.PriorityClassName == "system-node-critical"
+	}
+	res, err := s.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+	if patched {
+		t.Fatal("patched off a stale cache read — the direct-CS confirm must veto")
+	}
+}
+
+// A drifted cache read with a drifted LIVE object still patches.
+func TestDaemonSetSpecCachedReadConfirmPatchesDrift(t *testing.T) {
+	live := pinnedDS()
+	live.Spec.Template.Spec.PriorityClassName = "system-node-critical"
+	stale := pinnedDS()
+	stale.Spec.Template.Spec.PriorityClassName = "system-node-critical"
+	cs := fake.NewSimpleClientset(live)
+	var patches int
+	cs.PrependReactor("patch", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+
+	s := baseDSSpec(cs)
+	s.Reader = &fakeCacheReader{objs: []client.Object{stale}}
+	s.Drifted = func(ds *appsv1.DaemonSet) bool {
+		return ds.Spec.Template.Spec.PriorityClassName == "system-node-critical"
+	}
+	if _, err := s.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patches != 1 {
+		t.Fatalf("confirmed drift patch attempts = %d, want 1", patches)
 	}
 }

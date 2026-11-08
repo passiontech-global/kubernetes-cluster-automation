@@ -17,13 +17,15 @@ import (
 )
 
 // stealNode builds a Ready worker node carrying a CPUStealPressure
-// condition of the given status transitioned `age` ago.
+// condition of the given status transitioned `age` ago, with a fresh
+// heartbeat — nodereporter re-stamps it every ~2m while alive.
 func stealNode(name string, status corev1.ConditionStatus, age time.Duration) *corev1.Node {
 	n := testutil.Node(name, corev1.ConditionTrue, nil)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               cpuStealCond,
 		Status:             status,
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
 	})
 	return n
 }
@@ -45,6 +47,41 @@ func TestCPUStealTaintsPressuredWorkerWithHeadroom(t *testing.T) {
 		if kube.HasTaint(testutil.GetNode(t, cs, n).Spec.Taints, kube.TaintCPUSteal) {
 			t.Fatalf("healthy worker %s must not be tainted", n)
 		}
+	}
+}
+
+// A CPUStealPressure True whose heartbeat froze is a zombie from a
+// wedged reporter: no taint, and the latch stops counting as live
+// pressure. The same latch with a fresh heartbeat taints — proving
+// the difference is the heartbeat gate, not the headroom guard.
+func TestCPUStealZombieHeartbeatDoesNotTaint(t *testing.T) {
+	w1 := stealNode("w1", corev1.ConditionTrue, 10*time.Minute)
+	w1.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(w1,
+		testutil.Node("w2", corev1.ConditionTrue, nil),
+		testutil.Node("w3", corev1.ConditionTrue, nil),
+		testutil.Node("w4", corev1.ConditionTrue, nil))
+	p := testProber(cs)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("zombie steal latch must not fail the check: %+v", res)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
+		t.Fatal("zombie CPUStealPressure tainted the worker")
+	}
+
+	// A fresh heartbeat on the same latch (same fleet, ample
+	// headroom) taints as usual.
+	w1.Status.Conditions[1].LastHeartbeatTime = metav1.NewTime(time.Now())
+	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, w1, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx); res.Pass {
+		t.Fatalf("fresh steal latch must fail the check: %+v", res)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
+		t.Fatal("fresh CPUStealPressure did not taint the worker")
 	}
 }
 

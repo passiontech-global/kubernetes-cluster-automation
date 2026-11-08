@@ -66,6 +66,18 @@ func ConfigFromEnv(d EnvDeps) Config {
 		AdminCert:       d.PathJoin("/var/lib/k0s/pki/admin.crt"),
 		AdminKey:        d.PathJoin("/var/lib/k0s/pki/admin.key"),
 		AdminCA:         d.PathJoin("/var/lib/k0s/pki/ca.crt"),
+		// Same contract for the konnectivity UDS root and the kine
+		// cert dir — defaultK0sRunDir ("/host/run/k0s") and the
+		// applyPKIDriftDefaults prefix ("/host/etc/kine/pki") would
+		// 404 a standalone host (hostRoot "/").
+		K0sRunDir: d.PathJoin("/run/k0s"),
+		PKIDrift: PKIDriftConfig{
+			KinePKIDir: d.PathJoin("/etc/kine/pki"),
+		},
+		// hostctx already resolved NODE_HOST_AGENT_TEXTFILE_DIR with
+		// the shared hostPath default — the prom writers must honor
+		// the same override, not re-derive the dir.
+		TextfileDir: d.TextfileDir,
 		Feeder: FeederConfig{
 			StateDir:          d.PathJoin("/var/lib/k0s-systemd-watchdog"),
 			RemediatePeerFile: d.PathJoin("/etc/default/k0scontroller-watchdog"),

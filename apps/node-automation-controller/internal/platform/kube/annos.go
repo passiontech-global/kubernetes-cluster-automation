@@ -193,6 +193,15 @@ const (
 	// kargo-promotion-health stamps it on a Warehouse to nudge a
 	// credential/artifact refresh. Value must never change.
 	AnnoKargoRefresh = "kargo.akuity.io/refresh"
+	// AnnoVolumeSelectedNode is the kube-scheduler's late-binding
+	// marker on a PVC — the node the volume was selected for (the
+	// openebs localpv provisioner provisions hostpath claims against
+	// it). localpv-stranded-pods reads it as the "a node was picked
+	// but the volume never landed" gate: a Pending hostpath claim
+	// without it has no selected node, so it is not
+	// stalled-provisioning evidence. Value must never change
+	// (upstream key).
+	AnnoVolumeSelectedNode = "volume.kubernetes.io/selected-node"
 )
 
 // The third external key — weave.works/kured-node-lock, the reboot

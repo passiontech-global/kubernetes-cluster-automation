@@ -3,9 +3,14 @@ package maint
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -283,5 +288,104 @@ func TestMaintReaperSkipsOnListFailure(t *testing.T) {
 	}
 	if strings.Contains(fr.Joined(), "DROP INDEX CONCURRENTLY") {
 		t.Fatalf("drop ran despite the failed listing:\n%s", fr.Joined())
+	}
+}
+
+// epochPath is the GuardStateDir heavy-block epoch file — the
+// startup-skip contract under test.
+func epochPath(t *testing.T, dir string) string {
+	t.Helper()
+	return filepath.Join(dir, "guard", "last-maint-run")
+}
+
+func writeEpoch(t *testing.T, dir string, age time.Duration) {
+	t.Helper()
+	sec := kdepstest.TestNow - int64(age.Seconds())
+	if err := os.MkdirAll(filepath.Join(dir, "guard"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // test fixture path
+	if err := os.WriteFile(epochPath(t, dir),
+		[]byte(strconv.FormatInt(sec, 10)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A heavy block completed <24h ago (agent restart inside the window)
+// skips REINDEX + VACUUM FREEZE + pg_repack but still refreshes the
+// cheap gauges — sizes read, cycle counts ok.
+func TestMaintEpochFreshSkipsHeavyBlock(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
+	})
+	writeEpoch(t, dir, time.Hour)
+	res := k.Cycle(context.Background())
+	if !res.okReindex || res.freezeState != "skipped" ||
+		res.repackState != "skipped" {
+		t.Fatalf("res=%+v", res)
+	}
+	if res.heapBytes != 300000000 || !res.statsOK {
+		t.Fatalf("cheap stats must still land: %+v", res)
+	}
+	// The heavy script rides psql stdin — LastStdin() empty proves no
+	// REINDEX/FREEZE script ran; the repack exec would show on argv.
+	if ls := fr.LastStdin(); ls != "" {
+		t.Fatalf("heavy psql script ran inside the 24h window:\n%s", ls)
+	}
+	if j := fr.Joined(); strings.Contains(j, "pg_repack") ||
+		strings.Contains(j, "VACUUM (") {
+		t.Fatalf("heavy exec ran inside the 24h window:\n%s", j)
+	}
+	// The skip must not refresh the epoch — otherwise every cycle
+	// would push the heavy block 24h further out, forever.
+	sec, err := kdeps.ReadIntFile(epochPath(t, dir))
+	if err != nil || sec != kdepstest.TestNow-int64(time.Hour.Seconds()) {
+		t.Fatalf("epoch mutated by skip (err=%v sec=%d)", err, sec)
+	}
+}
+
+// An epoch older than 24h does not gate the heavy block — and a
+// successful heavy run stamps the epoch so the next startup skips.
+func TestMaintEpochStaleRunsAndStamps(t *testing.T) {
+	// Below-threshold repack rules: the heavy script is the only psql
+	// stdin this cycle (the repack lock-probe would shadow LastStdin).
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+	})
+	writeEpoch(t, dir, 25*time.Hour)
+	res := k.Cycle(context.Background())
+	if !res.okReindex || res.repackState != "skipped" {
+		t.Fatalf("res=%+v", res)
+	}
+	if ls := fr.LastStdin(); !strings.Contains(ls, `REINDEX TABLE CONCURRENTLY "kine"`) {
+		t.Fatalf("stale epoch must not gate the heavy block:\n%s", ls)
+	}
+	sec, err := kdeps.ReadIntFile(epochPath(t, dir))
+	if err != nil || sec != kdepstest.TestNow {
+		t.Fatalf("heavy run did not stamp epoch (err=%v sec=%d)", err, sec)
+	}
+}
+
+// No epoch file at all reads as "never ran" — the heavy block runs
+// and stamps the first epoch.
+func TestMaintEpochMissingRunsHeavy(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+	})
+	res := k.Cycle(context.Background())
+	if !res.okReindex {
+		t.Fatalf("res=%+v", res)
+	}
+	if ls := fr.LastStdin(); !strings.Contains(ls, `REINDEX TABLE CONCURRENTLY "kine"`) {
+		t.Fatalf("first run must go heavy:\n%s", ls)
+	}
+	sec, err := kdeps.ReadIntFile(epochPath(t, dir))
+	if err != nil || sec != kdepstest.TestNow {
+		t.Fatalf("epoch not stamped (err=%v sec=%d)", err, sec)
 	}
 }

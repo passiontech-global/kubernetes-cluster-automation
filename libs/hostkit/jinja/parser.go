@@ -113,15 +113,23 @@ func parseTemplate(text string) ([]tnode, error) {
 		switch kw {
 		case "set":
 			restStmt := strings.TrimSpace(strings.TrimPrefix(stmt, "set"))
-			eq := strings.Index(restStmt, "=")
+			eq := setAssignIndex(restStmt)
 			if eq < 0 {
 				return nil, fmt.Errorf("set: missing = in %q", stmt)
+			}
+			name := strings.TrimSpace(restStmt[:eq])
+			// A {% set %} target must be a plain identifier — a
+			// mangled name ("x !" off a `x != y` typo) or a dotted
+			// path (namespace() is unsupported) must error now,
+			// not bind garbage at render time.
+			if !isIdentifier(name) {
+				return nil, fmt.Errorf("set: invalid variable name %q", name)
 			}
 			e, err := parseExpr(restStmt[eq+1:])
 			if err != nil {
 				return nil, err
 			}
-			*cur() = append(*cur(), setNode{name: strings.TrimSpace(restStmt[:eq]), e: e})
+			*cur() = append(*cur(), setNode{name: name, e: e})
 		case "for":
 			fn, err := parseFor(stmt)
 			if err != nil {
@@ -149,6 +157,21 @@ func parseTemplate(text string) ([]tnode, error) {
 			if !ok {
 				return nil, fmt.Errorf("%s: frame is %T, not *ifNode", kw, frames[len(frames)-1].n)
 			}
+			// {% else %} is a bare keyword — "{% else if x %}" is
+			// an {% elif %} missing its first two letters, and
+			// silently treating it as else would DROP the
+			// condition.
+			if kw == "else" {
+				if restArgs := strings.TrimSpace(strings.TrimPrefix(stmt, "else")); restArgs != "" {
+					return nil, fmt.Errorf("{%% else %%} takes no arguments, got %q", restArgs)
+				}
+			}
+			// The else arm is the nil-cond arm; anything after it
+			// ({% else %} again, {% elif %}) is unreachable and
+			// almost never what the template meant.
+			if last := in.arms[len(in.arms)-1]; last.cond == nil {
+				return nil, fmt.Errorf("{%% %s %%} after {%% else %%}", kw)
+			}
 			containers = containers[:len(containers)-1] // pop previous arm body
 			if kw == "elif" {
 				e, err := parseExpr(strings.TrimSpace(strings.TrimPrefix(stmt, "elif")))
@@ -169,6 +192,15 @@ func parseTemplate(text string) ([]tnode, error) {
 		default:
 			return nil, fmt.Errorf("unsupported tag %q", stmt)
 		}
+	}
+	// Any frame left open means a block was never closed — the
+	// render would silently truncate at the missing {% endif %}/
+	// {% endfor %} (or silently drop the rest of the template).
+	// Report the INNERMOST open block: that's where the tag is
+	// missing.
+	if len(frames) > 0 {
+		f := frames[len(frames)-1]
+		return nil, fmt.Errorf("missing {%% end%s %%} for {%% %s %%} block", f.kind, f.kind)
 	}
 	return nodes, nil
 }
@@ -281,6 +313,45 @@ func topLevelWords(s, w string) []int {
 
 func isNameChar(c byte) bool {
 	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// setAssignIndex finds the '=' separating a {% set %} variable from
+// its value — and ONLY that '=': the sign inside !=/<=/>=/== must
+// not split ("set ok = a != b" cut at the comparison's '=' turned
+// the target into "ok " but left "= a ! b" garbage on both sides
+// of a `set x != y` typo).
+func setAssignIndex(s string) int {
+	for i := range len(s) {
+		if s[i] != '=' {
+			continue
+		}
+		if i > 0 && (s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>' || s[i-1] == '=') {
+			continue // tail of != <= >= or second half of ==
+		}
+		if i+1 < len(s) && s[i+1] == '=' {
+			continue // head of ==
+		}
+		return i
+	}
+	return -1
+}
+
+// isIdentifier reports whether s is a plain [A-Za-z_][A-Za-z0-9_]*
+// name — the only {% set %} target shape (dotted namespace names
+// are unsupported).
+func isIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	if c := s[0]; !isNameChar(c) || c >= '0' && c <= '9' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if !isNameChar(s[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------- expression parser ----------------
@@ -535,6 +606,13 @@ func (p *parser) parsePostfix() (expr, error) {
 		switch {
 		case p.at("|"):
 			p.next()
+			// The filter name must be a name token — `x | }` or
+			// `x | 1` used to consume the token blindly and build
+			// a filterExpr with an empty/garbage name that failed
+			// (or worse, matched) at render time.
+			if !p.atKind("name") {
+				return nil, fmt.Errorf("filter: expected filter name after '|', got %q", p.peek().val)
+			}
 			name := p.next().val
 			var args []expr
 			var kw []kwarg
@@ -565,6 +643,12 @@ func (p *parser) parsePostfix() (expr, error) {
 			e = filterExpr{in: e, name: name, args: args, kw: kw}
 		case p.at("."):
 			p.next()
+			// Same contract after '.': the attribute must be a
+			// name token (`x.` at eof, `x.0`, `x."k"`), not an
+			// anonymous accessor.
+			if !p.atKind("name") {
+				return nil, fmt.Errorf("attribute: expected name after '.', got %q", p.peek().val)
+			}
 			e = attrExpr{e, p.next().val}
 		case p.at("["):
 			p.next()

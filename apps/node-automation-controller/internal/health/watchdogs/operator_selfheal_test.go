@@ -32,6 +32,20 @@ func shLease(ns, name, holder string, age time.Duration, at time.Time) *coordina
 	}
 }
 
+// shCtlrOwned returns the ReplicaSet controller owner reference a
+// leader-pod fixture carries under `controller` — healOperatorLeader
+// only deletes pods a controller will recreate, and keys the cooldown
+// on kube.PodControllerKey (the controller name), so replacement
+// leaders must share the controller name for the cooldown to carry.
+func shCtlrOwned(controller string) []metav1.OwnerReference {
+	ctlr := true
+	return []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: controller, UID: types.UID(controller + "-uid"),
+		Controller: &ctlr,
+	}}
+}
+
 // shRenewLease moves renewTime to just before `at` — the "still
 // renewing" precondition the watchdog requires as test time advances.
 func shRenewLease(t *testing.T, cs *fake.Clientset, ns, name string, at time.Time) {
@@ -172,9 +186,11 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	leader := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "scylla-operator", Name: "scylla-operator-7d9f",
-			UID:    types.UID("leader-uid-1"),
-			Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+			UID:             types.UID("leader-uid-1"),
+			Labels:          map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+			OwnerReferences: shCtlrOwned("scylla-operator-6f9d"),
 		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	cs := fake.NewSimpleClientset(
 		shLease("scylla-operator", "scylla-operator-lock",
@@ -241,16 +257,19 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 			"scylla-operator-7d9f_3f2a1", 2*time.Second, base),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "scylla-operator", Name: "scylla-operator-7d9f",
-			UID:    types.UID("leader-uid-1"),
-			Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
-		}})
+			UID:             types.UID("leader-uid-1"),
+			Labels:          map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+			OwnerReferences: shCtlrOwned("scylla-operator-6f9d"),
+		},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
 	stuck := probetest.UnstructuredObj("scylla.scylladb.com/v1", "ScyllaCluster",
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	// Seed first-seen long ago so the signature is already frozen.
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
+		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -260,9 +279,11 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 	// cooldown — must NOT be deleted.
 	replacement := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "scylla-operator", Name: "scylla-operator-88zz",
-		UID:    types.UID("leader-uid-2"),
-		Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
-	}}
+		UID:             types.UID("leader-uid-2"),
+		Labels:          map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+		OwnerReferences: shCtlrOwned("scylla-operator-6f9d"),
+	},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
 	if _, err := cs.CoreV1().Pods("scylla-operator").
 		Create(ctx, replacement, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -302,15 +323,18 @@ func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset(lease,
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "scylla-operator", Name: "scylla-operator-7d9f",
-			UID:    types.UID("leader-uid-1"),
-			Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
-		}})
+			UID:             types.UID("leader-uid-1"),
+			Labels:          map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+			OwnerReferences: shCtlrOwned("scylla-operator-6f9d"),
+		},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
 	stuck := probetest.UnstructuredObj("scylla.scylladb.com/v1", "ScyllaCluster",
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
+		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -336,15 +360,18 @@ func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
 			"scylla-operator-7d9f_3f2a1", 2*time.Second, base),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "scylla-operator", Name: "scylla-operator-7d9f",
-			UID:    types.UID("leader-uid-1"),
-			Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
-		}})
+			UID:             types.UID("leader-uid-1"),
+			Labels:          map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+			OwnerReferences: shCtlrOwned("scylla-operator-6f9d"),
+		},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
 	stuck := probetest.UnstructuredObj("scylla.scylladb.com/v1", "ScyllaCluster",
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
+		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -373,7 +400,7 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(suspended))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("helm-controller/helmreleases/apps/hr", base.Add(-time.Hour))
+		Observe("helm-controller/helmreleases/apps/hr/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("suspended HelmRelease must not freeze the check: %+v", res)
@@ -390,11 +417,13 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "dragonfly-operator", kcmReasonStaleGen)
 	base := time.Now()
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "dragonfly-operator-system",
-		Name:      "dragonfly-operator-controller-manager-6f8bc-xy",
-		UID:       types.UID("dr-uid-1"),
-		Labels:    map[string]string{"control-plane": "controller-manager"},
-	}}
+		Namespace:       "dragonfly-operator-system",
+		Name:            "dragonfly-operator-controller-manager-6f8bc-xy",
+		UID:             types.UID("dr-uid-1"),
+		Labels:          map[string]string{"control-plane": "controller-manager"},
+		OwnerReferences: shCtlrOwned("dragonfly-operator-6f8bc"),
+	},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
 	cs := fake.NewSimpleClientset(
 		// Holder identity names a pod that doesn't exist (opaque
 		// suffix) — the selector must resolve the real one.
@@ -406,7 +435,7 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("dragonfly-operator/dragonflies/db/cache", base.Add(-time.Hour))
+		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stuck dragonfly must FAIL")
@@ -431,9 +460,12 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 			"cert-manager-cm-7d9f_uid", 2*time.Second, base),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "cert-manager", Name: "cert-manager-cm-7d9f",
-			UID:    types.UID("cm-leader-1"),
-			Labels: map[string]string{"app.kubernetes.io/name": "cert-manager"},
-		}},
+			UID:             types.UID("cm-leader-1"),
+			Labels:          map[string]string{"app.kubernetes.io/name": "cert-manager"},
+			OwnerReferences: shCtlrOwned("cert-manager-7d9f"),
+		},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
 		// Decoy: same selector, wrong namespace — must survive.
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "kube-system", Name: "cert-manager-cm-7d9f",
@@ -445,7 +477,7 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("cert-manager/certificates/apps/tls", base.Add(-time.Hour))
+		Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -468,10 +500,11 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 	base := time.Now()
 	opPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: kube.DragonflyOperatorNS,
-			Name:      "dragonfly-operator-controller-manager-6f8bc-xy",
-			UID:       types.UID("dr-op-1"),
-			Labels:    map[string]string{"control-plane": "controller-manager"},
+			Namespace:       kube.DragonflyOperatorNS,
+			Name:            "dragonfly-operator-controller-manager-6f8bc-xy",
+			UID:             types.UID("dr-op-1"),
+			Labels:          map[string]string{"control-plane": "controller-manager"},
+			OwnerReferences: shCtlrOwned("dragonfly-operator-6f8bc"),
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
@@ -482,7 +515,7 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("dragonfly-operator/dragonflies/db/cache", base.Add(-time.Hour))
+		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -534,7 +567,7 @@ func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(nhc))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("node-healthcheck-operator/nodehealthchecks/operators/nhc",
+		Observe("node-healthcheck-operator/nodehealthchecks/operators/nhc/"+opReasonNoStatus,
 			base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {

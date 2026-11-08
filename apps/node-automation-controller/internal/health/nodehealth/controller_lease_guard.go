@@ -42,7 +42,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -173,11 +172,13 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep, thrashRep probefw.SweepReport
 
-	// podsCache memoizes the per-namespace pod list the
-	// expired-lease heuristic needs — fetched lazily, only for
-	// namespaces that actually carry a stale-aged lease; the error
-	// is memoized too, so a failing apiserver is not re-listed once
-	// per stale lease in the namespace.
+	// podsCache memoizes the per-namespace pod slice the
+	// expired-lease heuristic needs — filtered client-side from the
+	// sweep's shared pod census (one cluster-wide LIST per cycle),
+	// fetched lazily, only for namespaces that actually carry a
+	// stale-aged lease; the census error is memoized with the
+	// snapshot, so a failing apiserver is not re-listed once per
+	// stale lease in the namespace.
 	podsCache := map[string][]corev1.Pod{}
 	podErrs := map[string]error{}
 	podsInNS := func(ns string) ([]corev1.Pod, error) {
@@ -187,12 +188,16 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 		if err, ok := podErrs[ns]; ok {
 			return nil, err
 		}
-		l, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.Pods(p.CS, ns))
+		all, err := p.AllPods(ctx)
 		if err != nil {
 			podErrs[ns] = err
 			return nil, err
+		}
+		var l []corev1.Pod
+		for i := range all {
+			if all[i].Namespace == ns {
+				l = append(l, all[i])
+			}
 		}
 		podsCache[ns] = l
 		return l, nil

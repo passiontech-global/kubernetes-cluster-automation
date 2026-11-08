@@ -82,6 +82,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -206,29 +207,34 @@ type apiServerEndpointGuard struct {
 	memQuarantine map[string]bool
 }
 
-// Setup registers the 30s wedge sweep.
+// Setup registers the 30s wedge sweep. Gated through
+// shared.SetupNoConfig like every other module: a disabled module
+// registers nothing — no runnable, no periodic probe/GET cycle
+// against the control-plane backends.
 func Setup(d shared.Deps) error {
-	mgr, cs := d.Mgr, d.CS
-	g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, backends: map[string]*backendProbeState{}}
-	g.probeFn = g.probe
-	g.log = mgr.GetLogger().WithName(g.queue)
-	// Dedicated dynamic client filtering the "v1 Endpoints is
-	// deprecated" 299 warning: on hosted planes the guard writes the
-	// deprecated object deliberately every sweep (it is the SSOT
-	// behind the mirror slice), which the shared client's default
-	// WarningLogger would turn into one klog line per cycle. Every
-	// other warning still delegates. Fall back to the shared dynamic
-	// client when the filtered one cannot be built — nil config on
-	// test doubles or a construction failure — the guard works either
-	// way, just noisier.
-	if cfg := mgr.GetConfig(); cfg != nil {
-		if filtered, err := endpointsWarningClient(cfg, d.Dyn); err == nil {
-			g.dyn = filtered
-		} else {
-			g.log.Error(err, "filtered dynamic client build failed — sharing the noisy default client")
+	return shared.SetupNoConfig(d, func() error {
+		mgr, cs := d.Mgr, d.CS
+		g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, backends: map[string]*backendProbeState{}}
+		g.probeFn = g.probe
+		g.log = mgr.GetLogger().WithName(g.queue)
+		// Dedicated dynamic client filtering the "v1 Endpoints is
+		// deprecated" 299 warning: on hosted planes the guard writes the
+		// deprecated object deliberately every sweep (it is the SSOT
+		// behind the mirror slice), which the shared client's default
+		// WarningLogger would turn into one klog line per cycle. Every
+		// other warning still delegates. Fall back to the shared dynamic
+		// client when the filtered one cannot be built — nil config on
+		// test doubles or a construction failure — the guard works either
+		// way, just noisier.
+		if cfg := mgr.GetConfig(); cfg != nil {
+			if filtered, err := endpointsWarningClient(cfg, d.Dyn); err == nil {
+				g.dyn = filtered
+			} else {
+				g.log.Error(err, "filtered dynamic client build failed — sharing the noisy default client")
+			}
 		}
-	}
-	return mgr.Add(g)
+		return mgr.Add(g)
+	})
 }
 
 // Start implements manager.Runnable — leader-gated like every other
@@ -258,21 +264,41 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 		}
-		// Per-cycle bound: sequential probes + clientset calls must
-		// never stall the loop past the interval.
-		runCtx, cancel := context.WithTimeout(ctx, endpointGuardRunTimeout)
-		err := g.run(runCtx)
-		cancel()
-		if err != nil {
-			metrics.IncError(g.queue)
-			log.Error(err, "sweep failed")
-		}
-		if g.quarantineActive {
-			interval = endpointGuardQuarantineInterval
-		} else {
-			interval = endpointGuardInterval
-		}
+		interval = g.runCycle(ctx, log, interval)
 	}
+}
+
+// runCycle executes one guarded sweep and returns the cadence the
+// Start loop adopts next. It bypasses shared.Periodic (adaptive
+// interval), which also bypasses that helper's panic recovery — so
+// the recovery lives HERE: a panic in any clientset/dynamic call
+// path (or a malformed unstructured Endpoints object slipping past
+// the skip-garbage accessors) is contained to this cycle and logged,
+// instead of unwinding into controller-runtime and killing the whole
+// process. The cadence decision stays inside the guard so a panicking
+// sweep cannot lose the fast-quarantine switch.
+func (g *apiServerEndpointGuard) runCycle(ctx context.Context,
+	log logr.Logger, interval time.Duration) (next time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.IncError(g.queue)
+			log.Error(nil, "endpoint guard sweep panicked — recovered, process continues",
+				"panic", r, "stack", string(debug.Stack()))
+			next = interval
+		}
+	}()
+	// Per-cycle bound: sequential probes + clientset calls must
+	// never stall the loop past the interval.
+	runCtx, cancel := context.WithTimeout(ctx, endpointGuardRunTimeout)
+	defer cancel()
+	if err := g.run(runCtx); err != nil {
+		metrics.IncError(g.queue)
+		log.Error(err, "sweep failed")
+	}
+	if g.quarantineActive {
+		return endpointGuardQuarantineInterval
+	}
+	return endpointGuardInterval
 }
 
 func (g *apiServerEndpointGuard) run(ctx context.Context) error {

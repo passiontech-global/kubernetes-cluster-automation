@@ -11,7 +11,15 @@ import (
 // Signature reports whether header is the expected
 // "sha256=<hex HMAC-SHA256 of body keyed by secret>" value GitHub
 // sends in X-Hub-Signature-256. The comparison is constant-time.
+//
+// An empty secret is rejected immediately: with no key configured
+// nothing can be verified, and an HMAC keyed by the empty string
+// would happily validate attacker-forged signatures — the key is no
+// secret at all. Fail closed.
 func Signature(secret string, body []byte, header string) bool {
+	if secret == "" {
+		return false
+	}
 	got, ok := strings.CutPrefix(header, "sha256=")
 	if !ok {
 		return false

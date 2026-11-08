@@ -6,6 +6,8 @@ package criticalns
 
 import (
 	"context"
+	"errors"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
@@ -326,6 +329,130 @@ func TestCriticalNSAutoPatch(t *testing.T) {
 		s.Sweep(g.TakeSnapshot(ctx))
 		if w := hookByName(t, fetchVWC(t, cs), "keep.example.com"); w.NamespaceSelector != nil {
 			t.Fatalf("allowlisted webhook patched: %+v", w.NamespaceSelector)
+		}
+	})
+}
+
+// The auto-patch must MERGE into the webhook's existing selector, not
+// replace it: MatchExpressions is a plain list in the Kubernetes API,
+// so the exclusion patch carries the FULL union — existing matchLabels
+// cloned, existing matchExpressions elements preserved, the missing
+// critical namespaces appended into the existing
+// kubernetes.io/metadata.name NotIn rule's values.
+func TestCriticalNSAutoPatchMergesSelector(t *testing.T) {
+	t.Setenv("WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED", "true")
+	sel := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"tier": "prod"},
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "tier", Operator: metav1.LabelSelectorOpIn, Values: []string{"prod"}},
+			{Key: "kubernetes.io/metadata.name", Operator: metav1.LabelSelectorOpNotIn,
+				Values: []string{"kube-system"}},
+		},
+	}
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-vwc"},
+		Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("narrow.example.com", sel, admissionv1.Fail, nil)},
+	}
+	// tier=prod on node-ops so the narrowing selector still MATCHES a
+	// critical namespace (kube-system is excluded by the partial
+	// NotIn; the audit only patches flagged webhooks).
+	nodeOps := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-ops",
+		Labels: map[string]string{"tier": "prod"},
+	}}
+	cs := fake.NewSimpleClientset(nodeOps, upNamespace("kube-system", ""), upNamespace("meshed", "enabled"), vwc)
+	s, g := upGuard(cs)
+	s.Sweep(g.TakeSnapshot(ctx))
+	got, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+		Get(ctx, "merge-vwc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := got.Webhooks[0].NamespaceSelector
+	if !maps.Equal(out.MatchLabels, map[string]string{"tier": "prod"}) {
+		t.Fatalf("matchLabels not preserved: %+v", out.MatchLabels)
+	}
+	if len(out.MatchExpressions) != 2 {
+		t.Fatalf("matchExpressions replaced, want both preserved: %+v", out.MatchExpressions)
+	}
+	tier := out.MatchExpressions[0]
+	if tier.Key != "tier" || tier.Operator != metav1.LabelSelectorOpIn ||
+		!slices.Equal(tier.Values, []string{"prod"}) {
+		t.Fatalf("foreign expression clobbered: %+v", tier)
+	}
+	notIn := out.MatchExpressions[1]
+	if notIn.Key != "kubernetes.io/metadata.name" || notIn.Operator != metav1.LabelSelectorOpNotIn {
+		t.Fatalf("NotIn rule wrong: %+v", notIn)
+	}
+	for _, ns := range criticalSelfHealingNamespaces {
+		if !slices.Contains(notIn.Values, ns) {
+			t.Fatalf("NotIn values not merged to the full set: %v", notIn.Values)
+		}
+	}
+}
+
+// Under the auto-patch the missing-exclusion series only reports
+// webhooks the patch does not cover: a LANDED patch suppresses the
+// series (the exclusion now exists), a FAILED patch and an allowlisted
+// webhook keep it live.
+func TestCriticalNSAutoPatchSeriesEmission(t *testing.T) {
+	cleanup := func(t *testing.T, name string) {
+		testutil.CleanupMetric(t, metrics.WebhookMissingCriticalNSExclusion,
+			guardstate.KindValidating, "series-vwc", name)
+	}
+	t.Run("landed patch suppresses the series", func(t *testing.T) {
+		t.Setenv("WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED", "true")
+		testutil.CleanupMetric(t, metrics.WebhookMissingCriticalNSExclusion,
+			guardstate.KindValidating, "series-vwc", "quiet.example.com")
+		vwc := &admissionv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "series-vwc"},
+			Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("quiet.example.com", nil, admissionv1.Fail, nil)},
+		}
+		cs := fake.NewSimpleClientset(upNamespace("kube-system", ""), upNamespace("meshed", "enabled"), vwc)
+		s, g := upGuard(cs)
+		s.Sweep(g.TakeSnapshot(ctx))
+		// DeleteLabelValues doubles as the exists-probe (returns whether
+		// the series was registered) — same pattern as the breaker's
+		// prune tests.
+		if metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues(
+			guardstate.KindValidating, "series-vwc", "quiet.example.com") {
+			t.Fatal("landed patch must not emit the missing-exclusion series")
+		}
+	})
+	t.Run("failed patch emits the series", func(t *testing.T) {
+		t.Setenv("WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED", "true")
+		t.Cleanup(func() { cleanup(t, "flaky.example.com") })
+		vwc := &admissionv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "series-vwc"},
+			Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("flaky.example.com", nil, admissionv1.Fail, nil)},
+		}
+		cs := fake.NewSimpleClientset(upNamespace("kube-system", ""), upNamespace("meshed", "enabled"), vwc)
+		cs.PrependReactor("patch", "validatingwebhookconfigurations",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("patch denied")
+			})
+		s, g := upGuard(cs)
+		s.Sweep(g.TakeSnapshot(ctx))
+		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
+			guardstate.KindValidating, "series-vwc", "flaky.example.com")); got != 1 {
+			t.Fatalf("failed patch must emit the series, got %v", got)
+		}
+	})
+	t.Run("allowlisted webhook keeps its series under enforce", func(t *testing.T) {
+		t.Setenv("WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED", "true")
+		t.Cleanup(func() { cleanup(t, "keep.example.com") })
+		criticalNSPatchAllowlist["series-vwc/keep.example.com"] = true
+		t.Cleanup(func() { delete(criticalNSPatchAllowlist, "series-vwc/keep.example.com") })
+		vwc := &admissionv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "series-vwc"},
+			Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("keep.example.com", nil, admissionv1.Fail, nil)},
+		}
+		cs := fake.NewSimpleClientset(upNamespace("kube-system", ""), upNamespace("meshed", "enabled"), vwc)
+		s, g := upGuard(cs)
+		s.Sweep(g.TakeSnapshot(ctx))
+		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
+			guardstate.KindValidating, "series-vwc", "keep.example.com")); got != 1 {
+			t.Fatalf("allowlisted webhook must keep its series, got %v", got)
 		}
 	})
 }

@@ -59,16 +59,24 @@ func PGWireOK(ctx context.Context, hostport string) bool {
 // tlsDialCert returns the leaf certificate addr presents — drift is
 // judged on the presented cert, not on chain trust, so the dial is
 // insecure by design. It is the TLSCertFn default (the PKI-drift
-// domain check consumes the seam).
+// domain check consumes the seam). The dialer carries the caller's
+// ctx via DialContext (tls.DialWithDialer ignores it — a cancelled
+// cycle must not leave the dial running).
 func tlsDialCert(ctx context.Context, addr string) (*x509.Certificate, error) {
-	d := &net.Dialer{Timeout: 8 * time.Second}
-	conn, err := tls.DialWithDialer(d, "tcp", addr,
-		&tls.Config{InsecureSkipVerify: true}) // drift check wants the presented cert
+	d := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 8 * time.Second},
+		Config:    &tls.Config{InsecureSkipVerify: true}, // drift check wants the presented cert
+	}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
-	state := conn.ConnectionState()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil, errors.New("dial did not return a TLS connection")
+	}
+	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return nil, errors.New("no peer certificate")
 	}

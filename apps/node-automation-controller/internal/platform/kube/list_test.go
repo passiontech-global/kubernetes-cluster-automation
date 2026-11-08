@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -174,6 +175,36 @@ func TestVolumeAttachmentsPageFunc(t *testing.T) {
 	}
 	if len(vas) != 1 || vas[0].Name != "va-1" {
 		t.Fatalf("vas = %+v", vas)
+	}
+}
+
+// The Apps workload constructors the snapshot censuses read through
+// (probefw AllDeployments/AllDaemonSets) — namespace scoping + Items
+// extraction, same single-page fake posture as the other adapters.
+func TestDeploymentsPageFunc(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d1", Namespace: "ns"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d2", Namespace: "other"}},
+	)
+	deps, err := ListAll(ctx, metav1.ListOptions{}, Deployments(cs, "ns"))
+	if err != nil {
+		t.Fatalf("ListAll Deployments: %v", err)
+	}
+	if len(deps) != 1 || deps[0].Name != "d1" {
+		t.Fatalf("deployments = %+v", deps)
+	}
+}
+
+func TestDaemonSetsPageFunc(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "ds1", Namespace: "ns"}},
+	)
+	dsets, err := ListAll(ctx, metav1.ListOptions{}, DaemonSets(cs, metav1.NamespaceAll))
+	if err != nil {
+		t.Fatalf("ListAll DaemonSets: %v", err)
+	}
+	if len(dsets) != 1 || dsets[0].Name != "ds1" {
+		t.Fatalf("daemonsets = %+v", dsets)
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -120,6 +121,16 @@ func (l *Latches) refreshLatches() {
 		// episode from being reaped as stale.
 		latchdefs.LatchKubeconfigCertExpiring,
 		latchdefs.LatchCPUStealPressure,
+		// The kernel-pressure + clocksource evidence latches the
+		// kmsg drain mints (ensureStateLatch refreshes only when the
+		// signature recurs; a sustained condition that has gone
+		// QUIET in kmsg but stays latched must still survive the
+		// reap), and workerhygiene's MTU-drift + apiprober's
+		// per-backend stale family — consumers key on those files
+		// staying present for as long as the condition holds.
+		latchdefs.LatchPageAllocFailure,
+		latchdefs.LatchClocksourceUnstable,
+		latchdefs.LatchCiliumMTUDrift,
 	} {
 		p := c.state.Path(name)
 		if _, err := os.Stat(p); err == nil {
@@ -130,6 +141,31 @@ func (l *Latches) refreshLatches() {
 			}
 		}
 	}
+	// The apiprober stale family is parameterized per backend IP
+	// (state-apiserver-backend-stale-<ip-dashed>) — glob the family
+	// instead of naming members.
+	for _, p := range snapStaleLatchPaths(c.state.Dir) {
+		now := c.cfg.Clock.Now()
+		if cerr := os.Chtimes(p, now, now); cerr != nil {
+			logger().Debug("hostmetrics: latch touch failed",
+				"path", p, "error", cerr)
+		}
+	}
+}
+
+// snapStaleLatchPaths globs the state-apiserver-backend-stale-*
+// family in dir — empty when the dir is "" (a bare-pattern glob
+// would resolve against the process CWD).
+func snapStaleLatchPaths(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	paths, err := filepath.Glob(filepath.Join(dir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchAPIServerBackendStalePrefix+"*"))
+	if err != nil {
+		return nil
+	}
+	return paths
 }
 
 // --- W8-KR3: /proc/key-users kernel keyring quota ---

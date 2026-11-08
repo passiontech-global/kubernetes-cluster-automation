@@ -158,11 +158,20 @@ func (p *Prober) staleLatched(dir string, b backend) bool {
 }
 
 // latchStale creates state-apiserver-backend-stale-<ip> — state_enter
-// semantics: create only if absent, content = current epoch.
+// semantics: create only if absent, content = current epoch. An
+// existing latch gets its mtime refreshed (BUG-H6) — the janitor
+// reaps state-* files older than 24h and a backend wedged for days
+// must not lose its latch mid-episode (the prober has no clock seam;
+// the same time.Now the epoch content carries keys the touch).
 func (p *Prober) latchStale(dir string, b backend) {
 	f := dir + "/" + latchdefs.LatchFilePrefix +
 		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
 	if _, err := os.Stat(f); err == nil {
+		now := time.Now()
+		if cerr := os.Chtimes(f, now, now); cerr != nil {
+			logger().Debug("watchdog stale latch touch failed",
+				"file", f, "backend", b.Name, "error", cerr)
+		}
 		return
 	}
 	if err := hostutil.WriteFileAtomicBytes(f,

@@ -39,6 +39,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -72,6 +73,15 @@ const (
 	// data. esConnectSyncRestartMax is the crashloop ceiling.
 	esConnectSyncContainer  = "connect-sync"
 	esConnectSyncRestartMax = 3
+	// esConnectSyncCrashloopWindow: RestartCount >= max only counts
+	// as a live crashloop while the pod is in CrashLoopBackOff or
+	// the last termination finished within this window — a stale
+	// restart count from hours ago is history, not a current loop.
+	esConnectSyncCrashloopWindow = 15 * time.Minute
+	// esConnectSyncCrashloopGrace: pods younger than this are
+	// exempt from the restart-based trigger — a freshly-created pod
+	// burning its startup retries is not yet a proven crashloop.
+	esConnectSyncCrashloopGrace = 5 * time.Minute
 )
 
 // esConnectNamespaces are where the 1Password Connect pod can live —
@@ -146,11 +156,6 @@ type externalSecretNudge struct {
 	// persistence clock for the connect-sync auto-heal trigger (a
 	// pod back to healthy or gone re-arms the window).
 	syncDegradedSince state.FirstSeenLedger
-	// syncUnhealthyEmitted is the emitted-gauge ledger for
-	// node_automation_onepassword_connect_sync_unhealthy — a pod
-	// that recovers (or is replaced) gets its series deleted rather
-	// than pinning a stale "unhealthy" flag.
-	syncUnhealthyEmitted state.GaugeLedger[string]
 }
 
 // secretRead is one memoized Secrets().Get result — errors included
@@ -188,7 +193,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		// before the ESO rollout finished). Not an operational
 		// error — skip quietly instead of spamming "could not find
 		// the requested resource" every 10 minutes.
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}
@@ -196,7 +201,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	namespacedStores, err := n.listFirst(ctx, secretStoreGVRs)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			namespacedStores = nil // SecretStore absent — cluster-only install
 		} else {
 			return fmt.Errorf("list secretstores: %w", err)

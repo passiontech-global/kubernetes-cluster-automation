@@ -59,15 +59,15 @@ func (p *olmHealthCheck) collectOLMSignatures(ctx context.Context,
 		scan.live[k] = []string{kind, ns, name, reason}
 		scan.objByKey[k] = obj
 	}
-	csvs, err := p.Dyn.Resource(olmCSVGVR).List(ctx, metav1.ListOptions{})
+	csvs, err := p.AllUnstructured(ctx, olmCSVGVR)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// OLM not installed on this cluster — nothing to audit.
 	case err != nil:
 		return nil, fmt.Errorf("list clusterserviceversions: %w", err)
 	default:
-		for i := range csvs.Items {
-			csv := &csvs.Items[i]
+		for i := range csvs {
+			csv := &csvs[i]
 			scan.audited[csv] = olmCSVGVR
 			phase, _ := kube.NestedString(csv.Object, "status", "phase")
 			if phase != "Succeeded" {
@@ -83,14 +83,14 @@ func (p *olmHealthCheck) collectOLMSignatures(ctx context.Context,
 			}
 		}
 	}
-	subs, err := p.Dyn.Resource(olmSubGVR).List(ctx, metav1.ListOptions{})
+	subs, err := p.AllUnstructured(ctx, olmSubGVR)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 	case err != nil:
 		return nil, fmt.Errorf("list subscriptions: %w", err)
 	default:
-		for i := range subs.Items {
-			sub := &subs.Items[i]
+		for i := range subs {
+			sub := &subs[i]
 			scan.audited[sub] = olmSubGVR
 			for _, c := range kube.Conditions(sub.Object, "status", "conditions") {
 				if c.Status != "True" {

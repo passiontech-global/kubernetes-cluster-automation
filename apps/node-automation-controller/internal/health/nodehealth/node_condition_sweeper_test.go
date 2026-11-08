@@ -126,3 +126,72 @@ func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 		t.Fatal("stamped cordon did not lift after zombie clear")
 	}
 }
+
+// InodePressure is kubelet-native and deliberately outside
+// nodecond.HeartbeatSweptNames — the sweeper must never clear a
+// kubelet condition even with a frozen heartbeat. The split is
+// pinned by nodecond: InodePressure stays in HangPreCordonNames (it
+// still precordons, see node_hang_precordon_test.go) but is absent
+// from the sweeper's allowlist.
+func TestNodeCondSweeperIgnoresInodePressure(t *testing.T) {
+	for _, c := range nodeCondSweptConds {
+		if c == "InodePressure" {
+			t.Fatal("InodePressure must not be swept — kubelet-owned")
+		}
+	}
+	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
+	n := probetest.ReadyWorkerNode("w-inode", "", 0, false)
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               "InodePressure",
+		Status:             corev1.ConditionTrue,
+		Reason:             "KubeletHasInodePressure",
+		LastHeartbeatTime:  old,
+		LastTransitionTime: old,
+	})
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("InodePressure failed the check: %+v", res)
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-inode", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := kube.NodeCondition(got, "InodePressure")
+	if c == nil || c.Status != corev1.ConditionTrue {
+		t.Fatalf("InodePressure = %+v, want Status=True untouched", c)
+	}
+}
+
+// The HeartbeatSweptNames superset: nodereporter-owned conditions
+// outside the old precordon-hang + clock-skew lists (here the
+// WatchdogStale probe latch) are swept too — nodecond is the
+// allowlist's single source of truth.
+func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
+	found := false
+	for _, c := range nodeCondSweptConds {
+		if c == "WatchdogStale" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("WatchdogStale missing from the sweeper allowlist")
+	}
+	n := probetest.ReadyWorkerNode("w-watchdog", "WatchdogStale",
+		nodeHangCondHeartbeatMaxAge+time.Minute, false)
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("zombie WatchdogStale did not fail the check")
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-watchdog", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := kube.NodeCondition(got, "WatchdogStale")
+	if c == nil || c.Status != corev1.ConditionFalse {
+		t.Fatalf("WatchdogStale zombie = %+v, want Status=False cleared", c)
+	}
+}

@@ -56,6 +56,13 @@ const (
 	// workspacePVCCap bounds delete attempts per sweep — same churn
 	// contract as the failed-Job sweep.
 	workspacePVCCap = 50
+
+	// failedJobsDeleteCap bounds the completed-run TTL sweep's delete
+	// attempts per sweep: a Tekton pipeline gone unwatched for weeks
+	// can park thousands of terminal runs, and uncapped churn would
+	// hammer the apiserver for one run — 500 per hourly sweep drains
+	// even a four-figure backlog inside a day.
+	failedJobsDeleteCap = 500
 )
 
 // runTTLKinds is the completed-run retention table. Every kind below
@@ -131,7 +138,8 @@ func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 	}
 	runs = nil
 
-	deleted, _, _ := reap.Sweep(ctx, log, targets, reap.Options[runTarget]{
+	deleted, _, capped := reap.Sweep(ctx, log, targets, reap.Options[runTarget]{
+		Cap: failedJobsDeleteCap,
 		LogTarget: func(log logr.Logger, t runTarget) {
 			log.Info("DELETE "+t.kind+": completed past TTL",
 				t.kind, t.ns+"/"+t.name,
@@ -161,6 +169,9 @@ func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 			}
 		},
 	})
+	if capped {
+		log.Info("SKIP rest: cap reached", "cap", failedJobsDeleteCap)
+	}
 	if deleted > 0 {
 		log.Info(kind+" TTL sweep done", "deleted", deleted)
 	}
@@ -315,7 +326,9 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 // reference — the same per-namespace scan the W4 pvc-protection
 // unstick runs (Succeeded/Failed pods released their volumes; every
 // other phase — including Pending pods not yet mounted — counts as a
-// claimant, fail closed).
+// claimant, fail closed). Generic ephemeral volumes count too: their
+// implicit <pod>-<volume> claim carries the same kubelet
+// pvc-protection finalizer a pre-provisioned claim does.
 func (j *failedJobsJanitor) claimedPVCNames(ctx context.Context,
 	ns string) (map[string]bool, error) {
 	pods, err := kube.ListAll(ctx,
@@ -332,8 +345,14 @@ func (j *failedJobsJanitor) claimedPVCNames(ctx context.Context,
 			continue
 		}
 		for _, v := range p.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil {
+			switch {
+			case v.PersistentVolumeClaim != nil:
 				claims[v.PersistentVolumeClaim.ClaimName] = true
+			case v.Ephemeral != nil:
+				// The ephemeral controller names the claim
+				// <pod>-<volume>; treating it as unclaimed could strip
+				// its protection finalizer while the pod still mounts it.
+				claims[p.Name+"-"+v.Name] = true
 			}
 		}
 	}
@@ -369,9 +388,11 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 	}
 
 	// claimsCache lazily fills one "who still claims what" pod scan per
-	// candidate namespace — shared between the collect filter, the
-	// Confirm re-vet AND the stuck-terminating audit so a namespace is
-	// listed at most once per RUN, not once per duty.
+	// candidate namespace — shared between the collect filter and the
+	// stuck-terminating audit so a namespace is listed at most once per
+	// RUN, not once per duty. Confirm deliberately does NOT ride the
+	// cache: its verdict re-queries pods fresh, because the snapshot
+	// from sweep start goes stale as this run's own deletes land.
 	claimsCache := census.claims()
 	claimed := func(ns, name string) bool {
 		pr, ok := claimsCache[ns]
@@ -424,12 +445,18 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 			}
 			return a.name < b.name
 		},
-		// Confirm re-vets live state close to the delete: still
-		// unmounted, and EVERY owner ref still gone-or-terminal (a run
-		// recreated or re-Resumed since the list keeps its workspace).
+		// Confirm re-vets live state close to the delete: a FRESH
+		// per-namespace pod re-query (the collect-time claimsCache
+		// predates this run's deletes and the minutes since), and
+		// EVERY owner ref still gone-or-terminal (a run recreated or
+		// re-Resumed since the list keeps its workspace).
 		Confirm: func(ctx context.Context, t orphanWorkspaceTarget) (bool, error) {
-			if claimed(t.ns, t.name) {
-				return false, nil
+			freshClaims, err := j.claimedPVCNames(ctx, t.ns)
+			if err != nil {
+				return false, err // cannot prove — keep, report via OnError
+			}
+			if freshClaims[t.name] {
+				return false, nil // a pod mounted the claim since collect
 			}
 			for _, ref := range t.refs {
 				done, err := j.runRefDone(ctx, t.ns, ref)

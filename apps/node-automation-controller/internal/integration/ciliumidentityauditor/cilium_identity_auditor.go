@@ -66,6 +66,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -266,8 +267,9 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 			}
 		}
 		slices = nil
-	case apierrors.IsNotFound(err):
-		// CES CRD absent — CEP-only cluster, nothing to merge.
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// CES CRD absent or API version not served — CEP-only
+		// cluster, nothing to merge.
 	default:
 		return fmt.Errorf("list ciliumendpointslices: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}

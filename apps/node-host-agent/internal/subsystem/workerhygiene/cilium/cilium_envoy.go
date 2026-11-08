@@ -77,8 +77,14 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if len(tasks) == 0 {
 		// No cilium-envoy container — older cilium or no L7 proxy:
-		// clear any stale latch like wdeps.CheckCilium does.
+		// clear any stale latch like wdeps.CheckCilium does. The xDS
+		// bookkeeping resets too: the baseline sum belonged to a
+		// container that no longer exists, and carrying it into the
+		// next envoy's fresh counters would misread its first pushes
+		// (xdsFails streak dies with the container either way).
 		c.fails = 0
+		c.xdsFails = 0
+		c.xdsInit = false
 		c.d.State.Exit(latchdefs.LatchCiliumEnvoyDown, nil)
 		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
@@ -149,6 +155,9 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // killCiliumEnvoy restarts the envoy container through its init
 // pids — kubelet rebuilds it like the agent path. The dedicated
 // budget keeps envoy kills from eating the agent's restart rate.
+// The xDS bookkeeping resets on a successful kill: the replacement
+// envoy starts its update_rejected counters from zero, so the old
+// baseline sum and streak must not leak into its first reads.
 func (c *CiliumEnvoyCheck) killCiliumEnvoy(tasks []wdeps.CtrTask, why string) {
 	if !c.d.State.RateTrySpend("last-cilium-envoy-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
@@ -159,11 +168,13 @@ func (c *CiliumEnvoyCheck) killCiliumEnvoy(tasks []wdeps.CtrTask, why string) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))
 		c.fails = 0
+		c.xdsFails = 0
+		c.xdsInit = false
 		c.d.Actions.WithLabelValues(wdeps.CheckCiliumEnvoy, "sigkill").Inc()
-	} else {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-envoy kill skipped (%s) — no running task to kill", why))
+		return
 	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"suspect: cilium-envoy kill skipped (%s) — no running task to kill", why))
 }
 
 // ParseEnvoyXDSRejected sums the cds/lds/rds update_rejected

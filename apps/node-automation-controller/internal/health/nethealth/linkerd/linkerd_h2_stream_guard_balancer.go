@@ -39,18 +39,49 @@ func init() {
 // W12-NM3 — outbound balancer lockout & proxy OOM detection
 // ---------------------------------------------------------------------------
 
+// linkerdProxyOOMWindow bounds how recent the OOM termination must
+// be — a FinishedAt older than the window describes a proxy that
+// already restarted clean (empty connection table but a rebuilt,
+// healthy balancer view), not the wedge seed.
+const linkerdProxyOOMWindow = 30 * time.Minute
+
+// oomkilledFresh reports whether a Termination is an OOMKilled whose
+// FinishedAt lands inside linkerdProxyOOMWindow of now (a zero
+// FinishedAt is unverifiable — not evidence).
+func oomkilledFresh(t *corev1.ContainerStateTerminated, now time.Time) bool {
+	return t != nil && t.Reason == "OOMKilled" &&
+		!t.FinishedAt.IsZero() &&
+		now.Sub(t.FinishedAt.Time) <= linkerdProxyOOMWindow
+}
+
 // linkerdProxyOOMKilled reports whether the pod's linkerd-proxy
-// container last terminated on OOMKilled — the wedge seed: an OOM'd
+// container (sidecar or init — an init OOM leaves the pod
+// un-Ready with a proxy that never started, same wedge seed) last
+// terminated on OOMKilled within linkerdProxyOOMWindow. An OOM'd
 // proxy restarts with an empty connection table and re-learns its
 // balancer view, which is exactly how a client-side dead-channel
 // lockout starts.
-func linkerdProxyOOMKilled(pod *corev1.Pod) bool {
+func linkerdProxyOOMKilled(pod *corev1.Pod, now time.Time) bool {
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.Name != kube.LinkerdProxyContainer {
 			continue
 		}
-		t := cs.LastTerminationState.Terminated
-		return t != nil && t.Reason == "OOMKilled"
+		if oomkilledFresh(cs.State.Terminated, now) ||
+			oomkilledFresh(cs.LastTerminationState.Terminated, now) {
+			return true
+		}
+	}
+	// Init containers: linkerd injects the proxy as an init container
+	// on injection shapes that mesh traffic before the app starts —
+	// an OOM there wedges the pod before the sidecar ever reports.
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.Name != kube.LinkerdProxyContainer {
+			continue
+		}
+		if oomkilledFresh(cs.State.Terminated, now) ||
+			oomkilledFresh(cs.LastTerminationState.Terminated, now) {
+			return true
+		}
 	}
 	return false
 }

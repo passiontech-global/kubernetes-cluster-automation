@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -277,6 +278,12 @@ func TestROPVCMounts(t *testing.T) {
 
 // --- clock-warp: wall-clock jump detector ---
 
+// TestClockWarpDetection drives the detector through the WarpDelta
+// seam: the public time API cannot synthesize two stamps whose
+// monotonic advance differs from their wall advance (both must come
+// from real clock reads), so a fake clock can only ever produce a
+// zero warp — the controlled gaps are injected, and warpDelta's own
+// fallback behavior is pinned separately below.
 func TestClockWarpDetection(t *testing.T) {
 	f := kfixture(t)
 	textfileDirOverride = t.TempDir()
@@ -284,22 +291,31 @@ func TestClockWarpDetection(t *testing.T) {
 	now := time.Now()
 	f.deps.Clock.Set(func() time.Time { return now })
 
+	// Controlled wall-vs-mono gap: 0 on quiet ticks, ±10s/5s on the
+	// incident ticks.
+	gap := time.Duration(0)
+	f.r.deps.WarpDelta = func(now, prev time.Time) time.Duration {
+		return gap
+	}
+
 	// First tick primes the baseline — no warp on a zero prev.
 	f.r.checkClockWarp()
 	if f.r.warp.events != 0 {
 		t.Fatal("first tick counted a warp")
 	}
 
-	// A tick that fires on cadence is clean.
-	now = now.Add(defaultTickInterval)
+	// A tick that fires on cadence (mono advance == wall advance)
+	// is clean.
 	f.r.checkClockWarp()
 	if f.r.warp.events != 0 {
 		t.Fatal("on-cadence tick counted a warp")
 	}
 
-	// A 10s-late tick (VM pause / live-migration) is a warp: marker,
-	// counter, watchdog ACTION line and the textfile series.
-	now = now.Add(defaultTickInterval + 10*time.Second)
+	// A 10s wall-vs-monotonic gap (VM pause / live-migration): wall
+	// jumps forward on resume while the frozen monotonic clock saw
+	// only the tick. Marker, counter, watchdog ACTION line and the
+	// textfile series must all fire.
+	gap = 10 * time.Second
 	f.r.checkClockWarp()
 	if f.r.warp.events != 1 {
 		t.Fatalf("warp events=%d want 1", f.r.warp.events)
@@ -325,12 +341,73 @@ func TestClockWarpDetection(t *testing.T) {
 		t.Fatalf("textfile missing warp counter:\n%s", prom)
 	}
 
-	// A tick that fires EARLY (clock stepped backward / NTP step)
-	// warps too — |delta| is symmetric.
-	now = now.Add(defaultTickInterval - 5*time.Second)
+	// A NEGATIVE gap (clock stepped backward / NTP step) warps too —
+	// |delta| is symmetric.
+	gap = -5 * time.Second
 	f.r.checkClockWarp()
 	if f.r.warp.events != 2 {
 		t.Fatalf("early-tick warp not counted: events=%d want 2", f.r.warp.events)
+	}
+}
+
+// TestWarpDeltaSyntheticClockStaysZero: two stamps without
+// monotonic readings (or only one carrying one) make Sub fall back
+// to wall for BOTH halves — the wall-minus-monotonic gap collapses
+// to 0, so a synthetic/fake clock reports no warp instead of a false
+// positive; and two REAL clock reads paired back sit far under the
+// threshold.
+func TestWarpDeltaSyntheticClockStaysZero(t *testing.T) {
+	base := time.Unix(1700000000, 0) // wall-only synthetic stamp
+	if got := warpDelta(base.Add(35*time.Second), base); got != 0 {
+		t.Fatalf("synthetic pair warp = %v, want exactly 0", got)
+	}
+	// One real (mono-carrying) + one synthetic — fallback again.
+	if got := warpDelta(time.Now(), base); got > clockWarpThreshold {
+		t.Fatalf("mixed pair warp = %v, must stay under the threshold", got)
+	}
+	// Real paired reads: mono advance == wall advance in-process, so
+	// the gap is noise-level.
+	if got := warpDelta(time.Now(), time.Now()); got > clockWarpThreshold {
+		t.Fatalf("real pair warp = %v, must stay under the threshold", got)
+	}
+}
+
+// TestEnsureStateLatchRefreshesHeldMtime: ensureStateLatch is
+// create-once — a re-occurring kmsg signature against a HELD latch
+// must refresh the mtime (janitor's 24h reap) without rewriting the
+// entry epoch or repeating the STATE-ENTER line.
+func TestEnsureStateLatchRefreshesHeldMtime(t *testing.T) {
+	f := kfixture(t)
+	fixed := time.Unix(1760000000, 0)
+	f.r.deps.Clock.Set(func() time.Time { return fixed })
+
+	p := filepath.Join(f.deps.StateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchPageAllocFailure)
+	testutil.WriteFile(t, p, "1700000000\n")
+	old := fixed.Add(-48 * time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	f.r.ensureStateLatch(p,
+		latchdefs.LatchFilePrefix+latchdefs.LatchPageAllocFailure,
+		"order=3 zone=normal")
+
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(fixed) {
+		t.Fatalf("held latch mtime = %v, want the clock %v", fi.ModTime(), fixed)
+	}
+	if got := testutil.ReadFile(t, p); got != "1700000000\n" {
+		t.Fatalf("held latch content rewritten: %q", got)
+	}
+	// The held-latch path appends nothing — the log may not even
+	// exist yet; absence equals silence here.
+	if b, rerr := os.ReadFile(f.log); rerr == nil &&
+		strings.Contains(string(b), "STATE-ENTER: page-alloc-failure") {
+		t.Fatal("held latch re-logged STATE-ENTER")
 	}
 }
 

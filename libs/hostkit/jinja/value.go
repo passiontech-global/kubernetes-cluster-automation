@@ -34,14 +34,43 @@ func Truthy(v any) bool {
 	return true
 }
 
-func Stringify(v any) string { return stringifyAt(v, 0) }
+func Stringify(v any) string {
+	steps := 0
+	return stringifyAt(v, 0, &steps)
+}
 
-// stringifyAt renders under a recursion budget (walkMaxDepth) —
-// a cyclic *List is constructible in-template and unbounded
-// recursion would burst the goroutine stack. Past the cap a
-// python-style "[...]" marks the elided tail.
-func stringifyAt(v any, depth int) string {
-	if depth > walkMaxDepth {
+// walkMaxSteps bounds the TOTAL number of node visits in one
+// top-level walk (stringify / json / plain / deepEq / yaml-decode),
+// shared through a *int across the whole recursion. A depth cap
+// alone can't stop an exponentially BRANCHING structure — a list
+// containing two copies of itself doubles the work every level
+// while staying shallow — so the walkers also burn a shared step
+// budget and bail (or error) once it's gone. That same budget is
+// what turns a YAML billion-laughs document into a decode error
+// instead of a hang.
+const walkMaxSteps = 100_000
+
+// stepBudgetExhausted bumps the shared walk counter and reports
+// whether the budget is spent — the walker must stop descending
+// NOW. A nil counter (leaf-only helpers) is never exhausted.
+func stepBudgetExhausted(steps *int) bool {
+	if steps == nil {
+		return false
+	}
+	*steps++
+	return *steps > walkMaxSteps
+}
+
+// stringifyAt renders under the walkMaxDepth recursion budget AND
+// the walkMaxSteps total-step budget — a cyclic *List is
+// constructible in-template ({% set _ = l.append(l) %}) and
+// unbounded recursion would burst the goroutine stack, while a
+// branching cycle doubles the work per level without ever
+// deepening. Past either cap a python-style "[...]" marks the
+// elided tail (Stringify's signature is public API, so the step
+// bail degrades instead of erroring).
+func stringifyAt(v any, depth int, steps *int) string {
+	if depth > walkMaxDepth || stepBudgetExhausted(steps) {
 		return "[...]"
 	}
 	switch t := v.(type) {
@@ -66,16 +95,16 @@ func stringifyAt(v any, depth int) string {
 	case []any:
 		parts := make([]string, len(t))
 		for i, x := range t {
-			parts[i] = stringifyAt(x, depth+1)
+			parts[i] = stringifyAt(x, depth+1, steps)
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case *List:
-		return stringifyAt(t.V, depth+1)
+		return stringifyAt(t.V, depth+1, steps)
 	case *OMap:
 		parts := make([]string, 0, t.Len())
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			parts = append(parts, "'"+k+"': "+stringifyAt(vv, depth+1))
+			parts = append(parts, "'"+k+"': "+stringifyAt(vv, depth+1, steps))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	}
@@ -208,6 +237,9 @@ func toFloat(v any) (float64, bool) {
 	case int64:
 		return float64(t), true
 	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return 0, false
+		}
 		return t, true
 	case bool:
 		if t {
@@ -216,7 +248,13 @@ func toFloat(v any) (float64, bool) {
 		return 0, true
 	case string:
 		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
-		return f, err == nil
+		// NaN/±Inf (ParseFloat accepts "nan"/"inf") are rejected so
+		// a numeric-looking string can never smuggle a non-finite
+		// float into comparisons or int conversion.
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, false
+		}
+		return f, true
 	}
 	return 0, false
 }
@@ -231,24 +269,96 @@ func numNeg(v any) (any, error) {
 	return nil, fmt.Errorf("cannot negate %v", v)
 }
 
+// numAsFloat converts only plain, finite numbers (int64/float64) —
+// no strings, no bools. numEq uses it to keep bool==number numeric
+// (python True == 1) while bool==string stays unequal.
+func numAsFloat(v any) (float64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return float64(t), true
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return 0, false
+		}
+		return t, true
+	}
+	return 0, false
+}
+
+// numEq compares two scalars for equality without cross-type
+// surprises:
+//
+//   - bool == bool is identity; a bool pairs numerically ONLY with
+//     a plain number (python True == 1) — never with a string, so
+//     false == '0' is false.
+//   - string == string is lexicographic, NEVER numeric: '0' and
+//     '00', '1e2' and '100' parse to the same float but are
+//     different strings.
+//   - numeric pairs (int64/float64/numeric-string) compare as
+//     floats — '1' == 1 stays true.
+//   - a non-finite number (toFloat rejects NaN/±Inf) equals
+//     nothing, not even itself (IEEE-754) — the Stringify
+//     fallback must not resurrect NaN == NaN as "NaN" == "NaN".
 func numEq(l, r any) bool {
+	lb, lIsBool := l.(bool)
+	rb, rIsBool := r.(bool)
+	switch {
+	case lIsBool && rIsBool:
+		return lb == rb
+	case lIsBool:
+		rf, ok := numAsFloat(r)
+		if !ok {
+			return false
+		}
+		lf := 0.0
+		if lb {
+			lf = 1
+		}
+		return lf == rf
+	case rIsBool:
+		lf, ok := numAsFloat(l)
+		if !ok {
+			return false
+		}
+		rf := 0.0
+		if rb {
+			rf = 1
+		}
+		return lf == rf
+	}
+	if ls, ok := l.(string); ok {
+		if rs, ok := r.(string); ok {
+			return ls == rs
+		}
+	}
 	lf, lok := toFloat(l)
 	rf, rok := toFloat(r)
 	if lok && rok {
 		return lf == rf
 	}
+	// Exactly one side numeric (or a rejected NaN/Inf number): a
+	// string form like "NaN" must not count as equality.
+	if isNum(l) || isNum(r) {
+		return false
+	}
 	return Stringify(l) == Stringify(r)
 }
 
-func deepEq(l, r any) bool { return deepEqAt(l, r, 0) }
+func deepEq(l, r any) bool {
+	steps := 0
+	return deepEqAt(l, r, 0, &steps)
+}
 
-// deepEqAt is deepEq under the walkMaxDepth recursion budget —
-// cyclic structures can't be compared meaningfully and would
-// overflow the stack; the deep tail answers false. Identical
-// container pointers short-circuit true so `l == l` stays true
-// even for a self-referential list.
-func deepEqAt(l, r any, depth int) bool {
-	if depth > walkMaxDepth {
+// deepEqAt is deepEq under the walkMaxDepth recursion budget AND
+// the walkMaxSteps total-step budget — cyclic structures can't be
+// compared meaningfully and would overflow the stack (the deep
+// tail answers false), while a branching cycle doubles the
+// comparison work per level without ever deepening; the shared
+// counter bails out in bounded time. Identical container pointers
+// short-circuit true so `l == l` stays true even for a
+// self-referential list.
+func deepEqAt(l, r any, depth int, steps *int) bool {
+	if depth > walkMaxDepth || stepBudgetExhausted(steps) {
 		return false
 	}
 	switch lt := l.(type) {
@@ -278,7 +388,7 @@ func deepEqAt(l, r any, depth int) bool {
 		for _, k := range lt.Keys() {
 			lv, _ := lt.Get(k)
 			rv, ok := rt.Get(k)
-			if !ok || !deepEqAt(lv, rv, depth+1) {
+			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
 				return false
 			}
 		}
@@ -289,7 +399,7 @@ func deepEqAt(l, r any, depth int) bool {
 			return false
 		}
 		for i := range lt {
-			if !deepEqAt(lt[i], rt[i], depth+1) {
+			if !deepEqAt(lt[i], rt[i], depth+1, steps) {
 				return false
 			}
 		}
@@ -377,12 +487,24 @@ func binOp(op string, l, r any) (any, error) {
 				if ri == 0 {
 					return nil, errors.New("division by zero")
 				}
-				return li / ri, nil
+				// python // FLOORS: -7//2 = -4, 7//-2 = -4 — Go's
+				// truncating division would give -3 for both.
+				q := li / ri
+				if li%ri != 0 && (li < 0) != (ri < 0) {
+					q--
+				}
+				return q, nil
 			case "%":
 				if ri == 0 {
 					return nil, errors.New("modulo by zero")
 				}
-				return li % ri, nil
+				// python's % takes the DIVISOR's sign: -7%2 = 1,
+				// 7%-2 = -1 — Go's remainder truncates toward zero.
+				m := li % ri
+				if m != 0 && (m < 0) != (ri < 0) {
+					m += ri
+				}
+				return m, nil
 			}
 		}
 		switch op {
@@ -393,6 +515,11 @@ func binOp(op string, l, r any) (any, error) {
 		case "/", "//":
 			if rf == 0 {
 				return nil, errors.New("division by zero")
+			}
+			if op == "//" {
+				// python's float // floors too: -7.0//2 = -4.0
+				// (plain division truncates toward zero).
+				return math.Floor(lf / rf), nil
 			}
 			return lf / rf, nil
 		case "%":

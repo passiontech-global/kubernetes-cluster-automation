@@ -8,6 +8,7 @@ package externalsecretnudge
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,16 +26,18 @@ import (
 // W9-GO1 — 1Password Connect auto-heal
 // ---------------------------------------------------------------------------
 
-// maybeHealConnect bounces the oldest running onepassword-connect pod
-// when the ESO data path has been broken long enough that a stuck
-// connect pod is the likely culprit: either a ClusterSecretStore has
-// reported Ready=False for >=esConnectHealMinAge, the ExternalSecret
-// storm has persisted that long, or a connect-sync container has sat
-// degraded that long. The delete is maintenance-gated,
-// UID-preconditioned, and capped at one bounce per
-// esConnectHealCooldown — and it NEVER fires on a transient first
-// observation, because all three clocks only start after the first
-// sweep that sees the bad state.
+// maybeHealConnect bounces a onepassword-connect pod when the ESO
+// data path has been broken long enough that a stuck connect pod is
+// the likely culprit: either a ClusterSecretStore has reported
+// Ready=False for >=esConnectHealMinAge, the ExternalSecret storm
+// has persisted that long, or a connect-sync container has sat
+// degraded that long. A degraded-pod trigger deletes THE POD
+// CARRYING the failing container; the store-outage/storm triggers
+// (which name no pod) fall back to the oldest running pod. The
+// delete is maintenance-gated, UID-preconditioned, and capped at
+// one bounce per esConnectHealCooldown — and it NEVER fires on a
+// transient first observation, because all three clocks only start
+// after the first sweep that sees the bad state.
 func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	storm bool, now time.Time) {
 	log := logf.FromContext(ctx)
@@ -67,10 +70,17 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// exact outage the heal exists for, invisible to triggers 1-2.
 	degraded := n.scanConnectSyncPods(ctx, now)
 	syncDegraded := false
+	var degradedPod *corev1.Pod
+	keys := make([]string, 0, len(degraded))
 	for key := range degraded {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys) // deterministic target when several pods degraded
+	for _, key := range keys {
 		if age, ok := n.syncDegradedSince.Seen(key, now); ok &&
 			age >= esConnectHealMinAge {
 			syncDegraded = true
+			degradedPod = degraded[key]
 			break
 		}
 	}
@@ -108,16 +118,30 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		return
 	}
 
-	pod := n.oldestConnectPod(ctx)
+	// The heal target: when the trigger is a degraded connect-sync,
+	// delete the pod CARRYING the failing container — the oldest
+	// pod may be the healthy replica. Only store-outage/storm
+	// triggers (which name no pod) fall back to the oldest running
+	// pod.
+	pod := degradedPod
+	if pod == nil {
+		pod = n.oldestConnectPod(ctx)
+	}
 	if pod == nil {
 		log.Info("connect heal: no running onepassword-connect pod found")
 		return
 	}
-	log.Info("ACTION: deleting oldest running onepassword-connect pod — "+
-		"sustained store outage/storm/sync degradation", "pod",
-		pod.Namespace+"/"+pod.Name,
-		"storeDown", storeDown, "stormLong", stormLong,
-		"syncDegraded", syncDegraded)
+	if degradedPod != nil {
+		log.Info("ACTION: deleting degraded onepassword-connect pod — "+
+			"connect-sync sustained degraded", "pod",
+			pod.Namespace+"/"+pod.Name,
+			"storeDown", storeDown, "stormLong", stormLong)
+	} else {
+		log.Info("ACTION: deleting oldest running onepassword-connect pod — "+
+			"sustained store outage/storm", "pod",
+			pod.Namespace+"/"+pod.Name,
+			"storeDown", storeDown, "stormLong", stormLong)
+	}
 	// DeletePod UID-preconditions the delete and stamps the cooldown
 	// on a DELIVERED delete only — a failed delete leaves the pod
 	// stuck and the next sweep retries.
@@ -133,24 +157,24 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 // scanConnectSyncPods censuses the connect-sync container inside
 // every Running onepassword-connect* pod across the candidate
 // namespaces. A pod whose connect-sync container status reports
-// !Ready or RestartCount >= esConnectSyncRestartMax is a stalled
+// !Ready or a live crashloop (restarts past the ceiling while in
+// CrashLoopBackOff or with a recent last termination) is a stalled
 // sync plane — connect-api keeps serving the stale SQLite cache, so
 // pod-level readiness stays green while every secret pull ages out
 // (the exact blind spot this module's storm census cannot see when
 // the sync failure is not a store outage). Degraded pods stamp
-// syncDegradedSince (the heal trigger's persistence clock) and emit
-// node_automation_onepassword_connect_sync_unhealthy; a pod back to
-// healthy, gone, or no longer Running forgets both. Returns the set
-// of "ns/pod" keys degraded THIS pass. Per-namespace list failures
-// are tolerated (IncError + carry-forward via the ledger's last
-// emissions): an unverifiable namespace must not flap live series
-// or the heal clock.
+// syncDegradedSince (the heal trigger's persistence clock); a pod
+// back to healthy, gone, or no longer Running forgets it. Returns
+// the pods degraded THIS pass by "ns/pod" key — the heal deletes the
+// pod carrying the failing container. Per-namespace list failures
+// are tolerated (IncError + carry-forward via the ledger): an
+// unverifiable namespace must not flap live series or the heal
+// clock.
 func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
-	now time.Time) map[string]bool {
+	now time.Time) map[string]*corev1.Pod {
 
 	log := logf.FromContext(ctx)
-	degraded := map[string]bool{}
-	n.syncUnhealthyEmitted.Begin() // drop an aborted pass's leftovers
+	degraded := map[string]*corev1.Pod{}
 	if n.cs == nil {
 		return degraded // no typed client wired — cannot inspect pods
 	}
@@ -174,12 +198,9 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 				n.syncDegradedSince.Forget(key)
 				continue
 			}
-			if why, bad := connectSyncDegraded(p); bad {
-				degraded[key] = true
+			if why, bad := connectSyncDegraded(p, now); bad {
+				degraded[key] = p
 				n.syncDegradedSince.Observe(key, now)
-				n.syncUnhealthyEmitted.Set(
-					metrics.OnePasswordConnectSyncUnhealthy, 1,
-					key, ns, p.Name)
 				if since, ok := n.syncDegradedSince.Seen(key, now); ok {
 					log.Info("connect-sync degraded",
 						"pod", key, "why", why,
@@ -190,18 +211,22 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 			}
 		}
 	}
-	n.syncUnhealthyEmitted.Prune(
-		metrics.OnePasswordConnectSyncUnhealthy.DeleteLabelValues)
 	return degraded
 }
 
 // connectSyncDegraded reports whether the pod's connect-sync
 // container is unhealthy — the status entry is !Ready, missing
 // while the container is declared (kubelet never started it), or
-// past the crashloop restart ceiling. Pods that do not declare a
-// connect-sync container at all are skipped: a different connect
-// image variant is not ours to judge.
-func connectSyncDegraded(p *corev1.Pod) (why string, bad bool) {
+// past the crashloop restart ceiling WHILE the loop is live: the
+// container sits in CrashLoopBackOff, or its last termination
+// finished within esConnectSyncCrashloopWindow. A restart count
+// above the ceiling with neither signature is stale history (the
+// container recovered), and a pod younger than
+// esConnectSyncCrashloopGrace is exempt from the restart-based
+// trigger entirely. Pods that do not declare a connect-sync
+// container at all are skipped: a different connect image variant
+// is not ours to judge.
+func connectSyncDegraded(p *corev1.Pod, now time.Time) (why string, bad bool) {
 	declared := false
 	for _, c := range p.Spec.Containers {
 		if c.Name == esConnectSyncContainer {
@@ -220,7 +245,19 @@ func connectSyncDegraded(p *corev1.Pod) (why string, bad bool) {
 		case !cs.Ready:
 			return "connect-sync container not Ready", true
 		case cs.RestartCount >= esConnectSyncRestartMax:
-			return "connect-sync container crashlooping", true
+			if now.Sub(p.CreationTimestamp.Time) < esConnectSyncCrashloopGrace {
+				return "", false // freshly-created pod — startup retries
+			}
+			if cs.State.Waiting != nil &&
+				cs.State.Waiting.Reason == "CrashLoopBackOff" {
+				return "connect-sync container crashlooping", true
+			}
+			if lt := cs.LastTerminationState.Terminated; lt != nil &&
+				!lt.FinishedAt.IsZero() &&
+				now.Sub(lt.FinishedAt.Time) <= esConnectSyncCrashloopWindow {
+				return "connect-sync container crashlooping", true
+			}
+			return "", false // stale restarts — the loop is over
 		}
 		return "", false
 	}

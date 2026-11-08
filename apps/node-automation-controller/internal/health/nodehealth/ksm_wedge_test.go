@@ -290,6 +290,7 @@ func TestKSMWedgePodListErrorIsInfraAndCarries(t *testing.T) {
 func TestKSMWedgeRealTailBouncesAndReports(t *testing.T) {
 	base := time.Now()
 	pod := ksmPod("monitoring", "kube-state-metrics-e2e")
+	pod.OwnerReferences = ksmOwnerRef("kube-state-metrics-e2e")
 	pod.Annotations = map[string]string{
 		kube.AnnoFirstSeenKSMWedge: `{"monitoring/kube-state-metrics-e2e":"` +
 			base.Add(-(ksmWedgeMinAge + time.Minute)).
@@ -317,5 +318,142 @@ func TestKSMWedgeRealTailBouncesAndReports(t *testing.T) {
 			"lease": "kube-state-metrics-e2e", "reason": "ksm_unauthorized"})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatal("ksm_unauthorized series missing after the bounce")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Marker precision + bounce gates (the 401 phrase fix)
+// ---------------------------------------------------------------------------
+
+// The 401 markers are full phrases — a bare "401" elsewhere in a line
+// (a retry count, a byte count, a metric value) must NOT classify as
+// the auth wedge, while both precise spellings still do.
+func TestKSMWedgeMarkerPrecision(t *testing.T) {
+	pod := ksmPod("monitoring", "kube-state-metrics-m401")
+	quiet := []struct{ name, log string }{
+		{"bare 401 number", "sync loop finished after 401 iterations\n"},
+		{"4xx that is not 401", "probe wrote 4013 bytes, status 200 OK\n"},
+	}
+	for _, tc := range quiet {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(pod)
+			cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(tc.log, nil))
+			reason, err := ksmLogTailWedge(ctx, cs, pod)
+			if err != nil {
+				t.Fatalf("ksmLogTailWedge err = %v", err)
+			}
+			if reason != "" {
+				t.Fatalf("bare-number line classified as %q — marker not phrase-precise", reason)
+			}
+		})
+	}
+	loud := []struct{ name, log string }{
+		{"401 unauthorized phrase",
+			"E0101 reflector.go:1] Failed to watch *v1.Pod: 401 Unauthorized\n"},
+		{"status code 401 phrase",
+			"E0101 watch.go:9] watch failed with status code 401\n"},
+	}
+	for _, tc := range loud {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(pod)
+			cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(tc.log, nil))
+			reason, err := ksmLogTailWedge(ctx, cs, pod)
+			if err != nil {
+				t.Fatalf("ksmLogTailWedge err = %v", err)
+			}
+			if reason != leaseReasonKSMUnauthorized {
+				t.Fatalf("ksmLogTailWedge = %q, want %q", reason, leaseReasonKSMUnauthorized)
+			}
+		})
+	}
+}
+
+// A wedged KSM pod with NO controller owner is reported (the gauge
+// carries the alert) but never bounced — deleting a controller-less
+// pod would remove kube-state-metrics permanently.
+func TestKSMWedgeUnownedPodNotBounced(t *testing.T) {
+	base := time.Now()
+	pod := ksmPod("monitoring", "kube-state-metrics-lone")
+	pod.Annotations = map[string]string{
+		kube.AnnoFirstSeenKSMWedge: `{"monitoring/kube-state-metrics-lone":"` +
+			base.Add(-(ksmWedgeMinAge + time.Minute)).
+				UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(pod)
+	p, ch := leaseGuardProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
+		return leaseReasonKSMUnauthorized, nil
+	}
+	t.Cleanup(func() {
+		controllerLeaseUnhealthyGauge.DeleteLabelValues(
+			"monitoring", "kube-state-metrics-lone", "ksm_unauthorized")
+	})
+
+	res := ch.Run(ctx)
+	if res.Pass {
+		t.Fatal("wedged controller-less ksm pod must still fail the check")
+	}
+	if _, err := cs.CoreV1().Pods("monitoring").
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("controller-less wedged pod deleted: %v", err)
+	}
+	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
+		map[string]string{"namespace": "monitoring",
+			"lease": "kube-state-metrics-lone", "reason": "ksm_unauthorized"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("ksm_unauthorized series missing for the un-bouncable pod")
+	}
+}
+
+// The heal cooldown keys on the pod's CONTROLLER (kube.PodControllerKey):
+// the replacement pod a bounce spawns inherits the 30m window — a
+// fresh pod name cannot re-arm a new heal every sweep (the pod-bounce
+// churn loop the old pod-scoped key allowed).
+func TestKSMWedgeCooldownFollowsController(t *testing.T) {
+	base := time.Now()
+	pastWindow := func(name string) map[string]string {
+		return map[string]string{
+			kube.AnnoFirstSeenKSMWedge: `{"monitoring/` + name + `":"` +
+				base.Add(-(ksmWedgeMinAge + time.Minute)).
+					UTC().Format(time.RFC3339) + `"}`}
+	}
+	podA := ksmPod("monitoring", "kube-state-metrics-6cc5c9d9b4-x1")
+	podA.OwnerReferences = ksmOwnerRef("kube-state-metrics-6cc5c9d9b4")
+	podA.Annotations = pastWindow(podA.Name)
+	cs := fake.NewSimpleClientset(podA)
+	p, ch := leaseGuardProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
+		return leaseReasonKSMUnauthorized, nil
+	}
+	t.Cleanup(func() {
+		controllerLeaseUnhealthyGauge.DeleteLabelValues(
+			"monitoring", "kube-state-metrics-6cc5c9d9b4-x1", "ksm_unauthorized")
+		controllerLeaseUnhealthyGauge.DeleteLabelValues(
+			"monitoring", "kube-state-metrics-6cc5c9d9b4-x2", "ksm_unauthorized")
+	})
+
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("precondition: first wedge must fail")
+	}
+	if _, err := cs.CoreV1().Pods("monitoring").Get(ctx, podA.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("first wedged pod not bounced: %v", err)
+	}
+
+	// The ReplicaSet respawns the pod under a NEW name inside the
+	// cooldown window, wedged again with a persisted stamp past the
+	// window.
+	podB := ksmPod("monitoring", "kube-state-metrics-6cc5c9d9b4-x2")
+	podB.OwnerReferences = ksmOwnerRef("kube-state-metrics-6cc5c9d9b4")
+	podB.Annotations = pastWindow(podB.Name)
+	if _, err := cs.CoreV1().Pods("monitoring").Create(ctx, podB, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(time.Minute))
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("respawned wedge must keep failing the check")
+	}
+	if _, err := cs.CoreV1().Pods("monitoring").Get(ctx, podB.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("cooldown keyed on the pod name re-bounced the replacement: %v", err)
 	}
 }

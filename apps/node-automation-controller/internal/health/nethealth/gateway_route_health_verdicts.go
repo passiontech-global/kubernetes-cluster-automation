@@ -94,7 +94,10 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 	}
 	c.grantsTried = true
 	for _, gvr := range referenceGrantGVRs {
-		l, err := p.Dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		// The per-sweep unstructured snapshot memoizes one LIST per
+		// GVR; the raw error keeps the NoMatch/NotFound = "this
+		// version is not served" interpretation.
+		l, err := p.AllUnstructured(ctx, gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // this version is not served on the cluster
@@ -105,8 +108,8 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 				"resource", gvr.Resource, "error", err)
 			return
 		}
-		for i := range l.Items {
-			c.grants = append(c.grants, decodeRouteGrant(&l.Items[i]))
+		for i := range l {
+			c.grants = append(c.grants, decodeRouteGrant(&l[i]))
 		}
 	}
 }
@@ -177,28 +180,37 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		return
 	}
 	c.wlLoaded[ns] = true
-	deps, err := p.CS.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+	// The Deployments/StatefulSets ride the per-sweep snapshot LISTs,
+	// filtered client-side to ns (a failed census is the same
+	// tolerated sub-failure the per-namespace lists were).
+	deps, err := p.AllDeployments(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
-		log.Info("WARN: gateway route health — deployment list failed, downscaler verdict off",
+		log.Info("WARN: gateway route health — deployment census failed, downscaler verdict off",
 			"namespace", ns, "error", err)
 	} else {
-		for i := range deps.Items {
-			d := &deps.Items[i]
+		for i := range deps {
+			d := &deps[i]
+			if d.Namespace != ns {
+				continue
+			}
 			c.workloads[ns] = append(c.workloads[ns], routeWorkload{
 				templateLabels: d.Spec.Template.Labels,
 				annotations:    d.Annotations,
 				replicas:       d.Spec.Replicas})
 		}
 	}
-	stss, err := p.CS.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
+	stss, err := p.AllStatefulSets(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
-		log.Info("WARN: gateway route health — statefulset list failed, downscaler verdict off",
+		log.Info("WARN: gateway route health — statefulset census failed, downscaler verdict off",
 			"namespace", ns, "error", err)
 	} else {
-		for i := range stss.Items {
-			s := &stss.Items[i]
+		for i := range stss {
+			s := &stss[i]
+			if s.Namespace != ns {
+				continue
+			}
 			c.workloads[ns] = append(c.workloads[ns], routeWorkload{
 				templateLabels: s.Spec.Template.Labels,
 				annotations:    s.Annotations,

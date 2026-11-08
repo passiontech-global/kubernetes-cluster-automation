@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -190,6 +191,48 @@ func (c *DiskBloatCheck) snapshotPodUID(id string) string {
 	return ""
 }
 
+// diskBloatEvictProtectedNamespaces — namespaces the critical-band
+// evictor never touches (psiEvictExcludedNamespaces parity): system
+// daemons, CNI/mesh control planes, storage operators, cert/secrets
+// plumbing, the flux delivery layer, the remediation namespace.
+// At 92% the disk is dying, but evicting the components needed to
+// recover makes the outage unrecoverable.
+var diskBloatEvictProtectedNamespaces = map[string]bool{
+	"kube-system":      true,
+	"node-ops":         true,
+	"medik8s":          true,
+	"cilium":           true,
+	"linkerd":          true,
+	"linkerd-cni":      true,
+	"openebs":          true,
+	"cert-manager":     true,
+	"external-secrets": true,
+	"operators":        true,
+	"everest-system":   true,
+	"scylla":           true,
+	"scylla-manager":   true,
+	"flux-system":      true,
+}
+
+// diskBloatEvictCriticalPriorityClasses — pods the scheduler marked
+// untouchable (psiEvictCriticalPriorityClasses parity).
+var diskBloatEvictCriticalPriorityClasses = map[string]bool{
+	"system-node-critical":    true,
+	"system-cluster-critical": true,
+}
+
+// diskBloatOwnedByStatefulSet reports whether any ownerReference is
+// a StatefulSet — a stateful workload's pod holds identity-bound
+// storage; the critical band must not churn it (psi parity).
+func diskBloatOwnedByStatefulSet(p *corev1.Pod) bool {
+	for _, ref := range p.OwnerReferences {
+		if ref.Kind == "StatefulSet" {
+			return true
+		}
+	}
+	return false
+}
+
 // DiskBloatCheck is the W6.3 runaway-dir detector as a Check. It
 // owns the scan stamp (ex-Hygiene.lastBloatScan) — the bounded
 // walk costs IO on the very disk that is full, so above the warn
@@ -272,7 +315,9 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		p := podByUID[uid]
 		if total <= c.d.Cfg.Disk.BloatPodThresholdBytes || p == nil ||
 			p.DeletionTimestamp != nil ||
-			p.Namespace == "kube-system" || p.Namespace == "node-ops" {
+			diskBloatEvictProtectedNamespaces[p.Namespace] ||
+			diskBloatEvictCriticalPriorityClasses[p.Spec.PriorityClassName] ||
+			diskBloatOwnedByStatefulSet(p) {
 			continue
 		}
 		if victim == nil || total > victimBytes {
@@ -290,17 +335,27 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
-	// Budget spent atomically BEFORE the delete (rate_spend parity —
-	// a failed delete still consumed it).
-	if err := c.d.Cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
-		ctx, victim.Name, metav1.DeleteOptions{}); err != nil {
+	// Budget spent atomically BEFORE the eviction (rate_spend parity
+	// — a failed evict still consumed it). policy/v1 Eviction — NOT
+	// a raw pod delete: the apiserver enforces the victim's
+	// PodDisruptionBudget atomically, so a PDB-protected pod is
+	// refused instead of silently disrupted (psi-memory-thrash
+	// evict parity).
+	ev := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      victim.Name,
+			Namespace: victim.Namespace,
+		},
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
+		victim.Namespace, victim.Name, victimBytes, used*100))
+	if err := c.d.Cfg.Client.PolicyV1().Evictions(victim.Namespace).
+		Evict(ctx, ev); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))
 	} else {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
-			victim.Namespace, victim.Name, victimBytes, used*100))
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "pod_evict").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
@@ -532,19 +587,31 @@ func (c *DiskBloatCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEn
 		}
 		c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
 	}
-	// (b) kubelet pod volume dirs of pods without the limit — the
-	// emptyDir/hostPath write surface the snapshot key can't see.
+	// (b) kubelet pod emptyDir volumes of pods without the limit —
+	// the write surface the snapshot key can't see. Restricted to
+	// volumes/kubernetes.io~empty-dir: configmap/secret/projected
+	// volumes are kubelet-materialized (read-only), and a
+	// medium=Memory emptyDir is tmpfs-backed — it fills RAM, never
+	// the data disk (scanBloat's emptyDir walk applies the same
+	// statfs gate).
 	for _, uidDir := range readDirNames(c.d.Cfg.PodsDir) {
 		pod := podByUID[filepath.Base(uidDir)]
 		if podDeclaresEphemeralStorage(pod) {
 			continue
 		}
-		volRoot := filepath.Join(uidDir, "volumes")
-		size, _ := c.walkBytes(e, volRoot)
-		if size <= threshold {
-			continue
+		for _, vol := range readDirNames(filepath.Join(
+			uidDir, "volumes", "kubernetes.io~empty-dir")) {
+			var vst unix.Statfs_t
+			if err := c.d.Cfg.Seams.Host.StatfsFn(vol, &vst); err == nil &&
+				vst.Type == int64(unix.TMPFS_MAGIC) {
+				continue // medium=Memory emptyDir — can't fill the disk
+			}
+			size, _ := c.walkBytes(e, vol)
+			if size <= threshold {
+				continue
+			}
+			c.emitWLayerBloatEvent(ctx, pod, vol, size)
 		}
-		c.emitWLayerBloatEvent(ctx, pod, volRoot, size)
 	}
 }
 

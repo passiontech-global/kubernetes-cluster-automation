@@ -43,11 +43,19 @@ import (
 //     SetupModules stamps the same slice on every row's Deps; only
 //     the cluster-health-probes sweep consumes it. Nil in
 //     literally-constructed test Deps.
+//   - ProbeCS/ProbeDyn are the latency-sensitive probe clients (own
+//     client-go rate limiter — see cmd/manager main.go). SetupModules
+//     hands them to a module's Setup AS CS/Dyn when the module row
+//     opts in (Module.ProbeClients), so the probe modules read the
+//     same call sites; nil (tests, StubManager wiring) leaves the
+//     row's CS/Dyn untouched.
 type Deps struct {
 	Name      string
 	Mgr       manager.Manager
 	CS        kubernetes.Interface
 	Dyn       dynamic.Interface
+	ProbeCS   kubernetes.Interface
+	ProbeDyn  dynamic.Interface
 	Log       logr.Logger
 	Disabled  bool
 	CheckRegs []CheckReg

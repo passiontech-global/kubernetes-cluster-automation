@@ -31,7 +31,10 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
 	rep *probefw.SweepReport, driftNow map[string][]string) {
 
-	ck := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, pod.Namespace+"/"+pod.Name)
+	// The cooldown keys on the pod's controller (kube.PodControllerKey)
+	// — the recreated pod carries a fresh suffix, so a "<ns>/<pod>"
+	// key lets the same workload's re-heal fire every sweep.
+	ck := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, kube.PodControllerKey(pod))
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, ck, linkerdOpaqueHealCool, now)
 	if unverifiable {
@@ -41,8 +44,8 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	if !proceed {
 		return
 	}
-	templateOK := p.patchLinkerdTemplate(ctx, log, pod, missing, now, rep, driftNow)
-	if !templateOK {
+	covered, patched := p.patchLinkerdTemplate(ctx, log, pod, missing, now, rep, driftNow)
+	if !covered {
 		// No pod-side annotation here: writing opaque-ports onto a pod
 		// that stays RUNNING (GitOps-reverted template inside the 6h
 		// stamp window, RBAC-refused patch) makes missingBinaryPorts()
@@ -54,6 +57,24 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
 		return
 	}
+	if patched {
+		// The template patch just landed — the workload controller
+		// (Deployment/StatefulSet/DaemonSet/Rollout) rolling-update
+		// replaces every pod with the corrected config itself.
+		// Mass-deleting all matching pods here would duplicate the
+		// rollout and churn the whole workload at once; skip the
+		// delete AND the pod annotation (a pod-side opaque-ports
+		// write would make the next sweep read the still-running
+		// pre-rollout pod as covered — the self-blind hazard).
+		log.Info("PATCH: linkerd protocol-detection stall — template patched, leaving the rolling update to the workload controller",
+			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
+		return
+	}
+	// Template already covered the ports but the pod is still running
+	// the pre-annotation config — the restart is the heal, and the
+	// bookkeeping annotation lands only once the delete is delivered
+	// (the same self-blind hazard applies to a pod whose delete
+	// failed).
 	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, pod, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd opaque-ports pod delete failed",

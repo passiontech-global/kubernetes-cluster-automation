@@ -22,13 +22,17 @@ import (
 var TextfileDirOverride = ""
 
 // textfilePromDir resolves the node-exporter textfile drop dir:
-// K0sDir is <hostRoot>/var/lib/k0s, so the dir is its sibling
-// <hostRoot>/var/lib/node-exporter/textfile (DaemonSet:
-// /host/var/lib/..., standalone: /var/lib/...). The override wins
-// for tests.
+// NODE_HOST_AGENT_TEXTFILE_DIR (wired into Config.TextfileDir from
+// hostctx) when set; else K0sDir is <hostRoot>/var/lib/k0s, so the
+// dir is its sibling <hostRoot>/var/lib/node-exporter/textfile
+// (DaemonSet: /host/var/lib/..., standalone: /var/lib/...). The
+// override wins for tests.
 func (d *Deps) textfilePromDir() string {
 	if TextfileDirOverride != "" {
 		return TextfileDirOverride
+	}
+	if d.Cfg.TextfileDir != "" {
+		return d.Cfg.TextfileDir
 	}
 	return filepath.Join(filepath.Dir(d.Cfg.K0sDir),
 		"node-exporter", "textfile")

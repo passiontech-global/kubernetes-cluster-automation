@@ -51,10 +51,12 @@ type splitBrainWatch struct {
 
 // eval records this sweep's ready-endpoint count for the candidate
 // and flags the gauge once the >1 streak reaches the two-sweep
-// minimum — the finding lands on the check's report, the series on
-// the signature's.
+// minimum — the finding lands on the signature's OWN report (its
+// verdict wording differs from the zero-endpoints one: these
+// services have TOO MANY masters, not none) and the series on the
+// signature's ledger.
 func (w *splitBrainWatch) eval(c masterSvc, key string, nReady int,
-	rep, sigRep *probefw.SweepReport) {
+	sigRep *probefw.SweepReport) {
 	// W12-SC2(i) — multi-master split brain: >1 Ready endpoint
 	// on the master role two sweeps running. A relabeling flap
 	// settles inside one sweep; two pods answering the role at
@@ -63,7 +65,7 @@ func (w *splitBrainWatch) eval(c masterSvc, key string, nReady int,
 		if w.streak.Hit(key) >= statefulMultiMasterMinStreak {
 			sigRep.Flag(statefulServiceMultipleMastersGauge, key,
 				[]string{c.ns, c.svc, c.sts.Name})
-			rep.Find(key + "(multiple_masters)")
+			sigRep.Find(key + "(multiple_masters)")
 		}
 	} else {
 		w.streak.Reset(key)

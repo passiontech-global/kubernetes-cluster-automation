@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,7 +39,9 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	// live on older objects.
 	if last, ok := kube.AnnoTime(deploy, corednsTSAnno); ok {
 		if ago := w.now.Now().Sub(last); ago < corednsCooldownS*time.Second {
-			metrics.IncError(w.queue)
+			// Legitimate skip — the cooldown IS the pacing doing its
+			// job, not a failure; no IncError (a 30m cooldown wrongly
+			// counted as a run error would page on every recovery).
 			log.Info("SKIP recovery: inside cooldown",
 				"pods", suspects, "agoS", int64(ago.Seconds()), "cooldownS", corednsCooldownS)
 			return nil
@@ -51,7 +54,8 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
 	if notReady > 0 {
-		metrics.IncError(w.queue)
+		// Legitimate skip — the storm gate holding is the guard
+		// working as designed.
 		log.Info("SKIP recovery: nodes NotReady — cluster storm",
 			"pods", suspects, "notReady", notReady)
 		return nil
@@ -62,18 +66,22 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	// heal.AllowedV runs with a nil heals ledger — the cooldown
 	// above is annotation-persisted on the Deployment, not a
 	// CooldownSet — and shares w.verdict so the run pays one
-	// evaluation. Held AND unverifiable both defer + count like the
-	// other gates' skips (the defer log with the why/error comes
-	// from AllowedV).
+	// evaluation. A held mutex defers with no error (the defer log
+	// with the why comes from AllowedV); only UNVERIFIABLE fails
+	// closed as an error and IncErrors the queue below.
 	proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
 		w.cs, w.dyn, nil, "coredns", 0, w.now.Now())
-	if unverifiable || !proceed {
+	if unverifiable {
 		metrics.IncError(w.queue)
+		return nil
+	}
+	if !proceed {
 		return nil
 	}
 	// Fleet not fully ready = a rollout is already recreating pods.
 	if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
-		metrics.IncError(w.queue)
+		// Legitimate skip — recovery would stack on the in-flight
+		// rollout it is waiting for.
 		log.Info("SKIP recovery: coredns not fully ready",
 			"pods", suspects,
 			"ready", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
@@ -121,11 +129,28 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		// empty-UID precondition that can never match a live pod —
 		// fail closed, delete nothing.
 		log.Info("ACTION: delete stale pods", "pods", suspects)
+		deleted := 0
 		for _, name := range suspects {
 			if err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name,
 				kube.UIDDeleteOptions(podUID[name], "")); err != nil {
+				if apierrors.IsNotFound(err) {
+					// Already gone — a previous cycle's delete (or the
+					// Deployment controller) got there first. Not a
+					// failure; the fleet is exactly where we wanted it.
+					log.Info("stale pod already gone", "pod", corednsNS+"/"+name)
+					continue
+				}
 				return fmt.Errorf("delete stale pod %s/%s: %w", corednsNS, name, err)
 			}
+			deleted++
+		}
+		// The cooldown annotation is stamped only for recovery we
+		// DELIVERED — zero deletes means nothing happened this cycle,
+		// and stamping anyway would suppress a needed recovery for a
+		// full cooldown window.
+		if deleted == 0 {
+			log.Info("sweep done: no stale pod deleted (all already gone)", "pods", suspects)
+			return nil
 		}
 		patch, err := kube.MergePatchAnnos(map[string]any{corednsTSAnno: stamp})
 		if err != nil {

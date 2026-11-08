@@ -937,3 +937,133 @@ func TestOrphanWorkspacePVCDeleteConflictNotMetered(t *testing.T) {
 		t.Fatal("pvc vanished despite the rejected delete")
 	}
 }
+
+// Confirm re-queries the namespace's pods FRESH instead of trusting
+// the claimsCache from sweep start: a pod that mounted the claim
+// between the collect scan and the confirm re-vet keeps it — the
+// cached snapshot cannot see mounts that landed after it was filled.
+func TestOrphanWorkspacePVCConfirmRequeriesPods(t *testing.T) {
+	pvc := fjjWorkspacePVC("cicd", "pvc-orphan", 8*time.Hour,
+		[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil)
+	cs := fake.NewSimpleClientset(pvc)
+	var podLists int32
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			// The collect scan (list #1) sees no pods; a claimant
+			// lands before the confirm re-query (list #2) runs.
+			if atomic.AddInt32(&podLists, 1) == 2 {
+				if err := cs.Tracker().Add(
+					fjjPodClaiming("cicd", "late-runner", "pvc-orphan", corev1.PodRunning)); err != nil {
+					return true, nil, err
+				}
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	j := &failedJobsJanitor{
+		cs: cs, dyn: fjjDynFake(), now: time.Now, queue: "failed-jobs-janitor",
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !fjjPVCExists(t, cs, "cicd", "pvc-orphan") {
+		t.Fatal("pvc deleted although a pod mounted it before confirm")
+	}
+	if got := atomic.LoadInt32(&podLists); got < 2 {
+		t.Fatalf("pod scans = %d, want a fresh re-query at confirm (>= 2)", got)
+	}
+}
+
+// claimedPVCNames derives the implicit <pod>-<volume> claim of a
+// generic ephemeral volume and skips terminal pods' claims.
+func TestClaimedPVCNamesIncludesEphemeral(t *testing.T) {
+	pods := []runtime.Object{
+		// Running pod with a generic ephemeral volume "scratch" —
+		// backs the implicit claim "runner-scratch".
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "cicd", Name: "runner"},
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "scratch",
+				VolumeSource: corev1.VolumeSource{
+					Ephemeral: &corev1.EphemeralVolumeSource{}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		// Pending pod with a plain PVC claim — a claimant too.
+		fjjPodClaiming("cicd", "mounter", "data", corev1.PodPending),
+		// Terminal pod — its claims are released.
+		fjjPodClaiming("cicd", "done", "gone", corev1.PodSucceeded),
+	}
+	cs := fake.NewSimpleClientset(pods...)
+	j := &failedJobsJanitor{cs: cs}
+	claims, err := j.claimedPVCNames(ctx, "cicd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claims["runner-scratch"] {
+		t.Fatalf("ephemeral-backed claim missing from %v", claims)
+	}
+	if !claims["data"] {
+		t.Fatalf("pvc claim missing from %v", claims)
+	}
+	if claims["gone"] {
+		t.Fatalf("terminal pod's claim counted: %v", claims)
+	}
+}
+
+// The reaper must not reap a claim whose only reference is a generic
+// ephemeral volume of a live pod — the pre-Ephemeral scan read it as
+// unmounted and would have deleted live storage.
+func TestOrphanWorkspacePVCEphemeralClaimKept(t *testing.T) {
+	pvc := fjjWorkspacePVC("cicd", "runner-scratch", 8*time.Hour, nil,
+		map[string]string{"tekton.dev/pipelineRun": "pr-gone"})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "cicd", Name: "runner"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "scratch",
+			VolumeSource: corev1.VolumeSource{
+				Ephemeral: &corev1.EphemeralVolumeSource{}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := fake.NewSimpleClientset(pvc, pod)
+	j := &failedJobsJanitor{
+		cs: cs, dyn: fjjDynFake(), now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !fjjPVCExists(t, cs, "cicd", "runner-scratch") {
+		t.Fatal("ephemeral-backed claim deleted while its pod still runs")
+	}
+}
+
+// The completed-run TTL sweep caps delete attempts at
+// failedJobsDeleteCap (500) per sweep — a four-figure backlog drains
+// over several hourly runs instead of hammering the apiserver once.
+func TestCompletedRunKindCappedAtFiveHundred(t *testing.T) {
+	var runs []runtime.Object
+	for i := 0; i <= failedJobsDeleteCap; i++ { // cap+1 candidates
+		runs = append(runs, fjjRun(kube.GVRTektonPipelineRun, "PipelineRun",
+			"cicd", fmt.Sprintf("pr-old-%04d", i), "True", 30*time.Hour))
+	}
+	dyn := fjjDynFake(runs...)
+	j := &failedJobsJanitor{
+		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	if err := j.sweepCompletedRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remaining := 0
+	for i := 0; i <= failedJobsDeleteCap; i++ {
+		if fjjRunExists(t, dyn, kube.GVRTektonPipelineRun, "cicd",
+			fmt.Sprintf("pr-old-%04d", i)) {
+			remaining++
+		}
+	}
+	if remaining != 1 {
+		t.Fatalf("%d runs left after the sweep, want exactly 1 (the cap held)", remaining)
+	}
+}

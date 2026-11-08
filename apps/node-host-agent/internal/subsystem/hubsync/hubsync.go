@@ -51,6 +51,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -265,14 +266,16 @@ type Syncer struct {
 	// renew loop to the cycle driver (buffered 1, drop-when-full).
 	cycleCh chan struct{}
 
-	// leaseOnce keeps the lease heartbeater single-flight: the
+	// leaseArmed keeps the lease heartbeater single-flight: the
 	// agent supervisor re-invokes Run on the SAME ctx after a Cycle
 	// panic, and a bare `go s.leaseLoop(ctx)` stacked another
 	// renewer per restart — two loops racing the same Lease update
 	// (the resourceVersion-conflict loser reads it as lease loss →
-	// spurious "lost lease" + an extra converge). feederOnce parity
-	// in controllerhygiene.
-	leaseOnce sync.Once
+	// spurious "lost lease" + an extra converge). CompareAndSwap
+	// arming, never reset — the renewer outlives Run like the
+	// SpawnFn child it starts (spawnRouteGuard's single-flight
+	// shape; feederOnce parity in controllerhygiene).
+	leaseArmed atomic.Bool
 
 	// lastTargets caches the target names of the last successful
 	// loadTargets — a parse failure must drive every known
@@ -354,16 +357,16 @@ func (s *Syncer) Run(ctx context.Context) {
 	// slow SSH/SCP converge (up to ~3min/target over WAN) starved it
 	// past the 60s LeaseDurationSeconds, letting a second pod claim
 	// the lease mid-cycle (two holders converging the same targets).
-	s.leaseOnce.Do(func() {
+	if s.leaseArmed.CompareAndSwap(false, true) {
 		// Spawn's stop is DELIBERATELY never called: the supervisor
 		// passes the same live ctx on every restart, so the renewer
-		// already outlived Run — the once just stops re-entries
+		// already outlived Run — the CAS just stops re-entries
 		// stacking duplicates. Tying its lifetime to Run would let a
 		// crash-looping Cycle lapse the 60s Lease through the
 		// restart backoff (5s doubling to 5m in agent.go) and hand
 		// the converge singleton to a second pod mid-flap.
 		s.cfg.SpawnFn(ctx, "hubsync lease renewer", s.leaseLoop)
-	})
+	}
 	syncT := time.NewTicker(s.cfg.SyncInterval)
 	watch := time.NewTicker(s.cfg.WatchInterval)
 	defer syncT.Stop()

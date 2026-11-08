@@ -75,8 +75,14 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		driftWhy = fmt.Sprintf("pod lxc*=%d nebula=%d", lxcMax, neb)
 	}
 	if driftWhy != "" {
-		if !c.d.State.Exists(latchdefs.LatchCiliumMTUDrift) {
-			c.d.State.Enter(latchdefs.LatchCiliumMTUDrift, driftWhy)
+		// BUG-H6: the mtime refresh runs EVERY drift cycle, not only
+		// on entry — the janitor reaps state-* files older than 24h
+		// and a multi-day MTU drift must not lose its latch between
+		// checks. Enter refreshes when held, creates when absent;
+		// the NPD ACTION line stays one-shot per episode.
+		fresh := !c.d.State.Exists(latchdefs.LatchCiliumMTUDrift)
+		c.d.State.Enter(latchdefs.LatchCiliumMTUDrift, driftWhy)
+		if fresh {
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
 			c.d.State.AppendLog(

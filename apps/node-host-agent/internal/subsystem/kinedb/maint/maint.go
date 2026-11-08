@@ -32,10 +32,25 @@ package maint
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
+)
+
+const (
+	// lastMaintFile — the heavy-block epoch under GuardStateDir:
+	// the unix second the last full REINDEX/FREEZE/repack run
+	// completed (the same last-* file contract as the guard).
+	lastMaintFile = "last-maint-run"
+	// maintEpochWindow — a heavy block younger than this skips the
+	// next cycle's REINDEX + VACUUM FREEZE + pg_repack. cycle.RunAll
+	// fires Cycle immediately on every agent (re)start, and without
+	// the epoch a restart during a reindex storm replays the storm
+	// from second zero.
+	maintEpochWindow = 24 * time.Hour
 )
 
 // buildHeavyScript renders the single-session psql script the heavy
@@ -127,7 +142,7 @@ func (m *Maint) Cycle(ctx context.Context) *Result {
 	case !m.d.ContainerRunning(ctx, pg):
 		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
-		m.maintRun(ctx, pg, user, pass, res, note)
+		m.maintRun(ctx, pg, user, pass, res, note, !m.maintEpochFresh())
 	}
 	m.emitMaint(res)
 	sum := fmt.Sprintf("reindex=%v repack=%s freeze=%s heap=%dB idx=%dB "+
@@ -145,8 +160,32 @@ func (m *Maint) Cycle(ctx context.Context) *Result {
 	return res
 }
 
+// maintEpochFresh reports whether a heavy maint block completed less
+// than 24h ago — ReadIntFile failing on a missing epoch file reads as
+// "never ran", so a fresh install always runs the heavy block.
+func (m *Maint) maintEpochFresh() bool {
+	epoch, err := kdeps.ReadIntFile(
+		filepath.Join(m.d.Cfg.GuardStateDir, lastMaintFile))
+	if err != nil {
+		return false
+	}
+	return m.d.Cfg.Clock.Now().Sub(time.Unix(epoch, 0)) < maintEpochWindow
+}
+
+// stampMaintEpoch records the heavy block's completion under
+// GuardStateDir — only the daemon stamps it (ReadOnly is the
+// check-kine-db CLI contract: no state-file writes).
+func (m *Maint) stampMaintEpoch() {
+	if m.d.Cfg.ReadOnly {
+		return
+	}
+	kdeps.WriteIntFile(
+		filepath.Join(m.d.Cfg.GuardStateDir, lastMaintFile),
+		m.d.Cfg.Clock.Now().Unix())
+}
+
 func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
-	res *Result, note func(string)) {
+	res *Result, note func(string), heavy bool) {
 
 	// (a0) W12-CP2 invalid-index reaper — BEFORE the reindex: an
 	// interrupted REINDEX CONCURRENTLY or pg_repack leaves *_ccnew /
@@ -160,6 +199,21 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	// FREEZE vacuum can ride the locked session below (runs before
 	// the repack gate so a failing stats read cannot skip it).
 	freeze := m.readXidAge(ctx, pg, user, pass, res, note)
+
+	if !heavy {
+		// Startup guard: a heavy block completed <24h ago. cycle.RunAll
+		// fires Cycle immediately on every agent (re)start, and
+		// replaying REINDEX + VACUUM FREEZE + pg_repack on the heels
+		// of the last run is pure churn on the same locks/snapshots
+		// the compact guard needs. The cheap reads above (and the
+		// stats below) still ran, so the gauges stay fresh.
+		res.okReindex = true
+		res.freezeState = "skipped"
+		note("heavy block skipped: last-maint-run epoch <24h old")
+		logger().Info("kinedb: maint heavy block skipped — last run <24h ago")
+		m.readSizes(ctx, pg, user, pass, res, note)
+		return
+	}
 
 	// (a) REINDEX CONCURRENTLY — always, cheap on a small table —
 	// plus the (b) FREEZE vacuum when the XID age triggers, inside
@@ -197,29 +251,17 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		if freeze {
 			res.freezeState = "done"
 		}
+		// The heavy block completed — stamp the epoch so a restart
+		// (or the next cycle) inside maintEpochWindow skips REINDEX +
+		// VACUUM FREEZE + pg_repack. repack still runs below but is
+		// part of this same heavy window.
+		m.stampMaintEpoch()
 	}
 
 	// (c) sizes + dead-tuple estimate from pg_stat_user_tables.
 	// Indexes via pg_indexes_size like the bash — total−heap would
 	// count TOAST as index bytes.
-	out, err := m.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT pg_relation_size(%[1]s), pg_indexes_size(%[1]s), "+
-			"COALESCE((SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0), "+
-			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0)",
-		kdeps.SQLQuote(m.d.Cfg.Table)))
-	if err == nil {
-		heap, idx, dead, live, perr := kdeps.ParseQuad(out)
-		if perr == nil {
-			res.heapBytes = heap
-			res.indexBytes = idx
-			res.deadPct = deadTuplePct(dead, live)
-			res.statsOK = true
-		} else {
-			note(fmt.Sprintf("sizes-unparsed: %v", perr))
-		}
-	} else {
-		note(fmt.Sprintf("sizes-fail: %v", err))
-	}
+	m.readSizes(ctx, pg, user, pass, res, note)
 	if !res.statsOK {
 		// deadPct=0 + heapBytes=0 reads as "not bloated" — a failed
 		// assessment must not skip repack and still report OK.
@@ -297,6 +339,30 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		res.okRepack = false
 		res.repackState = "fail"
 		note(fmt.Sprintf("repack-fail: %v", err))
+	}
+}
+
+// readSizes reads the heap/index bytes + dead/live-tuple estimate the
+// gauges and the repack gate consume (the (c) block of maintRun).
+func (m *Maint) readSizes(ctx context.Context, pg, user, pass string,
+	res *Result, note func(string)) {
+	out, err := m.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT pg_relation_size(%[1]s), pg_indexes_size(%[1]s), "+
+			"COALESCE((SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0), "+
+			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0)",
+		kdeps.SQLQuote(m.d.Cfg.Table)))
+	if err == nil {
+		heap, idx, dead, live, perr := kdeps.ParseQuad(out)
+		if perr == nil {
+			res.heapBytes = heap
+			res.indexBytes = idx
+			res.deadPct = deadTuplePct(dead, live)
+			res.statsOK = true
+		} else {
+			note(fmt.Sprintf("sizes-unparsed: %v", perr))
+		}
+	} else {
+		note(fmt.Sprintf("sizes-fail: %v", err))
 	}
 }
 

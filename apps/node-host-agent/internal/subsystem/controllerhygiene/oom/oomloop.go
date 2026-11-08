@@ -150,8 +150,7 @@ func (c *LoopCheck) Run(_ context.Context) {
 				filepath.Join(dir, cdeps.FileOOMShielded), err))
 			break
 		}
-		c.setAdj("kube-apiserver", c.d.Cfg.OOMLoop.APIServerShieldAdj)
-		c.setAdj("kine", c.d.Cfg.OOMLoop.KineShieldAdj)
+		c.reassertShields()
 		c.d.Actions.WithLabelValues(cdeps.CheckOOMLoop, "shield").Inc()
 	case cdeps.ModeDryRun:
 		c.d.State.SuspectLog(cdeps.StateControllerOOMLop, fmt.Sprintf(
@@ -168,6 +167,18 @@ func (c *LoopCheck) Run(_ context.Context) {
 		c.unshieldOOM(dir, "mode not enforce")
 	}
 	c.d.Cycles.WithLabelValues(cdeps.CheckOOMLoop, "ok").Inc()
+}
+
+// reassertShields re-applies the oom_score_adj shield — BOTH pins —
+// every enforce-mode cycle. PIDs change on every respawn and a fresh
+// process boots at adj=0: re-pinning only kube-apiserver (−800) and
+// skipping kine's +500 would leave every respawned kine fully
+// killable while the loop latch still stands — the exact crash
+// spiral this loop exists to break (kine must die FIRST so the
+// apiserver survives each refill).
+func (c *LoopCheck) reassertShields() {
+	c.setAdj("kube-apiserver", c.d.Cfg.OOMLoop.APIServerShieldAdj)
+	c.setAdj("kine", c.d.Cfg.OOMLoop.KineShieldAdj)
 }
 
 // unshieldOOM drops the apiserver/kine oom_score_adj shield when the

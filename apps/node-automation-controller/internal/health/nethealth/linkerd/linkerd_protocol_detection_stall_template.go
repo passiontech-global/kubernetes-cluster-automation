@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -67,17 +68,20 @@ func linkerdGitOpsManaged(obj metav1.Object) bool {
 
 // patchLinkerdTemplate resolves the pod's controller owner to
 // its workload and merges the missing ports into the pod-template
-// opaque-ports annotation. Returns true when the template now covers
-// the ports (patched now, or already covered — the pod just needs a
-// restart). False when no workload owner resolves or the patch fails
+// opaque-ports annotation. Returns covered=true when the template now
+// covers the ports (patched now, or already covered — the pod just
+// needs a restart) and patched=true only when THIS call landed the
+// template patch — the caller lets the workload controller run the
+// rolling update instead of deleting pods itself in that case.
+// covered=false means no workload owner resolves or the patch fails
 // (RBAC/not-found) — the caller must not delete the pod then.
 func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
-	rep *probefw.SweepReport, driftNow map[string][]string) bool {
+	rep *probefw.SweepReport, driftNow map[string][]string) (covered, patched bool) {
 
 	ref := metav1.GetControllerOf(pod)
 	if ref == nil {
-		return false
+		return false, false
 	}
 	ns := pod.Namespace
 	switch ref.Kind {
@@ -86,24 +90,39 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 		if err != nil {
 			log.Info("WARN: linkerd heal — replicaset get failed",
 				"rs", ns+"/"+ref.Name, "error", err)
-			return false
+			return false, false
 		}
 		dref := metav1.GetControllerOf(rs)
 		if dref == nil {
-			return false
+			return false, false
 		}
 		if dref.Kind == "Rollout" {
 			// W16-G1 — a Rollout-owned ReplicaSet: patch the parent
 			// Rollout (argoproj.io/v1alpha1, unstructured) exactly
 			// like the Deployment path — same template annotation,
 			// same patch stamp and GitOps drift guard via
-			// patchTemplatePorts, just a dynamic-client patch.
-			ro, err := p.Dyn.Resource(kube.GVRArgoRollout).
-				Namespace(ns).Get(ctx, dref.Name, metav1.GetOptions{})
+			// patchTemplatePorts, just a dynamic-client patch. The
+			// get goes through the per-sweep unstructured snapshot —
+			// a cluster-wide LIST memoized per GVR, filtered
+			// client-side to ns/name (the raw NoMatch/NotFound error
+			// means no Rollout CRD or no such object: no heal).
+			ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
 			if err != nil {
-				log.Info("WARN: linkerd heal — rollout get failed",
+				log.Info("WARN: linkerd heal — rollout census failed",
 					"rollout", ns+"/"+dref.Name, "error", err)
-				return false
+				return false, false
+			}
+			var ro *unstructured.Unstructured
+			for i := range ros {
+				if ros[i].GetNamespace() == ns && ros[i].GetName() == dref.Name {
+					ro = &ros[i]
+					break
+				}
+			}
+			if ro == nil {
+				log.Info("WARN: linkerd heal — rollout gone from the census",
+					"rollout", ns+"/"+dref.Name)
+				return false, false
 			}
 			annos, _, _ := unstructured.NestedStringMap(ro.Object,
 				"spec", "template", "metadata", "annotations")
@@ -111,40 +130,68 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 				annos, missing, false, now, rep, driftNow)
 		}
 		if dref.Kind != "Deployment" {
-			return false
+			return false, false
 		}
-		dep, err := p.CS.AppsV1().Deployments(ns).Get(ctx, dref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — deployment get failed",
-				"deployment", ns+"/"+dref.Name, "error", err)
-			return false
+		// Workload Gets go through the per-sweep snapshot LISTs —
+		// cluster-wide, memoized per kind, filtered client-side to
+		// ns/name. The Patches below stay direct (writes never ride
+		// the snapshot); a failed census fails the heal closed.
+		depList, depErr := p.AllDeployments(ctx)
+		if depErr != nil {
+			log.Info("WARN: linkerd heal — deployment census failed",
+				"deployment", ns+"/"+dref.Name, "error", depErr)
+			return false, false
+		}
+		dep := findDeployment(depList, ns, dref.Name)
+		if dep == nil {
+			log.Info("WARN: linkerd heal — deployment not in the census",
+				"deployment", ns+"/"+dref.Name)
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, dep, "deployment", ns, dep.Name,
 			dep.Spec.Template.Annotations, missing, false, now, rep, driftNow)
 	case "Deployment":
-		dep, err := p.CS.AppsV1().Deployments(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — deployment get failed",
-				"deployment", ns+"/"+ref.Name, "error", err)
-			return false
+		depList, depErr := p.AllDeployments(ctx)
+		if depErr != nil {
+			log.Info("WARN: linkerd heal — deployment census failed",
+				"deployment", ns+"/"+ref.Name, "error", depErr)
+			return false, false
+		}
+		dep := findDeployment(depList, ns, ref.Name)
+		if dep == nil {
+			log.Info("WARN: linkerd heal — deployment not in the census",
+				"deployment", ns+"/"+ref.Name)
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, dep, "deployment", ns, dep.Name,
 			dep.Spec.Template.Annotations, missing, false, now, rep, driftNow)
 	case "StatefulSet":
-		sts, err := p.CS.AppsV1().StatefulSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — statefulset get failed",
-				"statefulset", ns+"/"+ref.Name, "error", err)
-			return false
+		stsList, stsErr := p.AllStatefulSets(ctx)
+		if stsErr != nil {
+			log.Info("WARN: linkerd heal — statefulset census failed",
+				"statefulset", ns+"/"+ref.Name, "error", stsErr)
+			return false, false
+		}
+		sts := findStatefulSet(stsList, ns, ref.Name)
+		if sts == nil {
+			log.Info("WARN: linkerd heal — statefulset not in the census",
+				"statefulset", ns+"/"+ref.Name)
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, sts, "statefulset", ns, sts.Name,
 			sts.Spec.Template.Annotations, missing, false, now, rep, driftNow)
 	case "DaemonSet":
-		ds, err := p.CS.AppsV1().DaemonSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — daemonset get failed",
-				"daemonset", ns+"/"+ref.Name, "error", err)
-			return false
+		dsList, dsErr := p.AllDaemonSets(ctx)
+		if dsErr != nil {
+			log.Info("WARN: linkerd heal — daemonset census failed",
+				"daemonset", ns+"/"+ref.Name, "error", dsErr)
+			return false, false
+		}
+		ds := findDaemonSet(dsList, ns, ref.Name)
+		if ds == nil {
+			log.Info("WARN: linkerd heal — daemonset not in the census",
+				"daemonset", ns+"/"+ref.Name)
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, ds, "daemonset", ns, ds.Name,
 			ds.Spec.Template.Annotations, missing, false, now, rep, driftNow)
@@ -153,7 +200,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 		if err != nil {
 			log.Info("WARN: linkerd heal — job get failed",
 				"job", ns+"/"+ref.Name, "error", err)
-			return false
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, job, "job", ns, job.Name,
 			job.Spec.Template.Annotations, missing, false, now, rep, driftNow)
@@ -162,12 +209,12 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 		if err != nil {
 			log.Info("WARN: linkerd heal — cronjob get failed",
 				"cronjob", ns+"/"+ref.Name, "error", err)
-			return false
+			return false, false
 		}
 		return p.patchTemplatePorts(ctx, log, cj, "cronjob", ns, cj.Name,
 			cj.Spec.JobTemplate.Spec.Template.Annotations, missing, true, now, rep, driftNow)
 	default:
-		return false
+		return false, false
 	}
 }
 
@@ -177,32 +224,34 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 // stamp — live on ITS metadata, not the template's). existing is the
 // template's current annotations — when they already cover `missing`
 // the patch is skipped but the template is still reported covered
-// (the pod only needs a restart). Returns false on patch failure or
-// when the durable stamp says the template was patched inside
-// linkerdOpaquePatchCool and already reverted — re-patching inside
-// the window is a fight with whoever reverted it.
+// (patched=false — the pod only needs a restart). Returns
+// covered=false on patch failure or when the durable stamp says the
+// template was patched inside linkerdOpaquePatchCool and already
+// reverted — re-patching inside the window is a fight with whoever
+// reverted it.
 func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Context,
 	log logr.Logger, obj metav1.Object, kind, ns, name string,
 	existing map[string]string, missing []int, cronJob bool,
-	now time.Time, rep *probefw.SweepReport, driftNow map[string][]string) bool {
+	now time.Time, rep *probefw.SweepReport, driftNow map[string][]string,
+) (covered, patched bool) {
 
-	covered := parsePortSet(existing[linkerdOpaquePortsAnno])
+	covers := parsePortSet(existing[linkerdOpaquePortsAnno])
 	for pt := range parsePortSet(existing[linkerdSkipInboundAnno]) {
-		covered[pt] = true
+		covers[pt] = true
 	}
 	for pt := range parsePortSet(existing[linkerdSkipOutboundAnno]) {
-		covered[pt] = true
+		covers[pt] = true
 	}
 	stillMissing := map[int]bool{}
 	for _, pt := range missing {
-		if !covered[pt] {
+		if !covers[pt] {
 			stillMissing[pt] = true
 		}
 	}
 	if len(stillMissing) == 0 {
 		log.Info("linkerd heal: template already covers ports — pod restart suffices",
 			"kind", kind, "workload", ns+"/"+name)
-		return true
+		return true, false
 	}
 	// W12-P0-6 durable stamp: a workload we already patched that lost
 	// opaque-ports again inside the window was reverted by its owner.
@@ -233,12 +282,12 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 			log.Info("linkerd heal: template reverted inside patch cooldown — not re-patching",
 				"kind", kind, "workload", ns+"/"+name, "lastPatch", stamped)
 		}
-		return false
+		return false, false
 	}
 	for pt := range stillMissing {
-		covered[pt] = true
+		covers[pt] = true
 	}
-	value := portSetString(covered)
+	value := portSetString(covers)
 	var payload []byte
 	var err error
 	anno := map[string]string{linkerdOpaquePortsAnno: value}
@@ -276,7 +325,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd heal: marshal template patch failed",
 			"kind", kind, "workload", ns+"/"+name)
-		return false
+		return false, false
 	}
 	var patchErr error
 	switch kind {
@@ -306,9 +355,40 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		// daemonsets / jobs — log and fail closed (no pod delete).
 		log.Info("WARN: linkerd heal — template patch failed",
 			"kind", kind, "workload", ns+"/"+name, "error", patchErr)
-		return false
+		return false, false
 	}
 	log.Info("PATCH: linkerd opaque-ports added to workload template",
 		"kind", kind, "workload", ns+"/"+name, "ports", value)
-	return true
+	return true, true
+}
+
+// find{Deployment,StatefulSet,DaemonSet} resolve ns/name inside a
+// snapshot census — the client-side equivalent of a namespace Get
+// once the LIST came off the per-sweep snapshot. nil (or a failed
+// census read, filtered before the call) means fail closed: no heal.
+func findDeployment(items []appsv1.Deployment, ns, name string) *appsv1.Deployment {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func findStatefulSet(items []appsv1.StatefulSet, ns, name string) *appsv1.StatefulSet {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func findDaemonSet(items []appsv1.DaemonSet, ns, name string) *appsv1.DaemonSet {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
 }

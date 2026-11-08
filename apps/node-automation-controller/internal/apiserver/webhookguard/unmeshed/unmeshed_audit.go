@@ -26,6 +26,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -187,21 +188,25 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		return nil
 	}
 
-	// W7-C1 — the maintenance mutex gates the evictions: killing
-	// pods mid-drain/upgrade is exactly what the mutex exists to
-	// prevent, and "cannot verify" fails closed like every other
-	// caller of the shared check.
-	held, why, err := g.MaintenanceActive(ctx)
-	if err != nil {
+	// W7-C1 — the shared heal preamble gates the evictions
+	// (heal.Gate = the maintenance mutex + the fleet-wide heal
+	// budget, both fail closed): killing pods mid-drain/upgrade is
+	// exactly what the mutex exists to prevent, and the budget caps
+	// how many pods this sweep may unlock per window. The mutex
+	// evaluation is memoized through the Guard verdict, sharing one
+	// check with the breaker's bounce passes.
+	proceed, unverifiable := heal.Gate(ctx, log, &g.Verdict, g.CS, g.Dyn,
+		"unmeshed-pod-evict", now)
+	if unverifiable {
 		metrics.IncError(g.Queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: unmeshed remediation skipped (fail closed)",
-			"error", err, "candidates", len(candidates))
+			"candidates", len(candidates))
 		return nil
 	}
-	if held {
-		log.Info("DEFER: maintenance active — unmeshed remediation skipped",
-			"why", why, "candidates", len(candidates))
+	if !proceed {
+		log.Info("DEFER: maintenance active or heal budget spent — unmeshed remediation skipped",
+			"candidates", len(candidates))
 		return nil
 	}
 

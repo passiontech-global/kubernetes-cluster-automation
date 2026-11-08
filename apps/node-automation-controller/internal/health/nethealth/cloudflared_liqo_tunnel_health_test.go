@@ -128,6 +128,86 @@ func TestLiqoDeadPeerBouncesGateway(t *testing.T) {
 	}
 }
 
+// A multi-peer cluster runs one gateway pod per peer — the bounce must
+// hit the failing peer's own gateway (matched by the remote-cluster-id
+// label or the pod name), never a healthy peer's.
+func TestLiqoBounceMatchesFailingPeer(t *testing.T) {
+	conn := liqoConnection("liqo-tenant", "conn-peer-b", "False", 20*time.Minute)
+	healthy := probetest.PodWithPhase("liqo-tenant",
+		"liqo-gateway-wireguard-peer-a-0", corev1.PodRunning, true, 2*time.Hour)
+	failing := probetest.PodWithPhase("liqo-tenant",
+		"liqo-gateway-wireguard-peer-b-0", corev1.PodRunning, true, time.Hour)
+	cs := fake.NewSimpleClientset(healthy, failing)
+	p := testProberDyn(cs, probetest.OpDyn(conn))
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("dead peer must fail")
+	}
+	if _, err := cs.CoreV1().Pods("liqo-tenant").
+		Get(ctx, healthy.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy peer's gateway must survive: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("liqo-tenant").
+		Get(ctx, failing.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("failing peer's gateway should be bounced, err=%v", err)
+	}
+}
+
+// A cluster-scoped virtual-node finding (no namespace) refuses to
+// bounce a gateway it cannot tie to the failing peer — an
+// unattributable bounce heals nothing and can kill a healthy tunnel.
+func TestLiqoVirtualNodeNoPeerMatchSkipsBounce(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "virtual-node-peer-x",
+			Labels: map[string]string{"liqo.io/type": "virtual-node"},
+		},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(
+				time.Now().Add(-20 * time.Minute)),
+		}}},
+	}
+	gw := probetest.PodWithPhase("liqo-tenant",
+		"liqo-gateway-wireguard-peer-a-0", corev1.PodRunning, true, time.Hour)
+	cs := fake.NewSimpleClientset(gw, node)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("dead virtual node must fail (finding)")
+	}
+	if _, err := cs.CoreV1().Pods("liqo-tenant").
+		Get(ctx, gw.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("gateway not tied to the failing peer must survive: %v", err)
+	}
+}
+
+// A virtual node whose Ready condition carries a zero
+// LastTransitionTime falls back to the node's creation age — a
+// just-created virtual node never reads as a 10m-dead peer.
+func TestLiqoVirtualNodeZeroTransitionTimeUsesAge(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "virtual-node-peer-fresh",
+			Labels:            map[string]string{"liqo.io/type": "virtual-node"},
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+		},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionFalse,
+		}}},
+	}
+	cs := fake.NewSimpleClientset(node)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatal("a 1m-old virtual node must not read as a dead peer")
+	}
+	if m := probetest.FindMetric(t, "node_automation_liqo_peer_unhealthy",
+		map[string]string{"peer": "virtual-node-peer-fresh",
+			"reason": "virtual_node_not_ready"}); m != nil {
+		t.Fatal("fresh virtual node must not raise the peer gauge")
+	}
+}
+
 func TestLiqoConnectedPeerPasses(t *testing.T) {
 	conn := liqoConnection("liqo-tenant", "conn-peer-b", "True", time.Hour)
 	cs := fake.NewSimpleClientset()

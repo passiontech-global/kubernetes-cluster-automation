@@ -92,7 +92,7 @@ func TestCheckOperatorWorkqueuesPausedPerconaIgnored(t *testing.T) {
 	}
 	for _, k := range probetest.LedgerKeys(
 		&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
-		if k == "percona-xtradb-cluster-operator/perconaxtradbclusters/db/parked" {
+		if k == "percona-xtradb-cluster-operator/perconaxtradbclusters/db/parked/"+kcmReasonStaleGen {
 			t.Fatal("paused cluster must not be tracked")
 		}
 	}
@@ -103,7 +103,7 @@ func TestCheckOperatorWorkqueuesPausedPerconaIgnored(t *testing.T) {
 	p2 := testProberDyn(cs, probetest.OpDyn(paused, stale))
 	p2.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
-		Observe("percona-xtradb-cluster-operator/perconaxtradbclusters/db/live",
+		Observe("percona-xtradb-cluster-operator/perconaxtradbclusters/db/live/"+kcmReasonStaleGen,
 			base.Add(-time.Hour))
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
 		t.Fatal("unpaused stale PerconaXtraDBCluster must FAIL")

@@ -264,7 +264,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	if err != nil {
 		// Clusters without Velero have no CRDs — quiet skip, same
 		// contract as externalsecret-nudge.
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			log.Info("skip: velero CRDs not installed")
 			return dbErr
 		}
@@ -273,7 +273,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	backups, err := a.veleroList(ctx, veleroBackupGVR)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			backups = nil // schedules exist but backups CRD absent — check 1 still runs
 		} else {
 			return errors.Join(dbErr,
@@ -338,7 +338,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// the next restore has nothing to read.
 	bsls, err := a.veleroList(ctx, veleroBSLGVR)
 	switch {
-	case apierrors.IsNotFound(err):
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — nothing to audit.
 	case err != nil:
 		return errors.Join(everestErr,

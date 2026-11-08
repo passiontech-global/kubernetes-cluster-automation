@@ -117,7 +117,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -314,6 +313,24 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// Descending ordinals — order is irrelevant (Parallel policy) as
 	// long as it is sequential: ≥1 worker always serves builds.
 	for i := replicas - 1; i >= 0; i-- {
+		// Re-check the maintenance mutex before EACH worker: a run
+		// with several wipes takes hours (drain+waitReady per pod), so
+		// a cordon/drain, reboot lock or upgrade that starts mid-run
+		// must stop the remaining wipes — replacing worker N while the
+		// operator works fights them exactly like the pre-cycle check
+		// prevents for the first worker. Same fail-closed contract: an
+		// unverifiable check errors the run, "unknown" means "no".
+		mctx, mcancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
+		held, why, merr := kube.MaintenanceActive(mctx, j.cs, j.dyn)
+		mcancel()
+		if merr != nil {
+			return merr
+		}
+		if held {
+			log.Info("DEFER: cluster maintenance started mid-run — remaining workers skipped",
+				"why", why, "remainingWorkers", i+1)
+			return nil
+		}
 		pod := fmt.Sprintf("%s-%d", cjStatefulSet, i)
 		w, err := j.processPod(ctx, pod, flyOK, log)
 		if err != nil {
@@ -341,6 +358,25 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 		} else {
 			log.Info("SKIP: pod get failed", "pod", podName, "error", err)
 		}
+		return false, nil
+	}
+
+	// A pod created < readyTimeout ago that is still not Ready is
+	// almost certainly inside init-rm from an earlier wipe (a full
+	// rm -rf can take most of that window) — deleting it again just
+	// restarts the wipe without freeing anything new, and it is not
+	// serving builds anyway. Once the window passes the guard lifts so
+	// a wedged-not-Ready pod can still be replaced (bash had no such
+	// guard; an interrupted CronJob could thrash the same pod).
+	//
+	// The guard runs BEFORE readStats: the stats/summary node-proxy
+	// read costs an apiserver→kubelet round trip per worker, and its
+	// verdict is moot for a pod this guard skips anyway.
+	if !kube.PodReadyCond(pod) && j.now.Now().Sub(pod.CreationTimestamp.Time) < j.cfg.readyTimeout {
+		log.Info("SKIP: not Ready after creation — mid init-rm",
+			"pod", podName,
+			"createdAgo", j.now.Now().Sub(pod.CreationTimestamp.Time).Truncate(time.Minute),
+			"readyTimeout", j.cfg.readyTimeout)
 		return false, nil
 	}
 
@@ -378,27 +414,12 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 		}
 	}
 	if !s.nodefsOK || !s.workdirOK {
-		// A blind wipe is deliberate fail-open policy, but a
-		// persistently-unreadable stats path must be visible on the
-		// error metric — not just in logs.
-		metrics.IncError(j.queue)
+		// A blind wipe is deliberate fail-open policy; the unreadable
+		// read itself was already metered once inside readStats —
+		// counting the wipe decision again would double-count the
+		// same broken fetch.
 		log.Info("WARN: wiping with unreadable stats",
 			"pod", podName, "nodefsOK", s.nodefsOK, "workdirOK", s.workdirOK)
-	}
-
-	// A pod created < readyTimeout ago that is still not Ready is
-	// almost certainly inside init-rm from an earlier wipe (a full
-	// rm -rf can take most of that window) — deleting it again just
-	// restarts the wipe without freeing anything new, and it is not
-	// serving builds anyway. Once the window passes the guard lifts so
-	// a wedged-not-Ready pod can still be replaced (bash had no such
-	// guard; an interrupted CronJob could thrash the same pod).
-	if !kube.PodReadyCond(pod) && j.now.Now().Sub(pod.CreationTimestamp.Time) < j.cfg.readyTimeout {
-		log.Info("SKIP: not Ready after creation — mid init-rm",
-			"pod", podName,
-			"createdAgo", j.now.Now().Sub(pod.CreationTimestamp.Time).Truncate(time.Minute),
-			"readyTimeout", j.cfg.readyTimeout)
-		return false, nil
 	}
 
 	if flyOK {

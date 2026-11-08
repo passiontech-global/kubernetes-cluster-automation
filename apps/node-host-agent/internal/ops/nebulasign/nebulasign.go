@@ -290,6 +290,17 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 			_ = os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
+		// Chmod (WriteFile's mode rides the umask) + fsync before the
+		// rename — a crash after mv must never expose a truncated or
+		// mis-permissioned cert at the vars path.
+		if err := os.Chmod(tmpDst, 0o644); err != nil {
+			_ = os.Remove(tmpDst)
+			return fmt.Errorf("%s: %w", j.Hostname, err)
+		}
+		if err := syncFile(tmpDst); err != nil {
+			_ = os.Remove(tmpDst)
+			return fmt.Errorf("%s: %w", j.Hostname, err)
+		}
 		if err := os.Rename(tmpDst, dst); err != nil {
 			_ = os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
@@ -374,4 +385,15 @@ func jstrMap(v any) map[string]string {
 		}
 	}
 	return out
+}
+
+// syncFile fsyncs an existing file so the rename that publishes it
+// lands durable bytes, not cache promises (DownloadFile parity).
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return f.Sync()
 }

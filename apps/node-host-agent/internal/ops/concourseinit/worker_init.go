@@ -347,9 +347,18 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	// fsync before the rename — a crash after mv must never expose
+	// zeroed/partial bytes at the install path (DownloadFile parity).
+	if err := syncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	return nil
 }
+
+// syncFile lives in runc_wrapper.go — shared by both files in this
+// package.

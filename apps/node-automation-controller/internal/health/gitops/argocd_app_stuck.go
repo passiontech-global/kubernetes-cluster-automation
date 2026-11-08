@@ -119,10 +119,15 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
-	apps, err := p.Dyn.Resource(argocdAppGVR).List(ctx, metav1.ListOptions{})
+	apps, err := p.AllUnstructured(ctx, argocdAppGVR)
+	crdAbsent := apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		return probefw.Result{Pass: true} // CRD absent — ArgoCD not installed
+	case crdAbsent:
+		// CRD absent — ArgoCD not installed. The sweep IS complete
+		// (no Application can exist), so the ledgers still close out
+		// below: seen keys and emitted series held from when ArgoCD
+		// existed are resolved state now — returning early would
+		// leak them pinned forever.
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list applications: %w", err)}
 	}
@@ -131,8 +136,8 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	var rep probefw.SweepReport
 	comparisonErrors := 0
 	p.downscaledSeen = map[string]bool{} // per-sweep memo, reset each Run
-	for i := range apps.Items {
-		app := &apps.Items[i]
+	for i := range apps {
+		app := &apps[i]
 		ns, name := app.GetNamespace(), app.GetName()
 		var reasons []string
 
@@ -309,15 +314,9 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	var v bool
 	switch kind {
 	case "Deployment":
-		d, err := p.CS.AppsV1().Deployments(ns).
-			Get(ctx, name, metav1.GetOptions{})
-		v = err == nil &&
-			kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas)
+		v = p.deploymentDownscaled(ctx, ns, name)
 	case "StatefulSet":
-		s, err := p.CS.AppsV1().StatefulSets(ns).
-			Get(ctx, name, metav1.GetOptions{})
-		v = err == nil &&
-			kube.IsIntentionallyDownscaled(s.Annotations, s.Spec.Replicas)
+		v = p.statefulSetDownscaled(ctx, ns, name)
 	case "Rollout":
 		// W16-G1 — Argo Rollouts workloads in the Application's
 		// resource tree carry the same downscaled semantics: a
@@ -339,6 +338,42 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	}
 	p.downscaledSeen[key] = v
 	return v
+}
+
+// deploymentDownscaled resolves one workload against the sweep's
+// shared Deployment census — absent (or unreadable) reads false:
+// not proven downscaled is stuck evidence, the fail-closed posture.
+func (p *argoCDAppStuckCheck) deploymentDownscaled(ctx context.Context,
+	ns, name string) bool {
+
+	deps, err := p.AllDeployments(ctx)
+	if err != nil {
+		return false
+	}
+	for i := range deps {
+		if deps[i].Namespace == ns && deps[i].Name == name {
+			return kube.IsIntentionallyDownscaled(
+				deps[i].Annotations, deps[i].Spec.Replicas)
+		}
+	}
+	return false
+}
+
+// statefulSetDownscaled is the StatefulSet twin.
+func (p *argoCDAppStuckCheck) statefulSetDownscaled(ctx context.Context,
+	ns, name string) bool {
+
+	stss, err := p.AllStatefulSets(ctx)
+	if err != nil {
+		return false
+	}
+	for i := range stss {
+		if stss[i].Namespace == ns && stss[i].Name == name {
+			return kube.IsIntentionallyDownscaled(
+				stss[i].Annotations, stss[i].Spec.Replicas)
+		}
+	}
+	return false
 }
 
 // refreshArgoCDApp patches argocd.argoproj.io/refresh=hard on a
@@ -423,9 +458,21 @@ func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 		log.Info("argocd repo-server restart requested but no repo-server pod found")
 		return
 	}
+	// Only a controller-owned pod is restartable — the owner
+	// recreates it. A lone, controller-less pod would be deleted
+	// PERMANENTLY (repo-server gone until manual redeploy), so the
+	// heal skips it.
+	if metav1.GetControllerOf(oldest) == nil {
+		log.Info("SKIP: repo-server pod has no controller owner — delete would not be recreated",
+			"pod", oldest.Namespace+"/"+oldest.Name)
+		return
+	}
+	// The heal cooldown keys on the pod's controller so the
+	// replacement pod the restart spawns inherits the 30m window
+	// instead of re-arming it under a fresh pod name
+	// (kube.PodControllerKey).
 	p.DeletePodHeal(ctx, log, CheckNameArgoCDAppStuck,
-		"repo-server/"+oldest.Namespace+"/"+oldest.Name,
-		oldest, argocdRepoServerCool, now)
+		kube.PodControllerKey(oldest), oldest, argocdRepoServerCool, now)
 }
 
 // oldestRepoServerPod returns the oldest non-terminating

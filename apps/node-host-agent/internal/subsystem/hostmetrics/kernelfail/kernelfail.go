@@ -80,10 +80,19 @@ type Deps struct {
 	// provisioner roots the ro-mount evidence scans.
 	OpenEBSLocalDir string
 
-	// TickInterval is the latch ticker's expected cadence — the
-	// clock-warp detector compares each tick's elapsed wall-clock
-	// against it. <=0 → defaultTickInterval.
+	// TickInterval is the latch ticker's expected cadence — carried
+	// into the warp ACTION line's "tick=" evidence text. <=0 →
+	// defaultTickInterval.
 	TickInterval time.Duration
+
+	// WarpDelta computes the wall-vs-monotonic gap between two tick
+	// stamps — the checkClockWarp threshold input. nil → warpDelta.
+	// A seam because the public time API cannot synthesize two
+	// stamps whose monotonic advance differs from their wall advance
+	// (both must come from real clock reads), so a fake clock can
+	// only ever produce a zero warp; tests inject controlled gaps
+	// through this.
+	WarpDelta func(now, prev time.Time) time.Duration
 
 	// Store is the shared watchdog-state contract handle — the
 	// state-* latches, last-* rate budgets, counter files and
@@ -131,6 +140,15 @@ type Runner struct {
 // assumes when Deps.TickInterval is unset — the parent wires the
 // real LatchInterval; the constant only covers bare-New tests.
 const defaultTickInterval = 30 * time.Second
+
+// warpDelta resolves the Deps seam — nil field → the real
+// wall-minus-monotonic computation.
+func (d Deps) warpDelta(now, prev time.Time) time.Duration {
+	if d.WarpDelta != nil {
+		return d.WarpDelta(now, prev)
+	}
+	return warpDelta(now, prev)
+}
 
 // New applies the seam defaults and returns the engine.
 func New(d Deps) *Runner {

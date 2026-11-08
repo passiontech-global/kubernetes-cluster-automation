@@ -112,6 +112,13 @@ func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
 		if err != nil {
 			continue
 		}
+		// A query that ANSWERED is conclusive even with an empty
+		// vector — "no restarting proxies, no error closes" is a real
+		// result that narrows the log scan to nobody; only a query
+		// FAILURE leaves the prefilter inconclusive (nil → legacy
+		// full scan). Without this, a healthy mesh pays the full
+		// kubelet round-trip per pod forever.
+		conclusive = true
 		for _, s := range series {
 			if s.Value <= 0 {
 				continue
@@ -120,7 +127,6 @@ func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
 			if ns == "" || pod == "" {
 				continue
 			}
-			conclusive = true
 			suspect[ns+"/"+pod] = true
 		}
 	}

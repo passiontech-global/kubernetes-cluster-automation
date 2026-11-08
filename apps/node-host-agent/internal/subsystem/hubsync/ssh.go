@@ -98,6 +98,12 @@ func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode
 	if _, err := c.Run(ctx, "chmod "+mode+" "+hostutil.ShellQuote(tmp)); err != nil {
 		return fmt.Errorf("chmod %s: %w", tmp, err)
 	}
+	// fsync the staged file before the mv — the SSH upload is plain
+	// buffered writes; a crash after mv must not expose truncated
+	// bytes at the target (the local writers' f.Sync() parity).
+	if _, err := c.Run(ctx, "sync "+hostutil.ShellQuote(tmp)); err != nil {
+		return fmt.Errorf("sync %s: %w", tmp, err)
+	}
 	if _, err := c.Run(ctx, "mv "+hostutil.ShellQuote(tmp)+" "+hostutil.ShellQuote(remotePath)); err != nil {
 		return fmt.Errorf("mv %s: %w", remotePath, err)
 	}

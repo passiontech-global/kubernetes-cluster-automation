@@ -26,6 +26,7 @@ package storelocal
 // same 6432 fallback.
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -147,11 +148,26 @@ func (c *PoolCheck) kineDBConns(pid, dbPort int) int {
 	}
 	n := 0
 	for _, f := range []string{"net/tcp", "net/tcp6"} {
-		data, err := os.ReadFile(c.d.Proc.File(pid, f))
+		fp, err := os.Open(c.d.Proc.File(pid, f))
 		if err != nil {
 			continue
 		}
-		n += countConnsToPort(string(data), dbPort, inodes)
+		// Stream line-by-line — os.ReadFile + string() would pull the
+		// WHOLE host TCP table (kine shares the host netns; 15-25 MiB
+		// on busy nodes) into heap twice, every 60s cycle.
+		sc := bufio.NewScanner(fp)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		header := true
+		for sc.Scan() {
+			if header {
+				header = false
+				continue // header row
+			}
+			if connsToPortLine(sc.Text(), dbPort, inodes) {
+				n++
+			}
+		}
+		_ = fp.Close()
 	}
 	return n
 }
@@ -176,45 +192,32 @@ func (c *PoolCheck) socketInodes(pid int) map[string]bool {
 	return set
 }
 
-// countConnsToPort parses a /proc/net/tcp(6) table and counts rows
-// whose remote port is dbPort, that are not LISTEN and whose inode
+// connsToPortLine classifies one /proc/net/tcp(6) data row: true
+// when its remote port is dbPort, it is not LISTEN and its inode
 // belongs to the watched process.
 //
-// Table columns (0-indexed after the header row — tx_queue:rx_queue
-// and tr:tm->when are each ONE colon-joined field):
+// Table columns (0-indexed; tx_queue:rx_queue and tr:tm->when are
+// each ONE colon-joined field):
 //
 //	sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ...
 //	0  1     2   3  4     5     6        7   8       9
-func countConnsToPort(table string, dbPort int, inodes map[string]bool) int {
-	n := 0
-	header := true
-	for rest := table; rest != ""; {
-		line, after, _ := strings.Cut(rest, "\n")
-		rest = after
-		if header {
-			header = false
-			continue // header row
-		}
-		f := strings.Fields(line)
-		if len(f) < 10 {
-			continue
-		}
-		if f[3] == tcpStateListen {
-			continue
-		}
-		// rem_address is hex "0100007F:1538".
-		rem := f[2]
-		j := strings.LastIndexByte(rem, ':')
-		if j < 0 {
-			continue
-		}
-		port, err := strconv.ParseUint(rem[j+1:], 16, 16)
-		if err != nil || int(port) != dbPort {
-			continue
-		}
-		if inodes[f[9]] {
-			n++
-		}
+func connsToPortLine(line string, dbPort int, inodes map[string]bool) bool {
+	f := strings.Fields(line)
+	if len(f) < 10 {
+		return false
 	}
-	return n
+	if f[3] == tcpStateListen {
+		return false
+	}
+	// rem_address is hex "0100007F:1538".
+	rem := f[2]
+	j := strings.LastIndexByte(rem, ':')
+	if j < 0 {
+		return false
+	}
+	port, err := strconv.ParseUint(rem[j+1:], 16, 16)
+	if err != nil || int(port) != dbPort {
+		return false
+	}
+	return inodes[f[9]]
 }

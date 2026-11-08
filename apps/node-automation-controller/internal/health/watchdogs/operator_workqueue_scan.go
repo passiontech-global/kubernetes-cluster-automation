@@ -17,7 +17,6 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -127,18 +126,24 @@ func (p *operatorWorkqueueCheck) scanOperatorResources(ctx context.Context,
 		resolved:      map[string]opResolvedObj{},
 		reasonsFrozen: map[string]bool{},
 	}
-	// The per-GVR cache holds plain item slices: the cluster-wide
-	// List goes through kube.ListAll with the shared page Limit (a
-	// full CRD read every 5m sweep is what pagination exists to
-	// prevent), and sibling rows sharing the GVR still reuse the one
-	// fetch (BUG-C5) — errors cache the empty slice the same way.
+	// The per-GVR item cache: sibling rows sharing the GVR reuse the
+	// one fetch (BUG-C5) — the fetch itself goes through the
+	// sweep-wide snapshot (Deps.AllUnstructured), so the whole
+	// roster's read of a GVR memoizes per sweep; errors cache the
+	// empty slice the same way. v1Items counts the ExternalSecret
+	// v1 census: when v1 objects exist, the legacy v1beta1 rows are
+	// skipped — the same object served under two API versions would
+	// otherwise carry two first-seen keys (and two windows) for one
+	// stuck CR.
 	lists := map[schema.GroupVersionResource][]unstructured.Unstructured{}
+	v1Items := -1
 	for _, res := range op.resources {
+		if res.gvr == kube.GVRExternalSecretV1Beta1 && v1Items > 0 {
+			continue
+		}
 		items, listed := lists[res.gvr]
 		if !listed {
-			l, err := kube.ListAll(ctx,
-				metav1.ListOptions{Limit: kube.DefaultListPageSize},
-				kube.DynamicPage(p.Dyn.Resource(res.gvr)))
+			l, err := p.AllUnstructured(ctx, res.gvr)
 			switch {
 			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 				// CRD absent / not yet served — nothing to scan;
@@ -151,11 +156,14 @@ func (p *operatorWorkqueueCheck) scanOperatorResources(ctx context.Context,
 				items = l
 			}
 			lists[res.gvr] = items
+			if res.gvr == kube.GVRExternalSecretV1 {
+				v1Items = len(items)
+			}
 		}
 		for i := range items {
 			o := &items[i]
 			key := op.name + "/" + res.gvr.Resource + "/" +
-				o.GetNamespace() + "/" + o.GetName()
+				o.GetNamespace() + "/" + o.GetName() + "/" + res.reason
 			if !res.stuck(o) {
 				if _, ok := scan.resolved[key]; !ok {
 					scan.resolved[key] = opResolvedObj{o: o, gvr: res.gvr}

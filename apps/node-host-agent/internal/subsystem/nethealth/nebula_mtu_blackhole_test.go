@@ -48,12 +48,21 @@ func TestNebulaMTUBlackholeLatch(t *testing.T) {
 	if !e.host.Ran("clamp-mss-to-pmtu") {
 		t.Fatal("MSS clamp not attempted")
 	}
-	// DF ping succeeding clears the latch.
+	// DF ping succeeding clears the latch — and REMOVES the clamp
+	// rule it installed (a left-behind TCPMSS keeps forcing PMTU MSS
+	// on healthy overlay flows forever).
+	e.host.On("-C POSTROUTING -o neb1", "ok\n") // rule present → -D runs
 	e.host.Clear("-M do -s 1252")
 	n.checkNebulaMTUBlackhole(ctx, st)
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-nebula-mtu-blackhole")); !os.IsNotExist(err) {
 		t.Fatal("latch not cleared after DF ping recovers")
+	}
+	if !e.host.Ran("-D POSTROUTING -o neb1") {
+		t.Fatal("MSS clamp rule not removed on recovery")
+	}
+	if strings.Contains(logLines(t, e), "MSS unclamp failed") {
+		t.Fatalf("unclamp failed:\n%s", logLines(t, e))
 	}
 }
 

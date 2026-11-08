@@ -13,6 +13,63 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
+// ---- ProbeClients routing --------------------------------------------
+//
+// Latency-sensitive probe rows (Module.ProbeClients) swap the boot
+// Deps' ProbeCS/ProbeDyn in as CS/Dyn before Setup runs — the module
+// code still reads d.CS/d.Dyn, it just draws from the probe token
+// bucket. Rows without the flag keep the shared clients; a Deps
+// without ProbeCS (tests, StubManager wiring) leaves everything
+// shared.
+func TestSetupModulesProbeClientRouting(t *testing.T) {
+	probeCS := fake.NewSimpleClientset()
+	probeDyn := testutil.StubDyn()
+	sharedCS := fake.NewSimpleClientset()
+
+	type captured struct{ cs, dyn any }
+	got := map[string]captured{}
+	capture := func(name string) func(shared.Deps) error {
+		return func(d shared.Deps) error {
+			got[name] = captured{d.CS, d.Dyn}
+			return nil
+		}
+	}
+	deps := testDeps(testutil.NewStubManager())
+	deps.CS, deps.ProbeCS, deps.ProbeDyn = sharedCS, probeCS, probeDyn
+
+	if err := SetupModules(deps, []shared.Module{
+		{Name: "kubelet-liveness-reaper", ProbeClients: true,
+			Setup: capture("kubelet-liveness-reaper")},
+		{Name: "partition-pod-evictor", Setup: capture("partition-pod-evictor")},
+	}); err != nil {
+		t.Fatalf("SetupModules: %v", err)
+	}
+	if got["kubelet-liveness-reaper"].cs != probeCS ||
+		got["kubelet-liveness-reaper"].dyn != probeDyn {
+		t.Fatalf("probe row got CS=%T Dyn=%T — SetupModules must hand "+
+			"the probe clients in as CS/Dyn",
+			got["kubelet-liveness-reaper"].cs, got["kubelet-liveness-reaper"].dyn)
+	}
+	if got["partition-pod-evictor"].cs != sharedCS {
+		t.Fatalf("plain row got CS=%T — non-probe rows must keep the shared clientset",
+			got["partition-pod-evictor"].cs)
+	}
+
+	// Nil ProbeCS (literal test Deps) leaves the shared clients.
+	deps.ProbeCS, deps.ProbeDyn = nil, nil
+	clear(got)
+	if err := SetupModules(deps, []shared.Module{
+		{Name: "dead-node-sweeper", ProbeClients: true,
+			Setup: capture("dead-node-sweeper")},
+	}); err != nil {
+		t.Fatalf("SetupModules: %v", err)
+	}
+	if got["dead-node-sweeper"].cs != sharedCS {
+		t.Fatalf("probe row with nil ProbeCS got CS=%T, want the shared fallback",
+			got["dead-node-sweeper"].cs)
+	}
+}
+
 // ---- SetupModules ----------------------------------------------------
 //
 // Registration gates live on the shared.Module rows — SetupModules

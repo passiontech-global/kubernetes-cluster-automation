@@ -135,7 +135,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	degradedLive := map[string]bool{} // signatures observed THIS sweep — the degraded ledger's
 	var pgClusters []*unstructured.Unstructured
 	for _, gvr := range perconaClusterGVRs {
-		list, err := p.Dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		list, err := p.AllUnstructured(ctx, gvr)
 		if err != nil {
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue // operator/CRD not installed on this cluster
@@ -143,8 +143,8 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 			rep.InfraErr(fmt.Errorf("list %s: %w", gvr.Resource, err))
 			continue
 		}
-		for i := range list.Items {
-			o := &list.Items[i]
+		for i := range list {
+			o := &list[i]
 			key := gvr.Resource + "/" + o.GetNamespace() + "/" + o.GetName()
 			live[key] = true
 			if gvr == kube.GVRPerconaPGCluster {
@@ -358,8 +358,14 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 
 	ns, name := cr.GetNamespace(), cr.GetName()
 
-	// DCS surface A: the <cr>-leader Lease.
-	leaseVacant, leaseSeen := false, false
+	// DCS surface A: the <cr>-leader Lease. seen=true ONLY when the
+	// object actually exists — a 404 means the surface is absent
+	// (or the CRD mode never writes it), which is absence of
+	// evidence, NOT evidence the leader is gone (W17: a 404 on BOTH
+	// the Lease and the Endpoints must never read as leader loss —
+	// the whole cluster CR could be mid-bootstrap). Vacancy defaults
+	// true: a surface that does not exist cannot hold a lock.
+	leaseVacant, leaseSeen := true, false
 	lease, err := p.CS.CoordinationV1().Leases(ns).Get(ctx,
 		name+"-leader", metav1.GetOptions{})
 	switch {
@@ -368,14 +374,16 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 		leaseVacant = lease.Spec.HolderIdentity == nil ||
 			*lease.Spec.HolderIdentity == ""
 	case apierrors.IsNotFound(err):
-		leaseSeen, leaseVacant = true, true
+		// absent — stays unseen, vacancy stays default-true
 	default:
+		leaseVacant = false
 		log.Info("WARN: patroni leader lease fetch failed — lock evidence inconclusive",
 			"lease", ns+"/"+name+"-leader", "error", err)
 	}
 
-	// DCS surface B: the <cr>-leader Endpoints (endpoints DCS mode).
-	epVacant, epSeen := false, false
+	// DCS surface B: the <cr>-leader Endpoints (endpoints DCS mode) —
+	// same seen/vacant contract as the Lease.
+	epVacant, epSeen := true, false
 	ep, err := p.CS.CoreV1().Endpoints(ns).Get(ctx,
 		name+"-leader", metav1.GetOptions{})
 	switch {
@@ -383,12 +391,14 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 		epSeen = true
 		epVacant = corev1EndpointsVacant(ep)
 	case apierrors.IsNotFound(err):
-		epSeen, epVacant = true, true
 	default:
+		epVacant = false
 		log.Info("WARN: patroni leader endpoints fetch failed — lock evidence inconclusive",
 			"endpoints", ns+"/"+name+"-leader", "error", err)
 	}
 
+	// At least one surface must ACTUALLY exist (seen), and both must
+	// be vacant, before the absence of a primary holder is evidence.
 	if (leaseSeen || epSeen) && leaseVacant && epVacant {
 		return true // no primary holder in either DCS mode
 	}

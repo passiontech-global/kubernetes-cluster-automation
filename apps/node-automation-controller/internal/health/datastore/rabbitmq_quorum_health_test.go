@@ -565,3 +565,66 @@ func TestRabbitMQQuorumSkewFlagsLaggingMember(t *testing.T) {
 		t.Fatal("quorum_skew is alert-only — the pod must not be deleted")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W17 — the per-cluster heal budget.
+// ---------------------------------------------------------------------------
+
+// At most ONE member pod per RabbitmqCluster is deleted per sweep,
+// even when several qualify: the first delivered delete decrements
+// the Ready census AND sets the per-cluster break, so a sweep can
+// never halve a cluster. Here the stuck-unready pod heals first
+// (2 Ready siblings), the census drops to 1 — and the persisted
+// alarm on the still-Ready member plus the second unready member
+// both stay untouched this sweep.
+func TestRabbitMQQuorumOnePodPerClusterPerSweep(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "file_descriptor_limit") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	alarmedReady := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	alarmedReady.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-0":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	r2 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	unready1 := rabbitMQMemberPod("mq", "rabbitmq-server-2", false)
+	unready1.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		base.Add(-15 * time.Minute))
+	unready2 := rabbitMQMemberPod("mq", "rabbitmq-server-3", false)
+	unready2.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		base.Add(-15 * time.Minute))
+	cs := fake.NewSimpleClientset(alarmedReady, r2, unready1, unready2)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("the sweep must still FAIL on the findings")
+	}
+	deleted, alive := 0, 0
+	for _, name := range []string{
+		"rabbitmq-server-0", "rabbitmq-server-2", "rabbitmq-server-3"} {
+		if _, err := cs.CoreV1().Pods("mq").
+			Get(ctx, name, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+			deleted++
+			continue
+		}
+		alive++
+	}
+	if deleted != 1 || alive != 2 {
+		t.Fatalf("exactly one pod per cluster per sweep may heal: "+
+			"deleted=%d alive=%d", deleted, alive)
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-server-2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the first stuck-unready candidate must be the one healed, err=%v", err)
+	}
+}

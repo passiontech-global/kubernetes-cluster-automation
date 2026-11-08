@@ -25,6 +25,13 @@ var (
 	// cri.container-type=sandbox inside task config.json — pause
 	// tasks legitimately lack log.json (shell grep -q parity).
 	sandboxTypeRe = regexp.MustCompile(`cri\.container-type[^,]*sandbox`)
+	// hexTaskIDRe — a CRI task id is 64 lowercase hex (the container
+	// ID containerd mints). Anything else under the task root is not
+	// a task dir, and the wedged-cleanup path is kill-shaped: it
+	// SIGKILLs init.pid and every process whose cmdline CONTAINS the
+	// id (pkill -f parity). Gate the id first, or a stray dir named
+	// "kubelet" would make that scan SIGKILL the kubelet itself.
+	hexTaskIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // CtrTasksCheck cleans wedged containerd task dirs and orphan shims —
@@ -179,6 +186,12 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		id := e.Name()
+		if !hexTaskIDRe.MatchString(id) {
+			// Not a CRI task id — neither pid-scan nor SIGKILL
+			// anything for it (the cleanup below is kill-shaped
+			// over the id string; see hexTaskIDRe).
+			continue
+		}
 		d := filepath.Join(c.d.Cfg.CtrTaskRoot, id)
 		marker := "wedged-seen-" + id
 		dead := false

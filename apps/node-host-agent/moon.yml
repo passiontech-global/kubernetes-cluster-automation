@@ -31,6 +31,10 @@ tasks:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
+      # internal/envdoc's honesty test reads ENV.md — without this input
+      # an envdoc-only change never re-runs the test on CI.
+      - 'ENV.md'
       - 'internal/subsystem/hostconfig/templates/**'
       - 'internal/subsystem/hubsync/testdata/**'
 
@@ -38,12 +42,14 @@ tasks:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
 
   lint:
     inputs:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
       # golangci-lint resolves its config by walking up to the repo root.
       - '/.golangci.yml'
@@ -62,6 +68,7 @@ tasks:
       - 'go.sum'
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
     outputs:
       - 'bin/node-host-agent'
@@ -77,6 +84,9 @@ tasks:
       - 'cmd/**/*.go'
       - 'internal/**/*.go'
       - 'scripts/gen-envdoc.sh'
+      # envx knob declarations and the go.mod-replaced hostkit tree feed
+      # `go run ./internal/envdoc/cmd/genenvdoc` — touch them too.
+      - '/libs/hostkit/**'
     outputs:
       - 'ENV.md'
     options:
@@ -116,6 +126,7 @@ tasks:
       - '/.dockerignore'
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
     options:
       # script is a multi-line shell snippet — must run via shell.

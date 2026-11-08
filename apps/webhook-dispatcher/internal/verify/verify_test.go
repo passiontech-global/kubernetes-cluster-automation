@@ -32,6 +32,11 @@ func TestSignature(t *testing.T) {
 		{"sha1 scheme", "s3cret", body, "sha1=" + sign("s3cret", body)[7:], false},
 		{"not hex", "s3cret", body, "sha256=zzzz", false},
 		{"truncated sig", "s3cret", body, sign("s3cret", body)[:20], false},
+		// An empty secret verifies nothing — even a signature computed
+		// with the (known, hence worthless) empty key must be rejected.
+		{"empty secret, empty-key sig", "", body, sign("", body), false},
+		{"empty secret, real-key sig", "", body, sign("s3cret", body), false},
+		{"empty secret, missing header", "", body, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

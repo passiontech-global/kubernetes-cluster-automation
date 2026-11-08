@@ -10,6 +10,7 @@ import (
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -950,13 +951,13 @@ func connectPod(ns, name string, age time.Duration,
 
 // A connect-sync container stuck !Ready (or crashlooping) while
 // connect-api stays Ready is a stalled sync plane: once the degraded
-// state persists >=15m the oldest connect pod is bounced — under the
-// same 1h cooldown — and the unhealthy gauge flags the pod meanwhile.
+// state persists >=15m the DEGRADED pod is bounced — not the oldest
+// connect pod — under the same 1h cooldown.
 func TestConnectPodHealOnSyncContainerUnhealthy(t *testing.T) {
 	oldPod := connectPod("external-secrets", "onepassword-connect-aaa",
 		48*time.Hour, false, 0)
 	newPod := connectPod("external-secrets", "onepassword-connect-bbb",
-		time.Hour, true, 0)
+		time.Hour, false, 0)
 	cs := kfake.NewSimpleClientset(oldPod, newPod)
 	dyn := esNudgeDynFake(cssObj("store", "True"))
 	n := &externalSecretNudge{queue: "externalsecret-nudge",
@@ -965,7 +966,7 @@ func TestConnectPodHealOnSyncContainerUnhealthy(t *testing.T) {
 		storeReady: map[string]bool{},
 	}
 
-	// First sight: the pod is flagged unhealthy but NOT deleted —
+	// First sight: the pod is flagged degraded but NOT deleted —
 	// the persistence clock only starts now.
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
@@ -974,15 +975,14 @@ func TestConnectPodHealOnSyncContainerUnhealthy(t *testing.T) {
 		"onepassword-connect-aaa", metav1.GetOptions{}); err != nil {
 		t.Fatalf("transient connect-sync degradation must not delete the pod: %v", err)
 	}
-	if !metrics.OnePasswordConnectSyncUnhealthy.
-		DeleteLabelValues("external-secrets", "onepassword-connect-aaa") {
-		t.Fatal("unhealthy gauge not emitted for the degraded pod")
+	if _, ok := n.syncDegradedSince.Seen(
+		"external-secrets/onepassword-connect-aaa", time.Now()); !ok {
+		t.Fatal("degraded pod not tracked in syncDegradedSince")
 	}
-	metrics.OnePasswordConnectSyncUnhealthy.
-		WithLabelValues("external-secrets", "onepassword-connect-aaa").Set(1)
 
 	// The degradation has actually persisted past the 15m window —
-	// seed the ledger with the original sighting and re-run.
+	// seed the ledger with the original sighting and re-run. The
+	// DEGRADED pod goes (not the oldest healthy one).
 	n.syncDegradedSince.Seed("external-secrets/onepassword-connect-aaa",
 		time.Now().Add(-20*time.Minute))
 	if err := n.run(ctx); err != nil {
@@ -990,35 +990,171 @@ func TestConnectPodHealOnSyncContainerUnhealthy(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
 		"onepassword-connect-aaa", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("oldest degraded connect pod must be deleted, get err=%v", err)
+		t.Fatalf("degraded connect pod must be deleted, get err=%v", err)
 	}
 	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
 		"onepassword-connect-bbb", metav1.GetOptions{}); err != nil {
-		t.Fatalf("healthy connect pod must survive, get err=%v", err)
+		t.Fatalf("older healthy connect pod must survive, get err=%v", err)
 	}
 }
 
 // A crashlooping connect-sync (RestartCount >= 3) is the same
-// degraded signature even when its Ready flag still reads true.
+// degraded signature even when its Ready flag still reads true — but
+// only while the loop is LIVE: CrashLoopBackOff waiting or a last
+// termination finished within the 15m window. Stale restart counts
+// from a long-recovered container and freshly-created pods inside
+// the grace window are not degraded.
 func TestConnectSyncCrashloopCountsDegraded(t *testing.T) {
+	now := time.Now()
 	pod := connectPod("onepassword", "onepassword-connect-xyz",
 		time.Hour, true, esConnectSyncRestartMax)
-	if why, bad := connectSyncDegraded(pod); !bad {
+	pod.Status.ContainerStatuses[1].LastTerminationState.Terminated =
+		&corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(now.Add(-2 * time.Minute))}
+	if why, bad := connectSyncDegraded(pod, now); !bad {
 		t.Fatal("crashlooping connect-sync not flagged degraded")
 	} else if why != "connect-sync container crashlooping" {
 		t.Fatalf("why=%q", why)
 	}
+
+	// CrashLoopBackOff waiting reason — degraded even without a
+	// usable last-termination timestamp.
+	clb := connectPod("onepassword", "onepassword-connect-clb",
+		time.Hour, true, esConnectSyncRestartMax)
+	clb.Status.ContainerStatuses[1].State.Waiting =
+		&corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}
+	if _, bad := connectSyncDegraded(clb, now); !bad {
+		t.Fatal("CrashLoopBackOff connect-sync not flagged degraded")
+	}
+
+	// Last termination finished 5m ago — inside the window, degraded.
+	recent := connectPod("onepassword", "onepassword-connect-recent",
+		time.Hour, true, esConnectSyncRestartMax)
+	recent.Status.ContainerStatuses[1].LastTerminationState.Terminated =
+		&corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(now.Add(-5 * time.Minute))}
+	if _, bad := connectSyncDegraded(recent, now); !bad {
+		t.Fatal("connect-sync with recent last termination not flagged degraded")
+	}
+
+	// Last termination finished 2h ago — stale restarts, NOT degraded.
+	stale := connectPod("onepassword", "onepassword-connect-stale",
+		48*time.Hour, true, esConnectSyncRestartMax)
+	stale.Status.ContainerStatuses[1].LastTerminationState.Terminated =
+		&corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(now.Add(-2 * time.Hour))}
+	if _, bad := connectSyncDegraded(stale, now); bad {
+		t.Fatal("stale restart count flagged degraded")
+	}
+
+	// Freshly-created pod inside the grace window — startup retries
+	// are not a proven crashloop yet.
+	fresh := connectPod("onepassword", "onepassword-connect-fresh",
+		time.Minute, true, esConnectSyncRestartMax)
+	fresh.Status.ContainerStatuses[1].State.Waiting =
+		&corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}
+	if _, bad := connectSyncDegraded(fresh, now); bad {
+		t.Fatal("fresh pod inside grace window flagged degraded")
+	}
+
 	// Healthy pair — not degraded.
 	ok := connectPod("onepassword", "onepassword-connect-ok",
 		time.Hour, true, 0)
-	if _, bad := connectSyncDegraded(ok); bad {
+	if _, bad := connectSyncDegraded(ok, now); bad {
 		t.Fatal("healthy connect-sync flagged degraded")
 	}
 	// A pod without a connect-sync container is not ours to judge.
 	alien := &corev1.Pod{
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "connect-api"}}},
 	}
-	if _, bad := connectSyncDegraded(alien); bad {
+	if _, bad := connectSyncDegraded(alien, now); bad {
 		t.Fatal("pod without connect-sync flagged degraded")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// listFirst/listES — real-error preservation vs benign v1beta1 fallback
+// ---------------------------------------------------------------------------
+
+// A REAL API failure on one candidate GVR (RBAC denial, throttling,
+// timeout) must never be overwritten by the benign NotFound/NoMatch
+// the next candidate produces: the sweep would then quietly skip a
+// cluster it can actually see. The real error wins.
+func TestListFirstPreservesRealError(t *testing.T) {
+	dyn := newDynFake(cssObj("store", "True"))
+	realErr := apierrors.NewForbidden(
+		clusterSecretStoreGVRs[0].GroupResource(), "", errors.New("rbac"))
+	dyn.PrependReactor("list", "clustersecretstores",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.GetResource().Version == "v1" {
+				return true, nil, realErr
+			}
+			// v1beta1 answers with the benign not-installed shape —
+			// the OLD code returned this and swallowed realErr.
+			return true, nil, apierrors.NewNotFound(
+				clusterSecretStoreGVRs[1].GroupResource(), "")
+		})
+	n := &externalSecretNudge{dyn: dyn}
+	_, err := n.listFirst(ctx, clusterSecretStoreGVRs)
+	if err == nil {
+		t.Fatal("listFirst returned nil despite a real API error")
+	}
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("real API error must win over the v1beta1 fallback, got %v", err)
+	}
+	// Same rule for the ES list used to pick the patch GVR.
+	realESErr := apierrors.NewForbidden(
+		externalSecretGVRs[0].GroupResource(), "", errors.New("rbac"))
+	dyn.PrependReactor("list", "externalsecrets",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.GetResource().Version == "v1" {
+				return true, nil, realESErr
+			}
+			return true, nil, apierrors.NewNotFound(
+				externalSecretGVRs[1].GroupResource(), "")
+		})
+	if _, _, err := n.listES(ctx); !apierrors.IsForbidden(err) {
+		t.Fatalf("listES must preserve the real API error, got %v", err)
+	}
+}
+
+// A NotFound or NoKindMatch on one candidate GVR stays a benign
+// fallback: listFirst moves on to the next served version.
+func TestListFirstBenignFallback(t *testing.T) {
+	dyn := newDynFake(cssObj("store", "True"))
+	nf := apierrors.NewNotFound(
+		clusterSecretStoreGVRs[0].GroupResource(), "")
+	dyn.PrependReactor("list", "clustersecretstores",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.GetResource().Version == "v1" {
+				return true, nil, nf
+			}
+			return false, nil, nil // v1beta1 serves the list
+		})
+	n := &externalSecretNudge{dyn: dyn}
+	list, err := n.listFirst(ctx, clusterSecretStoreGVRs)
+	if err != nil {
+		t.Fatalf("benign v1 404 must fall through to v1beta1, got %v", err)
+	}
+	if list == nil {
+		t.Fatal("expected the v1beta1 list, got nil")
+	}
+
+	// A NoKindMatchError is equally benign — run() skips quietly
+	// instead of IncErroring every sweep.
+	dyn2 := newDynFake(cssObj("store", "True"))
+	nomatch := &meta.NoKindMatchError{
+		GroupKind: schema.GroupKind{
+			Group: clusterSecretStoreGVRs[0].Group,
+			Kind:  "ClusterSecretStore"}}
+	dyn2.PrependReactor("list", "clustersecretstores",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, nomatch
+		})
+	cs := kfake.NewSimpleClientset()
+	n2 := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: cs, dyn: dyn2, storeReady: map[string]bool{}}
+	if err := n2.run(ctx); err != nil {
+		t.Fatalf("NoKindMatch on the store list must skip quietly, got %v", err)
 	}
 }
