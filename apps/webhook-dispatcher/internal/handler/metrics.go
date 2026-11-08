@@ -31,7 +31,9 @@ func metricEventLabel(event string) string {
 
 var fanoutTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "webhook_dispatcher_fanout_total",
-	Help: "Concourse resource check webhooks dispatched, by result (ok|rejected|error).",
+	Help: "Concourse resource check webhooks dispatched, by result " +
+		"(ok|rejected|error|budget — budget = target gave up its slot " +
+		"queue when the fan-out budget expired, no POST was sent).",
 }, []string{"result"})
 
 // fanoutDuration buckets span a fast single-target fan-out up to a
