@@ -9,6 +9,11 @@
 // Flow (faithful to bash):
 //   - flag a node when any NWPD network condition (plural or singular
 //     spelling) is True continuously for >10m;
+//   - re-confirm every flagged node against the LIVE API before acting
+//     on it — the census rides the informer cache, and eviction must
+//     never fire on a partition that healed inside the cache's lag
+//     window (a failed live Get skips that node fail-closed for the
+//     sweep);
 //   - untaint recovered nodes first;
 //   - abort when >= half (or all) nodes are flagged — that's a mesh-wide
 //     partition where eviction only makes churn;
@@ -61,6 +66,9 @@ const (
 	// single-replica infra living outside the allow-list (a
 	// cert-manager webhook or a database proxy wedged on a
 	// blackholed node is just as stuck as source-controller was).
+	// Pod-level only: partitionEvictable reads p.Annotations, never
+	// the namespace object's — annotating the namespace opts
+	// nothing in.
 	partitionEvictAnno = kube.AnnoEvictOnPartition
 	// mirrorPodAnno is the kubelet's static-pod marker — the API
 	// object is only a mirror, the kubelet owns (and recreates) the
@@ -304,8 +312,39 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		}
 	}
 
+	// Re-confirm every flagged node against the LIVE API before
+	// anything acts on it. The census above rides the informer cache —
+	// watch-fresh in the happy path, but seconds-to-minutes behind
+	// under backlog — and eviction is destructive: a partition that
+	// healed inside the lag window must not cost live pods. Detection
+	// stays on the cache; the action set does not trust it.
+	action := make(map[string]bool, len(flagged))
+	for name := range flagged {
+		live, err := e.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			// Fail closed: no live confirmation, no eviction this
+			// sweep. The node stays in `flagged`, so an
+			// unconfirmable suspect still counts toward the
+			// mesh-wide guard below.
+			metrics.IncError(e.queue)
+			log.Error(err, "live node get failed — skipping node this sweep", "node", name)
+			continue
+		}
+		if nodePartitioned(live, now) {
+			action[name] = true
+			continue
+		}
+		// Live truth overrides the cache: drop the node from
+		// `flagged` so the recovery untaint below (and the
+		// mesh-wide guard) see it healed.
+		delete(flagged, name)
+		log.Info("partition healed — skipping evict", "node", name)
+	}
+
 	// Lift the taint on nodes that recovered — before the early exits,
-	// exactly like bash.
+	// exactly like bash. A node the cache still showed flagged but the
+	// live Get disproved is recovered too: the loop above removed it
+	// from `flagged`, so this existing path untaints it.
 	for i := range nodes {
 		n := &nodes[i]
 		if kube.HasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
@@ -324,20 +363,28 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		return nil
 	}
 
-	names := make([]string, 0, nFlagged)
+	flaggedNames := make([]string, 0, nFlagged)
 	for name := range flagged {
-		names = append(names, name)
+		flaggedNames = append(flaggedNames, name)
 	}
-	sort.Strings(names)
+	sort.Strings(flaggedNames)
 
 	// Mesh-wide guard: >50% of EVICTABLE nodes flagged means the
 	// partition is not node-local — evicting just churns pods
-	// between broken nodes.
+	// between broken nodes. Live-healed nodes left the set above;
+	// unconfirmable ones (live Get failed) deliberately still count.
 	if nFlagged*2 > total {
 		log.Info("ABORT: nodes flagged — mesh-wide partition, no evict",
-			"flagged", nFlagged, "total", total, "nodes", names)
+			"flagged", nFlagged, "total", total, "nodes", flaggedNames)
 		return nil
 	}
+
+	// The taint/evict loops act only on LIVE-confirmed nodes.
+	names := make([]string, 0, len(action))
+	for name := range action {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 
 	// Resolve the eviction set once per run: the Setup-parsed env
 	// allow-list plus the annotation opt-in (checked per pod inside

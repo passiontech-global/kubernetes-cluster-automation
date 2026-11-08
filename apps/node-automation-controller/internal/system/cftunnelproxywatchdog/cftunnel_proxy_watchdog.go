@@ -71,14 +71,28 @@ const (
 	// A pod must hold Ready=False this long before its logs are even
 	// read — protects normal rollout startup churn.
 	cfTunnelUnreadyMinAge = 5 * time.Minute
+	// Forced config resyncs are paced like the heal cooldown: the
+	// resync annotation VALUE must churn to emit an event, but doing
+	// that on every 5m sweep while a pod sits unready is an
+	// event storm on the EndpointSlice — at most one forced resync
+	// per 10m; gated sweeps only log the unready count.
+	cfTunnelResyncCooldown = 10 * time.Minute
 	// Per-pod delete cooldown: the Deployment's own backoff plus this
 	// guard keeps a crash-looping connector from being deleted every
 	// sweep.
 	cfTunnelHealCooldown      = 10 * time.Minute
 	cfTunnelMaxHealsPerTarget = 2
-	cfTunnelLogTailLines      = 200
-	cfTunnelLogMaxBytes       = 256 << 10
-	cfTunnelLogTimeout        = 8 * time.Second
+	// cfTunnelHealAnno is the durable half of that cooldown, stamped
+	// on the pod's owning ReplicaSet (RFC3339 via heal.StampPersisted)
+	// so it survives operator restarts where the in-RAM lastHeal
+	// ledger cannot. The ReplicaSet — not a shared Deployment — is the
+	// object that maps 1:1 to the ledger key (kube.PodControllerKey)
+	// and dies with its workload, so stamps can neither collide
+	// between controllers nor accumulate on decommissioned releases.
+	cfTunnelHealAnno     = "passiontech.dev/last-cloudflared-heal"
+	cfTunnelLogTailLines = 200
+	cfTunnelLogMaxBytes  = 256 << 10
+	cfTunnelLogTimeout   = 8 * time.Second
 )
 
 // cfTunnelConnectorTarget is one label-selected pod population that
@@ -105,8 +119,17 @@ type cfTunnelProxyWatchdog struct {
 	// recreation. Keyed by the pod's CONTROLLER (ReplicaSet), not the
 	// pod name: a recreated pod carries a fresh name suffix, so a
 	// pod-name cooldown never suppressed the re-heal — the replacement
-	// was deleted every sweep until the wedge cleared.
+	// was deleted every sweep until the wedge cleared. The in-RAM half
+	// is widened by cfTunnelHealAnno on the owning ReplicaSet
+	// (healCooledDown/stampHealPersisted) so the cooldown survives an
+	// operator restart.
 	lastHeal state.CooldownSet
+	// lastResync paces check 1: service -> last forced-resync sweep.
+	// One sweep per cfTunnelResyncCooldown stamps the headless
+	// EndpointSlices; the sweeps in between only log the unready
+	// count. Keyed on the (single) headless proxy Service so a second
+	// service inherits its own pacing for free.
+	lastResync state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation so the
 	// sweep pays one evaluation per TTL window.
 	verdict kube.Verdict
@@ -172,6 +195,7 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 // resync annotation (0 when every proxy pod is already ready).
 func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
+	now := w.now.Now()
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: cfTunnelProxyPodSelector,
 		Limit:         kube.DefaultListPageSize,
@@ -190,6 +214,18 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 		log.Info("all proxy pods ready", "namespace", w.namespace)
 		return 0, nil
 	}
+	// Sweep pacing: at most one forced resync per cooldown window.
+	// The stamp VALUE below must churn to emit the EndpointSlice
+	// event — but with the gate holding, consecutive stamps are >=
+	// the cooldown apart, so the churn stays real while the event
+	// rate stays bounded. Gated sweeps still log so an unready pod
+	// never disappears from the ops view.
+	w.lastResync.PruneExpired(now, cfTunnelResyncCooldown)
+	if w.lastResync.CooledDown(cfTunnelProxySliceService, cfTunnelResyncCooldown, now) {
+		log.Info("resync inside cooldown — unready pods counted only",
+			"namespace", w.namespace, "notReadyPods", len(unready), "pods", unready)
+		return 0, nil
+	}
 	epsList, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).List(ctx,
 		metav1.ListOptions{
 			LabelSelector: discoveryv1.LabelServiceName + "=" + cfTunnelProxySliceService,
@@ -199,9 +235,10 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	}
 	// kubectl annotate --overwrite: merge patch sets/replaces the key.
 	// The stamp stays unix — the VALUE churn is the resync signal
-	// (each sweep must differ or the EndpointSlice emits no event).
+	// (each gated sweep stamps >= the cooldown apart, so consecutive
+	// values always differ and the EndpointSlice emits its event).
 	patch, err := kube.MergePatchAnnos(map[string]any{
-		cfTunnelResyncAnno: strconv.FormatInt(w.now.Now().Unix(), 10),
+		cfTunnelResyncAnno: strconv.FormatInt(now.Unix(), 10),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("marshal resync patch: %w", err)
@@ -214,6 +251,10 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 				epsList.Items[i].Name, err)
 		}
 	}
+	// Delivered-only: the pacing stamp lands after every slice took
+	// the annotation — a failed patch loop returns above and the
+	// next sweep retries ungated.
+	w.lastResync.Stamp(cfTunnelProxySliceService, now)
 	log.Info("ACTION: forced proxy config resync",
 		"namespace", w.namespace, "notReadyPods", len(unready),
 		"pods", unready, "slices", len(epsList.Items))
@@ -382,7 +423,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				"pod", p.Namespace+"/"+p.Name, "error", err.Error())
 			continue
 		}
-		if !wedged || w.healOnCooldown(p, now) {
+		if !wedged || w.healCooledDown(ctx, p, now) {
 			continue
 		}
 		if err := w.deleteConnectorPod(ctx, p, "fatal_logs"); err != nil {
@@ -391,6 +432,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 			continue
 		}
 		w.lastHeal.Stamp(kube.PodControllerKey(p), now)
+		w.stampHealPersisted(ctx, p, now)
 		healed++
 	}
 	// readyCount==0 deadlock: every running replica unready — the
@@ -404,13 +446,14 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				oldest = p
 			}
 		}
-		if !w.healOnCooldown(oldest, now) {
+		if !w.healCooledDown(ctx, oldest, now) {
 			if err := w.deleteConnectorPod(ctx, oldest,
 				"all_unready_oldest"); err != nil {
 				log.Error(err, "delete oldest unready connector pod failed",
 					"pod", oldest.Namespace+"/"+oldest.Name)
 			} else {
 				w.lastHeal.Stamp(kube.PodControllerKey(oldest), now)
+				w.stampHealPersisted(ctx, oldest, now)
 				healed++
 			}
 		}
@@ -418,12 +461,57 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 	return healed, nil
 }
 
-// healOnCooldown reports whether this pod's controller was already
-// healed within cfTunnelHealCooldown — keyed on the owner (not the
-// pod name) so a recreated pod that wedges again waits out the
-// window instead of being killed every sweep under a fresh name.
-func (w *cfTunnelProxyWatchdog) healOnCooldown(p *corev1.Pod, now time.Time) bool {
-	return w.lastHeal.CooledDown(kube.PodControllerKey(p), cfTunnelHealCooldown, now)
+// healCooledDown reports whether this pod's controller is inside
+// cfTunnelHealCooldown on EITHER clock — the in-RAM lastHeal ledger
+// OR the passiontech.dev/last-cloudflared-heal annotation persisted
+// on the pod's owning ReplicaSet (the durable half that survives an
+// operator restart). Both reads are the heal.PersistedCooledDown
+// wider-of contract. Keyed on the owner (not the pod name) so a
+// recreated pod that wedges again waits out the window instead of
+// being killed every sweep under a fresh name. A failed (or absent)
+// ReplicaSet read degrades the gate to the in-RAM ledger alone —
+// never fail a heal over its cooldown's cheap half.
+func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
+	p *corev1.Pod, now time.Time) bool {
+	var rs metav1.Object
+	if ref := metav1.GetControllerOf(p); ref != nil && ref.Name != "" {
+		got, err := w.cs.AppsV1().ReplicaSets(p.Namespace).
+			Get(ctx, ref.Name, metav1.GetOptions{})
+		if err != nil {
+			logf.FromContext(ctx).Info(
+				"replicaset read failed — heal cooldown degrades to the in-RAM ledger",
+				"replicaset", p.Namespace+"/"+ref.Name, "error", err.Error())
+		} else {
+			rs = got
+		}
+	}
+	return heal.PersistedCooledDown(&w.lastHeal, rs, cfTunnelHealAnno,
+		kube.PodControllerKey(p), cfTunnelHealCooldown, now)
+}
+
+// stampHealPersisted is the durable half of the heal cooldown: the
+// RFC3339 annotation on the pod's owning ReplicaSet, delivered via
+// heal.StampPersisted AFTER the delete landed. A failed annotation
+// patch leaves the in-RAM lastHeal stamp holding (it was stamped on
+// the delivered delete) and only costs durability — the same
+// annotation-fails-but-heal-stands shape dragonfly_heals uses.
+func (w *cfTunnelProxyWatchdog) stampHealPersisted(ctx context.Context,
+	p *corev1.Pod, now time.Time) {
+	ref := metav1.GetControllerOf(p)
+	if ref == nil || ref.Name == "" {
+		return // standalone pod — no ReplicaSet to persist on
+	}
+	err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := w.cs.AppsV1().ReplicaSets(p.Namespace).
+				Patch(ctx, ref.Name, types.MergePatchType, data, metav1.PatchOptions{})
+			return err
+		},
+		cfTunnelHealAnno, nil, "", now)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "persist cloudflared heal stamp failed",
+			"replicaset", p.Namespace+"/"+ref.Name)
+	}
 }
 
 // deleteConnectorPod deletes a connector pod with a UID precondition
@@ -468,20 +556,31 @@ func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
 
 // cloudflaredLogsWedged matches the observed cloudflared failure
 // signatures: fatal startup/config errors, and a sustained
-// edge/QUIC transport error loop (>=3 error lines in the tail —
-// a single blip during an edge rollout is normal). The QUIC
-// patterns cover the UDP-blackhole wedge where the connector still
-// reports Ready but every dial to the edge times out: "failed to
-// dial to edge with quic", "timeout: no recent network activity"
-// and the "quic: " error prefix.
+// error loop (>=3 weighted error lines in the tail — a single blip
+// during an edge rollout is normal). The QUIC patterns cover the
+// UDP-blackhole wedge where the connector still reports Ready but
+// every dial to the edge times out: "failed to dial to edge with
+// quic", "timeout: no recent network activity" and the "quic: "
+// error prefix.
+//
+// "failed to sufficiently increase receive buffer size" is NOT
+// fatal: it is the benign startup warning cloudflared logs on every
+// Linux node whose default rmem is below its request, so it only
+// counts as weight-1 loop noise — three of them (or mixed with real
+// edge errors) still mean wedged, one alone never does.
 func cloudflaredLogsWedged(logs string) bool {
 	edgeErrs := 0
 	for _, line := range strings.Split(logs, "\n") {
 		l := strings.ToLower(line)
 		if strings.Contains(l, "couldn't start tunnel") ||
-			strings.Contains(l, "failed to sufficiently increase receive buffer") ||
 			strings.Contains(l, "serve tunnel error") {
 			return true
+		}
+		if strings.Contains(l, "failed to sufficiently increase receive buffer") {
+			// Benign startup warning — weight-1 noise, never an
+			// instant kill (it appears on EVERY Linux node at boot).
+			edgeErrs++
+			continue
 		}
 		if strings.Contains(l, "connection with edge") &&
 			(strings.Contains(l, "err") ||

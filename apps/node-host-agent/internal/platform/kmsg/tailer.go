@@ -93,8 +93,20 @@ type Tailer struct {
 }
 
 // NewTailer returns a Tailer that opens its device lazily on the
-// first Read (and on the first Read after every Close).
+// first Read (and on the first Read after every Close). The options
+// are normalized here: when the carry counts against the drain
+// budget, PendingCap >= DrainCap would zero the budget as soon as
+// the carry saturates — Drain(<=0) then returns caught-up with no
+// data every tick and the tail wedges forever (the carry can never
+// shrink below the cap it equals). The constructor has no error
+// return, so the invariant is clamped instead: PendingCap leaves at
+// least one fresh byte per drain, and Read clamps the remaining
+// budget as belt-and-braces for unbounded carries.
 func NewTailer(opts TailerOptions) *Tailer {
+	if opts.DrainIncludesPending && opts.DrainCap > 0 &&
+		opts.PendingCap >= opts.DrainCap {
+		opts.PendingCap = opts.DrainCap - 1
+	}
 	return &Tailer{opts: opts}
 }
 
@@ -119,6 +131,14 @@ func (t *Tailer) Read() (lines [][]byte, res ReadResult, err error) {
 		// The pending carry counts against this Read's drain budget
 		// — the cap bounds pending+fresh bytes, not just fd reads.
 		maxBytes -= len(t.pending)
+		// A saturated carry (unbounded PendingCap, or a cap clamped
+		// only here) can zero the budget — Drain(<=0) returns
+		// caught-up with no data and the tail would never advance.
+		// Clamp to one byte: every Read makes progress, and the
+		// PendingCap trim below still keeps the carry bounded.
+		if maxBytes < 1 {
+			maxBytes = 1
+		}
 	}
 	fresh, caughtUp, derr := Drain(t.f, maxBytes)
 	if derr != nil {

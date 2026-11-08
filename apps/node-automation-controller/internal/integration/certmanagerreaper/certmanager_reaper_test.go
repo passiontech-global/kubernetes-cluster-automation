@@ -562,6 +562,52 @@ func TestCertManagerReaperIgnoresForeignOrder(t *testing.T) {
 	}
 }
 
+// The Order List is memoized ONE list per namespace per sweep (same
+// shape as the CertificateRequest cache): two candidate certs sharing
+// "app" each reap their own wedged order, but the namespace pays a
+// single orders List — and a single certificaterequests List — no
+// matter how many cert candidates walk it.
+func TestCertManagerReaperMemoizesOrderListsPerNamespace(t *testing.T) {
+	dyn := testutil.NewDynamicClient(append(
+		stuckFixture("app", "tls-a", "order-a"),
+		stuckFixture("app", "tls-b", "order-b")...)...)
+	var orderLists, crLists atomic.Int64
+	dyn.PrependReactor("list", "orders",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			orderLists.Add(1)
+			return false, nil, nil
+		})
+	dyn.PrependReactor("list", "certificaterequests",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			crLists.Add(1)
+			return false, nil, nil
+		})
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"order-a", "order-b"} {
+		if cmrOrderExists(t, dyn, "app", name) {
+			t.Fatalf("order %s not reaped — memoization changed the verdict", name)
+		}
+	}
+	if n := orderLists.Load(); n != 1 {
+		t.Fatalf("orders List calls = %d, want 1 per namespace per sweep", n)
+	}
+	if n := crLists.Load(); n != 1 {
+		t.Fatalf("certificaterequests List calls = %d, want 1 per namespace per sweep", n)
+	}
+	// Each cert still charged exactly its own reset budget — the index
+	// attributes per-cert, never per-namespace.
+	if st := r.resets["app/tls-a"]; st == nil || st.total != 1 {
+		t.Fatalf("tls-a budget = %+v, want total 1", st)
+	}
+	if st := r.resets["app/tls-b"]; st == nil || st.total != 1 {
+		t.Fatalf("tls-b budget = %+v, want total 1", st)
+	}
+}
+
 // A CertificateRequest list failure makes attribution indeterminate —
 // per-item IncError + keep, same posture as the order/challenge lists.
 func TestCertManagerReaperCRListError(t *testing.T) {

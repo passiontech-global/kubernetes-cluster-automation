@@ -242,13 +242,15 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// onepassword-connect-sync-probe and linkerd-sidecar-oom-guard
 	// (pod censuses), cilium-datapath-map-guard and
 	// observability-pipeline-guard (their Prometheus queries die on
-	// the health-text stub) -> twenty-three total.
+	// the health-text stub), plus the W8-NM3 mesh-controlplane scan
+	// whose pod list is its only input (W8-NM3 no longer swallows
+	// the failure) -> twenty-four total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and
 	// linkerd-outlier-guard bails on the failed Prometheus query
 	// before ever listing pods.)
-	if got := errCount() - before; got != 23 {
-		t.Fatalf("run errors delta = %v, want 23", got)
+	if got := errCount() - before; got != 24 {
+		t.Fatalf("run errors delta = %v, want 24", got)
 	}
 }
 

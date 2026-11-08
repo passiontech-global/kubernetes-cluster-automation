@@ -123,6 +123,9 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	}
 
 	spawned := 0
+	// dedupeIdx is the sweep's lazily-built cluster-wide Job index
+	// (nil until the first dedupe check needs it).
+	var dedupeIdx *jobDedupeIndex
 	for i := range cronjobs {
 		cj := &cronjobs[i]
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
@@ -169,7 +172,12 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 				"cronjob", key)
 			continue
 		}
-		if c.deduped(ctx, log, cj) {
+		// The dedupe index builds lazily — sweeps that never reach a
+		// dedupe check (no opted-in stale CronJob) pay no Jobs List.
+		if dedupeIdx == nil {
+			dedupeIdx = c.buildJobDedupeIndex(ctx, log)
+		}
+		if c.deduped(log, cj, dedupeIdx) {
 			continue
 		}
 		if c.spawn(ctx, log, cj, key) {
@@ -330,37 +338,83 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 // deduped reports whether a catch-up for cj is already covered:
 // either a <24h-old Job carrying the missed-catchup label, or any
 // Active Job still owned by the CronJob (a scheduled run in flight —
-// replaying on top of it double-fires the workload).
-func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batchv1.CronJob) bool {
+// replaying on top of it double-fires the workload). Both lookups
+// run against the sweep's cluster-wide jobDedupeIndex — the per-sweep
+// snapshot buildJobDedupeIndex made, so N opted-in CronJobs cost one
+// Jobs List, not N.
+func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
+	idx *jobDedupeIndex) bool {
+	key := cj.Namespace + "/" + cj.Name
+	if job, ok := idx.labeled[key]; ok {
+		log.Info("skip: a catch-up job already exists",
+			"cronjob", key, "job", job)
+		return true
+	}
+	if job, ok := idx.activeOwner[key]; ok {
+		log.Info("skip: a scheduled job is still active",
+			"cronjob", key, "job", job)
+		return true
+	}
+	return false
+}
+
+// jobDedupeIndex is the per-sweep cluster-wide Job snapshot behind
+// the catch-up dedupe. Keys are "ns/cronjob-name" — exactly what the
+// old per-namespace List could match — so a same-named CronJob in
+// another namespace cannot collide and every verdict is unchanged.
+type jobDedupeIndex struct {
+	// labeled: the catch-up label's VALUE is the CronJob name —
+	// "ns/cronjob" → the name of a labeled Job younger than
+	// catchupDedupeAge (first in list order wins; any hit dedupes).
+	labeled map[string]string
+	// activeOwner: "ns/cronjob" → the name of a Job whose controller
+	// ownerRef points at that CronJob with Status.Active > 0.
+	activeOwner map[string]string
+}
+
+// buildJobDedupeIndex lists Jobs cluster-wide once per sweep and
+// indexes the two dedupe proofs. A list failure yields EMPTY maps —
+// the same fail-open the per-namespace List had (a missed catch-up
+// is worse than one extra idempotent Job), metered once instead of
+// once per CronJob.
+func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
+	log logr.Logger) *jobDedupeIndex {
 	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Jobs(c.cs, cj.Namespace))
+		kube.Jobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
-		// List failure = empty dedupe list, still create — a missed
-		// catch-up is worse than one extra idempotent Job.
 		metrics.IncError(c.queue)
-		log.Info("WARN: list jobs failed — skipping dedupe",
-			"cronjob", cj.Namespace+"/"+cj.Name, "error", err)
-		return false
+		log.Info("WARN: list jobs failed — skipping dedupe", "error", err)
+		return &jobDedupeIndex{
+			labeled:     map[string]string{},
+			activeOwner: map[string]string{},
+		}
+	}
+	now := c.now.Now()
+	idx := &jobDedupeIndex{
+		labeled:     map[string]string{},
+		activeOwner: map[string]string{},
 	}
 	for i := range jobs {
 		j := &jobs[i]
-		if j.Labels[catchupLabel] == cj.Name &&
-			c.now.Now().Sub(j.CreationTimestamp.Time) < catchupDedupeAge {
-			log.Info("skip: a catch-up job already exists",
-				"cronjob", cj.Namespace+"/"+cj.Name, "job", j.Name)
-			return true
+		if label := j.Labels[catchupLabel]; label != "" &&
+			now.Sub(j.CreationTimestamp.Time) < catchupDedupeAge {
+			key := j.Namespace + "/" + label
+			if _, ok := idx.labeled[key]; !ok {
+				idx.labeled[key] = j.Name
+			}
 		}
 		if j.Status.Active > 0 {
 			if owner := metav1.GetControllerOf(j); owner != nil &&
-				owner.Kind == "CronJob" && owner.Name == cj.Name {
-				log.Info("skip: a scheduled job is still active",
-					"cronjob", cj.Namespace+"/"+cj.Name, "job", j.Name)
-				return true
+				owner.Kind == "CronJob" {
+				key := j.Namespace + "/" + owner.Name
+				if _, ok := idx.activeOwner[key]; !ok {
+					idx.activeOwner[key] = j.Name
+				}
 			}
 		}
 	}
-	return false
+	return idx
 }
 
 // capped enforces the in-memory 1-catchup-per-cronjob-per-day limit.

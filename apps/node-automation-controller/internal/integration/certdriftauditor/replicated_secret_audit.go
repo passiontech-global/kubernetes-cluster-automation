@@ -112,6 +112,12 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 		live[replStreakKey(k)] = true
 	}
 	a.replicationMismatch.Prune(func(key string) bool { return live[key] })
+	// Same complete-sweep point, same leak bound as the streaks: the
+	// resync cooldown ledger keys on destination names that can be
+	// decommissioned, and a stamp past the 1h window can never
+	// suppress a future strip anyway — evict it instead of pinning it
+	// forever.
+	a.resyncHeals.PruneExpired(a.now.Now(), replicationResyncCooldown)
 }
 
 // forceReplicationResync strips the replicated-from-version

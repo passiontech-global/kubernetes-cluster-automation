@@ -325,6 +325,30 @@ func TestListRVDrainsBodyPastReadCap(t *testing.T) {
 	}
 }
 
+// A watch-cache rv=0 NodeList larger than the 1 MiB read cap (limit
+// ignored) must still yield the rv: the streaming decode stops at
+// metadata BEFORE the oversized items array instead of truncating
+// into failParse → apiserver-side → DEAD drain of a healthy backend.
+func TestListRVOversizedNodeList(t *testing.T) {
+	bigItems := `{"metadata":{"resourceVersion":"77"},"items":[` +
+		strings.Repeat(`{"metadata":{"name":"node-xxxxxxxx"},"s":{"f":`+
+			strings.Repeat("x", 512)+`}},`, 2200) + `{}]}`
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, bigItems)
+	}))
+	defer srv.Close()
+	p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, fc, ferr := p.listRV(context.Background(),
+		strings.TrimPrefix(srv.URL, "https://"), "/api/v1/nodes?limit=1&resourceVersion=0")
+	if fc != failNone || rv != 77 {
+		t.Fatalf("listRV(oversized) = %d, %v, %v want 77, failNone", rv, fc, ferr)
+	}
+}
+
 // --- probe-side vs apiserver-side failure classification ---
 // The DEAD verdict must only fire on apiserver-side evidence —
 // credential/TLS/request-build faults are probe-side (failClass.

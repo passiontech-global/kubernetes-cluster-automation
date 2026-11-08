@@ -113,18 +113,21 @@ func (p *olmHealthCheck) collectOLMSignatures(ctx context.Context,
 // olmCRPatch closes over the audited object the first-seen stamp
 // rides — the durable half of the unhealthy window lives on the
 // object itself, delivered as a merge patch on its own GVR. The
-// patch closure also applies the merge to the listed object: several
-// live keys can share one object's map and each stamp re-reads it —
-// an un-synced second stamp would clobber the first until the next
-// List.
+// patch closure mirrors each LANDED patch into the listed object
+// (after the API call succeeds — a failed patch must not leave a
+// phantom stamp the sweep then reads back): several live keys can
+// share one object's map and each stamp re-reads it — an un-synced
+// second stamp would clobber the first until the next List.
 func (p *olmHealthCheck) olmCRPatch(gvr schema.GroupVersionResource,
 	o *unstructured.Unstructured) func(context.Context, []byte) error {
 
 	return func(ctx context.Context, data []byte) error {
+		if _, err := p.Dyn.Resource(gvr).Namespace(o.GetNamespace()).Patch(ctx,
+			o.GetName(), types.MergePatchType, data, metav1.PatchOptions{}); err != nil {
+			return err
+		}
 		probefw.MergeAnnoPatchLocally(o, data)
-		_, err := p.Dyn.Resource(gvr).Namespace(o.GetNamespace()).Patch(ctx,
-			o.GetName(), types.MergePatchType, data, metav1.PatchOptions{})
-		return err
+		return nil
 	}
 }
 

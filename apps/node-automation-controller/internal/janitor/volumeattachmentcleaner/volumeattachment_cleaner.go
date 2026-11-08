@@ -40,7 +40,12 @@
 // Hard bounds: the node list must be non-empty (an empty list means
 // the apiserver or RBAC lied — every VA would look orphaned, so
 // refuse to evaluate anything) and at most vaDeleteCap deletions per
-// cycle bound the blast radius of a wrong verdict. Deletion is a
+// cycle bound the blast radius of a wrong verdict. The census rides
+// the informer cache, so every destructive verdict is additionally
+// confirmed by a live node Get on the direct clientset at the single
+// Confirm point — the live answer wins (node present again keeps the
+// VA; the apiserver answering NotFound stands), and a failed confirm
+// keeps the VA fail-closed. Deletion is a
 // plain Delete — the VA's own attacher finalizer still gates the
 // real detach, but for the two shapes above removing the object is
 // the unstick the PV needs.
@@ -61,6 +66,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
@@ -102,8 +108,11 @@ const (
 type volumeAttachmentCleaner struct {
 	cs kubernetes.Interface
 	// nodeReader backs ListNodesCached — the informer-backed node
-	// census; destructive gates still confirm on the direct
-	// clientset. Nil (test fixtures) falls back to ListNodes.
+	// census (read-only verdicts). Every destructive verdict still
+	// confirms the node on the direct clientset at the sweep's
+	// single Confirm point (confirmLiveNode) before any delete or
+	// finalizer strip — a list can lag a Get. Nil (test fixtures)
+	// falls back to ListNodes.
 	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
@@ -277,20 +286,72 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		// names, not whichever ordering the apiserver returned.
 		Less: func(a, b *vaTarget) bool { return a.va.Name < b.va.Name },
 		Confirm: func(ctx context.Context, t *vaTarget) (bool, error) {
+			// Census verdict off the informer-backed node map —
+			// cheap and cached; the direct confirm below runs only
+			// when this verdict is destructive.
+			censusVerdict := ""
 			if t.strip {
 				// The W4 wedged-detach gate — fails closed inside
 				// (a pod-list failure keeps the finalizers).
-				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName,
-					livePods, stuckReadyPrior, now), nil
-			}
-			if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
+				if c.stuckTerminatingNodeDead(ctx, t.va, nodeByName,
+					livePods, stuckReadyPrior, now) {
+					censusVerdict = "stuck_terminating"
+				}
+			} else if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
 				// missing_node — the node object is gone; the
 				// age + prior-sighting proof is the gate's.
-				t.reason = c.missingNodeReason(t.va, seenPrior, now)
+				censusVerdict = c.missingNodeReason(t.va, seenPrior, now)
 			} else if c.nodeFencedDead(ctx, node, livePods, now) {
-				t.reason = "out_of_service_node"
+				censusVerdict = "out_of_service_node"
 			}
-			return t.reason != "", nil
+			if censusVerdict == "" {
+				return false, nil
+			}
+			if !t.strip {
+				t.reason = censusVerdict
+			}
+			// The destructive verdict came off the informer cache,
+			// which can lag the apiserver — confirm the node on the
+			// DIRECT clientset before any write (the doc promise).
+			// Fail closed: an unverifiable confirm never detaches a
+			// volume.
+			live, gone, err := c.confirmLiveNode(ctx, t.va.Spec.NodeName)
+			if err != nil {
+				metrics.IncError(c.queue)
+				log.Error(err, "live node confirm failed — keeping VA (fail closed)",
+					"va", t.va.Name, "node", t.va.Spec.NodeName)
+				return false, nil
+			}
+			if gone {
+				// The apiserver itself answers NotFound — the
+				// strongest shape of every destructive verdict; the
+				// census verdict stands.
+				return true, nil
+			}
+			// The live Get found the node — the census snapshot may
+			// have been stale. The LIVE node wins: re-run the
+			// destructive branch against it.
+			if t.strip {
+				liveNodes := map[string]*corev1.Node{t.va.Spec.NodeName: live}
+				return c.stuckTerminatingNodeDead(ctx, t.va, liveNodes,
+					livePods, stuckReadyPrior, now), nil
+			}
+			if t.reason == "missing_node" {
+				// The node object exists on the live apiserver —
+				// the orphan sighting came off a stale snapshot.
+				// Clear it so the two-sighting window re-arms (same
+				// convention as the orphanendpointslicecleaner's
+				// stale-snapshot reset).
+				c.orphanFirstSeen.Forget(t.va.Name)
+				log.Info("KEEP: live node confirm found the node — census snapshot stale",
+					"va", t.va.Name, "node", t.va.Spec.NodeName)
+				return false, nil
+			}
+			// out_of_service_node — re-run the gate on the LIVE
+			// node: Ready again or the taint dropped keeps the VA;
+			// still fenced-and-dead holds the verdict (the pod
+			// census re-reads the cycle's cache).
+			return c.nodeFencedDead(ctx, live, livePods, now), nil
 		},
 		LogTarget: func(log logr.Logger, t *vaTarget) {
 			if t.strip {
@@ -320,10 +381,23 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			if t.strip {
 				return // stripFinalizers already metered + logged the failure
 			}
-			metrics.IncError(c.queue)
-			log.Error(err, "volumeattachment delete failed",
-				"va", t.va.Name, "node", t.va.Spec.NodeName,
-				"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
+			switch {
+			case apierrors.IsNotFound(err):
+				// The VA was deleted under us — raced with an
+				// external cleanup; nothing failed.
+				log.Info("SKIP: volumeattachment already gone — raced with an external delete",
+					"va", t.va.Name)
+			case apierrors.IsConflict(err):
+				// The UID precondition fired — the VA was recreated
+				// (same csi-hash name, new volume) since the list.
+				log.Info("SKIP: volumeattachment recreated since the list — UID precondition fired",
+					"va", t.va.Name, "node", t.va.Spec.NodeName)
+			default:
+				metrics.IncError(c.queue)
+				log.Error(err, "volumeattachment delete failed",
+					"va", t.va.Name, "node", t.va.Spec.NodeName,
+					"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
+			}
 		},
 	})
 	// Re-arm the grace window for every VA that stopped looking
@@ -338,4 +412,31 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
+}
+
+// confirmLiveNode re-reads the VA's node on the DIRECT clientset —
+// the destructive confirm the doc promises: the census verdict came
+// off the informer-backed node list, and a list can lag a Get. The
+// three-way verdict mirrors kube.ConfirmAbsent:
+//
+//	gone=true, node=nil — the apiserver itself answers NotFound: the
+//	                     absence verdict stands (the strongest shape
+//	                     of every destructive branch).
+//	err!=nil            — the confirm itself failed: the caller
+//	                     keeps the VA (fail closed) and meters once.
+//	node!=nil, gone=false — the node still exists and the snapshot
+//	                     was stale; the LIVE node wins over the
+//	                     census and the destructive branch re-runs
+//	                     against it.
+func (c *volumeAttachmentCleaner) confirmLiveNode(ctx context.Context,
+	name string) (node *corev1.Node, gone bool, err error) {
+	n, getErr := c.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	gone, confirmErr := kube.ConfirmAbsent(getErr)
+	if confirmErr != nil {
+		return nil, false, confirmErr
+	}
+	if gone {
+		return nil, true, nil
+	}
+	return n, false, nil
 }

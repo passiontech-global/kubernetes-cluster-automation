@@ -9,7 +9,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -35,13 +39,61 @@ var (
 	fenceAgentsRemediationGVR = kube.GVRFenceAgentsRemediation
 )
 
+// probeErrDeadEvidence classifies a KubeletHealthz probe error. The
+// probe rides the apiserver's node-proxy tunnel, so err != nil hides
+// two very different stories:
+//
+//   - DEAD evidence (true): the transport itself demonstrably failed
+//     while asking the kubelet endpoint to answer —
+//     context.DeadlineExceeded (nothing answered within
+//     kubeletHealthzTimeout), connection refused/reset/unreachable
+//     (syscall errors surfaced through *net.OpError / *url.Error),
+//     or io.EOF / io.ErrUnexpectedEOF (connection torn down
+//     mid-response). Ready=Unknown>30m plus a transport this dead is
+//     a usable death certificate.
+//
+//   - INCONCLUSIVE (false): the APISERVER answered with an error —
+//     HTTP >= 500 (its proxy could not reach the kubelet: exactly
+//     what a one-way partition on the controller's side looks like,
+//     even while a healthy kubelet keeps posting node status),
+//     401/403 (RBAC on the proxy subresource), or an unparseable
+//     response. None of these certify the kubelet dead, so the
+//     caller fails closed instead of fencing.
+func probeErrDeadEvidence(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// net/http wraps transport failures as *url.Error around a
+	// *net.OpError around the syscall error.
+	var urle *url.Error
+	if errors.As(err, &urle) {
+		err = urle.Err
+	}
+	var ope *net.OpError
+	if errors.As(err, &ope) {
+		return errors.Is(ope.Err, syscall.ECONNREFUSED) ||
+			errors.Is(ope.Err, syscall.ECONNRESET) ||
+			errors.Is(ope.Err, syscall.EHOSTUNREACH)
+	}
+	return false
+}
+
 // confirmedDead is the safety gate — dead only with independent
 // fencing evidence: (a) a medik8s remediation CR (viaSNR=true), or
 // (b) Ready=Unknown>30m + a dead kubelet probe (viaSNR=false — no
 // fencer has certified the death, so the caller owes the node the
-// stateful split-brain gate before tainting). reason carries
-// the evidence for the caller's logs; a dead=false result leaves it
-// empty.
+// stateful split-brain gate before tainting). A probe error is only
+// death evidence when it is transport-dead (probeErrDeadEvidence);
+// apiserver-side errors (proxy 5xx, 401/403, unparseable) are
+// inconclusive — the node is skipped this sweep, at Warn not Error.
+// reason carries the evidence for the caller's logs; a dead=false
+// result leaves it empty.
 func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
 	rem *remediationCache, nodeNames map[string]bool) (dead, viaSNR bool, reason string, err error) {
 	log := logf.FromContext(ctx)
@@ -69,12 +121,26 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
 	}
 	ok, err := s.probeFn(ctx, n.Name)
 	if err != nil {
-		// A probe that errors out IS a failed probe — the kubelet
-		// did not serve healthz (same meaning as kubelet reaper's
-		// DoRaw error). Logged for forensics, not counted as a
-		// module failure.
-		log.Error(err, "kubelet healthz probe errored — counts as failed", "node", n.Name)
-		return true, false, "Ready=Unknown>30m + kubelet probe failed", nil
+		if probeErrDeadEvidence(err) {
+			// Transport-level failure — nothing answered the probe
+			// (or the connection died mid-response). The kubelet
+			// endpoint did not serve healthz: evidence, not a
+			// module failure (same meaning the kubelet reaper's
+			// DoRaw error carried).
+			log.Info("fencing evidence: Ready=Unknown>30m + kubelet probe errored (transport dead)",
+				"node", n.Name, "err", err)
+			return true, false, "Ready=Unknown>30m + kubelet probe failed", nil
+		}
+		// The apiserver itself answered with an error (HTTP >= 500,
+		// 401/403, unparseable body): that is the proxy PATH failing
+		// — the one-way-partition shape where the kubelet may be
+		// perfectly alive and posting status — so the error
+		// certifies nothing about the kubelet. Fail closed: skip
+		// the node this sweep, and Warn rather than Error (a
+		// deliberately withheld verdict, not a fault).
+		log.Info("probe error inconclusive — kubelet not certified dead, node skipped this sweep",
+			"node", n.Name, "err", err)
+		return false, false, "", nil
 	}
 	if !ok {
 		log.Info("fencing evidence: Ready=Unknown>30m + kubelet probe failed", "node", n.Name)

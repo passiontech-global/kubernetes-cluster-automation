@@ -212,6 +212,238 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Bounce escalation + persisted heal stamp — a desync the managed-by
+// delete can never fix must not bounce linkerd-destination forever.
+// ---------------------------------------------------------------------------
+
+// Three consecutive ineffective bounces escalate the per-service
+// cooldown 1h→6h→24h and then STOP the bouncing entirely, while the
+// gauge stays at 1 — the alert carries a desync no delete can fix.
+func TestCheckLinkerdEndpointSyncBounceEscalatesAndStops(t *testing.T) {
+	base := time.Now()
+	dests := []*corev1.Pod{
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-a-111", 4*time.Hour),
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-b-222", 3*time.Hour),
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-c-333", 2*time.Hour),
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-d-444", 1*time.Hour),
+	}
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		// A stale slice WITHOUT the managed-by label — the heal never
+		// deletes it, so the desync can never converge.
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"),
+		dests[0], dests[1], dests[2], dests[3],
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	run := func(at time.Time) probefw.Result {
+		p.Now = func() time.Time { return at }
+		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	}
+	alive := func(name string) bool {
+		_, err := cs.CoreV1().Pods(kube.LinkerdNS).
+			Get(ctx, name, metav1.GetOptions{})
+		return err == nil
+	}
+	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "headless-svc")
+
+	if res := run(base); !res.Pass {
+		t.Fatalf("first-seen desync must pass: %+v", res)
+	}
+	// Bounce 1 — the base tier fires past the persistence window.
+	b1 := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
+	if res := run(b1); res.Pass {
+		t.Fatal("persisted desync did not fail")
+	}
+	if alive(dests[0].Name) {
+		t.Fatal("bounce 1 did not delete the oldest destination pod")
+	}
+	// 2h later: the escalated 6h cooldown still suppresses bounce 2.
+	if res := run(b1.Add(2 * time.Hour)); res.Pass {
+		t.Fatal("desync stopped failing during the escalated cooldown")
+	}
+	if !alive(dests[1].Name) {
+		t.Fatal("destination bounced inside the escalated 6h cooldown")
+	}
+	// Bounce 2 — fires only once 6h passed since bounce 1.
+	b2 := b1.Add(6*time.Hour + time.Minute)
+	run(b2)
+	if alive(dests[1].Name) {
+		t.Fatal("bounce 2 did not fire after the 6h cooldown")
+	}
+	if !alive(dests[2].Name) {
+		t.Fatal("bounce 3 fired early — 24h cooldown not applied")
+	}
+	// Bounce 3 — fires only once 24h passed since bounce 2.
+	b3 := b2.Add(24*time.Hour + time.Minute)
+	run(b3)
+	if alive(dests[2].Name) {
+		t.Fatal("bounce 3 did not fire after the 24h cooldown")
+	}
+	if !alive(dests[3].Name) {
+		t.Fatal("fourth bounce fired — the ladder must stop at three")
+	}
+	// Past even a fresh 24h window: the ladder is exhausted and the
+	// bouncing never resumes, but the alert series stays up.
+	b4 := b3.Add(24*time.Hour + time.Minute)
+	if res := run(b4); res.Pass {
+		t.Fatal("exhausted desync stopped failing — alert lost")
+	}
+	if !alive(dests[3].Name) {
+		t.Fatal("bouncing resumed after the ladder was exhausted")
+	}
+	if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
+		map[string]string{"namespace": "app", "service": "headless-svc"}); m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("desync gauge = %v, want 1 (alert must survive the stop)", m)
+	}
+}
+
+// A converged desync resets the escalation ladder: after one
+// ineffective bounce, a resync followed by a FRESH desync bounces on
+// the base 1h tier again — a new failure must not inherit the old
+// streak.
+func TestCheckLinkerdEndpointSyncConvergeResetsLadder(t *testing.T) {
+	base := time.Now()
+	destA := linkerdDestinationPod(kube.LinkerdDestinationName+"-a-111", 2*time.Hour)
+	destB := linkerdDestinationPod(kube.LinkerdDestinationName+"-b-222", time.Hour)
+	stale := probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9")
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		stale, destA, destB,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	run := func(at time.Time) probefw.Result {
+		p.Now = func() time.Time { return at }
+		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	}
+	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "headless-svc")
+
+	// Track, then bounce 1 past the window.
+	run(base)
+	b1 := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
+	run(b1)
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, destA.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("bounce 1 did not delete the oldest destination pod")
+	}
+	// The slices resync — the sweep converges and must reset the
+	// bounce-failure streak.
+	if err := cs.DiscoveryV1().EndpointSlices("app").Delete(ctx,
+		stale.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.DiscoveryV1().EndpointSlices("app").Create(ctx,
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.5"),
+		metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := run(b1.Add(15 * time.Minute)); !res.Pass {
+		t.Fatalf("resynced service must converge: %+v", res)
+	}
+	// A FRESH desync arms its own window; the heal must fire on the
+	// BASE 1h tier (b1+2h clears both the window and the base
+	// cooldown — a 6h escalated cooldown would still suppress it).
+	if err := cs.DiscoveryV1().EndpointSlices("app").Delete(ctx,
+		"headless-svc-abc", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.DiscoveryV1().EndpointSlices("app").Create(ctx,
+		stale, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	run(b1.Add(16 * time.Minute))
+	if res := run(b1.Add(2 * time.Hour)); res.Pass {
+		t.Fatal("fresh desync did not fail past its window")
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, destB.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("fresh desync did not bounce on the reset (1h) tier")
+	}
+}
+
+// The bounce stamp persists on the Service: a fresh post-restart
+// process reads passiontech.dev/last-linkerd-endpoint-sync-heal off
+// the Service and defers the bounce inside the cooldown window with
+// an empty in-RAM ledger — then bounces once the window clears.
+func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
+	base := time.Now()
+	destA := linkerdDestinationPod(kube.LinkerdDestinationName+"-a-111", 2*time.Hour)
+	destB := linkerdDestinationPod(kube.LinkerdDestinationName+"-b-222", time.Hour)
+	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "headless-svc")
+
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"), // stale
+		destA,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	at := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
+	p.Now = func() time.Time { return at }
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, destA.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("bounce did not delete the destination pod")
+	}
+	svc, err := cs.CoreV1().Services("app").
+		Get(ctx, "headless-svc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp, ok := kube.AnnoTime(svc, linkerdDestHealAnno)
+	if !ok {
+		t.Fatalf("service missing %s stamp", linkerdDestHealAnno)
+	}
+	if stamp.Before(at.Add(-time.Minute)) || stamp.After(at.Add(time.Minute)) {
+		t.Fatalf("heal stamp = %v, want ~%v (RFC3339 on the Service)", stamp, at)
+	}
+
+	// Restart: a fresh check against the same cluster objects — the
+	// Service carries BOTH persisted stamps (first-seen + heal), so
+	// the annotation alone suppresses the bounce inside the window.
+	svcPatched, err := cs.CoreV1().Services("app").
+		Get(ctx, "headless-svc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs2 := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"), svcPatched,
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"), // stale
+		destB,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p2 := testProberDyn(cs2, probetest.OpDyn())
+	p2.Now = func() time.Time { return at.Add(30 * time.Minute) }
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(ctx); res.Pass {
+		t.Fatal("desync stopped failing across the restart")
+	}
+	if _, err := cs2.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, destB.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("post-restart bounce ignored the persisted Service stamp")
+	}
+	// Past the window the bounce resumes — at the BASE tier, since a
+	// fresh process starts the ladder from zero.
+	p2.Now = func() time.Time { return at.Add(2 * time.Hour) }
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(ctx); res.Pass {
+		t.Fatal("desync stopped failing after the stamp expired")
+	}
+	if _, err := cs2.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, destB.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("bounce did not resume after the persisted stamp expired")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // staleLinkerdSlices — pure selection logic
 // ---------------------------------------------------------------------------
 

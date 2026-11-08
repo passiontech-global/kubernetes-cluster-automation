@@ -348,6 +348,54 @@ func TestLocalPVQuotaThrottle(t *testing.T) {
 	}
 }
 
+// TestLocalPVQuotaNoDirsSkipsAPI — no pvc-* dir under the scan
+// roots → the cluster-wide PV/PVC lists never fire (sweeper parity).
+func TestLocalPVQuotaNoDirsSkipsAPI(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-abc123"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+		},
+	}
+	e := fixture(t, pv)
+	e.H.Cfg.Disk.LocalPVQuotaDir = t.TempDir() // empty root — no pvc-* dirs
+	e.DiskUsed = 0.85
+	lists := func() (pvN, pvcN int) {
+		for _, a := range e.CS.Actions() {
+			switch a.GetResource().Resource {
+			case "persistentvolumes":
+				if a.GetVerb() == "list" {
+					pvN++
+				}
+			case "persistentvolumeclaims":
+				if a.GetVerb() == "list" {
+					pvcN++
+				}
+			}
+		}
+		return pvN, pvcN
+	}
+	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if pvN, pvcN := lists(); pvN != 0 || pvcN != 0 {
+		t.Fatalf("no-dir cycle issued API lists: pv=%d pvc=%d", pvN, pvcN)
+	}
+
+	// With a pvc-* candidate on disk the lists DO fire.
+	if err := os.MkdirAll(
+		filepath.Join(e.H.Cfg.Disk.LocalPVQuotaDir, "pvc-abc123"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	pvN, pvcN := lists()
+	if pvN != 1 || pvcN != 1 {
+		t.Fatalf("candidate cycle lists: pv=%d pvc=%d, want 1/1", pvN, pvcN)
+	}
+}
+
 // --- run-tmpfs: /run tmpfs guard ---
 
 func TestRunTmpfsGuard(t *testing.T) {

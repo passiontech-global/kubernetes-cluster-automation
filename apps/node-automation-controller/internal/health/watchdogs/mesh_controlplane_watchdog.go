@@ -111,6 +111,14 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 				break
 			}
 		}
+	} else {
+		// The pod list is the W8-NM3 scan's only input — a failure
+		// must count like every swallowed infra error in the heal
+		// path, or a wedged linkerd control plane reads as clean
+		// while the scan silently no-ops.
+		metrics.IncError(p.Name)
+		log.Info("WARN: list linkerd pods failed — wedge scan skipped",
+			"ns", kube.LinkerdNS, "error", err)
 	}
 
 	return rep.Verdict("mesh control-plane wedge: ", ", ")

@@ -206,21 +206,48 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 		}
 	})
 
-	t.Run("Unknown>30m + probe error counts as failed -> tainted", func(t *testing.T) {
+	t.Run("Unknown>30m + probe transport-dead -> tainted", func(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			unknownNode("w1", 45*time.Minute),
 			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
 		dyn := deadNodeDynFake()
 		s := deadNodeSweeperFor(cs, dyn,
 			func(context.Context, string) (bool, error) {
-				return false, errors.New("error trying to reach service")
+				// The shape rest.DoRaw surfaces when nothing answers
+				// the probe inside kubeletHealthzTimeout — dead
+				// evidence.
+				return false, context.DeadlineExceeded
 			})
 
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
-			t.Fatal("probe error (kubelet unreachable) not treated as dead")
+			t.Fatal("transport-dead probe (deadline, no answer) not treated as death evidence")
+		}
+	})
+
+	t.Run("Unknown>30m + probe error inconclusive (apiserver answered) -> skipped", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			unknownNode("w1", 45*time.Minute),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake()
+		s := deadNodeSweeperFor(cs, dyn,
+			func(context.Context, string) (bool, error) {
+				// The proxy PATH failed — HTTP 500 from the
+				// apiserver, the one-way-partition shape where the
+				// kubelet may still be alive and posting status.
+				// No death certificate, no fence.
+				return false, apierrors.NewGenericServerResponse(500, "GET",
+					schema.GroupResource{Resource: "nodes"}, "w1",
+					"error trying to reach service", 0, true)
+			})
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("inconclusive probe error (proxy 5xx) must not fence the node")
 		}
 	})
 

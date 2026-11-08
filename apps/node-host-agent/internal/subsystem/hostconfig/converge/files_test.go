@@ -268,8 +268,17 @@ func TestUntarInstall(t *testing.T) {
 		if st.Mode().Perm() != 0o755 {
 			t.Fatalf("mode = %o, want 755", st.Mode().Perm())
 		}
+		// The CreateTemp stage (installed.tmp-*) must be renamed
+		// away, not left behind next to the live binary.
+		leftovers, err := filepath.Glob(dst + ".tmp-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leftovers) != 0 {
+			t.Errorf("staged tmp left behind: %v", leftovers)
+		}
 		if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
-			t.Error("staged .tmp must be renamed away, not left behind")
+			t.Error("fixed .tmp stage name must be gone too")
 		}
 	})
 
@@ -317,4 +326,80 @@ func TestUntarInstall(t *testing.T) {
 			t.Fatal("expected an error installing into a missing dir")
 		}
 	})
+
+	t.Run("member exactly at the cap installs", func(t *testing.T) {
+		defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
+		maxArtifactBytes = int64(len("tool-bytes"))
+		dst := filepath.Join(t.TempDir(), "installed")
+		if err := UntarInstall(tgz, "tool", dst, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := testutil.ReadFile(t, dst); got != "tool-bytes" {
+			t.Fatalf("content = %q", got)
+		}
+	})
+}
+
+func TestUntarInstallExtractCap(t *testing.T) {
+	defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
+	maxArtifactBytes = 1024
+
+	dir := t.TempDir()
+	tgz := filepath.Join(dir, "bundle.tar.gz")
+	writeTarGz(t, tgz, map[string]string{"bin/tool": strings.Repeat("A", 2000)})
+
+	dst := filepath.Join(t.TempDir(), "installed")
+	err := UntarInstall(tgz, "tool", dst, 0o755)
+	if err == nil || !strings.Contains(err.Error(), "extract cap") {
+		t.Fatalf("err = %v, want the extract-cap failure", err)
+	}
+	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+		t.Error("dst must not exist when the member breaches the cap")
+	}
+	// The partial stage must be swept from the dst dir.
+	leftovers, gerr := filepath.Glob(dst + ".tmp-*")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("oversize member stage left behind: %v", leftovers)
+	}
+}
+
+func TestDownloadFileArtifactCap(t *testing.T) {
+	defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
+	maxArtifactBytes = 1024
+
+	overCap := strings.Repeat("B", 2000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(overCap))
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "f.bin")
+	err := DownloadFile(context.Background(), srv.URL, dst, "", 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the") {
+		t.Fatalf("err = %v, want the artifact-cap failure", err)
+	}
+	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+		t.Error("dst must not exist when the artifact breaches the cap")
+	}
+	if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {
+		t.Error("staged .dl must be swept after a cap failure")
+	}
+
+	// Boundary: exactly the cap downloads fine.
+	exact := strings.Repeat("B", 1024)
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(exact))
+	}))
+	t.Cleanup(srv2.Close)
+	dst2 := filepath.Join(dir, "exact.bin")
+	if err := DownloadFile(context.Background(), srv2.URL, dst2, "", 10*time.Second); err != nil {
+		t.Fatalf("artifact at exactly the cap rejected: %v", err)
+	}
+	if got := testutil.ReadFile(t, dst2); got != exact {
+		t.Fatalf("content = %d bytes, want the full capped artifact", len(got))
+	}
 }

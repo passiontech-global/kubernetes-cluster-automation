@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -367,5 +369,72 @@ func TestPVCStalledNeedsAWorker(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("openebs").
 		Get(ctx, "openebs-localpv-provisioner-abc", metav1.GetOptions{}); err != nil {
 		t.Fatal("provisioner deleted with no schedulable worker")
+	}
+}
+
+// The provisioner heal stamps
+// passiontech.dev/last-localpv-provisioner-heal on the provisioner
+// Deployment, and a fresh post-restart process reads it back: a
+// stamp inside the 1h window defers the bounce with an empty in-RAM
+// ledger — then bounces once the window clears.
+func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
+	t.Cleanup(func() {
+		pvcProvisioningStalledGauge.DeleteLabelValues("apps", "data-x", "openebs-hostpath")
+		pvcProvisionerHealsTotal.DeleteLabelValues("openebs-localpv-provisioner")
+	})
+	build := func(base, healStamp time.Time) (*fake.Clientset, *probetest.Prober) {
+		provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1"}}
+		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+			Namespace: openebsProvisionerNS, Name: openebsProvisionerName}}
+		if !healStamp.IsZero() {
+			dep.Annotations = map[string]string{
+				pvcProvHealAnno: healStamp.UTC().Format(time.RFC3339)}
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil),
+			provPod, dep,
+			pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
+			testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
+		p := testProberDyn(cs, probetest.OpDyn())
+		p.Now = func() time.Time { return base }
+		return cs, p
+	}
+
+	// Healed 10m ago (annotation only — fresh process): deferred.
+	cs, p := build(time.Now(), time.Now().Add(-10*time.Minute))
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stalled provisioning must FAIL even under the persisted cooldown")
+	}
+	if _, err := cs.CoreV1().Pods("openebs").
+		Get(ctx, "openebs-localpv-provisioner-abc", metav1.GetOptions{}); err != nil {
+		t.Fatal("post-restart bounce ignored the persisted Deployment stamp")
+	}
+
+	// No stamp: the heal fires and stamps the Deployment on delivery.
+	cs2, p2 := build(time.Now(), time.Time{})
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p2).Run(ctx); res.Pass {
+		t.Fatal("stalled provisioning must FAIL")
+	}
+	if _, err := cs2.CoreV1().Pods("openebs").
+		Get(ctx, "openebs-localpv-provisioner-abc", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("wedged provisioner must be deleted, err=%v", err)
+	}
+	depGot, err := cs2.AppsV1().Deployments(openebsProvisionerNS).
+		Get(ctx, openebsProvisionerName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := kube.AnnoTime(depGot, pvcProvHealAnno); !ok {
+		t.Fatalf("deployment missing %s stamp", pvcProvHealAnno)
+	}
+
+	// Healed 2h ago: window cleared, the bounce resumes.
+	cs3, p3 := build(time.Now(), time.Now().Add(-2*time.Hour))
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p3).Run(ctx); res.Pass {
+		t.Fatal("stalled provisioning must FAIL past the expired stamp")
+	}
+	if _, err := cs3.CoreV1().Pods("openebs").
+		Get(ctx, "openebs-localpv-provisioner-abc", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("bounce did not resume after the persisted stamp expired, err=%v", err)
 	}
 }

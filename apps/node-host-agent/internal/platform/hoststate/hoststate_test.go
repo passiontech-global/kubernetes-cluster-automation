@@ -125,6 +125,37 @@ func TestRateOKGarbageIsOK(t *testing.T) {
 	}
 }
 
+// TestRateOKFutureStampStaysCooled: a stamp from a stepped-back clock
+// (NTP correction, manual set) sits in the future — its age is
+// negative. RateOKIn clamps negative age to 0 so a future stamp is
+// exactly "not expired yet" (fail-closed), never an early gate: the
+// verdict no longer depends on the sign accident of
+// (negative-age >= interval) surviving every interval comparison.
+// RateTrySpend's check branch rides the same clamp (it checks via
+// RateOK).
+func TestRateOKFutureStampStaysCooled(t *testing.T) {
+	s, clk, _ := newTestStore(t)
+
+	// Stamp one hour in the future — the clock stepped back after
+	// the spend.
+	s.WriteEpochFile(filepath.Join(s.Dir, "last-stepped"),
+		clk.now.Add(time.Hour).Unix())
+
+	if s.RateOK("last-stepped", time.Hour) {
+		t.Fatal("future stamp must stay cooled, not open the gate")
+	}
+	if s.RateTrySpend("last-stepped", time.Hour) {
+		t.Fatal("RateTrySpend must inherit the clamp through its RateOK check")
+	}
+	// The budget was NOT spent by the losing try-spend — the stamp
+	// still reads future. Once the clock passes the stamp the budget
+	// expires normally.
+	clk.now = clk.now.Add(2 * time.Hour)
+	if !s.RateOK("last-stepped", time.Hour) {
+		t.Fatal("expired stamp must be OK again after the clock catches up")
+	}
+}
+
 func TestRateTrySpendSerializes(t *testing.T) {
 	s, _, _ := newTestStore(t)
 	if !s.RateTrySpend("last-restart", time.Hour) {

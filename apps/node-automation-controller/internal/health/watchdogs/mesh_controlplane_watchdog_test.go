@@ -4,6 +4,7 @@
 package watchdogs
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -11,8 +12,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -98,5 +101,38 @@ func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("pod not deleted outside maintenance")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W8-NM3 — linkerd wedge scan list failure (fail-closed parity)
+// ---------------------------------------------------------------------------
+
+// The linkerd pod list is the W8-NM3 wedge scan's only input: a list
+// failure must be COUNTED like every swallowed infra error in the
+// heal path — without it an apiserver flap reads as a clean sweep
+// while the scan silently no-ops. The skipped scan must not
+// fabricate a finding though: nothing was evaluated.
+func TestCheckMeshLinkerdPodListInfraCounted(t *testing.T) {
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false))
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	runErrors := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := runErrors()
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("a skipped wedge scan must not fabricate a finding: %+v", res)
+	}
+	if got := runErrors() - before; got != 1 {
+		t.Fatalf("hook_run_errors delta = %v, want 1 — the skipped scan must count its list error", got)
 	}
 }

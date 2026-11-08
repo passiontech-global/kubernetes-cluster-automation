@@ -128,6 +128,45 @@ func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 	}
 }
 
+// A young (inside BackupInterval) but INVALID dump must not ride its
+// age to the next interval — backupVerify recreates immediately.
+func TestBackupVerifyInvalidYoungDumpRecreates(t *testing.T) {
+	rules := []testutil.ExecRule{
+		{Substr: "pg_dump -Fc", Out: "dumped\n"},
+		{Substr: "pg_restore -l", Out: "ok\n"},
+		{Substr: "cp pg:", Out: "copied\n"},
+	}
+	k, fr, dir := fixture(t, rules)
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	if err := os.MkdirAll(bdir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh (mtime=now) garbage dump — passes the age check, fails
+	// the magic sniff.
+	dump := filepath.Join(bdir, "kine-1700000000.dump")
+	if err := os.WriteFile(dump, []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The fake cp writes no bytes — pre-stage the publish target so
+	// the rename lands and the dump reads back valid.
+	if err := os.WriteFile(dump+".tmp", []byte("PGDMP fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := &Result{}
+	var notes []string
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res,
+		func(s string) { notes = append(notes, s) })
+	if !strings.Contains(fr.Joined(), "pg_dump -Fc") {
+		t.Fatalf("invalid young dump did not trigger recreation:\n%s notes=%v",
+			fr.Joined(), notes)
+	}
+	if !res.backupValid {
+		t.Fatalf("recreated dump not valid: %+v notes=%v", res, notes)
+	}
+}
+
 func TestNewestDumpAndMagic(t *testing.T) {
 	dir := t.TempDir()
 	if p, mt := newestDump(dir); p != "" || mt != 0 {

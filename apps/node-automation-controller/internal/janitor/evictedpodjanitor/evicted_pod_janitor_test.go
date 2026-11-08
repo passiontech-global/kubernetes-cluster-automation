@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -280,5 +282,48 @@ func TestEvictedPodJanitorDeleteErrorTolerated(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&attempts); got != int32(evictedPodCap) {
 		t.Fatalf("expected exactly cap=%d delete attempts, got %d", evictedPodCap, got)
+	}
+}
+
+// A delete answered NotFound raced an external cleanup — logged as a
+// skip, NOT metered as an error (alert noise stays off the races).
+func TestEvictedPodJanitorDeleteNotFoundNotMetered(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		epjPod("a", "old-evicted", corev1.PodFailed, "Evicted", 2*time.Hour))
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				corev1.Resource("pods"), "old-evicted")
+		})
+	j := &evictedPodJanitor{cs: cs, queue: "evicted-pod-janitor"}
+	before := testutil.QueueErrorCount(t, "evicted-pod-janitor")
+	if err := j.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, "evicted-pod-janitor") - before; got != 0 {
+		t.Fatalf("NotFound race metered as an error: delta = %v, want 0", got)
+	}
+	if !epjPodExists(t, cs, "a", "old-evicted") {
+		t.Fatal("pod vanished despite the rejected delete")
+	}
+}
+
+// A Conflict answer is the UID precondition firing on a recreated
+// same-named pod — equally a race, equally not an error.
+func TestEvictedPodJanitorDeleteConflictNotMetered(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		epjPod("a", "old-evicted", corev1.PodFailed, "Evicted", 2*time.Hour))
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewConflict(
+				corev1.Resource("pods"), "old-evicted", errors.New("uid mismatch"))
+		})
+	j := &evictedPodJanitor{cs: cs, queue: "evicted-pod-janitor"}
+	before := testutil.QueueErrorCount(t, "evicted-pod-janitor")
+	if err := j.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, "evicted-pod-janitor") - before; got != 0 {
+		t.Fatalf("Conflict race metered as an error: delta = %v, want 0", got)
 	}
 }

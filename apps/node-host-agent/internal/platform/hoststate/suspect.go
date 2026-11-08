@@ -77,10 +77,12 @@ func (s *Store) ClearAllSuspects() {
 // announces the transition and a cadence re-reminder keeps a
 // long-held condition visible in the tail. Counters, latches and
 // metrics keep updating every cycle — only the LOG line is throttled.
+// The check+spend is atomic (RateTrySpend): two goroutines hitting
+// the same key in one window must not both pass the check and both
+// log — the budget is spent exactly once, by whoever wins.
 func (s *Store) SuspectLog(key, msg string, cadence time.Duration) {
-	if !s.RateOK(SuspectBudgetPrefix+key, cadence) {
+	if !s.RateTrySpend(SuspectBudgetPrefix+key, cadence) {
 		return
 	}
-	s.RateSpend(SuspectBudgetPrefix + key)
 	s.AppendLog(msg)
 }

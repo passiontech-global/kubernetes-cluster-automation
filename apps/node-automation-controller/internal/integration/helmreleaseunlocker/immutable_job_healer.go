@@ -14,6 +14,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -111,6 +112,14 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 			"kustomization", key, "job", jobNS+"/"+job.Name)
 		if err := u.cs.BatchV1().Jobs(jobNS).Delete(ctx, job.Name,
 			kube.UIDDeleteOptions(job.UID, metav1.DeletePropagationBackground)); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Raced with kustomize-controller's own recreate or a
+				// prior heal — the apply is already unblocked. Benign:
+				// a skip, not an error (cilium-identity janitor parity).
+				log.Info("skip: immutable Job already gone — raced with its own cleanup",
+					"kustomization", key, "job", jobNS+"/"+job.Name)
+				continue
+			}
 			metrics.IncError(u.queue)
 			log.Error(err, "immutable job delete failed", "job", jobNS+"/"+job.Name)
 			continue

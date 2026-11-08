@@ -49,11 +49,22 @@ type linkerdEndpointSyncCheck struct {
 	//   - linkerdDesyncEmitted: gauge tuples held at 1 — a tuple not
 	//     re-seen gets DeleteLabelValues, not a stale 1.
 	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
-	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
-	//     the heal target, nothing else can carry the stamp).
+	//     bounce — the in-RAM half of the escalating per-service
+	//     cooldown (the passiontech.dev/last-linkerd-endpoint-sync-heal
+	//     stamp on the Service is the durable half).
+	//   - linkerdDesyncBounceFails: "ns/svc" → consecutive bounces
+	//     that left the desync standing — the escalation ladder that
+	//     stops the never-converging bounce loop (F: a desync caused
+	//     by a slice no managed-by deletion can ever touch would
+	//     otherwise bounce destination every cooldown forever).
 	linkerdDesyncSince   state.FirstSeenLedger
 	linkerdDesyncEmitted state.GaugeLedger[string]
 	linkerdDesyncHealed  state.CooldownSet
+	// linkerdDesyncBounceFails is in-RAM only: the Service annotation
+	// carries the cooldown (the durable half) while the ladder count
+	// itself restarting at zero after a controller restart merely
+	// replays the 1h→6h→24h ramp before the stop trips again.
+	linkerdDesyncBounceFails state.StreakLedger
 }
 
 // The constructor lives in the package facade (linkerd.go).
@@ -61,8 +72,33 @@ type linkerdEndpointSyncCheck struct {
 const (
 	// W9-NM2 — linkerd-endpoint-sync knobs.
 	CheckNameLinkerdEndpointSync = "linkerd-endpoint-sync"
-	linkerdEndpointDesyncMinAge  = 10 * time.Minute
-	linkerdDestHealCooldown      = time.Hour
+	// linkerdDestHealAnno persists the last bounce moment on the
+	// desynced Service — the restart-proof half of the escalating
+	// bounce cooldown.
+	linkerdDestHealAnno         = kube.AnnoLastLinkerdEndpointSyncHeal
+	linkerdEndpointDesyncMinAge = 10 * time.Minute
+)
+
+// linkerdDestHealEscalation is the per-service bounce cooldown
+// ladder. A fresh desync bounces linkerd-destination after 1h; each
+// consecutive bounce that left the desync standing defers the next
+// one to 6h, then 24h; a bounce whose index reaches len(ladder)
+// (three consecutive ineffective bounces) stops the bouncing
+// entirely — the gauge + FAIL series stay up and the human alert
+// path converges it. The ladder exists for desyncs the managed-by
+// delete cannot fix (stale slices owned by a controller we never
+// reap): without it the destination pod bounced every cooldown
+// forever, for nothing.
+var linkerdDestHealEscalation = [3]time.Duration{
+	time.Hour, 6 * time.Hour, 24 * time.Hour,
+}
+
+const (
+	// linkerdDestHealCooldownMax is the longest cooldown the ladder
+	// serves — the PruneExpired bound (a shorter bound would drop
+	// still-binding stamps, per CooldownSet's widest-window-wins
+	// contract).
+	linkerdDestHealCooldownMax = 24 * time.Hour
 	// linkerdSliceHealMinAge is the fuse on the missing-IP half of
 	// the W10-FIX7 stale-slice delete: a Ready pod IP must have been
 	// Ready this long before its absence from the service's managed
@@ -108,9 +144,12 @@ func init() {
 // blackholes or misroutes traffic for the selected workload. A
 // divergence must persist
 // linkerdEndpointDesyncMinAge before the gauge fires; past the window
-// the oldest linkerd-destination pod is bounced (1h per-service
-// cooldown, maintenance-gated, UID-preconditioned) to force a full
-// resync — the same re-roll shape as the W8-NM3 wedged-pod heal.
+// the oldest linkerd-destination pod is bounced — 1h per-service
+// cooldown escalating to 6h and 24h after each bounce that left the
+// desync standing, and the bouncing stops entirely after three
+// consecutive ineffective bounces (maintenance-gated,
+// UID-preconditioned) — to force a full resync. The escalation is
+// the same re-roll shape as the W8-NM3 wedged-pod heal.
 // W10-FIX7 adds the other half of the heal: the bounce only re-reads
 // EndpointSlices, so when the slices themselves are provably stale
 // (a Ready address no live pod owns, or a >3m-Ready pod IP absent
@@ -296,6 +335,13 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	p.auditCiliumLinkerdSockLB(ctx, log, linkerdInstalled, &rep)
 
 	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
+	// The bounce-failure streak resets wherever the desync itself
+	// converged this sweep (or its Service vanished) — a later
+	// recurrence re-arms the full 1h→6h→24h ladder. Same
+	// complete-sweep contract as the first-seen prune above: this
+	// point is only reached after the full audit.
+	p.linkerdDesyncBounceFails.Prune(
+		func(k string) bool { _, ok := desynced[k]; return ok })
 	var emitted []string
 	for k, svc := range desynced {
 		// The window gates the stale-EndpointSlice delete plus the
@@ -318,12 +364,13 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.
-	// The 1h cooldown is per desynced SERVICE — two services stuck on
-	// the same root cause share one bounce. Iterates `emitted`, not
+	// The cooldown is per desynced SERVICE (escalating — see
+	// linkerdDestHealEscalation) — two services stuck on the same
+	// root cause share one bounce. Iterates `emitted`, not
 	// rep.Findings(): the socket-LB audit (W12-NM1b) also reports
 	// findings into rep and must not trigger a desync heal.
 	for _, k := range emitted {
-		p.healLinkerdDestination(ctx, log, k, now, staleSlices[k])
+		p.healLinkerdDestination(ctx, log, desynced[k], k, now, staleSlices[k])
 	}
 
 	return rep.Verdict(fmt.Sprintf(

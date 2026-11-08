@@ -222,28 +222,43 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 		st.mu.Unlock()
 		return
 	}
-	st.lastClamp = n.cfg.Clock.Now()
 	st.mu.Unlock()
 	dev := wd.NebulaDev
 	if dev == "" {
 		dev = "neb1"
 	}
-	n.clampMSSOn(ctx, dev)
+	// The rate-limit budget is spent only on a DELIVERED clamp —
+	// a failed iptables run keeps lastClamp untouched so the next
+	// tick retries immediately instead of waiting out
+	// mtuClampEvery while flows still blackhole.
+	if err := n.clampMSSOn(ctx, dev); err != nil {
+		return
+	}
 	// The double-encapsulation path also blackholes on the
 	// Cilium WireGuard dev — clamp it too whenever it exists.
-	n.clampMSSOn(ctx, "cilium_wg0")
+	// A cilium_wg0 failure must not re-open the (successful)
+	// overlay clamp rate limit every tick — only the overlay
+	// dev's outcome spends the budget.
+	_ = n.clampMSSOn(ctx, "cilium_wg0")
+	st.mu.Lock()
+	st.lastClamp = n.cfg.Clock.Now()
+	st.mu.Unlock()
 }
 
 // clampMSSOn idempotently installs the TCPMSS --clamp-mss-to-pmtu
 // rule on one interface (the -C existence probe keeps it idempotent).
-func (n *NetHealth) clampMSSOn(ctx context.Context, dev string) {
+// The error is the rate-limit gate's success signal: the clamp budget
+// (lastClamp) must only be spent once the rule actually landed —
+// a failed iptables run would otherwise mute retries for a full
+// mtuClampEvery while the blackhole persists.
+func (n *NetHealth) clampMSSOn(ctx context.Context, dev string) error {
 	args := []string{"-t", "mangle", "-C", "POSTROUTING",
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
 	if _, err := n.cfg.runMountCmd(ctx,
 		append([]string{"iptables"}, args...)); err == nil {
 		// Rule already present — nothing to do.
-		return
+		return nil
 	}
 	out, err := n.cfg.runMountCmd(ctx,
 		[]string{"iptables", "-t", "mangle", "-A",
@@ -254,10 +269,11 @@ func (n *NetHealth) clampMSSOn(ctx context.Context, dev string) {
 		n.state.AppendLog(fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole MSS clamp failed on %s: %v (%s)",
 			dev, err, trimRunErr(out)))
-		return
+		return err
 	}
 	n.actions.WithLabelValues(mtuCheckName, "mss_clamp").Inc()
 	n.state.AppendLog("ACTION: nebula-mtu-blackhole clamped TCP MSS to PMTU on " + dev)
+	return nil
 }
 
 // sysfsMTU reads the MTU of one interface through the host sysfs
@@ -296,7 +312,9 @@ func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string
 	n.state.AppendLog(fmt.Sprintf(
 		"warn: cilium_wg0 MTU %d exceeds nebula invariant (nebula %s MTU %d, max %d) — clamping TCP MSS on cilium_wg0",
 		cilMTU, nebDev, nebMTU, nebMTU-mtuCiliumWGOverhead))
-	n.clampMSSOn(ctx, "cilium_wg0")
+	if err := n.clampMSSOn(ctx, "cilium_wg0"); err != nil {
+		n.state.AppendLog("warn: cilium_wg0 MSS clamp failed: " + err.Error())
+	}
 }
 
 // writeMTUBHMetric emits node_agent_nebula_mtu_blackhole (0/1) to

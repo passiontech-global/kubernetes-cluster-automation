@@ -37,7 +37,9 @@ type localPVStrandedCheck struct {
 	//     30m cooldown (in-RAM: the PVC is deleted, nothing durable
 	//     can carry the stamp).
 	//   - pvcProvHealed: provisioner → last provisioner pod delete —
-	//     the 1h cooldown.
+	//     the in-RAM half of the 1h cooldown (the
+	//     passiontech.dev/last-localpv-provisioner-heal stamp on the
+	//     provisioner Deployment is the durable half).
 	localPVEmitted    state.GaugeLedger[string]
 	pvcStalledEmitted state.GaugeLedger[string]
 	// strandedStatefulEmitted is the W12-SC2 ledger for the
@@ -92,10 +94,14 @@ const (
 	// Ready workers exist means the provisioner wedged.
 	pvcStalledMinAge           = 15 * time.Minute
 	pvcProvisionerHealCooldown = time.Hour
-	openebsHostpathSC          = "openebs-hostpath"
-	openebsProvisionerNS       = "openebs"
-	openebsProvisionerPrefix   = "openebs-localpv-provisioner"
-	openebsProvisionerName     = "openebs-localpv-provisioner"
+	// pvcProvHealAnno persists the last provisioner heal moment on
+	// the provisioner Deployment — the restart-proof half of the 1h
+	// cooldown.
+	pvcProvHealAnno          = kube.AnnoLastLocalPVProvisionerHeal
+	openebsHostpathSC        = "openebs-hostpath"
+	openebsProvisionerNS     = "openebs"
+	openebsProvisionerPrefix = "openebs-localpv-provisioner"
+	openebsProvisionerName   = "openebs-localpv-provisioner"
 	// Stranded-reason gauge label values.
 	strandedReasonMissingNode  = "missing_node"
 	strandedReasonOutOfService = "out_of_service"

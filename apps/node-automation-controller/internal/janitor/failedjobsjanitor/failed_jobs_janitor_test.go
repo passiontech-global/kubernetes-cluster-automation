@@ -886,3 +886,54 @@ func TestOrphanWorkspacePVCReapedAfterRunTTL(t *testing.T) {
 		t.Fatal("workspace pvc of the reaped run must be deleted in the same pass")
 	}
 }
+
+// A failed-Job delete answered NotFound raced an external cleanup —
+// logged as a skip, NOT metered as an error.
+func TestFailedJobDeleteNotFoundNotMetered(t *testing.T) {
+	cs := fake.NewSimpleClientset(failedJob("ops", "dead", 48*time.Hour))
+	cs.PrependReactor("delete", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				batchv1.Resource("jobs"), "dead")
+		})
+	j := &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor"}
+	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	if err := j.sweepFailedJobs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 0 {
+		t.Fatalf("NotFound race metered as an error: delta = %v, want 0", got)
+	}
+	if !fjjJobExists(t, cs, "ops", "dead") {
+		t.Fatal("job vanished despite the rejected delete")
+	}
+}
+
+// An orphan-workspace-PVC delete answered Conflict is the UID
+// precondition firing on a recreated same-name claim — a race, not
+// an error.
+func TestOrphanWorkspacePVCDeleteConflictNotMetered(t *testing.T) {
+	pvc := fjjWorkspacePVC("cicd", "pvc-orphan", 8*time.Hour,
+		[]metav1.OwnerReference{fjjPVCOwner("tekton.dev/v1", "PipelineRun", "pr-gone")}, nil)
+	cs := fake.NewSimpleClientset(pvc)
+	cs.PrependReactor("delete", "persistentvolumeclaims",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewConflict(
+				corev1.Resource("persistentvolumeclaims"), "pvc-orphan",
+				errors.New("uid mismatch"))
+		})
+	j := &failedJobsJanitor{
+		cs: cs, dyn: fjjDynFake(), now: time.Now, queue: "failed-jobs-janitor",
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
+	}
+	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	if err := j.sweepOrphanWorkspacePVCs(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 0 {
+		t.Fatalf("Conflict race metered as an error: delta = %v, want 0", got)
+	}
+	if !fjjPVCExists(t, cs, "cicd", "pvc-orphan") {
+		t.Fatal("pvc vanished despite the rejected delete")
+	}
+}

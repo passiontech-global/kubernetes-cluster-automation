@@ -127,28 +127,33 @@ func (p *operatorWorkqueueCheck) scanOperatorResources(ctx context.Context,
 		resolved:      map[string]opResolvedObj{},
 		reasonsFrozen: map[string]bool{},
 	}
-	lists := map[schema.GroupVersionResource]*unstructured.UnstructuredList{}
+	// The per-GVR cache holds plain item slices: the cluster-wide
+	// List goes through kube.ListAll with the shared page Limit (a
+	// full CRD read every 5m sweep is what pagination exists to
+	// prevent), and sibling rows sharing the GVR still reuse the one
+	// fetch (BUG-C5) — errors cache the empty slice the same way.
+	lists := map[schema.GroupVersionResource][]unstructured.Unstructured{}
 	for _, res := range op.resources {
-		list, listed := lists[res.gvr]
+		items, listed := lists[res.gvr]
 		if !listed {
-			l, err := p.Dyn.Resource(res.gvr).List(ctx, metav1.ListOptions{})
+			l, err := kube.ListAll(ctx,
+				metav1.ListOptions{Limit: kube.DefaultListPageSize},
+				kube.DynamicPage(p.Dyn.Resource(res.gvr)))
 			switch {
 			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-				lists[res.gvr] = &unstructured.UnstructuredList{}
-				list = lists[res.gvr]
+				// CRD absent / not yet served — nothing to scan;
+				// the empty cache serves the sibling row too.
 			case err != nil:
 				scan.evalFailed = true
 				rep.InfraErr(fmt.Errorf("list %s (%s): %w",
 					res.gvr.Resource, op.name, err))
-				lists[res.gvr] = &unstructured.UnstructuredList{}
-				list = lists[res.gvr]
 			default:
-				lists[res.gvr] = l
-				list = l
+				items = l
 			}
+			lists[res.gvr] = items
 		}
-		for i := range list.Items {
-			o := &list.Items[i]
+		for i := range items {
+			o := &items[i]
 			key := op.name + "/" + res.gvr.Resource + "/" +
 				o.GetNamespace() + "/" + o.GetName()
 			if !res.stuck(o) {

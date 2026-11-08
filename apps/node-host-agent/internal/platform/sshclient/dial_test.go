@@ -27,6 +27,15 @@ import (
 // Close only need the banner + auth exchange.
 func startTestSSHServer(t *testing.T) string {
 	t.Helper()
+	addr, _ := startTestSSHServerHostKey(t)
+	return addr
+}
+
+// startTestSSHServerHostKey is startTestSSHServer, returning the
+// server's public host key — the host-key pin tests need it to build
+// the fingerprint a real operator would read off the VM.
+func startTestSSHServerHostKey(t *testing.T) (string, ssh.PublicKey) {
+	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +70,7 @@ func startTestSSHServer(t *testing.T) string {
 			}()
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), hostSigner.PublicKey()
 }
 
 // dialTestConfig builds a Config whose key file holds a fresh ed25519

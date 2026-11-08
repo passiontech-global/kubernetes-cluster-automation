@@ -214,6 +214,89 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	}
 }
 
+// The refresh patch rides the shared heal gate: under an active
+// maintenance mutex a stuck app still FAILs (the gauge carries the
+// alert) but draws NO refresh patch — the old CooledDown-only gate
+// patched straight through a drain.
+func TestArgoCDRefreshDefersUnderMaintenance(t *testing.T) {
+	base := time.Now()
+	app := argoCDApplication("argocd", "maint-app", "Progressing")
+	app.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/maint-app":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`})
+	dyn := probetest.OpDyn(app)
+	cordoned := testutil.Node("w1", corev1.ConditionTrue, nil)
+	cordoned.Spec.Unschedulable = true
+	cs := fake.NewSimpleClientset(cordoned)
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	testutil.CleanupMetric(t, argoCDAppStuckGauge,
+		"argocd", "maint-app", "progressing>45m0s")
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("stuck app must still FAIL under maintenance: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "maint-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
+		t.Fatal("refresh=hard patched through the maintenance mutex")
+	}
+}
+
+// Two stuck Applications sharing one downscaled Deployment pay ONE
+// workload Get per sweep — the per-app×resource lookups memoize on
+// downscaledSeen (ownerSeen's shape) without changing any verdict.
+func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
+	base := time.Now()
+	resources := func() []any {
+		return []any{map[string]any{
+			"kind": "Deployment", "namespace": "web", "name": "frontend",
+			"health": map[string]any{"status": "Suspended"}},
+		}
+	}
+	appA := argoCDApplication("argocd", "memo-a", "Progressing")
+	appA.Object["status"].(map[string]any)["resources"] = resources()
+	appA.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/memo-a":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`})
+	appB := argoCDApplication("argocd", "memo-b", "Progressing")
+	appB.Object["status"].(map[string]any)["resources"] = resources()
+	appB.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/memo-b":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`})
+	dyn := probetest.OpDyn(appA, appB)
+	zero := int32(0)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "web",
+			Name:        "frontend",
+			Annotations: map[string]string{"downscaler/downtime": "22:00-06:00"},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &zero},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	gets := 0
+	cs.PrependReactor("get", "deployments",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			gets++
+			return false, nil, nil
+		})
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("downscaled-only apps must pass: %+v", res)
+	}
+	if gets != 1 {
+		t.Fatalf("deployment Gets = %d, want 1 — the per-sweep memo collapsed the N+1", gets)
+	}
+}
+
 // argoCDApplication builds an ArgoCD Application unstructured carrying the
 // given health status and conditions.
 func argoCDApplication(ns, name, health string, conds ...map[string]any) *unstructured.Unstructured {

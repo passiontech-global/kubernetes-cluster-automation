@@ -62,12 +62,22 @@ func (s *Store) RateOK(name string, interval time.Duration) bool {
 
 // RateOKIn is RateOK with an explicit dir — controllerhygiene's
 // rateOK(dir, name, interval) parity for budgets outside Dir.
+// A clock step-back (NTP correction, manual set) must not open the
+// gate: a stamp from the future makes age negative, and "negative
+// age >= interval" passes every interval — a silent budget bypass.
+// Clamp to 0: a future stamp is simply not expired yet. This is the
+// ONLY now-last comparison in the package, so RateTrySpend's check
+// branch (and everything built on RateOK) inherits the clamp.
 func (s *Store) RateOKIn(dir, name string, interval time.Duration) bool {
 	if dir == "" {
 		dir = s.Dir
 	}
 	last := s.Epoch(filepath.Join(dir, name))
-	return s.Now().Unix()-last >= int64(interval.Seconds())
+	age := s.Now().Unix() - last
+	if age < 0 {
+		age = 0
+	}
+	return age >= int64(interval.Seconds())
 }
 
 // RateSpend stamps the budget file with the current epoch —

@@ -143,9 +143,22 @@ func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 				kube.UIDDeleteOptions(t.uid, ""))
 		},
 		OnError: func(log logr.Logger, t runTarget, err error) {
-			metrics.IncError(j.queue)
-			log.Error(err, kind+" delete failed",
-				kind, t.ns+"/"+t.name)
+			switch {
+			case apierrors.IsNotFound(err):
+				// The run was deleted under us — raced with its
+				// operator's own TTL cleaner; nothing failed.
+				log.Info("SKIP: "+kind+" already gone — raced with an external delete",
+					kind, t.ns+"/"+t.name)
+			case apierrors.IsConflict(err):
+				// The UID precondition fired — a same-named run was
+				// recreated since the list; not ours to reap.
+				log.Info("SKIP: "+kind+" recreated since the list — UID precondition fired",
+					kind, t.ns+"/"+t.name)
+			default:
+				metrics.IncError(j.queue)
+				log.Error(err, kind+" delete failed",
+					kind, t.ns+"/"+t.name)
+			}
 		},
 	})
 	if deleted > 0 {
@@ -440,9 +453,22 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 				kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground))
 		},
 		OnError: func(log logr.Logger, t orphanWorkspaceTarget, err error) {
-			metrics.IncError(j.queue)
-			log.Error(err, "orphan workspace pvc sweep failed",
-				"pvc", t.ns+"/"+t.name)
+			switch {
+			case apierrors.IsNotFound(err):
+				// The PVC was deleted under us — raced with its
+				// owner's workspace cleanup; nothing failed.
+				log.Info("SKIP: pvc already gone — raced with an external delete",
+					"pvc", t.ns+"/"+t.name)
+			case apierrors.IsConflict(err):
+				// The UID precondition fired — a same-named claim was
+				// recreated since the list; not ours to reap.
+				log.Info("SKIP: pvc recreated since the list — UID precondition fired",
+					"pvc", t.ns+"/"+t.name)
+			default:
+				metrics.IncError(j.queue)
+				log.Error(err, "orphan workspace pvc sweep failed",
+					"pvc", t.ns+"/"+t.name)
+			}
 		},
 	})
 	if capped {

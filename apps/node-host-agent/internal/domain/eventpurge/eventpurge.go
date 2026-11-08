@@ -38,6 +38,10 @@ const (
 	defaultAPI     = "https://127.0.0.1:6443"
 	defaultWorkers = 8
 	defaultTimeout = 30 * time.Second
+	// defaultMaxDeletes caps one purge run's DELETEs — tens of
+	// thousands of stale Events delete across cycles, never in one
+	// unbounded burst against the apiserver.
+	defaultMaxDeletes = 5000
 
 	defaultCAFile   = "/var/lib/k0s/pki/ca.crt"
 	fallbackCAFile  = "/var/lib/k0s/pki/etcd/ca.crt"
@@ -62,12 +66,14 @@ func DefaultCA() string {
 
 // Config carries the purge inputs — every field test-injectable.
 type Config struct {
-	API      string        // apiserver base URL (no trailing slash)
-	CAFile   string        // "" → DefaultCA()
-	CertFile string        // "" → admin.crt
-	KeyFile  string        // "" → admin.key
-	Workers  int           // parallel DELETEs; <=0 → 8
-	Timeout  time.Duration // per-request budget; <=0 → 30s
+	API      string // apiserver base URL (no trailing slash)
+	CAFile   string // "" → DefaultCA()
+	CertFile string // "" → admin.crt
+	KeyFile  string // "" → admin.key
+
+	Workers    int           // parallel DELETEs; <=0 → 8
+	Timeout    time.Duration // per-request budget; <=0 → 30s
+	MaxDeletes int           // per-run DELETE cap; <=0 → 5000 — overflow is skipped, not deleted
 
 	// Client, when non-nil, is used verbatim — CA/cert/key files are
 	// ignored. This is the httptest.NewTLSServer seam and the way a
@@ -93,6 +99,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = defaultTimeout
+	}
+	if c.MaxDeletes <= 0 {
+		c.MaxDeletes = defaultMaxDeletes
 	}
 }
 
@@ -163,8 +172,20 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 		return err
 	}
 	_, _ = fmt.Fprintf(out, "to delete: %d\n", len(paths))
-	ok, errs, firstErr := deleteAll(ctx, client, cfg.API, paths, cfg.Workers)
+	// The LIST runs fully, but only the first MaxDeletes stale paths
+	// feed the worker pool — the rest are skipped (next run deletes
+	// them). The cap line only prints when it actually bit, keeping
+	// the script's exact 2-line output otherwise.
+	toDelete := paths
+	capped := len(paths) > cfg.MaxDeletes
+	if capped {
+		toDelete = paths[:cfg.MaxDeletes]
+	}
+	ok, errs, firstErr := deleteAll(ctx, client, cfg.API, toDelete, cfg.Workers)
 	_, _ = fmt.Fprintf(out, "deleted=%d errors=%d\n", ok, errs)
+	if capped {
+		_, _ = fmt.Fprintf(out, "skipped_by_cap=%d\n", len(paths)-len(toDelete))
+	}
 	if firstErr != "" {
 		// The tally alone cannot say WHY deletes failed — RBAC,
 		// a wedged apiserver and a 404 storm all read "errors=N".

@@ -3,7 +3,9 @@ package hostexec
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -345,5 +347,45 @@ func TestRunEnvLayersOverInherited(t *testing.T) {
 
 	if _, _, err := RunEnv(context.Background(), nil, nil, ""); err == nil {
 		t.Fatal("empty argv want error")
+	}
+}
+
+// TestCtxExpiryKillsWholeProcessTree: CommandContext's default cancel
+// kills only the direct child — a grandchild (`sleep 30 &` behind a
+// `wait`) survives and keeps running. newCmd puts the child in its own
+// process group and SIGKILLs the GROUP at ctx expiry, so the whole
+// tree dies. The grandchild announces its pid on stdout; after Run
+// returns on the timeout, that pid must be gone from /proc.
+func TestCtxExpiryKillsWholeProcessTree(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	out, err := RunCombined(ctx, "sh", "-c", `sleep 30 & echo $!; wait`)
+	if err == nil {
+		t.Fatal("expected the ctx deadline to fail the run")
+	}
+	pid := strings.TrimSpace(out)
+	if pid == "" {
+		t.Fatalf("grandchild pid missing from output %q", out)
+	}
+	if _, convErr := strconv.Atoi(pid); convErr != nil {
+		t.Fatalf("output %q does not carry the grandchild pid: %v", out, convErr)
+	}
+
+	// SIGKILL delivery to a group member takes a moment after the
+	// kill lands on the leader — poll briefly before declaring the
+	// grandchild survived.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, serr := os.Stat("/proc/" + pid + "/cmdline"); os.IsNotExist(serr) {
+			return // group kill took the grandchild with the child
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild pid %s survived the group kill", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

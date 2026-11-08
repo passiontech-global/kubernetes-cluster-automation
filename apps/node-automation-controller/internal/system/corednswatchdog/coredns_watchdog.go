@@ -9,7 +9,9 @@
 // apiserver):
 //
 //  1. log fast-path: grep the informer/reflector death signature in
-//     the last 10m of logs — instant catch, no false positives.
+//     the last 10m of logs — the signature must hold on two
+//     consecutive runs (streak) before the pod counts as stale, so
+//     a one-off blip in the window cannot restart a healthy pod.
 //  2. active freshness query: pick a Service <10m old with a ready
 //     EndpointSlice (its delta certainly crossed a healthy watch) and
 //     resolve <svc>.<ns>.svc.cluster.local directly against each pod's
@@ -71,6 +73,14 @@ type coreDNSWatchdog struct {
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
 	streak state.StreakLedger
+	// logStreak is layer-1's own consecutive-hit counter, kept
+	// SEPARATE from the layer-2 streak: a run whose 10m log window
+	// no longer shows the death signature is not proof of health
+	// (the line scrolled out), so the miss resets only this ledger —
+	// resetting the shared streak here would let a clean log window
+	// erase layer-2's probe evidence forever and stale pods would
+	// never reach the two-failure threshold.
+	logStreak state.StreakLedger
 	// now is the clock seam — tests pin it so the recovery cooldown
 	// window and the stamped timestamps are deterministic.
 	// nil → time.Now.
@@ -134,14 +144,34 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		_, ok := podIP[name]
 		return ok
 	})
+	w.logStreak.Prune(func(name string) bool {
+		_, ok := podIP[name]
+		return ok
+	})
 	stale := map[string]bool{}
 
 	// ===== Layer 1: log fast-path =====
+	// Mirror of layer-2's streak: the signature must hold on two
+	// CONSECUTIVE runs before the pod counts as stale — one blip in
+	// the 10m window must not restart a healthy pod (a stale pod
+	// re-logs the reflector death every retry, so the hits keep
+	// coming). Per-pod like before — only layer-2 carries the
+	// fleet-wide abort.
 	for name := range podIP {
 		if hit := w.logHitFn(ctx, name); hit != "" {
-			stale[name] = true
-			w.streak.Set(name, corednsStreakMax)
-			log.Info("log: STALE — informer death signature", "pod", name, "match", hit)
+			if s := w.logStreak.Hit(name); s >= corednsStreakMax {
+				stale[name] = true
+				log.Info("log: STALE — informer death signature",
+					"pod", name, "match", hit, "streak", s)
+			} else {
+				log.Info("log: suspect — informer death signature",
+					"pod", name, "match", hit, "streak", s, "max", corednsStreakMax)
+			}
+		} else {
+			// No signature this run: reset so the next hit re-arms
+			// from zero instead of riding an old streak (only this
+			// ledger — see logStreak's field comment).
+			w.logStreak.Reset(name)
 		}
 	}
 

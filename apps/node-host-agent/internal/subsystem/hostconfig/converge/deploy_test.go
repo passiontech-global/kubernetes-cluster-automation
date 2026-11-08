@@ -280,6 +280,35 @@ func TestNftUnitCheckFailurePropagates(t *testing.T) {
 	}
 }
 
+// TestNftUnitUnitWriteFailurePropagates: the unit-file write is NOT
+// fire-and-forget — a failed WriteManaged must surface ErrManagedWrite-
+// wrapped (the caller's errors.Is skip treats it as already attributed)
+// and skip every systemctl verb: daemon-reload/enable/start would
+// apply a ruleset whose boot unit never landed.
+func TestNftUnitUnitWriteFailurePropagates(t *testing.T) {
+	o := &fakeOps{fakeFileOps: *newFakeFileOps(t)}
+	o.writeErrs = map[string]error{
+		"/etc/systemd/system/mesh-rules.service": errors.New("disk full"),
+	}
+	err := NftUnit(context.Background(), o, "mesh-rules",
+		"/etc/nftables.d/mesh.conf", []byte("table inet mesh {}"), "mesh ruleset")
+	if !errors.Is(err, ErrManagedWrite) {
+		t.Fatalf("err = %v, want ErrManagedWrite-wrapped unit write failure", err)
+	}
+	if !strings.Contains(err.Error(), "mesh-rules.service") ||
+		!strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want unit path + cause in the wrap", err)
+	}
+	if len(o.verbs) != 0 {
+		t.Fatalf("no unit verbs may run after a failed unit write: %v", o.verbs)
+	}
+	// The validated ruleset itself still landed — only the unit
+	// write failed.
+	if got := testutil.ReadFile(t, o.host.Join("/etc/nftables.d/mesh.conf")); got != "table inet mesh {}" {
+		t.Fatalf("ruleset = %q, want promoted", got)
+	}
+}
+
 // Deploy relies on os.ReadFile(Join(path)) — a fake Join that does
 // not root under real fs would break the unchanged check; assert the
 // seam by writing through the real Host once more from a different

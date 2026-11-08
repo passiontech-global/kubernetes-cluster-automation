@@ -84,6 +84,11 @@ type Host struct {
 	HostExecFn func(ctx context.Context, combined bool,
 		budget time.Duration, name string, args ...string) (string, error)
 	NotifyFn func(msg string) error
+	// StatFSFn returns (free, total) bytes of the filesystem holding
+	// path — the etcdguard pre-maintenance snapshot headroom gate
+	// reads it (the kine backup verifier has the same gate shape over
+	// kdeps.StatFSFn). nil → statfsFreeBytes.
+	StatFSFn func(path string) (freeBytes, totalBytes int64, err error)
 }
 
 // Etcd holds the etcdguard seams — the etcdctl probe exec and the
@@ -158,6 +163,9 @@ func (s *Seams) applyDefaults(c *Config) {
 		sock := c.Feeder.NotifySocket
 		s.NotifyFn = func(msg string) error { return sdNotify(sock, msg) }
 	}
+	if s.StatFSFn == nil {
+		s.StatFSFn = statfsFreeBytes
+	}
 	if s.ProbeFn == nil {
 		to := c.Feeder.ProbeTO
 		s.ProbeFn = func(ctx context.Context, url string) bool {
@@ -218,4 +226,15 @@ func (s *Seams) applyDefaults(c *Config) {
 	if s.TLSCertFn == nil {
 		s.TLSCertFn = tlsDialCert
 	}
+}
+
+// statfsFreeBytes returns the free and total byte counts of the
+// filesystem holding path — the StatFSFn production default.
+func statfsFreeBytes(path string) (freeBytes, totalBytes int64, err error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return st.Bsize * int64(st.Bfree),
+		st.Bsize * int64(st.Blocks), nil
 }

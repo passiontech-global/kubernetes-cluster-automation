@@ -62,8 +62,10 @@ const (
 	// AnnoAutoRollOnDelete opts a StatefulSet into
 	// statefulset-roller's roll-on-delete.
 	AnnoAutoRollOnDelete = "passiontech.dev/auto-roll-ondelete"
-	// AnnoEvictOnPartition opts a pod/namespace into
-	// partition-evictor's partitioned-node eviction.
+	// AnnoEvictOnPartition opts an individual POD (in any namespace)
+	// into partition-evictor's partitioned-node eviction — pod-level
+	// opt-in only: the sweep reads p.Annotations, never the
+	// namespace's, so annotating the namespace object opts nothing in.
 	AnnoEvictOnPartition = "passiontech.dev/evict-on-partition"
 	// AnnoQuarantinedEndpoints is apiserver-endpoint-guard's record
 	// of endpoints it removed from the apiserver Service.
@@ -125,6 +127,19 @@ const (
 	// AnnoLastKargoRefresh is kargo-promotion-health's persisted
 	// cooldown for its warehouse-refresh merge-patches.
 	AnnoLastKargoRefresh = "passiontech.dev/last-kargo-refresh"
+	// AnnoLastLinkerdEndpointSyncHeal is linkerd-endpoint-sync's
+	// durable bounce stamp on the desynced Service — the persisted
+	// half of the escalating per-service destination-bounce cooldown
+	// (survives operator restarts).
+	AnnoLastLinkerdEndpointSyncHeal = "passiontech.dev/last-linkerd-endpoint-sync-heal"
+	// AnnoLastOLMOperatorHeal is olm-subscription-health's durable
+	// stamp on the olm-operator Deployment — the persisted half of
+	// the 1h operator-bounce cooldown (survives operator restarts).
+	AnnoLastOLMOperatorHeal = "passiontech.dev/last-olm-operator-heal"
+	// AnnoLastLocalPVProvisionerHeal is localpv-stranded-pods' durable
+	// stamp on the openebs-localpv-provisioner Deployment — the
+	// persisted half of the 1h provisioner-bounce cooldown.
+	AnnoLastLocalPVProvisionerHeal = "passiontech.dev/last-localpv-provisioner-heal"
 	// AnnoAllowEmptySecretKey opts an ExternalSecret out of the
 	// externalsecret-nudge empty/whitespace-key audit (some Secrets
 	// legitimately carry empty values).

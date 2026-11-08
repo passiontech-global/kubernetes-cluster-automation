@@ -178,15 +178,37 @@ func CertNewerThan(disk, sock *x509.Certificate) bool {
 	return false
 }
 
-// readLeafCert parses the first PEM cert block of a file.
+// readLeafCert parses the leaf certificate of a file: the first PEM
+// block whose cert is NOT a CA (IsCA == false) — bundles carry the
+// chain after the leaf, and comparing the socket cert against an
+// intermediate would flag phantom drift. Falls back to the first
+// block when the file only holds CA certs.
 func readLeafCert(path string) (*x509.Certificate, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("no PEM block in %s", path)
+	var first *x509.Certificate
+	rest := data
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		if first == nil {
+			first = crt
+		}
+		if !crt.IsCA {
+			return crt, nil
+		}
 	}
-	return x509.ParseCertificate(block.Bytes)
+	if first != nil {
+		return first, nil
+	}
+	return nil, fmt.Errorf("no PEM certificate in %s", path)
 }

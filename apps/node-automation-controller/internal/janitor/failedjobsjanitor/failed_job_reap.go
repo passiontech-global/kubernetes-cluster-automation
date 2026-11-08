@@ -15,6 +15,7 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -94,9 +95,22 @@ func (j *failedJobsJanitor) sweepFailedJobs(ctx context.Context) error {
 				kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground))
 		},
 		OnError: func(log logr.Logger, t failedJobTarget, err error) {
-			metrics.IncError(j.queue)
-			log.Error(err, "job delete failed",
-				"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
+			switch {
+			case apierrors.IsNotFound(err):
+				// The Job was deleted under us — raced with an
+				// external cleanup; nothing failed.
+				log.Info("SKIP: job already gone — raced with an external delete",
+					"job", t.ns+"/"+t.name)
+			case apierrors.IsConflict(err):
+				// The UID precondition fired — a same-named Job was
+				// recreated since the list; not ours to reap.
+				log.Info("SKIP: job recreated since the list — UID precondition fired",
+					"job", t.ns+"/"+t.name)
+			default:
+				metrics.IncError(j.queue)
+				log.Error(err, "job delete failed",
+					"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
+			}
 		},
 	})
 	if capped {

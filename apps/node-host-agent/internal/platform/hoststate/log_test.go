@@ -7,8 +7,10 @@
 package hoststate
 
 import (
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,4 +57,66 @@ func TestAppendLogWarnRotatesOversizedLog(t *testing.T) {
 func TestAppendLogEmptyLogFileIsSlogOnly(t *testing.T) {
 	s := New(t.TempDir(), "", nil, nil)
 	s.AppendLogWarn("file half disabled") // must not panic
+}
+
+// TestAppendLogConcurrentRotationLosesNoGeneration: the rotate
+// decision+rename must be mutually exclusive (s.mu) — racing appends
+// that both stat an oversized log used to be able to BOTH rename, the
+// second rename replacing the .1 generation (and the fresh file's
+// early lines) wholesale. Every appended line must survive in the
+// union of the live file and the rotated .1.
+//
+// The write volume is tuned to fire EXACTLY ONE rotation (~11MiB
+// total against the 10MiB cap): the .1 slot is single-generation by
+// design — a second rotation legitimately replaces the first — so a
+// second rotation would defeat the invariant this test pins.
+func TestAppendLogConcurrentRotationLosesNoGeneration(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+
+	const (
+		goroutines = 8
+		linesEach  = 42
+		lineSize   = 32 << 10
+	)
+	line := strings.Repeat("x", lineSize)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := range linesEach {
+				s.AppendLog(line + fmt.Sprintf(" g%02d j%03d", g, j))
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if _, err := os.Stat(logFile + ".1"); err != nil {
+		t.Fatalf("rotation never fired — test wrote %d MiB: %v",
+			goroutines*linesEach*lineSize>>20, err)
+	}
+	// Exactly one rotation: the live file holds only the post-rotate
+	// lines (< cap), .1 holds the pre-rotate generation.
+	if fi, err := os.Stat(logFile); err != nil ||
+		fi.Size() >= watchdogLogMaxBytes {
+		t.Fatalf("live log size = %d err=%v — a second rotation fired", fi.Size(), err)
+	}
+	all := testutil.ReadFile(t, logFile)
+	if b, err := os.ReadFile(logFile + ".1"); err == nil {
+		all += string(b)
+	}
+	missing := 0
+	for g := range goroutines {
+		for j := range linesEach {
+			if !strings.Contains(all, fmt.Sprintf(" g%02d j%03d", g, j)) {
+				missing++
+			}
+		}
+	}
+	if missing > 0 {
+		t.Fatalf("%d appended lines lost to the rotation race", missing)
+	}
 }

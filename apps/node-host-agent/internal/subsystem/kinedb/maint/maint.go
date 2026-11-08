@@ -38,6 +38,40 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
+// buildHeavyScript renders the single-session psql script the heavy
+// block runs in: acquire the compact guard's advisory lock, REINDEX
+// TABLE CONCURRENTLY, VACUUM (FREEZE, ANALYZE) when the XID age
+// triggered, unlock. The \gset + \if keeps every statement behind
+// the lock check; a busy lock echoes kdeps.LockBusyMarker and skips
+// everything (probe deadTupleVacuum parity).
+func (m *Maint) buildHeavyScript(freeze bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS km_locked;\n",
+		m.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\gset\n\\if :km_locked\n")
+	fmt.Fprintf(&b, "REINDEX TABLE CONCURRENTLY %s;\n", kdeps.SQLIdent(m.d.Cfg.Table))
+	if freeze {
+		fmt.Fprintf(&b, "VACUUM (FREEZE, ANALYZE) %s;\n", kdeps.SQLIdent(m.d.Cfg.Table))
+	}
+	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", m.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
+	return b.String()
+}
+
+// buildLockProbe renders a try-lock/unlock probe for work that runs
+// outside psql (pg_repack) — a busy lock skips the caller this cycle.
+func (m *Maint) buildLockProbe() string {
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS km_probe;\n",
+		m.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\gset\n\\if :km_probe\n")
+	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", m.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
+	return b.String()
+}
+
 // deadTuplePct returns n_dead_tup as a percentage of estimated rows —
 // 0 when the stats view has no rows for the table (fresh stats or an
 // empty table never triggers repack).
@@ -122,18 +156,48 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	// listing or drop only notes, never fails the maint run.
 	m.reapInvalidIndexes(ctx, pg, user, pass, res, note)
 
-	// (a) REINDEX CONCURRENTLY — always, cheap on a small table.
-	if _, err := m.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), m.d.PsqlArgs(pg, user, false,
-		"-qc", "REINDEX TABLE CONCURRENTLY "+kdeps.SQLIdent(m.d.Cfg.Table)), ""); err == nil {
-		res.okReindex = true
-	} else {
-		note(fmt.Sprintf("reindex-fail: %v", err))
-	}
+	// (b) XID wraparound — read MAX(age(datfrozenxid)) first so the
+	// FREEZE vacuum can ride the locked session below (runs before
+	// the repack gate so a failing stats read cannot skip it).
+	freeze := m.readXidAge(ctx, pg, user, pass, res, note)
 
-	// (b) XID wraparound — VACUUM (FREEZE, ANALYZE) when
-	// MAX(age(datfrozenxid)) crosses 150M. Runs before the repack
-	// gate so a failing stats read cannot skip it.
-	m.xidFreezeCheck(ctx, pg, user, pass, res, note)
+	// (a) REINDEX CONCURRENTLY — always, cheap on a small table —
+	// plus the (b) FREEZE vacuum when the XID age triggers, inside
+	// ONE psql session holding the compact guard's advisory lock
+	// (session-level: held from the try-lock to the unlock / psql
+	// exit, so a concurrent compact guard cannot interleave its
+	// chunked deletes + VACUUM). A busy lock means a compact guard
+	// session is mid-run — skip the heavy block this cycle (it
+	// repeats daily; the compact ends in VACUUM anyway) without
+	// failing the maint cycle.
+	sout, serr := m.d.PsqlScript(ctx, pg, user, pass,
+		m.buildHeavyScript(freeze))
+	switch {
+	case serr != nil:
+		// ON_ERROR_STOP aborted the script — attribute the failure
+		// to every statement it may have carried.
+		res.okReindex = false
+		note(fmt.Sprintf("reindex-fail: %v", serr))
+		if freeze {
+			res.okFreeze = false
+			res.freezeState = "fail"
+			note(fmt.Sprintf("freeze-vacuum-fail: %v", serr))
+		}
+	case strings.Contains(sout, kdeps.LockBusyMarker):
+		// Skipped, not failed — the same skip-counts-as-ok parity the
+		// repack gates use; the block repeats next daily window.
+		res.okReindex = true
+		logger().Warn("kinedb: maint heavy block skipped — compact-guard advisory lock busy")
+		note("heavy block skipped: compact-guard advisory lock busy")
+		if freeze {
+			note(fmt.Sprintf("freeze skipped: lock busy (xid-age=%d)", res.xidAge))
+		}
+	default:
+		res.okReindex = true
+		if freeze {
+			res.freezeState = "done"
+		}
+	}
 
 	// (c) sizes + dead-tuple estimate from pg_stat_user_tables.
 	// Indexes via pg_indexes_size like the bash — total−heap would
@@ -185,6 +249,19 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 			"-qc", "VACUUM (ANALYZE) "+kdeps.SQLIdent(m.d.Cfg.Table)), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
+		return
+	}
+	// pg_repack runs in its own session, so it cannot hold the
+	// advisory lock — probe it and skip the repack this cycle when a
+	// compact guard is mid-run (best-effort: the probe releases
+	// before repack starts, but the compact is 10-minute-cadenced and
+	// retries next daily window).
+	if pout, perr := m.d.PsqlScript(ctx, pg, user, pass, m.buildLockProbe()); perr != nil {
+		note(fmt.Sprintf("repack-lock-probe-fail: %v", perr))
+	} else if strings.Contains(pout, kdeps.LockBusyMarker) {
+		res.repackState = "skipped-lock-busy"
+		note("repack skipped: compact-guard advisory lock busy")
+		logger().Warn("kinedb: pg_repack skipped — compact-guard advisory lock busy")
 		return
 	}
 	repackBin, rerr := m.d.Exec(ctx, []string{m.d.Cfg.Runtime, "exec", pg,

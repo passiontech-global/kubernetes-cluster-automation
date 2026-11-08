@@ -99,6 +99,11 @@ type certManagerReaper struct {
 	// path share ONE list per namespace per sweep (a failed list
 	// IncErrors once, not twice).
 	crCache map[string]crListResult
+	// orderCache: per-run ACME Order list + owner-cert attribution
+	// index keyed by namespace — reapCert consumes one entry per
+	// namespace per sweep instead of one Order List per cert
+	// candidate (same shape and lifecycle as crCache).
+	orderCache map[string]*orderIndex
 }
 
 // crListResult is the cached outcome of one namespace's CR List.
@@ -129,6 +134,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		r.resets = map[string]*certReset{}
 	}
 	r.crCache = map[string]crListResult{}
+	r.orderCache = map[string]*orderIndex{}
 	now := r.now.Now()
 
 	certs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},

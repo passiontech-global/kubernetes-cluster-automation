@@ -166,7 +166,9 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 func TestMaintCycleReindexFailure(t *testing.T) {
 	k, _, dir := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect", Out: "true"},
-		{Substr: "REINDEX TABLE CONCURRENTLY", Err: errors.New("lock timeout")},
+		// The reindex rides the locked psql script — a script failure
+		// (lock timeout etc.) aborts via ON_ERROR_STOP.
+		{Substr: "ON_ERROR_STOP", Err: errors.New("lock timeout")},
 		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
 	})
 	res := k.Cycle(context.Background())
@@ -246,19 +248,23 @@ func TestMaintReapsInvalidIndexes(t *testing.T) {
 	if strings.Contains(j, `DROP INDEX CONCURRENTLY IF EXISTS "kine_other_idx"`) {
 		t.Fatalf("non-ccnew/ccold index was dropped:\n%s", j)
 	}
-	// Ordering: every drop precedes the REINDEX TABLE run.
+	// Ordering: every drop precedes the locked heavy-script call
+	// (the REINDEX rides that psql session's stdin now).
 	dropIdx, reindexIdx := -1, -1
 	for i, c := range fr.Cmds() {
 		s := strings.Join(c, " ")
 		if strings.Contains(s, "DROP INDEX CONCURRENTLY") && dropIdx < 0 {
 			dropIdx = i
 		}
-		if strings.Contains(s, "REINDEX TABLE CONCURRENTLY") && reindexIdx < 0 {
+		if strings.Contains(s, "ON_ERROR_STOP") && reindexIdx < 0 {
 			reindexIdx = i
 		}
 	}
 	if dropIdx < 0 || reindexIdx < 0 || dropIdx > reindexIdx {
 		t.Fatalf("reaper ordering wrong (drop=%d reindex=%d)", dropIdx, reindexIdx)
+	}
+	if !strings.Contains(fr.LastStdin(), `REINDEX TABLE CONCURRENTLY "kine"`) {
+		t.Fatalf("heavy script missing reindex:\n%s", fr.LastStdin())
 	}
 }
 

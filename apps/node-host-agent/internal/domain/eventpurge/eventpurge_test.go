@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -165,5 +166,78 @@ func TestDefaultCAFallback(t *testing.T) {
 		}
 	} else if got != fallbackCAFile {
 		t.Fatalf("DefaultCA=%q want %q", got, fallbackCAFile)
+	}
+}
+
+// TestRunCapsDeletes — the LIST always runs fully, but only the
+// first MaxDeletes stale paths feed the worker pool; the overflow is
+// reported as skipped_by_cap=N (printed only when the cap bit — the
+// script's exact 2-line output otherwise).
+func TestRunCapsDeletes(t *testing.T) {
+	var deleted []string
+	var mu sync.Mutex
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		items := make([]any, 0, 5)
+		for i := 0; i < 5; i++ {
+			items = append(items, map[string]any{"metadata": map[string]any{
+				"namespace": "default", "name": fmt.Sprintf("old-%d", i),
+				"creationTimestamp": "2020-01-01T00:00:00Z"}})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"metadata": map[string]any{}, "items": items})
+	})
+	mux.HandleFunc("/api/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		deleted = append(deleted, r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	cutoff, err := time.Parse(time.RFC3339, "2026-08-23T04:27:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := Run(context.Background(), Config{
+		API: srv.URL, Client: srv.Client(),
+		Workers: 4, MaxDeletes: 3,
+	}, cutoff, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "to delete: 5\n") ||
+		!strings.Contains(got, "deleted=3 errors=0\n") ||
+		!strings.Contains(got, "skipped_by_cap=2\n") {
+		t.Fatalf("capped output wrong:\n%s", got)
+	}
+	mu.Lock()
+	if len(deleted) != 3 {
+		n := len(deleted)
+		mu.Unlock()
+		t.Fatalf("deleted=%d want exactly the cap (3)", n)
+	}
+	mu.Unlock()
+
+	// Uncapped run: the extra line must NOT appear (script parity).
+	mu.Lock()
+	deleted = nil
+	mu.Unlock()
+	out.Reset()
+	if err := Run(context.Background(), Config{
+		API: srv.URL, Client: srv.Client(),
+		Workers: 4, MaxDeletes: 5000,
+	}, cutoff, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "skipped_by_cap") {
+		t.Fatalf("cap line printed on an uncapped run:\n%s", out.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) != 5 {
+		t.Fatalf("uncapped run deleted=%d want 5", len(deleted))
 	}
 }

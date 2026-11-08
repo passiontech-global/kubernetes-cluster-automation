@@ -20,6 +20,11 @@ type atcClient struct {
 	base  string
 	hc    *http.Client
 	token string // "Bearer <token>", set by login
+	// user/pass memoize the last SUCCESSFUL login's credentials so
+	// doJSON can re-authenticate once when a 401 says the Dex token
+	// expired mid-run (a 190m run outlives the ~1h token TTL). Calls
+	// are strictly sequential within one run — no locking.
+	user, pass string
 }
 
 func newATCClient(base string, hc *http.Client) *atcClient {
@@ -79,6 +84,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 		return errors.New("atc token response has no access_token")
 	}
 	c.token = "Bearer " + tok.AccessToken
+	c.user, c.pass = user, pass
 	return nil
 }
 
@@ -117,18 +123,47 @@ func (c *atcClient) pruneWorker(ctx context.Context, name string) error {
 }
 
 // doJSON runs an authenticated request; a non-2xx status is an error
-// carrying the status line.
+// carrying the status line. A 401 means the token issued at login
+// expired mid-run — the whole-run bound (cjRunTimeout) outlives the
+// Dex token TTL, and every later call would 401: drain would then
+// read the land confirmation as a land FAILURE and delete the worker
+// pod undrained. doJSON therefore re-logins with the stored
+// credentials and retries the request EXACTLY once — no loop; a
+// second 401 (or a failed re-login) surfaces as the error it is.
 func (c *atcClient) doJSON(ctx context.Context, method, endpoint string, out any) error {
+	status, err := c.atcDo(ctx, method, endpoint, out)
+	if err == nil || status != http.StatusUnauthorized {
+		return err
+	}
+	if err := c.relogin(ctx); err != nil {
+		return fmt.Errorf("atc re-login after 401 on %s %s: %w", method, endpoint, err)
+	}
+	_, err = c.atcDo(ctx, method, endpoint, out)
+	return err
+}
+
+// relogin re-authenticates with the credentials of the last
+// successful login — a no-op-friendly passthrough to login when they
+// were never stored (the request then fails like the expired token
+// did).
+func (c *atcClient) relogin(ctx context.Context) error {
+	return c.login(ctx, c.user, c.pass)
+}
+
+// atcDo issues ONE authenticated request; status is the HTTP status
+// code (0 on transport error) and err the transport/status/decode
+// error — a non-2xx status is an error carrying the status line.
+func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, out any) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", c.token)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		// Drain so the connection can be reused (keep-alive);
@@ -138,10 +173,10 @@ func (c *atcClient) doJSON(ctx context.Context, method, endpoint string, out any
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("atc %s %s: status %s", method, endpoint, resp.Status)
+		return resp.StatusCode, fmt.Errorf("atc %s %s: status %s", method, endpoint, resp.Status)
 	}
 	if out == nil {
-		return nil
+		return resp.StatusCode, nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return resp.StatusCode, json.NewDecoder(resp.Body).Decode(out)
 }

@@ -13,10 +13,15 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -34,9 +39,10 @@ type olmHealthCheck struct {
 	//   - olmEmitted: the emitted-gauge ledger for the same keys
 	//     held at gauge=1 — a tuple not re-seen gets
 	//     DeleteLabelValues, not a stale 1.
-	//   - olmHealed: reason → last olm-operator pod delete — the 1h
-	//     cooldown (in-RAM: deleting the operator pod is the heal,
-	//     nothing else can carry the stamp).
+	//   - olmHealed: reason → last olm-operator pod delete — the
+	//     in-RAM half of the 1h cooldown (the
+	//     passiontech.dev/last-olm-operator-heal stamp on the
+	//     olm-operator Deployment is the durable half).
 	olmFirstSeen state.FirstSeenLedger
 	olmEmitted   state.GaugeLedger[string]
 	olmHealed    state.CooldownSet
@@ -67,6 +73,9 @@ const (
 	// rotation this long triggers the olm-operator pod delete.
 	olmHealMinAge   = 20 * time.Minute
 	olmHealCooldown = time.Hour
+	// olmHealAnno persists the last olm-operator heal moment on the
+	// operator's Deployment — the restart-proof half of the cooldown.
+	olmHealAnno = kube.AnnoLastOLMOperatorHeal
 	// olmOperatorNS/PodPrefix locate the operator pods the heal
 	// deletes to force CSV/webhook-cert reconciliation.
 	olmOperatorNS        = "olm"
@@ -168,14 +177,47 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 // healOLMOperator deletes the olm-operator pod(s) — a wedged
 // operator stops reconciling CSVs and stops rotating the webhook
 // certificates it owns, so a restart forces both queues to re-list.
-// probefw.BounceOperatorPod carries the gates (the 1h in-RAM
-// cooldown — the pod is the heal target, nothing else can carry the
-// stamp — and the maintenance mutex, fail closed) plus the
-// ns-scoped prefix-filtered list, the UID-preconditioned deletes and
-// the census invalidate; the per-reason heal counters key on the
-// delivered-delete count.
+// The cooldown is the wider of the in-RAM ledger and the
+// passiontech.dev/last-olm-operator-heal stamp persisted on the
+// olm-operator Deployment (survives operator restarts) — the same
+// persisted-cooldown preamble the dragonfly heal carries; a
+// Deployment read failure defers the heal fail-closed, and an absent
+// Deployment collapses the gate to the ledger half. probefw.
+// BounceOperatorPod carries the gates' second half (in-RAM ledger +
+// maintenance mutex, fail closed) plus the ns-scoped prefix-filtered
+// list, the UID-preconditioned deletes and the census invalidate;
+// the per-reason heal counters key on the delivered-delete count.
 func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	log logr.Logger, reasons []string, now time.Time) {
+
+	// The durable cooldown half rides the operator's own Deployment —
+	// the one object whose lifetime spans the heal window. A
+	// transient read failure defers (fail closed); NotFound means
+	// there is nothing to annotate and the gate degrades to the
+	// ledger-only shape (AllowedVPersisted's nil-obj contract).
+	var obj metav1.Object
+	dep, err := p.CS.AppsV1().Deployments(olmOperatorNS).
+		Get(ctx, olmOperatorPodPrefix, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		obj = dep
+	case apierrors.IsNotFound(err):
+	default:
+		metrics.IncError(p.Name)
+		log.Info("WARN: read olm-operator deployment failed — heal deferred",
+			"error", err)
+		return
+	}
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.olmHealed, obj, olmHealAnno, olmOperatorPodPrefix,
+		olmHealCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
+		return
+	}
 
 	deleted := p.BounceOperatorPod(ctx, log, olmOperatorPodPrefix,
 		olmOperatorNS,
@@ -194,5 +236,21 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	}
 	for _, r := range reasons {
 		olmOperatorHealsTotal.WithLabelValues(r).Inc()
+	}
+	// Persist the stamp on the Deployment — the durable half of the
+	// cooldown. A patch failure leaves the in-RAM half (the delivered
+	// delete already stamped olmHealed) holding; nil ledger because
+	// the in-RAM key is shared with BounceOperatorPod's own stamps.
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().Deployments(olmOperatorNS).
+				Patch(ctx, olmOperatorPodPrefix, types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		olmHealAnno, nil, "", now); err != nil {
+		metrics.IncError(p.Name)
+		log.Error(err, "persist olm-operator heal stamp failed",
+			"deployment", olmOperatorNS+"/"+olmOperatorPodPrefix)
 	}
 }

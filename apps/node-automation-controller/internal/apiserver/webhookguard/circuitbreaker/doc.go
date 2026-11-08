@@ -4,11 +4,15 @@
 // independent duties behind the admission-webhook-guard sweep. The
 // sweep trips fail-closed sub-webhooks whose backend Service has
 // reported 0 effective Ready endpoints past the dead threshold to
-// failurePolicy=Ignore, restores them on recovery, bounces the
+// failurePolicy=Ignore, restores them after RecoverConfirmSweeps
+// consecutive healthy sweeps (the annotation stays the SSOT for
+// "broken"; the gate only delays the recover patch so a 0↔1
+// flapping backend cannot churn the WebhookConfiguration), bounces the
 // oldest Ready backing pod of a TCP+TLS-unresponsive backend, and
 // exports node_automation_crd_conversion_webhook_unhealthy for CRDs
 // whose conversion webhook backend is measurably broken. Its state
-// (dead-backend streaks, the broken-series ledger, bounce cooldowns,
+// (dead-backend streaks, recover-confirmation streaks, the
+// broken-series ledger, bounce cooldowns,
 // test-seam thresholds) lives on Breaker; shared deps and the run
 // snapshot come from guardstate.
 package circuitbreaker

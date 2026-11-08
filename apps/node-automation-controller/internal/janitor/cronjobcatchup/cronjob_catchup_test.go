@@ -710,3 +710,56 @@ func TestCronJobCatchupUnderMissedCapNoPatch(t *testing.T) {
 		t.Fatal("no gauge series under the missed cap")
 	}
 }
+
+// The dedupe index is ONE cluster-wide Jobs list per sweep, no matter
+// how many opted-in CronJobs need the check — and the ns-keyed verdicts
+// survive the switch: same-named CronJobs in different namespaces
+// dedupe independently, each against its own namespace's proof.
+func TestCronJobCatchupDedupeIndexesJobsOncePerSweep(t *testing.T) {
+	stale := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	ops := ccCronJob("ops", "nightly", "*/5 * * * *", &stale)
+	team := ccCronJob("team", "nightly", "*/5 * * * *", &stale)
+	// team/nightly has a fresh catch-up — ops/nightly must NOT inherit it.
+	teamPrior := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "team",
+			Name:              "nightly-catchup-123",
+			Labels:            map[string]string{catchupLabel: "nightly"},
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+		},
+	}
+	// ops/nightly has an active owned job instead.
+	opsActive := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ops", Name: "nightly-29381234",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1", Kind: "CronJob",
+				Name: "nightly", Controller: ptr.To(true),
+			}},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	cs := fake.NewSimpleClientset(ops, team, teamPrior, opsActive)
+	var jobLists int32
+	cs.PrependReactor("list", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&jobLists, 1)
+			return false, nil, nil // fall through to the tracker
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&jobLists); got != 1 {
+		t.Fatalf("jobs lists = %d, want exactly 1 per sweep", got)
+	}
+	// team/nightly deduped off its own labeled job; ops/nightly
+	// deduped off its own active job — neither spawned anything and
+	// neither saw the other's proof.
+	if n := ccJobCount(t, cs, "ops"); n != 1 {
+		t.Fatalf("ops jobs = %d, want the pre-existing active job only", n)
+	}
+	if n := ccJobCount(t, cs, "team"); n != 1 {
+		t.Fatalf("team jobs = %d, want the pre-existing labeled job only", n)
+	}
+}
