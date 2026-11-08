@@ -7,6 +7,7 @@ package agent
 
 import (
 	"context"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -67,12 +68,18 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		// Run returned while ctx is live (panic recovered, or
 		// a silent early return) — restart after backoff
 		// instead of letting the subsystem die invisibly.
+		// Jitter (±15%) desynchronizes subsystems sharing a
+		// restart cadence — without it every crash-looping
+		// subsystem restarts in lockstep at 5s and again at
+		// the same multiple up the exponential ladder, piling
+		// all the restart log lines and work into one burst.
+		wait := backoff + time.Duration(rand.Float64()*2-1)*(backoff*3/20)
 		logger().Error("subsystem exited unexpectedly — restarting",
-			"subsystem", sub.Name(), "backoff", backoff)
+			"subsystem", name, "backoff", backoff, "wait", wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 		if backoff *= 2; backoff > 5*time.Minute {
 			backoff = 5 * time.Minute

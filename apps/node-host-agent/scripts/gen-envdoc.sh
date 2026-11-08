@@ -159,6 +159,21 @@ HDR
 		}
 		print "- `" $2 "` — `" $3 "`"
 	}' "$rows"
+
+	printf '\n## Contract envs (not `NODE_HOST_AGENT_*`)\n\n'
+	cat <<'CONTRACT'
+Read directly, by contract — deliberately outside `internal/envnames`
+(the env contract there covers the agent's own knobs only; these are
+set by systemd or the k8s downward API):
+
+| Env var | Set by | Read at |
+| --- | --- | --- |
+| `NODE_NAME` | k8s downward API (pod mode) | `cmd/agent` + `ops/hostconverge` via `platform/hostctx.NodeName` (`NODE_HOST_AGENT_NODE_NAME` > `NODE_NAME` > flag) |
+| `POD_NAME` | k8s downward API (pod mode) | `cmd/agent` (pod identity, hubsync lease-holder) |
+| `POD_NAMESPACE` | k8s downward API (pod mode) | `cmd/agent` |
+| `NOTIFY_SOCKET` | systemd (standalone units) | `internal/agent/sdnotify.go` + `controllerhygiene/cdeps` (env knob row + feeder default) — via `platform/sdnotify.SocketEnv` |
+| `KUBECONFIG` | operator (in-cluster fallback) | `cmd/agent/main.go` kube client factory |
+CONTRACT
 } >"$final"
 
 mv "$final" "$out"

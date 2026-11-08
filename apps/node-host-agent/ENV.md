@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them with the
-source location of the first reference (127 knobs referenced
+source location of the first reference (128 knobs referenced
 across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -42,18 +42,16 @@ subsystem has no env gate.
 
 ### `cmd/agent`
 
-- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:130`
+- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:131`
 - `NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY` — `localbin.go:26`
-- `NODE_HOST_AGENT_NODE_NAME` — `main.go:256`
-- `NODE_HOST_AGENT_REQUEST_TIMEOUT` — `main.go:82`
-- `NODE_HOST_AGENT_STANDALONE` — `main.go:121`
-- `NODE_HOST_AGENT_TEXTFILE_INTERVAL` — `wiring.go:238`
+- `NODE_HOST_AGENT_REQUEST_TIMEOUT` — `main.go:83`
+- `NODE_HOST_AGENT_STANDALONE` — `main.go:122`
+- `NODE_HOST_AGENT_TEXTFILE_INTERVAL` — `wiring.go:236`
 
 ### `internal/ops/hostconverge`
 
-- `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `hostconverge.go:36`
+- `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `hostconverge.go:37`
 - `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `hostconverge.go:42`
-- `NODE_HOST_AGENT_NODE_NAME` — `hostconverge.go:39`
 
 ### `internal/ops/nebulasign`
 
@@ -66,6 +64,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_JOURNAL_DIRS` — `deps_env.go:91`
 - `NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED` — `deps_env.go:109`
 - `NODE_HOST_AGENT_NODE_NAME` — `deps_env.go:119`
+- `NODE_HOST_AGENT_NODE_NAME` — `hostctx.go:30`
 - `NODE_HOST_AGENT_TEXTFILE_DIR` — `deps_env.go:117`
 - `NODE_HOST_AGENT_WATCHDOG_CONF` — `deps_env.go:71`
 - `NODE_HOST_AGENT_WATCHDOG_LOG` — `deps_env.go:102`
@@ -96,35 +95,35 @@ subsystem has no env gate.
 
 ### `internal/subsystem/controllerhygiene/cdeps`
 
-- `NODE_HOST_AGENT_API_PEER` — `env.go:84`
-- `NODE_HOST_AGENT_API_SELF` — `env.go:83`
-- `NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS` — `env.go:118`
-- `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `env.go:77`
-- `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `env.go:129`
-- `NODE_HOST_AGENT_ETCD_ENDPOINT` — `env.go:128`
-- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:134`
-- `NODE_HOST_AGENT_FROZEN_CYCLES` — `env.go:93`
-- `NODE_HOST_AGENT_GAP_CYCLES` — `env.go:91`
-- `NODE_HOST_AGENT_GAP_MIN` — `env.go:89`
-- `NODE_HOST_AGENT_K0S_DIR` — `env.go:126`
-- `NODE_HOST_AGENT_KINE_DB_PROBE` — `env.go:85`
-- `NODE_HOST_AGENT_KINE_POOL_AUTOFIX` — `env.go:106`
-- `NODE_HOST_AGENT_KINE_POOL_CYCLES` — `env.go:109`
-- `NODE_HOST_AGENT_KINE_POOL_MAX_CONNS` — `env.go:107`
-- `NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S` — `env.go:111`
-- `NODE_HOST_AGENT_KINE_TTL_AUTOFIX` — `env.go:99`
-- `NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S` — `env.go:102`
-- `NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S` — `env.go:100`
-- `NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES` — `env.go:104`
-- `NODE_HOST_AGENT_OOMLOOP_AUTOFIX` — `env.go:113`
-- `NODE_HOST_AGENT_OOMLOOP_MIN_KILLS` — `env.go:114`
-- `NODE_HOST_AGENT_OOMLOOP_WINDOW_S` — `env.go:116`
-- `NODE_HOST_AGENT_PROC_ROOT` — `env.go:78`
-- `NODE_HOST_AGENT_SIG13_AUTOFIX` — `env.go:86`
-- `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `env.go:97`
-- `NODE_HOST_AGENT_SOLO_CYCLES` — `env.go:95`
-- `NODE_HOST_AGENT_STALE_MIN_ERRS` — `env.go:87`
-- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:133`
+- `NODE_HOST_AGENT_API_PEER` — `env.go:85`
+- `NODE_HOST_AGENT_API_SELF` — `env.go:84`
+- `NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS` — `env.go:119`
+- `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `env.go:78`
+- `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `env.go:131`
+- `NODE_HOST_AGENT_ETCD_ENDPOINT` — `env.go:130`
+- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:136`
+- `NODE_HOST_AGENT_FROZEN_CYCLES` — `env.go:94`
+- `NODE_HOST_AGENT_GAP_CYCLES` — `env.go:92`
+- `NODE_HOST_AGENT_GAP_MIN` — `env.go:90`
+- `NODE_HOST_AGENT_K0S_DIR` — `env.go:128`
+- `NODE_HOST_AGENT_KINE_DB_PROBE` — `env.go:86`
+- `NODE_HOST_AGENT_KINE_POOL_AUTOFIX` — `env.go:107`
+- `NODE_HOST_AGENT_KINE_POOL_CYCLES` — `env.go:110`
+- `NODE_HOST_AGENT_KINE_POOL_MAX_CONNS` — `env.go:108`
+- `NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S` — `env.go:112`
+- `NODE_HOST_AGENT_KINE_TTL_AUTOFIX` — `env.go:100`
+- `NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S` — `env.go:103`
+- `NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S` — `env.go:101`
+- `NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES` — `env.go:105`
+- `NODE_HOST_AGENT_OOMLOOP_AUTOFIX` — `env.go:114`
+- `NODE_HOST_AGENT_OOMLOOP_MIN_KILLS` — `env.go:115`
+- `NODE_HOST_AGENT_OOMLOOP_WINDOW_S` — `env.go:117`
+- `NODE_HOST_AGENT_PROC_ROOT` — `env.go:79`
+- `NODE_HOST_AGENT_SIG13_AUTOFIX` — `env.go:87`
+- `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `env.go:98`
+- `NODE_HOST_AGENT_SOLO_CYCLES` — `env.go:96`
+- `NODE_HOST_AGENT_STALE_MIN_ERRS` — `env.go:88`
+- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:135`
 
 ### `internal/subsystem/hostconfig`
 
@@ -162,13 +161,13 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE` — `config_env.go:35`
 - `NODE_HOST_AGENT_PROC_ROOT` — `config_env.go:34`
 
-### `internal/subsystem/kinedb`
+### `internal/subsystem/kinedb/kdeps`
 
-- `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `config_env.go:41`
-- `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `config_env.go:43`
-- `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `config_env.go:33`
-- `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `config_env.go:35`
-- `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `config_env.go:39`
+- `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `env.go:44`
+- `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `env.go:46`
+- `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `env.go:36`
+- `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `env.go:38`
+- `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `env.go:42`
 
 ### `internal/subsystem/nethealth`
 
@@ -203,19 +202,20 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
 - `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
 - `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
-- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:202`
-- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:196`
+- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:213`
+- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:207`
 - `NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD` — `config_pressure.go:44`
-- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:206`
+- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:217`
 - `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:102`
-- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:216`
-- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:194`
+- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:227`
+- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:205`
+- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:204`
 - `NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE` — `config_teardown.go:38`
-- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:217`
+- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:228`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE` — `config_teardown.go:36`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE` — `config_teardown.go:37`
-- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:200`
-- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:204`
+- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:211`
+- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:215`
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
 - `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101`
@@ -223,7 +223,21 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
 - `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:101`
-- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:195`
-- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:198`
+- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:206`
+- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:209`
 - `NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S` — `config_runtime.go:57`
 - `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:55`
+
+## Contract envs (not `NODE_HOST_AGENT_*`)
+
+Read directly, by contract — deliberately outside `internal/envnames`
+(the env contract there covers the agent's own knobs only; these are
+set by systemd or the k8s downward API):
+
+| Env var | Set by | Read at |
+| --- | --- | --- |
+| `NODE_NAME` | k8s downward API (pod mode) | `cmd/agent` + `ops/hostconverge` via `platform/hostctx.NodeName` (`NODE_HOST_AGENT_NODE_NAME` > `NODE_NAME` > flag) |
+| `POD_NAME` | k8s downward API (pod mode) | `cmd/agent` (pod identity, hubsync lease-holder) |
+| `POD_NAMESPACE` | k8s downward API (pod mode) | `cmd/agent` |
+| `NOTIFY_SOCKET` | systemd (standalone units) | `internal/agent/sdnotify.go` + `controllerhygiene/cdeps` (env knob row + feeder default) — via `platform/sdnotify.SocketEnv` |
+| `KUBECONFIG` | operator (in-cluster fallback) | `cmd/agent/main.go` kube client factory |

@@ -7,6 +7,8 @@ package cdeps
 import (
 	"os"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sdnotify"
 )
 
 // FeederConfig is the systemd watchdog feeder — sd_notify WATCHDOG=1
@@ -59,6 +61,6 @@ func (c *Config) applyFeederDefaults() {
 		c.Feeder.RemediatePeerFile = defaultPeerFile
 	}
 	if c.Feeder.NotifySocket == "" {
-		c.Feeder.NotifySocket = os.Getenv("NOTIFY_SOCKET")
+		c.Feeder.NotifySocket = os.Getenv(sdnotify.SocketEnv)
 	}
 }

@@ -258,20 +258,34 @@ func (s *Store) ExitClearAllSuspects(name string) {
 }
 
 // ClearSuspect drops the last-suspect-<name> dedupe budget so the
-// next SuspectLog for the key logs immediately.
+// next SuspectLog for the key logs immediately. Best-effort: an
+// absent budget is already clear, but a failed remove would
+// silently keep suppressing a re-incident's first line — surfaced
+// at Debug so operators tracing a latch have the evidence without
+// spamming steady-state logs.
 func (s *Store) ClearSuspect(name string) {
-	_ = os.Remove(filepath.Join(s.Dir, SuspectBudgetPrefix+name))
+	if err := os.Remove(filepath.Join(s.Dir,
+		SuspectBudgetPrefix+name)); err != nil && !os.IsNotExist(err) {
+		s.log().Debug("hoststate: failed to clear suspect budget",
+			"key", name, "error", err)
+	}
 }
 
 // ClearAllSuspects drops every last-suspect-* dedupe budget in the
-// Store's dir.
+// Store's dir — best-effort like ClearSuspect, with the same Debug
+// surfacing of failed removes.
 func (s *Store) ClearAllSuspects() {
 	files, err := filepath.Glob(filepath.Join(s.Dir, SuspectBudgetPrefix+"*"))
 	if err != nil {
+		s.log().Debug("hoststate: failed to list suspect budgets",
+			"error", err)
 		return
 	}
 	for _, f := range files {
-		_ = os.Remove(f)
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			s.log().Debug("hoststate: failed to clear suspect budget",
+				"key", filepath.Base(f), "error", err)
+		}
 	}
 }
 
