@@ -6,6 +6,7 @@ package envnames
 const (
 	// Cadence + wedge budgets (the shared top-level Config rows).
 	EnvHygieneInterval           = "NODE_HOST_AGENT_HYGIENE_INTERVAL"
+	EnvHygieneCycleTimeout       = "NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT"
 	EnvHygieneMinRestartInterval = "NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL"
 	EnvHygieneConsecNeeded       = "NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED"
 

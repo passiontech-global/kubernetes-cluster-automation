@@ -26,6 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
@@ -308,5 +310,131 @@ func TestRateTrySpendAtomic(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.StateDir, "last-restart")); err != nil {
 		t.Fatal("budget file not written by the winner")
+	}
+}
+
+// --- cycle deadline (controllerhygiene runCycle parity) ---
+
+// TestRunCycleDeadlineAbortsStall: a hung systemd is-active probe
+// blocks its exec seam until the cycle ctx dies — the per-cycle
+// deadline (Config.CycleTimeout) must interrupt the stall, propagate
+// into the child call, log the degraded cycle, and leave the loop
+// free to start the next tick.
+func TestRunCycleDeadlineAbortsStall(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.CycleTimeout = 60 * time.Millisecond
+	var calls atomic.Int64
+	started := make(chan struct{}, 2)
+	sd := systemd.New(systemd.Config{
+		HostRoot: "/",
+		RunCmd: func(ctx context.Context, _ []string) (string, error) {
+			calls.Add(1)
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		RunCmdCombined: func(ctx context.Context, argv []string) (string, error) {
+			return "", ctx.Err()
+		},
+		ProcUptimeFile: filepath.Join(e.ProcDir, "uptime"),
+	})
+	e.H.Cfg.Systemd = sd
+
+	// Cycle one: the stall is aborted at the deadline and logged.
+	start := time.Now()
+	e.H.runCycle(context.Background())
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("cycle ran %s — deadline did not abort the stall", took)
+	}
+	<-started // runCycle returned → the seam was called and released
+	if log := e.LogLines(t); !strings.Contains(log, "cycle deadline") {
+		t.Fatalf("cycle deadline not logged:\n%s", log)
+	}
+
+	// The loop keeps running: the next tick reaches the seam again
+	// (the hung exec did not wedge the orchestrator silently).
+	e.H.runCycle(context.Background())
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("seam calls=%d — loop did not reach the next cycle", n)
+	}
+}
+
+// TestRunLoopTicksPastHungCycle drives Run itself (not just one
+// runCycle): with a perma-hung is-active probe, Interval-sized ticks
+// still fire after the first deadline abort.
+func TestRunLoopTicksPastHungCycle(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Interval = 20 * time.Millisecond
+	e.H.Cfg.CycleTimeout = 40 * time.Millisecond
+	var calls atomic.Int64
+	sd := systemd.New(systemd.Config{
+		HostRoot: "/",
+		RunCmd: func(ctx context.Context, _ []string) (string, error) {
+			calls.Add(1)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		RunCmdCombined: func(ctx context.Context, _ []string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		ProcUptimeFile: filepath.Join(e.ProcDir, "uptime"),
+	})
+	e.H.Cfg.Systemd = sd
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.H.Run(ctx) }()
+	// Wait until the seam has been entered at least twice (two ticks
+	// through the deadline), then tear Run down.
+	deadline := time.After(5 * time.Second)
+	for calls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("Run never ticked past the first hung cycle")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
+// --- pidsOnce nil-cache ---
+
+// TestPidsOnceErrorNotCached: a failed PIDs() read must NOT cache a
+// nil slice for the rest of the cycle — later pidsOnce calls retry,
+// and once the read succeeds the real pid list comes through.
+func TestPidsOnceErrorNotCached(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 4242, "S", "", "")
+	// Point the /proc view at a missing root: UptimeSeconds errors
+	// (uptime gate opens on read error) and PIDs() fails.
+	missing := filepath.Join(t.TempDir(), "proc-gone")
+	orig := e.H.Deps.Proc
+	e.H.Deps.Proc = procfs.New(missing)
+	e.H.Cycle(context.Background())
+
+	env := *e.H.envCell
+	if p := env.PidsOnce(); p != nil {
+		t.Fatalf("pidsOnce on unreadable root returned %v — error must not resolve to pids", p)
+	}
+	if p := env.PidsOnce(); p != nil {
+		t.Fatalf("second pidsOnce call returned %v — the error was cached", p)
+	}
+	if n := strings.Count(e.LogLines(t), "proc pid listing failed"); n != 1 {
+		t.Fatalf("PIDs failure logged %dx, want exactly 1 per cycle:\n%s", n, e.LogLines(t))
+	}
+
+	// Root back: the SAME cycle's closure retries and returns the
+	// real listing (no cached nil), stably across further calls.
+	e.H.Deps.Proc = orig
+	for i := 0; i < 3; i++ {
+		p := env.PidsOnce()
+		if len(p) != 1 || p[0] != 4242 {
+			t.Fatalf("pidsOnce after recovery = %v, want [4242]", p)
+		}
 	}
 }

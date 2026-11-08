@@ -22,6 +22,7 @@ import (
 // their checks.
 const (
 	DefaultInterval           = 2 * time.Minute
+	defaultCycleTimeout       = 15 * time.Minute // controllerhygiene cdeps defaultCycleTimeout parity
 	defaultWatchdogStateDir   = "/host/var/lib/node-watchdog"
 	defaultWatchdogLogFile    = "/host/var/log/node-watchdog.log"
 	defaultProcRoot           = "/proc" // hostPID:true makes pod /proc == host /proc
@@ -90,6 +91,12 @@ type Config struct {
 	ConsecNeeded       int           // consecutive suspect cycles before action
 	MinRestartInterval time.Duration // rate-limit budget for recreating actions
 	ProbeGap           time.Duration // sleep between probe retries (05/32)
+	// CycleTimeout is the per-Cycle deadline Run applies around each
+	// Cycle (controllerhygiene cdeps.CycleTimeout parity): every
+	// spawned command and HTTP probe is ctx-aware, so a stalled
+	// check is aborted instead of starving the later guards past
+	// this bound on any tick. <=0 → defaultCycleTimeout (15m).
+	CycleTimeout time.Duration
 
 	// Per-check-domain knob groups.
 	Kubelet  KubeletConfig  // 05/06 stall + watch-wedge, T15 feeder, A4 syncloop
@@ -134,6 +141,9 @@ func (c *Config) ApplyDefaults() {
 func (c *Config) applyWiringDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = DefaultInterval
+	}
+	if c.CycleTimeout <= 0 {
+		c.CycleTimeout = defaultCycleTimeout
 	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
@@ -192,6 +202,7 @@ func (c *Config) applyWiringDefaults() {
 func (c *Config) wiringEnvKnobs(hostPath func(string) string) []envx.Knob {
 	return []envx.Knob{
 		envx.DurationKnob(envnames.EnvHygieneInterval, &c.Interval, DefaultInterval),
+		envx.DurationKnob(envnames.EnvHygieneCycleTimeout, &c.CycleTimeout, defaultCycleTimeout),
 		envx.StringKnob(envnames.EnvProcRoot, &c.ProcRoot, defaultProcRoot),
 		envx.StringKnob(envnames.EnvCtrTaskRoot, &c.CtrTaskRoot,
 			hostPath("/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io")),
