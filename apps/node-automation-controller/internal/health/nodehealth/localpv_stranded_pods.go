@@ -11,17 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -255,64 +251,128 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	p.localPVHealed.PruneExpired(now, localPVEphemeralHealCooldown)
 	p.pvcProvHealed.PruneExpired(now, pvcProvisionerHealCooldown)
 
-	nodes, err := p.AllNodes(ctx)
+	snap, err := p.collectLocalPVSnapshot(ctx)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
-	}
-	nodesByName := make(map[string]*corev1.Node, len(nodes))
-	hasSchedulableWorker := false
-	for i := range nodes {
-		nodesByName[nodes[i].Name] = &nodes[i]
-		if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
-			!kube.IsControlPlane(&nodes[i]) {
-			hasSchedulableWorker = true
-		}
-	}
-
-	// Paged cluster-wide reads — the same full-truth posture as the
-	// masterless EndpointSlice census: a partial read cannot tell
-	// "stranded" from "no data", so a list error aborts the check.
-	pvsByName := map[string]*corev1.PersistentVolume{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.PersistentVolumes(p.CS),
-		func(items []corev1.PersistentVolume) error {
-			for i := range items {
-				pvsByName[items[i].Name] = &items[i]
-			}
-			return nil
-		})
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list persistentvolumes: %w", err)}
-	}
-	pvcsByKey := map[string]*corev1.PersistentVolumeClaim{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.PersistentVolumeClaims(p.CS, metav1.NamespaceAll),
-		func(items []corev1.PersistentVolumeClaim) error {
-			for i := range items {
-				pvcsByKey[items[i].Namespace+"/"+items[i].Name] = &items[i]
-			}
-			return nil
-		})
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list persistentvolumeclaims: %w", err)}
+		return probefw.Result{Infra: err}
 	}
 
 	// stranded/stalled/statefulRep accumulate each live gauge key's
 	// label values — the reports feed the ledgers so no key gets
 	// SplitN'd apart.
 	var stranded, stalledRep, statefulRep probefw.SweepReport
-	var heals []strandedHeal
+	heals := scanStrandedPods(snap, now,
+		&stranded, &stalledRep, &statefulRep)
+
+	// Prune the gauges' series for tuples not re-seen — same
+	// DeleteLabelValues hygiene as stsZeroEmitted; the ledgers hold
+	// the label tuples so no key gets re-split.
+	stranded.Close(&p.localPVEmitted,
+		localPVStrandedPodsGauge.DeleteLabelValues)
+	stalledRep.Close(&p.pvcStalledEmitted,
+		pvcProvisioningStalledGauge.DeleteLabelValues)
+	statefulRep.Close(&p.strandedStatefulEmitted,
+		localPVStrandedStatefulPodGauge.DeleteLabelValues)
+
+	// Heals run last — after the gauge ledgers reconcile — the
+	// monolithic Run's exact sequence: alert state lands before
+	// remediation (see localpv_heals.go).
+	p.healStrandedEphemeral(ctx, log, heals, now)
+	if stalledRep.Flagged() > 0 {
+		p.healLocalPVProvisioner(ctx, log, now)
+	}
+
+	return stranded.Verdict("localpv-stranded/stalled volumes: ", ", ")
+}
+
+// ---------------------------------------------------------------------------
+// localpv-stranded-pods (W7-C4) — per-sweep collectors (split out of
+// the monolithic Run; behavior byte-identical).
+// ---------------------------------------------------------------------------
+
+// localPVSnapshot is the sweep inventory the stranded/stalled scan
+// classifies against: nodes by name plus the schedulable-worker
+// gate, PVs by name, PVCs by "ns/name" and the pod snapshot.
+type localPVSnapshot struct {
+	nodesByName          map[string]*corev1.Node
+	hasSchedulableWorker bool
+	pvsByName            map[string]*corev1.PersistentVolume
+	pvcsByKey            map[string]*corev1.PersistentVolumeClaim
+	pods                 []corev1.Pod
+}
+
+// collectLocalPVSnapshot gathers the sweep inventory in the exact
+// call order the monolithic Run used — nodes, then the paged
+// cluster-wide PV/PVC reads, the shared pod snapshot last. The
+// wrapped "list <resource>" errors become Result.Infra verbatim.
+func (p *localPVStrandedCheck) collectLocalPVSnapshot(ctx context.Context) (*localPVSnapshot, error) {
+	snap := &localPVSnapshot{}
+	nodes, err := p.AllNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	snap.nodesByName = make(map[string]*corev1.Node, len(nodes))
+	for i := range nodes {
+		snap.nodesByName[nodes[i].Name] = &nodes[i]
+		if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
+			!kube.IsControlPlane(&nodes[i]) {
+			snap.hasSchedulableWorker = true
+		}
+	}
+
+	// Paged cluster-wide reads — the same full-truth posture as the
+	// masterless EndpointSlice census: a partial read cannot tell
+	// "stranded" from "no data", so a list error aborts the check.
+	snap.pvsByName = map[string]*corev1.PersistentVolume{}
+	err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.PersistentVolumes(p.CS),
+		func(items []corev1.PersistentVolume) error {
+			for i := range items {
+				snap.pvsByName[items[i].Name] = &items[i]
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("list persistentvolumes: %w", err)
+	}
+	snap.pvcsByKey = map[string]*corev1.PersistentVolumeClaim{}
+	err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.PersistentVolumeClaims(p.CS, metav1.NamespaceAll),
+		func(items []corev1.PersistentVolumeClaim) error {
+			for i := range items {
+				snap.pvcsByKey[items[i].Namespace+"/"+items[i].Name] = &items[i]
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
+	}
 
 	// Pending pods only — the old status.phase=Pending FieldSelector,
 	// evaluated client-side over the shared sweep snapshot.
-	pods, err := p.AllPods(ctx)
+	snap.pods, err = p.AllPods(ctx)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
+		return nil, fmt.Errorf("list pods: %w", err)
 	}
-	for i := range pods {
-		pod := &pods[i]
+	return snap, nil
+}
+
+// scanStrandedPods classifies the snapshot pod-by-pod: (a) a bound
+// local PV nodeAffinity-pinned to an unavailable node raises the
+// stranded gauge — plus the W12-SC2 stateful gauge for non-ephemeral
+// workloads on a confirmed-dead node — and queues a strandedHeal for
+// disposable volumes past localPVEphemeralHealMinAge; (b) a Pending
+// openebs-hostpath claim past pvcStalledMinAge while schedulable
+// workers exist raises the stalled gauge. Emitted keys land on the
+// caller's reports so the gauge lifecycle (Close) stays with Run;
+// the returned heals are consumed by healStrandedEphemeral AFTER the
+// reports close — the monolithic Run's exact order.
+func scanStrandedPods(snap *localPVSnapshot, now time.Time,
+	stranded, stalledRep, statefulRep *probefw.SweepReport) []strandedHeal {
+	var heals []strandedHeal
+	for i := range snap.pods {
+		pod := &snap.pods[i]
 		if pod.Status.Phase != corev1.PodPending {
 			continue // mirrors the FieldSelector for fake clients
 		}
@@ -325,16 +385,16 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			if claim == nil {
 				continue
 			}
-			pvc := pvcsByKey[pod.Namespace+"/"+claim.ClaimName]
+			pvc := snap.pvcsByKey[pod.Namespace+"/"+claim.ClaimName]
 			if pvc == nil {
 				continue
 			}
 			// Branch A — bound local PV on an unavailable node.
 			if pvc.Status.Phase == corev1.ClaimBound &&
 				pvc.Spec.VolumeName != "" {
-				if pv := pvsByName[pvc.Spec.VolumeName]; pv != nil {
+				if pv := snap.pvsByName[pvc.Spec.VolumeName]; pv != nil {
 					for _, node := range localPVNodeNames(pv) {
-						reason := strandedNodeReason(nodesByName, node)
+						reason := strandedNodeReason(snap.nodesByName, node)
 						if reason == "" {
 							continue
 						}
@@ -373,7 +433,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			// Branch B — claim still Pending on the hostpath
 			// provisioner while schedulable workers exist.
 			if pvc.Status.Phase == corev1.ClaimPending &&
-				hasSchedulableWorker &&
+				snap.hasSchedulableWorker &&
 				pvc.Spec.StorageClassName != nil &&
 				*pvc.Spec.StorageClassName == openebsHostpathSC &&
 				age >= pvcStalledMinAge {
@@ -384,137 +444,5 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-
-	// Prune the gauges' series for tuples not re-seen — same
-	// DeleteLabelValues hygiene as stsZeroEmitted; the ledgers hold
-	// the label tuples so no key gets re-split.
-	stranded.Close(&p.localPVEmitted,
-		localPVStrandedPodsGauge.DeleteLabelValues)
-	stalledRep.Close(&p.pvcStalledEmitted,
-		pvcProvisioningStalledGauge.DeleteLabelValues)
-	statefulRep.Close(&p.strandedStatefulEmitted,
-		localPVStrandedStatefulPodGauge.DeleteLabelValues)
-
-	// HealAllowed folds the per-target cooldown plus the maintenance
-	// mutex (memoized on the shared Deps verdict — one evaluation
-	// per sweep) — pod/PVC kills during a drain are exactly what it
-	// exists to prevent; "cannot verify" fails closed.
-	for i := range heals {
-		h := &heals[i]
-		pvcKey := h.pvc.Namespace + "/" + h.pvc.Name
-		proceed, unverifiable := p.HealAllowed(ctx, log,
-			&p.localPVHealed, pvcKey,
-			localPVEphemeralHealCooldown, now)
-		if unverifiable {
-			metrics.IncError(p.Name)
-			continue
-		}
-		if !proceed {
-			continue
-		}
-		// PVC first, then the pod — the claim release flips the PV
-		// to Released so the node-host-agent sweeps it, and the pod
-		// delete lets the StatefulSet rebind onto a live node. UID
-		// preconditions close the list→delete TOCTOU on both.
-		pvcUID := h.pvc.UID
-		pvcErr := p.CS.CoreV1().PersistentVolumeClaims(h.pvc.Namespace).
-			Delete(ctx, h.pvc.Name, metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &pvcUID},
-			})
-		switch {
-		case pvcErr == nil || apierrors.IsNotFound(pvcErr):
-			// NotFound: the claim vanished between list and heal —
-			// the release half is already done, still free the pod.
-		case apierrors.IsForbidden(pvcErr):
-			// RBAC-denied is permanent (PVC delete is only granted
-			// via the concourse Role — an ephemeral-localpv opt-in
-			// elsewhere can never succeed). Stamp the cooldown so
-			// the check doesn't error-loop every sweep, keep the
-			// pod, and surface once.
-			metrics.IncError(p.Name)
-			log.Error(pvcErr, "ephemeral localpv pvc delete forbidden — RBAC scope blocks the heal; stamping cooldown",
-				"pvc", pvcKey)
-			p.localPVHealed.Stamp(pvcKey, now)
-			continue
-		default:
-			metrics.IncError(p.Name)
-			log.Error(pvcErr, "ephemeral localpv pvc delete failed", "pvc", pvcKey)
-			continue
-		}
-		// A pod already gone (NotFound) still counts the heal — the
-		// claim release landed and the pod slot is free either way —
-		// so the stamp stays manual rather than riding
-		// heal.DeletePod's delivered-delete stamp.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", h.pod, now); err != nil &&
-			!apierrors.IsNotFound(err) {
-			metrics.IncError(p.Name)
-			log.Error(err, "stranded pod delete failed",
-				"pod", h.pod.Namespace+"/"+h.pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
-		p.localPVHealed.Stamp(pvcKey, now)
-		localPVEphemeralHealsTotal.
-			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
-		log.Info("DELETE: ephemeral localpv pvc+pod stranded on a confirmed-dead node — StatefulSet rebinds on a live node",
-			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
-			"node", h.node, "reason", h.reason)
-	}
-	if stalledRep.Flagged() > 0 {
-		p.healLocalPVProvisioner(ctx, log, now)
-	}
-
-	return stranded.Verdict("localpv-stranded/stalled volumes: ", ", ")
-}
-
-// healLocalPVProvisioner deletes the openebs-localpv-provisioner
-// pod(s) — the same re-sync nudge every operator heal here applies.
-// Pending hostpath claims while Ready workers exist mean the
-// provisioner missed a watch event; a restart makes it re-list and
-// provision. 1h cooldown (in-RAM — the pod itself is the heal
-// target, nothing else can carry the stamp), maintenance-gated via
-// the shared HealAllowed preamble.
-func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
-	log logr.Logger, now time.Time) {
-
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.pvcProvHealed, openebsProvisionerName,
-		pvcProvisionerHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	pods, err := p.PodsIn(ctx, openebsProvisionerNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list provisioner pods failed — heal deferred",
-			"error", err)
-		return
-	}
-	deleted := false
-	for i := range pods {
-		pod := pods[i]
-		if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) {
-			continue
-		}
-		if _, err := heal.DeletePod(ctx, p.CS, &p.pvcProvHealed,
-			openebsProvisionerName, pod, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "localpv provisioner delete failed",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
-		deleted = true
-		log.Info("DELETE: wedged localpv provisioner — stalled claims need a resync",
-			"pod", pod.Namespace+"/"+pod.Name)
-	}
-	if !deleted {
-		return
-	}
-	pvcProvisionerHealsTotal.
-		WithLabelValues(openebsProvisionerName).Inc()
+	return heals
 }
