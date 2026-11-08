@@ -82,7 +82,6 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -410,87 +409,17 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	// ---- Mutate the SSOT object, then persist ------------------------------
 	// Whichever object carries the quarantine annotation is the SSOT
 	// for "who is pulled"; if its update fails nothing was persisted
-	// and the next cycle retries the whole decision.
+	// and the next cycle retries the whole decision. Both appliers
+	// (quarantine_apply.go) mutate quarantinedIPs in place as they go.
 	if useSlice {
-		copies := deepCopySlices(epsList)
-		dirty := make([]bool, len(copies))
-		for _, ip := range toRemove {
-			quarantinedIPs[ip] = true
-			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes EndpointSlice",
-				"ip", ip, "remainingHealthy", healthyActive)
-			for i := range copies {
-				if removeSliceIP(copies[i], ip) {
-					dirty[i] = true
-				}
-			}
-		}
-		for _, ip := range toAdd {
-			if i := sliceIdxForIP(copies, ip); i >= 0 && addSliceIP(copies[i], ip) {
-				dirty[i] = true
-			}
-			delete(quarantinedIPs, ip)
-			log.Info("RE-ADD: recovered apiserver back in kubernetes EndpointSlice", "ip", ip)
-		}
-		// The primary always carries the annotation — persist it even
-		// when its endpoint set itself was unchanged this cycle.
-		writeQuarantineAnnotation(copies[0], quarantinedIPs)
-		for i, s := range copies {
-			if i > 0 && !dirty[i] {
-				continue
-			}
-			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-				Update(ctx, s, metav1.UpdateOptions{}); err != nil {
-				return fmt.Errorf("update endpointslice/%s: %w", s.Name, err)
-			}
-		}
+		err = g.applySliceQuarantine(ctx, log, epsList, toRemove, toAdd,
+			quarantinedIPs, healthyActive)
 	} else {
-		mutated := ep.DeepCopy()
-		for _, ip := range toRemove {
-			removeEndpointIP(mutated, ip)
-			quarantinedIPs[ip] = true
-			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes endpoints",
-				"ip", ip, "remainingHealthy", healthyActive)
-		}
-		for _, ip := range toAdd {
-			addEndpointIP(mutated, ip)
-			delete(quarantinedIPs, ip)
-			log.Info("RE-ADD: recovered apiserver back in kubernetes endpoints", "ip", ip)
-		}
-		writeQuarantineAnnotation(mutated, quarantinedIPs)
-		// Skip the write when the mutation produced the identical
-		// object — a pure slice-repair cycle (drift retry) would
-		// otherwise churn a no-op Endpoints update every sweep. A
-		// reconciler-wiped annotation still diffs and gets restored.
-		if !reflect.DeepEqual(mutated.Object, ep.Object) {
-			if _, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
-				Update(ctx, mutated, metav1.UpdateOptions{}); err != nil {
-				return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
-			}
-		}
-
-		// EndpointSlices converge to the FULL quarantine set (not just
-		// this cycle's removals) so a slice update that failed earlier
-		// is retried instead of leaving a wedged IP routable forever.
-		// On hosted planes the mirror controller propagates the
-		// Endpoints write itself within ~1s — this write just wins the
-		// race when propagation lags. The diff itself was computed
-		// above against the actual slice contents — reaching this
-		// block on drift alone repairs the slice without touching
-		// the Endpoints object at all.
-		for i, s := range sliceCopies {
-			if !sliceDirty[i] {
-				continue
-			}
-			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-				Update(ctx, s, metav1.UpdateOptions{}); err != nil {
-				// Logged/metered, not returned: Endpoints already
-				// persisted the decision and the next cycle re-applies
-				// the slice diff.
-				metrics.IncError(g.queue)
-				log.Error(err, "EndpointSlice update failed — retries next cycle",
-					"slice", s.Name)
-			}
-		}
+		err = g.applyEndpointsQuarantine(ctx, log, ep, toRemove, toAdd,
+			quarantinedIPs, healthyActive, sliceCopies, sliceDirty)
+	}
+	if err != nil {
+		return err
 	}
 	g.memQuarantine = maps.Clone(quarantinedIPs)
 
