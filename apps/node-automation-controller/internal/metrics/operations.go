@@ -117,17 +117,22 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Heal grants denied by the global heal budget (aggregate blast-radius cap).",
 })
 
-// init registers exactly the vectors declared in this file — the
-// per-domain init() split means adding an operations-domain metric
-// touches only this file, not a central registry list. Order
-// follows declaration order.
+// operationsCollectors lists every vector declared in this file, in
+// declaration order; the single init() below registers the table, so
+// registration order stays byte-stable and adding a metric touches
+// only this file.
+var operationsCollectors = []prometheus.Collector{
+	PDBDrainBlocked, StuckTerminatingResources,
+	VolumeAttachmentsCleanedTotal,
+	ZombieSidecarPodsReapedTotal, OrphanEndpointSlicesCleanedTotal,
+	StatefulSetOnDeletePodsRolledTotal,
+	CronJobTooManyMissedStarts,
+	VolumeAttachmentFinalizersRemovedTotal,
+	CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal,
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(
-		PDBDrainBlocked, StuckTerminatingResources,
-		VolumeAttachmentsCleanedTotal,
-		ZombieSidecarPodsReapedTotal, OrphanEndpointSlicesCleanedTotal,
-		StatefulSetOnDeletePodsRolledTotal,
-		CronJobTooManyMissedStarts,
-		VolumeAttachmentFinalizersRemovedTotal,
-		CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal)
+	for _, c := range operationsCollectors {
+		ctrlmetrics.Registry.MustRegister(c)
+	}
 }

@@ -9,10 +9,11 @@
 // The package is split by emitting domain: core.go (this file) holds
 // the run-error counters, PredeclareQueue and IncError;
 // apiserver.go / health.go / integration.go / operations.go hold the
-// per-domain vectors AND register them — each file's init() calls
-// MustRegister on exactly the vectors it declares, so adding a
-// metric touches only the file that owns it. Metric names, help
-// strings and label sets are unchanged from the original single-file
+// per-domain vectors AND register them — each file declares a
+// []prometheus.Collector table of exactly the vectors it defines and
+// one init() that walks it, so adding a metric touches only the file
+// that owns it. Metric names, help strings, label sets and
+// registration order are unchanged from the original single-file
 // layout.
 //
 // API convention — two shapes, by design:
@@ -63,9 +64,9 @@ var reconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 
 // init registers ONLY the two run-error counters this file owns.
 // Every other vector lives in — and is registered by — its own
-// domain file's init() (apiserver.go / health.go / integration.go /
-// operations.go), so this list no longer has to be edited when a
-// domain adds a series.
+// domain file's collector table (apiserver.go / health.go /
+// integration.go / operations.go), so this list no longer has to be
+// edited when a domain adds a series.
 func init() {
 	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors)
 }
