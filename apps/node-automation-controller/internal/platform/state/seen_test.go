@@ -34,3 +34,19 @@ func TestSeenSetPrune(t *testing.T) {
 		t.Fatal("re-Add of a pruned key should report new")
 	}
 }
+
+func TestSeenSetForget(t *testing.T) {
+	s := &SeenSet{}
+	s.Add("a")
+	s.Forget("a")
+	if s.Has("a") {
+		t.Fatal("forgotten key still present")
+	}
+	if !s.Add("a") {
+		t.Fatal("forgotten key did not re-arm")
+	}
+	s.Forget("never-added") // no-op on untracked key
+	if len(s.set) != 1 {
+		t.Fatalf("unexpected set size: %d", len(s.set))
+	}
+}

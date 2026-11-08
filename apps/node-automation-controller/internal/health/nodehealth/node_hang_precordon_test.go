@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // W8-ST2 — a hung worker gets spec.unschedulable patched; an already-
@@ -325,6 +327,87 @@ func TestCheckNodeHangStaleLatchHoldsPreCordon(t *testing.T) {
 	}
 	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
 		t.Fatal("pre-cordon stamp removed while latch still True")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Counter-series churn guard
+// ---------------------------------------------------------------------------
+
+// The cordon/uncordon counters must not leak {node} series on node
+// churn (pool rotation): a node leaving the sweep census keeps its
+// series for one sweep — a single missed list must not erase
+// evidence — and loses both series on the second consecutive
+// absence. Returning re-arms the absence streak.
+func TestNodeHangCounterSeriesPrunedOnNodeGone(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-churn")
+	testutil.CleanupMetric(t, nodeHangUncordonsTotal, "w-churn")
+
+	// Sweep 1 — the sustained latch cordons w-churn: both Inc paths
+	// book the node into the check's carry-forward ledger.
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-churn", "KernelHungTasks", 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	check := probetest.MustCheck[*nodeHangCheck](t, p)
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("hung node did not fail the check")
+	}
+	if got := ptestutil.ToFloat64(nodeHangCordonsTotal.WithLabelValues("w-churn")); got != 1 {
+		t.Fatalf("cordons_total = %v, want 1", got)
+	}
+
+	// Sweep 2 — the node left the cluster: first absence, series kept.
+	if err := cs.CoreV1().Nodes().Delete(ctx, "w-churn", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := check.Run(ctx); !res.Pass {
+		t.Fatalf("node-less roster must pass: %+v", res)
+	}
+	if got := ptestutil.ToFloat64(nodeHangCordonsTotal.WithLabelValues("w-churn")); got != 1 {
+		t.Fatalf("first absence pruned the cordon series: %v", got)
+	}
+
+	// Sweep 3 — the node object is back in its post-reboot shape
+	// (stamped cordon, latch cleared): the auto-uncordon Inc's the
+	// uncordon series and the sighting re-arms the streak.
+	if _, err := cs.CoreV1().Nodes().Create(ctx,
+		precordonedWorkerNode("w-churn", true), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := check.Run(ctx); !res.Pass {
+		t.Fatalf("auto-uncordon sweep must pass: %+v", res)
+	}
+	if got := ptestutil.ToFloat64(nodeHangUncordonsTotal.WithLabelValues("w-churn")); got != 1 {
+		t.Fatalf("uncordons_total = %v, want 1", got)
+	}
+
+	// Sweep 4 — gone again: first absence carries BOTH series.
+	if err := cs.CoreV1().Nodes().Delete(ctx, "w-churn", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := check.Run(ctx); !res.Pass {
+		t.Fatalf("node-less roster must pass: %+v", res)
+	}
+	if got := ptestutil.ToFloat64(nodeHangCordonsTotal.WithLabelValues("w-churn")); got != 1 {
+		t.Fatalf("cordon series pruned on first absence: %v", got)
+	}
+	if got := ptestutil.ToFloat64(nodeHangUncordonsTotal.WithLabelValues("w-churn")); got != 1 {
+		t.Fatalf("uncordon series pruned on first absence: %v", got)
+	}
+
+	// Sweep 5 — second consecutive absence: both series deleted. The
+	// DeleteLabelValues bool is the absence proof (WithLabelValues
+	// would silently re-create the series at 0); label-scoped on
+	// w-churn because sibling tests share the registered vecs.
+	if res := check.Run(ctx); !res.Pass {
+		t.Fatalf("node-less roster must pass: %+v", res)
+	}
+	if nodeHangCordonsTotal.DeleteLabelValues("w-churn") {
+		t.Fatal("cordon series survived two consecutive absences")
+	}
+	if nodeHangUncordonsTotal.DeleteLabelValues("w-churn") {
+		t.Fatal("uncordon series survived two consecutive absences")
 	}
 }
 

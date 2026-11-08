@@ -205,7 +205,70 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	}
 	metrics.FluxSourceReconcilesTriggeredTotal.
 		WithLabelValues(ref.kind, ref.namespace, ref.name).Inc()
+	// The counter series is born here — remember it so the sweep-end
+	// prune can delete it once no consumer resolves to this source
+	// anymore. fluxSourceKey is the exact label tuple of the series.
+	u.fluxSources.Add(fluxSourceKey(ref))
 	log.Info("ACTION: requested flux source reconcile — consumer reports a stale artifact",
 		"kind", ref.kind, "source", key, "consumer", consumer)
 	return true
+}
+
+// fluxSourceKey renders the metric label tuple (kind, namespace,
+// name) as one map key — "/" cannot appear in any of the three parts,
+// so splitting it back into label values is unambiguous.
+func fluxSourceKey(ref fluxSourceRef) string {
+	return ref.kind + "/" + ref.namespace + "/" + ref.name
+}
+
+// fluxSourceInventory resolves every consumer→source ref this sweep's
+// COMPLETE consumer lists can produce — the same pure spec reads the
+// emit path above uses (hrSourceRef / hrStatusHelmChartRef /
+// ksSourceRef), so every key a nudge could ever emit is covered by
+// it. Costs no API calls: the lists were already paged for the sweep.
+func fluxSourceInventory(hrs, kustomizations *unstructured.UnstructuredList) map[string]bool {
+	inv := map[string]bool{}
+	add := func(ref fluxSourceRef) { inv[fluxSourceKey(ref)] = true }
+	for i := range hrs.Items {
+		hr := &hrs.Items[i]
+		if ref, ok := hrSourceRef(hr); ok {
+			add(ref)
+		}
+		if hcRef, ok := hrStatusHelmChartRef(hr); ok {
+			add(hcRef)
+		}
+	}
+	if kustomizations != nil {
+		for i := range kustomizations.Items {
+			if ref, ok := ksSourceRef(&kustomizations.Items[i]); ok {
+				add(ref)
+			}
+		}
+	}
+	return inv
+}
+
+// pruneFluxSourceSeries carries the 2-set carry-forward prune for
+// FluxSourceReconcilesTriggeredTotal{kind,namespace,name}: the
+// fluxSources SeenSet holds the series past sweeps emitted, the
+// inventory is this sweep's complete consumer→source resolution, and
+// a set key absent from the inventory means its source no longer has
+// a single consumer — DeleteLabelValues it. A key still in the
+// inventory keeps both its series and its count. The caller skips
+// this on an incomplete sweep (Kustomization list error): a half
+// inventory would delete still-referenced series — the same complete-
+// sweep precondition SeenSet.Prune documents.
+func (u *helmReleaseUnlocker) pruneFluxSourceSeries(
+	hrs, kustomizations *unstructured.UnstructuredList) {
+	inv := fluxSourceInventory(hrs, kustomizations)
+	u.fluxSources.Prune(func(key string) bool {
+		if inv[key] {
+			return true
+		}
+		kind, rest, _ := strings.Cut(key, "/")
+		ns, name, _ := strings.Cut(rest, "/")
+		metrics.FluxSourceReconcilesTriggeredTotal.
+			DeleteLabelValues(kind, ns, name)
+		return false
+	})
 }

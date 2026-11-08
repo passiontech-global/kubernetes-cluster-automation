@@ -126,6 +126,14 @@ type helmReleaseUnlocker struct {
 	pending      pendingState
 	stall        stallState
 	immutableJob immutableJobState
+	// fluxSources tracks every FluxSourceReconcilesTriggeredTotal
+	// series this process has emitted (kind/ns/name keys): counter
+	// children are never collected by prometheus/client_golang, so
+	// this set is the delete half of the series lifecycle — the
+	// sweep prunes entries whose source no consumer resolves to
+	// anymore (pruneFluxSourceSeries). Zero-value ready like the
+	// ledgers above.
+	fluxSources state.SeenSet
 }
 
 // pendingState carries the pending-secret unlock duty's ledgers.
@@ -278,6 +286,15 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	u.stall.unwedged.PruneExpired(now, helmUnlockCooldown)
 	u.stall.alerted.PruneExpired(now, helmUnlockCooldown)
 	u.immutableJob.healed.PruneExpired(now, immutableJobCooldown)
+	// stallAttempts keys on the same decommissionable HR names but
+	// carries no stamps to age out — a revision change already resets
+	// the entry in unwedgeDue, so a vanished HR is the only dead
+	// weight: drop it by presence (deleting during range is safe).
+	for key := range u.stall.attempts {
+		if !present[key] {
+			delete(u.stall.attempts, key)
+		}
+	}
 
 	var due []string
 	for key := range stuck {
@@ -341,6 +358,16 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// in-progress unlock path: it scans the same HR list plus
 	// Kustomizations and must run on every sweep.
 	u.healArtifactSources(ctx, list, kustomizations)
+	// The FluxSourceReconcilesTriggeredTotal prune rides the same
+	// consumer lists the heal just used. It runs only on a complete
+	// sweep: a Kustomization LIST error leaves the inventory half-
+	// blind, and pruning then would delete series of sources that
+	// still have Kustomization consumers — carry-forward keeps the
+	// previous set and the next whole sweep decides. NotFound → nil
+	// (pre-v1 flux) is a complete-empty answer, not an error.
+	if ksErr == nil {
+		u.pruneFluxSourceSeries(list, kustomizations)
+	}
 	// W8-GO1 — immutable-Job apply errors on Kustomizations: the
 	// completed/failed Job blocking the apply is reaped so
 	// kustomize-controller can recreate it.

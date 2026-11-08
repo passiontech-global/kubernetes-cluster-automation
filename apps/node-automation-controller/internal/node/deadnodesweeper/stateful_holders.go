@@ -172,8 +172,13 @@ func (s *deadNodeSweeper) fenceNode(ctx context.Context, nodeName string,
 		return err
 	}
 	if !viaSNR {
-		metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues(
-			nodeName, strconv.FormatBool(hasVolumes)).Inc()
+		hv := strconv.FormatBool(hasVolumes)
+		metrics.DeadNodeFencedWithoutSNRTotal.WithLabelValues(nodeName, hv).Inc()
+		// Same series hygiene as the gauge sibling: book the tuple so
+		// the sweep prunes the series once the node leaves the census
+		// (key node\x00has_volumes — a counter series can otherwise
+		// only accumulate on node-pool rotation).
+		s.fencedWithoutSNREmitted.Emit(nodeName+"\x00"+hv, nodeName, hv)
 		metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(nodeName)
 	}
 	log.Info("TAINT: node confirmed dead -> out-of-service=nodeshutdown:NoExecute "+

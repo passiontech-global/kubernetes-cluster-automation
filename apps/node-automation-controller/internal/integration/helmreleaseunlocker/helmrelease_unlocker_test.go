@@ -1061,6 +1061,63 @@ func TestFluxSourceHealerDedupesSharedSource(t *testing.T) {
 	}
 }
 
+// FluxSourceReconcilesTriggeredTotal{kind,namespace,name} carries a
+// 2-set carry-forward prune: once the sweep no longer resolves ANY
+// consumer to a nudged source, its series is DeleteLabelValues'd; a
+// source a consumer still resolves keeps both its series and its
+// counter value (no reset, no re-Inc inside the 30m cooldown).
+func TestFluxSourceSeriesPrunedWhenConsumerVanishes(t *testing.T) {
+	staleHR := func(ns, name, repo string) *unstructured.Unstructured {
+		hr := hrObj(ns, name, "v2")
+		hrReady(hr, "False", "artifact not found: failed to fetch from origin")
+		hr.Object["spec"] = map[string]any{
+			"chart": map[string]any{"spec": map[string]any{
+				"sourceRef": map[string]any{"kind": "GitRepository", "name": repo},
+			}},
+		}
+		return hr
+	}
+	dyn := newDynFake(staleHR("apps", "stale-a", "repo-a"),
+		staleHR("apps", "stale-c", "repo-c"),
+		fluxSourceObj("GitRepository", "source.toolkit.fluxcd.io/v1", "apps", "repo-a"),
+		fluxSourceObj("GitRepository", "source.toolkit.fluxcd.io/v1", "apps", "repo-c"))
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+	for _, lv := range [][]string{
+		{"GitRepository", "apps", "repo-a"},
+		{"GitRepository", "apps", "repo-c"},
+	} {
+		testutil.CleanupMetric(t, metrics.FluxSourceReconcilesTriggeredTotal, lv...)
+	}
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range []string{"repo-a", "repo-c"} {
+		if got := promtestutil.ToFloat64(metrics.FluxSourceReconcilesTriggeredTotal.
+			WithLabelValues("GitRepository", "apps", repo)); got != 1 {
+			t.Fatalf("%s nudge counter = %v, want 1 after the first sweep", repo, got)
+		}
+	}
+
+	// The consumer of repo-a is gone; repo-c keeps its consumer. The
+	// next sweep prunes repo-a's series and leaves repo-c's untouched.
+	if err := dyn.Resource(helmReleaseGVRs[0]).Namespace("apps").
+		Delete(ctx, "stale-a", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.FluxSourceReconcilesTriggeredTotal.DeleteLabelValues(
+		"GitRepository", "apps", "repo-a") {
+		t.Fatal("series for a source with no consumer left was not deleted")
+	}
+	if got := promtestutil.ToFloat64(metrics.FluxSourceReconcilesTriggeredTotal.
+		WithLabelValues("GitRepository", "apps", "repo-c")); got != 1 {
+		t.Fatalf("surviving source's counter reset: got %v, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // W9-CP2 — superseded helm release secret pruner
 // ---------------------------------------------------------------------------

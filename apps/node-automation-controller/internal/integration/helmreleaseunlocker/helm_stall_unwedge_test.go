@@ -597,3 +597,27 @@ func TestHelmStallUnwedgeNonDeadlockShapeSkipped(t *testing.T) {
 		t.Fatalf("shape refusal did not IncError: got %v, want %v", got, before+1)
 	}
 }
+
+// The W8-GO2 retry ledger has no stamps to age out — its entries die
+// with the HR: a vanished HR's stallAttempt is deleted at the next
+// sweep-end prune, a still-listed HR keeps its entry (and its count).
+func TestHelmStallAttemptsPrunedWhenHRVanishes(t *testing.T) {
+	live := hrObj("apps", "myapp", "v2")
+	hrReady(live, "True", "Reconciliation finished")
+	dyn := newDynFake(live)
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+	u.stall.attempts = map[string]*stallAttempt{
+		"apps/gone":  {revision: "3", count: 2, last: time.Now()},
+		"apps/myapp": {revision: "7", count: 1, last: time.Now()},
+	}
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u.stall.attempts["apps/gone"]; ok {
+		t.Fatal("stallAttempt for a deleted HR not pruned after the sweep")
+	}
+	if att := u.stall.attempts["apps/myapp"]; att == nil || att.revision != "7" {
+		t.Fatalf("listed HR lost its stallAttempt entry: %+v", att)
+	}
+}
