@@ -138,9 +138,12 @@ const wgEncapOverheadBytes = 60
 // FRAG_NEEDED through neb1 (1300). Two datapaths are checked:
 // cilium_net (sysfs, falling back to agent-runtime-config.json)
 // must stay <= neb, and cilium_wg0 must stay <= neb-60 to leave
-// room for the WG header inside the double-encapsulated path. The
-// series emits when the overlay MTU resolves AND at least one
-// datapath MTU resolves; absent interfaces simply don't vote.
+// room for the WG header inside the double-encapsulated path, and
+// (W16-NM4) the MAX pod lxc* veth MTU must stay <= neb — a stale
+// pod veth dies on FRAG_NEEDED even with aligned datapath ifaces.
+// The series emits when the overlay MTU resolves AND at least one
+// datapath or pod-veth MTU resolves; absent interfaces simply don't
+// vote.
 func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 	neb, ok := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
 	if !ok {
@@ -151,11 +154,13 @@ func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 		cil, cilOK = hostutil.RuntimeConfigMTU(c.cfg.CiliumRuntimeConfig)
 	}
 	wg, wgOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
-	if !cilOK && !wgOK {
+	lxcMax, lxcOK := hostutil.MaxPodLxcMTU(c.cfg.SysClassNet)
+	if !cilOK && !wgOK && !lxcOK {
 		return
 	}
 	drift := 0.0
-	if (cilOK && cil > neb) || (wgOK && wg > neb-wgEncapOverheadBytes) {
+	if (cilOK && cil > neb) || (wgOK && wg > neb-wgEncapOverheadBytes) ||
+		(lxcOK && lxcMax > neb) {
 		drift = 1
 	}
 	ch <- prometheus.MustNewConstMetric(descMTUDrift,

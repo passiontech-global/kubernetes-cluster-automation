@@ -8,13 +8,16 @@ package kdeps
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -138,6 +141,11 @@ type Config struct {
 	FrozenHeadAdvance int64 // frozen trigger needs head > last+this
 	FrozenRetainedMin int64 // ...and retained > this
 	AdvisoryLockID    int64 // pg advisory lock key
+	// MaxStepRevisions caps how far one compact-guard cycle may
+	// advance compact_rev (W16-CP1). 0/absent = disabled = the
+	// unbounded head-Tail step (env NODE_HOST_AGENT_KINEDB_GUARD_
+	// MAX_STEP_REVISIONS).
+	MaxStepRevisions int64
 
 	// Maintenance.
 	RepackDeadPct      int64 // dead-tuple % → repack candidate
@@ -262,6 +270,11 @@ func (c *Config) ApplyDefaults() error {
 	if c.AdvisoryLockID == 0 {
 		c.AdvisoryLockID = defaultAdvisoryLockID
 	}
+	// W16-CP1: NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS
+	// overrides the step cap when set to a positive integer —
+	// 0/unset/garbage keeps MaxStepRevisions disabled (the
+	// unbounded head-Tail step).
+	applyStepRevisionEnv(c)
 	if c.RepackDeadPct <= 0 {
 		c.RepackDeadPct = defaultRepackDeadPct
 	}
@@ -306,6 +319,19 @@ func (c *Config) ApplyDefaults() error {
 		c.StatFSFn = statfsFree
 	}
 	return nil
+}
+
+// applyStepRevisionEnv is the W16-CP1 step-cap env rule shared by
+// ConfigFromEnv's knob and ApplyDefaults (a directly-constructed
+// Config never sees the knob): a positive NODE_HOST_AGENT_KINEDB_
+// GUARD_MAX_STEP_REVISIONS becomes the cap; unset/0/garbage stays
+// disabled.
+func applyStepRevisionEnv(c *Config) {
+	if v := strings.TrimSpace(os.Getenv(envnames.EnvKinedbGuardMaxStepRevisions)); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil && n > 0 {
+			c.MaxStepRevisions = n
+		}
+	}
 }
 
 // statfsFree returns the free-byte ratio of the fs holding path —

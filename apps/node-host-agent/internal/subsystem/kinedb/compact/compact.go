@@ -110,6 +110,20 @@ func (g *Guard) guardTrigger(head, compactRev, rows, retained, freeze int64, pre
 	return false, ""
 }
 
+// clampStepTarget is the W16-CP1 step cap — pure for tests. When
+// MaxStepRevisions > 0 and the head-Tail target would jump more than
+// MaxStepRevisions past compact_rev, the target is clamped so one
+// cycle cannot delete the whole watch-bookmark window (informer
+// 410 Gone reflector storm); the next cycles keep stepping down.
+// MaxStepRevisions <= 0 disables the cap entirely.
+func (g *Guard) clampStepTarget(crev, target int64) int64 {
+	maxStep := g.d.Cfg.MaxStepRevisions
+	if maxStep > 0 && target-crev > maxStep {
+		return crev + maxStep
+	}
+	return target
+}
+
 // buildCompactScript renders the single-session psql script: acquire
 // the advisory lock, replay UpdateCompactSQL + CompactSQL per chunk
 // (each DO block is its own autocommitted statement = one txn per
@@ -279,6 +293,8 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 	if target <= crev {
 		target = head
 	}
+	// W16-CP1: never step the whole window in one cycle.
+	target = g.clampStepTarget(crev, target)
 	sout, err := g.d.PsqlScript(ctx, pg, user, pass,
 		g.buildCompactScript(crev, target))
 	switch {

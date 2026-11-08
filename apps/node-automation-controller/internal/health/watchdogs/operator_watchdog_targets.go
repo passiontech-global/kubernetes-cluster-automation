@@ -11,6 +11,7 @@ import (
 	"context"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -460,4 +461,113 @@ var operatorTargets = []operatorTarget{
 			reason: opReasonNoConditions, stuck: noStatusConditions,
 		}},
 	},
+	{
+		// W16-G1 — argo-rollouts: the Rollouts controller reconciles
+		// argoproj.io/v1alpha1 Rollouts (the cluster runs the official
+		// chart in the argo-rollouts namespace — infrastructure/base/
+		// helm/helm-releases/argo-rollouts). A stalled observedGeneration
+		// is the same wedged-queue signature the other typed operators
+		// carry: the analysis-template gate wedged, the canary stuck
+		// mid-promotion, or the controller crashed-looping on one CR.
+		name:        "argo-rollouts-controller",
+		leaseNS:     "argo-rollouts",
+		leaseNames:  []string{"argo-rollouts-controller"},
+		podSelector: "app.kubernetes.io/name=argo-rollouts",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr:    kube.GVRArgoRollout,
+			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+		}},
+	},
+	{
+		// W16-G1 — cloudflare-tunnel-gateway-controller (lexfrei chart,
+		// cloudflare-tunnel-system ns — infrastructure/base/helm/
+		// helm-releases/cloudflare-tunnel-gateway-controller). The
+		// controller owns NO CRD of its own: it reconciles Gateway API
+		// objects whose traffic rides its GatewayClass, so the stuck
+		// set is the gateway/route kinds filtered to its class by the
+		// cftOwns* filters below. The chart may or may not leader-elect
+		// depending on replica count — leaseOptional lets a live pod
+		// prove liveness when no Lease exists (dragonfly-operator's
+		// W10-FIX2 posture).
+		name:          "cloudflare-tunnel-gateway-controller",
+		leaseNS:       "cloudflare-tunnel-system",
+		leaseNames:    []string{"cloudflare-tunnel-gateway-controller"},
+		podSelector:   "app.kubernetes.io/name=cloudflare-tunnel-gateway-controller",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: kube.GVRGateway, reason: opReasonStaleGWStatus,
+				stuck: gatewayObjectStuck, owns: cftOwnsGatewayObject},
+			{gvr: kube.GVRHTTPRoute, reason: opReasonStaleGWStatus,
+				stuck: gatewayStatusStuck, owns: cftOwnsRouteParent},
+			{gvr: kube.GVRGRPCRoute, reason: opReasonStaleGWStatus,
+				stuck: gatewayStatusStuck, owns: cftOwnsRouteParent},
+		},
+	},
+}
+
+// cftGatewayClassName is the GatewayClass the cloudflare-tunnel
+// gateway-controller serves — infrastructure/base/gateway-api/
+// gateways/cloudflare-tunnel pins it in Git. Ownership keys on the
+// class NAME, not the controller's spec.controllerName string: that
+// string is chart-version dependent, the class name is not.
+const cftGatewayClassName = "cloudflare-tunnel"
+
+// cftOwnsGatewayObject keeps a Gateway in the cloudflare-tunnel
+// stuck set when its spec.gatewayClassName names the cloudflare-tunnel
+// class. Unresolvable/absent class names KEEP the object — an
+// unattributable stuck Gateway is still a gateway-API-plane problem
+// (the same fail-open posture ciliumOwnsGatewayObject documents);
+// only a PROVEN foreign class drops it.
+func cftOwnsGatewayObject(_ context.Context, _ *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	class, _ := kube.NestedString(o.Object, "spec", "gatewayClassName")
+	return class == "" || class == cftGatewayClassName
+}
+
+// cftOwnsRouteParent keeps a route in the stuck set when any
+// spec.parentRefs[] Gateway resolves to the cloudflare-tunnel class —
+// the ciliumOwnsRouteParent shape with the class-name key. Routes
+// with no Gateway parents or unresolvable parents stay in the set;
+// a route provably riding another controller's Gateway is that
+// controller's problem.
+func cftOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	refs, found := kube.NestedSlice(o.Object, "spec", "parentRefs")
+	if !found || len(refs) == 0 {
+		return true
+	}
+	resolved := false
+	for _, ref := range refs {
+		m, ok := ref.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _ := kube.NestedString(m, "kind"); k != "" && k != "Gateway" {
+			continue
+		}
+		if g, _ := kube.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
+			continue
+		}
+		name, _ := kube.NestedString(m, "name")
+		if name == "" {
+			continue
+		}
+		ns, _ := kube.NestedString(m, "namespace")
+		if ns == "" {
+			ns = o.GetNamespace()
+		}
+		gw, err := p.Dyn.Resource(kube.GVRGateway).Namespace(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")
+		resolved = true
+		if class == cftGatewayClassName {
+			return true
+		}
+	}
+	return !resolved
 }

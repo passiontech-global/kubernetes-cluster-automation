@@ -104,10 +104,13 @@ package concoursejanitor
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
@@ -153,6 +156,18 @@ const (
 	cjATCTimeout        = 15 * time.Second
 	cjFastPoll          = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
 	cjSlowPoll          = 10 * time.Second // drain/ready waits (bash `sleep 10`)
+
+	// W16-CI1 — stalled / Garden max-containers recovery. A worker
+	// pod Running+Ready this long is steady-state; only a TSA or
+	// Garden fault on such a pod justifies a wipe despite an
+	// under-cap cache. Under 15m the pod may still be finishing
+	// init-rm from a previous wipe — replacing it again would thrash.
+	cjSteadyWorkerMinAge = 15 * time.Minute
+	// The Garden/baggageclaim fault signatures appear in the
+	// concourse-worker container's stdout; a bounded tail suffices —
+	// the lines repeat on every volume/container creation attempt.
+	cjWorkerContainer   = "concourse-worker"
+	cjWorkerLogTailLine = 50
 )
 
 // nodeStatsReader reads kubelet stats/summary through the apiserver
@@ -202,6 +217,10 @@ type concourseWorkdirJanitor struct {
 	// is deterministic. nil → time.Now.
 	now shared.Clock
 	cfg cjConfig
+	// workerLogTail fetches the tail of the pod's concourse-worker
+	// container log — the injected seam in tests, the bounded
+	// GetLogs tail in production (nil → real fetch).
+	workerLogTail func(ctx context.Context, pod *corev1.Pod) (string, error)
 }
 
 // Setup registers the 30-minute sweep (was the
@@ -339,11 +358,24 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// (fail-open).
 	if s.workdirOK && s.workdirGiB <= cjMaxWorkdirGiB &&
 		s.nodefsOK && s.pct < cjMinNodefsPct {
-		log.Info("SKIP: under caps — keep cache",
-			"pod", podName, "workdirGiB", s.workdirGiB,
-			"workdirCapGiB", cjMaxWorkdirGiB,
-			"nodefsPct", s.pct, "nodefsMinPct", cjMinNodefsPct)
-		return false, nil
+		// W16-CI1 — a steady-state (Ready >= 15m) worker can still be
+		// dead: the TSA records it `stalled`, or Garden hit
+		// max-containers / baggageclaim ran out of volume space. Such
+		// a worker takes no builds while the cache looks perfectly
+		// healthy — keep-cache would skip it forever. Recovery runs
+		// the exact same drain → delete → prune → waitReady chain as
+		// the over-cap path (fall through).
+		if why := j.staleWorkerReason(ctx, pod, podName, flyOK, log); why != "" {
+			log.Info("WIPE: worker unhealthy despite under-cap cache — replacing",
+				"pod", podName, "why", why,
+				"workdirGiB", s.workdirGiB, "nodefsPct", s.pct)
+		} else {
+			log.Info("SKIP: under caps — keep cache",
+				"pod", podName, "workdirGiB", s.workdirGiB,
+				"workdirCapGiB", cjMaxWorkdirGiB,
+				"nodefsPct", s.pct, "nodefsMinPct", cjMinNodefsPct)
+			return false, nil
+		}
 	}
 	if !s.nodefsOK || !s.workdirOK {
 		// A blind wipe is deliberate fail-open policy, but a
@@ -505,4 +537,87 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 		log.Info("=== worker state — no prune needed ===",
 			"pod", podName, "workerState", strOr(st, "gone"))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// W16-CI1 — stalled / Garden max-containers recovery. Detection only:
+// the recovery itself is the standard drain → delete → prune →
+// waitReady chain processPod already runs.
+// ---------------------------------------------------------------------------
+
+// staleWorkerReason reports WHY a steady-state worker pod must be
+// replaced despite an under-cap cache, "" when it is healthy (or the
+// check is inconclusive — an inconclusive read never wipes the
+// cache). Gated on flyOK: without ATC login neither the TSA state nor
+// a landed drain is available, and the wipe chain would lose the
+// land step the stalled worker needs.
+func (j *concourseWorkdirJanitor) staleWorkerReason(ctx context.Context,
+	pod *corev1.Pod, podName string, flyOK bool, log logr.Logger) string {
+	if !flyOK {
+		return ""
+	}
+	var readyAt time.Time
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			readyAt = c.LastTransitionTime.Time
+		}
+	}
+	if readyAt.IsZero() || j.now.Now().Sub(readyAt) < cjSteadyWorkerMinAge {
+		// Young/never-ready pods are inside init-rm or churn — the
+		// mid-init-rm guard downstream covers them; detection here
+		// must not compound it.
+		return ""
+	}
+	if state, err := j.atc.workerState(ctx, podName); err != nil {
+		log.Info("WARN: worker state read failed — stalled detection degrades to the log tail",
+			"pod", podName, "error", err)
+	} else if state == "stalled" {
+		return "tsa-state-stalled"
+	}
+	tail := j.workerLogTail
+	if tail == nil {
+		tail = j.fetchWorkerLogTail
+	}
+	logs, err := tail(ctx, pod)
+	if err != nil {
+		log.Info("WARN: worker log tail read failed — Garden fault detection inconclusive",
+			"pod", podName, "error", err)
+		return ""
+	}
+	return workerGardenFault(logs)
+}
+
+// fetchWorkerLogTail is the production half of the workerLogTail
+// seam: a bounded GetLogs tail of the concourse-worker container.
+func (j *concourseWorkdirJanitor) fetchWorkerLogTail(ctx context.Context,
+	pod *corev1.Pod) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
+	defer cancel()
+	tail := int64(cjWorkerLogTailLine)
+	stream, err := j.cs.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
+		&corev1.PodLogOptions{Container: cjWorkerContainer, TailLines: &tail}).Stream(cctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = stream.Close() }()
+	data, err := io.ReadAll(io.LimitReader(stream, 256<<10))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// workerGardenFault matches the observed Garden/baggageclaim fault
+// signatures (case-insensitive): the worker hit the container
+// ceiling, or baggageclaim cannot create new volumes (full disk /
+// leaked volumes). "" is healthy-or-inconclusive.
+func workerGardenFault(logs string) string {
+	l := strings.ToLower(logs)
+	if strings.Contains(l, "max containers reached") {
+		return "garden-max-containers"
+	}
+	if strings.Contains(l, "baggageclaim: failed to create volume") {
+		return "baggageclaim-volume-create-failed"
+	}
+	return ""
 }

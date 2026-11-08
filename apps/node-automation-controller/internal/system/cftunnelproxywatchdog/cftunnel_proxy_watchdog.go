@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -44,6 +45,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -93,7 +95,34 @@ const (
 	cfTunnelLogTailLines = 200
 	cfTunnelLogMaxBytes  = 256 << 10
 	cfTunnelLogTimeout   = 8 * time.Second
+
+	// W16-CI2 — gateway controller sync-error audit. The controller
+	// logs "failed to update tunnel configuration" (Cloudflare API
+	// rejected the Route push), "429 Too Many Requests" (API rate
+	// limit — a desync is accumulating silently), or an
+	// "authentication error" (dead API token). The watchdog's 5m
+	// sweep reads a bounded log tail and mirrors the finding to the
+	// gauge; a clean tail for a full clear-window resets it.
+	cfTunnelGatewayCtrlSelector = "app.kubernetes.io/name=cloudflare-tunnel-gateway-controller"
+	cfTunnelSyncErrSinceSeconds = int64(300)
+	cfTunnelSyncErrTailLines    = int64(200)
+	cfTunnelSyncErrClearAfter   = 5 * time.Minute
+	cfTunnelSyncErrLogTimeout   = 8 * time.Second
+	cfTunnelSyncErrLogMaxBytes  = 256 << 10
 )
+
+// node_automation_cftunnel_gateway_sync_error is 1 while the last
+// cfTunnelSyncErrClearAfter window saw a sync-error signature in the
+// controller's log tail, 0 otherwise (set once the first sweep
+// detects it — see auditControllerSyncErrors).
+var cftunnelGatewaySyncErrorGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_cftunnel_gateway_sync_error",
+	Help: "1 while the cloudflare-tunnel-gateway-controller log tail (5m window) carries a tunnel-config sync error (failed to update tunnel configuration, 429, authentication error) — W16-CI2.",
+}, []string{"namespace"})
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(cftunnelGatewaySyncErrorGauge)
+}
 
 // cfTunnelConnectorTarget is one label-selected pod population that
 // runs cloudflared and can wedge the same way.
@@ -135,6 +164,12 @@ type cfTunnelProxyWatchdog struct {
 	verdict kube.Verdict
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
+	// syncErrLast is namespace -> sweep time of the last log tail
+	// that carried a sync-error signature (W16-CI2). The gauge stays
+	// 1 until a sweep reads a clean tail at least
+	// cfTunnelSyncErrClearAfter after the last errored one — a single
+	// clean sweep between error sweeps would flap the series.
+	syncErrLast map[string]time.Time
 }
 
 // Setup registers the periodic sweep — only on
@@ -184,6 +219,10 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// W16-CI2 — the sync-error audit is observational (gauge only, no
+	// heal), so its failures never abort the sweep; the function
+	// logs them itself.
+	w.auditControllerSyncErrors(ctx)
 	log.Info("sweep done", "resyncedSlices", resynced, "stallCleared", cleared,
 		"wedgesHealed", healed)
 	return nil
@@ -598,4 +637,108 @@ func cloudflaredLogsWedged(logs string) bool {
 		}
 	}
 	return edgeErrs >= 3
+}
+
+// ---------------------------------------------------------------------------
+// W16-CI2 — cloudflare-tunnel-gateway-controller sync-error audit.
+// ---------------------------------------------------------------------------
+
+// auditControllerSyncErrors reads a bounded log tail of every
+// cloudflare-tunnel-gateway-controller pod and mirrors the finding to
+// node_automation_cftunnel_gateway_sync_error. The gauge sets to 1 on
+// the first sweep that sees a signature and only resets to 0 once a
+// sweep with a clean tail lands at least cfTunnelSyncErrClearAfter
+// after the last errored one — so a single clean sweep sandwiched
+// between error sweeps cannot clear a live desync, and an errored or
+// empty log read (controller pod restarting) never clears it either.
+// Observational only: failures log, they never abort the sweep.
+func (w *cfTunnelProxyWatchdog) auditControllerSyncErrors(ctx context.Context) {
+	log := logf.FromContext(ctx)
+	now := w.now.Now()
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: cfTunnelGatewayCtrlSelector,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(w.cs, w.namespace))
+	if err != nil {
+		metrics.IncError(w.queue)
+		log.Info("WARN: gateway controller pod list failed — sync-error audit skipped",
+			"namespace", w.namespace, "error", err.Error())
+		return
+	}
+	errSeen := false
+	readOK := false
+	readFailed := false
+	for i := range pods {
+		logs, rerr := w.controllerLogTail(ctx, &pods[i])
+		if rerr != nil {
+			// A failed read leaves that replica's evidence
+			// unverifiable — with 2 replicas a clean read on the
+			// other must NOT clear the gauge (the crash-loop shape
+			// is exactly when one tail is unreadable).
+			readFailed = true
+			log.Info("WARN: gateway controller log tail read failed",
+				"pod", pods[i].Name, "error", rerr.Error())
+			continue
+		}
+		if strings.TrimSpace(logs) == "" {
+			// Empty tail (fresh pod, quiet window) is inconclusive —
+			// no clean evidence, so it never clears either.
+			continue
+		}
+		readOK = true
+		if controllerSyncErrors(logs) {
+			errSeen = true
+			break
+		}
+	}
+	if errSeen {
+		if w.syncErrLast == nil {
+			w.syncErrLast = map[string]time.Time{}
+		}
+		w.syncErrLast[w.namespace] = now
+		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(1)
+		log.Info("gateway controller sync error detected",
+			"namespace", w.namespace, "pods", len(pods))
+		return
+	}
+	stamp, ok := w.syncErrLast[w.namespace]
+	if ok && readOK && !readFailed && now.Sub(stamp) >= cfTunnelSyncErrClearAfter {
+		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(0)
+		delete(w.syncErrLast, w.namespace)
+		log.Info("gateway controller sync error cleared",
+			"namespace", w.namespace)
+	}
+}
+
+// controllerLogTail is the bounded GetLogs tail of one controller
+// pod: SinceSeconds=300, TailLines=200, byte-capped.
+func (w *cfTunnelProxyWatchdog) controllerLogTail(ctx context.Context,
+	p *corev1.Pod) (string, error) {
+	lctx, cancel := context.WithTimeout(ctx, cfTunnelSyncErrLogTimeout)
+	defer cancel()
+	since := cfTunnelSyncErrSinceSeconds
+	tail := cfTunnelSyncErrTailLines
+	stream, err := w.cs.CoreV1().Pods(p.Namespace).GetLogs(p.Name,
+		&corev1.PodLogOptions{
+			SinceSeconds: &since,
+			TailLines:    &tail,
+		}).Stream(lctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = stream.Close() }()
+	data, err := io.ReadAll(io.LimitReader(stream, cfTunnelSyncErrLogMaxBytes))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// controllerSyncErrors matches the observed Cloudflare API sync
+// failure signatures in the controller's log (case-insensitive).
+func controllerSyncErrors(logs string) bool {
+	l := strings.ToLower(logs)
+	return strings.Contains(l, "failed to update tunnel configuration") ||
+		strings.Contains(l, "429 too many requests") ||
+		strings.Contains(l, "authentication error")
 }

@@ -15,6 +15,14 @@
 #     other style linters: they force churn without catching bugs.
 version: "2"
 
+# moon runs one golangci-lint per Go project concurrently (`moon run
+# :lint`), each with its own GOLANGCI_LINT_CACHE (see
+# .moon/tasks/all.yml) — without this, every instance acquires a file
+# lock on start and the losers die with "parallel golangci-lint is
+# running" (exit 3).
+run:
+  allow-parallel-runners: true
+
 linters:
   default: standard
 

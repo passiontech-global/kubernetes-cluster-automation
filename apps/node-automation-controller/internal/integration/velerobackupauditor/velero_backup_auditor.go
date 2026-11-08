@@ -32,8 +32,9 @@
 // Layout: this file holds the shared keys/state, the Setup + run
 // entry point and the paged-list helpers; schedule_audit.go the
 // per-Schedule rot checks, everest_audit.go the W9-ST3 Percona
-// Everest audit, inflight_pvb_audit.go the W10-ST6 wedged-transfer
-// audit + PVB cleanup.
+// Everest audit, cnpg_audit.go the W16-ST1 CloudNativePG backup
+// audit, inflight_pvb_audit.go the W10-ST6 wedged-transfer
+// audit + PVB cleanup (+ W16-ST1 DataUpload/DataDownload scan).
 package velerobackupauditor
 
 import (
@@ -82,6 +83,11 @@ var (
 	// carries spec.dbClusterName + status.state.
 	everestDBClusterGVR = kube.GVREverestDatabaseCluster
 	everestDBBackupGVR  = kube.GVREverestDatabaseClusterBackup
+	// W16-ST1 — CloudNativePG CRDs: the ScheduledBackup declares
+	// spec.clusterName + spec.schedule and the Backup carries
+	// spec.clusterName + status.phase.
+	cnpgScheduledBackupGVR = kube.GVRCNPGScheduledBackup
+	cnpgBackupGVR          = kube.GVRCNPGBackup
 )
 
 // veleroStuckPhases are terminal-failure and wedged-in-flight
@@ -196,6 +202,14 @@ type veleroBackupAuditor struct {
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
 	seenEverest state.GaugeLedger[everestKey]
+	// seenCNPG: series ledger for the W16-ST1 CNPG half of
+	// DBBackupUnhealthy — its own ledger so the Everest sweep's
+	// prune never deletes CNPG series (the two audits assert
+	// disjoint key sets on the same gauge vec).
+	seenCNPG state.GaugeLedger[everestKey]
+	// seenDataMovement: series ledger for the W16-ST1
+	// DataUpload/DataDownload wedge gauge — keys "kind/ns/name".
+	seenDataMovement state.GaugeLedger[string]
 	// seenStuckBackup / seenWedgedPVB: series ledgers for the
 	// W10-ST6 in-flight gauges — same prune-on-resolve contract.
 	seenStuckBackup state.GaugeLedger[pausedKey]
@@ -240,6 +254,11 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// so it runs before (and regardless of) the schedule 404 early
 	// return below. Its error joins the run's, never masks it.
 	everestErr := a.auditEverestBackups(ctx)
+	// W16-ST1 — the CNPG backup audit is likewise independent of
+	// Velero (CNPG runs fine with no Velero installed); its error
+	// joins the same way.
+	cnpgErr := a.auditCNPGBackups(ctx)
+	dbErr := errors.Join(everestErr, cnpgErr)
 
 	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
 	if err != nil {
@@ -247,9 +266,9 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// contract as externalsecret-nudge.
 		if apierrors.IsNotFound(err) {
 			log.Info("skip: velero CRDs not installed")
-			return everestErr
+			return dbErr
 		}
-		return errors.Join(everestErr,
+		return errors.Join(dbErr,
 			fmt.Errorf("list velero schedules: %w", err))
 	}
 	backups, err := a.veleroList(ctx, veleroBackupGVR)
@@ -257,7 +276,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		if apierrors.IsNotFound(err) {
 			backups = nil // schedules exist but backups CRD absent — check 1 still runs
 		} else {
-			return errors.Join(everestErr,
+			return errors.Join(dbErr,
 				fmt.Errorf("list velero backups: %w", err))
 		}
 	}
@@ -394,11 +413,14 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// cooldown so decommissioned nodes' stamps cannot accumulate.
 	a.pvbHealed.PruneExpired(a.now.Now(), veleroPVBCleanupCooldown)
 	stuckErr := a.auditInFlightTransfers(ctx, backups)
+	// W16-ST1 — the data-mover half of the in-flight audit: mark-only
+	// scan of DataUpload/DataDownload wedges.
+	dmErr := a.auditDataMovement(ctx)
 
 	log.Info("sweep done", "schedules", len(schedules.Items),
 		"paused", len(a.seenPaused.Last()), "badBackups", len(a.seenBad.Last()),
 		"bslUnavailable", len(a.seenBSL.Last()))
-	return errors.Join(everestErr, stuckErr)
+	return errors.Join(dbErr, stuckErr, dmErr)
 }
 
 // latestBackupsBySchedule indexes the newest Backup per owning

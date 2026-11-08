@@ -97,7 +97,8 @@ func cjWorkerPod(name, uid, node string, ready bool, annos map[string]string) *c
 	}
 	if ready {
 		p.Status.Conditions = []corev1.PodCondition{
-			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(time.Now())},
 		}
 	}
 	return p
@@ -185,6 +186,147 @@ func cjPod(t *testing.T, cs *fake.Clientset, name string) *corev1.Pod {
 		t.Fatalf("get pod %s: %v", name, err)
 	}
 	return p
+}
+
+// ---------------------------------------------------------------------------
+// W16-CI1 — stalled / Garden max-containers recovery
+// ---------------------------------------------------------------------------
+
+// cjSteadyWorkerPod is a worker Ready since `readyAt` — past the
+// cjSteadyWorkerMinAge steady-state gate when readyAt is old.
+func cjSteadyWorkerPod(name, uid, node string, readyAt time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cjNamespace, Name: name,
+			UID: types.UID(uid), CreationTimestamp: metav1.NewTime(readyAt),
+		},
+		Spec: corev1.PodSpec{NodeName: node},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(readyAt)},
+		}},
+	}
+}
+
+// The Garden fault classifier matches both observed signatures and
+// stays clean on worker noise.
+func TestWorkerGardenFaultClassifier(t *testing.T) {
+	for _, tc := range []struct {
+		logs string
+		want string
+	}{
+		{"", ""},
+		{"worker: build 42 finished\nworker: volume gc ok\n", ""},
+		{"gardener: error: max containers reached for this worker\n", "garden-max-containers"},
+		{"baggageclaim: failed to create volume: no space left on device\n", "baggageclaim-volume-create-failed"},
+		{"BAGGAGECLAIM: FAILED TO CREATE VOLUME: disk full\n", "baggageclaim-volume-create-failed"},
+		{"some other garden error\n", ""},
+	} {
+		if got := workerGardenFault(tc.logs); got != tc.want {
+			t.Errorf("workerGardenFault(%q) = %q, want %q", tc.logs, got, tc.want)
+		}
+	}
+}
+
+// A steady-state worker TSA-recorded `stalled` with a perfectly
+// healthy cache is wiped through the standard chain: stats → land →
+// drained → delete → prune → Ready.
+func TestConcourseJanitorStalledWorkerWipedDespiteUnderCapCache(t *testing.T) {
+	var events []string
+	old := time.Now().Add(-time.Hour)
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjSteadyWorkerPod("concourse-worker-0", "uid-0", "node-a", old),
+		cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events,
+			states: map[string]string{"concourse-worker-0": "stalled"}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"login:admin",
+		"stats:node-a",
+		"state:concourse-worker-0", // stalled detection
+		"land:concourse-worker-0", "state:concourse-worker-0",
+		"delete:concourse-worker-0",
+		"state:concourse-worker-0", "prune:concourse-worker-0",
+		"stats:node-a",
+	}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Fatalf("events:\n%v\nwant:\n%v", events, want)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-new-concourse-worker-0" {
+		t.Fatalf("stalled worker not replaced: uid %s", got)
+	}
+}
+
+// A steady-state worker whose TSA state is healthy but whose
+// concourse-worker log carries the Garden max-containers signature is
+// also wiped; the log read rides the workerLogTail seam.
+func TestConcourseJanitorMaxContainersLogWiped(t *testing.T) {
+	var events []string
+	old := time.Now().Add(-time.Hour)
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjSteadyWorkerPod("concourse-worker-0", "uid-0", "node-a", old),
+		cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events,
+			states: map[string]string{"concourse-worker-0": "running"}})
+	j.workerLogTail = func(_ context.Context, _ *corev1.Pod) (string, error) {
+		return "gardener: max containers reached\n", nil
+	}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-new-concourse-worker-0" {
+		t.Fatalf("max-containers worker not replaced: uid %s", got)
+	}
+	if !strings.Contains(fmt.Sprint(events), "land:concourse-worker-0") {
+		t.Fatalf("recovery chain skipped the land step: %v", events)
+	}
+}
+
+// The detection stays armed only past the steady-state age: a worker
+// Ready 5 minutes ago (likely still inside init-rm from a previous
+// wipe) is kept even when the TSA says stalled. State is never
+// queried for young pods.
+func TestConcourseJanitorYoungWorkerKeptEvenWhenStalled(t *testing.T) {
+	var events []string
+	fresh := time.Now().Add(-5 * time.Minute)
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjSteadyWorkerPod("concourse-worker-0", "uid-0", "node-a", fresh),
+		cjLocalUsers())
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events,
+			states: map[string]string{"concourse-worker-0": "stalled"}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
+		t.Fatalf("young stalled worker was replaced: uid %s", got)
+	}
+	for _, e := range events {
+		if strings.HasPrefix(e, "state:") {
+			t.Fatalf("worker state queried for a young pod: %v", events)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -721,4 +722,118 @@ func TestSetupCFTunnelProxyWatchdogPeriodic(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "cf-tunnel-proxy-watchdog", 5*time.Minute)
+}
+
+// ---------------------------------------------------------------------------
+// W16-CI2 — gateway controller sync-error audit
+// ---------------------------------------------------------------------------
+
+// gatewayCtrlPod builds a cloudflare-tunnel-gateway-controller pod
+// carrying the audit's label selector.
+func gatewayCtrlPod(name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: cfWatchdogTestNS,
+			Labels: map[string]string{
+				"app.kubernetes.io/name": "cloudflare-tunnel-gateway-controller",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func syncErrGaugeVal(t *testing.T) float64 {
+	t.Helper()
+	return ptestutil.ToFloat64(cftunnelGatewaySyncErrorGauge.
+		WithLabelValues(cfWatchdogTestNS))
+}
+
+// The classifier matches the three observed Cloudflare API sync
+// failure signatures and stays clean on unrelated controller noise.
+func TestControllerSyncErrorsClassifier(t *testing.T) {
+	for _, tc := range []struct {
+		logs string
+		want bool
+	}{
+		{"", false},
+		{"level=info msg=\"updating tunnel configuration\" ok\n", false},
+		{"level=error msg=\"failed to update tunnel configuration: 400\"\n", true},
+		{"request failed with 429 Too Many Requests\n", true},
+		{"ERROR authentication error: invalid token\n", true},
+		{"some unrelated reconciliation error\n", false},
+	} {
+		if got := controllerSyncErrors(tc.logs); got != tc.want {
+			t.Errorf("controllerSyncErrors(%q) = %v, want %v", tc.logs, got, tc.want)
+		}
+	}
+}
+
+// The gauge lifecycle: error tail sets 1; a clean tail inside the
+// clear window keeps 1; a clean tail past the window resets 0; a
+// failed log read inside the window keeps 1.
+func TestWatchdogSyncErrorGaugeSetsAndClears(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(gatewayCtrlPod("cf-gw-ctrl-0"))
+	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
+		namespace: cfWatchdogTestNS,
+		now:       shared.Clock(func() time.Time { return now })}
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR failed to update tunnel configuration\n"))
+
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run (error tail): %v", err)
+	}
+	if got := syncErrGaugeVal(t); got != 1 {
+		t.Fatalf("gauge = %v after error tail, want 1", got)
+	}
+
+	// Clean tail but only 2 minutes later — inside the clear window.
+	cs.PrependReactor("get", "pods", cfLogReactor("all quiet\n"))
+	w.syncErrLast[cfWatchdogTestNS] = now.Add(-2 * time.Minute)
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run (clean tail, inside window): %v", err)
+	}
+	if got := syncErrGaugeVal(t); got != 1 {
+		t.Fatalf("gauge = %v inside the clear window, want 1", got)
+	}
+
+	// Log read now fails (pod restarting) — still must not clear.
+	cs.PrependReactor("get", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "log" {
+				return false, nil, nil
+			}
+			return true, nil, errors.New("log stream dead")
+		})
+	w.syncErrLast[cfWatchdogTestNS] = now.Add(-6 * time.Minute)
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run (log read failure): %v", err)
+	}
+	if got := syncErrGaugeVal(t); got != 1 {
+		t.Fatalf("gauge = %v after failed log read, want 1", got)
+	}
+
+	// Clean tail past the window — the reset lands.
+	cs.PrependReactor("get", "pods", cfLogReactor("all quiet\n"))
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run (clean tail, past window): %v", err)
+	}
+	if got := syncErrGaugeVal(t); got != 0 {
+		t.Fatalf("gauge = %v after clean tail past the window, want 0", got)
+	}
+}
+
+// A healthy controller tail from the start never raises the gauge.
+func TestWatchdogSyncErrorGaugeHealthyNoRaise(t *testing.T) {
+	cs := fake.NewSimpleClientset(gatewayCtrlPod("cf-gw-ctrl-0"))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"level=info msg=\"reconciled routes\" ok\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
+		namespace: cfWatchdogTestNS}
+	if err := w.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := syncErrGaugeVal(t); got != 0 {
+		t.Fatalf("gauge = %v with a healthy tail, want 0", got)
+	}
 }

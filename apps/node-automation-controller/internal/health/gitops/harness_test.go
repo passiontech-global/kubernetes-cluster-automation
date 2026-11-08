@@ -26,6 +26,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewFluxKustomizationHealthCheck,
 	NewWorkloadScaleFlappingCheck,
 	NewImagePullSecretAuditorCheck,
+	NewArgoCDAgentSpinCheck,
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {

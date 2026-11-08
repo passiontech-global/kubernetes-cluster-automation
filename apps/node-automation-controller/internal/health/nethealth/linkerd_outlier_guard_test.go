@@ -140,6 +140,69 @@ func TestLinkerdOutlierDetected(t *testing.T) {
 	})
 }
 
+// W16-G1 — a stable Rollout cohort (one rollouts-pod-template-hash,
+// `rollout` metric label) is protected like a Deployment's: the
+// gray-failed member flags, membership and uniformity resolve via
+// the rollouts hash label.
+func TestLinkerdOutlierRolloutCohortDetected(t *testing.T) {
+	owner := types.UID("rs-api-h1")
+	bad := outlierDeployPod("apps", "api", "h1", "api-bad", true, owner)
+	sib := outlierDeployPod("apps", "api", "h1", "api-sib", true, owner)
+	// Swap the Deployment hash label for the Rollouts one — the
+	// membership/uniformity tests must accept it (W16-G1).
+	bad.Labels = map[string]string{"rollouts-pod-template-hash": "h1"}
+	sib.Labels = map[string]string{"rollouts-pod-template-hash": "h1"}
+	cs := fake.NewSimpleClientset(bad, sib)
+	p := testProber(cs)
+	wireProm(t, p,
+		[]probetest.PromTestSample{
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 2.0},
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 1.0},
+		},
+		[]probetest.PromTestSample{
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 1.8},
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 0.01},
+		})
+	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("stable Rollout cohort outlier must fail: %+v", res)
+	}
+	if !strings.Contains(res.Why, "api-bad") {
+		t.Fatalf("why missing rollout pod: %q", res.Why)
+	}
+	t.Cleanup(func() {
+		linkerdOutlierPodsGauge.DeleteLabelValues("apps", "api", "api-bad")
+	})
+}
+
+// W16-G1 — a Rollout mid-canary (>1 distinct rollouts-pod-template-
+// hash) has no valid control group: stand down, no flag, no evict.
+func TestLinkerdOutlierRolloutCanaryStandsDown(t *testing.T) {
+	owner := types.UID("rs-api-h1")
+	bad := outlierDeployPod("apps", "api", "h1", "api-bad", true, owner)
+	sib := outlierDeployPod("apps", "api", "h2", "api-sib", true, types.UID("rs-api-h2"))
+	bad.Labels = map[string]string{"rollouts-pod-template-hash": "h1"}
+	sib.Labels = map[string]string{"rollouts-pod-template-hash": "h2"}
+	cs := fake.NewSimpleClientset(bad, sib)
+	p := testProber(cs)
+	wireProm(t, p,
+		[]probetest.PromTestSample{
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 2.0},
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 1.0},
+		},
+		[]probetest.PromTestSample{
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 1.8},
+			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 0.01},
+		})
+	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("mid-canary Rollout cohort must stand down and pass: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_linkerd_outlier_pods",
+		map[string]string{"namespace": "apps", "deployment": "api", "pod": "api-bad"}); m != nil {
+		t.Fatal("canary cohort member flagged — no valid control group")
+	}
+}
+
 // Fleet-wide failure: every pod fails at ~50% — a downstream
 // outage, not a gray failure. Median sibling err >= 5% stands the
 // check down completely.

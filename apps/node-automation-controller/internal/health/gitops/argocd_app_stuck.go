@@ -78,10 +78,15 @@ const (
 	argocdRefreshAnno          = "argocd.argoproj.io/refresh"
 )
 
-// argocdAppGVR is the Application CRD the W10-CP6 auditor reads —
+// argoCDAppGVR is the Application CRD the W10-CP6 auditor reads —
 // argoproj.io/v1alpha1 (distinct from the argoproj.io/v1beta1
 // ArgoCD cluster CR the operator watchdog already scans).
 var argocdAppGVR = kube.GVRArgoCDApplication
+
+// rolloutZeroReplicas backs the W16-G1 Rollout branch of
+// argocdWorkloadDownscaled: unstructured Rollouts carry no typed
+// *int32, so the zero-replica check needs a shared zero.
+var rolloutZeroReplicas = int32(0)
 
 var (
 	// W10-CP6 — ArgoCD Application stuck.
@@ -290,8 +295,8 @@ func (p *argoCDAppStuckCheck) argocdAppOnlyDownscaled(ctx context.Context,
 
 // argocdWorkloadDownscaled resolves one Application resource-tree
 // entry to its live workload and asks the shared verdict — anything
-// that is not a Deployment/StatefulSet pinned at replicas:0 with
-// downscaler/* annotations counts as real stuck evidence. Verdicts
+// that is not a Deployment/StatefulSet/Rollout pinned at replicas:0
+// with downscaler/* annotations counts as real stuck evidence. Verdicts
 // memoize per sweep on downscaledSeen (kind/ns/name → verdict) so a
 // workload shared by several Applications pays one Get, not one per
 // app; the memo never changes a verdict, only its lookup count.
@@ -313,6 +318,21 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 			Get(ctx, name, metav1.GetOptions{})
 		v = err == nil &&
 			kube.IsIntentionallyDownscaled(s.Annotations, s.Spec.Replicas)
+	case "Rollout":
+		// W16-G1 — Argo Rollouts workloads in the Application's
+		// resource tree carry the same downscaled semantics: a
+		// Rollout parked at spec.replicas:0 with downscaler/*
+		// annotations is sleep, not stuck evidence. Rollouts are
+		// unstructured CRs — read replicas off the unstructured spec.
+		r, err := p.Dyn.Resource(kube.GVRArgoRollout).
+			Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			v = false
+			break
+		}
+		replicas, found, err := unstructured.NestedInt64(r.Object, "spec", "replicas")
+		v = err == nil && found && replicas == 0 &&
+			kube.IsIntentionallyDownscaled(r.GetAnnotations(), &rolloutZeroReplicas)
 	}
 	if p.downscaledSeen == nil {
 		p.downscaledSeen = map[string]bool{} // lazy init — Run seeds it

@@ -12,12 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -121,6 +124,80 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// W16-ST1 — velero.io/v2alpha1 DataUpload / DataDownload wedge audit
+// ---------------------------------------------------------------------------
+
+// dataMovementStuckPhases are the in-flight phases of the velero
+// data-mover CRDs — a DataUpload/DataDownload held in any of these
+// past veleroStuckMaxAge has lost its node-agent thread, same wedge
+// shape as a PodVolumeBackup (W16-ST1).
+var dataMovementStuckPhases = map[string]bool{
+	"InProgress": true,
+	"Accepted":   true,
+	"Prepared":   true,
+	"Canceling":  true,
+}
+
+// veleroDataMovementWedgedGauge marks (1) each DataUpload or
+// DataDownload stuck in an in-flight phase past the 6h window —
+// mark-only: unlike a PodVolumeBackup there is no provably-dead
+// node-agent thread to bounce a delete would safely restart, so the
+// wedged object pages and waits for operator/velero cleanup.
+var veleroDataMovementWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_data_movement_wedged",
+	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — W16-ST1.",
+}, []string{"namespace", "name", "kind"})
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(veleroDataMovementWedgedGauge)
+}
+
+// auditDataMovement scans DataUpload and DataDownload objects for
+// wedged in-flight phases, marking
+// veleroDataMovementWedgedGauge{namespace,name,kind} and pruning the
+// series the moment the object resolves or is deleted. CRD absence
+// (clusters without the data-mover CRDs installed) is a quiet no-op,
+// same contract as the rest of the module.
+func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
+	a.seenDataMovement.Begin() // drop any aborted sweep's leftover emissions
+	log := logf.FromContext(ctx)
+	now := a.now.Now()
+
+	for _, gvr := range []schema.GroupVersionResource{
+		kube.GVRVeleroDataUpload, kube.GVRVeleroDataDownload,
+	} {
+		kind := gvr.Resource
+		items, err := a.veleroList(ctx, gvr)
+		switch {
+		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			continue // CRD absent — nothing to scan, stale series still prune below
+		case err != nil:
+			err = fmt.Errorf("list velero %s: %w", kind, err)
+			a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
+			return err
+		}
+		for i := range items.Items {
+			u := &items.Items[i]
+			phase, _ := kube.NestedString(u.Object, "status", "phase")
+			if !dataMovementStuckPhases[phase] {
+				continue
+			}
+			if now.Sub(inFlightSince(u)) <= veleroStuckMaxAge {
+				continue
+			}
+			k := kind + "/" + u.GetNamespace() + "/" + u.GetName()
+			a.seenDataMovement.Set(veleroDataMovementWedgedGauge, 1, k,
+				u.GetNamespace(), u.GetName(), kind)
+			log.Info("velero data movement object wedged in-flight >6h",
+				"kind", kind, "object", u.GetNamespace()+"/"+u.GetName(),
+				"phase", phase)
+		}
+	}
+	a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
+	return nil
+}
+
 // pvbNode resolves the node the PVB's Kopia transfer runs on —
 // spec.node (the snapshot's node) first, status.node as the
 // older-velero fallback so pre-upgrade PVBs still resolve.
@@ -137,7 +214,13 @@ func pvbNode(pvb *unstructured.Unstructured) string {
 // creationTimestamp — the same convention flagBadBackup uses.
 func inFlightSince(u *unstructured.Unstructured) time.Time {
 	since := u.GetCreationTimestamp().Time
+	// startTimestamp is the PVB convention; velero.io/v2alpha1
+	// DataUpload/DataDownload expose startedAt instead.
 	if st, ok := kube.NestedString(u.Object, "status", "startTimestamp"); ok {
+		if t, err := time.Parse(time.RFC3339, st); err == nil {
+			since = t
+		}
+	} else if st, ok := kube.NestedString(u.Object, "status", "startedAt"); ok {
 		if t, err := time.Parse(time.RFC3339, st); err == nil {
 			since = t
 		}

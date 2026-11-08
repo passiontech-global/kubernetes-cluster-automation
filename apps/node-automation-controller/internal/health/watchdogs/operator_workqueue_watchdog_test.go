@@ -44,8 +44,8 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		}
 		seen[op.name] = true
 	}
-	if len(operatorTargets) != 23 {
-		t.Fatalf("operatorTargets = %d, want 23", len(operatorTargets))
+	if len(operatorTargets) != 25 {
+		t.Fatalf("operatorTargets = %d, want 25", len(operatorTargets))
 	}
 	for _, want := range []string{
 		"source-controller", "cert-manager",
@@ -58,6 +58,8 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		"percona-xtradb-cluster-operator", "percona-postgresql-operator",
 		"percona-server-mongodb-operator", "fluent-operator",
 		"tekton-pipelines-controller", "shipwright-operator",
+		// W16-G1 additions.
+		"argo-rollouts-controller", "cloudflare-tunnel-gateway-controller",
 	} {
 		if !seen[want] {
 			t.Fatalf("missing operator target %q", want)

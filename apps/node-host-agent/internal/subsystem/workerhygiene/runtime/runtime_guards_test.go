@@ -485,3 +485,48 @@ func TestPageAllocCompaction(t *testing.T) {
 		t.Fatal("compact_memory re-poked inside the 30m budget")
 	}
 }
+
+// TestSubprocOOMMemoryStatBreakdown — W16-KR1: at living-dead
+// confirmation the memory.stat of the same cgroup is folded into
+// the event note ("mem_stat=anon=XMiB shmem=YMiB file=ZMiB") — a
+// big shmem is the tmpfs/emptyDir{medium:Memory} fingerprint.
+func TestSubprocOOMMemoryStatBreakdown(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "tmpfs", Namespace: "default",
+			UID: types.UID(wdepstest.UIDA)},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	h := e.H
+	ctx := context.Background()
+	h.Cfg.Runtime.CgroupRoot = t.TempDir()
+	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}}
+	chk := wdepstest.Check[*runtime.SubprocOOMCheck](h, wdeps.CheckSubprocOOM)
+
+	scope := mkOOMScope(t, e, wdepstest.UIDA, "mem111", 1, 4242)
+	// 3.5 GiB anon, 1.2 GiB shmem, 0.1 GiB file (byte-exact MiB
+	// rounding: 3758096384 → 3584, 1288490189 → 1229, 107374183 → 102).
+	wdepstest.WriteFile(t, filepath.Join(scope, "memory.stat"),
+		"anon 3758096384\nfile 107374183\nshmem 1288490189\nkernel 100\nsock 5\n")
+	chk.Run(ctx, ce) // baseline
+	wdepstest.WriteFile(t, filepath.Join(scope, "memory.events"), "oom_kill 2\n")
+	chk.Run(ctx, ce)
+	e.Now = e.Now.Add(61 * time.Second)
+	chk.Run(ctx, ce)
+	evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 1 {
+		t.Fatalf("events=%d want 1", len(evs.Items))
+	}
+	note := evs.Items[0].Note
+	want := "mem_stat=anon=3584MiB shmem=1229MiB file=102MiB"
+	if !strings.Contains(note, want) {
+		t.Fatalf("event note missing breakdown %q:\n%s", want, note)
+	}
+	if !strings.Contains(e.LogLines(t), want) {
+		t.Fatalf("log missing breakdown %q:\n%s", want, e.LogLines(t))
+	}
+}

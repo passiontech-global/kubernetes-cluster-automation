@@ -92,6 +92,10 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// must be kept (inconclusive, never a flap).
 	shimEscalated := false
 	killCapHit := false
+	// W16-KR2: every shim id scoped to OUR containerd this round —
+	// a sandbox dir whose id a live shim holds is not an orphan,
+	// whatever the task-dir scan says.
+	shimIDs := map[string]bool{}
 	pids := e.PidsOnce()
 	for _, pid := range pids {
 		if nShim >= c.d.Cfg.Ctr.MaxShimKill {
@@ -107,6 +111,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if !inScope {
 			continue
 		}
+		shimIDs[sid] = true
 		if ns == "k8s.io" {
 			if liveDirs[sid] || sbDirs[sid] {
 				continue
@@ -261,6 +266,66 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		nClean++
 		c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "rm_dir").Inc()
+	}
+	// W16-KR2 — orphan CRI sandbox reaper: SandboxCtlRoot dirs with
+	// neither a task dir under CtrTaskRoot nor a live shim holding
+	// the id. Two-phase like the wedged dirs — sandbox-orphan-seen-<id>
+	// marker on first observation, removal only once the marker is
+	// >=30m old AND the dir ModTime is >=30m old (a sandbox dir
+	// mid-creation has a fresh ModTime; the marker alone can't tell
+	// creation from abandonment). A capped shim phase skips the
+	// whole sweep: an unexamined shim may still hold a candidate id.
+	if !killCapHit {
+		const orphanSandboxAge = 30 * time.Minute
+		now := c.d.Cfg.Seams.Host.Clock.Now()
+		for id := range sbDirs {
+			if liveDirs[id] || shimIDs[id] {
+				continue
+			}
+			d := filepath.Join(c.d.Cfg.SandboxCtlRoot, id)
+			info, err := os.Stat(d)
+			if err != nil {
+				continue
+			}
+			if now.Sub(info.ModTime()) < orphanSandboxAge {
+				continue
+			}
+			marker := "sandbox-orphan-seen-" + id
+			if !c.d.StateFileExists(marker) {
+				c.d.State.RateSpend(marker)
+				c.d.State.AppendLog(fmt.Sprintf(
+					"orphan sandbox candidate %.12s - no task dir, no shim - confirm next run", id))
+				continue
+			}
+			if !c.d.State.RateOK(marker, orphanSandboxAge) {
+				continue
+			}
+			if nClean >= c.d.Cfg.Ctr.MaxTaskClean {
+				c.d.State.AppendLog(fmt.Sprintf("suspect: orphan sandbox dir still pending cap=%d",
+					c.d.Cfg.Ctr.MaxTaskClean))
+				break
+			}
+			_ = os.Remove(filepath.Join(c.d.Cfg.WatchdogStateDir, marker))
+			if err := os.RemoveAll(d); err != nil {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: rm orphan sandbox dir %.12s failed: %v", id, err))
+				continue
+			}
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: rm orphan sandbox dir %.12s - no task dir, no shim, dir+marker >=30m", id))
+			nClean++
+			c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "rm_orphan_sandbox").Inc()
+		}
+	}
+	// Prune orphan-sandbox markers whose sandbox dir disappeared
+	// between runs (containerd GC'd it or a previous cleanup won).
+	if ms, err := filepath.Glob(filepath.Join(c.d.Cfg.WatchdogStateDir,
+		"sandbox-orphan-seen-*")); err == nil {
+		for _, m := range ms {
+			if !sbDirs[strings.TrimPrefix(filepath.Base(m), "sandbox-orphan-seen-")] {
+				_ = os.Remove(m)
+			}
+		}
 	}
 	// Full scan with no D/Z orphan shim left → release our hold on
 	// the shared latch (pod-teardown's own hold, if any, is

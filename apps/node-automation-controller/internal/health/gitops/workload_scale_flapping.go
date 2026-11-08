@@ -64,6 +64,13 @@ const (
 	// StatefulSet as the involved object.
 	stsFlapCreateReason = "SuccessfulCreate"
 	stsFlapDeleteReason = "SuccessfulDelete"
+	// W16-G1 — the Argo Rollouts controller's scale event reasons.
+	// The Rollouts controller never emits ScalingReplicaSet (it
+	// creates its ReplicaSets directly): its scale-ups/downs surface
+	// as RolloutScaledUp/RolloutScaledDown on the parent Rollout
+	// with the same "Scaled up replica set X to N" message shape.
+	rolloutFlapUpReason   = "RolloutScaledUp"
+	rolloutFlapDownReason = "RolloutScaledDown"
 	// scaleFlapWindow bounds the event history the flap counter
 	// reads — events older than this cannot be evidence of a live
 	// tug-of-war (event TTLs are short anyway).
@@ -116,7 +123,8 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	var events []corev1.Event
 	for _, reason := range []string{
-		scaleFlapReason, stsFlapCreateReason, stsFlapDeleteReason} {
+		scaleFlapReason, stsFlapCreateReason, stsFlapDeleteReason,
+		rolloutFlapUpReason, rolloutFlapDownReason} {
 		evs, err := kube.ListAll(ctx, metav1.ListOptions{
 			FieldSelector: "reason=" + reason,
 			Limit:         probefw.HealthListPageSize,
@@ -154,6 +162,17 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 			}
 			up = e.Reason == stsFlapCreateReason
 			down = e.Reason == stsFlapDeleteReason
+		case rolloutFlapUpReason, rolloutFlapDownReason:
+			// W16-G1 — the reason IS the direction; the message
+			// re-check keeps the count honest under silent-selector
+			// fakes the same way the Deployment path does. The
+			// involvedObject kind is the parent Rollout (GVRArgoRollout).
+			if e.InvolvedObject.Kind != "Rollout" ||
+				!strings.Contains(e.Message, "Scaled") {
+				continue
+			}
+			up = e.Reason == rolloutFlapUpReason
+			down = e.Reason == rolloutFlapDownReason
 		}
 		if !up && !down {
 			continue

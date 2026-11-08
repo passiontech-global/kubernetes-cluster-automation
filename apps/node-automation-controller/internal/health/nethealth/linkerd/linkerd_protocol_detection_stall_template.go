@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -88,7 +89,28 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 			return false
 		}
 		dref := metav1.GetControllerOf(rs)
-		if dref == nil || dref.Kind != "Deployment" {
+		if dref == nil {
+			return false
+		}
+		if dref.Kind == "Rollout" {
+			// W16-G1 — a Rollout-owned ReplicaSet: patch the parent
+			// Rollout (argoproj.io/v1alpha1, unstructured) exactly
+			// like the Deployment path — same template annotation,
+			// same patch stamp and GitOps drift guard via
+			// patchTemplatePorts, just a dynamic-client patch.
+			ro, err := p.Dyn.Resource(kube.GVRArgoRollout).
+				Namespace(ns).Get(ctx, dref.Name, metav1.GetOptions{})
+			if err != nil {
+				log.Info("WARN: linkerd heal — rollout get failed",
+					"rollout", ns+"/"+dref.Name, "error", err)
+				return false
+			}
+			annos, _, _ := unstructured.NestedStringMap(ro.Object,
+				"spec", "template", "metadata", "annotations")
+			return p.patchTemplatePorts(ctx, log, ro, "rollout", ns, ro.GetName(),
+				annos, missing, false, now, rep, driftNow)
+		}
+		if dref.Kind != "Deployment" {
 			return false
 		}
 		dep, err := p.CS.AppsV1().Deployments(ns).Get(ctx, dref.Name, metav1.GetOptions{})
@@ -273,6 +295,11 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	case "cronjob":
 		_, patchErr = p.CS.BatchV1().CronJobs(ns).Patch(ctx, name,
 			types.MergePatchType, payload, metav1.PatchOptions{})
+	case "rollout":
+		// W16-G1 — unstructured argoproj.io/v1alpha1 Rollout: the
+		// same merge-patch body through the dynamic client.
+		_, patchErr = p.Dyn.Resource(kube.GVRArgoRollout).Namespace(ns).
+			Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	if patchErr != nil {
 		// Forbidden until the RBAC wave lands patch on pods /

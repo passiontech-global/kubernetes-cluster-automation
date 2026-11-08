@@ -105,6 +105,15 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "pgv2.percona.com", Version: "v2", Kind: "PerconaPGCluster"},
 	{Group: "psmdb.percona.com", Version: "v1", Kind: "PerconaServerMongoDB"},
 	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"},
+	// W16-ST1 — CNPG backup audit (velerobackupauditor/cnpg_audit.go):
+	// ScheduledBackup -> "scheduledbackups" pluralizes correctly via
+	// the trailing-"y" -> "ies" rule.
+	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "ScheduledBackup"},
+	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Backup"},
+	// W16-ST1 — velero data-mover transfers (velerobackupauditor
+	// in-flight audit).
+	{Group: "velero.io", Version: "v2alpha1", Kind: "DataUpload"},
+	{Group: "velero.io", Version: "v2alpha1", Kind: "DataDownload"},
 
 	// trivy-operator reports + policy-reporter (clusterhealthprobes'
 	// api-object-sprawl-report-gc census/GC).
@@ -148,6 +157,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Warehouse"},
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Promotion"},
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "AnalysisRun"},
+	// W16-G1: api-object-sprawl-report-gc also GCs completed Rollouts
+	// Experiments — the sweep fake must serve their List kinds.
+	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Experiment"},
 	{Group: "scylla.scylladb.com", Version: "v1", Kind: "ScyllaCluster"},
 	{Group: "dragonflydb.io", Version: "v1alpha1", Kind: "Dragonfly"},
 

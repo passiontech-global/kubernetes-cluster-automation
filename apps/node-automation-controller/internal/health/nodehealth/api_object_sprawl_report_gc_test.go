@@ -5,6 +5,7 @@ package nodehealth
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
@@ -66,6 +68,16 @@ func helmSecret(ns, release string, version int, status string) *corev1.Secret {
 	}
 }
 
+// sprawlDyn builds a dynamic fake covering the shared CRD table plus
+// the argo rollouts kinds the W16-G1 census/GC reads (the shared
+// OpDyn table predates them).
+func sprawlDyn(objs ...runtime.Object) dynamic.Interface {
+	kinds := maps.Clone(testutil.DynListKinds())
+	kinds[kube.GVRArgoAnalysisRun] = "AnalysisRunList"
+	kinds[kube.GVRArgoExperiment] = "ExperimentList"
+	return testutil.NewFakeDyn(kinds, objs...)
+}
+
 func TestSprawlGCDeletesDeadOwnerReports(t *testing.T) {
 	// Orphaned: owned by a ReplicaSet that is gone.
 	orphan := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport",
@@ -78,7 +90,7 @@ func TestSprawlGCDeletesDeadOwnerReports(t *testing.T) {
 		"apps", "vr-young", 30*time.Minute, sprawlOwner("ReplicaSet", "gone-rs"))
 	rs := liveReplicaSet("apps", "live-rs")
 	cs := fake.NewSimpleClientset(rs)
-	p := testProberDyn(cs, probetest.OpDyn(orphan, liveOwner, young))
+	p := testProberDyn(cs, sprawlDyn(orphan, liveOwner, young))
 	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("live orphans must fail: %+v", res)
@@ -106,6 +118,71 @@ func TestSprawlGCDeletesDeadOwnerReports(t *testing.T) {
 	}
 }
 
+// sprawlArgoCR builds an AnalysisRun/Experiment with a status.phase.
+func sprawlArgoCR(gvr schema.GroupVersionResource, kind, ns, name string,
+	age time.Duration, phase string) *unstructured.Unstructured {
+	obj := testutil.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name,
+		map[string]any{"status": map[string]any{"phase": phase}})
+	obj.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	obj.SetUID(types.UID("uid-" + ns + "-" + name))
+	return obj
+}
+
+// W16-G1 — terminal-phase AnalysisRuns past the retention threshold
+// are GC'd (the Rollouts controller never prunes them); Running ones
+// and records inside the window survive.
+func TestSprawlGCCollectsCompletedAnalysisRuns(t *testing.T) {
+	done := sprawlArgoCR(kube.GVRArgoAnalysisRun, "AnalysisRun",
+		"apps", "ar-done", 3*time.Hour, "Successful")
+	failed := sprawlArgoCR(kube.GVRArgoAnalysisRun, "AnalysisRun",
+		"apps", "ar-failed", 4*time.Hour, "Failed")
+	running := sprawlArgoCR(kube.GVRArgoAnalysisRun, "AnalysisRun",
+		"apps", "ar-running", 5*time.Hour, "Running")
+	young := sprawlArgoCR(kube.GVRArgoAnalysisRun, "AnalysisRun",
+		"apps", "ar-young", 30*time.Minute, "Successful")
+	p := testProberDyn(fake.NewSimpleClientset(),
+		sprawlDyn(done, failed, running, young))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("uncollected completed AnalysisRuns must fail: %+v", res)
+	}
+	for _, name := range []string{"ar-done", "ar-failed"} {
+		if _, err := p.Dyn.Resource(kube.GVRArgoAnalysisRun).Namespace("apps").
+			Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("completed AnalysisRun %s should be GC'd, err=%v", name, err)
+		}
+	}
+	for _, name := range []string{"ar-running", "ar-young"} {
+		if _, err := p.Dyn.Resource(kube.GVRArgoAnalysisRun).Namespace("apps").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("AnalysisRun %s must survive: %v", name, err)
+		}
+	}
+}
+
+// W16-G1 — the same GC covers Experiments: only the terminal phases
+// (Successful/Failed/Error/Inconclusive) age out.
+func TestSprawlGCCollectsCompletedExperiments(t *testing.T) {
+	done := sprawlArgoCR(kube.GVRArgoExperiment, "Experiment",
+		"apps", "exp-done", 3*time.Hour, "Inconclusive")
+	running := sprawlArgoCR(kube.GVRArgoExperiment, "Experiment",
+		"apps", "exp-running", 3*time.Hour, "Running")
+	p := testProberDyn(fake.NewSimpleClientset(),
+		sprawlDyn(done, running))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("uncollected completed Experiment must fail: %+v", res)
+	}
+	if _, err := p.Dyn.Resource(kube.GVRArgoExperiment).Namespace("apps").
+		Get(ctx, "exp-done", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("completed Experiment should be GC'd, err=%v", err)
+	}
+	if _, err := p.Dyn.Resource(kube.GVRArgoExperiment).Namespace("apps").
+		Get(ctx, "exp-running", metav1.GetOptions{}); err != nil {
+		t.Fatalf("running Experiment must survive: %v", err)
+	}
+}
+
 func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	var objs []runtime.Object
 	for v := 1; v <= 13; v++ {
@@ -114,7 +191,7 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	// The newest revision is deployed — never a prune candidate.
 	objs = append(objs, helmSecret("apps", "myrelease", 14, "deployed"))
 	cs := fake.NewSimpleClientset(objs...)
-	p := testProberDyn(cs, probetest.OpDyn())
+	p := testProberDyn(cs, sprawlDyn())
 	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("superseded excess must fail: %+v", res)
@@ -171,7 +248,7 @@ func TestSprawlGCKineLargeObjects(t *testing.T) {
 	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "secret", "apps", "big-secret")
 
 	cs := fake.NewSimpleClientset(bigCM, smallCM, bigSecret)
-	p := testProberDyn(cs, probetest.OpDyn())
+	p := testProberDyn(cs, sprawlDyn())
 	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
 
 	res := chk.Run(ctx)

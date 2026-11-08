@@ -83,21 +83,45 @@ var sprawlReportKinds = []struct {
 	{kube.GVRPolicyReport, "policyreport", "policyreports"},
 }
 
-// sprawlCIKinds is the census-only half: CI/CD CRs that pile up when
-// their operators run without retention (Tekton prune keep cap
-// unset, Shipwright succeededLimit/failedLimit absent). Counted into
-// the same api-object census but NEVER orphan-GC'd — these are owned
-// pipeline records, not per-revision reports, so reportOwnerGone
-// does not apply. An absent CRD (a cluster without Tekton or
-// Shipwright) skips silently.
+// sprawlCIKinds is the census half plus, since W16-G1, the
+// completed-CR GC half: CI/CD CRs that pile up when their operators
+// run without retention (Tekton prune keep cap unset, Shipwright
+// succeededLimit/failedLimit absent). Counted into the same
+// api-object census. gcCompleted kinds additionally GC their
+// TERMINAL-phase objects past sprawlOrphanMinAge (argo rollouts'
+// AnalysisRun/Experiment never delete their Successful/Failed/
+// Error/Inconclusive records — they accumulate forever, one per
+// canary step) — still NEVER owner-orphan-GC'd (reportOwnerGone does
+// not apply to operator-owned records). An absent CRD (a cluster
+// without Tekton, Shipwright or Argo Rollouts) skips silently.
 var sprawlCIKinds = []struct {
 	gvr      schema.GroupVersionResource
 	kind     string
 	resource string
+	// gcCompleted marks kinds whose terminal-phase objects are GC'd
+	// past sprawlOrphanMinAge (W16-G1: argo AnalysisRun/Experiment).
+	gcCompleted bool
 }{
-	{kube.GVRTektonPipelineRun, "pipelinerun", "pipelineruns"},
-	{kube.GVRTektonTaskRun, "taskrun", "taskruns"},
-	{kube.GVRShipwrightBuildRun, "buildrun", "buildruns"},
+	{kube.GVRTektonPipelineRun, "pipelinerun", "pipelineruns", false},
+	{kube.GVRTektonTaskRun, "taskrun", "taskruns", false},
+	{kube.GVRShipwrightBuildRun, "buildrun", "buildruns", false},
+	{kube.GVRArgoAnalysisRun, "analysisrun", "analysisruns", true},
+	{kube.GVRArgoExperiment, "experiment", "experiments", true},
+}
+
+// argoCompletedPhases are the terminal AnalysisRun/Experiment
+// status.phase values — anything still Pending/Running is a live
+// analysis and must never be GC'd.
+var argoCompletedPhases = map[string]bool{
+	"Successful": true, "Failed": true, "Error": true, "Inconclusive": true,
+}
+
+// sprawlKindRef is the (gvr, kind, resource) triple deleteOrphanReport
+// needs — a named stand-in for both tables' anonymous element shapes.
+type sprawlKindRef struct {
+	gvr      schema.GroupVersionResource
+	kind     string
+	resource string
 }
 
 // sprawlCIMax is the CI/CD sprawl ceiling: past it the cluster's
@@ -185,7 +209,8 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			if orphanBudget <= 0 {
 				continue // GC capped this cycle — still counted
 			}
-			if p.deleteOrphanReport(ctx, log, rk, obj) {
+			if p.deleteOrphanReport(ctx, log,
+				sprawlKindRef{rk.gvr, rk.kind, rk.resource}, obj) {
 				orphanBudget--
 			}
 		}
@@ -215,13 +240,43 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.resource, err)}
 		}
 		perNS := map[string]int{}
+		completed := 0
 		for i := range items {
-			perNS[items[i].GetNamespace()]++
+			obj := &items[i]
+			perNS[obj.GetNamespace()]++
 			ciTotal++
+			// W16-G1 — terminal-phase argo records past the retention
+			// threshold GC like the orphan reports: same budget, same
+			// UID-preconditioned delete, same evidence surface. The
+			// phase test gates it — a Running/Pending analysis is a
+			// live canary gate.
+			if !rk.gcCompleted ||
+				now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
+				continue
+			}
+			phase, _ := kube.NestedString(obj.Object, "status", "phase")
+			if !argoCompletedPhases[phase] {
+				continue
+			}
+			completed++
+			if orphanBudget <= 0 {
+				continue // GC capped this cycle — still counted
+			}
+			if p.deleteOrphanReport(ctx, log,
+				sprawlKindRef{rk.gvr, rk.kind, rk.resource}, obj) {
+				orphanBudget--
+			}
 		}
 		for ns, count := range perNS {
 			objects.Set(apiObjectCountGauge, float64(count),
 				rk.resource+"/"+ns, []string{rk.resource, ns})
+		}
+		if completed > 0 {
+			// Same evidence surface as the report GC: the per-kind
+			// orphaned gauge and a sweep finding per surviving batch.
+			orphans.Set(ephemeralReportsOrphanedGauge, float64(completed),
+				rk.kind, []string{rk.kind})
+			objects.Find(fmt.Sprintf("%d completed %s GC'd", completed, rk.resource))
 		}
 	}
 	if ciTotal > sprawlCIMax {
@@ -287,15 +342,12 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	return gone
 }
 
-// deleteOrphanReport removes one orphaned report with a UID
-// precondition — the "delete the object I vetted" shape every reaper
-// in this codebase uses.
+// deleteOrphanReport removes one orphaned report (or, since W16-G1,
+// one completed argo analysis/experiment) with a UID precondition —
+// the "delete the object I vetted" shape every reaper in this
+// codebase uses.
 func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
-	log logr.Logger, rk struct {
-		gvr      schema.GroupVersionResource
-		kind     string
-		resource string
-	}, obj *unstructured.Unstructured) bool {
+	log logr.Logger, rk sprawlKindRef, obj *unstructured.Unstructured) bool {
 
 	err := p.Dyn.Resource(rk.gvr).Namespace(obj.GetNamespace()).Delete(ctx,
 		obj.GetName(), kube.UIDDeleteOptions(obj.GetUID(), ""))

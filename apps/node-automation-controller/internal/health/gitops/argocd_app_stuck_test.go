@@ -4,6 +4,7 @@
 package gitops
 
 import (
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,55 @@ func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
 	}
 	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
 		t.Fatal("downscaled app got a refresh patch")
+	}
+}
+
+// W16-G1 — the same excuse covers a Rollout resource-tree entry: a
+// Rollout the go-kube-downscaler parked at spec.replicas:0 with the
+// downscaler/* annotations is sleep, not stuck evidence.
+func TestArgoCDAppStuckSkipsDownscaledRollout(t *testing.T) {
+	app := argoCDApplication("argocd", "rollout-app", "Progressing")
+	app.Object["status"].(map[string]any)["resources"] = []any{
+		map[string]any{
+			"kind":      "Rollout",
+			"namespace": "web",
+			"name":      "canary-api",
+			"health":    map[string]any{"status": "Suspended"},
+		},
+	}
+	rollout := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata": map[string]any{
+			"namespace":   "web",
+			"name":        "canary-api",
+			"annotations": map[string]any{"downscaler/downtime": "22:00-06:00"},
+		},
+		"spec": map[string]any{"replicas": int64(0)},
+	}
+	kinds := maps.Clone(testutil.DynListKinds())
+	kinds[kube.GVRArgoRollout] = "RolloutList"
+	dyn := testutil.NewFakeDyn(kinds, app,
+		&unstructured.Unstructured{Object: rollout})
+	cs := fake.NewSimpleClientset()
+	p := testProberDyn(cs, dyn)
+	base := time.Now()
+	probetest.FreezeNow(p.Deps, base)
+
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-Rollout-only app must pass: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-Rollout-only app must pass past the window: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "rollout-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
+		t.Fatal("downscaled Rollout app got a refresh patch")
 	}
 }
 

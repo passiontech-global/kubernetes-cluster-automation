@@ -391,3 +391,177 @@ func rabbitMQOwnedPod(ns, name string, ready bool, ownerUID string) *corev1.Pod 
 		UID: types.UID(ownerUID), Controller: ptr.To(true)}}
 	return pod
 }
+
+// W16-ST3 — a member whose rabbitmq_raft_role series exist but sum
+// to 0 has lost leadership on every replicated quorum queue: the
+// quorum_leaderless reason FAILs the check, flags the gauge, and —
+// deliberately NOT healable — never deletes the pod (deleting a
+// member of a degraded queue membership can drop the queue under
+// its own Raft quorum).
+func TestRabbitMQQuorumLeaderlessFlagged(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "sum by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  0}}
+		case strings.Contains(query, "count by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  3}}
+		case strings.Contains(query, "raft_term"):
+			return nil
+		}
+		return nil
+	})
+	pods := []runtime.Object{}
+	for _, n := range []string{"rabbitmq-server-0", "rabbitmq-server-1", "rabbitmq-server-2"} {
+		pods = append(pods, rabbitMQMemberPod("mq", n, true))
+	}
+	cs := fake.NewSimpleClientset(pods...)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("quorum_leaderless must fail: %+v", res)
+	}
+	if !strings.Contains(res.Why, "rabbitmq-server-0") ||
+		!strings.Contains(res.Why, "quorum_leaderless") {
+		t.Fatalf("why missing quorum_leaderless diagnostics: %q", res.Why)
+	}
+	m := probetest.FindMetric(t, "node_automation_rabbitmq_quorum_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0",
+			"reason": "quorum_leaderless"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("quorum_leaderless gauge must flag the leaderless member")
+	}
+	// Alert-only: the leaderless member must survive the sweep even
+	// with quorum intact.
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-server-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("quorum_leaderless is alert-only — the pod must not be deleted")
+	}
+}
+
+// A member holding at least one raft role (sum > 0) is healthy — no
+// quorum_leaderless flag even when its peers' series exist.
+func TestRabbitMQQuorumLeaderWithRolesPasses(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "sum by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  2}}
+		case strings.Contains(query, "count by"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  3}}
+		case strings.Contains(query, "raft_term"):
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  7}}
+		}
+		return nil
+	})
+	pods := []runtime.Object{}
+	for _, n := range []string{"rabbitmq-server-0", "rabbitmq-server-1", "rabbitmq-server-2"} {
+		pods = append(pods, rabbitMQMemberPod("mq", n, true))
+	}
+	cs := fake.NewSimpleClientset(pods...)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).
+		Run(ctx); !res.Pass {
+		t.Fatalf("a member holding raft roles must pass: %+v", res)
+	}
+}
+
+// W16-ST3 — quorum_skew pools raft terms per RabbitmqCLUSTER, never
+// per namespace: a second cluster sharing the namespace must not
+// judge the first cluster's terms (W12 P0-2a hazard), and a member
+// genuinely lagging its OWN cluster's max term by >= 2 flags.
+func TestRabbitMQQuorumSkewClusterScoped(t *testing.T) {
+	// Cluster alpha (term 10 across members) and cluster beta
+	// (term 5) share namespace mq — beta must NOT flag even though
+	// 10-5 >= 2 crosses namespaces.
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "raft_term") {
+			terms := []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-alpha-0"}, Value: 10},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-alpha-1"}, Value: 10},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-beta-0"}, Value: 5},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-beta-1"}, Value: 5},
+			}
+			for i := range terms {
+				terms[i].Labels["pod_name"] = terms[i].Labels["pod"]
+			}
+			return terms
+		}
+		return nil
+	})
+	pods := []runtime.Object{}
+	for _, n := range []string{"rabbitmq-alpha-0", "rabbitmq-alpha-1"} {
+		pods = append(pods, rabbitMQClusterPod("mq", "alpha", n, true))
+	}
+	for _, n := range []string{"rabbitmq-beta-0", "rabbitmq-beta-1"} {
+		pods = append(pods, rabbitMQClusterPod("mq", "beta", n, true))
+	}
+	cs := fake.NewSimpleClientset(pods...)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).
+		Run(ctx); !res.Pass {
+		t.Fatalf("cross-cluster term gap must not flag skew: %+v", res)
+	}
+	for _, pod := range []string{"rabbitmq-alpha-0", "rabbitmq-beta-1"} {
+		if m := probetest.FindMetric(t, "node_automation_rabbitmq_quorum_unhealthy",
+			map[string]string{"namespace": "mq", "pod": pod, "reason": "quorum_skew"}); m != nil {
+			t.Fatalf("cross-cluster term gap must not flag %s", pod)
+		}
+	}
+}
+
+// A member lagging its OWN cluster's max term by >= 2 elections
+// flags quorum_skew (alert-only — the pod survives the sweep).
+func TestRabbitMQQuorumSkewFlagsLaggingMember(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "raft_term") {
+			terms := []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "pod_name": "rabbitmq-server-0"}, Value: 10},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-1", "pod_name": "rabbitmq-server-1"}, Value: 10},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-2", "pod_name": "rabbitmq-server-2"}, Value: 7},
+			}
+			return terms
+		}
+		return nil
+	})
+	pods := []runtime.Object{}
+	for _, n := range []string{"rabbitmq-server-0", "rabbitmq-server-1", "rabbitmq-server-2"} {
+		pods = append(pods, rabbitMQMemberPod("mq", n, true))
+	}
+	cs := fake.NewSimpleClientset(pods...)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("an in-cluster term laggard must fail: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_rabbitmq_quorum_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "rabbitmq-server-2",
+			"reason": "quorum_skew"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("quorum_skew gauge must flag the lagging member")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-server-2", metav1.GetOptions{}); err != nil {
+		t.Fatal("quorum_skew is alert-only — the pod must not be deleted")
+	}
+}

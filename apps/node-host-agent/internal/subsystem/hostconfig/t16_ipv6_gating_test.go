@@ -74,3 +74,41 @@ func TestT16PairsEphemeralPortHygiene(t *testing.T) {
 		t.Fatalf("tcp_tw_reuse = %q want \"1\"", got)
 	}
 }
+
+// W16-KR4: fs.aio-max-nr joins the T16 pair list only when the
+// kernel exposes the aio table — an unconditional key would fail
+// sysctl --system on an aio-less kernel.
+func TestT16PairsAIOMaxGated(t *testing.T) {
+	hr := t.TempDir()
+	r := &Reconciler{}
+	r.cfg.HostRoot = hr
+	c := &cyc{r: r}
+	p := filepath.Join(hr, "proc/sys/fs")
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p, "aio-max-nr"), []byte("65536\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	for _, kv := range c.t16Pairs() {
+		if kv[0] == "fs.aio-max-nr" {
+			found = kv[1]
+		}
+	}
+	if found != "1048576" {
+		t.Fatalf("fs.aio-max-nr pair = %q want \"1048576\" with the knob present", found)
+	}
+	// Knob removed → the pair must drop (unless the REAL host /proc
+	// exposes aio, which is out of the test's control).
+	if err := os.Remove(filepath.Join(p, "aio-max-nr")); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExistsNoRoot("/proc/sys/fs/aio-max-nr") {
+		for _, kv := range c.t16Pairs() {
+			if kv[0] == "fs.aio-max-nr" {
+				t.Fatal("fs.aio-max-nr emitted without a kernel knob")
+			}
+		}
+	}
+}

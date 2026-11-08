@@ -111,6 +111,7 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"onepassword-connect-sync-probe",
 		"linkerd-sidecar-oom-guard",
 		"cilium-datapath-map-guard",
+		"cilium-l2-lease-guard",
 		"observability-pipeline-guard",
 		// The three gated gitops rows close out the roster —
 		// they landed after the always-on sequence when checks first
@@ -118,6 +119,8 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"flux-kustomization-health",
 		"workload-scale-flapping",
 		"imagepull-secret-auditor",
+		// W16-G3 — the argocd-agent spin healer is the newest row.
+		"argocd-agent-spin",
 	}
 	var got []string
 	for _, m := range Modules {

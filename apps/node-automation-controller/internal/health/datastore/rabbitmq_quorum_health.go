@@ -57,7 +57,7 @@ var (
 	// W10-ST3 — RabbitMQ quorum/partition signal.
 	rabbitMQQuorumUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_rabbitmq_quorum_unhealthy",
-		Help: "1 while the RabbitMQ pod/cluster reports an alarm, partition or stuck-unready signature — W10-ST3.",
+		Help: "1 while the RabbitMQ pod/cluster reports an alarm, partition, stuck-unready, quorum-leaderless or term-skew signature — W10-ST3/W16-ST3.",
 	}, []string{"namespace", "pod", "reason"})
 )
 
@@ -93,7 +93,11 @@ func rabbitClusterKey(pod *corev1.Pod) string {
 // disk_watermark_alarm (W12 P0-2c): a pod delete cannot free the
 // PVC, and the restart replays the quorum-queue WAL onto a
 // still-full disk; a future unknown reason defaults to alert-only
-// too.
+// too. W16-ST3's quorum_leaderless / quorum_skew land in that same
+// alert-only bucket on purpose: a leaderless quorum queue's
+// membership is already degraded, and deleting a term-skewed member
+// can drop the queue under its own Raft quorum (the operator, not a
+// pod bounce, re-forms queue leadership).
 var rabbitHealableReasons = map[string]bool{
 	"mnesia_partition":       true,
 	"stuck_unready":          true,
@@ -214,6 +218,121 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 				findings[key] = map[string]bool{}
 			}
 			findings[key][q.reason] = true
+		}
+	}
+
+	// W16-ST3 — quorum-queue Raft health, beyond the alarm queries:
+	//
+	// quorum_leaderless — a member publishes rabbitmq_raft_role
+	// series for the quorum queues it replicates; when a member's
+	// series exist but its sum is 0, none of those queues currently
+	// sees it (or anyone, from this member's view) as leader — the
+	// queue cannot accept writes. Diffed client-side across two
+	// instant queries (the literal `and` form never matches: a ==0
+	// comparison produces an empty vector on the leader side, and
+	// PromQL `and` intersects it away) — same shape as the NATS
+	// meta-leaderless check.
+	counts, errC := p.PromQuery(ctx,
+		`count by (namespace, pod) (rabbitmq_raft_role)`)
+	sums, errS := p.PromQuery(ctx,
+		`sum by (namespace, pod) (rabbitmq_raft_role)`)
+	if errC != nil || errS != nil {
+		log.Info("WARN: rabbitmq raft-role queries failed — quorum_leaderless signal skipped",
+			"countErr", errC, "sumErr", errS)
+	} else {
+		sumByPod := map[string]float64{}
+		for _, s := range sums {
+			sumByPod[s.Label("namespace")+"/"+s.Label("pod", "pod_name")] = s.Value
+		}
+		for _, s := range counts {
+			podName := s.Label("pod", "pod_name")
+			ns := s.Metric["namespace"]
+			if ns == "" {
+				if pod := rabbitByPodName[podName]; pod != nil {
+					ns = pod.Namespace
+				}
+			}
+			if podName == "" || s.Value <= 0 {
+				continue
+			}
+			if sumByPod[ns+"/"+podName] != 0 {
+				continue // at least one queue leadership role held — healthy
+			}
+			if downscaledMemberPod(ns, podName, downscaled) {
+				continue // parked cluster — stale series, not quorum evidence
+			}
+			key := ns + "/" + podName
+			if findings[key] == nil {
+				findings[key] = map[string]bool{}
+			}
+			findings[key]["quorum_leaderless"] = true
+		}
+	}
+
+	// quorum_skew — severe Raft-term lag: a member whose max
+	// rabbitmq_raft_term lags the namespace's highest term by >= 2
+	// missed >= 2 elections — its WAL view is far behind the
+	// cluster's, and its queue replicas cannot vote meaningfully.
+	terms, errT := p.PromQuery(ctx,
+		`max by (namespace, pod) (rabbitmq_raft_term)`)
+	if errT != nil {
+		log.Info("WARN: rabbitmq raft-term query failed — quorum_skew signal skipped",
+			"error", errT)
+	} else {
+		// Pool the max term per RabbitmqCLUSTER, not per namespace —
+		// two clusters sharing one namespace must not judge each
+		// other's terms (same hazard as the Ready-sibling census
+		// below, W12 P0-2a): the younger cluster's whole membership
+		// would lag the older cluster's term and false-flag skew.
+		// Pods we cannot group cluster-wise fall back to the
+		// namespace bucket (fail-safe, may over-flag) rather than
+		// being skipped silently.
+		maxTermByCluster := map[string]float64{}
+		for _, s := range terms {
+			podName := s.Label("pod", "pod_name")
+			ns := s.Metric["namespace"]
+			pod := rabbitByPodName[podName]
+			if ns == "" && pod != nil {
+				ns = pod.Namespace
+			}
+			ck := ns
+			if pod != nil {
+				if k := rabbitClusterKey(pod); k != "" {
+					ck = k
+				}
+			}
+			if s.Value > maxTermByCluster[ck] {
+				maxTermByCluster[ck] = s.Value
+			}
+		}
+		for _, s := range terms {
+			podName := s.Label("pod", "pod_name")
+			ns := s.Metric["namespace"]
+			pod := rabbitByPodName[podName]
+			if ns == "" && pod != nil {
+				ns = pod.Namespace
+			}
+			if podName == "" || s.Value <= 0 {
+				continue
+			}
+			ck := ns
+			if pod != nil {
+				if k := rabbitClusterKey(pod); k != "" {
+					ck = k
+				}
+			}
+			// Only judge members of clusters with a real term spread.
+			if maxTermByCluster[ck]-s.Value < 2 {
+				continue
+			}
+			if downscaledMemberPod(ns, podName, downscaled) {
+				continue
+			}
+			key := ns + "/" + podName
+			if findings[key] == nil {
+				findings[key] = map[string]bool{}
+			}
+			findings[key]["quorum_skew"] = true
 		}
 	}
 

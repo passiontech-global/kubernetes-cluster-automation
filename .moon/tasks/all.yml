@@ -27,8 +27,18 @@ tasks:
       - '**/*.go'
 
   # golangci-lint (pinned in mise.toml) — part of the `moon ci` PR gate.
+  # GOLANGCI_LINT_CACHE is per-project: `moon run :lint` spawns one
+  # golangci-lint per Go project concurrently, and concurrent
+  # golangci-lint processes sharing one cache dir lock each other out
+  # ("parallel golangci-lint is running", exit 3). A script (not
+  # command+env — moon does not expand variables in env values) so the
+  # shell expands moon's exported OS env: MOON_WORKSPACE_ROOT and
+  # MOON_PROJECT_ID (NOT MOON_PROJECT_NAME — that token has no env
+  # twin and expands empty, collapsing every project onto one dir).
+  # Cache lives under .moon/cache (gitignored); each project owns its
+  # directory and the runs stay parallel.
   lint:
-    command: 'golangci-lint run ./...'
+    script: 'GOLANGCI_LINT_CACHE=$MOON_WORKSPACE_ROOT/.moon/cache/golangci-lint/$MOON_PROJECT_ID golangci-lint run ./...'
     toolchains: 'system'
     inputs:
       - '**/*.go'

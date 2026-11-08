@@ -5,6 +5,7 @@
 package linkerd
 
 import (
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -13,11 +14,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -235,6 +238,55 @@ func TestLinkerdNonBinaryPortPasses(t *testing.T) {
 	p := testProber(cs)
 	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("non-binary ports must pass: %+v", res)
+	}
+}
+
+// W16-G1 — a Rollout-owned ReplicaSet resolves to the parent Rollout:
+// the opaque-ports merge-patch lands on the Rollout's pod template via
+// the dynamic client, with the same durable stamp on the Rollout.
+func TestLinkerdTemplatePatchPatchesRollout(t *testing.T) {
+	pod := meshedPodWithPorts("apps", "api-abc12-x1", []int32{5432}, "", "")
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "api-abc12", Controller: ptr.To(true)}}
+	rollout := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata":   map[string]any{"namespace": "apps", "name": "api"},
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{"app": "api"}},
+			},
+		},
+	}
+	kinds := maps.Clone(testutil.DynListKinds())
+	kinds[kube.GVRArgoRollout] = "RolloutList"
+	dyn := testutil.NewFakeDyn(kinds,
+		&unstructured.Unstructured{Object: rollout})
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "api-abc12",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "argoproj.io/v1alpha1", Kind: "Rollout",
+			Name: "api", UID: "uid-rollout", Controller: ptr.To(true)}},
+	}}
+	cs := fake.NewSimpleClientset(pod, rs)
+	p := testProberDyn(cs, dyn)
+
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+		t.Fatalf("unannotated Rollout binary port must fail: %+v", res)
+	}
+	got, err := dyn.Resource(kube.GVRArgoRollout).Namespace("apps").
+		Get(ctx, "api", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	annos, _, _ := unstructured.NestedStringMap(got.Object,
+		"spec", "template", "metadata", "annotations")
+	if annos["config.linkerd.io/opaque-ports"] != "5432" {
+		t.Fatalf("Rollout template opaque-ports = %v, want 5432", annos)
+	}
+	if _, ok := kube.AnnoTime(got, kube.AnnoLastLinkerdOpaquePatch); !ok {
+		t.Fatal("durable patch stamp missing on the Rollout")
 	}
 }
 

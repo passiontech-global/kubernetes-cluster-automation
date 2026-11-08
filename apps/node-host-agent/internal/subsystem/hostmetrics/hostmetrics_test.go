@@ -228,8 +228,10 @@ func TestDescribe(t *testing.T) {
 	// + 3 clocksource/conntrack descs (clocksource_non_tsc, conntrack
 	//   search_restarts/invalid counters).
 	// + 1 mountinfo desc (mountinfo entries count).
-	if got := len(ch); got != 72 {
-		t.Fatalf("Describe emitted %d descs want 72", got)
+	// + 3 W16-KR4 AIO descs (aio allocated/maximum/used_ratio in the
+	//   filefd domain).
+	if got := len(ch); got != 75 {
+		t.Fatalf("Describe emitted %d descs want 75", got)
 	}
 }
 
