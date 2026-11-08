@@ -45,6 +45,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -148,13 +149,20 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 	// and nodereporter share a lazily-built client instead of
 	// carrying three pools. On standalone hosts no kube client is
 	// built at all unless one of those subsystems is enabled.
-	var cs kubernetes.Interface
+	//
+	// Mutex-guarded lazy init, NOT sync.OnceValue: only a
+	// successful build is cached — a transient failure (token not
+	// mounted yet, brief apiserver outage) must not disable every
+	// kube consumer for the process lifetime, so a failed build is
+	// retried on the next csOnce call.
+	var (
+		csMu sync.Mutex
+		cs   kubernetes.Interface
+	)
 	csOnce := func() (kubernetes.Interface, error) {
+		csMu.Lock()
+		defer csMu.Unlock()
 		if cs == nil {
-			// Only a successful build is cached — a transient
-			// failure (token not mounted yet, brief apiserver
-			// outage) must not disable every kube consumer for
-			// the process lifetime.
 			c, err := kubeClient()
 			if err != nil {
 				return nil, err
@@ -253,8 +261,7 @@ func main() {
 
 	// Precedence: NODE_HOST_AGENT_NODE_NAME > NODE_NAME > --node-name.
 	// Standalone units pass --node-name (no downward API on the host).
-	nodeName := envx.String(envnames.EnvNodeName,
-		envx.String("NODE_NAME", nodeNameFlag))
+	nodeName := hostctx.NodeName(nodeNameFlag)
 	podName := envx.String("POD_NAME", "")
 	namespace := envx.String("POD_NAMESPACE", "")
 

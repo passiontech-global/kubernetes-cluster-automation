@@ -5,6 +5,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sdnotify"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -118,8 +119,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.BoolKnob(envnames.EnvControllerInsecureTLS, &cfg.InsecureTLS, true),
 		envx.BoolKnob(envnames.EnvEnableFeeder, &cfg.Feeder.Enabled, true),
 		// NOTIFY_SOCKET is a systemd contract, not a
-		// NODE_HOST_AGENT_* knob — read it directly.
-		{Name: "NOTIFY_SOCKET", Resolve: func(k string) {
+		// NODE_HOST_AGENT_* knob — the const lives in
+		// platform/sdnotify; read it directly.
+		{Name: sdnotify.SocketEnv, Resolve: func(k string) {
 			cfg.Feeder.NotifySocket = os.Getenv(k)
 		}},
 		// PathJoin default — NOT defaultK0sDir, which hardcodes "/host".

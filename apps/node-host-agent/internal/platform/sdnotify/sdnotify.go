@@ -24,6 +24,13 @@ import (
 	"time"
 )
 
+// SocketEnv is the env var name systemd uses to publish the notify
+// socket address — a systemd contract, not a NODE_HOST_AGENT_* knob
+// (which is why it is a plain const here rather than an envnames
+// entry). Callers read os.Getenv(SocketEnv) and pass the address to
+// Dial/SendOnce.
+const SocketEnv = "NOTIFY_SOCKET"
+
 // sendDeadline bounds each datagram write — datagram writes are
 // near-instant, so the deadline only covers a pathological socket
 // state (a full receive queue behind a hung reader). A wedged

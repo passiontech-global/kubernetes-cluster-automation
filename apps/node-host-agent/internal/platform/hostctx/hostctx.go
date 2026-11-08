@@ -12,10 +12,24 @@
 package hostctx
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
+
+// NodeName resolves the node identity with the shared precedence —
+// NODE_HOST_AGENT_NODE_NAME > NODE_NAME > fallback (the --node-name
+// flag value, empty for default-off callers) — the same chain
+// main.go and the ops subcommands used to repeat inline. It lives
+// here (not envnames, which is const-only) because hostctx already
+// owns the resolved-identity inputs and the envnames leaf must never
+// grow behavior.
+func NodeName(fallback string) string {
+	return envx.String(envnames.EnvNodeName,
+		envx.String("NODE_NAME", fallback))
+}
 
 // Deps is the shared watchdog/host context — one value per process,
 // built by DepsFromEnv and spliced verbatim into every subsystem

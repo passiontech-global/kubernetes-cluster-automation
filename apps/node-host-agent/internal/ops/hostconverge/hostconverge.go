@@ -13,6 +13,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -35,16 +36,18 @@ func Cmd(ctx context.Context, args []string) int {
 	varsDir := fs.String("vars-dir",
 		envx.String(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
 		"vars dir holding defaults.yaml/cluster.yaml/interdc_nodes.yaml")
-	nodeName := fs.String("node-name",
-		envx.String(envnames.EnvNodeName, envx.String("NODE_NAME", "")),
-		"registry node name (default: OS hostname)")
+	nodeName := fs.String("node-name", "",
+		"registry node name (default: NODE_HOST_AGENT_NODE_NAME/NODE_NAME env, then OS hostname)")
 	certsDir := fs.String("nebula-certs-dir",
 		envx.String(envnames.EnvNebulaCertsDir, "/etc/node-host-agent/nebula-certs"),
 		"nebula cert dir (hubsync pushes to /etc/node-host-agent/nebula-certs)")
 	if code, ok := opsx.Parse(fs, args); !ok {
 		return code
 	}
-	return converge(ctx, *varsDir, *nodeName, *certsDir)
+	// hostctx.NodeName owns the NODE_HOST_AGENT_NODE_NAME > NODE_NAME
+	// > flag precedence (main.go parity); converge keeps the OS
+	// hostname as the final fallback.
+	return converge(ctx, *varsDir, hostctx.NodeName(*nodeName), *certsDir)
 }
 
 // converge runs exactly one hostconfig cycle on the host.

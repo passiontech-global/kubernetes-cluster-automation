@@ -100,9 +100,8 @@ type Descriptor struct {
 	// is non-nil only when Needs.Kube is set. Most descriptors
 	// return exactly one subsystem — hostmetrics may return two
 	// (the latch ticker plus the standalone textfile writer). A
-	// non-nil error logs "<name> setup failed"; an empty slice with
-	// a nil error means the failure was already logged — append
-	// nothing.
+	// non-nil error logs "<name> setup failed" and the descriptor
+	// is held back from Config.Subsystems.
 	Build func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error)
 }
 
@@ -169,8 +168,7 @@ func (w *wiring) descriptors() []Descriptor {
 				knobs := concoursecache.ConfigFromEnv()
 				pr, err := concoursecache.New(knobs.Config, w.reg)
 				if err != nil {
-					logger().Error("concourse-cache pruner setup failed", "error", err)
-					return nil, nil
+					return nil, err
 				}
 				return []agent.Subsystem{cycle.Every(
 					"concourse-cache", knobs.Interval,
@@ -425,9 +423,6 @@ func (w *wiring) resolveAndBuild(d Descriptor) {
 	if err != nil {
 		logger().Error(d.Name+" setup failed", "error", err)
 		return
-	}
-	if len(subs) == 0 {
-		return // Build already logged its own failure
 	}
 	w.subsystems = append(w.subsystems, subs...)
 	w.built[d.Name] = true

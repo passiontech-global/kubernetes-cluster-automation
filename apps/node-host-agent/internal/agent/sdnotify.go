@@ -43,7 +43,7 @@ var (
 // (no NOTIFY_SOCKET — pod mode, tests) so the goroutine is a no-op
 // outside standalone deployments.
 func (a *Agent) sdNotifyLoop(ctx context.Context) {
-	sock := os.Getenv("NOTIFY_SOCKET")
+	sock := os.Getenv(sdnotify.SocketEnv)
 	if sock == "" || !a.ready.Load() {
 		return
 	}
