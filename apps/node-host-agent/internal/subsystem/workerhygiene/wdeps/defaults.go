@@ -48,6 +48,9 @@ const (
 	defaultCtrIngestDir    = "/host/var/lib/k0s/containerd/io.containerd.content.v1.content/ingest"
 	ctrIngestMaxAge        = 3 * time.Hour
 	ctrIngestScanInterval  = 6 * time.Hour
+	// ctrIngestStaleAge is the orphan-lease age gate — leases older
+	// than this with no gc.expire label pin content blobs forever.
+	ctrIngestStaleAge = 2 * time.Hour
 
 	// cilium domain (was cilium_common.go / cilium_envoy.go /
 	// cilium_mtu.go / cilium_lrp.go / cilium_agent.go).

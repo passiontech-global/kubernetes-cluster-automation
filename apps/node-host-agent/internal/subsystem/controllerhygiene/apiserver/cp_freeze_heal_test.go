@@ -7,6 +7,9 @@ import (
 
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // --- W10-FIX1: apiserver.KCMQueueSnapshot / apiserver.KCMQueueStalled ---
@@ -517,5 +522,113 @@ func TestEmitAPFMetricsTerminatedWatchers(t *testing.T) {
 	if strings.Contains(string(b),
 		"\nnode_host_agent_apiserver_terminated_watchers ") {
 		t.Fatalf("blind scrape left a stale series:\n%s", b)
+	}
+}
+
+// --- konnectivity-server probe + heal (G4) ---
+
+type nodesTransport struct{ readyWorkers int }
+
+func (nt nodesTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/api/v1/nodes") {
+		var items []string
+		for i := 0; i < nt.readyWorkers; i++ {
+			items = append(items, fmt.Sprintf(
+				`{"metadata":{"labels":{"kubernetes.io/hostname":"w%d"}},`+
+					`"status":{"conditions":[{"type":"Ready","status":"True"}]}}`, i))
+		}
+		// One Ready control-plane node always exists — it must NOT
+		// count as a worker.
+		items = append(items, `{"metadata":{"labels":{"node-role.kubernetes.io/control-plane":""}},`+
+			`"status":{"conditions":[{"type":"Ready","status":"True"}]}}`)
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"items":[` + strings.Join(items, ",") + `]}`)),
+			Request: req,
+		}, nil
+	}
+	return nil, errors.New("nodesTransport: unexpected url " + req.URL.String())
+}
+
+func TestKonnectivityServerProbeAndHeal(t *testing.T) {
+	e := fixture(t)
+	runDir := t.TempDir()
+	e.H.Cfg.K0sRunDir = runDir
+	// The UDS exists — the zero-backends reading is the bad signal.
+	if err := os.MkdirAll(filepath.Join(runDir, "konnectivity-server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "konnectivity-server",
+		"konnectivity-server.sock"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	// The supervisor child — comm truncates to 15 chars but the
+	// argv basename is what the pid sweep matches.
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server", "--uds-name=x"}, 600)
+
+	// Cycles 1+2: streak below the 3-cycle gate — no kill.
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("kill fired before the 3-cycle streak: %v", e.Kills)
+	}
+	// Cycle 3: unhealthy >= 3 cycles + Ready worker + enforce → kill.
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 4242 {
+		t.Fatalf("kills=%v want [{4242 SIGKILL}]", e.Kills)
+	}
+	if log := e.LogLines(); !strings.Contains(log,
+		"ACTION: killed konnectivity-server pid=4242") {
+		t.Fatalf("watchdog log missing kill ACTION:\n%s", log)
+	}
+	if v := promtest.ToFloat64(e.H.KonnReadyBackends); v != 0 {
+		t.Fatalf("ready_backends gauge=%v want 0", v)
+	}
+	// The 30-minute restart budget suppresses a second kill.
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 {
+		t.Fatalf("budget did not suppress repeat kill: %v", e.Kills)
+	}
+}
+
+func TestKonnectivityNoWorkerSuppressesHeal(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad every cycle
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 0}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	for i := 0; i < 4; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("heal fired with zero Ready workers: %v", e.Kills)
+	}
+	if log := e.LogLines(); !strings.Contains(log, "no Ready workers") {
+		t.Fatalf("suppression not logged:\n%s", log)
+	}
+	// Scrape failure exports -1, never a fabricated 0.
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, _ string) (string, error) {
+		return "", errors.New("refused")
+	}
+	e.H.Cycle(context.Background())
+	if v := promtest.ToFloat64(e.H.KonnReadyBackends); v != -1 {
+		t.Fatalf("scrape-failed gauge=%v want -1", v)
 	}
 }

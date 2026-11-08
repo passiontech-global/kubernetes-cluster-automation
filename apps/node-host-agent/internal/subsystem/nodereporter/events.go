@@ -156,6 +156,9 @@ var logRules = []logRule{
 	// previously entered without ever emitting an Event.
 	{"KubeletPLEGUnhealthy", stateEnterRe(hoststate.LatchKubeletPLEGUnhealthy)},
 	{"DiskSlowIO", stateEnterRe(hoststate.LatchDiskSlowIO)},
+	// hostmetrics' clock-warp detector line —
+	// "ACTION clock-warp: delta=... tick=... (events=N)".
+	{"NodeClockWarpDetected", regexp.MustCompile(`ACTION:? *clock-warp:`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

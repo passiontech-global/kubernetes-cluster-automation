@@ -75,19 +75,27 @@ const (
 	FileRateTTLKill   = "last-ttl-restart"
 	FileRatePoolKill  = "last-kinepool-kill"
 	FileRateEtcdGuard = "last-etcd-guard" // eventpurge+rescue budget
-	FileCtrGap        = "consecutive-sig13-gap"
-	FileCtrFrozen     = "consecutive-sig13-frozen"
-	FileCtrPeerFrozen = "consecutive-sig13-peer-frozen"
-	FileCtrDead       = "consecutive-sig13-dead"
-	FileCtrPool       = "consecutive-kine-pool"
-	FileCtrTTLRewedge = "consecutive-ttl-rewedge"
-	FileLastRVC       = "last-rvc"
-	FileLastPRVC      = "last-prvc"
-	FileTTLWedgedPID  = "ttl-last-wedged-pid"
-	FileOOMSeen       = "oomloop-seen"
-	FileOOMKills      = "oomloop-kills"
-	FileOOMShielded   = "oomloop-shielded"
-	FileFeederLastRst = "last-restart" // under FeederStateDir
+	// FileRateEtcdPreMaintSnap is the pre-maintenance snapshot
+	// budget — one etcdctl snapshot save per hour ahead of the
+	// online compact+defrag.
+	FileRateEtcdPreMaintSnap = "last-etcd-premaint-snapshot"
+	// FileRateKonnRestart is the konnectivity-server child-kill
+	// budget — one heal per 30 minutes; the k0s supervisor owns the
+	// restart itself.
+	FileRateKonnRestart = "last-konnectivity-server-restart"
+	FileCtrGap          = "consecutive-sig13-gap"
+	FileCtrFrozen       = "consecutive-sig13-frozen"
+	FileCtrPeerFrozen   = "consecutive-sig13-peer-frozen"
+	FileCtrDead         = "consecutive-sig13-dead"
+	FileCtrPool         = "consecutive-kine-pool"
+	FileCtrTTLRewedge   = "consecutive-ttl-rewedge"
+	FileLastRVC         = "last-rvc"
+	FileLastPRVC        = "last-prvc"
+	FileTTLWedgedPID    = "ttl-last-wedged-pid"
+	FileOOMSeen         = "oomloop-seen"
+	FileOOMKills        = "oomloop-kills"
+	FileOOMShielded     = "oomloop-shielded"
+	FileFeederLastRst   = "last-restart" // under FeederStateDir
 	// W8-CP3 (KCM/scheduler freeze auto-heal) + W8-CP4 (PKI reload
 	// drift) bookkeeping.
 	FileRateCPRestart  = "last-cp-restart"

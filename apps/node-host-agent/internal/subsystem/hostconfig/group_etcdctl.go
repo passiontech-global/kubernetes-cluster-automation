@@ -167,6 +167,20 @@ func (c *cyc) groupKineService() {
 	// =:2380 (HUBMETRICS whitelist + hub-kine-metrics ServiceMonitor).
 	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
 	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
+	// Phase-3 mTLS cutover (spec.storage.etcd.externalCluster over
+	// TCP :2379): when the cert vars are declared they become kine's
+	// etcd-client TLS flags — unset vars render no flag at all, so a
+	// plaintext-TCP or unix-socket deployment stays byte-identical.
+	tls := ""
+	if s := c.v("kine_ca_file"); s != "" && s != "None" {
+		tls += " --ca-file=" + s
+	}
+	if s := c.v("kine_server_cert_file"); s != "" && s != "None" {
+		tls += " --server-cert-file=" + s
+	}
+	if s := c.v("kine_server_key_file"); s != "" && s != "None" {
+		tls += " --server-key-file=" + s
+	}
 	// unix socket: /run is tmpfs — create the parent dir before start
 	// (k0scontroller creates that dir, but it starts AFTER because of
 	// Before=), and wait for the socket bind before Before= is
@@ -181,6 +195,19 @@ func (c *cyc) groupKineService() {
 		execPre = "ExecStartPre=/usr/bin/mkdir -p " + filepath.Dir(sock) + "\n"
 		execPost = "ExecStartPost=/bin/sh -c 'i=0; while [ ! -S " + sock +
 			" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; [ -S " + sock + " ]'\n"
+	} else if hp := strings.TrimPrefix(listen, "tcp://"); hp != listen {
+		// tcp://host:port — the mTLS cutover shape: Before= must also
+		// hold until the TCP listener actually accepts, or
+		// k0scontroller starts against a port that is not accepting
+		// yet. bash /dev/tcp probes the accept path (a listener that
+		// exists but is wedged still fails open/timeout). Same
+		// fail-the-unit contract as the unix wait: a 30s no-show
+		// exits non-zero so Restart=always retries instead of
+		// booting the apiserver on a dead endpoint.
+		execPost = "ExecStartPost=/bin/bash -c 'i=0; while ! (echo > /dev/tcp/" +
+			strings.Replace(hp, ":", "/", 1) +
+			") 2>/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; (echo > /dev/tcp/" +
+			strings.Replace(hp, ":", "/", 1) + ") 2>/dev/null'\n"
 	}
 	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: kine split out of k0scontroller.
 # SEPARATE cgroup boundary: a kine OOM does not drag apiserver into
@@ -201,7 +228,7 @@ Environment=GOMEMLIMIT=1500MiB
 Environment=GOGC=50
 # KINE_ENDPOINT lives in /etc/kine/kine.env (0600, holds DB password).
 EnvironmentFile=/etc/kine/kine.env
-%s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s
+%s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s%s
 MemoryMax=2G
 # OOMScoreAdjust negative: the kernel kills other processes before
 # kine (apiserver data-path); high CPUWeight protects kine under CPU
@@ -213,7 +240,7 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`, execPre, execPost, listen, metrics)), 0o644)
+`, execPre, execPost, listen, metrics, tls)), 0o644)
 	if unitChanged {
 		r.daemonReload(ctx)
 	}

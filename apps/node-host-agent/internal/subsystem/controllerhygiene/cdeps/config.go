@@ -112,6 +112,9 @@ const (
 	// defaultK0sDir is the shared k0s data dir — etcdguard probes
 	// under it and the PKI-drift default pairs derive from it.
 	defaultK0sDir = "/host/var/lib/k0s" // DaemonSet host mount
+	// defaultK0sRunDir is the k0s runtime dir — konnectivity-server
+	// and its UDS live under it (DaemonSet host mount).
+	defaultK0sRunDir = "/host/run/k0s"
 	// defaultSuspectLogCadence is the re-reminder interval suspectLog
 	// applies to suspect/hold lines whose latch stays held: STATE-
 	// ENTER announces the transition and the raw line then repeats
@@ -167,6 +170,10 @@ type Config struct {
 	// K0sDir is the k0s data dir — etcdguard probes under it and the
 	// PKI-drift default pairs derive from it. "" → /host/var/lib/k0s.
 	K0sDir string
+	// K0sRunDir is the k0s runtime dir — the konnectivity-server
+	// UDS probe reads <K0sRunDir>/konnectivity-server/*.sock.
+	// "" → /host/run/k0s (DaemonSet host mount).
+	K0sRunDir string
 	// AdminKubeconfig is the k0s admin.conf (embedded client creds);
 	// AdminCert/AdminKey/AdminCA are the fallback client-cert triple.
 	AdminKubeconfig string
@@ -297,6 +304,9 @@ func (c *Config) ApplyDefaults() {
 	c.applyFeederDefaults()
 	if c.K0sDir == "" {
 		c.K0sDir = defaultK0sDir
+	}
+	if c.K0sRunDir == "" {
+		c.K0sRunDir = defaultK0sRunDir
 	}
 	c.applyEtcdGuardDefaults()
 	if c.SuspectLogCadence <= 0 {

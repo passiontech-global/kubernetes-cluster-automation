@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // clockSkew thresholds (W10-KR5): makestep fires above 0.5s or
@@ -142,4 +143,65 @@ func (r *Runner) checkClockSkew() {
 	_ = os.Remove(countPath)
 	// Exit self-gates on the file existing and logs STATE-EXIT.
 	r.deps.Store.Exit(hoststate.LatchClockSkew, nil)
+}
+
+// --- clock-warp: wall-clock jump detector (G5) ---
+
+// clockWarpThreshold is the |elapsed_wall - expected_tick| budget —
+// a VM pause / live-migration / suspend freezes the vCPU so the
+// ticker fires LATE, and an NTP step can also make a tick fire
+// early. 2.0s covers scheduler jitter without masking a real jump.
+const clockWarpThreshold = 2 * time.Second
+
+// clockWarpState is the detector's cross-tick baseline — the
+// previous tick's wall-clock stamp and the cumulative warp counter
+// the textfile exports.
+type clockWarpState struct {
+	prev   time.Time
+	events int64
+}
+
+// checkClockWarp detects wall-clock jumps the NTP discipline never
+// reports: a hypervisor pause or live-migration freezes the vCPU so
+// the elapsed wall time between two latch ticks exceeds the
+// expected cadence. On a warp it stamps clock-stepped-at (the same
+// marker workerhygiene's clock-jump-session-healer correlates
+// konnectivity 401/x509 bursts with), counts the event into
+// node_agent_clock_warp_events_total, and lands an
+// "ACTION clock-warp:" line in the watchdog log that nodereporter
+// maps onto the NodeClockWarpDetected Kubernetes Event.
+func (r *Runner) checkClockWarp() {
+	now := r.deps.Clock.Now()
+	prev := r.warp.prev
+	r.warp.prev = now
+	if !prev.IsZero() {
+		delta := now.Sub(prev) - r.deps.TickInterval
+		if math.Abs(float64(delta)) > float64(clockWarpThreshold) {
+			r.warp.events++
+			r.deps.Store.WriteEpochFile(
+				r.statePath(clockSteppedMarkerFile), now.Unix())
+			r.deps.Store.AppendLogWarn(fmt.Sprintf(
+				"ACTION clock-warp: delta=%.1fs tick=%s — VM pause / live-migration / NTP step suspected (events=%d)",
+				delta.Seconds(), r.deps.TickInterval, r.warp.events))
+		}
+	}
+	r.writeClockWarpProm()
+}
+
+// writeClockWarpProm emits node_agent_clock_warp_events_total into
+// the node-exporter textfile — every refresh, not only on a warp,
+// so the series exists at 0 and post-restart scrapes keep a value.
+func (r *Runner) writeClockWarpProm() {
+	var b promfile.Builder
+	b.HeaderType("node_agent_clock_warp_events_total",
+		"Wall-clock jumps detected between latch ticks (VM pause, live-migration, NTP step) — kernel-net clock-warp detector.",
+		"counter")
+	b.Line(fmt.Sprintf("node_agent_clock_warp_events_total %d",
+		r.warp.events))
+	dir := r.textfileDir()
+	if err := promfile.Write(dir, "node-agent-clockwarp.prom",
+		[]byte(b.String())); err != nil {
+		logger().Debug("hostmetrics: clock-warp textfile install failed",
+			"dir", dir, "error", err)
+	}
 }

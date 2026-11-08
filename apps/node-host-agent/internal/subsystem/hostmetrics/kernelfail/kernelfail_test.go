@@ -274,3 +274,62 @@ func TestROPVCMounts(t *testing.T) {
 		t.Fatal("fs-readonly latch missing from kmsg marker")
 	}
 }
+
+// --- clock-warp: wall-clock jump detector ---
+
+func TestClockWarpDetection(t *testing.T) {
+	f := kfixture(t)
+	textfileDirOverride = t.TempDir()
+	t.Cleanup(func() { textfileDirOverride = "" })
+	now := time.Now()
+	f.deps.Clock.Set(func() time.Time { return now })
+
+	// First tick primes the baseline — no warp on a zero prev.
+	f.r.checkClockWarp()
+	if f.r.warp.events != 0 {
+		t.Fatal("first tick counted a warp")
+	}
+
+	// A tick that fires on cadence is clean.
+	now = now.Add(defaultTickInterval)
+	f.r.checkClockWarp()
+	if f.r.warp.events != 0 {
+		t.Fatal("on-cadence tick counted a warp")
+	}
+
+	// A 10s-late tick (VM pause / live-migration) is a warp: marker,
+	// counter, watchdog ACTION line and the textfile series.
+	now = now.Add(defaultTickInterval + 10*time.Second)
+	f.r.checkClockWarp()
+	if f.r.warp.events != 1 {
+		t.Fatalf("warp events=%d want 1", f.r.warp.events)
+	}
+	marker := filepath.Join(f.deps.StateDir, clockSteppedMarkerFile)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("clock-stepped-at marker missing after warp")
+	}
+	log := f.log
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "ACTION clock-warp: delta=10.0s") {
+		t.Fatalf("watchdog log missing clock-warp ACTION:\n%s", data)
+	}
+	prom, err := os.ReadFile(filepath.Join(
+		textfileDirOverride, "node-agent-clockwarp.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prom), "node_agent_clock_warp_events_total 1") {
+		t.Fatalf("textfile missing warp counter:\n%s", prom)
+	}
+
+	// A tick that fires EARLY (clock stepped backward / NTP step)
+	// warps too — |delta| is symmetric.
+	now = now.Add(defaultTickInterval - 5*time.Second)
+	f.r.checkClockWarp()
+	if f.r.warp.events != 2 {
+		t.Fatalf("early-tick warp not counted: events=%d want 2", f.r.warp.events)
+	}
+}

@@ -132,7 +132,51 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // while the disk stays above the watermark. The budget is spent
 // BEFORE the command (rate_spend parity); a failed prune logs
 // suspect and does NOT count as an action.
+// maybeReapOrphanLeases deletes containerd leases that pin the
+// content blobs the prune below would otherwise drop: a lease
+// WITHOUT a containerd.io/gc.expire label has no GC lifetime — a
+// crashed image pull or interrupted unpack leaves it behind
+// forever, and every blob it references survives the store prune.
+// Only leases past Cfg.Ctr.IngestStaleAge (2h) are touched — a
+// fresh label-less lease may belong to a pull still in flight —
+// and the pass is bounded by MaxTaskClean per cycle.
+func maybeReapOrphanLeases(d *wdeps.Deps, ctx context.Context) {
+	leases, err := d.Cfg.Seams.Ctr.Leases(ctx)
+	if err != nil {
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: ctr-ingest-gc lease list failed: %v", err))
+		return
+	}
+	now := d.Cfg.Seams.Host.Clock.Now()
+	n := 0
+	for _, l := range leases {
+		if l.HasGCExp || l.Created.IsZero() ||
+			now.Sub(l.Created) < d.Cfg.Ctr.IngestStaleAge {
+			continue
+		}
+		if n >= d.Cfg.Ctr.MaxTaskClean {
+			d.State.AppendLog(fmt.Sprintf(
+				"suspect: ctr-ingest-gc orphan leases still pending cap=%d",
+				d.Cfg.Ctr.MaxTaskClean))
+			break
+		}
+		if err := d.Cfg.Seams.Ctr.RmLease(ctx, l.ID); err != nil {
+			d.State.AppendLog(fmt.Sprintf(
+				"suspect: ctr-ingest-gc lease rm %s failed: %v", l.ID, err))
+			continue
+		}
+		d.State.AppendLog(fmt.Sprintf(
+			"ACTION: ctr-ingest-gc reaped orphan lease %s (age=%.1fh, no gc.expire label)",
+			l.ID, now.Sub(l.Created).Hours()))
+		d.Actions.WithLabelValues(wdeps.CheckIngestGC, "lease_rm").Inc()
+		n++
+	}
+}
+
 func maybePruneContentStore(d *wdeps.Deps, ctx context.Context) {
+	// Lease reaper FIRST: an orphan lease pins the blobs the prune
+	// would drop — reaping it lets this GC pass actually reclaim.
+	maybeReapOrphanLeases(d, ctx)
 	if !d.State.RateTrySpend("last-content-gc", contentPruneInterval) {
 		return
 	}

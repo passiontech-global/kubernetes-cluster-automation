@@ -93,6 +93,10 @@ type Deps struct {
 	// EtcdSnapAge is the backup-health etcd snapshot freshness gauge
 	// (embedded-etcd controllers).
 	EtcdSnapAge prometheus.Gauge
+	// KonnReadyBackends is the konnectivity-server ready-backend
+	// gauge — konnectivity_network_proxy_server_ready_backend_
+	// connections scraped each cycle, -1 on scrape failure.
+	KonnReadyBackends prometheus.Gauge
 }
 
 // SingleController reports whether this node's control plane is a

@@ -56,6 +56,10 @@ const (
 	LatchSystemdSessionBloat    = "systemd-session-bloat"    // systemd-session-hygiene
 	LatchKubeletPLEGUnhealthy   = "kubelet-pleg-unhealthy"   // kubelet-syncloop PLEG metrics
 	LatchDiskSlowIO             = "disk-slow-io"             // W12-KR4 io-pressure gray failure
+	// LatchKernelNetShim is the kernel-net-shim-hygiene degradation
+	// latch — sustained kernel socket/softnet drop growth or a
+	// containerd-shim RSS breach (individual 200MiB / total 1.5GiB).
+	LatchKernelNetShim = "kernel-net-shim-degraded"
 	// LatchJournalUnreadable is the blindness latch the shared
 	// journalwatch tracker sets — produced by BOTH hygienes'
 	// journal-read accounting (workerhygiene journald.go,
@@ -201,6 +205,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchSystemdSessionBloat, Owner: "workerhygiene"},
 	{Name: LatchKubeletPLEGUnhealthy, Owner: "workerhygiene"},
 	{Name: LatchDiskSlowIO, Owner: "workerhygiene"},
+	{Name: LatchKernelNetShim, Owner: "workerhygiene"},
 	{Name: LatchJournalUnreadable, Owner: "workerhygiene+controllerhygiene"},
 	{Name: LatchCiliumIPAMPrefix, Owner: "workerhygiene", Prefix: true},
 
