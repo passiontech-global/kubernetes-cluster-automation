@@ -12,8 +12,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -180,13 +178,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		if pod != nil {
 			persisted = heal.FirstSeenPersisted(ctx, log, &p.seen, pod,
 				kube.AnnoFirstSeenDragonflyLinkStorm, sig,
-				dragonflyLinkMinAge, now,
-				func(ctx context.Context, data []byte) error {
-					_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(
-						ctx, pod.Name, types.MergePatchType, data,
-						metav1.PatchOptions{})
-					return err
-				})
+				dragonflyLinkMinAge, now, kube.PodMergePatcher(p.CS, pod))
 		} else {
 			persisted = probefw.Persisted(&p.seen, sig, now,
 				dragonflyLinkMinAge, log)
@@ -228,12 +220,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		}
 		if err := heal.ClearPersistedFirstSeen(ctx, log, &p.seen, pod,
 			kube.AnnoFirstSeenDragonflyLinkStorm, "link/"+key,
-			func(ctx context.Context, data []byte) error {
-				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
-					pod.Name, types.MergePatchType, data,
-					metav1.PatchOptions{})
-				return err
-			}); err != nil {
+			kube.PodMergePatcher(p.CS, pod)); err != nil {
 			log.Info("WARN: dragonfly link-storm first-seen clear failed",
 				"pod", key, "error", err)
 		}

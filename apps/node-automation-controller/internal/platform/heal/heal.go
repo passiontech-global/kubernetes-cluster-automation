@@ -143,3 +143,21 @@ func OldestRunningPod(pods []corev1.Pod, prefixes ...string) *corev1.Pod {
 	}
 	return oldest
 }
+
+// Gate runs AllowedV's mutex+budget shape — the nil-heals-ledger,
+// zero-cooldown call every maintenance-gated module repeats — so the
+// WHY-comment for that preamble lives once, here, instead of being
+// re-pasted per module. It returns AllowedV's pair unchanged:
+// proceed=false means defer (held mutex or spent budget) and the
+// caller just returns; unverifiable=true is fail-closed and the
+// CALLER IncErrors its queue — platform must not import
+// internal/metrics (depguard leaf rule), and every gate user is a
+// domain module that already owns that counter. Callers that can run
+// with a nil dyn client keep their `dyn != nil` guard at the call
+// site (nil dyn there means "gate skipped, proceed", not
+// "deferred").
+func Gate(ctx context.Context, log logr.Logger, v *kube.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	key string, now time.Time) (proceed, unverifiable bool) {
+	return AllowedV(ctx, log, v, cs, dyn, nil, key, 0, now)
+}

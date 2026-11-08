@@ -247,7 +247,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 					continue
 				}
 				liveIPs[pod.Status.PodIP] = true
-				if since, ok := podReadySince(pod); ok {
+				if since, ok := kube.PodReadySince(pod); ok {
 					readyIPs[pod.Status.PodIP] = true
 					// W10-FIX7 fuse — only a pod Ready past
 					// linkerdSliceHealMinAge counts as "missing"

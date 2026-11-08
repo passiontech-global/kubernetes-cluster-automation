@@ -26,6 +26,7 @@ package probefw
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -209,4 +211,63 @@ func LinkerdPodMatchesComponent(pod *corev1.Pod, component string) bool {
 	}
 	short := strings.TrimPrefix(component, "linkerd-")
 	return short != "" && pod.Labels["linkerd.io/control-plane-component"] == short
+}
+
+// MergeAnnoPatchLocally applies a landed
+// {"metadata":{"annotations":{k:v|null}}} merge patch to the LISTED
+// copy of obj — the serial sweep sees no apiserver echo, so without
+// the mirror a second annotation write this sweep would compute its
+// patch from the pre-write state (several reason-keys share one
+// object's annotation map, so a stale read can resurrect a cleared
+// key or drop a just-stamped one). Malformed payloads are ignored —
+// the input is always kube.MergePatchAnnos output.
+func MergeAnnoPatchLocally(obj metav1.Object, data []byte) {
+	var doc struct {
+		Metadata struct {
+			Annotations map[string]*string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	annos := obj.GetAnnotations()
+	if annos == nil {
+		annos = map[string]string{}
+	}
+	for k, v := range doc.Metadata.Annotations {
+		if v == nil {
+			delete(annos, k)
+			continue
+		}
+		annos[k] = *v
+	}
+	obj.SetAnnotations(annos)
+}
+
+// Section renders one findings family into a Why part: "" when
+// findings is empty, otherwise fmt.Sprintf(format, args...,
+// strings.Join(findings, ", ")) — format always ends in the %s the
+// sorted-joined findings fill.
+func Section(format string, findings []string, args ...any) string {
+	if len(findings) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(format, append(args, strings.Join(findings, ", "))...)
+}
+
+// WhyFold folds section strings (Section output) into a probe Result:
+// the non-empty sections joined with " | " become the Why, and a fold
+// with nothing to report is a pass — the standard tail every
+// collect→sort→join sweep ends with.
+func WhyFold(sections ...string) Result {
+	var parts []string
+	for _, s := range sections {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return Result{Pass: true}
+	}
+	return Result{Why: strings.Join(parts, " | ")}
 }

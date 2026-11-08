@@ -201,8 +201,7 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	}
 	log.Info("image pull storm detected", "detail", detail,
 		"namespaces", len(namespaces), "pods", len(podSet))
-	return probefw.Result{Why: fmt.Sprintf(
+	return probefw.WhyFold(probefw.Section(
 		"%s: %d pod(s) across %d namespace(s) waiting >%s: %s",
-		detail, len(podSet), len(namespaces), imagePullMinAge,
-		strings.Join(summary, ", "))}
+		summary, detail, len(podSet), len(namespaces), imagePullMinAge))
 }

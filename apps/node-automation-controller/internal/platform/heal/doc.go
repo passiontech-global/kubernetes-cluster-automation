@@ -11,7 +11,9 @@
 //
 // heal is a leaf platform package: it imports only platform/kube and
 // platform/state, returns verdicts and errors, and NEVER calls
-// metrics — the caller owns IncError and its heal counters so the
-// shared path cannot blur which module acted or hide a failure
-// behind a generic counter name.
+// metrics on the shared path — the caller owns IncError and its heal
+// counters so the shared path cannot blur which module acted or hide
+// a failure behind a generic counter name. The one exception is
+// Gate (heal.go), which only ever IncErrors the queue name the
+// CALLER passes in — the module identity stays at the call site.
 package heal

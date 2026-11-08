@@ -158,12 +158,9 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 		}
 		p.maybePatchHRRetry(ctx, log, gvr, hr, key, now)
 	}
-	if len(stuck) > 0 {
-		return probefw.Result{Why: fmt.Sprintf(
-			"helmreleases retries-exhausted >=%s: %s",
-			fluxHRStuckMinAge, strings.Join(stuck, ", "))}
-	}
-	return probefw.Result{Pass: true}
+	return probefw.WhyFold(probefw.Section(
+		"helmreleases retries-exhausted >=%s: %s",
+		stuck, fluxHRStuckMinAge))
 }
 
 // fluxHRReadyCondition extracts the Ready condition's status, reason,

@@ -8,7 +8,6 @@ package watchdogs
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -409,35 +408,7 @@ func (p *operatorWorkqueueCheck) opCRPatch(gvr schema.GroupVersionResource,
 				metav1.PatchOptions{}); err != nil {
 			return err
 		}
-		mergeAnnoPatchLocally(o, data)
+		probefw.MergeAnnoPatchLocally(o, data)
 		return nil
 	}
-}
-
-// mergeAnnoPatchLocally applies a landed
-// {"metadata":{"annotations":{k:v|null}}} merge patch to the LISTED
-// copy of obj — the serial sweep sees no apiserver echo, so without
-// the mirror a second annotation write this sweep would compute its
-// patch from the pre-write state.
-func mergeAnnoPatchLocally(obj metav1.Object, data []byte) {
-	var doc struct {
-		Metadata struct {
-			Annotations map[string]*string `json:"annotations"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return
-	}
-	annos := obj.GetAnnotations()
-	if annos == nil {
-		annos = map[string]string{}
-	}
-	for k, v := range doc.Metadata.Annotations {
-		if v == nil {
-			delete(annos, k)
-			continue
-		}
-		annos[k] = *v
-	}
-	obj.SetAnnotations(annos)
 }

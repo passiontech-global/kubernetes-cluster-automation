@@ -5,9 +5,14 @@
 package kube
 
 import (
+	"context"
+	"time"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
 // ---------------------------------------------------------------------------
@@ -60,4 +65,51 @@ func PodSpecHasContainer(ps *corev1.PodSpec, name string) bool {
 		}
 	}
 	return false
+}
+
+// PodReadySince returns the pod's PodReady=True LastTransitionTime —
+// the clock for stable-age fuses and "settled for >= min" gates.
+// ok=false when the pod is not Ready, or the Ready condition is
+// missing / carries a zero transition time — an unverifiable age is
+// never treated as a settled pod (mirrors PodReadyCond, which reads
+// the first PodReady-typed condition).
+func PodReadySince(pod *corev1.Pod) (since time.Time, ok bool) {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			if c.Status != corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
+				return time.Time{}, false
+			}
+			return c.LastTransitionTime.Time, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// PodUnreadyFor reports how long the pod's Ready condition has been
+// non-True. Missing/zero transition time or a Ready=True condition
+// both fail closed (not counted as stale-unready).
+func PodUnreadyFor(pod *corev1.Pod, now time.Time) (time.Duration, bool) {
+	for _, c := range pod.Status.Conditions {
+		if c.Type != corev1.PodReady {
+			continue
+		}
+		if c.Status == corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
+			return 0, false
+		}
+		return now.Sub(c.LastTransitionTime.Time), true
+	}
+	return 0, false
+}
+
+// PodMergePatcher returns the patch func heal.FirstSeenPersisted /
+// heal.ClearPersistedFirstSeen take when a first-seen stamp is
+// carried on the pod itself: a JSON merge patch to the pod object —
+// the annotation survives an operator restart that would otherwise
+// re-arm an in-memory window mid-incident.
+func PodMergePatcher(cs kubernetes.Interface, pod *corev1.Pod) func(context.Context, []byte) error {
+	return func(ctx context.Context, data []byte) error {
+		_, err := cs.CoreV1().Pods(pod.Namespace).Patch(ctx,
+			pod.Name, types.MergePatchType, data, metav1.PatchOptions{})
+		return err
+	}
 }

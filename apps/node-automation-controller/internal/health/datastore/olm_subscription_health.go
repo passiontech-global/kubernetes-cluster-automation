@@ -237,7 +237,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		if !heal.FirstSeenPersisted(ctx, log, &p.olmFirstSeen, obj,
 			kube.AnnoFirstSeenOLMUnhealthy, k, olmUnhealthyMinAge, now,
 			func(ctx context.Context, data []byte) error {
-				applyAnnoMerge(obj, data)
+				probefw.MergeAnnoPatchLocally(obj, data)
 				_, err := p.Dyn.Resource(gvr).Namespace(ns).Patch(ctx,
 					name, types.MergePatchType, data,
 					metav1.PatchOptions{})
@@ -276,7 +276,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			if err := heal.ClearPersistedFirstSeen(ctx, log,
 				&p.olmFirstSeen, obj, kube.AnnoFirstSeenOLMUnhealthy, k,
 				func(ctx context.Context, data []byte) error {
-					applyAnnoMerge(obj, data)
+					probefw.MergeAnnoPatchLocally(obj, data)
 					_, err := p.Dyn.Resource(gvr).
 						Namespace(obj.GetNamespace()).
 						Patch(ctx, obj.GetName(), types.MergePatchType,
@@ -354,35 +354,4 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	for _, r := range reasons {
 		olmOperatorHealsTotal.WithLabelValues(r).Inc()
 	}
-}
-
-// applyAnnoMerge applies a {"metadata":{"annotations":{k:v|null}}}
-// merge patch to the already-listed object so a second stamp — or a
-// clear — in the SAME sweep sees the first write: several OLM
-// reason-keys share one object's first-seen map and every stamp
-// re-reads that map, so an un-synced second write would clobber the
-// first (or a clear would wipe a just-stamped sibling) until the
-// next List re-fetches. Malformed payloads are ignored — the input
-// is always kube.MergePatchAnnos output.
-func applyAnnoMerge(obj metav1.Object, data []byte) {
-	var doc struct {
-		Metadata struct {
-			Annotations map[string]*string `json:"annotations"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return
-	}
-	annos := obj.GetAnnotations()
-	if annos == nil {
-		annos = map[string]string{}
-	}
-	for k, v := range doc.Metadata.Annotations {
-		if v == nil {
-			delete(annos, k)
-			continue
-		}
-		annos[k] = *v
-	}
-	obj.SetAnnotations(annos)
 }
