@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -38,8 +38,7 @@ func (c *CiliumMTUCheck) Name() string { return wdeps.CheckCiliumMTU }
 
 // Run executes one cilium-mtu round.
 func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumMTU, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumMTU) {
 		return
 	}
 	neb, nebOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)
@@ -56,8 +55,8 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.
-		c.d.State.Exit(hoststate.LatchCiliumMTUDrift, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumMTU, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumMTUDrift, nil)
+		c.d.CycleResult(wdeps.CheckCiliumMTU, "ok")
 		return
 	}
 	var driftWhy string
@@ -69,15 +68,15 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			wg, neb, wgEncapOverheadBytes)
 	}
 	if driftWhy != "" {
-		if !c.d.State.Exists(hoststate.LatchCiliumMTUDrift) {
-			c.d.State.Enter(hoststate.LatchCiliumMTUDrift, driftWhy)
+		if !c.d.State.Exists(latchdefs.LatchCiliumMTUDrift) {
+			c.d.State.Enter(latchdefs.LatchCiliumMTUDrift, driftWhy)
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
 			c.d.State.AppendLog(
-				"ACTION cilium-mtu-drift: " + driftWhy)
+				latchdefs.ActionEntryPrefix(latchdefs.LatchCiliumMTUDrift) + driftWhy)
 		}
 	} else {
-		c.d.State.Exit(hoststate.LatchCiliumMTUDrift, nil)
+		c.d.State.Exit(latchdefs.LatchCiliumMTUDrift, nil)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumMTU, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCiliumMTU, "ok")
 }

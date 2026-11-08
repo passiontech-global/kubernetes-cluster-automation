@@ -17,7 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 const (
@@ -77,11 +77,11 @@ func (c *Collector) psiAvg60() (float64, bool) {
 func (c *Collector) updateOverloadLatch(avg60 float64) {
 	switch {
 	case avg60 >= psiOverloadedOn:
-		c.state.Enter(hoststate.LatchNodeOverloaded,
+		c.state.Enter(latchdefs.LatchNodeOverloaded,
 			fmt.Sprintf("psi cpu some avg60=%.1f >= %.1f",
 				avg60, psiOverloadedOn))
 	case avg60 < psiOverloadedOff:
-		c.state.Exit(hoststate.LatchNodeOverloaded, nil)
+		c.state.Exit(latchdefs.LatchNodeOverloaded, nil)
 	}
 }
 

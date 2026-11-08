@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -67,21 +67,20 @@ func (c *CiliumEnvoyCheck) Name() string { return wdeps.CheckCiliumEnvoy }
 
 // Run executes one cilium-envoy round.
 func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumEnvoy) {
 		return
 	}
 	tasks, reachable := ciliumNamedTasks(c.d, e, "cilium-envoy")
 	if !reachable {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "abort")
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-envoy container — older cilium or no L7 proxy:
 		// clear any stale latch like wdeps.CheckCilium does.
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumEnvoyDown, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumEnvoyDown, nil)
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
 	// 2.5: subsystem/datapath health off the agent socket is
@@ -98,7 +97,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// the stale socket, restart it alongside (B1).
 	if c.d.CiliumAgentKilled {
 		c.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
 	// W7-H3: xDS NACK guard — envoy can answer /ready=200 while
@@ -116,10 +115,10 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.xdsFails++
 	} else {
 		c.xdsFails = 0
-		c.d.State.Exit(hoststate.LatchCiliumEnvoyXDSReject, nil)
+		c.d.State.Exit(latchdefs.LatchCiliumEnvoyXDSReject, nil)
 	}
 	if c.xdsFails >= c.d.Cfg.ConsecNeeded {
-		c.d.State.Enter(hoststate.LatchCiliumEnvoyXDSReject,
+		c.d.State.Enter(latchdefs.LatchCiliumEnvoyXDSReject,
 			fmt.Sprintf("update_rejected=%d fails=%d",
 				c.xdsLast, c.xdsFails))
 		c.killCiliumEnvoy(tasks,
@@ -130,23 +129,21 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumEnvoyDown, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumEnvoyDown, nil)
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
-	c.fails++
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-envoy-down ready probe code=%d err=%v (check %d/%d)",
-			code, err, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: cilium-envoy-down ready probe code=%d err=%v",
+		code, err)) {
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchCiliumEnvoyDown,
+	c.d.State.Enter(latchdefs.LatchCiliumEnvoyDown,
 		fmt.Sprintf("ready_probe_fails=%d", c.fails))
 	c.killCiliumEnvoy(tasks,
 		fmt.Sprintf("unready %d consecutive cycles", c.fails))
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 }
 
 // killCiliumEnvoy restarts the envoy container through its init

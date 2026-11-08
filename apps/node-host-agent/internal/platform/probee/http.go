@@ -49,14 +49,26 @@ func drainBody(resp *http.Response, limit int64) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
 }
 
+// clientOrDefault resolves a probe's optional injected client: the
+// variadic trailing *http.Client every HTTP probe accepts, nil (or
+// absent) meaning the probe's package default (insecureClient or
+// plainClient). Callers that only need the default simply omit it.
+func clientOrDefault(injected []*http.Client, def *http.Client) *http.Client {
+	if len(injected) > 0 && injected[0] != nil {
+		return injected[0]
+	}
+	return def
+}
+
 // HTTP2xx GETs url and reports whether the answer is a 2xx — the
 // KCM/scheduler healthz contract (500 = component wedged, any other
 // failure = unreachable). Insecure TLS: those endpoints serve
 // self-signed certs with no loopback SANs.
 //
 // Mirrors controllerhygiene.probeHTTP2xx (cp_freeze_heal.go).
-func HTTP2xx(ctx context.Context, url string, timeout time.Duration) bool {
-	ok, _ := httpGet(ctx, insecureClient, url, "", timeout,
+func HTTP2xx(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) bool {
+	ok, _ := httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
 		func(resp *http.Response) (bool, error) {
 			drainBody(resp, 64<<10)
 			return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
@@ -70,8 +82,9 @@ func HTTP2xx(ctx context.Context, url string, timeout time.Duration) bool {
 // != 000` parity: a 401/403 is an auth denial, not a dead listener).
 //
 // Mirrors controllerhygiene.probeAnyCode (probes.go).
-func HTTPAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
-	ok, _ := httpGet(ctx, insecureClient, url, "", timeout,
+func HTTPAnyCode(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) bool {
+	ok, _ := httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
 		func(resp *http.Response) (bool, error) {
 			drainBody(resp, 64<<10)
 			return true, nil
@@ -88,8 +101,9 @@ func HTTPAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
 // probeHTTPGet — the latter used http.DefaultClient, which differs
 // only on https targets (nebula stats is plaintext), so the shared
 // insecure client is a superset with zero behavioral delta.
-func HTTPGet(ctx context.Context, url string, timeout time.Duration) error {
-	_, err := httpGet(ctx, insecureClient, url, "", timeout,
+func HTTPGet(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) error {
+	_, err := httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
 		func(resp *http.Response) (struct{}, error) {
 			drainBody(resp, 1<<20)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -107,8 +121,9 @@ func HTTPGet(ctx context.Context, url string, timeout time.Duration) error {
 // requires auth). Insecure TLS, curl -ks parity.
 //
 // Mirrors workerhygiene's probeHTTPStatus seam default.
-func HTTPStatus(ctx context.Context, url, bearer string, timeout time.Duration) (int, error) {
-	return httpGet(ctx, insecureClient, url, bearer, timeout,
+func HTTPStatus(ctx context.Context, url, bearer string, timeout time.Duration,
+	client ...*http.Client) (int, error) {
+	return httpGet(ctx, clientOrDefault(client, insecureClient), url, bearer, timeout,
 		func(resp *http.Response) (int, error) {
 			drainBody(resp, 1<<20)
 			return resp.StatusCode, nil
@@ -120,8 +135,9 @@ func HTTPStatus(ctx context.Context, url, bearer string, timeout time.Duration) 
 // error: the caller's verdict is unreadable, not "zero". 4MiB cap.
 //
 // Mirrors workerhygiene's httpGetBody seam default.
-func HTTPBody(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
-	return httpGet(ctx, plainClient, url, "", timeout,
+func HTTPBody(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) ([]byte, error) {
+	return httpGet(ctx, clientOrDefault(client, plainClient), url, "", timeout,
 		func(resp *http.Response) ([]byte, error) {
 			if resp.StatusCode != http.StatusOK {
 				drainBody(resp, 64<<10)
@@ -140,8 +156,9 @@ func HTTPBody(ctx context.Context, url string, timeout time.Duration) ([]byte, e
 // Mirrors controllerhygiene.httpGetInsecure (cp_freeze_heal.go) —
 // returns a string because the original (and its kcmMetricsFn seam)
 // is string-typed.
-func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration) (string, error) {
-	return httpGet(ctx, insecureClient, url, "", timeout,
+func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) (string, error) {
+	return httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
 		func(resp *http.Response) (string, error) {
 			b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 			if err != nil {
@@ -158,8 +175,9 @@ func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration) (s
 // deliberately not checked, matching the original.
 //
 // Mirrors workerhygiene's probeBodyOK seam default.
-func BodyOK(ctx context.Context, url string, timeout time.Duration) bool {
-	ok, _ := httpGet(ctx, plainClient, url, "", timeout,
+func BodyOK(ctx context.Context, url string, timeout time.Duration,
+	client ...*http.Client) bool {
+	ok, _ := httpGet(ctx, clientOrDefault(client, plainClient), url, "", timeout,
 		func(resp *http.Response) (bool, error) {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			return strings.TrimSpace(string(body)) == "ok", nil

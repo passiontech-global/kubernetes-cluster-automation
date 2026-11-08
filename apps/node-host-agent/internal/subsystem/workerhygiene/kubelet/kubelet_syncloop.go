@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -69,8 +69,7 @@ func (c *SyncloopCheck) Name() string { return wdeps.CheckSyncloop }
 
 // Run executes one kubelet-syncloop round.
 func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckSyncloop) {
 		return
 	}
 	// The /metrics PLEG series degrade before /healthz/syncloop ever
@@ -106,7 +105,7 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if i+1 < wdeps.ProbeAttempts {
 			select {
 			case <-ctx.Done():
-				c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "abort").Inc()
+				c.d.CycleResult(wdeps.CheckSyncloop, "abort")
 				return
 			case <-time.After(c.d.Cfg.ProbeGap):
 			}
@@ -123,33 +122,31 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				"granted) — inconclusive, keeping state")
 			c.unauth = true
 		}
-		c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "inconclusive").Inc()
+		c.d.CycleResult(wdeps.CheckSyncloop, "inconclusive")
 		return
 	}
 	c.unauth = false
 	if alive {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchKubeletSyncloopDown, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchKubeletSyncloopDown, nil)
+		c.d.CycleResult(wdeps.CheckSyncloop, "ok")
 		return
 	}
-	c.fails++
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-syncloop-down /healthz/syncloop fail (PLEG?) err=%v (check %d/%d)",
-			lastErr, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: kubelet-syncloop-down /healthz/syncloop fail (PLEG?) err=%v",
+		lastErr)) {
+		c.d.CycleResult(wdeps.CheckSyncloop, "ok")
 		return
 	}
 	// BUG-H4: a frozen PLEG is a kubelet stall the 05 probe can't
 	// see — confirmed consecutive fails now self-heal through the
 	// shared k0sworker restart gates (overload / settle /
 	// last-restart budget), checkKubeletStall parity.
-	overloaded := c.d.State.Exists(hoststate.LatchNodeOverloaded)
+	overloaded := c.d.State.Exists(latchdefs.LatchNodeOverloaded)
 	if !overloaded {
-		c.d.State.Enter(hoststate.LatchKubeletSyncloopDown,
+		c.d.State.Enter(latchdefs.LatchKubeletSyncloopDown,
 			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
-	} else if !c.d.State.Exists(hoststate.LatchKubeletSyncloopDown) {
+	} else if !c.d.State.Exists(latchdefs.LatchKubeletSyncloopDown) {
 		// A stall under CPU starvation is a symptom — latching
 		// would escalate to NHC→SNR and dump 100% of the load
 		// onto the survivors (amplifier). Log-only.
@@ -167,8 +164,8 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	default:
 		// Budget already spent atomically by the rateTrySpend
 		// case — the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: restarting k0sworker - kubelet-syncloop-down pleg-frozen (persisted %dx)",
+		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
+			" - kubelet-syncloop-down pleg-frozen (persisted %dx)",
 			c.fails))
 		c.fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
@@ -177,7 +174,7 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckSyncloop, "restart").Inc()
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckSyncloop, "ok")
 }
 
 // --- PLEG relist-latency early warning (kubelet /metrics) ---
@@ -374,18 +371,15 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 		(lastSeenOK && lastSeenAge > plegLastSeenHighSec)
 	if !over {
 		c.plegFails = 0
-		c.d.State.Exit(hoststate.LatchKubeletPLEGUnhealthy, nil)
+		c.d.State.Exit(latchdefs.LatchKubeletPLEGUnhealthy, nil)
 		return
 	}
-	c.plegFails++
-	if c.plegFails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-pleg-unhealthy relist_avg=%.2f relist_q=%.2f last_seen_age=%.1f discards=+%d (check %d/%d)",
-			relistAvg, s.relistQuant, lastSeenAge, discardDelta,
-			c.plegFails, c.d.Cfg.ConsecNeeded))
+	if c.d.StreakPending(&c.plegFails, fmt.Sprintf(
+		"suspect: kubelet-pleg-unhealthy relist_avg=%.2f relist_q=%.2f last_seen_age=%.1f discards=+%d",
+		relistAvg, s.relistQuant, lastSeenAge, discardDelta)) {
 		return
 	}
-	c.d.State.Enter(hoststate.LatchKubeletPLEGUnhealthy, fmt.Sprintf(
+	c.d.State.Enter(latchdefs.LatchKubeletPLEGUnhealthy, fmt.Sprintf(
 		"relist_avg=%.2f relist_q=%.2f last_seen_age=%.1f discards=+%d",
 		relistAvg, s.relistQuant, lastSeenAge, discardDelta))
 }
@@ -414,34 +408,31 @@ func (c *CtrsockCheck) Name() string { return wdeps.CheckCtrSock }
 
 // Run executes one containerd-sock round.
 func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCtrSock) {
 		return
 	}
 	err := c.d.Cfg.Seams.Probe.ProbeUnixSock(ctx, c.d.Cfg.CtrSocket, unixSockProbeTimeout)
 	if err == nil {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchContainerdSockDown, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchContainerdSockDown, nil)
+		c.d.CycleResult(wdeps.CheckCtrSock, "ok")
 		return
 	}
-	c.fails++
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
-			c.d.Cfg.CtrSocket, err, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: containerd-sock-down %s probe fail: %v",
+		c.d.Cfg.CtrSocket, err)) {
+		c.d.CycleResult(wdeps.CheckCtrSock, "ok")
 		return
 	}
 	// BUG-H4: a hung containerd socket wedges PLEG and every pod
 	// lifecycle op — confirmed consecutive fails self-heal through
 	// the shared k0sworker restart gates, checkKubeletSyncloop
 	// parity.
-	overloaded := c.d.State.Exists(hoststate.LatchNodeOverloaded)
+	overloaded := c.d.State.Exists(latchdefs.LatchNodeOverloaded)
 	if !overloaded {
-		c.d.State.Enter(hoststate.LatchContainerdSockDown,
+		c.d.State.Enter(latchdefs.LatchContainerdSockDown,
 			fmt.Sprintf("probe_err=%v", err))
-	} else if !c.d.State.Exists(hoststate.LatchContainerdSockDown) {
+	} else if !c.d.State.Exists(latchdefs.LatchContainerdSockDown) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
 	}
@@ -456,8 +447,8 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	default:
 		// Budget already spent atomically by the rateTrySpend
 		// case — the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: restarting k0sworker - containerd-sock-down %s (persisted %dx)",
+		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
+			" - containerd-sock-down %s (persisted %dx)",
 			c.d.Cfg.CtrSocket, c.fails))
 		c.fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
@@ -466,12 +457,5 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckCtrSock, "restart").Inc()
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCtrSock, "ok")
 }
-
-// --- Check: containerd stale ingest GC (A3 — 39-ctr-ingest-gc) ---
-// A hard-reboot or OOM mid-pull leaves ingest dirs containerd never
-// reaps; kubelet's ImageGC can't see them because the lease is
-// orphaned. Runs when /var/lib/k0s is >75% full OR every 6h; ingest
-// dirs with mtime >3h (no legitimate pull survives that) are removed
-// via `ctr content ingest rm`, with a direct dir rm as fallback.

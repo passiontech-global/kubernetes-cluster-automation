@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -49,8 +49,7 @@ func (c *CtrTasksCheck) Name() string { return wdeps.CheckCtrTasks }
 
 // Run executes one ctr-tasks round.
 func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCtrTasks) {
 		return
 	}
 	entries, err := os.ReadDir(c.d.Cfg.CtrTaskRoot)
@@ -58,7 +57,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr task root %s unreadable: %v — ctr-tasks check skipped",
 			c.d.Cfg.CtrTaskRoot, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCtrTasks, "abort")
 		return
 	}
 	liveDirs := map[string]bool{}
@@ -138,7 +137,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if state, _, ok := c.d.ProcStatStatePPID(pid); ok &&
 			(state == "D" || state == "Z") {
 			shimEscalated = true
-			c.d.State.EnterFrom(hoststate.LatchPodTeardownWedged,
+			c.d.State.EnterFrom(latchdefs.LatchPodTeardownWedged,
 				wdeps.CheckCtrTasks, fmt.Sprintf(
 					"unkillable-orphan-shim pid=%d id=%.12s state=%s",
 					pid, sid, state))
@@ -216,7 +215,8 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	for _, d := range wedged {
 		id := filepath.Base(d)
 		if nClean >= c.d.Cfg.Ctr.MaxTaskClean {
-			c.d.State.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
+			c.d.State.AppendLog(fmt.Sprintf("suspect: "+latchdefs.ReasonCtrTaskWedged+
+				" still pending cap=%d",
 				c.d.Cfg.Ctr.MaxTaskClean))
 			break
 		}
@@ -249,7 +249,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 		c.d.State.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
-		// W15-R1a: runc create mounts the bundle rootfs (overlay on
+		// runc create mounts the bundle rootfs (overlay on
 		// the snapshot) before exec — RemoveAll on a wedged task dir
 		// then hits EBUSY and leaves the mountpoint leaking in the
 		// host mountinfo table. Lazily unmount it in the HOST mount
@@ -266,14 +266,14 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// the shared latch (pod-teardown's own hold, if any, is
 	// untouched). A capped or escalated scan keeps it.
 	if !shimEscalated && !killCapHit {
-		c.d.State.ExitFrom(hoststate.LatchPodTeardownWedged,
+		c.d.State.ExitFrom(latchdefs.LatchPodTeardownWedged,
 			wdeps.CheckCtrTasks, nil)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCtrTasks, "ok")
 }
 
 // lazyUnmountRootfs lazily unmounts <d>/rootfs in the HOST mount
-// namespace when it exists (W15-R1a) — the systemd exec seam runs
+// namespace when it exists — the systemd exec seam runs
 // nsenter -m wrapped, so the umount path must be the host-side view
 // (the /host DaemonSet prefix stripped; fixture paths carry no
 // prefix and pass through verbatim). No systemd client → log-only,

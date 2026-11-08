@@ -258,10 +258,34 @@ func Load(path string) (*Config, error) {
 
 // Parse parses conf content — separated from Load so tests and the
 // runner-feeder can parse embedded text.
+//
+// Parse is a short orchestrator: each config block (overlay, DNS
+// fallback map, API backends, nebula, controller-plane, signal kill
+// switches) has its own parseXxxBlock func operating on the one
+// shared vars map. Sequencing them in file order keeps the outcome
+// identical to the previous single-pass body.
 func Parse(data []byte) (*Config, error) {
 	vars := parseKV(string(data))
 	c := &Config{Disabled: map[string]bool{}}
+	parseOverlayBlock(vars, c)
+	parseDNSBlock(vars, c)
+	parseBackendsBlock(vars, c)
+	parseNebulaBlock(vars, c)
+	parseControllerBlock(vars, c)
+	parseSigKillSwitches(vars, c)
+	c.Normalize()
+	return c, nil
+}
 
+// parseOverlayBlock fills the OVERLAY_* fields: dataplane probe
+// targets/markers, slowpath/site-edge RTT thresholds, probe
+// count/wait, egress relays + routing table, the egress TCP map and
+// the active-overlay selector. Scalars and lists fall back to their
+// TINC_* predecessors via pick — lib.sh's rename migration for conf
+// files written before the 2026-10 overlay-agnostic rewrite. The
+// block-local defaults here (tinc active) are re-asserted by
+// Normalize for literally-constructed Configs.
+func parseOverlayBlock(vars map[string]string, c *Config) {
 	c.OverlayProbeTargets = wordList(pick(vars, "OVERLAY_PROBE_TARGETS", "TINC_PROBE_TARGETS"))
 	c.OverlayProbeMarkers = wordList(pick(vars, "OVERLAY_PROBE_MARKERS", "TINC_PROBE_MARKERS"))
 	c.OverlaySlowpathMarkers = wordList(pick(vars, "OVERLAY_SLOWPATH_MARKERS", "TINC_SLOWPATH_MARKERS"))
@@ -286,16 +310,38 @@ func Parse(data []byte) (*Config, error) {
 		}
 		c.OverlayEgressTCP[ip] = port
 	}
+}
+
+// parseDNSBlock fills DNSFallback from DNS_FALLBACK_MAP — the
+// "name[:port]=ip1,ip2,..." entries the resolv.conf fallback merges
+// into per-node resolver views. Malformed entries are skipped (the
+// shell `${DNS_FALLBACK_MAP}` word split tolerated them the same
+// way).
+func parseDNSBlock(vars map[string]string, c *Config) {
 	for _, e := range wordList(vars["DNS_FALLBACK_MAP"]) {
 		if d, ok := parseDNSEntry(e); ok {
 			c.DNSFallback = append(c.DNSFallback, d)
 		}
 	}
+}
+
+// parseBackendsBlock fills APIBackends from API_BACKENDS — the
+// per-controller "name=ip:port" list consumers hit directly, never
+// via VIP. Malformed entries are skipped.
+func parseBackendsBlock(vars map[string]string, c *Config) {
 	for _, e := range wordList(vars["API_BACKENDS"]) {
 		if b, ok := parseAPIBackend(e); ok {
 			c.APIBackends = append(c.APIBackends, b)
 		}
 	}
+}
+
+// parseNebulaBlock fills the NEBULA_* fields (net name, tun device,
+// lighthouse port, stats URL, degraded streak) plus TINC_NET — the
+// shell modules kept both names and the agent reads both. Empty
+// strings get the same defaults lib.sh expanded (`${NEBULA_NET:-…}`);
+// Normalize re-asserts them for literally-constructed Configs.
+func parseNebulaBlock(vars map[string]string, c *Config) {
 	c.NebulaNet = vars["NEBULA_NET"]
 	if c.NebulaNet == "" {
 		c.NebulaNet = "interdc"
@@ -311,8 +357,15 @@ func Parse(data []byte) (*Config, error) {
 	if c.TincNet == "" {
 		c.TincNet = "interdc"
 	}
-	// Controller-plane block — raw values; consumers apply their
-	// own defaults (shell ${VAR:-def} parity).
+}
+
+// parseControllerBlock copies the controller-plane block into the
+// Config verbatim — raw values, no defaults applied (the hub-only
+// keys API_SELF/API_PEER, the SIG13/API_SERVER knobs and the
+// kine-ttl / kine-pool / k0s-oomloop autofix knobs). Consumers
+// apply their own defaults on empty/0, exactly like the shell's
+// ${VAR:-def} expansions.
+func parseControllerBlock(vars map[string]string, c *Config) {
 	c.APISelf = vars["API_SELF"]
 	c.APIPeer = vars["API_PEER"]
 	c.KineDBProbe = vars["KINE_DB_PROBE"]
@@ -334,6 +387,15 @@ func Parse(data []byte) (*Config, error) {
 	c.OOMLoopAutofix = vars["K0S_OOMLOOP_AUTOFIX"]
 	c.OOMLoopMinKills = int(num(vars["K0S_OOMLOOP_MIN_KILLS"], 0))
 	c.OOMLoopWindowS = int(num(vars["K0S_OOMLOOP_WINDOW_S"], 0))
+}
+
+// parseSigKillSwitches scans every WD_SIG_<NAME> key: a value of
+// "off"/"0"/"false"/"disabled" (case/space-insensitive) records the
+// normalized signal name — lowercase with '-' separators — in
+// Config.Disabled, the same kill switch the shell runner reads.
+// Every other value (and every non-WD_SIG_ key) leaves the signal
+// enabled.
+func parseSigKillSwitches(vars map[string]string, c *Config) {
 	for k, v := range vars {
 		name, ok := strings.CutPrefix(k, "WD_SIG_")
 		if !ok {
@@ -345,8 +407,6 @@ func Parse(data []byte) (*Config, error) {
 			c.Disabled[norm] = true
 		}
 	}
-	c.Normalize()
-	return c, nil
 }
 
 // Normalize applies the shell defaults to unset fields — callers that

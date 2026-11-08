@@ -9,9 +9,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/apiserver"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/etcd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/kine"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/oom"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/pki"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/storelocal"
 )
 
 // initChecks builds the ordered dispatch table Cycle drives — the
@@ -34,7 +34,7 @@ func (h *Hygiene) initChecks() {
 		h.checks = append(h.checks, c)
 		*entries = append(*entries, checks.Entry{Name: c.Name(), Run: c.Run})
 	}
-	add(kine.NewPool(h.Deps), &ungated)
+	add(storelocal.NewPool(h.Deps), &ungated)
 	add(oom.NewLoop(h.Deps), &ungated)
 	add(etcd.NewGuard(h.Deps), &ungated)
 	// The W10-CP2/W10-CP5 ride-alongs share the cp-freeze dispatch
@@ -44,7 +44,7 @@ func (h *Hygiene) initChecks() {
 	// (the Check accessor + domain tests reach them) but get no
 	// table row of their own — built first, then handed to the
 	// freeze check explicitly.
-	storage := kine.NewStorage(h.Deps)
+	storage := storelocal.NewStorage(h.Deps)
 	kubecert := pki.NewKubeCert(h.Deps)
 	h.checks = append(h.checks, storage, kubecert)
 	add(apiserver.NewFreeze(h.Deps, storage, kubecert), &ungated)
@@ -56,7 +56,7 @@ func (h *Hygiene) initChecks() {
 	// the gated cycle always reported.
 	var gated []checks.Entry
 	add(apiserver.NewHub(h.Deps), &gated)
-	add(kine.NewTTL(h.Deps), &gated)
+	add(storelocal.NewTTL(h.Deps), &gated)
 
 	h.groups = []checks.Group{
 		{Entries: ungated},

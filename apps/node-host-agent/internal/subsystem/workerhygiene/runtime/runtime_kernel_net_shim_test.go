@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -68,7 +68,7 @@ func TestKernelNetShimHygieneCheck(t *testing.T) {
 	// oversized shim already degrades on its own threshold.
 	e.H.Cycle(context.Background())
 	latchPath := filepath.Join(e.StateDir,
-		hoststate.LatchFilePrefix+hoststate.LatchKernelNetShim)
+		latchdefs.LatchFilePrefix+latchdefs.LatchKernelNetShim)
 	if _, err := os.Stat(latchPath); err != nil {
 		t.Fatal("shim over 200MiB did not enter the latch")
 	}

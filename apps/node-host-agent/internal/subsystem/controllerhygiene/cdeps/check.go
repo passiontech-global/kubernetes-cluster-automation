@@ -17,7 +17,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // Check names — prometheus `check` label + log context.
@@ -42,30 +42,30 @@ const (
 // prom_emit contract, node_watchdog_state{signal=...}); the values
 // come from the canonical hoststate latch registry.
 const (
-	StateCacheStale       = hoststate.LatchAPIServerCacheStale
-	StateCacheWedged      = hoststate.LatchAPIServerCacheWedged
-	StateKineUnreachable  = hoststate.LatchKineBackendUnreachable
-	StateKinePoolRunaway  = hoststate.LatchKinePoolRunaway
-	StateKineTTLDead      = hoststate.LatchKineTTLDead
-	StateKineTTLLoop      = hoststate.LatchKineTTLLoop
-	StateControllerOOMLop = hoststate.LatchK0sControllerOOMLoop
+	StateCacheStale       = latchdefs.LatchAPIServerCacheStale
+	StateCacheWedged      = latchdefs.LatchAPIServerCacheWedged
+	StateKineUnreachable  = latchdefs.LatchKineBackendUnreachable
+	StateKinePoolRunaway  = latchdefs.LatchKinePoolRunaway
+	StateKineTTLDead      = latchdefs.LatchKineTTLDead
+	StateKineTTLLoop      = latchdefs.LatchKineTTLLoop
+	StateControllerOOMLop = latchdefs.LatchK0sControllerOOMLoop
 	// StateJournalUnreadable latches while journal reads keep
 	// producing nothing although journal storage exists — every
 	// journal-grep check is blind until it clears (suspectLog's
 	// last-suspect- budget drops with the latch via stateExit).
-	StateJournalUnreadable = hoststate.LatchJournalUnreadable
+	StateJournalUnreadable = latchdefs.LatchJournalUnreadable
 	// StateCPComponentFrozen is the W8-CP3 latch: a KCM/scheduler
 	// component frozen while the peer apiserver stays healthy.
-	StateCPComponentFrozen = hoststate.LatchCPComponentFrozen
+	StateCPComponentFrozen = latchdefs.LatchCPComponentFrozen
 	// StatePKIReloadStale is the W8-CP4 latch: an on-disk PKI cert
 	// newer than what the live socket presents — the daemon never
 	// reloaded the rotated cert.
-	StatePKIReloadStale = hoststate.LatchCPCertReloadStale
+	StatePKIReloadStale = latchdefs.LatchCPCertReloadStale
 	// StateKubeCertExpiring latches while an embedded kubeconfig
 	// client cert sits inside the warn window — surfaces through
 	// node_host_agent_watchdog_state{state=...} like every other
 	// state-* latch.
-	StateKubeCertExpiring = hoststate.LatchKubeconfigCertExpiring
+	StateKubeCertExpiring = latchdefs.LatchKubeconfigCertExpiring
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -304,7 +305,7 @@ func TestOwnerLatchSecondOwnerJoins(t *testing.T) {
 // resolves its declared set.
 func TestOwnerLatchLegacyFile(t *testing.T) {
 	s, _, _ := newTestStore(t)
-	name := LatchPodTeardownWedged
+	name := latchdefs.LatchPodTeardownWedged
 	s.Enter(name, "") // legacy file — no recorded owners
 
 	// One owner's release must NOT clear the file — the seed

@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // The registry of currently-producible state-<name> latch names
 // (exact names + the parameterized families whose suffix is minted
-// per target at write time) lives in platform/hoststate —
-// hoststate.LatchDefs / hoststate.KnownLatchName, cross-checked
+// per target at write time) lives in internal/latchdefs —
+// latchdefs.LatchDefs / latchdefs.KnownLatchName, cross-checked
 // against every latch-write site. The janitor only consumes it: a
 // reaped latch is classified rule=max-age for a registered name and
 // rule=unknown for anything else.
@@ -102,7 +102,7 @@ func (j *Janitor) sweepLatches() {
 	}
 	now := j.cfg.Clock.Now()
 	for _, e := range entries {
-		key, ok := strings.CutPrefix(e.Name(), hoststate.LatchFilePrefix)
+		key, ok := strings.CutPrefix(e.Name(), latchdefs.LatchFilePrefix)
 		if !ok {
 			continue
 		}
@@ -122,7 +122,7 @@ func (j *Janitor) sweepLatches() {
 		switch {
 		case age < 0 || age <= j.cfg.LatchMaxAge:
 			continue
-		case !hoststate.KnownLatchName(key):
+		case !latchdefs.KnownLatchName(key):
 			rule = "unknown"
 		default:
 			rule = "max-age"

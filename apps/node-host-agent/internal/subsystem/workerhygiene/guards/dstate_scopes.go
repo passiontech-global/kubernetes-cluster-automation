@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -88,8 +88,7 @@ func (c *ZombieStormCheck) Name() string { return wdeps.CheckZombieStorm }
 
 // Run executes one zombie-storm round.
 func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckZombieStorm, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckZombieStorm) {
 		return
 	}
 	byPPID := map[int]int{}
@@ -140,7 +139,8 @@ func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			// interval (the !stateExists gating wdeps.CheckCiliumMTU
 			// uses).
 			c.d.State.AppendLog(fmt.Sprintf(
-				"ACTION zombie-storm: pod_uid=%s zombies=%d ppid=%d", uid, n, ppid))
+				latchdefs.ActionEntryPrefix(latchdefs.LatchZombieStorm)+
+					"pod_uid=%s zombies=%d ppid=%d", uid, n, ppid))
 		case streak > c.d.Cfg.ConsecNeeded:
 			storm = true // latched storm continues — no repeated ACTION line
 		default:
@@ -150,11 +150,11 @@ func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if storm {
-		c.d.State.Enter(hoststate.LatchZombieStorm, "")
+		c.d.State.Enter(latchdefs.LatchZombieStorm, "")
 	} else {
-		c.d.State.Exit(hoststate.LatchZombieStorm, nil)
+		c.d.State.Exit(latchdefs.LatchZombieStorm, nil)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckZombieStorm, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckZombieStorm, "ok")
 }
 
 // procStatCommState parses /proc/<pid>/stat for comm + state — comm
@@ -214,8 +214,7 @@ func (c *DstateCheck) Name() string { return wdeps.CheckDState }
 
 // Run executes one d-state-storm round.
 func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDState, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckDState) {
 		return
 	}
 	total, runtime := 0, 0
@@ -240,29 +239,28 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	if total < c.d.Cfg.Pressure.DStateStormThreshold && runtime < dStateRuntimeMin {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchDStateStorm, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckDState, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchDStateStorm, nil)
+		c.d.CycleResult(wdeps.CheckDState, "ok")
 		return
 	}
-	c.fails++
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: d-state-storm count=%d runtime=%d (check %d/%d)",
-			total, runtime, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckDState, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: d-state-storm count=%d runtime=%d",
+		total, runtime)) {
+		c.d.CycleResult(wdeps.CheckDState, "ok")
 		return
 	}
-	if !c.d.State.Exists(hoststate.LatchDStateStorm) {
+	if !c.d.State.Exists(latchdefs.LatchDStateStorm) {
 		// NPD contract: nodereporter maps this line to the
 		// KernelHungTasks Event + problem_counter — logged once per
 		// latch entry (the !stateExists gate, wdeps.CheckCiliumMTU parity).
 		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION d-state-storm: count=%d runtime=%d wchan=%s",
+			latchdefs.ActionEntryPrefix(latchdefs.LatchDStateStorm)+
+				"count=%d runtime=%d wchan=%s",
 			total, runtime, strings.Join(wchans, ",")))
 	}
-	c.d.State.Enter(hoststate.LatchDStateStorm,
+	c.d.State.Enter(latchdefs.LatchDStateStorm,
 		fmt.Sprintf("count=%d runtime=%d", total, runtime))
-	c.d.Cycles.WithLabelValues(wdeps.CheckDState, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckDState, "ok")
 }
 
 // --- Check: systemd-scopes (W7-H2) ---
@@ -287,16 +285,15 @@ func (c *ScopesCheck) Name() string { return wdeps.CheckSysScopes }
 
 // Run executes one systemd-scopes round.
 func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckSysScopes) {
 		return
 	}
 	if c.d.Cfg.Systemd == nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "gated").Inc()
+		c.d.CycleResult(wdeps.CheckSysScopes, "gated")
 		return
 	}
 	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < systemdScopeScanInterval {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
 	}
 	out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
@@ -309,7 +306,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: systemd-scopes list-units failed: %v (%s) — scan skipped",
 			err, strings.TrimSpace(out)))
-		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckSysScopes, "abort")
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
@@ -321,7 +318,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if n == 0 {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
 	}
 	// NPD contract line (reset-failed evidence in the watchdog log).
@@ -334,7 +331,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	} else {
 		c.d.Actions.WithLabelValues(wdeps.CheckSysScopes, "reset_failed").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckSysScopes, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 }
 
 // --- Check: cilium-envoy xDS NACK + node-local-dns LRP (W7-H3) ---

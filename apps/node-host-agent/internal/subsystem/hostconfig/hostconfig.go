@@ -29,10 +29,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -56,7 +57,7 @@ const (
 	defaultHTTPTimeout = 120 * time.Second
 )
 
-// The exec contract lives in platform/converge (it owns the systemd
+// The exec contract lives in the sibling converge package (it owns the systemd
 // verbs + deploys that run over it); aliased here so the Config
 // surface — and ops/hostconverge's RunnerFactory — keeps the
 // hostconfig.* spelling.
@@ -458,7 +459,7 @@ func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := topology.Render(string(text), ctx,
+	out, err := jinja.Render(string(text), ctx,
 		topology.NewEnv(r.cfg.VarsDir, r.cfg.Clock))
 	if err != nil {
 		return nil, fmt.Errorf("render %s: %w", name, err)
@@ -546,7 +547,7 @@ func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 //
 // Several groups build `sh -c`/`bash -c` command strings with
 // vars-derived values (nebula tables/dev, mesh IPs, ports). The
-// charset/shape predicates live in platform/converge — these
+// charset/shape predicates live in the converge package — these
 // wrappers add the cycle-error attribution: a refused value counts a
 // cycle error AND refuses the shell work.
 

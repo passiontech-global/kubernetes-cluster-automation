@@ -13,7 +13,7 @@ import (
 // --- helpers over jinja values ---
 
 func mapGet(m any, key string) any {
-	if om, ok := m.(*OMap); ok {
+	if om, ok := m.(*jinja.OMap); ok {
 		if v, ok := om.Get(key); ok {
 			return v
 		}
@@ -40,7 +40,12 @@ func LastOctet(ip string) string {
 	return ip
 }
 
-func uniqSorted(in []string) []string {
+// UniqSorted returns the distinct entries of in in ascending sort
+// order — the canonical normalisation derive() applies to every
+// peer-set it emits (relay targets, egress, resolvers, cert
+// subnets) and ops/nebulasign reuses when it renders the registry's
+// cert subnets into the nebula-sign job list.
+func UniqSorted(in []string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, x := range in {

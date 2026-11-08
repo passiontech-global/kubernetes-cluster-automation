@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -136,14 +137,13 @@ func (c *CtrImagesCheck) Name() string { return wdeps.CheckCtrImages }
 
 // Run executes one ctr-image-healer round.
 func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrImages, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCtrImages) {
 		return
 	}
 	if !e.APIOK {
 		// Inconclusive — same "keep state, never act" rule as the
 		// other pod-list checks.
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrImages, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCtrImages, "abort")
 		return
 	}
 	// Dedupe refs across pods and statuses — several containers
@@ -186,7 +186,7 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if len(seen) == 0 {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrImages, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCtrImages, "ok")
 		return
 	}
 	images := make([]string, 0, len(seen))
@@ -198,7 +198,7 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-image-healer corrupted image(s) %s - in rm cooldown (<15m), skip",
 			strings.Join(images, " ")))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCtrImages, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCtrImages, "ok")
 		return
 	}
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
@@ -217,8 +217,8 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		// NPD contract: "removed corrupted image" feeds the
 		// CorruptedImageRemoved filelog pattern.
-		c.d.State.AppendLog("ACTION: removed corrupted image " + img)
+		c.d.State.AppendLog(latchdefs.ActionCorruptedImageRemove + " " + img)
 		c.d.Actions.WithLabelValues(wdeps.CheckCtrImages, "image_rm").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCtrImages, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCtrImages, "ok")
 }

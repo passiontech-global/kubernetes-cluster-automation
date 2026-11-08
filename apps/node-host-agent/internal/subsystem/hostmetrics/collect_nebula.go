@@ -17,7 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -100,7 +100,7 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 func (c *Collector) updateCertLatch(days int64, ok bool) {
 	daysPath := filepath.Join(c.cfg.WatchdogStateDir, "nebula-cert-days-left")
 	if !ok {
-		c.state.Exit(hoststate.LatchNebulaCertExpiring, nil)
+		c.state.Exit(latchdefs.LatchNebulaCertExpiring, nil)
 		_ = os.Remove(daysPath)
 		return
 	}
@@ -113,10 +113,10 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 	}
 	switch {
 	case days < nebulaCertWarnDays:
-		c.state.Enter(hoststate.LatchNebulaCertExpiring,
+		c.state.Enter(latchdefs.LatchNebulaCertExpiring,
 			fmt.Sprintf("daysLeft=%d < warnDays=%d", days, nebulaCertWarnDays))
 	default:
-		c.state.Exit(hoststate.LatchNebulaCertExpiring, nil)
+		c.state.Exit(latchdefs.LatchNebulaCertExpiring, nil)
 	}
 }
 

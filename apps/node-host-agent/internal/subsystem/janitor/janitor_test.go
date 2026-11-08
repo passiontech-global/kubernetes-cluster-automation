@@ -54,8 +54,8 @@ func jfixture(t *testing.T) *jenv {
 			t.Fatal(err)
 		}
 	}
-	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run,
-		ProcUptimeFile: filepath.Join(e.proc, "uptime")})
+	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run},
+		systemd.WithProcUptimeFile(filepath.Join(e.proc, "uptime")))
 	j, err := New(Config{
 		Interval:         time.Hour,
 		WatchdogStateDir: e.state,

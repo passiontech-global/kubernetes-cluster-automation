@@ -1,4 +1,4 @@
-// mountinfo_hygiene_test.go — the W15-R1b mountinfo-hygiene check:
+// mountinfo_hygiene_test.go — the mountinfo-hygiene check:
 // the >1500-entry MountinfoTableBloat event, the orphan task-rootfs
 // reaper (30m marker confirmation, umount through the systemd seam)
 // and the orphan pod-volume reaper (pod gone from apiserver + ctr,

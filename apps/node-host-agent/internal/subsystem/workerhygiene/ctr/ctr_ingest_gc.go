@@ -32,8 +32,7 @@ func (c *IngestGCCheck) Name() string { return wdeps.CheckIngestGC }
 
 // Run executes one ctr-ingest-gc round.
 func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckIngestGC) {
 		return
 	}
 	var st unix.Statfs_t
@@ -52,7 +51,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	due := c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval
 	if !diskHigh && !due {
-		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckIngestGC, "ok")
 		return
 	}
 	// W9: above the high watermark the content store itself may be
@@ -68,7 +67,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
 			c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-			c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
+			c.d.CycleResult(wdeps.CheckIngestGC, "ok")
 			return
 		}
 		// A transient read failure must NOT stamp lastScan —
@@ -77,7 +76,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr ingest dir %s unreadable: %v — ingest GC skipped",
 			c.d.Cfg.Ctr.IngestDir, err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckIngestGC, "abort")
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
@@ -120,7 +119,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CtrIngestsCleaned.Inc()
 		c.d.Actions.WithLabelValues(wdeps.CheckIngestGC, "ingest_rm").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckIngestGC, "ok")
 }
 
 // maybePruneContentStore runs `k0s ctr -n k8s.io content prune` —

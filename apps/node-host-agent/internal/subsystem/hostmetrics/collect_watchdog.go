@@ -13,7 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 const (
@@ -67,7 +67,7 @@ func (b *latchSeenBook) update(present map[string]bool, certOK bool,
 	// must emit an explicit 0 from then on (alert contract), even
 	// if the cert later disappears.
 	for s, clearedAt := range b.m {
-		if present[s] || (certOK && s == hoststate.LatchNebulaCertExpiring) {
+		if present[s] || (certOK && s == latchdefs.LatchNebulaCertExpiring) {
 			continue
 		}
 		if clearedAt.IsZero() {
@@ -80,7 +80,7 @@ func (b *latchSeenBook) update(present map[string]bool, certOK bool,
 		b.m[name] = time.Time{}
 	}
 	if certOK {
-		b.m[hoststate.LatchNebulaCertExpiring] = time.Time{}
+		b.m[latchdefs.LatchNebulaCertExpiring] = time.Time{}
 	}
 	// Hard bound: a latch storm must not grow the map without
 	// limit — evict the longest-cleared entries first (active
@@ -143,7 +143,7 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 				continue
 			}
 			if name, ok := strings.CutPrefix(e.Name(),
-				hoststate.LatchFilePrefix); ok && name != "" {
+				latchdefs.LatchFilePrefix); ok && name != "" {
 				present[name] = true
 			}
 		}
@@ -175,7 +175,7 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 		return
 	}
 	if sc.certOK && sc.certDays < nebulaCertWarnDays {
-		present[hoststate.LatchNebulaCertExpiring] = true
+		present[latchdefs.LatchNebulaCertExpiring] = true
 	}
 	for _, name := range c.seen.update(present, sc.certOK, c.cfg.Clock.Now()) {
 		v := 0.0

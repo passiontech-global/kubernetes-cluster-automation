@@ -5,10 +5,11 @@ package hostconfig
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T5b nebula mesh ----------
@@ -17,10 +18,7 @@ func (c *cyc) groupNebula() {
 	r, ctx, t := c.r, c.ctx, c.t
 	_ = ctx
 	enabled := c.vb("interdc_nebula_enabled")
-	net := c.v("interdc_nebula_net")
-	if net == "" || net == "None" {
-		net = "interdc"
-	}
+	net := c.t.Vars.StrDef("interdc_nebula_net", "interdc")
 	// interdc_nebula_dev is resolved where it's consumed (tplCtx,
 	// nebulaRouting) — no local resolution needed here.
 	unit := "nebula@" + net + ".service"
@@ -64,7 +62,7 @@ func (c *cyc) groupNebula() {
 	// certs from CM mounts (NebulaCertsDir, fallback VarsDir).
 	certFile := func(name string) (string, bool) {
 		for _, d := range []string{r.cfg.NebulaCertsDir, r.cfg.VarsDir} {
-			p := filepath2(d, name)
+			p := filepath.Join(d, name)
 			if _, err := os.Stat(p); err != nil {
 				continue
 			}
@@ -186,11 +184,13 @@ WantedBy=multi-user.target
 	c.nebulaRouting()
 }
 
-// nebulaInstallBinary ports the version-check + tarball install path.
+// nebulaInstallBinary ports the version-check + tarball install path
+// through installManagedBinary: <bin> -version probe → sha256-pinned
+// tarball (staged or downloaded) → untarInstall of nebula plus the
+// best-effort nebula-cert companion (tmp+rename).
 func (c *cyc) nebulaInstallBinary() {
-	r, ctx := c.r, c.ctx
-	ver := c.v("interdc_nebula_version")
-	if ver == "" || ver == "None" {
+	ver := c.t.Vars.StrDef("interdc_nebula_version", "")
+	if ver == "" {
 		// An empty pin is NOT a match — strings.Contains(out, "") is
 		// vacuously true (would pin any installed version forever)
 		// and download("") is a counted bogus fetch. Not pinned =
@@ -198,37 +198,33 @@ func (c *cyc) nebulaInstallBinary() {
 		c.err("T5b: interdc_nebula_version not pinned — nebula not installed")
 		return
 	}
-	if out, err := r.run(ctx, "/usr/local/bin/nebula", "-version"); err == nil &&
-		strings.Contains(out, ver) {
-		return
-	}
 	tgzFile := c.v("interdc_nebula_tgz_file")
 	sum := c.v("interdc_nebula_tgz_sha256")
 	url := c.v("interdc_nebula_tgz_url")
-	local := filepath2(r.cfg.DownloadDir, tgzFile)
-	if fileExistsNoRoot(local) {
+	c.installManagedBinary(managedBinarySpec{
+		name:     "T5b",
+		artifact: "nebula tarball",
+		probe: func(c *cyc) bool {
+			out, err := c.r.run(c.ctx, "/usr/local/bin/nebula", "-version")
+			return err == nil && strings.Contains(out, ver)
+		},
+		url:    url,
+		sum:    sum,
+		staged: filepath.Join(c.r.cfg.DownloadDir, tgzFile),
 		// ansible: sha256sum -c on the STAGED file every run — a
 		// corrupted/operator-swapped tarball must not install.
-		if !sha256FileOK(local, sum) {
-			c.err("T5b: staged nebula tarball sha256 mismatch — not installing",
-				"file", local, "sha256", sum)
-			return
-		}
-	} else if err := r.download(ctx, url, local, sum); err != nil {
-		c.err("T5b: nebula tarball download", "url", url, "file", local, "error", err)
-		return
-	}
-	if err := untarInstall(local, "nebula", r.hp("/usr/local/bin/nebula"), 0o755); err != nil {
-		c.err("T5b: nebula install", "file", local, "error", err)
-		return
-	}
-	if err := untarInstall(local, "nebula-cert", r.hp("/usr/local/bin/nebula-cert"), 0o755); err != nil {
-		// Best-effort companion binary — the nebula binary itself is
-		// installed above; a missing key only errors when keygen is
-		// actually needed (counted at the keygen call site).
-		logger().Warn("T5b: nebula-cert install failed — keygen unavailable",
-			"file", local, "error", err)
-	}
+		refuseBadStaged: true,
+		downloadLine:    "T5b: nebula tarball download",
+		member:          "nebula",
+		dest:            "/usr/local/bin/nebula",
+		mode:            0o755,
+		installErr: func(c *cyc, local string, err error) {
+			c.err("T5b: nebula install", "file", local, "error", err)
+		},
+		companionMember:   "nebula-cert",
+		companionDest:     "/usr/local/bin/nebula-cert",
+		companionFailLine: "T5b: nebula-cert install failed — keygen unavailable",
+	})
 }
 
 // nebulaConfig renders nebula.yaml.j2 via the shared ctx.
@@ -243,14 +239,14 @@ func (c *cyc) nebulaConfig() ([]byte, error) {
 // handshakes, listen, pki PATHS, lighthouse.am_lighthouse, tun minus
 // unsafe_routes.
 func (c *cyc) nebulaNeedsRestart(old, new []byte) bool {
-	oldV, err1 := topology.DecodeYAML(old)
-	newV, err2 := topology.DecodeYAML(new)
+	oldV, err1 := jinja.DecodeYAML(old)
+	newV, err2 := jinja.DecodeYAML(new)
 	if err1 != nil || err2 != nil {
 		return true // unparseable → restart (safe default)
 	}
 	diff := func(key string) bool {
-		a, _ := oldV.(*topology.OMap)
-		b, _ := newV.(*topology.OMap)
+		a, _ := oldV.(*jinja.OMap)
+		b, _ := newV.(*jinja.OMap)
 		var av, bv any
 		if a != nil {
 			av, _ = a.Get(key)
@@ -269,7 +265,7 @@ func (c *cyc) nebulaNeedsRestart(old, new []byte) bool {
 	sub := func(root any, keys ...string) any {
 		cur := root
 		for _, k := range keys {
-			om, _ := cur.(*topology.OMap)
+			om, _ := cur.(*jinja.OMap)
 			if om == nil {
 				return nil
 			}
@@ -283,7 +279,7 @@ func (c *cyc) nebulaNeedsRestart(old, new []byte) bool {
 	// tun minus unsafe_routes
 	strip := func(root any) map[string]any {
 		out := map[string]any{}
-		if om, ok := root.(*topology.OMap); ok {
+		if om, ok := root.(*jinja.OMap); ok {
 			for _, k := range om.Keys() {
 				if k == "unsafe_routes" {
 					continue
@@ -304,19 +300,11 @@ func deepEqJ(a, b any) bool {
 }
 
 func (c *cyc) tablePub() string {
-	p := c.v("interdc_nebula_table_pub")
-	if p == "" || p == "None" {
-		return "100"
-	}
-	return p
+	return c.t.Vars.StrDef("interdc_nebula_table_pub", "100")
 }
 
 func (c *cyc) tableMark() string {
-	p := c.v("interdc_nebula_table_marker")
-	if p == "" || p == "None" {
-		return "101"
-	}
-	return p
+	return c.t.Vars.StrDef("interdc_nebula_table_marker", "101")
 }
 
 // hairpinViaRe extracts the first `via <ipv4>` next-hop from
@@ -348,10 +336,7 @@ func (c *cyc) nebulaDirectTCPPorts() []string {
 // marker-daddr snat use the marker (--node-ip / registry marker).
 func (c *cyc) nebulaRouting() {
 	r, ctx, t := c.r, c.ctx, c.t
-	dev := c.v("interdc_nebula_dev")
-	if dev == "" || dev == "None" {
-		dev = "neb1"
-	}
+	dev := c.t.Vars.StrDef("interdc_nebula_dev", "neb1")
 	pub, mark, mb := c.tablePub(), c.tableMark(), c.markerBase()
 	pubIP := nodeIPStr(t.Node, "ip") // interdc_nebula_node.ip (public)
 	mkIP := t.Markers[t.MeshName]    // registry marker
@@ -391,7 +376,7 @@ func (c *cyc) nebulaRouting() {
 		meshIPs := map[string]bool{}
 		for _, k := range t.Nodes.Keys() {
 			nv, _ := t.Nodes.Get(k)
-			if om, ok := nv.(*topology.OMap); ok {
+			if om, ok := nv.(*jinja.OMap); ok {
 				if ip := nodeIPStr(om, "ip"); ip != "" {
 					meshIPs[ip] = true
 				}
@@ -438,7 +423,7 @@ func (c *cyc) nebulaRouting() {
 	}
 	rs.WriteString(`ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main` + "\n")
 
-	// W15-NM1 proactive TCP MSS clamp: double encapsulation
+	// Proactive TCP MSS clamp: double encapsulation
 	// (nebula + cilium-wg/liqo) silently blackholes TCP when a
 	// SYN carries an MSS larger than the innermost path MTU. Add
 	// idempotent mangle TCPMSS clamp rules for both POSTROUTING and
@@ -556,11 +541,7 @@ func (c *cyc) nebulaRouting() {
 }
 
 func port(c *cyc) string {
-	p := c.v("interdc_nebula_port")
-	if p == "" || p == "None" {
-		return "45670"
-	}
-	return p
+	return c.t.Vars.StrDef("interdc_nebula_port", "45670")
 }
 
 // nodeIP: --node-ip from k0sworker unit, else marker for hubs.

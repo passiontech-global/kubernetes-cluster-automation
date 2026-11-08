@@ -16,7 +16,7 @@ const (
 	// H6 fd/socket sources.
 	defaultFileNRFile   = "/proc/sys/fs/file-nr"
 	defaultSockstatFile = "/proc/1/net/sockstat"
-	// defaultMountinfoFile is the host mountinfo table the W15-R1c
+	// defaultMountinfoFile is the host mountinfo table the mountinfo
 	// entries gauge counts (init-pid proc — hostPID makes it the
 	// host view).
 	defaultMountinfoFile = "/proc/1/mountinfo"
@@ -92,7 +92,7 @@ var (
 		"node_tcp_close_wait_sockets",
 		"Sockets in TCP_CLOSE_WAIT (state 08) across /proc/1/net/tcp and /proc/1/net/tcp6.",
 		[]string{"node"}, nil)
-	// W15-R1c: the host mountinfo table size — a growing count is
+	// Mountinfo census: the host mountinfo table size — a growing count is
 	// leaked mounts accumulating (task rootfs / pod volume leaks).
 	descMountinfoEntries = prometheus.NewDesc(
 		"node_host_agent_mountinfo_entries_count",
@@ -130,8 +130,8 @@ var (
 
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
 // max" (fields 0 and 2; the middle "unused" field is always ~0 on
-// modern kernels). Absent/malformed → no series. The W15-R1c
-// mountinfo line count rides the same family — emitted only when
+// modern kernels). Absent/malformed → no series. The mountinfo
+// line count rides the same family — emitted only when
 // the file reads (no fake 0 on an unreadable /proc view).
 func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 	if f, err := os.Open(c.cfg.MountinfoFile); err == nil {

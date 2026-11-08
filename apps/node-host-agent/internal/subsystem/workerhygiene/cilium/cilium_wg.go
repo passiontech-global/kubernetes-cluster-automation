@@ -18,7 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -115,13 +115,13 @@ func readyNodeCount(d *wdeps.Deps, ctx context.Context) int {
 type CiliumWGCheck struct {
 	d     *wdeps.Deps
 	Fails int
-	// peerStats — the W15-NM2 per-peer state held across Run
+	// peerStats — the per-peer zombie state held across Run
 	// cycles: last transfer counters, when tx first flowed with a
 	// zero handshake, and the consecutive stalled-cycle streak.
 	peerStats map[string]wgPeerSample
 }
 
-// W15-NM2 zombie-peer thresholds.
+// Zombie-peer thresholds.
 const (
 	// wgZombieHandshakeStale — a peer whose latest handshake is
 	// older than this while its tx grows but rx never does.
@@ -191,29 +191,28 @@ func (c *CiliumWGCheck) Name() string { return wdeps.CheckCiliumWG }
 
 // Run executes one cilium-wg-peers round.
 func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumWG) {
 		return
 	}
 	if !e.APIOK {
 		// Inconclusive — keep counters/latch exactly like the other
 		// API-dependent checks.
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumWG, "abort")
 		return
 	}
 	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_wg0")); err != nil {
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence (incl. the
-		// W15-NM2 per-peer zombie state).
+		// per-peer zombie state).
 		c.Fails = 0
 		c.peerStats = nil
-		c.d.State.Exit(hoststate.LatchCiliumWGPeerWipe, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumWGPeerWipe, nil)
+		c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 		return
 	}
 	tasks, reachable := ciliumAgentTasks(c.d, e)
 	if !reachable {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumWG, "abort")
 		return
 	}
 	running := false
@@ -227,10 +226,10 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// No live cilium-agent — sig9 owns agent-down; killing
 		// nothing here is correct, not a miss.
 		c.Fails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 		return
 	}
-	// W15-NM2: prefer the full `wg show cilium_wg0 dump` evidence —
+	// Prefer the full `wg show cilium_wg0 dump` evidence —
 	// it carries per-peer transfer counters and handshakes, so
 	// zombie peers (tx flowing, rx dead, stale/no handshake) can be
 	// excluded from the healthy count. The dump exec failing keeps
@@ -266,7 +265,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumWG, "abort")
 		return
 	}
 	expected, err := c.d.Cfg.Seams.Cilium.EncryptPeers(ctx, c.d.Cfg.Cilium.Socket)
@@ -282,27 +281,25 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if expected <= 0 {
 		// No expectation available — inconclusive but not harmful:
 		// neither count nor clear a streak we cannot verify.
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 		return
 	}
 	if actual >= expected {
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumWGPeerWipe, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumWGPeerWipe, nil)
+		c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-wg-peers allowed_ips=%d expected=%d (check %d/%d)",
-			actual, expected, c.Fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+	if c.d.StreakPending(&c.Fails, fmt.Sprintf(
+		"suspect: cilium-wg-peers allowed_ips=%d expected=%d",
+		actual, expected)) {
+		c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchCiliumWGPeerWipe,
+	c.d.State.Enter(latchdefs.LatchCiliumWGPeerWipe,
 		fmt.Sprintf("allowed_ips=%d expected=%d", actual, expected))
 	switch {
-	case c.d.State.Exists(hoststate.LatchNodeOverloaded):
+	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but node overloaded — skip kill",
 			actual, expected, c.Fails))
@@ -315,8 +312,8 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if killCiliumAgent(c.d, tasks) {
 			// NPD contract: the cilium_wg0 line feeds
 			// CiliumWireGuardPeerDrift (events.go).
-			c.d.State.AppendLog(fmt.Sprintf(
-				"ACTION: killed cilium-agent container - cilium_wg0 has %d allowed-ip peers while expected %d (kubelet will restart -> wireguard peer resync)",
+			c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionCiliumWGKill+
+				" has %d allowed-ip peers while expected %d (kubelet will restart -> wireguard peer resync)",
 				actual, expected))
 			c.Fails = 0
 			c.d.Actions.WithLabelValues(wdeps.CheckCiliumWG, "sigkill").Inc()
@@ -331,5 +328,5 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				actual, expected))
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCiliumWG, "ok")
 }

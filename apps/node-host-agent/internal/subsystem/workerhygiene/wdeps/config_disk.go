@@ -50,15 +50,15 @@ type DiskConfig struct {
 	// nsenter -m wrapped, so container-side /host paths would not
 	// resolve.
 	JournalVacuumDir string
-	// W15-K2b: WLayerSnapshotsDir is the ACTIVE overlayfs snapshotter
+	// WLayerSnapshotsDir is the ACTIVE overlayfs snapshotter
 	// root the writable-layer runaway scan walks (<id>/fs is the
 	// container's writable upperdir); CoredumpDir is the host
-	// systemd coredump store the W15-K2 coredump-storm guard sweeps
+	// systemd coredump store the coredump-storm guard sweeps
 	// once its filesystem crosses BloatWatermark. Both are /host-
 	// prefixed agent views like the wiring block.
 	WLayerSnapshotsDir string
 	CoredumpDir        string
-	// WLayerBloatThresholdBytes is the W15-K2b writable-layer scan's
+	// WLayerBloatThresholdBytes is the writable-layer scan's
 	// Warning threshold (default 5 GiB) — deliberately separate from
 	// BloatPodThresholdBytes, which stays the W6.3 eviction path's
 	// threshold so the plan's parity does not alter eviction

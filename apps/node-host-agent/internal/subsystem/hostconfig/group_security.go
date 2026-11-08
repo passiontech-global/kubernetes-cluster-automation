@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- security (fail2ban + sshd hardening) ----------
@@ -41,7 +41,7 @@ func (c *cyc) groupSecurity() {
 			r.restartService(ctx, "fail2ban.service")
 		}
 		_, _ = r.run(ctx, "fail2ban-client", "status", "sshd") // informational
-	} else if _, u := c.t.Vars.Get("fail2ban_enabled").(topology.Undefined); !u {
+	} else if _, u := c.t.Vars.Get("fail2ban_enabled").(jinja.Undefined); !u {
 		// ansible: only when fail2ban_enabled is defined and false —
 		// remove the jail AND purge the package.
 		_, _ = r.removeManaged("/etc/fail2ban/jail.d/90-cluster-sshd.conf")
@@ -90,7 +90,7 @@ ClientAliveCountMax 2
 			c.err("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
 				"path", "/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")
 		}
-	} else if _, u := c.t.Vars.Get("ssh_hardening_enabled").(topology.Undefined); !u {
+	} else if _, u := c.t.Vars.Get("ssh_hardening_enabled").(jinja.Undefined); !u {
 		rm1, _ := r.removeManaged("/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")
 		rm2, _ := r.removeManaged("/etc/ssh/sshd_config.d/60-passiontech-hardening.conf")
 		if rm1 || rm2 {
@@ -110,7 +110,7 @@ func (c *cyc) fail2banIgnoreIP() string {
 	var mesh []string
 	for _, k := range c.t.Nodes.Keys() {
 		nv, _ := c.t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}

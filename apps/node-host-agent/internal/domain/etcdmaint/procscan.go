@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 // waitPidExit polls /proc/<pid> until the process is gone — the old
@@ -26,17 +28,13 @@ import (
 func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 	procDir := filepath.Join(r.cfg.ProcRoot, strconv.Itoa(pid))
 	statFile := filepath.Join(procDir, "stat")
-	for i := 0; i < pidExitWaitTries; i++ {
+	if cycle.Poll(ctx, pidExitWaitTries, time.Second, func() bool {
 		if _, err := os.Stat(procDir); os.IsNotExist(err) {
-			return nil
+			return true
 		}
-		if procZombie(statFile) {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		r.cfg.SleepFn(time.Second)
+		return procZombie(statFile)
+	}, r.cfg.SleepFn) {
+		return nil
 	}
 	return fmt.Errorf("etcd pid %d did not exit after %ds",
 		pid, pidExitWaitTries)

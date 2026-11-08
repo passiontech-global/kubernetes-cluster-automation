@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -194,23 +195,23 @@ func TestLookupFailLoud(t *testing.T) {
 		"{{ lookup() }}",                   // no plugin name
 	}
 	for _, tpl := range cases {
-		if out, err := Render(tpl, map[string]any{}, nil); err == nil {
+		if out, err := jinja.Render(tpl, map[string]any{}, nil); err == nil {
 			t.Fatalf("render %q succeeded with %q — must error", tpl, out)
 		}
 	}
 	// Unsupported plugin errors even when an env is wired.
 	env := NewEnv(t.TempDir(), nil)
-	if _, err := Render("{{ lookup('url', 'http://x') }}", nil, env); err == nil {
+	if _, err := jinja.Render("{{ lookup('url', 'http://x') }}", nil, env); err == nil {
 		t.Fatal("unsupported plugin must error with env set")
 	}
 }
 
-// lookup('file', ...) resolves via Env.FileLookup — here the
+// lookup('file', ...) resolves via jinja.Env.FileLookup — here the
 // vars-dir-rooted env Load/NewEnv build.
 func TestLookupFileViaEnv(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("s3cr3t\n"), 0o644)
-	got, err := Render("{{ lookup('file', 'secret.txt') | trim }}",
+	got, err := jinja.Render("{{ lookup('file', 'secret.txt') | trim }}",
 		map[string]any{}, NewEnv(dir, nil))
 	if err != nil {
 		t.Fatal(err)
@@ -219,12 +220,12 @@ func TestLookupFileViaEnv(t *testing.T) {
 		t.Fatalf("lookup file = %q", got)
 	}
 	// Missing file → render error (was silently "" when env was nil).
-	if _, err := Render("{{ lookup('file', 'nope.txt') }}",
+	if _, err := jinja.Render("{{ lookup('file', 'nope.txt') }}",
 		map[string]any{}, NewEnv(dir, nil)); err == nil {
 		t.Fatal("missing file must error")
 	}
 	// 'date +%s' pipe lookup honours the injected clock.
-	got, err = Render("{{ lookup('pipe', 'date +%s') }}", map[string]any{},
+	got, err = jinja.Render("{{ lookup('pipe', 'date +%s') }}", map[string]any{},
 		NewEnv(dir, timex.NewCell(func() time.Time { return time.Unix(123, 0) })))
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +234,7 @@ func TestLookupFileViaEnv(t *testing.T) {
 		t.Fatalf("pipe date = %q", got)
 	}
 	// Any other pipe command errors.
-	if _, err := Render("{{ lookup('pipe', 'rm -rf /') }}",
+	if _, err := jinja.Render("{{ lookup('pipe', 'rm -rf /') }}",
 		map[string]any{}, NewEnv(dir, nil)); err == nil {
 		t.Fatal("unsupported pipe command must error")
 	}

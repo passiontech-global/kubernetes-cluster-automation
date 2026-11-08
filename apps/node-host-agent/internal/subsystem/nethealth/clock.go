@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 const (
@@ -53,7 +53,7 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 	}
 	if bad == "" {
 		n.clockFails = 0
-		n.stateExit(hoststate.LatchClockUnsync)
+		n.stateExit(latchdefs.LatchClockUnsync)
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
@@ -64,11 +64,11 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
-	n.state.Enter(hoststate.LatchClockUnsync, bad)
+	n.state.Enter(latchdefs.LatchClockUnsync, bad)
 	if n.state.RateOK("last-ntp-restart", ntpRestartInterval) {
 		n.restartNTPDaemon(ctx)
 	} else {
-		n.state.SuspectLog(hoststate.LatchClockUnsync, "suspect: clock-unsync persists "+
+		n.state.SuspectLog(latchdefs.LatchClockUnsync, "suspect: clock-unsync persists "+
 			"but ntp restart cooldown (<30m), skip", suspectLogCadence)
 	}
 	n.cycles.WithLabelValues(checkClock, "ok").Inc()
@@ -93,19 +93,19 @@ func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 	// Preference: enabled+active (the live daemon), then
 	// enabled-only (crashed — needs the restart most), then
 	// active-only (live but unmanaged enablement). A unit that
-	// merely exists never qualifies.
-	units := []string{
-		"systemd-timesyncd.service", "chrony.service", "chronyd.service",
-	}
+	// merely exists never qualifies. The candidate list is the
+	// shared latchdefs.ClockRestartUnits — the restart line below
+	// and the ClockUnsynchronized filelog rule derive from the same
+	// slice.
 	pick := ""
-	for _, u := range units {
+	for _, u := range latchdefs.ClockRestartUnits {
 		if n.unitEnabledActive(ctx, u) {
 			pick = u
 			break
 		}
 	}
 	if pick == "" {
-		for _, u := range units {
+		for _, u := range latchdefs.ClockRestartUnits {
 			if n.cfg.Systemd.IsEnabled(ctx, u) {
 				pick = u
 				break
@@ -113,7 +113,7 @@ func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 		}
 	}
 	if pick == "" {
-		for _, u := range units {
+		for _, u := range latchdefs.ClockRestartUnits {
 			if n.cfg.Systemd.IsActive(ctx, u) {
 				pick = u
 				break
@@ -130,7 +130,7 @@ func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 		return
 	}
 	n.state.AppendLog(fmt.Sprintf(
-		"ACTION: restarting %s - clock unsynchronized (persisted %dx)",
+		latchdefs.ActionPrefix+"restarting %s - clock unsynchronized (persisted %dx)",
 		pick, n.clockFails))
 	n.state.RateSpend("last-ntp-restart")
 	if err := n.cfg.Systemd.Restart(ctx, pick); err != nil {

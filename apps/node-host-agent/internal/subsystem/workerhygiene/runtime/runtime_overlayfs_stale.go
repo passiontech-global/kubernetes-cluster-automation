@@ -39,14 +39,13 @@ func (c *OverlayFSStaleCheck) Name() string { return wdeps.CheckOverlayFSStale }
 
 // Run executes one overlayfs-stale round.
 func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckOverlayFSStale) {
 		return
 	}
 	if !e.APIOK {
 		// Inconclusive — same "keep state, never act" rule as the
 		// other pod-list checks.
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckOverlayFSStale, "abort")
 		return
 	}
 	stale := 0
@@ -89,16 +88,13 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if stale == 0 {
 		c.fails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckOverlayFSStale, "ok")
 		return
 	}
-	c.fails++
 	c.d.OverlayFSStaleMounts += int64(stale)
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: overlayfs-stale-mount stale_pods=%d (check %d/%d)",
-			stale, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: overlayfs-stale-mount stale_pods=%d", stale)) {
+		c.d.CycleResult(wdeps.CheckOverlayFSStale, "ok")
 		return
 	}
 	if len(seen) == 0 {
@@ -106,7 +102,7 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// logged, nothing removable.
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: overlayfs-stale-mount stale_pods=%d but no image refs", stale))
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckOverlayFSStale, "ok")
 		return
 	}
 	images := make([]string, 0, len(seen))
@@ -118,7 +114,7 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: overlayfs-stale-mount image(s) %s - in rm cooldown (<15m), skip",
 			strings.Join(images, " ")))
-		c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckOverlayFSStale, "ok")
 		return
 	}
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
@@ -132,5 +128,5 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog("ACTION: overlayfs-stale-mount removed image " + img)
 		c.d.Actions.WithLabelValues(wdeps.CheckOverlayFSStale, "image_rm").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckOverlayFSStale, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckOverlayFSStale, "ok")
 }

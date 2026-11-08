@@ -4,7 +4,10 @@
 # never hand-edited:
 #
 #   * the ENABLE_* tri-state gates come from the Descriptor registry
-#     in cmd/agent/wiring.go (subsystem name + default mode included);
+#     in cmd/agent/wiring.go (subsystem name + default mode included),
+#     parsed with go/ast by internal/envdoc/cmd/genenvdoc; gates
+#     declared in internal/envnames but not wired as a descriptor
+#     (ENABLE_FEEDER) are appended with an empty subsystem/default;
 #   * every knob name is declared ONCE as an envnames.Env* const in
 #     internal/envnames (the single source of truth for the env
 #     contract) — call sites reference envnames.Env*, so each knob is
@@ -117,37 +120,16 @@ subsystem has no env gate.
 | --- | --- | --- |
 HDR
 
-	# One row per descriptor: Name/EnvFlag/Default are emitted when the
-	# block's Build: line is reached (every descriptor has a Build).
-	# EnvFlag holds an envnames.Env* const — resolve it through the
-	# const map (a bare "..." literal is still accepted).
-	awk -v mapfile="$constmap" '
-		BEGIN {
-			while ((getline l < mapfile) > 0) {
-				split(l, kv, "\t"); cmap[kv[1]] = kv[2]
-			}
-			close(mapfile)
-		}
-		/^[[:space:]]*Name:/    { match($0, /"[^"]+"/)
-		                        name = substr($0, RSTART + 1, RLENGTH - 2) }
-		/^[[:space:]]*EnvFlag:/ {
-			if (match($0, /envnames\.[A-Za-z0-9_]+/)) {
-				c = substr($0, RSTART + 9, RLENGTH - 9)
-				flag = (c in cmap) ? cmap[c] : c
-			} else if (match($0, /"[^"]+"/)) {
-				flag = substr($0, RSTART + 1, RLENGTH - 2)
-			}
-		}
-		/^[[:space:]]*Default:/ { d = $0
-		                        sub(/.*Default:[[:space:]]*/, "", d)
-		                        sub(/[[:space:]]*,.*/, "", d); def = d }
-		/^[[:space:]]*Build:/   {
-			f = (flag == "") ? "—" : "`" flag "`"
-			v = (def  == "") ? "—" : "`" def "`"
-			printf "| %s | %s | %s |\n", f, name, v
-			name = flag = def = ""
-		}
-	' cmd/agent/wiring.go
+	# One row per descriptor, parsed with go/ast by the envdoc gates
+	# generator (the line-based awk it replaced could be tripped by
+	# comment lines inside the registry). The generator re-parses the
+	# envnames contract itself, so EnvFlag consts resolve without the
+	# shell's const map; a bare "..." literal is still accepted.
+	# Gates declared in internal/envnames but not wired as a
+	# Descriptor EnvFlag (NODE_HOST_AGENT_ENABLE_FEEDER, a bool
+	# sub-gate read inside controllerhygiene) are appended with an
+	# empty subsystem/default.
+	go run ./internal/envdoc/cmd/genenvdoc
 
 	printf '\n## Knobs by package\n\n'
 

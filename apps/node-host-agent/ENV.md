@@ -37,6 +37,7 @@ subsystem has no env gate.
 | `NODE_HOST_AGENT_ENABLE_HOSTCONFIG` | hostconfig | `envx.ModeAuto` |
 | — | hubsync | — |
 | `NODE_HOST_AGENT_ENABLE_KINEDB` | kinedb | `envx.ModeAuto` |
+| `NODE_HOST_AGENT_ENABLE_FEEDER` | — | — |
 
 ## Knobs by package
 
@@ -48,15 +49,14 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_STANDALONE` — `main.go:122`
 - `NODE_HOST_AGENT_TEXTFILE_INTERVAL` — `wiring.go:236`
 
-### `internal/ops/hostconverge`
-
-- `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `hostconverge.go:37`
-- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `hostconverge.go:42`
-
 ### `internal/ops/nebulasign`
 
-- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:66`
-- `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `nebulasign.go:58`
+- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:63`
+
+### `internal/ops/opsx`
+
+- `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `opsx.go:63`
+- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `opsx.go:74`
 
 ### `internal/platform/hostctx`
 

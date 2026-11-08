@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- T4 nodelocaldns guard ----------
@@ -100,7 +100,7 @@ func (c *cyc) guardAllowSources() []string {
 		c.vs("nodelocaldns_guard_allow_extra")...)
 	for _, k := range c.t.Nodes.Keys() {
 		nv, _ := c.t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
@@ -134,7 +134,7 @@ func (c *cyc) convergeHostPortsGuard() {
 	// a missing firewall rule only ever surfaces as "how did a
 	// scanner reach kubelet", so opt-out must be explicit.
 	enabled := true
-	if _, undef := c.t.Vars.Get("host_internal_ports_guard_enabled").(topology.Undefined); !undef {
+	if _, undef := c.t.Vars.Get("host_internal_ports_guard_enabled").(jinja.Undefined); !undef {
 		enabled = c.vb("host_internal_ports_guard_enabled")
 	}
 	if !enabled {

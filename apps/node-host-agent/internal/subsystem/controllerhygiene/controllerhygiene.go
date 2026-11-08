@@ -25,9 +25,10 @@
 // This file is the orchestrator only — the checks live in
 // per-domain packages under controllerhygiene/:
 //
-//   - kine/      — kinepool.go (pool-spiral backstop), kine_ttl.go
+//   - storelocal/ — kinepool.go (pool-spiral backstop), kine_ttl.go
 //     (module-22 TTL dead/rewedge tail), kine_storage.go (W10-CP2
-//     store health + WAL checkpoint)
+//     store health + WAL checkpoint; LOCAL controller sqlite
+//     state.db — the external Kine-DB VM lives in kinedb)
 //   - apiserver/ — apiserverhub.go (module-22 sig13 wedge guard +
 //     dead-fallback), cp_freeze_heal.go (W8-CP3 KCM/scheduler freeze
 //   - W10-FIX1 workqueue stall + the APF queue-starvation probe)

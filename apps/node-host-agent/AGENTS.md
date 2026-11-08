@@ -33,9 +33,16 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   `envx` (env knobs/Mode/Knob tables), `logx` (named slog loggers),
   `timex` (settable clock seam), and `jinja` (the mini-Jinja2
   evaluator + ordered-map/YAML values behind vars-file resolution).
+- `internal/latchdefs` — pure-data leaf owning the `state-<name>`
+  latch REGISTRY: every `Latch*` name const, the `LatchDefs` table
+  (owner subsystem + declared multi-owner ids), and the
+  `KnownLatchName`/`SharedOwners` lookups. Stdlib-only; both the
+  platform leaf (`hoststate` imports it for shared-owner
+  validation) and every producing subsystem import it.
 - `internal/platform/*` — leaf libraries: cycle (period loop),
   checks (check-group dispatch),
-  hoststate (`state-*`/`last-*` latch files), hostexec, hostutil,
+  hoststate (`state-*`/`last-*` latch files; the latch NAMES'
+  registry lives in `internal/latchdefs`), hostexec, hostutil,
   systemd, watchdogconf, probee, procfs, journalwatch, promfile,
   kmsg, pagecache, sshclient.
 - `internal/subsystem/*` — the 12 periodic subsystems (sweeper,
@@ -57,7 +64,9 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   `Run(ctx, Config, ...)`-style logic behind a one-shot op that a
   periodic subsystem also drives (topology is the inter-DC
   vars-files → derived-topology pass consumed by hostconfig,
-  hubsync, workerhygiene, and ops/nebulasign). Domain pkgs sit
+  hubsync, workerhygiene, and ops/nebulasign — those consumers
+  use libs/hostkit/jinja directly for the ordered-map/render
+  surface). Domain pkgs sit
   above platform (they may use hostexec/hostkit) and below
   subsystem/ops — they must not import either.
 - `internal/ops/*` — one-shot subcommand packages: thin

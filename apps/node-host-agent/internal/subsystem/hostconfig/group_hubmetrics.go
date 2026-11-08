@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- hub-metrics-fw (node_exporter_hub.yaml) ----------
@@ -93,21 +93,31 @@ func (c *cyc) hubMetricsNodeExporter() {
 	// one step); a staged file that already matches the pin is not
 	// re-fetched.
 	local := r.hp("/tmp/" + file)
-	if !(fileExistsNoRoot(local) && sha256FileOK(local, sum)) {
-		if err := r.nexpDownload(ctx, url, local, sum); err != nil {
+	if _, ok := c.installManagedBinary(managedBinarySpec{
+		name:   "hub-metrics-fw",
+		url:    url,
+		sum:    sum,
+		staged: local,
+		// nexpDownload floors the client timeout above HTTPTimeout —
+		// the slow-egress infra VMs need minutes for the ~4.5MB deb.
+		download: r.nexpDownload,
+		downloadErr: func(c *cyc, err error) {
 			c.err("hub-metrics-fw: node_exporter deb download failed",
 				"url", url, "error", err)
-			return
-		}
-	}
-	// ansible apt deb: => apt-get on the deb path (dep resolution
-	// included); the runner sees host paths, not HostRoot-joined.
-	// runLong: dep resolution on a slow-egress VM outlives the
-	// interactive budget.
-	if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-		"apt-get", "install", "-y", "/tmp/"+file); err != nil {
-		c.err("hub-metrics-fw: node_exporter deb install failed",
-			"deb", "/tmp/"+file, "error", err)
+		},
+		install: func(c *cyc, _ string) {
+			// ansible apt deb: => apt-get on the deb path (dep resolution
+			// included); the runner sees host paths, not HostRoot-joined.
+			// runLong: dep resolution on a slow-egress VM outlives the
+			// interactive budget.
+			if _, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+				"apt-get", "install", "-y", "/tmp/"+file); err != nil {
+				c.err("hub-metrics-fw: node_exporter deb install failed",
+					"deb", "/tmp/"+file, "error", err)
+			}
+		},
+	}); !ok {
+		return
 	}
 }
 
@@ -150,7 +160,7 @@ func (c *cyc) hubMetricsScript() string {
 	safe := c.shMarkerBase("interdc_marker_base", c.markerBase())
 	for _, k := range c.t.Nodes.Keys() {
 		nv, _ := c.t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}

@@ -1,4 +1,4 @@
-// cilium_wg_test.go — W15-NM2 zombie-peer detection: the state
+// cilium_wg_test.go — zombie-peer detection: the state
 // machine driven over fake-clock cycles with synthetic
 // `wg show cilium_wg0 dump` outputs, plus the allowed-ips
 // backward-compatibility fallback.
@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -59,7 +59,7 @@ func runWGCycles(t *testing.T, e *env, env *wdeps.CycleEnv, now *time.Time, n in
 		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
 		wg.Run(ctx, env)
 	}
-	return e.H.State.Exists(hoststate.LatchCiliumWGPeerWipe)
+	return e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe)
 }
 
 // logContains reads the watchdog log for the evidence lines.
@@ -90,7 +90,7 @@ func TestWGZombieDetectedAtThreeStalledCycles(t *testing.T) {
 		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
 		wg.Run(context.Background(), env)
 	}
-	if latched := e.H.State.Exists(hoststate.LatchCiliumWGPeerWipe); latched {
+	if latched := e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe); latched {
 		t.Fatal("zombie must not classify before the 3rd stalled cycle")
 	}
 	if strings.Contains(wgLog(t, e), "zombie peer") {
@@ -105,7 +105,7 @@ func TestWGZombieDetectedAtThreeStalledCycles(t *testing.T) {
 		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
 		wg.Run(context.Background(), env)
 	}
-	if !e.H.State.Exists(hoststate.LatchCiliumWGPeerWipe) {
+	if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
 		t.Fatal("cilium-agent restart path must fire once the zombie is excluded for ConsecNeeded cycles")
 	}
 	if !strings.Contains(wgLog(t, e), "zombie peer") {
@@ -130,7 +130,7 @@ func TestWGNotZombieWhenRxAdvancesOrHandshakeFresh(t *testing.T) {
 		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
 		wg.Run(context.Background(), env)
 	}
-	if e.H.State.Exists(hoststate.LatchCiliumWGPeerWipe) {
+	if e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
 		t.Fatal("no latch expected — neither peer is a zombie")
 	}
 	if strings.Contains(wgLog(t, e), "zombie peer") {

@@ -7,6 +7,7 @@
 package journalwatch
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
@@ -40,7 +41,7 @@ func NewUnreadableTracker(state *hoststate.Store, dirs []string, needed int) Tra
 		Counter:     state,
 		CounterName: UnreadableCounter,
 		LatchedSeed: func() bool {
-			return state.Exists(hoststate.LatchJournalUnreadable)
+			return state.Exists(latchdefs.LatchJournalUnreadable)
 		},
 	}
 }

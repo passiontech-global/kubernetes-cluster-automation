@@ -7,7 +7,7 @@ package wdeps
 import (
 	"fmt"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // journalWindow mirrors the runner's `journalctl -u k0sworker
@@ -18,7 +18,7 @@ const journalWindow = "-10 min"
 // accounting sets: journald installed (journal storage exists) but
 // every read produces nothing — the 05/06 signature greps and the
 // nodereporter journal monitors are blind until it clears.
-const StateJournalUnreadable = hoststate.LatchJournalUnreadable
+const StateJournalUnreadable = latchdefs.LatchJournalUnreadable
 
 // NoteJournalRead feeds one classified journal read into the
 // journal-unreadable tracker and drives the latch on transitions:
@@ -38,7 +38,7 @@ func (d *Deps) NoteJournalRead(ok bool, detail string) {
 				"reads produced nothing while journal storage exists; "+
 				"every journal-grep check is blind",
 			detail, d.JournalReads.Fails()))
-		d.Cycles.WithLabelValues(CheckJournald, "journal_unreadable").Inc()
+		d.CycleResult(CheckJournald, "journal_unreadable")
 	} else if d.JournalReads.Latched() &&
 		!d.State.Exists(StateJournalUnreadable) {
 		// Re-establish after external removal: the latch file can

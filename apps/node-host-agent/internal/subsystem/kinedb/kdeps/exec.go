@@ -130,7 +130,8 @@ func (d *Deps) PsqlScript(ctx context.Context, pg, user, pass, script string) (s
 // <TextfileDir>/<name> — promfile.Write stages + renames so the
 // textfile collector never sees a partial file.
 func (d *Deps) EmitTextfile(name string, p *promfile.Builder) {
-	if err := promfile.Write(d.Cfg.TextfileDir, name, []byte(p.String())); err != nil {
-		logger().Warn("kinedb textfile write failed", "file", name, "error", err)
-	}
+	_ = promfile.WriteLogged(d.Cfg.TextfileDir, name, []byte(p.String()),
+		func(_, name string, err error) {
+			logger().Warn("kinedb textfile write failed", "file", name, "error", err)
+		})
 }

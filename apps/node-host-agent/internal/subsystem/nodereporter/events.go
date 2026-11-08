@@ -33,7 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // logRule is one temporary filelog rule — reason → K8s Event reason +
@@ -44,126 +44,160 @@ type logRule struct {
 	re     *regexp.Regexp
 }
 
-// stateEnterRe builds the "STATE-ENTER: <latch>" match pattern for
-// one or more hoststate latch names. Every latch→event rule derives
-// its token from the hoststate registry constants — a renamed latch
-// can never silently drift the filelog contract (the
-// filesystem-readonly vs fs-readonly split is exactly the drift this
-// prevents: both registered tokens feed the one event reason).
-func stateEnterRe(latches ...string) *regexp.Regexp {
-	alts := make([]string, 0, len(latches))
-	for _, l := range latches {
-		alts = append(alts, regexp.QuoteMeta(l))
-	}
-	return regexp.MustCompile(`STATE-ENTER: (?:` + strings.Join(alts, "|") + `)`)
-}
-
 // logRules is the watchdog-filelog-monitor.json rules array, in order.
+//
+// Derivation contract: whenever an in-repo emitter writes the line a
+// rule matches, the rule is BUILT from the shared latchdefs protocol
+// constant (QuoteMeta / StateEnterRe / ActionEntryRe) — rewording the
+// emitter is then a compile error at the emitter's own site and the
+// rule follows automatically, so drift cannot strand an Event.
+// Alternations matching lines nothing in this repo writes anymore
+// (retired lib.sh shell modules, kernel/kubelet lines the old
+// watchdog copied into the log) stay literal and are documented per
+// entry — they must keep matching the retained legacy log lines.
 var logRules = []logRule{
+	// overlay_egress.go writes "overlay-egress unreachable"; the
+	// "tinc" spelling is retired lib.sh vocabulary retained logs
+	// still carry.
 	{"TincEgressUnreachable", regexp.MustCompile(`(?:tinc|overlay)-egress unreachable`)},
-	{"TincEgressFailover", regexp.MustCompile(`ACTION: egress [0-9.]+ -> (?:tinc|overlay) relay`)},
+	// overlay_egress.go writes the head from latchdefs.ActionEgress
+	// ("ACTION: egress <ip> -> overlay relay table N (...)"); the
+	// "tinc relay" spelling is retired lib.sh vocabulary.
+	{"TincEgressFailover", regexp.MustCompile(
+		regexp.QuoteMeta(latchdefs.ActionEgress) + `[0-9.]+ -> (?:tinc|overlay) relay`)},
+	// hostmetrics' PSI latch writes "node-overloaded"
+	// (latchdefs.LatchNodeOverloaded); "node overloaded" is retired
+	// lib.sh wording.
 	{"NodeOverloaded", regexp.MustCompile(`node[- ]overloaded`)},
-	{"K0sworkerRestarted", regexp.MustCompile(`ACTION: restarting k0sworker`)},
-	{"KubeletInformerZombie", regexp.MustCompile(`informer-zombie`)},
-	{"KubeletPhantomPods", regexp.MustCompile(`phantom-pods`)},
-	{"CtrTaskWedged", regexp.MustCompile(`ctr-task-wedged|ctr tasks delete|orphaned task dir`)},
-	{"KonnectivityStaleId", regexp.MustCompile(`konnectivity stale identifier|recreating konnectivity-agent`)},
-	{"TincEgressRecovered", regexp.MustCompile(`ACTION: egress [0-9.]+ -> direct underlay`)},
-	{"TincEgressHeal", regexp.MustCompile(`ACTION: heal egress`)},
-	{"NebulaRestarted", regexp.MustCompile(`ACTION: restarting nebula@`)},
-	{"NebulaIsolatedEnter", stateEnterRe(hoststate.LatchNebulaIsolated)},
-	{"NebulaDataplaneDegraded", regexp.MustCompile(`nebula-dataplane-degraded`)},
-	{"NebulaSlowPath", regexp.MustCompile(`nebula-dataplane-slowpath`)},
-	{"NebulaSiteEdge", regexp.MustCompile(`nebula-siteedge-degraded`)},
-	{"NebulaCertExpiring", regexp.MustCompile(`nebula-cert-expiring`)},
+	{"K0sworkerRestarted", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionK0sworkerRestart))},
+	{"KubeletInformerZombie", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonInformerZombie))},
+	{"KubeletPhantomPods", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonPhantomPods))},
+	// "ctr-task-wedged" is ctr_tasks.go's suspect keyword
+	// (latchdefs.ReasonCtrTaskWedged); the other two alternations are
+	// the retired shell's remediation wording.
+	{"CtrTaskWedged", regexp.MustCompile(
+		regexp.QuoteMeta(latchdefs.ReasonCtrTaskWedged) +
+			`|ctr tasks delete|orphaned task dir`)},
+	{"KonnectivityStaleId", regexp.MustCompile(
+		regexp.QuoteMeta(latchdefs.ReasonKonnectivityStaleID) + `|` +
+			regexp.QuoteMeta(latchdefs.ReasonKonnectivityAgentRecreate))},
+	{"TincEgressRecovered", regexp.MustCompile(
+		regexp.QuoteMeta(latchdefs.ActionEgress) + `[0-9.]+ -> direct underlay`)},
+	{"TincEgressHeal", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionEgressHeal))},
+	{"NebulaRestarted", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionNebulaRestart))},
+	{"NebulaIsolatedEnter", latchdefs.StateEnterRe(latchdefs.LatchNebulaIsolated)},
+	{"NebulaDataplaneDegraded", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonNebulaDataplaneDegraded))},
+	{"NebulaSlowPath", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonNebulaDataplaneSlowpath))},
+	{"NebulaSiteEdge", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonNebulaSiteedgeDegraded))},
+	{"NebulaCertExpiring", regexp.MustCompile(regexp.QuoteMeta(latchdefs.LatchNebulaCertExpiring))},
+	// WatchdogRunFailed: emitted by the retired lib.sh runner — no
+	// in-repo producer.
 	{"WatchdogRunFailed", regexp.MustCompile(`WATCHDOG-FAILED`)},
-	{"WatchdogModuleFailed", regexp.MustCompile(`STATE-ENTER: module-failed-`)},
-	{"CiliumAgentDown", regexp.MustCompile(`cilium-agent-down|killed cilium-agent`)},
-	{"KubeletRuntimeStall", regexp.MustCompile(`kubelet-runtime-stall`)},
-	{"DnsResolvStale", regexp.MustCompile(`dns-resolv-stale`)},
-	{"StuckPodForceDeleted", regexp.MustCompile(`force-delete pod `)},
-	{"PodTeardownWedged", regexp.MustCompile(`pod-teardown-wedged`)},
+	// WatchdogModuleFailed: STATE-ENTER lines of the retired shell's
+	// per-module failure latches ("module-failed-<id>-<name>") — the
+	// prefix derives from the shared StateEnterPrefix; the
+	// module-failed vocabulary has no in-repo producer.
+	{"WatchdogModuleFailed", regexp.MustCompile(latchdefs.StateEnterPrefix + "module-failed-")},
+	// The cilium-agent-down latch plus the "killed cilium-agent" half
+	// of latchdefs.ActionCiliumAgentKill — kept at the shorter legacy
+	// form, because the retired shell killed the agent without the
+	// " container -" tail those lines must still match.
+	{"CiliumAgentDown", regexp.MustCompile(
+		regexp.QuoteMeta(latchdefs.LatchCiliumAgentDown) + `|` +
+			regexp.QuoteMeta(strings.TrimPrefix(latchdefs.ActionCiliumAgentKill, latchdefs.ActionPrefix)))},
+	{"KubeletRuntimeStall", regexp.MustCompile(regexp.QuoteMeta(latchdefs.LatchKubeletRuntimeStall))},
+	{"DnsResolvStale", regexp.MustCompile(regexp.QuoteMeta(latchdefs.LatchDNSResolvStale))},
+	{"StuckPodForceDeleted", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ReasonForceDeletePod))},
+	{"PodTeardownWedged", regexp.MustCompile(regexp.QuoteMeta(latchdefs.LatchPodTeardownWedged))},
+	// The remediation half derives from ClockRestartUnits — the same
+	// slice clock.go (and nebula_health.go's timesyncd latch line)
+	// restarts from.
 	{"ClockUnsynchronized", regexp.MustCompile(
-		stateEnterRe(hoststate.LatchClockUnsync).String() +
-			`|ACTION: restarting (systemd-timesyncd|chrony|chronyd)\.service`)},
+		latchdefs.StateEnterRe(latchdefs.LatchClockUnsync).String() +
+			`|` + latchdefs.ActionClockRestartRe().String())},
+	// The nf_conntrack halves match kernel dmesg lines the retired
+	// shell copied into the watchdog log — the kernel is the
+	// producer, there is no in-repo wording to share.
 	{"ConntrackPressure", regexp.MustCompile(
-		stateEnterRe(hoststate.LatchConntrackPressure).String() +
+		latchdefs.StateEnterRe(latchdefs.LatchConntrackPressure).String() +
 			`|nf_conntrack.*table full`)},
+	// "no more IPs available" is kubelet's FailedCreatePodSandBox
+	// wording — an external producer.
 	{"CiliumIPAMExhausted", regexp.MustCompile(
-		stateEnterRe(hoststate.LatchCiliumIPAMExhausted).String() +
+		latchdefs.StateEnterRe(latchdefs.LatchCiliumIPAMExhausted).String() +
 			`|no more IPs available`)},
-	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
-	{"ZombieProcessStorm", regexp.MustCompile(`ACTION:? *zombie-storm:`)},
-	{"CiliumMTUExceedsOverlay", regexp.MustCompile(`ACTION:? *cilium-mtu-drift:`)},
+	{"CorruptedImageRemoved", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionCorruptedImageRemove))},
+	{"ZombieProcessStorm", latchdefs.ActionEntryRe(latchdefs.LatchZombieStorm)},
+	{"CiliumMTUExceedsOverlay", latchdefs.ActionEntryRe(latchdefs.LatchCiliumMTUDrift)},
 	// W5.6: workerhygiene's cilium WireGuard peer-gc drift healer —
 	// "ACTION: killed cilium-agent container - cilium_wg0 has N
 	// allowed-ip peers while expected M".
-	{"CiliumWireGuardPeerDrift", regexp.MustCompile(`ACTION: killed cilium-agent container - cilium_wg0`)},
+	{"CiliumWireGuardPeerDrift", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionCiliumWGKill))},
 	// W6.3: disk-bloat runaway detector —
 	// "ACTION disk-bloat: target=... bytes=... used_pct=...".
-	{"DiskBloatRunaway", regexp.MustCompile(`ACTION:? *disk-bloat:`)},
+	{"DiskBloatRunaway", latchdefs.ActionEntryRe(latchdefs.LatchDiskBloat)},
 	// journalwatch blindness latch — STATE-ENTER only (one event per
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).
-	{"JournaldUnreadable", stateEnterRe(hoststate.LatchJournalUnreadable)},
+	{"JournaldUnreadable", latchdefs.StateEnterRe(latchdefs.LatchJournalUnreadable)},
 	// W7-H1: workerhygiene's d-state-storm latch-entry line —
 	// "ACTION d-state-storm: count=N runtime=M wchan=...".
-	{"KernelHungTasks", regexp.MustCompile(`ACTION:? *d-state-storm:`)},
+	{"KernelHungTasks", latchdefs.ActionEntryRe(latchdefs.LatchDStateStorm)},
 	// --- Wave-8 latch→event surface ---
 	// One Event per STATE-ENTER of a latch that maps to a permanent
 	// NodeCondition (conditions.go). Latches already covered by an
 	// older rule (nebula-isolated → NebulaIsolatedEnter,
 	// conntrack-pressure → ConntrackPressure, cilium-ipam-exhausted
 	// → CiliumIPAMExhausted) are intentionally not duplicated.
-	{"NebulaDegraded", stateEnterRe(hoststate.LatchNebulaDegraded)},
-	{"CiliumEnvoyDown", stateEnterRe(hoststate.LatchCiliumEnvoyDown)},
-	{"CiliumBPFMapPressure", stateEnterRe(hoststate.LatchCiliumBPFMapPressure)},
-	{"SpegelMirrorDegraded", stateEnterRe(hoststate.LatchSpegelMirrorDegraded)},
-	{"CalicoVethLeak", stateEnterRe(hoststate.LatchCalicoVethLeak)},
-	{"CalicoFelixDown", stateEnterRe(hoststate.LatchCalicoFelixDown)},
-	{"Fail2banDown", stateEnterRe(hoststate.LatchFail2banDown)},
-	{"KernelKeysPressure", stateEnterRe(hoststate.LatchKernelKeysPressure)},
-	{"ControlPlaneCertReloadStale", stateEnterRe(hoststate.LatchCPCertReloadStale)},
-	// W15-K1: the kernel clocksource-unstable evidence latch —
+	{"NebulaDegraded", latchdefs.StateEnterRe(latchdefs.LatchNebulaDegraded)},
+	{"CiliumEnvoyDown", latchdefs.StateEnterRe(latchdefs.LatchCiliumEnvoyDown)},
+	{"CiliumBPFMapPressure", latchdefs.StateEnterRe(latchdefs.LatchCiliumBPFMapPressure)},
+	{"SpegelMirrorDegraded", latchdefs.StateEnterRe(latchdefs.LatchSpegelMirrorDegraded)},
+	{"CalicoVethLeak", latchdefs.StateEnterRe(latchdefs.LatchCalicoVethLeak)},
+	{"CalicoFelixDown", latchdefs.StateEnterRe(latchdefs.LatchCalicoFelixDown)},
+	{"Fail2banDown", latchdefs.StateEnterRe(latchdefs.LatchFail2banDown)},
+	{"KernelKeysPressure", latchdefs.StateEnterRe(latchdefs.LatchKernelKeysPressure)},
+	{"ControlPlaneCertReloadStale", latchdefs.StateEnterRe(latchdefs.LatchCPCertReloadStale)},
+	// Clocksource: the kernel clocksource-unstable evidence latch —
 	// STATE-ENTER only (one Event per latch entry, like the other
 	// Wave-8 latch→event rules).
-	{"ClocksourceUnstable", stateEnterRe(hoststate.LatchClocksourceUnstable)},
+	{"ClocksourceUnstable", latchdefs.StateEnterRe(latchdefs.LatchClocksourceUnstable)},
 	// W2: workerhygiene's psi-memory-thrash latch-entry line —
 	// "ACTION psi-memory-thrash: avg60=... free=...".
-	{"NodeMemoryPSIThrashing", regexp.MustCompile(`ACTION:? *psi-memory-thrash:`)},
+	{"NodeMemoryPSIThrashing", latchdefs.ActionEntryRe(latchdefs.LatchPSIMemoryThrash)},
 	// --- Wave-9 latch→event surface ---
 	// workerhygiene's W9-KR3 slab-leak guard + nethealth's W9-NM1
 	// DF PMTU probe — one Event per STATE-ENTER (clock-unsync is
 	// already covered by the ClockUnsynchronized rule above).
-	{"KernelSlabLeak", stateEnterRe(hoststate.LatchKernelSlabLeak)},
-	{"NebulaPMTUBlackhole", stateEnterRe(hoststate.LatchNebulaPMTUBlackhole)},
+	{"KernelSlabLeak", latchdefs.StateEnterRe(latchdefs.LatchKernelSlabLeak)},
+	{"NebulaPMTUBlackhole", latchdefs.StateEnterRe(latchdefs.LatchNebulaPMTUBlackhole)},
 	// --- latch→event surface: kernel/host deep-failure + hygiene ---
 	// One Event per STATE-ENTER for the remaining registered latches.
 	// containerd-corrupt and fs-readonly feed shared conditions via
 	// altStateKeys in conditions.go (KubeletRuntimeStall and
 	// FilesystemReadOnly respectively); the rest own their condition
 	// type 1:1.
-	{"ContainerdCorrupt", stateEnterRe(hoststate.LatchContainerdCorrupt)},
+	{"ContainerdCorrupt", latchdefs.StateEnterRe(latchdefs.LatchContainerdCorrupt)},
 	// FilesystemReadOnly is fed by TWO latches: the W5.3 statfs
 	// latch (filesystem-readonly) and the W10 evidence latch
 	// (fs-readonly) — both registered tokens map to the one reason.
-	{"FilesystemReadOnly", stateEnterRe(
-		hoststate.LatchFSReadonly, hoststate.LatchFilesystemReadonly)},
-	{"KernelResourceExhaustion", stateEnterRe(hoststate.LatchPIDFDPressure)},
-	{"ClockSkewDetected", stateEnterRe(hoststate.LatchClockSkew)},
-	{"KubeconfigCertExpiring", stateEnterRe(hoststate.LatchKubeconfigCertExpiring)},
-	{"CPUStealPressure", stateEnterRe(hoststate.LatchCPUStealPressure)},
-	{"CgroupDyingLeak", stateEnterRe(hoststate.LatchCgroupDyingLeak)},
-	{"SystemdSessionBloat", stateEnterRe(hoststate.LatchSystemdSessionBloat)},
+	{"FilesystemReadOnly", latchdefs.StateEnterRe(
+		latchdefs.LatchFSReadonly, latchdefs.LatchFilesystemReadonly)},
+	{"KernelResourceExhaustion", latchdefs.StateEnterRe(latchdefs.LatchPIDFDPressure)},
+	{"ClockSkewDetected", latchdefs.StateEnterRe(latchdefs.LatchClockSkew)},
+	{"KubeconfigCertExpiring", latchdefs.StateEnterRe(latchdefs.LatchKubeconfigCertExpiring)},
+	{"CPUStealPressure", latchdefs.StateEnterRe(latchdefs.LatchCPUStealPressure)},
+	{"CgroupDyingLeak", latchdefs.StateEnterRe(latchdefs.LatchCgroupDyingLeak)},
+	{"SystemdSessionBloat", latchdefs.StateEnterRe(latchdefs.LatchSystemdSessionBloat)},
 	// W11/W12 latches that had conditions (conditions.go) but no
 	// filelog rule — kubelet-pleg-unhealthy and disk-slow-io
 	// previously entered without ever emitting an Event.
-	{"KubeletPLEGUnhealthy", stateEnterRe(hoststate.LatchKubeletPLEGUnhealthy)},
-	{"DiskSlowIO", stateEnterRe(hoststate.LatchDiskSlowIO)},
-	{"KernelNetShimDegraded", stateEnterRe(hoststate.LatchKernelNetShim)},
+	{"KubeletPLEGUnhealthy", latchdefs.StateEnterRe(latchdefs.LatchKubeletPLEGUnhealthy)},
+	{"DiskSlowIO", latchdefs.StateEnterRe(latchdefs.LatchDiskSlowIO)},
+	{"KernelNetShimDegraded", latchdefs.StateEnterRe(latchdefs.LatchKernelNetShim)},
 	// hostmetrics' clock-warp detector line —
 	// "ACTION clock-warp: delta=... tick=... (events=N)".
-	{"NodeClockWarpDetected", regexp.MustCompile(`ACTION:? *clock-warp:`)},
+	{"NodeClockWarpDetected", latchdefs.ActionEntryRe(latchdefs.ActionClockWarp)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

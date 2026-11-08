@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -153,7 +154,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					r, comm, table, herr), suspectLogCadence)
 			} else {
 				n.state.AppendLog(fmt.Sprintf(
-					"ACTION: heal egress %s rule -> %s table %d (was %s)", r, comm, table, live))
+					latchdefs.ActionEgressHeal+" %s rule -> %s table %d (was %s)", r, comm, table, live))
 				live = comm
 				// B3: the rule change just switched the underlay path for
 				// this peer — drop its stale nebula-udp conntrack so the
@@ -265,17 +266,17 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 						// measurement the skipped TCP fallback
 						// never produced.
 						n.state.AppendLog(fmt.Sprintf(
-							"ACTION: egress %s -> overlay relay table %d (unprobeable window — committed to live)", r, table))
+							latchdefs.ActionEgress+"%s -> overlay relay table %d (unprobeable window — committed to live)", r, table))
 					} else {
 						n.state.AppendLog(fmt.Sprintf(
-							"ACTION: egress %s -> overlay relay table %d (direct failed)", r, table))
+							latchdefs.ActionEgress+"%s -> overlay relay table %d (direct failed)", r, table))
 					}
 					_, _ = n.ip(ctx, "rule", "add", "pref", "1500", "to",
 						r+"/32", "lookup", strconv.Itoa(table))
 					n.actions.WithLabelValues(checkEgress, "rule_add").Inc()
 				} else {
 					n.state.AppendLog(fmt.Sprintf(
-						"ACTION: egress %s -> direct underlay (recovered)", r))
+						latchdefs.ActionEgress+"%s -> direct underlay (recovered)", r))
 					_, _ = n.ip(ctx, "rule", "del", "pref", "1500", "to",
 						r+"/32", "lookup", strconv.Itoa(table))
 					n.actions.WithLabelValues(checkEgress, "rule_del").Inc()

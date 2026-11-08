@@ -44,7 +44,10 @@
 // probeClient and workerhygiene's seam closures — DefaultTransport
 // clones with a 90s IdleConnTimeout so an idle conn survives the
 // 60s check cycle instead of being re-dialed (and re-TLS'd) every
-// probe. UnixGet is the deliberate exception: its transport is
+// probe. Every HTTP probe also accepts an optional trailing
+// *http.Client (variadic, nil/absent → the probe's package default)
+// for callers that need a bespoke transport; existing callers are
+// unchanged. UnixGet is the deliberate exception: its transport is
 // per-call with DisableKeepAlives, because a kept-alive unix conn
 // pins the transport read/write goroutines.
 package probee

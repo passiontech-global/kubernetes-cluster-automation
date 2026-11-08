@@ -75,8 +75,7 @@ func (c *UnlinkedOpenFilesCheck) Name() string { return wdeps.CheckUnlinkedOpenF
 
 // Run executes one unlinked-open-files round.
 func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckUnlinkedOpenFiles) {
 		return
 	}
 	var st unix.Statfs_t
@@ -88,20 +87,20 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if used < 0 {
 		// statfs failed or returned garbage — inconclusive; keep
 		// the series like a failed probe.
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "abort")
 		return
 	}
 	if used <= unlinkedFDsWatermark {
 		c.d.UnlinkedOpenFileBytes = 0
 		c.d.UnlinkedOpenFileCount = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
 	// The fd walk is IO on the disk that is already full — at most
 	// once per BloatScanInterval while over the watermark; the last
 	// exported series values persist meanwhile.
 	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
@@ -109,7 +108,7 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	c.d.UnlinkedOpenFileBytes = total
 	c.d.UnlinkedOpenFileCount = int64(count)
 	if len(holderPids) == 0 {
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
 	var shipperBytes int64
@@ -120,14 +119,14 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: unlinked-open-files shipper-held=%d below %d — no SIGHUP (total=%d files=%d)",
 			shipperBytes, unlinkedSighupBytes, total, count))
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
 	if !c.d.State.RateTrySpend("last-unlinked-fd-sighup", unlinkedSighupInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: unlinked-open-files shipper-held=%d files=%d - SIGHUP cooldown (<30m), skip",
 			shipperBytes, count))
-		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
 	// Budget spent atomically BEFORE signalling (rate_spend parity —
@@ -144,7 +143,7 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			pid, holderBytes[pid], shipperBytes, used*100))
 		c.d.Actions.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "sighup").Inc()
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 }
 
 // sweep walks <ProcRoot>/<pid>/fd and returns the deduped

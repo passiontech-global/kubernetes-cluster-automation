@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // Target is one SSH-converge destination. Source flags are OR-merged
@@ -69,7 +70,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 	// ssh_user resolution, 1:1 with hub_converge's add_host chains:
 	//   interdc/api-lb: ssh_user → by_site[site] → default_user
 	//   extra_hosts:    ssh_user → default_user   (no site lookup)
-	userOf := func(om *topology.OMap, siteMap bool) string {
+	userOf := func(om *jinja.OMap, siteMap bool) string {
 		if u := omStr(om, "ssh_user"); u != "" {
 			return u
 		}
@@ -122,7 +123,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 	// a. interdc registry — `agent | default(true)` gating.
 	for _, k := range t.Nodes.Keys() {
 		nv, _ := t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
+		om, _ := nv.(*jinja.OMap)
 		if om == nil || omBool(om, "agent", true) {
 			continue
 		}
@@ -139,7 +140,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 
 	// b. infra VMs needing node_exporter (+ kine_db flag).
 	for _, e := range t.Vars.List("node_exporter_extra_hosts") {
-		om, _ := e.(*topology.OMap)
+		om, _ := e.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
@@ -153,7 +154,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 
 	// c. API LB VMs — guard credentials + flag.
 	for _, e := range t.Vars.List("api_lb_guard_vms") {
-		om, _ := e.(*topology.OMap)
+		om, _ := e.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
@@ -174,7 +175,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 
 // --- jinja value helpers (topology keeps its coercions unexported) ---
 
-func omStr(m *topology.OMap, key string) string {
+func omStr(m *jinja.OMap, key string) string {
 	v, ok := m.Get(key)
 	if !ok {
 		return ""
@@ -182,7 +183,7 @@ func omStr(m *topology.OMap, key string) string {
 	return strOf(v)
 }
 
-func omBool(m *topology.OMap, key string, def bool) bool {
+func omBool(m *jinja.OMap, key string, def bool) bool {
 	v, ok := m.Get(key)
 	if !ok {
 		return def
@@ -218,11 +219,11 @@ func strOf(v any) string {
 	return ""
 }
 
-// strMap flattens a resolved *topology.OMap var into a plain
+// strMap flattens a resolved *jinja.OMap var into a plain
 // string map (interdc_ssh_user_by_site).
 func strMap(v any) map[string]string {
 	out := map[string]string{}
-	if om, ok := v.(*topology.OMap); ok && om != nil {
+	if om, ok := v.(*jinja.OMap); ok && om != nil {
 		for _, k := range om.Keys() {
 			vv, _ := om.Get(k)
 			out[k] = strOf(vv)

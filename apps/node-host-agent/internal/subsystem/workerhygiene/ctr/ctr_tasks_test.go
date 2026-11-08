@@ -33,7 +33,7 @@ import (
 
 // --- check 6: ctr-tasks (31) ---
 
-// TestCtrTasksUmountsRootfsBeforeRemove (W15-R1a): a wedged task
+// TestCtrTasksUmountsRootfsBeforeRemove: a wedged task
 // bundle whose rootfs is still a mount must be lazily unmounted in
 // the HOST mount namespace BEFORE the dir removal — RemoveAll would
 // hit EBUSY and leak the mountpoint into the mountinfo table.

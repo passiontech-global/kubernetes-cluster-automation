@@ -21,7 +21,7 @@ const (
 	// W7 sources: H5 conntrack per-CPU stats + ARP table.
 	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
 	defaultARPTableFile      = "/proc/net/arp"
-	// W15-K1 clocksource sources (sysfs clocksource0).
+	// Clocksource sources (sysfs clocksource0).
 	defaultClocksourceCurrentFile   = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 	defaultClocksourceAvailableFile = "/sys/devices/system/clocksource/clocksource0/available_clocksource"
 )
@@ -60,7 +60,7 @@ func (c *Collector) collectClock(ch chan<- prometheus.Metric) {
 		prometheus.GaugeValue, float64(tx.Esterror)/1e6, c.cfg.NodeName)
 }
 
-// --- W15-K1: clocksource health ---
+// --- Clocksource health ---
 
 var descClocksourceNonTSC = prometheus.NewDesc(
 	"node_host_agent_clocksource_non_tsc",
@@ -84,7 +84,7 @@ var fastClocksources = map[string]bool{
 }
 
 // collectClocksource emits node_host_agent_clocksource_non_tsc and,
-// when drifted, restores kvm-clock (W15-K1): on kernels where the
+// when drifted, restores kvm-clock: on kernels where the
 // hypervisor offers kvm-clock, an hpet/acpi_pm current_clocksource
 // means the pvclock vDSO mapping was lost (host suspend/migration)
 // — writing "kvm-clock" back re-arms the fast vDSO path. Idempotent:
@@ -175,7 +175,7 @@ var (
 		"node_nf_conntrack_stat_drop_total",
 		"Sum of the drop + early_drop columns across all CPU rows of /proc/net/stat/nf_conntrack.",
 		[]string{"node"}, nil)
-	// W15-K3: search_restart grows when a conntrack lookup has to
+	// Conntrack health: search_restart grows when a conntrack lookup has to
 	// restart because the entry moved between buckets (hash-chain
 	// contention under NAT-heavy workloads); invalid counts protocol
 	// checks that rejected a packet's conntrack state.
@@ -236,7 +236,7 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(descCtStatDrop,
 				prometheus.CounterValue, float64(drops), c.cfg.NodeName)
 		}
-		// W15-K3: hash-chain contention and invalid-state counters —
+		// Hash-chain contention and invalid-state counters —
 		// each emitted only when its own column exists (an older
 		// kernel missing the column → absent series, no fake 0).
 		if v, found := st["search_restart"]; found {

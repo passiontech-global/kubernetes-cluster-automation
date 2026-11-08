@@ -17,13 +17,13 @@ import (
 
 // Vars is a lazily-resolved view over the merged vars maps.
 type Vars struct {
-	raw       *OMap
+	raw       *jinja.OMap
 	extra     map[string]any // interdc_nodes / interdc_dns_zone preloaded
 	resolved  map[string]any
 	resolving map[string]bool
 	cur       string // var being resolved (for error attribution)
 	errs      []string
-	env       *Env
+	env       *jinja.Env
 }
 
 // Errors returns the accumulated resolution failures (eval errors,
@@ -82,15 +82,15 @@ func (v *Vars) resolve(x any) any {
 			return out
 		}
 		return t
-	case *OMap:
-		m := NewOMap()
+	case *jinja.OMap:
+		m := jinja.NewOMap()
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
 			m.Set(k, v.resolve(vv))
 		}
 		return m
-	case *List:
-		out := &List{V: make([]any, len(t.V))}
+	case *jinja.List:
+		out := &jinja.List{V: make([]any, len(t.V))}
 		for i, x := range t.V {
 			out.V[i] = v.resolve(x)
 		}
@@ -109,6 +109,18 @@ func (v *Vars) resolve(x any) any {
 func (v *Vars) Get(name string) any { return v.get(name) }
 
 func (v *Vars) Str(name string) string { return jinja.Stringify(v.get(name)) }
+
+// StrDef resolves name and stringifies it, mapping the unset
+// renderings vars files produce onto def: an empty string, or "None"
+// for a nil value — the exact sentinel (`s == "" || s == "None"`)
+// hostconfig group generators historically applied after every Str
+// read of an optional var with a sane built-in default.
+func (v *Vars) StrDef(name, def string) string {
+	if s := v.Str(name); s != "" && s != "None" {
+		return s
+	}
+	return def
+}
 
 func (v *Vars) Bool(name string) bool { return jinja.Truthy(v.get(name)) }
 
@@ -133,8 +145,8 @@ func (v *Vars) StrList(name string) []string {
 // and lookup('pipe', 'date +%s') returns the unix epoch (clock
 // injectable for tests; nil → time.Now). No other pipe command is
 // honoured.
-func NewEnv(varsDir string, clock *timex.Cell) *Env {
-	return &Env{
+func NewEnv(varsDir string, clock *timex.Cell) *jinja.Env {
+	return &jinja.Env{
 		FileLookup: func(p string) (string, error) {
 			b, err := os.ReadFile(filepath.Join(varsDir, filepath.Base(p)))
 			return string(b), err

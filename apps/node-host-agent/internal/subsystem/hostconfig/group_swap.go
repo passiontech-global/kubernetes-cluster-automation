@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- swap (node_tuning_swap.yaml) ----------
@@ -66,7 +66,7 @@ func (c *cyc) groupSwap() {
 // entry carrying kine_db: true (the pgbouncer/postgres SPOF VMs).
 func (c *cyc) kineDBHost() bool {
 	for _, it := range c.vl("node_exporter_extra_hosts") {
-		m, _ := it.(*topology.OMap)
+		m, _ := it.(*jinja.OMap)
 		if m == nil {
 			continue
 		}

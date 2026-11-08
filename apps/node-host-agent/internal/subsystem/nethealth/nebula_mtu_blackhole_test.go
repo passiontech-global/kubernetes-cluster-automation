@@ -103,3 +103,65 @@ func TestNebulaMTUMetric(t *testing.T) {
 		t.Fatalf("metric not latched:\n%s", b)
 	}
 }
+
+// ciliumSysfsMTU renders Host sysfs MTU files for the invariant check.
+func ciliumSysfsMTU(t *testing.T, mtus map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for dev, mtu := range mtus {
+		path := filepath.Join(root, "sys", "class", "net", dev, "mtu")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(mtu+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// The cilium_wg0 MTU invariant is config-drift enforcement,
+// not a blackhole symptom — it must run EVERY probe cycle, including
+// when neb1 is fully healthy (DF ping passes → no latch, no
+// maybeClampNebulaMSS). A cilium_wg0 sized against the underlay
+// (1420 > nebula 1300−80) must be caught + MSS-clamped here, not only
+// after the blackhole latches.
+func TestCiliumWGMTUInvariantOnHealthyOverlay(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	n.cfg.HostRoot = ciliumSysfsMTU(t, map[string]string{
+		"neb1":       "1300",
+		"cilium_wg0": "1420",
+	})
+	// Healthy overlay: small ping answers AND DF ping passes — no
+	// blackhole, no clamp via maybeClampNebulaMSS.
+	e.pingOK["10.128.0.2|false"] = true
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if _, err := os.Stat(filepath.Join(e.state,
+		"state-nebula-mtu-blackhole")); !os.IsNotExist(err) {
+		t.Fatal("latch set on healthy DF ping")
+	}
+	if !e.host.Ran("-o cilium_wg0") {
+		t.Fatal("cilium_wg0 invariant not enforced on a healthy overlay — MSS clamp missing")
+	}
+}
+
+// Compliant control: cilium_wg0 within the invariant (1200 <= 1300−80)
+// must NOT trigger a clamp on the healthy-overlay path.
+func TestCiliumWGMTUInvariantCompliantNoClamp(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	n.cfg.HostRoot = ciliumSysfsMTU(t, map[string]string{
+		"neb1":       "1300",
+		"cilium_wg0": "1200",
+	})
+	e.pingOK["10.128.0.2|false"] = true
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if e.host.Ran("-o cilium_wg0") {
+		t.Fatal("clamp fired although cilium_wg0 satisfies the MTU invariant")
+	}
+}

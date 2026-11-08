@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -39,7 +39,7 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 	usedStr := hostutil.ReadTrimmed(n.cfg.ConntrackCountFile)
 	maxStr := hostutil.ReadTrimmed(n.cfg.ConntrackMaxFile)
 	if usedStr == "" || maxStr == "" {
-		n.stateExit(hoststate.LatchConntrackPressure)
+		n.stateExit(latchdefs.LatchConntrackPressure)
 		n.cycles.WithLabelValues(checkCT, "gated").Inc()
 		return
 	}
@@ -53,18 +53,18 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 		return
 	}
 	ratio := used / max
-	if n.state.Exists(hoststate.LatchConntrackPressure) {
+	if n.state.Exists(latchdefs.LatchConntrackPressure) {
 		if ratio < conntrackExitRatio {
 			n.state.AppendLog(fmt.Sprintf(
 				"conntrack-pressure cleared (used=%.0f max=%.0f ratio=%.2f)",
 				used, max, ratio))
-			n.stateExit(hoststate.LatchConntrackPressure)
+			n.stateExit(latchdefs.LatchConntrackPressure)
 		}
 	} else if ratio > conntrackEnterRatio {
 		n.state.AppendLog(fmt.Sprintf(
 			"suspect: conntrack-pressure used=%.0f max=%.0f ratio=%.2f > %.2f",
 			used, max, ratio, conntrackEnterRatio))
-		n.state.Enter(hoststate.LatchConntrackPressure,
+		n.state.Enter(latchdefs.LatchConntrackPressure,
 			fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
 	}
 	n.checkConntrackDropSpike(ctx)

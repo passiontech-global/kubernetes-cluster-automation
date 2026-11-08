@@ -183,8 +183,8 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 	// canned replies too, and a nil combined seam would exec REAL
 	// journalctl on the test host.
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: f.sdRun,
-		RunCmdCombined: f.sdRun,
-		ProcUptimeFile: filepath.Join(f.ProcDir, "uptime")})
+		RunCmdCombined: f.sdRun},
+		systemd.WithProcUptimeFile(filepath.Join(f.ProcDir, "uptime")))
 	// k0sworker is active and settled — the restart checks need both.
 	f.SDReply["systemctl is-active k0sworker.service"] = "active\n"
 	f.SDReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] =
@@ -252,7 +252,7 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		return nil
 	}
 	d.Cfg.Seams.Host.Clock.Set(func() time.Time { return f.Now })
-	// W15-NM2 seams: the wg dump exec is canned as an error (tests
+	// Zombie-peer seams: the wg dump exec is canned as an error (tests
 	// stub it with synthetic dump output) and the zombie clock rides
 	// the same fake time as the host clock.
 	d.Cfg.Seams.Cilium.WGDump = func(_ context.Context, _ *systemd.Client) (string, error) {

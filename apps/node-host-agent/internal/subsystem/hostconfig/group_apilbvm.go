@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- api-lb-vm (api_lb_guard.yaml) ----------
@@ -30,9 +30,9 @@ import (
 
 // apiLBVMEntry returns this node's api_lb_guard_vms entry (match on
 // the entry name == NODE_NAME, same key ansible add_host used).
-func (c *cyc) apiLBVMEntry() *topology.OMap {
+func (c *cyc) apiLBVMEntry() *jinja.OMap {
 	for _, it := range c.vl("api_lb_guard_vms") {
-		m, _ := it.(*topology.OMap)
+		m, _ := it.(*jinja.OMap)
 		if m == nil {
 			continue
 		}

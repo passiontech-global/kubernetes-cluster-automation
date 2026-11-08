@@ -14,7 +14,7 @@ import (
 
 	yaml3 "go.yaml.in/yaml/v3"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -154,7 +154,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		// Nebula disabled/left mesh → drop this module's states
 		// (stale files feed phantom gauges). Egress state is module
 		// 12's own business.
-		n.rmFiles(hoststate.LatchFilePrefix + "nebula-")
+		n.rmFiles(latchdefs.LatchFilePrefix + "nebula-")
 		n.nebulaFails, n.nebulaDpFail, n.nebulaDeg = 0, 0, 0
 		n.pmtuFails = 0
 		n.nebulaSiteedgeRun = 0
@@ -239,11 +239,12 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			}
 		}
 		if len(slowpath) > 0 {
-			n.state.SuspectLog(hoststate.LatchNebulaSlowpath, "suspect: nebula-dataplane-slowpath (reroute via remote site) "+
+			n.state.SuspectLog(latchdefs.LatchNebulaSlowpath, "suspect: "+
+				latchdefs.ReasonNebulaDataplaneSlowpath+" (reroute via remote site) "+
 				strings.Join(slowpath, " "), suspectLogCadence)
-			n.state.Enter(hoststate.LatchNebulaSlowpath, strings.Join(slowpath, " "))
+			n.state.Enter(latchdefs.LatchNebulaSlowpath, strings.Join(slowpath, " "))
 		} else {
-			n.stateExit(hoststate.LatchNebulaSlowpath)
+			n.stateExit(latchdefs.LatchNebulaSlowpath)
 		}
 		if len(wd.OverlaySiteMarkers) > 0 {
 			var siteedge []string
@@ -265,12 +266,13 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				// counter the per-peer flush waits on — same
 				// ConsecNeeded gate the degraded path carries.
 				n.nebulaSiteedgeRun++
-				n.state.SuspectLog(hoststate.LatchNebulaSiteedge, "suspect: nebula-siteedge-degraded (site-mesh edge lost) "+
+				n.state.SuspectLog(latchdefs.LatchNebulaSiteedge, "suspect: "+
+					latchdefs.ReasonNebulaSiteedgeDegraded+" (site-mesh edge lost) "+
 					strings.Join(siteedge, " "), suspectLogCadence)
-				n.state.Enter(hoststate.LatchNebulaSiteedge, strings.Join(siteedge, " "))
+				n.state.Enter(latchdefs.LatchNebulaSiteedge, strings.Join(siteedge, " "))
 			} else {
 				n.nebulaSiteedgeRun = 0
-				n.stateExit(hoststate.LatchNebulaSiteedge)
+				n.stateExit(latchdefs.LatchNebulaSiteedge)
 			}
 		} else {
 			n.nebulaSiteedgeRun = 0
@@ -281,8 +283,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				dpAlive, dpTotal, mkAlive, mkTotal)
 			dpFail = true
 			n.nebulaDeg = 0
-			n.stateExit(hoststate.LatchNebulaDegraded)
-			if !n.state.Exists(hoststate.LatchNebulaIsolated) {
+			n.stateExit(latchdefs.LatchNebulaDegraded)
+			if !n.state.Exists(latchdefs.LatchNebulaIsolated) {
 				// B3: on the isolation edge the conntrack entries
 				// learned on the dead path keep the tunnel blackholed
 				// — drop each affected peer's udp/<nebula-port>
@@ -295,25 +297,26 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				// stale flows have long expired by then).
 				n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
 			}
-			n.state.Enter(hoststate.LatchNebulaIsolated, "dataplane dead")
+			n.state.Enter(latchdefs.LatchNebulaIsolated, "dataplane dead")
 		case dpTotal-dpAlive >= 2 || mkTotal-mkAlive >= 2:
 			n.nebulaDeg++
 			need := wd.NebulaDegradedConsec
 			if need <= 0 {
 				need = 2
 			}
-			n.state.SuspectLog(hoststate.LatchNebulaDegraded, fmt.Sprintf(
-				"suspect: nebula-dataplane-degraded pub=%d/%d marker=%d/%d (run %d/%d)",
+			n.state.SuspectLog(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
+				"suspect: "+latchdefs.ReasonNebulaDataplaneDegraded+
+					" pub=%d/%d marker=%d/%d (run %d/%d)",
 				dpAlive, dpTotal, mkAlive, mkTotal, n.nebulaDeg, need),
 				suspectLogCadence)
 			if n.nebulaDeg >= need {
-				n.state.Enter(hoststate.LatchNebulaDegraded, fmt.Sprintf(
+				n.state.Enter(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
 					"pub=%d/%d marker=%d/%d", dpAlive, dpTotal, mkAlive, mkTotal))
 			}
 		default:
 			n.nebulaDeg = 0
-			n.stateExit(hoststate.LatchNebulaDegraded)
-			n.stateExit(hoststate.LatchNebulaIsolated)
+			n.stateExit(latchdefs.LatchNebulaDegraded)
+			n.stateExit(latchdefs.LatchNebulaIsolated)
 		}
 		// W12-NM2: a partially-dead dataplane leaves the dead
 		// peers' udp/<nebula-port> conntrack pinning the tunnel
@@ -340,11 +343,11 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		n.nebulaDeg = 0
 		n.pmtuFails = 0
 		n.nebulaSiteedgeRun = 0
-		n.stateExit(hoststate.LatchNebulaDegraded)
-		n.stateExit(hoststate.LatchNebulaSlowpath)
-		n.stateExit(hoststate.LatchNebulaSiteedge)
-		n.stateExit(hoststate.LatchNebulaIsolated)
-		n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
+		n.stateExit(latchdefs.LatchNebulaDegraded)
+		n.stateExit(latchdefs.LatchNebulaSlowpath)
+		n.stateExit(latchdefs.LatchNebulaSiteedge)
+		n.stateExit(latchdefs.LatchNebulaIsolated)
+		n.stateExit(latchdefs.LatchNebulaPMTUBlackhole)
 	}
 
 	if reason == "" {
@@ -365,8 +368,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	*fails++
 	if *fails >= n.cfg.ConsecNeeded &&
 		n.state.RateOK("last-nebula-restart", n.cfg.MinRestart) {
-		n.state.AppendLog(fmt.Sprintf("ACTION: restarting nebula@%s - %s (persisted %dx)",
-			net, reason, *fails))
+		n.state.AppendLog(fmt.Sprintf(latchdefs.ActionNebulaRestart+
+			"%s - %s (persisted %dx)", net, reason, *fails))
 		n.state.RateSpend("last-nebula-restart")
 		n.nebulaFails, n.nebulaDpFail = 0, 0
 		n.nebulaRestart(ctx)
@@ -406,25 +409,25 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 		// degraded verdicts own the diagnosis; a PMTU streak
 		// cannot be measured without a reachable target.
 		n.pmtuFails = 0
-		n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
+		n.stateExit(latchdefs.LatchNebulaPMTUBlackhole)
 		return
 	}
 	out, err := n.cfg.runHostCmd(ctx, []string{
 		"ping", "-c", "1", "-W", "2", "-M", "do", "-s", "1200", target})
 	if err != nil {
 		n.pmtuFails++
-		n.state.SuspectLog(hoststate.LatchNebulaPMTUBlackhole, fmt.Sprintf(
+		n.state.SuspectLog(latchdefs.LatchNebulaPMTUBlackhole, fmt.Sprintf(
 			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200 (check %d/%d): %v (%s)",
 			target, n.pmtuFails, n.cfg.ConsecNeeded, err,
 			trimRunErr(out)), suspectLogCadence)
 		if n.pmtuFails >= n.cfg.ConsecNeeded {
-			n.state.Enter(hoststate.LatchNebulaPMTUBlackhole,
+			n.state.Enter(latchdefs.LatchNebulaPMTUBlackhole,
 				fmt.Sprintf("target=%s df_size=1200", target))
 		}
 		return
 	}
 	n.pmtuFails = 0
-	n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
+	n.stateExit(latchdefs.LatchNebulaPMTUBlackhole)
 }
 
 // flushDeadNebulaPeers — W12-NM2: the targeted per-peer conntrack
@@ -445,7 +448,7 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 // tunnels.
 func (n *NetHealth) flushDeadNebulaPeers(ctx context.Context,
 	wd *watchdogconf.Config, deadUnderlay, deadOverlay []string) {
-	confirmed := n.state.Exists(hoststate.LatchNebulaDegraded) ||
+	confirmed := n.state.Exists(latchdefs.LatchNebulaDegraded) ||
 		n.nebulaSiteedgeRun >= n.cfg.ConsecNeeded
 	if !confirmed || (len(deadUnderlay) == 0 && len(deadOverlay) == 0) {
 		return
@@ -546,8 +549,8 @@ func underlayHost(addr string) string {
 // budget file is shared with checkClockSync so the two remedies
 // can't double-fire.
 func (n *NetHealth) restartTimesyncdOnClockLatch(ctx context.Context) {
-	if !n.state.Exists(hoststate.LatchClockUnsync) &&
-		!n.state.Exists(hoststate.LatchClockSkew) {
+	if !n.state.Exists(latchdefs.LatchClockUnsync) &&
+		!n.state.Exists(latchdefs.LatchClockSkew) {
 		return
 	}
 	if n.cfg.Systemd == nil {
@@ -566,11 +569,11 @@ func (n *NetHealth) restartTimesyncdOnClockLatch(ctx context.Context) {
 	if !n.state.RateTrySpend("last-ntp-restart", nebulaNTPRestartInterval) {
 		return
 	}
-	n.state.AppendLog(
-		"ACTION: restarting systemd-timesyncd.service — clock latch active while nebula unhealthy")
-	if err := n.cfg.Systemd.Restart(ctx, "systemd-timesyncd.service"); err != nil {
+	n.state.AppendLog("ACTION: restarting " + latchdefs.ClockRestartUnits[0] +
+		" — clock latch active while nebula unhealthy")
+	if err := n.cfg.Systemd.Restart(ctx, latchdefs.ClockRestartUnits[0]); err != nil {
 		n.state.AppendLog(fmt.Sprintf(
-			"systemd-timesyncd.service restart failed: %v", err))
+			latchdefs.ClockRestartUnits[0]+" restart failed: %v", err))
 		return
 	}
 	n.actions.WithLabelValues(checkNebula, "ntp_restart").Inc()

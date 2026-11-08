@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -56,10 +56,10 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 			"unit", "fail2ban.service",
 			"error", err)
 	} else if !active {
-		n.state.SuspectLog(hoststate.LatchFail2banDown,
+		n.state.SuspectLog(latchdefs.LatchFail2banDown,
 			"suspect: fail2ban-down (unit exists but service inactive)",
 			suspectLogCadence)
-		n.state.Enter(hoststate.LatchFail2banDown, "service=inactive")
+		n.state.Enter(latchdefs.LatchFail2banDown, "service=inactive")
 		// A stopped jail protects nothing — restart it under the
 		// last-fail2ban-restart budget (30m) instead of only latching.
 		if n.state.RateOK("last-fail2ban-restart", f2bRestartInterval) {
@@ -72,7 +72,7 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 			}
 		}
 	} else {
-		n.stateExit(hoststate.LatchFail2banDown)
+		n.stateExit(latchdefs.LatchFail2banDown)
 	}
 	bannedFile := filepath.Join(n.cfg.WatchdogStateDir, "fail2ban-banned")
 	out, err := n.cfg.runMountCmd(ctx, []string{"fail2ban-client", "status"})

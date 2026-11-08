@@ -5,7 +5,7 @@
 //	node_agent_kine_{db,wal}_bytes and forces a sqlite3
 //	wal_checkpoint(TRUNCATE) when the WAL grows past the
 //	threshold (30m cooldown).
-package kine
+package storelocal
 
 import (
 	"context"
@@ -58,7 +58,7 @@ const (
 	// NodeKubeconfigCertExpiringSoon) key on these exact series.
 	kineDBBytesMetric  = "node_agent_kine_db_bytes"
 	kineWALBytesMetric = "node_agent_kine_wal_bytes"
-	// kineMaxObjectBytesMetric is the W15-CP2a gauge — the largest
+	// kineMaxObjectBytesMetric is the kine large-object gauge — the largest
 	// live (deleted=0) kine value in bytes (top-1 by length(value)).
 	kineMaxObjectBytesMetric = "node_agent_kine_max_object_bytes"
 
@@ -108,7 +108,7 @@ func (c *StorageCheck) Run(ctx context.Context) {
 		c.d.Cycles.WithLabelValues(cdeps.CheckKineStorage, "absent").Inc()
 		return
 	}
-	// W15-CP2a: scan the kine table for oversized live values —
+	// Large-object scan: scan the kine table for oversized live values —
 	// SQLite backend only (the query targets the kine table),
 	// cooldown-throttled so it stays off the hot cycle path.
 	if _, err := os.Stat(c.kineDBPath()); err == nil {

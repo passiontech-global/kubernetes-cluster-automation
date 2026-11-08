@@ -127,3 +127,24 @@ func Write(dir, name string, content []byte) error {
 		DirSync: true,
 	})
 }
+
+// FailureLogger receives one install failure from WriteLogged. The
+// message text stays at the call site — subsystems report through
+// different channels (SuspectLog, a subsystem slog logger), and
+// WriteLogged only guarantees the failure is reported exactly once,
+// at the caller's chosen level.
+type FailureLogger func(dir, name string, err error)
+
+// WriteLogged is Write plus the caller's failure channel — the one
+// logged writer every textfile emitter routes through. A successful
+// install stays quiet (the one caller that historically logged
+// success keeps doing so itself); a failure runs onFail exactly
+// once, then the error is still returned for callers that also
+// propagate it. A nil onFail degrades to plain Write.
+func WriteLogged(dir, name string, content []byte, onFail FailureLogger) error {
+	err := Write(dir, name, content)
+	if err != nil && onFail != nil {
+		onFail(dir, name, err)
+	}
+	return err
+}

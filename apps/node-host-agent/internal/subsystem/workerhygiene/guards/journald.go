@@ -53,8 +53,7 @@ func (c *JournaldCheck) Name() string { return wdeps.CheckJournald }
 
 // Run executes one journald-integrity round.
 func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckJournald) {
 		return
 	}
 	out, err := c.d.Cfg.Seams.Host.JournalFn(ctx)
@@ -109,33 +108,31 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.NoteJournalRead(!unreadable, udetail)
 	switch {
 	case corrupt, empty:
-		c.fails++
-		if c.fails < c.d.Cfg.ConsecNeeded {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
-				corrupt, empty, err, c.fails, c.d.Cfg.ConsecNeeded))
-			c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "ok").Inc()
+		if c.d.StreakPending(&c.fails, fmt.Sprintf(
+			"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active",
+			corrupt, empty, err)) {
+			c.d.CycleResult(wdeps.CheckJournald, "ok")
 			return
 		}
 	case err != nil:
 		// Exec failure without corruption evidence — inconclusive
 		// (the unreadable tracker owns this signal): keep the fail
 		// streak intact but never grow it, and never vacuum.
-		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckJournald, "abort")
 		return
 	default:
 		c.fails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckJournald, "ok")
 		return
 	}
 	if c.d.Cfg.Systemd == nil {
-		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "gated").Inc()
+		c.d.CycleResult(wdeps.CheckJournald, "gated")
 		return
 	}
 	if !c.d.State.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
 		c.d.State.AppendLog("suspect: journald-integrity confirmed but vacuum " +
 			"cooldown active — skip")
-		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckJournald, "ok")
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
@@ -150,7 +147,7 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Actions.WithLabelValues(wdeps.CheckJournald, "rotate_vacuum").Inc()
 	}
 	c.fails = 0
-	c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckJournald, "ok")
 }
 
 // --- Check: cilium-envoy readiness + agent healthz (2.5 & B1) ---

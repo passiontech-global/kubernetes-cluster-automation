@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -76,8 +76,7 @@ func cgroupStatDying(path string) (int64, bool) {
 
 // Run executes one cgroup-dying round.
 func (c *CgroupDyingCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCgroupDying) {
 		return
 	}
 	root := c.d.Cfg.Runtime.CgroupRoot
@@ -98,35 +97,33 @@ func (c *CgroupDyingCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		// cgroup v1 host or the hierarchy isn't mounted — the whole
 		// check is dormant (same "unreadable → abort" rule as the
 		// other procfs probes).
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCgroupDying, "abort")
 		return
 	}
 	c.d.CgroupDyingDescendants = dying
 	if dying <= cgroupDyingThreshold {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchCgroupDyingLeak, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCgroupDyingLeak, nil)
+		c.d.CycleResult(wdeps.CheckCgroupDying, "ok")
 		return
 	}
-	c.fails++
-	if c.fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cgroup-dying-leak nr_dying_descendants=%d (check %d/%d)",
-			dying, c.fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "ok").Inc()
+	if c.d.StreakPending(&c.fails, fmt.Sprintf(
+		"suspect: cgroup-dying-leak nr_dying_descendants=%d",
+		dying)) {
+		c.d.CycleResult(wdeps.CheckCgroupDying, "ok")
 		return
 	}
-	c.d.State.Enter(hoststate.LatchCgroupDyingLeak,
+	c.d.State.Enter(latchdefs.LatchCgroupDyingLeak,
 		fmt.Sprintf("nr_dying_descendants=%d", dying))
 	if !c.d.State.RateTrySpend("last-cgroup-drop-caches", cgroupReclaimInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cgroup-dying-leak nr_dying_descendants=%d - reclaim cooldown (<30m), skip",
 			dying))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCgroupDying, "ok")
 		return
 	}
 	c.reclaim(root, dying)
-	c.d.Cycles.WithLabelValues(wdeps.CheckCgroupDying, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCgroupDying, "ok")
 }
 
 // reclaim runs the budgeted reclaim pass: drop_caches frees the

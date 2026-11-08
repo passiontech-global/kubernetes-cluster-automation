@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -68,15 +69,14 @@ func (c *CiliumLRPCheck) Name() string { return wdeps.CheckCiliumLRP }
 
 // Run executes one cilium-lrp-dns round.
 func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumLRP) {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_host")); err != nil {
 		// No cilium datapath — the LRP wedge can't exist here.
 		c.Fails = 0
 		c.svcFails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
 	// The plan gates on cilium-agent actually running: cilium_host
@@ -85,7 +85,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// mask the real failure (wdeps.CheckCilium owns the agent-down verdict).
 	agentTasks, ctrOK := ciliumAgentTasks(c.d, e)
 	if !ctrOK {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "abort")
 		return
 	}
 	if len(agentTasks) == 0 {
@@ -93,13 +93,13 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// check stands down rather than punish a healthy pod.
 		c.Fails = 0
 		c.svcFails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "gated").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "gated")
 		return
 	}
 	if !e.APIOK {
 		// Inconclusive — keep the streak like the other API-gated
 		// checks (a LIST flake must not count or clear evidence).
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "abort")
 		return
 	}
 	// BPF service-map desync runs BEFORE the nld datapath verdict:
@@ -107,7 +107,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// programmed backends explains every :53 failure — deleting the
 	// nld pod then punishes the wrong component.
 	if c.serviceDesync(ctx, e, agentTasks) {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
 	var nld *corev1.Pod
@@ -124,7 +124,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// No Ready node-local-dns pod → nothing owes a datapath
 		// answer (not-Running/NotReady pods are kubelet's problem).
 		c.Fails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
 	// The :53 datapath must answer on BOTH transports — resolvers
@@ -137,23 +137,21 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cfg.Net.LocalDNSProbeName, ciliumProbeTime)
 	if udpOK && tcpOK {
 		c.Fails = 0
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-lrp-dns :53 probe of %s failed (udp=%v tcp=%v) while %s/%s Ready=True (check %d/%d)",
-			c.d.Cfg.Net.LocalDNSProbeAddr, udpOK, tcpOK,
-			nld.Namespace, nld.Name, c.Fails, c.d.Cfg.ConsecNeeded))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+	if c.d.StreakPending(&c.Fails, fmt.Sprintf(
+		"suspect: cilium-lrp-dns :53 probe of %s failed (udp=%v tcp=%v) while %s/%s Ready=True",
+		c.d.Cfg.Net.LocalDNSProbeAddr, udpOK, tcpOK,
+		nld.Namespace, nld.Name)) {
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
 	if !c.d.State.RateTrySpend("last-nld-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe fails %dx but pod restart in cooldown (<30m), skip",
 			c.Fails))
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
@@ -169,7 +167,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Actions.WithLabelValues(wdeps.CheckCiliumLRP, "pod_delete").Inc()
 	}
 	c.Fails = 0
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 }
 
 // --- local BPF service-map desync ---
@@ -219,11 +217,9 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 		c.svcFails = 0
 		return false
 	}
-	c.svcFails++
-	if c.svcFails < c.d.Cfg.ConsecNeeded {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-lrp-dns BPF service-map desync %s (ready endpoints but 0 backends) (check %d/%d)",
-			strings.Join(desynced, " "), c.svcFails, c.d.Cfg.ConsecNeeded))
+	if c.d.StreakPending(&c.svcFails, fmt.Sprintf(
+		"suspect: cilium-lrp-dns BPF service-map desync %s (ready endpoints but 0 backends)",
+		strings.Join(desynced, " "))) {
 		return true
 	}
 	if !c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval) {
@@ -234,8 +230,8 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 	}
 	// Budget spent atomically BEFORE acting (rate_spend parity).
 	if killCiliumAgent(c.d, agentTasks) {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: killed cilium-agent container - BPF service-map desync %s (0 backends for ready endpoints, persisted %dx)",
+		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionCiliumAgentKill+
+			" container - BPF service-map desync %s (0 backends for ready endpoints, persisted %dx)",
 			strings.Join(desynced, " "), c.svcFails))
 		c.svcFails = 0
 		c.d.Actions.WithLabelValues(wdeps.CheckCiliumLRP, "agent_kill").Inc()

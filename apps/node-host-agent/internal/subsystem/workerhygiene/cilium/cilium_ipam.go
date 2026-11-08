@@ -12,7 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -163,27 +163,26 @@ func (c *CiliumIPAMCheck) Name() string { return wdeps.CheckCiliumIPAM }
 
 // Run executes one cilium-ipam round.
 func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckCiliumIPAM) {
 		return
 	}
 	if !e.APIOK {
 		// The in-use count comes from the API — a failed LIST would
 		// make EVERY allocated IP look leaked.
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumIPAM, "abort")
 		return
 	}
 	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz")
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumIPAM, "abort")
 		return
 	}
 	used, available, ok := ParseCiliumIPAM(body)
 	if !ok {
 		c.d.State.AppendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckCiliumIPAM, "abort")
 		return
 	}
 	inUse := 0
@@ -211,18 +210,17 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchCiliumIPAMExhausted, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchCiliumIPAMExhausted, nil)
+		c.d.CycleResult(wdeps.CheckCiliumIPAM, "ok")
 		return
 	}
-	c.Fails++
-	if c.Fails >= c.d.Cfg.ConsecNeeded {
-		c.d.State.Enter(hoststate.LatchCiliumIPAMExhausted, fmt.Sprintf(
-			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
-	} else {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d (check %d/%d)",
-			used, inUse, leaked, available, c.Fails, c.d.Cfg.ConsecNeeded))
+	if c.d.StreakPending(&c.Fails, fmt.Sprintf(
+		"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d",
+		used, inUse, leaked, available)) {
+		c.d.CycleResult(wdeps.CheckCiliumIPAM, "ok")
+		return
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "ok").Inc()
+	c.d.State.Enter(latchdefs.LatchCiliumIPAMExhausted, fmt.Sprintf(
+		"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
+	c.d.CycleResult(wdeps.CheckCiliumIPAM, "ok")
 }

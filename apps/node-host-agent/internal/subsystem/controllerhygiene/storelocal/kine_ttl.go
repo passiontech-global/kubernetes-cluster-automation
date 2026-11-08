@@ -11,7 +11,7 @@
 //	                race (WAN DB + large seed list); fast-kill
 //	                suppressed, only a low-cadence recovery-probe
 //	                kill.
-package kine
+package storelocal
 
 import (
 	"context"

@@ -1,0 +1,31 @@
+# Managed by node-config-agent - Phase 3: kine split out of k0scontroller.
+# SEPARATE cgroup boundary: a kine OOM does not drag apiserver into
+# the OOM loop (incident 2026-10-02). GOMEMLIMIT 1500MiB < MemoryMax 2G
+# so Go GC fires before hitting the cgroup limit; GOGC=50 slows heap
+# growth between cycles.
+[Unit]
+Description=kine (etcd3 API shim -> external datastore)
+Documentation=file:/etc/kine/kine.env
+After=network-online.target
+Wants=network-online.target
+# Storage must come up BEFORE k0scontroller — apiserver will not boot
+# with a dead endpoint.
+Before=k0scontroller.service
+
+[Service]
+Environment=GOMEMLIMIT=1500MiB
+Environment=GOGC=50
+# KINE_ENDPOINT lives in /etc/kine/kine.env (0600, holds DB password).
+EnvironmentFile=/etc/kine/kine.env
+{{ exec_pre }}{{ exec_post }}ExecStart=/usr/local/bin/kine --listen-address={{ listen }} --metrics-bind-address={{ metrics }}{{ tls }}
+MemoryMax=2G
+# OOMScoreAdjust negative: the kernel kills other processes before
+# kine (apiserver data-path); high CPUWeight protects kine under CPU
+# pressure.
+OOMScoreAdjust=-500
+CPUWeight=2000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

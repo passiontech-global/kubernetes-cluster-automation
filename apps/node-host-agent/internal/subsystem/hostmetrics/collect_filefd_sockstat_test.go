@@ -12,7 +12,7 @@ import (
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
 
-// --- W15-R1c: mountinfo entries gauge ---
+// --- Mountinfo entries gauge ---
 
 func TestMountinfoEntriesCount(t *testing.T) {
 	cfg, _ := fixture(t)

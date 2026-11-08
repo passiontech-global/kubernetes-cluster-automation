@@ -22,8 +22,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -91,15 +89,14 @@ func cgroupInitPID(scopeDir string) (int, bool) {
 
 // Run executes one subproc-oom round.
 func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckSubprocOOM, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckSubprocOOM) {
 		return
 	}
 	kubepods := filepath.Join(c.d.Cfg.Runtime.CgroupRoot, "kubepods.slice")
 	if _, err := os.Stat(kubepods); err != nil {
 		// cgroup v1 host or no kubepods — dormant (abort parity
 		// with cgroup-pod-throttle).
-		c.d.Cycles.WithLabelValues(wdeps.CheckSubprocOOM, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
 		return
 	}
 	if c.scopes == nil {
@@ -175,7 +172,7 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			delete(c.scopes, dir)
 		}
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckSubprocOOM, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckSubprocOOM, "ok")
 }
 
 // report emits the ContainerSubprocessOOMKilled Warning event on
@@ -192,20 +189,14 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-			Namespace: pod.Namespace,
-		},
-		EventTime: metav1.NewMicroTime(now),
+	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
 		Reason:    "ContainerSubprocessOOMKilled",
 		Note: fmt.Sprintf(
 			"container %s hit memcg oom_kill (total %d) but PID 1 (%d) survived %s — subprocess kill, container left running (living dead)",
 			base, kill, pid1, subprocOOMConfirm),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-host-agent",
-		ReportingInstance:   c.d.Cfg.NodeName,
-		Action:              "ContainerSubprocessOOMKilled",
+		When: now,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Pod",
@@ -213,12 +204,8 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 			Name:       pod.Name,
 			UID:        pod.UID,
 		},
-	}
-	if _, err := c.d.Cfg.Client.EventsV1().Events(pod.Namespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: ContainerSubprocessOOMKilled event create failed for %s/%s: %v",
-			pod.Namespace, pod.Name, err))
+		Owner: pod.Namespace + "/" + pod.Name,
+	}); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

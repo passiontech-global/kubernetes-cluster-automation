@@ -13,7 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -46,14 +46,13 @@ func (c *PodTeardownCheck) Name() string { return wdeps.CheckTeardown }
 
 // Run executes one pod-teardown round.
 func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckTeardown, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckTeardown) {
 		return
 	}
 	if !e.APIOK {
 		// Inconclusive — shell "exit 0" semantics: abort silently,
 		// keep counters and latches (no state_exit flap on API blip).
-		c.d.Cycles.WithLabelValues(wdeps.CheckTeardown, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckTeardown, "abort")
 		return
 	}
 	// The task map is only worth building once a Terminating pod
@@ -78,7 +77,7 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				// (wdeps.CheckCtrTasks unreadable-root parity).
 				c.d.State.AppendLog(
 					"suspect: pod-teardown aborted — ctr task map incomplete, force-deletes unverifiable")
-				c.d.Cycles.WithLabelValues(wdeps.CheckTeardown, "abort").Inc()
+				c.d.CycleResult(wdeps.CheckTeardown, "abort")
 				return
 			}
 		}
@@ -117,14 +116,14 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 	switch {
 	case wedged >= 1:
-		c.fails++
-		if c.fails >= c.d.Cfg.ConsecNeeded {
-			if c.d.State.Exists(hoststate.LatchNodeOverloaded) {
+		if !c.d.StreakPending(&c.fails,
+			fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d", wedged)) {
+			if c.d.State.Exists(latchdefs.LatchNodeOverloaded) {
 				// Suppression parity: a wedge under overload is a
 				// symptom — rebooting would dump 100% of its load
 				// onto the remaining nodes (amplifier). Log-only,
 				// once per suppression episode.
-				if !c.d.State.Exists(hoststate.LatchPodTeardownWedged) {
+				if !c.d.State.Exists(latchdefs.LatchPodTeardownWedged) {
 					c.d.State.AppendLog(fmt.Sprintf(
 						"pod-teardown-wedged suppressed-overloaded stuck=%d", wedged))
 				}
@@ -132,19 +131,16 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				// EnterFrom: ctr-tasks shares this latch for
 				// unkillable orphan shims — our exit below must
 				// release only OUR hold, never theirs.
-				c.d.State.EnterFrom(hoststate.LatchPodTeardownWedged,
+				c.d.State.EnterFrom(latchdefs.LatchPodTeardownWedged,
 					wdeps.CheckTeardown, fmt.Sprintf("stuck=%d", wedged))
 			}
-		} else {
-			c.d.State.AppendLog(fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d (check %d/%d)",
-				wedged, c.fails, c.d.Cfg.ConsecNeeded))
 		}
 	default:
 		c.fails = 0
-		c.d.State.ExitFrom(hoststate.LatchPodTeardownWedged,
+		c.d.State.ExitFrom(latchdefs.LatchPodTeardownWedged,
 			wdeps.CheckTeardown, nil)
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckTeardown, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckTeardown, "ok")
 }
 
 // --- Check 2: konnectivity IP drift (30-konnectivity.sh) ---
@@ -220,8 +216,7 @@ func (c *KonnCheck) Name() string { return wdeps.CheckKonn }
 
 // Run executes one konnectivity round.
 func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckKonn, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckKonn) {
 		return
 	}
 	nodeIP := k0sWorkerNodeIP(c.d)
@@ -255,13 +250,13 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Healthy or inconclusive (no node-ip parsed / no proxy-agent
 		// found — e.g. konnectivity not deployed): reset, drop latch.
 		c.Fails = 0
-		c.d.State.Exit(hoststate.LatchKonnectivityIPMismatch, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckKonn, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchKonnectivityIPMismatch, nil)
+		c.d.CycleResult(wdeps.CheckKonn, "ok")
 		return
 	}
 
 	c.Fails++
-	c.d.State.Enter(hoststate.LatchKonnectivityIPMismatch,
+	c.d.State.Enter(latchdefs.LatchKonnectivityIPMismatch,
 		fmt.Sprintf("host=%s node-ip=%s", agentHost, nodeIP))
 	if c.Fails >= c.d.Cfg.ConsecNeeded &&
 		c.d.State.RateTrySpend("last-konn-restart", c.d.Cfg.MinRestartInterval) {
@@ -270,9 +265,10 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.Fails = 0
 		// NPD contract: "recreating konnectivity-agent ..." fires the
 		// KonnectivityStaleId filelog pattern.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"KONNECTIVITY-IP-RESTART: recreating konnectivity-agent sandbox - stale identifier host=%s != node-ip=%s",
-			agentHost, nodeIP))
+		c.d.State.AppendLog("KONNECTIVITY-IP-RESTART: " +
+			latchdefs.ReasonKonnectivityAgentRecreate +
+			fmt.Sprintf(" sandbox - stale identifier host=%s != node-ip=%s",
+				agentHost, nodeIP))
 		if DeleteKonnectivityPod(c.d, ctx, e.Pods) {
 			c.d.Actions.WithLabelValues(wdeps.CheckKonn, "pod_delete").Inc()
 		} else if stalePID > 0 {
@@ -294,10 +290,11 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// NPD contract: "konnectivity stale identifier ..." fires the
 		// same KonnectivityStaleId pattern while accumulating.
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: konnectivity stale identifier host=%s != node-ip=%s (check %d/%d)",
+			"suspect: "+latchdefs.ReasonKonnectivityStaleID+
+				" host=%s != node-ip=%s (check %d/%d)",
 			agentHost, nodeIP, c.Fails, c.d.Cfg.ConsecNeeded))
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckKonn, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckKonn, "ok")
 }
 
 // --- Check 3: DNS resolv.conf drift (33-dns-resolv-drift.sh) ---
@@ -370,14 +367,13 @@ func (c *DNSResolvCheck) Name() string { return wdeps.CheckDNS }
 
 // Run executes one dns-resolv round.
 func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
-	if !e.WorkerActive {
-		c.d.Cycles.WithLabelValues(wdeps.CheckDNS, "gated").Inc()
+	if c.d.Gated(e, wdeps.CheckDNS) {
 		return
 	}
 	if !e.APIOK {
 		// Same inconclusive rule as teardown: a failed LIST keeps
 		// counters and the latch (no flap on API blip).
-		c.d.Cycles.WithLabelValues(wdeps.CheckDNS, "abort").Inc()
+		c.d.CycleResult(wdeps.CheckDNS, "abort")
 		return
 	}
 	hostNS, _ := nameserverSet(c.d.Cfg.HostResolvConf)
@@ -423,8 +419,8 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 
 	if len(stale) == 0 {
 		c.fails = 0
-		c.d.State.Exit(hoststate.LatchDNSResolvStale, nil)
-		c.d.Cycles.WithLabelValues(wdeps.CheckDNS, "ok").Inc()
+		c.d.State.Exit(latchdefs.LatchDNSResolvStale, nil)
+		c.d.CycleResult(wdeps.CheckDNS, "ok")
 		return
 	}
 
@@ -435,7 +431,7 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	staleStr := strings.Join(specs, " ")
 	// Latch first — the state file is what NPD's permanent
 	// DnsResolvStale condition checks; the counter gates the action.
-	c.d.State.Enter(hoststate.LatchDNSResolvStale, staleStr)
+	c.d.State.Enter(latchdefs.LatchDNSResolvStale, staleStr)
 	c.fails++
 	switch {
 	case c.fails >= c.d.Cfg.ConsecNeeded &&
@@ -459,7 +455,7 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s (check %d/%d)",
 			staleStr, c.fails, c.d.Cfg.ConsecNeeded))
 	}
-	c.d.Cycles.WithLabelValues(wdeps.CheckDNS, "ok").Inc()
+	c.d.CycleResult(wdeps.CheckDNS, "ok")
 }
 
 // --- shared helpers for the ported kubelet/cilium/ctr checks ---

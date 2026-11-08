@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
@@ -112,7 +112,7 @@ func (r *Runner) roPVCMounts() []string {
 // unreadable mounts file contributes nothing (fail-safe, not
 // fail-latch).
 func (r *Runner) updateFSReadonlyEvidence() {
-	p := r.deps.Store.Path(hoststate.LatchFSReadonly)
+	p := r.deps.Store.Path(latchdefs.LatchFSReadonly)
 	_, lerr := os.Stat(p)
 	evidence := ""
 	if b, err := os.ReadFile(r.statePath(kmsgFsErrorFile)); err == nil {
@@ -135,10 +135,10 @@ func (r *Runner) updateFSReadonlyEvidence() {
 	}
 	switch {
 	case evidence != "" && lerr != nil:
-		r.ensureStateLatch(p, hoststate.LatchFilePrefix+hoststate.LatchFSReadonly, evidence)
+		r.ensureStateLatch(p, latchdefs.LatchFilePrefix+latchdefs.LatchFSReadonly, evidence)
 	case evidence == "" && lerr == nil:
 		// STATE-EXIT: the file is the contract half; the log line
 		// is what nodereporter's filelog tails for the transition.
-		r.deps.Store.Exit(hoststate.LatchFSReadonly, nil)
+		r.deps.Store.Exit(latchdefs.LatchFSReadonly, nil)
 	}
 }
