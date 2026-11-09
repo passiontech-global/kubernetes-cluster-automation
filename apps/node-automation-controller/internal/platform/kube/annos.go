@@ -232,6 +232,20 @@ const (
 	// stalled-provisioning evidence. Value must never change
 	// (upstream key).
 	AnnoVolumeSelectedNode = "volume.kubernetes.io/selected-node"
+	// AnnoRelistStormSuspend opts a CronJob into the
+	// apiserver-relist-storm-breaker's relief window: while an
+	// apiserver LIST storm is proven, the check flips
+	// spec.suspend=true on every CronJob carrying this annotation
+	// (value "true") and restores it — but only objects it stamped
+	// itself — when the storm clears. Background scanners like
+	// popeye are exactly the LIST-heavy clients a relist storm
+	// cannot afford. Value must never change.
+	AnnoRelistStormSuspend = "passiontech.dev/relist-storm-suspend"
+	// AnnoRelistStormSuspendedBy marks a CronJob the storm breaker
+	// itself suspended — the restore path only unsuspends objects
+	// carrying THIS stamp, so a CronJob an operator suspended
+	// manually is never resurrected by the check.
+	AnnoRelistStormSuspendedBy = "passiontech.dev/relist-storm-suspended-by"
 )
 
 // The third external key — weave.works/kured-node-lock, the reboot

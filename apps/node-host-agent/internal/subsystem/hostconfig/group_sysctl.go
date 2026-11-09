@@ -93,7 +93,18 @@ func (c *cyc) t16Pairs() [][2]string {
 	// pairs above.
 	if c.r.fileExists("/proc/sys/fs/aio-max-nr") ||
 		fileExistsNoRoot("/proc/sys/fs/aio-max-nr") {
-		p = append(p, [2]string{"fs.aio-max-nr", "1048576"})
+		// W20-KR2: 4M slots — the 1M convergence value still starves
+		// nodes running many DB instances (ScyllaDB/MySQL/CNPG
+		// workers each hold aio contexts); collect_filefd_sockstat's
+		// runtime bump covers the gap before this sysctl lands.
+		p = append(p, [2]string{"fs.aio-max-nr", "4194304"})
+	}
+	// user-namespace headroom for rootless/containerd userns-remap
+	// workloads — same existence gate as aio (kernels compiled
+	// without USER_NS leave no sysctl node).
+	if c.r.fileExists("/proc/sys/user/max_user_namespaces") ||
+		fileExistsNoRoot("/proc/sys/user/max_user_namespaces") {
+		p = append(p, [2]string{"user.max_user_namespaces", "65536"})
 	}
 	// sysctl-hardening: keyring quota headroom — a full keyring fails
 	// keyctl/add_key silently for new sessions.

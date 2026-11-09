@@ -70,3 +70,44 @@ func TestPodLogTail(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveDefaultContainer(t *testing.T) {
+	multi := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "p2"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "linkerd-proxy"},
+			{Name: "app"},
+			{Name: "config-reloader"},
+		}}}
+
+	if got := ResolveDefaultContainer(multi, "explicit"); got != "explicit" {
+		t.Errorf("explicit = %q, want explicit", got)
+	}
+	// The annotation wins when it names a real container — even an
+	// infra sidecar, since kubectl trusts it verbatim.
+	ann := multi.DeepCopy()
+	ann.Annotations = map[string]string{
+		"kubectl.kubernetes.io/default-container": "config-reloader"}
+	if got := ResolveDefaultContainer(ann, ""); got != "config-reloader" {
+		t.Errorf("annotation = %q, want config-reloader", got)
+	}
+	// An annotation naming a nonexistent container is ignored.
+	ann.Annotations["kubectl.kubernetes.io/default-container"] = "ghost"
+	if got := ResolveDefaultContainer(ann, ""); got != "app" {
+		t.Errorf("bad annotation = %q, want app (first non-sidecar)", got)
+	}
+	// No annotation: first non-infra container.
+	if got := ResolveDefaultContainer(multi, ""); got != "app" {
+		t.Errorf("no annotation = %q, want app", got)
+	}
+	// All infra sidecars: fall back to the first container.
+	allSide := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: "linkerd-proxy"}, {Name: "envoy"}}}}
+	if got := ResolveDefaultContainer(allSide, ""); got != "linkerd-proxy" {
+		t.Errorf("all-sidecar pod = %q, want linkerd-proxy", got)
+	}
+	// No containers at all: "" keeps the apiserver's own verdict.
+	if got := ResolveDefaultContainer(&corev1.Pod{}, ""); got != "" {
+		t.Errorf("empty pod = %q, want \"\"", got)
+	}
+}

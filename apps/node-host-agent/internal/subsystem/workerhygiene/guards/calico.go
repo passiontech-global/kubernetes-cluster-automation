@@ -70,12 +70,13 @@ func calicoIfaceCount(d *wdeps.Deps) int {
 }
 
 // CalicoCheck is the calico-hygiene calico guard as a Check; it owns the
-// veth-leak and felix readiness streaks (ex-Hygiene.calicoVethFails/
-// .calicoFelixFails).
+// veth-leak, felix readiness and wireguard.cali streaks (ex-Hygiene
+// .calicoVethFails/.calicoFelixFails + the W20-NM3 wg streak).
 type CalicoCheck struct {
 	d          *wdeps.Deps
 	VethFails  int
 	felixFails int
+	wgFails    int
 }
 
 // Name returns the check label / WD_SIG key.
@@ -91,6 +92,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// guard family; drop stale evidence like checkCiliumWGPeers.
 		c.VethFails = 0
 		c.felixFails = 0
+		c.wgFails = 0
 		c.d.State.Exit(latchdefs.LatchCalicoVethLeak, nil)
 		c.d.State.Exit(latchdefs.LatchCalicoFelixDown, nil)
 		c.d.CycleResult(wdeps.CheckCalico, "ok")
@@ -102,6 +104,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// sysfs reports -1 the same way: nothing to verify).
 		c.VethFails = 0
 		c.felixFails = 0
+		c.wgFails = 0
 		c.d.State.Exit(latchdefs.LatchCalicoVethLeak, nil)
 		c.d.State.Exit(latchdefs.LatchCalicoFelixDown, nil)
 		c.d.CycleResult(wdeps.CheckCalico, "ok")
@@ -201,7 +204,80 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 	}
+	// W20-NM3 wireguard.cali datapath: Calico's WireGuard backend
+	// iface exists in sysfs but reads operstate=down or carrier=0
+	// across consecutive cycles — the encrypted datapath is dead
+	// while every pod still looks Running (same invisible-wedge
+	// class as the felix readiness probe). Diagnose via streak,
+	// then rebuild calico-node under the same cooldown/overload
+	// gates as the felix remedy.
+	c.checkWireguardCali(ctx, felix)
 	c.d.CycleResult(wdeps.CheckCalico, "ok")
+}
+
+// checkWireguardCali is the W20-NM3 WireGuard-backend wedge
+// detector. wireguard.cali only exists on Calico nodes running the
+// WireGuard datapath — its absence is not a fault. A present iface
+// reporting down/no-carrier for ConsecNeeded consecutive cycles
+// gets the same pod-rebuild remedy as a felix readiness wedge.
+func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod) {
+	wgDir := filepath.Join(c.d.Cfg.SysClassNet, "wireguard.cali")
+	if _, err := os.Stat(wgDir); err != nil {
+		c.wgFails = 0
+		return
+	}
+	down := false
+	readable := false
+	if b, err := os.ReadFile(filepath.Join(wgDir, "operstate")); err == nil {
+		readable = true
+		if strings.TrimSpace(string(b)) == "down" {
+			down = true
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(wgDir, "carrier")); err == nil {
+		readable = true
+		if strings.TrimSpace(string(b)) == "0" {
+			down = true
+		}
+	}
+	if !readable {
+		// Neither file readable — inconclusive, keep the streak.
+		return
+	}
+	if !down {
+		c.wgFails = 0
+		return
+	}
+	if c.d.StreakPending(&c.wgFails, fmt.Sprintf(
+		"suspect: calico-hygiene wireguard.cali down/no-carrier")) {
+		return
+	}
+	if felix == nil {
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene wireguard.cali down but no Running calico-node pod — skip restart")
+		return
+	}
+	switch {
+	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: calico-hygiene wireguard.cali down but node overloaded — skip pod restart"))
+	case !c.d.State.RateTrySpend("last-calico-restart", c.d.Cfg.MinRestartInterval):
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: calico-hygiene wireguard.cali down but pod restart in cooldown (<30m), skip"))
+	default:
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: calico-hygiene deleted pod %s/%s - wireguard.cali down/no-carrier",
+			felix.Namespace, felix.Name))
+		if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
+			ctx, felix.Name, metav1.DeleteOptions{
+				GracePeriodSeconds: ptr.To[int64](0)}); derr != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: calico-hygiene delete %s/%s failed: %v",
+				felix.Namespace, felix.Name, derr))
+		} else {
+			c.d.Actions.WithLabelValues(wdeps.CheckCalico, "pod_delete").Inc()
+		}
+	}
 }
 
 // gcCalicoOrphanVeths reaps cali* host veths that have been DOWN

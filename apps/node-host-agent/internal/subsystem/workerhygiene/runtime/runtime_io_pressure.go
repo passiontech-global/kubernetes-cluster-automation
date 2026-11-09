@@ -61,11 +61,12 @@ var (
 // diskIOStat is one whole-disk row of /proc/diskstats, reduced to
 // the counters the deltas need (all in kernel units: ios, ms).
 type diskIOStat struct {
-	rdIOS   uint64 // field 3  — reads completed
-	rdTicks uint64 // field 6  — ms spent reading
-	wrIOS   uint64 // field 7  — writes completed
-	wrTicks uint64 // field 10 — ms spent writing
-	ioTicks uint64 // field 12 — ms doing IO (utilization source)
+	rdIOS    uint64 // field 4  — reads completed
+	rdTicks  uint64 // field 7  — ms spent reading
+	wrIOS    uint64 // field 8  — writes completed
+	wrTicks  uint64 // field 11 — ms spent writing
+	ioTicks  uint64 // field 13 — ms doing IO (utilization source)
+	inflight uint64 // field 12 — ios in progress (queue depth)
 }
 
 // isWholeDisk reports whether a diskstats device name is a whole
@@ -109,6 +110,13 @@ func parseDiskstats(data []byte) map[string]diskIOStat {
 		if v, err := strconv.ParseUint(f[12], 10, 64); err == nil {
 			s.ioTicks = v
 		}
+		// Field 12 (f[11]) is "ios in progress" — the number of I/O
+		// requests sitting in the block queue RIGHT NOW. Unlike the
+		// cumulative counters it is instantaneous, so it is read
+		// without a delta (W20-KR3 inflight-freeze detector).
+		if v, err := strconv.ParseUint(f[11], 10, 64); err == nil {
+			s.inflight = v
+		}
 		out[f[2]] = s
 	}
 	return out
@@ -150,14 +158,16 @@ func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
 
 // IOPressureCheck is the disk-IO starvation guard as a Check. It
 // keeps the previous diskstats snapshot for the delta math, the
-// pid→comm throttle ledger (pid reuse protection) and the disk-slow-io
-// consecutive-cycle disk-slow-io streak.
+// pid→comm throttle ledger (pid reuse protection), the disk-slow-io
+// consecutive-cycle disk-slow-io streak and the W20-KR3
+// inflight-freeze streak.
 type IOPressureCheck struct {
-	d             *wdeps.Deps
-	lastDisk      map[string]diskIOStat
-	lastTime      time.Time
-	throttled     map[int]string
-	diskSlowFails int
+	d                   *wdeps.Deps
+	lastDisk            map[string]diskIOStat
+	lastTime            time.Time
+	throttled           map[int]string
+	diskSlowFails       int
+	inflightFreezeFails int
 }
 
 // Name returns the check label / WD_SIG key.
@@ -176,8 +186,21 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	cur := parseDiskstats(data)
 	util, await, maxAwait := 0.0, 0.0, 0.0
+	// dIO is the fleet-wide completed-I/O delta (reads+writes) and
+	// inflightMax the deepest block queue — both feed the W20-KR3
+	// inflight-freeze detector below. They only mean anything once a
+	// previous snapshot exists.
+	var dIO, inflightMax uint64
+	var dtMs float64
+	var hadPrev bool
 	if c.lastDisk != nil {
-		dtMs := float64(now.Sub(c.lastTime).Milliseconds())
+		hadPrev = true
+		for _, s := range cur {
+			if s.inflight > inflightMax {
+				inflightMax = s.inflight
+			}
+		}
+		dtMs = float64(now.Sub(c.lastTime).Milliseconds())
 		if dtMs > 0 {
 			var dWr, dWrMs uint64
 			for name, s := range cur {
@@ -186,6 +209,12 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 				// delta — skip rather than invent huge numbers.
 				if !ok || s.ioTicks < prev.ioTicks {
 					continue
+				}
+				if s.rdIOS >= prev.rdIOS {
+					dIO += s.rdIOS - prev.rdIOS
+				}
+				if s.wrIOS >= prev.wrIOS {
+					dIO += s.wrIOS - prev.wrIOS
 				}
 				if u := float64(s.ioTicks-prev.ioTicks) / dtMs; u > util {
 					util = u
@@ -238,19 +267,48 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// scheduler stops placing stateful pods here — it must NEVER
 	// feed a reboot path (a shared SAN slowdown would
 	// mass-reboot the fleet).
-	if maxAwait > diskWriteAwaitHighMs && psiOK && avg60 >= ioPSIFullHigh {
+	slowCond := maxAwait > diskWriteAwaitHighMs && psiOK &&
+		avg60 >= ioPSIFullHigh
+	// W20-KR3 inflight freeze: ios-in-progress >0 while ZERO I/O
+	// completed fleet-wide means the block queue is wedged — requests
+	// sit inflight forever (dead spindle, hung SCSI/SAS path, frozen
+	// device-mapper leg). PSI/diskstats-avg conditions above catch a
+	// slow disk; this catches a DEAD one that never reports await.
+	freezeCond := hadPrev && dtMs > 0 && inflightMax > 0 && dIO == 0
+	if slowCond {
 		c.diskSlowFails++
-		if c.diskSlowFails >= diskSlowIOConsecNeeded {
-			c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
-				"max_await=%.1fms psi_avg60=%.1f fails=%d",
-				maxAwait, avg60, c.diskSlowFails))
-		} else {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: disk-slow-io max_await=%.1fms psi_avg60=%.1f (check %d/%d)",
-				maxAwait, avg60, c.diskSlowFails, diskSlowIOConsecNeeded))
-		}
 	} else {
 		c.diskSlowFails = 0
+	}
+	if freezeCond {
+		c.inflightFreezeFails++
+	} else {
+		c.inflightFreezeFails = 0
+	}
+	latched := false
+	if c.diskSlowFails >= diskSlowIOConsecNeeded {
+		c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
+			"max_await=%.1fms psi_avg60=%.1f fails=%d",
+			maxAwait, avg60, c.diskSlowFails))
+		latched = true
+	} else if slowCond {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: disk-slow-io max_await=%.1fms psi_avg60=%.1f (check %d/%d)",
+			maxAwait, avg60, c.diskSlowFails, diskSlowIOConsecNeeded))
+	}
+	if c.inflightFreezeFails >= diskSlowIOConsecNeeded {
+		c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
+			"inflight=%d ios_delta=0 fails=%d",
+			inflightMax, c.inflightFreezeFails))
+		latched = true
+	} else if freezeCond {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: disk-inflight-freeze inflight=%d ios_delta=0 (check %d/%d)",
+			inflightMax, c.inflightFreezeFails, diskSlowIOConsecNeeded))
+	}
+	// The latch clears only when BOTH detectors' streaks have reset —
+	// a freeze must not be masked by the slow-IO path going quiet.
+	if !latched && c.diskSlowFails == 0 && c.inflightFreezeFails == 0 {
 		c.d.State.Exit(latchdefs.LatchDiskSlowIO, nil)
 	}
 	pressure := await > diskWriteAwaitHighMs ||

@@ -452,7 +452,7 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 		MatchExpressions: []metav1.LabelSelectorRequirement{{
 			Key:      "kubernetes.io/metadata.name",
 			Operator: metav1.LabelSelectorOpNotIn,
-			Values:   []string{"kube-system", "kube-node-lease", "node-ops", "medik8s"},
+			Values:   []string{"kube-system", "kube-node-lease", "node-ops", "medik8s", "operators"},
 		}},
 	}
 	optInSel := &metav1.LabelSelector{

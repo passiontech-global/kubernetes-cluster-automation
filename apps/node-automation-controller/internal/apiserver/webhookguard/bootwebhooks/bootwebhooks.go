@@ -17,16 +17,18 @@
 //
 // The duty enforces failurePolicy=Ignore, ONE-WAY, on the validating
 // webhook entries that sit on that boot path: every rule of the entry
-// must reference the self-node-remediation.medik8s.io group and only
-// the selfnoderemediationconfigs / selfnoderemediationtemplates
-// resources. One-way by design — a circuit-breaker-style
-// restore-to-Fail would re-arm the boot fatality at the very next
-// operator restart. Scope guards: mutating webhook configs are never
-// touched (only the Validating list is swept), the remediation-CR
-// entry (selfnoderemediations, already Ignore upstream) and everything
-// outside the medik8s group keep their declared policies, and
-// fence-agents-remediation / node-healthcheck entries are out of scope
-// until their own boot paths are proven webhook-fatal.
+// must reference one of the medik8s boot groups
+// (self-node-remediation.medik8s.io, fence-agents-remediation.medik8s.io,
+// remediation.medik8s.io) and only that group's boot CR kinds — the
+// self-node-remediation configs/templates, the fence-agents-remediation
+// configs/templates, and the node-healthcheck CRs respectively. One-way
+// by design — a circuit-breaker-style restore-to-Fail would re-arm the
+// boot fatality at the very next operator restart. Scope guards:
+// mutating webhook configs are never touched (only the Validating list
+// is swept), entries reaching anything beyond the boot CRs keep their
+// declared policies (selfnoderemediations — the self-node-remediation
+// CR itself — stays fail-closed: flipping it would open validation on
+// the remediation CR), and non-medik8s groups are never in scope.
 //
 // OLM re-asserts Fail from the CSV webhookdefinitions on every
 // reconcile and on each operator upgrade — this sweep re-heals that
@@ -46,7 +48,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -62,18 +63,28 @@ import (
 const (
 	// FailOpenGate is the sub-feature gate env var (on unless "false").
 	FailOpenGate = "MEDIK8S_BOOT_FAIL_OPEN_ENABLED"
-
-	// medik8sGroup is the API group whose config/template CR kinds sit
-	// on the operators' boot path.
-	medik8sGroup = "self-node-remediation.medik8s.io"
 )
 
-// bootResources are the medik8s CR kinds the operators ensure at boot.
-// Entries touching anything else in the group — above all
-// selfnoderemediations, the remediation CR itself — are out of scope.
-var bootResources = map[string]bool{
-	"selfnoderemediationconfigs":   true,
-	"selfnoderemediationtemplates": true,
+// bootScope maps each medik8s API group whose webhook-validated CRs
+// sit on an operator boot path to the CR kinds those entries may
+// cover — bootResources generalized to the three boot paths (W20):
+// self-node-remediation's config/template pair (the CRs the manager
+// ensures at startup), fence-agents-remediation's remediation/template
+// pair, and node-healthcheck's NodeHealthCheck CR. Entries touching
+// anything else — above all selfnoderemediations, the
+// self-node-remediation CR itself — are out of scope.
+var bootScope = map[string]map[string]bool{
+	"self-node-remediation.medik8s.io": {
+		"selfnoderemediationconfigs":   true,
+		"selfnoderemediationtemplates": true,
+	},
+	"fence-agents-remediation.medik8s.io": {
+		"fenceagentsremediations":         true,
+		"fenceagentsremediationtemplates": true,
+	},
+	"remediation.medik8s.io": {
+		"nodehealthchecks": true,
+	},
 }
 
 // Enabled reads the fail-open gate EVERY sweep — the sanctioned
@@ -84,25 +95,39 @@ func Enabled() bool {
 	return envx.Gate(FailOpenGate, true)
 }
 
-// bootWebhook reports whether a validating webhook entry sits on the
-// medik8s boot path: at least one rule referencing the medik8s group
-// whose resources are exclusively the boot CR kinds, and no rule —
-// medik8s or otherwise — reaching anything beyond that scope. A
-// broader entry (one covering the remediation CR too, or mixing
-// groups) is disqualified whole: flipping it would open validation on
-// resources this duty deliberately leaves fail-closed.
+// bootWebhook reports whether a validating webhook entry sits on a
+// medik8s boot path: at least one rule referencing a bootScope group
+// whose resources are exclusively that group's boot CR kinds, and no
+// rule — medik8s or otherwise — reaching anything beyond that scope.
+// A broader entry (one covering the self-node-remediation CR too, or
+// mixing groups) is disqualified whole: flipping it would open
+// validation on resources this duty deliberately leaves fail-closed.
 func bootWebhook(w admissionv1.ValidatingWebhook) bool {
 	onBoot := false
 	for _, r := range w.Rules {
-		if !slices.Contains(r.APIGroups, medik8sGroup) {
-			return false // any non-medik8s rule disqualifies the entry
-		}
 		if len(r.Resources) == 0 {
 			return false // empty resources = wildcard — never in scope
 		}
+		// allowed is the union of the boot CR kinds across the rule's
+		// boot groups; a rule with no boot group at all disqualifies
+		// the entry (the old "any non-medik8s rule" guard, generalized).
+		var allowed map[string]bool
+		for _, g := range r.APIGroups {
+			if res, ok := bootScope[g]; ok {
+				if allowed == nil {
+					allowed = map[string]bool{}
+				}
+				for resName := range res {
+					allowed[resName] = true
+				}
+			}
+		}
+		if allowed == nil {
+			return false
+		}
 		for _, res := range r.Resources {
-			if !bootResources[res] {
-				return false // remediation CR or a subresource — out of scope
+			if !allowed[res] {
+				return false // out-of-scope resource — never flip the entry
 			}
 		}
 		onBoot = true

@@ -82,7 +82,7 @@ func TestListLengths(t *testing.T) {
 	if got, want := len(HeartbeatSweptNames), 42; got != want {
 		t.Errorf("len(HeartbeatSweptNames) = %d, want %d", got, want)
 	}
-	if got, want := len(HangPreCordonNames), 17; got != want {
+	if got, want := len(HangPreCordonNames), 19; got != want {
 		t.Errorf("len(HangPreCordonNames) = %d, want %d", got, want)
 	}
 	if got, want := len(ClockSkewPreCordonNames), 3; got != want {
@@ -91,7 +91,7 @@ func TestListLengths(t *testing.T) {
 	// 37 storm-gate conditions minus 4 legacy spellings, plus
 	// CiliumBPFMapPressure and the 4 foreign names already counted
 	// in the original list.
-	if got, want := len(StormGateNames), 38; got != want {
+	if got, want := len(StormGateNames), 42; got != want {
 		t.Errorf("len(StormGateNames) = %d, want %d", got, want)
 	}
 	if got, want := len(PartitionNames), 6; got != want {
@@ -245,6 +245,20 @@ func TestStormGateForeignNamesPinned(t *testing.T) {
 	for _, name := range foreignStormGateNames {
 		if !gate[name] {
 			t.Errorf("StormGateNames lost foreign condition %q", name)
+		}
+	}
+}
+
+func TestAllPreCordonConditionsInStormGate(t *testing.T) {
+	gate := make(map[string]bool, len(StormGateNames))
+	for _, name := range StormGateNames {
+		gate[name] = true
+	}
+	for _, list := range [][]string{HangPreCordonNames, ClockSkewPreCordonNames} {
+		for _, name := range list {
+			if !gate[name] {
+				t.Errorf("StormGateNames must contain pre-cordon condition %q", name)
+			}
 		}
 	}
 }

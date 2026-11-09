@@ -28,9 +28,11 @@ const (
 )
 
 // vwc builds a validating webhook config with the medik8s family:
-// the two boot-path entries, the remediation-CR entry (upstream
-// Ignore) and, for contrast, a fence-agents entry that must never be
-// touched by this duty.
+// the boot-path entries of all three groups (self-node-remediation,
+// fence-agents-remediation, node-healthcheck), the
+// self-node-remediation CR entry (must stay Fail), a mixed-scope
+// entry, an already-open entry, and — for contrast — a genuinely
+// foreign webhook that must never be touched by this duty.
 func vwc() *admissionv1.ValidatingWebhookConfiguration {
 	fpf := func(p admissionv1.FailurePolicyType) *admissionv1.FailurePolicyType { return &p }
 	return &admissionv1.ValidatingWebhookConfiguration{
@@ -96,14 +98,49 @@ func vwc() *admissionv1.ValidatingWebhookConfiguration {
 				}},
 			},
 			{
+				// The fence-agents-remediation boot pair (W20) — FAR's
+				// own webhook-fatal boot path, flips like the
+				// self-node-remediation config/template entries.
+				Name:          "vfenceagentsremediation.kb.io",
+				ClientConfig:  admissionv1.WebhookClientConfig{Service: &admissionv1.ServiceReference{Namespace: ns, Name: service}},
+				FailurePolicy: fpf(admissionv1.Fail),
+				Rules: []admissionv1.RuleWithOperations{{
+					Operations: []admissionv1.OperationType{admissionv1.Create, admissionv1.Update},
+					Rule: admissionv1.Rule{APIGroups: []string{"fence-agents-remediation.medik8s.io"},
+						APIVersions: []string{"v1alpha1"}, Resources: []string{"fenceagentsremediations"}},
+				}},
+			},
+			{
+				Name:          "vfenceagentsremediationtemplate.kb.io",
+				ClientConfig:  admissionv1.WebhookClientConfig{Service: &admissionv1.ServiceReference{Namespace: ns, Name: service}},
+				FailurePolicy: fpf(admissionv1.Fail),
+				Rules: []admissionv1.RuleWithOperations{{
+					Operations: []admissionv1.OperationType{admissionv1.Create, admissionv1.Update},
+					Rule: admissionv1.Rule{APIGroups: []string{"fence-agents-remediation.medik8s.io"},
+						APIVersions: []string{"v1alpha1"}, Resources: []string{"fenceagentsremediationtemplates"}},
+				}},
+			},
+			{
+				// The node-healthcheck boot entry (W20) — the NHC
+				// operator's webhook-validated CR, flips too.
+				Name:          "vnodehealthcheck.kb.io",
+				ClientConfig:  admissionv1.WebhookClientConfig{Service: &admissionv1.ServiceReference{Namespace: ns, Name: service}},
+				FailurePolicy: fpf(admissionv1.Fail),
+				Rules: []admissionv1.RuleWithOperations{{
+					Operations: []admissionv1.OperationType{admissionv1.Create, admissionv1.Update},
+					Rule: admissionv1.Rule{APIGroups: []string{"remediation.medik8s.io"},
+						APIVersions: []string{"v1alpha1"}, Resources: []string{"nodehealthchecks"}},
+				}},
+			},
+			{
 				// Non-medik8s group — foreign, untouched.
 				Name:          "vforeign.kb.io",
 				ClientConfig:  admissionv1.WebhookClientConfig{Service: &admissionv1.ServiceReference{Namespace: ns, Name: service}},
 				FailurePolicy: fpf(admissionv1.Fail),
 				Rules: []admissionv1.RuleWithOperations{{
 					Operations: []admissionv1.OperationType{admissionv1.Create},
-					Rule: admissionv1.Rule{APIGroups: []string{"fence-agents-remediation.medik8s.io"},
-						APIVersions: []string{"v1alpha1"}, Resources: []string{"fenceagentsremediationtemplates"}},
+					Rule: admissionv1.Rule{APIGroups: []string{"cert-manager.io"},
+						APIVersions: []string{"v1"}, Resources: []string{"certificates"}},
 				}},
 			},
 		},
@@ -136,6 +173,9 @@ func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 	want := map[string]admissionv1.FailurePolicyType{
 		"vselfnoderemediationconfig.kb.io":      admissionv1.Ignore,
 		"vselfnoderemediationtemplate.kb.io":    admissionv1.Ignore,
+		"vfenceagentsremediation.kb.io":         admissionv1.Ignore,
+		"vfenceagentsremediationtemplate.kb.io": admissionv1.Ignore,
+		"vnodehealthcheck.kb.io":                admissionv1.Ignore,
 		"vselfnoderemediation.kb.io":            admissionv1.Fail,
 		"vmixed.kb.io":                          admissionv1.Fail,
 		"vselfnoderemediationconfig.kb.io-open": admissionv1.Ignore,
@@ -167,8 +207,8 @@ func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 		if err := json.Unmarshal(pa.GetPatch(), &p); err != nil {
 			t.Fatalf("patch payload: %v", err)
 		}
-		if len(p.Webhooks) != 2 {
-			t.Fatalf("patch flips %d entries, want 2: %+v", len(p.Webhooks), p.Webhooks)
+		if len(p.Webhooks) != 5 {
+			t.Fatalf("patch flips %d entries, want 5: %+v", len(p.Webhooks), p.Webhooks)
 		}
 		names := map[string]bool{}
 		for _, e := range p.Webhooks {
@@ -177,7 +217,11 @@ func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 				t.Errorf("patch entry %s: policy %+v, want Ignore", e.Name, e.FailurePolicy)
 			}
 		}
-		for _, want := range []string{"vselfnoderemediationconfig.kb.io", "vselfnoderemediationtemplate.kb.io"} {
+		for _, want := range []string{
+			"vselfnoderemediationconfig.kb.io", "vselfnoderemediationtemplate.kb.io",
+			"vfenceagentsremediation.kb.io", "vfenceagentsremediationtemplate.kb.io",
+			"vnodehealthcheck.kb.io",
+		} {
 			if !names[want] {
 				t.Errorf("patch missing boot entry %s", want)
 			}
@@ -186,7 +230,11 @@ func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 	if patches != 1 {
 		t.Errorf("patch actions = %d, want 1", patches)
 	}
-	for _, w := range []string{"vselfnoderemediationconfig.kb.io", "vselfnoderemediationtemplate.kb.io"} {
+	for _, w := range []string{
+		"vselfnoderemediationconfig.kb.io", "vselfnoderemediationtemplate.kb.io",
+		"vfenceagentsremediation.kb.io", "vfenceagentsremediationtemplate.kb.io",
+		"vnodehealthcheck.kb.io",
+	} {
 		if got := testutil.ToFloat64(metrics.BootWebhookFailOpenTotal.WithLabelValues(cfg.Name, w)); got != 1 {
 			t.Errorf("failopen counter %s = %v, want 1 (metric only after patch landed)", w, got)
 		}

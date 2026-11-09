@@ -22,6 +22,10 @@ import (
 var linkerdBinaryPorts = map[int]bool{
 	3306: true, 5432: true, 6379: true, 27017: true, 9042: true,
 	4369: true, 25672: true, 7000: true, 7001: true, 9999: true,
+	// W20-NM1: server-speaks-first protocols the proxy cannot
+	// classify — NATS client/leaf ports and RabbitMQ AMQP — matching
+	// the static gate and VAP port tables 1:1.
+	4222: true, 5672: true, 6222: true,
 }
 
 // parsePortSet parses a linkerd port annotation

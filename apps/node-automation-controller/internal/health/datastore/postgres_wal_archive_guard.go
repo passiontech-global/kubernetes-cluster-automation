@@ -407,6 +407,28 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 			p.emitSlotBloat(&slotRep, &rep, s)
 		}
 	}
+	// W20-ST2 — the CNPG exporter's own spelling of the same
+	// signature: cnpg_pg_replication_slots_active==0 joined to high
+	// retained WAL catches the inactive slot even while WAL
+	// archiving still reports green (the retained_bytes{active=
+	// "false"} branch above only sees slots the exporter already
+	// marks inactive; this one catches the lag between the active
+	// gauge and the retained-bytes label). `and` returns the
+	// active==0 samples (value 0) — emitSlotBloat flags 1.
+	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
+		`(cnpg_pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
+			`(cnpg_pg_replication_slots_retained_bytes > %d or `+
+			`cnpg_pg_replication_slots_pg_wal_lsn_diff > %d)`,
+		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
+		log.Info("WARN: cnpg active-flag slot query failed — slot-bloat evidence incomplete",
+			"error", qerr)
+	} else {
+		for _, s := range series {
+			emit(s.Label("namespace"),
+				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
+			p.emitSlotBloat(&slotRep, &rep, s)
+		}
+	}
 	// Volume pressure: the data volume a postgres pod mounts above
 	// 60% is the pg_wal runaway we CAN see without exec — the WAL dir
 	// lives on that volume and no other signal reaches inside it.

@@ -237,6 +237,54 @@ func TestWebhookHeartbeatResourceExposedDetection(t *testing.T) {
 	}
 }
 
+// The heartbeat audit's namespaceSelector split is resource-aware:
+// a webhook whose selector already excludes every critical namespace
+// still flags on the cluster-scoped/every-namespace paths
+// (nodes/status — the selector is never consulted for it —
+// pods/eviction, wildcards) but stays silent on the namespaced hits
+// (pods/status, coordination leases).
+func TestWebhookHeartbeatClusterScopedBypassSelector(t *testing.T) {
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "heartbeat-scope-vwc"},
+		Webhooks: []admissionv1.ValidatingWebhook{
+			// Full exclusion, but nodes/status + pods/eviction + a
+			// wildcard — all unconditional.
+			cpValidatingHook("scoped-out.example.com", cpFullExclusion(), admissionv1.Fail,
+				[]string{"nodes/status", "pods/eviction"}),
+			// Same selector, namespaced resources only — silent.
+			cpValidatingHook("namespaced-only.example.com", cpFullExclusion(), admissionv1.Fail,
+				[]string{"pods/status"}),
+			// Coord-group leases under the full exclusion — silent.
+			func() admissionv1.ValidatingWebhook {
+				w := cpValidatingHook("leases-scoped-out.example.com",
+					cpFullExclusion(), admissionv1.Fail, nil)
+				w.Rules = []admissionv1.RuleWithOperations{cpCoordLeasesRule([]string{"leases"})}
+				return w
+			}(),
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""), upNamespace("meshed", "enabled"), vwc)
+	s, g := upGuard(cs)
+	s.Sweep(g.TakeSnapshot(ctx))
+	for _, res := range []string{"nodes/status", "pods/eviction"} {
+		if got := ptestutil.ToFloat64(metrics.WebhookHeartbeatResourceExposed.WithLabelValues(
+			guardstate.KindValidating, "heartbeat-scope-vwc",
+			"scoped-out.example.com", res)); got != 1 {
+			t.Fatalf("cluster-scoped %s under full exclusion = %v, want 1", res, got)
+		}
+	}
+	for _, tc := range []struct{ wh, res string }{
+		{"namespaced-only.example.com", "pods/status"},
+		{"leases-scoped-out.example.com", "leases"},
+	} {
+		if got := ptestutil.ToFloat64(metrics.WebhookHeartbeatResourceExposed.WithLabelValues(
+			guardstate.KindValidating, "heartbeat-scope-vwc", tc.wh, tc.res)); got != 0 {
+			t.Fatalf("namespaced %s/%s under full exclusion = %v, want 0", tc.wh, tc.res, got)
+		}
+	}
+}
+
 // The auto-patch (WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED): off (default)
 // touches nothing; on, it
 // injects the four-namespace NotIn into every flagged fail-closed

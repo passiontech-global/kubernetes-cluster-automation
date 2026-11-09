@@ -50,6 +50,20 @@ var (
 // tcpStateListen is the st column of /proc/net/tcp(6) rows in LISTEN.
 const tcpStateListen = "0A"
 
+// W20-CP2 stuck-connection states on the same st column:
+// FIN_WAIT2 (05) — we closed, the peer never ACKed our FIN;
+// CLOSE_WAIT (08) — the peer closed, the local app never did.
+// Either held open against the DB port is an orphaned connection
+// the pool count alone cannot distinguish from a live one.
+const (
+	tcpStateFinWait2  = "05"
+	tcpStateCloseWait = "08"
+	// kineRetransmitStuck is the retrnsmt column floor that reads
+	// as "retransmitting abnormally" — occasional loss retries sit
+	// at 1-2; a socket past 3 has stopped making progress.
+	kineRetransmitStuck = 3
+)
+
 // PoolCheck is the kine->DB connection-spiral backstop as a
 // Check — it keeps no in-memory state: the spiral streak lives in
 // consecutive-kine-pool (the cross-process shell contract).
@@ -72,6 +86,20 @@ func (c *PoolCheck) Run(_ context.Context) {
 	dbPort := c.kineDBPort(kpid)
 	conns := c.kineDBConns(kpid, dbPort)
 	c.d.KineConns.Set(float64(conns))
+	// W20-CP2 — the conn COUNT stays under the cap while individual
+	// sockets rot: CLOSE_WAIT/FIN_WAIT2 rows are connections the
+	// peer already closed that kine never reaped, and a climbing
+	// retrnsmt counter is a socket retransmitting into a dead
+	// PgBouncer/Postgres. Count them on the same inode∩port scan
+	// and surface the stuck set on its own gauge + suspect line —
+	// early warning before the orphans starve the pool.
+	stuck := c.kineStuckConns(kpid, dbPort)
+	c.d.KineStuckConns.Set(float64(stuck))
+	if stuck > 0 {
+		c.d.State.SuspectLog(cdeps.StateKinePoolRunaway, fmt.Sprintf(
+			"suspect: kine db conns stuck — %d socket(s) CLOSE_WAIT/FIN_WAIT2 or retransmitting (kine->pgbouncer/postgres orphaned-conn signature)",
+			stuck), c.d.Cfg.SuspectLogCadence)
+	}
 
 	if conns <= c.d.Cfg.KinePool.MaxConns {
 		c.d.State.ResetCounter(cdeps.FileCtrPool)
@@ -209,15 +237,81 @@ func connsToPortLine(line string, dbPort int, inodes map[string]bool) bool {
 	if f[3] == tcpStateListen {
 		return false
 	}
-	// rem_address is hex "0100007F:1538".
-	rem := f[2]
-	j := strings.LastIndexByte(rem, ':')
-	if j < 0 {
-		return false
-	}
-	port, err := strconv.ParseUint(rem[j+1:], 16, 16)
-	if err != nil || int(port) != dbPort {
+	port, ok := tcpRemotePort(f)
+	if !ok || port != dbPort {
 		return false
 	}
 	return inodes[f[9]]
+}
+
+// tcpRemotePort parses the remote port out of a /proc/net/tcp(6)
+// row's fields — rem_address is hex "0100007F:1538".
+func tcpRemotePort(f []string) (int, bool) {
+	rem := f[2]
+	j := strings.LastIndexByte(rem, ':')
+	if j < 0 {
+		return 0, false
+	}
+	port, err := strconv.ParseUint(rem[j+1:], 16, 16)
+	if err != nil {
+		return 0, false
+	}
+	return int(port), true
+}
+
+// kineStuckConns is the W20-CP2 half of kineDBConns: the same
+// inode∩remote-port scan, counting only the rows whose TCP state
+// or retransmit counter says the connection is orphaned —
+// CLOSE_WAIT/FIN_WAIT2 (the peer is gone, kine never noticed) or a
+// retrnsmt count past kineRetransmitStuck (the socket is
+// retransmitting into a dead endpoint).
+func (c *PoolCheck) kineStuckConns(pid, dbPort int) int {
+	inodes := c.socketInodes(pid)
+	if len(inodes) == 0 {
+		return 0
+	}
+	n := 0
+	for _, f := range []string{"net/tcp", "net/tcp6"} {
+		fp, err := os.Open(c.d.Proc.File(pid, f))
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(fp)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		header := true
+		for sc.Scan() {
+			if header {
+				header = false
+				continue
+			}
+			if stuckConnLine(sc.Text(), dbPort, inodes) {
+				n++
+			}
+		}
+		_ = fp.Close()
+	}
+	return n
+}
+
+// stuckConnLine is the W20-CP2 row classifier: remote port is
+// dbPort, inode belongs to the watched process, and the row shows
+// an orphaned connection — FIN_WAIT2/CLOSE_WAIT state or a
+// retrnsmt counter past the stuck floor.
+func stuckConnLine(line string, dbPort int, inodes map[string]bool) bool {
+	f := strings.Fields(line)
+	if len(f) < 10 {
+		return false
+	}
+	if f[3] == tcpStateListen {
+		return false
+	}
+	port, ok := tcpRemotePort(f)
+	if !ok || port != dbPort || !inodes[f[9]] {
+		return false
+	}
+	if f[3] == tcpStateFinWait2 || f[3] == tcpStateCloseWait {
+		return true
+	}
+	retr, err := strconv.Atoi(f[6])
+	return err == nil && retr > kineRetransmitStuck
 }

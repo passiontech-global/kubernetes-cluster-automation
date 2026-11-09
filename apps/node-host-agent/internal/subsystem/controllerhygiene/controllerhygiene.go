@@ -198,6 +198,12 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Name: "node_host_agent_controllerhygiene_kine_db_conns",
 		Help: "Kine process TCP connections to the datastore port.",
 	})
+	d.KineStuckConns = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_kine_stuck_conns",
+		Help: "Kine process DB-port sockets wedged in CLOSE_WAIT/" +
+			"FIN_WAIT2 or retransmitting (W20-CP2 orphaned-conn " +
+			"signature).",
+	})
 	d.OOMWindow = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_oom_kills_window",
 		Help: "memcg OOM kills inside the sliding window.",
@@ -245,7 +251,8 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 
 	h := &Hygiene{Deps: d}
 	if err := subframe.RegisterAll(reg,
-		d.Cycles, d.Actions, d.RVGap, d.KineConns, d.OOMWindow, d.Feeding,
+		d.Cycles, d.Actions, d.RVGap, d.KineConns, d.KineStuckConns,
+		d.OOMWindow, d.Feeding,
 		d.EtcdDBSize, d.EtcdDBUse, d.EtcdNospace,
 		d.TerminatedWatchers, d.EtcdSnapAge, d.KonnReadyBackends); err != nil {
 		return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)

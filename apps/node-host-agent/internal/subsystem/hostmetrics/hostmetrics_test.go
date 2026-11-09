@@ -229,9 +229,9 @@ func TestDescribe(t *testing.T) {
 	//   search_restarts/invalid counters).
 	// + 1 mountinfo desc (mountinfo entries count).
 	// + 3 aio-pressure AIO descs (aio allocated/maximum/used_ratio in the
-	//   filefd domain).
-	if got := len(ch); got != 75 {
-		t.Fatalf("Describe emitted %d descs want 75", got)
+	//   filefd domain) + 1 max_user_namespaces desc (W20-KR2).
+	if got := len(ch); got != 76 {
+		t.Fatalf("Describe emitted %d descs want 76", got)
 	}
 }
 

@@ -44,8 +44,8 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		}
 		seen[op.name] = true
 	}
-	if len(operatorTargets) != 25 {
-		t.Fatalf("operatorTargets = %d, want 25", len(operatorTargets))
+	if len(operatorTargets) != 29 {
+		t.Fatalf("operatorTargets = %d, want 29", len(operatorTargets))
 	}
 	for _, want := range []string{
 		"source-controller", "cert-manager",
@@ -60,6 +60,9 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		"tekton-pipelines-controller", "shipwright-operator",
 		// rollout-scale-flap additions.
 		"argo-rollouts-controller", "cloudflare-tunnel-gateway-controller",
+		// W20-CP4 operator-watchdog additions.
+		"cloudnative-pg", "velero", "fence-agents-remediation-operator",
+		"liqo-controller-manager",
 	} {
 		if !seen[want] {
 			t.Fatalf("missing operator target %q", want)

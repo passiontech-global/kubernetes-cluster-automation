@@ -79,6 +79,10 @@ var (
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
 	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
+	// W20-ST3 — podvolumerestores.velero.io: the restore-side twin
+	// of the PVB wedge audit; a restore held InProgress past 6h with
+	// a dead node-agent thread is the same lost-thread signature.
+	veleroPVRGVR = kube.GVVeleroPodVolumeRestore
 	// backup-health — backuprepositories.velero.io: the restic/kopia repo
 	// each BSL's snapshots land in; its phase and maintenance clock
 	// say whether a restore can actually read them.
@@ -231,6 +235,8 @@ type veleroBackupAuditor struct {
 	// velero-inflight-audit in-flight gauges — same prune-on-resolve contract.
 	seenStuckBackup state.GaugeLedger[pausedKey]
 	seenWedgedPVB   state.GaugeLedger[pausedKey]
+	// seenWedgedPVR is the W20-ST3 restore-side twin of seenWedgedPVB.
+	seenWedgedPVR state.GaugeLedger[pausedKey]
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.

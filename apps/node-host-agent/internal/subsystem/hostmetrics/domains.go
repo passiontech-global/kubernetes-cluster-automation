@@ -201,6 +201,8 @@ var domainTable = []domainEntry{
 				"aio-max-nr — AIO table limit."},
 			{descAIORatio, "node_host_agent_aio_used_ratio",
 				"aio-nr / aio-max-nr."},
+			{descMaxUserNS, "node_host_agent_max_user_namespaces",
+				"user.max_user_namespaces — userns creation ceiling."},
 		}},
 	{name: "sockstat",
 		emit: (*Collector).collectSockstat,
