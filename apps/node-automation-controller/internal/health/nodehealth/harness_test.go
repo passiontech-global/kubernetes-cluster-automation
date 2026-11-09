@@ -28,6 +28,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewKedaScaledObjectGuardCheck,
 	NewControllerLeaseGuardCheck,
 	NewNodeConditionSweeperCheck,
+	NewAPIServerRelistStormCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

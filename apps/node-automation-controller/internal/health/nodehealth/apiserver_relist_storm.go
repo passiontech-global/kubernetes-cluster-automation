@@ -167,12 +167,10 @@ func (p *apiserverRelistStormCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := client + "/" + resource
 		rep.Emit(apiserverRelistStormGauge, key, []string{client, resource}, key)
-		rep.Find(key)
 		emitted = true
 	}
 	if !emitted {
 		rep.Emit(apiserverRelistStormGauge, "-/-", []string{"-", "-"}, "-")
-		rep.Find("-")
 	}
 
 	p.emitRelistStormEvent(ctx, log, top, now)
@@ -265,6 +263,11 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		log.Info("WARN: relist storm cronjob list failed", "error", err)
 		return
 	}
+	// The pass ran — stamp the relief cooldown so the next storm
+	// sweep skips the list+mutex re-check for the window (the
+	// comment on relistStormReliefCooldown promises exactly this;
+	// an unstamped key would re-run every sweep).
+	p.Heals.Stamp(ck, now)
 	for i := range cjs {
 		cj := &cjs[i]
 		if cj.Annotations[kube.AnnoRelistStormSuspend] != "true" ||
@@ -274,10 +277,10 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		}
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":true},"metadata":{"annotations":{%q:%q}}}`,
-			"/"+kube.AnnoRelistStormSuspendedBy,
+			kube.AnnoRelistStormSuspendedBy,
 			now.Format(time.RFC3339)))
 		if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).Patch(ctx,
-			cj.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			cj.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			metrics.IncError(CheckNameAPIServerRelistStorm)
 			log.Error(err, "relist storm cronjob suspend failed",
 				"cronjob", cj.Namespace+"/"+cj.Name)
@@ -310,9 +313,9 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 		}
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":false},"metadata":{"annotations":{%q:null}}}`,
-			"/"+kube.AnnoRelistStormSuspendedBy))
+			kube.AnnoRelistStormSuspendedBy))
 		if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).Patch(ctx,
-			cj.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			cj.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			metrics.IncError(CheckNameAPIServerRelistStorm)
 			log.Error(err, "relist storm cronjob restore failed",
 				"cronjob", cj.Namespace+"/"+cj.Name)
