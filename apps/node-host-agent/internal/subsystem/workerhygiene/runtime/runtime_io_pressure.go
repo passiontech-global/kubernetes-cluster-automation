@@ -186,20 +186,14 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	cur := parseDiskstats(data)
 	util, await, maxAwait := 0.0, 0.0, 0.0
-	// dIO is the fleet-wide completed-I/O delta (reads+writes) and
-	// inflightMax the deepest block queue — both feed the W20-KR3
-	// inflight-freeze detector below. They only mean anything once a
-	// previous snapshot exists.
-	var dIO, inflightMax uint64
+	// freezeDisks counts the per-disk W20-KR3 inflight-freeze votes —
+	// it only means anything once a previous snapshot exists.
+	var freezeDisks int
+	var freezeInflight uint64
 	var dtMs float64
 	var hadPrev bool
 	if c.lastDisk != nil {
 		hadPrev = true
-		for _, s := range cur {
-			if s.inflight > inflightMax {
-				inflightMax = s.inflight
-			}
-		}
 		dtMs = float64(now.Sub(c.lastTime).Milliseconds())
 		if dtMs > 0 {
 			var dWr, dWrMs uint64
@@ -210,11 +204,30 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 				if !ok || s.ioTicks < prev.ioTicks {
 					continue
 				}
+				var dDiskIO uint64
 				if s.rdIOS >= prev.rdIOS {
-					dIO += s.rdIOS - prev.rdIOS
+					dDiskIO += s.rdIOS - prev.rdIOS
 				}
 				if s.wrIOS >= prev.wrIOS {
-					dIO += s.wrIOS - prev.wrIOS
+					dDiskIO += s.wrIOS - prev.wrIOS
+				}
+				// W20-KR3 per-disk freeze vote: THIS disk has
+				// requests inflight and completed ZERO of them
+				// since the last snapshot — a wedged spindle or
+				// hung controller. Evaluated per device, NOT on
+				// the fleet-wide dIO: on a two-disk node (OS on
+				// sda, data on sdb) one healthy disk completing
+				// a single IO would mask a frozen sibling
+				// forever. A wrapped ios counter makes the
+				// delta unknowable — that disk abstains rather
+				// than voting on invented data.
+				countersOK := s.rdIOS >= prev.rdIOS &&
+					s.wrIOS >= prev.wrIOS
+				if countersOK && s.inflight > 0 && dDiskIO == 0 {
+					freezeDisks++
+					if s.inflight > freezeInflight {
+						freezeInflight = s.inflight
+					}
 				}
 				if u := float64(s.ioTicks-prev.ioTicks) / dtMs; u > util {
 					util = u
@@ -269,12 +282,13 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// mass-reboot the fleet).
 	slowCond := maxAwait > diskWriteAwaitHighMs && psiOK &&
 		avg60 >= ioPSIFullHigh
-	// W20-KR3 inflight freeze: ios-in-progress >0 while ZERO I/O
-	// completed fleet-wide means the block queue is wedged — requests
-	// sit inflight forever (dead spindle, hung SCSI/SAS path, frozen
-	// device-mapper leg). PSI/diskstats-avg conditions above catch a
-	// slow disk; this catches a DEAD one that never reports await.
-	freezeCond := hadPrev && dtMs > 0 && inflightMax > 0 && dIO == 0
+	// W20-KR3 inflight freeze: a whole disk holding ios-in-progress
+	// >0 while completing ZERO I/Os since the last snapshot means
+	// the block queue is wedged — requests sit inflight forever
+	// (dead spindle, hung SCSI/SAS path, frozen device-mapper leg).
+	// PSI/diskstats-avg conditions above catch a slow disk; this
+	// catches a DEAD one that never reports await.
+	freezeCond := hadPrev && dtMs > 0 && freezeDisks > 0
 	if slowCond {
 		c.diskSlowFails++
 	} else {
@@ -298,13 +312,13 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	if c.inflightFreezeFails >= diskSlowIOConsecNeeded {
 		c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
-			"inflight=%d ios_delta=0 fails=%d",
-			inflightMax, c.inflightFreezeFails))
+			"frozen_disks=%d inflight=%d fails=%d",
+			freezeDisks, freezeInflight, c.inflightFreezeFails))
 		latched = true
 	} else if freezeCond {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: disk-inflight-freeze inflight=%d ios_delta=0 (check %d/%d)",
-			inflightMax, c.inflightFreezeFails, diskSlowIOConsecNeeded))
+			"suspect: disk-inflight-freeze frozen_disks=%d inflight=%d ios_delta=0 (check %d/%d)",
+			freezeDisks, freezeInflight, c.inflightFreezeFails, diskSlowIOConsecNeeded))
 	}
 	// The latch clears only when BOTH detectors' streaks have reset —
 	// a freeze must not be masked by the slow-IO path going quiet.

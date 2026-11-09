@@ -65,13 +65,9 @@ package deschedulerstormgate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
-	"slices"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -250,60 +246,20 @@ func Setup(d shared.Deps) error {
 	})
 }
 
+// Reconcile runs one storm-gate sweep: collect the node-local and
+// cluster-wide storm evidence, then — unless the deployment is
+// absent or a manual hold is set — scale kube-system/descheduler
+// to match the verdict. Evidence collection lives in
+// descheduler_storm_signals.go; the verdict/scale act in
+// descheduler_storm_act.go.
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: 5 * time.Minute}
-
-	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
-	}
-	if len(nodes) == 0 {
-		// An empty-but-successful node list is an apiserver/RBAC
-		// flap, never a real cluster — without this gate the scan
-		// below yields a "clear" verdict and scales the descheduler
-		// back up on blind data (same fail-closed posture as the
-		// statefulset-ondelete-roller's nodesSafe check).
-		return ctrl.Result{}, errors.New("empty node list (API flap) — refusing to compute a verdict")
-	}
-
-	var notReady, bad, tainted, cordoned []string
 	now := r.now.Now()
-	for i := range nodes {
-		n := &nodes[i]
-		if !kube.NodeReady(n) {
-			notReady = append(notReady, n.Name)
-		}
-		// Only an ACTIVE cordon is a storm signal — a node statically
-		// cordoned past the cordon window is deliberate state, and
-		// counting it would pin the descheduler at 0 forever.
-		if kube.NodeActivelyCordoned(n, now) {
-			cordoned = append(cordoned, n.Name)
-		}
-		for _, c := range n.Status.Conditions {
-			if c.Status != corev1.ConditionTrue ||
-				!slices.Contains(stormConds, c.Type) {
-				continue
-			}
-			// A nodereporter-owned True with a frozen or absent
-			// heartbeat is a zombie — the wedged reporter cannot
-			// vouch for the condition anymore, so it must not hold
-			// the descheduler at 0 forever. Kubelet-native storm
-			// conditions (MemoryPressure/DiskPressure/
-			// NetworkUnavailable/InodePressure) and the foreign
-			// CiliumLRPDegraded spelling are not agent-managed and
-			// keep gating on status alone.
-			if nodecond.AgentHeartbeatManaged(string(c.Type)) &&
-				!kube.CondHeartbeatLive(&c, stormCondHeartbeatMaxAge, now) {
-				continue
-			}
-			bad = append(bad, n.Name+" "+string(c.Type))
-		}
-		for _, t := range n.Spec.Taints {
-			if slices.Contains(stormTaints, t.Key) {
-				tainted = append(tainted, n.Name+" "+t.Key)
-			}
-		}
+
+	ev, err := r.nodeStormSignals(ctx, now)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// The deployment-exists check runs BEFORE the maintenance mutex:
@@ -339,136 +295,24 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	}
 
 	// 2.7 maintenance mutex (signals b + c — signal a is the
-	// `cordoned` list above): deliberate maintenance gates the
-	// descheduler exactly like a storm does.
+	// `cordoned` list inside nodeStormSignals): deliberate
+	// maintenance gates the descheduler exactly like a storm does.
 	maintenance, err := r.maintenanceEvidence(ctx)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	ev.maintenance = maintenance
 
-	// preemption-cascade-signal storm signal (d): a PriorityClass preemption cascade
-	// — a domino wave of reason=Preempted events — gates the
-	// descheduler so its own evictions do not amplify the storm.
-	// The read happens AFTER the deployment-exists skip so a
-	// cluster without descheduler never pays for (or fails on)
-	// the events scan; a list error aborts the reconcile — never a
-	// "clear" verdict on blind data.
-	var preempted []string
-	preemptedCount, err := kube.CountRecentEvents(ctx, r.cs,
-		kube.PreemptedEventReason, stormPreemptionWindow, now)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("list preempted events: %w", err)
-	}
-	if preemptedCount > stormPreemptionMax {
-		preempted = append(preempted, fmt.Sprintf(
-			"%d Preempted events in %s (>%d)",
-			preemptedCount, stormPreemptionWindow, stormPreemptionMax))
+	// The cluster-wide storm reads run AFTER the deployment-exists
+	// skip so a cluster without descheduler never pays for (or fails
+	// on) them; a list error aborts the reconcile — never a "clear"
+	// verdict on blind data.
+	if err := r.clusterStormSignals(ctx, now, ev); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// image-pull-storm-gate storm signal (e): a cluster-wide image-pull storm —
-	// enough pods stuck in ImagePullBackOff/ErrImagePull that
-	// rescheduling would just spread unrunnable pods onto more
-	// nodes. Same fail-closed posture as the events scan above: a
-	// pod-list error aborts the reconcile, never a "clear" verdict
-	// on blind data. The read happens after the deployment-exists
-	// skip so a cluster without descheduler never pays for it.
-	stallPods, stallNamespaces, err := kube.CountImagePullStalledPods(ctx, r.cs)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf(
-			"list pods (image-pull storm census): %w", err)
-	}
-	var imagePull []string
-	if stallPods >= stormImagePullMinPods ||
-		stallNamespaces >= stormImagePullMinNamespaces {
-		imagePull = append(imagePull, fmt.Sprintf(
-			"image-pull-stall: %d pods in %d namespaces stuck on ImagePullBackOff/ErrImagePull",
-			stallPods, stallNamespaces))
-	}
-
-	want := int32(1)
-	verdict := "clear"
-	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 ||
-		len(cordoned) > 0 || len(maintenance) > 0 || len(preempted) > 0 ||
-		len(imagePull) > 0 {
-		want, verdict = 0, "storm"
-	}
-
-	if deploy.Annotations[stormGateHoldAnno] == "true" {
-		// maintenance-hold-stale: a hold kept "true" past the stale window is a
-		// forgotten one — one MaintenanceHoldStale Warning per
-		// episode. Runs before the early return so the hold path
-		// never scales but still audibly complains.
-		r.checkHoldStale(ctx, deploy, now, log)
-		log.Info("storm-gate HOLD (annotation "+stormGateHoldAnno+
-			") - verdict computed but not scaling", "verdict", verdict)
-		return res, nil
-	}
-
-	// Hold released (or never held) — drop the persisted first-seen
-	// stamp and the emitted-once marker so the NEXT hold re-arms the
-	// full stale window. A failed clear is Warn-logged, never
-	// returned: the annotation would only make a future warning
-	// arrive early, never hold the descheduler.
-	if err := heal.ClearPersistedFirstSeen(ctx, log, &r.holdSeen, deploy,
-		kube.AnnoFirstSeenStormGateHold, stormHoldLedgerKey,
-		r.deployAnnoPatch()); err != nil {
-		log.Info("WARN: storm-gate hold first-seen clear failed — "+
-			"a stale stamp could warn early on the next hold",
-			"error", err)
-	}
-	r.holdWarned.Forget(stormHoldLedgerKey)
-
-	cur := int32(-1)
-	curStr := ""
-	if deploy.Spec.Replicas != nil {
-		cur = *deploy.Spec.Replicas
-		curStr = strconv.Itoa(int(cur))
-	}
-	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s] imagepull=[%s]",
-		r.now.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
-		strings.Join(notReady, "\n"), strings.Join(bad, "\n"),
-		strings.Join(tainted, "\n"), strings.Join(cordoned, "\n"),
-		strings.Join(maintenance, "\n"), strings.Join(preempted, "\n"),
-		strings.Join(imagePull, "\n"))
-
-	switch {
-	case cur != want:
-		log.Info("storm-gate: scaling replicas",
-			"verdict", verdict, "from", curStr, "to", want,
-			"notReady", notReady, "bad", bad, "tainted", tainted,
-			"cordoned", cordoned, "maintenance", maintenance,
-			"preempted", preempted, "imagePull", imagePull)
-		// One merge patch carries spec.replicas AND the decision
-		// annotation — two back-to-back merge patches on the same
-		// Deployment would pay two API writes for one logical act.
-		// Merge-patch only (never a full-object Update): a cached
-		// Get races any concurrent spec edit (HPA, gitops) and
-		// would clobber it or fail on resourceVersion.
-		patch, err := json.Marshal(map[string]any{
-			"spec": map[string]any{"replicas": want},
-			"metadata": map[string]any{"annotations": map[string]string{
-				stormGateDecisionAnno: decision,
-			}},
-		})
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("marshal replicas patch: %w", err)
-		}
-		if _, err := r.cs.AppsV1().Deployments("kube-system").
-			Patch(ctx, "descheduler", types.MergePatchType, patch,
-				metav1.PatchOptions{}); err != nil {
-			return ctrl.Result{}, fmt.Errorf(
-				"scale deployment kube-system/descheduler to %d replicas: %w",
-				want, err)
-		}
-	case deploy.Annotations[stormGateDecisionAnno] == "":
-		// Replicas already right but no decision recorded yet —
-		// annotate anyway so the verdict is auditable (bash elif).
-		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			return ctrl.Result{}, err
-		}
-	default:
-		log.Info("storm-gate: nothing to do",
-			"verdict", verdict, "replicas", want)
+	if err := r.applyVerdict(ctx, deploy, ev, now, log); err != nil {
+		return ctrl.Result{}, err
 	}
 	return res, nil
 }

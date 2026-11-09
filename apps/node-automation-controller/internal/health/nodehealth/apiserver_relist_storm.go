@@ -52,11 +52,19 @@ type apiserverRelistStormCheck struct {
 	// eventHealed is the in-RAM half of the Event dedupe cooldown —
 	// a storm emits ONE cluster event per window, not one per sweep.
 	eventHealed state.CooldownSet
+	// restoreDue/suspended gate restoreSuspendedCronJobs: without
+	// them every non-storm sweep would LIST every CronJob
+	// cluster-wide just to discover nothing is stamped. restoreDue
+	// starts true so a controller restart still finds CronJobs a
+	// previous process suspended; suspended flips on the first
+	// successful relief patch and re-arms the restore pass.
+	restoreDue bool
+	suspended  bool
 }
 
 // NewAPIServerRelistStormCheck builds the apiserver-relist-storm-breaker check.
 func NewAPIServerRelistStormCheck(d *probefw.Deps) probefw.Check {
-	return &apiserverRelistStormCheck{Deps: d}
+	return &apiserverRelistStormCheck{Deps: d, restoreDue: true}
 }
 
 const (
@@ -136,7 +144,11 @@ func (p *apiserverRelistStormCheck) Run(ctx context.Context) probefw.Result {
 		sumSamples(p99) > relistStormListP99Seconds
 	if !storm {
 		p.seen.Forget("storm")
-		p.restoreSuspendedCronJobs(ctx, log, now)
+		if (p.restoreDue || p.suspended) &&
+			p.restoreSuspendedCronJobs(ctx, log, now) {
+			p.restoreDue = false
+			p.suspended = false
+		}
 		return rep.Result(&p.emitted, apiserverRelistStormGauge.DeleteLabelValues,
 			"apiserver relist storm: ", ", ")
 	}
@@ -270,8 +282,12 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 	p.Heals.Stamp(ck, now)
 	for i := range cjs {
 		cj := &cjs[i]
+		// spec.suspend is a *bool — nil means "not suspended" (the
+		// API default), so the skip must test the pointed-to value,
+		// not nil-ness: `Suspend == nil || *Suspend` skipped EVERY
+		// CronJob that never declared suspend explicitly.
 		if cj.Annotations[kube.AnnoRelistStormSuspend] != "true" ||
-			cj.Spec.Suspend == nil || *cj.Spec.Suspend ||
+			(cj.Spec.Suspend != nil && *cj.Spec.Suspend) ||
 			cj.Annotations[kube.AnnoRelistStormSuspendedBy] != "" {
 			continue
 		}
@@ -288,15 +304,19 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		}
 		log.Info("ACTION: suspended cronjob for relist-storm relief",
 			"cronjob", cj.Namespace+"/"+cj.Name)
+		p.suspended = true
 	}
 }
 
 // restoreSuspendedCronJobs unsuspends every CronJob carrying the
 // check's own AnnoRelistStormSuspendedBy stamp — the storm cleared,
 // so the relief window ends. Objects suspended by anyone else (no
-// stamp) are left alone by construction.
+// stamp) are left alone by construction. Returns true only when the
+// pass completed cleanly — a failed list or patch keeps the caller's
+// restoreDue/suspended flags armed so the next sweep retries instead
+// of stranding stamped CronJobs suspended forever.
 func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context,
-	log logr.Logger, now time.Time) {
+	log logr.Logger, now time.Time) bool {
 
 	cjs, err := kube.ListAll(ctx, metav1.ListOptions{
 		Limit: kube.DefaultListPageSize,
@@ -304,8 +324,9 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 	if err != nil {
 		metrics.IncError(CheckNameAPIServerRelistStorm)
 		log.Info("WARN: relist storm cronjob restore list failed", "error", err)
-		return
+		return false
 	}
+	ok := true
 	for i := range cjs {
 		cj := &cjs[i]
 		if cj.Annotations[kube.AnnoRelistStormSuspendedBy] == "" {
@@ -319,9 +340,11 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 			metrics.IncError(CheckNameAPIServerRelistStorm)
 			log.Error(err, "relist storm cronjob restore failed",
 				"cronjob", cj.Namespace+"/"+cj.Name)
+			ok = false
 			continue
 		}
 		log.Info("ACTION: restored cronjob after relist-storm relief",
 			"cronjob", cj.Namespace+"/"+cj.Name)
 	}
+	return ok
 }

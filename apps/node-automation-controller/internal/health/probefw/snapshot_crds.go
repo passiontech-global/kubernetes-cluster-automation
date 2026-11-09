@@ -80,3 +80,19 @@ func (d *Deps) AllUnstructured(ctx context.Context,
 	}
 	return read.items, read.err
 }
+
+// AllUnstructuredFirst is AllUnstructured's first-serving-GVR
+// variant for CRDs that ship multiple served versions (HelmRelease
+// v2+v2beta2): candidates are tried in order through the same
+// per-sweep memoizer — each GVR's LIST is still paid at most once
+// per cycle — and the first success wins. The error contract is
+// kube.ListFirstGVR's verbatim: NotFound/NoMatch marks "not served",
+// a real failure is preferred over benign misses when nothing
+// lists, so the caller can tell "CRD absent" (IsNotFound /
+// IsNoMatchError on the result → Pass) from "API broken" (Infra).
+func (d *Deps) AllUnstructuredFirst(ctx context.Context,
+	gvrs []schema.GroupVersionResource) ([]unstructured.Unstructured,
+	schema.GroupVersionResource, error) {
+
+	return kube.ListFirstGVR(ctx, gvrs, d.AllUnstructured)
+}

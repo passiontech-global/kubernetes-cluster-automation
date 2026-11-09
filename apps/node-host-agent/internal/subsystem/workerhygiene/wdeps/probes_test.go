@@ -1,8 +1,9 @@
 // probes_test.go — the production defaults behind the newer probe
 // seams (in-package: they are unexported): the deleted-fd stat over
-// /proc/self/fd magic links, the TCP half of the :53 DNS probe
-// against a loopback fake, and the bearer-authenticated kubelet
-// /metrics GET against an httptest server.
+// /proc/self/fd magic links, the TCP :53 DNS probe (probee.
+// DNSQueryTCP — the DNSProbeTCP seam default) against a loopback
+// fake, and the bearer-authenticated kubelet /metrics GET against
+// an httptest server.
 package wdeps
 
 import (
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"time"
 )
 
@@ -146,20 +149,20 @@ func dnsTCPServer(t *testing.T, replyQR bool, replyLen int, delay time.Duration)
 func TestTcpDNSQuery(t *testing.T) {
 	name := "kubernetes.default.svc.cluster.local."
 	addr := dnsTCPServer(t, true, 4, 0)
-	if !tcpDNSQuery(addr, name, 2*time.Second) {
+	if !probee.DNSQueryTCP(addr, name, 2*time.Second) {
 		t.Fatal("well-formed reply read as wedged")
 	}
 
 	// QR bit clear — a request echo is not an answer.
-	if tcpDNSQuery(dnsTCPServer(t, false, 4, 0), name, 2*time.Second) {
+	if probee.DNSQueryTCP(dnsTCPServer(t, false, 4, 0), name, 2*time.Second) {
 		t.Fatal("QR-clear reply counted as alive")
 	}
 	// Short reply (rlen < 4) — unreadable, not alive.
-	if tcpDNSQuery(dnsTCPServer(t, true, 3, 0), name, 2*time.Second) {
+	if probee.DNSQueryTCP(dnsTCPServer(t, true, 3, 0), name, 2*time.Second) {
 		t.Fatal("3-byte reply counted as alive")
 	}
 	// Silence past the deadline — the wedged TCP listener.
-	if tcpDNSQuery(dnsTCPServer(t, true, -1, time.Second), name, 100*time.Millisecond) {
+	if probee.DNSQueryTCP(dnsTCPServer(t, true, -1, time.Second), name, 100*time.Millisecond) {
 		t.Fatal("silent listener counted as alive")
 	}
 	// Connection refused — nothing listens.
@@ -171,7 +174,7 @@ func TestTcpDNSQuery(t *testing.T) {
 	if err := dead.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if tcpDNSQuery(deadAddr, name, 2*time.Second) {
+	if probee.DNSQueryTCP(deadAddr, name, 2*time.Second) {
 		t.Fatal("closed port counted as alive")
 	}
 }

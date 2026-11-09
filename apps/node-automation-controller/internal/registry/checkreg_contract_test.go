@@ -151,7 +151,8 @@ func TestSetupModulesCheckRegGate(t *testing.T) {
 	}
 	var got []shared.CheckReg
 	spy := shared.Module{
-		Name: "checkreg-spy",
+		Name:              "checkreg-spy",
+		ConsumesCheckRegs: true,
 		Setup: func(d shared.Deps) error {
 			got = d.CheckRegs
 			return nil
@@ -179,6 +180,25 @@ func TestSetupModulesCheckRegGate(t *testing.T) {
 		}
 		if len(got) != 1 || got[0].Name != "spy-check" {
 			t.Fatalf("CheckRegs = %+v, want exactly the spy-check reg", got)
+		}
+	})
+
+	t.Run("non-consumer rows get a nil roster", func(t *testing.T) {
+		t.Setenv("TEST_CHECKREG_GATE", "true")
+		var plain []shared.CheckReg
+		plainSpy := shared.Module{
+			Name: "plain-spy",
+			Setup: func(d shared.Deps) error {
+				plain = d.CheckRegs
+				return nil
+			},
+		}
+		m := testutil.NewStubManager()
+		if err := SetupModules(testDeps(m), []shared.Module{checkRow, spy, plainSpy}); err != nil {
+			t.Fatalf("SetupModules: %v", err)
+		}
+		if plain != nil {
+			t.Fatalf("non-consumer CheckRegs = %+v, want nil", plain)
 		}
 	})
 }

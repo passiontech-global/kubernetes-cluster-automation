@@ -103,28 +103,17 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	}
 	now := p.Now()
 
-	// Find the served HelmRelease version — try v2 then v2beta2. The
-	// snapshot memoizes each GVR's RAW error, so a v2 NoMatch falls
-	// through to v2beta2 and both lists are paid once per sweep.
-	var gvr schema.GroupVersionResource
-	var hrs []unstructured.Unstructured
-	var listErr error
-	for _, g := range helmReleaseRetryGVRs {
-		l, err := p.AllUnstructured(ctx, g)
-		if err == nil {
-			gvr, hrs = g, l
-			break
+	// Find the served HelmRelease version — v2 then v2beta2 through
+	// the sweep-memoized reader: each GVR's LIST is paid at most once
+	// per cycle, a v2 NoMatch falls through to v2beta2, and a real
+	// API failure is preferred over benign misses (kube.ListFirstGVR
+	// semantics via probefw.AllUnstructuredFirst).
+	hrs, gvr, err := p.AllUnstructuredFirst(ctx, helmReleaseRetryGVRs)
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return probefw.Result{Pass: true} // CRD not installed
 		}
-		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
-			listErr = err
-		}
-	}
-	if hrs == nil {
-		if listErr != nil {
-			return probefw.Result{Infra: fmt.Errorf(
-				"list helmreleases: %w", listErr)}
-		}
-		return probefw.Result{Pass: true} // CRD not installed
+		return probefw.Result{Infra: fmt.Errorf("list helmreleases: %w", err)}
 	}
 
 	var stuck []string

@@ -91,11 +91,23 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		if !changed {
 			continue
 		}
-		if _, err := p.Dyn.Resource(olmCSVGVR).
-			Namespace(csv.GetNamespace()).Update(ctx, csv,
-			metav1.UpdateOptions{}); err != nil {
+		// Patch (not Update): the controller's RBAC on
+		// clusterserviceversions is get/list/patch — an Update call
+		// would 403 every sweep. A merge patch carrying the WHOLE
+		// mutated spec is equivalent here because the unstructured
+		// object already holds the complete spec — nothing is
+		// invented or dropped.
+		spec, _ := csv.Object["spec"].(map[string]any)
+		patch, err := json.Marshal(map[string]any{"spec": spec})
+		if err != nil {
 			metrics.IncError(p.Name)
-			log.Error(err, "olm csv auto-patch update failed",
+			continue
+		}
+		if _, err := p.Dyn.Resource(olmCSVGVR).
+			Namespace(csv.GetNamespace()).Patch(ctx, csv.GetName(),
+			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "olm csv auto-patch failed",
 				"csv", csv.GetNamespace()+"/"+csv.GetName())
 			continue
 		}
@@ -140,6 +152,15 @@ func ensureArgocdOperatorProbes(obj map[string]any) bool {
 				changed = true
 			}
 		}
+		// NestedSlice returns a DEEP COPY — mutations on dep/ctr
+		// above live only inside `deployments`. Write the slice
+		// back or the patch payload below ships the unmutated spec.
+		_ = unstructured.SetNestedSlice(dep, containers,
+			"spec", "template", "spec", "containers")
+	}
+	if changed {
+		_ = unstructured.SetNestedSlice(obj, deployments,
+			"spec", "install", "spec", "deployments")
 	}
 	return changed
 }
@@ -173,12 +194,32 @@ func ensureLivenessInitialDelay(ctr map[string]any) bool {
 	if !ok {
 		return false
 	}
-	delay, _ := lp["initialDelaySeconds"].(float64)
-	if int64(delay) >= olmLivenessMinInitialDelay {
+	delay, ok := unstructuredNumber(lp["initialDelaySeconds"])
+	if ok && delay >= float64(olmLivenessMinInitialDelay) {
 		return false
 	}
 	lp["initialDelaySeconds"] = olmLivenessMinInitialDelay
 	return true
+}
+
+// unstructuredNumber reads a JSON number out of an unstructured
+// field. The dynamic client's decoder preserves integers as int64 —
+// a bare .(float64) assertion silently fails on them, which made
+// every already-patched CSV look unpatched and PATCH-looped the API
+// server every sweep.
+func unstructuredNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return float64(n), true
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // stripManagerLeaderElect removes --leader-elect /
@@ -212,19 +253,30 @@ func stripManagerLeaderElect(obj map[string]any) bool {
 			if !ok {
 				continue
 			}
-			kept := args[:0]
+			kept := make([]any, 0, len(args))
+			stripped := false
 			for _, a := range args {
 				if s, ok := a.(string); ok &&
 					(s == "--leader-elect" || s == "--leader-elect=true") {
-					changed = true
+					stripped = true
 					continue
 				}
 				kept = append(kept, a)
 			}
-			if changed {
+			if stripped {
+				changed = true
 				ctr["args"] = kept
 			}
 		}
+		// Same NestedSlice deep-copy contract as
+		// ensureArgocdOperatorProbes — write containers back into
+		// dep, then dep back into obj below.
+		_ = unstructured.SetNestedSlice(dep, containers,
+			"spec", "template", "spec", "containers")
+	}
+	if changed {
+		_ = unstructured.SetNestedSlice(obj, deployments,
+			"spec", "install", "spec", "deployments")
 	}
 	return changed
 }

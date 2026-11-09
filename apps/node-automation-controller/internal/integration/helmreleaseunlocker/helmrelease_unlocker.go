@@ -379,21 +379,19 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 }
 
 // listHelmReleases returns the HR list and the GVR that answered — v2
-// first, v2beta2 when the v2 CRDs are absent. Pages at
-// kube.DefaultListPageSize: HRs are unbounded cluster-wide and each item
-// embeds values/crds hooks — a single shot List of a large fleet is
-// a heap spike.
+// first, v2beta2 when the v2 CRDs are absent. The fallback loop and
+// its benign/real error split are kube.ListFirstGVR's; HRs are
+// unbounded cluster-wide and each item embeds values/crds hooks — a
+// single shot List of a large fleet is a heap spike, so the shared
+// helper pages at kube.DefaultListPageSize.
 func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
-	var lastErr error
-	for _, gvr := range helmReleaseGVRs {
-		list, err := u.listAllPages(ctx, u.dyn.Resource(gvr))
-		if err == nil {
-			return list, gvr, nil
-		}
-		lastErr = err
+	list, gvr, err := kube.ListFirstUnstructured(ctx, u.dyn, helmReleaseGVRs,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	if err != nil {
+		return nil, schema.GroupVersionResource{},
+			fmt.Errorf("list helmreleases (all known GVRs failed): %w", err)
 	}
-	return nil, schema.GroupVersionResource{},
-		fmt.Errorf("list helmreleases (all known GVRs failed): %w", lastErr)
+	return list, gvr, nil
 }
 
 // listAllPages walks ListOptions.Continue until the apiserver stops

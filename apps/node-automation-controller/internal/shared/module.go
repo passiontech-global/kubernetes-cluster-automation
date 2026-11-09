@@ -49,14 +49,20 @@ package shared
 //     SetupModules collects the enabled rows' CheckRegs into
 //     Deps.CheckRegs for the sweep to consume; rows with CheckReg
 //     have Setup == nil and are never Setup-called.
+//   - ConsumesCheckRegs marks the ONE row whose Setup reads
+//     Deps.CheckRegs (today: cluster-health-probes). SetupModules
+//     stamps the collected roster only on rows carrying it — every
+//     other module's Deps.CheckRegs stays nil so the roster cannot
+//     be mistaken for a general-purpose dep.
 type Module struct {
-	Name         string
-	Group        string
-	GateEnv      string
-	DefaultOn    bool
-	ProbeClients bool
-	Setup        func(Deps) error
-	CheckReg     *CheckReg
+	Name              string
+	Group             string
+	GateEnv           string
+	DefaultOn         bool
+	ProbeClients      bool
+	ConsumesCheckRegs bool
+	Setup             func(Deps) error
+	CheckReg          *CheckReg
 }
 
 // CheckReg is one health-sweep check contribution — what a

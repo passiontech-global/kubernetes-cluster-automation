@@ -16,22 +16,16 @@ package datastore
 
 import (
 	"context"
-	"fmt"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/sync/errgroup"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -157,34 +151,27 @@ func natsLogReason(line string) string {
 	return ""
 }
 
-// checkNatsJetstreamHealth runs the nats-jetstream-health sweep: StatefulSet
-// discovery (absence tolerated — no NATS on this cluster is a clean
-// pass), then Prometheus for the disabled/meta-leaderless/ack-floor
-// signatures, then the Running-member log scan. Prometheus-derived
-// findings emit immediately (the metric IS the state); log markers
-// carry no timestamp so the 10m first-seen window IS their
-// persistence clock. A pod-local wedge past the window bounces the
-// member under the >=2-Ready-siblings quorum guard.
+// checkNatsJetstreamHealth runs the nats-jetstream-health sweep:
+// StatefulSet discovery (absence tolerated — no NATS on this
+// cluster is a clean pass), then Prometheus for the
+// disabled/meta-leaderless/ack-floor signatures, then the
+// Running-member log scan. Prometheus-derived findings emit
+// immediately (the metric IS the state); log markers carry no
+// timestamp so the 10m first-seen window IS their persistence
+// clock. A pod-local wedge past the window bounces the member
+// under the >=2-Ready-siblings quorum guard. The sweep is collect
+// (nats_jetstream_collect.go) → signals (nats_jetstream_signals.go)
+// → heal (nats_jetstream_heals.go); Run below is only the
+// orchestration.
 func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	// Discover the NATS StatefulSets — the app.kubernetes.io/name=nats
-	// label is the canonical helm marker. Absence means no NATS
-	// deployed: tolerate, pass clean, and (importantly) never pay
-	// the pods List on clusters without it. The snapshot returns the
-	// cluster-wide list; the label filter applies client-side.
-	allSTS, err := p.AllStatefulSets(ctx)
+	census, err := collectNATS(ctx, p.Deps)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list nats statefulsets: %w", err)}
+		return probefw.Result{Infra: err}
 	}
-	var stss []appsv1.StatefulSet
-	for i := range allSTS {
-		if allSTS[i].Labels["app.kubernetes.io/name"] == natsAppLabelValue {
-			stss = append(stss, allSTS[i])
-		}
-	}
-	if len(stss) == 0 {
+	if census == nil {
 		// No NATS on this cluster — still reconcile the ledgers: a
 		// tuple emitted while NATS existed (or a removed deployment
 		// that left wedge evidence behind) must DeleteLabelValues,
@@ -195,387 +182,17 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Result(&p.emitted, natsJetstreamUnhealthyGauge.DeleteLabelValues,
 			"nats jetstream wedge signatures: ", ", ")
 	}
-	natsNamespaces := map[string]bool{}
-	for i := range stss {
-		natsNamespaces[stss[i].Namespace] = true
-	}
-
-	// Member pods: the same canonical label, one cluster-wide read
-	// serving the log scan, the prom pod mapping and the quorum
-	// census. A list failure on a populated cluster is Infra — the
-	// census cannot be proven.
-	pods, err := p.PodsMatching(ctx, metav1.NamespaceAll,
-		"app.kubernetes.io/name="+natsAppLabelValue)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list nats pods: %w", err)}
-	}
-	memberByName := map[string]*corev1.Pod{} // "ns/name"
-	memberByShort := map[string]*corev1.Pod{}
-	readyBySTS := map[string]int{} // "ns/stsName" -> Running+Ready members
-	for i := range pods {
-		pod := pods[i]
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
-		memberByName[pod.Namespace+"/"+pod.Name] = pod
-		if memberByShort[pod.Name] == nil {
-			memberByShort[pod.Name] = pod
-		}
-		if probefw.PodRunningReady(pod) {
-			readyBySTS[natsSTSKey(pod)]++
-		}
-	}
-	resolvePod := func(ns, name string) *corev1.Pod {
-		if ns != "" {
-			return memberByName[ns+"/"+name]
-		}
-		return memberByShort[name] // series without a namespace label
-	}
 
 	var rep probefw.SweepReport
-	// podReasons is the union of wedge reasons observed per member
-	// pod; emitNow marks the Prometheus-derived subset — those emit
-	// this sweep, while log-only markers wait out the first-seen
-	// window before they count.
-	podReasons := map[string]map[string]bool{}
-	emitNow := map[string]map[string]bool{}
-	addReason := func(key, reason string, now bool) {
-		if podReasons[key] == nil {
-			podReasons[key] = map[string]bool{}
-		}
-		podReasons[key][reason] = true
-		if now {
-			if emitNow[key] == nil {
-				emitNow[key] = map[string]bool{}
-			}
-			emitNow[key][reason] = true
-		}
-	}
-
-	// Prometheus signatures — skipped entirely when no endpoint
-	// resolves (same "no endpoint configured, skip" gate the other
-	// metrics-backed checks use).
+	s := newNatsSweep(p, log, now, census, &rep)
 	if _, err := p.PromEndpoint(); err == nil {
-		p.natsPromSignals(ctx, log, resolvePod, natsNamespaces, &rep, addReason)
+		s.promSignals(ctx)
 	}
-
-	// Log-marker scan on Running members old enough for their
-	// JetStream startup to have settled — a fetch/read failure is
-	// inconclusive, not healthy (warn + skip). The fetches run
-	// through a bounded worker pool (max natsLogScanWorkers
-	// concurrent kubelet log streams); results apply serially below.
-	type logScan struct {
-		key    string
-		reason string
-		err    error
-	}
-	scanKeys := make([]string, 0, len(memberByName))
-	for key, pod := range memberByName {
-		if pod.Status.Phase != corev1.PodRunning ||
-			now.Sub(pod.CreationTimestamp.Time) < natsLogScanMinPodAge {
-			continue
-		}
-		scanKeys = append(scanKeys, key)
-	}
-	sort.Strings(scanKeys)
-	scans := make([]logScan, len(scanKeys))
-	g := errgroup.Group{}
-	g.SetLimit(natsLogScanWorkers)
-	for j, key := range scanKeys {
-		pod := memberByName[key]
-		g.Go(func() error {
-			reason := ""
-			hit, lerr := probefw.PodLogTail(ctx, p.CS, pod, "",
-				probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-				func(line string) bool {
-					if r := natsLogReason(line); r != "" {
-						reason = r // the first marker wins
-						return true
-					}
-					return false
-				})
-			if lerr == nil && !hit {
-				reason = "" // clean tail — no marker
-			}
-			scans[j] = logScan{key: key, reason: reason, err: lerr}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	for _, s := range scans {
-		if s.err != nil {
-			log.Info("WARN: nats pod log tail failed — wedge evidence inconclusive",
-				"pod", s.key, "error", s.err)
-			continue
-		}
-		if s.reason != "" {
-			addReason(s.key, s.reason, false)
-		}
-	}
-
-	// Per-reason persistence: every observed (pod,reason) shares the
-	// 10m first-seen clock — JetStream startup churn and Raft
-	// elections flap through these states on every rollout.
-	seenKeep := map[string]bool{}
-	past := map[string]map[string]bool{} // key -> reason -> window lapsed
-	for key, rs := range podReasons {
-		for r := range rs {
-			seenKey := key + "/" + r
-			seenKeep[seenKey] = true
-			if probefw.Persisted(&p.seen, seenKey, now, natsWedgeMinAge, log) {
-				if past[key] == nil {
-					past[key] = map[string]bool{}
-				}
-				past[key][r] = true
-			}
-		}
-	}
-	p.seen.Prune(func(k string) bool { return seenKeep[k] })
-
-	// Emit pod-local findings: a Prometheus-sourced reason reports
-	// now; a log-only reason reports once its window lapses.
-	for key, rs := range podReasons {
-		pod := memberByName[key]
-		var live []string
-		for r := range rs {
-			if emitNow[key][r] || past[key][r] {
-				live = append(live, r)
-			}
-		}
-		if len(live) == 0 {
-			continue
-		}
-		sort.Strings(live)
-		reason := strings.Join(live, "+")
-		rep.Emit(natsJetstreamUnhealthyGauge, key+"/"+reason,
-			[]string{pod.Namespace, pod.Name, reason},
-			key+"("+reason+")")
-	}
-
-	// Quorum-safe bounce: a wedged member may still report Ready
-	// (the gray-failure shape), so the sibling count self-discounts
-	// — >=2 OTHER Ready members of the SAME StatefulSet or the
-	// delete could drop the cluster under Raft quorum. At most ONE
-	// member is bounced per cycle even when several qualify — a
-	// fleet-wide wedge must heal one member at a time so a bad
-	// verdict can never halve the cluster in a single pass. The
-	// key sort makes WHICH member goes first deterministic — map
-	// order would bounce a random one, and the ledger stamp going
-	// from missing/stale to `now` is how a DELIVERED delete reads
-	// (DeletePodHeal swallows cooldown/mutex/delete failures).
-	healed := false
-	bounceKeys := make([]string, 0, len(podReasons))
-	for key := range podReasons {
-		bounceKeys = append(bounceKeys, key)
-	}
-	sort.Strings(bounceKeys)
-	for _, key := range bounceKeys {
-		rs := podReasons[key]
-		pod := memberByName[key]
-		healable := false
-		for r := range rs {
-			if natsHealableReasons[r] && past[key][r] {
-				healable = true
-				break
-			}
-		}
-		if !healable || healed {
-			continue
-		}
-		other := readyBySTS[natsSTSKey(pod)]
-		if probefw.PodRunningReady(pod) {
-			other--
-		}
-		if other < 2 {
-			log.Info("skip nats jetstream heal: fewer than 2 other Ready "+
-				"members — a delete would break Raft quorum",
-				"pod", key, "otherReady", other)
-			continue
-		}
-		// The heal cooldown keys on the pod's CONTROLLER
-		// (kube.PodControllerKey), not the pod name — the wedge
-		// evidence (the Prom series and the seen ledger) outlives the
-		// pod, so a member recreated under a fresh name must read as
-		// the SAME heal target or the 30m window never applies and
-		// the member bounces again on the very next sweep (same
-		// controller-keyed shape dragonfly_replica_sync_storm keys
-		// its restarts on). The pod-name key still decides WHICH
-		// member goes first, and the >=2-Ready-siblings quorum census
-		// stays grouped per StatefulSet.
-		ck := kube.PodControllerKey(pod)
-		hk := probefw.SelfHealKey(CheckNameNatsJetstreamHealth, ck)
-		before, _ := p.Heals.Last(hk)
-		p.DeletePodHeal(ctx, log, CheckNameNatsJetstreamHealth,
-			ck, pod, natsHealCool, now)
-		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
-			healed = true
-		}
-	}
+	s.logScan(ctx)
+	s.applyPersistence()
+	s.emitPodFindings()
+	s.bounceWedged(ctx)
 
 	return rep.Result(&p.emitted, natsJetstreamUnhealthyGauge.DeleteLabelValues,
 		"nats jetstream wedge signatures: ", ", ")
-}
-
-// natsPromSignals runs the three Prometheus wedges: a member running
-// with JetStream disabled (pod-local — joins the windowed/healable
-// reason set), a namespace whose meta-group is leaderless
-// (namespace-scope, pod label left empty — no single culprit), and a
-// consumer pinned at its ack-floor (consumption stall — the member
-// bounce cannot move it). Each query's failure only disables its own
-// signal — a Prometheus outage must not blind the pod paths.
-func (p *natsJetstreamHealthCheck) natsPromSignals(ctx context.Context,
-	log logr.Logger, resolvePod func(ns, name string) *corev1.Pod,
-	natsNamespaces map[string]bool, rep *probefw.SweepReport,
-	addReason func(key, reason string, emitNow bool)) {
-
-	// (a) JetStream disabled on a RUNNING member — the binary is up,
-	// core NATS serves, JetStream never came online.
-	if disabled, err := p.PromQuery(ctx,
-		`nats_jetstream_server_jetstream_disabled > 0`); err != nil {
-		log.Info("WARN: nats jetstream-disabled query failed — signal skipped",
-			"error", err)
-	} else {
-		for _, s := range disabled {
-			podName := s.Label("pod", "pod_name")
-			pod := resolvePod(s.Label("namespace"), podName)
-			if pod == nil || pod.DeletionTimestamp != nil {
-				continue // stale series or a non-member — not ours
-			}
-			addReason(pod.Namespace+"/"+pod.Name,
-				natsReasonJetStreamDisabled, true)
-		}
-	}
-
-	// (b) Leaderless meta-group: count>0 of the per-pod
-	// nats_jetstream_meta_leader while the namespace sum is 0 —
-	// diffed client-side across two instant queries (the literal
-	// `and` form never matches: a ==0 comparison produces an empty
-	// vector on the leader side, and PromQL `and` intersects it
-	// away).
-	counts, errC := p.PromQuery(ctx,
-		`count by (namespace) (nats_jetstream_meta_leader)`)
-	sums, errS := p.PromQuery(ctx,
-		`sum by (namespace) (nats_jetstream_meta_leader)`)
-	if errC != nil || errS != nil {
-		log.Info("WARN: nats meta-leader queries failed — leaderless signal skipped",
-			"countErr", errC, "sumErr", errS)
-	} else {
-		sumByNS := map[string]float64{}
-		for _, s := range sums {
-			sumByNS[s.Label("namespace")] = s.Value
-		}
-		for _, s := range counts {
-			ns := s.Label("namespace")
-			if ns == "" || !natsNamespaces[ns] || s.Value <= 0 {
-				continue
-			}
-			if sumByNS[ns] != 0 {
-				continue // a meta leader exists — healthy
-			}
-			rep.Emit(natsJetstreamUnhealthyGauge,
-				ns+"/"+natsReasonMetaLeaderless,
-				[]string{ns, "", natsReasonMetaLeaderless},
-				ns+"(meta_leaderless: "+
-					fmt.Sprintf("%.0f members report no leader)", s.Value))
-		}
-	}
-
-	// (b2) stream-leaderless — stream leader loss: members publish the
-	// per-stream nats_jetstream_stream_leader gauge; a namespace
-	// whose series exist but sum to 0 has lost the leader of every
-	// tracked stream group. Diffed client-side across the same two
-	// instant queries as the meta check (the literal `and` form
-	// never matches: a ==0 comparison produces an empty vector on
-	// the leader side, and PromQL `and` intersects it away).
-	// Pod-resolvable findings join the windowed/healable pod-local
-	// path (bounce only under the >=2-Ready-siblings quorum guard);
-	// series whose pod cannot be resolved emit at namespace scope —
-	// a namespace-scope Raft verdict has no single culprit pod.
-	streamCounts, errSC := p.PromQuery(ctx,
-		`nats_jetstream_stream_leader`)
-	streamSums, errSS := p.PromQuery(ctx,
-		`sum by (namespace) (nats_jetstream_stream_leader)`)
-	if errSC != nil || errSS != nil {
-		log.Info("WARN: nats stream-leader queries failed — stream-leaderless signal skipped",
-			"countErr", errSC, "sumErr", errSS)
-	} else {
-		sumByNS := map[string]float64{}
-		for _, s := range streamSums {
-			sumByNS[s.Label("namespace")] = s.Value
-		}
-		podsByNS := map[string][]string{}
-		for _, s := range streamCounts {
-			ns := s.Label("namespace")
-			if ns == "" {
-				continue
-			}
-			if _, seen := podsByNS[ns]; !seen {
-				podsByNS[ns] = nil // registered even without pod labels
-			}
-			if pod := s.Label("pod", "pod_name"); pod != "" {
-				podsByNS[ns] = append(podsByNS[ns], pod)
-			}
-		}
-		for ns, podNames := range podsByNS {
-			if !natsNamespaces[ns] || sumByNS[ns] != 0 {
-				continue // a stream leader exists — healthy, or not a NATS namespace
-			}
-			resolved := false
-			for _, podName := range podNames {
-				pod := resolvePod(ns, podName)
-				if pod == nil || pod.DeletionTimestamp != nil {
-					continue // stale series or a non-member — not ours
-				}
-				addReason(pod.Namespace+"/"+pod.Name,
-					natsReasonStreamLeaderless, true)
-				resolved = true
-			}
-			if !resolved {
-				rep.Emit(natsJetstreamUnhealthyGauge,
-					ns+"/"+natsReasonStreamLeaderless,
-					[]string{ns, "", natsReasonStreamLeaderless},
-					fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, sum 0)",
-						ns, len(podNames)))
-			}
-		}
-	}
-
-	// positive max_ack_pending — every consumer flow-control stops
-	// while nothing crashes. Joined client-side on the consumer
-	// identity labels both counters share.
-	pending, errP := p.PromQuery(ctx, `nats_consumer_num_ack_pending`)
-	maxPend, errM := p.PromQuery(ctx, `nats_consumer_max_ack_pending`)
-	if errP != nil || errM != nil {
-		log.Info("WARN: nats consumer ack-floor queries failed — signal skipped",
-			"pendingErr", errP, "maxErr", errM)
-		return
-	}
-	maxByKey := map[string]float64{}
-	for _, s := range maxPend {
-		maxByKey[s.Label("namespace")+"/"+s.Label("pod", "pod_name")+"/"+
-			s.Label("nats_stream_name", "stream_name", "stream")+"/"+
-			s.Label("nats_consumer_name", "consumer_name", "consumer")] = s.Value
-	}
-	for _, s := range pending {
-		key := s.Label("namespace") + "/" + s.Label("pod", "pod_name") + "/" +
-			s.Label("nats_stream_name", "stream_name", "stream") + "/" +
-			s.Label("nats_consumer_name", "consumer_name", "consumer")
-		max := maxByKey[key]
-		if max <= 0 || s.Value < max {
-			continue
-		}
-		ns := s.Label("namespace")
-		podName := s.Label("pod", "pod_name")
-		pod := resolvePod(ns, podName)
-		lvPod := ""
-		if pod != nil {
-			lvPod, ns = pod.Name, pod.Namespace
-		}
-		consumer := s.Label("nats_consumer_name", "consumer_name", "consumer")
-		rep.Emit(natsJetstreamUnhealthyGauge,
-			ns+"/"+lvPod+"/"+natsReasonConsumerAckFloor,
-			[]string{ns, lvPod, natsReasonConsumerAckFloor},
-			fmt.Sprintf("%s(%s consumer=%s ack_floor=%.0f/%.0f)",
-				ns, lvPod, consumer, s.Value, max))
-	}
 }

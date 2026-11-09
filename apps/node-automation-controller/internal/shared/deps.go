@@ -40,8 +40,9 @@ import (
 //     registry.SetupModules collected from the ENABLED CheckReg
 //     module rows, in registry order — that order IS the sweep
 //     order (a gated-off or unselected row contributes nothing).
-//     SetupModules stamps the same slice on every row's Deps; only
-//     the cluster-health-probes sweep consumes it. Nil in
+//     SetupModules stamps the same slice only on rows marked
+//     Module.ConsumesCheckRegs (the cluster-health-probes sweep);
+//     every other module's CheckRegs stays nil. Nil in
 //     literally-constructed test Deps.
 //   - ProbeCS/ProbeDyn are the latency-sensitive probe clients (own
 //     client-go rate limiter — see cmd/manager main.go). SetupModules

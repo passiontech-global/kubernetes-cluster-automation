@@ -3,8 +3,9 @@
 // contributes one check into this sweep's roster rather than
 // registering runnables of its own. registry.SetupModules collects
 // the ENABLED, SELECTED rows' registrations into Deps.CheckRegs
-// (stamped on every module's Deps, in registry order — which IS the
-// sweep order) and appendCheckRegs folds them into the prober's
+// (in registry order — which IS the sweep order) and stamps them
+// only on rows marked Module.ConsumesCheckRegs — this sweep is the
+// sole consumer — and appendCheckRegs folds them into the prober's
 // check list. There is no second roster: Deps.CheckRegs is the
 // whole thing.
 //

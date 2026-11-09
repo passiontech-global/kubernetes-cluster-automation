@@ -12,8 +12,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
@@ -49,6 +51,126 @@ func TestListAllUnstructuredPagesAndRewraps(t *testing.T) {
 	if list, err = ListAllUnstructured(context.Background(),
 		dyn.Resource(gvr), metav1.ListOptions{}); err == nil || list != nil {
 		t.Fatalf("failed list = (%v, %v), want (nil, error)", list, err)
+	}
+}
+
+// TestListFirstGVR walks the candidate-GVR fallback contract: first
+// success wins with its GVR, benign NotFound/NoMatch misses are
+// skipped, a real error beats benign misses when nothing lists, and
+// an empty candidate set is a caller bug.
+func TestListFirstGVR(t *testing.T) {
+	gvrA := schema.GroupVersionResource{Group: "x.io", Version: "v1", Resource: "foos"}
+	gvrB := schema.GroupVersionResource{Group: "x.io", Version: "v1beta1", Resource: "foos"}
+	benign := apierrors.NewNotFound(schema.GroupResource{Group: "x.io", Resource: "foos"}, "")
+	real := apierrors.NewForbidden(schema.GroupResource{Group: "x.io", Resource: "foos"}, "", errors.New("rbac"))
+
+	t.Run("first candidate answers", func(t *testing.T) {
+		items, gvr, err := ListFirstGVR(context.Background(),
+			[]schema.GroupVersionResource{gvrA, gvrB},
+			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
+				if g != gvrA {
+					t.Fatalf("listed %v, want first candidate %v", g, gvrA)
+				}
+				return "items-a", nil
+			})
+		if err != nil || items != "items-a" || gvr != gvrA {
+			t.Fatalf("ListFirstGVR = (%q, %v, %v), want (items-a, %v, nil)",
+				items, gvr, err, gvrA)
+		}
+	})
+
+	t.Run("benign miss falls through to next GVR", func(t *testing.T) {
+		items, gvr, err := ListFirstGVR(context.Background(),
+			[]schema.GroupVersionResource{gvrA, gvrB},
+			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
+				if g == gvrA {
+					return "", benign
+				}
+				return "items-b", nil
+			})
+		if err != nil || items != "items-b" || gvr != gvrB {
+			t.Fatalf("ListFirstGVR = (%q, %v, %v), want (items-b, %v, nil)",
+				items, gvr, err, gvrB)
+		}
+	})
+
+	t.Run("real error still falls through — later success wins", func(t *testing.T) {
+		items, gvr, err := ListFirstGVR(context.Background(),
+			[]schema.GroupVersionResource{gvrA, gvrB},
+			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
+				if g == gvrA {
+					return "", real
+				}
+				return "items-b", nil
+			})
+		if err != nil || items != "items-b" || gvr != gvrB {
+			t.Fatalf("ListFirstGVR = (%q, %v, %v), want (items-b, %v, nil)",
+				items, gvr, err, gvrB)
+		}
+	})
+
+	t.Run("all benign returns the first benign error", func(t *testing.T) {
+		_, _, err := ListFirstGVR(context.Background(),
+			[]schema.GroupVersionResource{gvrA, gvrB},
+			func(context.Context, schema.GroupVersionResource) (string, error) {
+				return "", benign
+			})
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("ListFirstGVR err = %v, want NotFound", err)
+		}
+	})
+
+	t.Run("real error beats benign misses", func(t *testing.T) {
+		_, _, err := ListFirstGVR(context.Background(),
+			[]schema.GroupVersionResource{gvrA, gvrB},
+			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
+				if g == gvrA {
+					return "", benign
+				}
+				return "", real
+			})
+		if !apierrors.IsForbidden(err) {
+			t.Fatalf("ListFirstGVR err = %v, want Forbidden", err)
+		}
+	})
+
+	t.Run("empty candidates is a caller bug", func(t *testing.T) {
+		if _, _, err := ListFirstGVR(context.Background(),
+			nil, func(context.Context, schema.GroupVersionResource) (string, error) {
+				return "", nil
+			}); err == nil {
+			t.Fatal("ListFirstGVR with no candidates returned nil error")
+		}
+	})
+}
+
+// TestListFirstUnstructured exercises the dyn-bound convenience
+// wrapper end to end: a candidate whose LIST the apiserver 404s is
+// skipped and the next registered GVR answers.
+func TestListFirstUnstructured(t *testing.T) {
+	dyn := testhelp.NewDynamicClient(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "a"}},
+	)
+	// secrets is registered in the fake's list-kind table; the
+	// reactor makes its LIST answer NotFound — the "not served"
+	// shape a v1beta1-fallback probe sees on a cluster without the
+	// older API.
+	dyn.PrependReactor("list", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				corev1.Resource("secrets"), "")
+		})
+	gvrA := corev1.SchemeGroupVersion.WithResource("secrets")
+	gvrB := corev1.SchemeGroupVersion.WithResource("namespaces")
+
+	list, gvr, err := ListFirstUnstructured(context.Background(), dyn,
+		[]schema.GroupVersionResource{gvrA, gvrB}, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("ListFirstUnstructured: %v", err)
+	}
+	if gvr != gvrB || len(list.Items) != 1 {
+		t.Fatalf("ListFirstUnstructured = (gvr %v, %d items), want (%v, 1)",
+			gvr, len(list.Items), gvrB)
 	}
 }
 

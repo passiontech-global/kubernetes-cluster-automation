@@ -19,11 +19,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -258,7 +254,8 @@ func postgresClusterOf(pod *corev1.Pod) string {
 // node_automation_postgres_wal_archive_unhealthy. Nothing is healed:
 // archive repair needs pgbackrest/slot surgery that must stay an
 // operator decision; the check's job is making the stall visible
-// before the volume actually fills.
+// before the volume actually fills. Evidence collection lives in
+// postgres_wal_archive_guard_scan.go.
 func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	if r := p.RequireDyn("postgres wal archive guard"); r != nil {
 		return *r
@@ -266,191 +263,24 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	type finding struct {
-		ns, cluster, reason string
-	}
 	var rep probefw.SweepReport
-	findings := map[string]finding{}
-	emit := func(ns, cluster, reason string) {
-		if cluster == "" {
-			cluster = "-"
-		}
-		findings[ns+"/"+cluster+"/"+reason] = finding{ns, cluster, reason}
-	}
+	s := newWALGuardSweep(p, log, now, &rep)
 
 	// (a) CR conditions — the operator's own archive/backup verdicts.
-	var cnpgClusters []*unstructured.Unstructured
-	for _, rk := range postgresCRKinds {
-		items, err := p.AllUnstructured(ctx, rk.gvr)
-		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-			continue
-		case err != nil:
-			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.gvr.Resource, err)}
-		}
-		for i := range items {
-			cr := &items[i]
-			// cnpg-health — CNPG clusters get the dedicated cluster-health
-			// pass below on top of the archive-condition scan.
-			if rk.gvr == kube.GVRCNPGCluster {
-				cnpgClusters = append(cnpgClusters, cr)
-			}
-			for _, c := range kube.Conditions(cr.Object, "status", "conditions") {
-				if pgWALConditionUnhealthy(c, now) {
-					emit(cr.GetNamespace(), cr.GetName(), "archive_condition")
-				}
-			}
-		}
+	cnpgClusters, err := s.scanCRConditions(ctx)
+	if err != nil {
+		return probefw.Result{Infra: err}
 	}
 
 	// (b) pod logs — crash/stall evidence the CR status cannot see.
-	// The fetches run through a bounded worker pool (max
-	// postgresWALLogWorkers concurrent kubelet log streams) so a
-	// fleet of postgres pods cannot stampede the apiserver's log
-	// proxy; the results are applied serially below.
-	pods, err := p.AllPods(ctx)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
-	}
-	pgPVCs := map[string]string{} // "ns/pvc" -> owning operator cluster
-	var scanIdx []int
-	for i := range pods {
-		pod := &pods[i]
-		cluster := postgresClusterOf(pod)
-		if cluster == "" {
-			continue
-		}
-		for _, v := range pod.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil &&
-				pgPVCs[pod.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] == "" {
-				pgPVCs[pod.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] = cluster
-			}
-		}
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded {
-			continue
-		}
-		scanIdx = append(scanIdx, i)
-	}
-	type logScan struct {
-		reason string
-		err    error
-	}
-	scans := make([]logScan, len(scanIdx))
-	g := errgroup.Group{}
-	g.SetLimit(postgresWALLogWorkers)
-	for j, i := range scanIdx {
-		pod := pods[i]
-		g.Go(func() error {
-			reason, lerr := p.pgWALLogHit(ctx, &pod)
-			scans[j] = logScan{reason: reason, err: lerr}
-			return nil // tolerated sub-failure — applied below
-		})
-	}
-	_ = g.Wait()
-	for j, i := range scanIdx {
-		pod := &pods[i]
-		key := pod.Namespace + "/" + pod.Name
-		if scans[j].err != nil {
-			log.Info("WARN: postgres log fetch failed — WAL signature inconclusive",
-				"pod", key, "error", scans[j].err)
-			continue
-		}
-		if scans[j].reason != "" {
-			emit(pod.Namespace, postgresClusterOf(pod), scans[j].reason)
-		}
+	if err := s.scanPodLogs(ctx); err != nil {
+		return probefw.Result{Infra: err}
 	}
 
 	// (c) Prometheus — archiver failure counters and retained slot
 	// WAL; a dead Prometheus is inconclusive (http-content-check owns
 	// liveness), never a false FAIL.
-	if series, qerr := p.PromQuery(ctx,
-		`(increase(pg_stat_archiver_failed_count[30m]) > 0) or `+
-			`(increase(cnpg_pg_stat_archiver_failed_count[30m]) > 0)`); qerr != nil {
-		log.Info("WARN: pg_stat_archiver query failed — archiver evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, s := range series {
-			emit(s.Label("namespace"),
-				s.Label("cluster", "postgres_cluster", "pod"), "archiver_failing")
-		}
-	}
-	var slotRep probefw.SweepReport
-	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
-		`(pg_replication_slots_retained_bytes{active="false"} > %d) or `+
-			`(cnpg_pg_replication_slots_retained_bytes{active="false"} > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		log.Info("WARN: replication slot query failed — slot evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, s := range series {
-			emit(s.Label("namespace"),
-				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			p.emitSlotBloat(&slotRep, &rep, s)
-		}
-	}
-	// percona-degraded-quorum — the postgres_exporter spelling of the same
-	// signature: the active flag and the retained-bytes diff live on
-	// separate series joined by the slot labels. `and` returns the
-	// active==0 samples themselves (value 0) — the bloat gauge
-	// flags 1 since this exporter family can't give a byte count.
-	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
-		`(pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
-			`(pg_replication_slots_pg_wal_lsn_diff > %d or `+
-			`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		log.Info("WARN: active-flag slot query failed — slot-bloat evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, s := range series {
-			emit(s.Label("namespace"),
-				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			p.emitSlotBloat(&slotRep, &rep, s)
-		}
-	}
-	// W20-ST2 — the CNPG exporter's own spelling of the same
-	// signature: cnpg_pg_replication_slots_active==0 joined to high
-	// retained WAL catches the inactive slot even while WAL
-	// archiving still reports green (the retained_bytes{active=
-	// "false"} branch above only sees slots the exporter already
-	// marks inactive; this one catches the lag between the active
-	// gauge and the retained-bytes label). `and` returns the
-	// active==0 samples (value 0) — emitSlotBloat flags 1.
-	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
-		`(cnpg_pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
-			`(cnpg_pg_replication_slots_retained_bytes > %d or `+
-			`cnpg_pg_replication_slots_pg_wal_lsn_diff > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		log.Info("WARN: cnpg active-flag slot query failed — slot-bloat evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, s := range series {
-			emit(s.Label("namespace"),
-				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			p.emitSlotBloat(&slotRep, &rep, s)
-		}
-	}
-	// Volume pressure: the data volume a postgres pod mounts above
-	// 60% is the pg_wal runaway we CAN see without exec — the WAL dir
-	// lives on that volume and no other signal reaches inside it.
-	if series, qerr := p.PromQuery(ctx,
-		`kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > `+
-			fmt.Sprintf("%.2f", pgWALVolumeRatio)); qerr != nil {
-		log.Info("WARN: volume stats query failed — volume evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, s := range series {
-			ns := s.Label("namespace")
-			pvc := s.Label("persistentvolumeclaim")
-			// The finding's entity is the CLUSTER, not the PVC —
-			// the gauge series are per operator cluster, and the
-			// claim name is an implementation detail of the
-			// operator's volume layout (heal-budget: emitting the PVC name
-			// produced series that match no alert label set).
-			if cluster := pgPVCs[ns+"/"+pvc]; cluster != "" {
-				emit(ns, cluster, "wal_volume_pressure")
-			}
-		}
-	}
+	s.scanPromSignals(ctx)
 
 	// cnpg-health — CloudNativePG cluster liveness: a wedged failover
 	// phase, a ready<count shortfall or disabled continuous archiving
@@ -458,11 +288,11 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	// archiver is sick, these say the cluster underneath is.
 	p.checkCNPGClusterHealth(ctx, log, &rep, cnpgClusters, now)
 
-	for k, f := range findings {
+	for k, f := range s.findings {
 		rep.Emit(postgresWALUnhealthyGauge, k,
 			[]string{f.ns, f.cluster, f.reason}, k)
 	}
-	slotRep.Close(&p.emittedSlot, postgresInactiveSlotWALGauge.DeleteLabelValues)
+	s.slotRep.Close(&p.emittedSlot, postgresInactiveSlotWALGauge.DeleteLabelValues)
 	return rep.Result(&p.emitted, postgresWALUnhealthyGauge.DeleteLabelValues,
 		"postgres wal/archive unhealthy: ", ", ")
 }

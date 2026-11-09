@@ -19,9 +19,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -164,163 +162,14 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	// Namespaces opted into injection — the only places a desynced
-	// EndpointSlice actually strands mesh traffic.
-	nsList, err := p.AllNamespaces(ctx)
+	// The census (namespaces → audited services → pod/slice IP
+	// sets → per-service desync + stale-slice verdicts) lives in
+	// linkerd_endpoint_sync_scan.go.
+	scan, err := p.scanDesync(ctx, log, now)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
+		return probefw.Result{Infra: err}
 	}
-	injected := map[string]bool{}
-	// linkerdInstalled feeds the socket-lb-vs-linkerd socket-LB audit — the
-	// Cilium config only conflicts while the mesh itself is
-	// deployed on this cluster.
-	linkerdInstalled := false
-	for i := range nsList {
-		if nsList[i].Labels[kube.LinkerdInjectKey] == "enabled" {
-			injected[nsList[i].Name] = true
-		}
-		if nsList[i].Name == kube.LinkerdNS {
-			linkerdInstalled = true
-		}
-	}
-
-	// desynced maps each "ns/name" diverged this sweep to its
-	// Service object — the persisted first-seen variant stamps the
-	// window onto the Service itself, so the emit loop needs the
-	// object, not just the gauge label tuple.
-	desynced := map[string]*corev1.Service{}
-	// staleSlices: "ns/svc" → the provably-stale managed EndpointSlices
-	// to delete if the service's desync survives the window (endpoint-sync-heal).
-	staleSlices := map[string][]linkerdSliceRef{}
-	if len(injected) > 0 {
-		svcList, err := p.AllServices(ctx)
-		if err != nil {
-			return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
-		}
-		podList, err := p.AllPods(ctx)
-		if err != nil {
-			return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
-		}
-		// Audited services — selector + injected ns (+ the
-		// ExternalName/publishNotReady exclusions), the same filter
-		// the per-service loop applies. Only their controller-owned
-		// slices are delete candidates (endpoint-sync-heal).
-		audited := map[string]bool{}
-		for i := range svcList {
-			svc := &svcList[i]
-			if linkerdAuditedService(injected, svc) {
-				audited[svc.Namespace+"/"+svc.Name] = true
-			}
-		}
-		// Ready endpoint addresses per ns/service — same source and
-		// nil-ready-counts-as-ready convention as the masterless
-		// census. Paged like every cluster-wide read in this sweep.
-		esReady := map[string]map[string]bool{}
-		// managedSlices: "ns/svc" → the service's
-		// endpointslice-controller-owned EndpointSlices with their
-		// Ready address sets — the endpoint-sync-heal delete candidates.
-		managedSlices := map[string][]linkerdSliceRef{}
-		slices, err := p.AllEndpointSlices(ctx)
-		if err != nil {
-			return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
-		}
-		for _, s := range slices {
-			svc := s.Labels[discoveryv1.LabelServiceName]
-			if svc == "" {
-				continue
-			}
-			key := s.Namespace + "/" + svc
-			managed := audited[key] &&
-				s.Labels[discoveryv1.LabelManagedBy] == linkerdSliceManagedByESC &&
-				s.DeletionTimestamp == nil
-			var sliceAddrs map[string]bool
-			if managed {
-				sliceAddrs = map[string]bool{}
-			}
-			set := esReady[key]
-			if set == nil {
-				set = map[string]bool{}
-				esReady[key] = set
-			}
-			for _, ep := range s.Endpoints {
-				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-					continue
-				}
-				for _, a := range ep.Addresses {
-					set[a] = true
-					if managed {
-						sliceAddrs[a] = true
-					}
-				}
-			}
-			if managed {
-				managedSlices[key] = append(managedSlices[key],
-					linkerdSliceRef{ns: s.Namespace, name: s.Name,
-						uid: s.UID, addrs: sliceAddrs})
-			}
-		}
-
-		podsByNS := map[string][]*corev1.Pod{}
-		for i := range podList {
-			pod := &podList[i]
-			podsByNS[pod.Namespace] = append(podsByNS[pod.Namespace], pod)
-		}
-		for i := range svcList {
-			svc := &svcList[i]
-			if !linkerdAuditedService(injected, svc) {
-				continue
-			}
-			sel := labels.SelectorFromSet(svc.Spec.Selector)
-			readyIPs := map[string]bool{}
-			liveIPs := map[string]bool{}
-			readyAgedIPs := map[string]bool{}
-			for _, pod := range podsByNS[svc.Namespace] {
-				if pod.DeletionTimestamp != nil ||
-					!sel.Matches(labels.Set(pod.Labels)) ||
-					pod.Status.PodIP == "" {
-					continue
-				}
-				liveIPs[pod.Status.PodIP] = true
-				// endpoint-sync-heal: kube.PodReadySince fails closed on a
-				// zero LastTransitionTime, but the desync read
-				// treats a zero stamp as maximally aged — restore
-				// the lenient read for Ready pods (zero →
-				// since=zero → the age fuse below always trips).
-				since, ready := kube.PodReadySince(pod)
-				if !ready && kube.PodReadyCond(pod) {
-					since, ready = time.Time{}, true
-				}
-				if ready {
-					readyIPs[pod.Status.PodIP] = true
-					// endpoint-sync-heal fuse — only a pod Ready past
-					// linkerdSliceHealMinAge counts as "missing"
-					// from the slices.
-					if now.Sub(since) >= linkerdSliceHealMinAge {
-						readyAgedIPs[pod.Status.PodIP] = true
-					}
-				}
-			}
-			key := svc.Namespace + "/" + svc.Name
-			if linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady[key]) {
-				desynced[key] = svc
-			} else if err := heal.ClearPersistedFirstSeen(ctx, log,
-				&p.linkerdDesyncSince, svc,
-				kube.AnnoFirstSeenLinkerdEndpointSync, key,
-				p.linkerdSvcPatch(svc)); err != nil {
-				// CONVERGED services clear any persisted stamp so a
-				// later desync re-arms the full window. Tolerated
-				// sub-failure — Warn + continue, never fail the
-				// sweep; the stamp retries next sweep.
-				log.Info("WARN: persisted first-seen clear failed — "+
-					"a stale stamp could fast-trip the next desync",
-					"service", key, "error", err)
-			}
-			if stale := staleLinkerdSlices(
-				managedSlices[key], readyAgedIPs, liveIPs); len(stale) > 0 {
-				staleSlices[key] = stale
-			}
-		}
-	}
+	desynced, staleSlices := scan.desynced, scan.staleSlices
 
 	var rep probefw.SweepReport
 
@@ -333,7 +182,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// cni-exclusive="false" (Cilium respects linkerd-init's iptables
 	// rules) or bpf-lb-sock-hostns-only="true" (socket-LB stays in
 	// the host netns — enough for the node-local-dns LRPs).
-	p.auditCiliumLinkerdSockLB(ctx, log, linkerdInstalled, &rep)
+	p.auditCiliumLinkerdSockLB(ctx, log, scan.linkerdInstalled, &rep)
 
 	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
 	// The bounce-failure streak resets wherever the desync itself

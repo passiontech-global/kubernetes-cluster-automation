@@ -110,7 +110,7 @@ func (s *Probe) applyDefaults(c *Config) {
 		s.ProbeUnixSock = probee.UnixDial
 	}
 	if s.DNSProbeTCP == nil {
-		s.DNSProbeTCP = tcpDNSQuery
+		s.DNSProbeTCP = probee.DNSQueryTCP
 	}
 	if s.KubeletMetricsFn == nil {
 		s.KubeletMetricsFn = kubeletMetricsGet
