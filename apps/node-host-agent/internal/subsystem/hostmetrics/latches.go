@@ -76,20 +76,24 @@ func (l *Latches) refreshLatches() {
 	}
 	days, certOK := c.nebulaCertDaysLeft()
 	c.updateCertLatch(days, certOK)
-	// Filesystem read-only: probe each target like collectFilesystem
-	// but only for the latch (metrics are scrape-side).
+	// Filesystem read-only + W18-1 inode pressure: probe each target
+	// like collectFilesystem but only for the latches (metrics are
+	// scrape-side).
 	anyRO, probed := false, false
+	var ie fsInodeEvidence
 	for _, mount := range c.cfg.FilesystemTargets {
 		st, _, ok := c.probeFS(mount)
 		if !ok {
 			continue
 		}
 		probed = true
+		c.noteInodeEvidence(&ie, mount, st)
 		if st.Flags&1 != 0 { // unix.ST_RDONLY without importing unix twice
 			anyRO = true
 		}
 	}
 	c.updateFSReadonlyLatch(anyRO, probed)
+	c.updateInodePressureLatch(ie)
 	// W8-KR3: kernel keyring quota pressure.
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)
@@ -110,6 +114,7 @@ func (l *Latches) refreshLatches() {
 		latchdefs.LatchFilesystemReadonly,
 		latchdefs.LatchNebulaCertExpiring,
 		latchdefs.LatchKernelKeysPressure,
+		latchdefs.LatchInodePressure,
 		// W10 maintained latches — same reap protection.
 		latchdefs.LatchFSReadonly,
 		latchdefs.LatchPIDFDPressure,

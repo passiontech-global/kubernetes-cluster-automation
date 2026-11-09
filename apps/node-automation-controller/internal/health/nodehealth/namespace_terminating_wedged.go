@@ -28,6 +28,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -304,9 +305,21 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	if err != nil {
 		return false
 	}
-	if dref := metav1.GetControllerOf(rs); dref != nil && dref.Kind == "Deployment" {
-		gone, _ := probefw.OwnerGone(ctx, p.CS, ns, dref, "Deployment")
-		return gone
+	if dref := metav1.GetControllerOf(rs); dref != nil {
+		switch dref.Kind {
+		case "Deployment":
+			gone, _ := probefw.OwnerGone(ctx, p.CS, ns, dref, "Deployment")
+			return gone
+		case "Rollout":
+			// W18-5 — a Rollout-owned ReplicaSet whose argoproj.io
+			// Rollout is gone is the same GC-pending garbage shape;
+			// the typed clientset has no argoproj.io access, so the
+			// existence check rides the dynamic client (any error
+			// other than NotFound fails closed: owner presumed alive).
+			_, err := p.Dyn.Resource(kube.GVRArgoRollout).
+				Namespace(ns).Get(ctx, dref.Name, metav1.GetOptions{})
+			return apierrors.IsNotFound(err)
+		}
 	}
 	return false
 }

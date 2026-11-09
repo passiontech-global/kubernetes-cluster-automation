@@ -208,6 +208,8 @@ func TestAllConditionDefaults(t *testing.T) {
 		// workerhygiene cilium latch→condition surface.
 		"CiliumMTUDrift": {"CiliumMTUAligned", "cilium datapath MTU matches nebula overlay (no drift)"},
 		"CiliumWGStale":  {"CiliumWGPeersOk", "cilium_wg0 live peers match expected encryption peers (no stale state)"},
+		// W18-1 inode-pressure latch→condition surface.
+		"InodePressure": {"FilesystemInodesHealthy", "all monitored filesystems below inode-pressure thresholds"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

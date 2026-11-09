@@ -549,3 +549,33 @@ func TestRotationDrainsDotOneTail(t *testing.T) {
 		t.Fatalf("counter after re-cycle = %v, want 3 (no re-delivery)", got)
 	}
 }
+
+// TestInodePressureEvents: the W18-1 inode-pressure latch's
+// STATE-ENTER line emits a Warning Event (reason InodePressure, note
+// carries the offending mount + ratio) and its STATE-EXIT line emits
+// an informational (Normal) Event for the clean episode end.
+func TestInodePressureEvents(t *testing.T) {
+	e := fixture(t)
+	e.appendLog(t, "STATE-ENTER: inode-pressure mount=/var/openebs/local ratio=0.970 >= 0.95")
+	e.cycle()
+	if got := e.counter("InodePressure"); got != 1 {
+		t.Fatalf("problem_counter{InodePressure} = %v, want 1", got)
+	}
+	evs := eventsByReason(t, e, "InodePressure")
+	if len(evs) != 1 {
+		t.Fatalf("InodePressure events = %d, want 1", len(evs))
+	}
+	if evs[0].Type != "Warning" || !strings.Contains(evs[0].Note, "mount=/var/openebs/local") {
+		t.Fatalf("entry event = %s/%q want Warning with mount detail",
+			evs[0].Type, evs[0].Note)
+	}
+	e.appendLog(t, "STATE-EXIT: inode-pressure")
+	e.cycle()
+	healthy := eventsByReason(t, e, "FilesystemInodesHealthy")
+	if len(healthy) != 1 {
+		t.Fatalf("FilesystemInodesHealthy events = %d, want 1", len(healthy))
+	}
+	if healthy[0].Type != "Normal" {
+		t.Fatalf("exit event type = %s, want Normal", healthy[0].Type)
+	}
+}

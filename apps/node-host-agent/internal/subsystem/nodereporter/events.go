@@ -196,9 +196,25 @@ var logRules = []logRule{
 	{nodecond.KubeletPLEGUnhealthy, latchdefs.StateEnterRe(latchdefs.LatchKubeletPLEGUnhealthy)},
 	{nodecond.DiskSlowIO, latchdefs.StateEnterRe(latchdefs.LatchDiskSlowIO)},
 	{nodecond.KernelNetShimDegraded, latchdefs.StateEnterRe(latchdefs.LatchKernelNetShim)},
+	// W18-1: hostmetrics' inode-pressure latch — a Warning on entry
+	// (the STATE-ENTER line carries the offending mount + ratio); the
+	// clean end of the episode earns an informational Event via
+	// exitLogRules below.
+	{nodecond.InodePressure, latchdefs.StateEnterRe(latchdefs.LatchInodePressure)},
 	// hostmetrics' clock-warp detector line —
 	// "ACTION clock-warp: delta=... tick=... (events=N)".
 	{"NodeClockWarpDetected", latchdefs.ActionEntryRe(latchdefs.ActionClockWarp)},
+}
+
+// exitLogRules — STATE-EXIT lines that earn an informational (Normal)
+// Event marking a latch episode's clean end. Entry events live in
+// logRules; an exit is recovery, not a problem, so it must not render
+// as a Warning. The counter for a matched exit still rides the shared
+// problem_counter surface (reason = the episode's healthy reason).
+var exitLogRules = []logRule{
+	// W18-1: inode-pressure cleared — every monitored mount back to
+	// <=90% inode usage.
+	{"FilesystemInodesHealthy", latchdefs.StateExitRe(latchdefs.LatchInodePressure)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the
@@ -442,16 +458,27 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 			continue
 		}
 		r.problemCounter.WithLabelValues(rule.reason).Inc()
-		if err := r.emitEvent(ctx, rule.reason, msg); err != nil {
+		if err := r.emitEvent(ctx, rule.reason, msg, corev1.EventTypeWarning); err != nil {
 			// Logged, not fatal — the counter already reflects the
 			// match and the next identical line retries the Event.
 			logger().Error("nodereporter: event emit failed",
 				"reason", rule.reason, "error", err)
 		}
 	}
+	for _, rule := range exitLogRules {
+		if !rule.re.MatchString(msg) {
+			continue
+		}
+		r.problemCounter.WithLabelValues(rule.reason).Inc()
+		if err := r.emitEvent(ctx, rule.reason, msg, corev1.EventTypeNormal); err != nil {
+			logger().Error("nodereporter: exit event emit failed",
+				"reason", rule.reason, "error", err)
+		}
+	}
 }
 
-// emitEvent creates or aggregates one Warning Event on this Node.
+// emitEvent creates or aggregates one Event of the given type on this
+// Node.
 // Dedup key is reason+message: a fresh key creates a new object; a
 // repeat inside EventDedupTTL series-patches the existing one
 // (count++, lastObservedTime). A NotFound patch failure (event TTL'd
@@ -459,7 +486,7 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 // the entry and returns the error — recreating a fresh object per
 // occurrence under a persistent failure (RBAC create-but-not-patch,
 // apiserver degradation) would spam unbounded Events.
-func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
+func (r *Reporter) emitEvent(ctx context.Context, reason, note string, eventType string) error {
 	events := r.cfg.Client.EventsV1().Events(r.cfg.EventNamespace)
 	now := r.cfg.Clock.Now()
 	// Truncate BEFORE keying: two >1KiB notes sharing the first
@@ -509,7 +536,7 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 		EventTime:           metav1.NewMicroTime(now),
 		Reason:              reason,
 		Note:                note,
-		Type:                corev1.EventTypeWarning,
+		Type:                eventType,
 		ReportingController: "node-host-agent",
 		ReportingInstance:   r.cfg.NodeName,
 		// events.k8s.io/v1 validation: action is REQUIRED and the

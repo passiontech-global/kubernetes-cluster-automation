@@ -122,6 +122,11 @@ const (
 	LatchFilesystemReadonly = "filesystem-readonly"  // W5.3 statfs ST_RDONLY
 	LatchNebulaCertExpiring = "nebula-cert-expiring" // 13 cert parse
 	LatchKernelKeysPressure = "kernel-keys-pressure" // W8-KR3
+	// LatchInodePressure is the W18-1 filesystem inode-pressure latch —
+	// hostmetrics' inode-usage hysteresis over the statfs targets
+	// (enter at >=95% inode usage on any mount, clear only when every
+	// monitored mount is back to <=90%).
+	LatchInodePressure = "inode-pressure" // W18-1 fs inode hysteresis
 	LatchFSReadonly         = "fs-readonly"          // W10-ST1/KR1
 	LatchPIDFDPressure      = "pid-fd-pressure"      // W10-KR2
 	LatchClockSkew          = "clock-skew"           // W10-KR5
@@ -184,7 +189,8 @@ type LatchDef struct {
 //	controllerhygiene + workerhygiene (shared journalwatch tracker):
 //	  journal-unreadable
 //	hostmetrics: node-overloaded (PSI hysteresis), filesystem-readonly,
-//	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3)
+//	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3),
+//	  inode-pressure (W18-1)
 var LatchDefs = []LatchDef{
 	// workerhygiene — pod-teardown-wedged is the shared latch:
 	// pods.PodTeardownCheck holds it for stuck Terminating pods,
@@ -270,6 +276,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchPIDFDPressure, Owner: "hostmetrics"},
 	{Name: LatchClockSkew, Owner: "hostmetrics"},
 	{Name: LatchCPUStealPressure, Owner: "hostmetrics"},
+	{Name: LatchInodePressure, Owner: "hostmetrics"},
 	{Name: LatchPageAllocFailure, Owner: "hostmetrics"},
 	{Name: LatchClocksourceUnstable, Owner: "hostmetrics"},
 

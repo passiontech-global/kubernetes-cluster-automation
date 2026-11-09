@@ -133,6 +133,49 @@ TasksMax=infinity
 		c.k0scontrollerGoMemlimitSumGuard()
 	}
 
+	// W18-7 host-level protection drop-ins, written idempotently
+	// (writeManaged is a sha256-gated atomic write; a no-diff cycle
+	// rewrites nothing):
+	//   - networkd: never manage the CNI's foreign routes/rules — a
+	//     networkd restart wiping cilium/calico routes is the classic
+	//     "node loses its pod network after an upgrade" outage.
+	//   - logind: 65s inhibit delay — the kubelet's graceful-shutdown
+	//     window (shutdownGracePeriod=60s) must fit inside logind's
+	//     InhibitDelayMaxSec or systemd kills the node mid-drain.
+	//   - apt: keep unattended-upgrades off the packages a k0s node
+	//     depends on, and off automatic reboots.
+	_ = r.ensureDir("/etc/systemd/networkd.conf.d", 0o755)
+	_, _ = r.writeManaged("/etc/systemd/networkd.conf.d/99-preserve-cni-routes.conf",
+		[]byte(`# Managed by node-config-agent - W18-7 CNI route preservation.
+# networkd must not flush routes/rules the CNI installed.
+[Network]
+ManageForeignRoutes=no
+ManageForeignRoutingPolicyRules=no
+`), 0o644)
+	_ = r.ensureDir("/etc/systemd/logind.conf.d", 0o755)
+	_, _ = r.writeManaged("/etc/systemd/logind.conf.d/99-k8s-shutdown.conf",
+		[]byte(`# Managed by node-config-agent - W18-7 graceful kubelet shutdown.
+# InhibitDelayMaxSec must exceed the kubelet's shutdownGracePeriod (60s).
+[Login]
+InhibitDelayMaxSec=65
+`), 0o644)
+	_ = r.ensureDir("/etc/apt/apt.conf.d", 0o755)
+	_, _ = r.writeManaged("/etc/apt/apt.conf.d/99-k8s-unattended-safety",
+		[]byte(`// Managed by node-config-agent - W18-7 unattended-upgrade safety.
+Unattended-Upgrade::Package-Blacklist {
+    "containerd*";
+    "runc";
+    "k0s*";
+    "iptables*";
+    "nftables";
+    "kmod";
+    "systemd";
+    "systemd-sysv";
+    "udev";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+`), 0o644)
+
 	// hostname -> 127.0.1.1 in /etc/hosts (lineinfile parity).
 	c.hostnamePin()
 

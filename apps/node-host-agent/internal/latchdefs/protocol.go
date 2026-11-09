@@ -45,7 +45,8 @@ const (
 	StateEnterPrefix = "STATE-ENTER: "
 
 	// StateExitPrefix opens the latch exit line Store.Exit writes.
-	// No filelog rule matches exits today; the emitted form is
+	// StateExitRe-derived rules (the informational episode-end
+	// events) are the only filelog matches; the emitted form is
 	// still the shared log contract (ops grep + tests).
 	StateExitPrefix = "STATE-EXIT: "
 
@@ -87,6 +88,17 @@ func StateEnterRe(latches ...string) *regexp.Regexp {
 		alts = append(alts, regexp.QuoteMeta(l))
 	}
 	return regexp.MustCompile(StateEnterPrefix + `(?:` + strings.Join(alts, "|") + `)`)
+}
+
+// StateExitRe builds the "STATE-EXIT: <latch>" match pattern for one
+// or more latch names — the matcher the informational exit-event
+// rules use (the mirror of StateEnterRe for episode-end lines).
+func StateExitRe(latches ...string) *regexp.Regexp {
+	alts := make([]string, 0, len(latches))
+	for _, l := range latches {
+		alts = append(alts, regexp.QuoteMeta(l))
+	}
+	return regexp.MustCompile(StateExitPrefix + `(?:` + strings.Join(alts, "|") + `)`)
 }
 
 // ActionEntryRe builds the unanchored ACTION-entry match pattern for

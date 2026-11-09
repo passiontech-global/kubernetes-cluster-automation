@@ -19,12 +19,30 @@
 //	   high-priority pod preempts victims that preempt their own
 //	   victims) — the descheduler's evictions would add another
 //	   wave on top.
+//	e) W18-8 — no cluster-wide image-pull storm: stormImagePullMinPods
+//	   pods or stormImagePullMinNamespaces namespaces with containers
+//	   waiting in ImagePullBackOff/ErrImagePull mean images are not
+//	   landing; rescheduling pods onto other nodes just spreads
+//	   unrunnable pods around (kube.ImagePullStallReason /
+//	   CountImagePullStalledPods, the census the roller defers on
+//	   too).
 //
 // Storm -> scale to 0, clear -> back to 1. The verdict + evidence is
 // recorded in annotation passiontech.dev/storm-gate-decision for
 // post-incident debugging; passiontech.dev/storm-gate-hold=true is a
 // manual hold (game-day/runbook) that skips scaling. An API failure
 // aborts the reconcile — never a "clear" verdict on empty data.
+//
+// W18-9 — forgotten maintenance holds are warned about: a hold kept
+// "true" continuously past maintenanceHoldStaleAfter fires ONE
+// Warning event MaintenanceHoldStale on the descheduler Deployment
+// (first-seen tracked under kube.AnnoFirstSeenStormGateHold — the
+// hold annotation itself carries no timestamp), and a NodeHealthCheck
+// whose spec.pauseRequests has been non-empty equally long fires the
+// same warning on the NHC object (kube.AnnoFirstSeenNHCPause). No NHC
+// watcher exists in this controller, so the NHC probe rides this
+// module's 5m sweep — one warning per hold/pause episode, re-armed
+// only when the hold releases.
 //
 // 2.7 — Cluster Maintenance Mutex. On top of the storm signals the
 // gate also holds the descheduler at 0 while any deliberate
@@ -56,12 +74,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -70,7 +93,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
@@ -85,6 +110,27 @@ const (
 	// ceiling inside the window is a domino cascade.
 	stormPreemptionWindow = 5 * time.Minute
 	stormPreemptionMax    = 15
+
+	// W18-8 — image-pull storm thresholds (storm signal (e)): 3
+	// stuck pods in one namespace is one broken Deployment, but
+	// three pods anywhere — or members of sets in TWO namespaces —
+	// is a cluster-level pull problem (same shape as the W10-GI5
+	// health check's classification, tightened to the gating
+	// verdict).
+	stormImagePullMinPods       = 3
+	stormImagePullMinNamespaces = 2
+
+	// W18-9 — a maintenance hold (storm-gate-hold annotation or a
+	// NodeHealthCheck spec.pauseRequests) kept continuously past
+	// this age is a forgotten one: the Warning
+	// MaintenanceHoldStale event asks the operator to confirm it is
+	// still wanted. One warning per episode — re-armed only when
+	// the hold releases.
+	maintenanceHoldStaleAfter  = 2 * time.Hour
+	maintenanceHoldStaleReason = "MaintenanceHoldStale"
+	// stormHoldLedgerKey is the single ledger key the descheduler
+	// Deployment's hold first-seen stamp rides.
+	stormHoldLedgerKey = "kube-system/descheduler"
 )
 
 // stormConds mirrors STORM_CONDS (see package comment for sources) —
@@ -148,6 +194,23 @@ type deschedulerStormGate struct {
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
+	// recorder emits the W18-9 MaintenanceHoldStale warnings — the
+	// manager-provided event recorder. nil (StubManager tests)
+	// drops the event rather than panicking.
+	recorder record.EventRecorder
+	// holdSeen persists the storm-gate-hold first-seen window across
+	// operator restarts (the annotation half is
+	// kube.AnnoFirstSeenStormGateHold on the Deployment);
+	// holdWarned is the emitted-once tracker for the current hold
+	// episode (a SeenSet key, not a gauge — there is no series, only
+	// one Warning per episode). nhcSeen/nhcWarned are the same pair
+	// for NodeHealthCheck pauseRequests, keyed per NHC object.
+	// All zero-value ready — literal-constructed test fixtures need
+	// no Setup path; the reconciler is single-keyed so no lock.
+	holdSeen   state.FirstSeenLedger
+	holdWarned state.SeenSet
+	nhcSeen    state.FirstSeenLedger
+	nhcWarned  state.SeenSet
 	// now is the clock seam — tests pin it so the cordon-window and
 	// decision-stamp reads are deterministic. nil → time.Now.
 	now shared.Clock
@@ -189,7 +252,8 @@ func Setup(d shared.Deps) error {
 	// runs — a gated-off module registers no controller, no watch,
 	// no informer.
 	return shared.SetupNoConfig(d, func() error {
-		r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock}
+		r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock,
+			recorder: d.Mgr.GetEventRecorderFor(d.Name)}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -269,10 +333,28 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		Get(ctx, "descheduler", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		log.Info("SKIP: no descheduler deployment on this cluster")
+		// The stamp dies with the object — the in-RAM half of the
+		// hold bookkeeping must die with it too, or a deployment
+		// recreated later (hold still set) would inherit a window
+		// measured against the previous object's lifetime.
+		r.holdSeen.Forget(stormHoldLedgerKey)
+		r.holdWarned.Forget(stormHoldLedgerKey)
 		return res, nil
 	}
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
+	}
+
+	// W18-9 (NHC half): a NodeHealthCheck whose spec.pauseRequests has
+	// been non-empty past maintenanceHoldStaleAfter is a forgotten
+	// maintenance pause — warn once. It sits behind the
+	// deployment-exists skip like the mutex reads: a cluster without
+	// descheduler never pays for (or fails on) the NHC list, and a
+	// nil dynamic client errors the reconcile instead of reading as
+	// "nothing paused" (fail closed). An absent CRD is an empty
+	// scan.
+	if err := r.checkNHCPauseStale(ctx, now, log); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// 2.7 maintenance mutex (signals b + c — signal a is the
@@ -302,18 +384,58 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			preemptedCount, stormPreemptionWindow, stormPreemptionMax))
 	}
 
+	// W18-8 storm signal (e): a cluster-wide image-pull storm —
+	// enough pods stuck in ImagePullBackOff/ErrImagePull that
+	// rescheduling would just spread unrunnable pods onto more
+	// nodes. Same fail-closed posture as the events scan above: a
+	// pod-list error aborts the reconcile, never a "clear" verdict
+	// on blind data. The read happens after the deployment-exists
+	// skip so a cluster without descheduler never pays for it.
+	stallPods, stallNamespaces, err := kube.CountImagePullStalledPods(ctx, r.cs)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf(
+			"list pods (image-pull storm census): %w", err)
+	}
+	var imagePull []string
+	if stallPods >= stormImagePullMinPods ||
+		stallNamespaces >= stormImagePullMinNamespaces {
+		imagePull = append(imagePull, fmt.Sprintf(
+			"image-pull-stall: %d pods in %d namespaces stuck on ImagePullBackOff/ErrImagePull",
+			stallPods, stallNamespaces))
+	}
+
 	want := int32(1)
 	verdict := "clear"
 	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 ||
-		len(cordoned) > 0 || len(maintenance) > 0 || len(preempted) > 0 {
+		len(cordoned) > 0 || len(maintenance) > 0 || len(preempted) > 0 ||
+		len(imagePull) > 0 {
 		want, verdict = 0, "storm"
 	}
 
 	if deploy.Annotations[stormGateHoldAnno] == "true" {
+		// W18-9: a hold kept "true" past the stale window is a
+		// forgotten one — one MaintenanceHoldStale Warning per
+		// episode. Runs before the early return so the hold path
+		// never scales but still audibly complains.
+		r.checkHoldStale(ctx, deploy, now, log)
 		log.Info("storm-gate HOLD (annotation "+stormGateHoldAnno+
 			") - verdict computed but not scaling", "verdict", verdict)
 		return res, nil
 	}
+
+	// Hold released (or never held) — drop the persisted first-seen
+	// stamp and the emitted-once marker so the NEXT hold re-arms the
+	// full stale window. A failed clear is Warn-logged, never
+	// returned: the annotation would only make a future warning
+	// arrive early, never hold the descheduler.
+	if err := heal.ClearPersistedFirstSeen(ctx, log, &r.holdSeen, deploy,
+		kube.AnnoFirstSeenStormGateHold, stormHoldLedgerKey,
+		r.deployAnnoPatch()); err != nil {
+		log.Info("WARN: storm-gate hold first-seen clear failed — "+
+			"a stale stamp could warn early on the next hold",
+			"error", err)
+	}
+	r.holdWarned.Forget(stormHoldLedgerKey)
 
 	cur := int32(-1)
 	curStr := ""
@@ -321,11 +443,12 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		cur = *deploy.Spec.Replicas
 		curStr = strconv.Itoa(int(cur))
 	}
-	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s]",
+	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s] imagepull=[%s]",
 		r.now.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
 		strings.Join(notReady, "\n"), strings.Join(bad, "\n"),
 		strings.Join(tainted, "\n"), strings.Join(cordoned, "\n"),
-		strings.Join(maintenance, "\n"), strings.Join(preempted, "\n"))
+		strings.Join(maintenance, "\n"), strings.Join(preempted, "\n"),
+		strings.Join(imagePull, "\n"))
 
 	switch {
 	case cur != want:
@@ -333,7 +456,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			"verdict", verdict, "from", curStr, "to", want,
 			"notReady", notReady, "bad", bad, "tainted", tainted,
 			"cordoned", cordoned, "maintenance", maintenance,
-			"preempted", preempted)
+			"preempted", preempted, "imagePull", imagePull)
 		// One merge patch carries spec.replicas AND the decision
 		// annotation — two back-to-back merge patches on the same
 		// Deployment would pay two API writes for one logical act.
@@ -397,6 +520,143 @@ func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]strin
 		return nil, err
 	}
 	return append(append(kured, plans...), remediations...), nil
+}
+
+// ---------------------------------------------------------------------------
+// W18-9 — forgotten maintenance holds (MaintenanceHoldStale).
+// ---------------------------------------------------------------------------
+
+// checkHoldStale fires the one-per-episode MaintenanceHoldStale
+// Warning for a storm-gate-hold="true" annotation held continuously
+// past maintenanceHoldStaleAfter. The hold annotation carries no
+// timestamp, so the window lives under
+// kube.AnnoFirstSeenStormGateHold on the Deployment (the annotation
+// half of heal.FirstSeenPersisted — a restart resumes the window
+// instead of re-arming it) with r.holdSeen as the in-RAM half. The
+// Warning rides the manager's event recorder; a nil recorder
+// (StubManager tests) drops it rather than panicking.
+func (r *deschedulerStormGate) checkHoldStale(ctx context.Context,
+	deploy *appsv1.Deployment, now time.Time, log logr.Logger) {
+	if !heal.FirstSeenPersisted(ctx, log, &r.holdSeen, deploy,
+		kube.AnnoFirstSeenStormGateHold, stormHoldLedgerKey,
+		maintenanceHoldStaleAfter, now, r.deployAnnoPatch()) {
+		return // window not yet held out — nothing to warn about
+	}
+	if !r.holdWarned.Add(stormHoldLedgerKey) {
+		return // this episode already warned — no spam on re-reconciles
+	}
+	if r.recorder != nil {
+		r.recorder.Eventf(deploy, corev1.EventTypeWarning,
+			maintenanceHoldStaleReason,
+			"storm-gate hold annotation %s has been \"true\" for more than %s — "+
+				"confirm the maintenance hold is still wanted",
+			stormGateHoldAnno, maintenanceHoldStaleAfter)
+	}
+	log.Info("WARN: storm-gate hold is stale",
+		"deployment", stormHoldLedgerKey,
+		"annotation", stormGateHoldAnno,
+		"heldForMoreThan", maintenanceHoldStaleAfter)
+}
+
+// deployAnnoPatch delivers the hold's first-seen stamp merge patch
+// onto the descheduler Deployment — the same merge-patch-only
+// contract the scale path runs (no full-object Update that would
+// race a concurrent spec edit).
+func (r *deschedulerStormGate) deployAnnoPatch() func(context.Context, []byte) error {
+	return func(ctx context.Context, data []byte) error {
+		if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
+			"descheduler", types.MergePatchType, data, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf(
+				"patch first-seen annotation on deployment kube-system/descheduler: %w", err)
+		}
+		return nil
+	}
+}
+
+// checkNHCPauseStale is the NHC half of W18-9: every NodeHealthCheck
+// whose spec.pauseRequests has been non-empty past
+// maintenanceHoldStaleAfter gets the same one-per-episode
+// MaintenanceHoldStale Warning on the NHC object itself, window
+// tracked under kube.AnnoFirstSeenNHCPause. A released pause clears
+// the stamp (re-arms the full window for the next pause) and resets
+// the emitted-once marker; objects that vanish take their ledger
+// entries with them via the live prune. NHC is cluster-scoped, so
+// keys are bare names. One stamp key per object and one visit per
+// sweep — the patch closure needs no read-back mirror into the
+// listed object (olmCRPatch mirrors because several live reasons
+// share ONE CSV's map; here nothing re-reads the annotation after
+// the patch).
+func (r *deschedulerStormGate) checkNHCPauseStale(ctx context.Context,
+	now time.Time, log logr.Logger) error {
+	if r.dyn == nil {
+		return errors.New(
+			"no dynamic client — NodeHealthCheck pause-staleness probe unverifiable")
+	}
+	list, err := kube.ListAllUnstructured(ctx,
+		r.dyn.Resource(kube.GVRNodeHealthCheck),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		return nil // CRD absent on this cluster — nothing to probe
+	case err != nil:
+		return fmt.Errorf("list nodehealthchecks (pause staleness): %w", err)
+	}
+	live := make(map[string]bool, len(list.Items))
+	for i := range list.Items {
+		obj := &list.Items[i]
+		key := obj.GetName()
+		live[key] = true
+		pauseRequests, _, _ := unstructured.NestedStringSlice(
+			obj.Object, "spec", "pauseRequests")
+		if len(pauseRequests) == 0 {
+			// Pause released — the episode ended: drop the stamp and
+			// the emitted-once marker so a later pause warns fresh.
+			if err := heal.ClearPersistedFirstSeen(ctx, log, &r.nhcSeen,
+				obj, kube.AnnoFirstSeenNHCPause, key, r.nhcAnnoPatch(obj)); err != nil {
+				log.Info("WARN: NHC pause first-seen clear failed — "+
+					"a stale stamp could fast-trip a recurrence",
+					"nodehealthcheck", key, "error", err)
+			}
+			r.nhcWarned.Forget(key)
+			continue
+		}
+		if !heal.FirstSeenPersisted(ctx, log, &r.nhcSeen, obj,
+			kube.AnnoFirstSeenNHCPause, key,
+			maintenanceHoldStaleAfter, now, r.nhcAnnoPatch(obj)) {
+			continue // window not yet held out
+		}
+		if !r.nhcWarned.Add(key) {
+			continue // this pause episode already warned — no spam
+		}
+		if r.recorder != nil {
+			r.recorder.Eventf(obj, corev1.EventTypeWarning,
+				maintenanceHoldStaleReason,
+				"spec.pauseRequests has been non-empty for more than %s — "+
+					"confirm the pause is still wanted",
+				maintenanceHoldStaleAfter)
+		}
+		log.Info("WARN: NodeHealthCheck pause is stale",
+			"nodehealthcheck", key,
+			"pauseRequests", len(pauseRequests))
+	}
+	r.nhcWarned.Prune(func(key string) bool { return live[key] })
+	r.nhcSeen.Prune(func(key string) bool { return live[key] })
+	return nil
+}
+
+// nhcAnnoPatch delivers the NHC's first-seen stamp merge patch via
+// the dynamic client (cluster-scoped resource — no namespace).
+func (r *deschedulerStormGate) nhcAnnoPatch(
+	obj *unstructured.Unstructured) func(context.Context, []byte) error {
+	return func(ctx context.Context, data []byte) error {
+		_, err := r.dyn.Resource(kube.GVRNodeHealthCheck).Patch(ctx,
+			obj.GetName(), types.MergePatchType, data, metav1.PatchOptions{})
+		if err != nil {
+			return fmt.Errorf("patch %s on nodehealthcheck %s: %w",
+				kube.AnnoFirstSeenNHCPause, obj.GetName(), err)
+		}
+		return nil
+	}
 }
 
 // condStatusMap is the jqFilter projection: condition type -> status,

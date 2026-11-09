@@ -4,6 +4,7 @@
 package hostmetrics
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -163,6 +164,7 @@ var (
 func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 	anyRO := false
 	probed := false // at least one statfs answered — the latch's evidence base
+	var ie fsInodeEvidence // W18-1 inode-pressure verdict for this pass
 	for _, mount := range c.cfg.FilesystemTargets {
 		st, stalled, ok := c.probeFS(mount)
 		v := 0.0
@@ -191,6 +193,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 			continue
 		}
 		probed = true
+		c.noteInodeEvidence(&ie, mount, st)
 		ro := 0.0
 		if st.Flags&unix.ST_RDONLY != 0 {
 			ro = 1
@@ -211,6 +214,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 		}
 	}
 	c.updateFSReadonlyLatch(anyRO, probed)
+	c.updateInodePressureLatch(ie)
 }
 
 // updateFSReadonlyLatch drives state-filesystem-readonly (W5.3):
@@ -228,5 +232,69 @@ func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
 			"a probed mount reports ST_RDONLY")
 	case probed:
 		c.state.Exit(latchdefs.LatchFilesystemReadonly, nil)
+	}
+}
+
+// --- W18-1: filesystem inode-pressure hysteresis ---
+
+// fsInodeEvidence is one pass's inode-pressure verdict over the
+// configured filesystem targets — the input both the scrape path
+// (collectFilesystem) and the latch ticker (refreshLatches) hand to
+// updateInodePressureLatch. probed counts mounts whose statfs
+// answered; parsed the subset whose inode ratio was computable
+// (Ffree > Files wraps uint64 on pseudo/network filesystems — that
+// is inconclusive evidence, not a healthy ratio); worstMount/
+// worstRatio name the fullest mount for the STATE-ENTER detail.
+type fsInodeEvidence struct {
+	probed     int
+	parsed     int
+	worstMount string
+	worstRatio float64
+}
+
+// noteInodeEvidence folds one successful statfs answer into the
+// pass's verdict.
+func (c *Collector) noteInodeEvidence(e *fsInodeEvidence, mount string, st unix.Statfs_t) {
+	e.probed++
+	if st.Files == 0 || st.Ffree > st.Files {
+		return
+	}
+	e.parsed++
+	used := float64(st.Files-st.Ffree) / float64(st.Files)
+	if e.worstMount == "" || used > e.worstRatio {
+		e.worstMount, e.worstRatio = mount, used
+	}
+}
+
+// inodePressureEnter reports whether any parsed mount crossed the
+// enter threshold.
+func (e fsInodeEvidence) inodePressureEnter() bool {
+	return e.parsed > 0 && e.worstRatio >= inodePressureEnterRatio
+}
+
+// inodePressureClear reports whether the evidence justifies clearing:
+// every probed mount answered AND every parsed ratio sits at or below
+// the clear threshold. Between the thresholds the verdict is neither
+// — the latch holds (hysteresis), and an inconclusive pass (a statfs
+// failure or an unparseable ratio) never moves it either way, the
+// same rule updateFSReadonlyLatch follows.
+func (e fsInodeEvidence) inodePressureClear() bool {
+	return e.probed > 0 && e.parsed == e.probed &&
+		e.worstRatio <= inodePressureClearRatio
+}
+
+// updateInodePressureLatch drives state-inode-pressure (W18-1): an
+// exhausted inode table makes kubelet's own imagefs/nodefs GC and
+// every pod's tmpfs write fail before DiskPressure ever fires — the
+// condition surfaces as nodecond.InodePressure with the offending
+// mountpoint + ratio in the STATE-ENTER detail.
+func (c *Collector) updateInodePressureLatch(e fsInodeEvidence) {
+	switch {
+	case e.inodePressureEnter():
+		c.state.Enter(latchdefs.LatchInodePressure, fmt.Sprintf(
+			"mount=%s ratio=%.3f >= %.2f",
+			e.worstMount, e.worstRatio, inodePressureEnterRatio))
+	case e.inodePressureClear():
+		c.state.Exit(latchdefs.LatchInodePressure, nil)
 	}
 }

@@ -136,6 +136,14 @@ const (
 	defaultKeyUsersFile = "/proc/key-users"
 	// kernelKeysPressureRatio arms state-kernel-keys-pressure.
 	kernelKeysPressureRatio = 0.80
+	// W18-1 inode-pressure hysteresis: any monitored mount at or
+	// above inodePressureEnterRatio of its inode table latches
+	// state-inode-pressure; the latch clears only once EVERY
+	// monitored mount sits at or below inodePressureClearRatio —
+	// between the two the latch holds (a 92% mount must not flap
+	// the condition on every scrape).
+	inodePressureEnterRatio = 0.95
+	inodePressureClearRatio = 0.90
 	// defaultLatchInterval is the Run() ticker's cadence (BUG-H5) —
 	// the watchdog-state file contract must hold even when nothing
 	// scrapes this collector (DaemonSet mode).

@@ -455,6 +455,21 @@ var conditionDefs = []conditionDef{
 		problemReason:  "CiliumWGStaleDetected",
 		stateKey:       latchdefs.LatchCiliumWGPeerWipe,
 	},
+	// --- W18-1 inode-pressure latch→condition surface ---
+	{
+		// hostmetrics' W18-1 inode-usage hysteresis guard — a
+		// monitored mount at >=95% inode usage latches
+		// state-inode-pressure; a full inode table fails new
+		// file/tmpfs writes before DiskPressure ever fires. The
+		// kubelet-native InodePressure spelling is reused so the
+		// controller's pre-cordon and storm-gate consumers see the
+		// agent-detected episodes under the same name.
+		typ:            nodecond.InodePressure,
+		defaultReason:  "FilesystemInodesHealthy",
+		defaultMessage: "all monitored filesystems below inode-pressure thresholds",
+		problemReason:  "FilesystemInodesExhausted",
+		stateKey:       latchdefs.LatchInodePressure,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

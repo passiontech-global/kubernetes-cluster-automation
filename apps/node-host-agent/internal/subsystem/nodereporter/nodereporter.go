@@ -334,7 +334,7 @@ func (r *Reporter) npdDeps() npd.Deps {
 type npdSink struct{ r *Reporter }
 
 func (s npdSink) EmitEvent(ctx context.Context, reason, note string) error {
-	return s.r.emitEvent(ctx, reason, note)
+	return s.r.emitEvent(ctx, reason, note, "Warning")
 }
 
 func (s npdSink) BumpCounter(reason string) {

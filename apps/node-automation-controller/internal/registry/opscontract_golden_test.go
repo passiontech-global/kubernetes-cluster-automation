@@ -168,6 +168,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_gateway_route_unhealthy",
 	"node_automation_gateway_route_zero_endpoints",
 	"node_automation_heal_budget_exhausted_total",
+	"node_automation_heal_target_circuit_broken_total",
 	"node_automation_helm_hook_jobs_cleaned_total",
 	"node_automation_helm_release_secrets_excess",
 	"node_automation_helm_release_secrets_pruned_total",
@@ -300,6 +301,8 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoFirstSeenOperatorWorkqueue", "passiontech.dev/first-seen-operator-workqueue"},
 	{"AnnoFirstSeenLinkerdEndpointSync", "passiontech.dev/first-seen-linkerd-endpoint-sync"},
 	{"AnnoFirstSeenArgoCDAppStuck", "passiontech.dev/first-seen-argocd-app-stuck"},
+	{"AnnoFirstSeenStormGateHold", "passiontech.dev/first-seen-storm-gate-hold"},
+	{"AnnoFirstSeenNHCPause", "passiontech.dev/first-seen-nhc-pause"},
 	{"AnnoLastLinkerdOpaquePatch", "passiontech.dev/last-linkerd-opaque-patch"},
 	{"AnnoLastKargoRefresh", "passiontech.dev/last-kargo-refresh"},
 	{"AnnoAllowEmptySecretKey", "passiontech.dev/allow-empty-secret-key"},
@@ -510,6 +513,10 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoFirstSeenLinkerdEndpointSync
 	case "AnnoFirstSeenArgoCDAppStuck":
 		return kube.AnnoFirstSeenArgoCDAppStuck
+	case "AnnoFirstSeenStormGateHold":
+		return kube.AnnoFirstSeenStormGateHold
+	case "AnnoFirstSeenNHCPause":
+		return kube.AnnoFirstSeenNHCPause
 	case "AnnoLastLinkerdOpaquePatch":
 		return kube.AnnoLastLinkerdOpaquePatch
 	case "AnnoLastKargoRefresh":

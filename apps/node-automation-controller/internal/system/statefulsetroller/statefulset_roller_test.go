@@ -653,3 +653,51 @@ func TestStatefulSetRollerStaleUnreadyBlocksRoll(t *testing.T) {
 		t.Fatal("pod rolled while a non-newest member was still settling")
 	}
 }
+
+// W18-9 image-pull gate: an owned pod waiting in
+// ImagePullBackOff/ErrImagePull defers the whole StatefulSet's roll
+// for the cycle — fail-safe, no error, no eviction attempted, the
+// rolled counter must not move.
+func TestStatefulSetRollerDefersOnImagePullStall(t *testing.T) {
+	natestutil.CleanupMetric(t, metrics.StatefulSetOnDeletePodsRolledTotal, "apps", "db")
+
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 2)
+	// db-1 is Ready as a whole (the membership + stability gates
+	// pass) but its sidecar is wedged pulling its image — the roll
+	// must defer on the pull stall alone.
+	stuck := srPod("db", 1, "rev-old", 30*time.Minute)
+	stuck.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "sidecar",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason:  "ImagePullBackOff",
+			Message: "back-off pulling image"}},
+	}}
+	objs := srNodes(1)
+	objs = append(objs, sts,
+		srPod("db", 0, "rev-old", 30*time.Minute),
+		stuck)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"db-0", "db-1"} {
+		if !srPodExists(t, cs, "apps", name) {
+			t.Fatalf("pod %s deleted despite the image-pull defer gate", name)
+		}
+	}
+	if got := ptestutil.ToFloat64(metrics.StatefulSetOnDeletePodsRolledTotal.
+		WithLabelValues("apps", "db")); got != 0 {
+		t.Fatalf("rolled counter = %v, want 0 (a defer is not a roll)", got)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "pods" &&
+			a.GetVerb() == "create" && a.GetSubresource() == "eviction" {
+			t.Fatal("eviction attempted despite the image-pull defer gate")
+		}
+	}
+}

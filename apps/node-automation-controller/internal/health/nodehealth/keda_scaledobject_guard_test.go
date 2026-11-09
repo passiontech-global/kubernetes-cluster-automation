@@ -81,6 +81,39 @@ func TestKedaGuardFlagsUnhealthyPastWindowAndRescuesZero(t *testing.T) {
 	}
 }
 
+// The W18-5 Rollout twin: a ScaledObject targeting a wedged-at-zero
+// argoproj.io Rollout gets the same rescue, patched through the
+// dynamic client.
+func TestKedaGuardRescuesZeroRollout(t *testing.T) {
+	so := kedaObj("apps", "ro-scaler", "ro-worker", 1, "False", "")
+	ro := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata":   map[string]any{"namespace": "apps", "name": "ro-worker"},
+		"spec":       map[string]any{"replicas": int64(0)},
+	}}
+	dyn := probetest.OpDyn(so, ro)
+	cs := fake.NewSimpleClientset()
+	p := testProberDyn(cs, dyn)
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
+	chk.Run(ctx)
+	base = base.Add(16 * time.Minute)
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("unhealthy scaledobject past window must fail: %+v", res)
+	}
+	got, err := dyn.Resource(kube.GVRArgoRollout).Namespace("apps").
+		Get(ctx, "ro-worker", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get rollout: %v", err)
+	}
+	reps, _, _ := unstructured.NestedInt64(got.Object, "spec", "replicas")
+	if reps != 1 {
+		t.Fatalf("wedged Rollout replicas = %d want 1", reps)
+	}
+}
+
 func TestKedaGuardSkipsDownscalerManagedZero(t *testing.T) {
 	so := kedaObj("apps", "worker-scaler", "worker", 2, "", "Unknown")
 	dep := zeroDeploy("apps", "worker",

@@ -157,6 +157,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Warehouse"},
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Promotion"},
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "AnalysisRun"},
+	// W18-5: gateway downscaler verdicts, keda zero-rescue and flux
+	// workload readiness also census the Rollout GVR.
+	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout"},
 	// W16-G1: api-object-sprawl-report-gc also GCs completed Rollouts
 	// Experiments — the sweep fake must serve their List kinds.
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Experiment"},

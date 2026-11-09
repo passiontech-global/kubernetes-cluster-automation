@@ -14,6 +14,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // A True managed condition whose heartbeat froze is reconciled to
@@ -127,39 +128,34 @@ func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 	}
 }
 
-// InodePressure is kubelet-native and deliberately outside
-// nodecond.HeartbeatSweptNames — the sweeper must never clear a
-// kubelet condition even with a frozen heartbeat. The split is
-// pinned by nodecond: InodePressure stays in HangPreCordonNames (it
-// still precordons, see node_hang_precordon_test.go) but is absent
-// from the sweeper's allowlist.
-func TestNodeCondSweeperIgnoresInodePressure(t *testing.T) {
-	for _, c := range nodeCondSweptConds {
-		if c == "InodePressure" {
-			t.Fatal("InodePressure must not be swept — kubelet-owned")
-		}
-	}
+// InodePressure is agent-latched since W18-1 (hostmetrics
+// state-inode-pressure) and kubelet never emits a condition of this
+// type — a frozen heartbeat on it can only be a dead reporter's
+// zombie, so the sweeper clears it like any other HeartbeatSweptNames
+// member. The remaining split (KernelDeadlock permanent, kubelet
+// condition types untouched) is pinned by nodecond.
+func TestNodeCondSweeperSweepsFrozenInodePressure(t *testing.T) {
 	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
 	n := probetest.ReadyWorkerNode("w-inode", "", 0, false)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               "InodePressure",
 		Status:             corev1.ConditionTrue,
-		Reason:             "KubeletHasInodePressure",
+		Reason:             "FilesystemInodesExhausted",
 		LastHeartbeatTime:  old,
 		LastTransitionTime: old,
 	})
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
-		t.Fatalf("InodePressure failed the check: %+v", res)
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("frozen InodePressure zombie did not fail the check")
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-inode", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := kube.NodeCondition(got, "InodePressure")
-	if c == nil || c.Status != corev1.ConditionTrue {
-		t.Fatalf("InodePressure = %+v, want Status=True untouched", c)
+	if c == nil || c.Status != corev1.ConditionFalse {
+		t.Fatalf("InodePressure = %+v, want Status=False swept", c)
 	}
 }
 
@@ -193,5 +189,53 @@ func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
 	c := kube.NodeCondition(got, "WatchdogStale")
 	if c == nil || c.Status != corev1.ConditionFalse {
 		t.Fatalf("WatchdogStale zombie = %+v, want Status=False cleared", c)
+	}
+}
+
+// TestNodeCondSweeperSweepsEveryAgentEmittedCondition proves the
+// allowlist covers EVERY condition nodereporter emits and re-stamps:
+// each nodecond.HeartbeatSweptNames entry — including the 20 that
+// joined in W18 (NodeOverloaded, WatchdogStale, DnsFallbackActive,
+// DnsResolvStale, JournaldUnreadable, NebulaDegraded,
+// CiliumIPAMExhausted, CiliumBPFMapPressure, SpegelMirrorDegraded,
+// CalicoVethLeak, Fail2banDown, ConntrackPressure,
+// KernelKeysPressure, ControlPlaneCertReloadStale,
+// NebulaPMTUBlackhole,
+// KubeconfigCertExpiring, CPUStealPressure, SystemdSessionBloat,
+// KernelNetShimDegraded, ClocksourceUnstable) — must be cleared when
+// it sits True with a frozen heartbeat. nodecond pins the list
+// against the agent's own emitter (libs/hostkit
+// TestHeartbeatSweptCoversLatchBackedExactly + the agent's
+// kernel_latch_conditions_test cross-check); this test pins the
+// CONSUMER side: a name in HeartbeatSweptNames that the sweeper
+// skipped would be a zombie the reporter can never reconcile.
+func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
+	for _, name := range nodecond.HeartbeatSweptNames {
+		n := probetest.ReadyWorkerNode("w-sweep-"+name, corev1.NodeConditionType(name),
+			nodeHangCondHeartbeatMaxAge+time.Minute, false)
+		n.Status.Conditions[1].LastHeartbeatTime = old
+		cs := fake.NewSimpleClientset(n)
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+			t.Errorf("%s: zombie True did not fail the check", name)
+			continue
+		}
+		got, err := cs.CoreV1().Nodes().Get(ctx, "w-sweep-"+name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		c := kube.NodeCondition(got, corev1.NodeConditionType(name))
+		if c == nil || c.Status != corev1.ConditionFalse {
+			t.Errorf("%s: zombie condition = %+v, want Status=False swept", name, c)
+		}
+	}
+	// And nothing outside the allowlist: kubelet-native InodePressure
+	// (pinned above) plus the agent-carried-but-permanent
+	// KernelDeadlock latch must NOT appear in the swept set.
+	for _, c := range nodeCondSweptConds {
+		if c == "KernelDeadlock" {
+			t.Error("KernelDeadlock must not be swept — permanent latch")
+		}
 	}
 }

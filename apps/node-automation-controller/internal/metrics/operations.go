@@ -117,6 +117,19 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Heal grants denied by the global heal budget (aggregate blast-radius cap).",
 })
 
+// HealTargetCircuitBrokenTotal counts per-target heal circuit-breaker
+// open transitions (internal/platform/heal — consulted by the node
+// cordon/taint patch actions of kubelet-liveness-reaper,
+// partition-pod-evictor and cpu-steal-taint-sync). An open means the
+// same (module,node) was already remediated 3 times inside the 3h
+// window without converging; further remediation defers until the
+// window expires or the target reports healthy. A sustained rate is
+// a node stuck in a remediation loop — look at the module+node pair.
+var HealTargetCircuitBrokenTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_heal_target_circuit_broken_total",
+	Help: "Per-target heal circuit-breaker open transitions (non-convergent remediation), by module and target.",
+}, []string{"module", "target"})
+
 // ---------------------------------------------------------------------------
 // Dead-node-sweeper operations metrics (the branch-(b) split-brain
 // gate).
@@ -156,6 +169,7 @@ var operationsCollectors = []prometheus.Collector{
 	CronJobTooManyMissedStarts,
 	VolumeAttachmentFinalizersRemovedTotal,
 	CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal,
+	HealTargetCircuitBrokenTotal,
 	DeadNodeUnfencedStatefulSkipped, DeadNodeFencedWithoutSNRTotal,
 }
 
