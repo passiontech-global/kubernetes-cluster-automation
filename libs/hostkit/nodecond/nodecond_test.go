@@ -85,7 +85,7 @@ func TestListLengths(t *testing.T) {
 	if got, want := len(HangPreCordonNames), 17; got != want {
 		t.Errorf("len(HangPreCordonNames) = %d, want %d", got, want)
 	}
-	if got, want := len(ClockSkewPreCordonNames), 2; got != want {
+	if got, want := len(ClockSkewPreCordonNames), 3; got != want {
 		t.Errorf("len(ClockSkewPreCordonNames) = %d, want %d", got, want)
 	}
 	// 37 storm-gate conditions minus 4 legacy spellings, plus
