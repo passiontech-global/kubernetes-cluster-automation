@@ -120,6 +120,29 @@ firewall:
 	}
 }
 
+// nebulaConvergeFixture seeds the vars/certs/hostRoot a groupNebula
+// test needs: node-b's signed cert material in NebulaCertsDir, an
+// empty HostRoot with /usr/local/bin present (untarInstall does not
+// create parents), and a fresh DownloadDir.
+func nebulaConvergeFixture(t *testing.T) (vars, certs, hostRoot, dl string) {
+	t.Helper()
+	vars = writeVarsDir(t, "")
+	certs = t.TempDir()
+	for name, content := range map[string]string{
+		"nebula-ca.crt": "-----BEGIN NEBULA CA-----\nfake\n",
+		"nebula-b.crt":  "-----BEGIN NEBULA CERT-----\nfake\n",
+	} {
+		if err := os.WriteFile(filepath.Join(certs, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hostRoot = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostRoot, "usr/local/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return vars, certs, hostRoot, t.TempDir()
+}
+
 // TestNebulaBinarySwapRestartsService — a version-pin binary install
 // must restart nebula@interdc even when cert+config are unchanged:
 // SIGHUP reloads config inside the OLD image; only exec picks up the
@@ -131,7 +154,7 @@ func TestNebulaBinarySwapRestartsService(t *testing.T) {
 		"nebula":      "#!/bin/sh\n# fake nebula\n",
 		"nebula-cert": "#!/bin/sh\n# fake nebula-cert\n",
 	})
-	vars := writeVarsDir(t, "")
+	vars, certs, hostRoot, dl := nebulaConvergeFixture(t)
 	dp := filepath.Join(vars, "defaults.yaml")
 	db, err := os.ReadFile(dp)
 	if err != nil {
@@ -145,20 +168,6 @@ interdc_nebula_tgz_file: "nebula.tgz"
 	if err := os.WriteFile(dp, db, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	certs := t.TempDir()
-	for name, content := range map[string]string{
-		"nebula-ca.crt": "-----BEGIN NEBULA CA-----\nfake\n",
-		"nebula-b.crt":  "-----BEGIN NEBULA CERT-----\nfake\n",
-	} {
-		if err := os.WriteFile(filepath.Join(certs, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	hostRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(hostRoot, "usr/local/bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	dl := t.TempDir()
 
 	// Phase A — steady state: probe reports the pin so nothing
 	// installs; certs/config/unit land so phase B sees zero drift.
@@ -200,6 +209,65 @@ interdc_nebula_tgz_file: "nebula.tgz"
 	}
 	if len(srB.CallsMatching("reload nebula@interdc.service")) > 0 {
 		t.Fatal("binary swap took the SIGHUP reload path — old image keeps running")
+	}
+}
+
+// TestNebulaSkewedBinaryRestartsService — the production incident
+// shape (nebula 1.11.2 → 1.12.0): the on-disk binary already carries
+// the pin — installed by a converge that never restarted the unit —
+// while the daemon still runs the old image. No install runs this
+// cycle, so the restart must come from the mtime-vs-active-since
+// skew probe alone.
+func TestNebulaSkewedBinaryRestartsService(t *testing.T) {
+	vars, certs, hostRoot, dl := nebulaConvergeFixture(t)
+	// The "already installed" binary: present before any converge,
+	// mtime = now → newer than any plausible active-since.
+	if err := os.WriteFile(filepath.Join(hostRoot, "usr/local/bin/nebula"),
+		[]byte("#!/bin/sh\n# fake nebula 1.11.2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase A — steady state: probe reports the pin, certs/config
+	// land so phase B sees zero content drift.
+	srA := newScripted(map[string]string{
+		"/usr/local/bin/nebula -version": "Version: 1.11.2",
+	}, nil)
+	rA, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+		VarsDir: vars, NebulaCertsDir: certs, Runner: srA, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cA := loadCyc(t, rA, vars, "node-b")
+	cA.groupNebula()
+	if !hostExists(rA, "/etc/nebula/interdc/config.yaml") {
+		t.Fatal("phase A did not seed the nebula config")
+	}
+
+	// Phase B — probe still reports the pin (NO install), daemon
+	// active since ~boot → skew detected → restart, not reload.
+	srB := newScripted(map[string]string{
+		"/usr/local/bin/nebula -version": "Version: 1.11.2",
+		"is-active nebula@interdc":       "active",
+		"ActiveEnterTimestampMonotonic":  "1000000\n",
+	}, nil)
+	rB, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+		VarsDir: vars, NebulaCertsDir: certs, Runner: srB, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cB := loadCyc(t, rB, vars, "node-b")
+	cB.groupNebula()
+	if len(srB.CallsMatching("systemctl restart nebula@interdc.service")) == 0 {
+		t.Fatalf("skewed binary did not restart nebula@interdc: %v", srB.Calls())
+	}
+	if len(srB.CallsMatching("reload nebula@interdc.service")) > 0 {
+		t.Fatal("skewed binary took the SIGHUP reload path — old image keeps running")
+	}
+	if entries, _ := os.ReadDir(dl); len(entries) > 0 {
+		t.Fatal("phase B downloaded despite the pin matching")
+	}
+	if got := hostRead(t, rB, "/usr/local/bin/nebula"); !strings.Contains(got, "fake nebula 1.11.2") {
+		t.Fatal("phase B reinstalled over the pinned binary")
 	}
 }
 
