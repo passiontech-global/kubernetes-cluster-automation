@@ -166,10 +166,12 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 }
 
 // rescueZeroTarget lifts a wedged-at-zero scale target back to
-// max(minReplicaCount, 1). Only Deployment/StatefulSet targets are
-// handled — the apiext kinds KEDA can scale beyond those carry no
-// typed handle here. A target the downscaler parked (any
-// downscaler/* annotation on a 0-replica spec) is skipped: that zero
+// max(minReplicaCount, 1). Deployment/StatefulSet targets resolve
+// through the typed censuses; argoproj.io Rollout targets ride the
+// unstructured census + dynamic patch (W18-5) — the apiext kinds
+// KEDA can scale beyond those carry no typed handle here. A target
+// the downscaler parked (any downscaler/* annotation on a 0-replica
+// spec) is skipped: that zero
 // is intent, and un-parking it fights the downscaler's own schedule.
 func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	log logr.Logger, so *unstructured.Unstructured, now time.Time) {
@@ -221,6 +223,28 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		}
 	}
 	if kind == "" {
+		// W18-5 — argoproj.io Rollout fallback: KEDA scales Rollouts
+		// the same way (scaleTargetRef kind Rollout). Unstructured CR
+		// — spec.replicas comes off the census object; a failed
+		// census stays inconclusive, not "not at zero".
+		ros, rerr := p.AllUnstructured(ctx, kube.GVRArgoRollout)
+		if rerr != nil {
+			return // census unreadable — inconclusive
+		}
+		for i := range ros {
+			r := &ros[i]
+			if r.GetNamespace() == ns && r.GetName() == target {
+				kind = "Rollout"
+				annotations = r.GetAnnotations()
+				if reps, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
+					v := int32(reps)
+					replicas = &v
+				}
+				break
+			}
+		}
+	}
+	if kind == "" {
 		return // target unresolvable this sweep — inconclusive
 	}
 	if replicas == nil || *replicas != 0 {
@@ -253,6 +277,9 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	case "StatefulSet":
 		_, err = p.CS.AppsV1().StatefulSets(ns).Patch(ctx, target,
 			types.MergePatchType, payload, metav1.PatchOptions{})
+	case "Rollout":
+		_, err = p.Dyn.Resource(kube.GVRArgoRollout).Namespace(ns).
+			Patch(ctx, target, types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	if err != nil {
 		metrics.IncError(p.Name)

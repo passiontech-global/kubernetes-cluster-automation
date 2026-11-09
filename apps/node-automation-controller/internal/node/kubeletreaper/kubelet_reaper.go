@@ -35,6 +35,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -210,6 +211,12 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	log := logf.FromContext(ctx)
 
 	if ok {
+		// The kubelet serves :10250 — the node's own convergence
+		// evidence: clear its breaker history now so the next real
+		// episode starts from zero instead of inheriting a stale
+		// count (and so a half-open episode cannot trip on an
+		// unrelated later taint).
+		heal.RecordTargetHealthy(r.queue, listed.Name)
 		if kube.HasTaint(listed.Spec.Taints, kubeletReaperTaint) {
 			// kube.UntaintNode re-Gets the node inside before patching,
 			// so a stale listed snapshot cannot remove a taint that
@@ -255,6 +262,22 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	}
 	if age == -1 || age > kubeletReaperHBStaleS {
 		if !has {
+			// Per-target non-convergent circuit breaker — the 4th
+			// taint of the same node inside the breaker window
+			// defers: a kubelet this module keeps tainting without
+			// it ever coming back is not converging, and re-patching
+			// every 2m cycle is exactly the churn the breaker stops.
+			// Same semantics as the module's other no-action paths:
+			// log, skip, return nil — never an error (IncError would
+			// page on our own fail-safe). The history clears the
+			// moment a probe succeeds (the ok branch above), so a
+			// kubelet restart ends the episode instead of banking
+			// against the next one.
+			if allowed, reason := heal.TryAcquireTarget(r.queue, name, r.now.Now()); !allowed {
+				log.Info("DEFER: heal target circuit open — taint skipped",
+					"node", name, "reason", reason)
+				return nil
+			}
 			if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
 				corev1.TaintEffectNoSchedule); err != nil {
 				return fmt.Errorf("taint %s on node %s: %w",

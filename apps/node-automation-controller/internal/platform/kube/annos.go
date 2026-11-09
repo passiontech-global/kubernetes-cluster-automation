@@ -114,6 +114,17 @@ const (
 	AnnoFirstSeenOperatorWorkqueue   = "passiontech.dev/first-seen-operator-workqueue"
 	AnnoFirstSeenLinkerdEndpointSync = "passiontech.dev/first-seen-linkerd-endpoint-sync"
 	AnnoFirstSeenArgoCDAppStuck      = "passiontech.dev/first-seen-argocd-app-stuck"
+	// AnnoFirstSeenStormGateHold is descheduler-storm-gate's persisted
+	// first-seen stamp for a passiontech.dev/storm-gate-hold="true"
+	// hold — the hold annotation carries no timestamp of its own, so
+	// the W18-9 MaintenanceHoldStale warning (>2h continuous hold)
+	// measures from this map on the descheduler Deployment.
+	AnnoFirstSeenStormGateHold = "passiontech.dev/first-seen-storm-gate-hold"
+	// AnnoFirstSeenNHCPause is the same persisted first-seen window
+	// for a NodeHealthCheck whose spec.pauseRequests has been
+	// non-empty — the W18-9 MaintenanceHoldStale warning rides this
+	// map on the NHC object itself.
+	AnnoFirstSeenNHCPause = "passiontech.dev/first-seen-nhc-pause"
 	// AnnoLastLinkerdOpaquePatch is linkerd-protocol-detection-stall's
 	// durable stamp on the owning Deployment/StatefulSet — a GitOps
 	// (Flux/ArgoCD) managed workload whose pod template keeps losing

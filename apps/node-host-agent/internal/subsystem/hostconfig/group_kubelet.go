@@ -182,6 +182,8 @@ func (c *cyc) groupPulls() {
 	apiBurst := defStr(c.v("kubelet_api_burst"), "50")
 	pids := defStr(c.v("kubelet_pod_pids_limit"), "4096")
 	dl := defStr(c.v("containerd_max_concurrent_downloads"), "5")
+	shutdownGrace := defStr(c.v("kubelet_shutdown_grace_period"), "60s")
+	shutdownGraceCritical := defStr(c.v("kubelet_shutdown_grace_period_critical_pods"), "20s")
 
 	// Flags go INSIDE --kubelet-extra-args with literal \x20
 	// separators — a real space would turn them into bare k0s argv.
@@ -256,6 +258,14 @@ func (c *cyc) groupPulls() {
 				{"kubeAPIQPS", apiQPS},
 				{"kubeAPIBurst", apiBurst},
 				{"podPidsLimit", pids},
+				// W18-7: k0sworker-profile parity — graceful node
+				// shutdown must have a kubelet window to drain in,
+				// fitting logind's InhibitDelayMaxSec=65
+				// (group_base.go). Values come from the node-config-agent
+				// defaults (kubelet_shutdown_grace_period*) and match
+				// the k0sctl worker profiles.
+				{"shutdownGracePeriod", shutdownGrace},
+				{"shutdownGracePeriodCriticalPods", shutdownGraceCritical},
 			} {
 				s = lineInFile(s, "(?m)^"+kv[0]+":", kv[0]+": "+kv[1],
 					`(?m)^kind: KubeletConfiguration`)

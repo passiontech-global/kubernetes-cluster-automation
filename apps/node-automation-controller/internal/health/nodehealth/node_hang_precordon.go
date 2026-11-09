@@ -409,7 +409,17 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		if target == nil || target.Spec.Unschedulable {
 			continue
 		}
-		if workers > 0 && float64(cordoned)/float64(workers) >= nodeHangMaxCordonedRatio {
+		// Cap invariant: after this cordon at most
+		// max(1, floor(nodeHangMaxCordonedRatio*workers)) workers
+		// are cordoned. The post-increment count (cordoned+1) is
+		// what must stay inside the ratio — testing the
+		// pre-increment count with >= let the fleet reach exactly
+		// 35%+one, over-cap by one. The cordoned==0 exception lets
+		// the FIRST cordon through regardless of ratio, so a
+		// 2-worker cluster (floor(0.35*2)=0) keeps pre-cordon
+		// ability: without it a 2-node fleet could never precordon.
+		if workers > 0 && cordoned > 0 &&
+			float64(cordoned+1)/float64(workers) > nodeHangMaxCordonedRatio {
 			log.Info("skip precordon: cordoned-worker ratio at cap — refusing to unnode the fleet",
 				"cordoned", cordoned, "workers", workers)
 			continue

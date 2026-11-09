@@ -470,7 +470,7 @@ var operatorTargets = []operatorTarget{
 		// mid-promotion, or the controller crashed-looping on one CR.
 		name:        "argo-rollouts-controller",
 		leaseNS:     "argo-rollouts",
-		leaseNames:  []string{"argo-rollouts-controller"},
+		leaseNames:  []string{"argo-rollouts-controller", "rollouts-controller-leader-election"},
 		podSelector: "app.kubernetes.io/name=argo-rollouts",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{

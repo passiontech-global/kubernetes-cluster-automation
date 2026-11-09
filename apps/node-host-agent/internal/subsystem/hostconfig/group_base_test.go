@@ -13,6 +13,49 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
+// ---------- W18-7: host-level protection files ----------
+
+func TestGroupBaseHostProtectionFilesConverge(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	networkd := hostRead(t, r, "/etc/systemd/networkd.conf.d/99-preserve-cni-routes.conf")
+	for _, want := range []string{
+		"[Network]", "ManageForeignRoutes=no", "ManageForeignRoutingPolicyRules=no",
+	} {
+		if !strings.Contains(networkd, want) {
+			t.Fatalf("networkd drop-in missing %q:\n%s", want, networkd)
+		}
+	}
+	logind := hostRead(t, r, "/etc/systemd/logind.conf.d/99-k8s-shutdown.conf")
+	if !strings.Contains(logind, "[Login]") || !strings.Contains(logind, "InhibitDelayMaxSec=65") {
+		t.Fatalf("bad logind drop-in:\n%s", logind)
+	}
+	apt := hostRead(t, r, "/etc/apt/apt.conf.d/99-k8s-unattended-safety")
+	for _, want := range []string{
+		`"containerd*"`, `"runc"`, `"k0s*"`, `"iptables*"`,
+		`"nftables"`, `"kmod"`, `"systemd"`, `"systemd-sysv"`, `"udev"`,
+		`Unattended-Upgrade::Automatic-Reboot "false";`,
+	} {
+		if !strings.Contains(apt, want) {
+			t.Fatalf("apt safety file missing %q:\n%s", want, apt)
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(r.cfg.HostRoot,
+		"/etc/apt/apt.conf.d/99-k8s-unattended-safety")); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("apt safety mode = %v want 0644", fi)
+	}
+}
+
 // ---------- Coredump: coredump.conf.d disable drop-in ----------
 
 func TestGroupBaseCoredumpDropInConverges(t *testing.T) {

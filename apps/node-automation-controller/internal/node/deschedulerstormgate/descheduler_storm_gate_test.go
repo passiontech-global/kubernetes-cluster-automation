@@ -12,12 +12,15 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -680,5 +683,417 @@ func TestStormGatePreemptionListError(t *testing.T) {
 	}
 	if got := getDeschedulerReplicas(t, cs); got != 1 {
 		t.Fatalf("replicas changed on blind data: %d", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W18-8 — image-pull storm (storm signal (e))
+// ---------------------------------------------------------------------------
+
+// stalledPod builds a pod whose app container is currently waiting
+// in `reason` (ImagePullBackOff / ErrImagePull / "" for healthy).
+func stalledPod(ns, name, reason string) *corev1.Pod {
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+	if reason != "" {
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "app",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason:  reason,
+				Message: "back-off pulling image"}},
+		}}
+	}
+	return p
+}
+
+// Signal (e): stormImagePullMinPods stuck pods gate the descheduler
+// exactly like a node storm — rescheduling pods whose images cannot
+// land just spreads unrunnable pods across more nodes — and the
+// decision annotation records the image-pull-stall reason.
+func TestStormGateImagePullStormGates(t *testing.T) {
+	objs := []runtime.Object{
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		stalledPod("apps", "a", "ImagePullBackOff"),
+		stalledPod("apps", "b", "ImagePullBackOff"),
+		stalledPod("apps", "c", "ErrImagePull"),
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("image-pull storm must gate the descheduler, replicas=%d", got)
+	}
+	decision := getDescheduler(t, cs).Annotations[stormGateDecisionAnno]
+	if !strings.Contains(decision, "image-pull-stall") ||
+		!strings.Contains(decision, "verdict=storm") ||
+		!strings.Contains(decision, "imagepull=[") {
+		t.Fatalf("decision missing the image-pull-stall signal: %q", decision)
+	}
+}
+
+// Under the thresholds — 2 stuck pods in ONE namespace — is an
+// ordinary broken Deployment, not a storm: the descheduler keeps
+// running.
+func TestStormGateImagePullUnderThresholdIsClear(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		stalledPod("apps", "a", "ImagePullBackOff"),
+		stalledPod("apps", "b", "ErrImagePull"),
+	)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("under-threshold pull stalls must not gate, replicas=%d", got)
+	}
+	if decision := getDescheduler(t, cs).Annotations[stormGateDecisionAnno]; strings.Contains(decision, "image-pull-stall") {
+		t.Fatalf("under-threshold verdict recorded a storm signal: %q", decision)
+	}
+}
+
+// The namespace half of the threshold: stuck pods in TWO namespaces
+// gate even below stormImagePullMinPods — two unrelated workloads
+// failing to pull points at the cluster (registry/network), not one
+// bad Deployment.
+func TestStormGateImagePullTwoNamespacesGate(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		stalledPod("apps", "a", "ImagePullBackOff"),
+		stalledPod("db", "b", "ErrImagePull"),
+	)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("pull stalls in 2 namespaces must gate, replicas=%d", got)
+	}
+}
+
+// A pod-list failure aborts the reconcile — never a "clear" verdict
+// on blind data (same posture as the node/events list failures).
+func TestStormGateImagePullListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the pod census list fails")
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("replicas changed on blind data: %d", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W18-9 — forgotten maintenance holds (MaintenanceHoldStale)
+// ---------------------------------------------------------------------------
+
+// drainMaintenanceHoldStale counts the recorder's queued
+// MaintenanceHoldStale events — NewFakeRecorder delivers synchronously,
+// so the count is deterministic right after Reconcile returns.
+func drainMaintenanceHoldStale(rec *record.FakeRecorder) int {
+	n := 0
+	for {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, maintenanceHoldStaleReason) {
+				n++
+			}
+		default:
+			return n
+		}
+	}
+}
+
+// holdAnnos builds the descheduler Deployment annotations for a hold
+// whose first-seen stamp says it has been "true" for `age` ("" age =
+// no stamp — a hold the controller just started tracking).
+func holdAnnos(age time.Duration) map[string]string {
+	annos := map[string]string{stormGateHoldAnno: "true"}
+	if age != 0 {
+		annos[kube.AnnoFirstSeenStormGateHold] = fmt.Sprintf(
+			`{"%s":"%s"}`, stormHoldLedgerKey,
+			time.Now().Add(-age).UTC().Format(time.RFC3339))
+	}
+	return annos
+}
+
+// A hold kept "true" past the stale window fires exactly ONE
+// MaintenanceHoldStale Warning — repeat reconciles must not spam.
+func TestStormGateStaleHoldWarnsOnce(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, holdAnnos(3*time.Hour)))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 1 {
+		t.Fatalf("stale hold warnings = %d, want 1", got)
+	}
+	// The hold path still skips scaling.
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("hold must skip scaling, replicas=%d", got)
+	}
+	// Repeat reconciles of the SAME stale hold must stay silent.
+	for range 2 {
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("repeated reconciles spammed %d extra warnings", got)
+	}
+}
+
+// A hold inside the stale window (fresh stamp, or none yet) warns
+// nothing — the annotation has to HOLD past 2h first.
+func TestStormGateFreshHoldDoesNotWarn(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, holdAnnos(time.Hour)))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
+	for range 2 {
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("fresh hold warned %d times, want 0", got)
+	}
+}
+
+// Releasing the hold clears the persisted stamp and re-arms: a NEW
+// hold starts a fresh 2h window instead of inheriting the old one.
+func TestStormGateHoldReleaseReArms(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, holdAnnos(3*time.Hour)))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 1 {
+		t.Fatalf("stale hold warnings = %d, want 1", got)
+	}
+
+	// Release the hold: the next sweep must clear the stamp...
+	d := getDescheduler(t, cs)
+	d.Annotations[stormGateHoldAnno] = "false"
+	if _, err := cs.AppsV1().Deployments("kube-system").
+		Update(ctx, d, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDescheduler(t, cs).Annotations[kube.AnnoFirstSeenStormGateHold]; got != "" {
+		t.Fatalf("released hold left first-seen stamp behind: %q", got)
+	}
+
+	// ...and a NEW hold starts fresh: stamped at now, no warning.
+	d = getDescheduler(t, cs)
+	d.Annotations[stormGateHoldAnno] = "true"
+	if _, err := cs.AppsV1().Deployments("kube-system").
+		Update(ctx, d, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("re-armed hold warned %d times, want 0", got)
+	}
+	if got := getDescheduler(t, cs).Annotations[kube.AnnoFirstSeenStormGateHold]; got == "" {
+		t.Fatal("new hold was not stamped with a fresh first-seen")
+	}
+}
+
+// nhcCR builds a NodeHealthCheck fixture — pauseRequests nil renders
+// no spec at all (a healthy, unpaused NHC). The slice is []any: the
+// dynamic fake deep-copies fixture JSON, which chokes on typed
+// slices.
+func nhcCR(name string, pauseRequests []string) *unstructured.Unstructured {
+	fields := map[string]any{}
+	if pauseRequests != nil {
+		reqs := make([]any, len(pauseRequests))
+		for i, r := range pauseRequests {
+			reqs[i] = r
+		}
+		fields["spec"] = map[string]any{"pauseRequests": reqs}
+	}
+	return testutil.Unstructured(
+		kube.GVRNodeHealthCheck.GroupVersion().WithKind("NodeHealthCheck"),
+		"", name, fields)
+}
+
+func nhcPauseAnno(name string, age time.Duration) map[string]string {
+	return map[string]string{
+		kube.AnnoFirstSeenNHCPause: fmt.Sprintf(
+			`{"%s":"%s"}`, name,
+			time.Now().Add(-age).UTC().Format(time.RFC3339)),
+	}
+}
+
+// A NodeHealthCheck paused via spec.pauseRequests past the stale
+// window fires exactly ONE MaintenanceHoldStale Warning on the NHC —
+// repeat sweeps must not spam.
+func TestStormGateNHCPauseStaleWarnsOnce(t *testing.T) {
+	nhc := nhcCR("nhc", []string{"runbook pause"})
+	nhc.SetAnnotations(nhcPauseAnno("nhc", 3*time.Hour))
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(nhc), recorder: rec}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 1 {
+		t.Fatalf("stale NHC pause warnings = %d, want 1", got)
+	}
+	for range 2 {
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("repeated sweeps spammed %d extra warnings", got)
+	}
+}
+
+// A fresh (or untracked) pause warns nothing until the window holds.
+func TestStormGateNHCPauseFreshDoesNotWarn(t *testing.T) {
+	nhc := nhcCR("nhc", []string{"runbook pause"})
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(nhc), recorder: rec}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("fresh pause warned %d times, want 0", got)
+	}
+}
+
+// Releasing the pause clears the persisted stamp on the NHC and
+// re-arms the window; re-pausing warns nothing until it holds again.
+func TestStormGateNHCPauseReleaseClearsStamp(t *testing.T) {
+	nhc := nhcCR("nhc", []string{"runbook pause"})
+	nhc.SetAnnotations(nhcPauseAnno("nhc", 3*time.Hour))
+	dyn := stormGateDynFake(nhc)
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: dyn, recorder: rec}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 1 {
+		t.Fatalf("stale NHC pause warnings = %d, want 1", got)
+	}
+
+	// Release the pause — the next sweep clears the stamp.
+	if _, err := dyn.Resource(kube.GVRNodeHealthCheck).
+		Update(ctx, nhcCR("nhc", nil), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	obj, err := dyn.Resource(kube.GVRNodeHealthCheck).
+		Get(ctx, "nhc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := obj.GetAnnotations()[kube.AnnoFirstSeenNHCPause]; got != "" {
+		t.Fatalf("released pause left first-seen stamp behind: %q", got)
+	}
+
+	// A NEW pause starts fresh — no immediate warning.
+	if _, err := dyn.Resource(kube.GVRNodeHealthCheck).
+		Update(ctx, nhcCR("nhc", []string{"again"}), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("re-armed pause warned %d times, want 0", got)
+	}
+}
+
+// A cluster without the medik8s CRD is an empty scan — the probe
+// must not error the reconcile (same posture as the mutex's absent
+// autopilot/medik8s CRDs). The fake needs the list kind REGISTERED
+// (an unregistered List panics before reactors run), so the absent
+// CRD is simulated with the error a real absent CRD produces.
+func TestStormGateNHCCRDAbsentIsClear(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
+		kube.GVRNodeHealthCheck: "NodeHealthCheckList",
+		// The reconcile continues into the maintenance mutex after
+		// the probe — the fake needs every GVR that later List
+		// touches registered or it panics before any reactor runs.
+		kube.AutopilotPlanGVR:          "PlanList",
+		kube.GVRSelfNodeRemediation:    "SelfNodeRemediationList",
+		kube.GVRFenceAgentsRemediation: "FenceAgentsRemediationList",
+		kube.GVRNodeMaintenance:        "NodeMaintenanceList",
+	})
+	dyn.PrependReactor("list", "nodehealthchecks",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, &meta.NoKindMatchError{
+				GroupKind: schema.GroupKind{
+					Group: kube.GVRNodeHealthCheck.Group, Kind: "NodeHealthCheck"},
+			}
+		})
+	rec := record.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: dyn, recorder: rec}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("absent NHC CRD must not error the reconcile: %v", err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("absent CRD warned %d times, want 0", got)
+	}
+}
+
+// A real NHC list failure errors the reconcile — never a silent
+// "nothing paused".
+func TestStormGateNHCListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	dyn := stormGateDynFake()
+	dyn.PrependReactor("list", "nodehealthchecks",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the NHC list fails")
 	}
 }

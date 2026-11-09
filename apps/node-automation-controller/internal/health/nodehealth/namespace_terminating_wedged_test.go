@@ -15,8 +15,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -108,6 +110,109 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	fins := got.GetFinalizers()
 	if len(fins) != 1 || fins[0] != "kubernetes.io/pvc-protection" {
 		t.Fatalf("finalizers after strip = %v, want only kubernetes.io/pvc-protection", fins)
+	}
+}
+
+// A ReplicaSet-owned CR whose controller Rollout (argoproj.io, W18-5)
+// is gone is the same GC-pending garbage — the Rollout existence
+// check rides the dynamic client.
+func TestMaybeStripFinalizersDeadRolloutOwner(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "foos"}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "dead-ns", Name: "foo-rs",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "argoproj.io/v1alpha1", Kind: "Rollout",
+				Name: "gone-rollout", UID: "uid-ro", Controller: ptr.To(true),
+			}},
+		},
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Foo",
+		"metadata": map[string]any{
+			"namespace":         "dead-ns",
+			"name":              "foo-ro",
+			"resourceVersion":   "100",
+			"finalizers":        []any{"example.com/finalizer"},
+			"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
+			"ownerReferences": []any{map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "ReplicaSet",
+				"name":       "foo-rs",
+				"controller": true,
+				"uid":        "uid-rs",
+			}},
+		},
+	}}
+	cs := fake.NewSimpleClientset(rs)
+	kinds := testutil.DynListKinds()
+	kinds[gvr] = "FooList"
+	kinds[kube.GVRArgoRollout] = "RolloutList"
+	dyn := testutil.NewFakeDyn(kinds, obj) // Rollout absent → dead owner
+	p := testProberDyn(cs, dyn)
+
+	if !probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+		t.Fatal("dead-Rollout-owner CR should be stripped")
+	}
+	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-ro", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.GetFinalizers()) != 0 {
+		t.Fatalf("finalizers after strip = %v, want none", got.GetFinalizers())
+	}
+}
+
+// A live Rollout owner must keep the CR — the same fail-closed
+// posture as the live Deployment chain.
+func TestMaybeStripFinalizersLiveRolloutOwnerSkipped(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "foos"}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "dead-ns", Name: "foo-rs",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "argoproj.io/v1alpha1", Kind: "Rollout",
+				Name: "live-rollout", UID: "uid-ro", Controller: ptr.To(true),
+			}},
+		},
+	}
+	ro := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata":   map[string]any{"namespace": "dead-ns", "name": "live-rollout"},
+	}}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Foo",
+		"metadata": map[string]any{
+			"namespace":         "dead-ns",
+			"name":              "foo-ro-live",
+			"resourceVersion":   "100",
+			"finalizers":        []any{"example.com/finalizer"},
+			"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
+			"ownerReferences": []any{map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "ReplicaSet",
+				"name":       "foo-rs",
+				"controller": true,
+				"uid":        "uid-rs",
+			}},
+		},
+	}}
+	cs := fake.NewSimpleClientset(rs)
+	kinds := testutil.DynListKinds()
+	kinds[gvr] = "FooList"
+	kinds[kube.GVRArgoRollout] = "RolloutList"
+	dyn := testutil.NewFakeDyn(kinds, obj, ro)
+	p := testProberDyn(cs, dyn)
+
+	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+		t.Fatal("live-Rollout-owner CR must not be stripped")
+	}
+	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-ro-live", metav1.GetOptions{})
+	if len(got.GetFinalizers()) != 1 {
+		t.Fatalf("finalizers = %v, want untouched", got.GetFinalizers())
 	}
 }
 

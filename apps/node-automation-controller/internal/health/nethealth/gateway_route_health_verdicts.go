@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -216,6 +217,37 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 				annotations:    s.Annotations,
 				replicas:       s.Spec.Replicas})
 		}
+	}
+	// argoproj.io Rollouts are first-class workload backends too
+	// (W18-5): a Rollout the downscaler parked at zero reads the same
+	// asleep-on-purpose exemption. Unstructured CR — template labels,
+	// annotations and spec.replicas come off the unstructured object
+	// through the per-sweep snapshot census; a failed census is the
+	// same tolerated sub-failure (verdict stays "not provably
+	// downscaled", fail closed).
+	ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: gateway route health — rollout census failed, downscaler verdict off",
+			"namespace", ns, "error", err)
+		return
+	}
+	for i := range ros {
+		r := &ros[i]
+		if r.GetNamespace() != ns {
+			continue
+		}
+		tl, _, _ := unstructured.NestedStringMap(r.Object,
+			"spec", "template", "metadata", "labels")
+		var replicas *int32
+		if reps, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
+			v := int32(reps)
+			replicas = &v
+		}
+		c.workloads[ns] = append(c.workloads[ns], routeWorkload{
+			templateLabels: tl,
+			annotations:    r.GetAnnotations(),
+			replicas:       replicas})
 	}
 }
 

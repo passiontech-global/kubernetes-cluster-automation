@@ -47,6 +47,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -55,6 +56,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -100,6 +103,50 @@ func defaultCacheTransform(obj interface{}) (interface{}, error) {
 		n.Status.Images = nil
 	}
 	return obj, nil
+}
+
+// eventReasonRemediationCircuitBreakerOpen is the Warning event
+// reason stamped on the remediation target Node when its per-target
+// heal circuit opens — one event per open episode (the breaker fires
+// the hook once per transition).
+const eventReasonRemediationCircuitBreakerOpen = "RemediationCircuitBreakerOpen"
+
+// emitCircuitOpenEvent stamps the RemediationCircuitBreakerOpen
+// Warning Event on the target Node — the events.k8s.io/v1 shape the
+// health-check emitters use (Regarding+Action, deprecated corev1
+// fields unset); the ClusterRole grants cluster-wide events create
+// (the zone-starvation emitter's rule). Best-effort: a failure is
+// logged and never escalates — the HealTargetCircuitBrokenTotal
+// counter is the guaranteed signal.
+func emitCircuitOpenEvent(cs kubernetes.Interface, module, target, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	ev := &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("%s.%x", target, now.UnixNano()),
+		},
+		EventTime:           metav1.NewMicroTime(now),
+		Reason:              eventReasonRemediationCircuitBreakerOpen,
+		Note:                fmt.Sprintf("%s remediated this node repeatedly without convergence (%s) — further remediation is deferred until the window expires or the node reports healthy", module, reason),
+		Type:                corev1.EventTypeWarning,
+		ReportingController: "node-automation-controller",
+		ReportingInstance:   module,
+		Action:              eventReasonRemediationCircuitBreakerOpen,
+		Regarding: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Node",
+			Name:       target,
+		},
+	}
+	if _, err := cs.EventsV1().Events(metav1.NamespaceAll).
+		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		ctrl.Log.Error(err, "RemediationCircuitBreakerOpen event create failed",
+			"module", module, "node", target)
+		return
+	}
+	ctrl.Log.Info("EVENT: RemediationCircuitBreakerOpen — remediation deferred",
+		"module", module, "node", target, "reason", reason)
 }
 
 // buildCacheOptions assembles the informer cache shape. The cache
@@ -361,6 +408,22 @@ func main() {
 		envx.GetenvInt("NODE_AUTOMATION_HEAL_BUDGET_MAX", 10),
 		envx.GetenvDuration("NODE_AUTOMATION_HEAL_BUDGET_WINDOW", 5*time.Minute))
 	heal.SetBudgetExhaustedHook(metrics.HealBudgetExhaustedTotal.Inc)
+
+	// The per-target non-convergent circuit breaker — the other half
+	// of the budget above: one (module,node) remediated 3 times
+	// inside 3h without the target converging defers further
+	// remediation until the window expires or the target reports
+	// healthy (RecordTargetHealthy from each module's recovery path).
+	// Same hook bridge as the budget (platform cannot import
+	// internal/metrics — depguard leaf rule): the open transition
+	// increments the counter and stamps the
+	// RemediationCircuitBreakerOpen Warning event on the Node
+	// (best-effort — see emitCircuitOpenEvent).
+	heal.ConfigureTargetBreaker(heal.TargetBreakerLimit, heal.TargetBreakerWindow)
+	heal.SetTargetCircuitOpenHook(func(module, target, reason string) {
+		metrics.HealTargetCircuitBrokenTotal.WithLabelValues(module, target).Inc()
+		emitCircuitOpenEvent(cs, module, target, reason)
+	})
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn,
 		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}

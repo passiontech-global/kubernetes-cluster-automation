@@ -426,6 +426,74 @@ func TestGatewayRouteHealthSkipsDownscaledBackend(t *testing.T) {
 	}
 }
 
+// downscaledRollout builds an argoproj.io Rollout (W18-5) the
+// go-kube-downscaler parked at replicas:0 whose pod template the
+// service selector matches — the unstructured twin of
+// downscaledDeployment.
+func downscaledRollout(ns, name string, tplLabels map[string]string) *unstructured.Unstructured {
+	labels := map[string]any{}
+	for k, v := range tplLabels {
+		labels[k] = v
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata": map[string]any{
+			"namespace":   ns,
+			"name":        name,
+			"annotations": map[string]any{"downscaler/downtime-replicas": "0"},
+		},
+		"spec": map[string]any{
+			"replicas": int64(0),
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": labels}},
+		},
+	}}
+}
+
+// A zero-endpoint backend served by an intentionally downscaled
+// argoproj.io Rollout is asleep on purpose too — never flagged.
+func TestGatewayRouteHealthSkipsDownscaledRolloutBackend(t *testing.T) {
+	route := routeFixture("HTTPRoute", "apps", "downscaled-ro-route")
+	setRouteBackends(route, map[string]any{"name": "web-svc", "port": int64(80)})
+	setRouteParents(route, routeCond("Accepted", "True"))
+	cs := fake.NewSimpleClientset(
+		clusterIPService("apps", "web-svc", map[string]string{"app": "x"}))
+	dyn := probetest.OpDyn(route, downscaledRollout("apps", "web", map[string]string{"app": "x"}))
+	p := testProberDyn(cs, dyn)
+	res := driveRouteCheck(t, p, time.Now())
+	if !res.Pass {
+		t.Fatalf("downscaler-owned Rollout zero must pass: %s", res.Why)
+	}
+	if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",
+		map[string]string{"kind": "HTTPRoute", "namespace": "apps",
+			"name": "downscaled-ro-route", "reason": "backend_zero_endpoints"}); m != nil {
+		t.Fatal("gauge emitted for an intentionally downscaled Rollout backend")
+	}
+}
+
+// A Rollout parked at zero WITHOUT downscaler annotations is not a
+// sanctioned zero — the backend verdict must still fire.
+func TestGatewayRouteHealthFlagsZeroReplicaRolloutBackend(t *testing.T) {
+	route := routeFixture("HTTPRoute", "apps", "zero-ro-route")
+	setRouteBackends(route, map[string]any{"name": "web-svc", "port": int64(80)})
+	setRouteParents(route, routeCond("Accepted", "True"))
+	ro := downscaledRollout("apps", "web", map[string]string{"app": "x"})
+	delete(ro.Object["metadata"].(map[string]any), "annotations")
+	cs := fake.NewSimpleClientset(
+		clusterIPService("apps", "web-svc", map[string]string{"app": "x"}))
+	p := testProberDyn(cs, probetest.OpDyn(route, ro))
+	res := driveRouteCheck(t, p, time.Now())
+	if res.Pass {
+		t.Fatalf("non-downscaler Rollout zero must flag: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",
+		map[string]string{"kind": "HTTPRoute", "namespace": "apps",
+			"name": "zero-ro-route", "reason": "backend_zero_endpoints"}); m == nil {
+		t.Fatal("gauge absent for a non-downscaler zero-replica Rollout backend")
+	}
+}
+
 // A selectorless Service's endpoints are user-managed — zero Ready
 // addresses is never this check's verdict.
 func TestGatewayRouteHealthSkipsSelectorlessBackend(t *testing.T) {

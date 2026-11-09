@@ -349,6 +349,11 @@ func (p *fluxKustomizationHealthCheck) fluxKustWorkloadsReady(ctx context.Contex
 			ready = p.fluxDeploymentReady(ctx, ns, name)
 		case "StatefulSet":
 			ready = p.fluxStatefulSetReady(ctx, ns, name)
+		case "Rollout":
+			// W18-5 — argoproj.io Rollouts land in the inventory the
+			// same way; same ready-replicas corroboration, read off
+			// the unstructured CR.
+			ready = p.fluxRolloutReady(ctx, ns, name)
 		default:
 			continue // not a readiness-workload entry — ignore
 		}
@@ -392,6 +397,34 @@ func (p *fluxKustomizationHealthCheck) fluxDeploymentReady(ctx context.Context,
 			continue
 		}
 		return d.Status.ReadyReplicas >= desiredReplicas(d.Spec.Replicas)
+	}
+	return false
+}
+
+// fluxRolloutReady is the argoproj.io Rollout twin (W18-5): the
+// same ready-replicas cover check over the unstructured Rollout
+// census — status.readyReplicas vs spec.replicas (absent spec
+// replicas means the apiserver default of 1; a replicas:0
+// downscale reads ready). Absent or unreadable is not ready:
+// fail closed.
+func (p *fluxKustomizationHealthCheck) fluxRolloutReady(ctx context.Context,
+	ns, name string) bool {
+
+	ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
+	if err != nil {
+		return false
+	}
+	for i := range ros {
+		r := &ros[i]
+		if r.GetNamespace() != ns || r.GetName() != name {
+			continue
+		}
+		desired := int64(1)
+		if d, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
+			desired = d
+		}
+		ready, _, _ := unstructured.NestedInt64(r.Object, "status", "readyReplicas")
+		return ready >= desired
 	}
 	return false
 }

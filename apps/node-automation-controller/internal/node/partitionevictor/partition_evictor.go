@@ -375,6 +375,10 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		// `flagged` so the recovery untaint below (and the
 		// mesh-wide guard) see it healed.
 		delete(flagged, name)
+		// Partition healed — the node's own convergence evidence:
+		// clear its breaker history now rather than waiting out the
+		// window.
+		heal.RecordTargetHealthy(e.queue, name)
 		log.Info("partition healed — skipping evict", "node", name)
 	}
 
@@ -391,6 +395,11 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 				continue
 			}
 			log.Info("UNTAINT: network partition cleared", "node", n.Name)
+			// Recovery untainted — the episode converged: clear the
+			// node's breaker history so the next partition starts
+			// from zero instead of tripping a circuit half filled by
+			// the last one.
+			heal.RecordTargetHealthy(e.queue, n.Name)
 		}
 	}
 
@@ -437,6 +446,19 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	for _, name := range names {
 		node := byName[name]
 		if !kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
+			// Per-target non-convergent circuit breaker — a node the
+			// controller already acted on limit times inside the
+			// window defers the re-taint. A FRESHLY flagged node has
+			// no history and always fences on the first sweep: the
+			// breaker never blocks first-line fencing, only the
+			// re-patch churn of a node that will not converge (each
+			// recovery untaint clears the history — see above).
+			// Defer semantics: log, skip this node, never an error.
+			if allowed, reason := heal.TryAcquireTarget(e.queue, name, now); !allowed {
+				log.Info("DEFER: heal target circuit open — taint skipped",
+					"node", name, "reason", reason)
+				continue
+			}
 			if err := kube.TaintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
 				metrics.IncError(e.queue)
 				log.Error(err, "taint failed", "node", name)
@@ -492,6 +514,10 @@ loop:
 			log.Error(err, "list pods failed", "node", name)
 			continue
 		}
+		// Per-target breaker charge state for this node's pass —
+		// spent lazily on the first real victim below, so a sweep
+		// with nothing to evict never banks against the node.
+		charged := false
 		for i := range pods {
 			p := &pods[i]
 			if evicted >= partitionEvictCap {
@@ -514,6 +540,21 @@ loop:
 			// stranded pod (or a Pending one) on the broken host.
 			if podOnNodePinnedPVC(p, pinnedPVCs) {
 				continue
+			}
+			// Per-target non-convergent circuit breaker, eviction
+			// side: a sweep that evicts off a node spends ONE grant
+			// (the batch is one heal of the target), charged lazily
+			// on the first real victim. Past limit evicting sweeps
+			// inside the window the rest defer — pods keep sitting
+			// on a fenced node rather than the controller churning
+			// them off it forever. Defer, never an error.
+			if !charged {
+				if allowed, reason := heal.TryAcquireTarget(e.queue, name, now); !allowed {
+					log.Info("DEFER: heal target circuit open — evictions skipped",
+						"node", name, "reason", reason)
+					continue loop
+				}
+				charged = true
 			}
 			log.Info("EVICT: pod off partitioned node",
 				"pod", p.Namespace+"/"+p.Name, "node", name)

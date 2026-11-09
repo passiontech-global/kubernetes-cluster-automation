@@ -16,6 +16,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -1050,5 +1051,62 @@ func TestPartitionEvictorLiveGetFailClosedSkipsNode(t *testing.T) {
 	}
 	if !pePodExists(t, cs, "flux-system", "victim") {
 		t.Fatal("pod evicted though the live Get failed")
+	}
+}
+
+// A node whose breaker already opened defers BOTH of this module's
+// actions: the fencing taint is skipped and the pods survive the
+// sweep — the run absorbs the defer without an error. (A fresh
+// circuit tainting and evicting is covered by the earlier tests.)
+func TestPartitionEvictorDefersUnderOpenCircuit(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	flagged := pePartitionedNode("p1", "HostNetworkProblems", 15*time.Minute)
+	objs := append([]runtime.Object{flagged, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	for range 3 {
+		heal.TryAcquireTarget("partition-pod-evictor", "p1", now)
+	}
+	e := &partitionEvictor{cs: cs, queue: "partition-pod-evictor"}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("open circuit must defer, not error: %v", err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("taint applied while the target circuit is open")
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted while the target circuit is open")
+	}
+}
+
+// Recovery is never breaker-gated: a recovered node untaints even
+// while its circuit sits open, and the untaint clears its history so
+// the next partition episode starts from zero.
+func TestPartitionEvictorRecoveryUntaintUnderOpenCircuit(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	recovered := testutil.Node("p1", corev1.ConditionTrue, nil, corev1.Taint{
+		Key: partitionTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule,
+	})
+	objs := append([]runtime.Object{recovered}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	for range 3 {
+		heal.TryAcquireTarget("partition-pod-evictor", "p1", now)
+	}
+	e := &partitionEvictor{cs: cs, queue: "partition-pod-evictor"}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("recovered node kept its partition taint under an open circuit")
+	}
+	if ok, _ := heal.TryAcquireTarget("partition-pod-evictor", "p1",
+		now.Add(time.Minute)); !ok {
+		t.Fatal("recovery untaint did not clear the node's breaker history")
 	}
 }

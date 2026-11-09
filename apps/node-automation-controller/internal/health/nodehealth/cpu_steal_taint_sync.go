@@ -165,7 +165,23 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			if age, ok := pressured[n.Name]; ok {
 				rep.Find(fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
 				if !tainted && p.stealHealthyWorkers(nodes, n.Name, now) >= cpuStealMinHealthy {
-					if err := kube.TaintNode(ctx, p.CS, n.Name,
+					// Per-target non-convergent circuit breaker — the
+					// 4th taint of the same worker inside the window
+					// defers: steal pressure that keeps coming back
+					// despite repeated taints is hypervisor-side, and
+					// re-patching the same node every sweep is churn
+					// the breaker stops. Defer semantics: log, skip —
+					// the check still FAILs below so the pressure
+					// stays visible; never an error. The untaint path
+					// clears the history the moment the steal clears.
+					// The module label is the check's canonical name
+					// (the const), not Deps.Name — the latter is the
+					// harness's shared name in tests.
+					if allowed, reason := heal.TryAcquireTarget(
+						CheckNameCPUStealTaintSync, n.Name, now); !allowed {
+						log.Info("DEFER: heal target circuit open — taint skipped",
+							"node", n.Name, "reason", reason)
+					} else if err := kube.TaintNode(ctx, p.CS, n.Name,
 						kube.TaintCPUSteal, cpuStealTaintValue,
 						corev1.TaintEffectPreferNoSchedule); err != nil {
 						metrics.IncError(p.Name)
@@ -204,6 +220,12 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 							logr.Discard(), &p.clear, n,
 							kube.AnnoFirstSeenCPUStealClear, n.Name,
 							annoPatch)
+						// Untainted — the steal cleared: the node's
+						// own convergence evidence. Clear its breaker
+						// history so a future pressure episode starts
+						// from zero instead of tripping a circuit
+						// half filled by the last one.
+						heal.RecordTargetHealthy(CheckNameCPUStealTaintSync, n.Name)
 						log.Info("UNTAINT: CPUStealPressure cleared — worker back in the pool",
 							"node", n.Name)
 					}

@@ -5,12 +5,14 @@
 package nodehealth
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -461,4 +463,86 @@ func precordonedWorkerNode(name string, unschedulable bool) *corev1.Node {
 		nodeHangPreCordonAnno: nodeHangPreCordonValue,
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// 35% cap — off-by-one fix (W18-2) + first-cordon exception
+// ---------------------------------------------------------------------------
+
+// Two-worker cluster: floor(0.35*2)=0, so the ratio math alone would
+// block every precordon there. The FIRST cordon (cordoned == 0) is
+// exempt — a hung 2-node fleet must still be precordonable — and the
+// SECOND hung worker must then be capped (invariant: at most
+// max(1, floor(0.35*workers)) = 1 worker cordoned after the sweep).
+func TestCheckNodeHangPreCordonTwoWorkerFirstCordon(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-a", "KernelHungTasks", 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-b", "KernelHungTasks", 5*time.Minute, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("hung workers did not fail the check")
+	}
+	a, err := cs.CoreV1().Nodes().Get(ctx, "w-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Spec.Unschedulable {
+		t.Fatal("first cordon in a 2-worker cluster was blocked by the ratio cap")
+	}
+	b, err := cs.CoreV1().Nodes().Get(ctx, "w-b", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Spec.Unschedulable {
+		t.Fatal("second cordon in a 2-worker cluster exceeded the cap invariant (max 1)")
+	}
+}
+
+// The off-by-one: at exactly the cap (3/10 workers already cordoned)
+// the old pre-increment test (3/10 >= 0.35 is false) let a FOURTH
+// cordon through, leaving 4/10 = 40% cordoned. The post-increment
+// test blocks it. One below the cap (2/10) still cordons a third —
+// landing exactly on max(1, floor(0.35*10)) = 3.
+func TestCheckNodeHangPreCordonCapBoundary(t *testing.T) {
+	// alreadyCordoned = foreign-cordoned workers; hungCordoned says
+	// whether the hung worker may be precordoned: at the cap
+	// (3/10) the old pre-increment test (3/10 >= 0.35 is false)
+	// let a FOURTH cordon through, leaving 4/10 = 40% cordoned —
+	// the post-increment test blocks it. One below the cap (2/10)
+	// still cordons a third, landing exactly on
+	// max(1, floor(0.35*10)) = 3.
+	cases := []struct {
+		alreadyCordoned int
+		hungCordoned    bool
+	}{
+		{alreadyCordoned: 3, hungCordoned: false},
+		{alreadyCordoned: 2, hungCordoned: true},
+	}
+	for _, tc := range cases {
+		nodes := []corev1.Node{*probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false)}
+		for i := range tc.alreadyCordoned {
+			nodes = append(nodes, *probetest.ReadyWorkerNode(fmt.Sprintf("w-manual-%d", i), "", 0, true))
+		}
+		for i := tc.alreadyCordoned + 1; len(nodes) < 10; i++ {
+			nodes = append(nodes, *probetest.ReadyWorkerNode(fmt.Sprintf("w-ok-%d", i), "", 0, false))
+		}
+		objs := make([]runtime.Object, len(nodes))
+		for i := range nodes {
+			objs[i] = &nodes[i]
+		}
+		cs := fake.NewSimpleClientset(objs...)
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+			t.Fatalf("alreadyCordoned=%d: hung node did not fail the check", tc.alreadyCordoned)
+		}
+		n, err := cs.CoreV1().Nodes().Get(ctx, "w-hang", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n.Spec.Unschedulable != tc.hungCordoned {
+			t.Fatalf("alreadyCordoned=%d: unschedulable = %v, want %v",
+				tc.alreadyCordoned, n.Spec.Unschedulable, tc.hungCordoned)
+		}
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-hang")
+	}
 }

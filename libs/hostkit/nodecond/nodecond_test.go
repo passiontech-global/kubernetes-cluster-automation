@@ -38,7 +38,6 @@ var allConditionNames = []string{
 // the names a frozen LastHeartbeatTime says nothing about.
 var notHeartbeatManaged = []string{
 	KernelDeadlock, // permanent latch, never reconciles False
-	InodePressure,  // kubelet-owned
 	HostNetworkProblems, ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
 }
@@ -77,9 +76,10 @@ func TestConstantsNonEmptyAndUnique(t *testing.T) {
 }
 
 func TestListLengths(t *testing.T) {
-	// HeartbeatSweptNames: 40 latch-backed + ReadonlyFilesystem;
-	// InodePressure (kubelet) and KernelDeadlock (permanent) excluded.
-	if got, want := len(HeartbeatSweptNames), 41; got != want {
+	// HeartbeatSweptNames: 41 latch-backed (incl. InodePressure,
+	// agent-latched since W18-1) + ReadonlyFilesystem; KernelDeadlock
+	// (permanent) excluded.
+	if got, want := len(HeartbeatSweptNames), 42; got != want {
 		t.Errorf("len(HeartbeatSweptNames) = %d, want %d", got, want)
 	}
 	if got, want := len(HangPreCordonNames), 17; got != want {
@@ -149,8 +149,9 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	for _, name := range HeartbeatSweptNames {
 		swept[name] = true
 	}
-	// The 7 monitor/kubelet-owned names split: ReadonlyFilesystem in,
-	// everything else out.
+	// The 7 monitor/kubelet-owned names split: ReadonlyFilesystem and
+	// InodePressure in (the agent latches InodePressure since W18-1 and
+	// kubelet never emits the type), everything else out.
 	for _, name := range notHeartbeatManaged {
 		if swept[name] {
 			t.Errorf("HeartbeatSweptNames must not contain %q (kubelet-owned or permanent latch)", name)
@@ -159,7 +160,10 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[ReadonlyFilesystem] {
 		t.Error("HeartbeatSweptNames must contain ReadonlyFilesystem (NPD mount monitor rides the heartbeat)")
 	}
-	// Every remaining constant — exactly the 40 latch-backed — in.
+	if !swept[InodePressure] {
+		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, W18-1)")
+	}
+	// Every remaining constant — exactly the 41 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {
@@ -180,8 +184,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 40 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 40", latchBacked)
+	if latchBacked != 41 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 41", latchBacked)
 	}
 }
 

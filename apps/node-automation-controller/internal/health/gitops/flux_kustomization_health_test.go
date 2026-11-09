@@ -181,6 +181,56 @@ func TestFluxKustHealthCheckFailedGate(t *testing.T) {
 	}
 }
 
+// The W18-5 Rollout twin of the HealthCheckFailed gate: the applied
+// argoproj.io Rollout corroborates the failure — a ready Rollout
+// admits the nudge, an unready one does not.
+func TestFluxKustHealthCheckFailedGateRollout(t *testing.T) {
+	base := time.Now()
+	mk := func() *unstructured.Unstructured {
+		k := shKust("flux-system", "apps", "False", "HealthCheckFailed",
+			base.Add(-20*time.Minute))
+		_ = unstructured.SetNestedSlice(k.Object, []any{
+			map[string]any{"id": "apps_web_argoproj.io_Rollout", "v": "v1alpha1"},
+		}, "status", "inventory", "entries")
+		return k
+	}
+	rollout := func(replicas, ready int64) *unstructured.Unstructured {
+		r := probetest.UnstructuredObj("argoproj.io/v1alpha1", "Rollout",
+			"apps", "web", 1, 1)
+		_ = unstructured.SetNestedField(r.Object, replicas, "spec", "replicas")
+		_ = unstructured.SetNestedField(r.Object, ready, "status", "readyReplicas")
+		return r
+	}
+
+	// Rollout ready → nudge lands.
+	p := testProberDyn(fake.NewSimpleClientset(),
+		probetest.OpDyn(mk(), rollout(2, 2)))
+	p.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck Kustomization must FAIL")
+	}
+	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); !found {
+		t.Fatal("HealthCheckFailed with a ready Rollout should be nudged")
+	}
+
+	// Rollout unready → no nudge.
+	p = testProberDyn(fake.NewSimpleClientset(),
+		probetest.OpDyn(mk(), rollout(2, 0)))
+	p.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck Kustomization must FAIL")
+	}
+	got, _ = p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); found {
+		t.Fatal("HealthCheckFailed with an unready Rollout must not be nudged")
+	}
+}
+
 // Non-nudgeable reasons emit but never patch.
 func TestFluxKustHealthOtherReasonNoNudge(t *testing.T) {
 	base := time.Now()

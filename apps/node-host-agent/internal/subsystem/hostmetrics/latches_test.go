@@ -3,9 +3,13 @@ package hostmetrics
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -88,5 +92,97 @@ func TestRefreshLatchesTouchesHeldLatches(t *testing.T) {
 		if !fi.ModTime().Equal(now) {
 			t.Fatalf("%s mtime = %v, want the clock %v", name, fi.ModTime(), now)
 		}
+	}
+}
+
+// inodeStatfs returns a statfsFn stub reporting per-mount inode
+// counts — used/total pairs drive the W18-1 hysteresis exactly.
+func inodeStatfs(vals map[string][2]uint64) func(string, *unix.Statfs_t) error {
+	return func(path string, st *unix.Statfs_t) error {
+		v, ok := vals[path]
+		if !ok {
+			return unix.ENOENT
+		}
+		st.Files = v[1]
+		st.Ffree = v[1] - v[0]
+		return nil
+	}
+}
+
+// latchExists stats state-inode-pressure under the fixture state dir.
+func latchExists(t *testing.T, cfg Config) bool {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchInodePressure))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+// TestInodePressureHysteresis drives the W18-1 latch through one full
+// episode via the ticker (refreshLatches): enter at >=95% on any
+// mount, HOLD between 90% and 95% (no flap), clear only when every
+// mount is <=90%, and never clear on inconclusive evidence.
+func TestInodePressureHysteresis(t *testing.T) {
+	cfg, _ := fixture(t)
+	logFile := filepath.Join(t.TempDir(), "watchdog.log")
+	cfg.FilesystemTargets = []string{"/fake/etc", "/fake/k0s"}
+	cfg.WatchdogLogFile = logFile
+	c := New(cfg)
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/fake/etc": {960, 1000}, "/fake/k0s": {500, 1000},
+	})
+	l := c.Latches()
+
+	// 96% on /fake/etc → enter, detail names the mount + ratio.
+	l.refreshLatches()
+	if !latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch not set at 0.96")
+	}
+	b, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b),
+		"STATE-ENTER: inode-pressure mount=/fake/etc ratio=0.960 >= 0.95") {
+		t.Fatalf("STATE-ENTER line missing mount/ratio detail:\n%s", b)
+	}
+
+	// 92% (between thresholds) → the latch must HOLD.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/fake/etc": {920, 1000}, "/fake/k0s": {500, 1000},
+	})
+	l.refreshLatches()
+	if !latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch cleared inside the hysteresis band")
+	}
+
+	// Every mount <=90% → clear.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/fake/etc": {900, 1000}, "/fake/k0s": {500, 1000},
+	})
+	l.refreshLatches()
+	if latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch not cleared at 0.90")
+	}
+
+	// Inconclusive evidence (unparseable ratio: Ffree > Files) must
+	// not re-enter even though /fake/k0s would parse below the band.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/fake/etc": {0, 0}, "/fake/k0s": {500, 1000},
+	})
+	l.refreshLatches()
+	if latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch set from inconclusive evidence")
+	}
+	// A healthy (sub-threshold) full pass still exits cleanly — the
+	// no-op exit path must leave the latch absent, not error.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/fake/etc": {10, 1000}, "/fake/k0s": {500, 1000},
+	})
+	l.refreshLatches()
+	if latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch appeared on a healthy pass")
 	}
 }

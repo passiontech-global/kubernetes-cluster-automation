@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -170,5 +171,28 @@ func TestCPUStealUntaintRestartResume(t *testing.T) {
 	}
 	if _, ok := got.Annotations[kube.AnnoFirstSeenCPUStealClear]; ok {
 		t.Fatal("resolved clear stamp lingered on the node")
+	}
+}
+
+// A worker whose breaker already opened defers its taint: the check
+// still FAILs (the pressure is present and that stays visible), but
+// no taint lands this sweep — and never an error.
+func TestCPUStealTaintDefersUnderOpenCircuit(t *testing.T) {
+	w1 := stealNode("w1", corev1.ConditionTrue, 10*time.Minute)
+	w2 := testutil.Node("w2", corev1.ConditionTrue, nil)
+	w3 := testutil.Node("w3", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(w1, w2, w3)
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	for range 3 {
+		heal.TryAcquireTarget(CheckNameCPUStealTaintSync, "w1", now)
+	}
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(ctx)
+	if res.Pass {
+		t.Fatalf("sustained steal pressure must still fail: %+v", res)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
+		t.Fatal("taint applied while the target circuit is open")
 	}
 }

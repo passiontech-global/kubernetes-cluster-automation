@@ -241,6 +241,24 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		return false, nil // nothing to roll
 	}
 
+	// W18-9 image-pull gate: an owned pod waiting in
+	// ImagePullBackOff/ErrImagePull means the PREVIOUS replacement
+	// never finished landing its image — evicting the next member
+	// stacks a second stuck pod on the set (and the replacement
+	// would hang on the same pull). Defer this StatefulSet for the
+	// cycle: fail-safe, no error, the sweep retries in 10m. This
+	// reads the same kube.ImagePullStallReason predicate the storm
+	// gate's cluster census runs.
+	for _, p := range pods {
+		if reason := kube.ImagePullStallReason(p); reason != "" {
+			log.Info("skip: owned pod stuck on image pull — deferring the OnDelete roll",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", p.Namespace+"/"+p.Name,
+				"reason", reason)
+			return false, nil
+		}
+	}
+
 	// Membership gate (BUG-C3): the full desired set must be present
 	// AND Ready before the next eviction — ownedPods already drops
 	// terminating pods, so a pod still Terminating or not yet

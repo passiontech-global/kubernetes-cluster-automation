@@ -41,15 +41,14 @@ const CheckNameNodeCondSweeper = "node-condition-sweeper"
 // nodeCondSweptConds is the sweeper's allowlist — every condition
 // nodereporter owns and re-stamps lastHeartbeatTime on while alive
 // (nodecond.HeartbeatSweptNames in libs/hostkit, the single source of
-// truth shared with the agent: the 40 latch-backed conditions plus
-// the ReadonlyFilesystem mount monitor — a superset of the old
+// truth shared with the agent: the 41 latch-backed conditions
+// (incl. InodePressure, agent-latched since W18-1) plus the
+// ReadonlyFilesystem mount monitor — a superset of the old
 // precordon-hang + clock-skew lists). Kubelet-owned types (Ready,
-// MemoryPressure/DiskPressure) are never touched, and InodePressure
-// is deliberately absent — kubelet-native, the sweeper must never
-// clear a kubelet condition — as is KernelDeadlock, the permanent
-// latch whose frozen heartbeat means nothing. The sweeper only
-// reconciles conditions whose writer is a node agent that re-stamps
-// lastHeartbeatTime every ~2m while alive.
+// MemoryPressure/DiskPressure) are never touched, as is
+// KernelDeadlock, the permanent latch whose frozen heartbeat means
+// nothing. The sweeper only reconciles conditions whose writer is a
+// node agent that re-stamps lastHeartbeatTime every ~2m while alive.
 var nodeCondSweptConds = condTypes(nodecond.HeartbeatSweptNames)
 
 var nodeCondSweepsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

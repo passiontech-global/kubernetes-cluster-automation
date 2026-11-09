@@ -170,11 +170,11 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 40 {
-		t.Fatalf("conditionDefs has %d defs, want 40 (38 ported + CiliumMTUDrift + CiliumWGStale)",
+	if len(conditionDefs) != 41 {
+		t.Fatalf("conditionDefs has %d defs, want 41 (38 ported + CiliumMTUDrift + CiliumWGStale + W18-1 InodePressure)",
 			len(conditionDefs))
 	}
-	tail := conditionDefs[len(conditionDefs)-2:]
+	tail := conditionDefs[len(conditionDefs)-3 : len(conditionDefs)-1]
 	if tail[0].typ != nodecond.CiliumMTUDrift || tail[0].stateKey != latchdefs.LatchCiliumMTUDrift {
 		t.Fatalf("tail def 0 = %s/state-%s, want CiliumMTUDrift/state-%s",
 			tail[0].typ, tail[0].stateKey, latchdefs.LatchCiliumMTUDrift)
@@ -216,6 +216,40 @@ func TestCiliumLatchConditions(t *testing.T) {
 		if got := condEvalFor(t, e.r, typ); got.status != corev1.ConditionFalse {
 			t.Fatalf("%s stuck True after latch removal", typ)
 		}
+	}
+}
+
+// TestInodePressureCondition covers the W18-1 tail entry: hostmetrics'
+// inode-pressure latch maps 1:1 to the kubelet-native InodePressure
+// condition — True with FilesystemInodesExhausted while
+// state-inode-pressure exists, False with FilesystemInodesHealthy
+// once it is removed.
+func TestInodePressureCondition(t *testing.T) {
+	e := fixture(t)
+	state := func(key string) {
+		if err := os.WriteFile(filepath.Join(e.dir, "state-"+key),
+			[]byte("1700000000\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := condEvalFor(t, e.r, nodecond.InodePressure); got.status != corev1.ConditionFalse ||
+		got.reason != "FilesystemInodesHealthy" {
+		t.Fatalf("InodePressure baseline=%v/%s want False/FilesystemInodesHealthy",
+			got.status, got.reason)
+	}
+	state(latchdefs.LatchInodePressure)
+	got := condEvalFor(t, e.r, nodecond.InodePressure)
+	if got.status != corev1.ConditionTrue || got.reason != "FilesystemInodesExhausted" {
+		t.Fatalf("InodePressure=%v/%s want True/FilesystemInodesExhausted",
+			got.status, got.reason)
+	}
+	if wantMsg := "watchdog state inode-pressure active since 1700000000"; got.message != wantMsg {
+		t.Fatalf("InodePressure message=%q want %q", got.message, wantMsg)
+	}
+	_ = os.Remove(filepath.Join(e.dir, "state-"+latchdefs.LatchInodePressure))
+	if got := condEvalFor(t, e.r, nodecond.InodePressure); got.status != corev1.ConditionFalse ||
+		got.reason != "FilesystemInodesHealthy" {
+		t.Fatalf("InodePressure stuck True after latch removal")
 	}
 }
 
