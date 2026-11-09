@@ -81,7 +81,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// than pod creation + margin is the proof; a missing/unreadable
 	// socket is inconclusive and skips (pod-mode agents without a
 	// host /run view land here too).
-	if spegelSocketStale(sp.CreationTimestamp.Time) {
+	if spegelSocketStale(spegelContainerdSock, sp.CreationTimestamp.Time) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s holds stale containerd.sock inode (socket recreated after pod start)",
 			sp.Namespace, sp.Name))
@@ -149,11 +149,13 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // spegelSocketStale reports whether the host's containerd socket was
 // recreated after the spegel pod started — ModTime newer than pod
 // creation plus spegelSockStaleMargin proves k0sworker/containerd
-// restarted under the pod, leaving it bound to a dead inode. Any
-// stat failure (no host /run view, socket absent mid-restart) is
-// inconclusive → false, never a false-positive delete.
-func spegelSocketStale(podCreated time.Time) bool {
-	fi, err := os.Stat(spegelContainerdSock)
+// restarted under the pod, leaving it bound to a dead inode. sockPath
+// is a parameter (not the const) so tests can point the stat at a
+// temp file. Any stat failure (no host /run view, socket absent
+// mid-restart) is inconclusive → false, never a false-positive
+// delete.
+func spegelSocketStale(sockPath string, podCreated time.Time) bool {
+	fi, err := os.Stat(sockPath)
 	if err != nil {
 		return false
 	}

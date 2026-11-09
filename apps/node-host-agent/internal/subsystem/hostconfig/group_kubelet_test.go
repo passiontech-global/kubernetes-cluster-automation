@@ -6,6 +6,8 @@ package hostconfig
 import (
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 )
 
 // ---------- #3: groupPulls ----------
@@ -219,5 +221,61 @@ func TestT7AppendExtraArgsUnterminated(t *testing.T) {
 	if out, ok := t7AppendExtraArgs(`ExecStart=k0s --kubelet-extra-args=abc`, `\x20--x`); !ok ||
 		!strings.Contains(out, `--kubelet-extra-args=abc\x20--x`) {
 		t.Fatalf("bare append wrong: %q ok=%v", out, ok)
+	}
+}
+
+// ---------- evictionMinimumReclaim compare/dump helpers ----------
+
+func emrWant() *jinja.OMap {
+	m := jinja.NewOMap()
+	m.Set("memory.available", "200Mi")
+	m.Set("nodefs.available", "1Gi")
+	return m
+}
+
+func TestEmrMapEqual(t *testing.T) {
+	want := emrWant()
+
+	if !emrMapEqual("memory.available: 200Mi\nnodefs.available: 1Gi\n", want) {
+		t.Fatal("identical block must compare equal")
+	}
+	// Quoting style is YAML-noise — the semantic compare ignores it.
+	if !emrMapEqual("memory.available: \"200Mi\"\nnodefs.available: '1Gi'\n", want) {
+		t.Fatal("quoted scalars must compare equal")
+	}
+	for name, cur := range map[string]string{
+		"value drift":    "memory.available: 200Mi\nnodefs.available: 2Gi\n",
+		"missing key":    "memory.available: 200Mi\n",
+		"extra key":      "memory.available: 200Mi\nnodefs.available: 1Gi\nimagefs.available: 3Gi\n",
+		"non-map yaml":   "just a scalar\n",
+		"invalid yaml":   "a:\n\tb: c\n",
+		"empty document": "",
+	} {
+		if emrMapEqual(cur, want) {
+			t.Fatalf("%s: emrMapEqual must be false for %q", name, cur)
+		}
+	}
+}
+
+func TestEmrDump(t *testing.T) {
+	in := "kind: KubeletConfiguration\n" +
+		"evictionMinimumReclaim:\n" +
+		"  memory.available: \"200Mi\"\n" +
+		"  nodefs.available: \"1Gi\"\n" +
+		"evictionHard:\n" +
+		"  memory.available: \"100Mi\"\n"
+	want := "  memory.available: \"200Mi\"\n  nodefs.available: \"1Gi\"\n"
+	if got := emrDump(in); got != want {
+		t.Fatalf("emrDump=%q want %q", got, want)
+	}
+
+	// Absent block → empty; a following top-level key ends the block.
+	if got := emrDump("kind: KubeletConfiguration\n"); got != "" {
+		t.Fatalf("absent block emrDump=%q want empty", got)
+	}
+
+	// Block at EOF with no trailing newline still yields its lines.
+	if got := emrDump("evictionMinimumReclaim:\n\ta: b\nnext: 1"); got != "\ta: b\n" {
+		t.Fatalf("tab-indented EOF block emrDump=%q", got)
 	}
 }
