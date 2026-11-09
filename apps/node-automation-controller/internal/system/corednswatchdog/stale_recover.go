@@ -49,7 +49,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	}
 	// Storm-gate: never evict while nodes are NotReady — eviction
 	// only slows recovery during a cluster storm.
-	notReady, err := kube.CountNotReadyNodes(ctx, w.cs)
+	notReady, err := kube.CountNotReadyNodesCached(ctx, w.nodeReader, w.cs)
 	if err != nil {
 		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}

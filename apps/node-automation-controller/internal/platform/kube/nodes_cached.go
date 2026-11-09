@@ -48,3 +48,24 @@ func ListNodesCached(ctx context.Context, r CachedNodeReader,
 	}
 	return nl.Items, nil
 }
+
+// CountNotReadyNodesCached is the storm-gate census over the cached
+// node read — the informer-backed twin of the CountNotReadyNodes
+// list+count the module loops ran directly. Same cache discipline as
+// ListNodesCached: nil reader (tests, fixtures) falls back to the
+// direct clientset path.
+func CountNotReadyNodesCached(ctx context.Context, r CachedNodeReader,
+	cs kubernetes.Interface) (int, error) {
+
+	nodes, err := ListNodesCached(ctx, r, cs)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for i := range nodes {
+		if !NodeReady(&nodes[i]) {
+			n++
+		}
+	}
+	return n, nil
+}

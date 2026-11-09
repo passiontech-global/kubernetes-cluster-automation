@@ -125,6 +125,12 @@ type coreDNSWatchdog struct {
 	cachedFQDN string
 	cachedWant map[string]bool
 	cachedAt   time.Time
+	// nodeReader is the informer-cache client for the storm-gate
+	// node census (CountNotReadyNodesCached): the manager cache
+	// mirrors Nodes, so the 60s sweep's not-ready count costs no
+	// apiserver LIST. nil (tests, fixtures) falls back to the
+	// direct read.
+	nodeReader kube.CachedNodeReader
 }
 
 // probeFQDN returns the cached probe target while it is inside the
@@ -162,6 +168,9 @@ func Setup(d shared.Deps) error {
 			http:  &http.Client{Timeout: 5 * time.Second},
 			queue: d.Name,
 			now:   shared.SystemClock,
+		}
+		if d.Mgr != nil {
+			w.nodeReader = d.Mgr.GetClient()
 		}
 		w.logHitFn = w.logHit
 		w.dnsFn = w.dnsProbe

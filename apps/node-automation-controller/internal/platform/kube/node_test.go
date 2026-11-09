@@ -6,6 +6,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var ctx = context.Background()
@@ -309,8 +311,21 @@ func TestDropTaintsByKeyInPlace(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ListNodes / CountNotReadyNodes.
+// ListNodes / CountNotReadyNodesCached.
 // ---------------------------------------------------------------------------
+
+// nodeListReader is a minimal CachedNodeReader fake serving a fixed
+// NodeList — the cached path of the storm-gate census.
+type nodeListReader struct{ items []corev1.Node }
+
+func (r nodeListReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	nl, ok := list.(*corev1.NodeList)
+	if !ok {
+		return fmt.Errorf("unexpected list type %T", list)
+	}
+	nl.Items = append(nl.Items, r.items...)
+	return nil
+}
 
 func TestListNodesError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
@@ -321,21 +336,35 @@ func TestListNodesError(t *testing.T) {
 	if _, err := ListNodes(ctx, cs); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
-	if _, err := CountNotReadyNodes(ctx, cs); err == nil {
-		t.Fatal("expected CountNotReadyNodes to propagate the list error")
+	if _, err := CountNotReadyNodesCached(ctx, nil, cs); err == nil {
+		t.Fatal("expected CountNotReadyNodesCached to propagate the list error")
 	}
 }
 
-func TestCountNotReadyNodes(t *testing.T) {
+func TestCountNotReadyNodesCached(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		node("a", corev1.ConditionTrue, nil),
 		node("b", corev1.ConditionFalse, nil),
 		node("c", corev1.ConditionTrue, nil))
-	n, err := CountNotReadyNodes(ctx, cs)
+	// nil reader → direct clientset fallback path.
+	n, err := CountNotReadyNodesCached(ctx, nil, cs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
 		t.Fatalf("expected 1 NotReady, got %d", n)
+	}
+	// wired reader → informer-cache path, no clientset read.
+	cached := nodeListReader{items: []corev1.Node{
+		*node("a", corev1.ConditionTrue, nil),
+		*node("b", corev1.ConditionFalse, nil),
+		*node("c", corev1.ConditionFalse, nil),
+	}}
+	n, err = CountNotReadyNodesCached(ctx, cached, cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 NotReady from cache, got %d", n)
 	}
 }
