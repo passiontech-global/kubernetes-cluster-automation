@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -160,7 +161,11 @@ type eventList struct {
 // worker pool and prints the script's two summary lines to out.
 // Per-event DELETE failures are counted in errors, not returned — only
 // fatal problems (TLS setup, a failed LIST page) produce an error,
-// matching the script which exits 0 regardless of err count.
+// matching the script which exits 0 regardless of err count. A ctx
+// cancellation is fatal too: a SIGTERM/timeout between deletes leaves
+// a PARTIAL purge, and returning nil made that read as exit-0
+// success — so it is surfaced (cmd.go maps a Run error to exit 1)
+// and the tally is marked aborted on the output.
 func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error {
 	cfg.applyDefaults()
 	client, err := cfg.httpClient()
@@ -191,19 +196,30 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 		// a wedged apiserver and a 404 storm all read "errors=N".
 		_, _ = fmt.Fprintf(out, "first error: %s\n", firstErr)
 	}
+	// SIGTERM or a caller's bounded deadline killing the run mid-purge
+	// leaves a partial delete: report `deleted=N aborted` and fail the
+	// run instead of the old unconditional nil that scored the partial
+	// purge as a clean exit-0.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_, _ = fmt.Fprintf(out, "deleted=%d aborted: %v\n", ok, ctxErr)
+		return fmt.Errorf("purge aborted after deleted=%d of %d: %w",
+			ok, len(toDelete), ctxErr)
+	}
 	return nil
 }
 
-// doReq issues one request and returns (status, body) — status 0 when
-// the request never reached a response (dial/ctx error).
-func doReq(ctx context.Context, client *http.Client, method, u string) (int, []byte, error) {
+// doReq issues one request and returns (status, header, body) —
+// status 0 when the request never reached a response (dial/ctx
+// error). The header rides along so the DELETE retry policy can
+// honor a server-sent Retry-After.
+func doReq(ctx context.Context, client *http.Client, method, u string) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Read cap+1 so an oversize body is distinguishable from one
@@ -211,13 +227,13 @@ func doReq(ctx context.Context, client *http.Client, method, u string) (int, []b
 	// otherwise surface downstream as a misleading JSON syntax error.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return resp.StatusCode, nil, err
+		return resp.StatusCode, resp.Header, nil, err
 	}
 	if len(body) > maxResponseBytes {
-		return resp.StatusCode, nil, fmt.Errorf(
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf(
 			"response exceeded %dMiB cap", maxResponseBytes>>20)
 	}
-	return resp.StatusCode, body, nil
+	return resp.StatusCode, resp.Header, body, nil
 }
 
 // listStale walks the paginated event LIST once (limit=500,
@@ -230,7 +246,7 @@ func listStale(ctx context.Context, client *http.Client,
 	var paths []string
 	cont := ""
 	for {
-		code, body, err := doReq(ctx, client, http.MethodGet,
+		code, _, body, err := doReq(ctx, client, http.MethodGet,
 			base+"/api/v1/events?limit=500&resourceVersion=0"+cont)
 		if err != nil {
 			return nil, fmt.Errorf("list events: %w", err)
@@ -259,40 +275,122 @@ func listStale(ctx context.Context, client *http.Client,
 	}
 }
 
+// Retry policy for one DELETE — a purge bursts 8 workers at full
+// speed, and the window that matters (right after a control-plane
+// outage, when the event backlog is biggest) is exactly when the
+// apiserver is most loaded. The one-attempt version counted every
+// 429/5xx as a permanent loss while the remaining workers kept
+// slamming full speed.
+const (
+	// deleteMaxAttempts is first try + 3 retries: still-throttled
+	// after 4 tries is load the purge itself is contributing to —
+	// back off and let the next cycle finish the backlog.
+	deleteMaxAttempts = 4
+	deleteBackoffBase = 500 * time.Millisecond
+	deleteBackoffCap  = 30 * time.Second
+)
+
+// deleteOne issues one event DELETE. 2xx counts as ok — and so do
+// 404/410, since an event GC'd or deleted between LIST and DELETE is
+// already in the desired end state, not a failure. 429 and 5xx are
+// retried up to deleteMaxAttempts, honoring the server's Retry-After
+// when present (the seconds form the apiserver sends; also on a 503,
+// same header semantics) and exponential backoff otherwise, both
+// capped at 30s so a wedged server cannot park a worker forever. A
+// give-up after exhausting attempts, a ctx dying (in the request or
+// mid-backoff) and any other 4xx count as one error: 4xx is a real
+// refusal (RBAC, validation) no retry fixes, and the per-event
+// failure stays a tally, never a returned error (the script's
+// `except: err += 1`). detail names the first failure for the
+// summary line.
+func deleteOne(ctx context.Context, client *http.Client, base, p string) (ok bool, detail string) {
+	for attempt := 0; ; attempt++ {
+		code, hdr, _, err := doReq(ctx, client, http.MethodDelete, base+p)
+		if err != nil {
+			// Transport-level (dial, TLS, client timeout, dead ctx):
+			// retrying into a dying run would only burn the budget.
+			return false, fmt.Sprintf("%s: %v", p, err)
+		}
+		switch {
+		case code/100 == 2, code == http.StatusNotFound, code == http.StatusGone:
+			return true, ""
+		case code == http.StatusTooManyRequests || code/100 == 5:
+			if attempt+1 >= deleteMaxAttempts {
+				return false, fmt.Sprintf("%s: HTTP %d after %d attempts",
+					p, code, attempt+1)
+			}
+			if !sleepCtx(ctx, retryDelay(hdr, attempt)) {
+				return false, fmt.Sprintf("%s: aborted retrying HTTP %d: %v",
+					p, code, ctx.Err())
+			}
+		default:
+			return false, fmt.Sprintf("%s: HTTP %d", p, code)
+		}
+	}
+}
+
+// retryDelay picks the wait before the next DELETE attempt: the
+// server's Retry-After in seconds when it sent one, else exponential
+// 0.5s→1s→2s — capped at 30s either way so a hostile or wedged
+// server cannot stretch one worker's pause past the run's usefulness.
+func retryDelay(hdr http.Header, attempt int) time.Duration {
+	if hdr != nil {
+		if ra := hdr.Get("Retry-After"); ra != "" {
+			if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
+				d := time.Duration(secs) * time.Second
+				if d > deleteBackoffCap {
+					d = deleteBackoffCap
+				}
+				return d
+			}
+		}
+	}
+	d := deleteBackoffBase << attempt
+	// d <= 0 guards a shift overflow on absurd attempt counts.
+	if d > deleteBackoffCap || d <= 0 {
+		d = deleteBackoffCap
+	}
+	return d
+}
+
+// sleepCtx waits d or until ctx dies — true means the full delay
+// elapsed and the retry may proceed.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // deleteAll is the script's ThreadPoolExecutor(WORKERS) map — one
 // shared client, N workers pulling delete paths off a channel.
-// A DELETE counts as ok on any 2xx — and on 404/410, since an event
-// GC'd or deleted between LIST and DELETE is already in the desired
-// end state, not a failure. Any other transport error or non-2xx
-// status counts as errors (the script's `except: err += 1`). The
-// first failure's detail is returned for the summary — the bare
-// tally cannot distinguish RBAC denials from a wedged apiserver.
+// Per-path outcomes follow deleteOne: 2xx/404/410 ok, throttled and
+// server-error deletes retried with backoff, everything else (and a
+// retry budget exhausted) tallied as errors. The first failure's
+// detail is returned for the summary — the bare tally cannot
+// distinguish RBAC denials from a wedged apiserver.
 func deleteAll(ctx context.Context, client *http.Client, base string,
 	paths []string, workers int) (ok, errs int, firstErr string) {
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	for i := 0; i < workers; i++ {
+	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				code, _, err := doReq(ctx, client, http.MethodDelete, base+p)
+				good, detail := deleteOne(ctx, client, base, p)
 				mu.Lock()
-				if err == nil && (code/100 == 2 ||
-					code == http.StatusNotFound || code == http.StatusGone) {
-					// 2xx deleted it; 404/410 means the event was
-					// GC'd or deleted between LIST and DELETE — the
-					// desired end state either way, not an error.
+				if good {
 					ok++
 				} else {
 					errs++
 					if firstErr == "" {
-						if err != nil {
-							firstErr = fmt.Sprintf("%s: %v", p, err)
-						} else {
-							firstErr = fmt.Sprintf("%s: HTTP %d", p, code)
-						}
+						firstErr = detail
 					}
 				}
 				mu.Unlock()

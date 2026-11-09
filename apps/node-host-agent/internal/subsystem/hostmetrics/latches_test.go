@@ -167,8 +167,9 @@ func TestInodePressureHysteresis(t *testing.T) {
 		t.Fatal("inode-pressure latch not cleared at 0.90")
 	}
 
-	// Inconclusive evidence (unparseable ratio: Ffree > Files) must
-	// not re-enter even though /fake/k0s would parse below the band.
+	// A Files==0 mount (no inode table) now counts as parsed healthy
+	// — it must not re-enter even though /fake/k0s would parse below
+	// the band.
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/fake/etc": {0, 0}, "/fake/k0s": {500, 1000},
 	})

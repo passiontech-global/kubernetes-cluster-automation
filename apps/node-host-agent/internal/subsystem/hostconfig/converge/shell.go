@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // SHTokenRe is the safe-charset gate for values interpolated into
@@ -74,3 +75,68 @@ func SHPort(s string) bool {
 func SHIPCIDRReq(s string) bool { return s != "" && SHIPCIDR(s) }
 
 func SHPortReq(s string) bool { return s != "" && SHPort(s) }
+
+// ---------- rendered-config gates ----------
+//
+// A second class of vars-derived scalars never reaches a shell: it is
+// rendered verbatim into config FILES (kubelet KubeletConfiguration
+// YAML, containerd toml, systemd drop-in LimitNOFILE=, /etc/sysctl.d
+// pairs). The injection shape is the same minus the shell — a newline
+// in a var turns one scalar into extra keys/lines the consuming
+// daemon parses wholesale. Like the SH* predicates these are pure;
+// the caller owns the error attribution and the skip scope.
+
+var (
+	// sysctl keys are dotted procfs knob paths (net.ipv4.tcp_tw_reuse,
+	// fs.aio-max-nr, kernel.pid_max) — anything outside the namespace
+	// cannot address a sysctl and would render as garbage or an
+	// injected directive.
+	sysctlKeyRe = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
+
+	// systemd LimitNOFILE= accepts digits, soft:hard digit pairs, or
+	// the unit's own specials; anything else systemd drops at
+	// daemon-reload with a parse warning and the unit silently keeps
+	// stock fd limits.
+	limitNOFILERe = regexp.MustCompile(`^(?:[0-9]+|infinity|max|unset)(?::(?:[0-9]+|infinity|max|unset))?$`)
+)
+
+// CfgScalar reports whether s may be rendered as a plain scalar into
+// a config file (YAML mapping value, toml assignment): printable
+// ASCII only — a control byte, first of all '\n', would splice an
+// extra key/line into the file — and no ':' or '#', the mapping /
+// comment separators that re-open the file's syntax.
+func CfgScalar(s string) bool {
+	return printableASCII(s) && !strings.ContainsAny(s, ":#")
+}
+
+// CfgSysctlKey validates a sysctl key for the /etc/sysctl.d render.
+func CfgSysctlKey(s string) bool {
+	return sysctlKeyRe.MatchString(s)
+}
+
+// CfgSysctlVal validates a sysctl VALUE: printable ASCII. That covers
+// the no-newline contract — a newline in a var would render further
+// `key = value` lines the next `sysctl --system` applies verbatim —
+// while keeping every legitimate shape (numbers, ranges, space lists).
+func CfgSysctlVal(s string) bool {
+	return printableASCII(s)
+}
+
+// CfgLimitNOFILE validates a systemd LimitNOFILE= assignment.
+func CfgLimitNOFILE(s string) bool {
+	return limitNOFILERe.MatchString(s)
+}
+
+// printableASCII — non-empty, every byte 0x20-0x7e. No control bytes
+// means no newline, tab, or NUL anywhere in the rendered scalar.
+func printableASCII(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range s {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}

@@ -5,7 +5,9 @@ package hostconfig
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -230,6 +232,164 @@ func TestSwapSwaponProbeFailureSkipsCycle(t *testing.T) {
 	}
 	if hostExists(r, "/etc/sysctl.d/99-kine-swap.conf") {
 		t.Fatal("swappiness drop-in written despite skipped cycle")
+	}
+	if strings.Contains(hostRead(t, r, "/etc/fstab"), "swapfile-kine") {
+		t.Fatal("fstab entry added despite skipped cycle")
+	}
+}
+
+// ---------- blkid probe fail-closed ----------
+
+// exitStatusErr synthesizes a REAL *exec.ExitError with the wanted
+// status: the blkid gate distinguishes the documented exit-2
+// no-signature from probe failures BY exit code, so the fixture must
+// carry one (FakeRunner's scripted failure is a plain error).
+func exitStatusErr(t *testing.T, code int) error {
+	t.Helper()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh on PATH")
+	}
+	runErr := exec.Command(sh, "-c", "exit "+strconv.Itoa(code)).Run()
+	var ee *exec.ExitError
+	if !errors.As(runErr, &ee) || ee.ExitCode() != code {
+		t.Fatalf("cannot synthesize exit-%d error: %v", code, runErr)
+	}
+	return runErr
+}
+
+// seedSwapFile materializes a sparse swapfile at mb under HostRoot.
+func seedSwapFile(t *testing.T, r *Reconciler, path string, mb int64) {
+	t.Helper()
+	f, err := os.Create(filepath.Join(r.cfg.HostRoot, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(mb * 1048576); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+}
+
+// TestSwapBlkidFailureSkipsCycle — a blkid probe failure is "cannot
+// tell a fresh file from ACTIVE swap": the old `out, _ :=` swallowed
+// it and ran mkswap anyway, rewriting the signature of live swap
+// whenever the swapon probe missed the active entry. Fail closed:
+// counted error, no mkswap, nothing past the probe.
+func TestSwapBlkidFailureSkipsCycle(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	sr.FailOn("blkid", nil)
+	r := newSwapHost(t, vars, "node-a", sr)
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+	seedSwapFile(t, r, "/swapfile-kine", 12288) // right size — no recreate path
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupSwap()
+
+	if c.errs == 0 {
+		t.Fatal("blkid failure not counted")
+	}
+	if len(sr.CallsMatching("mkswap")) > 0 {
+		t.Fatalf("mkswap ran past a failed blkid probe: %v", sr.CallsMatching("mkswap"))
+	}
+	// Nothing past the probe: only the swapon probe + blkid ran.
+	if n := sr.Count(); n != 2 {
+		t.Fatalf("swap converge proceeded past the failed probe (%d calls): %v", n, sr.Calls())
+	}
+	if strings.Contains(hostRead(t, r, "/etc/fstab"), "swapfile-kine") {
+		t.Fatal("fstab entry added despite skipped cycle")
+	}
+	if hostExists(r, "/etc/sysctl.d/99-kine-swap.conf") {
+		t.Fatal("swappiness drop-in written despite skipped cycle")
+	}
+}
+
+// TestSwapBlkidFailureOnActiveSkips — an ACTIVE swapfile with a failed
+// blkid probe must skip too: fail-closed does not soften because the
+// file is live — that is exactly the file whose signature mkswap
+// would rewrite.
+func TestSwapBlkidFailureOnActiveSkips(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(map[string]string{
+		"swapon --show=NAME": "/swapfile-kine\n",
+	}, nil)
+	sr.FailOn("blkid", nil)
+	r := newSwapHost(t, vars, "node-a", sr)
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+	seedSwapFile(t, r, "/swapfile-kine", 12288)
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupSwap()
+
+	if c.errs == 0 {
+		t.Fatal("blkid failure on an active swapfile not counted")
+	}
+	if len(sr.CallsMatching("mkswap")) > 0 || len(sr.CallsMatching("swapon /swapfile-kine")) > 0 {
+		t.Fatalf("mkswap/swapon ran past a failed blkid probe on an active file: %v", sr.Calls())
+	}
+	if n := sr.Count(); n != 2 {
+		t.Fatalf("swap converge proceeded past the failed probe (%d calls): %v", n, sr.Calls())
+	}
+}
+
+// TestSwapBlkidExit2UnsignedStillMkswaps — blkid's documented exit-2
+// "no signature" is the healthy fresh-file answer; treating EVERY
+// probe error as failure would strand fresh swapfiles. The exit-2 arm
+// still mkswaps the inactive file, and swapon/fstab follow.
+func TestSwapBlkidExit2UnsignedStillMkswaps(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	sr.FailOn("blkid", exitStatusErr(t, 2))
+	r := newSwapHost(t, vars, "node-a", sr)
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupSwap()
+
+	if len(sr.CallsMatching("mkswap /swapfile-kine")) == 0 {
+		t.Fatalf("exit-2 no-signature must still mkswap the fresh file: %v", sr.Calls())
+	}
+	if len(sr.CallsMatching("swapon /swapfile-kine")) == 0 {
+		t.Fatal("fresh swapfile not activated after exit-2 probe")
+	}
+	if c.errs != 0 {
+		t.Fatalf("exit-2 no-signature counted as probe failure: %v", sr.Calls())
+	}
+}
+
+// TestSwapRefusesMkswapOnActiveUnsigned — "active but unsigned" means
+// the swapon and blkid probes disagree; mkswap is only ever
+// legitimate on an INACTIVE file, so the cycle skips rather than
+// rewrite the signature of live swap out from under the kernel.
+func TestSwapRefusesMkswapOnActiveUnsigned(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(map[string]string{
+		"swapon --show=NAME": "/swapfile-kine\n",
+	}, nil) // blkid answers unsigned (empty output, success)
+	r := newSwapHost(t, vars, "node-a", sr)
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+	seedSwapFile(t, r, "/swapfile-kine", 12288)
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupSwap()
+
+	if c.errs == 0 {
+		t.Fatal("active-but-unsigned contradiction not counted")
+	}
+	if len(sr.CallsMatching("mkswap")) > 0 || len(sr.CallsMatching("swapon /swapfile-kine")) > 0 {
+		t.Fatalf("mkswap/swapon ran on an active unsigned swapfile: %v", sr.Calls())
+	}
+	if n := sr.Count(); n != 2 {
+		t.Fatalf("cycle proceeded past the contradiction (%d calls): %v", n, sr.Calls())
 	}
 	if strings.Contains(hostRead(t, r, "/etc/fstab"), "swapfile-kine") {
 		t.Fatal("fstab entry added despite skipped cycle")

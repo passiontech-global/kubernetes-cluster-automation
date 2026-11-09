@@ -3,6 +3,9 @@
 package hostmetrics
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,6 +80,63 @@ func TestFilesystemZeroInodesSkipsRatio(t *testing.T) {
 	if _, ok := metricValue(t, c,
 		"node_host_agent_filesystem_inodes_used_ratio", mnt); ok {
 		t.Fatal("inodes_used_ratio emitted with Files=0 (div-by-zero)")
+	}
+}
+
+// TestInodePressureFilesZeroClearsLatch: a latch entered while a
+// parsed mount was over the enter threshold must EXIT once the only
+// remaining unparseable-looking mount is a Files==0 filesystem
+// (btrfs dynamic inodes, pseudo-fs). Before the fix such a mount was
+// inconclusive evidence on EVERY pass — parsed never reached probed,
+// inodePressureClear stayed false and the heartbeat kept refreshing
+// a stale condition True forever (hang-pre-cordon/storm-gate stayed
+// gated despite healthy disks). Files==0 counts as parsed healthy
+// (ratio 0); the exit asserts the STATE-EXIT transition line.
+func TestInodePressureFilesZeroClearsLatch(t *testing.T) {
+	cfg, _ := fixture(t)
+	logFile := filepath.Join(t.TempDir(), "watchdog.log")
+	cfg.FilesystemTargets = []string{"/mnt/btrfs", "/mnt/data"}
+	cfg.WatchdogLogFile = logFile
+	c := New(cfg)
+	l := c.Latches()
+
+	// 96% on /mnt/data → latch enters.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/mnt/data": {960, 1000}, "/mnt/btrfs": {0, 0},
+	})
+	l.refreshLatches()
+	if !latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch not set at 0.96")
+	}
+
+	// Recovery: /mnt/data healthy, /mnt/btrfs still answers statfs
+	// with no inode table — the pass must count as fully parsed and
+	// clear the latch.
+	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
+		"/mnt/data": {500, 1000}, "/mnt/btrfs": {0, 0},
+	})
+	l.refreshLatches()
+	if latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch held despite a Files==0 healthy pass")
+	}
+	b, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "STATE-EXIT: inode-pressure") {
+		t.Fatalf("STATE-EXIT line missing:\n%s", b)
+	}
+
+	// No ratio was computed for the Files==0 mount — the worst-mount
+	// detail must never divide by zero or go negative; a follow-up
+	// healthy pass (already exited) stays a no-op.
+	c.cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		st.Files, st.Ffree = 0, 0
+		return nil
+	}
+	l.refreshLatches()
+	if latchExists(t, cfg) {
+		t.Fatal("inode-pressure latch set from an all-Files==0 pass")
 	}
 }
 

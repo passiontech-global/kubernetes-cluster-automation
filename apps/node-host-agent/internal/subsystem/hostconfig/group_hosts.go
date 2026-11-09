@@ -82,10 +82,16 @@ func (c *cyc) hostnamePin() {
 	r := c.r
 	hosts, hostsErr := os.ReadFile(r.hp("/etc/hosts"))
 	if hostsErr != nil && !os.IsNotExist(hostsErr) {
-		// Best-effort pre-warning only — the writeManaged failure
-		// below is what counts the group error.
-		logger().Warn("base: cannot read /etc/hosts — hostname pin update will fail",
+		// Bail like blockInHosts: a failed read leaves hosts nil, the
+		// Find below misses, and the append path would rewrite
+		// /etc/hosts to ONLY the hostname pin — dropping every
+		// unmanaged entry (node IP, registry mirrors, interdc) for
+		// good. ENOENT stays fine: a minimal image may ship no
+		// /etc/hosts at all, and writing the pin is then the whole
+		// file.
+		c.err("hosts: cannot read /etc/hosts — hostname pin not updated",
 			"error", hostsErr)
+		return
 	}
 	hn := c.r.cfg.NodeName
 	// The separator must be a non-newline whitespace — bare `\s`

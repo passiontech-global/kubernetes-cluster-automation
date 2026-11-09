@@ -9,7 +9,9 @@ package hostconfig
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
@@ -18,15 +20,32 @@ func (c *cyc) groupBase() {
 	r := c.r
 	ctx := c.ctx
 	// T1 inotify + tcp keepalive (ansible.posix.sysctl per-key files).
+	// Vars-derived values are charset-gated BEFORE the render — a
+	// newline or metachar in a var would render as extra `key = value`
+	// lines the next `sysctl --system` applies verbatim. A refused (or
+	// unset) value drops its PAIR: the file converges with the
+	// remaining pairs, the refusal is counted per dropped pair.
+	var inotifyPairs [][2]string
+	for _, kv := range []struct{ key, varName string }{
+		{"fs.inotify.max_user_instances", "inotify_max_user_instances"},
+		{"fs.inotify.max_user_watches", "inotify_max_user_watches"},
+	} {
+		v := c.v(kv.varName)
+		if v == "" {
+			continue // var absent — converge nothing rather than a valueless line
+		}
+		if !c.cfgSysctlVal(kv.varName, v) {
+			continue // refused + already counted
+		}
+		inotifyPairs = append(inotifyPairs, [2]string{kv.key, v})
+	}
 	changed := false
 	for _, f := range []struct {
 		path  string
 		pairs [][2]string
 		hdr   string
 	}{
-		{"/etc/sysctl.d/99-k8s-inotify.conf",
-			[][2]string{{"fs.inotify.max_user_instances", c.v("inotify_max_user_instances")},
-				{"fs.inotify.max_user_watches", c.v("inotify_max_user_watches")}},
+		{"/etc/sysctl.d/99-k8s-inotify.conf", inotifyPairs,
 			"# Managed by node-config-agent - inotify limits\n"},
 		{"/etc/sysctl.d/99-tcp-keepalive.conf", c.sysctlPairs("tcp_keepalive_sysctls"),
 			"# Managed by node-config-agent - TCP keepalive (meta-conn zombie cleanup)\n"},
@@ -102,14 +121,21 @@ ProcessSizeMax=0
 	// T2 k0sworker limits drop-in.
 	if c.worker() {
 		_ = c.r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
-		if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/10-limits.conf",
-			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s worker
+		// The value is a systemd assignment rendered verbatim — a
+		// newline/metachar var would inject a SECOND directive
+		// systemd applies; an unparsable one is dropped at
+		// daemon-reload and the unit silently keeps stock fd limits.
+		// Refuse both: skip the write, count the error.
+		if nofile := c.v("k0sworker_limit_nofile"); c.cfgLimitNOFILE("k0sworker_limit_nofile", nofile) {
+			if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/10-limits.conf",
+				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s worker
 [Service]
 LimitNOFILE=%s
 LimitNPROC=infinity
 TasksMax=infinity
-`, c.v("k0sworker_limit_nofile"))), 0o644); ch {
-			r.daemonReload(ctx)
+`, nofile)), 0o644); ch {
+				r.daemonReload(ctx)
+			}
 		}
 	}
 
@@ -118,14 +144,17 @@ TasksMax=infinity
 	// count below kernel pid_max during reconcile bursts.
 	if c.controller() {
 		_ = c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
-		if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
-			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
+		// Same verbatim-assignment gate as the worker drop-in above.
+		if nofile := c.v("k0scontroller_limit_nofile"); c.cfgLimitNOFILE("k0scontroller_limit_nofile", nofile) {
+			if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
+				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
 [Service]
 LimitNOFILE=%s
 LimitNPROC=infinity
 TasksMax=infinity
-`, c.v("k0scontroller_limit_nofile"))), 0o644); ch {
-			r.daemonReload(ctx)
+`, nofile)), 0o644); ch {
+				r.daemonReload(ctx)
+			}
 		}
 		// gomemlimit-sum: clamp GOMEMLIMIT so the per-child soft cap can
 		// never leave the unit's sibling processes without room under
@@ -139,9 +168,14 @@ TasksMax=infinity
 	//   - networkd: never manage the CNI's foreign routes/rules — a
 	//     networkd restart wiping cilium/calico routes is the classic
 	//     "node loses its pod network after an upgrade" outage.
-	//   - logind: 65s inhibit delay — the kubelet's graceful-shutdown
-	//     window (shutdownGracePeriod=60s) must fit inside logind's
-	//     InhibitDelayMaxSec or systemd kills the node mid-drain.
+	//   - logind: InhibitDelayMaxSec derives from the SAME
+	//     kubelet_shutdown_grace_period var groupPulls renders into
+	//     the kubelet's shutdownGracePeriod (+5s scheduling buffer,
+	//     floor 65) — the kubelet's graceful-shutdown window must fit
+	//     inside logind's inhibit delay or systemd kills the node
+	//     mid-drain. logind only parses logind.conf at start/reload,
+	//     so a changed drop-in triggers a unit RELOAD below (reload
+	//     only — a restart tears down sessions).
 	//   - apt: keep unattended-upgrades off the packages a k0s node
 	//     depends on, and off automatic reboots.
 	_ = r.ensureDir("/etc/systemd/networkd.conf.d", 0o755)
@@ -153,12 +187,30 @@ ManageForeignRoutes=no
 ManageForeignRoutingPolicyRules=no
 `), 0o644)
 	_ = r.ensureDir("/etc/systemd/logind.conf.d", 0o755)
-	_, _ = r.writeManaged("/etc/systemd/logind.conf.d/99-k8s-shutdown.conf",
+	// The rendered value is the numeric seconds — the raw var never
+	// enters the file, so nothing can inject comment/section lines.
+	grace := defStr(c.v("kubelet_shutdown_grace_period"), "60s")
+	if ch, _ := r.writeManaged("/etc/systemd/logind.conf.d/99-k8s-shutdown.conf",
 		[]byte(`# Managed by node-config-agent - host-protection-drop-ins graceful kubelet shutdown.
-# InhibitDelayMaxSec must exceed the kubelet's shutdownGracePeriod (60s).
+# InhibitDelayMaxSec tracks kubelet_shutdown_grace_period (the kubelet's
+# shutdownGracePeriod) plus a 5s scheduling buffer.
 [Login]
-InhibitDelayMaxSec=65
-`), 0o644)
+InhibitDelayMaxSec=`+strconv.FormatInt(logindInhibitDelaySecs(grace), 10)+`
+`), 0o644); ch {
+		// The drop-in is INERT until logind re-parses its config
+		// (W18-7: a written delay sat unloaded until the next
+		// reboot). `systemctl reload systemd-logind.service` is the
+		// safe apply — the unit is Type=notify-reload with
+		// ReloadSignal=SIGHUP, no session teardown (a restart WOULD
+		// drop sessions/inhibits mid-shutdown). Warn-only on failure,
+		// coredump daemon-reload parity: the declared state is on
+		// disk and lands at the next reload/reboot.
+		r.actions.WithLabelValues("reload:systemd-logind.service").Inc()
+		if err := r.sysd().ReloadService(ctx, "systemd-logind.service"); err != nil {
+			logger().Warn("base: systemd-logind reload failed — drop-in inert until the next reload/reboot",
+				"error", err)
+		}
+	}
 	_ = r.ensureDir("/etc/apt/apt.conf.d", 0o755)
 	_, _ = r.writeManaged("/etc/apt/apt.conf.d/99-k8s-unattended-safety",
 		[]byte(`// Managed by node-config-agent - host-protection-drop-ins unattended-upgrade safety.
@@ -226,6 +278,26 @@ blacklist {
 	if !r.cfg.Standalone {
 		c.selfStageBinary()
 	}
+}
+
+// logindInhibitDelaySecs derives logind's InhibitDelayMaxSec from the
+// SAME kubelet_shutdown_grace_period var groupPulls renders into the
+// kubelet's shutdownGracePeriod (group_kubelet.go) — the two must move
+// together: if the kubelet's graceful-shutdown window outgrows
+// logind's inhibit delay, systemd kills the node mid-drain. The kubelet
+// window carries a 5s scheduling buffer, floored at 65s (the 60s
+// default + buffer); an unparsable/zero var falls back to that 60s
+// default rather than shrinking the protection below the floor.
+func logindInhibitDelaySecs(grace string) int64 {
+	d, err := time.ParseDuration(grace)
+	if err != nil || d <= 0 {
+		d = time.Minute
+	}
+	s := int64((d + 5*time.Second) / time.Second)
+	if s < 65 {
+		s = 65
+	}
+	return s
 }
 
 // selfStageBinary mirrors the RUNNING agent binary out to the host's

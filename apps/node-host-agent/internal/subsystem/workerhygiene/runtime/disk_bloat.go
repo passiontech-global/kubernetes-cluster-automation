@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -418,7 +419,10 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 		}
 	}
 	// (2) orphan .tmp sweep — files older than 2h under /run.
-	// Bounded: at most runTmpfsSweepMax removals per cycle.
+	// Bounded: at most runTmpfsSweepMax removals per cycle. An
+	// fd-held file is skipped (runTmpfsFDOpen): unlinking it would
+	// orphan the writer's inode — no space regained, data lost at
+	// close (incident parity with unlinked-open-files).
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	removed := 0
 	_ = filepath.WalkDir(c.d.Cfg.Disk.HostRunDir,
@@ -434,6 +438,17 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 			if ierr != nil || now.Sub(fi.ModTime()) < runTmpfsMinAge {
 				return nil //nolint:nilerr // stat failures skip the entry, never fatal
 			}
+			if c.runTmpfsFDOpen(path, fi) {
+				// SKIP open-fd — removing an fd-held spool file
+				// unlinks the name but not the inode: the writer
+				// keeps filling an orphan inode (no space regained)
+				// and its data vanishes at close, exactly during
+				// the ≥80% emergency this sweep serves.
+				c.d.State.AppendLog(fmt.Sprintf(
+					"SKIP open-fd %s — held open, not an orphan; sweep left it alone",
+					path))
+				return nil
+			}
 			if rerr := os.Remove(path); rerr == nil {
 				removed++
 				cleaned = true
@@ -447,6 +462,46 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 			used*100, removed))
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "run_tmpfs_clean").Inc()
 	}
+}
+
+// runTmpfsFDOpen reports whether any process holds an open fd on
+// the candidate file. The /proc fd walk runs only once a sweep
+// candidate exists (never on an empty walk) and compares
+// readlink targets under HostRunDir by Dev+Inode — the path check
+// alone would miss hardlinks/renames. Unreadable /proc/<pid>
+// entries are skipped: a process dying mid-scan is normal.
+func (c *DiskBloatCheck) runTmpfsFDOpen(path string, fi os.FileInfo) bool {
+	cst, ok := fi.Sys().(*syscall.Stat_t) // os stat results expose syscall.Stat_t, not unix.Stat_t
+	if !ok {
+		return false // uncomparable — fail open like the old sweep
+	}
+	pids, err := c.d.Proc.PIDs()
+	if err != nil {
+		return false
+	}
+	runPrefix := c.d.Cfg.Disk.HostRunDir + "/"
+	for _, pid := range pids {
+		fdDir := c.d.Proc.File(pid, "fd")
+		fds, rerr := os.ReadDir(fdDir)
+		if rerr != nil {
+			continue // raced exit — normal, never fatal
+		}
+		for _, fd := range fds {
+			target, lerr := os.Readlink(filepath.Join(fdDir, fd.Name()))
+			if lerr != nil || !strings.HasPrefix(target, runPrefix) {
+				continue
+			}
+			tfi, serr := os.Stat(target)
+			if serr != nil {
+				continue
+			}
+			if tst, tok := tfi.Sys().(*syscall.Stat_t); tok &&
+				tst.Dev == cst.Dev && tst.Ino == cst.Ino {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // --- dev-shm: host /dev/shm tmpfs fill gauge (W19-K2) ---

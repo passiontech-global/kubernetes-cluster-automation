@@ -241,10 +241,12 @@ func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
 // configured filesystem targets — the input both the scrape path
 // (collectFilesystem) and the latch ticker (refreshLatches) hand to
 // updateInodePressureLatch. probed counts mounts whose statfs
-// answered; parsed the subset whose inode ratio was computable
-// (Ffree > Files wraps uint64 on pseudo/network filesystems — that
-// is inconclusive evidence, not a healthy ratio); worstMount/
-// worstRatio name the fullest mount for the STATE-ENTER detail.
+// answered; parsed the subset whose verdict is decidable — a
+// computable ratio, or Files==0 (no inode table: never under
+// pressure, ratio 0). Ffree > Files wraps uint64 on pseudo/network
+// filesystems — that is inconclusive evidence, not a healthy ratio;
+// worstMount/worstRatio name the fullest mount for the STATE-ENTER
+// detail.
 type fsInodeEvidence struct {
 	probed     int
 	parsed     int
@@ -256,7 +258,21 @@ type fsInodeEvidence struct {
 // pass's verdict.
 func (c *Collector) noteInodeEvidence(e *fsInodeEvidence, mount string, st unix.Statfs_t) {
 	e.probed++
-	if st.Files == 0 || st.Ffree > st.Files {
+	if st.Files == 0 {
+		// btrfs (dynamic inodes) and pseudo-filesystems report no
+		// inode table at all: such a mount can never be under inode
+		// pressure, so it counts as PARSED evidence with ratio 0 —
+		// treating it as inconclusive wedged a once-entered latch
+		// open forever (parsed never reached probed, the heartbeat
+		// kept refreshing the condition and the sweeper/gates never
+		// saw a clearable pass). Check this BEFORE the wrap guard:
+		// Ffree can exceed Files == 0.
+		e.parsed++
+		return
+	}
+	if st.Ffree > st.Files {
+		// Ffree > Files wraps uint64 — inconclusive evidence,
+		// not a healthy ratio.
 		return
 	}
 	e.parsed++

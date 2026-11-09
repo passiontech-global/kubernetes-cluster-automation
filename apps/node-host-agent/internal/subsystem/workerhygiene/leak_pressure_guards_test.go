@@ -182,6 +182,27 @@ func TestKernelSlabLeakHysteresis(t *testing.T) {
 	}
 }
 
+// TestKernelSlabLeakCountsSecPageTables: SecPageTables is kernel
+// memory outside SUnreclaim — a pagetable leak must trip the same
+// latch. Regression for the meminfo key missing its colon
+// ("SecPageTables" never matched the "SecPageTables:" field, so the
+// value was silently dropped from the ratio).
+func TestKernelSlabLeakCountsSecPageTables(t *testing.T) {
+	e := fixture(t)
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "vm", "drop_caches"), "")
+	// SUnreclaim alone is 20% of MemTotal — under the 0.35 enter
+	// bar; SecPageTables lifts kernel memory to 40%.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "meminfo"), fmt.Sprintf(
+		"MemTotal: %d kB\nMemFree: %d kB\nMemAvailable: %d kB\nSUnreclaim: %d kB\nSecPageTables: %d kB\n",
+		1000000, 500000, 500000, 200000, 200000))
+
+	wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if !e.H.State.Exists("kernel-slab-leak") {
+		t.Fatal("no kernel-slab-leak latch — SecPageTables not counted toward kernel memory")
+	}
+}
+
 // TestPSIThrashEvictSuppressedBySlabLeak: while kernel-slab-leak is
 // latched the PSI evictor holds its latch but refuses to evict —
 // a kernel slab leak is not a pod-size problem. Once the slab
