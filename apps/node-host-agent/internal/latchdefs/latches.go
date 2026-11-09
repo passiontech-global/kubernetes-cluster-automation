@@ -49,23 +49,23 @@ const (
 	LatchCiliumInitStuck        = "cilium-init-stuck"        // 35
 	LatchCiliumIPAMExhausted    = "cilium-ipam-exhausted"    // 38
 	LatchCiliumEnvoyDown        = "cilium-envoy-down"        // B1
-	LatchCiliumEnvoyXDSReject   = "cilium-envoy-xds-reject"  // W7-H3
+	LatchCiliumEnvoyXDSReject   = "cilium-envoy-xds-reject"  // envoy-xds-lrp
 	LatchCiliumMTUDrift         = "cilium-mtu-drift"         // B4
-	LatchCiliumBPFMapPressure   = "cilium-bpf-map-pressure"  // W8-NM3
-	LatchCiliumWGPeerWipe       = "cilium-wg-peer-wipe"      // W5.6
-	LatchDiskBloat              = "disk-bloat"               // W6.3
-	LatchZombieStorm            = "zombie-storm"             // A2
-	LatchDStateStorm            = "d-state-storm"            // W7-H1
-	LatchSpegelMirrorDegraded   = "spegel-mirror-degraded"   // W7-H4
-	LatchCalicoVethLeak         = "calico-veth-leak"         // W7-H7
-	LatchCalicoFelixDown        = "calico-felix-down"        // W7-H7
-	LatchPSIMemoryThrash        = "psi-memory-thrash"        // W2
-	LatchKernelSlabLeak         = "kernel-slab-leak"         // W9-KR3
-	LatchContainerdCorrupt      = "containerd-corrupt"       // W10-KR3
-	LatchCgroupDyingLeak        = "cgroup-dying-leak"        // cgroup-dying-reclaim
-	LatchSystemdSessionBloat    = "systemd-session-bloat"    // systemd-session-hygiene
-	LatchKubeletPLEGUnhealthy   = "kubelet-pleg-unhealthy"   // kubelet-syncloop PLEG metrics
-	LatchDiskSlowIO             = "disk-slow-io"             // W12-KR4 io-pressure gray failure
+	LatchCiliumBPFMapPressure   = "cilium-bpf-map-pressure"  // mesh-net-guards
+	LatchCiliumWGPeerWipe       = "cilium-wg-peer-wipe"      // cilium-wg-peer-gc
+	LatchDiskBloat              = "disk-bloat"
+	LatchZombieStorm            = "zombie-storm" // A2
+	LatchDStateStorm            = "d-state-storm"
+	LatchSpegelMirrorDegraded   = "spegel-mirror-degraded" // spegel-mirror
+	LatchCalicoVethLeak         = "calico-veth-leak"       // calico-hygiene
+	LatchCalicoFelixDown        = "calico-felix-down"      // calico-hygiene
+	LatchPSIMemoryThrash        = "psi-memory-thrash"
+	LatchKernelSlabLeak         = "kernel-slab-leak"
+	LatchContainerdCorrupt      = "containerd-corrupt"     // meta-db-corruption
+	LatchCgroupDyingLeak        = "cgroup-dying-leak"      // cgroup-dying-reclaim
+	LatchSystemdSessionBloat    = "systemd-session-bloat"  // systemd-session-hygiene
+	LatchKubeletPLEGUnhealthy   = "kubelet-pleg-unhealthy" // kubelet-syncloop PLEG metrics
+	LatchDiskSlowIO             = "disk-slow-io"           // disk-slow-io io-pressure gray failure
 	// LatchKernelNetShim is the kernel-net-shim-hygiene degradation
 	// latch — sustained kernel socket/softnet drop growth or a
 	// containerd-shim RSS breach (individual 200MiB / total 1.5GiB).
@@ -90,7 +90,7 @@ const (
 	LatchFail2banDown        = "fail2ban-down"         // 50
 	LatchClockUnsync         = "clock-unsync"          // H1
 	LatchConntrackPressure   = "conntrack-pressure"    // H2
-	LatchNebulaPMTUBlackhole = "nebula-pmtu-blackhole" // W9-NM1
+	LatchNebulaPMTUBlackhole = "nebula-pmtu-blackhole" // overlay-mtu-guard
 	LatchNebulaMTUBlackhole  = "nebula-mtu-blackhole"  // routeguard NM4
 	// LatchClocksourceUnstable is the clocksource evidence latch — the
 	// kernel marked its clocksource unstable (kmsg signature) or
@@ -106,9 +106,9 @@ const (
 	LatchKineTTLDead            = "kine-ttl-dead"
 	LatchKineTTLLoop            = "kine-ttl-loop"
 	LatchK0sControllerOOMLoop   = "k0scontroller-oom-loop"
-	LatchCPComponentFrozen      = "cp-component-frozen"      // W8-CP3
-	LatchCPCertReloadStale      = "cp-cert-reload-stale"     // W8-CP4
-	LatchKubeconfigCertExpiring = "kubeconfig-cert-expiring" // W10
+	LatchCPComponentFrozen      = "cp-component-frozen"      // cp-freeze-heal
+	LatchCPCertReloadStale      = "cp-cert-reload-stale"     // pki-cert-drift
+	LatchKubeconfigCertExpiring = "kubeconfig-cert-expiring" // kubeconfig-cert-expiry
 
 	// nodereporter — the kernel monitor's permanent-class evidence
 	// latches, Entered on a soft-lockup / RCU-stall kmsg signature
@@ -119,17 +119,17 @@ const (
 
 	// hostmetrics — the latch ticker's file-contract latches.
 	LatchNodeOverloaded     = "node-overloaded"      // PSI hysteresis
-	LatchFilesystemReadonly = "filesystem-readonly"  // W5.3 statfs ST_RDONLY
+	LatchFilesystemReadonly = "filesystem-readonly"  // statfs ST_RDONLY evidence
 	LatchNebulaCertExpiring = "nebula-cert-expiring" // 13 cert parse
-	LatchKernelKeysPressure = "kernel-keys-pressure" // W8-KR3
-	// LatchInodePressure is the W18-1 filesystem inode-pressure latch —
+	LatchKernelKeysPressure = "kernel-keys-pressure"
+	// LatchInodePressure is the inode-pressure filesystem inode-pressure latch —
 	// hostmetrics' inode-usage hysteresis over the statfs targets
 	// (enter at >=95% inode usage on any mount, clear only when every
 	// monitored mount is back to <=90%).
-	LatchInodePressure    = "inode-pressure"     // W18-1 fs inode hysteresis
-	LatchFSReadonly       = "fs-readonly"        // W10-ST1/KR1
-	LatchPIDFDPressure    = "pid-fd-pressure"    // W10-KR2
-	LatchClockSkew        = "clock-skew"         // W10-KR5
+	LatchInodePressure    = "inode-pressure" // inode-pressure fs inode hysteresis
+	LatchFSReadonly       = "fs-readonly"    // updateFSReadonlyEvidence/checkKernelDmesg
+	LatchPIDFDPressure    = "pid-fd-pressure"
+	LatchClockSkew        = "clock-skew"
 	LatchCPUStealPressure = "cpu-steal-pressure" // cpu-steal-guard
 	// LatchPageAllocFailure is the kernel-pressure fragmentation latch:
 	// hostmetrics' kmsg drain Enters it on "page allocation
@@ -174,23 +174,23 @@ type LatchDef struct {
 //	  cilium-init-stuck (35), kubelet-healthz-down (T15 remediate),
 //	  kubelet-syncloop-down / containerd-sock-down (A4),
 //	  cilium-envoy-down (B1), cilium-mtu-drift (B4),
-//	  zombie-storm (A2), d-state-storm (W7-H1),
-//	  cilium-envoy-xds-reject (W7-H3), spegel-mirror-degraded (W7-H4),
-//	  calico-veth-leak / calico-felix-down (W7-H7),
-//	  cilium-bpf-map-pressure (W8-NM3), psi-memory-thrash (W2),
-//	  kernel-slab-leak (W9-KR3)
+//	  zombie-storm (A2), d-state-storm (d-state-storm),
+//	  cilium-envoy-xds-reject (envoy-xds-lrp), spegel-mirror-degraded (spegel-mirror),
+//	  calico-veth-leak / calico-felix-down (calico-hygiene),
+//	  cilium-bpf-map-pressure (mesh-net-guards), psi-memory-thrash (psi-memory-thrash),
+//	  kernel-slab-leak (kernel-slab-leak)
 //	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
 //	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
-//	  conntrack-pressure (H2), nebula-pmtu-blackhole (W9-NM1)
+//	  conntrack-pressure (H2), nebula-pmtu-blackhole (overlay-mtu-guard)
 //	controllerhygiene: apiserver-cache-stale/-wedged (sig13),
 //	  kine-backend-unreachable, kine-pool-runaway, kine-ttl-dead,
-//	  kine-ttl-loop, k0scontroller-oom-loop, cp-cert-reload-stale (W8-CP4),
-//	  cp-component-frozen (W8-CP3)
+//	  kine-ttl-loop, k0scontroller-oom-loop, cp-cert-reload-stale (pki-cert-drift),
+//	  cp-component-frozen (cp-freeze-heal)
 //	controllerhygiene + workerhygiene (shared journalwatch tracker):
 //	  journal-unreadable
 //	hostmetrics: node-overloaded (PSI hysteresis), filesystem-readonly,
-//	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3),
-//	  inode-pressure (W18-1)
+//	  nebula-cert-expiring, kernel-keys-pressure (kernel-keys-pressure),
+//	  inode-pressure (inode-pressure)
 var LatchDefs = []LatchDef{
 	// workerhygiene — pod-teardown-wedged is the shared latch:
 	// pods.PodTeardownCheck holds it for stuck Terminating pods,

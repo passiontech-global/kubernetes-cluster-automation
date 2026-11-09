@@ -1,5 +1,5 @@
 // churn_test.go — the kine-churn top-churn watermark sampler tests,
-// lifted out of the flat package's w13_test.go. The emit half of
+// lifted out of the flat package's churn tests. The emit half of
 // the old test lives in compact's suite now (the guard owns the
 // textfile render of Deps.ChurnTop).
 package probe

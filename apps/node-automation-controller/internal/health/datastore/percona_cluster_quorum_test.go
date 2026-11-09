@@ -1,5 +1,5 @@
 // percona_cluster_quorum_test.go — coverage for the
-// percona-cluster-quorum check's W12-ST2 signatures: degraded
+// percona-cluster-quorum check's percona-degraded-quorum signatures: degraded
 // quorum (ready<size >=20m), the Galera wsrep Prometheus evidence
 // (non-Primary / OFF / Donor-Desynced >=30m), and the
 // PerconaPGCluster Patroni failover lock (vacant leader surfaces
@@ -25,7 +25,7 @@ import (
 
 // pxcCluster builds a PerconaXtraDBCluster CR with the given
 // status.ready/size — a healthy state ("ready") exercises the
-// W12-ST2 degraded-quorum branch, which lives on the default path.
+// percona-degraded-quorum degraded-quorum branch, which lives on the default path.
 func pxcCluster(ns, name string, ready, size int64) *unstructured.Unstructured {
 	return testutil.Unstructured(
 		kube.GVRPerconaXtraDBCluster.GroupVersion().WithKind("PerconaXtraDBCluster"),
@@ -186,7 +186,7 @@ func TestPerconaPatroniLeaderLock(t *testing.T) {
 	}
 }
 
-// W17 — a 404 on BOTH the leader Lease and the leader Endpoints is
+// heal-budget — a 404 on BOTH the leader Lease and the leader Endpoints is
 // absence of evidence, NOT leader loss: the CR could be mid-
 // bootstrap with no DCS surface written yet. No lock, pass.
 func TestPerconaPatroniBothSurfacesAbsentNoLock(t *testing.T) {

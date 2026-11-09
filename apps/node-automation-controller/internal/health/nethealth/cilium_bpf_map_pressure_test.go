@@ -1,5 +1,5 @@
 // cilium_bpf_map_pressure_test.go — coverage for the
-// cilium-bpf-map-pressure check (W10-NM1).
+// cilium-bpf-map-pressure check (cilium-bpf-map-pressure).
 package nethealth
 
 import (
@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-NM1 — cilium-bpf-map-pressure
+// cilium-bpf-map-pressure — cilium-bpf-map-pressure
 // ---------------------------------------------------------------------------
 
 func TestCiliumBPFMapPressureFailsAboveThreshold(t *testing.T) {

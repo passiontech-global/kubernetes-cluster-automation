@@ -188,7 +188,7 @@ func TestLeaseGuardExpiredLeaseMaintenanceGate(t *testing.T) {
 	}
 }
 
-// W12-SC2 — a jump of 4 transitions inside 10m is thrashing: the
+// stateful-split-brain — a jump of 4 transitions inside 10m is thrashing: the
 // dedicated gauge fires and the check fails, but below the flap
 // threshold (5/15m) no unhealthy flapping series appears.
 func TestLeaseGuardThrashing(t *testing.T) {

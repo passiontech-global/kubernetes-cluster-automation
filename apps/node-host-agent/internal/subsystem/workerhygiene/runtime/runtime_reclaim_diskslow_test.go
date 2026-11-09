@@ -1,7 +1,7 @@
-// runtime_w12_test.go — Wave-12 KR coverage for existing runtime
-// guards: the W12-KR-C targeted memory.reclaim on hot
-// kubepods.slice children (cgroup-dying-reclaim) and the W12-KR4
-// DiskSlowIO gray-failure latch (io-pressure-throttler).
+// runtime_reclaim_diskslow_test.go — coverage for the existing
+// runtime guards: the targeted memory.reclaim on hot kubepods.slice
+// children (cgroup-dying-reclaim) and the disk-slow-io DiskSlowIO
+// gray-failure latch (io-pressure-throttler).
 package runtime_test
 
 import (
@@ -19,7 +19,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W12-KR-C: targeted child-slice reclaim ---
+// --- targeted-memory-reclaim: targeted child-slice reclaim ---
 
 // TestCgroupDyingReclaimsHotChildren: while the root/kubepods
 // aggregate reclaim runs as before, first-level kubepods.slice
@@ -62,7 +62,7 @@ func TestCgroupDyingReclaimsHotChildren(t *testing.T) {
 	}
 }
 
-// --- W12-KR4: disk-slow-io latch ---
+// --- disk-slow-io: disk-slow-io latch ---
 
 // writeDiskIO lays down one sda diskstats row — counters are
 // cumulative, so each call grows wrIOS/wrTicks to keep the

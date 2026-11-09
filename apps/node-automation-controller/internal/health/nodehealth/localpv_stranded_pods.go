@@ -1,5 +1,5 @@
 // localpv_stranded_pods.go — the localpv-stranded-pods check
-// (W7-C4): Pending pods whose bound local PV is nodeAffinity-pinned
+// (localpv-stranded-pods): Pending pods whose bound local PV is nodeAffinity-pinned
 // to a dead node get the stranded gauge (and, for disposable
 // volumes, a PVC+pod rescue); Pending openebs-hostpath claims with
 // Ready workers bounce the localpv provisioner.
@@ -22,12 +22,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// localPVStrandedCheck is the W7-C4 local-PV dead-node diagnostic,
+// localPVStrandedCheck is the localpv-stranded-pods local-PV dead-node diagnostic,
 // ephemeral-PVC rescue and provisioner watchdog.
 type localPVStrandedCheck struct {
 	*probefw.Deps
 
-	// W7-C4 watchdog state (serial sweep — unguarded):
+	// localpv-stranded-pods watchdog state (serial sweep — unguarded):
 	//   - localPVEmitted: "ns/pod/pvc/node/reason" gauge tuples held
 	//     at 1 — pruned via DeleteLabelValues when not re-seen (same
 	//     hygiene as stsZeroEmitted).
@@ -42,7 +42,7 @@ type localPVStrandedCheck struct {
 	//     provisioner Deployment is the durable half).
 	localPVEmitted    state.GaugeLedger[string]
 	pvcStalledEmitted state.GaugeLedger[string]
-	// strandedStatefulEmitted is the W12-SC2 ledger for the
+	// strandedStatefulEmitted is the stateful-split-brain ledger for the
 	// stranded-stateful-pod tuples — a pod whose node comes back
 	// (or whose claim rebinds) loses its series via
 	// DeleteLabelValues, same hygiene as localPVEmitted.
@@ -51,7 +51,7 @@ type localPVStrandedCheck struct {
 	pvcProvHealed           state.CooldownSet
 }
 
-// newLocalPVStrandedCheck builds the W7-C4 check — every ledger is
+// newLocalPVStrandedCheck builds the localpv-stranded-pods check — every ledger is
 // zero-value ready, so the constructor carries no initialization
 // (the state-map literals retired with the monolithic
 // newClusterHealthProber).
@@ -60,14 +60,14 @@ func NewLocalPVStrandedCheck(d *probefw.Deps) probefw.Check {
 }
 
 // ---------------------------------------------------------------------------
-// localpv-stranded-pods (W7-C4) — local-PV dead-node diagnostics +
+// localpv-stranded-pods (localpv-stranded-pods) — local-PV dead-node diagnostics +
 // ephemeral-PVC rescue + provisioner watchdog.
 // ---------------------------------------------------------------------------
 
-// W7-C4 — localpv-stranded-pods knobs.
+// localpv-stranded-pods — localpv-stranded-pods knobs.
 const (
 	// CheckNameLocalPVStranded is the check's kuberhealthy_check
-	// label value — W7; not a ported HealthCheck but reports under
+	// label value — agent-added; not a ported HealthCheck but reports under
 	// its own check name so the generic FAIL alerting path covers
 	// it.
 	CheckNameLocalPVStranded = "localpv-stranded-pods"
@@ -110,7 +110,7 @@ const (
 )
 
 var (
-	// W7-C4 — the stranded-pod signal: 1 while the Pod pends on a
+	// localpv-stranded-pods — the stranded-pod signal: 1 while the Pod pends on a
 	// local PV node-affinity-pinned to an unavailable node. reason is
 	// missing_node | out_of_service | not_ready | cordoned.
 	localPVStrandedPodsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -118,7 +118,7 @@ var (
 		Help: "1 while the Pod pends on a local PV node-affinity-pinned to an unavailable node.",
 	}, []string{"namespace", "pod", "pvc", "node", "reason"})
 
-	// W7-C4 — ephemeral localpv PVC+pod pairs reaped after their
+	// localpv-stranded-pods — ephemeral localpv PVC+pod pairs reaped after their
 	// bound node was confirmed gone (missing or out-of-service).
 	// Counts delivered heals only.
 	localPVEphemeralHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -126,7 +126,7 @@ var (
 		Help: "Ephemeral localpv PVC+pod pairs reaped after their bound node was confirmed gone.",
 	}, []string{"namespace", "pvc", "node"})
 
-	// W12-SC2 — the stranded-stateful signal: 1 while a
+	// stateful-split-brain — the stranded-stateful signal: 1 while a
 	// NON-ephemeral LocalPV pod pends on a volume pinned to a
 	// confirmed-dead node (missing or out-of-service). The generic
 	// stranded gauge carries the pvc+reason detail; this one names
@@ -136,7 +136,7 @@ var (
 		Help: "1 while a non-ephemeral LocalPV pod pends on a volume nodeAffinity-pinned to a dead (missing/out-of-service) node — data recovery needed, never auto-healed.",
 	}, []string{"namespace", "pod", "dead_node"})
 
-	// W7-C4 — the stalled-provisioning signal: 1 while the PVC
+	// localpv-stranded-pods — the stalled-provisioning signal: 1 while the PVC
 	// pends on a local provisioner despite Ready schedulable
 	// workers existing.
 	pvcProvisioningStalledGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -144,7 +144,7 @@ var (
 		Help: "1 while the PVC pends on a local provisioner despite Ready schedulable workers existing.",
 	}, []string{"namespace", "pvc", "storageclass"})
 
-	// W7-C4 — local provisioner pods deleted to unstick Pending
+	// localpv-stranded-pods — local provisioner pods deleted to unstick Pending
 	// claims, by provisioner. Counts delivered heals only.
 	pvcProvisionerHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_automation_pvc_provisioner_heals_total",
@@ -294,7 +294,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 }
 
 // ---------------------------------------------------------------------------
-// localpv-stranded-pods (W7-C4) — per-sweep collectors (split out of
+// localpv-stranded-pods (localpv-stranded-pods) — per-sweep collectors (split out of
 // the monolithic Run; behavior byte-identical).
 // ---------------------------------------------------------------------------
 
@@ -364,7 +364,7 @@ func (p *localPVStrandedCheck) collectLocalPVSnapshot(ctx context.Context) (*loc
 
 // scanStrandedPods classifies the snapshot pod-by-pod: (a) a bound
 // local PV nodeAffinity-pinned to an unavailable node raises the
-// stranded gauge — plus the W12-SC2 stateful gauge for non-ephemeral
+// stranded gauge — plus the stateful-split-brain stateful gauge for non-ephemeral
 // workloads on a confirmed-dead node — and queues a strandedHeal for
 // disposable volumes past localPVEphemeralHealMinAge; (b) a Pending
 // openebs-hostpath claim past pvcStalledMinAge while schedulable
@@ -407,7 +407,7 @@ func scanStrandedPods(snap *localPVSnapshot, now time.Time,
 						stranded.Emit(localPVStrandedPodsGauge, key,
 							[]string{pod.Namespace, pod.Name, pvc.Name,
 								node, reason}, key)
-						// W12-SC2 — a NON-ephemeral workload
+						// stateful-split-brain — a NON-ephemeral workload
 						// stranded on a confirmed-dead node is
 						// the data-loss class the ephemeral heal
 						// deliberately never touches; the

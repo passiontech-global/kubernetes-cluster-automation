@@ -8,7 +8,7 @@
 // shrinks the heap — so this job runs:
 //
 //	reindex  REINDEX TABLE CONCURRENTLY kine — always (cheap on a
-//	         small table, SHARE UPDATE EXCLUSIVE lock). W12-CP2:
+//	         small table, SHARE UPDATE EXCLUSIVE lock). invalid-index-reaper:
 //	         preceded by the invalid-index reaper — an interrupted
 //	         REINDEX CONCURRENTLY / pg_repack leaves *_ccnew / *_ccold
 //	         shells with indisvalid=false; they cost every INSERT,
@@ -122,7 +122,7 @@ type Result struct {
 	indexBytes  int64
 	deadPct     int64
 	statsOK     bool // sizes/dead-tuple stats were actually read this run
-	// W12-CP2 invalid-index reaper tallies.
+	// invalid-index-reaper invalid-index reaper tallies.
 	invalidDropped int
 	invalidKept    int // non-ccnew/ccold invalids left for an operator
 	notes          []string
@@ -216,7 +216,7 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		}
 	}()
 
-	// (a0) W12-CP2 invalid-index reaper — BEFORE the reindex: an
+	// (a0) invalid-index-reaper invalid-index reaper — BEFORE the reindex: an
 	// interrupted REINDEX CONCURRENTLY or pg_repack leaves *_ccnew /
 	// *_ccold shells with indisvalid=false, and those shells make
 	// the next reindex error out ("cannot reindex invalid index")
@@ -307,7 +307,7 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		res.heapBytes <= m.d.Cfg.RepackMinHeapBytes {
 		return
 	}
-	// W8-CP2 item 3: repack shadows the heap + WAL churn — require
+	// kinedb-maintenance item 3: repack shadows the heap + WAL churn — require
 	// free >= 2.5*(heap+wal) on the data fs first; otherwise run
 	// only a VACUUM (ANALYZE) and warn (repack would fill the disk).
 	free, wal, headroom := m.repackHeadroom(ctx, pg, user, pass,
@@ -397,7 +397,7 @@ func (m *Maint) readSizes(ctx context.Context, pg, user, pass string,
 	}
 }
 
-// reapInvalidIndexes — W12-CP2: drop the invalid index shells an
+// reapInvalidIndexes — invalid-index-reaper: drop the invalid index shells an
 // interrupted REINDEX CONCURRENTLY / pg_repack leaves on the kine
 // table. Only the *_ccnew / *_ccold names PostgreSQL itself mints
 // are auto-dropped — any other invalid index is noted and kept for

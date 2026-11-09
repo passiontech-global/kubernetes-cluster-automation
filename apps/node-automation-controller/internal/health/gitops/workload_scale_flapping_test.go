@@ -187,7 +187,7 @@ func rolloutScaleEvent(ns, name string, up bool, when time.Time) *corev1.Event {
 	}
 }
 
-// W16-G1 — a Rollout whose scale direction flipped >=6 times inside
+// rollout-scale-flap — a Rollout whose scale direction flipped >=6 times inside
 // the window (GitOps vs downscaler vs KEDA on spec.replicas) is the
 // same tug-of-war the Deployment path flags.
 func TestScaleFlappingRollout(t *testing.T) {

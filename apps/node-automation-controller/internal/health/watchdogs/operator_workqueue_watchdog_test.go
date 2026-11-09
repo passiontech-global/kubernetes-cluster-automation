@@ -1,4 +1,4 @@
-// operator_workqueue_watchdog_test.go — W7-C2/W10-CP3 coverage
+// operator_workqueue_watchdog_test.go — operator-watchdog-targets/operator-workqueue-watchdog coverage
 // for the operator-workqueue-watchdog target list completeness and
 // the never-reconciled stuck predicates.
 package watchdogs
@@ -26,11 +26,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W7-C2 — operator watchdog expansion
+// operator-watchdog-targets — operator watchdog expansion
 // ---------------------------------------------------------------------------
 
-// The watchdog must cover the original five plus the W7-C2 additions
-// and the W10-CP3 expansion — notification-controller IS a target
+// The watchdog must cover the original five plus the operator-watchdog-targets additions
+// and the operator-workqueue-watchdog expansion — notification-controller IS a target
 // again but carries ZERO resources: its v1beta3 Alert/Provider/
 // Receiver objects are static (no reconciler writes status on them),
 // so no stuck signature can ever be accurate — the entry exists for
@@ -52,13 +52,13 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		"external-secrets", "rabbitmq-cluster-operator", "keda-operator",
 		"argocd-operator", "kargo-controller", "everest-operator",
 		"shipwright-build-controller",
-		// W10-CP3 additions.
+		// operator-workqueue-watchdog additions.
 		"notification-controller", "node-healthcheck-operator",
 		"self-node-remediation-operator",
 		"percona-xtradb-cluster-operator", "percona-postgresql-operator",
 		"percona-server-mongodb-operator", "fluent-operator",
 		"tekton-pipelines-controller", "shipwright-operator",
-		// W16-G1 additions.
+		// rollout-scale-flap additions.
 		"argo-rollouts-controller", "cloudflare-tunnel-gateway-controller",
 	} {
 		if !seen[want] {
@@ -67,7 +67,7 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 	}
 	// notification-controller may only ever watch the Lease — any
 	// CR resource on it would resurrect the static-object false
-	// positive the W7-C2 incident fix removed.
+	// positive the operator-watchdog-targets incident fix removed.
 	for _, op := range operatorTargets {
 		if op.name == "notification-controller" && len(op.resources) != 0 {
 			t.Fatalf("notification-controller must carry no CR resources, got %d",

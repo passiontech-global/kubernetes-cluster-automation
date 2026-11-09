@@ -1599,7 +1599,7 @@ func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {
 	}
 }
 
-// W12-CP4b: a backend whose JWKS kid set dissents from the healthy
+// jwks-kid-skew: a backend whose JWKS kid set dissents from the healthy
 // majority for 3 consecutive cycles is flagged (gauge+log) — the
 // sa.pub/sa.key rotation skew surfaces as random 401s through the LB.
 func TestEndpointGuardJWKSKIDSkew(t *testing.T) {

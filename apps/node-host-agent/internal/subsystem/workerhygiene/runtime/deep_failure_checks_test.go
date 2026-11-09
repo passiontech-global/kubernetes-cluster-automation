@@ -18,7 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W10-KR3: containerd meta.db corruption latch ---
+// --- meta-db-corruption: containerd meta.db corruption latch ---
 
 func TestContainerdMetaJournalLatch(t *testing.T) {
 	e := fixture(t)
@@ -61,7 +61,7 @@ func TestContainerdMetaJournalLatch(t *testing.T) {
 	}
 }
 
-// --- W10-KR1 consumer: SystemOOMVictim event ---
+// --- kernel-dmesg consumer: SystemOOMVictim event ---
 
 func TestHostOOMVictimEvent(t *testing.T) {
 	e := fixture(t)
@@ -108,7 +108,7 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	}
 }
 
-// --- W10-ST2: orphan hostPath dirs ---
+// --- orphan-hostpath: orphan hostPath dirs ---
 
 func TestOrphanHostPathVolumes(t *testing.T) {
 	e := fixture(t)

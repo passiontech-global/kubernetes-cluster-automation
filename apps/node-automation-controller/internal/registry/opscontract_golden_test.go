@@ -114,7 +114,7 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"workload-scale-flapping", "health"},
 	{"imagepull-secret-auditor", "health"},
 	{"cluster-health-probes", "health"},
-	// W16-G3 — argocd-agent spin healer, last row (see registry.go).
+	// argocd-agent-spin — argocd-agent spin healer, last row (see registry.go).
 	{"argocd-agent-spin", "health"},
 }
 
@@ -256,7 +256,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_webhook_missing_critical_ns_exclusion",
 	"node_automation_workload_scale_flapping",
 	"node_automation_zombie_sidecar_pods_reaped_total",
-	// W16-G3 — argocd-agent spin gauge (not alphabetical, new row).
+	// argocd-agent-spin — argocd-agent spin gauge (not alphabetical, new row).
 	"node_automation_argocd_agent_spin",
 	"shell_operator_hook_run_errors_total",
 }

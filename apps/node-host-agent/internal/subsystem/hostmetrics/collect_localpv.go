@@ -1,4 +1,4 @@
-// collect_localpv.go — W9 OpenEBS LocalPV per-PVC dir bytes: a
+// collect_localpv.go — OpenEBS LocalPV per-PVC dir bytes: a
 // bounded du walk cached for LocalPVScanInterval. Split out of
 // hostmetrics.go.
 package hostmetrics
@@ -15,14 +15,14 @@ import (
 )
 
 const (
-	// W9 LocalPV telemetry: the openebs localpv-provisioner
+	// LocalPV telemetry: the openebs localpv-provisioner
 	// hostPath root + the du-walk cache TTL + per-volume entry cap.
 	defaultOpenEBSLocalDir  = "/var/openebs/local"
 	defaultLocalPVScanEvery = 15 * time.Minute
 	localPVMaxWalkEntries   = 20000
 )
 
-// --- W9: OpenEBS LocalPV per-PVC dir bytes ---
+// --- OpenEBS LocalPV per-PVC dir bytes ---
 
 // localpvCache is the per-PVC du-walk domain — one slice of what
 // used to be the Collector's shared mu-guarded fields: the walk

@@ -1,4 +1,4 @@
-// collect_localpv_test.go — Wave-9 OpenEBS LocalPV pvc-* dir bytes and the du-walk cache.
+// collect_localpv_test.go — OpenEBS LocalPV pvc-* dir bytes and the du-walk cache.
 
 package hostmetrics
 

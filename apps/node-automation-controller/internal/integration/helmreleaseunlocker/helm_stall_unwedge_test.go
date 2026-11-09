@@ -514,7 +514,7 @@ func TestHelmStallUnwedgeListFallback(t *testing.T) {
 	}
 }
 
-// W8-GO2 attempt budget: a REFUSAL consumes one of the
+// helm-stall-unwedge attempt budget: a REFUSAL consumes one of the
 // stallMaxAttemptsPerRevision tries just like an action does —
 // otherwise a permanently refused signature would re-run the full
 // workload-layer analysis every sweep and never reach the cap. At
@@ -598,7 +598,7 @@ func TestHelmStallUnwedgeNonDeadlockShapeSkipped(t *testing.T) {
 	}
 }
 
-// The W8-GO2 retry ledger has no stamps to age out — its entries die
+// The helm-stall-unwedge retry ledger has no stamps to age out — its entries die
 // with the HR: a vanished HR's stallAttempt is deleted at the next
 // sweep-end prune, a still-listed HR keeps its entry (and its count).
 func TestHelmStallAttemptsPrunedWhenHRVanishes(t *testing.T) {

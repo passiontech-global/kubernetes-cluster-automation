@@ -1,5 +1,5 @@
 // linkerd_endpoint_sync_desync.go — the desync-detection helpers of
-// the linkerd-endpoint-sync check (W9-NM2/W10-FIX7): the EndpointSlice
+// the linkerd-endpoint-sync check (netns-endpoint-sync/endpoint-sync-heal): the EndpointSlice
 // vs Ready-pod-IP set-divergence test, the controller-owned-slice
 // staleness pick, the pod-Ready-since fuse clock, and the
 // audited-Service filter.
@@ -33,7 +33,7 @@ func linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady map[string]bool) bool
 
 // linkerdSliceRef is one endpointslice-controller-owned EndpointSlice
 // of an audited Service — a delete candidate when it
-// provably holds stale endpoint data (W10-FIX7). addrs is the set of
+// provably holds stale endpoint data (endpoint-sync-heal). addrs is the set of
 // Ready endpoint addresses (nil Ready counts as ready, same
 // convention as the aggregate census).
 type linkerdSliceRef struct {
@@ -44,7 +44,7 @@ type linkerdSliceRef struct {
 
 // staleLinkerdSlices picks the controller-owned EndpointSlices of a
 // desynced Service that provably hold stale endpoint data
-// (W10-FIX7):
+// (endpoint-sync-heal):
 //
 //   - a slice retaining a Ready address no live selected pod owns
 //     (a deleted pod's IP still receiving traffic) is stale on its

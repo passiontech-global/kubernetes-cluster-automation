@@ -45,7 +45,7 @@ func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 	for _, want := range []string{
 		"maxParallelImagePulls: 4", "kubeAPIQPS: 100", "kubeAPIBurst: 50",
 		"podPidsLimit: 4096",
-		// W18-7 graceful-shutdown contract values.
+		// host-protection-drop-ins graceful-shutdown contract values.
 		"shutdownGracePeriod: 60s",
 		"shutdownGracePeriodCriticalPods: 20s",
 		"evictionMinimumReclaim:\n  memory.available: \"200Mi\"\n  nodefs.available: \"1Gi\"\n  imagefs.available: \"2Gi\"",

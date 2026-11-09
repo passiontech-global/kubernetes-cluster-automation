@@ -1,5 +1,5 @@
 // mesh_controlplane_watchdog.go — the mesh-controlplane-watchdog
-// check (W8-NM2/NM3): heals the Cilium operator IPAM wedge and
+// check (issuer-serial-watch/mesh-net-guards): heals the Cilium operator IPAM wedge and
 // wedged linkerd control-plane pods via pod deletes behind the
 // shared heal cooldowns + maintenance gate.
 package watchdogs
@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// meshControlPlaneCheck is the W8 mesh control-plane watchdog —
+// meshControlPlaneCheck is the mesh control-plane watchdog —
 // cilium-operator / linkerd control-plane pod heals.
 type meshControlPlaneCheck struct {
 	*probefw.Deps
@@ -32,7 +32,7 @@ type meshControlPlaneCheck struct {
 	gateEvals int
 }
 
-// newMeshControlPlaneCheck builds the W8-NM2/NM3 watchdog —
+// newMeshControlPlaneCheck builds the issuer-serial-watch/mesh-net-guards watchdog —
 // stateless itself; heal cooldowns ride the shared Deps.Heals
 // cooldown set.
 func NewMeshControlPlaneCheck(d *probefw.Deps) probefw.Check {
@@ -40,7 +40,7 @@ func NewMeshControlPlaneCheck(d *probefw.Deps) probefw.Check {
 }
 
 const (
-	// W8-NM2/NM3 — mesh-controlplane-watchdog knobs.
+	// issuer-serial-watch/mesh-net-guards — mesh-controlplane-watchdog knobs.
 	CheckNameMeshWatchdog = "mesh-controlplane-watchdog"
 	ciliumIPAMMinAge      = 10 * time.Minute
 	linkerdWedgedMinAge   = 5 * time.Minute
@@ -54,16 +54,16 @@ const (
 )
 
 // ---------------------------------------------------------------------------
-// W8-NM2/NM3 — mesh-controlplane-watchdog
+// issuer-serial-watch/mesh-net-guards — mesh-controlplane-watchdog
 // ---------------------------------------------------------------------------
 
 // checkMeshControlPlane heals two control-plane wedge shapes:
 //
-//	a) W8-NM2 — any Node reporting CiliumIPAMExhausted=True >=10m:
+//	a) issuer-serial-watch — any Node reporting CiliumIPAMExhausted=True >=10m:
 //	   the operator's IPAM bookkeeping wedged; delete a
 //	   cilium-operator-* pod (1h cooldown) so the restarted leader
 //	   resyncs.
-//	b) W8-NM3 — linkerd-destination/linkerd-identity pods in
+//	b) mesh-net-guards — linkerd-destination/linkerd-identity pods in
 //	   namespace linkerd stuck >=5m: CrashLoopBackOff or the
 //	   started-but-never-Ready wedge while the apiserver is
 //	   healthy (our own client calls working proves that). Delete
@@ -117,7 +117,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	} else {
-		// The pod list is the W8-NM3 scan's only input — a failure
+		// The pod list is the mesh-net-guards scan's only input — a failure
 		// must count like every swallowed infra error in the heal
 		// path, or a wedged linkerd control plane reads as clean
 		// while the scan silently no-ops.
@@ -158,7 +158,7 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 }
 
 // healComponentPod deletes one pod matching prefix in ns — the
-// generic W8-NM2 shape. The cooldown/maintenance gate lives ONLY in
+// generic issuer-serial-watch shape. The cooldown/maintenance gate lives ONLY in
 // healNamedPod (one HealAllowed evaluation per heal attempt — the
 // old pre-gate here double-evaluated the same verdict back-to-back);
 // this helper just resolves the target and hands it over.

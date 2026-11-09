@@ -1,4 +1,4 @@
-// unblock_heal.go — duty (c) of apiservice-guard, the W10-CP1
+// unblock_heal.go — duty (c) of apiservice-guard, the namespace-terminating-wedged
 // dead-APIService unblocker: an aggregated APIService in a protected
 // namespace that stays Available=False wedges every namespace
 // termination whose GC still references its API group, so the sweep
@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	// W10-CP1 — dead-APIService unblocker. An aggregated APIService
+	// namespace-terminating-wedged — dead-APIService unblocker. An aggregated APIService
 	// in a protected namespace that stays Available=False wedges
 	// every namespace termination whose GC still references its API
 	// group. The unblock pass is the ONLY path allowed to restart
@@ -52,7 +52,7 @@ var apiServiceProtectedNamespaces = map[string]bool{
 	"monitoring":  true,
 }
 
-// unblockHealer owns the W10-CP1 sweep's per-sweep state — embedded
+// unblockHealer owns the namespace-terminating-wedged sweep's per-sweep state — embedded
 // in apiServiceGuard so the facade's method set (and every
 // in-package test fixture built on it) is unchanged by the split.
 // Shared deps (cs/dyn/now/verdict) are reached through snap.g; only

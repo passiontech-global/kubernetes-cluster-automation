@@ -1,5 +1,5 @@
 // gateway_targets.go — the gateway-API stuck signatures and
-// ownership filters of the operator-workqueue-watchdog check (W5.8):
+// ownership filters of the operator-workqueue-watchdog check (operator-workqueue-watchdog):
 // the parent/listener/Accepted-condition staleness predicates for
 // the GatewayClass, Gateway and route kinds (their status has no
 // top-level observedGeneration), the cached GatewayClass →

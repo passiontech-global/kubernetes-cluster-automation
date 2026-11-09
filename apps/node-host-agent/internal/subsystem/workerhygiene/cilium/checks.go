@@ -8,7 +8,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// NewCilium returns the 32-cilium healthz check (sig9 + the W8-NM3
+// NewCilium returns the 32-cilium healthz check (sig9 + the mesh-net-guards
 // BPF-map probe that rides inside it).
 func NewCilium(d *wdeps.Deps) *CiliumCheck { return &CiliumCheck{d: d} }
 
@@ -32,10 +32,10 @@ func NewCiliumMTU(d *wdeps.Deps) *CiliumMTUCheck {
 	return &CiliumMTUCheck{d: d}
 }
 
-// NewCiliumWG returns the W5.6 WireGuard peer-deficit check.
+// NewCiliumWG returns the cilium-wg-peer-gc WireGuard peer-deficit check.
 func NewCiliumWG(d *wdeps.Deps) *CiliumWGCheck { return &CiliumWGCheck{d: d} }
 
-// NewCiliumLRP returns the W7-H3 node-local-dns LRP datapath probe.
+// NewCiliumLRP returns the envoy-xds-lrp node-local-dns LRP datapath probe.
 func NewCiliumLRP(d *wdeps.Deps) *CiliumLRPCheck {
 	return &CiliumLRPCheck{d: d}
 }

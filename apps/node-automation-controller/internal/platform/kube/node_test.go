@@ -41,7 +41,7 @@ func getNode(t *testing.T, cs *fake.Clientset, name string) *corev1.Node {
 }
 
 // ---------------------------------------------------------------------------
-// NodeActivelyCordoned — BUG-C4 fresh-cordon verdict + the W12 P0-1
+// NodeActivelyCordoned — BUG-C4 fresh-cordon verdict + the node-hang-precordon
 // precordon exemption.
 // ---------------------------------------------------------------------------
 
@@ -76,7 +76,7 @@ func TestNodeActivelyCordoned(t *testing.T) {
 	}
 }
 
-// W12 P0-1 — a node pre-cordoned by node-hang-precordon
+// node-hang-precordon — a node pre-cordoned by node-hang-precordon
 // (AnnoPreCordonedBy) is the controller's own defensive quarantine
 // of a sick worker, not an operator drain: its fresh unschedulable
 // taint must NOT trip the active-cordon verdict or the maintenance

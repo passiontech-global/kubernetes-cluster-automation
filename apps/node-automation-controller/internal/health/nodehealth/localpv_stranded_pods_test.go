@@ -1,5 +1,5 @@
 // localpv_stranded_pods_test.go — coverage for the
-// localpv-stranded-pods check (W7-C4): stranded-pod detection,
+// localpv-stranded-pods check (localpv-stranded-pods): stranded-pod detection,
 // ephemeral-PVC reap gating, and the stalled-provisioning branch.
 package nodehealth
 
@@ -20,7 +20,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W7-C4 — localpv-stranded-pods
+// localpv-stranded-pods — localpv-stranded-pods
 // ---------------------------------------------------------------------------
 
 // nodePinnedPV builds a hostpath PV nodeAffinity-pinned to hostname.
@@ -253,7 +253,7 @@ func TestLocalPVStrandedTooYoungForHeal(t *testing.T) {
 	}
 }
 
-// W12-SC2 — a NON-ephemeral workload stranded on a confirmed-dead
+// stateful-split-brain — a NON-ephemeral workload stranded on a confirmed-dead
 // node fires the dedicated stateful gauge naming the dead node;
 // ephemeral pods stay on the generic gauge only.
 func TestLocalPVStrandedStatefulPodGauge(t *testing.T) {

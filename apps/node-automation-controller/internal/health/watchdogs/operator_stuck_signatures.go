@@ -1,5 +1,5 @@
 // operator_stuck_signatures.go — the generic per-CRD stuck
-// predicates of the operator-workqueue-watchdog check (W5.8): the
+// predicates of the operator-workqueue-watchdog check (operator-workqueue-watchdog): the
 // stale-observedGeneration signature and its deliberate-park
 // carve-outs (flux spec.suspend, HelmRepository type=oci, percona
 // spec.pause/mode) plus the never-reconciled signatures for CR
@@ -54,7 +54,7 @@ func helmRepoStaleGen(o *unstructured.Unstructured) bool {
 // types that lack a reliable observedGeneration (cert-manager
 // Certificates, ExternalSecrets, KEDA ScaledObjects): the controller
 // stamps status.conditions on its first reconcile pass, so an absent
-// or empty list means it never picked the object up (W7-C2).
+// or empty list means it never picked the object up (operator-watchdog-targets).
 func noStatusConditions(o *unstructured.Unstructured) bool {
 	conds, found := kube.NestedSlice(o.Object, "status", "conditions")
 	return !found || len(conds) == 0
@@ -62,7 +62,7 @@ func noStatusConditions(o *unstructured.Unstructured) bool {
 
 // emptyStatusPhase is the same never-reconciled signature for CR
 // types that report a status.phase (ArgoCD): an absent/empty phase
-// means the operator never touched the object (W7-C2).
+// means the operator never touched the object (operator-watchdog-targets).
 func emptyStatusPhase(o *unstructured.Unstructured) bool {
 	phase, found := kube.NestedString(o.Object, "status", "phase")
 	return !found || phase == ""
@@ -86,7 +86,7 @@ func noStatusAtAll(o *unstructured.Unstructured) bool {
 // perconaUnpausedStaleGen is staleObservedGeneration with the Percona
 // pause brake honored: spec.pause=true (and psmdb's spec.mode=paused)
 // parks reconciliation deliberately — paused clusters are parked,
-// not stuck (W10-CP3).
+// not stuck (operator-workqueue-watchdog).
 func perconaUnpausedStaleGen(o *unstructured.Unstructured) bool {
 	if paused, _ := kube.NestedBool(o.Object, "spec", "pause"); paused {
 		return false

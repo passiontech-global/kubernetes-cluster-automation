@@ -1,5 +1,5 @@
 // node_hang_precordon.go — the node-hang-precordon check
-// (W8-ST2/W9-CP3/W10-KR6): patches spec.unschedulable onto worker
+// (node-hang-precordon/clock-skew-precordon/kubelet-watch-wedge): patches spec.unschedulable onto worker
 // nodes carrying a sustained hang latch before NHC/SNR reboots
 // them, stamps the cordon, and auto-uncordons once every latch
 // clears.
@@ -33,7 +33,7 @@ type nodeHangCheck struct {
 	hangCounters hangCounterLedger
 }
 
-// newNodeHangCheck builds the W8-ST2 watchdog — it reads only Deps;
+// newNodeHangCheck builds the node-hang-precordon watchdog — it reads only Deps;
 // hangCounters arms lazily on the first cordon/uncordon Inc (zero
 // value ready, the platform/state convention).
 func NewNodeHangCheck(d *probefw.Deps) probefw.Check {
@@ -102,15 +102,15 @@ func (h *hangCounterLedger) reconcile(present map[string]bool,
 }
 
 const (
-	// W8-ST2 — node-hang-precordon knobs.
+	// node-hang-precordon — node-hang-precordon knobs.
 	CheckNameNodeHang        = "node-hang-precordon"
 	nodeHangCondMinAge       = 2 * time.Minute
 	nodeHangMaxCordonedRatio = 0.35
 
-	// W9-CP3 — clock-skew pre-cordon: the clock conditions get a
+	// clock-skew-precordon — clock-skew pre-cordon: the clock conditions get a
 	// longer fuse than the hang latches — the NTP daemon needs
 	// restart time to resync before the node counts as hanging.
-	// ClockSkewDetected (W12-1.4) is the host-agent's >2s-offset
+	// ClockSkewDetected (node-hang-extra-conds) is the host-agent's >2s-offset
 	// latch (chrony still reports a source, so ClockUnsynchronized
 	// never trips) — skewed mTLS/Raft leases harm every pod that
 	// lands on the node, same blast radius.
@@ -150,7 +150,7 @@ const (
 // inode exhaustion, no agent latch involved; the Cilium*/CalicoFelixDown
 // latches are the CNI death signals a pre-reboot node carries;
 // NebulaIsolated is the overlay partition latch;
-// KubeletPLEGUnhealthy — W12-1.4 — is the PLEG relist stall that
+// KubeletPLEGUnhealthy — node-hang-extra-conds — is the PLEG relist stall that
 // precedes the kubelet dying outright).
 // The clock conditions are deliberately NOT here: they carry their
 // own longer fuse (nodeClockSkewCordonAge) and are checked
@@ -160,7 +160,7 @@ var nodeHangConds = condTypes(nodecond.HangPreCordonNames)
 // nodeClockSkewConds are the clock-health latches on the longer
 // fuse (nodecond.ClockSkewPreCordonNames) — ClockUnsynchronized
 // (no sync source) and ClockSkewDetected (synchronized but >2s
-// offset, W12-1.4).
+// offset, node-hang-extra-conds).
 var nodeClockSkewConds = condTypes(nodecond.ClockSkewPreCordonNames)
 
 // condTypes converts a nodecond name list into the
@@ -176,14 +176,14 @@ func condTypes(names []string) []corev1.NodeConditionType {
 }
 
 var (
-	// W8-ST2 — worker nodes patched spec.unschedulable after a
+	// node-hang-precordon — worker nodes patched spec.unschedulable after a
 	// sustained hang condition (delivered cordons only).
 	nodeHangCordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_automation_node_hang_cordons_total",
 		Help: "Worker nodes patched spec.unschedulable after a sustained hang condition.",
 	}, []string{"node"})
 
-	// W8-ST2 — worker nodes patched schedulable after the
+	// node-hang-precordon — worker nodes patched schedulable after the
 	// pre-cordon hang latch cleared (delivered uncordons only).
 	nodeHangUncordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_automation_node_hang_uncordons_total",
@@ -198,13 +198,13 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W8-ST2 — node-hang-precordon
+// node-hang-precordon — node-hang-precordon
 // ---------------------------------------------------------------------------
 
 // nodeHangLatch reports the first hang latch past its cordon fuse on
 // the node whose lastHeartbeatTime is still fresh — "" when none
 // qualifies. Every nodeHangConds entry fuses at nodeHangCondMinAge;
-// the nodeClockSkewConds latches (W9-CP3) get
+// the nodeClockSkewConds latches (clock-skew-precordon) get
 // nodeClockSkewCordonAge so an NTP daemon restart has time to
 // resync before the node counts as hanging. stale returns the first
 // fused latch the heartbeat-freshness gate rejected — a frozen or

@@ -1,5 +1,5 @@
 // namespace_terminating_wedged.go — the
-// namespace-terminating-wedged check (W10-CP1): Namespaces stuck
+// namespace-terminating-wedged check (namespace-terminating-wedged): Namespaces stuck
 // Terminating past the threshold with their content/finalizers
 // conditions, plus a throttled dead-owner finalizer sweep on CRs
 // whose controller workload no longer exists.
@@ -43,7 +43,7 @@ type namespaceTerminatingWedgedCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newNamespaceTerminatingWedgedCheck builds the W10-CP1 check — its
+// newNamespaceTerminatingWedgedCheck builds the namespace-terminating-wedged check — its
 // only state is the emitted-gauge ledger; sweep cooldowns ride the
 // shared Deps.Heals set.
 func NewNamespaceTerminatingWedgedCheck(d *probefw.Deps) probefw.Check {
@@ -53,17 +53,17 @@ func NewNamespaceTerminatingWedgedCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameNamespaceWedged = "namespace-terminating-wedged"
 
-	// W10-CP1 — namespace-terminating-wedged knobs.
+	// namespace-terminating-wedged — namespace-terminating-wedged knobs.
 	nsTerminatingMinAge      = 20 * time.Minute
 	nsFinalizerSweepCooldown = 30 * time.Minute
 	nsFinalizerMaxStrips     = 20
 )
 
 var (
-	// W10-CP1 — namespace stuck Terminating.
+	// namespace-terminating-wedged — namespace stuck Terminating.
 	namespaceTerminatingWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_namespace_terminating_wedged",
-		Help: "1 while the Namespace has been Terminating past the wedge threshold — W10-CP1.",
+		Help: "1 while the Namespace has been Terminating past the wedge threshold — namespace-terminating-wedged.",
 	}, []string{"namespace"})
 )
 
@@ -263,7 +263,7 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 	if _, err := p.Dyn.Resource(gvr).Namespace(obj.GetNamespace()).Patch(ctx,
 		obj.GetName(), types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 		if apierrors.IsForbidden(err) {
-			// Expected until the RBAC wave grants patch on the CR —
+			// Expected until the RBAC rollout grants patch on the CR —
 			// not an apiserver failure, don't count a run error.
 			log.Info("WARN: finalizer strip forbidden (RBAC pending)",
 				"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
@@ -311,7 +311,7 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 			gone, _ := probefw.OwnerGone(ctx, p.CS, ns, dref, "Deployment")
 			return gone
 		case "Rollout":
-			// W18-5 — a Rollout-owned ReplicaSet whose argoproj.io
+			// argo-rollout-gates — a Rollout-owned ReplicaSet whose argoproj.io
 			// Rollout is gone is the same GC-pending garbage shape;
 			// the typed clientset has no argoproj.io access, so the
 			// existence check rides the dynamic client (any error

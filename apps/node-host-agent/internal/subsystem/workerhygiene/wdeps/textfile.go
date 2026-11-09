@@ -1,4 +1,4 @@
-// textfile.go — the W10 node_agent_* textfile surface: the dir
+// textfile.go — the node_agent_* textfile surface: the dir
 // resolution, the once-per-cycle writer (the ONLY reader of the
 // embedded Series + OrphanHostPath gauges + the hostmetrics kmsg
 // markers), and the two generic host-side helpers several domains
@@ -90,7 +90,7 @@ func (d *Deps) PromTextfileDir() string {
 		"node-exporter", "textfile")
 }
 
-// WriteNodeAgentPromTextfile emits the W10 node_agent_* series once per cycle:
+// WriteNodeAgentPromTextfile emits the node_agent_* series once per cycle:
 // host_oom_kills_total + conntrack_drops_detected_total read the
 // hostmetrics kmsg markers (cumulative — monotonic across restarts),
 // orphan_hostpath_{bytes,dirs} carry this cycle's ST2 measurement.
@@ -191,13 +191,13 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 		"kubelet_pleg_discard_events counter passthrough — PLEG events dropped under backlog.",
 		d.Series.KubeletPLEGDiscardEvents)
 	counter("node_agent_pod_cgroup_memory_throttled",
-		"Pod cgroups with memory.pressure full avg60 >40% and rising memory.events high while node PSI is quiet — memory.high throttle without OOM (W12-KR1).",
+		"Pod cgroups with memory.pressure full avg60 >40% and rising memory.events high while node PSI is quiet — memory.high throttle without OOM (cgroup-pod-throttle).",
 		d.Series.PodCgroupMemoryThrottled)
 	b.Gauge("node_cgroup_pids_utilization_max_ratio",
 		"Max pids.current/pids.max ratio across kubepods pod cgroups — near 1 means fork() denials are next.",
 		d.Series.PodCgroupPIDsMaxUtilRatio)
 	counter("node_kubelet_storage_operation_errors_total",
-		"storage_operation_errors_total summed over volume_plugin/operation labels from the kubelet :10250/metrics scrape (W12-KR4).",
+		"storage_operation_errors_total summed over volume_plugin/operation labels from the kubelet :10250/metrics scrape (disk-slow-io).",
 		d.Series.KubeletStorageOperationErrors)
 	// Guard series — the subproc-OOM, SA-token, LocalPV-quota,
 	// memory-compaction and /run tmpfs guards refresh these fields

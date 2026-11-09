@@ -119,7 +119,7 @@ const (
 	endpointGuardGapCycles          = 2               // consecutive gapped cycles before wedge
 	endpointGuardFrozenCyc          = 3               // cache_rv frozen cycles (live_rv growing)
 	endpointGuardRecoverCyc         = 2               // consecutive healthy cycles to re-add
-	endpointGuardKidSkewCycles      = 3               // consecutive JWKS kid-set minority cycles (W12-CP4b)
+	endpointGuardKidSkewCycles      = 3               // consecutive JWKS kid-set minority cycles (jwks-kid-skew)
 	// endpointGuardExpireCyc: consecutive probe-error cycles after
 	// which a quarantined IP that is ALSO absent from the current
 	// address sets is declared decommissioned and dropped from

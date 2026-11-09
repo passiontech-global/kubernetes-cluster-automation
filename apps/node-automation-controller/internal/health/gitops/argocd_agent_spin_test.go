@@ -1,5 +1,5 @@
 // argocd_agent_spin_test.go — coverage for the argocd-agent-spin
-// check (W16-G3): the log-spin predicate, the CPU channel, the
+// check (argocd-agent-spin): the log-spin predicate, the CPU channel, the
 // FirstSeenLedger persistence window and the gated pod delete.
 package gitops
 
@@ -19,7 +19,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W16-G3 — argocd-agent-spin
+// argocd-agent-spin — argocd-agent-spin
 // ---------------------------------------------------------------------------
 
 // spinLogBody renders the log body nErr repeated stream errors with

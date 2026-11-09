@@ -16,7 +16,7 @@
 //     kcm-workqueue-watchdog (C6) detects a kube-controller-manager
 //     whose leader Lease still renews while its object controllers
 //     stop reconciling — a "gray" failure a dead-KCM check cannot
-//     see — plus operator-workqueue-watchdog (W5.8, which
+//     see — plus operator-workqueue-watchdog (operator-workqueue-watchdog, which
 //     AUTO-HEALS: outside a maintenance window the stuck leader pod
 //     is deleted, 1h cooldown persisted on the Lease), the
 //     scheduler watchdog and the mesh control-plane watchdog.
@@ -28,7 +28,7 @@
 //     map pressure + node IPAM exhaustion).
 //   - datastore — datastore operator health (scylla, rabbitmq
 //     quorum + suspended listener, dragonfly sync storm, percona
-//     quorum, stateful-masterless-services W6.2, OLM subscriptions,
+//     quorum, stateful-masterless-services stateful-masterless-services, OLM subscriptions,
 //     PVC resize stalls pvc-resize).
 //   - gitops — argocd-app-stuck, flux-helmrelease-retries,
 //     kargo-promotion-health plus the three gated gitops rows
@@ -184,7 +184,7 @@ func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthPr
 // opts out); setupModules evaluates it and stamps Deps.Disabled —
 // disabled skips mgr.Add entirely, matching the
 // cilium-taint-reaper pattern. dyn feeds the CRD scans inside the
-// self-healing checks (W5.8/W6.2) — wired like every other
+// self-healing checks (operator-workqueue-watchdog/stateful-masterless-services) — wired like every other
 // dynamic-client module. Deps.CheckRegs carries the whole check
 // roster — the registrations SetupModules collected from the
 // selected, enabled check rows — a mistyped one fails boot here,

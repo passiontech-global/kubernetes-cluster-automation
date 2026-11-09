@@ -1,4 +1,4 @@
-// linkerd_endpoint_sync_socklb.go — the W12-NM1b half of the
+// linkerd_endpoint_sync_socklb.go — the socket-lb-vs-linkerd half of the
 // linkerd-endpoint-sync sweep: the Cilium socket-LB vs Linkerd
 // compatibility audit — pod-netns bpf-lb-sock rewrites connect()
 // before linkerd-init's iptables rules can steer into the proxy,
@@ -19,7 +19,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 )
 
-// W12-NM1b — the socket-LB conflict signal: 1 while Cilium runs
+// socket-lb-vs-linkerd — the socket-LB conflict signal: 1 while Cilium runs
 // pod-netns bpf-lb-sock alongside Linkerd without either
 // compatibility knob (cni-exclusive=false keeps linkerd-init's
 // iptables redirect authoritative; bpf-lb-sock-hostns-only=true
@@ -36,7 +36,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit
+// socket-lb-vs-linkerd — Cilium socket-LB vs Linkerd compatibility audit
 // ---------------------------------------------------------------------------
 
 // ciliumSockLBConflictsWithLinkerd reports whether the cilium-config
@@ -55,7 +55,7 @@ func ciliumSockLBConflictsWithLinkerd(data map[string]string) bool {
 		data["bpf-lb-sock-hostns-only"] != "true"
 }
 
-// auditCiliumLinkerdSockLB runs the W12-NM1b runtime half of the
+// auditCiliumLinkerdSockLB runs the socket-lb-vs-linkerd runtime half of the
 // static socket-LB gate: with Linkerd installed AND Cilium's
 // ConfigMap present, pod-netns bpf-lb-sock without a compatibility
 // knob silently bypasses linkerd-proxy (SO_ORIGINAL_DST never sees

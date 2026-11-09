@@ -8,7 +8,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 )
 
-// NewLinkerdEndpointSyncCheck builds the W9-NM2 endpoint-sync check —
+// NewLinkerdEndpointSyncCheck builds the netns-endpoint-sync endpoint-sync check —
 // every ledger is zero-value ready, so the constructor carries no
 // initialization.
 func NewLinkerdEndpointSyncCheck(d *probefw.Deps) probefw.Check {

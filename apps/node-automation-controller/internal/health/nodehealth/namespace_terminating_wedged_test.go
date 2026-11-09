@@ -1,5 +1,5 @@
 // namespace_terminating_wedged_test.go — coverage for the
-// namespace-terminating-wedged check (W10-CP1) and the dead-owner
+// namespace-terminating-wedged check (namespace-terminating-wedged) and the dead-owner
 // finalizer sweep.
 package nodehealth
 
@@ -23,7 +23,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-CP1 — namespace-terminating-wedged
+// namespace-terminating-wedged — namespace-terminating-wedged
 // ---------------------------------------------------------------------------
 
 func TestNamespaceTerminatingWedged(t *testing.T) {
@@ -113,7 +113,7 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	}
 }
 
-// A ReplicaSet-owned CR whose controller Rollout (argoproj.io, W18-5)
+// A ReplicaSet-owned CR whose controller Rollout (argoproj.io, argo-rollout-gates)
 // is gone is the same GC-pending garbage — the Rollout existence
 // check rides the dynamic client.
 func TestMaybeStripFinalizersDeadRolloutOwner(t *testing.T) {

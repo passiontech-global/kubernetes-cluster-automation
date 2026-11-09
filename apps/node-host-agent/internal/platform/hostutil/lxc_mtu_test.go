@@ -1,4 +1,4 @@
-// lxc_mtu_test.go — W16-NM4 fixture sysfs coverage for
+// lxc_mtu_test.go — lxc-mtu-drift fixture sysfs coverage for
 // MaxPodLxcMTU: hex-name matching, lxc_health exclusion and the
 // MAX-wins aggregation.
 package hostutil

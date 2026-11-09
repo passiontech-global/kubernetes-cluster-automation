@@ -36,13 +36,13 @@ type Config struct {
 	// state-node-overloaded latch.
 	PSIFile string
 	// PSIMemoryFile/PSIIOFile are /proc/pressure/{memory,io} — the
-	// W5.7 some/full avg60 gauges (memory-reclaim and block-IO stall
+	// psi-swap-thrash some/full avg60 gauges (memory-reclaim and block-IO stall
 	// evidence the cpu PSI can't see). Missing files (PSI off in the
 	// kernel) simply emit no series.
 	PSIMemoryFile string
 	PSIIOFile     string
 	// VMStatFile is /proc/vmstat — pswpin/pswpout swap-thrash
-	// counters (W5.7).
+	// counters (psi-swap-thrash).
 	VMStatFile string
 	// EgressRelays is OVERLAY_EGRESS_RELAYS (wired from watchdogconf
 	// by main) — each target gets a relay-active gauge.
@@ -66,7 +66,7 @@ type Config struct {
 	// mountinfo-entries gauge (line count).
 	MountinfoFile string
 	// LocalPortRangeFile is /proc/sys/net/ipv4/ip_local_port_range
-	// — the ephemeral source-port pool width the W12-KR3 sockstat
+	// — the ephemeral source-port pool width the conntrack-port-pressure sockstat
 	// saturation ratio divides by; ProcNetTCP/ProcNetTCP6 are the
 	// /proc/1/net/tcp{,6} tables the CLOSE_WAIT count scans.
 	LocalPortRangeFile string
@@ -109,14 +109,14 @@ type Config struct {
 	// CiliumIface is the cilium host-side interface for the B4 MTU
 	// drift check vs NebulaIface; CiliumWG0Iface is the WireGuard
 	// datapath iface checked against NebulaIface minus the ~60B
-	// encapsulation overhead (W9 double-encap guard);
+	// encapsulation overhead (double-encap guard);
 	// CiliumRuntimeConfig is the fallback MTU source
 	// (agent-runtime-config.json under HostRoot).
 	CiliumIface         string
 	CiliumWG0Iface      string
 	CiliumRuntimeConfig string
 	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
-	// per-CPU conntrack counters (insert_failed/drop for W7-H5);
+	// per-CPU conntrack counters (insert_failed/drop for conntrack-arp-pressure);
 	// ARPTableFile is /proc/net/arp — the ARP neighbour-table fill
 	// gauge.
 	ConntrackStatFile string
@@ -128,9 +128,9 @@ type Config struct {
 	ClocksourceCurrentFile   string
 	ClocksourceAvailableFile string
 	// CgroupMemUnits are the system.slice unit names whose
-	// memory.events feed the W7-H6 high/oom_kill counters.
+	// memory.events feed the memory-events-reclaim high/oom_kill counters.
 	CgroupMemUnits []string
-	// KeyUsersFile is /proc/key-users — the W8-KR3 kernel keyring
+	// KeyUsersFile is /proc/key-users — the kernel-keys-pressure kernel keyring
 	// quota source (per-UID usage vs maxkeys).
 	KeyUsersFile string
 	// OpenEBSLocalDir is the localpv-provisioner hostPath root —
@@ -138,7 +138,7 @@ type Config struct {
 	// DaemonSet mounts it at the same path, not under /host).
 	// LocalPVScanInterval caches the per-PVC du walk: a full
 	// filesystem walk per PVC per scrape is too heavy on a node
-	// with hundreds of volumes (W9).
+	// with hundreds of volumes (localpv scan).
 	OpenEBSLocalDir     string
 	LocalPVScanInterval time.Duration
 	// FSBytesTargets are the mounts statfs'd per scrape for the

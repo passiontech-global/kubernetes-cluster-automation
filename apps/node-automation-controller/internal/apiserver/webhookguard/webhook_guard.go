@@ -25,7 +25,7 @@
 // passiontech.dev/circuit-broken-webhooks annotation on the config; when the
 // Service reports >= 1 Ready endpoint again the declared Fail policy
 // is restored and the annotation shrinks (removed when empty).
-// W5.5 — the endpoint census is node-aware: Ready endpoints on
+// endpoint-census — the endpoint census is node-aware: Ready endpoints on
 // partitioned/unresponsive/NotReady nodes are discounted, and when
 // they are ALL that remains the breaker trips on the faster
 // partitionZeroThreshold (90s) instead of webhookDeadThreshold.
@@ -52,7 +52,7 @@
 // k8s-app=cilium only), so the audit reads through the direct
 // clientset exactly like every other module.
 //
-// W7-C1 — remediation hardening: before evicting anything the sweep
+// unmeshed-pod-auditor — remediation hardening: before evicting anything the sweep
 // holds the shared maintenance mutex (a cordon/drain/kured reboot or
 // an in-flight k0s autopilot upgrade defers the work), and the pod
 // kill goes through the policy/v1 Eviction API — a raw Delete would
@@ -101,7 +101,7 @@ type webhookGuard struct {
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
 // the autopilot-Plan signal of the maintenance mutex consulted by
-// the unmeshed-pod healer (W7-C1). Gated through shared.SetupNoConfig:
+// the unmeshed-pod healer (unmeshed-pod-auditor). Gated through shared.SetupNoConfig:
 // a disabled module registers nothing — no runnable, no periodic
 // cluster LIST against the apiserver.
 func Setup(d shared.Deps) error {

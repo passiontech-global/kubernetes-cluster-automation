@@ -24,7 +24,7 @@
 // poked, so a flapping store cannot stampede the API even across
 // controller restarts.
 //
-// W12-GO3 rides the same sweep: a Ready=True ES whose target Secret
+// empty-key-audit rides the same sweep: a Ready=True ES whose target Secret
 // carries a missing/empty/whitespace-only key is flagged on
 // node_automation_externalsecret_empty_key (ESO happily reports
 // SecretSynced while the app reads an empty credential), and a
@@ -58,7 +58,7 @@ const (
 	// cooldown — force-sync is a bare unix stamp ESO consumes,
 	// passiontech.dev/last-es-nudge is the same moment for operators.
 	esLastNudgeAnno = kube.AnnoLastESNudge
-	// W9-GO1 — storm guard + 1Password Connect auto-heal thresholds.
+	// externalsecret-storm-guard — storm guard + 1Password Connect auto-heal thresholds.
 	// A storm is >=5 failing ExternalSecrets making up >=half the
 	// population; either a ClusterSecretStore down or a storm must
 	// persist esConnectHealMinAge before the connect pod is bounced,
@@ -141,7 +141,7 @@ type externalSecretNudge struct {
 	// sweep's heal preambles — one evaluation per Verdict TTL
 	// instead of three API reads per target.
 	verdict kube.Verdict
-	// emptyKeyEmitted: the ns/ES/key triples the W12-GO3 empty-key
+	// emptyKeyEmitted: the ns/ES/key triples the empty-key-audit empty-key
 	// audit flagged on the previous sweep — a key that synced
 	// populated (or an ES that vanished) gets its series deleted so
 	// /metrics never leaks a stale "empty" series.
@@ -216,7 +216,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		seen[key] = true
 		prev, tracked := n.storeReady[key]
 		n.storeReady[key] = isReady
-		// W9-GO1 — the down-since clock for the connect auto-heal:
+		// externalsecret-storm-guard — the down-since clock for the connect auto-heal:
 		// first observed False starts it, True or vanish clears it.
 		if isReady {
 			n.storeDownSince.Forget(key)
@@ -260,7 +260,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 			break
 		}
 	}
-	// W9-GO1 — always census the ExternalSecrets: the storm guard
+	// externalsecret-storm-guard — always census the ExternalSecrets: the storm guard
 	// and the connect auto-heal must see a mass-failure storm even
 	// when NO store is healthy and no recovery edge fired — a full
 	// ESO/1Password outage is exactly that case, and skipping the

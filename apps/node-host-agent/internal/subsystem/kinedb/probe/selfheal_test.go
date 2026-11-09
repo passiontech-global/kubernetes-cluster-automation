@@ -1,4 +1,4 @@
-// selfheal_test.go — the W12-CP1 pgbouncer server-pool starvation
+// selfheal_test.go — the pgbouncer-pool-starvation pgbouncer server-pool starvation
 // tests, lifted out of the flat package's kinedb_test.go.
 package probe
 
@@ -14,7 +14,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// starvePoolsOut is the W12-CP1 starvation shape: maxwait=12s (>10s)
+// starvePoolsOut is the pgbouncer-pool-starvation starvation shape: maxwait=12s (>10s)
 // on a pool still holding 10 server conns while the queue is short
 // — clients wait while the backend is not actually busy.
 const starvePoolsOut = `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
@@ -187,7 +187,7 @@ func TestPGBStarveReconnectFallsBackToRestart(t *testing.T) {
 	}
 }
 
-// W16-CP3: the starvation shape/verdict matrix — including the
+// half-open-pool-starvation: the starvation shape/verdict matrix — including the
 // half-open sv_active shape (clients queued, servers "active",
 // Postgres running zero queries).
 func TestPGBStarveShapeVerdictMatrix(t *testing.T) {
@@ -219,7 +219,7 @@ func TestPGBStarveShapeVerdictMatrix(t *testing.T) {
 	}
 }
 
-// halfOpenPoolsOut is the W16-CP3 shape: clients queued
+// halfOpenPoolsOut is the half-open-pool-starvation shape: clients queued
 // (cl_waiting=5, under WaitMax), server conns held AND sv_active>0,
 // maxwait fresh — the pool LOOKS healthy while the backend runs
 // nothing (the fixture answers 0 active queries).
@@ -228,7 +228,7 @@ postgres|postgres|4|5|4|3|0|0|0|0|0|transaction
 pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
 `
 
-// W16-CP3 end-to-end: the half-open shape sustains 2 consecutive
+// half-open-pool-starvation end-to-end: the half-open shape sustains 2 consecutive
 // probes → RECONNECT; a backend running queries vetoes it.
 func TestPGBStarveHalfOpenSvActive(t *testing.T) {
 	k, fr, dir := starveFixture(t, halfOpenPoolsOut)

@@ -138,7 +138,7 @@ func wgPatchCounter(cs *fake.Clientset) *int32 {
 // wgBreakerGuard builds a guard with a scripted clock — advance *now
 // between runs to walk the deadSince streak past DeadThreshold.
 // The endpointProber stub answers "responsive" for every IP so the
-// W9-CP1 brownout probe never fires in tests that predate it — those
+// circuit-breaker-bounce brownout probe never fires in tests that predate it — those
 // fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) (*guardstate.Guard, *Breaker) {
 	return &guardstate.Guard{
@@ -846,7 +846,7 @@ func TestWebhookCircuitBreakerPrunesSeriesForRecreatedConfig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W5.5 — partitioned-node-aware circuit breaker
+// endpoint-census — partitioned-node-aware circuit breaker
 // ---------------------------------------------------------------------------
 
 // wgReadyNode builds a Ready Node carrying the given taints.
@@ -862,7 +862,7 @@ func wgReadyNode(name string, taints ...corev1.Taint) *corev1.Node {
 }
 
 // wgSliceOnNode builds a slice with one Ready endpoint bound to
-// nodeName — the shape that exercises the W5.5 effective-ready math.
+// nodeName — the shape that exercises the endpoint-census effective-ready math.
 func wgSliceOnNode(ns, svc, nodeName string) *discoveryv1.EndpointSlice {
 	es := wgEndpointSlice(ns, svc, 0, 0)
 	up := true
@@ -874,7 +874,7 @@ func wgSliceOnNode(ns, svc, nodeName string) *discoveryv1.EndpointSlice {
 	return es
 }
 
-// The W5.5 signature: every Ready endpoint of the backend Service sits
+// The endpoint-census signature: every Ready endpoint of the backend Service sits
 // on a partitioned node — raw > 0, effective == 0 — so the breaker
 // trips on the 90s partition threshold instead of waiting 5m.
 func TestWebhookCircuitBreakerPartitionedBackendTripsFast(t *testing.T) {
@@ -1017,7 +1017,7 @@ func TestWebhookCircuitBreakerNodeListErrorSkips(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-CP1 — brownout probe, pod bounce, unresponsive breaker
+// circuit-breaker-bounce — brownout probe, pod bounce, unresponsive breaker
 // ---------------------------------------------------------------------------
 
 // wgPod builds a Running+Ready Pod fixture for the bounce path.
@@ -1040,7 +1040,7 @@ func wgPod(ns, name string, age time.Duration) *corev1.Pod {
 
 // wgHungSlice builds a slice whose single Ready endpoint targets a
 // Pod and carries no NodeName — effective-ready by benefit of the
-// doubt, exactly the brownout shape W9-CP1 probes.
+// doubt, exactly the brownout shape circuit-breaker-bounce probes.
 func wgHungSlice(ns, svc, pod string) *discoveryv1.EndpointSlice {
 	es := wgEndpointSlice(ns, svc, 0, 0)
 	up := true

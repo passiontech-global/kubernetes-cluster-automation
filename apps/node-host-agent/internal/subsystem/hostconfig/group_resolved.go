@@ -22,7 +22,7 @@ Cache=yes
 `, c.v("fallback_dns"))), 0o644); ch {
 		c.r.restartService(c.ctx, "systemd-resolved.service")
 	}
-	// W2: timesyncd NTP fallback — when the primary NTP source dies
+	// psi-memory-thrash: timesyncd NTP fallback — when the primary NTP source dies
 	// (site upstream blocked), the public pools keep the clock
 	// disciplined instead of drifting unsynced.
 	if c.r.serviceState(c.ctx, "systemd-timesyncd.service") != "" ||

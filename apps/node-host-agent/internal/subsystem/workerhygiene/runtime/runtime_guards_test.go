@@ -486,7 +486,7 @@ func TestPageAllocCompaction(t *testing.T) {
 	}
 }
 
-// TestSubprocOOMMemoryStatBreakdown — W16-KR1: at living-dead
+// TestSubprocOOMMemoryStatBreakdown — subproc-oom-breakdown: at living-dead
 // confirmation the memory.stat of the same cgroup is folded into
 // the event note ("mem_stat=anon=XMiB shmem=YMiB file=ZMiB") — a
 // big shmem is the tmpfs/emptyDir{medium:Memory} fingerprint.

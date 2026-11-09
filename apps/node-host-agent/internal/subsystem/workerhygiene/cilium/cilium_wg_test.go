@@ -196,7 +196,7 @@ func TestWGPeerGoneResetsState(t *testing.T) {
 }
 
 // TestWGAllowedIPsFallbackStillWorks — when the dump exec fails the
-// check keeps the W5.6 allowed-ips counting path (wiped peers at
+// check keeps the cilium-wg-peer-gc allowed-ips counting path (wiped peers at
 // "(none)" are not counted) and the restart path fires unchanged.
 func TestWGAllowedIPsFallbackStillWorks(t *testing.T) {
 	e := fixture(t)
@@ -214,6 +214,6 @@ func TestWGAllowedIPsFallbackStillWorks(t *testing.T) {
 		t.Fatal("allowed-ips fallback must still drive the restart path")
 	}
 	if !strings.Contains(wgLog(t, e), "allowed_ips=1 expected=2") {
-		t.Fatal("expected the W5.6 allowed-ips deficit evidence in the log")
+		t.Fatal("expected the cilium-wg-peer-gc allowed-ips deficit evidence in the log")
 	}
 }

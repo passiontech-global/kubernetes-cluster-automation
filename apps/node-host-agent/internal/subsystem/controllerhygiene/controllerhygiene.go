@@ -26,16 +26,16 @@
 // per-domain packages under controllerhygiene/:
 //
 //   - storelocal/ — kinepool.go (pool-spiral backstop), kine_ttl.go
-//     (module-22 TTL dead/rewedge tail), kine_storage.go (W10-CP2
+//     (module-22 TTL dead/rewedge tail), kine_storage.go (kine-storage
 //     store health + WAL checkpoint; LOCAL controller sqlite
 //     state.db — the external Kine-DB VM lives in kinedb)
 //   - apiserver/ — apiserverhub.go (module-22 sig13 wedge guard +
-//     dead-fallback), cp_freeze_heal.go (W8-CP3 KCM/scheduler freeze
-//   - W10-FIX1 workqueue stall + the APF queue-starvation probe)
+//     dead-fallback), cp_freeze_heal.go (cp-freeze-heal KCM/scheduler freeze
+//   - kcm-queue-stall workqueue stall + the APF queue-starvation probe)
 //   - etcd/      — etcdguard.go (embedded-etcd quota self-defence +
 //     backup-health snapshot verifier)
-//   - pki/       — pki_cert_drift.go (W8-CP4 reload drift + W12-CP4a
-//     sa.pub fingerprint), kubeconfig_cert_expiry.go (W10-CP5)
+//   - pki/       — pki_cert_drift.go (pki-cert-drift reload drift + sa-pub-key-fingerprint
+//     sa.pub fingerprint), kubeconfig_cert_expiry.go (kubeconfig-cert-expiry)
 //   - oom/       — oomloop.go (memcg OOM-loop detector + shield)
 //   - feeder/    — the sd_notify watchdog feeder + G1..G6 remediate
 //   - cdeps/     — the shared dependency surface (Config/Seams, Deps,

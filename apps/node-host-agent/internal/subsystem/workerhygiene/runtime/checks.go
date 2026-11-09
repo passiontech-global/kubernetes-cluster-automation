@@ -1,8 +1,8 @@
 // checks.go — the runtime-domain check constructors: the eight
 // runtime-resource guards (runtime_<name>.go — one file per guard,
-// see runtime_common.go for the family overview), the W6.3
-// disk-bloat detector (disk_bloat.go) and the W10 KR1/ST2
-// deep-failure guards (deep_failure_checks.go). The parent
+// see runtime_common.go for the family overview), the disk-bloat
+// disk-bloat detector (disk_bloat.go) and the deep-failure
+// guards (deep_failure_checks.go). The parent
 // workerhygiene package wires them into its ordered dispatch list.
 package runtime
 
@@ -50,21 +50,21 @@ func NewCgroupSwap(d *wdeps.Deps) *CgroupSwapCheck {
 	return &CgroupSwapCheck{d: d}
 }
 
-// NewCgroupThrottle returns the W12-KR1 pod memory.high throttle +
+// NewCgroupThrottle returns the cgroup-pod-throttle pod memory.high throttle +
 // pids.max guard.
 func NewCgroupThrottle(d *wdeps.Deps) *CgroupThrottleCheck {
 	return &CgroupThrottleCheck{d: d}
 }
 
-// NewDiskBloat returns the W6.3 disk-bloat runaway detector.
+// NewDiskBloat returns the disk-bloat disk-bloat runaway detector.
 func NewDiskBloat(d *wdeps.Deps) *DiskBloatCheck {
 	return &DiskBloatCheck{d: d}
 }
 
-// NewHostOOM returns the W10-KR1 SystemOOMVictim consumer.
+// NewHostOOM returns the kernel-dmesg SystemOOMVictim consumer.
 func NewHostOOM(d *wdeps.Deps) *HostOOMCheck { return &HostOOMCheck{d: d} }
 
-// NewOrphanHP returns the W10-ST2 orphaned hostPath dir guard.
+// NewOrphanHP returns the orphan-hostpath orphaned hostPath dir guard.
 func NewOrphanHP(d *wdeps.Deps) *OrphanHPCheck {
 	return &OrphanHPCheck{d: d}
 }

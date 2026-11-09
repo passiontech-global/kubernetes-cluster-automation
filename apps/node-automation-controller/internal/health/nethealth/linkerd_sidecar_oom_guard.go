@@ -43,7 +43,7 @@ type linkerdSidecarOOMCheck struct {
 	// while a repeating status is reported once.
 	evented state.SeenSet
 
-	// W16-NM2 (linkerdInitSidecarDeadlock): since tracks the
+	// linkerd-init-deadlock (linkerdInitSidecarDeadlock): since tracks the
 	// Init:Error / Init:CrashLoopBackOff signature per pod (the 5m
 	// persistence window, pruned when the pod leaves the state so a
 	// later flap re-arms); deadlockEmitted reconciles the deadlock
@@ -73,7 +73,7 @@ const (
 	// the pod — the byte-stable reason the alert runbook references.
 	linkerdOOMEventReason = "LinkerdSidecarOOMKilled"
 
-	// W16-NM2 — linkerdInitSidecarDeadlock knobs.
+	// linkerd-init-deadlock — linkerdInitSidecarDeadlock knobs.
 	// linkerdInitContainer is the injected mesh-setup init container
 	// (runs BEFORE linkerd-proxy is injected into the init chain).
 	linkerdInitContainer = "linkerd-init"
@@ -109,7 +109,7 @@ var (
 		Name: "node_automation_linkerd_sidecar_oom",
 		Help: "1 while a pod's linkerd-proxy container shows an OOMKilled termination inside the 30m window.",
 	}, []string{"namespace", "pod"})
-	// W16-NM2 — a pod stuck Pending in Init:Error/Init:CrashLoopBackOff
+	// linkerd-init-deadlock — a pod stuck Pending in Init:Error/Init:CrashLoopBackOff
 	// past 5m whose completed linkerd-init proves the mesh setup ran
 	// while an app init ordered before linkerd-proxy still crashes.
 	linkerdInitDeadlockGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -166,7 +166,7 @@ func (p *linkerdSidecarOOMCheck) Run(ctx context.Context) probefw.Result {
 	res := rep.Result(&p.emitted, linkerdSidecarOOMGauge.DeleteLabelValues,
 		"linkerd-proxy OOMKilled inside 30m: ", ", ")
 
-	// W16-NM2 — the init-order deadlock detector rides the same pod
+	// linkerd-init-deadlock — the init-order deadlock detector rides the same pod
 	// census as its own gauge/window/event (the oom emitted ledger
 	// keys into a different vec, so it carries its own report tail).
 	res2 := p.scanInitDeadlock(ctx, log, pods, now)
@@ -184,7 +184,7 @@ func (p *linkerdSidecarOOMCheck) Run(ctx context.Context) probefw.Result {
 }
 
 // ---------------------------------------------------------------------------
-// W16-NM2 — linkerdInitSidecarDeadlock
+// linkerd-init-deadlock — linkerdInitSidecarDeadlock
 // ---------------------------------------------------------------------------
 
 // scanInitDeadlock sweeps the pod census for the init-order deadlock:

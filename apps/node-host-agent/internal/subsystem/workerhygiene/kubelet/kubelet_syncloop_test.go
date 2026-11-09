@@ -17,7 +17,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- Wave-2 tests: A4 syncloop + containerd-sock ---
+// --- syncloop + containerd-sock tests ---
 
 func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
 	e := fixture(t)

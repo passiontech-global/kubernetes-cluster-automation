@@ -136,7 +136,7 @@ func TestProbeHTTPContentBodyCapInconclusive(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestProbePodRestarts(t *testing.T) {
-	// W10-FIX5: an over-threshold RestartCount only FAILs while the
+	// pinned-volume-guard: an over-threshold RestartCount only FAILs while the
 	// restarts are live signal — a recent last termination or a
 	// container currently Waiting (CrashLoopBackOff).
 	over := chPod("kube-system", "restarty", corev1.PodRunning, time.Hour)
@@ -165,7 +165,7 @@ func TestProbePodRestarts(t *testing.T) {
 		t.Fatal("expected FAIL on CrashLoopBackOff over threshold")
 	}
 
-	// W10-FIX5: the same count with a STALE last termination (>24h)
+	// pinned-volume-guard: the same count with a STALE last termination (>24h)
 	// and a Running state is historical — the check must recover.
 	stale := chPod("kube-system", "oldcrash", corev1.PodRunning, time.Hour)
 	stale.Status.ContainerStatuses = []corev1.ContainerStatus{

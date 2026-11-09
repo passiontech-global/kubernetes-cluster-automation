@@ -1,5 +1,5 @@
 // kargo_promotion_health.go — the kargo-promotion-health check
-// (W12-GO1): Kargo Promotion stalls, Warehouse refresh starvation
+// (kargo-promotion-health): Kargo Promotion stalls, Warehouse refresh starvation
 // and Argo Rollouts AnalysisRun zombies. operator-workqueue-watchdog
 // only proves the kargo controller keeps reconciling; this check
 // catches the work objects it strands: a Promotion parked
@@ -35,7 +35,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// kargoPromotionHealthCheck is the W12-GO1 stall watchdog.
+// kargoPromotionHealthCheck is the kargo-promotion-health stall watchdog.
 type kargoPromotionHealthCheck struct {
 	*probefw.Deps
 
@@ -51,7 +51,7 @@ type kargoPromotionHealthCheck struct {
 	emittedAnalysisRuns state.GaugeLedger[string]
 }
 
-// NewKargoPromotionHealthCheck builds the W12-GO1 check — its state
+// NewKargoPromotionHealthCheck builds the kargo-promotion-health check — its state
 // is the refresh cooldown plus the three emitted-gauge ledgers
 // (zero values usable).
 func NewKargoPromotionHealthCheck(d *probefw.Deps) probefw.Check {
@@ -61,7 +61,7 @@ func NewKargoPromotionHealthCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameKargoPromotionHealth = "kargo-promotion-health"
 
-	// W12-GO1 — kargo-promotion-health knobs.
+	// kargo-promotion-health — kargo-promotion-health knobs.
 	kargoPromotionStuckMinAge  = 60 * time.Minute
 	kargoWarehouseUnhealthyAge = 30 * time.Minute
 	kargoWarehouseRefreshCool  = time.Hour
@@ -69,25 +69,25 @@ const (
 )
 
 var (
-	// W12-GO1 — a Promotion holding a non-terminal phase past the
+	// kargo-promotion-health — a Promotion holding a non-terminal phase past the
 	// hour.
 	kargoPromotionStuckGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_kargo_promotion_stuck",
-		Help: "1 while a Kargo Promotion stays in Running/Pending phase for >=60m — W12-GO1.",
+		Help: "1 while a Kargo Promotion stays in Running/Pending phase for >=60m — kargo-promotion-health.",
 	}, []string{"namespace", "name", "stage"})
 
-	// W12-GO1 — a Warehouse Ready=False past the half hour (registry
+	// kargo-promotion-health — a Warehouse Ready=False past the half hour (registry
 	// auth / rate-limit starving the artifact feed).
 	kargoWarehouseUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_kargo_warehouse_unhealthy",
-		Help: "1 while a Kargo Warehouse reports Ready=False for >=30m — W12-GO1.",
+		Help: "1 while a Kargo Warehouse reports Ready=False for >=30m — kargo-promotion-health.",
 	}, []string{"namespace", "name"})
 
-	// W12-GO1 — an Argo Rollouts verification AnalysisRun still
+	// kargo-promotion-health — an Argo Rollouts verification AnalysisRun still
 	// Running past the hour.
 	argoAnalysisRunStuckGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_analysisrun_stuck",
-		Help: "1 while an Argo Rollouts AnalysisRun stays in Running phase for >=60m — W12-GO1.",
+		Help: "1 while an Argo Rollouts AnalysisRun stays in Running phase for >=60m — kargo-promotion-health.",
 	}, []string{"namespace", "name"})
 )
 

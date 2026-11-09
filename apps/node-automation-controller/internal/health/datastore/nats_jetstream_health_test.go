@@ -1,5 +1,5 @@
 // nats_jetstream_health_test.go — coverage for the
-// nats-jetstream-health check (W12-ST1): the Prometheus wedge
+// nats-jetstream-health check (nats-jetstream-health): the Prometheus wedge
 // signals (jetstream disabled, meta leaderless, consumer ack-floor),
 // the log-marker persistence window, the quorum-safe bounce, and the
 // no-NATS / no-Prometheus postures.
@@ -291,10 +291,10 @@ func TestNatsLogReason(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W16-ST2 — stream leaderless
+// stream-leaderless — stream leaderless
 // ---------------------------------------------------------------------------
 
-// The W16-ST2 stream markers map to stream_leaderless — pure table,
+// The stream-leaderless stream markers map to stream_leaderless — pure table,
 // no log stream needed.
 func TestNatsLogReasonStreamLeaderless(t *testing.T) {
 	for _, tc := range []struct{ line, want string }{

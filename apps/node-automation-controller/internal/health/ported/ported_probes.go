@@ -123,7 +123,7 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 // probePodRestarts ports pod-restarts-check: FAIL when any container
 // status — app, init or ephemeral — in the target namespace has
 // RestartCount over the limit (live check: kube-system, 10) AND the
-// restarts are still live signal (W10-FIX5): a container that crossed
+// restarts are still live signal (pinned-volume-guard): a container that crossed
 // the threshold weeks ago and has been stable since must not hold the
 // check red forever — RestartCount is monotonic, so the raw count
 // alone can never recover.
@@ -157,7 +157,7 @@ func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
 
 // podRestartRecentWindow bounds how far back the last termination may
 // sit before an over-threshold RestartCount reads as historical rather
-// than live (W10-FIX5).
+// than live (pinned-volume-guard).
 const podRestartRecentWindow = 24 * time.Hour
 
 // restartRecentlyActive reports whether an over-threshold restart

@@ -69,7 +69,7 @@ type Deps struct {
 	// direct ListNodes). Read-only censuses only; destructive acts
 	// still confirm on CS.
 	NodeReader kube.CachedNodeReader
-	// Dyn reads the CRD types the W5.8 stuck signatures scan
+	// Dyn reads the CRD types the operator-workqueue-watchdog stuck signatures scan
 	// (gateway-api, scylladb, dragonflydb, flux) and the autopilot
 	// Plan inside the maintenance mutex — no typed clients exist.
 	Dyn dynamic.Interface

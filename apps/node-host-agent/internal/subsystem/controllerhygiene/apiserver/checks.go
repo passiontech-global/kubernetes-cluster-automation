@@ -9,8 +9,8 @@ import "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-ho
 // guard.
 func NewHub(d *cdeps.Deps) *HubCheck { return &HubCheck{d: d} }
 
-// NewFreeze returns the W8-CP3/W10-FIX1 KCM/scheduler freeze
-// auto-heal. storage and kubecert are the W10-CP2/W10-CP5
+// NewFreeze returns the cp-freeze-heal/kcm-queue-stall KCM/scheduler freeze
+// auto-heal. storage and kubecert are the kine-storage/kubeconfig-cert-expiry
 // ride-alongs sharing its ungated dispatch slot (Run invokes them
 // before its own probe so they keep the pre-uptime-gate position
 // they had as inlined calls).

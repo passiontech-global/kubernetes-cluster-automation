@@ -1,6 +1,6 @@
 // linkerd_h2_stream_guard_test.go — coverage for the
 // linkerd-h2-stream-guard check: storm-signature delete with a
-// Ready sibling, the no-sibling skip, the W12-NM3 outbound balancer
+// Ready sibling, the no-sibling skip, the linkerd-h2-stream-guard outbound balancer
 // lockout and proxy OOM detection.
 package linkerd
 
@@ -100,7 +100,7 @@ func TestLinkerdIdentityStallMarkers(t *testing.T) {
 		"linkerd-proxy ERR identity: certificate_expired for default.web",
 		"linkerd-proxy ERR tonic: InvalidCertificate(Expired)",
 		"linkerd-proxy ERR Failed to certify identity: status: Unauthenticated",
-		// W12-NM3 — issued-at skew (NotValidYet) and trust-root skew
+		// linkerd-h2-stream-guard — issued-at skew (NotValidYet) and trust-root skew
 		// (UnknownIssuer) stall the identity the same way.
 		"linkerd-proxy ERR tonic: InvalidCertificate(NotValidYet)",
 		"linkerd-proxy ERR identity: UnknownIssuer for default.web",
@@ -209,7 +209,7 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM3 — linkerd-proxy OOMKilled detection
+// linkerd-h2-stream-guard — linkerd-proxy OOMKilled detection
 // ---------------------------------------------------------------------------
 
 // oomKilledPod builds a meshed pod whose linkerd-proxy container last
@@ -312,7 +312,7 @@ func TestLinkerdProxyInitOOMKilledFlagged(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM3 — outbound balancer lockout
+// linkerd-h2-stream-guard — outbound balancer lockout
 // ---------------------------------------------------------------------------
 
 // linkerdTargetService parses the service identity back out of a

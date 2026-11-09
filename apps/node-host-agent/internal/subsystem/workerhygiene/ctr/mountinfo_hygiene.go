@@ -42,7 +42,7 @@ const (
 	// groups must be stale past before any umount fires.
 	mountinfoOrphanAge = 30 * time.Minute
 	// mountinfoMaxReapPerCycle bounds the per-cycle umount blast
-	// radius (W12-KR2 parity — a mass leak drains at a fixed rate).
+	// radius (orphan-sandbox-netns parity — a mass leak drains at a fixed rate).
 	mountinfoMaxReapPerCycle = 10
 	// mountinfoBloatEventBudget rate-limits the MountinfoTableBloat
 	// event — the table bloats slowly, one event per hour is ample.

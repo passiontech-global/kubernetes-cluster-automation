@@ -1,6 +1,6 @@
 // cilium_agent.go — sig9 cilium-agent healthz check (CiliumCheck):
 // :9879 healthz down → latch + SIGKILL the agent container — plus
-// the W8-NM3 BPF map-pressure probe that rides inside it on a green
+// the mesh-net-guards BPF map-pressure probe that rides inside it on a green
 // healthz.
 package cilium
 
@@ -18,14 +18,14 @@ import (
 
 const (
 // defaultBPFMapHighRatio is the critical BPF map fill ratio
-// (W8-NM3) — past it the bpf-maps sub-check latches.
+// (mesh-net-guards) — past it the bpf-maps sub-check latches.
 )
 
 // CiliumCheck — sig9: cilium-agent :9879 healthz down → latch
 // cilium-agent-down + SIGKILL the agent container (kubelet restarts
 // it immediately, bypassing CrashLoopBackOff). Gates: apiOK (restart
 // while the API is dead can't resync), node-overloaded, shared
-// last-cilium-restart 30m budget. The W8-NM3 BPF map-pressure probe
+// last-cilium-restart 30m budget. The mesh-net-guards BPF map-pressure probe
 // rides inside this check (CheckBPFMaps) — it only runs on a green
 // healthz, off the same agent socket. fails is the healthz streak
 // (ex-Hygiene.ciliumFails).
@@ -61,7 +61,7 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if err == nil {
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchCiliumAgentDown, nil)
-		// W8-NM3: a healthy healthz doesn't prove the datapath —
+		// mesh-net-guards: a healthy healthz doesn't prove the datapath —
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
 		// the same agent socket.
@@ -101,7 +101,7 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckCilium, "ok")
 }
 
-// --- W8-NM3: cilium BPF map pressure ---
+// --- mesh-net-guards: cilium BPF map pressure ---
 // The datapath dies silently long before the agent does: once the
 // conntrack, SNAT or LB-service maps hit maxEntries, new flows are
 // dropped/blackholed while :9879/healthz keeps returning 200. The

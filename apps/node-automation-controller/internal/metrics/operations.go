@@ -43,7 +43,7 @@ var VolumeAttachmentsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterO
 }, []string{"reason"})
 
 // ---------------------------------------------------------------------------
-// Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
+// Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
 
 // ZombieSidecarPodsReapedTotal counts Job Pods reaped because the
@@ -68,37 +68,37 @@ var StatefulSetOnDeletePodsRolledTotal = prometheus.NewCounterVec(prometheus.Cou
 }, []string{"namespace", "statefulset"})
 
 // ---------------------------------------------------------------------------
-// Wave 5/6 self-healing metrics (W5.8/W5.9b/W6.2/W6.4).
+// Self-healing metrics (operator-workqueue-watchdog/cronjob-catchup/stateful-masterless-services/rabbitmq-suspended-listener).
 // ---------------------------------------------------------------------------
 
 // CronJobTooManyMissedStarts marks (1) CronJobs that accumulated
 // more than 100 missed start times — the point where the controller
 // permanently stops scheduling them until startingDeadlineSeconds is
-// set (cronjob-catchup auto-unfreezer, W5.9b).
+// set (cronjob-catchup auto-unfreezer, cronjob-catchup).
 var CronJobTooManyMissedStarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_cronjob_too_many_missed_starts",
 	Help: "1 while the CronJob has more than 100 missed start times (controller stops scheduling it).",
 }, []string{"namespace", "cronjob"})
 
 // ---------------------------------------------------------------------------
-// Wave 8 metrics (W8-CP3/W8-ST1/W8-ST2/W8-NM2-3/W4).
+// Health metrics (cp-freeze-heal/velero-bsl-audit/node-hang-precordon/issuer-serial-watch/mesh-net-guards/va-stuck-terminating).
 // ---------------------------------------------------------------------------
 
 // VolumeAttachmentFinalizersRemovedTotal counts wedged VolumeAttachment
 // finalizers stripped after the attach-detach cleanup provably died
-// (node gone, or out-of-service with zero non-DaemonSet pods) — W4.
+// (node gone, or out-of-service with zero non-DaemonSet pods) — va-stuck-terminating.
 var VolumeAttachmentFinalizersRemovedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_volumeattachment_finalizers_removed_total",
 	Help: "Stuck VolumeAttachment finalizers stripped to free the volume, by node.",
 }, []string{"node"})
 
 // ---------------------------------------------------------------------------
-// Later self-healing metrics grouped by owning module (W9-CP2/W9-ST3/
-// W9-GO1/W10-NM2/W10-ST6/W10-CP1).
+// Later self-healing metrics grouped by owning module (kine-bloat-guard/backup-posture-audit/
+// externalsecret-storm-guard/cloudflared-wedge-heal/velero-inflight-audit/namespace-terminating-wedged).
 // ---------------------------------------------------------------------------
 
 // CFTunnelWedgePodsDeletedTotal counts cloudflared connector pods
-// deleted by the cf-tunnel proxy watchdog wedge healer (W10-NM2).
+// deleted by the cf-tunnel proxy watchdog wedge healer (cloudflared-wedge-heal).
 // reason is fatal_logs (wedged log signature) or all_unready_oldest
 // (readyCount==0 deadlock — oldest stale-unready pod deleted once per
 // cooldown). Labels: pod namespace + reason.

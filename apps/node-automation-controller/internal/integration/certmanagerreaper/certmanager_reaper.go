@@ -46,7 +46,7 @@ const (
 	certRenewalWindow  = 7 * 24 * time.Hour // renewalTime within this window = candidate
 	certReaperMinGap   = time.Hour          // max 1 order reset per cert per hour
 	certReaperMaxReset = 3                  // stop acting after N resets on the same cert
-	// W8 — the stuck-CertificateRequest path: a CR wedged Ready=False
+	// the stuck-CertificateRequest path: a CR wedged Ready=False
 	// (Pending/Failed) past crStuckMinAge under a Ready=False or
 	// expiring cert gets deleted so cert-manager re-issues it. It
 	// draws on the same acme-order-resets budget, on a wider 6h gap.
@@ -90,12 +90,12 @@ type certManagerReaper struct {
 	// deterministic. nil → time.Now.
 	now shared.Clock
 	// crReaped: cert key → last stuck-CertificateRequest delete —
-	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
+	// the 6h in-RAM half of the stuck-CR-reap cooldown (the durable
 	// half shares passiontech.dev/acme-order-resets). CooldownSet is
 	// zero-value ready — no arm needed.
 	crReaped state.CooldownSet
 	// crCache: per-run CertificateRequest list cache keyed by
-	// namespace — the Order-attribution path and the W8 stuck-CR
+	// namespace — the Order-attribution path and the stuck-CR
 	// path share ONE list per namespace per sweep (a failed list
 	// IncErrors once, not twice).
 	crCache map[string]crListResult
@@ -172,7 +172,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 			}
 		}
 		if !needsReap {
-			// W8: a cert that is Ready=False or expires <14d may
+			// stuck-CR-reap: a cert that is Ready=False or expires <14d may
 			// carry a wedged CertificateRequest even with no stuck
 			// Order — the CR path holds its own gates and cooldown.
 			if r.reapStuckCR(ctx, cert, now) {

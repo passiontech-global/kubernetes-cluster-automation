@@ -1,5 +1,5 @@
 // linkerd_protocol_detection_stall_ports.go — the port arithmetic of
-// the linkerd-protocol-detection-stall check (W10-NM3): the
+// the linkerd-protocol-detection-stall check (linkerd-protocol-detection-stall): the
 // well-known binary/stateful port table, the linkerd port-annotation
 // parser ("6379,8000-8010" ranges included), and the
 // missingBinaryPorts audit across opaque-ports / skip-inbound-ports /
@@ -17,7 +17,7 @@ import (
 // linkerdBinaryPorts are the well-known binary/stateful server
 // ports Linkerd protocol detection cannot classify — a meshed pod
 // exposing one of these without an opaque/skip annotation stalls on
-// every new connection (the W6.2/W9 linkerd port lists live in
+// every new connection (the stateful-masterless-services linkerd port lists live in
 // check-linkerd-stateful-ports; this is the pod-level audit mirror).
 var linkerdBinaryPorts = map[int]bool{
 	3306: true, 5432: true, 6379: true, 27017: true, 9042: true,
@@ -79,7 +79,7 @@ func joinPorts(ports []int) string {
 // direction it governs (skip-outbound is the client-side escape a
 // meshed pod INITIATING to MySQL/Postgres/Redis needs; the static
 // gate and the VAP accept it, so the runtime audit must too —
-// W12-P0-6, or every skip-outbound workload gets patched +
+// template-patch-stamp, or every skip-outbound workload gets patched +
 // re-rolled every 30m).
 func missingBinaryPorts(pod *corev1.Pod) []int {
 	covered := parsePortSet(pod.Annotations[linkerdOpaquePortsAnno])

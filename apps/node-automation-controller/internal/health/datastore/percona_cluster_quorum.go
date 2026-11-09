@@ -1,5 +1,5 @@
-// percona_cluster_quorum.go — the W10-ST5 percona-cluster-quorum
-// watchdog (stuck-initializing Percona clusters) plus the W12-ST2
+// percona_cluster_quorum.go — the percona-cluster-quorum percona-cluster-quorum
+// watchdog (stuck-initializing Percona clusters) plus the percona-degraded-quorum
 // degraded-quorum / Patroni-lock gauge.
 package datastore
 
@@ -25,16 +25,16 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// perconaQuorumCheck is the W10-ST5 Percona cluster quorum watchdog.
+// perconaQuorumCheck is the percona-cluster-quorum Percona cluster quorum watchdog.
 type perconaQuorumCheck struct {
 	*probefw.Deps
 
 	//   - perconaInitSeen: "gvr/ns/name" → first sweep the Percona
 	//     cluster read "initializing" — the 30m stuck-initializing
-	//     window for checkPerconaClusterQuorum (W10-ST5). Pruned on
+	//     window for checkPerconaClusterQuorum (percona-cluster-quorum). Pruned on
 	//     resolve so a later re-init re-arms.
 	//   - perconaDegradedSeen: "degraded/gvr/ns/name" |
-	//     "patroni/ns/name" → first sweep the W12-ST2 degraded-quorum
+	//     "patroni/ns/name" → first sweep the percona-degraded-quorum degraded-quorum
 	//     (ready<size) or Patroni-lock signature showed — each must
 	//     hold its own window before it counts.
 	//   - perconaDegradedEmitted: the emitted-gauge ledger for the
@@ -45,19 +45,19 @@ type perconaQuorumCheck struct {
 	perconaDegradedEmitted state.GaugeLedger[string]
 }
 
-// newPerconaQuorumCheck builds the W10-ST5 check — the first-seen
+// newPerconaQuorumCheck builds the percona-cluster-quorum check — the first-seen
 // ledger arms lazily on first use.
 func NewPerconaQuorumCheck(d *probefw.Deps) probefw.Check {
 	return &perconaQuorumCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
-// W10-ST5 — percona-cluster-quorum.
+// percona-cluster-quorum — percona-cluster-quorum.
 // ---------------------------------------------------------------------------
 
 const (
 	// CheckNamePerconaQuorum is the check's kuberhealthy_check
-	// label value — W10-ST5; not a ported HealthCheck but reports
+	// label value — percona-cluster-quorum; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNamePerconaQuorum = "percona-cluster-quorum"
@@ -66,7 +66,7 @@ const (
 	// clusters legitimately take tens of minutes to bootstrap.
 	perconaInitMinAge = 30 * time.Minute
 
-	// W12-ST2 — perconaDegradedMinAge bounds a degraded quorum
+	// percona-degraded-quorum — perconaDegradedMinAge bounds a degraded quorum
 	// (status.ready < status.size while ready >= 1 and size >= 3):
 	// one member down still serves, so the signature must persist
 	// 20m before it counts — longer than a node blip, shorter than
@@ -84,7 +84,7 @@ const (
 	perconaWsrepLocalStateDonor = 2
 )
 
-// perconaClusterDegradedGauge is the W12-ST2 signal: 1 while a
+// perconaClusterDegradedGauge is the percona-degraded-quorum signal: 1 while a
 // Percona cluster reports fewer ready instances than its declared
 // size for >=20m (degraded quorum — one failure short of losing
 // writes), a Galera member sits non-Primary / OFF / Donor-Desynced
@@ -116,7 +116,7 @@ var perconaGVRKind = map[schema.GroupVersionResource]string{
 // checkPerconaClusterQuorum flags Percona database clusters that
 // report an error state, sit in "initializing" past
 // perconaInitMinAge, or show fewer than one ready instance while not
-// paused (W10-ST5). W12-ST2 adds the signatures a CR status hides:
+// paused (percona-cluster-quorum). percona-degraded-quorum adds the signatures a CR status hides:
 // a degraded quorum (ready < size >= 20m while >=1 member still
 // serves — one blip short of losing writes), Galera member state
 // from Prometheus wsrep metrics (non-Primary / OFF / Donor-Desynced
@@ -169,7 +169,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				// cluster's operator writes status.ready:0 while
 				// bootstrapping — flagging it here would bypass
 				// the perconaInitMinAge grace and flap new
-				// clusters (W10-ST5 review).
+				// clusters (percona-cluster-quorum review).
 				if probefw.Persisted(&p.perconaInitSeen, key, now,
 					perconaInitMinAge, logr.Discard()) {
 					rep.Find(fmt.Sprintf(
@@ -182,7 +182,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				p.clearPerconaInit(key)
 			default:
 				p.clearPerconaInit(key)
-				// W12-ST2 — degraded quorum: at least one member
+				// percona-degraded-quorum — degraded quorum: at least one member
 				// serving but short of the declared size for >=20m.
 				// ready>=1 keeps this disjoint from the ready<1
 				// branch; size>=3 keeps single/dual-member clusters
@@ -214,11 +214,11 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// W12-ST2 (b) — Patroni failover lock: a PerconaPGCluster whose
+	// percona-degraded-quorum (b) — Patroni failover lock: a PerconaPGCluster whose
 	// leader surfaces stay vacant while member pods still run.
 	p.checkPatroniLeaderLock(ctx, log, &rep, pgClusters, degradedLive, now)
 
-	// W12-ST2 (c) — Galera member state the CR status cannot see:
+	// percona-degraded-quorum (c) — Galera member state the CR status cannot see:
 	// wsrep non-Primary, OFF, or a Donor/Desynced member stuck for
 	// >=30m. Unresolvable endpoint skips the section; a query failure
 	// is tolerated evidence loss, never a false FAIL.
@@ -283,7 +283,7 @@ func perconaReadySize(o *unstructured.Unstructured) (ready, size int64, found bo
 }
 
 // checkPatroniLeaderLock sweeps the PerconaPGCluster CRs collected in
-// the main loop for the W12-ST2 failover-lock signature: Patroni
+// the main loop for the percona-degraded-quorum failover-lock signature: Patroni
 // elects its primary through the <cr>-leader Lease (or Endpoints in
 // the endpoints DCS mode) — both surfaces vacant means no primary
 // holds; an empty <cr>-pgbouncer pooler Endpoints means clients have
@@ -361,7 +361,7 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 	// DCS surface A: the <cr>-leader Lease. seen=true ONLY when the
 	// object actually exists — a 404 means the surface is absent
 	// (or the CRD mode never writes it), which is absence of
-	// evidence, NOT evidence the leader is gone (W17: a 404 on BOTH
+	// evidence, NOT evidence the leader is gone (heal-budget: a 404 on BOTH
 	// the Lease and the Endpoints must never read as leader loss —
 	// the whole cluster CR could be mid-bootstrap). Vacancy defaults
 	// true: a surface that does not exist cannot hold a lock.

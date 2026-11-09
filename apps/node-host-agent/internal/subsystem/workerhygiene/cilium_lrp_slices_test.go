@@ -1,4 +1,4 @@
-// cilium_lrp_slices_test.go — W12/P0-5: the cilium-lrp serviceDesync
+// cilium_lrp_slices_test.go — cilium-lrp-desync: the cilium-lrp serviceDesync
 // ready-endpoint count now reads discovery.k8s.io/v1 EndpointSlices
 // (the source cilium-agent programs the BPF map from), falling back
 // to the deprecated corev1.Endpoints object only when the slice LIST

@@ -1,11 +1,11 @@
-// cp_freeze_heal.go — W8-CP3/W10-FIX1 control-plane freeze
+// cp_freeze_heal.go — cp-freeze-heal/kcm-queue-stall control-plane freeze
 // auto-heal:
 //
 //	KCM/scheduler freeze auto-heal. k0s hosts
 //	kube-controller-manager (:10257) and kube-scheduler
 //	(:10259) inside k0scontroller — when either /healthz
 //	stays dead for CPFreezeCycles consecutive cycles, or the
-//	KCM workqueue shows a stalled backlog (W10-FIX1) for
+//	KCM workqueue shows a stalled backlog (kcm-queue-stall) for
 //	longer than CPFreezeQuietFor, while the peer apiserver
 //	still answers, the component (not the apiserver) is
 //	frozen → restart k0scontroller.service under the
@@ -18,7 +18,7 @@
 // that used to live alongside them moved to apf_probe.go
 // and konnectivity_heal.go in this package. The ungated-
 // cycle dispatch slot still rides this entry point: the
-// W10-CP2 kine-storage and W10-CP5 kubeconfig-cert checks
+// kine-storage kine-storage and kubeconfig-cert-expiry kubeconfig-cert checks
 // (see cdeps.CheckCPFreeze) are dispatched from Run.
 package apiserver
 
@@ -35,7 +35,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
-// W10-FIX1 stall thresholds — a stalled KCM workqueue, never an
+// kcm-queue-stall stall thresholds — a stalled KCM workqueue, never an
 // idle one. depthSum==0 (the healthy idle reading) can NEVER fire.
 const (
 	kcmStallDepthSum     = 50  // (a) total queued items across queues
@@ -57,7 +57,7 @@ const (
 
 // KCMQueueSnapshot is one scrape of the KCM /metrics workqueue
 // state, persisted under WatchdogStateDir so consecutive scrapes
-// can be compared for stall evidence (W10-FIX1).
+// can be compared for stall evidence (kcm-queue-stall).
 type KCMQueueSnapshot struct {
 	At       int64              `json:"at"` // scrape epoch (Clock)
 	Leader   bool               `json:"leader"`
@@ -147,7 +147,7 @@ func kcmDeltas(prev, cur map[string]float64) (map[string]float64, bool) {
 	return out, true
 }
 
-// KCMQueueStalled is the W10-FIX1 stall predicate — true ONLY when
+// KCMQueueStalled is the kcm-queue-stall stall predicate — true ONLY when
 // this node is the KCM leader (leader_election_master_status >= 1)
 // AND the workqueue shows a backlog with zero forward progress
 // across two consecutive scrapes:
@@ -243,7 +243,7 @@ func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
 	}
 }
 
-// peerHealthy reports whether the OTHER apiserver answers — the W8-CP3
+// peerHealthy reports whether the OTHER apiserver answers — the cp-freeze-heal
 // gate that proves only the controller components froze, not the whole
 // control plane. Falls back to the local apiserver when no peer is
 // configured (single-hub).
@@ -258,12 +258,12 @@ func (c *FreezeCheck) peerHealthy(ctx context.Context) bool {
 	return c.d.Cfg.ProbeFn(ctx, "https://"+ep+"/readyz")
 }
 
-// FreezeCheck is the W8-CP3/W10-FIX1 freeze auto-heal as a
+// FreezeCheck is the cp-freeze-heal/kcm-queue-stall freeze auto-heal as a
 // Check — its only in-memory state is the kcmQuietSince stamp +
 // the APF reject baseline, both kept on the check itself;
 // everything else is the consecutive-cp-freeze / kcm-queue
 // snapshot bookkeeping. It also owns the ungated-cycle dispatch
-// slot the W10-CP2 kine-storage and W10-CP5 kubeconfig-cert checks
+// slot the kine-storage kine-storage and kubeconfig-cert-expiry kubeconfig-cert checks
 // ride (initChecks wires them in).
 type FreezeCheck struct {
 	d        *cdeps.Deps
@@ -272,7 +272,7 @@ type FreezeCheck struct {
 
 	// kcmQuietSince is the first cycle the KCM read
 	// leader+stalled-queue — leader-without-progress only counts as
-	// frozen after CPFreezeQuietFor (W8-CP3/W10-FIX1). In-memory:
+	// frozen after CPFreezeQuietFor (cp-freeze-heal/kcm-queue-stall). In-memory:
 	// an agent restart just re-arms the quiet window.
 	kcmQuietSince time.Time
 
@@ -300,9 +300,9 @@ type FreezeCheck struct {
 // Name returns the check label / log context.
 func (c *FreezeCheck) Name() string { return cdeps.CheckCPFreeze }
 
-// Run — W8-CP3. Restart evidence is (a) KCM or scheduler healthz dead
+// Run — cp-freeze-heal. Restart evidence is (a) KCM or scheduler healthz dead
 // for CPFreezeCycles consecutive cycles, or (b) a stalled KCM
-// workqueue (W10-FIX1 KCMQueueStalled) persisting past
+// workqueue (kcm-queue-stall KCMQueueStalled) persisting past
 // CPFreezeQuietFor. The restart only fires while the peer apiserver
 // stays healthy and honors Sig13Mode. The phases: runSlot (the
 // ungated-cycle dispatch riders), probeFreeze (healthz + workqueue
@@ -327,9 +327,9 @@ func (c *FreezeCheck) Run(ctx context.Context) {
 	c.healFreeze(ctx, reason)
 }
 
-// runSlot runs the ungated-cycle riders: W10-CP2/W10-CP5 ride
+// runSlot runs the ungated-cycle riders: kine-storage/kubeconfig-cert-expiry ride
 // this slot (Cycle() dispatch lives in check.go, so those checks
-// are invoked from the first W8-CP entry point — same
+// are invoked from the first controllerhygiene entry point — same
 // pre-uptime-gate position, every cycle). The APF queue-starvation
 // probe (apf_probe.go) and the konnectivity-server probe + heal
 // (konnectivity_heal.go) ride the same slot — read-only scrape +
@@ -372,7 +372,7 @@ func (c *FreezeCheck) decideFreeze(ctx context.Context) (bool, string, bool) {
 
 	// Leader-with-a-stalled-workqueue is an OR-condition: even with
 	// a healthy healthz a frozen KCM scheduler loop shows up as a
-	// leader holding a backlog with zero forward progress (W10-FIX1
+	// leader holding a backlog with zero forward progress (kcm-queue-stall
 	// — the old leader+zero-depth reading fired on every healthy
 	// idle cluster). Only evaluated when the fast path didn't
 	// already fire; every successful scrape refreshes the snapshot

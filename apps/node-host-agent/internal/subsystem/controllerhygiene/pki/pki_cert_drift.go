@@ -1,4 +1,4 @@
-// pki_cert_drift.go — W8-CP4 PKI reload drift detection:
+// pki_cert_drift.go — pki-cert-drift PKI reload drift detection:
 //
 //	After cert rotation the on-disk cert can be newer than the one
 //	a live socket still presents (the daemon never reloaded).
@@ -8,7 +8,7 @@
 //	state-cp-cert-reload-stale and restarts the owning unit under
 //	the last-cp-cert-restart budget.
 //
-//	W12-CP4a: the same Run also exports the SHA-256 fingerprint of
+//	sa-pub-key-fingerprint: the same Run also exports the SHA-256 fingerprint of
 //	the k0s ServiceAccount token signer public key (sa.pub) to the
 //	textfile channel — a signer key drifted between control-plane
 //	nodes means TokenRequest tokens minted on this node randomly
@@ -31,7 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
-// SAPubMetric/SAPubPromFile — the W12-CP4a ServiceAccount signer-key
+// SAPubMetric/SAPubPromFile — the sa-pub-key-fingerprint ServiceAccount signer-key
 // fingerprint export: same series the hostmetrics collector exports
 // on pods ({sha256} only here — the textfile is already node-local).
 // saPubHashHelp is the identical sentence hostmetrics carries in
@@ -58,7 +58,7 @@ func sha256FileHex(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// emitSAPubFingerprint — W12-CP4a: write
+// emitSAPubFingerprint — sa-pub-key-fingerprint: write
 // node_k0s_sa_pub_fingerprint_hash{sha256=...} to the textfile
 // channel every cycle. The whole subsystem only runs on
 // k0scontroller hosts (unit-file gate in Cycle/ShouldRun), so no
@@ -76,7 +76,7 @@ func (c *DriftCheck) emitSAPubFingerprint() {
 	c.d.WriteTextfileProm(SAPubPromFile, p.String())
 }
 
-// DriftCheck is the W8-CP4 PKI reload drift detector as a
+// DriftCheck is the pki-cert-drift PKI reload drift detector as a
 // Check — stateless: per-pair streaks live in the
 // consecutive-cp-cert-stale-<i> counters.
 type DriftCheck struct {
@@ -86,12 +86,12 @@ type DriftCheck struct {
 // Name returns the check label / log context.
 func (c *DriftCheck) Name() string { return cdeps.CheckPKIDrift }
 
-// Run — W8-CP4. For each pair: read the on-disk leaf and the
+// Run — pki-cert-drift. For each pair: read the on-disk leaf and the
 // socket-presented leaf; drift means the file describes a NEWER cert
 // (later NotAfter, or different serial with a not-older NotAfter)
 // than the socket serves. Drift held for PKIDriftCycles consecutive
 // cycles latches the state and restarts the owning unit under the
-// last-cp-cert-restart budget. W12-CP4a rides the same cycle: the
+// last-cp-cert-restart budget. sa-pub-key-fingerprint rides the same cycle: the
 // sa.pub signer-key fingerprint export runs first so it lands even
 // when a pair fails early.
 func (c *DriftCheck) Run(ctx context.Context) {

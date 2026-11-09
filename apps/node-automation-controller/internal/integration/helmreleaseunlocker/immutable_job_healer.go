@@ -1,4 +1,4 @@
-// immutable_job_healer.go — the W8-GO1 immutable-Job apply error
+// immutable_job_healer.go — the immutable-job-heal immutable-Job apply error
 // healer of helmrelease-unlocker: a Flux Kustomization Ready=False
 // >=15m on a `field is immutable` Job apply error gets the
 // completed/failed Job reaped so kustomize-controller can recreate
@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	// W8-GO1 — a Flux Kustomization Ready=False >=15m on an
+	// immutable-job-heal — a Flux Kustomization Ready=False >=15m on an
 	// immutable-Job apply error gets the completed/failed Job
 	// deleted so kustomize-controller recreates it; the cooldown is
 	// per-Kustomization (in-RAM + persisted annotation).

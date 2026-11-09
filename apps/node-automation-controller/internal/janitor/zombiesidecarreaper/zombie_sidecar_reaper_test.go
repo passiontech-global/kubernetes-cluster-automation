@@ -435,7 +435,7 @@ func TestZombieSidecarNonZeroExitReaped(t *testing.T) {
 	}
 }
 
-// W10-FIX3 — a failed direct pod-IP shutdown falls back to the
+// sidecar-shutdown-fallback — a failed direct pod-IP shutdown falls back to the
 // apiserver pods/<name>:<port>/proxy subresource: the pod is poked
 // (one graceful cycle) instead of deleted on the spot, and the next
 // cycle still reaps it when it keeps qualifying.
@@ -509,7 +509,7 @@ func TestZombieSidecarProxyFallbackNoPodIP(t *testing.T) {
 	}
 }
 
-// W10-FIX3 — backoffLimit==0 Jobs spawn no replacement pod, so an
+// sidecar-shutdown-fallback — backoffLimit==0 Jobs spawn no replacement pod, so an
 // all-exit-0 zombie may be reaped even while job.Status.Succeeded is
 // still 0 — but only AFTER a shutdown attempt already ran.
 func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {

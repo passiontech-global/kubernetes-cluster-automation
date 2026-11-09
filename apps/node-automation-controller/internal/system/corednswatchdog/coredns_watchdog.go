@@ -101,7 +101,7 @@ type coreDNSWatchdog struct {
 	// UDP+TCP:53 and :9153 access that the fake clientset cannot reach.
 	logHitFn func(ctx context.Context, pod string) string
 	// dnsFn resolves fqdn through one coredns pod and returns the
-	// A-record IPs it answered — the W8-NM5 fallback verifies them
+	// A-record IPs it answered — the coredns-probe-fallback fallback verifies them
 	// against the live EndpointSlice/ClusterIP instead of accepting
 	// any answer as "fresh". nil → dnsProbe.
 	dnsFn func(ctx context.Context, podIP, fqdn string) ([]string, error)

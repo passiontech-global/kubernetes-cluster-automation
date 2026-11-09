@@ -68,7 +68,7 @@ DNSStubListener=no
 		}
 	}
 	// guard allow list = private + node IPs + extra, sorted —
-	// shared with the host-internal-ports guard (W6.1).
+	// shared with the host-internal-ports guard (host-internal-ports).
 	allow := c.guardAllowSources()
 	nft := fmt.Sprintf(`# Managed by node-config-agent - block DNS from non-cluster sources
 destroy table ip nodelocaldns_guard
@@ -86,7 +86,7 @@ table ip nodelocaldns_guard {
 		[]byte(nft), "nodelocal-dns :53 guard (block non-cluster sources)")
 	// sweep the buggy nftables.d path this port originally wrote
 	_, _ = r.removeManaged("/etc/nftables.d/nodelocaldns-guard.nft")
-	// W6.1: the node-internal listener ports get the same guard —
+	// host-internal-ports: the node-internal listener ports get the same guard —
 	// non-cluster sources have no business reaching kubelet/NPD/
 	// exporter endpoints over the underlay.
 	c.convergeHostPortsGuard()
@@ -114,7 +114,7 @@ func (c *cyc) guardAllowSources() []string {
 	return allow
 }
 
-// hostPortsGuardPorts are the node-internal TCP listeners (W6.1)
+// hostPortsGuardPorts are the node-internal TCP listeners (host-internal-ports)
 // that must never answer a non-cluster source over the underlay:
 // kubelet healthz/ro-port/read-only, node-exporter, blackbox
 // exporter, coredns metrics, node-problem-detector and the
@@ -122,7 +122,7 @@ func (c *cyc) guardAllowSources() []string {
 var hostPortsGuardPorts = []int{10248, 10250, 10256, 9100, 9115, 9253, 20256, 30020}
 
 // convergeHostPortsGuard deploys the host-internal-ports nft guard
-// + its boot oneshot (W6.1): inbound TCP to the internal listeners
+// + its boot oneshot (host-internal-ports): inbound TCP to the internal listeners
 // is dropped unless it arrives via loopback, a cluster datapath
 // interface (neb1, cilium/lxc/cali — pod traffic paths), an
 // established/related flow, or an allowlisted source. Enabled by

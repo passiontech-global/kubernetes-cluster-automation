@@ -34,7 +34,7 @@ func counterValue(t *testing.T, c *Collector, name string,
 	return 0, false
 }
 
-// --- W7-H5: conntrack stat + ARP ---
+// --- conntrack-arp-pressure: conntrack stat + ARP ---
 
 const conntrackStatBody = "  entries  searched found insert insert_failed drop early_drop\n" +
 	"00000ed4  00000000 00000000 00000000 0000000a 00000004 00000000\n" +
@@ -90,7 +90,7 @@ func TestCollectARP(t *testing.T) {
 	}
 }
 
-// --- W7-H1 + W7-H2: dstate + scope footprint ---
+// --- d-state-storm + systemd-scopes: dstate + scope footprint ---
 
 func TestCollectDStateProcesses(t *testing.T) {
 	cfg, dirs := fixture(t)
@@ -136,7 +136,7 @@ func TestCollectSystemdScopes(t *testing.T) {
 	}
 }
 
-// --- W7-H6: cgroup memory.events ---
+// --- memory-events-reclaim: cgroup memory.events ---
 
 func TestCollectCgroupMemEvents(t *testing.T) {
 	cfg, _ := fixture(t)

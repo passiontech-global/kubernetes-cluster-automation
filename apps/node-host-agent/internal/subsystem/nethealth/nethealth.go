@@ -92,7 +92,7 @@ const (
 
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
-	// W12-KR3: the per-CPU conntrack stat table — insert_failed /
+	// conntrack-port-pressure: the per-CPU conntrack stat table — insert_failed /
 	// drop / early_drop column sums drive the stale-UDP flush.
 	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
 )
@@ -132,7 +132,7 @@ type Config struct {
 	ConntrackCountFile string // nf_conntrack_count (entries used)
 	ConntrackMaxFile   string // nf_conntrack_max (table size)
 	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
-	// per-CPU insert_failed/drop counters the W12-KR3 spike
+	// per-CPU insert_failed/drop counters the conntrack-port-pressure spike
 	// detector reads (module absent → no file → detector idles).
 	ConntrackStatFile string
 	ConsecNeeded      int
@@ -353,12 +353,12 @@ type NetHealth struct {
 	nebulaFails  int            // socket/tun/stats fails
 	nebulaDpFail int            // dataplane-dead fails
 	nebulaDeg    int            // dataplane-degraded runs
-	pmtuFails    int            // consecutive DF-probe failures (W9-NM1)
+	pmtuFails    int            // consecutive DF-probe failures (overlay-mtu-guard)
 	clockFails   int            // consecutive unsynced adjtimex reads
 	egressCtr    map[string]int // per relay probe!=committed counter
 	// nebulaSiteedgeRun counts consecutive cycles the siteedge
 	// marker set keeps failing — the siteedge LATCH arms on the
-	// first detection, but the W12-NM2 per-peer conntrack flush
+	// first detection, but the nebula-conntrack-flush per-peer conntrack flush
 	// waits for ConsecNeeded confirmed runs like the degraded path.
 	nebulaSiteedgeRun int
 	// ctStatPrev is the last-cycle sum of the nf_conntrack

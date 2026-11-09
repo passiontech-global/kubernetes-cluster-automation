@@ -1,10 +1,10 @@
-// kmsg_rules.go — the classifier half of W10-KR1 checkKernelDmesg:
+// kmsg_rules.go — the classifier half of kernel-dmesg checkKernelDmesg:
 // the kernel-message detector regexes, the cross-line OOM pairing
 // context and the line→detector dispatch. This file answers "what
 // does this message mean"; the plumbing it dispatches into (the
 // kmsg session/cursor machinery, the marker writes, the dmesg
 // fallback, the conntrack sysctl bump) stays in kmsg.go. The
-// Wave-10 contract overview lives in kernelfail.go.
+// kernelfail contract overview lives in kernelfail.go.
 package kernelfail
 
 import (
@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// --- kernel-message detectors (W10-KR1) ---
+// --- kernel-message detectors (kernel-dmesg) ---
 
 var (
 	// Filesystem/block error signatures — the plan's literal set.

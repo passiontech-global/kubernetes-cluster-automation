@@ -49,7 +49,7 @@ var TLSSecretDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"namespace", "secret"})
 
 // ---------------------------------------------------------------------------
-// Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
+// Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
 
 // WebhookCABundleDaysToExpiry exposes days until each webhook
@@ -98,36 +98,36 @@ var VeleroBackupEmptyOrErrored = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"namespace", "schedule", "reason"})
 
 // ---------------------------------------------------------------------------
-// Wave 7 self-healing metrics (W7-C3/W7-C4/W7-C5/W7-C6).
+// Self-healing metrics (dual-replica-deadlock/localpv-stranded-pods/olm-subscription-health/replicator-cert-drift).
 // ---------------------------------------------------------------------------
 
 // ReplicatedSecretDrift marks (1) kubernetes-replicator copies
 // (replicator.v1.mittwald.de/replicated-from) whose tls.crt diverged
 // from the source Secret across consecutive scans — the replicator
-// missed a watch event or the copy was hand-edited (W7-C6).
+// missed a watch event or the copy was hand-edited (replicator-cert-drift).
 var ReplicatedSecretDrift = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_replicated_secret_drift",
 	Help: "1 while the replicated Secret's tls.crt differs from its source across consecutive scans.",
 }, []string{"namespace", "name", "source"})
 
 // ---------------------------------------------------------------------------
-// Wave 8 metrics (W8-CP3/W8-ST1/W8-ST2/W8-NM2-3/W4).
+// Health metrics (cp-freeze-heal/velero-bsl-audit/node-hang-precordon/issuer-serial-watch/mesh-net-guards/va-stuck-terminating).
 // ---------------------------------------------------------------------------
 
 // VeleroBSLUnavailable marks (1) each velero.io BackupStorageLocation
-// whose status.phase is not Available (W8-ST1).
+// whose status.phase is not Available (velero-bsl-audit).
 var VeleroBSLUnavailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_velero_bsl_unavailable",
 	Help: "1 while the BackupStorageLocation reports a phase other than Available.",
 }, []string{"namespace", "name"})
 
 // ---------------------------------------------------------------------------
-// Later self-healing metrics grouped by owning module (W9-CP2/W9-ST3/
-// W9-GO1/W10-NM2/W10-ST6/W10-CP1).
+// Later self-healing metrics grouped by owning module (kine-bloat-guard/backup-posture-audit/
+// externalsecret-storm-guard/cloudflared-wedge-heal/velero-inflight-audit/namespace-terminating-wedged).
 // ---------------------------------------------------------------------------
 
 // HelmSecretsPrunedTotal counts superseded helm release secrets
-// deleted by the helmrelease-unlocker Kine bloat guard (W9-CP2) —
+// deleted by the helmrelease-unlocker Kine bloat guard (kine-bloat-guard) —
 // helm keeps every revision forever and each secret embeds the full
 // compressed chart, so unbounded superseded history bloats Kine.
 // Label: the namespace the release secrets live in.
@@ -137,7 +137,7 @@ var HelmSecretsPrunedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"namespace"})
 
 // DBBackupUnhealthy marks (1) each Everest DatabaseCluster whose
-// backup posture is unhealthy (W9-ST3). reason is failed (latest
+// backup posture is unhealthy (backup-posture-audit). reason is failed (latest
 // backup Failed), stuck (a Running/Starting backup older than 6h)
 // or stale (newest Succeeded backup older than 36h). Labels:
 // DatabaseCluster namespace + name + reason.
@@ -147,7 +147,7 @@ var DBBackupUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"namespace", "cluster", "reason"})
 
 // ExternalSecretStormSuppressed marks (1) while the
-// externalsecret-nudge storm guard is active (W9-GO1): >=5
+// externalsecret-nudge storm guard is active (externalsecret-storm-guard): >=5
 // ExternalSecrets Ready=False AND >=50% of all ExternalSecrets
 // failing simultaneously — the signature of a 1Password
 // Connect/429/store outage where force-sync stamps would only
@@ -160,7 +160,7 @@ var ExternalSecretStormSuppressed = prometheus.NewGauge(prometheus.GaugeOpts{
 // ExternalSecretEmptyKey marks (1) each key in a Ready=True
 // ExternalSecret's target Secret that synced missing, empty or
 // whitespace-only — ESO reports SecretSynced while the app reads a
-// blank credential (W12-GO3). Labels: ES namespace + ES name + the
+// blank credential (empty-key-audit). Labels: ES namespace + ES name + the
 // offending secret key.
 var ExternalSecretEmptyKey = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_externalsecret_empty_key",
@@ -179,7 +179,7 @@ var OnePasswordConnectSyncUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpt
 }, []string{"namespace", "pod"})
 
 // VeleroBackupStuck marks (1) each velero.io Backup wedged
-// InProgress or Deleting for over 6h (W10-ST6). Labels: namespace +
+// InProgress or Deleting for over 6h (velero-inflight-audit). Labels: namespace +
 // backup name.
 var VeleroBackupStuck = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_velero_backup_stuck",
@@ -188,7 +188,7 @@ var VeleroBackupStuck = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 
 // VeleroPodVolumeBackupWedged marks (1) each velero.io
 // PodVolumeBackup stuck InProgress for over 6h whose node-agent
-// restarted or has no active Kopia process (W10-ST6). Labels:
+// restarted or has no active Kopia process (velero-inflight-audit). Labels:
 // namespace + pvb name.
 var VeleroPodVolumeBackupWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_velero_podvolumebackup_wedged",
@@ -196,7 +196,7 @@ var VeleroPodVolumeBackupWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"namespace", "pvb"})
 
 // VeleroWedgedObjectsCleanedTotal counts wedged velero objects
-// cleaned by the backup auditor (W10-ST6). action is pvb_deleted or
+// cleaned by the backup auditor (velero-inflight-audit). action is pvb_deleted or
 // pod_restarted. Labels: namespace + action.
 var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_velero_wedged_objects_cleaned_total",

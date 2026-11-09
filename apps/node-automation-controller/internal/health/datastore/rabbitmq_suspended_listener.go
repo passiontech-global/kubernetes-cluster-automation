@@ -1,4 +1,4 @@
-// rabbitmq_suspended_listener.go — the W6.4
+// rabbitmq_suspended_listener.go — the rabbitmq-suspended-listener
 // rabbitmq-suspended-listener healer: deletes a Running-but-never-
 // Ready rabbit pod once the quorum-safe check passes.
 package datastore
@@ -21,11 +21,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// rabbitMQSuspendedCheck is the W6.4 suspended-listener healer.
+// rabbitMQSuspendedCheck is the rabbitmq-suspended-listener suspended-listener healer.
 type rabbitMQSuspendedCheck struct {
 	*probefw.Deps
 
-	// W6.4 watchdog state (serial sweep — unguarded):
+	// rabbitmq-suspended-listener watchdog state (serial sweep — unguarded):
 	//   - rbSuspendedSince: "ns/pod/uid" → first sweep the pod
 	//     showed the suspended-listener signature (uid in the key
 	//     keeps a same-named replacement from inheriting the streak).
@@ -34,16 +34,16 @@ type rabbitMQSuspendedCheck struct {
 	rbHealed         state.CooldownSet
 }
 
-// newRabbitMQSuspendedCheck builds the W6.4 check — both ledgers
+// newRabbitMQSuspendedCheck builds the rabbitmq-suspended-listener check — both ledgers
 // arm lazily on first use.
 func NewRabbitMQSuspendedCheck(d *probefw.Deps) probefw.Check {
 	return &rabbitMQSuspendedCheck{Deps: d}
 }
 
-// W6.4 — rabbitmq-suspended-listener knobs.
+// rabbitmq-suspended-listener — rabbitmq-suspended-listener knobs.
 const (
 	// CheckNameRabbitMQSuspended is the check's kuberhealthy_check
-	// label value — W6.4; not a ported HealthCheck but reports
+	// label value — rabbitmq-suspended-listener; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNameRabbitMQSuspended = "rabbitmq-suspended-listener"
@@ -53,7 +53,7 @@ const (
 )
 
 var (
-	// W6.4 — RabbitMQ pods deleted while running with a suspended
+	// rabbitmq-suspended-listener — RabbitMQ pods deleted while running with a suspended
 	// listener (started but never Ready). Counts delivered heals
 	// only — the counter increments after a quorum-safe delete
 	// landed.
@@ -69,7 +69,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// rabbitmq-suspended-listener (W6.4) — suspended listener healer.
+// rabbitmq-suspended-listener (rabbitmq-suspended-listener) — suspended listener healer.
 // ---------------------------------------------------------------------------
 
 // rabbitSuspended reports the suspended-listener signature: the pod
@@ -215,7 +215,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		// only answers "may it be deleted NOW" — a pod that would
 		// break the cluster must never consume the heal budget or
 		// the Deps-wide maintenance-mutex verdict slot, so the
-		// quorum guard runs before HealAllowed (W17).
+		// quorum guard runs before HealAllowed (heal-budget).
 		safe, err := p.rabbitQuorumSafe(ctx, pod)
 		if err != nil {
 			metrics.IncError(p.Name)

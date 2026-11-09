@@ -147,7 +147,7 @@ func outlierPodKey(ns, deploy, pod string) string {
 // pod-keyed sample map, dropping series that carry no
 // namespace/deployment/pod label (an unlabeled series can never
 // join a cohort — linkerd's own control-plane pods and
-// non-Deployment workloads read that way). W16-G1: the destination
+// non-Deployment workloads read that way). rollout-scale-flap: the destination
 // control plane labels Rollout-owned pods with `rollout` instead of
 // `deployment` — that label joins the same cohort key so a stable
 // Rollout cohort is protected like a Deployment's.
@@ -168,7 +168,7 @@ func linkerdOutlierSamples(series []promq.Sample) map[string]outlierSample {
 
 // linkerdPodTemplateHash returns the pod's replica-template hash
 // label — Deployments stamp pod-template-hash, Argo Rollouts stamp
-// rollouts-pod-template-hash (W16-G1); both name the RS owner the
+// rollouts-pod-template-hash (rollout-scale-flap); both name the RS owner the
 // membership tests resolve.
 func linkerdPodTemplateHash(pod *corev1.Pod) string {
 	if h := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; h != "" {
@@ -182,7 +182,7 @@ func linkerdPodTemplateHash(pod *corev1.Pod) string {
 // verdict: a member is a pod whose ReplicaSet owner is named
 // deploy+"-"+hash where hash is the pod's own pod-template-hash
 // label — the naming shape a Deployment rollout guarantees (and an
-// Argo Rollout at steady state mirrors, W16-G1, via the
+// Argo Rollout at steady state mirrors, rollout-scale-flap, via the
 // rollouts-pod-template-hash label). uniform=false means the members
 // carry >1 distinct hash (rollout or canary in flight → no valid
 // control group).

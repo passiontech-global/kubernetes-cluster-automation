@@ -232,7 +232,7 @@ func (c *HubCheck) Run(ctx context.Context) {
 				wreason, gn, peerNote, soloOK))
 			c.d.State.RateSpend(cdeps.FileRateRestart)
 			c.d.State.ResetCounter(cdeps.FileCtrGap)
-			// W8-CP1: hung HTTP/2 watch streams can survive past the
+			// cp-component-restart: hung HTTP/2 watch streams can survive past the
 			// wedge decision and pin the apiserver's watch cache —
 			// ss -K drops the zombie sockets so the restart (and the
 			// post-restart reconnect) starts clean.

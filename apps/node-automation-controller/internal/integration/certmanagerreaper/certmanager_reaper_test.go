@@ -66,8 +66,8 @@ func cmrOrderOwned(ns, name, state string, age time.Duration, crName string) *un
 // cmrCertRequest builds a CertificateRequest owned by certName — the
 // second hop of the attribution chain (cert-manager sets the
 // Certificate ownerRef on every CR it creates). Freshly created and
-// Ready-True: a stuck Ready=False/old CR is built inline by the W8
-// stuck-CR tests instead.
+// Ready-True: a stuck Ready=False/old CR is built inline by the
+// stuck-CR-reap tests instead.
 func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
 	o := testutil.Unstructured(
 		certificateRequestGVR.GroupVersion().WithKind("CertificateRequest"), ns, name, nil)
@@ -80,7 +80,7 @@ func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
 	return o
 }
 
-// cmrCertRequestStuck is the W8 wedge: Ready=False (Pending/Failed)
+// cmrCertRequestStuck is the stuck-CR wedge: Ready=False (Pending/Failed)
 // for >30m under certName — reaped by reapStuckCR.
 func cmrCertRequestStuck(ns, name, certName string, age time.Duration) *unstructured.Unstructured {
 	o := cmrCertRequest(ns, name, certName)
@@ -761,7 +761,7 @@ func TestCertResetFromAnnotation(t *testing.T) {
 	}
 }
 
-// W8 — a CertificateRequest wedged Ready=False >30m under a
+// stuck-CR-reap — a CertificateRequest wedged Ready=False >30m under a
 // Ready=False Certificate is deleted (budget-charged), so
 // cert-manager re-issues on the next sync.
 func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {

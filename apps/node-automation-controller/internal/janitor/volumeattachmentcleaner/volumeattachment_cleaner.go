@@ -53,7 +53,7 @@
 // The gate proofs live in sibling files: va_missing_node_gate.go
 // (gate 1 — the orphan sighting pre-pass and age proof),
 // va_out_of_service_gate.go (gate 2 — the fenced-node proof) and
-// va_stuck_terminating_gate.go (gate 3 — the W4 stuck-Terminating
+// va_stuck_terminating_gate.go (gate 3 — the va-stuck-terminating stuck-Terminating
 // finalizer strip); this file keeps Setup and the sweep
 // orchestration that consumes their verdicts.
 package volumeattachmentcleaner
@@ -101,7 +101,7 @@ const (
 	// this long whose node is gone or fenced-and-empty is a wedged
 	// attach-detach cleanup — the external-attacher finalizer never
 	// drains because the node it reports to no longer exists. Past
-	// this age the cleaner strips the finalizers itself (W4).
+	// this age the cleaner strips the finalizers itself (va-stuck-terminating).
 	vaStuckTerminatingAge = 15 * time.Minute
 )
 
@@ -243,7 +243,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	c.sightMissingNodeOrphans(vas, nodeByName, orphanNow, seenPrior, now, log)
 
 	// vaTarget is one listed VA carried into the sweep — strip tags
-	// the W4 finalizer-strip action, reason the metric label of the
+	// the va-stuck-terminating finalizer-strip action, reason the metric label of the
 	// plain delete (decided inside Confirm, so a capped-out VA costs
 	// no gate evaluation at all). Items are pointers so Confirm's
 	// reason reaches LogTarget/Delete.
@@ -256,7 +256,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	for i := range vas {
 		va := &vas[i]
 		if va.DeletionTimestamp != nil {
-			// W4: already terminating past the stuck age on a node
+			// va-stuck-terminating: already terminating past the stuck age on a node
 			// that is gone (or fenced with zero non-DaemonSet pods)
 			// — the attacher finalizer can never drain, so the
 			// finalizers are stripped to free the volume. Inside
@@ -291,7 +291,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			// when this verdict is destructive.
 			censusVerdict := ""
 			if t.strip {
-				// The W4 wedged-detach gate — fails closed inside
+				// The va-stuck-terminating wedged-detach gate — fails closed inside
 				// (a pod-list failure keeps the finalizers).
 				if c.stuckTerminatingNodeDead(ctx, t.va, nodeByName,
 					livePods, stuckReadyPrior, now) {

@@ -113,7 +113,7 @@ TasksMax=infinity
 		}
 	}
 
-	// W10-KR4 k0scontroller limits drop-in — same fd/task headroom as
+	// k0scontroller-limits k0scontroller limits drop-in — same fd/task headroom as
 	// the worker unit so systemd never caps the controller's thread
 	// count below kernel pid_max during reconcile bursts.
 	if c.controller() {
@@ -133,7 +133,7 @@ TasksMax=infinity
 		c.k0scontrollerGoMemlimitSumGuard()
 	}
 
-	// W18-7 host-level protection drop-ins, written idempotently
+	// host-protection-drop-ins host-level protection drop-ins, written idempotently
 	// (writeManaged is a sha256-gated atomic write; a no-diff cycle
 	// rewrites nothing):
 	//   - networkd: never manage the CNI's foreign routes/rules — a
@@ -146,7 +146,7 @@ TasksMax=infinity
 	//     depends on, and off automatic reboots.
 	_ = r.ensureDir("/etc/systemd/networkd.conf.d", 0o755)
 	_, _ = r.writeManaged("/etc/systemd/networkd.conf.d/99-preserve-cni-routes.conf",
-		[]byte(`# Managed by node-config-agent - W18-7 CNI route preservation.
+		[]byte(`# Managed by node-config-agent - host-protection-drop-ins CNI route preservation.
 # networkd must not flush routes/rules the CNI installed.
 [Network]
 ManageForeignRoutes=no
@@ -154,14 +154,14 @@ ManageForeignRoutingPolicyRules=no
 `), 0o644)
 	_ = r.ensureDir("/etc/systemd/logind.conf.d", 0o755)
 	_, _ = r.writeManaged("/etc/systemd/logind.conf.d/99-k8s-shutdown.conf",
-		[]byte(`# Managed by node-config-agent - W18-7 graceful kubelet shutdown.
+		[]byte(`# Managed by node-config-agent - host-protection-drop-ins graceful kubelet shutdown.
 # InhibitDelayMaxSec must exceed the kubelet's shutdownGracePeriod (60s).
 [Login]
 InhibitDelayMaxSec=65
 `), 0o644)
 	_ = r.ensureDir("/etc/apt/apt.conf.d", 0o755)
 	_, _ = r.writeManaged("/etc/apt/apt.conf.d/99-k8s-unattended-safety",
-		[]byte(`// Managed by node-config-agent - W18-7 unattended-upgrade safety.
+		[]byte(`// Managed by node-config-agent - host-protection-drop-ins unattended-upgrade safety.
 Unattended-Upgrade::Package-Blacklist {
     "containerd*";
     "runc";

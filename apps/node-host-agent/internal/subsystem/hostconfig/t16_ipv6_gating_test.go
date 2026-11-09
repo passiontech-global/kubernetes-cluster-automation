@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// W7-H5: the IPv6 gc_thresh keys join the T16 pair list only when
+// conntrack-arp-pressure: the IPv6 gc_thresh keys join the T16 pair list only when
 // the kernel exposes the ndisc table — an unconditional key would
 // fail sysctl --system on an IPv6-less host.
 func TestT16PairsIPv6Gated(t *testing.T) {
@@ -58,7 +58,7 @@ func TestT16PairsIPv6Gated(t *testing.T) {
 	}
 }
 
-// W12-KR3: the sysctl drop-in must widen the ephemeral source-port
+// conntrack-port-pressure: the sysctl drop-in must widen the ephemeral source-port
 // range and allow TIME_WAIT reuse — the pair that prevents
 // EADDRNOTAVAIL on gateway/proxy churn bursts.
 func TestT16PairsEphemeralPortHygiene(t *testing.T) {
@@ -75,7 +75,7 @@ func TestT16PairsEphemeralPortHygiene(t *testing.T) {
 	}
 }
 
-// W16-KR4: fs.aio-max-nr joins the T16 pair list only when the
+// aio-pressure: fs.aio-max-nr joins the T16 pair list only when the
 // kernel exposes the aio table — an unconditional key would fail
 // sysctl --system on an aio-less kernel.
 func TestT16PairsAIOMaxGated(t *testing.T) {

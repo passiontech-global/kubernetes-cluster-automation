@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// nebulaDegradedCTFlushInterval is the W12-NM2 dead-peer
+	// nebulaDegradedCTFlushInterval is the nebula-conntrack-flush dead-peer
 	// conntrack flush budget — often enough to unstick a
 	// recovered underlay promptly, rare enough that a permanently
 	// dead peer can't make `conntrack -D` spam the table every
@@ -208,7 +208,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		wg.Wait()
 
 		dpAlive, dpTotal := 0, 0
-		// W12-NM2: record WHICH peers failed this round — the
+		// nebula-conntrack-flush: record WHICH peers failed this round — the
 		// degraded/siteedge remediation needs the dead set to evict
 		// only their conntrack tuples, never a live peer's.
 		var deadUnderlay, deadOverlay []string
@@ -262,7 +262,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			if len(siteedge) > 0 {
 				// The siteedge latch still arms on the first
 				// detection (a lost site edge is urgent evidence);
-				// nebulaSiteedgeRun is the W12-NM2 confirmation
+				// nebulaSiteedgeRun is the nebula-conntrack-flush confirmation
 				// counter the per-peer flush waits on — same
 				// ConsecNeeded gate the degraded path carries.
 				n.nebulaSiteedgeRun++
@@ -318,7 +318,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			n.stateExit(latchdefs.LatchNebulaDegraded)
 			n.stateExit(latchdefs.LatchNebulaIsolated)
 		}
-		// W12-NM2: a partially-dead dataplane leaves the dead
+		// nebula-conntrack-flush: a partially-dead dataplane leaves the dead
 		// peers' udp/<nebula-port> conntrack pinning the tunnel
 		// long after the underlay recovers — the old code only
 		// latched and waited for full isolation before any flush.
@@ -330,7 +330,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		if !isolated {
 			n.flushDeadNebulaPeers(ctx, wd, deadUnderlay, deadOverlay)
 		}
-		// W9-NM1: small-packet pings can pass while a DF probe at
+		// overlay-mtu-guard: small-packet pings can pass while a DF probe at
 		// near-MTU size blackholes — the double-encap path MTU
 		// sits below the overlay's. Only evaluated when at least
 		// one overlay target answered the small pings; total
@@ -355,7 +355,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		n.cycles.WithLabelValues(checkNebula, "ok").Inc()
 		return
 	}
-	// W12-NM2: a skewed/unsynced clock wedges the Nebula handshake
+	// nebula-conntrack-flush: a skewed/unsynced clock wedges the Nebula handshake
 	// (cert not-yet-valid / replay window) — when a clock latch is
 	// armed and Nebula is failing, bounce timesyncd under the
 	// shared last-ntp-restart budget rather than only cycling
@@ -384,7 +384,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	n.cycles.WithLabelValues(checkNebula, "ok").Inc()
 }
 
-// checkNebulaPMTU is the W9-NM1 double-encapsulation PMTU probe:
+// checkNebulaPMTU is the overlay-mtu-guard double-encapsulation PMTU probe:
 // small-packet overlay pings keep passing while a 1200-byte
 // don't-fragment probe blackholes — the signature of a path MTU
 // below the overlay's (nebula-in-nebula / wg-in-overlay double
@@ -430,7 +430,7 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 	n.stateExit(latchdefs.LatchNebulaPMTUBlackhole)
 }
 
-// flushDeadNebulaPeers — W12-NM2: the targeted per-peer conntrack
+// flushDeadNebulaPeers — nebula-conntrack-flush: the targeted per-peer conntrack
 // eviction for the degraded/siteedge verdicts. Dead
 // OVERLAY_PROBE_TARGETS are already underlay/public IPs (the -d/-s
 // tuples conntrack records); dead markers are overlay addresses
@@ -541,7 +541,7 @@ func underlayHost(addr string) string {
 	return strings.Trim(a, "[]")
 }
 
-// restartTimesyncdOnClockLatch — W12-NM2: when the Nebula check is
+// restartTimesyncdOnClockLatch — nebula-conntrack-flush: when the Nebula check is
 // failing AND a clock latch (clock-unsync from the H1 check or the
 // hostmetrics clock-skew latch) is armed, the handshake's
 // not-before/replay-window math is a prime suspect. Restart

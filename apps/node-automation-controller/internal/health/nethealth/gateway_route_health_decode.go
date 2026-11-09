@@ -21,7 +21,7 @@ import (
 // route's spec.rules — non-Service backends are filtered out before
 // this struct exists. crossNS records whether the ref names a
 // different namespace than the route's (the ReferenceGrant gate —
-// W12-NM4b): an unset namespace resolves to same-ns by default.
+// negative-cache-guard): an unset namespace resolves to same-ns by default.
 type routeBackendRef struct {
 	ns, name string
 	port     int64
@@ -204,7 +204,7 @@ func routeBackendRefs(route *unstructured.Unstructured) []routeBackendRef {
 // Accepted=False or ResolvedRefs=False flags the matching reason —
 // one stuck attachment is enough to blackhole that parent.
 // ResolvedRefs carries the more precise ref_not_permitted reason
-// when the controller names it (W12-NM4b) so alerting can tell a
+// when the controller names it (negative-cache-guard) so alerting can tell a
 // ReferenceGrant problem apart from a plain unresolved ref.
 func routeParentConditionReasons(route *unstructured.Unstructured) map[string]bool {
 	reasons := map[string]bool{}

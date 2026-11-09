@@ -33,7 +33,7 @@ const (
 	// which latency-critical IO is queued behind bulk writers.
 	diskWriteAwaitHighMs = 200.0
 	// diskSlowIOConsecNeeded is the consecutive-cycle count the
-	// W12-KR4 DiskSlowIO gray-failure verdict must persist before
+	// disk-slow-io DiskSlowIO gray-failure verdict must persist before
 	// latching — ~10m at the default 2m interval, so a bursty
 	// backup or fstrim spike can't cordon the node.
 	diskSlowIOConsecNeeded = 5
@@ -150,7 +150,7 @@ func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
 
 // IOPressureCheck is the disk-IO starvation guard as a Check. It
 // keeps the previous diskstats snapshot for the delta math, the
-// pid→comm throttle ledger (pid reuse protection) and the W12-KR4
+// pid→comm throttle ledger (pid reuse protection) and the disk-slow-io
 // consecutive-cycle disk-slow-io streak.
 type IOPressureCheck struct {
 	d             *wdeps.Deps
@@ -195,7 +195,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 				}
 				if s.wrTicks >= prev.wrTicks {
 					dWrMs += s.wrTicks - prev.wrTicks
-					// Per-disk max read/write await for the W12-KR4
+					// Per-disk max read/write await for the disk-slow-io
 					// DiskSlowIO latch — a single dying device
 					// (bad-sector remap, RAID rebuild, slow SAN)
 					// is the signal; the pooled await above
@@ -227,7 +227,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	avg60, avg300, psiOK := psiIOFullAvgs(c.d)
 	c.d.IOPSIFullAvg60 = avg60
 	c.d.IOPSIFullAvg300 = avg300
-	// W12-KR4: the DiskSlowIO gray-failure latch — a whole disk
+	// disk-slow-io: the DiskSlowIO gray-failure latch — a whole disk
 	// whose write await stays >200ms WHILE io PSI full avg60 sits
 	// >= 25% for >=5 consecutive cycles (~10m) is a dying device
 	// or a slow shared-storage path: ScyllaDB/PostgreSQL/kubelet

@@ -83,7 +83,7 @@ const (
 // node affinity, so a pod mounted to one can ONLY ever reschedule
 // onto the node holding the data. Evicting such a pod off a
 // partitioned node is pure churn: the replacement lands right back
-// on the same broken host (or pends forever) — W10-FIX5 adds
+// on the same broken host (or pends forever) — pinned-volume-guard adds
 // openebs-hostpath alongside local-path, both hostPath-backed.
 var partitionNodePinnedStorageClasses = map[string]bool{
 	"local-path":       true,
@@ -468,7 +468,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		}
 	}
 
-	// W10-FIX5 — resolve the node-pinned PVC set once per run: pods
+	// pinned-volume-guard — resolve the node-pinned PVC set once per run: pods
 	// mounted to local-path / openebs-hostpath volumes can only run
 	// on the node holding the data, so evicting them off a
 	// partitioned node is useless churn. A PVC list failure skips

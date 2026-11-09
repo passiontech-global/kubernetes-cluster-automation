@@ -5,7 +5,7 @@
 // gates (the lookback window stays armed until a drain ends
 // caught-up; a reopen re-arms it). The Tailer owns ONLY the
 // mechanics: cursor bookkeeping, record classification and
-// latch/event emission stay in the consumers (hostmetrics' W10-KR1
+// latch/event emission stay in the consumers (hostmetrics' kernel-dmesg
 // scanner, nodereporter's NPD kernel monitor), which is why every
 // point they legitimately diverged on — whether the carry counts
 // against the drain budget, the pending overflow rule, and the

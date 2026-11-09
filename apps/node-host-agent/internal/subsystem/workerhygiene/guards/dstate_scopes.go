@@ -12,7 +12,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// Wave-7 defaults (W7-H1..H7): the D-state storm thresholds
+// Guard defaults (d-state-storm..H7): the D-state storm thresholds
 // (total procs OR runtime-critical procs), the 30m
 // systemd-scope reaper cadence, and the A2 zombie-storm
 // threshold.
@@ -202,7 +202,7 @@ func DstateRuntimeComm(comm string) bool {
 	return false
 }
 
-// DstateCheck is the W7-H1 storm detector as a Check; it owns the
+// DstateCheck is the d-state-storm storm detector as a Check; it owns the
 // over-threshold streak (ex-Hygiene.dstateFails).
 type DstateCheck struct {
 	d     *wdeps.Deps
@@ -263,7 +263,7 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckDState, "ok")
 }
 
-// --- Check: systemd-scopes (W7-H2) ---
+// --- Check: systemd-scopes (systemd-scopes) ---
 // On high-churn nodes (cicd's Concourse/Tekton/Shipwright build
 // pods, crashloop storms) PID 1 leaks transient
 // cri-containerd-*.scope units in the failed state — they pile into
@@ -273,7 +273,7 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 // reset-failed is safe on live scopes (it only clears the failed
 // bookkeeping of already-dead units).
 
-// ScopesCheck is the W7-H2 failed-scope reaper as a Check; it owns
+// ScopesCheck is the systemd-scopes failed-scope reaper as a Check; it owns
 // the 30m sweep stamp (ex-Hygiene.lastScopeScan).
 type ScopesCheck struct {
 	d        *wdeps.Deps
@@ -334,7 +334,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 }
 
-// --- Check: cilium-envoy xDS NACK + node-local-dns LRP (W7-H3) ---
+// --- Check: cilium-envoy xDS NACK + node-local-dns LRP (envoy-xds-lrp) ---
 // Two datapath wedges that leave every healthz green:
 //   - envoy rejects xDS pushes (cds/lds/rds update_rejected
 //     counters climbing) — the listener accepts connections but

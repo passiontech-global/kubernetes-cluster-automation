@@ -8,13 +8,13 @@
 //     manual jobs and jobs that failed before the limit existed linger
 //     forever, wasting storage and cluttering `kubectl get jobs`
 //     (nonprod 2026-09-22).
-//   - buildrun_reap.go    — W9-GO2 + W12-GO2: the completed-run TTL
+//   - buildrun_reap.go    — buildrun-ttl-sweep + run-workspace-reaper: the completed-run TTL
 //     sweep (Shipwright BuildRuns plus Tekton PipelineRuns/TaskRuns,
 //     same 24h retention horizon) and the orphaned run-workspace PVC
 //     reaper.
 //   - stuck_terminating.go — C3b: detect-only auditor for Namespaces,
 //     PVCs and VolumeAttachments wedged in Terminating past 2h, plus
-//     the W4 pvc-protection unstick.
+//     the va-stuck-terminating pvc-protection unstick.
 //
 // The duties are independent — a failure in one is joined into the
 // run error without skipping the others (the failed-Job sweep still
@@ -44,7 +44,7 @@ type stuckTerminatingKey struct {
 type failedJobsJanitor struct {
 	cs kubernetes.Interface
 	// dyn reads/writes CRDs (Shipwright BuildRuns and Tekton
-	// PipelineRuns/TaskRuns — W9-GO2/W12-GO2) — nil disables the
+	// PipelineRuns/TaskRuns — buildrun-ttl-sweep/run-workspace-reaper) — nil disables the
 	// completed-run sweep only and keeps CRD-owned workspace PVCs
 	// (their owner cannot be verified); every typed sweep is
 	// unaffected. main.go always wires the manager's dynamic client.
@@ -63,7 +63,7 @@ type failedJobsJanitor struct {
 }
 
 // Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
-// carries the dynamic client the W9-GO2/W12-GO2 completed-run TTL
+// carries the dynamic client the buildrun-ttl-sweep/run-workspace-reaper completed-run TTL
 // sweep and the CRD half of the workspace-PVC reaper need — pass nil
 // only in tests that never exercise them. The gate rides
 // shared.SetupNoConfig like every module: Deps.Disabled registers
@@ -88,7 +88,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		return err
 	}
 	// C3b audit rides the same hourly tick — detect-only, it shares
-	// neither the job list nor the delete cap. The W9-GO2/W12-GO2
+	// neither the job list nor the delete cap. The buildrun-ttl-sweep/run-workspace-reaper
 	// retention sweeps join it: completed runs first so a just-reaped
 	// run's workspace PVC reads "owner gone" in the same pass — all
 	// three are cluster-wide retention hygiene. The PVC census is

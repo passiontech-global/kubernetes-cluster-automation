@@ -1,5 +1,5 @@
 // operator_workqueue_scan.go — the per-operator sweep core of the
-// operator-workqueue-watchdog check (W5.8): the leader-election
+// operator-workqueue-watchdog check (operator-workqueue-watchdog): the leader-election
 // liveness precondition, the CR stuck-signature scan (collect +
 // persist first-seen), and the post-scan window maintenance (prune +
 // resolved clears + gauge emit). Split out of

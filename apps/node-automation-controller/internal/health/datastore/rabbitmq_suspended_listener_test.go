@@ -1,5 +1,5 @@
 // rabbitmq_suspended_listener_test.go — coverage for the quorum
-// gates and heal guards self_healing_test.go's W6.4 section does
+// gates and heal guards self_healing_test.go's rabbitmq-suspended-listener section does
 // not reach: the BUG-C2 count check (fewer live pods than
 // spec.replicas can never prove a delete leaves quorum), the
 // "not every other replica Ready" sibling check reached only once

@@ -77,7 +77,7 @@ const nodeCordonActiveMaxAge = 45 * time.Minute
 // controller's OWN defensive cordon of a degraded worker, and its
 // fresh unschedulable taint would otherwise read as a 45m operator
 // drain and lock every heal.AllowedV-gated remediation cluster-wide
-// exactly while the cluster is sick (W12 P0-1 — self-inflicted
+// exactly while the cluster is sick (node-hang-precordon — self-inflicted
 // maintenance lockout).
 func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
 	if !n.Spec.Unschedulable {

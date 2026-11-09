@@ -83,7 +83,7 @@ const (
 	diskBloatPodThresholdBytes    = int64(15) << 30 // 15 GiB
 	diskBloatScanInterval         = 15 * time.Minute
 	// wlayerBloatThresholdBytes is the writable-layer
-	// Warning threshold, deliberately tighter than the W6.3
+	// Warning threshold, deliberately tighter than the disk-bloat
 	// eviction threshold above: the scan only raises a
 	// ContainerWritableLayerBloat event, so it can afford to fire
 	// before the node approaches DiskPressure.

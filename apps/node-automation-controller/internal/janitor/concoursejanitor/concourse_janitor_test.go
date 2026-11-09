@@ -189,7 +189,7 @@ func cjPod(t *testing.T, cs *fake.Clientset, name string) *corev1.Pod {
 }
 
 // ---------------------------------------------------------------------------
-// W16-CI1 — stalled / Garden max-containers recovery
+// concourse-worker-stall — stalled / Garden max-containers recovery
 // ---------------------------------------------------------------------------
 
 // cjSteadyWorkerPod is a worker Ready since `readyAt` — past the

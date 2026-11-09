@@ -1,4 +1,4 @@
-// cilium_lrp.go — W7-H3 node-local-dns LRP datapath guard
+// cilium_lrp.go — envoy-xds-lrp node-local-dns LRP datapath guard
 // (CiliumLRPCheck): a Ready node-local-dns pod whose :53 UDP
 // listener is wedged → delete the pod so the DaemonSet respawns it
 // with a fresh socket.
@@ -35,7 +35,7 @@ const (
 // it on a cilium node always fails → false-positive pod kills.
 )
 
-// W7 pod matcher — anchored like konnPodRe/dnsPodRe.
+// pod matcher — anchored like konnPodRe/dnsPodRe.
 var nldPodRe = regexp.MustCompile(`^node-local-dns-[a-z0-9]+$`) // H3 LRP DNS guard
 
 // The dnsProbe seam default is probee.DNSQuery (the old probeDNSUDP
@@ -51,7 +51,7 @@ var nldPodRe = regexp.MustCompile(`^node-local-dns-[a-z0-9]+$`) // H3 LRP DNS gu
 // (the DaemonSet respawns it with a fresh socket; last-nld-restart
 // 30m budget). Only evaluated on cilium nodes (cilium_host present)
 // — calico nodes serve local DNS without the LRP datapath.
-// CiliumLRPCheck is the W7-H3 node-local-dns datapath guard as a
+// CiliumLRPCheck is the envoy-xds-lrp node-local-dns datapath guard as a
 // Check; it owns the :53 probe fail streak (ex-Hygiene.nldFails)
 // plus the BPF service-map desync streak (svcFails — an apiserver
 // Service with Ready endpoints whose local BPF map entry has 0

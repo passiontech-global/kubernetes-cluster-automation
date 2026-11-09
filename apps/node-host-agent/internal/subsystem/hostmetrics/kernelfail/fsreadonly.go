@@ -1,7 +1,7 @@
-// fsreadonly.go — W10-ST1 updateFSReadonlyEvidence: ro ext4/xfs/btrfs
+// fsreadonly.go — fs-readonly updateFSReadonlyEvidence: ro ext4/xfs/btrfs
 // mounts under the PVC provisioner roots parsed out of
 // /proc/<pid>/mounts → state-fs-readonly (FilesystemReadOnly) ahead
-// of statfs. The Wave-10 contract overview lives in kernelfail.go.
+// of statfs. The kernelfail contract overview lives in kernelfail.go.
 package kernelfail
 
 import (
@@ -22,7 +22,7 @@ import (
 // latch FilesystemReadOnly forever).
 const fsErrorLatchTTL = 30 * time.Minute
 
-// --- W10-ST1: read-only mounts under PVC dirs ---
+// --- fs-readonly: read-only mounts under PVC dirs ---
 
 // pvcMountFSTypes are the journaled filesystems a PVC backing mount
 // realistically uses — the plan's ext4/xfs plus btrfs (same failure
@@ -98,7 +98,7 @@ func (r *Runner) roPVCMounts() []string {
 	return out
 }
 
-// updateFSReadonlyEvidence drives state-fs-readonly — the Wave-10
+// updateFSReadonlyEvidence drives state-fs-readonly — the kernelfail
 // evidence latch feeding FilesystemReadOnly. Two evidence sources,
 // either sufficient:
 //
@@ -106,7 +106,7 @@ func (r *Runner) roPVCMounts() []string {
 //     saw a filesystem/block error — the fs may already be remounted
 //     ro or heading there), and
 //   - an ro ext4/xfs/btrfs mount under a PVC root in the host mount
-//     table (W10-ST1 — catches the remount statfs hasn't probed).
+//     table (fs-readonly — catches the remount statfs hasn't probed).
 //
 // The latch clears only when BOTH evidences are absent; an
 // unreadable mounts file contributes nothing (fail-safe, not

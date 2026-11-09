@@ -1,4 +1,4 @@
-// immutable_job_healer_test.go — the W8-GO1 immutable-Job heal path:
+// immutable_job_healer_test.go — the immutable-job-heal immutable-Job heal path:
 // the happy-path reap, and the NotFound race on the delete being a
 // benign skip (no IncError, no cooldown stamp — cilium-identity
 // janitor parity).

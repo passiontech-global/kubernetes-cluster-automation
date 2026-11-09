@@ -22,10 +22,10 @@ import (
 )
 
 // ===========================================================================
-// W10-NM4 — Nebula overlay MTU blackhole prober
+// nebula-mtu-blackhole — Nebula overlay MTU blackhole prober
 // ===========================================================================
 //
-// The W9-NM1 PMTU check (nethealth.go) probes ONE DF packet at 1200B
+// The overlay-mtu-guard PMTU check (nethealth.go) probes ONE DF packet at 1200B
 // bytes against the first alive overlay target every Cycle. NM4 is
 // the deeper variant the plan assigns to this file: every 5th prober
 // tick it DF-pings a peer NEBULA ip at 1252 payload bytes (neb1 MTU
@@ -37,7 +37,7 @@ import (
 // clamp MSS on the overlay dev via iptables TCPMSS (rate-limited —
 // the -C existence check keeps the rule idempotent). The
 // node_agent_nebula_mtu_blackhole gauge rides the node-exporter
-// textfile channel, the W10 metric convention.
+// textfile channel, the node-exporter textfile convention.
 //
 // The prober is a separate goroutine from the netlink guard: the
 // guard blocks inside routeGuardRead while the socket lives, so a
@@ -141,7 +141,7 @@ func (n *NetHealth) mtuProbeLoop(ctx context.Context, st *mtuProbeState) {
 	}).Run(ctx)
 }
 
-// checkNebulaMTUBlackhole runs one DF probe cycle (W10-NM4). Gating
+// checkNebulaMTUBlackhole runs one DF probe cycle (nebula-mtu-blackhole). Gating
 // mirrors checkNebulaHealth's dataplane section: the nebula unit
 // must be enabled+active AND nebula must own the overlay — probing
 // a dormant mesh would latch on a dataplane that isn't carrying
@@ -397,7 +397,7 @@ func (n *NetHealth) checkCiliumWGMTUInvariant(ctx context.Context, nebDev string
 }
 
 // writeMTUBHMetric emits node_agent_nebula_mtu_blackhole (0/1) to
-// the node-exporter textfile — the W10 metric channel
+// the node-exporter textfile — the node-exporter textfile channel
 // (controllerhygiene's textfile-dir override parity). Identical values
 // skip the rewrite so the file's mtime tracks real changes.
 func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {

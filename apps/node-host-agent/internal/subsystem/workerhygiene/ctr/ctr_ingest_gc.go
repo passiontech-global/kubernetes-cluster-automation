@@ -1,6 +1,6 @@
 // ctr_ingest_gc.go — the 39/A3 ctr-ingest-gc check: stale containerd
 // content ingest dirs reaped above the /var/lib/k0s high watermark
-// (or on the 6h rescan cadence), plus the W9 store-wide content
+// (or on the 6h rescan cadence), plus the store-wide content
 // prune on its own 6h budget while the disk stays high.
 package ctr
 
@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	contentPruneInterval = 6 * time.Hour // content-store prune budget (Wave-9)
+	contentPruneInterval = 6 * time.Hour // content-store prune budget
 )
 
 // IngestGCCheck is the A3 stale-ingest reaper as a Check; it owns
@@ -54,7 +54,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckIngestGC, "ok")
 		return
 	}
-	// W9: above the high watermark the content store itself may be
+	// above the high watermark the content store itself may be
 	// the hog — run the store-wide prune on its own 6h budget IN
 	// ADDITION to the stale-ingest sweep below. Below the
 	// watermark (periodic rescan only) it never fires.

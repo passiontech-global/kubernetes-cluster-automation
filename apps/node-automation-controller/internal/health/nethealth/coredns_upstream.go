@@ -1,4 +1,4 @@
-// coredns_upstream.go — the coredns-upstream check (W10-NM5):
+// coredns_upstream.go — the coredns-upstream check (coredns-upstream):
 // per-pod CoreDNS/node-local-dns upstream healthcheck failures or
 // SERVFAIL ratio from Prometheus; an isolated failing pod is
 // deleted while siblings stay healthy, with a pod-readiness
@@ -34,7 +34,7 @@ type coreDNSUpstreamCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newCoreDNSUpstreamCheck builds the W10-NM5 check — its only state
+// newCoreDNSUpstreamCheck builds the coredns-upstream check — its only state
 // is the emitted-gauge ledger; heal cooldowns ride the shared
 // Deps.Heals set via deletePodHeal.
 func NewCoreDNSUpstreamCheck(d *probefw.Deps) probefw.Check {
@@ -44,16 +44,16 @@ func NewCoreDNSUpstreamCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameCoreDNSUpstream = "coredns-upstream"
 
-	// W10-NM5 — coredns-upstream knobs.
+	// coredns-upstream — coredns-upstream knobs.
 	coreDNSUpstreamHealCool = 30 * time.Minute
 	coreDNSFallbackMinAge   = 10 * time.Minute
 )
 
 var (
-	// W10-NM5 — per-pod DNS upstream failure signal.
+	// coredns-upstream — per-pod DNS upstream failure signal.
 	coreDNSUpstreamFailingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_coredns_upstream_failing",
-		Help: "1 while the coredns/node-local-dns pod reports isolated upstream failures — W10-NM5.",
+		Help: "1 while the coredns/node-local-dns pod reports isolated upstream failures — coredns-upstream.",
 	}, []string{"namespace", "pod"})
 )
 

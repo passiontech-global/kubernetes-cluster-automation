@@ -1,4 +1,4 @@
-// site_skew.go — the W12-SC2(ii) cross-DC site-skew signature of
+// site_skew.go — the stateful-split-brain(ii) cross-DC site-skew signature of
 // the stateful-masterless-services check: after maintenance on the
 // main site every stateful master can stay pinned to the standby
 // site — reads/writes then pay the inter-DC tunnel RTT forever.
@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	// W12-SC2 — primary-site skew: the two DC zones this cluster
+	// stateful-split-brain — primary-site skew: the two DC zones this cluster
 	// spans. After maintenance on the main site every stateful
 	// master can stay pinned to the standby site — reads/writes
 	// then pay the inter-DC tunnel RTT forever.
@@ -42,7 +42,7 @@ const (
 )
 
 var (
-	// W12-SC2 — the cross-DC pinning signal: 1 while a stateful
+	// stateful-split-brain — the cross-DC pinning signal: 1 while a stateful
 	// master's Ready endpoint lives in the standby zone (lanit)
 	// while the STS also serves Ready replicas in the main zone
 	// (datahub) — or while >=80% of all stateful masters are pinned
@@ -58,7 +58,7 @@ func init() {
 		statefulMasterSiteSkewGauge)
 }
 
-// siteSkewWatch is the W12-SC2(ii) cross-DC skew signature's
+// siteSkewWatch is the stateful-split-brain(ii) cross-DC skew signature's
 // watchdog state (serial sweep — unguarded):
 //   - emitted: the emitted-gauge ledger for
 //     statefulMasterSiteSkewGauge — a skew that resolves loses its
@@ -140,7 +140,7 @@ func (w *siteSkewWatch) begin(ctx context.Context, log logr.Logger,
 // place — and records the standby pin for the trigger-B ratio.
 func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 	eps []kube.ReadyEndpoint, rep *probefw.SweepReport) {
-	// W12-SC2(ii) — cross-DC pin accounting: only meaningful on
+	// stateful-split-brain(ii) — cross-DC pin accounting: only meaningful on
 	// a multi-zone cluster with a live master to place.
 	if !s.multiZone || len(eps) == 0 {
 		return
@@ -184,7 +184,7 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 // close runs trigger B — the cluster-wide pin ratio — then
 // reconciles the emitted-gauge ledger.
 func (s *siteSkewSweep) close(rep *probefw.SweepReport) {
-	// W12-SC2(ii) trigger B — the pin is cluster-wide when >=80% of
+	// stateful-split-brain(ii) trigger B — the pin is cluster-wide when >=80% of
 	// evaluated stateful masters live in the standby zone (every
 	// resolved endpoint lanit, none datahub). Flag every pinned
 	// master not already caught by trigger A.

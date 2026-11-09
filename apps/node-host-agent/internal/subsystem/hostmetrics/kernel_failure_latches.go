@@ -1,4 +1,4 @@
-// kernel_failure_latches.go — the parent half of the Wave-10
+// kernel_failure_latches.go — the parent half of the
 // kernel deep-failure contract.
 //
 // The engine itself — the /dev/kmsg drain, the pid/fd
@@ -30,7 +30,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
 
-// runHostCmd executes a host binary for the Wave-10 probes that have
+// runHostCmd executes a host binary for the deep-failure probes that have
 // no Config seam (chronyc, dmesg) — a package var so tests stub it.
 // The 30s cap matches the nethealth runHostCmd convention; the exec
 // itself is hostexec.RunCombined — capped output + WaitDelay, no

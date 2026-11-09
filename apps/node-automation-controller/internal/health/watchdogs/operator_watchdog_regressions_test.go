@@ -6,7 +6,7 @@
 //     status on them), so the generic stale-generation signature
 //     flagged every healthy OCI repo forever.
 //   - notification-controller carries ZERO CR resources — its
-//     v1beta3 Alert/Provider/Receiver are static objects (W10-CP3
+//     v1beta3 Alert/Provider/Receiver are static objects (operator-workqueue-watchdog
 //     restored the target for lease liveness only; the
 //     passiontech-k0s-nonprod false-positive incident still applies).
 //   - leaderPods selector fallback capped at ONE pod (the oldest)
@@ -271,7 +271,7 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// notification-controller — zero CR resources (W10-CP3)
+// notification-controller — zero CR resources (operator-workqueue-watchdog)
 // ---------------------------------------------------------------------------
 
 // The notification-controller target is back for lease-liveness

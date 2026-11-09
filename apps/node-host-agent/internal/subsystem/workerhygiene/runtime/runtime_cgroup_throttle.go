@@ -1,10 +1,10 @@
 // runtime_cgroup_throttle.go — the cgroup-pod-throttle guard
-// (wdeps.CheckCgroupThrottle, W12-KR1). kubelet MemoryQoS writes
+// (wdeps.CheckCgroupThrottle, cgroup-pod-throttle). kubelet MemoryQoS writes
 // memory.high on pod cgroups: a container whose working set
 // outgrows it is NOT OOM-killed — the kernel forces every
 // allocation into direct reclaim / sleep-throttle instead, so the
 // pod's own memory.pressure `full` spikes and memory.events:high
-// keeps counting while node-wide PSI (psi-memory-thrash, W2)
+// keeps counting while node-wide PSI (psi-memory-thrash, psi-memory-thrash)
 // stays flat. The pod stays Running, its probes answer, and p99
 // goes 100x — the classic Datadog/Meta cgroup-v2 stall with no
 // OOMKill to point at. The check walks the pod-level cgroups
@@ -41,7 +41,7 @@ const (
 	podCgroupPSIFullHigh = 40.0
 )
 
-// CgroupThrottleCheck is the W12-KR1 pod-cgroup throttle guard as
+// CgroupThrottleCheck is the cgroup-pod-throttle pod-cgroup throttle guard as
 // a Check. prevHigh / prevPidsDenials keep last cycle's
 // memory.events:high / pids.events:max per pod slice — both
 // verdicts are DELTAS, not levels (a high-but-flat counter means
@@ -178,7 +178,7 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCgroupThrottle, "abort")
 		return
 	}
-	// The W2 node-wide thrash latch owns the signal while the WHOLE
+	// The psi-memory-thrash node-wide thrash latch owns the signal while the WHOLE
 	// node is under memory pressure — pod-level throttle verdicts
 	// only mean anything when the node itself is quiet (a mis-sized
 	// memory.request, not a global event).
@@ -208,7 +208,7 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			avg60 > podCgroupPSIFullHigh && !nodeThrashing {
 			c.d.PodCgroupMemoryThrottled++
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: cgroup-pod-throttle pod uid=%s memory.pressure full avg60=%.1f high_delta=+%d — memory.high throttle stall without node PSI pressure (W12-KR1)",
+				"suspect: cgroup-pod-throttle pod uid=%s memory.pressure full avg60=%.1f high_delta=+%d — memory.high throttle stall without node PSI pressure (cgroup-pod-throttle)",
 				podUIDFromSlice(dir), avg60, highDelta))
 		}
 		// --- pids.max utilization half ---

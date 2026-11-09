@@ -1,4 +1,4 @@
-// argocd_agent_spin.go — the argocd-agent-spin check (W16-G3): the
+// argocd_agent_spin.go — the argocd-agent-spin check (argocd-agent-spin): the
 // argocd-agent-agent pods stuck in a gRPC dead-stream reconnect
 // hot-loop. When the agent's stream to the remote ArgoCD dies
 // without a clean close, the client spins: Recv returns an error
@@ -54,7 +54,7 @@ type argoCDAgentSpinCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewArgoCDAgentSpinCheck builds the W16-G3 check — its state is the
+// NewArgoCDAgentSpinCheck builds the argocd-agent-spin check — its state is the
 // seen/emitted ledgers (zero value usable); the delete cooldown
 // rides the shared Deps.Heals set.
 func NewArgoCDAgentSpinCheck(d *probefw.Deps) probefw.Check {
@@ -64,7 +64,7 @@ func NewArgoCDAgentSpinCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameArgoCDAgentSpin = "argocd-agent-spin"
 
-	// W16-G3 — argocd-agent-spin knobs. The agent install lives in
+	// argocd-agent-spin — argocd-agent-spin knobs. The agent install lives in
 	// the argocd namespace with the argocd-agent-agent- name prefix
 	// (argocd-agent upstream's default naming).
 	argocdAgentNS      = "argocd"
@@ -100,10 +100,10 @@ var argocdAgentReconnectMarkers = []string{
 }
 
 var (
-	// W16-G3 — spinning argocd-agent-agent pods.
+	// argocd-agent-spin — spinning argocd-agent-agent pods.
 	argocdAgentSpinGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_argocd_agent_spin",
-		Help: "1 while an argocd-agent-agent pod shows the gRPC dead-stream reconnect hot-loop (CPU or log channel) — W16-G3.",
+		Help: "1 while an argocd-agent-agent pod shows the gRPC dead-stream reconnect hot-loop (CPU or log channel) — argocd-agent-spin.",
 	}, []string{"namespace", "pod", "reason"})
 )
 

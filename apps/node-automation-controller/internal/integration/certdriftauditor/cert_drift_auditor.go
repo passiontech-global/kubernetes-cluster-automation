@@ -32,7 +32,7 @@
 //     Secret in namespace linkerd carrying ca.crt/crt.pem (Opaque
 //     included, e.g. linkerd-identity-issuer) get days-to-expiry of
 //     the earliest cert in the bundle.
-//  5. kubernetes-replicator sync drift (W7-C6) — every TLS Secret
+//  5. kubernetes-replicator sync drift (replicator-cert-drift) — every TLS Secret
 //     carrying replicator.v1.mittwald.de/replicated-from has its
 //     tls.crt compared against the source Secret's. A mismatch that
 //     persists across >= 2 consecutive scans flags
@@ -47,7 +47,7 @@
 //
 // Layout: this file holds the shared state/types, the Setup + run
 // entry point and the shared helpers; webhook_ca_audit.go Check A,
-// tls_secret_audit.go Check B (+ the W8-NM2 issuer-serial watch),
+// tls_secret_audit.go Check B (+ the issuer-serial-watch issuer-serial watch),
 // replicated_secret_audit.go Check E, trust_bundle_audit.go Check D.
 package certdriftauditor
 
@@ -78,7 +78,7 @@ const (
 	injectCAFromSecretAnno = "cert-manager.io/inject-ca-from-secret"
 	// replicatedFromAnno carries "src-namespace/src-name" — the
 	// kubernetes-replicator annotation marking a replicated copy
-	// (W7-C6).
+	// (replicator-cert-drift).
 	replicatedFromAnno = "replicator.v1.mittwald.de/replicated-from"
 	// replicationDriftScans is how many consecutive sweeps a tls.crt
 	// mismatch must persist before the drift gauge fires — a
@@ -86,7 +86,7 @@ const (
 	replicationDriftScans = 2
 	// replicatedFromVersionAnno is the replicator's source-version
 	// stamp — removing it on a drifted destination forces
-	// kubernetes-replicator to resync the copy (W8-NM2).
+	// kubernetes-replicator to resync the copy (issuer-serial-watch).
 	replicatedFromVersionAnno = "replicator.v1.mittwald.de/replicated-from-version"
 	replicationResyncCooldown = time.Hour
 	// tlsExpiryEmitWindow bounds TLSSecretDaysToExpiry cardinality:
@@ -99,7 +99,7 @@ const (
 	// pushes a tracked Secret back past the window lets the ledger
 	// prune its series again.
 	tlsExpiryEmitWindow = 30 * 24 * time.Hour
-	// linkerd-identity-issuer fingerprint tracking (W8-NM2): the
+	// linkerd-identity-issuer fingerprint tracking (issuer-serial-watch): the
 	// issuer cert's SerialNumber is the fingerprint — a change means
 	// cert-manager rotated the issuer and linkerd-identity must
 	// re-roll to pick the new bundle up. linkerdIssuerSecret names
@@ -181,7 +181,7 @@ type certDriftAuditor struct {
 	// replicationMismatch counts consecutive scans where a
 	// replicated secret's tls.crt differed from its source — drift
 	// fires only at replicationDriftScans, so a replicator mid-sync
-	// never raises a false alert (W7-C6). StreakLedger arms itself
+	// never raises a false alert (replicator-cert-drift). StreakLedger arms itself
 	// lazily, so literal-constructed fixtures need no nil dance.
 	replicationMismatch state.StreakLedger
 	// seenReplication: series ledger for ReplicatedSecretDrift —

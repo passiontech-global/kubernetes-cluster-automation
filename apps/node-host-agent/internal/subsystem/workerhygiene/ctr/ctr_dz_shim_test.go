@@ -1,4 +1,4 @@
-// ctr_dz_shim_test.go — W12-KR2 coverage: an orphan containerd
+// ctr_dz_shim_test.go — orphan-sandbox-netns coverage: an orphan containerd
 // shim wedged in D (uninterruptible) or Z (zombie) state cannot
 // be SIGKILLed away — ctr-tasks escalates it into the
 // pod-teardown-wedged latch instead of burning a pointless kill.

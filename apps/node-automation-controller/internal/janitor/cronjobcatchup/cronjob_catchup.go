@@ -68,7 +68,7 @@ const (
 	// more than 100 missed start times and kube-controller-manager
 	// logs "too many missed start times" and NEVER schedules the
 	// CronJob again while spec.startingDeadlineSeconds is unset —
-	// the job silently dies (W5.9b).
+	// the job silently dies (cronjob-catchup).
 	missedStartsLimit = 100
 	// deadlinePatchSeconds is the startingDeadlineSeconds the
 	// auto-unfreezer stamps — 1h of slack lets the controller pick
@@ -136,7 +136,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
 			continue // deliberately paused — honor the operator's intent
 		}
-		// W5.9b — the too-many-missed-starts unfreeze runs for EVERY
+		// cronjob-catchup — the too-many-missed-starts unfreeze runs for EVERY
 		// non-suspended CronJob, opt-in or not: unlike a backlog
 		// replay, stamping startingDeadlineSeconds has no side
 		// effect on the workload — it only un-breaks the controller.
@@ -281,7 +281,7 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 }
 
 // ---------------------------------------------------------------------------
-// W5.9b — TooManyMissedStarts detector + auto-unfreezer.
+// cronjob-catchup — TooManyMissedStarts detector + auto-unfreezer.
 // ---------------------------------------------------------------------------
 
 // missedOver100 reports whether the schedule owes more than 100 ticks

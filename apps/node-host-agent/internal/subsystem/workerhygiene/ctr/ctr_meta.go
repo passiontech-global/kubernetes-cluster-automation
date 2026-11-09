@@ -1,4 +1,4 @@
-// ctr_meta.go — the W10-KR3 containerd meta.db corruption guard
+// ctr_meta.go — the meta-db-corruption containerd meta.db corruption guard
 // (split out of the old deep_failure_checks.go): journal-signature
 // probe plus the reparented-orphan-shim evidence channel. Shares the
 // shim-scope helpers in ctr_tasks.go.
@@ -33,7 +33,7 @@ const ctrMetaJournalWindow = "3 minutes ago"
 var ctrMetaCorruptRe = regexp.MustCompile(
 	`failed to loadmeta|invalid freelist page|bbolt|meta\.db: Somethings wrong`)
 
-// CtrMetaCheck is the W10-KR3 containerd meta.db corruption
+// CtrMetaCheck is the meta-db-corruption containerd meta.db corruption
 // guard as a Check; it owns the evidence streak
 // (ex-Hygiene.ctrMetaFails). Two evidence channels, either
 // sufficient for state-containerd-corrupt (KubeletRuntimeStall
@@ -159,7 +159,7 @@ func ctrTaskInitLive(d *wdeps.Deps, dir string) bool {
 	return d.PidLive(ipid)
 }
 
-// --- W10-KR1 consumer: host-level OOM → event + metric ---
+// --- kernel-dmesg consumer: host-level OOM → event + metric ---
 
 // lastHostOOMEventFile dedups SystemOOMVictim events — the marker
 // files are cumulative, so "already emitted" is a count/epoch pair.

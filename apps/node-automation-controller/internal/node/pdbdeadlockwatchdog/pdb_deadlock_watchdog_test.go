@@ -224,7 +224,7 @@ func TestPDBWatchdogCordonedNodeBlocked(t *testing.T) {
 	}
 }
 
-// W10-FIX5 — a statically-cordoned node (spec.unschedulable held past
+// pinned-volume-guard — a statically-cordoned node (spec.unschedulable held past
 // the cordon-active window, companion taint older than 45m) is
 // deliberate state, not a drain in flight: cordoned_node_blocked must
 // not open its continuity window for it.

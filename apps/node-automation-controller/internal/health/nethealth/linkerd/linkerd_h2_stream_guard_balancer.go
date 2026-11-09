@@ -1,4 +1,4 @@
-// linkerd_h2_stream_guard_balancer.go — the W12-NM3 half of the
+// linkerd_h2_stream_guard_balancer.go — the linkerd-h2-stream-guard half of the
 // linkerd-h2-stream-guard check: the outbound failure-accrual lockout
 // (a client proxy holding balancer endpoints with NONE state="ready"
 // long after the destination recovered) and the proxy-OOMKilled wedge
@@ -22,7 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// W12-NM3 — pods whose linkerd-proxy keeps endpoints for a
+// linkerd-h2-stream-guard — pods whose linkerd-proxy keeps endpoints for a
 // target but ZERO in state="ready" past the persistence window,
 // while the destination Service still has Ready endpoints: the
 // client-side failure-accrual / dead-channel lockout.
@@ -36,7 +36,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM3 — outbound balancer lockout & proxy OOM detection
+// linkerd-h2-stream-guard — outbound balancer lockout & proxy OOM detection
 // ---------------------------------------------------------------------------
 
 // linkerdProxyOOMWindow bounds how recent the OOM termination must
@@ -136,7 +136,7 @@ func (p *linkerdH2StreamGuardCheck) readyEndpointsByService(
 	return ready, nil
 }
 
-// scanOutboundBalancers implements the W12-NM3 outbound
+// scanOutboundBalancers implements the linkerd-h2-stream-guard outbound
 // failure-accrual lockout detection: a meshed client pod whose
 // linkerd-proxy holds balancer endpoints for a target but reports
 // ZERO in state="ready" is circuit-broken — the destination

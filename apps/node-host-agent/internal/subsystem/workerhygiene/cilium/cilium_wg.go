@@ -1,4 +1,4 @@
-// cilium_wg.go — W5.6 WireGuard peer-gc drift healer
+// cilium_wg.go — cilium-wg-peer-gc WireGuard peer-gc drift healer
 // (CiliumWGCheck): cilium_wg0 alive but allowed-ips peers below the
 // expected count → latch + agent restart — plus the wg/encrypt-
 // status/healthz peer-count parsers and the ReadyNodes fallback.
@@ -23,7 +23,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// --- Check: cilium WireGuard peer-gc drift healer (W5.6) ---
+// --- Check: cilium WireGuard peer-gc drift healer (cilium-wg-peer-gc) ---
 // A cilium WireGuard node can lose its wg0 peer table (kernel-side
 // peer GC racing agent bookkeeping): cilium_wg0 exists, the agent's
 // healthz stays green, but every peer's allowed-ips reads "(none)"
@@ -233,7 +233,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// it carries per-peer transfer counters and handshakes, so
 	// zombie peers (tx flowing, rx dead, stale/no handshake) can be
 	// excluded from the healthy count. The dump exec failing keeps
-	// the W5.6 allowed-ips count path (backward compatibility).
+	// the cilium-wg-peer-gc allowed-ips count path (backward compatibility).
 	peers, dumpErr := c.d.Cfg.Seams.Cilium.WGDumpPeers(ctx, c.d.Cfg.Systemd)
 	if dumpErr != nil {
 		peers = nil

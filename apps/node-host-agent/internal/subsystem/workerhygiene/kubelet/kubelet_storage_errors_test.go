@@ -1,4 +1,4 @@
-// kubelet_storage_errors_test.go — W12-KR4 coverage: the
+// kubelet_storage_errors_test.go — disk-slow-io coverage: the
 // kubelet-syncloop :10250/metrics scrape now also parses
 // storage_operation_errors_total into the
 // node_kubelet_storage_operation_errors_total textfile series —

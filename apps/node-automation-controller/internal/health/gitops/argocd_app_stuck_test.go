@@ -1,5 +1,5 @@
 // argocd_app_stuck_test.go — coverage for the argocd-app-stuck
-// check (W10-CP6): absent-CRD quiet, Progressing refresh patch,
+// check (argocd-app-stuck): absent-CRD quiet, Progressing refresh patch,
 // ComparisonError repo-server restart.
 package gitops
 
@@ -27,7 +27,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-CP6 — argocd-app-stuck
+// argocd-app-stuck — argocd-app-stuck
 // ---------------------------------------------------------------------------
 
 func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
@@ -119,7 +119,7 @@ func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
 	}
 }
 
-// W16-G1 — the same excuse covers a Rollout resource-tree entry: a
+// rollout-scale-flap — the same excuse covers a Rollout resource-tree entry: a
 // Rollout the go-kube-downscaler parked at spec.replicas:0 with the
 // downscaler/* annotations is sleep, not stuck evidence.
 func TestArgoCDAppStuckSkipsDownscaledRollout(t *testing.T) {

@@ -164,7 +164,7 @@ type pendingState struct {
 // cooldown (also persisted via passiontech.dev/last-helm-stall-unwedge),
 // alerted the once-per-cooldown alert dedup shared by "re-stalled
 // after unwedge" and "signature matched but a guard refused", and
-// attempts the W8-GO2 retry-cycle cap. CooldownSets are zero-value
+// attempts the helm-stall-unwedge retry-cycle cap. CooldownSets are zero-value
 // ready and deliberately unbounded: stamps past the window read
 // uncooled and entries for vanished HRs are dead weight.
 type stallState struct {
@@ -175,7 +175,7 @@ type stallState struct {
 	attempts  map[string]*stallAttempt
 }
 
-// immutableJobState carries the W8-GO1 immutable-Job heal ledger:
+// immutableJobState carries the immutable-job-heal immutable-Job heal ledger:
 // Kustomization ns/name → last failed-immutable-Job delete — the 30m
 // in-RAM half of the cooldown; the durable half is
 // passiontech.dev/last-immutable-job-heal on the Kustomization itself.
@@ -315,7 +315,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// and the Kustomization list are independent duties — a failure
 	// in one must never blind the others, so all run and their
 	// errors join (nil+nil+nil → nil).
-	// W9-CP2 — Kine bloat guard: cap superseded helm release secrets
+	// kine-bloat-guard — Kine bloat guard: cap superseded helm release secrets
 	// per release. Independent of every signature below — it runs on
 	// every sweep, healthy cluster or not, and BEFORE the per-HR
 	// unlock pass so its cluster-wide list never masks the
@@ -368,7 +368,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	if ksErr == nil {
 		u.pruneFluxSourceSeries(list, kustomizations)
 	}
-	// W8-GO1 — immutable-Job apply errors on Kustomizations: the
+	// immutable-job-heal — immutable-Job apply errors on Kustomizations: the
 	// completed/failed Job blocking the apply is reaped so
 	// kustomize-controller can recreate it.
 	u.healImmutableJobs(ctx, kustomizations)

@@ -13,13 +13,13 @@
 //	   watchdog-state-monitor latches, network-problem-detector
 //	   K8sExporter, kubelet pressure);
 //	c) no node may carry a stormTaints key (set by reaper/evictor);
-//	d) W12-SC1 — no PriorityClass preemption cascade: more than
+//	d) preemption-cascade-signal — no PriorityClass preemption cascade: more than
 //	   stormPreemptionMax reason=Preempted events inside
 //	   stormPreemptionWindow is a domino eviction storm (a
 //	   high-priority pod preempts victims that preempt their own
 //	   victims) — the descheduler's evictions would add another
 //	   wave on top.
-//	e) W18-8 — no cluster-wide image-pull storm: stormImagePullMinPods
+//	e) image-pull-storm-gate — no cluster-wide image-pull storm: stormImagePullMinPods
 //	   pods or stormImagePullMinNamespaces namespaces with containers
 //	   waiting in ImagePullBackOff/ErrImagePull mean images are not
 //	   landing; rescheduling pods onto other nodes just spreads
@@ -33,7 +33,7 @@
 // manual hold (game-day/runbook) that skips scaling. An API failure
 // aborts the reconcile — never a "clear" verdict on empty data.
 //
-// W18-9 — forgotten maintenance holds are warned about: a hold kept
+// maintenance-hold-stale — forgotten maintenance holds are warned about: a hold kept
 // "true" continuously past maintenanceHoldStaleAfter fires ONE
 // Warning event MaintenanceHoldStale on the descheduler Deployment
 // (first-seen tracked under kube.AnnoFirstSeenStormGateHold — the
@@ -104,23 +104,23 @@ const (
 	stormGateHoldAnno     = kube.AnnoStormGateHold
 	stormGateDecisionAnno = kube.AnnoStormGateDecision
 
-	// W12-SC1 — preemption-cascade knobs, matched to
+	// preemption-cascade-signal — preemption-cascade knobs, matched to
 	// scheduler-watchdog's: an ordinary scheduler emits a handful
 	// of Preempted events during placement churn; more than the
 	// ceiling inside the window is a domino cascade.
 	stormPreemptionWindow = 5 * time.Minute
 	stormPreemptionMax    = 15
 
-	// W18-8 — image-pull storm thresholds (storm signal (e)): 3
+	// image-pull-storm-gate — image-pull storm thresholds (storm signal (e)): 3
 	// stuck pods in one namespace is one broken Deployment, but
 	// three pods anywhere — or members of sets in TWO namespaces —
-	// is a cluster-level pull problem (same shape as the W10-GI5
+	// is a cluster-level pull problem (same shape as the image-pull-storm
 	// health check's classification, tightened to the gating
 	// verdict).
 	stormImagePullMinPods       = 3
 	stormImagePullMinNamespaces = 2
 
-	// W18-9 — a maintenance hold (storm-gate-hold annotation or a
+	// maintenance-hold-stale — a maintenance hold (storm-gate-hold annotation or a
 	// NodeHealthCheck spec.pauseRequests) kept continuously past
 	// this age is a forgotten one: the Warning
 	// MaintenanceHoldStale event asks the operator to confirm it is
@@ -145,7 +145,7 @@ const (
 // node-host-agent overlay conditions; KernelHungTasks,
 // KernelSlabLeak, KernelResourceExhaustion, CgroupDyingLeak,
 // MemoryPSIThrashing, ClockUnsynchronized, ClockSkewDetected
-// (W12-1.4 — chrony still synced but >2s offset), InodePressure,
+// (node-hang-extra-conds — chrony still synced but >2s offset), InodePressure,
 // KubeletPLEGUnhealthy, CalicoFelixDown, CiliumIPAMExhausted and the
 // remaining Cilium* latches are the
 // node-problem-detector/kubelet/CNI latches that make rebalancing
@@ -194,7 +194,7 @@ type deschedulerStormGate struct {
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
-	// recorder emits the W18-9 MaintenanceHoldStale warnings — the
+	// recorder emits the maintenance-hold-stale MaintenanceHoldStale warnings — the
 	// manager-provided event recorder. nil (StubManager tests)
 	// drops the event rather than panicking.
 	recorder events.EventRecorder
@@ -345,7 +345,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
 	}
 
-	// W18-9 (NHC half): a NodeHealthCheck whose spec.pauseRequests has
+	// maintenance-hold-stale (NHC half): a NodeHealthCheck whose spec.pauseRequests has
 	// been non-empty past maintenanceHoldStaleAfter is a forgotten
 	// maintenance pause — warn once. It sits behind the
 	// deployment-exists skip like the mutex reads: a cluster without
@@ -365,7 +365,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		return ctrl.Result{}, err
 	}
 
-	// W12-SC1 storm signal (d): a PriorityClass preemption cascade
+	// preemption-cascade-signal storm signal (d): a PriorityClass preemption cascade
 	// — a domino wave of reason=Preempted events — gates the
 	// descheduler so its own evictions do not amplify the storm.
 	// The read happens AFTER the deployment-exists skip so a
@@ -384,7 +384,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			preemptedCount, stormPreemptionWindow, stormPreemptionMax))
 	}
 
-	// W18-8 storm signal (e): a cluster-wide image-pull storm —
+	// image-pull-storm-gate storm signal (e): a cluster-wide image-pull storm —
 	// enough pods stuck in ImagePullBackOff/ErrImagePull that
 	// rescheduling would just spread unrunnable pods onto more
 	// nodes. Same fail-closed posture as the events scan above: a
@@ -413,7 +413,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	}
 
 	if deploy.Annotations[stormGateHoldAnno] == "true" {
-		// W18-9: a hold kept "true" past the stale window is a
+		// maintenance-hold-stale: a hold kept "true" past the stale window is a
 		// forgotten one — one MaintenanceHoldStale Warning per
 		// episode. Runs before the early return so the hold path
 		// never scales but still audibly complains.
@@ -523,7 +523,7 @@ func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]strin
 }
 
 // ---------------------------------------------------------------------------
-// W18-9 — forgotten maintenance holds (MaintenanceHoldStale).
+// maintenance-hold-stale — forgotten maintenance holds (MaintenanceHoldStale).
 // ---------------------------------------------------------------------------
 
 // checkHoldStale fires the one-per-episode MaintenanceHoldStale
@@ -573,7 +573,7 @@ func (r *deschedulerStormGate) deployAnnoPatch() func(context.Context, []byte) e
 	}
 }
 
-// checkNHCPauseStale is the NHC half of W18-9: every NodeHealthCheck
+// checkNHCPauseStale is the NHC half of maintenance-hold-stale: every NodeHealthCheck
 // whose spec.pauseRequests has been non-empty past
 // maintenanceHoldStaleAfter gets the same one-per-episode
 // MaintenanceHoldStale Warning on the NHC object itself, window

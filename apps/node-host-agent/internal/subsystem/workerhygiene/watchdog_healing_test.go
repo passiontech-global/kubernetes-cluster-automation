@@ -1,9 +1,9 @@
-// Wave-8 tests — the agent-owned watchdog heartbeat (BUG-H1),
+// Infra-guard tests — the agent-owned watchdog heartbeat (BUG-H1),
 // A4-latch self-healing (BUG-H4), latch mtime refresh (BUG-H6),
 // 2xx-only probeHTTP verdicts (BUG-H7), the disk-bloat log/
 // snapshot attribution (BUG-H8), calico felix restart + cali*
-// orphan-veth GC (W8-NM3), the cilium BPF-map-pressure latch
-// (W8-NM3) and the PSI memory-thrash evictor (W2).
+// orphan-veth GC (mesh-net-guards), the cilium BPF-map-pressure latch
+// (mesh-net-guards) and the PSI memory-thrash evictor (psi-memory-thrash).
 
 package workerhygiene
 
@@ -316,7 +316,7 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	}
 }
 
-// --- W8-NM3: calico felix restart + orphan-veth GC ---
+// --- mesh-net-guards: calico felix restart + orphan-veth GC ---
 
 // calicoPod builds a Running calico-node-* pod on this node.
 func calicoPod(name, uid string) *corev1.Pod {
@@ -458,7 +458,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 	}
 }
 
-// --- W8-NM3: cilium BPF map pressure ---
+// --- mesh-net-guards: cilium BPF map pressure ---
 
 // TestCheckCiliumBPFMapPressureLatches: a critical map past the
 // fill ratio latches state-cilium-bpf-map-pressure; back under the
@@ -513,7 +513,7 @@ func TestParseCiliumBPFMapsShapes(t *testing.T) {
 	}
 }
 
-// --- W2: PSI memory thrash ---
+// --- psi-memory-thrash: PSI memory thrash ---
 
 // writeThrashFiles lays down the PSI pressure/memory + meminfo
 // files the thrash check reads: full avg60 (percent) and

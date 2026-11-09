@@ -1,4 +1,4 @@
-// disk_bloat.go — the W6.3 runaway-dir detector
+// disk_bloat.go — the disk-bloat runaway-dir detector
 // (wdeps.CheckDiskBloat) plus the disk side-guards that ride
 // the same cycle slot: the run-tmpfs host /run tmpfs guard
 // (80% fill → journald vacuum + orphan .tmp sweep, 15m budget)
@@ -26,7 +26,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// W6.3 disk-bloat thresholds: above the warn watermark the
+// disk-bloat disk-bloat thresholds: above the warn watermark the
 // bounded walk runs (at most once per DiskBloatScanInterval —
 // the walk itself costs IO on the disk that is already full);
 // above the critical watermark a non-system offender may be
@@ -233,7 +233,7 @@ func diskBloatOwnedByStatefulSet(p *corev1.Pod) bool {
 	return false
 }
 
-// DiskBloatCheck is the W6.3 runaway-dir detector as a Check. It
+// DiskBloatCheck is the disk-bloat runaway-dir detector as a Check. It
 // owns the scan stamp (ex-Hygiene.lastBloatScan) — the bounded
 // walk costs IO on the very disk that is full, so above the warn
 // watermark it runs at most once per DiskBloatScanInterval.
@@ -452,7 +452,7 @@ func (c *DiskBloatCheck) runTmpfsGuard(ctx context.Context) {
 
 // coredumpGC sweeps stale core dumps under CoredumpDir once the
 // filesystem holding it crosses the disk-bloat warn watermark (the
-// same evidence source the W6.3 walk gates on). The coredump
+// same evidence source the disk-bloat walk gates on). The coredump
 // Storage=none drop-in keeps a converged host's store empty; this is
 // the backstop for nodes the drop-in has not reached yet. Files
 // younger than coredumpMinAge survive one cycle so an in-progress
@@ -551,7 +551,7 @@ func podDeclaresEphemeralStorage(pod *corev1.Pod) bool {
 // The scan walks (a) the active overlayfs snapshotter's <id>/fs
 // upperdirs and (b) the kubelet pod volume dirs of pods lacking the
 // limit; any writable layer past WLayerBloatThresholdBytes (5 GiB —
-// deliberately tighter than the W6.3 eviction threshold) raises a
+// deliberately tighter than the disk-bloat eviction threshold) raises a
 // ContainerWritableLayerBloat Warning event (on the owning pod when
 // the snapshot/pod dir resolves, else node-scoped). It is
 // interval-budgeted (BloatScanInterval) because the size walk is IO

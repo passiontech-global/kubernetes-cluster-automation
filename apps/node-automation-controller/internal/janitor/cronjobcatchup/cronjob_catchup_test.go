@@ -559,7 +559,7 @@ func TestCronJobCatchupTimeZoneHonored(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W5.9b — TooManyMissedStarts detector + auto-unfreezer
+// cronjob-catchup — TooManyMissedStarts detector + auto-unfreezer
 // ---------------------------------------------------------------------------
 
 // missedOver100 counts the schedule ticks owed between anchor and now

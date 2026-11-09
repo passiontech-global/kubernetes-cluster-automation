@@ -42,7 +42,7 @@ const CheckNameNodeCondSweeper = "node-condition-sweeper"
 // nodereporter owns and re-stamps lastHeartbeatTime on while alive
 // (nodecond.HeartbeatSweptNames in libs/hostkit, the single source of
 // truth shared with the agent: the 41 latch-backed conditions
-// (incl. InodePressure, agent-latched since W18-1) plus the
+// (incl. InodePressure, agent-latched since inode-pressure) plus the
 // ReadonlyFilesystem mount monitor — a superset of the old
 // precordon-hang + clock-skew lists). Kubelet-owned types (Ready,
 // MemoryPressure/DiskPressure) are never touched, as is

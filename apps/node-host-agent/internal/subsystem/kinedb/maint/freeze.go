@@ -2,7 +2,7 @@
 // the probe-side files: the XID-wraparound VACUUM (FREEZE, ANALYZE)
 // half of wal_xid_hygiene.go's item 3 (the gauge stays probe-side —
 // the freeze is a full-table rewrite storm that belongs inside the
-// daily serialisation window) and the W8-CP2 item-3 pg_repack
+// daily serialisation window) and the kinedb-maintenance item-3 pg_repack
 // headroom gate from kine_self_healing.go.
 package maint
 
@@ -67,7 +67,7 @@ func (m *Maint) readXidAge(ctx context.Context, pg, user, pass string,
 }
 
 // repackHeadroom checks whether the postgres data filesystem has
-// >= 2.5*(heap+wal) free before pg_repack — W8-CP2 item 3. walBytes
+// >= 2.5*(heap+wal) free before pg_repack — kinedb-maintenance item 3. walBytes
 // comes from pg_ls_waldir; free bytes from `df -B1 <datadir>` inside
 // the container. Returns ok=false (and a note) when the check itself
 // can't run — inconclusive means DON'T repack, same as assess-fail.

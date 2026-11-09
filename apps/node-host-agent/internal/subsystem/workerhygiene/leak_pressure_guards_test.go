@@ -1,7 +1,7 @@
-// Wave-9 tests — the kernel slab-leak guard + PSI evictor hardening
-// (W9-KR3), the orphan /run/netns/cni-* reaper (W9-NM2), the
-// containerd content-store prune (W9-NM4), and the cilium_wg0
-// double-encapsulation MTU guard (W9-NM1 worker side).
+// Leak-pressure tests — the kernel slab-leak guard + PSI evictor hardening
+// (kernel-slab-leak), the orphan /run/netns/cni-* reaper (netns-endpoint-sync), the
+// containerd content-store prune (content-store-prune), and the cilium_wg0
+// double-encapsulation MTU guard (overlay-mtu-guard worker side).
 
 package workerhygiene
 
@@ -30,7 +30,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W9-KR3: kernel slab-leak guard ---
+// --- kernel-slab-leak: kernel slab-leak guard ---
 
 // writeMeminfoSlab writes a meminfo carrying MemTotal, MemAvailable
 // and SUnreclaim (kB) — the three fields the slab guard + PSI check
@@ -224,7 +224,7 @@ func TestPSIThrashEvictSuppressedBySlabLeak(t *testing.T) {
 	}
 }
 
-// --- W9 victim-selection hardening ---
+// --- victim-selection hardening ---
 
 // thrashEnv lays down sustained PSI thrash + a healthy slab ratio.
 func thrashEnv(t *testing.T, e *env) {
@@ -453,7 +453,7 @@ func TestPSIEvictorEvictionAPIError(t *testing.T) {
 	}
 }
 
-// --- W9-NM2: orphan CNI netns reaper ---
+// --- netns-endpoint-sync: orphan CNI netns reaper ---
 
 // netnsFixture points the reaper at a tempdir netns root inside the
 // fixture's proc tree (same filesystem → hardlinks work for the
@@ -641,7 +641,7 @@ func TestOrphanCNINetnsReappearedResetsWindow(t *testing.T) {
 	}
 }
 
-// --- W9-NM4: containerd content-store prune ---
+// --- content-store-prune: containerd content-store prune ---
 
 // stubPruneCount stubs the single Seams.Ctr.Exec seam to count
 // `content prune` execs (the argv the PruneContent method builds —
@@ -730,7 +730,7 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	}
 }
 
-// --- W9-NM1 (worker side): cilium_wg0 double-encap MTU guard ---
+// --- overlay-mtu-guard (worker side): cilium_wg0 double-encap MTU guard ---
 
 // TestCiliumMTUWG0DriftLatches: cilium_wg0 above nebula−60 latches
 // cilium-mtu-drift even with NO cilium_net datapath — the wg0 path

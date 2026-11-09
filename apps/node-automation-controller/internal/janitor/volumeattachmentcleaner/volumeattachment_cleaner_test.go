@@ -531,7 +531,7 @@ func TestVACleanerDeleteErrorTolerated(t *testing.T) {
 	}
 }
 
-// W4 — a VolumeAttachment Terminating >15m whose node is gone has its
+// va-stuck-terminating — a VolumeAttachment Terminating >15m whose node is gone has its
 // finalizers stripped (the attacher-side detach can never drain).
 func TestVACleanerStuckTerminatingFinalizerStrip(t *testing.T) {
 	now := time.Now()

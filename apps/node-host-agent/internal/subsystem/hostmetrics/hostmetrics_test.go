@@ -62,7 +62,7 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		NetstatFile:       filepath.Join(root, "netstat"),
 		SNMPFile:          filepath.Join(root, "snmp"),
 		FilesystemTargets: []string{"/fake/etc", "/fake/k0s"},
-		// Wave-2 sources under root — never the real /proc or /sys:
+		// Base sources under root — never the real /proc or /sys:
 		// an fdinfo/zombie sweep of the live host would leak real
 		// series into the scrape assertions.
 		ProcRoot:                filepath.Join(root, "proc"),
@@ -89,7 +89,7 @@ func fixture(t *testing.T) (Config, map[string]string) {
 	return cfg, dirs
 }
 
-// fixtureSeams pins the Wave-10 seams to a nonexistent path for the
+// fixtureSeams pins the deep-failure seams to a nonexistent path for the
 // whole test binary — fixture() re-points them at its own temp root
 // per test. Without this every refreshLatches would open the REAL
 // /dev/kmsg and exec REAL dmesg/chronyc on the test host — the
@@ -213,22 +213,22 @@ func TestDescribe(t *testing.T) {
 	c.Describe(ch)
 	// 10 base descs + the 2 legacy prom_emit aliases
 	// (node_watchdog_state, node_watchdog_egress_relay) + 16
-	// gray-failure telemetry descs (H1/H2/H3/H6/H7) + 7 W7 descs
+	// gray-failure telemetry descs (H1/H2/H3/H6/H7) + 7 host-guard descs
 	// (dstate, systemd scopes, conntrack insert_failed/drop, arp,
 	// cgroup memory high/oom_kill).
-	// + 2 W8 descs (kernel-keys ratio, sockstat tcp close_wait).
-	// + 1 W9 desc (localpv dir bytes).
+	// + 2 kernel descs (kernel-keys ratio, sockstat tcp close_wait).
+	// + 1 localpv desc (localpv dir bytes).
 	// + 6 netstat/snmp kernel TCP/IP counter descs.
-	// + 4 W12-KR3 descs (ephemeral port saturation, tcp CLOSE_WAIT
+	// + 4 conntrack-port-pressure descs (ephemeral port saturation, tcp CLOSE_WAIT
 	// count, node_exporter-named nf_conntrack insert_failed/drop).
-	// + 1 W12-CP4a desc (sa.pub signer-key fingerprint hash).
+	// + 1 sa-pub-key-fingerprint desc (sa.pub signer-key fingerprint hash).
 	// + 6 guard descs (daemon fd ratio, containerd meta.db,
 	//   k0scontroller children RSS, fs bytes used ratio, eBPF
 	//   programs/maps counts).
 	// + 3 clocksource/conntrack descs (clocksource_non_tsc, conntrack
 	//   search_restarts/invalid counters).
 	// + 1 mountinfo desc (mountinfo entries count).
-	// + 3 W16-KR4 AIO descs (aio allocated/maximum/used_ratio in the
+	// + 3 aio-pressure AIO descs (aio allocated/maximum/used_ratio in the
 	//   filefd domain).
 	if got := len(ch); got != 75 {
 		t.Fatalf("Describe emitted %d descs want 75", got)

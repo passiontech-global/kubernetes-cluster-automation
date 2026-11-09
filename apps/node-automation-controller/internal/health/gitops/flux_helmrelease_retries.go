@@ -1,5 +1,5 @@
 // flux_helmrelease_retries.go — the flux-helmrelease-retries check
-// (W10-CP4): HelmReleases parked Ready=False past the stuck window
+// (flux-helmrelease-retries): HelmReleases parked Ready=False past the stuck window
 // with a retries-exhausted failure get the reconcile annotation
 // triple stamped (requestedAt/forceAt/resetAt) so helm-controller
 // runs the release again.
@@ -27,19 +27,19 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// fluxHRRetriesCheck is the W10-CP4 Flux HelmRelease
+// fluxHRRetriesCheck is the flux-helmrelease-retries Flux HelmRelease
 // retries-exhausted remediator.
 type fluxHRRetriesCheck struct {
 	*probefw.Deps
 
 	//   - hrRetryHealed: "ns/name" → last reconcile-annotation patch —
 	//     the 30m per-HelmRelease cooldown for the retries-exhausted
-	//     remediator (W10-CP4). The requestedAt annotation we stamp is
+	//     remediator (flux-helmrelease-retries). The requestedAt annotation we stamp is
 	//     the durable half across restarts.
 	hrRetryHealed state.CooldownSet
 }
 
-// newFluxHRRetriesCheck builds the W10-CP4 check — the constructor
+// newFluxHRRetriesCheck builds the flux-helmrelease-retries check — the constructor
 // that used to seed the cooldown map inside the monolithic
 // newClusterHealthProber literal; the ledger is zero-value ready.
 func NewFluxHRRetriesCheck(d *probefw.Deps) probefw.Check {
@@ -47,12 +47,12 @@ func NewFluxHRRetriesCheck(d *probefw.Deps) probefw.Check {
 }
 
 // ---------------------------------------------------------------------------
-// W10-CP4 — flux HelmRelease retries-exhausted remediator.
+// flux-helmrelease-retries — flux HelmRelease retries-exhausted remediator.
 // ---------------------------------------------------------------------------
 
 const (
 	// CheckNameFluxHRRetries is the check's kuberhealthy_check
-	// label value — W10-CP4; not a ported HealthCheck but reports
+	// label value — flux-helmrelease-retries; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNameFluxHRRetries = "flux-helmrelease-retries"
@@ -69,7 +69,7 @@ const (
 	// check (same pair the flux CLI `reconcile --with-source`
 	// writes), and resetAt clears the exhausted retry counter —
 	// helm-controller >= v0.37.0 ignores requestedAt/forceAt on a
-	// RetriesExceeded/Stalled HR without it (W12 P0-3).
+	// RetriesExceeded/Stalled HR without it (flux-reset-at).
 )
 
 // helmReleaseRetryGVRs are the HelmRelease API versions the check
@@ -80,7 +80,7 @@ var helmReleaseRetryGVRs = kube.HelmReleaseGVRs
 // fluxHRFailureReasons are the Ready=False reasons that mean the
 // helm action itself failed — combined with the "retries exhausted"
 // message substring they cover every spelling helm-controller uses
-// once spec.upgrade.remediation.retries is spent (W10-CP4).
+// once spec.upgrade.remediation.retries is spent (flux-helmrelease-retries).
 var fluxHRFailureReasons = map[string]bool{
 	"InstallFailed":    true,
 	"UpgradeFailed":    true,

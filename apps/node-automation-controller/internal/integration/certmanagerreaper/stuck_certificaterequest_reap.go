@@ -1,4 +1,4 @@
-// stuck_certificaterequest_reap.go — the W8 stuck-CertificateRequest
+// stuck_certificaterequest_reap.go — the stuck-CertificateRequest
 // path: a CR wedged Ready=False (Pending/Failed) past crStuckMinAge
 // under a Ready=False or expiring cert gets deleted so cert-manager
 // re-issues it on the cert's next sync. Also hosts the shared
@@ -28,7 +28,7 @@ import (
 
 // listCRs returns the CertificateRequests of one namespace, caching
 // the result (and the error) for the whole sweep — the Order-
-// attribution path and the W8 stuck-CR path share a single List, so a
+// attribution path and the stuck-CR path share a single List, so a
 // shared API outage IncErrors once instead of once per consumer.
 func (r *certManagerReaper) listCRs(ctx context.Context, ns string) (*unstructured.UnstructuredList, error) {
 	if res, ok := r.crCache[ns]; ok {

@@ -188,7 +188,7 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		return nil
 	}
 
-	// W7-C1 — the shared heal preamble gates the evictions
+	// unmeshed-pod-auditor — the shared heal preamble gates the evictions
 	// (heal.Gate = the maintenance mutex + the fleet-wide heal
 	// budget, both fail closed): killing pods mid-drain/upgrade is
 	// exactly what the mutex exists to prevent, and the budget caps
@@ -225,7 +225,7 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			"pod", p.Namespace+"/"+p.Name,
 			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
 		// The kill goes through the policy/v1 Eviction API, NOT a raw
-		// Delete (W7-C1): the apiserver enforces PodDisruptionBudgets
+		// Delete (unmeshed-pod-auditor): the apiserver enforces PodDisruptionBudgets
 		// and consumes a disruption slot atomically, so an already
 		// degraded workload cannot lose its last replica to a
 		// cosmetic fix. The UID precondition closes the TOCTOU

@@ -1,6 +1,6 @@
 // linkerd_protocol_detection_stall_template.go — the
 // workload-template patch of the linkerd-protocol-detection-stall
-// check (W10-NM3/W12-P0-6): resolve the pod's controller owner to its
+// check (linkerd-protocol-detection-stall/template-patch-stamp): resolve the pod's controller owner to its
 // Deployment/StatefulSet/DaemonSet/Job/CronJob and merge the missing
 // ports into the pod template — carrying the durable patch stamp and
 // the GitOps-drift guard that refuses the re-patch fight when
@@ -40,13 +40,13 @@ var linkerdGitOpsMarkers = []string{
 	"argocd.argoproj.io/tracking-id",
 }
 
-// W12-P0-6 — a GitOps-owned workload whose template keeps losing
+// template-patch-stamp — a GitOps-owned workload whose template keeps losing
 // the opaque-ports annotation the check already patched: Flux/
 // ArgoCD selfHeal is reverting it, and re-patching is a rollout
 // fight the controller must refuse to join.
 var linkerdGitOpsOpaqueDriftGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_linkerd_gitops_opaque_drift",
-	Help: "1 while a GitOps-managed workload's pod template lost opaque-ports again inside the patch stamp window — fix the annotation in Git, the controller stops re-patching (W12-P0-6).",
+	Help: "1 while a GitOps-managed workload's pod template lost opaque-ports again inside the patch stamp window — fix the annotation in Git, the controller stops re-patching (template-patch-stamp).",
 }, []string{"namespace", "kind", "name"})
 
 func init() {
@@ -98,7 +98,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 			return false, false
 		}
 		if dref.Kind == "Rollout" {
-			// W16-G1 — a Rollout-owned ReplicaSet: patch the parent
+			// rollout-scale-flap — a Rollout-owned ReplicaSet: patch the parent
 			// Rollout (argoproj.io/v1alpha1, unstructured) exactly
 			// like the Deployment path — same template annotation,
 			// same patch stamp and GitOps drift guard via
@@ -254,7 +254,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 			"kind", kind, "workload", ns+"/"+name)
 		return true, false
 	}
-	// W12-P0-6 durable stamp: a workload we already patched that lost
+	// template-patch-stamp durable stamp: a workload we already patched that lost
 	// opaque-ports again inside the window was reverted by its owner.
 	// GitOps-owned (Flux kustomize/helm labels, ArgoCD tracking-id)
 	// means force/selfHeal is doing the revert — do NOT re-patch (the
@@ -346,13 +346,13 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		_, patchErr = p.CS.BatchV1().CronJobs(ns).Patch(ctx, name,
 			types.MergePatchType, payload, metav1.PatchOptions{})
 	case "rollout":
-		// W16-G1 — unstructured argoproj.io/v1alpha1 Rollout: the
+		// rollout-scale-flap — unstructured argoproj.io/v1alpha1 Rollout: the
 		// same merge-patch body through the dynamic client.
 		_, patchErr = p.Dyn.Resource(kube.GVRArgoRollout).Namespace(ns).
 			Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	if patchErr != nil {
-		// Forbidden until the RBAC wave lands patch on pods /
+		// Forbidden until the RBAC rollout lands patch on pods /
 		// daemonsets / jobs — log and fail closed (no pod delete).
 		log.Info("WARN: linkerd heal — template patch failed",
 			"kind", kind, "workload", ns+"/"+name, "error", patchErr)

@@ -1,11 +1,11 @@
 // cilium_l2_lease_guard.go — the cilium-l2-lease-guard check
-// (W16-NM1): the cilium-agent leader for a Service's L2 announcement
+// (cilium-l2-lease-guard): the cilium-agent leader for a Service's L2 announcement
 // holds the Lease cilium-l2announce-<svc>_<ns> in kube-system; when
 // that holder is a node that cannot actually answer ARP on the VIP
 // segment — the node is gone, NotReady, reports
 // NetworkUnavailable=True, is cordoned (unschedulable), carries the
 // control-plane role (the L2 policy's nodeSelector excludes it —
-// W16-NM1's static Rule 9), or its cilium-agent pod has been
+// cilium-l2-lease-guard's static Rule 9), or its cilium-agent pod has been
 // not-Ready for >= 2 consecutive sweep cycles — the VIP keeps being
 // announced from a blackhole: every route backend behind it reads
 // zero Ready endpoints exactly like gateway-route-health's
@@ -58,7 +58,7 @@ type ciliumL2LeaseGuardCheck struct {
 	agentNotReadyStreak map[string]int
 }
 
-// NewCiliumL2LeaseGuardCheck builds the W16-NM1 check — the gauge
+// NewCiliumL2LeaseGuardCheck builds the cilium-l2-lease-guard check — the gauge
 // ledger and the streak map are zero-value ready; heal cooldowns
 // ride the shared Deps.Heals set.
 func NewCiliumL2LeaseGuardCheck(d *probefw.Deps) probefw.Check {
@@ -69,7 +69,7 @@ func NewCiliumL2LeaseGuardCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameCiliumL2LeaseGuard = "cilium-l2-lease-guard"
 
-	// W16-NM1 — cilium-l2-lease-guard knobs.
+	// cilium-l2-lease-guard — cilium-l2-lease-guard knobs.
 	// ciliumL2LeaseHealCool is the per-lease delete cooldown — the
 	// Cilium agent re-elects within seconds of losing the Lease, so
 	// ten minutes means the heal either worked or the cluster has a
@@ -99,7 +99,7 @@ const (
 )
 
 var (
-	// W16-NM1 — one series per (lease, holder, stale reason).
+	// cilium-l2-lease-guard — one series per (lease, holder, stale reason).
 	ciliumL2StaleLeaseGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_cilium_l2_stale_lease",
 		Help: "1 while a cilium-l2announce Lease's holder cannot answer the VIP segment (node_missing, node_not_ready, network_unavailable, node_unschedulable, control_plane_node, cilium_agent_not_ready) — the check deletes the Lease under the heal gate so Cilium re-elects.",
@@ -192,7 +192,7 @@ func ciliumL2StaleHolderReasons(lease *coordinationv1.Lease,
 	}
 	if _, cp := node.Labels[l2ControlPlaneRoleLabel]; cp {
 		// The L2 announcement policy's nodeSelector excludes
-		// control-plane nodes (W16-NM1 Rule 9) — a holder carrying
+		// control-plane nodes (cilium-l2-lease-guard Rule 9) — a holder carrying
 		// the role announces a VIP no policy-selected agent answers.
 		reasons = append(reasons, l2ReasonControlPlane)
 	}

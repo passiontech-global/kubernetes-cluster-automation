@@ -1,4 +1,4 @@
-// cnpg_audit.go — W16-ST1 of velero-backup-auditor: the CloudNativePG
+// cnpg_audit.go — cnpg-backup-audit of velero-backup-auditor: the CloudNativePG
 // backup audit. CNPG ScheduledBackups drive a spec.clusterName's
 // Backup objects (matched on spec.clusterName in the same namespace);
 // the schedule's posture is judged for the failed / stuck / stale /
@@ -23,10 +23,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W16-ST1 — CloudNativePG backup auditor
+// cnpg-backup-audit — CloudNativePG backup auditor
 // ---------------------------------------------------------------------------
 
-// W16-ST1 — CNPG backup health thresholds: a backup still "running"
+// cnpg-backup-audit — CNPG backup health thresholds: a backup still "running"
 // after 6h lost the thread (same window as the Velero in-flight and
 // Everest stuck checks), and the newest "completed" backup older than
 // 36h means the schedule stopped producing restorable points (same

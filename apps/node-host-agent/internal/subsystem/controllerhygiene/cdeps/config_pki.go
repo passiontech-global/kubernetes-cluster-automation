@@ -1,5 +1,5 @@
 // config_pki.go — the PKIDrift domain knobs: PKIDriftPair and
-// PKIDriftConfig (the W8-CP4 on-disk-vs-served PKI cert drift
+// PKIDriftConfig (the pki-cert-drift on-disk-vs-served PKI cert drift
 // check — no env wiring) and the applyDefaults block lifted out
 // of config.go.
 package cdeps
@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// PKIDriftPair is one W8-CP4 check row: the on-disk cert file, the
+// PKIDriftPair is one pki-cert-drift check row: the on-disk cert file, the
 // TLS listener that must already serve it, and the systemd unit a
 // detected drift restarts.
 type PKIDriftPair struct {
@@ -19,7 +19,7 @@ type PKIDriftPair struct {
 	Unit     string
 }
 
-// PKIDriftConfig is the W8-CP4 on-disk-vs-served PKI cert drift check.
+// PKIDriftConfig is the pki-cert-drift on-disk-vs-served PKI cert drift check.
 // No env wiring — package defaults unless set programmatically.
 type PKIDriftConfig struct {
 	// Pairs pairs an on-disk cert with the socket that must present

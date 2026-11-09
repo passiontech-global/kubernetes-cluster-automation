@@ -1,5 +1,5 @@
 // scylla_cluster_health.go — the scylla-cluster-health check
-// (W9-ST1): audits ScyllaDB operand health — degraded ScyllaCluster
+// (scylla-cluster-health): audits ScyllaDB operand health — degraded ScyllaCluster
 // conditions, per-member Service/EndpointSlice desync, and gossip/
 // raft stall signatures in member pod logs — reported on
 // node_automation_scylla_unhealthy{reason}.
@@ -25,11 +25,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
+// scyllaHealthCheck is the scylla-cluster-health scylla cluster health watchdog.
 type scyllaHealthCheck struct {
 	*probefw.Deps
 
-	// W9-ST1 watchdog state (serial sweep — unguarded):
+	// scylla-cluster-health watchdog state (serial sweep — unguarded):
 	//   - scyllaFirstSeen: "member/ns/svc" | "gossip/ns/pod/uid" →
 	//     first sweep the signature showed; it must persist
 	//     scyllaSignatureMinAge before the gauge fires (the
@@ -42,14 +42,14 @@ type scyllaHealthCheck struct {
 	scyllaEmitted   state.GaugeLedger[string]
 }
 
-// newScyllaHealthCheck builds the W9-ST1 check — both ledgers arm
+// newScyllaHealthCheck builds the scylla-cluster-health check — both ledgers arm
 // lazily on first use (the GaugeLedger zero value is ready).
 func NewScyllaHealthCheck(d *probefw.Deps) probefw.Check {
 	return &scyllaHealthCheck{Deps: d}
 }
 
 const (
-	// W9-ST1 — scylla-cluster-health knobs.
+	// scylla-cluster-health — scylla-cluster-health knobs.
 	CheckNameScyllaHealth = "scylla-cluster-health"
 	scyllaDegradedMinAge  = 15 * time.Minute
 	scyllaSignatureMinAge = 10 * time.Minute
@@ -63,19 +63,19 @@ const (
 	scyllaReasonDegraded     = "degraded_condition"
 	scyllaReasonMemberDesync = "member_service_desync"
 	scyllaReasonGossipStall  = "gossip_or_raft_stall"
-	// W12-ST3 — the tombstone-avalanche / overload stall reason.
+	// scylla-shard-imbalance — the tombstone-avalanche / overload stall reason.
 	scyllaReasonTombstoneStall = "tombstone_overload_stall"
 )
 
-// scyllaClusterGVR is the ScyllaCluster CR the W9-ST1 auditor reads —
-// the same GVR the W5.8 scylla-operator watchdog scans.
+// scyllaClusterGVR is the ScyllaCluster CR the scylla-cluster-health auditor reads —
+// the same GVR the operator-workqueue-watchdog scylla-operator watchdog scans.
 var scyllaClusterGVR = kube.GVRScyllaCluster
 
 var (
-	// W9-ST1 — the ScyllaDB unhealthy signal: 1 while the
+	// scylla-cluster-health — the ScyllaDB unhealthy signal: 1 while the
 	// ScyllaCluster/member shows a sustained unhealthy signature.
 	// reason is degraded_condition | member_service_desync |
-	// gossip_or_raft_stall | tombstone_overload_stall (W12-ST3).
+	// gossip_or_raft_stall | tombstone_overload_stall (scylla-shard-imbalance).
 	scyllaClusterUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_scylla_unhealthy",
 		Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
@@ -88,7 +88,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W9-ST1 — scylla-cluster-health
+// scylla-cluster-health — scylla-cluster-health
 // ---------------------------------------------------------------------------
 
 // scyllaGossipPatterns are the log signatures of the three ScyllaDB
@@ -109,7 +109,7 @@ var scyllaGossipPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`raft_group0`),
 }
 
-// scyllaTombstonePatterns are the W12-ST3 log signatures of a
+// scyllaTombstonePatterns are the scylla-shard-imbalance log signatures of a
 // tombstone avalanche / overload stall — the failure shape where a
 // member stays Running but its reads time out scanning thousands of
 // tombstones or one shard's reactor wedges on a hot partition:
@@ -148,7 +148,7 @@ type scyllaFinding struct {
 // scyllaPodTroubled selects the member pods worth a log fetch:
 // anything not cleanly Running+Ready — Pending/Failed/Unknown phase,
 // a pod that never went Ready, or a container in CrashLoopBackOff
-// ("unready/restarting" in the W9-ST1 contract). Succeeded pods and
+// ("unready/restarting" in the scylla-cluster-health contract). Succeeded pods and
 // pods already terminating are skipped — their logs describe a dead
 // end, not a live stall.
 func scyllaPodTroubled(pod *corev1.Pod) bool {
@@ -172,7 +172,7 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 // scyllaStallLogHit fetches the last probefw.DefaultTailLines of the
 // pod's "scylla" container and returns the reason label of the first
 // matching stall signature — scyllaReasonGossipStall for the gossip/
-// raft patterns, scyllaReasonTombstoneStall for the W12-ST3
+// raft patterns, scyllaReasonTombstoneStall for the scylla-shard-imbalance
 // tombstone/overload set. Bounded to probefw.LogTimeout /
 // probefw.LogMaxBytes (same posture as the coredns watchdog's log
 // probe); a stream/read failure is inconclusive — PodLogTail returns
@@ -205,7 +205,7 @@ func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.P
 
 // checkScyllaHealth audits the ScyllaDB operand stack on the three
 // failure shapes that leave the cluster degraded without the operator
-// noticing (W9-ST1):
+// noticing (scylla-cluster-health):
 //
 //	a) degraded_condition — the ScyllaCluster CR itself reports
 //	   Degraded=True or Available=False for >=15m (the condition's
@@ -218,7 +218,7 @@ func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.P
 //	   unready/restarting member pod
 //	   (scylla.scylladb.com/cluster=<name>) whose scylla log tail
 //	   matches the ghost-gossip / replace_address_first_boot /
-//	   group0-raft-timeout signatures — or, W12-ST3, the tombstone-
+//	   group0-raft-timeout signatures — or, scylla-shard-imbalance, the tombstone-
 //	   avalanche / reactor-stall signatures — for >=10m.
 //
 // Every signature must persist its window before

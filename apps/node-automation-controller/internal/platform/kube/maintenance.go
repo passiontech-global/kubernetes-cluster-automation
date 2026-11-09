@@ -46,7 +46,7 @@ const (
 // active-cordon window: spec.unschedulable with the unschedulable
 // taint younger than 45m. A statically-cordoned node (>45m, no kured
 // lock, no live Plan) is deliberate state, not maintenance: counting
-// it would freeze every deferring remediation forever (W8). A node
+// it would freeze every deferring remediation forever. A node
 // LIST failure is an error — "cannot verify" must never read as
 // "clear". now is the clock the 45m freshness window is evaluated on
 // — plumbed from Verdict.Active's own `now` so the window and the
@@ -179,7 +179,7 @@ func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]s
 //	   unschedulable taint younger than 45m. A statically-cordoned
 //	   node (>45m, no kured lock, no live Plan) is deliberate
 //	   state, not maintenance: counting it would freeze every
-//	   deferring remediation forever (W8).
+//	   deferring remediation forever.
 //	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
 //	c) an autopilot Plan whose status.state is neither Schedulable
 //	   nor Completed — a k0s upgrade in flight;

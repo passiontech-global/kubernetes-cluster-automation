@@ -62,7 +62,7 @@ const (
 	cfTunnelProxySliceService = "cloudflare-tunnel-gateway-controller-proxy-headless"
 	cfTunnelResyncAnno        = kube.AnnoWatchdogForceResync
 
-	// W10-NM2 — cloudflared wedge healer. The proxy gateway's pods
+	// cloudflared-wedge-heal — cloudflared wedge healer. The proxy gateway's pods
 	// are cloudflared connectors; the ingress controller release
 	// (cloudflare-tunnel-ingress-controller ns) runs the same binary
 	// under a different label scheme. A connector stuck on a fatal
@@ -97,7 +97,7 @@ const (
 	cfTunnelLogMaxBytes  = 256 << 10
 	cfTunnelLogTimeout   = 8 * time.Second
 
-	// W16-CI2 — gateway controller sync-error audit. The controller
+	// cf-gateway-sync-error — gateway controller sync-error audit. The controller
 	// logs "failed to update tunnel configuration" (Cloudflare API
 	// rejected the Route push), "429 Too Many Requests" (API rate
 	// limit — a desync is accumulating silently), or an
@@ -118,7 +118,7 @@ const (
 // detects it — see auditControllerSyncErrors).
 var cftunnelGatewaySyncErrorGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_cftunnel_gateway_sync_error",
-	Help: "1 while the cloudflare-tunnel-gateway-controller log tail (5m window) carries a tunnel-config sync error (failed to update tunnel configuration, 429, authentication error) — W16-CI2.",
+	Help: "1 while the cloudflare-tunnel-gateway-controller log tail (5m window) carries a tunnel-config sync error (failed to update tunnel configuration, 429, authentication error) — cf-gateway-sync-error.",
 }, []string{"namespace"})
 
 func init() {
@@ -166,7 +166,7 @@ type cfTunnelProxyWatchdog struct {
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
 	// syncErrLast is namespace -> sweep time of the last log tail
-	// that carried a sync-error signature (W16-CI2). The gauge stays
+	// that carried a sync-error signature (cf-gateway-sync-error). The gauge stays
 	// 1 until a sweep reads a clean tail at least
 	// cfTunnelSyncErrClearAfter after the last errored one — a single
 	// clean sweep between error sweeps would flap the series.
@@ -213,14 +213,14 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// W10-NM2 — third check: wedged cloudflared connectors need a
+	// cloudflared-wedge-heal — third check: wedged cloudflared connectors need a
 	// pod restart, not a config resync. Runs after the resync pass
 	// so freshly-configured pods get their grace window first.
 	healed, err := w.healCloudflaredWedges(ctx)
 	if err != nil {
 		return err
 	}
-	// W16-CI2 — the sync-error audit is observational (gauge only, no
+	// cf-gateway-sync-error — the sync-error audit is observational (gauge only, no
 	// heal), so its failures never abort the sweep; the function
 	// logs them itself.
 	w.auditControllerSyncErrors(ctx)
@@ -354,7 +354,7 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 }
 
 // ---------------------------------------------------------------------------
-// W10-NM2 — wedged cloudflared connector healer.
+// cloudflared-wedge-heal — wedged cloudflared connector healer.
 // ---------------------------------------------------------------------------
 
 // connectorTargets is the full population of cloudflared pods the
@@ -665,7 +665,7 @@ func cloudflaredLogsWedged(logs string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// W16-CI2 — cloudflare-tunnel-gateway-controller sync-error audit.
+// cf-gateway-sync-error — cloudflare-tunnel-gateway-controller sync-error audit.
 // ---------------------------------------------------------------------------
 
 // auditControllerSyncErrors reads a bounded log tail of every

@@ -654,7 +654,7 @@ func TestStatefulSetRollerStaleUnreadyBlocksRoll(t *testing.T) {
 	}
 }
 
-// W18-9 image-pull gate: an owned pod waiting in
+// maintenance-hold-stale image-pull gate: an owned pod waiting in
 // ImagePullBackOff/ErrImagePull defers the whole StatefulSet's roll
 // for the cycle — fail-safe, no error, no eviction attempted, the
 // rolled counter must not move.

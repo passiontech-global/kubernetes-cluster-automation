@@ -1,10 +1,10 @@
-// scheduler_watchdog.go — the scheduler-watchdog check (W8-CP3):
+// scheduler_watchdog.go — the scheduler-watchdog check (cp-freeze-heal):
 // detects a stopped kube-scheduler (Pending pods with no
 // PodScheduled condition while Ready uncordoned workers exist) and
 // reports node_automation_scheduler_frozen. Detect-only — restarting
 // the scheduler is the platform's job.
 //
-// W12-SC1 adds the second scheduler fault signature: a
+// preemption-cascade-signal adds the second scheduler fault signature: a
 // PriorityClass preemption cascade (a high-priority pod preempts
 // victims that preempt their own victims — the Monzo/Zalando domino
 // eviction shape) reads as a burst of reason=Preempted events;
@@ -28,23 +28,23 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// schedulerWatchdogCheck is the W8-CP3 scheduler-watchdog — a stopped
+// schedulerWatchdogCheck is the cp-freeze-heal scheduler-watchdog — a stopped
 // kube-scheduler detected via Pending pods with no PodScheduled
 // condition while Ready uncordoned workers exist.
 type schedulerWatchdogCheck struct{ *probefw.Deps }
 
-// newSchedulerWatchdogCheck builds the W8-CP3 watchdog — stateless,
+// newSchedulerWatchdogCheck builds the cp-freeze-heal watchdog — stateless,
 // it reads only Deps.
 func NewSchedulerWatchdogCheck(d *probefw.Deps) probefw.Check {
 	return &schedulerWatchdogCheck{Deps: d}
 }
 
 const (
-	// W8-CP3 — scheduler-watchdog knobs.
+	// cp-freeze-heal — scheduler-watchdog knobs.
 	CheckNameSchedulerWatchdog = "scheduler-watchdog"
 	schedulerPendingMinAge     = 5 * time.Minute
 
-	// W12-SC1 — preemption-cascade knobs: an ordinary scheduler
+	// preemption-cascade-signal — preemption-cascade knobs: an ordinary scheduler
 	// emits a handful of Preempted events during placement churn;
 	// more than the ceiling inside the window is a domino cascade —
 	// each preempted victim requeues and preempts its own victims.
@@ -53,7 +53,7 @@ const (
 )
 
 var (
-	// W8-CP3 — the scheduler-freeze signal: 1 while unscheduled
+	// cp-freeze-heal — the scheduler-freeze signal: 1 while unscheduled
 	// Pending pods accumulate past the fuse despite Ready uncordoned
 	// workers. A plain gauge — the freeze is cluster-wide, not
 	// per-object.
@@ -62,7 +62,7 @@ var (
 		Help: "1 while unscheduled Pending pods accumulate past 5m despite Ready uncordoned workers.",
 	})
 
-	// W12-SC1 — the preemption-cascade signal: 1 while
+	// preemption-cascade-signal — the preemption-cascade signal: 1 while
 	// reason=Preempted events outpace the ceiling — the same plain
 	// cluster-wide shape as the freeze gauge.
 	schedulerPreemptionStormGauge = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -78,7 +78,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W8-CP3 — scheduler-watchdog
+// cp-freeze-heal — scheduler-watchdog
 // ---------------------------------------------------------------------------
 
 // checkSchedulerFrozen detects a stopped kube-scheduler: unscheduled
@@ -89,7 +89,7 @@ func init() {
 // scheduler is the platform's job; this check makes the freeze
 // visible on node_automation_scheduler_frozen.
 //
-// The W12-SC1 preemption-cascade signal folds into the same sweep:
+// The preemption-cascade-signal preemption-cascade signal folds into the same sweep:
 // a burst of reason=Preempted events (>15 in 5m) is a PriorityClass
 // domino eviction storm, reported on
 // node_automation_scheduler_preemption_storm — the freeze signal is
@@ -103,7 +103,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	var rep probefw.SweepReport
 
-	// W12-SC1 — PriorityClass preemption cascade. The count reads the
+	// preemption-cascade-signal — PriorityClass preemption cascade. The count reads the
 	// sweep's shared event census (EventsWithReason filters the
 	// reason client-side — the apiserver cannot field-select reasons
 	// on most versions anyway, so this is the same filter the

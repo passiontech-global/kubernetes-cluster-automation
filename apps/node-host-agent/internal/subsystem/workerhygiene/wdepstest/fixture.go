@@ -217,7 +217,7 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 			StuckWedgeAge:  30 * time.Minute,
 			MaxForceDelete: 5,
 		},
-		// Wave-2 knobs: paths under the fixture root, never the real
+		// Base knobs: paths under the fixture root, never the real
 		// /sys or /var/lib/k0s.
 		Ctr: wdeps.CtrConfig{
 			IngestDir:    f.IngestDir,
@@ -283,7 +283,7 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	d.Cfg.Seams.Host.JournalFn = func(_ context.Context) (string, error) {
 		return f.Journal, f.JournalErr
 	}
-	// Wave-2 seams: status-code probes default 200 (healthy) unless
+	// Base seams: status-code probes default 200 (healthy) unless
 	// Probes[url] errors or Status[url] overrides; the unix socket
 	// probe answers from SockErrs (nil = connects); statfs reports
 	// f.DiskUsed of 100 blocks.

@@ -1,6 +1,6 @@
 // stateful_masterless_services_test.go — coverage for the
-// stateful-masterless-services check: the W7-C3 dragonfly
-// dual-replica deadlock heal and the W4/W10-FIX4 db-operator pod
+// stateful-masterless-services check: the dual-replica-deadlock dragonfly
+// dual-replica deadlock heal and the va-stuck-terminating/dbOperatorPodPrefixes db-operator pod
 // prefix resolution.
 package datastore
 
@@ -22,7 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
-// W4 — dbOperatorFor matches a pod-template label carrying the
+// va-stuck-terminating — dbOperatorFor matches a pod-template label carrying the
 // operator name; a generic STS matches nothing.
 func TestDBOperatorFor(t *testing.T) {
 	sts := &appsv1.StatefulSet{
@@ -40,7 +40,7 @@ func TestDBOperatorFor(t *testing.T) {
 	}
 }
 
-// W10-FIX4 — dbOperatorPodPrefixes resolves BOTH spellings of a
+// dbOperatorPodPrefixes — dbOperatorPodPrefixes resolves BOTH spellings of a
 // Percona operator to the same alias group: the long Deployment
 // name AND the short chart alias must yield every pod-name prefix,
 // whichever spelling dbOperatorFor matched.
@@ -66,7 +66,7 @@ func TestDBOperatorPodPrefixes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W7-C3 — dragonfly dual-replica deadlock heal
+// dual-replica-deadlock — dragonfly dual-replica deadlock heal
 // ---------------------------------------------------------------------------
 
 // dragonflyRolePod builds a Ready STS pod with the given role label
@@ -300,7 +300,7 @@ func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-SC2 — multi-master split brain + cross-DC site skew
+// stateful-split-brain — multi-master split brain + cross-DC site skew
 // ---------------------------------------------------------------------------
 
 // endpointSliceWithZones builds an EndpointSlice bound to svc whose

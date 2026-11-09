@@ -119,7 +119,7 @@ var guardAfterRule = testutil.ExecRule{
 	Out:    "599000|695000\n",
 }
 
-// W16-CP1: the step cap clamps an over-wide compaction target so a
+// compact-step-cap: the step cap clamps an over-wide compaction target so a
 // single cycle cannot delete the whole watch-bookmark window.
 func TestClampStepTarget(t *testing.T) {
 	k, _, _ := fixture(t, nil)
@@ -149,7 +149,7 @@ func TestClampStepTarget(t *testing.T) {
 	}
 }
 
-// W16-CP1 end-to-end: a triggered cycle under the cap compacts only
+// compact-step-cap end-to-end: a triggered cycle under the cap compacts only
 // up to crev + MaxStepRevisions, not the full head-Tail window.
 func TestGuardCycleStepCap(t *testing.T) {
 	k, fr, _ := fixture(t, []testutil.ExecRule{

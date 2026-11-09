@@ -1,5 +1,5 @@
 // olm_subscription_scan.go — the audit collectors of the
-// olm-subscription-health check (W7-C5): the CSV/Subscription
+// olm-subscription-health check (olm-subscription-health): the CSV/Subscription
 // signature scan, the persisted unhealthy-window evaluation + gauge
 // emit, and the resolved-signature stamp clear. Split out of
 // olm_subscription_health.go — see that file for the check, its

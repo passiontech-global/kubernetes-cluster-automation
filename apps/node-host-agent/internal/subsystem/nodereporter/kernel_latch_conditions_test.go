@@ -24,7 +24,7 @@ func condEvalFor(t *testing.T, r *Reporter, typ string) condEval {
 	return condEval{}
 }
 
-// TestKernelLatchConditions covers the W10 latch→condition wiring:
+// TestKernelLatchConditions covers the kernel latch→condition wiring:
 // KubeletRuntimeStall's new alt keys, plus the three new condition
 // types (FilesystemReadOnly/KR-exhaustion/ClockSkew).
 func TestKernelLatchConditions(t *testing.T) {
@@ -77,7 +77,7 @@ func TestKernelLatchConditions(t *testing.T) {
 	}
 	// state-fs-readonly (the hostmetrics latch name) also matches via
 	// FilesystemReadOnly's primary stateKey "filesystem-readonly"? —
-	// primary is "filesystem-readonly"; the W10 latch is "fs-readonly"
+	// primary is "filesystem-readonly"; the kernelfail latch is "fs-readonly"
 	// covered by altStateKeys. Verify a DIFFERENT key does NOT trip.
 	_ = os.Remove(filepath.Join(e.dir, "state-fs-readonly"))
 	_ = os.Remove(filepath.Join(e.dir, "state-pid-fd-pressure"))
@@ -164,14 +164,14 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 }
 
 // TestCiliumLatchConditions covers the newest tail entries: the
-// workerhygiene cilium MTU-drift (B4) and WireGuard peer-wipe (W5.6)
+// workerhygiene cilium MTU-drift (B4) and WireGuard peer-wipe (cilium-wg-peer-gc)
 // latches map 1:1 to the CiliumMTUDrift and CiliumWGStale conditions
 // appended at the tail of conditionDefs — the defs carry the exact
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
 	if len(conditionDefs) != 41 {
-		t.Fatalf("conditionDefs has %d defs, want 41 (38 ported + CiliumMTUDrift + CiliumWGStale + W18-1 InodePressure)",
+		t.Fatalf("conditionDefs has %d defs, want 41 (38 ported + CiliumMTUDrift + CiliumWGStale + inode-pressure InodePressure)",
 			len(conditionDefs))
 	}
 	tail := conditionDefs[len(conditionDefs)-3 : len(conditionDefs)-1]
@@ -219,7 +219,7 @@ func TestCiliumLatchConditions(t *testing.T) {
 	}
 }
 
-// TestInodePressureCondition covers the W18-1 tail entry: hostmetrics'
+// TestInodePressureCondition covers the inode-pressure tail entry: hostmetrics'
 // inode-pressure latch maps 1:1 to the kubelet-native InodePressure
 // condition — True with FilesystemInodesExhausted while
 // state-inode-pressure exists, False with FilesystemInodesHealthy

@@ -44,23 +44,23 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.core.netdev_max_backlog", "8192"},
 		{"net.ipv4.tcp_max_syn_backlog", "8192"},
 		{"net.ipv4.ip_local_port_range", "10240 65535"},
-		// W12-KR3: reuse TIME_WAIT sockets for new outbound
+		// conntrack-port-pressure: reuse TIME_WAIT sockets for new outbound
 		// connections — safe with tcp_timestamps on (default), and
 		// the difference between a healthy node and EADDRNOTAVAIL on
 		// the gateway/proxy churn bursts the port-range width above
 		// is sized for.
 		{"net.ipv4.tcp_tw_reuse", "1"},
-		// W5.1: keep the kernel's ephemeral source-port allocation off
+		// ip_local_port_range: keep the kernel's ephemeral source-port allocation off
 		// ports host daemons LISTEN on — an ephemeral steal of kubelet
 		// 10248/10250/10256, NPD 20256, NodePort+Spegel 30000-32767,
 		// Nebula UDP 45670 or Cilium WireGuard 51871 wedges the real
 		// listener's next bind or blackholes its replies.
 		{"net.ipv4.ip_local_reserved_ports", "10248-10260,20256,30000-32767,45670,51871"},
 		{"fs.file-max", "2097152"},
-		// W10-KR2: pid_max headroom for the thread/FD exhaustion
+		// pid-fd-pressure: pid_max headroom for the thread/FD exhaustion
 		// guard (node_agent_threads_utilization_ratio latch).
 		{"kernel.pid_max", "4194304"},
-		// W10-NM2: QUIC (cloudflared) UDP buffers — the 208KB
+		// cloudflared-wedge-heal: QUIC (cloudflared) UDP buffers — the 208KB
 		// default drops edge streams under load.
 		{"net.core.rmem_max", "7500000"},
 		{"net.core.wmem_max", "7500000"},
@@ -69,7 +69,7 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.ipv4.neigh.default.gc_thresh2", "32768"},
 		{"net.ipv4.neigh.default.gc_thresh3", "65536"},
 	}
-	// W16-KR4: AIO table headroom — io_uring/native-aio DB engines
+	// aio-pressure: AIO table headroom — io_uring/native-aio DB engines
 	// exhaust the stock aio-max-nr and surface EAGAIN as generic
 	// "storage slow" grey failures. Only when the kernel exposes
 	// aio (compiled out leaves no sysctl node; an unconditional key
@@ -79,7 +79,7 @@ func (c *cyc) t16Pairs() [][2]string {
 		fileExistsNoRoot("/proc/sys/fs/aio-max-nr") {
 		p = append(p, [2]string{"fs.aio-max-nr", "1048576"})
 	}
-	// W8-KR2: keyring quota headroom — a full keyring fails
+	// sysctl-hardening: keyring quota headroom — a full keyring fails
 	// keyctl/add_key silently for new sessions.
 	if c.r.fileExists("/proc/sys/kernel/keys/root_maxkeys") ||
 		fileExistsNoRoot("/proc/sys/kernel/keys/root_maxkeys") {
@@ -94,7 +94,7 @@ func (c *cyc) t16Pairs() [][2]string {
 		p = append(p, [2]string{"net.netfilter.nf_conntrack_max",
 			strconv.FormatInt(c.conntrackMax(), 10)})
 	}
-	// W8-KR2: shrink dead-flow occupancy of the conntrack table —
+	// sysctl-hardening: shrink dead-flow occupancy of the conntrack table —
 	// TIME_WAIT/CLOSE_WAIT pileups ate the table on WAN flaps.
 	if c.r.fileExists("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait") ||
 		fileExistsNoRoot("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait") {
@@ -102,7 +102,7 @@ func (c *cyc) t16Pairs() [][2]string {
 			[2]string{"net.netfilter.nf_conntrack_tcp_timeout_time_wait", "30"},
 			[2]string{"net.netfilter.nf_conntrack_tcp_timeout_close_wait", "60"})
 	}
-	// W7-H5: give the IPv6 neighbour cache the same headroom as
+	// conntrack-arp-pressure: give the IPv6 neighbour cache the same headroom as
 	// IPv4 — only when the kernel exposes the ndisc table (IPv6
 	// compiled out leaves no gc_thresh3 node to write to; an
 	// unconditional key would fail sysctl --system). Values come

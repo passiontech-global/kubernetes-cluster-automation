@@ -1,4 +1,4 @@
-// selfheal.go — the probe-cadence half of the Wave-8 kine-DB
+// selfheal.go — the probe-cadence half of the kine-DB
 // self-healing block (was kine_self_healing.go):
 //
 //  1. Session reaper — every probe round terminates stuck kine
@@ -10,8 +10,8 @@
 //     backend login (backend_env) still works, means the pooler
 //     itself is the wedge → `runtime restart kine-pgbouncer`
 //     under the GuardStateDir last-pgb-restart budget (15m).
-//     W12-CP1 rides the same check: a starved wait queue
-//     (maxwait > 10s, cl_waiting with sv_active == 0, or — W16-CP3 —
+//     pgbouncer-pool-starvation rides the same check: a starved wait queue
+//     (maxwait > 10s, cl_waiting with sv_active == 0, or — half-open-pool-starvation —
 //     cl_waiting with sv_active > 0 while the backend runs zero
 //     queries) while
 //     the backend runs FEWER active queries than the
@@ -43,7 +43,7 @@ const (
 	// GuardStateDir (cross-restart persistence).
 	pgbE2EFailFile = "e2e-auth-fails"
 	// pgbStarveFile counts consecutive server-pool-starvation probes
-	// (W12-CP1) under GuardStateDir — same cross-restart contract.
+	// (pgbouncer-pool-starvation) under GuardStateDir — same cross-restart contract.
 	pgbStarveFile = "pgb-starve-cycles"
 	// pgbMaxWaitStarveSecs — a client queue older than this marks
 	// starvation; a healthy pool drains its queue in milliseconds.
@@ -54,7 +54,7 @@ const (
 	pgbRestartFile  = "last-pgb-restart"
 )
 
-// reapStuckSessions terminates stuck kine sessions — W8-CP2 item 1.
+// reapStuckSessions terminates stuck kine sessions — kinedb-maintenance item 1.
 // The kine TABLE lives inside the database named 'postgres' (the
 // PsqlArgs -d postgres contract), so datname='kine' alone matched
 // nothing: the IN list covers both the real backend database and
@@ -120,7 +120,7 @@ func boolToInt(b bool) int {
 }
 
 // activeBackendQueries counts backends currently running a query on
-// the postgres/kine databases (self excluded). The W12-CP1
+// the postgres/kine databases (self excluded). The pgbouncer-pool-starvation
 // starvation detector compares this against the pooler's held server
 // conns: far fewer active queries than server conns means the conns
 // sit in a stalled half-open state (sv_login/sv_tested wedge), not
@@ -145,8 +145,8 @@ func (p *Probe) activeBackendQueries(ctx context.Context, pg, user, pass string,
 
 // pgbStarveShape classifies the pool-side starvation shapes — pure
 // for tests. classic: the wait queue is too old (maxwait > 10s) or
-// clients wait with NO active server conn at all (W12-CP1).
-// halfOpen (W16-CP3): clients wait while server conns exist AND
+// clients wait with NO active server conn at all (pgbouncer-pool-starvation).
+// halfOpen (half-open-pool-starvation): clients wait while server conns exist AND
 // appear active — but the backend runs zero queries, the
 // PgBouncer-side sv_active bookkeeping being half-open on a wedged
 // socket. Either shape plus the backend query evidence below is
@@ -161,7 +161,7 @@ func pgbStarveShape(maxWaitSec, clWaiting, svActive int64) (classic, halfOpen bo
 // starveVerdict combines the pool shape with the pg_stat_activity
 // evidence — pure for tests. classic needs "fewer active queries
 // than the pool holds server conns"; halfOpen needs the stricter
-// "zero active queries" (W16-CP3's half-open sv_active starvation).
+// "zero active queries" (half-open-pool-starvation's half-open sv_active starvation).
 func starveVerdict(classic, halfOpen bool, activeQueries, serverConns int64) bool {
 	switch {
 	case classic:
@@ -173,13 +173,13 @@ func starveVerdict(classic, halfOpen bool, activeQueries, serverConns int64) boo
 }
 
 // checkPGBWedge remediates the pooler on saturation/auth wedge —
-// W8-CP2 item 2 + W12-CP1 starvation. Fire conditions:
+// kinedb-maintenance item 2 + pgbouncer-pool-starvation starvation. Fire conditions:
 //   - cl_waiting > WaitMax this cycle (hard saturation) → restart;
 //   - e2e_auth failed 2 consecutive probes while the raw backend
 //     login (backend_env) is still ok — postgres itself is healthy,
 //     so the wedge lives in pgbouncer → restart;
-//   - W12-CP1: the wait queue starved (maxwait > 10s, or cl_waiting
-//     > 0 with sv_active == 0; W16-CP3 adds cl_waiting > 0 with
+//   - pgbouncer-pool-starvation: the wait queue starved (maxwait > 10s, or cl_waiting
+//     > 0 with sv_active == 0; half-open-pool-starvation adds cl_waiting > 0 with
 //     sv_active > 0 while the backend runs ZERO queries — the
 //     half-open sv_active bookkeeping shape) for 2 consecutive
 //     probes while
@@ -204,7 +204,7 @@ func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	authWedge := res.Checks[CheckE2EAuth] == 0 &&
 		res.Checks[CheckBackendEnv] == 1
 
-	// W12-CP1 + W16-CP3: server-pool starvation evaluation. The
+	// pgbouncer-pool-starvation + half-open-pool-starvation: server-pool starvation evaluation. The
 	// backend-env gate is required like the auth wedge's — a broken
 	// postgres can legitimately starve the queue and RECONNECT
 	// cannot fix it. The active-query count is only asked for once

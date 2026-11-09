@@ -1,5 +1,5 @@
 // cilium_l2_lease_guard_test.go — coverage for the
-// cilium-l2-lease-guard check (W16-NM1): the stale-holder predicate
+// cilium-l2-lease-guard check (cilium-l2-lease-guard): the stale-holder predicate
 // matrix (every reason), the healthy-holder pass, the two-cycle
 // cilium-agent not-Ready streak, and the heal-gated Lease delete.
 package nethealth

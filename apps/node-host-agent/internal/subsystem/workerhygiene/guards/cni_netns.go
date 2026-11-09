@@ -1,5 +1,5 @@
-// cni_netns.go — the W9 orphan /run/netns/cni-* reaper (hardened
-// W12-KR2): CNI plugins pin each pod sandbox's network namespace by
+// cni_netns.go — the orphan /run/netns/cni-* reaper (hardened
+// orphan-sandbox-netns): CNI plugins pin each pod sandbox's network namespace by
 // bind-mounting its nsfs file at /run/netns/cni-<id>; a teardown
 // that dies mid-DEL leaks the mount, and only a file whose nsfs
 // inode NO live process (or live containerd task) still references
@@ -22,16 +22,16 @@ const (
 	// defaultNetnsDir is the host /run/netns mount — the CNI
 	// netns-file leak reaper scans cni-* entries here.
 	// cniNetnsMinAge is the orphan CNI netns confirmation age
-	// (Wave-9).
+	// (the orphan-netns reaper).
 	cniNetnsMinAge = 30 * time.Minute
 	// cniNetnsMaxReapPerCycle bounds the per-cycle umount blast
-	// radius (W12-KR2) — a mass CNI DEL failure can leak dozens of
+	// radius (orphan-sandbox-netns) — a mass CNI DEL failure can leak dozens of
 	// netns mounts at once; the reaper drains them at a fixed rate
 	// rather than stalling the check budget on one cycle.
 	cniNetnsMaxReapPerCycle = 10
 )
 
-// --- Check: orphan CNI netns reaper (W9, hardened W12-KR2) ---
+// --- Check: orphan CNI netns reaper (hardened orphan-sandbox-netns) ---
 // CNI plugins pin each pod sandbox's network namespace by
 // bind-mounting its nsfs file at /run/netns/cni-<id>. A pod teardown
 // that dies mid-DEL (crash, OOM kill, kubelet restart) leaks the
@@ -48,7 +48,7 @@ const (
 // >= cniNetnsMinAge later is lazily unmounted + removed. The umount
 // runs through the systemd nsenter wrapper so the HOST mount
 // namespace is the one modified; the file removal uses the /host
-// view (NetnsDir). W12-KR2 adds three qualifiers to the reap
+// view (NetnsDir). orphan-sandbox-netns adds three qualifiers to the reap
 // itself: the file mtime must be older than the confirm window
 // (a just-created mount point the sweep raced is never an
 // orphan), the containerd task map must not show a live task
@@ -86,7 +86,7 @@ func liveNetnsInodes(d *wdeps.Deps, pids []int) map[uint64]bool {
 
 // netnsHeldByLiveTask reports whether any containerd task with a
 // live init pid still sits inside the netns inode — the
-// containerd-side half of the W12-KR2 orphan verdict (a live task
+// containerd-side half of the orphan-sandbox-netns orphan verdict (a live task
 // pins the sandbox netns even when the /proc sweep raced it).
 func netnsHeldByLiveTask(d *wdeps.Deps, tasks map[string][]wdeps.CtrTask,
 	ino uint64) bool {
@@ -105,7 +105,7 @@ func netnsHeldByLiveTask(d *wdeps.Deps, tasks map[string][]wdeps.CtrTask,
 	return false
 }
 
-// CNINetnsCheck is the W9 orphan /run/netns/cni-* reaper as a Check.
+// CNINetnsCheck is the orphan /run/netns/cni-* reaper as a Check.
 type CNINetnsCheck struct{ d *wdeps.Deps }
 
 // Name returns the check label / WD_SIG key.
@@ -181,7 +181,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if !ok2 || live[ino2] {
 			continue
 		}
-		// W12-KR2: the netns file itself must be older than the
+		// orphan-sandbox-netns: the netns file itself must be older than the
 		// confirm window — a just-created mount point whose sweep
 		// raced the CNI ADD is not an orphan no matter what the
 		// inode check says.
@@ -189,7 +189,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Cfg.Seams.Host.Clock.Now().Sub(fi.ModTime()) < cniNetnsMinAge {
 			continue
 		}
-		// W12-KR2: the containerd task map is the stronger liveness
+		// orphan-sandbox-netns: the containerd task map is the stronger liveness
 		// verdict — a live task pins its sandbox netns even when
 		// the pid sweep raced it. An unreadable map makes "no
 		// live task" unverifiable → fail closed, retry next cycle.

@@ -119,7 +119,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
 		t.Fatalf("CiliumSocket=%q", cfg.Cilium.Socket)
 	}
-	// W10 runtime-resource guards — same hostPath-joined default
+	// runtime-resource guards — same hostPath-joined default
 	// contract as the mount paths above.
 	if cfg.Runtime.CgroupRoot != "/host/sys/fs/cgroup" {
 		t.Fatalf("Runtime.CgroupRoot=%q", cfg.Runtime.CgroupRoot)
@@ -142,7 +142,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	}
 	// The writable-layer Warning threshold defaults to 5 GiB
 	// (via the env knob's default) and must stay independent of the
-	// W6.3 eviction threshold (15 GiB) — parity with the wave plan
+	// disk-bloat eviction threshold (15 GiB) — parity with the disk-bloat default
 	// without altering eviction behavior. BloatPodThresholdBytes has
 	// no env row; ApplyDefaults fills it exactly like New does.
 	if cfg.Disk.WLayerBloatThresholdBytes != int64(5)<<30 {

@@ -96,7 +96,7 @@ func TestRefreshLatchesTouchesHeldLatches(t *testing.T) {
 }
 
 // inodeStatfs returns a statfsFn stub reporting per-mount inode
-// counts — used/total pairs drive the W18-1 hysteresis exactly.
+// counts — used/total pairs drive the inode-pressure hysteresis exactly.
 func inodeStatfs(vals map[string][2]uint64) func(string, *unix.Statfs_t) error {
 	return func(path string, st *unix.Statfs_t) error {
 		v, ok := vals[path]
@@ -120,7 +120,7 @@ func latchExists(t *testing.T, cfg Config) bool {
 	return err == nil
 }
 
-// TestInodePressureHysteresis drives the W18-1 latch through one full
+// TestInodePressureHysteresis drives the inode-pressure latch through one full
 // episode via the ticker (refreshLatches): enter at >=95% on any
 // mount, HOLD between 90% and 95% (no flap), clear only when every
 // mount is <=90%, and never clear on inconclusive evidence.

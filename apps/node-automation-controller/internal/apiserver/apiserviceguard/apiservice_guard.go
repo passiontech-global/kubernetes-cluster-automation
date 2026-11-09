@@ -29,7 +29,7 @@
 //	    service_namespace, service_name}=1. A seen-set prunes
 //	    series whose APIService recovered or vanished — a stale
 //	    label tuple must not pin the alert forever.
-//	(c) unblock_heal.go — the W10-CP1 dead-APIService unblocker:
+//	(c) unblock_heal.go — the namespace-terminating-wedged dead-APIService unblocker:
 //	    a protected-namespace APIService wedging a Terminating
 //	    namespace gets its backing pods restarted (maintenance-
 //	    gated, UID-preconditioned, capped).

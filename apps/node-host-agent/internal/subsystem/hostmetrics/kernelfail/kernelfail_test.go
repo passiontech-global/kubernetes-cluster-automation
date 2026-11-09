@@ -1,4 +1,4 @@
-// kernelfail_test.go — the W10 latch-contract coverage that used
+// kernelfail_test.go — the kernelfail latch-contract coverage that used
 // to be kernel_failure_latches_test.go: the kmsg classification +
 // cursor resume, the pid/fd pressure streaks, clock-skew makestep +
 // latch, and the ro-mount / kmsg-marker fs-readonly evidence.
@@ -18,7 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// --- W10-KR1: kmsg classification ---
+// --- kernel-dmesg: kmsg classification ---
 
 func TestKmsgFSAndConntrack(t *testing.T) {
 	f := kfixture(t)
@@ -98,7 +98,7 @@ func TestKmsgFirstOpenPrimesBacklog(t *testing.T) {
 	}
 }
 
-// --- W10-KR2: pid/thread/fd pressure ---
+// --- pid-fd-pressure: pid/thread/fd pressure ---
 
 func TestKernelProcRatios(t *testing.T) {
 	f := kfixture(t)
@@ -177,7 +177,7 @@ func TestPidFDPressureLatch(t *testing.T) {
 	}
 }
 
-// --- W10-KR5: clock skew ---
+// --- clock-skew: clock skew ---
 
 func TestParseChronycTracking(t *testing.T) {
 	off, synced, ok := parseChronycTracking(
@@ -224,7 +224,7 @@ func TestClockSkew(t *testing.T) {
 	}
 }
 
-// --- W10-ST1: ro mounts ---
+// --- fs-readonly: ro mounts ---
 
 // The parser itself is covered in platform/procfs — this pins the
 // consumer-side contract (ro opt lookup) the evidence scan relies

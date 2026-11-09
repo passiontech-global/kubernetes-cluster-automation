@@ -16,7 +16,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// --- W10-CP2: checkKineStorageHealth ---
+// --- kine-storage: checkKineStorageHealth ---
 
 // setupKineStore points K0sDir at a tempdir carrying db/state.db +
 // state.db-wal of the given sizes, shrinks the checkpoint threshold,

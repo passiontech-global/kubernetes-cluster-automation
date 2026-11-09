@@ -1,4 +1,4 @@
-// config_host.go — the W10 KR1/ST2 host-side markers: HostConfig and
+// config_host.go — the deep-failure host-side markers: HostConfig and
 // its defaults (the hostmetrics kmsg scanner's files this subsystem
 // consumes and the SystemOOMVictim event sink). The marker paths
 // derive from WatchdogStateDir, so the domain has no env rows of
@@ -7,7 +7,7 @@ package wdeps
 
 import "path/filepath"
 
-// HostConfig groups the W10 KR1/ST2 host-side markers: the
+// HostConfig groups the deep-failure host-side markers: the
 // hostmetrics kmsg scanner's files this check consumes (defaults
 // derive from WatchdogStateDir so both subsystems agree on the file
 // contract without wiring) and the SystemOOMVictim event sink.
@@ -19,7 +19,7 @@ type HostConfig struct {
 	EventNamespace string
 }
 
-// applyDefaults fills the Wave-10 (KR1/KR3/ST2) defaults —
+// applyDefaults fills the deep-failure (KR1/KR3/ST2) defaults —
 // WatchdogStateDir is already resolved by applyWiringDefaults, so
 // the marker-file paths derive from the same dir hostmetrics writes
 // into.

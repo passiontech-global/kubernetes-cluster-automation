@@ -1,7 +1,7 @@
 // textfile.go — node-exporter textfile channel helpers shared
 // by the control-plane checks that export node_agent_* gauges.
 //
-// W10 metrics note: the subsystem prometheus registry is owned by
+// metrics note: the subsystem prometheus registry is owned by
 // the parent's New() (outside this file), so the
 // node_agent_* gauges are emitted through the node-exporter
 // textfile channel — the DaemonSet bind-mounts

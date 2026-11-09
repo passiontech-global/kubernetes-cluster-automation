@@ -1,6 +1,6 @@
-// deep_failure_checks.go — the W10 host-side deep-failure guards
-// (W10-KR1 SystemOOMVictim consumer + W10-ST2 orphaned hostPath
-// volumes); the W10-KR3 containerd meta.db half lives in the ctr
+// deep_failure_checks.go — the host-side deep-failure guards
+// (kernel-dmesg SystemOOMVictim consumer + orphan-hostpath orphaned hostPath
+// volumes); the meta-db-corruption containerd meta.db half lives in the ctr
 // package, the shared textfile writer + watermark/walk helpers in
 // wdeps.
 package runtime
@@ -39,7 +39,7 @@ const lastHostOOMEventFile = "last-host-oom-event"
 // page allocation while it runs.
 const memoryCompactEvery = 30 * time.Minute
 
-// HostOOMCheck is the W10-KR1 hostmetrics kmsg-marker consumer as
+// HostOOMCheck is the kernel-dmesg hostmetrics kmsg-marker consumer as
 // a Check (no streak — the dedup marker file is the state). It also
 // owns the kernel-pressure memory-compaction remedy, consuming the
 // state-page-alloc-failure latch produced by the hostmetrics kmsg
@@ -174,7 +174,7 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 	return true
 }
 
-// --- W10-ST2: orphaned hostPath volume dirs ---
+// --- orphan-hostpath: orphaned hostPath volume dirs ---
 
 // OrphanHPCheck finds pvc-* dirs under the local-provisioner roots
 // whose PersistentVolume is gone from the apiserver — the disk leak

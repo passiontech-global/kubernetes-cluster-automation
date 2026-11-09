@@ -1,4 +1,4 @@
-// census_test.go — coverage for the W5.5 node-health discount:
+// census_test.go — coverage for the endpoint-census node-health discount:
 // nodeUnhealthyForEndpoints flags every node whose pod network is
 // presumed dead for admission.
 package guardstate

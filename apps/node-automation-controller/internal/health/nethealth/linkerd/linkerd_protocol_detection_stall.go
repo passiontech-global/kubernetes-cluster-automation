@@ -1,11 +1,11 @@
 // linkerd_protocol_detection_stall.go — the
-// linkerd-protocol-detection-stall check (W10-NM3): a meshed pod
+// linkerd-protocol-detection-stall check (linkerd-protocol-detection-stall): a meshed pod
 // exposing a well-known binary/stateful port not covered by
 // config.linkerd.io/opaque-ports, skip-inbound-ports or
 // skip-outbound-ports gets protocol detection it cannot survive; the
 // owning workload template is patched and the pod re-rolled.
 //
-// W12-P0-6 GitOps drift guard: the template patch carries a durable
+// template-patch-stamp GitOps drift guard: the template patch carries a durable
 // stamp (kube.AnnoLastLinkerdOpaquePatch, 6h cooldown) on the
 // workload's own metadata. When a Flux/ArgoCD-managed workload's
 // template loses opaque-ports again inside the window, its GitOps
@@ -51,7 +51,7 @@ type linkerdProtocolDetectionStallCheck struct {
 const (
 	CheckNameLinkerdOpaqueStall = "linkerd-protocol-detection-stall"
 
-	// W10-NM3 — linkerd-protocol-detection-stall knobs. The injected
+	// linkerd-protocol-detection-stall — linkerd-protocol-detection-stall knobs. The injected
 	// sidecar container name lives in platform/kube
 	// (kube.LinkerdProxyContainer) — the apiserver webhook guard
 	// matches the same container.
@@ -69,10 +69,10 @@ const (
 )
 
 var (
-	// W10-NM3 — meshed pod exposing an unannotated binary port.
+	// linkerd-protocol-detection-stall — meshed pod exposing an unannotated binary port.
 	linkerdOpaquePortMissingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_linkerd_opaque_port_missing",
-		Help: "1 while the meshed pod exposes a well-known binary port without opaque/skip-inbound annotation — W10-NM3.",
+		Help: "1 while the meshed pod exposes a well-known binary port without opaque/skip-inbound annotation — linkerd-protocol-detection-stall.",
 	}, []string{"namespace", "pod", "port"})
 )
 

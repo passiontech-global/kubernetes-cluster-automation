@@ -1,4 +1,4 @@
-// flux_helmrelease_retries_test.go — the W10-CP4 flux
+// flux_helmrelease_retries_test.go — the flux-helmrelease-retries flux
 // HelmRelease retries-exhausted remediator driven through the
 // fake clientset + fake dynamic client.
 package gitops
@@ -16,7 +16,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-CP4 — flux HelmRelease retries-exhausted remediator
+// flux-helmrelease-retries — flux HelmRelease retries-exhausted remediator
 // ---------------------------------------------------------------------------
 
 // shHR builds a HelmRelease carrying a Ready condition at `since`.
@@ -57,7 +57,7 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	}
 	for _, anno := range []string{
 		kube.AnnoFluxRequestedAt, kube.AnnoFluxForceAt,
-		kube.AnnoFluxResetAt, // W12 P0-3 — required to clear RetriesExceeded
+		kube.AnnoFluxResetAt, // flux-reset-at — required to clear RetriesExceeded
 	} {
 		v, found, _ := unstructured.NestedString(
 			got.Object, "metadata", "annotations", anno)

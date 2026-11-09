@@ -47,7 +47,7 @@ func TestCertNewerThan(t *testing.T) {
 	}
 }
 
-// --- W12-CP4a: sa.pub ServiceAccount signer-key fingerprint ---
+// --- sa-pub-key-fingerprint: sa.pub ServiceAccount signer-key fingerprint ---
 
 func TestSAPubFingerprintTextfile(t *testing.T) {
 	e := fixture(t)

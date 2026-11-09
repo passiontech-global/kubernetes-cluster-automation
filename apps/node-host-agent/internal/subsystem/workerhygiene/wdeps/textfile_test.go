@@ -1,4 +1,4 @@
-// textfile_test.go — the W10 node_agent_* textfile surface: the
+// textfile_test.go — the node_agent_* textfile surface: the
 // bounded dir-size walk, the statfs watermark probe, the textfile-dir
 // resolution, the once-per-cycle writer over canned marker files and
 // the capped marker read.

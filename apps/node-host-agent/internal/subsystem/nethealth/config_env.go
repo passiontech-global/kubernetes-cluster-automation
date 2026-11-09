@@ -45,7 +45,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.StringKnob(envnames.EnvUptimeFile, &cfg.UptimeFile, defaultUptimeFile),
 		envx.IntKnob(envnames.EnvNethealthConsecNeeded, &cfg.ConsecNeeded, defaultConsecNeeded),
 		envx.DurationKnob(envnames.EnvNethealthMinRestart, &cfg.MinRestart, defaultMinRestart),
-		// W8: pref-1499 direct-underlay TCP bypass; empty env → nil →
+		// pref-1499 direct-underlay TCP bypass; empty env → nil →
 		// applyDefaults' package default [22 6443 8132 9443 39901].
 		envx.IntListKnob(envnames.EnvNebulaDirectTCPPorts, &cfg.NebulaDirectTCPPorts),
 	})

@@ -1,4 +1,4 @@
-// db_operator_heals_test.go — end-to-end coverage for the W4
+// db_operator_heals_test.go — end-to-end coverage for the va-stuck-terminating
 // generic db-operator heal (healDBOperator): the per-operator
 // helpers are unit-tested in stateful_masterless_services_test.go
 // but no fixture ever drove the heal itself — a masterless STS
@@ -68,7 +68,7 @@ func TestDBOperatorHealBouncesOperatorPod(t *testing.T) {
 	}
 }
 
-// W10-FIX4: the STS attributes itself to the LONG Deployment name
+// dbOperatorPodPrefixes: the STS attributes itself to the LONG Deployment name
 // (percona-xtradb-cluster-operator) while its pods still run under
 // the short chart alias (pxc-operator-*) — a heal keyed on the
 // matched spelling alone would find no pod. The alias group must

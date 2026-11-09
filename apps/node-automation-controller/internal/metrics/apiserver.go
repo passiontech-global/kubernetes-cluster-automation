@@ -1,6 +1,6 @@
 // apiserver.go — series emitted by the internal/apiserver modules:
 // apiserver-endpoint-guard (per-backend wedge gauges), apiservice-
-// guard (aggregated API availability + the W10-CP1 unblock heals)
+// guard (aggregated API availability + the namespace-terminating-wedged unblock heals)
 // and admission-webhook-guard (circuit breaker + unmeshed-pod
 // auditor). Var order and comments follow the original metrics.go
 // layout.
@@ -27,7 +27,7 @@ var apiBackendQuarantined = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 // apiBackendJWKSKIDSkew marks (1) a backend whose /openid/v1/jwks kid
 // set disagrees with the healthy-backend majority for the streak
 // threshold — sa.pub/sa.key rotation skew surfaces as random 401s
-// across the HAProxy pool (W12-CP4b).
+// across the HAProxy pool (jwks-kid-skew).
 var apiBackendJWKSKIDSkew = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_apiserver_jwks_kid_skew",
 	Help: "1 while the backend's JWKS kid set mismatches the control-plane majority (SA signer-key skew).",
@@ -58,7 +58,7 @@ var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.Counte
 // with failurePolicy=Fail whose namespaceSelector still matches any of the
 // critical self-healing namespaces (kube-system, kube-node-lease, node-ops,
 // medik8s) — catches Helm/operator-installed webhooks invisible to static
-// check-webhook-guard.sh (W12-CP-B; kube-node-lease added later — its
+// check-webhook-guard.sh (critical-ns-audit; kube-node-lease added later — its
 // leases ARE the kubelet node heartbeat).
 var WebhookMissingCriticalNSExclusion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_webhook_missing_critical_ns_exclusion",
@@ -80,7 +80,7 @@ var WebhookHeartbeatResourceExposed = prometheus.NewGaugeVec(prometheus.GaugeOpt
 }, []string{"kind", "name", "webhook", "resource"})
 
 // ---------------------------------------------------------------------------
-// Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
+// Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
 
 // APIServiceUnavailable marks (1) aggregated APIServices whose
@@ -106,12 +106,12 @@ var UnmeshedPodsRecreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts
 }, []string{"namespace"})
 
 // ---------------------------------------------------------------------------
-// Later self-healing metrics grouped by owning module (W9-CP2/W9-ST3/
-// W9-GO1/W10-NM2/W10-ST6/W10-CP1).
+// Later self-healing metrics grouped by owning module (kine-bloat-guard/backup-posture-audit/
+// externalsecret-storm-guard/cloudflared-wedge-heal/velero-inflight-audit/namespace-terminating-wedged).
 // ---------------------------------------------------------------------------
 
 // APIServiceUnblockHealsTotal counts dead APIService heals forced
-// through the namespace-skip gate by the apiservice guard (W10-CP1):
+// through the namespace-skip gate by the apiservice guard (namespace-terminating-wedged):
 // an APIService in a normally-skipped namespace that stayed
 // Available=False >=15m while a namespace sat Terminating >=15m with
 // references to its API group.
@@ -153,7 +153,7 @@ func ObserveAPIBackend(ip string, rvGap float64, quarantined bool) {
 }
 
 // ObserveAPIBackendJWKSSkew records this cycle's JWKS kid-set
-// majority verdict for backend `ip` (W12-CP4b).
+// majority verdict for backend `ip` (jwks-kid-skew).
 func ObserveAPIBackendJWKSSkew(ip string, skewed bool) {
 	v := 0.0
 	if skewed {

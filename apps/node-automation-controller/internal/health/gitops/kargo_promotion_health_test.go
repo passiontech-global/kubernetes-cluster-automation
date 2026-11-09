@@ -1,5 +1,5 @@
 // kargo_promotion_health_test.go — coverage for the
-// kargo-promotion-health check (W12-GO1): stuck Promotions,
+// kargo-promotion-health check (kargo-promotion-health): stuck Promotions,
 // unhealthy Warehouses (emit + persisted-cooldown refresh nudge),
 // zombie AnalysisRuns, and the CRD-absent tolerance.
 package gitops

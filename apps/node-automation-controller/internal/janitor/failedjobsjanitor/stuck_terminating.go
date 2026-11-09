@@ -1,5 +1,5 @@
 // stuck_terminating.go — duty 3 of failed-jobs-janitor: the C3b
-// stuck-Terminating auditor (detect-only) plus the W4
+// stuck-Terminating auditor (detect-only) plus the va-stuck-terminating
 // pvc-protection unstick.
 //
 // Namespaces, PVCs and VolumeAttachments can wedge in Terminating
@@ -15,7 +15,7 @@
 // list — the finalizer names the controller that stopped draining, so
 // it is the debugging payload. Detection only: finalizers are never
 // stripped automatically (a stripped finalizer on a still-mounted
-// volume is a data-loss vector) — the sole exception is the W4
+// volume is a data-loss vector) — the sole exception is the va-stuck-terminating
 // pvc-protection unstick, which fires only when a per-namespace pod
 // scan proves nothing references the claim.
 package failedjobsjanitor
@@ -45,7 +45,7 @@ const (
 	// pvcProtectionFinalizer is the in-tree claim-protection finalizer —
 	// it drains only after the pvc-protection-controller verifies no pod
 	// references the claim; a wedged controller (or a deleted pod whose
-	// reference the controller missed) leaves it forever (W4).
+	// reference the controller missed) leaves it forever (va-stuck-terminating).
 	pvcProtectionFinalizer = "kubernetes.io/pvc-protection"
 )
 
@@ -113,7 +113,7 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 		mark("Namespace", "", n.Name, n.DeletionTimestamp, nsFinalizerNames(n))
 	}
 	nss = nil
-	// W4: a PVC wedged past the threshold whose ONLY finalizer is
+	// va-stuck-terminating: a PVC wedged past the threshold whose ONLY finalizer is
 	// kubernetes.io/pvc-protection is stuck waiting on the protection
 	// controller to prove no pod uses it — when zero pods in the
 	// namespace still reference it, the finalizer is stripped. The

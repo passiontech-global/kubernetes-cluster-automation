@@ -37,7 +37,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 			d.PathJoin(DefaultEnvFile)),
 		envx.StringKnob(envnames.EnvKinedbGuardStateDir, &cfg.GuardStateDir,
 			d.PathJoin(defaultGuardStateDir)),
-		// W8-CP2: in-container postgres data dir for the repack
+		// kinedb-maintenance: in-container postgres data dir for the repack
 		// headroom gate; empty → package default.
 		envx.StringKnob(envnames.EnvKinedbPgDataDir, &cfg.PGDataDir, ""),
 		// backup-health: the physical-backup verifier dir + cadence.
@@ -45,7 +45,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 			d.PathJoin(defaultBackupDir)),
 		envx.DurationKnob(envnames.EnvKinedbBackupInterval,
 			&cfg.BackupInterval, defaultBackupInterval),
-		// W16-CP1: the compact-guard step cap — 0/unset = disabled
+		// compact-step-cap: the compact-guard step cap — 0/unset = disabled
 		// (the unbounded head-Tail step); ApplyDefaults re-applies
 		// the same rule for a directly-constructed Config.
 		envx.Int64Knob(envnames.EnvKinedbGuardMaxStepRevisions,

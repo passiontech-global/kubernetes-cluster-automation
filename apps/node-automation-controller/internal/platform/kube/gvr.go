@@ -115,9 +115,9 @@ var (
 		Group: "velero.io", Version: "v1", Resource: "backuprepositories"}
 
 	// ---------------------------------------------------------------
-	// Percona Everest operator (velero-backup-auditor W9-ST3) and the
-	// three Percona database operators (cluster-health-probes W10-ST5
-	// quorum check + W10-CP3 watchdog rows).
+	// Percona Everest operator (velero-backup-auditor backup-posture-audit) and the
+	// three Percona database operators (cluster-health-probes percona-cluster-quorum
+	// quorum check + operator-workqueue-watchdog watchdog rows).
 	// ---------------------------------------------------------------
 	GVREverestDatabaseCluster = schema.GroupVersionResource{
 		Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}

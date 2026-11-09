@@ -40,7 +40,7 @@ var maintBloatRules = []testutil.ExecRule{
 	{Substr: "pg_repack", Out: "/usr/pgsql-16/bin/pg_repack\n"},
 	{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 	{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
-	// W8-CP2 headroom gate: 0 WAL bytes, 100GiB free — ample for the
+	// kinedb-maintenance headroom gate: 0 WAL bytes, 100GiB free — ample for the
 	// 300MB heap (needs >= 2.5*heap).
 	{Substr: "pg_ls_waldir", Out: "0\n"},
 	{Substr: "df", Out: "Avail\n107374182400\n"},
@@ -223,7 +223,7 @@ func TestMaintCycleAssessFailGatesGauges(t *testing.T) {
 	}
 }
 
-// W12-CP2: the invalid-index reaper drops *_ccnew/*_ccold shells
+// invalid-index-reaper: the invalid-index reaper drops *_ccnew/*_ccold shells
 // BEFORE the reindex and leaves other invalid indexes for an
 // operator.
 func TestMaintReapsInvalidIndexes(t *testing.T) {

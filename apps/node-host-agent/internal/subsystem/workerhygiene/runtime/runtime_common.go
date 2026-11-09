@@ -1,4 +1,4 @@
-// runtime_common.go — the W10 host runtime-resource hygiene guard
+// runtime_common.go — the host runtime-resource hygiene guard
 // family overview: the things a node can be silently dying of while
 // every healthz is still green. One file per guard
 // (runtime_<name>.go); there is deliberately no shared helper layer

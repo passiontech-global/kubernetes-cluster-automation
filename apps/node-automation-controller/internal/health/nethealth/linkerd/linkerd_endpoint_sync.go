@@ -1,10 +1,10 @@
 // linkerd_endpoint_sync.go — the linkerd-endpoint-sync check
-// (W9-NM2/W10-FIX7): audits every selector-bearing Service in
+// (netns-endpoint-sync/endpoint-sync-heal): audits every selector-bearing Service in
 // linkerd-injected namespaces for EndpointSlice desync, deletes
 // provably-stale controller-owned slices, and bounces the oldest
 // linkerd-destination pod past the persistence window.
 //
-// W12-NM1b rides the same sweep for the Cilium socket-LB vs Linkerd
+// socket-lb-vs-linkerd rides the same sweep for the Cilium socket-LB vs Linkerd
 // compatibility audit: pod-netns bpf-lb-sock rewrites connect()
 // before linkerd-init's iptables rules can steer into the proxy,
 // silently killing SO_ORIGINAL_DST/mTLS — reported on
@@ -32,13 +32,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
+// linkerdEndpointSyncCheck is the netns-endpoint-sync linkerd endpoint-sync
 // watchdog — a meshed Service whose EndpointSlice diverges from
 // its Ready pod IPs, healed by bouncing linkerd-destination.
 type linkerdEndpointSyncCheck struct {
 	*probefw.Deps
 
-	// W9-NM2 watchdog state (serial sweep — unguarded):
+	// netns-endpoint-sync watchdog state (serial sweep — unguarded):
 	//   - linkerdDesyncSince: "ns/svc" → first sweep the Service's
 	//     EndpointSlice diverged from its Ready pod IPs. The window
 	//     gates the stale-slice delete + destination-pod bounce,
@@ -71,7 +71,7 @@ type linkerdEndpointSyncCheck struct {
 // The constructor lives in the package facade (linkerd.go).
 
 const (
-	// W9-NM2 — linkerd-endpoint-sync knobs.
+	// netns-endpoint-sync — linkerd-endpoint-sync knobs.
 	CheckNameLinkerdEndpointSync = "linkerd-endpoint-sync"
 	// linkerdDestHealAnno persists the last bounce moment on the
 	// desynced Service — the restart-proof half of the escalating
@@ -101,7 +101,7 @@ const (
 	// contract).
 	linkerdDestHealCooldownMax = 24 * time.Hour
 	// linkerdSliceHealMinAge is the fuse on the missing-IP half of
-	// the W10-FIX7 stale-slice delete: a Ready pod IP must have been
+	// the endpoint-sync-heal stale-slice delete: a Ready pod IP must have been
 	// Ready this long before its absence from the service's managed
 	// EndpointSlices counts as staleness — younger pods may simply
 	// not have been reconciled into the slices yet.
@@ -112,14 +112,14 @@ const (
 	// recreates them with corrected contents.
 	linkerdSliceManagedByESC = "endpointslice-controller.k8s.io"
 
-	// W12-NM1b — ciliumConfigNS/ciliumConfigName locate the Cilium
+	// socket-lb-vs-linkerd — ciliumConfigNS/ciliumConfigName locate the Cilium
 	// ConfigMap the socket-LB audit reads.
 	ciliumConfigNS   = "kube-system"
 	ciliumConfigName = "cilium-config"
 )
 
 var (
-	// W9-NM2 — the endpoint-desync signal: 1 while the Service's
+	// netns-endpoint-sync — the endpoint-desync signal: 1 while the Service's
 	// EndpointSlice misses a Ready pod IP or holds a deleted pod's
 	// address. Past the persistence window the check also
 	// rolling-bounces the oldest linkerd-destination pod (1h
@@ -135,7 +135,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// W9-NM2 — linkerd-endpoint-sync
+// netns-endpoint-sync — linkerd-endpoint-sync
 // ---------------------------------------------------------------------------
 
 // checkLinkerdEndpointSync audits every selector-bearing Service in
@@ -150,8 +150,8 @@ func init() {
 // desync standing, and the bouncing stops entirely after three
 // consecutive ineffective bounces (maintenance-gated,
 // UID-preconditioned) — to force a full resync. The escalation is
-// the same re-roll shape as the W8-NM3 wedged-pod heal.
-// W10-FIX7 adds the other half of the heal: the bounce only re-reads
+// the same re-roll shape as the mesh-net-guards wedged-pod heal.
+// endpoint-sync-heal adds the other half of the heal: the bounce only re-reads
 // EndpointSlices, so when the slices themselves are provably stale
 // (a Ready address no live pod owns, or a >3m-Ready pod IP absent
 // from the whole endpointslice-controller-owned set) the heal first
@@ -171,7 +171,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}
 	injected := map[string]bool{}
-	// linkerdInstalled feeds the W12-NM1b socket-LB audit — the
+	// linkerdInstalled feeds the socket-lb-vs-linkerd socket-LB audit — the
 	// Cilium config only conflicts while the mesh itself is
 	// deployed on this cluster.
 	linkerdInstalled := false
@@ -190,7 +190,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// object, not just the gauge label tuple.
 	desynced := map[string]*corev1.Service{}
 	// staleSlices: "ns/svc" → the provably-stale managed EndpointSlices
-	// to delete if the service's desync survives the window (W10-FIX7).
+	// to delete if the service's desync survives the window (endpoint-sync-heal).
 	staleSlices := map[string][]linkerdSliceRef{}
 	if len(injected) > 0 {
 		svcList, err := p.AllServices(ctx)
@@ -204,7 +204,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		// Audited services — selector + injected ns (+ the
 		// ExternalName/publishNotReady exclusions), the same filter
 		// the per-service loop applies. Only their controller-owned
-		// slices are delete candidates (W10-FIX7).
+		// slices are delete candidates (endpoint-sync-heal).
 		audited := map[string]bool{}
 		for i := range svcList {
 			svc := &svcList[i]
@@ -218,7 +218,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		esReady := map[string]map[string]bool{}
 		// managedSlices: "ns/svc" → the service's
 		// endpointslice-controller-owned EndpointSlices with their
-		// Ready address sets — the W10-FIX7 delete candidates.
+		// Ready address sets — the endpoint-sync-heal delete candidates.
 		managedSlices := map[string][]linkerdSliceRef{}
 		slices, err := p.AllEndpointSlices(ctx)
 		if err != nil {
@@ -281,7 +281,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 					continue
 				}
 				liveIPs[pod.Status.PodIP] = true
-				// W10-FIX7: kube.PodReadySince fails closed on a
+				// endpoint-sync-heal: kube.PodReadySince fails closed on a
 				// zero LastTransitionTime, but the desync read
 				// treats a zero stamp as maximally aged — restore
 				// the lenient read for Ready pods (zero →
@@ -292,7 +292,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 				}
 				if ready {
 					readyIPs[pod.Status.PodIP] = true
-					// W10-FIX7 fuse — only a pod Ready past
+					// endpoint-sync-heal fuse — only a pod Ready past
 					// linkerdSliceHealMinAge counts as "missing"
 					// from the slices.
 					if now.Sub(since) >= linkerdSliceHealMinAge {
@@ -324,7 +324,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 
-	// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit:
+	// socket-lb-vs-linkerd — Cilium socket-LB vs Linkerd compatibility audit:
 	// when Cilium's bpf-lb-sock rewrites connect() inside the pod
 	// netns, packets reach linkerd-proxy already resolved to a
 	// backend IP — the proxy never sees the Service identity, so
@@ -379,7 +379,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// The cooldown is per desynced SERVICE (escalating — see
 	// linkerdDestHealEscalation) — two services stuck on the same
 	// root cause share one bounce. Iterates `emitted`, not
-	// rep.Findings(): the socket-LB audit (W12-NM1b) also reports
+	// rep.Findings(): the socket-LB audit (socket-lb-vs-linkerd) also reports
 	// findings into rep and must not trigger a desync heal.
 	for _, k := range emitted {
 		p.healLinkerdDestination(ctx, log, desynced[k], k, now, staleSlices[k])

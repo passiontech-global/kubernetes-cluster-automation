@@ -93,7 +93,7 @@ func TestAllowedVNoBudgetIsInert(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-target non-convergent circuit breaker (W18-4).
+// Per-target non-convergent circuit breaker (target-circuit-breaker).
 // ---------------------------------------------------------------------------
 
 // resetTargetBreaker restores the inert (unconfigured) breaker after

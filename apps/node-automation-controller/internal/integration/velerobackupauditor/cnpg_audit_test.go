@@ -1,7 +1,7 @@
-// cnpg_audit_test.go — coverage for the W16-ST1 CloudNativePG backup
+// cnpg_audit_test.go — coverage for the cnpg-backup-audit CloudNativePG backup
 // audit: the classification matrix (failed / stuck / stale), the
 // end-to-end audit against a fake dynamic client (missing, suspend
-// skip, resolve-and-clear), and the W16-ST1 DataUpload/DataDownload
+// skip, resolve-and-clear), and the cnpg-backup-audit DataUpload/DataDownload
 // wedge scan.
 package velerobackupauditor
 
@@ -287,7 +287,7 @@ func TestVeleroAuditorCNPGCRDAbsent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W16-ST1 — DataUpload / DataDownload wedge scan
+// cnpg-backup-audit — DataUpload / DataDownload wedge scan
 // ---------------------------------------------------------------------------
 
 // DataUpload/DataDownload objects stuck in an in-flight phase past

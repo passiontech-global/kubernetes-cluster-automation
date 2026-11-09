@@ -1,5 +1,5 @@
 // collect_clock_conntrack.go — H1 clock sync (adjtimex) and the
-// conntrack/ARP neighbour-table pressure signals (H2, W7-H5).
+// conntrack/ARP neighbour-table pressure signals (H2, conntrack-arp-pressure).
 // Split out of hostmetrics.go.
 package hostmetrics
 
@@ -18,7 +18,7 @@ const (
 	// H2 conntrack table sources.
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
-	// W7 sources: H5 conntrack per-CPU stats + ARP table.
+	// telemetry sources: conntrack per-CPU stats + ARP table.
 	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
 	defaultARPTableFile      = "/proc/net/arp"
 	// Clocksource sources (sysfs clocksource0).
@@ -151,7 +151,7 @@ var (
 		"node_host_agent_conntrack_used_ratio",
 		"Conntrack table fill ratio (entries/limit; emitted only when both files parse and limit > 0).",
 		[]string{"node"}, nil)
-	// W7-H5 conntrack per-CPU stat counters + ARP table fill.
+	// conntrack-arp-pressure conntrack per-CPU stat counters + ARP table fill.
 	descCtInsertFail = prometheus.NewDesc(
 		"node_host_agent_conntrack_insert_failed_total",
 		"Sum of the insert_failed column across all CPU rows of /proc/net/stat/nf_conntrack (UDP tuple-collision drops).",
@@ -160,7 +160,7 @@ var (
 		"node_host_agent_conntrack_drops_total",
 		"Sum of the drop column across all CPU rows of /proc/net/stat/nf_conntrack.",
 		[]string{"node"}, nil)
-	// W12-KR3: the same counters under the node_exporter
+	// conntrack-port-pressure: the same counters under the node_exporter
 	// nf_conntrack collector names — dashboards/alerts written for
 	// node_exporter's conntrack module then port over without
 	// translation. drop folds in early_drop: both count packets the
@@ -209,7 +209,7 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue,
 			float64(count)/float64(limit), c.cfg.NodeName)
 	}
-	// W7-H5: the per-CPU stat counters — insert_failed grows on the
+	// conntrack-arp-pressure: the per-CPU stat counters — insert_failed grows on the
 	// UDP source-port tuple collision (A+AAAA race) long before the
 	// table fills; drop counts the packets conntrack refused. Both
 	// are cumulative kernel counters → CounterValue.
@@ -297,7 +297,7 @@ var descARPEntries = prometheus.NewDesc(
 	[]string{"node"}, nil)
 
 // collectARP counts /proc/net/arp entry rows (header skipped) — the
-// ARP neighbour-table fill half of W7-H5 (gc_thresh overflow drops
+// ARP neighbour-table fill half of conntrack-arp-pressure (gc_thresh overflow drops
 // outbound packets while every other signal stays green). Emits
 // only when the file reads.
 func (c *Collector) collectARP(ch chan<- prometheus.Metric) {

@@ -659,7 +659,7 @@ func TestCertDriftAuditorTrustBundles(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W7-C6 — kubernetes-replicator tls.crt drift
+// replicator-cert-drift — kubernetes-replicator tls.crt drift
 // ---------------------------------------------------------------------------
 
 // replicatedSecret builds a TLS-type secret carrying the

@@ -29,7 +29,7 @@ var (
 // recording FakeExec runners for host commands and the systemd
 // client. The recorders serialize their own logs — Cycle
 // (checkNebulaDirectTCP → n.ip) and a spawned routeGuard goroutine
-// can invoke them concurrently (W8).
+// can invoke them concurrently.
 type env struct {
 	n        *NetHealth
 	state    string

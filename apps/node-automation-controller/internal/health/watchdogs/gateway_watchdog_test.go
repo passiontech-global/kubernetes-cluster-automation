@@ -1,6 +1,6 @@
 // gateway_watchdog_test.go — regression coverage for the gateway-API
 // signature + ownership fix in the operator-workqueue watchdog
-// (W5.8). The fix landed three corrections:
+// (operator-workqueue-watchdog). The fix landed three corrections:
 //
 //  1. Gateway-API types carry NO top-level status.observedGeneration —
 //     generation lag is judged inside the per-condition

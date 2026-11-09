@@ -1,5 +1,5 @@
 // cilium_bpf_map_pressure.go — the cilium-bpf-map-pressure check
-// (W10-NM1): Prometheus max by (node, map_name)
+// (cilium-bpf-map-pressure): Prometheus max by (node, map_name)
 // (cilium_bpf_map_pressure) above the fill threshold means a BPF
 // map is approaching max_entries — a full map blackholes the
 // traffic class it serves (conntrack full = all new flows
@@ -30,7 +30,7 @@ type ciliumBPFMapPressureCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newCiliumBPFMapPressureCheck builds the W10-NM1 check — its only
+// newCiliumBPFMapPressureCheck builds the cilium-bpf-map-pressure check — its only
 // state is the emitted-gauge ledger.
 func NewCiliumBPFMapPressureCheck(d *probefw.Deps) probefw.Check {
 	return &ciliumBPFMapPressureCheck{Deps: d}
@@ -41,10 +41,10 @@ const (
 )
 
 var (
-	// W10-NM1 — Cilium BPF map fill ratio per node/map.
+	// cilium-bpf-map-pressure — Cilium BPF map fill ratio per node/map.
 	ciliumBPFMapPressureGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_cilium_bpf_map_pressure",
-		Help: "Cilium BPF map fill ratio (used/max) per node and map_name — W10-NM1.",
+		Help: "Cilium BPF map fill ratio (used/max) per node and map_name — cilium-bpf-map-pressure.",
 	}, []string{"node", "map_name"})
 )
 

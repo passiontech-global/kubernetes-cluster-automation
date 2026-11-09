@@ -1,5 +1,5 @@
 // dragonfly_replica_sync_storm_test.go — coverage for the
-// dragonfly-replica-sync-storm check (W10-ST4): replica restart
+// dragonfly-replica-sync-storm check (dragonfly-replica-sync-storm): replica restart
 // (never the master) on confirmed storm, link-down alone FAILs
 // without restart.
 package datastore
@@ -221,7 +221,7 @@ func TestDragonflySyncStormSkipsUnownedPod(t *testing.T) {
 	}
 }
 
-// W17 — a Prometheus outage must not leave the previous sweep's
+// heal-budget — a Prometheus outage must not leave the previous sweep's
 // gauge series or first-seen windows dangling: the early return
 // still prunes the seen ledger and reconciles the emitted ledger
 // against an empty set (a stale 1 leaks otherwise).

@@ -1,4 +1,4 @@
-// collect_pki_test.go — Wave-2 PKI cert days-left series.
+// collect_pki_test.go — PKI cert days-left series.
 
 package hostmetrics
 
@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// --- Wave-2 tests: 2.4 PKI certs, A1 inotify, A2 zombie/cgroup, B4 MTU ---
+// --- collector tests: 2.4 PKI certs, A1 inotify, A2 zombie/cgroup, B4 MTU ---
 
 // mkTestCertPEM generates a throwaway self-signed cert expiring at
 // notAfter — enough for the pki-cert-days-left parse path.
@@ -124,7 +124,7 @@ func TestPKICertDaysLeftExpiredFloors(t *testing.T) {
 	}
 }
 
-// --- W12-CP4a: sa.pub ServiceAccount signer-key fingerprint ---
+// --- sa-pub-key-fingerprint: sa.pub ServiceAccount signer-key fingerprint ---
 
 // saPubHashOf returns the expected {sha256} label value for a file
 // content — mirrors sha256FileHex so the label assertion is exact.

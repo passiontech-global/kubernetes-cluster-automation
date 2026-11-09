@@ -1,6 +1,6 @@
 // ctr_shims.go — the containerd-shim scope machinery shared by the
 // ctr-tasks reaper (31) and the ctr-meta orphan-shim sweep
-// (W10-KR3): which containerd-shim-runc-v2 processes belong to the
+// (meta-db-corruption): which containerd-shim-runc-v2 processes belong to the
 // containerd instance this agent watches, and where their task dirs
 // live. The scope test is deliberately fail-closed — an
 // unidentifiable shim is foreign, never a kill candidate.

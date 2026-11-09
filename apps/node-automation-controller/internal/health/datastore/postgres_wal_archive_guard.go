@@ -41,7 +41,7 @@ type postgresWALArchiveGuardCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	// emittedSlot is the same ledger for the W12-ST2 slot-bloat
+	// emittedSlot is the same ledger for the percona-degraded-quorum slot-bloat
 	// gauge — a slot that drains or goes active loses its series.
 	// emittedCNPG is the cnpg-health cnpg_cluster_unhealthy ledger —
 	// a cluster that recovers its phase/quorum/archiving loses the
@@ -106,7 +106,7 @@ var (
 		Help: "1 while the Postgres cluster shows a WAL/archive runaway signature (archive condition, archiver failure, retained slot WAL, volume pressure, disk-full crash evidence).",
 	}, []string{"namespace", "cluster", "reason"})
 
-	// W12-ST2 — inactive replication slots retaining WAL, carried
+	// percona-degraded-quorum — inactive replication slots retaining WAL, carried
 	// with the slot name and the retained size the
 	// wal_archive_unhealthy{reason=inactive_slot} flag cannot show.
 	postgresInactiveSlotWALGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -381,7 +381,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 			p.emitSlotBloat(&slotRep, &rep, s)
 		}
 	}
-	// W12-ST2 — the postgres_exporter spelling of the same
+	// percona-degraded-quorum — the postgres_exporter spelling of the same
 	// signature: the active flag and the retained-bytes diff live on
 	// separate series joined by the slot labels. `and` returns the
 	// active==0 samples themselves (value 0) — the bloat gauge
@@ -415,7 +415,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 			// The finding's entity is the CLUSTER, not the PVC —
 			// the gauge series are per operator cluster, and the
 			// claim name is an implementation detail of the
-			// operator's volume layout (W17: emitting the PVC name
+			// operator's volume layout (heal-budget: emitting the PVC name
 			// produced series that match no alert label set).
 			if cluster := pgPVCs[ns+"/"+pvc]; cluster != "" {
 				emit(ns, cluster, "wal_volume_pressure")
@@ -438,7 +438,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		"postgres wal/archive unhealthy: ", ", ")
 }
 
-// emitSlotBloat flags one inactive-slot sample on the W12-ST2
+// emitSlotBloat flags one inactive-slot sample on the percona-degraded-quorum
 // slot-bloat gauge and records the finding on the shared report.
 // The value is the retained byte count where the exporter reports
 // one (retained_bytes / lsn-diff families); the `and`-joined

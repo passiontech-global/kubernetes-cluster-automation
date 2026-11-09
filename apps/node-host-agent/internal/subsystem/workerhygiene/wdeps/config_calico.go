@@ -1,4 +1,4 @@
-// config_calico.go — the W7-H7 calico-hygiene knobs: CalicoConfig,
+// config_calico.go — the calico-hygiene calico-hygiene knobs: CalicoConfig,
 // its defaults and its NODE_HOST_AGENT_CALICO_* env rows (the felix
 // readiness probe and the orphan cali* veth leak headroom).
 package wdeps
@@ -8,7 +8,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// CalicoConfig groups the W7-H7 calico-hygiene knobs — the felix
+// CalicoConfig groups the calico-hygiene calico-hygiene knobs — the felix
 // readiness probe and the orphan cali* veth leak headroom.
 type CalicoConfig struct {
 	FelixReadyURL       string // calico-node felix :9099/readiness probe
@@ -24,7 +24,7 @@ func (cl *CalicoConfig) applyDefaults() {
 	}
 }
 
-// envKnobs returns the calico domain's env rows — the W7 felix
+// envKnobs returns the calico domain's env rows — the felix
 // readiness URL (empty env → in-package default) and the
 // orphan-veth threshold.
 func (cl *CalicoConfig) envKnobs() []envx.Knob {

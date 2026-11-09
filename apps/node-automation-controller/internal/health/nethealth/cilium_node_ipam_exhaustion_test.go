@@ -1,5 +1,5 @@
 // cilium_node_ipam_exhaustion_test.go — coverage for the
-// cilium-node-ipam-exhaustion check (W10-NM6): exhaustion FAIL +
+// cilium-node-ipam-exhaustion check (cilium-node-ipam-exhaustion): exhaustion FAIL +
 // terminal-pod reap, healthy node, podCIDR capacity math.
 package nethealth
 
@@ -18,7 +18,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-NM6 — cilium-node-ipam-exhaustion
+// cilium-node-ipam-exhaustion — cilium-node-ipam-exhaustion
 // ---------------------------------------------------------------------------
 
 func TestCiliumIPAMExhaustionFailsAndReapsTerminalPods(t *testing.T) {
