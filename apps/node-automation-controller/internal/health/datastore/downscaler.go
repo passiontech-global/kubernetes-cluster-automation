@@ -5,15 +5,12 @@
 package datastore
 
 import (
-	"context"
 	"strconv"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -23,28 +20,25 @@ import (
 // checks (rabbitmq-quorum-health, dragonfly-replica-sync-storm).
 // ---------------------------------------------------------------------------
 
-// downscaledClusterCRs lists the cluster CRs of gvr the
-// go-kube-downscaler parked — spec.replicas explicitly 0 plus a
-// downscaler/* annotation (kube.IsIntentionallyDownscaled) — keyed
-// "ns/name". A nil dynamic client or an absent CRD reads as "none
-// parked": the calling check works pod-first and simply cannot
-// prove the park, so the pod-level signatures keep their normal
-// posture.
-func downscaledClusterCRs(ctx context.Context, dyn dynamic.Interface,
-	gvr schema.GroupVersionResource) (map[string]bool, error) {
-	out := map[string]bool{}
-	if dyn == nil {
-		return out, nil
-	}
-	list, err := dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+// downscaledClusterCRs filters the sweep's shared cluster-CR census
+// (AllUnstructured's paged dynamic LIST, memoized per GVR) to the
+// CRs the go-kube-downscaler parked — spec.replicas explicitly 0
+// plus a downscaler/* annotation (kube.IsIntentionallyDownscaled) —
+// keyed "ns/name". listErr is that census read's memoized raw error:
+// an absent CRD (NotFound/NoMatch) still reads as "none parked", any
+// other failure returns (nil, err) — the calling check warns and
+// keeps its pod-first posture without downscaler awareness.
+func downscaledClusterCRs(items []unstructured.Unstructured,
+	listErr error) (map[string]bool, error) {
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		return out, nil
-	case err != nil:
-		return nil, err
+	case listErr == nil, apierrors.IsNotFound(listErr),
+		meta.IsNoMatchError(listErr):
+	default:
+		return nil, listErr
 	}
-	for i := range list.Items {
-		cr := &list.Items[i]
+	out := map[string]bool{}
+	for i := range items {
+		cr := &items[i]
 		var reps *int32
 		if n, found := kube.NestedInt64(cr.Object, "spec", "replicas"); found {
 			r := int32(n)

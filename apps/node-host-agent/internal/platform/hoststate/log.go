@@ -34,14 +34,14 @@ func (s *Store) AppendLogWarn(msg string) {
 // SHRINK (the rename-to-.1 case) it first drains the unread tail
 // from the rotated .1 generation, then restarts the fresh file at
 // offset 0 (events.go readNewLogLines). The rotate decision + rename
-// run under s.mu so two concurrent appends cannot both rename.
+// run under s.shared.mu so two concurrent appends cannot both rename.
 const watchdogLogMaxBytes = 10 << 20
 
 func (s *Store) appendFile(msg string) {
 	if s.LogFile == "" {
 		return
 	}
-	// The rotate decision + rename run under s.mu: two concurrent
+	// The rotate decision + rename run under s.shared.mu: two concurrent
 	// appends that both stat an oversized log can otherwise BOTH
 	// rename — the second rename throwing away the fresh file the
 	// first rotation just started (and its early lines) by replacing
@@ -50,7 +50,7 @@ func (s *Store) appendFile(msg string) {
 	// whose open raced the rename simply follows its fd into the
 	// rotated .1 file (no loss, one stray line in the old
 	// generation).
-	s.mu.Lock()
+	s.shared.mu.Lock()
 	if fi, err := os.Stat(s.LogFile); err == nil &&
 		fi.Size() >= watchdogLogMaxBytes {
 		// Single-file rotation: <log> → <log>.1, then append to a
@@ -61,7 +61,7 @@ func (s *Store) appendFile(msg string) {
 				"file", s.LogFile, "error", rerr)
 		}
 	}
-	s.mu.Unlock()
+	s.shared.mu.Unlock()
 	f, err := os.OpenFile(s.LogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

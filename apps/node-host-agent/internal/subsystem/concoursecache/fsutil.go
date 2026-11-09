@@ -94,7 +94,11 @@ func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
 }
 
 // filesByAge lists every regular file under root sorted oldest-first —
-// `find -type f -printf '%T@ %s %p\n' | sort -n`.
+// `find -type f -printf '%T@ %s %p\n' | sort -n`. size carries ALLOCATED
+// blocks (entryBlocks), not apparent size: the trim accumulators compare
+// it against diskUsage totals and the size marks, which are all du-style
+// st_blocks×512 — mixing units would let sparse files (huge apparent
+// size, tiny footprint) blow the cap math and misreport bytesFreed.
 func filesByAge(root string) []cacheFile {
 	var out []cacheFile
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -107,7 +111,11 @@ func filesByAge(root string) []cacheFile {
 			return nil
 		}
 		if info, err := d.Info(); err == nil {
-			out = append(out, cacheFile{path: path, size: info.Size(), modTime: info.ModTime()})
+			out = append(out, cacheFile{
+				path:    path,
+				size:    int64(entryBlocks(info)),
+				modTime: info.ModTime(),
+			})
 		}
 		return nil
 	})

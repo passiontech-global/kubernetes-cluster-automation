@@ -58,6 +58,15 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 		return
 	}
 	if patched {
+		// Stamp the cooldown the moment the patch lands. HealAllowed
+		// already spent this heal's budget token getting here — and
+		// heal.DeletePod (the only other Stamp site) never runs on
+		// this path, so without the stamp a second stalled pod of the
+		// SAME workload resolves to the same controller key this
+		// sweep, passes the un-stamped cooldown, spends another token
+		// and re-PATCHes the Deployment from the snapshot's stale
+		// pre-write copy.
+		p.Heals.Stamp(ck, now)
 		// The template patch just landed — the workload controller
 		// (Deployment/StatefulSet/DaemonSet/Rollout) rolling-update
 		// replaces every pod with the corrected config itself.

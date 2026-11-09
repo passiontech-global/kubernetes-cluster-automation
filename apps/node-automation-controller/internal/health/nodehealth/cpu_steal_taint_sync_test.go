@@ -9,8 +9,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -195,4 +198,124 @@ func TestCPUStealTaintDefersUnderOpenCircuit(t *testing.T) {
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("taint applied while the target circuit is open")
 	}
+}
+
+// Both taint patches must invalidate ONLY the node census: a
+// sweep-wide InvalidateSweep here wiped the pod/... caches a node
+// taint cannot stale, re-listing the whole snapshot for every later
+// check — and the armed direct-CS re-read must carry the patch.
+func TestCPUStealPatchInvalidatesNodesOnly(t *testing.T) {
+	t.Run("taint", func(t *testing.T) {
+		w1 := stealNode("w1", corev1.ConditionTrue, 10*time.Minute)
+		w2 := testutil.Node("w2", corev1.ConditionTrue, nil)
+		w3 := testutil.Node("w3", corev1.ConditionTrue, nil)
+		cs := fake.NewSimpleClientset(w1, w2, w3,
+			probetest.PendingUnscheduledPod("apps", "witness", time.Minute, true))
+		var podLists, nodeLists int
+		cs.PrependReactor("list", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				podLists++
+				return false, nil, nil
+			})
+		cs.PrependReactor("list", "nodes",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				nodeLists++
+				return false, nil, nil
+			})
+		p := testProber(cs)
+		chk := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p)
+		sweepCtx := probefw.WithSweepSnapshot(ctx)
+		if _, err := chk.AllPods(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := chk.AllNodes(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if podLists != 1 || nodeLists != 1 {
+			t.Fatalf("warm-up lists pods=%d nodes=%d, want 1/1", podLists, nodeLists)
+		}
+		if res := chk.Run(sweepCtx); res.Pass {
+			t.Fatalf("sustained steal pressure must fail: %+v", res)
+		}
+		// The taint landed; re-reading the pod census must hit the
+		// memoized snapshot — a sweep-wide wipe would re-LIST here.
+		if _, err := chk.AllPods(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if podLists != 1 {
+			t.Fatalf("taint re-listed pods %d time(s) — sweep-wide wipe, want 0", podLists-1)
+		}
+		fresh, err := chk.AllNodes(sweepCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nodeLists != 2 {
+			t.Fatalf("node census reads=%d, want 2 (memo + one armed re-read)", nodeLists)
+		}
+		for i := range fresh {
+			if fresh[i].Name == "w1" && !kube.HasTaint(fresh[i].Spec.Taints, kube.TaintCPUSteal) {
+				t.Fatal("post-patch census carries the pre-taint copy")
+			}
+		}
+	})
+	t.Run("untaint", func(t *testing.T) {
+		w1 := stealNode("w1", corev1.ConditionFalse, 20*time.Minute)
+		w1.Spec.Taints = append(w1.Spec.Taints, corev1.Taint{
+			Key:    kube.TaintCPUSteal,
+			Value:  cpuStealTaintValue,
+			Effect: corev1.TaintEffectPreferNoSchedule,
+		})
+		w1.Annotations = map[string]string{
+			kube.AnnoFirstSeenCPUStealClear: `{"w1":"` +
+				time.Now().Add(-(cpuStealClearMinAge + time.Minute)).
+					UTC().Format(time.RFC3339) + `"}`}
+		cs := fake.NewSimpleClientset(w1,
+			probetest.PendingUnscheduledPod("apps", "witness", time.Minute, true))
+		var podLists, nodeLists int
+		cs.PrependReactor("list", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				podLists++
+				return false, nil, nil
+			})
+		cs.PrependReactor("list", "nodes",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				nodeLists++
+				return false, nil, nil
+			})
+		p := testProber(cs)
+		chk := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p)
+		sweepCtx := probefw.WithSweepSnapshot(ctx)
+		if _, err := chk.AllPods(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := chk.AllNodes(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if podLists != 1 || nodeLists != 1 {
+			t.Fatalf("warm-up lists pods=%d nodes=%d, want 1/1", podLists, nodeLists)
+		}
+		if res := chk.Run(sweepCtx); !res.Pass {
+			t.Fatalf("cleared pressure should pass: %+v", res)
+		}
+		// The untaint landed; re-reading the pod census must hit the
+		// memoized snapshot — a sweep-wide wipe would re-LIST here.
+		if _, err := chk.AllPods(sweepCtx); err != nil {
+			t.Fatal(err)
+		}
+		if podLists != 1 {
+			t.Fatalf("untaint re-listed pods %d time(s) — sweep-wide wipe, want 0", podLists-1)
+		}
+		fresh, err := chk.AllNodes(sweepCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nodeLists != 2 {
+			t.Fatalf("node census reads=%d, want 2 (memo + one armed re-read)", nodeLists)
+		}
+		for i := range fresh {
+			if fresh[i].Name == "w1" && kube.HasTaint(fresh[i].Spec.Taints, kube.TaintCPUSteal) {
+				t.Fatal("post-patch census carries the pre-untaint copy")
+			}
+		}
+	})
 }

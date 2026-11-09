@@ -700,7 +700,7 @@ func TestFloatModuloNoPanic(t *testing.T) {
 		`{{ "5.5" % "2" }}`:   "1.5",
 		`{{ "-5.5" % "2" }}`:  "0.5", // floored (divisor's sign)
 		`{{ "5.5" % "-2" }}`:  "-0.5",
-		`{{ 5.5 % 2.0 }}`:     "1", // int path still governs
+		`{{ 5.5 % 2.0 }}`:     "1.5", // float operands take the float path
 		`{{ "10" % "0.25" }}`: "0",
 	}
 	for tpl, want := range cases {

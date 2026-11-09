@@ -429,13 +429,16 @@ func (p *statefulMasterlessCheck) logStatefulPodRoles(ctx context.Context, log l
 	if err != nil {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(sig.sts.Namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: sel.String()})
+	allPods, err := p.AllPods(ctx)
 	if err != nil {
 		return
 	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range allPods {
+		pod := &allPods[i]
+		if pod.Namespace != sig.sts.Namespace ||
+			!sel.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
 		roles := map[string]string{}
 		for _, k := range masterlessRoleKeys {
 			if v := pod.Labels[k]; v != "" {

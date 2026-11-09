@@ -268,6 +268,42 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	}
 }
 
+// A non-Running repo-server pod is never the restart target — it has
+// no repo cache to flush, so restarting it would spend the heal on a
+// pod that cannot hold stale state while the Running cache-carrier
+// survives.
+func TestArgoCDRepoServerPendingPodNotPicked(t *testing.T) {
+	cond := func() map[string]any {
+		return map[string]any{
+			"type":               "ComparisonError",
+			"lastTransitionTime": time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	}
+	appA := argoCDApplication("argocd", "app-a", "", cond())
+	appB := argoCDApplication("argocd", "app-b", "", cond())
+	dyn := testutil.NewDynamicClient(appA, appB)
+
+	pending := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodPending, false, 2*time.Hour)
+	pending.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	pending.OwnerReferences = repoServerOwnerRef("argocd-repo-server-0")
+	running := probetest.PodWithPhase("argocd", "argocd-repo-server-1", corev1.PodRunning, true, time.Hour)
+	running.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	running.OwnerReferences = repoServerOwnerRef("argocd-repo-server-1")
+	cs := fake.NewSimpleClientset(pending, running)
+	p := testProberDyn(cs, dyn)
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("two ComparisonErrors must fail: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("oldest RUNNING repo-server pod should be restarted, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pending repo-server pod must not consume the heal: %v", err)
+	}
+}
+
 // repoServerOwnerRef builds the ReplicaSet controller ownerRef a
 // real repo-server pod carries — the restart heal refuses a
 // controller-less pod (deleting it would not be recreated).

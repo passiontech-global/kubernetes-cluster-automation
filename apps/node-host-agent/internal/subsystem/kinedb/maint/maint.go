@@ -45,12 +45,22 @@ const (
 	// the unix second the last full REINDEX/FREEZE/repack run
 	// completed (the same last-* file contract as the guard).
 	lastMaintFile = "last-maint-run"
+	// maintEpochGrace bounds the skip window BELOW the maintenance
+	// interval (kdeps.DefaultMaintInterval). Failure mode without
+	// it: the cycle cadence lands just inside a full-length window
+	// (say hour 23 of 24) → the startup run SKIPS → the next look
+	// is another interval away → real maintenance slides to ~47h
+	// since the last heavy block. With the grace, a restart that
+	// late re-runs the block up to 2h "early" instead of pushing it
+	// a full interval late.
+	maintEpochGrace = 2 * time.Hour
 	// maintEpochWindow — a heavy block younger than this skips the
 	// next cycle's REINDEX + VACUUM FREEZE + pg_repack. cycle.RunAll
 	// fires Cycle immediately on every agent (re)start, and without
 	// the epoch a restart during a reindex storm replays the storm
-	// from second zero.
-	maintEpochWindow = 24 * time.Hour
+	// from second zero. Derived from the interval (not spelled 24h)
+	// so the skip window can never outgrow the cadence it gates.
+	maintEpochWindow = kdeps.DefaultMaintInterval - maintEpochGrace
 )
 
 // buildHeavyScript renders the single-session psql script the heavy
@@ -161,8 +171,10 @@ func (m *Maint) Cycle(ctx context.Context) *Result {
 }
 
 // maintEpochFresh reports whether a heavy maint block completed less
-// than 24h ago — ReadIntFile failing on a missing epoch file reads as
-// "never ran", so a fresh install always runs the heavy block.
+// than maintEpochWindow ago (the interval minus the boundary grace —
+// see maintEpochGrace for the ~47h failure mode) — ReadIntFile
+// failing on a missing epoch file reads as "never ran", so a fresh
+// install always runs the heavy block.
 func (m *Maint) maintEpochFresh() bool {
 	epoch, err := kdeps.ReadIntFile(
 		filepath.Join(m.d.Cfg.GuardStateDir, lastMaintFile))
@@ -187,6 +199,23 @@ func (m *Maint) stampMaintEpoch() {
 func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string), heavy bool) {
 
+	// The epoch stamps only after the FULL heavy block — reindex +
+	// freeze AND the repack phase — has run to its end. Stamping
+	// after the reindex alone let a restart mid-repack read a fresh
+	// epoch and park the unfinished repack (heap still bloated) for
+	// another full window. The flag is set once the locked psql
+	// script succeeded; the deferred stamp then fires on EVERY
+	// exit past that point (repack done, skipped, failed, or
+	// unattempted) — a repack that already tried must not replay the
+	// reindex storm next cycle either. A crash mid-repack never
+	// reaches the defer, so the next cycle re-runs the whole block.
+	stampEpoch := false
+	defer func() {
+		if stampEpoch {
+			m.stampMaintEpoch()
+		}
+	}()
+
 	// (a0) W12-CP2 invalid-index reaper — BEFORE the reindex: an
 	// interrupted REINDEX CONCURRENTLY or pg_repack leaves *_ccnew /
 	// *_ccold shells with indisvalid=false, and those shells make
@@ -209,8 +238,9 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		// stats below) still ran, so the gauges stay fresh.
 		res.okReindex = true
 		res.freezeState = "skipped"
-		note("heavy block skipped: last-maint-run epoch <24h old")
-		logger().Info("kinedb: maint heavy block skipped — last run <24h ago")
+		note("heavy block skipped: last-maint-run epoch inside the " +
+			"skip window")
+		logger().Info("kinedb: maint heavy block skipped — epoch inside the skip window")
 		m.readSizes(ctx, pg, user, pass, res, note)
 		return
 	}
@@ -251,11 +281,12 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		if freeze {
 			res.freezeState = "done"
 		}
-		// The heavy block completed — stamp the epoch so a restart
-		// (or the next cycle) inside maintEpochWindow skips REINDEX +
-		// VACUUM FREEZE + pg_repack. repack still runs below but is
-		// part of this same heavy window.
-		m.stampMaintEpoch()
+		// The locked heavy script completed — arm the epoch stamp.
+		// It lands only after the repack phase below has run its
+		// course (the deferred stamp at maintRun's exit), so a
+		// restart mid-repack finds no fresh epoch and replays the
+		// full block, repack included.
+		stampEpoch = true
 	}
 
 	// (c) sizes + dead-tuple estimate from pg_stat_user_tables.

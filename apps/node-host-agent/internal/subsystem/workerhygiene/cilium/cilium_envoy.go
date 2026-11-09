@@ -130,6 +130,13 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.killCiliumEnvoy(tasks,
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))
+		// The kill just SIGKILLed envoy — fall through to the /ready
+		// probe and it would probe the corpse, instantly burn a
+		// /ready fail (and risk a second kill next cycle on a streak
+		// the restart was meant to clear). The cycle ends here, same
+		// shape as the agent-restart kill above.
+		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
+		return
 	}
 	code, err := c.d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
 		c.d.Cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)

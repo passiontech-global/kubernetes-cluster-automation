@@ -159,7 +159,8 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	// and any lingering alarm series are intent, not a quorum
 	// failure. A list failure fails open (empty set): the pod
 	// signatures keep their normal posture.
-	downscaled, err := downscaledClusterCRs(ctx, p.Dyn, kube.GVRRabbitMQCluster)
+	crs, err := p.AllUnstructured(ctx, kube.GVRRabbitMQCluster)
+	downscaled, err := downscaledClusterCRs(crs, err)
 	if err != nil {
 		log.Info("WARN: list rabbitmqclusters failed — downscaler awareness off",
 			"error", err)
@@ -380,13 +381,21 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 			ck, pod, rabbitQuorumHealCool, now)
 		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
 			healedCluster[ck] = true
-			if rck := rabbitClusterKey(pod); rck != "" {
-				if readyByCluster[rck] > 0 {
-					readyByCluster[rck]--
-				}
-			} else if ref := metav1.GetControllerOf(pod); ref != nil {
-				if readyByOwner[ref.UID] > 0 {
-					readyByOwner[ref.UID]--
+			// Only discount a pod the census counted Ready
+			// (PodRunningReady): pass-1 deletes of already-unready
+			// members never entered the tally, and decrementing
+			// anyway would erase a Ready sibling that still exists —
+			// the next candidate would then see a quorum that is
+			// one short of reality and defer a legitimate heal.
+			if probefw.PodRunningReady(pod) {
+				if rck := rabbitClusterKey(pod); rck != "" {
+					if readyByCluster[rck] > 0 {
+						readyByCluster[rck]--
+					}
+				} else if ref := metav1.GetControllerOf(pod); ref != nil {
+					if readyByOwner[ref.UID] > 0 {
+						readyByOwner[ref.UID]--
+					}
 				}
 			}
 		}

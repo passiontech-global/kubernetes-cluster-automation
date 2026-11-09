@@ -323,9 +323,23 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 		// Rollout parked at spec.replicas:0 with downscaler/*
 		// annotations is sleep, not stuck evidence. Rollouts are
 		// unstructured CRs — read replicas off the unstructured spec.
-		r, err := p.Dyn.Resource(kube.GVRArgoRollout).
-			Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		// The lookup rides the per-sweep unstructured snapshot — one
+		// paged cluster LIST memoized per GVR, filtered client-side
+		// to ns/name (the raw NotFound/NoMatch census error means no
+		// Rollout CRD or failed read: fail closed, not downscaled).
+		ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
 		if err != nil {
+			v = false
+			break
+		}
+		var r *unstructured.Unstructured
+		for i := range ros {
+			if ros[i].GetNamespace() == ns && ros[i].GetName() == name {
+				r = &ros[i]
+				break
+			}
+		}
+		if r == nil {
 			v = false
 			break
 		}
@@ -494,6 +508,13 @@ func (p *argoCDAppStuckCheck) oldestRepoServerPod(ctx context.Context,
 	for i := range pods {
 		pod := pods[i]
 		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		// A non-Running repo-server pod (Pending/PodInitializing or
+		// a phase-stuck remnant) has no cache to flush — restarting
+		// it spends the heal on a pod that cannot hold stale repo
+		// state.
+		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
 		if selector == "" &&

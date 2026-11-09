@@ -85,17 +85,42 @@ func TestBoundOpNilLog(t *testing.T) {
 }
 
 // TestBoundOpCtxUsesCtxDeadline: the whole-op bound mirrors the
-// caller's ctx budget (hubsync's per-target timeout), not the dial
-// timeout — a blackholed session body must fail AT the op budget.
+// caller's ctx budget when it is the TIGHTER bound (hubsync's
+// per-target converge timeout below the conn fallback) — a
+// blackholed session body must fail AT the ctx budget.
 func TestBoundOpCtxUsesCtxDeadline(t *testing.T) {
 	nc := &dlConn{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	want := time.Now().Add(3 * time.Minute)
+	want := time.Now().Add(3 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), want)
 	defer cancel()
-	clear := BoundOpCtx(ctx, log, nc, time.Second)
+	clear := BoundOpCtx(ctx, log, nc, time.Minute)
 	if len(nc.dls) != 1 || !nc.dls[0].Equal(want) {
 		t.Fatalf("deadline = %v, want the ctx deadline %v", nc.dls, want)
+	}
+	clear()
+	if len(nc.dls) != 2 || !nc.dls[1].IsZero() {
+		t.Fatalf("deadline not cleared: %v", nc.dls)
+	}
+}
+
+// TestBoundOpCtxTimeoutClampsLooseCtx: a ctx deadline that expires
+// LATER than the op budget must not win wholesale — the bound is
+// min(now+timeout, ctx deadline) exactly like BoundOp/Handshake, so
+// the session body still fails AT the op budget instead of living
+// under a far-out ctx deadline on a blackholed transport.
+func TestBoundOpCtxTimeoutClampsLooseCtx(t *testing.T) {
+	nc := &dlConn{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	loose := time.Now().Add(3 * time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), loose)
+	defer cancel()
+	before := time.Now().Add(time.Second)
+	clear := BoundOpCtx(ctx, log, nc, time.Second)
+	after := time.Now().Add(time.Second)
+	if len(nc.dls) != 1 || nc.dls[0].Before(before) || nc.dls[0].After(after) {
+		t.Fatalf("deadline = %v, want ~now+1s (the timeout must clamp "+
+			"the %v ctx deadline)", nc.dls, loose.Format(time.RFC3339))
 	}
 	clear()
 	if len(nc.dls) != 2 || !nc.dls[1].IsZero() {

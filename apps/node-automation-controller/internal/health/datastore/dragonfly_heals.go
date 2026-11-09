@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -76,8 +77,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(kube.DragonflyOperatorNS).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list dragonfly-operator pods failed — heal deferred",
@@ -85,9 +85,20 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 		return
 	}
 	deleted := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if !strings.HasPrefix(pod.Name, dragonflyOperatorPodPrefix) {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Namespace != kube.DragonflyOperatorNS ||
+			!strings.HasPrefix(pod.Name, dragonflyOperatorPodPrefix) {
+			continue
+		}
+		// A terminating, not-yet-Running or controller-less pod is
+		// not a leader to bounce: deleting a failed/terminating
+		// remnant locks the shared 30m cooldown while the actually
+		// running leader survives untouched, and a controller-less
+		// pod would be deleted PERMANENTLY (nothing recreates it).
+		if pod.DeletionTimestamp != nil ||
+			pod.Status.Phase != corev1.PodRunning ||
+			metav1.GetControllerOf(pod) == nil {
 			continue
 		}
 		// The cooldown keys on the pod's CONTROLLER, not its name —
@@ -153,7 +164,7 @@ func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time
 // ordinal — "<sts>-0" in the common case — or nil when none of the
 // pods match the "<sts>-<n>" naming. StatefulSet pod names are the
 // only source of truth for the ordinal (there is no field for it).
-func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
+func smallestOrdinalPod(pods []*corev1.Pod, stsName string) *corev1.Pod {
 	var best *corev1.Pod
 	bestOrd := -1
 	for i := range pods {
@@ -167,7 +178,7 @@ func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
 		}
 		if bestOrd < 0 || ord < bestOrd {
 			bestOrd = ord
-			best = &pods[i]
+			best = pods[i]
 		}
 	}
 	return best
@@ -224,24 +235,34 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			"statefulset", stsKey, "error", err)
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(sig.sts.Namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: sel.String()})
+	allPods, err := p.AllPods(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list statefulset pods failed — deadlock heal deferred",
 			"statefulset", stsKey, "error", err)
 		return
 	}
+	// Client-side ns+selector filter over the shared pod census —
+	// the same shape PodsMatching serves, but sel is the STS's
+	// structured selector, not a string.
+	var pods []*corev1.Pod
+	for i := range allPods {
+		pod := &allPods[i]
+		if pod.Namespace == sig.sts.Namespace &&
+			sel.Matches(labels.Set(pod.Labels)) {
+			pods = append(pods, pod)
+		}
+	}
 
 	// Gate 2 — confirm the deadlock shape: all replicas Ready but
 	// nobody holds the master role.
-	if len(pods.Items) == 0 {
+	if len(pods) == 0 {
 		return // no pods — nothing safe to delete
 	}
 	allReady := true
 	hasMaster := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if !kube.PodReadyCond(pod) {
 			allReady = false
 		}
@@ -276,7 +297,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		return
 	}
 
-	target := smallestOrdinalPod(pods.Items, sig.sts.Name)
+	target := smallestOrdinalPod(pods, sig.sts.Name)
 	if target == nil {
 		return // no STS-named pod found — nothing safe to delete
 	}

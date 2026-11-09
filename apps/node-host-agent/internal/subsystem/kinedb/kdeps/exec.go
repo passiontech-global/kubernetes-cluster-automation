@@ -114,10 +114,22 @@ func (d *Deps) PsqlArgs(pg, user string, interactive bool, extra ...string) []st
 	return append(argv, extra...)
 }
 
+// PGAPPNAME is the application_name every maint/compact-side psql
+// session presents in pg_stat_activity — the marker the probe's
+// stuck-session reaper exempts (stuckSessionPredicate's
+// application_name NOT IN ('pg_repack', 'pg_dump',
+// 'node_host_agent_maint')). Without it our own psql children show
+// up as application_name='psql' and the reaper would terminate the
+// very maintenance/remediation sessions it shares the DB with.
+const PGAPPNAME = "node_host_agent_maint"
+
 // PsqlPassEnv is the env half of the password hand-off — paired with
-// the bare `-e PGPASSWORD` in PsqlArgs/the exec call sites.
+// the bare `-e PGPASSWORD` in PsqlArgs/the exec call sites. It also
+// pins PGAPPNAME (see PGAPPNAME): the env is the only channel a
+// dynamic value may take, and the application_name marker must ride
+// every session built from this helper.
 func PsqlPassEnv(pass string) []string {
-	return []string{"PGPASSWORD=" + pass}
+	return []string{"PGPASSWORD=" + pass, "PGAPPNAME=" + PGAPPNAME}
 }
 
 // PsqlQuery runs one statement with -tAc (unaligned, tuples only).

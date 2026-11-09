@@ -75,6 +75,18 @@ func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 	// track. The per-release "highest" guard still protects the
 	// newest superseded revision (the rollback point), and a
 	// non-superseded current revision was never a candidate anyway.
+	//
+	// NOTE: this cluster-wide LIST duplicates
+	// integration/helmreleaseunlocker's superseded_secret_prune.go
+	// (helmrelease-unlocker, 10m) — same owner=helm,status=superseded
+	// selector, same per-release cap. Deliberate: the trees cannot
+	// share a read (different sweep ctx and cadence), and THIS side's
+	// list is load-bearing beyond the prune — it feeds the
+	// api_object_count helm_release_secrets/<ns> census and the
+	// sprawl-report findings, so dropping or deferring it would
+	// change the report, not just the deletes. There is no
+	// helm-release-namespace index to namespace-scope either list to
+	// (a per-namespace fan-out would replace one paged LIST with N).
 	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: "owner=helm,status=superseded",
 		Limit:         probefw.HealthListPageSize},

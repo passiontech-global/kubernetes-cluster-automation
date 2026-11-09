@@ -66,6 +66,27 @@ func shStatefulZeroGauge(t *testing.T, ns, svc, sts string) (float64, bool) {
 	return m.GetGauge().GetValue(), true
 }
 
+// shOperatorPod builds the dragonfly-operator leader pod the W6.2
+// step-1 bounce targets — Running and ReplicaSet-owned, the live
+// shape healDragonflyOperator's candidate filter requires (a
+// terminating/not-Running/controller-less pod is never a leader to
+// bounce).
+func shOperatorPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kube.DragonflyOperatorNS,
+			Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
+			UID:       types.UID("dr-op-1"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: dragonflyOperatorPodPrefix + "-6f8bc",
+				UID:  types.UID("dr-op-rs-1"), Controller: ptr.To(true),
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
 // A master-role Service on a ready STS with 0 Ready endpoints: tracked
 // first, gauge at 3m — and because the STS is Dragonfly-owned the
 // operator leader gets bounced at 5m to force re-election.
@@ -76,11 +97,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
 	svc := shMasterSvc("db", "dragonfly-master",
 		map[string]string{"app": "dragonfly", "role": "master"})
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: kube.DragonflyOperatorNS,
-		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
-		UID:       types.UID("dr-op-1"),
-	}}
+	opPod := shOperatorPod()
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
@@ -134,11 +151,7 @@ func TestDragonflyOperatorHealMaintenanceDefers(t *testing.T) {
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
 	svc := shMasterSvc("db", "dragonfly-master",
 		map[string]string{"app": "dragonfly", "role": "master"})
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: kube.DragonflyOperatorNS,
-		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
-		UID:       types.UID("dr-op-1"),
-	}}
+	opPod := shOperatorPod()
 	cs := fake.NewSimpleClientset(cordoned, sts, svc, opPod)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
@@ -169,11 +182,7 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 			base.Add(-6*time.Minute).UTC().Format(time.RFC3339) + `"}`}
 	svc := shMasterSvc("db", "dragonfly-master",
 		map[string]string{"app": "dragonfly", "role": "master"})
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: kube.DragonflyOperatorNS,
-		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
-		UID:       types.UID("dr-op-1"),
-	}}
+	opPod := shOperatorPod()
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
@@ -187,6 +196,48 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 	}
 }
 
+// The step-1 candidate filter: a Pending (or otherwise not-Running,
+// terminating or controller-less) operator pod is never a leader to
+// bounce — deleting such a remnant would lock the shared 30m cooldown
+// while the actually-Running leader survives untouched. Only the
+// Running, owned pod is deleted.
+func TestDragonflyOperatorHealSkipsUnreadyPods(t *testing.T) {
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "dragonfly-master", "dragonfly")
+	base := time.Now()
+	sts := shSTS("db", "dragonfly", 3,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	pending := shOperatorPod()
+	pending.Name = dragonflyOperatorPodPrefix + "-9d2fa-old"
+	pending.UID = types.UID("dr-op-2")
+	pending.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: dragonflyOperatorPodPrefix + "-9d2fa",
+		UID:  types.UID("dr-op-rs-2"), Controller: ptr.To(true),
+	}}
+	pending.Status.Phase = corev1.PodPending
+	good := shOperatorPod()
+	cs := fake.NewSimpleClientset(sts, svc, pending, good)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	// Seed the zero-endpoint streak past the 5m heal window.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+		Observe("db/dragonfly-master/dragonfly", base.Add(-6*time.Minute))
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("masterless streak must still FAIL")
+	}
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+		Get(ctx, good.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("running operator leader must be bounced, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+		Get(ctx, pending.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("pending operator pod must not consume the heal: %v", err)
+	}
+}
+
 // A masterless non-Dragonfly service fires the gauge but never
 // touches any operator pod.
 func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
@@ -197,10 +248,7 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	// plain app set.
 	svc := shMasterSvc("cache", "redis-master", map[string]string{"app": "redis"})
 	svc.Labels = map[string]string{"app.kubernetes.io/role": "master"}
-	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: kube.DragonflyOperatorNS,
-		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
-	}}
+	opPod := shOperatorPod()
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }

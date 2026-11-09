@@ -91,8 +91,9 @@ func TestNoteJournalReadStreakLatches(t *testing.T) {
 // never fires: failing reads are configuration, not blindness.
 func TestNoteJournalReadNoStorage(t *testing.T) {
 	e := fixture(t)
-	e.D.JournalReads = journalwatch.NewUnreadableTracker(e.D.State,
-		[]string{filepath.Join(t.TempDir(), "no-journal")}, 2)
+	e.D.JournalReads = journalwatch.NewUnreadableTrackerForOwner(
+		e.D.State, []string{filepath.Join(t.TempDir(), "no-journal")}, 2,
+		journalwatch.OwnerWorkerHygiene)
 	for range 5 {
 		e.D.NoteJournalRead(false, "read fails")
 	}

@@ -459,7 +459,8 @@ func binOp(op string, l, r any) (any, error) {
 			if rf, ok := toFloat(r); ok {
 				li, lInt := ToInt(l)
 				ri, rInt := ToInt(r)
-				if lInt && rInt && isNum(l) && isNum(r) {
+				if lInt && rInt && isNum(l) && isNum(r) &&
+					!isFloatNum(l) && !isFloatNum(r) {
 					return li + ri, nil
 				}
 				return lf + rf, nil
@@ -477,7 +478,14 @@ func binOp(op string, l, r any) (any, error) {
 		}
 		li, lInt := ToInt(l)
 		ri, rInt := ToInt(r)
-		if lInt && rInt && isNum(l) && isNum(r) && op != "/" {
+		// ToInt TRUNCATES every float64 (5.5 → 5, ok=true), so
+		// lInt/rInt alone would route `5.5 * 2.0` through the
+		// integer branch below and silently drop the fraction
+		// (10 instead of 11). The fast-path is only for genuinely
+		// integer-typed operands — any float64 takes the float
+		// math further down.
+		if lInt && rInt && isNum(l) && isNum(r) &&
+			!isFloatNum(l) && !isFloatNum(r) && op != "/" {
 			switch op {
 			case "-":
 				return li - ri, nil
@@ -486,6 +494,14 @@ func binOp(op string, l, r any) (any, error) {
 			case "//":
 				if ri == 0 {
 					return nil, errors.New("division by zero")
+				}
+				if li == math.MinInt64 && ri == -1 {
+					// The only int64 divide whose quotient
+					// overflows: the hardware divide would raise
+					// SIGFPE. MinInt64 is exact as a float64 and
+					// /-1 gives exactly 2^63, so the float path
+					// answers exactly.
+					return math.Floor(lf / rf), nil
 				}
 				// python // FLOORS: -7//2 = -4, 7//-2 = -4 — Go's
 				// truncating division would give -3 for both.
@@ -497,6 +513,12 @@ func binOp(op string, l, r any) (any, error) {
 			case "%":
 				if ri == 0 {
 					return nil, errors.New("modulo by zero")
+				}
+				if li == math.MinInt64 && ri == -1 {
+					// Same divide-overflow SIGFPE hazard; the
+					// remainder never overflows and is exactly 0
+					// (x % -1 == 0 in python for every x).
+					return int64(0), nil
 				}
 				// python's % takes the DIVISOR's sign: -7%2 = 1,
 				// 7%-2 = -1 — Go's remainder truncates toward zero.
@@ -600,6 +622,15 @@ func isNum(v any) bool {
 		return true
 	}
 	return false
+}
+
+// isFloatNum reports whether v is a float64 — the one numeric type
+// ToInt cannot convert losslessly (it truncates 5.5 to 5 and still
+// reports ok). binOp's integer fast-paths must exclude it so float
+// arithmetic keeps its fraction.
+func isFloatNum(v any) bool {
+	_, ok := v.(float64)
+	return ok
 }
 
 // minMaxLess is the min/max comparator: numeric when both operands

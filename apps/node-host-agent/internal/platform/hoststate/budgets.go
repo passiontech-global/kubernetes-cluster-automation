@@ -104,8 +104,8 @@ func (s *Store) RateSpendIn(dir, name string) {
 // spend lands BEFORE the caller acts — a failed action still
 // consumed the budget (lib.sh rate_spend parity).
 func (s *Store) RateTrySpend(name string, interval time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
 	if !s.RateOK(name, interval) {
 		return false
 	}

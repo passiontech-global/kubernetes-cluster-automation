@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -157,6 +158,12 @@ func dragonflyMemberPod(ns, name string, role string) *corev1.Pod {
 	if role != "" {
 		pod.Labels["app.kubernetes.io/role"] = role
 	}
+	// Live members are StatefulSet-owned — the heal's candidate
+	// filter requires a controller and its cooldown keys on one.
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "StatefulSet",
+		Name: name + "-sts", Controller: ptr.To(true),
+	}}
 	return pod
 }
 
@@ -184,6 +191,34 @@ func dragonflyPromServer(t *testing.T) *httptest.Server {
 		}}
 	})
 	return srv
+}
+
+// A desynced replica with NO controller owner is never restarted —
+// the delete would be PERMANENT (nothing recreates the pod) and the
+// cooldown keys on that very controller. The finding still FAILs the
+// check; only the heal is withheld.
+func TestDragonflySyncStormSkipsUnownedPod(t *testing.T) {
+	srv := dragonflyPromServer(t)
+	base := time.Now()
+	lone := dragonflyMemberPod("dragonfly", "dragonfly-replica-1", "replica")
+	lone.OwnerReferences = nil // controller-less — the skip shape
+	lone.Annotations = map[string]string{
+		kube.AnnoFirstSeenDragonflyLinkStorm: `{"link/dragonfly/dragonfly-replica-1":"` +
+			base.Add(-6*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(lone)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("sustained link-down must still FAIL: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("dragonfly").
+		Get(ctx, "dragonfly-replica-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("controller-less replica must not be restarted: %v", err)
+	}
 }
 
 // W17 — a Prometheus outage must not leave the previous sweep's

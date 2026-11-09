@@ -32,6 +32,16 @@ const (
 // compressed chart, so a frequently-upgraded release grows Kine
 // (and the storage backend behind it) without bound.
 //
+// NOTE: duplicates api-object-sprawl-report-gc's superseded-helm
+// census (helm_secret_prune.go) — that check runs the same paged
+// cluster-wide `owner=helm,status=superseded` LIST every 5m to feed
+// the helm_release_secrets census gauge AND its cap-10 prune in one
+// read, so neither side can drop its scan: this one cannot reuse the
+// unlock path's per-HR lists (they are namespace+release scoped and
+// only run for HRs stuck past the threshold), and scoping to
+// HelmRelease namespaces would miss plain-helm releases or fan out
+// one LIST per namespace. The read stays cluster-wide.
+//
 // For every release — grouped by storage namespace + the `name`
 // label, the same identity unlock() scopes its revision scan to —
 // secrets with status=="superseded" and a valid integer `version`

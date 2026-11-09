@@ -48,10 +48,9 @@ func TestFromDepsSplicesFields(t *testing.T) {
 // TestStoreAtPackageFunc: the single hoststate construction shape —
 // dir/logFile carried, nil clock falls back to system time, a cell
 // clock binds the POINTER (a post-New Clock.Set is observed), and
-// the per-Dir singleton: a second StoreAt over one dir returns THE
-// SAME instance (the multi-owner latch registry and the log rotation
-// mutex must be process-wide), with a later non-empty logFile
-// filling an empty one.
+// the per-Dir sync-state singleton: a second StoreAt over one dir
+// shares the multi-owner latch registry (the log rotation mutex is
+// process-wide too), while each Store keeps its own logFile.
 func TestStoreAtPackageFunc(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	logFile := filepath.Join(t.TempDir(), "wd.log")
@@ -72,23 +71,32 @@ func TestStoreAtPackageFunc(t *testing.T) {
 		t.Fatalf("post-New Set not observed: %v want %v", s.Now(), later)
 	}
 
-	// Singleton identity: same dir → the same handle, LogFile intact.
-	if again := StoreAt(dir, logFile, clk, nil); again != s {
-		t.Fatal("second StoreAt over one dir must return the shared instance")
+	// Same dir → shared sync state: an owner registered through the
+	// first handle releases through the second, and each Store keeps
+	// its OWN logFile (a "" handle stays "" — readers-only callers).
+	if again := StoreAt(dir, logFile, clk, nil); again.LogFile != logFile {
+		t.Fatalf("second StoreAt LogFile = %q want its own %q", again.LogFile, logFile)
 	}
-	// A later "" logFile is a no-op (readers-only callers); a later
-	// non-empty one upgrades an empty one — never clobbers a real log.
-	if unnamed := StoreAt(dir, "", clk, nil); unnamed != s || unnamed.LogFile != logFile {
-		t.Fatalf("empty logFile must inherit, got %q", unnamed.LogFile)
+	unnamed := StoreAt(dir, "", clk, nil)
+	if unnamed.LogFile != "" {
+		t.Fatalf("empty logFile must stay the caller's own, got %q", unnamed.LogFile)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.EnterFrom("storeat-latch", "workerhygiene", "")
+	unnamed.ExitFrom("storeat-latch", "workerhygiene", nil)
+	if s.Exists("storeat-latch") {
+		t.Fatal("StoreAt instances over one dir must share the owners registry")
 	}
 	dir2 := filepath.Join(t.TempDir(), "state")
 	anon := StoreAt(dir2, "", clk, nil)
 	if anon.LogFile != "" {
-		t.Fatalf("fresh dir must start LogFile-empty, got %q", anon.LogFile)
+		t.Fatalf("fresh dir must keep the caller's empty LogFile, got %q", anon.LogFile)
 	}
 	named := StoreAt(dir2, logFile, clk, nil)
-	if named != anon || named.LogFile != logFile {
-		t.Fatalf("late non-empty logFile must fill the empty one, got %q", named.LogFile)
+	if named.LogFile != logFile {
+		t.Fatalf("named caller must keep its own LogFile, got %q", named.LogFile)
 	}
 
 	// nil clock → hoststate falls back to system time (never nil panics).
@@ -129,9 +137,16 @@ func TestBaseStoreMethods(t *testing.T) {
 		t.Fatalf("StoreAt clock not Base.Clock: %v", priv.Now())
 	}
 	// The private dir is its OWN key — two StoreAt calls over it
-	// converge on one instance there too.
-	if priv2 := b.StoreAt(privDir, "", nil); priv2 != priv {
-		t.Fatal("private-dir StoreAt must share its own singleton")
+	// share the sync state (one owners registry / mutex), while each
+	// Store keeps its own config fields.
+	priv2 := b.StoreAt(privDir, "", nil)
+	if priv2.Dir != privDir || priv2.LogFile != "" {
+		t.Fatalf("second StoreAt fields = %q/%q", priv2.Dir, priv2.LogFile)
+	}
+	priv.EnterFrom("storeat-latch", "workerhygiene", "")
+	priv2.ExitFrom("storeat-latch", "workerhygiene", nil)
+	if priv.Exists("storeat-latch") {
+		t.Fatal("StoreAt instances over one dir must share the owners registry")
 	}
 }
 

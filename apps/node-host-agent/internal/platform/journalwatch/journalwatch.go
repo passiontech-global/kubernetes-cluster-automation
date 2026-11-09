@@ -84,6 +84,13 @@ type Tracker struct {
 	// 0 return): the file is the restart witness, RAM the fast path.
 	Counter     *hoststate.Store
 	CounterName string
+	// Owner binds the tracker to ONE producer id when wired through
+	// NewUnreadableTrackerForOwner (the production wiring): streaks,
+	// persisted files, the seed resume and the reset all resolve to
+	// THAT id, so a call-site owner can never straddle two files or
+	// leak across the hygienes. Hand-built literals (tests) leave it
+	// empty and keep the per-call owner.
+	Owner string
 	// LatchedSeed, when non-nil, is consulted ONCE before the first
 	// EnterFrom/ExitFrom — callers bind it to their latch file's
 	// existence so a restart while latched resumes latched: the first
@@ -104,6 +111,18 @@ func (t *Tracker) needed() int {
 		return DefaultNeeded
 	}
 	return t.Needed
+}
+
+// resolveOwner returns the effective streak owner: a tracker wired
+// through NewUnreadableTrackerForOwner is bound to one producer id —
+// its streaks, persisted files and seed resume all use THAT id, so a
+// call-site owner can never straddle two streak files. Hand-built
+// literals carry no binding and keep the per-call owner.
+func (t *Tracker) resolveOwner(owner string) string {
+	if t.Owner != "" {
+		return t.Owner
+	}
+	return owner
 }
 
 // counterWired reports whether the persistence pair is usable: a
@@ -179,6 +198,7 @@ func (t *Tracker) Present() bool {
 // name is the latch name the caller drives — used only to seed the
 // latched state when no LatchedSeed func is wired.
 func (t *Tracker) EnterFrom(owner, name string) bool {
+	owner = t.resolveOwner(owner)
 	t.seed(owner, name)
 	n := t.streaks[owner] + 1
 	t.streaks[owner] = n
@@ -213,6 +233,7 @@ func (t *Tracker) EnterFrom(owner, name string) bool {
 // alive), so a producer that joined an episode without ever reaching
 // its own Needed streak must still be able to drop its hold.
 func (t *Tracker) ExitFrom(owner, name string) bool {
+	owner = t.resolveOwner(owner)
 	t.seed(owner, name)
 	delete(t.streaks, owner)
 	if t.counterWired() {

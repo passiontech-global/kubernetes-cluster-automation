@@ -20,7 +20,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -801,7 +801,7 @@ func TestStormGateImagePullListError(t *testing.T) {
 // drainMaintenanceHoldStale counts the recorder's queued
 // MaintenanceHoldStale events — NewFakeRecorder delivers synchronously,
 // so the count is deterministic right after Reconcile returns.
-func drainMaintenanceHoldStale(rec *record.FakeRecorder) int {
+func drainMaintenanceHoldStale(rec *events.FakeRecorder) int {
 	n := 0
 	for {
 		select {
@@ -834,7 +834,7 @@ func TestStormGateStaleHoldWarnsOnce(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, holdAnnos(3*time.Hour)))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -864,7 +864,7 @@ func TestStormGateFreshHoldDoesNotWarn(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, holdAnnos(time.Hour)))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
 	for range 2 {
 		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -882,7 +882,7 @@ func TestStormGateHoldReleaseReArms(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, holdAnnos(3*time.Hour)))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -959,7 +959,7 @@ func TestStormGateNHCPauseStaleWarnsOnce(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(nhc), recorder: rec}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -984,7 +984,7 @@ func TestStormGateNHCPauseFreshDoesNotWarn(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(nhc), recorder: rec}
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -1005,7 +1005,7 @@ func TestStormGateNHCPauseReleaseClearsStamp(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil))
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: dyn, recorder: rec}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
@@ -1071,7 +1071,7 @@ func TestStormGateNHCCRDAbsentIsClear(t *testing.T) {
 					Group: kube.GVRNodeHealthCheck.Group, Kind: "NodeHealthCheck"},
 			}
 		})
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	r := &deschedulerStormGate{cs: cs, dyn: dyn, recorder: rec}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatalf("absent NHC CRD must not error the reconcile: %v", err)

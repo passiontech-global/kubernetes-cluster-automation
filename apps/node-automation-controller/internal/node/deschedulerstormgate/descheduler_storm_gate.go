@@ -84,7 +84,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -197,7 +197,7 @@ type deschedulerStormGate struct {
 	// recorder emits the W18-9 MaintenanceHoldStale warnings — the
 	// manager-provided event recorder. nil (StubManager tests)
 	// drops the event rather than panicking.
-	recorder record.EventRecorder
+	recorder events.EventRecorder
 	// holdSeen persists the storm-gate-hold first-seen window across
 	// operator restarts (the annotation half is
 	// kube.AnnoFirstSeenStormGateHold on the Deployment);
@@ -253,7 +253,7 @@ func Setup(d shared.Deps) error {
 	// no informer.
 	return shared.SetupNoConfig(d, func() error {
 		r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock,
-			recorder: d.Mgr.GetEventRecorderFor(d.Name)}
+			recorder: d.Mgr.GetEventRecorder(d.Name)}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -546,8 +546,8 @@ func (r *deschedulerStormGate) checkHoldStale(ctx context.Context,
 		return // this episode already warned — no spam on re-reconciles
 	}
 	if r.recorder != nil {
-		r.recorder.Eventf(deploy, corev1.EventTypeWarning,
-			maintenanceHoldStaleReason,
+		r.recorder.Eventf(deploy, nil, corev1.EventTypeWarning,
+			maintenanceHoldStaleReason, "StormGateHoldStale",
 			"storm-gate hold annotation %s has been \"true\" for more than %s — "+
 				"confirm the maintenance hold is still wanted",
 			stormGateHoldAnno, maintenanceHoldStaleAfter)
@@ -629,8 +629,8 @@ func (r *deschedulerStormGate) checkNHCPauseStale(ctx context.Context,
 			continue // this pause episode already warned — no spam
 		}
 		if r.recorder != nil {
-			r.recorder.Eventf(obj, corev1.EventTypeWarning,
-				maintenanceHoldStaleReason,
+			r.recorder.Eventf(obj, nil, corev1.EventTypeWarning,
+				maintenanceHoldStaleReason, "NodeHealthCheckPauseStale",
 				"spec.pauseRequests has been non-empty for more than %s — "+
 					"confirm the pause is still wanted",
 				maintenanceHoldStaleAfter)

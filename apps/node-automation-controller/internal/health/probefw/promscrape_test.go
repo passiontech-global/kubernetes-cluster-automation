@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -122,17 +121,25 @@ func TestFetchPodMetrics(t *testing.T) {
 }
 
 // Prometheus text exposition can spell the sample value NaN, +Inf or
-// -Inf; strconv.ParseFloat accepts all three and the parse path must
-// not reject them — interpretation of the value belongs to the
-// consuming check, not the scraper.
-func TestParseMetricValuePassesNaNInf(t *testing.T) {
-	if v, ok := ParseMetricValue("ha_connections NaN", "ha_connections"); !ok || !math.IsNaN(v) {
-		t.Fatalf("NaN not passed through: (%v,%v)", v, ok)
+// -Inf; strconv.ParseFloat accepts all three but they are not
+// samples — stale/absent series emit them and every consuming check
+// must read them as "no data" (ok=false), never as a live reading.
+func TestParseMetricValueRejectsNaNInf(t *testing.T) {
+	for _, line := range []string{
+		"ha_connections NaN",
+		"ha_connections +Inf",
+		"ha_connections -Inf",
+		"ha_connections Inf",
+		"ha_connections inf",
+		"ha_connections -inf",
+	} {
+		if v, ok := ParseMetricValue(line, "ha_connections"); ok || v != 0 {
+			t.Fatalf("%q parsed as (%v,%v), want (0,false)", line, v, ok)
+		}
 	}
-	if v, ok := ParseMetricValue("ha_connections +Inf", "ha_connections"); !ok || !math.IsInf(v, 1) {
-		t.Fatalf("+Inf not passed through: (%v,%v)", v, ok)
-	}
-	if v, ok := ParseMetricValue("ha_connections -Inf", "ha_connections"); !ok || !math.IsInf(v, -1) {
-		t.Fatalf("-Inf not passed through: (%v,%v)", v, ok)
+	// Finite values still parse — the rejection is exact, not a
+	// widening of the failure posture.
+	if v, ok := ParseMetricValue("ha_connections 12.5", "ha_connections"); !ok || v != 12.5 {
+		t.Fatalf("finite value rejected: (%v,%v)", v, ok)
 	}
 }

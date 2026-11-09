@@ -550,6 +550,67 @@ func TestRotationDrainsDotOneTail(t *testing.T) {
 	}
 }
 
+// TestRotationFreshLinesAreNotReplay: after a REAL rename rotation
+// (non-empty .1 tail) with the scan already armed, only the
+// OLD-generation bytes replay through the lookback filter — the
+// fresh file's lines are live events even when the blanket replay
+// flag of the pre-fix code would have filtered them (an unparseable
+// timestamp, or one outside the lookback window). The stale .1 tail
+// line (an hour old) must stay filtered.
+func TestRotationFreshLinesAreNotReplay(t *testing.T) {
+	e := fixture(t)
+	e.appendLog(t, "ACTION: restarting k0sworker - pre")
+	e.cycle()
+	base := e.counter("K0sworkerRestarted")
+
+	// Rotate like the store: live → .1; the old generation grows one
+	// line the reader has not seen — timestamped OUTSIDE the lookback
+	// window, so it must be replay-filtered; then the fresh live file
+	// starts SHORTER than the old offset (the shrink is the rotation
+	// signal) with a line whose timestamp does not parse at all (the
+	// discriminator: replay=true drops ts-less lines, live counting
+	// keeps them).
+	if err := os.Rename(e.log, e.log+".1"); err != nil {
+		t.Fatal(err)
+	}
+	e.appendRawTo(t, e.log+".1",
+		e.now.Add(-time.Hour).Format(time.RFC3339)+
+			" ACTION: restarting k0sworker - stale-tail padding padding\n")
+	e.appendRawLog(t,
+		"bad ACTION: restarting k0sworker - post-rotation\n")
+
+	e.cycle()
+
+	if got := e.counter("K0sworkerRestarted"); got != base+1 {
+		t.Fatalf("counter = %v, want +%d (stale tail filtered, fresh "+
+			"ts-less line counted as live)", got, 1)
+	}
+	for _, ev := range eventsByReason(t, e, "K0sworkerRestarted") {
+		if strings.Contains(ev.Note, "stale-tail") {
+			t.Fatalf("stale .1 tail line emitted as live: %q", ev.Note)
+		}
+	}
+	found := false
+	for _, ev := range eventsByReason(t, e, "K0sworkerRestarted") {
+		if strings.Contains(ev.Note, "post-rotation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("fresh post-rotation line was replay-filtered and lost")
+	}
+	// The offset must sit at the fresh file's end (the tail's bytes
+	// belong to the old generation's coordinates).
+	fi, err := os.Stat(e.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.r.logOffset != fi.Size() {
+		t.Fatalf("logOffset = %d, want the fresh file size %d",
+			e.r.logOffset, fi.Size())
+	}
+}
+
 // TestInodePressureEvents: the W18-1 inode-pressure latch's
 // STATE-ENTER line emits a Warning Event (reason InodePressure, note
 // carries the offending mount + ratio) and its STATE-EXIT line emits

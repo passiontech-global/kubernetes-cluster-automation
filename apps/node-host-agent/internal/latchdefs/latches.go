@@ -126,11 +126,11 @@ const (
 	// hostmetrics' inode-usage hysteresis over the statfs targets
 	// (enter at >=95% inode usage on any mount, clear only when every
 	// monitored mount is back to <=90%).
-	LatchInodePressure = "inode-pressure" // W18-1 fs inode hysteresis
-	LatchFSReadonly         = "fs-readonly"          // W10-ST1/KR1
-	LatchPIDFDPressure      = "pid-fd-pressure"      // W10-KR2
-	LatchClockSkew          = "clock-skew"           // W10-KR5
-	LatchCPUStealPressure   = "cpu-steal-pressure"   // cpu-steal-guard
+	LatchInodePressure    = "inode-pressure"     // W18-1 fs inode hysteresis
+	LatchFSReadonly       = "fs-readonly"        // W10-ST1/KR1
+	LatchPIDFDPressure    = "pid-fd-pressure"    // W10-KR2
+	LatchClockSkew        = "clock-skew"         // W10-KR5
+	LatchCPUStealPressure = "cpu-steal-pressure" // cpu-steal-guard
 	// LatchPageAllocFailure is the kernel-pressure fragmentation latch:
 	// hostmetrics' kmsg drain Enters it on "page allocation
 	// failure: order:[1-9]"; workerhygiene consumes it to trigger
