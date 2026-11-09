@@ -103,12 +103,12 @@ func TestKmsgFirstOpenPrimesBacklog(t *testing.T) {
 func TestKernelProcRatios(t *testing.T) {
 	f := kfixture(t)
 	// Inconclusive when nothing parses.
-	if _, _, _, _, _, _, ok := f.r.kernelProcRatios(); ok {
+	if _, _, _, _, _, _, _, _, ok := f.r.kernelProcRatios(); ok {
 		t.Fatal("empty proc reported ok")
 	}
 	// file-nr only → fd ratio.
 	testutil.WriteFile(t, f.deps.FileNRFile, "900 100 1000\n")
-	_, _, fd, _, _, fdOK, ok := f.r.kernelProcRatios()
+	_, _, fd, _, _, _, fdOK, _, ok := f.r.kernelProcRatios()
 	if !ok || !fdOK || fd != 0.9 {
 		t.Fatalf("fd ratio=%v ok=%v fdOK=%v want 0.9", fd, ok, fdOK)
 	}
@@ -129,7 +129,7 @@ func TestKernelProcRatios(t *testing.T) {
 	testutil.WriteFile(t, filepath.Join(f.deps.ProcRoot, "sys/kernel/threads-max"), "100\n")
 	testutil.WriteFile(t, filepath.Join(f.deps.ProcRoot, "loadavg"),
 		"0.5 0.4 0.3 95/200 1234\n")
-	pids, threads, _, pOK, tOK, _, ok := f.r.kernelProcRatios()
+	pids, threads, _, _, pOK, tOK, _, _, ok := f.r.kernelProcRatios()
 	if !ok || !pOK || !tOK {
 		t.Fatalf("ratios not ok: pids=%v threads=%v", pids, threads)
 	}

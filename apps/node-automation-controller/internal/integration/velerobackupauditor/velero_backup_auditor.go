@@ -23,7 +23,11 @@
 // status.lastMaintenanceTime older than 7 days means the scheduled
 // prune/repack maintenance loop stopped — either way the next
 // restore reads an unmaintained or unreachable repo. Both flag on
-// VeleroRepoUnhealthy{namespace,name,reason}.
+// VeleroRepoUnhealthy{namespace,name,reason}. W19-ST2 adds the heal
+// half: a repo held at phase=NotReady for >=30m is deleted (UID-
+// preconditioned, heal.AllowedV-gated, 2h cooldown) so Velero's repo
+// controller re-creates it and re-initializes the Kopia/Restic
+// connection — the only recovery a wedged repo handshake has.
 //
 // Series lifecycle mirrors cert-drift-auditor: seen-sets prune the
 // gauges the moment the condition resolves (unpaused, healthy new
@@ -53,6 +57,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -112,6 +117,18 @@ const veleroStuckMaxAge = 6 * time.Hour
 // stopped (dead velero server, unreachable repo, wedged maintenance
 // job) and the next restore reads an unmaintained repo.
 const veleroRepoMaintenanceMaxAge = 7 * 24 * time.Hour
+
+// veleroRepoNotReadyMinAge (W19-ST2) bounds how long a
+// BackupRepository may report phase=NotReady before the auditor
+// deletes the CR — Velero's repo controller recreates it and
+// re-initializes the Kopia/Restic connection, which is the only
+// recovery a wedged repo handshake has ever had.
+const veleroRepoNotReadyMinAge = 30 * time.Minute
+
+// veleroRepoHealedCooldown bounds re-init churn per repository — a
+// repo that re-wedges inside the window keeps its unhealthy series
+// but is not delete-looped.
+const veleroRepoHealedCooldown = 2 * time.Hour
 
 // veleroList pages a full dynamic List through the shared page bound —
 // same contract as a raw .List but bounded per response (Velero and
@@ -218,6 +235,15 @@ type veleroBackupAuditor struct {
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
 	pvbHealed state.CooldownSet
+	// firstSeenRepoNotReady: "ns/name" -> first sweep the repo
+	// reported phase=NotReady — the 30m persistence window the
+	// W19-ST2 re-init heal requires; pruned when the repo leaves
+	// NotReady so a re-wedge measures fresh.
+	firstSeenRepoNotReady state.FirstSeenLedger
+	// repoHealed: "backuprepository/ns/name" -> last repo re-init —
+	// the 2h cooldown that stops a still-broken repo being
+	// delete-looped.
+	repoHealed state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation for the
 	// sweep's PVB-cleanup preambles — the deletes below are
 	// destructive (a PVB object AND a live node-agent pod), so they
@@ -374,6 +400,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		return errors.Join(everestErr,
 			fmt.Errorf("list velero backuprepositories: %w", err))
 	default:
+		repoNotReadyNow := map[string]bool{}
 		for i := range repos.Items {
 			repo := &repos.Items[i]
 			ns, name := repo.GetNamespace(), repo.GetName()
@@ -384,6 +411,18 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 					ns, name, "phase_not_ready")
 				log.Info("velero backup repository not Ready — repo cannot be opened",
 					"repo", ns+"/"+name, "phase", phase)
+				// W19-ST2 — a repo wedged NotReady >=30m gets
+				// deleted so Velero re-initializes the Kopia/
+				// Restic connection (heal-gated + cooled down).
+				if phase == "NotReady" {
+					lk := ns + "/" + name
+					repoNotReadyNow[lk] = true
+					first, _ := a.firstSeenRepoNotReady.Observe(
+						lk, a.now.Now())
+					if a.now.Now().Sub(first) >= veleroRepoNotReadyMinAge {
+						a.reinitStaleRepo(ctx, repo, ns, name)
+					}
+				}
 			}
 			lmt, ok := kube.NestedString(
 				repo.Object, "status", "lastMaintenanceTime")
@@ -401,6 +440,8 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 				"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
 				"age", a.now.Now().Sub(t).Truncate(time.Hour))
 		}
+		a.firstSeenRepoNotReady.Prune(
+			func(k string) bool { return repoNotReadyNow[k] })
 	}
 	a.seenRepo.Prune(metrics.VeleroRepoUnhealthy.DeleteLabelValues)
 
@@ -421,6 +462,45 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		"paused", len(a.seenPaused.Last()), "badBackups", len(a.seenBad.Last()),
 		"bslUnavailable", len(a.seenBSL.Last()))
 	return errors.Join(dbErr, stuckErr, dmErr)
+}
+
+// reinitStaleRepo deletes a BackupRepository that has reported
+// phase=NotReady for the full persistence window — Velero's repo
+// controller recreates the CR and re-initializes the Kopia/Restic
+// connection, the only recovery a wedged repo handshake has. The
+// delete is destructive on a live object, so it gates on
+// heal.AllowedV (per-repo cooldown + maintenance mutex, fail closed
+// on unverifiable) and is UID-preconditioned; the cooldown stamps
+// only after the delete is delivered.
+func (a *veleroBackupAuditor) reinitStaleRepo(ctx context.Context,
+	repo *unstructured.Unstructured, ns, name string) {
+
+	log := logf.FromContext(ctx)
+	now := a.now.Now()
+	key := "backuprepository/" + ns + "/" + name
+	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs,
+		a.dyn, &a.repoHealed, key, veleroRepoHealedCooldown, now)
+	switch {
+	case unverifiable:
+		metrics.IncError(a.queue)
+		return
+	case !proceed:
+		return // cooldown or maintenance — detection already flagged
+	}
+	if err := a.dyn.Resource(veleroRepoGVR).Namespace(ns).Delete(ctx,
+		name, kube.UIDDeleteOptions(repo.GetUID(), "")); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "stale backup repository delete failed",
+				"repo", ns+"/"+name)
+			metrics.IncError(a.queue)
+		}
+		return
+	}
+	a.repoHealed.Stamp(key, now)
+	metrics.VeleroWedgedObjectsCleanedTotal.
+		WithLabelValues(ns, "repo_reinitialized").Inc()
+	log.Info("ACTION: deleted stale BackupRepository — velero will re-init the repo",
+		"repo", ns+"/"+name)
 }
 
 // latestBackupsBySchedule indexes the newest Backup per owning

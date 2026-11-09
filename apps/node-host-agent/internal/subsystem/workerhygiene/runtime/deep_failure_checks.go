@@ -176,6 +176,12 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 
 // --- orphan-hostpath: orphaned hostPath volume dirs ---
 
+// orphanHPCacheTTL bounds the live-PV-name cache — the LIST is
+// cluster-scope and every worker pays it every cycle for a handful
+// of pvc-* dirs. 30m staleness is safe: the 24h dir-age gate keeps
+// fresh dirs out of the removal path regardless.
+const orphanHPCacheTTL = 30 * time.Minute
+
 // OrphanHPCheck finds pvc-* dirs under the local-provisioner roots
 // whose PersistentVolume is gone from the apiserver — the disk leak
 // a deleted PV leaves behind (the provisioner removes the PV
@@ -188,7 +194,15 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 // (metrics keep their last values). The gauge values live on
 // deps (orphanHostPathBytes/Dirs) — writeNodeAgentPromTextfile
 // reads them at end of Cycle.
-type OrphanHPCheck struct{ d *wdeps.Deps }
+type OrphanHPCheck struct {
+	d *wdeps.Deps
+	// orphanPVNames/orphanPVAt cache the live PV-name set for
+	// orphanHPCacheTTL so the cluster-scope LIST does not run every
+	// cycle (W19-HP1). A stale entry only delays detecting a
+	// brand-new PV by one refresh — the 24h dir-age gate covers it.
+	orphanPVNames map[string]bool
+	orphanPVAt    time.Time
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *OrphanHPCheck) Name() string { return wdeps.CheckOrphanHP }
@@ -227,10 +241,39 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
 		return
 	}
+	// W19-HP1 fast path: when the PV-name cache is fresh AND every
+	// local pvc-* dir maps to a live PV, there can be no orphan —
+	// clear the gauges and skip both the apiserver LIST and the
+	// per-dir stat/walk entirely.
+	pvCacheFresh := !c.orphanPVAt.IsZero() &&
+		c.d.Cfg.Seams.Host.Clock.Now().Sub(c.orphanPVAt) < orphanHPCacheTTL
+	if pvCacheFresh {
+		allKnown := true
+		for _, cd := range cands {
+			if !orphanHPKnownPV(c.orphanPVNames, cd.name) {
+				allKnown = false
+				break
+			}
+		}
+		if allKnown {
+			c.d.OrphanHostPathBytes = 0
+			c.d.OrphanHostPathDirs = 0
+			c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
+			return
+		}
+	}
+	// Any dir the cache does NOT know might be a PV created inside
+	// the cache window — acting on the stale set could delete a
+	// live volume's hostPath. Only the all-known fast path above
+	// trusts the cache; every other cycle pays a fresh LIST.
 	pvNames := map[string]bool{}
 	apiOK := true
-	if pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
-		List(ctx, metav1.ListOptions{}); err != nil {
+	// ResourceVersion "0" = quorum read from cache — a full
+	// etcd-backed LIST on every refresh would re-serialize the
+	// whole PV table per worker per cycle.
+	pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
+		List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+	if err != nil {
 		apiOK = false
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: orphan-hostpath PV list failed: %v — removal half inconclusive",
@@ -239,6 +282,8 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		for _, pv := range pvs.Items {
 			pvNames[pv.Name] = true
 		}
+		c.orphanPVNames = pvNames
+		c.orphanPVAt = c.d.Cfg.Seams.Host.Clock.Now()
 	}
 	var totalBytes int64
 	orphans := 0

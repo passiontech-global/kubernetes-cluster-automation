@@ -38,18 +38,32 @@ const (
 	apiServiceUnblockMinAge   = 15 * time.Minute
 	apiServiceUnblockPodCap   = 10
 	apiServiceUnblockCooldown = 15 * time.Minute
+	// W19-CP2 standalone unblock: an aggregated APIService in a
+	// protected namespace that stays Available=False >=30m gets its
+	// backing pods restarted even with NO namespace stuck
+	// Terminating — KEDA/cert-manager/prometheus-operator adapters
+	// deadlock their own consumers (HPA, cert orders, scrape
+	// configs) without ever wedging a namespace deletion, so the
+	// Terminating-namespace evidence alone never fires for them.
+	apiServiceStandaloneUnblockMinAge   = 30 * time.Minute
+	apiServiceStandaloneUnblockCooldown = 30 * time.Minute
 )
 
 // apiServiceProtectedNamespaces is the plan's skipNamespaces set —
 // APIServices backed in these namespaces are core-ish infra the
 // guard otherwise never touches. Membership here does NOT skip the
 // availability metric; it scopes which backends the unblock healer
-// may restart.
+// may restart. W19-CP2 added keda/cert-manager/prometheus-operator —
+// aggregated adapters whose outage stalls HPA scaling, cert
+// issuance and Prometheus scraping respectively.
 var apiServiceProtectedNamespaces = map[string]bool{
-	"kube-system": true,
-	"linkerd":     true,
-	"linkerd-viz": true,
-	"monitoring":  true,
+	"kube-system":         true,
+	"linkerd":             true,
+	"linkerd-viz":         true,
+	"monitoring":          true,
+	"keda":                true,
+	"cert-manager":        true,
+	"prometheus-operator": true,
 }
 
 // unblockHealer owns the namespace-terminating-wedged sweep's per-sweep state — embedded
@@ -62,6 +76,19 @@ type unblockHealer struct {
 	// bounds restart churn on a backend that wedges again right
 	// after its pods are recreated.
 	unblocked state.CooldownSet
+	// standaloneUnblocked is the same ledger for the W19-CP2
+	// standalone path (no Terminating-namespace evidence) — a
+	// separate keyspace so a standalone heal cannot mask or be
+	// masked by a wedge-evidence heal on the same APIService.
+	standaloneUnblocked state.CooldownSet
+}
+
+// unblockCandidate is one APIService that passed the cheap
+// unavailability+namespace+group gates — the shared input of the
+// wedge-evidence pass and the W19-CP2 standalone pass.
+type unblockCandidate struct {
+	svc   *unstructured.Unstructured
+	group string
 }
 
 // sweepUnblock consumes the same per-run snapshot. It heals ONLY the
@@ -80,7 +107,6 @@ type unblockHealer struct {
 // operator-owned APIService object itself.
 func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapshot) error {
 	g := snap.g
-	log := logf.FromContext(ctx)
 	now := g.now.Now()
 	// PruneExpired runs BEFORE the error gate so the cooldown ledger
 	// is pruned on EVERY cycle — an apiservices list flap must not
@@ -89,17 +115,14 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	// bound the map so decommissioned backends' stamps cannot
 	// accumulate in the first place.
 	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
+	u.standaloneUnblocked.PruneExpired(now, apiServiceStandaloneUnblockCooldown)
 	if snap.err != nil {
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", snap.err)
 	}
 
 	// Candidate pass — cheap unstructured reads only; the namespace
 	// scan below is skipped entirely when nothing qualifies.
-	type candidate struct {
-		svc   *unstructured.Unstructured
-		group string
-	}
-	var cands []candidate
+	var cands []unblockCandidate
 	for i := range snap.svcs.Items {
 		svc := &snap.svcs.Items[i]
 		unavailSince, ok := apiServiceUnavailableSince(svc)
@@ -114,7 +137,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		if group == "" {
 			continue // "v1." core registration — never unblocked
 		}
-		cands = append(cands, candidate{svc: svc, group: group})
+		cands = append(cands, unblockCandidate{svc: svc, group: group})
 	}
 	if len(cands) == 0 {
 		return nil
@@ -128,10 +151,14 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		return err
 	}
 	if len(stuck) == 0 {
-		return nil
+		// W19-CP2: no Terminating-namespace wedge — fall through to
+		// the standalone pass: a protected APIService dead >=30m
+		// still gets its backing pods restarted (KEDA/cert-manager/
+		// prometheus-operator adapters stall their consumers
+		// silently without ever wedging a namespace deletion).
+		return u.sweepStandaloneUnblock(ctx, snap, cands, now)
 	}
 
-	healed := 0
 	for _, c := range cands {
 		var refs []string
 		for ns, corpus := range stuck {
@@ -142,57 +169,96 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		if len(refs) == 0 {
 			continue
 		}
-		svcNs, svcName, _ := apiServiceBackend(c.svc)
-		// Confirm a live restart target BEFORE the heal preamble: the
-		// wedge evidence alone doesn't mean anything is left to
-		// restart, and AllowedV spends a fleet-wide budget grant on
-		// every proceed — a stale/empty backend must not burn one.
-		targets, err := u.backingPodTargets(ctx, g, svcNs, svcName)
-		if err != nil {
-			log.Error(err, "unblock heal target lookup failed",
-				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
-			metrics.IncError(g.queue)
-			continue
-		}
-		if len(targets) == 0 {
-			log.Info("unblock heal skipped — no live backing pod to restart",
-				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
-			continue
-		}
-		// Wedge proven AND a target exists — the shared preamble gates
-		// the heal: per-APIService cooldown first, then the
-		// maintenance mutex (a cordon/drain/kured reboot or an
-		// in-flight k0s upgrade defers the restart, and "cannot
-		// verify" fails closed AND IncErrors the queue). The
-		// facade's verdict memoizes the mutex so a run of candidates
-		// pays one evaluation.
-		proceed, unverifiable := heal.AllowedV(ctx, log, &g.verdict,
-			g.cs, g.dyn, &u.unblocked, c.svc.GetName(),
-			apiServiceUnblockCooldown, now)
-		switch {
-		case unverifiable:
-			metrics.IncError(g.queue)
-			continue
-		case !proceed:
-			continue
-		}
-		deleted := u.deleteBackingPods(ctx, g, targets, now)
-		// Stamp the cooldown, count the heal and log ACTION only on a
-		// DELIVERED heal — a pass that deleted nothing (NotFound
-		// races) must not open the suppression window or log an
-		// unblock that did not happen.
-		if deleted > 0 {
-			u.unblocked.Stamp(c.svc.GetName(), now)
-			metrics.APIServiceUnblockHealsTotal.
-				WithLabelValues(svcNs, "backing_pods_deleted").Inc()
-			healed++
-			log.Info("ACTION: unblocked dead APIService wedging namespace termination",
-				"apiservice", c.svc.GetName(), "group", c.group,
-				"service", svcNs+"/"+svcName,
-				"terminatingNamespaces", refs, "podsDeleted", deleted)
-		}
+		u.healCandidate(ctx, snap, c.svc, c.group, &u.unblocked,
+			apiServiceUnblockCooldown, now, refs)
 	}
 	return nil
+}
+
+// sweepStandaloneUnblock is the W19-CP2 no-wedge path: every
+// protected-namespace APIService unavailable for
+// apiServiceStandaloneUnblockMinAge (30m — double the wedge-evidence
+// bar, since there is no Terminating namespace corroborating) gets
+// the same backing-pod restart under its own cooldown ledger.
+func (u *unblockHealer) sweepStandaloneUnblock(ctx context.Context,
+	snap *apiServiceSnapshot, cands []unblockCandidate, now time.Time) error {
+
+	for _, c := range cands {
+		unavailSince, _ := apiServiceUnavailableSince(c.svc)
+		if now.Sub(unavailSince) < apiServiceStandaloneUnblockMinAge {
+			continue
+		}
+		u.healCandidate(ctx, snap, c.svc, c.group,
+			&u.standaloneUnblocked, apiServiceStandaloneUnblockCooldown,
+			now, nil)
+	}
+	return nil
+}
+
+// healCandidate runs the shared heal tail for one candidate:
+// resolve live backing pods → heal.AllowedV preamble (per-name
+// cooldown + maintenance mutex) → capped UID-preconditioned delete
+// → stamp + metric + ACTION log only when a pod was actually
+// deleted. refs carries the wedge-evidence namespace names for the
+// log (nil on the standalone path).
+func (u *unblockHealer) healCandidate(ctx context.Context,
+	snap *apiServiceSnapshot, svc *unstructured.Unstructured,
+	group string, cooldown *state.CooldownSet, cooldownDur time.Duration,
+	now time.Time, refs []string) bool {
+
+	g := snap.g
+	log := logf.FromContext(ctx)
+	svcNs, svcName, _ := apiServiceBackend(svc)
+	// Confirm a live restart target BEFORE the heal preamble: the
+	// wedge evidence alone doesn't mean anything is left to
+	// restart, and AllowedV spends a fleet-wide budget grant on
+	// every proceed — a stale/empty backend must not burn one.
+	targets, err := u.backingPodTargets(ctx, g, svcNs, svcName)
+	if err != nil {
+		log.Error(err, "unblock heal target lookup failed",
+			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName)
+		metrics.IncError(g.queue)
+		return false
+	}
+	if len(targets) == 0 {
+		log.Info("unblock heal skipped — no live backing pod to restart",
+			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName)
+		return false
+	}
+	// Wedge proven AND a target exists — the shared preamble gates
+	// the heal: per-APIService cooldown first, then the
+	// maintenance mutex (a cordon/drain/kured reboot or an
+	// in-flight k0s upgrade defers the restart, and "cannot
+	// verify" fails closed AND IncErrors the queue). The
+	// facade's verdict memoizes the mutex so a run of candidates
+	// pays one evaluation.
+	proceed, unverifiable := heal.AllowedV(ctx, log, &g.verdict,
+		g.cs, g.dyn, cooldown, svc.GetName(),
+		cooldownDur, now)
+	switch {
+	case unverifiable:
+		metrics.IncError(g.queue)
+		return false
+	case !proceed:
+		return false
+	}
+	deleted := u.deleteBackingPods(ctx, g, targets, now)
+	// Stamp the cooldown, count the heal and log ACTION only on a
+	// DELIVERED heal — a pass that deleted nothing (NotFound
+	// races) must not open the suppression window or log an
+	// unblock that did not happen.
+	if deleted > 0 {
+		cooldown.Stamp(svc.GetName(), now)
+		metrics.APIServiceUnblockHealsTotal.
+			WithLabelValues(svcNs, "backing_pods_deleted").Inc()
+		log.Info("ACTION: unblocked dead APIService",
+			"apiservice", svc.GetName(), "group", group,
+			"service", svcNs+"/"+svcName,
+			"terminatingNamespaces", refs, "podsDeleted", deleted,
+			"standalone", refs == nil)
+		return true
+	}
+	return false
 }
 
 // stuckTerminatingNamespaces returns "<ns name>" -> lowercased

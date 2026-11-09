@@ -342,6 +342,13 @@ func (p *Prober) Cycle(ctx context.Context) {
 			continue
 		}
 		svname, inPrimary := actionTarget(b, svnameByAddr)
+		// W19-PI1: same last-standing fence as the drain phase —
+		// when fresh < 1 a HAProxy restart may have resurrected
+		// this server as the ONLY usable backend; re-disabling it
+		// would take the VIP down with it.
+		if fresh < 1 {
+			continue
+		}
 		if p.eff.mode == ModeEnforce {
 			if err := p.haproxyServer(ctx, "disable",
 				svname, !inPrimary); err != nil {
@@ -384,7 +391,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 			// backend is a constant "UP" with no HAProxy state to
 			// forget, so re-applying would just repeat the socket
 			// command every cycle.
-			if p.eff.mode == ModeEnforce && b.discovered && b.up() {
+			// W19-PI1: fence on fresh < 1 — same last-standing
+			// protection as the drain phase below.
+			if p.eff.mode == ModeEnforce && b.discovered && b.up() &&
+				fresh >= 1 {
 				if err := p.haproxyServer(ctx, "disable",
 					svname, !inPrimary); err != nil {
 					log.Error("re-apply disable failed",

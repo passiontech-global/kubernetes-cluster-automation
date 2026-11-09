@@ -176,6 +176,28 @@ Unattended-Upgrade::Package-Blacklist {
 Unattended-Upgrade::Automatic-Reboot "false";
 `), 0o644)
 
+	// W19-ST3 multipathd isolation: on hosts where multipath-tools is
+	// installed, multipathd claims every new block device it can see —
+	// including /dev/longhorn/*, RBD images and plain sd*/vd*/nvme*
+	// disks the kubelet/CSI layer owns — and wedges MountVolume.SetUp
+	// with "device is already mounted or busy". Blacklist them all so
+	// multipathd stays out of the CSI path. Only converged when
+	// multipath is actually present on the host: an unconditional
+	// drop-in would create /etc/multipath/conf.d on hosts that never
+	// installed the daemon.
+	if r.fileExists("/etc/multipath") || r.fileExists("/etc/multipath.conf") {
+		_ = r.ensureDir("/etc/multipath/conf.d", 0o755)
+		_, _ = r.writeManaged("/etc/multipath/conf.d/99-k8s-node-ops.conf",
+			[]byte(`# Managed by node-config-agent - host-protection-drop-ins multipathd isolation.
+# multipathd must not claim local disks or CSI/RBD/Longhorn block
+# devices — a claimed device wedges kubelet MountVolume.SetUp with
+# "device is already mounted or busy" (W19-ST3).
+blacklist {
+    devnode "^(sd[a-z0-9]+|vd[a-z0-9]+|nvme[0-9]+n[0-9]+|longhorn/.*|rbd[0-9]+)$"
+}
+`), 0o644)
+	}
+
 	// hostname -> 127.0.1.1 in /etc/hosts (lineinfile parity).
 	c.hostnamePin()
 

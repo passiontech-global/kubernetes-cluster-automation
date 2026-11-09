@@ -91,6 +91,7 @@ const (
 	l2ReasonNodeNotReady  = "node_not_ready"
 	l2ReasonNetUnavail    = "network_unavailable"
 	l2ReasonUnschedulable = "node_unschedulable"
+	l2ReasonTainted       = "node_remediation_tainted"
 	l2ReasonControlPlane  = "control_plane_node"
 	l2ReasonAgentNotReady = "cilium_agent_not_ready"
 
@@ -189,6 +190,13 @@ func ciliumL2StaleHolderReasons(lease *coordinationv1.Lease,
 	}
 	if node.Spec.Unschedulable {
 		reasons = append(reasons, l2ReasonUnschedulable)
+	}
+	// W19-T1: a remediation/out-of-service TAINT flags the holder as
+	// stale even when spec.Unschedulable is false — cordon alone does
+	// not always precede a fence, and a partitioned/stealing node
+	// still answers L2 announcements while pods are being evicted.
+	if kube.HasRemediationOrOutOfServiceTaint(node) {
+		reasons = append(reasons, l2ReasonTainted)
 	}
 	if _, cp := node.Labels[l2ControlPlaneRoleLabel]; cp {
 		// The L2 announcement policy's nodeSelector excludes

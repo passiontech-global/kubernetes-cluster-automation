@@ -391,9 +391,11 @@ func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 
 // Every gate leg is required: a Terminating namespace younger than
 // 15m must not trigger the heal even with a long-dead APIService.
+// The APIService is only 20m dead — under the W19-CP2 30m standalone
+// bar — so neither path can fire.
 func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
-	asgUnavailable(apiSvc, 30*time.Minute)
+	asgUnavailable(apiSvc, 20*time.Minute)
 	cs := asgUnblockCS("kube-system", "metrics.k8s.io", "metrics-server", "metrics-server", 5*time.Minute, "ms-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
@@ -403,6 +405,53 @@ func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	}
 	if !asgPodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("backing pod deleted although the namespace only just started terminating")
+	}
+}
+
+// W19-CP2 standalone unblock: a protected-namespace APIService dead
+// >=30m gets its backing pods restarted even with NO namespace
+// stuck Terminating — the KEDA/cert-manager/prometheus-operator
+// adapter deadlock signature.
+func TestAPIServiceGuardUnblockStandaloneRestarts(t *testing.T) {
+	apiSvc := asgObj("v1beta1.external.metrics.k8s.io", "keda",
+		"keda-operator")
+	asgUnavailable(apiSvc, 45*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("keda"),
+		asgBackendSvc("keda", "keda-operator", "keda-operator"),
+		asgBackendPod("keda", "keda-operator-0", "keda-operator"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if asgPodExists(t, cs, "keda", "keda-operator-0") {
+		t.Fatal("standalone-unblock: backing pod not restarted")
+	}
+	if !asgExists(t, dyn, "v1beta1.external.metrics.k8s.io") {
+		t.Fatal("APIService object itself deleted — only pods should restart")
+	}
+}
+
+// The standalone bar is 30m: a protected APIService dead only 20m
+// with no Terminating namespace must NOT be restarted.
+func TestAPIServiceGuardUnblockStandaloneTooYoungSkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.external.metrics.k8s.io", "keda",
+		"keda-operator")
+	asgUnavailable(apiSvc, 20*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("keda"),
+		asgBackendSvc("keda", "keda-operator", "keda-operator"),
+		asgBackendPod("keda", "keda-operator-0", "keda-operator"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "keda", "keda-operator-0") {
+		t.Fatal("backing pod deleted below the 30m standalone bar")
 	}
 }
 

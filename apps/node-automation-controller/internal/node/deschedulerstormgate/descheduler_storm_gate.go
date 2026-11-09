@@ -180,10 +180,11 @@ func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
 		now.Sub(c.LastHeartbeatTime.Time) < stormCondHeartbeatMaxAge
 }
 
-// stormTaints mirrors STORM_TAINTS.
-var stormTaints = []string{
-	kube.TaintKubeletUnresponsive, kube.TaintNetworkPartitioned,
-}
+// stormTaints mirrors STORM_TAINTS — now driven by
+// kube.RemediationTaints so all four remediation taints (incl.
+// node-hang-precordon and cpu-steal) count toward the gate and a
+// new remediation taint cannot silently bypass it (W19-T1).
+var stormTaints = kube.RemediationTaints
 
 type deschedulerStormGate struct {
 	cs kubernetes.Interface

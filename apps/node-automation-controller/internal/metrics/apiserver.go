@@ -54,6 +54,15 @@ var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.Counte
 	Help: "Circuit-breaker trips per webhook config.",
 }, []string{"kind", "name"})
 
+// BootWebhookFailOpenTotal counts medik8s boot-path validating webhook
+// entries enforced to failurePolicy=Ignore by the bootwebhooks duty —
+// incremented only when the patch landed, so it also counts post-OLM
+// drift re-heals. Labels: webhook config name, sub-webhook name.
+var BootWebhookFailOpenTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_boot_webhook_failopen_total",
+	Help: "Medik8s boot-path webhook entries enforced to failurePolicy=Ignore.",
+}, []string{"name", "webhook"})
+
 // WebhookMissingCriticalNSExclusion marks (1) live admission sub-webhooks
 // with failurePolicy=Fail whose namespaceSelector still matches any of the
 // critical self-healing namespaces (kube-system, kube-node-lease, node-ops,
@@ -127,6 +136,7 @@ var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 var apiserverCollectors = []prometheus.Collector{
 	apiBackendRVGap, apiBackendQuarantined, apiBackendJWKSKIDSkew,
 	WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
+	BootWebhookFailOpenTotal,
 	WebhookMissingCriticalNSExclusion, WebhookHeartbeatResourceExposed,
 	APIServiceUnavailable,
 	UnmeshedPods, UnmeshedPodsRecreatedTotal,

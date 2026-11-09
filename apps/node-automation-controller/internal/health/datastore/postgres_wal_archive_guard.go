@@ -50,11 +50,18 @@ type postgresWALArchiveGuardCheck struct {
 	emittedSlot state.GaugeLedger[string]
 	emittedCNPG state.GaugeLedger[string]
 
-	// cnpgSeen: "phase/ns/name" | "replicas/ns/name" → first sweep
-	// the cnpg-health stuck-phase or under-replicated signature held —
-	// each must persist p.Cfg.Datastore.CNPGUnhealthyMinAge before
-	// it counts; pruned on resolve so a flap re-arms.
+	// cnpgSeen: "phase/ns/name" | "replicas/ns/name" | "primary/ns/name"
+	// → first sweep the cnpg-health stuck-phase, under-replicated or
+	// primary-mismatch signature held — each must persist
+	// p.Cfg.Datastore.CNPGUnhealthyMinAge before it counts; pruned on
+	// resolve so a flap re-arms.
 	cnpgSeen state.FirstSeenLedger
+	// cnpgFenceSeen: "fence/ns/name/instance" → first sweep the
+	// cnpg.io/fencedInstances annotation carried that instance —
+	// the auto-unfence heal only fires once the fence has persisted
+	// CNPGUnhealthyMinAge (a fence the operator just stamped may be
+	// mid-failover, not stale).
+	cnpgFenceSeen state.FirstSeenLedger
 }
 
 // NewPostgresWALArchiveGuardCheck builds the WAL guard — its only

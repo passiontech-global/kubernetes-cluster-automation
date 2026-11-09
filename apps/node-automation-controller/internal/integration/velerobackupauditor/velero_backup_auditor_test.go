@@ -875,6 +875,61 @@ func TestVeleroAuditorRepoClearsResolved(t *testing.T) {
 	}
 }
 
+// W19-ST2 — a BackupRepository held at phase=NotReady for the full
+// 30m window is deleted so Velero re-initializes the Kopia/Restic
+// connection; a younger NotReady repo is only flagged.
+func TestVeleroAuditorRepoNotReadyReinit(t *testing.T) {
+	now := time.Now()
+	repo := veleroRepo("velero", "repo-wedged", "NotReady", time.Time{})
+	dyn := newDynFake(repo)
+	a := newVeleroAuditor(dyn, now)
+
+	// First sweep arms the window — the repo must survive.
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-wedged", metav1.GetOptions{}); err != nil {
+		t.Fatalf("repo deleted inside the 30m window: %v", err)
+	}
+	if v, ok := repoSeries(t, "velero", "repo-wedged",
+		"phase_not_ready"); !ok || v != 1 {
+		t.Fatalf("phase_not_ready series = %v,%v want 1,true", v, ok)
+	}
+
+	// Past the window the heal deletes the CR.
+	a.now = func() time.Time { return now.Add(31 * time.Minute) }
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-wedged", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("wedged repo still present after the window: %v", err)
+	}
+}
+
+// A repo that reports a non-Ready phase OTHER than NotReady (e.g.
+// a transient "Error") flags the gauge but is never auto-deleted —
+// only the NotReady wedge has the re-init heal.
+func TestVeleroAuditorRepoErrorPhaseNotDeleted(t *testing.T) {
+	now := time.Now()
+	repo := veleroRepo("velero", "repo-err", "Error", time.Time{})
+	dyn := newDynFake(repo)
+	a := newVeleroAuditor(dyn, now)
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a.now = func() time.Time { return now.Add(45 * time.Minute) }
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-err", metav1.GetOptions{}); err != nil {
+		t.Fatalf("non-NotReady repo deleted: %v", err)
+	}
+}
+
 // An older Velero without the BackupRepository CRD 404s the list —
 // a quiet skip, not a run error (same contract as the BSL audit).
 func TestVeleroAuditorRepoCRDAbsent(t *testing.T) {
