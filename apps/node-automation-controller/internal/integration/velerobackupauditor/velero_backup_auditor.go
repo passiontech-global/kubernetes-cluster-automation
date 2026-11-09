@@ -38,7 +38,9 @@
 // per-Schedule rot checks, everest_audit.go the backup-posture-audit Percona
 // Everest audit, cnpg_audit.go the cnpg-backup-audit CloudNativePG backup
 // audit, inflight_pvb_audit.go the velero-inflight-audit wedged-transfer
-// audit + PVB cleanup (+ cnpg-backup-audit DataUpload/DataDownload scan).
+// audit + PVB cleanup (+ cnpg-backup-audit DataUpload/DataDownload scan),
+// velero_storage_audit.go the BSL + BackupRepository audits and the
+// W19-ST2 repo re-init heal.
 package velerobackupauditor
 
 import (
@@ -56,8 +58,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -292,164 +292,29 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	cnpgErr := a.auditCNPGBackups(ctx)
 	dbErr := errors.Join(everestErr, cnpgErr)
 
-	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
+	schedules, backups, err := a.veleroObjects(ctx)
 	if err != nil {
+		return errors.Join(dbErr, err)
+	}
+	if schedules == nil {
 		// Clusters without Velero have no CRDs — quiet skip, same
 		// contract as externalsecret-nudge.
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			log.Info("skip: velero CRDs not installed")
-			return dbErr
-		}
-		return errors.Join(dbErr,
-			fmt.Errorf("list velero schedules: %w", err))
-	}
-	backups, err := a.veleroList(ctx, veleroBackupGVR)
-	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			backups = nil // schedules exist but backups CRD absent — check 1 still runs
-		} else {
-			return errors.Join(dbErr,
-				fmt.Errorf("list velero backups: %w", err))
-		}
+		log.Info("skip: velero CRDs not installed")
+		return dbErr
 	}
 	latest := latestBackupsBySchedule(backups)
 
-	pausedNow := map[string]bool{}
-	for i := range schedules.Items {
-		s := &schedules.Items[i]
-		ns, name := s.GetNamespace(), s.GetName()
+	a.auditSchedules(ctx, schedules, latest, log)
 
-		// Check 1 — spec.paused held past 24h. A Schedule carries no
-		// "paused since" timestamp, so firstSeenPaused measures the
-		// real pause duration from first sight; an entry pruned on
-		// unpause means a re-pause restarts the clock, and the UID in
-		// the key keeps a delete+recreate from inheriting pause time.
-		isPaused, _ := kube.NestedBool(s.Object, "spec", "paused")
-		if isPaused {
-			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
-			pausedNow[lk] = true
-			first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
-			k := pausedKey{ns, name}
-			v := 0.0
-			if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
-				v = 1
-				log.Info("velero schedule paused >24h — backups silently stopped",
-					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
-			}
-			a.seenPaused.Set(metrics.VeleroSchedulePaused, v, k, ns, name)
-		}
-
-		// Check 2 — the latest schedule-owned Backup empty/errored.
-		b := latest[ns+"/"+name]
-		if b == nil {
-			// zero-backup-guard — zero Backup objects is not "nothing to
-			// judge" once the Schedule itself is old enough to have
-			// produced some. A paused Schedule is exempt: it
-			// legitimately stops producing (check 1 already covers
-			// it).
-			if !isPaused {
-				a.flagMissingBackups(ctx, s, ns, name)
-			}
-			continue
-		}
-		a.flagBadBackup(ctx, b, ns, name)
+	// velero-bsl-audit + backup-health — the storage-side audits run
+	// after the schedule checks; a list failure short-circuits the
+	// remaining audits exactly as the inline code did.
+	if err := a.auditBSLs(ctx, log); err != nil {
+		return errors.Join(everestErr, err)
 	}
-
-	// Prune series whose condition resolved since the last sweep —
-	// a schedule unpaused or a fresh healthy backup must clear the
-	// gauge, not pin it at 1.
-	a.seenPaused.Prune(metrics.VeleroSchedulePaused.DeleteLabelValues)
-	// Drop first-seen entries for schedules that unpaused or vanished
-	// — a later re-pause measures a fresh duration, not the
-	// cumulative time it once spent paused.
-	a.firstSeenPaused.Prune(func(lk string) bool { return pausedNow[lk] })
-	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
-
-	// velero-bsl-audit — BackupStorageLocation availability: a BSL not
-	// phase=Available means backups run to an unreachable bucket and
-	// the next restore has nothing to read.
-	bsls, err := a.veleroList(ctx, veleroBSLGVR)
-	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// CRD absent — nothing to audit.
-	case err != nil:
-		return errors.Join(everestErr,
-			fmt.Errorf("list velero backupstoragelocations: %w", err))
-	default:
-		for i := range bsls.Items {
-			bsl := &bsls.Items[i]
-			ns, name := bsl.GetNamespace(), bsl.GetName()
-			phase, _ := kube.NestedString(bsl.Object, "status", "phase")
-			if phase == "Available" {
-				continue
-			}
-			k := pausedKey{ns, name}
-			a.seenBSL.Set(metrics.VeleroBSLUnavailable, 1, k, ns, name)
-			log.Info("velero BSL unavailable — backups/restore at risk",
-				"bsl", ns+"/"+name, "phase", phase)
-		}
+	if err := a.auditBackupRepositories(ctx, log); err != nil {
+		return errors.Join(everestErr, err)
 	}
-	a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
-
-	// backup-health — BackupRepository health: the restic/kopia repo every
-	// snapshot lands in. A repo whose phase is not Ready cannot be
-	// opened at all, and a lastMaintenanceTime older than 7d means
-	// the scheduled maintenance (prune/repack) stopped — both leave
-	// "successful" backups unrestorable. reason=phase_not_ready |
-	// maintenance_stale.
-	repos, err := a.veleroList(ctx, veleroRepoGVR)
-	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// CRD absent (older Velero without the repo API) — nothing
-		// to audit.
-	case err != nil:
-		return errors.Join(everestErr,
-			fmt.Errorf("list velero backuprepositories: %w", err))
-	default:
-		repoNotReadyNow := map[string]bool{}
-		for i := range repos.Items {
-			repo := &repos.Items[i]
-			ns, name := repo.GetNamespace(), repo.GetName()
-			if phase, ok := kube.NestedString(
-				repo.Object, "status", "phase"); ok && phase != "Ready" {
-				a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
-					repoKey{ns, name, "phase_not_ready"},
-					ns, name, "phase_not_ready")
-				log.Info("velero backup repository not Ready — repo cannot be opened",
-					"repo", ns+"/"+name, "phase", phase)
-				// W19-ST2 — a repo wedged NotReady >=30m gets
-				// deleted so Velero re-initializes the Kopia/
-				// Restic connection (heal-gated + cooled down).
-				if phase == "NotReady" {
-					lk := ns + "/" + name
-					repoNotReadyNow[lk] = true
-					first, _ := a.firstSeenRepoNotReady.Observe(
-						lk, a.now.Now())
-					if a.now.Now().Sub(first) >= veleroRepoNotReadyMinAge {
-						a.reinitStaleRepo(ctx, repo, ns, name)
-					}
-				}
-			}
-			lmt, ok := kube.NestedString(
-				repo.Object, "status", "lastMaintenanceTime")
-			if !ok {
-				continue // never stamped — can't tell, not stale
-			}
-			t, perr := time.Parse(time.RFC3339, lmt)
-			if perr != nil || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
-				continue
-			}
-			a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
-				repoKey{ns, name, "maintenance_stale"},
-				ns, name, "maintenance_stale")
-			log.Info("velero backup repository maintenance stale — prune/repack loop stopped",
-				"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
-				"age", a.now.Now().Sub(t).Truncate(time.Hour))
-		}
-		a.firstSeenRepoNotReady.Prune(
-			func(k string) bool { return repoNotReadyNow[k] })
-	}
-	a.seenRepo.Prune(metrics.VeleroRepoUnhealthy.DeleteLabelValues)
 
 	// velero-inflight-audit — in-flight transfer audit: mark Backups/PVBs wedged
 	// InProgress|Deleting >6h, and clean up PVBs whose node-agent
@@ -470,43 +335,31 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	return errors.Join(dbErr, stuckErr, dmErr)
 }
 
-// reinitStaleRepo deletes a BackupRepository that has reported
-// phase=NotReady for the full persistence window — Velero's repo
-// controller recreates the CR and re-initializes the Kopia/Restic
-// connection, the only recovery a wedged repo handshake has. The
-// delete is destructive on a live object, so it gates on
-// heal.AllowedV (per-repo cooldown + maintenance mutex, fail closed
-// on unverifiable) and is UID-preconditioned; the cooldown stamps
-// only after the delete is delivered.
-func (a *veleroBackupAuditor) reinitStaleRepo(ctx context.Context,
-	repo *unstructured.Unstructured, ns, name string) {
-
-	log := logf.FromContext(ctx)
-	now := a.now.Now()
-	key := "backuprepository/" + ns + "/" + name
-	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs,
-		a.dyn, &a.repoHealed, key, veleroRepoHealedCooldown, now)
-	switch {
-	case unverifiable:
-		metrics.IncError(a.queue)
-		return
-	case !proceed:
-		return // cooldown or maintenance — detection already flagged
-	}
-	if err := a.dyn.Resource(veleroRepoGVR).Namespace(ns).Delete(ctx,
-		name, kube.UIDDeleteOptions(repo.GetUID(), "")); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Error(err, "stale backup repository delete failed",
-				"repo", ns+"/"+name)
-			metrics.IncError(a.queue)
+// veleroObjects lists the Velero Schedule and Backup objects the
+// schedule audits and the in-flight audit consume. A missing Velero
+// CRD set (no Velero installed) returns (nil, nil, nil) — the caller
+// logs the quiet skip and returns the already-collected db errors.
+// A missing Backups CRD while Schedules exist is tolerated (the
+// paused-schedule check still runs on an empty backup view); any
+// other list error aborts the sweep.
+func (a *veleroBackupAuditor) veleroObjects(ctx context.Context) (
+	*unstructured.UnstructuredList, *unstructured.UnstructuredList, error) {
+	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil, nil, nil
 		}
-		return
+		return nil, nil, fmt.Errorf("list velero schedules: %w", err)
 	}
-	a.repoHealed.Stamp(key, now)
-	metrics.VeleroWedgedObjectsCleanedTotal.
-		WithLabelValues(ns, "repo_reinitialized").Inc()
-	log.Info("ACTION: deleted stale BackupRepository — velero will re-init the repo",
-		"repo", ns+"/"+name)
+	backups, err := a.veleroList(ctx, veleroBackupGVR)
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			backups = nil // schedules exist but backups CRD absent — check 1 still runs
+		} else {
+			return nil, nil, fmt.Errorf("list velero backups: %w", err)
+		}
+	}
+	return schedules, backups, nil
 }
 
 // latestBackupsBySchedule indexes the newest Backup per owning
