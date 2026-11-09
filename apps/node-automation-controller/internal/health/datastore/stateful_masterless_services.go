@@ -2,7 +2,8 @@
 // stateful-masterless-services check (stateful-masterless-services): a master-role Service
 // routing to a ready StatefulSet's pods reporting 0 Ready endpoints
 // past the gauge window — the operator that assigns the role wedged.
-// The dragonfly auto-heals live in dragonfly_heals.go, the generic
+// The per-sweep phases live in stateful_masterless_sweep.go; the
+// dragonfly auto-heals live in dragonfly_heals.go, the generic
 // db-operator heal in db_operator_heals.go, and the stateful-split-brain
 // split-brain/site-skew signatures in split_brain.go/site_skew.go.
 package datastore
@@ -19,12 +20,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -225,184 +223,19 @@ func dragonflyOwned(sts *appsv1.StatefulSet) bool {
 // STS additionally triggers a dragonfly-operator leader delete (30m
 // cooldown) — a wedged operator is the common cause of a missing
 // master label/election.
+//
+// The per-sweep phases (census → candidate pairing → streak/signature
+// eval → report close → heal dispatch → verdict) live in
+// stateful_masterless_sweep.go.
 func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
-	log := logf.FromContext(ctx)
-	now := p.Now()
-
-	stsList, err := p.AllStatefulSets(ctx)
+	s, err := p.beginMasterlessSweep(ctx)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list statefulsets: %w", err)}
+		return probefw.Result{Infra: err}
 	}
-	svcList, err := p.AllServices(ctx)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
-	}
-	// Ready-endpoint census per ns/service — the shared rollup the
-	// endpoint censuses converge on (service-name label binding,
-	// nil ready counts as ready — kube.ReadyEndpointsByService). A
-	// list error skips the whole check: "0 ready" is
-	// indistinguishable from "no data". stateful-split-brain keeps the endpoint
-	// detail (zone/node/targetRef) the rollup captures so the
-	// split-brain and site-skew signatures can place each endpoint.
-	// The census rides the per-sweep snapshot — this check was the
-	// last one paying its own cluster-wide list.
-	esSlices, err := p.AllEndpointSlices(ctx)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
-	}
-	ready := kube.ReadyEndpointsByService(esSlices)
-
-	// stateful-split-brain(ii) — arm the cross-DC site-skew sweep: the census
-	// reads, the multi-zone gate and the trigger bookkeeping live
-	// in site_skew.go.
-	skew := p.siteSkew.begin(ctx, log, p.Deps)
-
-	// Candidates: a ready STS paired with a master-role Service
-	// routing to its pods.
-	var candidates []masterSvc
-	for i := range stsList {
-		sts := &stsList[i]
-		// A StatefulSet the go-kube-downscaler parked at
-		// spec.replicas:0 (downscaler/* annotations present) is
-		// asleep on purpose — its master Service reading 0 ready
-		// endpoints is intent, not a wedged operator.
-		if kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas) {
-			continue
-		}
-		if sts.Status.ReadyReplicas == 0 {
-			continue
-		}
-		for j := range svcList {
-			svc := &svcList[j]
-			if svc.Namespace != sts.Namespace ||
-				svc.Spec.ClusterIP == "" ||
-				svc.Spec.ClusterIP == corev1.ClusterIPNone {
-				continue // headless services are deliberately per-pod
-			}
-			if !masterRoleService(svc) ||
-				!selectorMatchesSTS(svc, sts.Spec.Template.Labels) {
-				continue
-			}
-			candidates = append(candidates,
-				masterSvc{ns: svc.Namespace, svc: svc.Name, sts: sts})
-		}
-	}
-
-	seen := map[string]bool{}      // tuples observed at 0 ready this sweep
-	evaluated := map[string]bool{} // candidate keys evaluated this sweep — the streak's keep set
-	var rep probefw.SweepReport    // tuples past the gauge window
-	var multiRep probefw.SweepReport
-	var due []masterlessDue // past the heal window
-	for _, c := range candidates {
-		key := c.ns + "/" + c.svc + "/" + c.sts.Name
-		evaluated[key] = true
-		sts := c.sts
-		patch := func(ctx context.Context, data []byte) error {
-			_, err := p.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx,
-				sts.Name, types.MergePatchType, data,
-				metav1.PatchOptions{})
-			return err
-		}
-		eps := ready[c.ns+"/"+c.svc]
-		// stateful-split-brain(i)/(ii) — the split-brain streak and the cross-DC
-		// pin accounting, one signature per file.
-		p.splitBrain.eval(c, key, len(eps), &multiRep)
-		skew.evalMaster(c, key, eps, &rep)
-		if len(eps) > 0 {
-			// Master reachable — the signature resolved on a live
-			// object: drop the persisted stamp so a recurrence
-			// re-arms the full window (a stale stamp would
-			// fast-trip the heal). Tolerated sub-failure — the
-			// ledger Forget already landed, the annotation retry
-			// is Warn-only.
-			if err := heal.ClearPersistedFirstSeen(ctx, log,
-				&p.stsZeroSince, sts,
-				kube.AnnoFirstSeenStatefulMasterless, key,
-				patch); err != nil {
-				log.Info("WARN: masterless first-seen clear failed",
-					"statefulset", sts.Namespace+"/"+sts.Name,
-					"error", err)
-			}
-			continue
-		}
-		seen[key] = true
-		// The zero-endpoint streak gates the dragonfly/db-operator
-		// bounce and the dual-replica-deadlock ordinal-0 pod delete, so it runs the
-		// persisted (annotation-backed) variant — the stamp on the
-		// STS survives an operator restart that would otherwise
-		// re-arm the gauge and heal windows mid-wedge.
-		if !heal.FirstSeenPersisted(ctx, log, &p.stsZeroSince, sts,
-			kube.AnnoFirstSeenStatefulMasterless, key,
-			masterlessZeroMinAge, now, patch) {
-			continue
-		}
-		rep.Emit(statefulServiceZeroEndpointsGauge, key,
-			[]string{c.ns, c.svc, c.sts.Name}, key)
-		// The heal window reads the same streak — Seen never
-		// re-stamps, and reports the WIDER window once
-		// FirstSeenPersisted Seeds a resumed persisted stamp back
-		// into the ledger (a streak that crossed a restart keeps
-		// its full age).
-		if age, _ := p.stsZeroSince.Seen(key, now); age >= masterlessHealMinAge {
-			due = append(due, masterlessDue{svc: c, since: now.Add(-age)})
-		}
-	}
-
-	skew.close(&rep)
-
-	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
-	p.splitBrain.streak.Prune(func(k string) bool { return evaluated[k] })
-	rep.Close(&p.stsZeroEmitted, statefulServiceZeroEndpointsGauge.DeleteLabelValues)
-	multiRep.Close(&p.splitBrain.emitted, statefulServiceMultipleMastersGauge.DeleteLabelValues)
-
-	// Dragonfly auto-heal — a masterless dragonfly past the heal
-	// window bounces the operator leader to force re-election (step
-	// 1); past the deadlock window and >=3m after that bounce the
-	// dual-replica heal deletes the lowest-ordinal pod to restart
-	// the election from scratch (step 2, dual-replica-deadlock). A non-dragonfly
-	// masterless STS gets per-pod role diagnostics instead — its
-	// election contract is operand-specific and a generic pod kill
-	// is not safe to automate.
-	for _, d := range due {
-		if !dragonflyOwned(d.svc.sts) {
-			// va-stuck-terminating: a masterless stateful service owned by a known db
-			// operator gets the operator pod bounced to force
-			// re-election — the same re-election nudge as the
-			// dragonfly heal, on its own per-operator 30m cooldown.
-			if op := dbOperatorFor(d.svc.sts); op != "" {
-				p.healDBOperator(ctx, log, d.svc, op, now)
-			} else {
-				p.logStatefulPodRoles(ctx, log, d.svc)
-			}
-			continue
-		}
-		p.healDragonflyOperator(ctx, log, d.svc, now)
-		if now.Sub(d.since) >= dragonflyReplicaDeadlockMinAge {
-			p.healDragonflyReplicaDeadlock(ctx, log, d.svc, now)
-		}
-	}
-
-	// Zero-endpoints and split-brain are OPPOSITE signatures (0
-	// ready masters vs >1) — each renders under its own verdict
-	// wording instead of the split-brain findings hiding behind the
-	// "0 ready endpoints" prefix (heal-budget verdict-detail fix).
-	res := rep.Verdict(fmt.Sprintf(
-		"master-role services at 0 ready endpoints >=%s: ",
-		masterlessZeroMinAge), ", ")
-	if split := multiRep.Verdict(
-		"master-role services with multiple ready masters (split brain) "+
-			">=2 sweeps: ", ", "); split.Why != "" {
-		if res.Why != "" {
-			res.Why += " | " + split.Why
-		} else {
-			res.Why = split.Why
-			res.Pass = false
-		}
-		if res.Infra == nil {
-			res.Infra = split.Infra
-		}
-	}
-	return res
+	s.evalCandidates(ctx)
+	s.closeReports()
+	s.healDue(ctx)
+	return s.verdict()
 }
 
 // podMasterRole reports whether the pod carries a master/primary/

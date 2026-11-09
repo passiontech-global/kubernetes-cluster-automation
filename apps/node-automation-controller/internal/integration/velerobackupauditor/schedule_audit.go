@@ -1,8 +1,9 @@
-// schedule_audit.go — the per-Schedule rot checks of
-// velero-backup-auditor: flagMissingBackups (zero-backup-guard — a Schedule
-// older than veleroMissingBackupMaxAge that produced ZERO Backup
-// objects is silently unprotected) and flagBadBackup (the latest
-// schedule-owned Backup's empty/errored/wedged signatures on
+// schedule_audit.go — the Schedule half of velero-backup-auditor:
+// auditSchedules (the per-Schedule sweep loop + ledger lifecycle)
+// over flagMissingBackups (zero-backup-guard — a Schedule older than
+// veleroMissingBackupMaxAge that produced ZERO Backup objects is
+// silently unprotected) and flagBadBackup (the latest schedule-owned
+// Backup's empty/errored/wedged signatures on
 // VeleroBackupEmptyOrErrored{namespace,schedule,reason}).
 package velerobackupauditor
 
@@ -10,12 +11,75 @@ import (
 	"context"
 	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
+
+// auditSchedules runs the two per-Schedule rot checks over the listed
+// Schedules and owns their ledger lifecycle: the paused>24h clock
+// (firstSeenPaused measures the real pause duration — a Schedule
+// carries no "paused since" timestamp) and the latest-backup rot
+// signature via flagBadBackup / flagMissingBackups. The trailing
+// prunes clear series whose condition resolved — an unpaused
+// Schedule or a fresh healthy backup must not pin the gauge at 1.
+func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
+	schedules *unstructured.UnstructuredList,
+	latest map[string]*unstructured.Unstructured, log logr.Logger) {
+	pausedNow := map[string]bool{}
+	for i := range schedules.Items {
+		s := &schedules.Items[i]
+		ns, name := s.GetNamespace(), s.GetName()
+
+		// Check 1 — spec.paused held past 24h. A Schedule carries no
+		// "paused since" timestamp, so firstSeenPaused measures the
+		// real pause duration from first sight; an entry pruned on
+		// unpause means a re-pause restarts the clock, and the UID in
+		// the key keeps a delete+recreate from inheriting pause time.
+		isPaused, _ := kube.NestedBool(s.Object, "spec", "paused")
+		if isPaused {
+			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
+			pausedNow[lk] = true
+			first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
+			k := pausedKey{ns, name}
+			v := 0.0
+			if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
+				v = 1
+				log.Info("velero schedule paused >24h — backups silently stopped",
+					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
+			}
+			a.seenPaused.Set(metrics.VeleroSchedulePaused, v, k, ns, name)
+		}
+
+		// Check 2 — the latest schedule-owned Backup empty/errored.
+		b := latest[ns+"/"+name]
+		if b == nil {
+			// zero-backup-guard — zero Backup objects is not "nothing to
+			// judge" once the Schedule itself is old enough to have
+			// produced some. A paused Schedule is exempt: it
+			// legitimately stops producing (check 1 already covers
+			// it).
+			if !isPaused {
+				a.flagMissingBackups(ctx, s, ns, name)
+			}
+			continue
+		}
+		a.flagBadBackup(ctx, b, ns, name)
+	}
+
+	// Prune series whose condition resolved since the last sweep —
+	// a schedule unpaused or a fresh healthy backup must clear the
+	// gauge, not pin it at 1.
+	a.seenPaused.Prune(metrics.VeleroSchedulePaused.DeleteLabelValues)
+	// Drop first-seen entries for schedules that unpaused or vanished
+	// — a later re-pause measures a fresh duration, not the
+	// cumulative time it once spent paused.
+	a.firstSeenPaused.Prune(func(lk string) bool { return pausedNow[lk] })
+	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
+}
 
 // flagMissingBackups is the zero-backup-guard zero-backup check: a Schedule
 // older than veleroMissingBackupMaxAge (36h) that has produced ZERO

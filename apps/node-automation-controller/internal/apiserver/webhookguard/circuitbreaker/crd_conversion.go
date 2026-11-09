@@ -8,22 +8,18 @@
 // oldest wedged backing pod through the same BounceCooldown ledger
 // and maintenance-mutex gate as the admission path. The gauge is a
 // single-check series, so it lives here (colocated var + init)
-// instead of internal/metrics.
+// instead of internal/metrics. The per-sweep phases (input gates,
+// per-CRD eval, bounce dispatch) live in crd_conversion_sweep.go.
 package circuitbreaker
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
 
 // ---------------------------------------------------------------------------
@@ -95,151 +91,24 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 	snap *guardstate.Snapshot) error {
 	b.crdUnhealthyEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
-	log := logf.FromContext(ctx)
-	now := g.Now.Now()
+	s := &crdConversionSweep{
+		b: b, g: g, snap: snap,
+		log:         logf.FromContext(ctx),
+		now:         g.Now.Now(),
+		bounceSeen:  map[string]bool{},
+		svcVerdicts: map[string]bool{},
+		svcMissing:  map[string]bool{},
+	}
 	// The shared bounce ledger is stamped below for hung conversion
 	// backends too — same once-per-sweep bound as Sweep.
-	b.bounceAt.PruneExpired(now, BounceCooldown)
+	b.bounceAt.PruneExpired(s.now, BounceCooldown)
 
-	// carryForward re-asserts last sweep's tuples when this sweep
-	// cannot measure the surface. Liveness-aware when the CRD list
-	// succeeded: live holds the CRD names snap.CRDs carries, so a
-	// tuple whose CRD left the list is NOT re-asserted — the Prune
-	// below forgets its series instead of re-pinning it while
-	// reads keep failing. nil live (the CRD list itself failed)
-	// carries everything — no liveness evidence exists to filter on.
-	carryForward := func(live map[string]bool) {
-		for k, lv := range b.crdUnhealthyEmitted.Last() {
-			if live == nil || live[k.crd] {
-				b.crdUnhealthyEmitted.Emit(k, lv...)
-			}
-		}
-		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+	proceed, err := s.loadInputs()
+	if err != nil || !proceed {
+		return err
 	}
 
-	if snap.CRDErr != nil {
-		// API flap — "can't read the surface" fails closed: carry
-		// the series forward and surface the error.
-		carryForward(nil)
-		return fmt.Errorf("list customresourcedefinitions — conversion webhook health skipped: %w", snap.CRDErr)
-	}
-	ready, err := snap.ReadyCounts()
-	if err != nil {
-		// The breaker reports the same census failure as ITS error —
-		// re-reporting it here would double-count. Defer quietly and
-		// keep the last verdict alive — UNLESS the breaker is
-		// levered off this cycle, in which case nobody else reports
-		// it and the failure would be invisible.
-		//
-		// The CRD list DID succeed here, so snap.CRDs is live
-		// evidence: only its CRDs' tuples carry forward.
-		live := make(map[string]bool, len(snap.CRDs))
-		for i := range snap.CRDs {
-			live[snap.CRDs[i].GetName()] = true
-		}
-		carryForward(live)
-		if !Enabled() {
-			return fmt.Errorf("endpoint/node census — conversion webhook health skipped: %w", err)
-		}
-		return nil
-	}
-
-	// svcVerdict caches each backend Service's existence check for the
-	// sweep — a single conversion server commonly backs an operator's
-	// whole API group (dozens of CRDs), so re-Getting the same Service
-	// per CRD is pure apiserver churn. Inconclusive gets (flap,
-	// timeout) are NOT cached: a transient error must not freeze the
-	// verdict for the rest of the sweep.
-	svcVerdicts := map[string]bool{} // svcKey -> confirmed present
-	svcMissing := map[string]bool{}  // svcKey -> confirmed NotFound
-	svcExists := func(svcKey, ns, name string) (missing, exists bool, err error) {
-		if svcVerdicts[svcKey] {
-			return false, true, nil
-		}
-		if svcMissing[svcKey] {
-			return true, false, nil
-		}
-		_, gerr := g.CS.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(gerr):
-			svcMissing[svcKey] = true
-			return true, false, nil
-		case gerr != nil:
-			return false, false, gerr
-		}
-		svcVerdicts[svcKey] = true
-		return false, true, nil
-	}
-
-	// probeBlind — the same fleet-blind gate as the admission path:
-	// when every probed backend failed the handshake the monitor is
-	// the likely culprit, so the tls_probe_failed verdict must not
-	// emit fresh or drive a bounce (the apiserver-truth reasons —
-	// missing_service, zero_endpoints — stay live).
-	blind := probeBlind(ready)
-	var hung []string
-	bounceSeen := map[string]bool{}
-	for i := range snap.CRDs {
-		crd := &snap.CRDs[i]
-		svcKey, svcNS, svcName, ok := guardstate.CRDConversionServiceKey(crd)
-		if !ok {
-			continue // no webhook conversion or a URL backend — unmeasurable
-		}
-		reason := ""
-		missing, _, err := svcExists(svcKey, svcNS, svcName)
-		switch {
-		case missing:
-			reason = CRDReasonMissingService
-			log.Info("UNHEALTHY: CRD conversion webhook backend Service missing",
-				"crd", crd.GetName(), "service", svcKey)
-		case err != nil:
-			// Can't verify — carry this CRD's last verdict forward
-			// rather than flap; absorbed sub-failure, sweep
-			// continues.
-			metrics.IncError(g.Queue)
-			log.Error(err, "conversion webhook backend Service get failed",
-				"crd", crd.GetName(), "service", svcKey)
-			for k, lv := range b.crdUnhealthyEmitted.Last() {
-				if k.crd == crd.GetName() {
-					b.crdUnhealthyEmitted.Emit(k, lv...)
-				}
-			}
-			continue
-		case ready.Effective[svcKey] == 0:
-			reason = CRDReasonZeroEndpoints
-			log.Info("UNHEALTHY: CRD conversion webhook backend has 0 effective-ready endpoints",
-				"crd", crd.GetName(), "service", svcKey)
-		case ready.Probed[svcKey] && !ready.Responsive[svcKey]:
-			if blind {
-				// Monitor-blind — the handshake verdict is
-				// unverifiable from this vantage point: carry the
-				// CRD's last tuple forward ("can't tell", the same
-				// contract as the Service-get flap above) instead of
-				// emitting a fresh tls_probe_failed or queueing a
-				// bounce against possibly healthy pods.
-				for k, lv := range b.crdUnhealthyEmitted.Last() {
-					if k.crd == crd.GetName() {
-						b.crdUnhealthyEmitted.Emit(k, lv...)
-					}
-				}
-				continue
-			}
-			reason = CRDReasonTLSProbeFailed
-			log.Info("UNHEALTHY: CRD conversion webhook backend fails TCP+TLS probe on every endpoint — pods wedged",
-				"crd", crd.GetName(), "service", svcKey)
-			if !bounceSeen[svcKey] {
-				bounceSeen[svcKey] = true
-				hung = append(hung, svcKey)
-			}
-		}
-		if reason == "" {
-			continue
-		}
-		k := crdConversionKey{crd: crd.GetName(), service: svcKey, reason: reason}
-		b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1,
-			k, k.crd, k.service, k.reason)
-	}
-	b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+	s.evalCRDs(ctx)
 
 	if !Enabled() {
 		// The shared ops lever silences pod kills module-wide —
@@ -247,31 +116,6 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		// unmeshed audit).
 		return nil
 	}
-	for _, svcKey := range hung {
-		// Confirm a live bounce target BEFORE the heal preamble: a
-		// stale census ref must not spend a budget grant (or open the
-		// per-service cooldown) on a pod that no longer exists.
-		target := b.oldestLiveBackingPod(ctx, snap, svcKey, ready.BackingPods[svcKey], now)
-		if target == nil {
-			log.Info("conversion bounce: no live Ready backing pod found — endpoint refs are stale",
-				"service", svcKey)
-			continue
-		}
-		// heal.AllowedV folds the BounceCooldown per-service cooldown AND the
-		// maintenance mutex into one fail-closed preamble; &g.Verdict
-		// memoizes the mutex across services (and shares it with the
-		// admission bounce + unmeshed paths) instead of paying three
-		// API reads per service.
-		proceed, unverifiable := heal.AllowedV(ctx, log, &g.Verdict,
-			g.CS, g.Dyn, &b.bounceAt, svcKey, BounceCooldown, now)
-		if unverifiable {
-			metrics.IncError(g.Queue)
-			continue
-		}
-		if !proceed {
-			continue
-		}
-		b.deleteBouncePod(ctx, snap, svcKey, target, now)
-	}
+	s.bounceHung(ctx)
 	return nil
 }

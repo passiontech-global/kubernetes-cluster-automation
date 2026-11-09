@@ -5,10 +5,11 @@
 // the facade calls — it runs every webhook config through
 // circuitPatch (circuit_patch.go), lands the strategic-merge
 // patches, invokes the circuit-breaker-bounce pod bounce (pod_bounce.go) and prunes
-// the emitted series. The trip thresholds, the hot-reloaded
-// Enabled() ops lever and the hookView projection shared with
-// pod_bounce.go live here too; the CRD conversion-backend duty
-// moved to crd_conversion.go.
+// the emitted series. The per-sweep phases (input census, job build,
+// patch loop) live in circuit_sweep.go; the trip thresholds, the
+// hot-reloaded Enabled() ops lever and the hookView projection
+// shared with pod_bounce.go live here too; the CRD
+// conversion-backend duty moved to crd_conversion.go.
 package circuitbreaker
 
 import (
@@ -18,8 +19,6 @@ import (
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
@@ -178,19 +177,18 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	allowTrips bool) error {
 	b.brokenEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
-	log := logf.FromContext(ctx)
-	now := g.Now.Now()
+	s := &circuitSweep{
+		b: b, g: g, snap: snap,
+		log:         logf.FromContext(ctx),
+		now:         g.Now.Now(),
+		seen:        map[string]bool{},
+		recoverSeen: map[string]bool{},
+		allowTrips:  allowTrips,
+	}
 	// bounceAt keys on backend Service names that die with the
 	// Service — bound the map so stale stamps cannot accumulate.
-	b.bounceAt.PruneExpired(now, BounceCooldown)
+	b.bounceAt.PruneExpired(s.now, BounceCooldown)
 
-	// seen marks the deadSince keys still under evaluation — streaks
-	// for entries gone since the last sweep are pruned below.
-	seen := map[string]bool{}
-	// recoverSeen marks the recover-confirmation streaks Hit this
-	// sweep — the prune's keep set (Hit and defer land together, so
-	// every live streak key appears here each sweep).
-	recoverSeen := map[string]bool{}
 	// The two streak ledgers prune on EVERY cycle — declared up front
 	// so the defers also fire on the census/config-list failures that
 	// early-return below: a sweep that lost its inputs must not leave
@@ -201,109 +199,14 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	// the carry-forward contract — an aborted sweep re-asserts
 	// nothing, so pruning it would flap live circuit_broken=1 series
 	// off during an API outage.
-	defer b.deadSince.Prune(func(k string) bool { return seen[k] })
-	defer b.recoverStreak.Prune(func(k string) bool { return recoverSeen[k] })
+	defer b.deadSince.Prune(func(k string) bool { return s.seen[k] })
+	defer b.recoverStreak.Prune(func(k string) bool { return s.recoverSeen[k] })
 
-	ready, err := snap.ReadyCounts()
-	if err != nil {
+	if err := s.loadInputs(); err != nil {
 		return err
 	}
-	if snap.MWCErr != nil {
-		return fmt.Errorf("list mutatingwebhookconfigurations — circuit breaker skipped: %w", snap.MWCErr)
-	}
-	if snap.VWCErr != nil {
-		return fmt.Errorf("list validatingwebhookconfigurations — circuit breaker skipped: %w", snap.VWCErr)
-	}
-	mwcs, vwcs := snap.MWC, snap.VWC
-
-	var failed []string
-
-	// cfgJob is one webhook configuration's per-sweep work: the
-	// kind-independent fields the breaker evaluates plus the
-	// kind-specific patch-and-refresh closure (the only true MWC/VWC
-	// difference — the evaluation loop below is shared by both kinds,
-	// so a kind-specific edit lands in exactly one place).
-	type cfgJob struct {
-		kind  string
-		name  string
-		anno  string
-		views []hookView
-		patch func(context.Context, []byte) error
-	}
-	patchMutating := func(cfg *admissionv1.MutatingWebhookConfiguration) func(context.Context, []byte) error {
-		return func(ctx context.Context, payload []byte) error {
-			patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
-				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if err != nil {
-				return err
-			}
-			snap.SetMWC(patched)
-			return nil
-		}
-	}
-	patchValidating := func(cfg *admissionv1.ValidatingWebhookConfiguration) func(context.Context, []byte) error {
-		return func(ctx context.Context, payload []byte) error {
-			patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if err != nil {
-				return err
-			}
-			snap.SetVWC(patched)
-			return nil
-		}
-	}
-	jobs := make([]cfgJob, 0, len(mwcs.Items)+len(vwcs.Items))
-	for i := range mwcs.Items {
-		cfg := &mwcs.Items[i]
-		jobs = append(jobs, cfgJob{
-			kind: guardstate.KindMutating, name: cfg.Name,
-			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
-			views: mutHookViews(cfg.Webhooks), patch: patchMutating(cfg),
-		})
-	}
-	for i := range vwcs.Items {
-		cfg := &vwcs.Items[i]
-		jobs = append(jobs, cfgJob{
-			kind: guardstate.KindValidating, name: cfg.Name,
-			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
-			views: valHookViews(cfg.Webhooks), patch: patchValidating(cfg),
-		})
-	}
-	for _, job := range jobs {
-		payload, trips, recovered, stillBroken, dropped := b.circuitPatch(log, g.Queue,
-			job.kind, job.name, job.anno, job.views, ready, now, seen, recoverSeen,
-			allowTrips)
-		if payload == nil {
-			// Nothing to write — the still-broken re-asserts read
-			// verified live state (the annotation already lists
-			// them, the policy is already Ignore), so the series
-			// emits without a landed patch.
-			circuitMetrics(&b.brokenEmitted, job.kind, job.name, nil, nil, stillBroken)
-			continue
-		}
-		if err := job.patch(ctx, payload); err != nil {
-			// The post-patch annotation state is unverifiable —
-			// carry the config's last-emitted tuples forward so
-			// the sweep-end prune does not flap a still-broken
-			// series off (the annotation may well still list it).
-			// Liveness-aware: a tuple whose sub-webhook is no
-			// longer in the config's snapshot views is not
-			// carried, so the sweep-end prune forgets its series
-			// instead of re-pinning it while patches keep failing.
-			b.carryBrokenForward(job.kind, job.name, job.views)
-			log.Error(err, "circuit breaker patch failed",
-				"kind", job.kind, "config", job.name)
-			failed = append(failed, job.name)
-			continue
-		}
-		// The patch landed — the stale-annotation drops are durable,
-		// so their series are released only here (a failed patch
-		// keeps the annotation, the SSOT, listing those names).
-		for _, name := range dropped {
-			metrics.WebhookCircuitBroken.DeleteLabelValues(job.kind, job.name, name)
-		}
-		circuitMetrics(&b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
-	}
+	s.buildJobs()
+	s.runJobs(ctx)
 
 	// circuit-breaker-bounce stage 1 — rolling pod bounce: a webhook backend whose
 	// Ready endpoints ALL fail the TCP+TLS handshake has a hung pod,
@@ -313,7 +216,7 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	// back would keep the webhook circuit-broken forever. Restore
 	// mode (kill-switch on) is deliberately passive — no pod kills.
 	if allowTrips {
-		b.bounceHungWebhookPods(ctx, snap, ready)
+		b.bounceHungWebhookPods(ctx, snap, s.ready)
 	}
 
 	// Prune broken series whose label tuple was not re-seen — a config
@@ -324,9 +227,9 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	// The deadSince and recoverStreak prunes run via defer (declared
 	// beside their keep-sets above) so they fire on every cycle,
 	// including the early-return census failures.
-	if len(failed) > 0 {
+	if len(s.failed) > 0 {
 		return fmt.Errorf("circuit breaker patches failed for: %s",
-			strings.Join(failed, ", "))
+			strings.Join(s.failed, ", "))
 	}
 	return nil
 }
