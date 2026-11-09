@@ -113,6 +113,7 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"cilium-datapath-map-guard",
 		"cilium-l2-lease-guard",
 		"observability-pipeline-guard",
+		"apiserver-relist-storm-breaker",
 		// The three gated gitops rows close out the roster —
 		// they landed after the always-on sequence when checks first
 		// became registry rows, so they stay last.
