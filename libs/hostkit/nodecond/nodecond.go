@@ -155,9 +155,13 @@ var HangPreCordonNames = []string{
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
 // precordon's longer fuse — ClockUnsynchronized (chrony has no
-// sync source) and ClockSkewDetected (synchronized but >2s off).
+// sync source), ClockSkewDetected (synchronized but >2s off), and
+// ClocksourceUnstable (W18-2: the underlying clocksource itself is
+// drifting/unstable — with it, the other two fire and the node's
+// whole timebase is untrustworthy, so it precordons on the same
+// longer fuse).
 var ClockSkewPreCordonNames = []string{
-	ClockUnsynchronized, ClockSkewDetected,
+	ClockUnsynchronized, ClockSkewDetected, ClocksourceUnstable,
 }
 
 // StormGateNames are the node-unhealthy conditions the
