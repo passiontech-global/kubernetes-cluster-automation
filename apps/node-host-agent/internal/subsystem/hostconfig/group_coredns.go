@@ -139,7 +139,12 @@ WantedBy=multi-user.target
 		r.daemonReload(ctx)
 	}
 	r.ensureService(ctx, "coredns.service", true, true)
-	if cfgChanged || binChanged {
+	// binStale: same skew probe as nebula — a binary newer than the
+	// running daemon must restart even with an unchanged Corefile
+	// (monoUS=0 on an inactive unit answers false; ensureService
+	// already started it on the on-disk binary).
+	binStale := c.binaryNewerThanService("/usr/local/bin/coredns", "coredns.service")
+	if cfgChanged || binChanged || binStale {
 		r.restartService(ctx, "coredns.service")
 	}
 

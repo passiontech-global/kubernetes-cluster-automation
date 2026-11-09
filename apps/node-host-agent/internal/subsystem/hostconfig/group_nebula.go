@@ -171,9 +171,15 @@ WantedBy=multi-user.target
 		return
 	}
 	r.ensureService(ctx, unit, true, true)
-	if wasActive && (certChanged || cfgChanged || binChanged) {
+	// binStale catches skew onInstalled cannot see: a binary written
+	// by an earlier converge that never restarted the unit
+	// (pre-onInstalled builds installed nebula 1.12.0 while the
+	// daemon kept running 1.11.2). Only probed while the unit was
+	// already active — a fresh start execs the on-disk binary anyway.
+	binStale := wasActive && c.binaryNewerThanService("/usr/local/bin/nebula", unit)
+	if wasActive && (certChanged || cfgChanged || binChanged || binStale) {
 		r.daemonReload(ctx)
-		if needRestart || binChanged {
+		if needRestart || binChanged || binStale {
 			// A swapped binary only takes effect on exec — SIGHUP
 			// reloads config inside the OLD image, so a version-pin
 			// install must force a real restart even when the
