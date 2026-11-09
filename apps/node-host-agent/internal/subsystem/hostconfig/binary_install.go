@@ -95,6 +95,16 @@ type managedBinarySpec struct {
 	companionMember   string
 	companionDest     string
 	companionFailLine string
+
+	// onInstalled fires after the main member untar succeeds — the
+	// "binary file was actually replaced this cycle" signal. `changed`
+	// only covers the fresh-download path: a staged tarball already
+	// matching the pin installs without a download (changed=false)
+	// yet still swaps the binary, so callers whose daemon must
+	// restart on a new binary (nebula, coredns — unlike kine whose
+	// staged path IS the dest, where changed is exact) hook this
+	// instead of reading `changed`.
+	onInstalled func(c *cyc, local string)
 }
 
 // installManagedBinary runs the shared sha256-pinned artifact flow:
@@ -157,6 +167,9 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 				// call site).
 				logger().Warn(sp.companionFailLine, "file", local, "error", err)
 			}
+		}
+		if mainErr == nil && sp.onInstalled != nil {
+			sp.onInstalled(c, local)
 		}
 	}
 	return changed, true

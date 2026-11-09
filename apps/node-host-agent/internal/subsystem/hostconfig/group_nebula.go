@@ -56,7 +56,7 @@ func (c *cyc) groupNebula() {
 		c.err("T5b: /dev/net/tun is not a char device — modprobe tun before nebula")
 		return
 	}
-	c.nebulaInstallBinary()
+	binChanged := c.nebulaInstallBinary()
 	_ = c.r.ensureDir("/etc/nebula/"+net, 0o755)
 
 	// certs from CM mounts (NebulaCertsDir, fallback VarsDir).
@@ -171,9 +171,13 @@ WantedBy=multi-user.target
 		return
 	}
 	r.ensureService(ctx, unit, true, true)
-	if wasActive && (certChanged || cfgChanged) {
+	if wasActive && (certChanged || cfgChanged || binChanged) {
 		r.daemonReload(ctx)
-		if needRestart {
+		if needRestart || binChanged {
+			// A swapped binary only takes effect on exec — SIGHUP
+			// reloads config inside the OLD image, so a version-pin
+			// install must force a real restart even when the
+			// rendered config diff says reload suffices.
 			r.restartService(ctx, unit)
 		} else {
 			r.reloadService(ctx, unit)
@@ -187,8 +191,12 @@ WantedBy=multi-user.target
 // nebulaInstallBinary ports the version-check + tarball install path
 // through installManagedBinary: <bin> -version probe → sha256-pinned
 // tarball (staged or downloaded) → untarInstall of nebula plus the
-// best-effort nebula-cert companion (tmp+rename).
-func (c *cyc) nebulaInstallBinary() {
+// best-effort nebula-cert companion (tmp+rename). Returns true when
+// the nebula binary file was actually replaced this cycle — the
+// caller folds it into the service restart decision (a running
+// daemon keeps the OLD image until exec; cert/config diffs alone
+// never noticed a pure version bump).
+func (c *cyc) nebulaInstallBinary() bool {
 	ver := c.t.Vars.StrDef("interdc_nebula_version", "")
 	if ver == "" {
 		// An empty pin is NOT a match — strings.Contains(out, "") is
@@ -196,11 +204,12 @@ func (c *cyc) nebulaInstallBinary() {
 		// and download("") is a counted bogus fetch. Not pinned =
 		// not installed.
 		c.err("T5b: interdc_nebula_version not pinned — nebula not installed")
-		return
+		return false
 	}
 	tgzFile := c.v("interdc_nebula_tgz_file")
 	sum := c.v("interdc_nebula_tgz_sha256")
 	url := c.v("interdc_nebula_tgz_url")
+	installed := false
 	c.installManagedBinary(managedBinarySpec{
 		name:     "T5b",
 		artifact: "nebula tarball",
@@ -224,7 +233,11 @@ func (c *cyc) nebulaInstallBinary() {
 		companionMember:   "nebula-cert",
 		companionDest:     "/usr/local/bin/nebula-cert",
 		companionFailLine: "T5b: nebula-cert install failed — keygen unavailable",
+		onInstalled: func(c *cyc, _ string) {
+			installed = true
+		},
 	})
+	return installed
 }
 
 // nebulaConfig renders nebula.yaml.j2 via the shared ctx.
