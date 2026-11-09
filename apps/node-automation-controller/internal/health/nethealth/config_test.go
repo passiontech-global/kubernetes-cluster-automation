@@ -58,3 +58,26 @@ func TestCiliumConfigFromEnv(t *testing.T) {
 		}
 	})
 }
+
+// LinkerdConfigFromEnv resolves the LINKERD_* knobs through envx.Gate
+// — enabled unless the value is exactly "false" (the always-on
+// convention the ported checks kept).
+func TestLinkerdConfigFromEnv(t *testing.T) {
+	t.Run("enabled by default", func(t *testing.T) {
+		t.Setenv("LINKERD_OUTLIER_EVICT_ENABLED", "")
+		if c := LinkerdConfigFromEnv(); !c.OutlierEvictEnabled {
+			t.Fatal("OutlierEvictEnabled = false on unset env")
+		}
+	})
+
+	t.Run("only exact false disables", func(t *testing.T) {
+		for _, v := range []string{"false", "FALSE", "0", "no", "off"} {
+			t.Setenv("LINKERD_OUTLIER_EVICT_ENABLED", v)
+			got := LinkerdConfigFromEnv().OutlierEvictEnabled
+			want := v != "false"
+			if got != want {
+				t.Fatalf("value %q -> %v, want %v", v, got, want)
+			}
+		}
+	})
+}

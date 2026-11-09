@@ -429,3 +429,76 @@ func TestMedik8sRemediationEvidencePagesThroughObjects(t *testing.T) {
 		}
 	}
 }
+
+// Verdict.Active memoizes one MaintenanceActive evaluation for the
+// verdict TTL: a signal that appears mid-window must NOT flip the
+// held verdict (the sweep's per-target heal preambles share the one
+// evaluation), and a fresh evaluation past the TTL sees it. An error
+// verdict is sticky for the window too — the fail-closed contract.
+func TestVerdictActiveMemoizesWithinTTL(t *testing.T) {
+	ctx := context.Background()
+	cs := fake.NewSimpleClientset()
+	dyn := maintenanceDynFake()
+	base := time.Now()
+
+	var v Verdict
+	held, why, err := v.Active(ctx, cs, dyn, base)
+	if err != nil || held || why != "" {
+		t.Fatalf("empty cluster verdict = (%v,%q,%v), want clear", held, why, err)
+	}
+
+	// A drain starts mid-window — inside the TTL the memoized clear
+	// verdict still answers (one mutex evaluation per sweep, not per
+	// target).
+	cordoned := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "draining"},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key:       UnschedulableTaintKey,
+				TimeAdded: &metav1.Time{Time: base},
+			}},
+		},
+	}
+	if _, err := cs.CoreV1().Nodes().Create(ctx, cordoned, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	held, _, err = v.Active(ctx, cs, dyn, base.Add(verdictTTL-time.Second))
+	if err != nil || held {
+		t.Fatalf("memoized verdict inside TTL = (%v,%v), want the stale clear", held, err)
+	}
+
+	// Past the TTL the verdict re-evaluates and sees the cordon.
+	held, why, err = v.Active(ctx, cs, dyn, base.Add(verdictTTL+time.Second))
+	if err != nil || !held {
+		t.Fatalf("re-evaluated verdict = (%v,%v), want held", held, err)
+	}
+	if !strings.Contains(why, "draining") {
+		t.Fatalf("verdict why = %q, want the cordon evidence", why)
+	}
+}
+
+// An unverifiable evaluation (nil dyn → the autopilot/medik8s plan
+// signals cannot be read) is memoized for the window too — a caller
+// looping targets does not re-pay three failing API reads per target,
+// and the fail-closed error never silently clears.
+func TestVerdictActiveSticksErrorWithinTTL(t *testing.T) {
+	ctx := context.Background()
+	cs := fake.NewSimpleClientset()
+	base := time.Now()
+
+	var v Verdict
+	if _, _, err := v.Active(ctx, cs, nil, base); err == nil {
+		t.Fatal("nil dyn must make the verdict unverifiable")
+	}
+	// Wire a working dyn mid-window — the memoized error still
+	// answers; only a TTL expiry re-evaluates.
+	if _, _, err := v.Active(ctx, cs, maintenanceDynFake(),
+		base.Add(verdictTTL-time.Second)); err == nil {
+		t.Fatal("error verdict re-evaluated inside the TTL")
+	}
+	if _, _, err := v.Active(ctx, cs, maintenanceDynFake(),
+		base.Add(verdictTTL+time.Second)); err != nil {
+		t.Fatalf("post-TTL re-evaluation kept the stale error: %v", err)
+	}
+}

@@ -7,7 +7,11 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -228,5 +232,93 @@ func TestDynamicPage(t *testing.T) {
 	names := map[string]bool{items[0].GetName(): true, items[1].GetName(): true}
 	if !names["f1"] || !names["f2"] {
 		t.Fatalf("unexpected items: %v %v", items[0].GetName(), items[1].GetName())
+	}
+}
+
+// The remaining typed PageFunc constructors — one namespaced fixture
+// pair ("ns" hit + "other" decoy) and one cluster-scoped fixture each,
+// counted through ListAll so Items extraction AND namespace scoping
+// are both exercised.
+func TestTypedPageFuncs(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "j1", Namespace: "ns"}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "j2", Namespace: "other"}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "cj1", Namespace: "ns"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm1", Namespace: "ns"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm2", Namespace: "other"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "ns"}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc1", Namespace: "ns"}},
+		&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "es1", Namespace: "ns"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-a"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc1", Namespace: "ns"}},
+		&corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv1"}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "sts1", Namespace: "ns"}},
+		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "pdb1", Namespace: "ns"}},
+		&certificatesv1.CertificateSigningRequest{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}},
+	)
+
+	for _, tc := range []struct {
+		name string
+		list func() (int, error)
+		want int
+	}{
+		{"Jobs", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, Jobs(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"CronJobs", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, CronJobs(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"ConfigMaps", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, ConfigMaps(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"Secrets", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, Secrets(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"Services", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, Services(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"EndpointSlices", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, EndpointSlices(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"Namespaces", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, Namespaces(cs))
+			return len(items), err
+		}, 1},
+		{"PersistentVolumeClaims", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, PersistentVolumeClaims(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"PersistentVolumes", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, PersistentVolumes(cs))
+			return len(items), err
+		}, 1},
+		{"StatefulSets", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, StatefulSets(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"PodDisruptionBudgets", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, PodDisruptionBudgets(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"CertificateSigningRequests", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, CertificateSigningRequests(cs))
+			return len(items), err
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.list()
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got != tc.want {
+				t.Fatalf("%s: got %d items, want %d", tc.name, got, tc.want)
+			}
+		})
 	}
 }

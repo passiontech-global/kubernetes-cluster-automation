@@ -405,3 +405,64 @@ func TestOldestRunningPod(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gate — the nil-heals/zero-cooldown AllowedV shape every
+// maintenance-gated module repeats. The pair contract is AllowedV's:
+// proceed=false on a held mutex or a spent budget, unverifiable=true
+// (fail closed) when the maintenance read itself fails.
+// ---------------------------------------------------------------------------
+
+func TestGateProceedsWhenClear(t *testing.T) {
+	resetBudget(t)
+	cs := fake.NewSimpleClientset()
+	proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs,
+		planAwareDyn(), "k", time.Now())
+	if !proceed || unverifiable {
+		t.Fatalf("clear Gate = (%v,%v), want (true,false)",
+			proceed, unverifiable)
+	}
+}
+
+func TestGateHeldMutexDefers(t *testing.T) {
+	resetBudget(t)
+	cs := fake.NewSimpleClientset(cordonedNow("w1"))
+	proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs,
+		planAwareDyn(), "k", time.Now())
+	if proceed || unverifiable {
+		t.Fatalf("held Gate = (%v,%v), want (false,false)",
+			proceed, unverifiable)
+	}
+}
+
+func TestGateUnverifiableFailsClosed(t *testing.T) {
+	resetBudget(t)
+	cs := fake.NewSimpleClientset()
+	proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs,
+		nil, "k", time.Now()) // nil dyn = wiring bug -> unverifiable
+	if proceed || !unverifiable {
+		t.Fatalf("unverifiable Gate = (%v,%v), want (false,true)",
+			proceed, unverifiable)
+	}
+}
+
+// Gate has no heals ledger — a target stamped hot still proceeds
+// (the cooldown lives in the caller's own stamp checks), and a spent
+// aggregate budget defers exactly like a held mutex.
+func TestGateBudgetExhaustedDefers(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	cs := fake.NewSimpleClientset()
+	now := time.Now()
+	if proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs,
+		planAwareDyn(), "k1", now); !proceed || unverifiable {
+		t.Fatalf("first Gate = (%v,%v), want (true,false)",
+			proceed, unverifiable)
+	}
+	proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs,
+		planAwareDyn(), "k2", now)
+	if proceed || unverifiable {
+		t.Fatalf("budget-spent Gate = (%v,%v), want (false,false)",
+			proceed, unverifiable)
+	}
+}

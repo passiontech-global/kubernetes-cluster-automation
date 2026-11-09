@@ -6,12 +6,16 @@ package kubeletreaper
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -101,5 +105,140 @@ func TestKubeletReaperHealthyProbeClearsHistory(t *testing.T) {
 	if ok, _ := heal.TryAcquireTarget("kubelet-liveness-reaper", "w1",
 		now.Add(time.Minute)); !ok {
 		t.Fatal("healthy probe did not clear the node's breaker history")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// run() — the sweep driver: parallel probes, the zero-success abort,
+// control-plane skip, and per-node error absorption.
+// ---------------------------------------------------------------------------
+
+// krRunReaper builds the reaper with a stubbed probeFn — the apiserver
+// REST path the fake clientset cannot serve.
+func krRunReaper(cs *fake.Clientset, now time.Time,
+	probe func(ctx context.Context, node string) bool) *kubeletReaper {
+
+	r := krReaper(cs, now)
+	r.probeFn = probe
+	return r
+}
+
+// A node census failure is the run's only hard error — the periodic
+// meters it through the returned error.
+func TestKubeletReaperRunListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver down")
+		})
+	r := krRunReaper(cs, time.Now(), func(context.Context, string) bool { return true })
+	if err := r.run(context.Background()); err == nil {
+		t.Fatal("node list failure must return an error")
+	}
+}
+
+// Zero successful probes means the probe PATH is broken (apiserver or
+// konnectivity), not that every kubelet died — the run aborts before
+// any taint decision rather than mass-tainting the fleet.
+func TestKubeletReaperRunAbortsWhenNoProbeSucceeds(t *testing.T) {
+	cp := testutil.Node("cp1", corev1.ConditionTrue,
+		map[string]string{"node-role.kubernetes.io/control-plane": ""})
+	w1 := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(cp, w1)
+	var probed []string
+	var mu sync.Mutex
+	r := krRunReaper(cs, time.Now(),
+		func(_ context.Context, node string) bool {
+			mu.Lock()
+			probed = append(probed, node)
+			mu.Unlock()
+			return false
+		})
+	if err := r.run(context.Background()); err != nil {
+		t.Fatalf("all-fail run must absorb, not error: %v", err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("tainted on a dead probe path — the mass-taint guard failed")
+	}
+	for _, n := range probed {
+		if n == "cp1" {
+			t.Fatal("control-plane node was probed — k0s CPs run no kubelet")
+		}
+	}
+	if len(probed) != 1 || probed[0] != "w1" {
+		t.Fatalf("probed = %v, want [w1]", probed)
+	}
+}
+
+// The healthy/dead split: a serving kubelet clears its marks, a dead
+// one with a stale heartbeat gets the NoSchedule taint — and the
+// control-plane node is never probed nor swept.
+func TestKubeletReaperRunTaintsOnlyTheDeadWorker(t *testing.T) {
+	cp := testutil.Node("cp1", corev1.ConditionTrue,
+		map[string]string{"node-role.kubernetes.io/control-plane": ""})
+	wOK := testutil.Node("w-ok", corev1.ConditionTrue, nil)
+	wDead := krStaleNode("w-dead")
+	wDead.Spec.Taints = []corev1.Taint{{
+		Key: kubeletReaperTaint, Effect: corev1.TaintEffectNoSchedule}}
+	wFresh := krStaleNode("w-fresh") // probe fails but heartbeat is fresh -> skip
+	wFresh.Status.Conditions[0].LastHeartbeatTime =
+		metav1.NewTime(time.Now())
+	cs := fake.NewSimpleClientset(cp, wOK, wDead, wFresh)
+	now := time.Now()
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return node == "w-ok" })
+	if err := r.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// w-dead already carried the taint -> kept (heartbeat stale).
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w-dead").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("stale-heartbeat dead worker lost its taint")
+	}
+	// w-fresh: probe failed but the heartbeat proves life -> no taint.
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-fresh").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("fresh-heartbeat worker tainted — broken proxy path punished")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-ok").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("healthy worker tainted")
+	}
+}
+
+// A per-node sweep failure is absorbed — logged, IncError'd, and the
+// remaining nodes still get their decision (the bash loop's
+// best-effort contract).
+func TestKubeletReaperRunAbsorbsSweepErrors(t *testing.T) {
+	wBad := krStaleNode("w-bad")
+	wDead := krStaleNode("w-dead")
+	cs := fake.NewSimpleClientset(wBad, wDead)
+	// The re-Get inside sweep fails for w-bad — but only the FIRST
+	// one, so the test's own verification Get below still reads the
+	// node back.
+	badGets := 0
+	cs.PrependReactor("get", "nodes",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.(ktesting.GetAction).GetName() == "w-bad" {
+				badGets++
+				if badGets == 1 {
+					return true, nil, errors.New("get boom")
+				}
+			}
+			return false, nil, nil
+		})
+	// One healthy node keeps anyOK true so the sweep runs at all —
+	// zero successes would abort before any per-node decision.
+	wOK := testutil.Node("w-ok", corev1.ConditionTrue, nil)
+	if _, err := cs.CoreV1().Nodes().Create(context.Background(), wOK, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := krRunReaper(cs, time.Now(),
+		func(_ context.Context, node string) bool { return node == "w-ok" })
+	if err := r.run(context.Background()); err != nil {
+		t.Fatalf("sweep error must be absorbed into a nil return: %v", err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w-dead").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("w-dead not tainted — the w-bad failure blocked the sweep")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-bad").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("w-bad tainted despite its get failing")
 	}
 }

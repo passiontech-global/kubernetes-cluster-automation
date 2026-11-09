@@ -353,3 +353,148 @@ func TestDeletePodHealFailedDeleteLeavesNoStamp(t *testing.T) {
 		t.Fatal("heal ledger stamped after a failed delete")
 	}
 }
+
+func TestMergeAnnoPatchLocally(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "p1",
+		Annotations: map[string]string{
+			"keep": "1", "del": "x", "over": "old"}}}
+
+	// A merge-patch doc: set two keys, delete one — applied to the
+	// listed copy exactly like the apiserver merge would.
+	MergeAnnoPatchLocally(pod, []byte(
+		`{"metadata":{"annotations":{"new":"v","over":"new","del":null}}}`))
+
+	want := map[string]string{"keep": "1", "new": "v", "over": "new"}
+	got := pod.GetAnnotations()
+	if len(got) != len(want) {
+		t.Fatalf("annotations = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("annotations[%q] = %q, want %q (all: %v)", k, got[k], v, got)
+		}
+	}
+
+	// A nil annotation map materializes on first write.
+	bare := &corev1.Pod{}
+	MergeAnnoPatchLocally(bare, []byte(
+		`{"metadata":{"annotations":{"k":"v"}}}`))
+	if bare.GetAnnotations()["k"] != "v" {
+		t.Fatalf("nil-map annotations = %v", bare.GetAnnotations())
+	}
+
+	// Malformed payloads are ignored — the input is always
+	// kube.MergePatchAnnos output, but a bad read must never corrupt
+	// the listed copy.
+	MergeAnnoPatchLocally(pod, []byte(`{not json`))
+	if pod.GetAnnotations()["new"] != "v" {
+		t.Fatal("malformed patch mutated the object")
+	}
+}
+
+func TestSection(t *testing.T) {
+	if got := Section("found: %s", nil); got != "" {
+		t.Fatalf("Section with no findings = %q, want empty", got)
+	}
+	got := Section("stuck %d: %s", []string{"b", "a"}, 2)
+	if got != "stuck 2: b, a" {
+		t.Fatalf("Section = %q", got)
+	}
+}
+
+func TestWhyFold(t *testing.T) {
+	if res := WhyFold(); !res.Pass || res.Why != "" {
+		t.Fatalf("WhyFold() = %+v, want pass", res)
+	}
+	if res := WhyFold("", "  ", "x"); res.Pass || res.Why != "   | x" {
+		t.Fatalf(`WhyFold("", "  ", "x") = %+v — only empty strings drop`, res)
+	}
+	res := WhyFold("a", "", "b")
+	if res.Pass || res.Why != "a | b" {
+		t.Fatalf("WhyFold = %+v, want Why 'a | b'", res)
+	}
+}
+
+// HealAllowedPersisted is the wider-of cooldown gate: the in-RAM
+// ledger stamp OR the object's persisted annotation inside the window
+// defers; a clear cooldown falls through to the maintenance mutex
+// (clear here) and proceeds. nil obj/empty annoKey collapses to the
+// plain ledger+mutex gate.
+func TestHealAllowedPersisted(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	log := logr.Discard()
+	newDeps := func(cs *fake.Clientset) *Deps {
+		return &Deps{Name: "test-queue", CS: cs,
+			Dyn: testhelp.NewDynamicClient()}
+	}
+	objWith := func(stamp time.Time) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "target",
+			Annotations: map[string]string{
+				"passiontech.dev/last-heal": stamp.UTC().Format(time.RFC3339)}}}
+	}
+
+	t.Run("no stamps proceeds", func(t *testing.T) {
+		d := newDeps(fake.NewSimpleClientset())
+		proceed, unverifiable := d.HealAllowedPersisted(ctx, log,
+			&d.Heals, objWith(now.Add(-time.Hour)),
+			"passiontech.dev/last-heal", "selfheal/check/target",
+			time.Hour, now)
+		if !proceed || unverifiable {
+			t.Fatalf("clear cooldown = (%v,%v), want (true,false)", proceed, unverifiable)
+		}
+	})
+
+	t.Run("fresh persisted stamp defers", func(t *testing.T) {
+		d := newDeps(fake.NewSimpleClientset())
+		proceed, unverifiable := d.HealAllowedPersisted(ctx, log,
+			&d.Heals, objWith(now.Add(-time.Minute)),
+			"passiontech.dev/last-heal", "selfheal/check/target",
+			time.Hour, now)
+		if proceed || unverifiable {
+			t.Fatalf("persisted stamp inside window = (%v,%v), want (false,false)",
+				proceed, unverifiable)
+		}
+	})
+
+	t.Run("ledger stamp defers with stale annotation", func(t *testing.T) {
+		d := newDeps(fake.NewSimpleClientset())
+		d.Heals.Stamp("selfheal/check/target", now.Add(-time.Minute))
+		proceed, _ := d.HealAllowedPersisted(ctx, log,
+			&d.Heals, objWith(now.Add(-2*time.Hour)),
+			"passiontech.dev/last-heal", "selfheal/check/target",
+			time.Hour, now)
+		if proceed {
+			t.Fatal("in-RAM stamp inside window did not defer")
+		}
+	})
+
+	t.Run("nil object collapses to ledger+mutex", func(t *testing.T) {
+		d := newDeps(fake.NewSimpleClientset())
+		d.Heals.Stamp("selfheal/check/target", now.Add(-time.Minute))
+		proceed, unverifiable := d.HealAllowedPersisted(ctx, log,
+			&d.Heals, nil, "", "selfheal/check/target",
+			time.Hour, now)
+		if proceed || unverifiable {
+			t.Fatalf("nil obj + ledger stamp = (%v,%v), want (false,false)",
+				proceed, unverifiable)
+		}
+	})
+
+	t.Run("unverifiable mutex fails closed", func(t *testing.T) {
+		// Dyn=nil makes the autopilot-Plan signal unverifiable — the
+		// gate must report it, never read "cannot verify" as clear.
+		d := &Deps{Name: "test-queue",
+			CS: fake.NewSimpleClientset()}
+		proceed, unverifiable := d.HealAllowedPersisted(ctx, log,
+			&d.Heals, objWith(now.Add(-time.Hour)),
+			"passiontech.dev/last-heal", "selfheal/check/target",
+			time.Hour, now)
+		if proceed || !unverifiable {
+			t.Fatalf("unverifiable mutex = (%v,%v), want (false,true)",
+				proceed, unverifiable)
+		}
+	})
+}
