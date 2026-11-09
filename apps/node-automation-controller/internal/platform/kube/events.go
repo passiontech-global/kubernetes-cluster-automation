@@ -61,7 +61,9 @@ func CountRecentEvents(ctx context.Context, cs kubernetes.Interface,
 				if e.Reason != reason {
 					continue
 				}
-				if now.Sub(EventTime(e)) <= window {
+				// Future EventTime (clock skew) is outside the window:
+				// a negative Sub must never count as "recent".
+				if d := now.Sub(EventTime(e)); d >= 0 && d <= window {
 					count++
 				}
 			}

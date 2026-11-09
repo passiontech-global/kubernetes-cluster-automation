@@ -1,9 +1,10 @@
-// heal.go — the three helpers implementing the sequence doc.go
-// describes, split at the points call sites differ: AllowedV runs
-// the preamble (cooldown + mutex), OldestRunningPod is the shared
-// "bounce the operator" target pick, and DeletePod is the delete +
-// stamp actuation. Modules that pick a different target (a leader
-// pod, a wedged consumer) simply skip OldestRunningPod.
+// heal.go — the shared preamble + actuation helpers implementing the
+// sequence doc.go describes, split at the points call sites differ:
+// AllowedV runs the preamble (cooldown + mutex), OldestRunningPod is
+// the shared "bounce the operator" target pick, DeletePod is the raw
+// delete + stamp actuation and EvictPod is its PDB-respecting
+// policy/v1-Eviction sibling. Modules that pick a different target (a
+// leader pod, a wedged consumer) simply skip OldestRunningPod.
 package heal
 
 import (
@@ -13,6 +14,9 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
@@ -96,7 +100,9 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 // caller IncErrors its own queue and logs err in its own wording
 // (each module phrases the failure with its own target context).
 // A nil heals pointer skips the stamp, mirroring AllowedV's
-// nil-ledger contract.
+// nil-ledger contract. Callers whose target pod may sit under a
+// PodDisruptionBudget use EvictPod instead — a raw Delete bypasses
+// every PDB.
 func DeletePod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (bool, error) {
@@ -109,6 +115,48 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 		heals.Stamp(key, now)
 	}
 	return true, nil
+}
+
+// EvictPod is DeletePod's PDB-respecting sibling: the same
+// UID-preconditioned kill (kube.UIDDeleteOptions, apiserver-default
+// propagation) issued through the policy/v1 Eviction API instead of a
+// raw Delete — a raw Delete bypasses every PodDisruptionBudget and
+// could take a workload's last Ready replica, which is exactly the
+// contract the unmeshed-pod-auditor path already runs on. The
+// apiserver enforces the PDB and consumes a disruption slot
+// atomically; the stamp contract is identical to DeletePod (ledger
+// stamped on a DELIVERED eviction only; nil heals skips it).
+//
+// Returns (evicted, refused, err). refused=true means HTTP 429 — a
+// PDB with disruptionsAllowed==0 refused the eviction. That is a
+// DEFERRAL, not a failure (err is nil): the workload is already at
+// its replica floor, so the caller keeps the pod, counts no error and
+// stamps no ledger — the next sweep retries once disruptions free up.
+// Any other API failure is (false, false, err) — the caller IncErrors
+// its own queue and logs err in its own wording.
+func EvictPod(ctx context.Context, cs kubernetes.Interface,
+	heals *state.CooldownSet, key string, pod *corev1.Pod,
+	now time.Time) (evicted bool, refused bool, err error) {
+
+	deleteOpts := kube.UIDDeleteOptions(pod.UID, "")
+	err = cs.CoreV1().Pods(pod.Namespace).EvictV1(ctx, &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+		DeleteOptions: &deleteOpts,
+	})
+	if apierrors.IsTooManyRequests(err) {
+		// PDB refusal — a deferral, never an error.
+		return false, true, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if heals != nil {
+		heals.Stamp(key, now)
+	}
+	return true, false, nil
 }
 
 // OldestRunningPod returns the oldest Running, non-terminating pod

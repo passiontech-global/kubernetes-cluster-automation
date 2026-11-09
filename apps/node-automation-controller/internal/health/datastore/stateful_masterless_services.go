@@ -42,9 +42,10 @@ type statefulMasterlessCheck struct {
 	//     statefulServiceZeroEndpointsGauge — a tuple not re-seen gets
 	//     DeleteLabelValues, not a stale 1 (same hygiene as the
 	//     webhook guard's brokenEmitted).
-	//   - drHealed: operator pod "ns/name" → last delete — the
-	//     in-RAM half of the 30m dragonfly heal cooldown (the STS
-	//     annotation stamp is the durable half).
+	//   - drHealed: operator pod controller "ns/<rs>" → last delete
+	//     (kube.PodControllerKey — the ReplicaSet outlives every pod
+	//     it spawns) — the in-RAM half of the 30m dragonfly heal
+	//     cooldown (the STS annotation stamp is the durable half).
 	//   - drPodHealed: "ns/sts" → last ordinal-0 pod delete — the
 	//     in-RAM half of the 30m dual-replica-deadlock cooldown
 	//     (dual-replica-deadlock; the STS annotation is the durable half).

@@ -273,14 +273,29 @@ func TestCNPGUnderReplicatedFlags(t *testing.T) {
 
 // ContinuousArchiving=False flags archiving_disabled on the CNPG
 // gauge — and still rides the WAL archive_condition reason (the
-// cnpgCluster fixture's transition is an hour old).
+// cnpgCluster fixture's transition is an hour old). Like the sibling
+// branches the emit persists CNPGUnhealthyMinAge via the first-seen
+// ledger: first sight arms, a second sweep past the window flags.
 func TestCNPGArchivingDisabledFlags(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge, "db", "pg-main", "archiving_disabled")
 	cr := cnpgCluster("db", "pg-main", time.Hour)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+	now := time.Now()
+	probetest.FreezeNow(p.Deps, now)
+	res := chk.Run(ctx)
 	if res.Pass {
 		t.Fatalf("ContinuousArchiving=False must fail: %+v", res)
+	}
+	if _, ok := cnpgSeries(t, "db", "pg-main",
+		"archiving_disabled"); ok {
+		t.Fatal("archiving_disabled flagged on first sight")
+	}
+	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
+	res = chk.Run(ctx)
+	if res.Pass {
+		t.Fatalf("ContinuousArchiving=False held past the window must fail: %+v", res)
 	}
 	if v, ok := cnpgSeries(t, "db", "pg-main",
 		"archiving_disabled"); !ok || v != 1 {

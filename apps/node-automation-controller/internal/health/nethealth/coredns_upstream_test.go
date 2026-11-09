@@ -101,3 +101,34 @@ func coreDNSUpstreamPromServer(t *testing.T) *httptest.Server {
 	})
 	return srv
 }
+
+// Two dns pods sharing a bare name across namespaces must each be
+// attributed to their own namespace — a bare-name census key would
+// collapse them and silently drop one namespace's flag.
+func TestCoreDNSUpstreamDuplicateNamesAcrossNamespaces(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "ForwardHealthcheckFailureCount") {
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"pod": "coredns-dup", "namespace": "kube-system"}, Value: 1},
+				{Labels: map[string]string{"pod": "coredns-dup", "namespace": "dns-secondary"}, Value: 1},
+			}
+		}
+		return nil
+	})
+	kube1 := probetest.PodWithPhase("kube-system", "coredns-dup", corev1.PodRunning, true, time.Hour)
+	kube2 := probetest.PodWithPhase("dns-secondary", "coredns-dup", corev1.PodRunning, true, time.Hour)
+	cs := fake.NewSimpleClientset(kube1, kube2)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*coreDNSUpstreamCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("both flagged pods must fail the check: %+v", res)
+	}
+	for _, key := range []string{"kube-system/coredns-dup", "dns-secondary/coredns-dup"} {
+		if !strings.Contains(res.Why, key) {
+			t.Fatalf("why missing %s (cross-ns name collision misattributed): %q", key, res.Why)
+		}
+	}
+}

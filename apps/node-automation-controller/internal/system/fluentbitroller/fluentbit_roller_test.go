@@ -145,12 +145,19 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 				t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 			}
 
-			ts := dsRestartedAt(getFluentBitDS(t, cs))
+			ds := getFluentBitDS(t, cs)
+			ts := dsRestartedAt(ds)
 			if ts == "" {
 				t.Fatal("restartedAt annotation not set on the DS pod template")
 			}
 			if _, err := time.Parse(time.RFC3339, ts); err != nil {
 				t.Fatalf("restartedAt %q is not RFC3339: %v", ts, err)
+			}
+			// The restart patch embeds the rolled hash on the pod
+			// template (one patch, one generation bump) — the marker
+			// the idempotence short-circuit reads.
+			if got := ds.Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != "h1" {
+				t.Fatalf("pod-template rolled-config-hash = %q, want h1", got)
 			}
 
 			sec := getPipelineSecret(t, cs)
@@ -314,6 +321,108 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 	}
 	if patches != 1 {
 		t.Fatalf("second reconcile re-rolled the DS: daemonset patch count = %d, want 1", patches)
+	}
+}
+
+// The restart patch embeds the rolled hash on the pod template, so a
+// live DS already carrying today's hash means the fleet was already
+// rolled and only the secret stamp is missing (e.g. an RBAC
+// regression). That sweep must patch the secret stamp ONLY — no
+// DaemonSet write, restartedAt untouched.
+func TestFluentBitRollerFleetAlreadyRolledStampsSecretOnly(t *testing.T) {
+	ds := fluentBitDS(2, 2, 3, 3)
+	ds.Spec.Template.Annotations = map[string]string{kube.AnnoRolledConfigHash: "h1"}
+	cs := fake.NewSimpleClientset(
+		pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"}),
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		ds)
+	r := newRoller(cs)
+	before := len(cs.Actions())
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	var dsPatches, secretPatches int
+	for _, a := range cs.Actions()[before:] {
+		if a.GetVerb() != "patch" {
+			continue
+		}
+		switch a.GetResource().Resource {
+		case "daemonsets":
+			dsPatches++
+		case "secrets":
+			secretPatches++
+		}
+	}
+	if dsPatches != 0 {
+		t.Fatalf("DS patched although the pod template already carries the hash (%d patches)", dsPatches)
+	}
+	if secretPatches != 1 {
+		t.Fatalf("secret stamp patches on the already-rolled path = %d, want 1", secretPatches)
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "h1" {
+		t.Fatalf("rolled-config-hash = %q, want h1", got)
+	}
+	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
+		t.Fatalf("already-rolled path moved restartedAt: %q", got)
+	}
+}
+
+// The loop this fix removes: the restart lands (the pod template now
+// carries the hash) but the secret stamp keeps failing (RBAC
+// regression). Every later sweep must retry the stamp ALONE — the
+// fleet must not roll again while the drift sits on a failed stamp.
+func TestFluentBitRollerStampFailureDoesNotReroll(t *testing.T) {
+	cs := driftedFixture()
+	r := newRoller(cs)
+	// Sweep 1: healthy roll — the restart patch embeds h1 on the pod
+	// template and the stamp lands.
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	// Fluent-operator regenerates the config mid-incident: fresh drift.
+	sec := getPipelineSecret(t, cs)
+	sec.Annotations[kube.AnnoFluentConfigHash] = "h2"
+	if _, err := cs.CoreV1().Secrets(fluentNS).Update(context.Background(), sec,
+		metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Sweep 2: the roll proceeds but the stamp starts failing.
+	cs.PrependReactor("patch", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("secrets is forbidden")
+		})
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+		t.Fatal("expected the failing stamp to error the reconcile")
+	}
+	if got := getFluentBitDS(t, cs).Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != "h2" {
+		t.Fatalf("pod-template rolled-config-hash = %q, want h2 (sweep-2 roll)", got)
+	}
+	// Sweep 3 (and every sweep after): the DS already carries h2 —
+	// stamp-only, the fleet stays untouched.
+	before := len(cs.Actions())
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+		t.Fatal("expected the still-failing stamp to error again")
+	}
+	var dsPatches, stampAttempts int
+	for _, a := range cs.Actions()[before:] {
+		if a.GetVerb() != "patch" {
+			continue
+		}
+		switch a.GetResource().Resource {
+		case "daemonsets":
+			dsPatches++
+		case "secrets":
+			stampAttempts++
+		}
+	}
+	if dsPatches != 0 {
+		t.Fatalf("stamp-failure loop re-rolled the fleet (%d DS patches)", dsPatches)
+	}
+	if stampAttempts != 1 {
+		t.Fatalf("secret stamp attempts on the short-circuit sweep = %d, want 1", stampAttempts)
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got == "h2" {
+		t.Fatal("stamp landed although the patch reactor rejects it")
 	}
 }
 

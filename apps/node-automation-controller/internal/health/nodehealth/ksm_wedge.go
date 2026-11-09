@@ -51,11 +51,17 @@ const (
 // full phrases ("401 unauthorized" / "status code 401") — a bare
 // "401" substring would false-positive on any log line that merely
 // carries the number (a metric value, a line number, a byte count).
+// Bare "unauthorized" is likewise not a marker: matching is
+// return-first substring, so the generic word sat ahead of the full
+// phrases, left them dead, and misfiled every line merely carrying
+// the word — an RBAC "unauthorized"/forbidden list error bounced the
+// pod as an auth wedge with the wrong cause. Only the full-phrase
+// 401/token spells classify auth; a bare "Unauthorized" tail now
+// reads as the generic reflector reason (or clean with no marker).
 var ksmWedgeSignatures = []struct {
 	marker string
 	reason string
 }{
-	{"unauthorized", leaseReasonKSMUnauthorized},
 	{"401 unauthorized", leaseReasonKSMUnauthorized},
 	{"status code 401", leaseReasonKSMUnauthorized},
 	{"provide credentials", leaseReasonKSMUnauthorized},

@@ -1158,3 +1158,37 @@ func TestListFirstBenignFallback(t *testing.T) {
 		t.Fatalf("NoKindMatch on the store list must skip quietly, got %v", err)
 	}
 }
+
+// A store listed before its controller has written the Ready condition
+// is not an observation of False — the down clock for the connect
+// auto-heal must not start until a real condition exists.
+func TestExternalSecretNudgeMissingConditionNoDownClock(t *testing.T) {
+	// Builder twin of cssObj with no status.conditions at all.
+	unconditioned := testutil.Unstructured(
+		kube.GVRClusterSecretStoreV1.GroupVersion().WithKind("ClusterSecretStore"),
+		"", "css-young", nil)
+	dyn := newDynFake(unconditioned, esObj("apps", "es-stuck", "False", time.Hour))
+	n := newNudge(dyn)
+
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, tracked := n.storeReady["ClusterSecretStore//css-young"]; tracked {
+		t.Fatal("condition-less store must not be tracked as any readiness state")
+	}
+	if _, down := n.storeDownSince.Seen("ClusterSecretStore//css-young", time.Now()); down {
+		t.Fatal("down clock started for a condition-less store — would bounce connect pod after 15m")
+	}
+
+	// The clock only arms once the condition appears (as False).
+	setStoreReady(t, dyn, "css-young", "False")
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r, tracked := n.storeReady["ClusterSecretStore//css-young"]; !tracked || r {
+		t.Fatal("store not tracked after its Ready condition appeared")
+	}
+	if _, down := n.storeDownSince.Seen("ClusterSecretStore//css-young", time.Now()); !down {
+		t.Fatal("down clock did not start on a real Ready=False observation")
+	}
+}

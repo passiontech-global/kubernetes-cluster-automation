@@ -336,14 +336,25 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 	// time this patch lands — an unguarded remove could then delete
 	// e.g. a fresh Available=False. The test op makes the remove
 	// conditional on the slot still holding the stale
-	// ProgressDeadlineExceeded; a mismatch just fails the patch
-	// (harmless — the next sweep re-reads and retries).
+	// ProgressDeadlineExceeded; the API server rejects the whole
+	// patch with Invalid when the precondition misses. That rejection
+	// is the EXPECTED raced outcome, not a sweep failure: this
+	// function returns (false, nil) for it so run() proceeds to
+	// healCloudflaredWedges/audit and the periodic loop doesn't
+	// IncError — the next sweep re-reads and retries anyway. Real
+	// patch failures (conn refused, RBAC) still propagate.
 	patch := []byte(fmt.Sprintf(
 		`[{"op":"test","path":"/status/conditions/%d/reason","value":"ProgressDeadlineExceeded"},`+
 			`{"op":"remove","path":"/status/conditions/%d"}]`, idx, idx))
 	if _, err := w.cs.AppsV1().Deployments(w.namespace).Patch(ctx,
 		cfTunnelProxyDeployName, types.JSONPatchType, patch,
 		metav1.PatchOptions{}, "status"); err != nil {
+		if apierrors.IsInvalid(err) || apierrors.IsConflict(err) {
+			log.Info("stale-stall clear raced with the deployment "+
+				"controller — retrying next sweep",
+				"deployment", w.namespace+"/"+cfTunnelProxyDeployName)
+			return false, nil
+		}
 		return false, fmt.Errorf("patch deployment %s/%s status: %w",
 			w.namespace, cfTunnelProxyDeployName, err)
 	}

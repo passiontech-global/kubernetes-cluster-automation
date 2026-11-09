@@ -41,10 +41,16 @@ func init() {
 		dragonflyMasterlessPodHealsTotal)
 }
 
-// healDragonflyOperator deletes the dragonfly-operator controller
-// pod(s) — the same re-election nudge the operator watchdog applies,
-// keyed on its own 30m cooldown so the leader is never churned. The
-// cooldown is the wider of the in-RAM ledger and the
+// healDragonflyOperator deletes at most ONE dragonfly-operator
+// controller pod per cycle — the same re-election nudge the operator
+// watchdog applies, keyed on its own 30m cooldown so the leader is
+// never churned. Mid-rollout the operator runs two ReplicaSet
+// generations side by side and the per-controller cooldown only
+// dedups pods of the SAME RS, so deleting every prefix match in one
+// sweep would take out the whole operator (leader election included)
+// in a single pass; the 1-per-cycle cap with the deterministic
+// oldest-pod pick mirrors healOLMOperator. The cooldown is the wider
+// of the in-RAM ledger and the
 // passiontech.dev/last-dragonfly-operator-heal stamp persisted on the STS
 // that triggered it (survives operator restarts).
 func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log logr.Logger,
@@ -56,19 +62,61 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// bound the map so their stamps cannot accumulate. It mirrors
 	// the drHealed stamps, so it prunes on the same cooldown.
 	p.drOpHealed.PruneExpired(now, dragonflyHealCooldown)
-	// Persisted stamp → maintenance mutex in ONE call
-	// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): the
-	// persisted passiontech.dev/last-dragonfly-operator-heal stamp is
-	// the cooldown's cheap half and defers before the mutex ever
-	// reads — a stamp inside the window skips the three-signal API
-	// reads entirely. The in-RAM half stays nil: this heal's per-pod
-	// drHealed keys are checked inside the delete loop, not here, so
-	// only the annotation half of the cooldown applies. Never kill an
-	// operator mid-drain/upgrade — "cannot verify" fails closed like
+	// Pick ONE candidate from the sweep's pod snapshot BEFORE the
+	// gate (mirrors healOLMOperator): mid-rollout the operator runs
+	// two ReplicaSet generations side by side and the per-controller
+	// cooldown only dedups pods of the SAME RS — deleting every
+	// prefix match in one sweep would take out the whole operator
+	// (leader election included) in a single pass. The cap is one
+	// pod per cycle, picked deterministically as the OLDEST
+	// candidate (name as the tie-break) so WHICH leader goes first
+	// never depends on map order; with no candidate at all the
+	// annotation read and the mutex verdict slot stay unspent. A
+	// terminating, not-yet-Running or controller-less pod is not a
+	// leader to bounce: deleting a failed/terminating remnant locks
+	// the shared 30m cooldown while the actually running leader
+	// survives untouched, and a controller-less pod would be deleted
+	// PERMANENTLY (nothing recreates it).
+	pods, err := p.AllPods(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list dragonfly-operator pods failed — heal deferred",
+			"error", err)
+		return
+	}
+	var target *corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Namespace != kube.DragonflyOperatorNS ||
+			!strings.HasPrefix(pod.Name, dragonflyOperatorPodPrefix) ||
+			pod.DeletionTimestamp != nil ||
+			pod.Status.Phase != corev1.PodRunning ||
+			metav1.GetControllerOf(pod) == nil {
+			continue
+		}
+		if target == nil ||
+			pod.CreationTimestamp.Before(&target.CreationTimestamp) ||
+			(pod.CreationTimestamp.Equal(&target.CreationTimestamp) &&
+				pod.Name < target.Name) {
+			target = pod // oldest — the deterministic 1-per-cycle pick
+		}
+	}
+	if target == nil {
+		return
+	}
+	// Gate: per-controller cooldown + persisted STS stamp +
+	// maintenance mutex in ONE call (Deps.HealAllowedPersisted →
+	// heal.AllowedVPersisted), fail closed on unverifiable. The
+	// in-RAM half keys on the pod's CONTROLLER, not its name — a
+	// deleted operator pod is recreated by its ReplicaSet under a
+	// fresh suffix, so a pod-name stamp never suppressed the re-heal
+	// and the leader was deleted every sweep. Never kill an operator
+	// mid-drain/upgrade — "cannot verify" fails closed like
 	// healOperatorLeader (operator-workqueue-watchdog).
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
+	key := kube.PodControllerKey(target)
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
-		nil, sig.sts, dragonflyHealAnno, stsKey,
+		&p.drHealed, sig.sts, dragonflyHealAnno, key,
 		dragonflyHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
@@ -77,60 +125,23 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	if !proceed {
 		return
 	}
-	pods, err := p.AllPods(ctx)
-	if err != nil {
+	if _, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, target,
+		now); err != nil {
 		metrics.IncError(p.Name)
-		log.Info("WARN: list dragonfly-operator pods failed — heal deferred",
-			"error", err)
+		log.Error(err, "dragonfly operator delete failed",
+			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	deleted := false
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Namespace != kube.DragonflyOperatorNS ||
-			!strings.HasPrefix(pod.Name, dragonflyOperatorPodPrefix) {
-			continue
-		}
-		// A terminating, not-yet-Running or controller-less pod is
-		// not a leader to bounce: deleting a failed/terminating
-		// remnant locks the shared 30m cooldown while the actually
-		// running leader survives untouched, and a controller-less
-		// pod would be deleted PERMANENTLY (nothing recreates it).
-		if pod.DeletionTimestamp != nil ||
-			pod.Status.Phase != corev1.PodRunning ||
-			metav1.GetControllerOf(pod) == nil {
-			continue
-		}
-		// The cooldown keys on the pod's CONTROLLER, not its name —
-		// a deleted operator pod is recreated by its ReplicaSet under
-		// a fresh suffix, so a pod-name stamp never suppressed the
-		// re-heal and the leader was deleted every sweep.
-		key := kube.PodControllerKey(pod)
-		if p.drHealed.CooledDown(key, dragonflyHealCooldown, now) {
-			log.Info("skip heal: dragonfly operator inside cooldown",
-				"controller", key, "pod", pod.Name)
-			continue
-		}
-		if _, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, pod, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "dragonfly operator delete failed",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the census
-		p.drOpHealed.Stamp(stsKey, now)
-		deleted = true
-		log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
-			"pod", pod.Namespace+"/"+pod.Name, "service", sig.ns+"/"+sig.svc,
-			"statefulset", sig.sts.Name)
-	}
-	if !deleted {
-		return
-	}
+	p.InvalidatePods(ctx) // pod gone — drop the census
+	p.drOpHealed.Stamp(stsKey, now)
+	log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
+		"pod", target.Namespace+"/"+target.Name, "service", sig.ns+"/"+sig.svc,
+		"statefulset", sig.sts.Name)
 	// Persist the stamp on the STS — the durable half of the
-	// cooldown. A patch failure leaves the in-RAM half (the per-pod
-	// drHealed stamps inside DeletePod) holding; nil ledger because
-	// there is no per-STS ledger key for this heal.
+	// cooldown. A patch failure leaves the in-RAM half (the delivered
+	// delete already stamped drHealed under the controller key)
+	// holding; nil ledger because the in-RAM key is the
+	// per-controller cooldown stamped above.
 	if err := heal.StampPersisted(ctx,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).

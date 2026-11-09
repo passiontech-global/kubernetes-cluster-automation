@@ -137,8 +137,16 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 		// scheduled snapshots keep looking green.
 		if c, ok := kube.ConditionOf(cr.Object, "ContinuousArchiving"); ok &&
 			c.Status == "False" {
-			emit(cr, "archiving_disabled", fmt.Sprintf(
-				"%s/%s cnpg ContinuousArchiving=False", ns, name))
+			// Same minAge gate as the sibling branches: the
+			// condition can flap during a backup-window restart, and
+			// an unpersisted emit pins a stale gauge forever.
+			lk := "arch/" + key
+			live[lk] = true
+			if probefw.Persisted(&p.cnpgSeen, lk, now, minAge, log) {
+				emit(cr, "archiving_disabled", fmt.Sprintf(
+					"%s/%s cnpg ContinuousArchiving=False held >=%s",
+					ns, name, minAge))
+			}
 		}
 
 		// (4) W19-ST1 primary_mismatch: with instances declared, an

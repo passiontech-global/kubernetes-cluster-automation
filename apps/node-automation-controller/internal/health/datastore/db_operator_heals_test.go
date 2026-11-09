@@ -27,8 +27,8 @@ import (
 
 // dbOpSTS builds a ready StatefulSet labeled as owned by the named
 // db operator — the app.kubernetes.io/managed-by value is the
-// label dbOperatorFor matches on (any label value containing the
-// operator name attributes it).
+// label dbOperatorFor matches on (operator identity keys only;
+// arbitrary label values are never substring-matched).
 func dbOpSTS(ns, name, operator string, ready int32) *appsv1.StatefulSet {
 	return shSTS(ns, name, ready, map[string]string{
 		"app": name, "app.kubernetes.io/managed-by": operator})

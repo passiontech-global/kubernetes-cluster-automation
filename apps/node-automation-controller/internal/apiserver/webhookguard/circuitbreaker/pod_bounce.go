@@ -1,7 +1,7 @@
 // pod_bounce.go — the circuit-breaker-bounce stage-1 remediation behind the C1
 // circuit breaker: a webhook backend whose Ready endpoints ALL fail
 // the TCP+TLS handshake has hung pods, not partitioned ones, so the
-// sweep deletes the oldest Ready backing pod for its controller to
+// sweep evicts the oldest Ready backing pod for its controller to
 // recreate fresh — one bounce per service per BounceCooldown, routed
 // through the shared heal preamble (per-service cooldown + the
 // maintenance mutex + the fleet-wide heal budget, all fail closed).
@@ -25,7 +25,7 @@ import (
 // bounceHungWebhookPods is the circuit-breaker-bounce stage-1 remediation: for every
 // Service referenced by a webhook config whose census verdict is
 // "unresponsive" (Ready endpoints on healthy nodes, ALL probed IPs
-// failing TCP+TLS), delete the oldest Ready backing pod — its owner
+// failing TCP+TLS), evict the oldest Ready backing pod — its owner
 // controller (Deployment/ReplicaSet) recreates it fresh, which is
 // the rolling bounce a hung webhook process needs. One bounce per
 // service per BounceCooldown; every bounce runs the shared heal
@@ -39,6 +39,15 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	g := snap.G
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()
+	if probeBlind(ready) {
+		// Fleet-blind guard: when EVERY probed backend failed the
+		// handshake, this pod's path to webhook pods is the likely
+		// culprit (NetworkPolicy/CNI on the monitor) — one vantage
+		// point must not read as a fleet-wide brownout, and the
+		// kills would hit healthy Ready pods.
+		log.Info("DEFER: every probed webhook backend failed the handshake from this pod — monitor likely blind, bounce skipped")
+		return
+	}
 	// Distinct unresponsive webhook backend services, deduped across
 	// configs and kinds — several webhooks routinely share one
 	// Service, and one hung pod set is one bounce.
@@ -127,21 +136,31 @@ func (b *Breaker) oldestLiveBackingPod(ctx context.Context, snap *guardstate.Sna
 	return oldest
 }
 
-// deleteBouncePod issues the UID-preconditioned delete of a
-// pre-resolved bounce target. heal.DeletePod stamps bounceAt on a
-// DELIVERED bounce only — a failed delete leaves the pod hung and the
-// next sweep retries.
+// deleteBouncePod issues the UID-preconditioned eviction of a
+// pre-resolved bounce target through the policy/v1 Eviction API
+// (heal.EvictPod) — never a raw Delete, which would bypass every
+// PodDisruptionBudget and could take the backend's last Ready replica
+// (the contract the unmeshed path already runs on). A PDB refusal
+// (429) is a deferral: the pod stays hung, nothing is metered and
+// bounceAt is not stamped, so the next sweep retries once disruptions
+// free up. EvictPod stamps bounceAt on a DELIVERED bounce only — a
+// failed eviction leaves the pod hung and the next sweep retries.
 func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot,
 	svcKey string, target *corev1.Pod, now time.Time) {
 	g := snap.G
 	log := logf.FromContext(ctx)
-	log.Info("BOUNCE: deleting oldest Ready webhook pod — hung TCP+TLS handshake",
+	log.Info("BOUNCE: evicting oldest Ready webhook pod — hung TCP+TLS handshake",
 		"service", svcKey, "pod", target.Namespace+"/"+target.Name,
 		"age", now.Sub(target.CreationTimestamp.Time).Truncate(time.Second))
-	if _, err := heal.DeletePod(ctx, g.CS, &b.bounceAt, svcKey,
-		target, now); err != nil {
+	_, refused, err := heal.EvictPod(ctx, g.CS, &b.bounceAt, svcKey,
+		target, now)
+	switch {
+	case refused:
+		log.Info("DEFER: PDB refused webhook pod bounce — keeping pod alive",
+			"service", svcKey, "pod", target.Namespace+"/"+target.Name)
+	case err != nil:
 		metrics.IncError(g.Queue)
-		log.Error(err, "webhook pod bounce delete failed",
+		log.Error(err, "webhook pod bounce eviction failed",
 			"pod", target.Namespace+"/"+target.Name, "service", svcKey)
 	}
 }

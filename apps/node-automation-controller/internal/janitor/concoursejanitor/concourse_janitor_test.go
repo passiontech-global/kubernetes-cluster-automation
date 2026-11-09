@@ -329,6 +329,110 @@ func TestConcourseJanitorYoungWorkerKeptEvenWhenStalled(t *testing.T) {
 	}
 }
 
+// concourse-worker-stall parity — a worker pod that is NOT Ready and
+// has stayed that way past cjSteadyWorkerMinAge is wedged: it takes
+// no builds while the cache looks healthy, so the under-cap branch
+// must not skip it forever. It goes through the standard
+// drain → delete → prune → waitReady chain even though the TSA state
+// read is never consulted (the wedged verdict precedes it).
+func TestConcourseJanitorWedgedNotReadyPodReplacedDespiteUnderCap(t *testing.T) {
+	var events []string
+	old := time.Now().Add(-time.Hour)
+	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
+	p.CreationTimestamp = metav1.NewTime(old)
+	p.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(old)},
+	}
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events,
+			states: map[string]string{"concourse-worker-0": "running"}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fmt.Sprint(events), "delete:concourse-worker-0") {
+		t.Fatalf("wedged not-Ready pod was not deleted: %v", events)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-new-concourse-worker-0" {
+		t.Fatalf("wedged not-Ready worker not replaced: uid %s", got)
+	}
+}
+
+// A not-Ready pod whose Ready condition flipped recently is still
+// churning (or mid init-rm) — the under-cap branch keeps it and never
+// queries the TSA state for it.
+func TestConcourseJanitorYoungNotReadyPodKeptDespiteUnderCap(t *testing.T) {
+	var events []string
+	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
+	p.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour)) // past readyTimeout guard
+	p.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-5 * time.Minute))},
+	}
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
+		t.Fatalf("young not-Ready pod was replaced: uid %s", got)
+	}
+	for _, e := range events {
+		if strings.HasPrefix(e, "state:") || strings.HasPrefix(e, "delete:") {
+			t.Fatalf("young not-Ready pod was touched: %v", events)
+		}
+	}
+}
+
+// A pod still inside init-rm (an init container has not terminated)
+// is never replaced by the wedged-not-Ready path — replacing mid-wipe
+// restarts the wipe without freeing anything new.
+func TestConcourseJanitorInitRmNotReadyPodUntouched(t *testing.T) {
+	var events []string
+	old := time.Now().Add(-time.Hour)
+	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
+	p.CreationTimestamp = metav1.NewTime(old)
+	p.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(old)},
+	}
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "init-rm",
+		State: corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(old)},
+		},
+	}}
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
+		t.Fatalf("mid init-rm pod was replaced: uid %s", got)
+	}
+	for _, e := range events {
+		if strings.HasPrefix(e, "state:") || strings.HasPrefix(e, "delete:") {
+			t.Fatalf("mid init-rm pod was touched: %v", events)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Module tests
 // ---------------------------------------------------------------------------

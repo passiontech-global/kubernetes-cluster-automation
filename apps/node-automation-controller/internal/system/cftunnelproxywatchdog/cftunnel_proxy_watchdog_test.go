@@ -10,9 +10,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -273,6 +275,66 @@ func TestWatchdogClearsStaleStall(t *testing.T) {
 	if gotSubresource != "status" {
 		t.Fatalf("subresource = %q, want %q", gotSubresource, "status")
 	}
+}
+
+// A raced test-op rejection (Invalid, the API server's answer when
+// the precondition misses) must NOT abort the sweep: run() proceeds
+// to healCloudflaredWedges (the wedged pod is deleted) and the
+// periodic loop doesn't IncError. Non-conflict patch failures still
+// propagate.
+func TestWatchdogStallClearRaceDoesNotAbortSweep(t *testing.T) {
+	now := time.Now()
+	newCS := func() *fake.Clientset {
+		return fake.NewSimpleClientset(
+			proxyPod("proxy-ok", true),
+			staleUnreadyProxyPod("proxy-wedged",
+				now.Add(-time.Hour), now.Add(-10*time.Minute)),
+			proxyDeploy([]appsv1.DeploymentCondition{
+				{Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded"},
+			}))
+	}
+
+	t.Run("Invalid test-op rejection — sweep continues", func(t *testing.T) {
+		const queue = "cf-tunnel-proxy-watchdog-race-test"
+		before := testutil.QueueErrorCount(t, queue)
+		cs := newCS()
+		cs.PrependReactor("patch", "deployments",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewInvalid(
+					appsv1.SchemeGroupVersion.WithKind("Deployment").
+						GroupKind(), "cloudflare-tunnel-proxy",
+					field.ErrorList{field.Invalid(
+						field.NewPath("status", "conditions").Index(0),
+						"ProgressDeadlineExceeded", "test failed")})
+			})
+		cs.PrependReactor("get", "pods", cfLogReactor(
+			"2026-11-20T00:00:00Z ERR Couldn't start tunnel: config file error\n"))
+		w := &cfTunnelProxyWatchdog{cs: cs, dyn: testutil.NewDynamicClient(),
+			queue: queue, namespace: cfWatchdogTestNS,
+			now: func() time.Time { return now }}
+		if err := w.run(context.Background()); err != nil {
+			t.Fatalf("raced stall clear must not abort the sweep: %v", err)
+		}
+		if d := testutil.QueueErrorCount(t, queue) - before; d != 0 {
+			t.Fatalf("raced stall clear counted %v sweep errors", d)
+		}
+		if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+			t.Fatal("wedge heal skipped after raced stall clear")
+		}
+	})
+
+	t.Run("non-conflict patch failure still surfaces", func(t *testing.T) {
+		cs := newCS()
+		cs.PrependReactor("patch", "deployments",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("conn refused")
+			})
+		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+			now: func() time.Time { return now }}
+		if err := w.run(context.Background()); err == nil {
+			t.Fatal("real patch failure must surface")
+		}
+	})
 }
 
 // No stale condition -> no status patch.

@@ -51,12 +51,22 @@ func cwPodSlice(ns, svc string, pods ...string) *discoveryv1.EndpointSlice {
 // prober — the brownout seam the tls_probe_failed verdict needs.
 func cwGuard(cs *fake.Clientset, now *time.Time, responsive bool,
 	dynObjs ...runtime.Object) *webhookGuard {
+	return cwGuardProber(cs, now, func(context.Context, string, int32) bool {
+		return responsive
+	}, dynObjs...)
+}
+
+// cwGuardProber is cwGuard with a per-IP prober — the shape the
+// probeBlind contrast fixtures need: a healthy backend answering
+// alongside a wedged one proves the monitor is not blind.
+func cwGuardProber(cs *fake.Clientset, now *time.Time,
+	prober func(context.Context, string, int32) bool,
+	dynObjs ...runtime.Object) *webhookGuard {
 	return &webhookGuard{Guard: guardstate.Guard{
 		CS: cs, Dyn: wgDyn(dynObjs...),
-		Now: func() time.Time { return *now },
-		EndpointProber: func(context.Context, string, int32) bool {
-			return responsive
-		}}}
+		Now:            func() time.Time { return *now },
+		EndpointProber: prober,
+	}}
 }
 
 // cwUnhealthy reads the unhealthy gauge for one (crd, service,
@@ -142,14 +152,23 @@ func TestCRDConversionUnhealthyZeroEndpoints(t *testing.T) {
 // usually the longest-lived replica).
 func TestCRDConversionUnhealthyTLSProbeFailedBounces(t *testing.T) {
 	cwCleanup(t, "widgets.example.com", "conv/conv-svc")
+	cwCleanup(t, "healthy.example.com", "conv/live-svc")
 	cs := fake.NewSimpleClientset(
 		wgNamespace("kube-system"), wgNamespace("conv"),
 		wgService("conv", "conv-svc"),
 		cwPodSlice("conv", "conv-svc", "conv-old", "conv-new"),
+		wgService("conv", "live-svc"),
+		wgEndpointSlice("conv", "live-svc", 1, 0),
 		wgPod("conv", "conv-old", 48*time.Hour),
 		wgPod("conv", "conv-new", time.Hour))
+	emulateEviction(cs) // the bounce evicts through policy/v1
 	now := time.Unix(1_700_000_000, 0)
-	g := cwGuard(cs, &now, false, wgCRDConversion("widgets.example.com", "conv", "conv-svc"))
+	// live-svc's endpoint (10.10.0.1) answers so the census is not
+	// monitor-blind; conv-svc's (10.20.0.x) fail every handshake.
+	g := cwGuardProber(cs, &now,
+		func(_ context.Context, ip string, _ int32) bool { return ip == "10.10.0.1" },
+		wgCRDConversion("widgets.example.com", "conv", "conv-svc"),
+		wgCRDConversion("healthy.example.com", "conv", "live-svc"))
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -188,6 +207,7 @@ func TestCRDConversionUnhealthyTLSProbeFailedBounces(t *testing.T) {
 // but no pod is touched while the mutex is held.
 func TestCRDConversionBounceDefersDuringMaintenance(t *testing.T) {
 	cwCleanup(t, "widgets.example.com", "conv/conv-svc")
+	cwCleanup(t, "healthy.example.com", "conv/live-svc")
 	fresh := metav1.NewTime(time.Now())
 	cordoned := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "w1"},
@@ -203,9 +223,14 @@ func TestCRDConversionBounceDefersDuringMaintenance(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("conv"),
 		wgService("conv", "conv-svc"),
 		cwPodSlice("conv", "conv-svc", "conv-old"),
+		wgService("conv", "live-svc"),
+		wgEndpointSlice("conv", "live-svc", 1, 0),
 		wgPod("conv", "conv-old", 48*time.Hour))
 	now := time.Unix(1_700_000_000, 0)
-	g := cwGuard(cs, &now, false, wgCRDConversion("widgets.example.com", "conv", "conv-svc"))
+	g := cwGuardProber(cs, &now,
+		func(_ context.Context, ip string, _ int32) bool { return ip == "10.10.0.1" },
+		wgCRDConversion("widgets.example.com", "conv", "conv-svc"),
+		wgCRDConversion("healthy.example.com", "conv", "live-svc"))
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -224,13 +249,19 @@ func TestCRDConversionBounceDefersDuringMaintenance(t *testing.T) {
 func TestCRDConversionBounceDisabledByEnv(t *testing.T) {
 	t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "false")
 	cwCleanup(t, "widgets.example.com", "conv/conv-svc")
+	cwCleanup(t, "healthy.example.com", "conv/live-svc")
 	cs := fake.NewSimpleClientset(
 		wgNamespace("kube-system"), wgNamespace("conv"),
 		wgService("conv", "conv-svc"),
 		cwPodSlice("conv", "conv-svc", "conv-old"),
+		wgService("conv", "live-svc"),
+		wgEndpointSlice("conv", "live-svc", 1, 0),
 		wgPod("conv", "conv-old", 48*time.Hour))
 	now := time.Unix(1_700_000_000, 0)
-	g := cwGuard(cs, &now, false, wgCRDConversion("widgets.example.com", "conv", "conv-svc"))
+	g := cwGuardProber(cs, &now,
+		func(_ context.Context, ip string, _ int32) bool { return ip == "10.10.0.1" },
+		wgCRDConversion("widgets.example.com", "conv", "conv-svc"),
+		wgCRDConversion("healthy.example.com", "conv", "live-svc"))
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)

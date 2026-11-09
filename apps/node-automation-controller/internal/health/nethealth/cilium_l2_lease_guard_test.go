@@ -208,3 +208,73 @@ func TestCiliumL2LeaseGuardAgentStreak(t *testing.T) {
 		}
 	}
 }
+
+// TestCiliumL2LeaseGuardOperatorNotReadyNeverFlags — cilium-operator
+// shares the `cilium-` name prefix but is a DIFFERENT workload: its
+// not-Ready window during an operator restart/upgrade must not poison
+// the per-node agent streak into flagging (and deleting) a healthy
+// holder's lease.
+func TestCiliumL2LeaseGuardOperatorNotReadyNeverFlags(t *testing.T) {
+	node := l2Node("w-op", false, false, false, false)
+	operator := probetest.PodWithPhase("kube-system", "cilium-operator-abcde",
+		corev1.PodRunning, false, time.Hour)
+	operator.Spec.NodeName = "w-op"
+	cs := fake.NewSimpleClientset(
+		l2Lease("cilium-l2announce-web_apps", "w-op"), node, operator)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
+
+	// Well past the streak threshold — an operator not-Ready never
+	// accumulates, so agent_not_ready never flags on a healthy node.
+	for range 4 {
+		res := chk.Run(ctx)
+		if flagged := ciliumL2StaleLeaseGauge.DeleteLabelValues(
+			"cilium-l2announce-web_apps", "w-op", l2ReasonAgentNotReady); flagged || !res.Pass {
+			t.Fatalf("operator not-Ready must never flag agent_not_ready (res=%+v)", res)
+		}
+	}
+}
+
+// TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes — a node that
+// vanishes while its not-Ready streak is live is never revisited by
+// the pod loop (its agent pod is gone with it), so the sweep must
+// prune the dead key against the live node census while a present
+// node's streak survives and keeps accumulating.
+func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
+	gone := l2Node("w-gone", false, false, false, false)
+	keep := l2Node("w-keep", false, false, false, false)
+	agent := func(node string) *corev1.Pod {
+		pod := probetest.PodWithPhase("kube-system", "cilium-"+node,
+			corev1.PodRunning, false, time.Hour)
+		pod.Labels = map[string]string{"k8s-app": "cilium"}
+		pod.Spec.NodeName = node
+		return pod
+	}
+	cs := fake.NewSimpleClientset(
+		l2Lease("cilium-l2announce-web_apps", "w-keep"),
+		gone, keep, agent("w-gone"), agent("w-keep"))
+	p := testProber(cs)
+	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
+
+	chk.Run(ctx)
+	if chk.agentNotReadyStreak["w-gone"] != 1 ||
+		chk.agentNotReadyStreak["w-keep"] != 1 {
+		t.Fatalf("streaks after one not-Ready sweep = %v, want both 1",
+			chk.agentNotReadyStreak)
+	}
+
+	// w-gone leaves the cluster; its streak must not outlive it.
+	if err := cs.CoreV1().Nodes().Delete(ctx, "w-gone",
+		metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	chk.Run(ctx)
+	if _, tracked := chk.agentNotReadyStreak["w-gone"]; tracked {
+		t.Fatalf("streak for a deleted node must be pruned, got %v",
+			chk.agentNotReadyStreak)
+	}
+	if chk.agentNotReadyStreak["w-keep"] != 2 {
+		t.Fatalf("present node streak must survive and accumulate, got %v",
+			chk.agentNotReadyStreak)
+	}
+}

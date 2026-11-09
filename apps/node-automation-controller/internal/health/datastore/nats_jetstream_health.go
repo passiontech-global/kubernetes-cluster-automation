@@ -31,6 +31,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -391,10 +392,21 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 				"pod", key, "otherReady", other)
 			continue
 		}
-		hk := probefw.SelfHealKey(CheckNameNatsJetstreamHealth, key)
+		// The heal cooldown keys on the pod's CONTROLLER
+		// (kube.PodControllerKey), not the pod name — the wedge
+		// evidence (the Prom series and the seen ledger) outlives the
+		// pod, so a member recreated under a fresh name must read as
+		// the SAME heal target or the 30m window never applies and
+		// the member bounces again on the very next sweep (same
+		// controller-keyed shape dragonfly_replica_sync_storm keys
+		// its restarts on). The pod-name key still decides WHICH
+		// member goes first, and the >=2-Ready-siblings quorum census
+		// stays grouped per StatefulSet.
+		ck := kube.PodControllerKey(pod)
+		hk := probefw.SelfHealKey(CheckNameNatsJetstreamHealth, ck)
 		before, _ := p.Heals.Last(hk)
 		p.DeletePodHeal(ctx, log, CheckNameNatsJetstreamHealth,
-			key, pod, natsHealCool, now)
+			ck, pod, natsHealCool, now)
 		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
 			healed = true
 		}

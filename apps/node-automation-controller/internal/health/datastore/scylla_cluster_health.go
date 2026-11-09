@@ -105,8 +105,11 @@ func init() {
 var scyllaGossipPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`InetAddress .* is already present in gossip`),
 	regexp.MustCompile(`replace_address_first_boot`),
-	regexp.MustCompile(`group0.*timed out`),
-	regexp.MustCompile(`raft_group0`),
+	// Narrow: a bare `raft_group0` matches every log line that even
+	// mentions group0 (benign topology chatter included) and would
+	// noise gossip_or_raft_stall. Only the failure shapes — a group0
+	// operation timing out, failing or retrying — are stall evidence.
+	regexp.MustCompile(`group0.*(timed out|failed|retry)`),
 }
 
 // scyllaTombstonePatterns are the scylla-shard-imbalance log signatures of a

@@ -5,6 +5,7 @@ package watchdogs
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ import (
 
 // mesh-net-guards — a wedged linkerd pod (started, never Ready, >5m) is
 // deleted to force a re-roll, matching Deployment-suffixed pod names.
+// The fixture carries a controller ownerRef and one Ready sibling: the
+// delete must fire only when the component has a replica that can
+// absorb traffic during the re-roll.
 func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	started := true
 	podName := kube.LinkerdDestinationName + "-7f8b9c6d4-abcde"
@@ -31,6 +35,11 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 			Namespace: kube.LinkerdNS, Name: podName,
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
 			UID:               types.UID("u-dest"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "linkerd-destination-7f8b9c6d4", UID: types.UID("rs-dest"),
+				Controller: &ctrue,
+			}},
 			Labels: map[string]string{
 				"linkerd.io/control-plane-component": "destination",
 			},
@@ -41,7 +50,9 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 				Name: "destination", Started: &started, Ready: false}},
 		},
 	}
-	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	sibling := readyLinkerdPod("linkerd-destination-7f8b9c6d4-ffff",
+		"u-dest-ready", "rs-dest")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, sibling)
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("wedged linkerd pod passed")
@@ -49,6 +60,62 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, podName, metav1.GetOptions{}); err == nil {
 		t.Fatal("wedged linkerd pod not deleted")
+	}
+}
+
+var ctrue = true
+
+// wedgedLinkerdPod builds a started-never-Ready Running pod >5m old —
+// the all-started-none-Ready wedge signature.
+func wedgedLinkerdPod(name, uid, ownerUID string) *corev1.Pod {
+	started := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kube.LinkerdNS, Name: name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			UID:               types.UID(uid),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: name + "-rs", UID: types.UID(ownerUID),
+				Controller: &ctrue,
+			}},
+			Labels: map[string]string{
+				"linkerd.io/control-plane-component": "destination",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "destination", Started: &started, Ready: false}},
+		},
+	}
+}
+
+// readyLinkerdPod builds the Running+Ready sibling the sibling gate
+// counts (Running phase, Ready=True condition, same controller UID).
+func readyLinkerdPod(name, uid, ownerUID string) *corev1.Pod {
+	started := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kube.LinkerdNS, Name: name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			UID:               types.UID(uid),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: name + "-rs", UID: types.UID(ownerUID),
+				Controller: &ctrue,
+			}},
+			Labels: map[string]string{
+				"linkerd.io/control-plane-component": "destination",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "destination", Started: &started, Ready: true}},
+		},
 	}
 }
 
@@ -84,7 +151,8 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	}
 }
 
-// Without a maintenance signal the same call deletes the pod.
+// Without a maintenance signal the same call deletes the pod (owned:
+// the ownerRef gate in healNamedPod only rejects unowned pods).
 func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -92,6 +160,11 @@ func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 			Name:              kube.LinkerdDestinationName + "-bbb-222",
 			UID:               types.UID("u-dest2"),
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "linkerd-destination-bbb", UID: types.UID("rs-dest2"),
+				Controller: &ctrue,
+			}},
 		},
 	}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
@@ -149,7 +222,12 @@ func TestMeshHealComponentPodSingleGateEval(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ciliumOperatorNS, Name: ciliumOperatorPrefix + "6f9d8-abcde",
-			UID:    types.UID("u-cilium-op"),
+			UID: types.UID("u-cilium-op"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "Deployment",
+				Name: "cilium-operator", UID: types.UID("dep-cilium-op"),
+				Controller: &ctrue,
+			}},
 			Labels: map[string]string{"io.cilium/app": "operator"},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
@@ -175,7 +253,12 @@ func TestMeshHealComponentPodRespectsCooldown(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ciliumOperatorNS, Name: ciliumOperatorPrefix + "6f9d8-abcde",
-			UID:    types.UID("u-cilium-op"),
+			UID: types.UID("u-cilium-op"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "Deployment",
+				Name: "cilium-operator", UID: types.UID("dep-cilium-op"),
+				Controller: &ctrue,
+			}},
 			Labels: map[string]string{"io.cilium/app": "operator"},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
@@ -190,5 +273,67 @@ func TestMeshHealComponentPodRespectsCooldown(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the heal cooldown — gate refused too late")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// mesh-net-guards — sibling / ownerRef gates on the wedged-linkerd heal
+// ---------------------------------------------------------------------------
+
+// Sole-replica wedge (started, never Ready, >5m, no Ready sibling):
+// the sweep must still emit the finding (the wedge gauge stays live)
+// but NOT delete — re-rolling a lone not-Ready replica every cooldown
+// only churns pods while the component stays degraded.
+func TestCheckMeshLinkerdSoleReplicaWedgedNotDeleted(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-7f8b9c6d4-abcde",
+		"u-dest", "rs-dest")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx)
+	if res.Pass || !strings.Contains(res.Why, "destination:wedged") {
+		t.Fatalf("sole-replica wedge must stay detect-only with the finding emitted, got pass=%v why=%q", res.Pass, res.Why)
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("sole-replica wedged pod deleted — no Ready sibling must stand the heal down")
+	}
+}
+
+// With a second replica genuinely Ready, the not-Ready pod may be
+// re-rolled — the sibling can absorb mesh traffic during the bounce.
+func TestCheckMeshLinkerdWedgedWithReadySiblingDeletes(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-7f8b9c6d4-abcde",
+		"u-dest", "rs-dest")
+	sibling := readyLinkerdPod(kube.LinkerdDestinationName+"-7f8b9c6d4-ffff",
+		"u-dest-ready", "rs-dest")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, sibling)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("wedged linkerd pod passed")
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("wedged pod with a Ready sibling not deleted")
+	}
+}
+
+// A pod with no controller ownerRef must never be deleted: nothing
+// would re-roll it, so the delete turns a stuck component into a
+// missing one. The rejection happens before the gate — no
+// HealAllowed evaluation is spent on an undeletable target.
+func TestHealNamedPodSkipsUnownedPod(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-ccc-333", "u-dest3", "rs-dest3")
+	pod.OwnerReferences = nil
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	chk.healNamedPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
+		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
+	if chk.gateEvals != 0 {
+		t.Fatalf("gate evaluations = %d, want 0 — unowned pod must be rejected before the gate", chk.gateEvals)
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("unowned pod deleted — nothing would re-roll it")
 	}
 }

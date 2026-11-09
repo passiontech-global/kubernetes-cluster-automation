@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -125,6 +126,78 @@ func TestNatsJetstreamDisabledEmitsThenHeals(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("mq").
 		Get(ctx, "nats-0", metav1.GetOptions{}); err == nil {
 		t.Fatal("wedged member must be deleted with quorum intact")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy members must survive: %v", err)
+	}
+}
+
+// The heal cooldown keys on the pod's CONTROLLER (kube.PodControllerKey
+// — the owning StatefulSet), not the pod name: the STS recreates a
+// bounced member and the wedge evidence (the Prom series and the seen
+// ledger) outlives the pod, so a fresh pod name must still read as the
+// SAME heal target inside the 30m window — a name-keyed stamp never
+// matches the replacement and the member bounces again on the very
+// next sweep. The >=2 Ready-siblings quorum census is untouched.
+func TestNatsJetstreamHealCooldownKeysOnController(t *testing.T) {
+	base := time.Now()
+	// The wedged member's name follows the pod the sweep actually
+	// sees — it changes when the STS recreates the member.
+	wedged := "nats-0"
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "jetstream_disabled") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": wedged},
+				Value:  1}}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset(natsFixture()...)
+	p := natsProber(cs, srv)
+	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
+
+	// Arm the 10m window, then sweep past it — nats-0 is bounced.
+	probetest.FreezeNow(p.Deps, base)
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("jetstream_disabled member must FAIL the check")
+	}
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("persisted jetstream_disabled must keep failing")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-0", metav1.GetOptions{}); err == nil {
+		t.Fatal("wedged member must be bounced with quorum intact")
+	}
+	if _, ok := check.Heals.Last(probefw.SelfHealKey(
+		CheckNameNatsJetstreamHealth, "mq/nats")); !ok {
+		t.Fatal("heal stamp must key on the owning StatefulSet, not the pod name")
+	}
+
+	// The STS recreates the member — under a fresh name here — and the
+	// wedge signature persists on the replacement.
+	wedged = "nats-0-reborn"
+	reborn := natsMemberPod("mq", "nats", wedged, true)
+	if _, err := cs.CoreV1().Pods("mq").
+		Create(ctx, reborn, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("recreate member: %v", err)
+	}
+	// The replacement inherits the wedge evidence: seed its first-seen
+	// entry so the 10m window reads as already lapsed — only the heal
+	// cooldown can hold the bounce now (the member is Ready and both
+	// siblings are up, so the quorum guard would allow it).
+	check.seen.Observe("mq/"+wedged+"/jetstream_disabled",
+		base.Add(-time.Hour))
+
+	probetest.FreezeNow(p.Deps, base.Add(12*time.Minute))
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("wedged replacement must keep the check failing")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, wedged, metav1.GetOptions{}); err != nil {
+		t.Fatal("controller-keyed cooldown must hold: the recreated member " +
+			"must not be bounced again inside the window")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
 		Get(ctx, "nats-1", metav1.GetOptions{}); err != nil {

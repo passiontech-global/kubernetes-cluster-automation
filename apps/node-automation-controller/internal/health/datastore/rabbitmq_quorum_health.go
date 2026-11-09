@@ -201,11 +201,13 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		for _, s := range series {
 			podName := s.Label("pod", "pod_name")
+			// Fail-closed: a series without a namespace label cannot
+			// be attributed — a bare pod name is ambiguous across
+			// namespaces, and guessing would heal the wrong cluster's
+			// pod on a name collision.
 			ns := s.Metric["namespace"]
 			if ns == "" {
-				if pod := rabbitByPodName[podName]; pod != nil {
-					ns = pod.Namespace
-				}
+				continue
 			}
 			if podName != "" &&
 				downscaledMemberPod(ns, podName, downscaled) {
@@ -247,11 +249,11 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		for _, s := range counts {
 			podName := s.Label("pod", "pod_name")
+			// Fail-closed like the alarm loop: no namespace label →
+			// unattributable series, never resolved by bare pod name.
 			ns := s.Metric["namespace"]
 			if ns == "" {
-				if pod := rabbitByPodName[podName]; pod != nil {
-					ns = pod.Namespace
-				}
+				continue
 			}
 			if podName == "" || s.Value <= 0 {
 				continue

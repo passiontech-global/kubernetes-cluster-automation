@@ -83,6 +83,7 @@ var metricsServerWantArgs = []string{
 type metricsServerPatcher struct {
 	cs              kubernetes.Interface
 	nodeReader      kube.CachedNodeReader
+	reader          kube.CachedObjectReader
 	minReplicas     int
 	nodesPerReplica int
 }
@@ -120,6 +121,9 @@ func Setup(d shared.Deps) error {
 			NodesPerReplica: cfg.nodesPerReplica,
 		}.WatchNodes(b, "metrics-server-patcher-sweep")
 		r := &metricsServerPatcher{cs: d.CS, nodeReader: d.Mgr.GetClient(),
+			// Reader wires the informer cache for the drift Get — same seam
+			// as corednspatcher; nil (stub manager) falls back to direct CS.
+			reader:      d.Mgr.GetClient(),
 			minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
@@ -150,6 +154,7 @@ func configFromEnv() metricsServerPatcherConfig {
 func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	return pinnedworkload.DeploymentSpec{
 		CS:         r.cs,
+		Reader:     r.reader,
 		NodeReader: r.nodeReader,
 		Namespace:  "kube-system",
 		Name:       "metrics-server",

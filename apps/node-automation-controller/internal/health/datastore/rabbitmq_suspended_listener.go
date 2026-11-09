@@ -131,6 +131,14 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 		return false, nil
 	}
 	want := int(*sts.Spec.Replicas)
+	// A single-replica cluster has no quorum to lose — but it also
+	// has NO surviving member to serve while the pod is being
+	// recreated, so a delete is a full outage, not a heal. The guard
+	// below (`want-1` ready peers) degenerates to 0<0 for want==1
+	// and would bless the only pod; require real redundancy first.
+	if want <= 1 {
+		return false, nil
+	}
 	if len(peers) < want {
 		return false, nil
 	}

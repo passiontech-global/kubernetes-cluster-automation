@@ -342,13 +342,17 @@ func TestEndpointGuardKeepsSoleRemainingBackend(t *testing.T) {
 	}
 }
 
-// A quarantined IP probing healthy for 2 consecutive cycles is put
-// back into both objects and dropped from the annotation.
+// A quarantined IP the reconciler still lists (notReady copy) probing
+// healthy for 2 consecutive cycles is put back into both objects and
+// dropped from the annotation. The IP must stay visible to activeIPs —
+// since the re-add gate, a quarantined IP absent from the current
+// endpoints is never re-added on streak alone (it would fight the
+// reconciler; see the absent-IP regression test below).
 func TestEndpointGuardReaddsRecoveredBackend(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeEndpointSlice([]string{"10.0.0.2", "10.0.0.3"}))
 	dyn := testutil.NewDynamicClient(
-		kubeEndpoints([]string{"10.0.0.2", "10.0.0.3"}, nil, []string{"10.0.0.1"}))
+		kubeEndpoints([]string{"10.0.0.2", "10.0.0.3"}, []string{"10.0.0.1"}, []string{"10.0.0.1"}))
 	probes := probeTable{
 		"10.0.0.1": apiHealthyProbe(1000),
 		"10.0.0.2": apiHealthyProbe(1000),
@@ -380,6 +384,57 @@ func TestEndpointGuardReaddsRecoveredBackend(t *testing.T) {
 	}
 	if got := sliceAddrSet(getKubeSlice(t, cs)); !got["10.0.0.1"] {
 		t.Fatalf("recovered backend not back in EndpointSlice: %v", got)
+	}
+}
+
+// A quarantined backend whose okStreak is sufficient is re-added ONLY
+// while the reconciler still lists it — the decommissioned-backend
+// flapping fix. 10.0.0.1 stays in the Endpoints object (notReady copy,
+// as the reconciler leaves behind) so it recovers back into both
+// objects; 10.0.0.3's host still answers :6443 (healthy probes,
+// okStreak climbs) but the reconciler dropped it everywhere — re-adding
+// on streak alone made the guard fight the reconciler every cycle and
+// kube-proxy flapped kubernetes.default. It must stay quarantined (and
+// must NOT expire either — a live host never accumulates errStreak).
+func TestEndpointGuardSkipsReaddOfAbsentQuarantinedBackend(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpointSlice([]string{"10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2"}, []string{"10.0.0.1"}, []string{"10.0.0.1", "10.0.0.3"}))
+	probes := probeTable{
+		"10.0.0.1": apiHealthyProbe(1000), // decommissioned twin: healthy host
+		"10.0.0.2": apiHealthyProbe(1000),
+		"10.0.0.3": apiHealthyProbe(1000), // quarantined AND absent
+	}
+	g := newEndpointGuard(cs, dyn, probes)
+
+	for i := range endpointGuardRecoverCyc + 1 { // +1: stability after re-add
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ep := getKubeEndpoints(t, dyn)
+		got := endpointAddrSet(ep)
+		slice := sliceAddrSet(getKubeSlice(t, cs))
+		if got["10.0.0.3"] || slice["10.0.0.3"] {
+			t.Fatalf("cycle %d: absent quarantined backend re-added — reconciler fight (ep=%v slice=%v)",
+				i+1, got, slice)
+		}
+		if ann := ep.GetAnnotations()[endpointGuardAnno]; !strings.Contains(ann, "10.0.0.3") {
+			t.Fatalf("cycle %d: absent backend dropped from annotation early: %q", i+1, ann)
+		}
+		if i+1 < endpointGuardRecoverCyc {
+			// Latch not reached: the listed twin must also stay out.
+			if got["10.0.0.1"] {
+				t.Fatalf("cycle %d: listed backend re-added after a single healthy cycle", i+1)
+			}
+			continue
+		}
+		if !got["10.0.0.1"] || !slice["10.0.0.1"] {
+			t.Fatalf("cycle %d: listed recovered backend not re-added (ep=%v slice=%v)", i+1, got, slice)
+		}
+		if ann := ep.GetAnnotations()[endpointGuardAnno]; ann != "10.0.0.3" {
+			t.Fatalf("cycle %d: annotation = %q, want only absent 10.0.0.3", i+1, ann)
+		}
 	}
 }
 
@@ -1256,11 +1311,14 @@ func TestEndpointGuardSliceModeQuarantine(t *testing.T) {
 	}
 }
 
-// A quarantined slice backend probing healthy for 2 cycles is
-// re-added to the slice and dropped from its annotation.
+// A quarantined slice backend the reconciler still lists (its address
+// stayed in the slice while the annotation held) probing healthy for 2
+// cycles is dropped from its annotation — the re-add gate requires the
+// IP to remain in the slice's endpoint set, since an absent quarantined
+// IP is never re-added on streak alone (decommissioned-backend fix).
 func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeSliceWithQuarantine([]string{"10.0.0.2"}, []string{"10.0.0.1"}))
+		kubeSliceWithQuarantine([]string{"10.0.0.2", "10.0.0.1"}, []string{"10.0.0.1"}))
 	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "34")
 	probes := probeTable{

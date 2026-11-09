@@ -7,9 +7,13 @@
 //
 // Drift signal lives entirely on that secret: fluent.io/config-hash
 // (written by fluent-operator) vs passiontech.dev/rolled-config-hash
-// (written by us). The secret is the only safe place for state — the
-// DS metadata/spec annotations are rewritten/stripped by fluent-
-// -operator within seconds, and Flux reverts anything it manages.
+// (written by us). The secret stays the authoritative state — the DS
+// metadata/spec annotations are rewritten/stripped by fluent-operator
+// within seconds, and Flux reverts anything it manages. The one
+// exception is the pod-template stamp the restart patch itself
+// carries (see restartWithHashPatch): a best-effort idempotence
+// marker — if fluent-operator strips it we merely fall back to the
+// unconditional re-roll the marker exists to prevent, never worse.
 //
 // Storm gates (bash): skip when any node is NotReady, skip while a
 // previous rollout has not settled; API failure = do nothing.
@@ -19,6 +23,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -155,6 +160,41 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		}
 	}
 
+	// The DaemonSet read stays on the direct clientset: the manager's
+	// DaemonSet informer is field-scoped to konnectivity-agent
+	// (buildCacheOptions), so a cache Get of fluent-system/fluent-bit
+	// would come back NotFound-from-cache. It runs before the storm
+	// gate because the idempotence short-circuit below needs the live
+	// pod template.
+	ds, err := r.cs.AppsV1().DaemonSets("fluent-system").Get(ctx, "fluent-bit", metav1.GetOptions{})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("get daemonset fluent-system/fluent-bit: %w", err)
+	}
+
+	// Idempotence short-circuit: the restart patch stamps the hash it
+	// rolls FOR onto the pod template (restartWithHashPatch), so a
+	// live DS already carrying today's hash means this config was
+	// already rolled out and only the secret stamp failed afterwards
+	// (RBAC regression, patch rejections). Re-running the full roll
+	// here would restart every fluent-bit pod on every ~30m sweep,
+	// forever. Retry the stamp alone: a secret-annotation write
+	// mutates no workload, so the storm/settled/maintenance gates
+	// below — which exist to guard the destructive restart — do not
+	// apply to this path.
+	if ds.Spec.Template.Annotations[kube.AnnoRolledConfigHash] == hash {
+		statePatch, err := kube.MergePatchAnnos(map[string]any{kube.AnnoRolledConfigHash: hash})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("render rolled-config-hash patch: %w", err)
+		}
+		if _, err := r.cs.CoreV1().Secrets("fluent-system").Patch(ctx, "passiontech-pipeline",
+			types.MergePatchType, statePatch, metav1.PatchOptions{}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("stamp rolled-config-hash on secret fluent-system/passiontech-pipeline: %w", err)
+		}
+		log.Info("fleet already rolled for this config — stamping secret only",
+			"secret", "fluent-system/passiontech-pipeline", "hash", hash)
+		return res, nil
+	}
+
 	// Storm gate: never restart the DS while nodes are down — adds
 	// churn; positionDB guarantees resume once stable.
 	notReady, err := kube.CountNotReadyNodesCached(ctx, r.nodeReader, r.cs)
@@ -167,14 +207,6 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		return res, nil
 	}
 
-	// The DaemonSet read stays on the direct clientset: the manager's
-	// DaemonSet informer is field-scoped to konnectivity-agent
-	// (buildCacheOptions), so a cache Get of fluent-system/fluent-bit
-	// would come back NotFound-from-cache.
-	ds, err := r.cs.AppsV1().DaemonSets("fluent-system").Get(ctx, "fluent-bit", metav1.GetOptions{})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("get daemonset fluent-system/fluent-bit: %w", err)
-	}
 	// Bash settled check exactly: generation observed AND updated ==
 	// desired. NumberReady is deliberately NOT required (bash didn't —
 	// do not use kube.DaemonSetSettled, which is stricter).
@@ -190,7 +222,11 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// kubectl rollout restart equivalent. The stamp must land on the
 	// POD TEMPLATE — kube.MergePatchAnnos only covers top-level
 	// metadata.annotations, so kube.RestartTemplatePatch renders the
-	// nested doc (same shared builder stale_recover.go uses).
+	// nested doc (same shared builder stale_recover.go uses), and
+	// restartWithHashPatch embeds AnnoRolledConfigHash=<hash> into the
+	// same pod-template map: one patch, one generation bump, and the
+	// marker the idempotence short-circuit at the top of Reconcile
+	// reads.
 	//
 	// Maintenance mutex — a LIVE-workload mutation (rolling every
 	// fluent-bit pod), so per AGENTS.md it gates on the
@@ -213,13 +249,16 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 			"daemonset", "fluent-system/fluent-bit")
 		return res, nil
 	}
-	restartPatch := kube.RestartTemplatePatch(r.now.Now())
+	restartPatch, err := restartWithHashPatch(r.now.Now(), hash)
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// State written only AFTER the restart succeeded (bash ordering):
 	// writing first would silently swallow the drift if restart failed.
+	// If THIS stamp fails instead, the pod template already carries the
+	// hash — the short-circuit at the top of the next sweep retries the
+	// stamp alone instead of re-rolling the fleet.
 	statePatch, err := kube.MergePatchAnnos(map[string]any{kube.AnnoRolledConfigHash: hash})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render rolled-config-hash patch: %w", err)
@@ -231,6 +270,36 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	log.Info("ROLL: restarted fluent-bit for config",
 		"daemonset", "fluent-system/fluent-bit", "hash", hash)
 	return res, nil
+}
+
+// restartWithHashPatch renders the rollout-restart patch and embeds
+// the config hash the restart rolls FOR into the same pod-template
+// annotation map — one patch, one generation bump. The embedded stamp
+// is the idempotence marker: if the secret stamp after the restart
+// keeps failing (RBAC regression, patch rejections), the short-circuit
+// at the top of Reconcile sees the live DS already carrying the hash
+// and retries the stamp alone instead of re-rolling the whole fleet
+// every ~30m sweep, forever. kube.RestartTemplatePatch stays the shape
+// authority: its output is decoded, extended and re-encoded — the
+// stale_recover.go precedent for callers needing more keys in one
+// document.
+func restartWithHashPatch(ts time.Time, hash string) ([]byte, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(kube.RestartTemplatePatch(ts), &doc); err != nil {
+		return nil, fmt.Errorf("decode restart template patch: %w", err)
+	}
+	// Walk the documented shape defensively: the helper owns the doc
+	// and may legitimately grow — a shape change must surface as a
+	// reconcile error, not a panic in the destructive-patch path.
+	spec, _ := doc["spec"].(map[string]any)
+	tmpl, _ := spec["template"].(map[string]any)
+	meta, _ := tmpl["metadata"].(map[string]any)
+	annos, _ := meta["annotations"].(map[string]any)
+	if annos == nil {
+		return nil, fmt.Errorf("restart template patch: unexpected shape (missing pod-template annotations)")
+	}
+	annos[kube.AnnoRolledConfigHash] = hash
+	return json.Marshal(doc)
 }
 
 // pipelineDrift extracts the drift pair from one read of the

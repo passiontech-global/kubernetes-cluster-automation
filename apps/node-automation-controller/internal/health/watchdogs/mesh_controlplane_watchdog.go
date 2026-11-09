@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
@@ -104,6 +105,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	// the linkerd.io/control-plane-component label); exact-name match is
 	// kept alongside prefix/label match for unit-test fixtures.
 	if pods, err := p.PodsIn(ctx, kube.LinkerdNS); err == nil {
+		readyByOwner := probefw.ReadyByOwner(derefPods(pods))
 		for _, component := range []string{kube.LinkerdDestinationName, kube.LinkerdIdentityName} {
 			for i := range pods {
 				pod := pods[i]
@@ -111,6 +113,18 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 					continue
 				}
 				rep.Find(component + ":wedged")
+				// A sole-replica Running-but-never-Ready pod has no
+				// Ready sibling to absorb the mesh traffic while the
+				// re-roll comes up: deleting it just churns replicas
+				// every cooldown window while the component stays
+				// degraded (the new pod starts from the same wedge).
+				// Detect-only — the finding above still emits so the
+				// gauge/verdict surface the wedge.
+				if probefw.ReadySiblings(readyByOwner, pod) < 1 {
+					log.Info("skip wedged linkerd pod: no Ready sibling replica — delete would churn a sole replica while degraded",
+						"component", component, "pod", pod.Namespace+"/"+pod.Name)
+					break
+				}
 				p.healNamedPod(ctx, log, component, pod.Namespace+"/"+pod.Name,
 					pod, linkerdHealCooldown, now)
 				break
@@ -127,6 +141,16 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	return rep.Verdict("mesh control-plane wedge: ", ", ")
+}
+
+// derefPods copies a []*corev1.Pod census into []corev1.Pod for
+// probefw.ReadyByOwner (the sibling census takes values).
+func derefPods(pods []*corev1.Pod) []corev1.Pod {
+	out := make([]corev1.Pod, len(pods))
+	for i := range pods {
+		out[i] = *pods[i]
+	}
+	return out
 }
 
 // linkerdPodWedged reports the wedged-watch / crashloop signature:
@@ -193,6 +217,16 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 // is in flight, and "cannot verify" fails closed.
 func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logger,
 	component, key string, pod *corev1.Pod, cooldown time.Duration, now time.Time) {
+	// A pod with no controller owner reference would NOT be recreated
+	// after the delete (mirrors operator_leader_heal.go): deleting an
+	// unowned control-plane pod turns a stuck component into a
+	// missing one. Only a Deployment/ReplicaSet-managed pod is a safe
+	// re-roll target.
+	if metav1.GetControllerOf(pod) == nil {
+		log.Info("skip control-plane pod heal: no controller ownerRef — nothing would re-roll the pod",
+			"component", component, "pod", key)
+		return
+	}
 	p.gateEvals++
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, component, cooldown, now)
