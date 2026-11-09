@@ -228,6 +228,7 @@ var Modules = []shared.Module{
 	{Name: "cilium-datapath-map-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumDatapathMapGuard, New: nethealth.NewCiliumDatapathMapGuardCheck}},
 	{Name: "cilium-l2-lease-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCiliumL2LeaseGuard, New: nethealth.NewCiliumL2LeaseGuardCheck}},
 	{Name: "observability-pipeline-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck}},
+	{Name: "apiserver-relist-storm-breaker", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameAPIServerRelistStorm, New: nodehealth.NewAPIServerRelistStormCheck}},
 	// The gated gitops check rows carry the section's only per-check
 	// registration gates; they close out the roster — the sweep
 	// order contract puts them after the always-on block.

@@ -129,12 +129,19 @@ const (
 	leaseReasonExpiredRunningPods = "expired_with_running_pods"
 )
 
-// leaseGuardNamespaces are the control-plane namespaces whose
+// leaseGuardNamespaces are the namespaces whose
 // coordination.k8s.io/v1 Leases the guard audits — every namespace a
 // cluster controller or platform operator elects its leader in.
+// W20 adds the platform-operator set: backup (velero), progressive
+// delivery (argo-rollouts, kargo), the everest DB stack, the
+// dragonfly operator, the second monitoring plane, liqo, the
+// stakater reloader, and the CNPG/Scylla operators.
 var leaseGuardNamespaces = []string{
 	"kube-system", "flux-system", "node-ops", "operators",
 	"linkerd", "argocd", "cert-manager", "external-secrets",
+	"velero", "argo-rollouts", "kargo", "everest-system", "everest",
+	"dragonfly-operator-system", "monitoring", "liqo", "reloader",
+	"cnpg-system", "scylla-operator",
 }
 
 var (

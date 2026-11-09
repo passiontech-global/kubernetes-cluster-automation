@@ -206,12 +206,21 @@ var VeleroPodVolumeBackupWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while a PodVolumeBackup is wedged InProgress past the Kopia criteria.",
 }, []string{"namespace", "pvb"})
 
+// VeleroPodVolumeRestoreWedged is the W20-ST3 restore-side twin of
+// VeleroPodVolumeBackupWedged: 1 while a velero.io PodVolumeRestore
+// sits InProgress past the 6h window. Labels: namespace + pvr name.
+var VeleroPodVolumeRestoreWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_podvolumerestore_wedged",
+	Help: "1 while a PodVolumeRestore is wedged InProgress past the 6h window.",
+}, []string{"namespace", "pvr"})
+
 // VeleroWedgedObjectsCleanedTotal counts wedged velero objects
-// cleaned by the backup auditor (velero-inflight-audit). action is pvb_deleted or
-// pod_restarted. Labels: namespace + action.
+// cleaned by the backup auditor (velero-inflight-audit). action is
+// pvb_deleted, pvr_deleted or pod_restarted. Labels: namespace +
+// action.
 var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_velero_wedged_objects_cleaned_total",
-	Help: "Wedged velero PodVolumeBackups deleted and pods bounced, by namespace and action.",
+	Help: "Wedged velero PodVolumeBackups/PodVolumeRestores deleted and pods bounced, by namespace and action.",
 }, []string{"namespace", "action"})
 
 // VeleroRepoUnhealthy marks (1) each velero.io BackupRepository
@@ -243,6 +252,7 @@ var integrationCollectors = []prometheus.Collector{
 	ExternalSecretStormSuppressed, ExternalSecretEmptyKey,
 	OnePasswordConnectSyncUnhealthy,
 	VeleroBackupStuck, VeleroPodVolumeBackupWedged,
+	VeleroPodVolumeRestoreWedged,
 	VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy,
 }
 

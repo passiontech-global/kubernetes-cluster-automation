@@ -186,10 +186,12 @@ func isKSMPod(pod *corev1.Pod) bool {
 // ksmWedgeReason resolves this sweep's wedge signature for one
 // kube-state-metrics pod. The log tail is the primary signal — the
 // injected seam in tests, the bounded GetLogs tail in production;
-// when the tail reads clean, the Prometheus counter increase is the
-// "or metrics" half of the detection (a spamming reflector can
-// rotate the 401 storm out of the last tail lines between sweeps).
-// "" is clean; an error means inconclusive.
+// when the tail reads clean — OR fails outright (a hung kubelet
+// :10250 on the pod's node turns every log read into a timeout) —
+// the Prometheus counter increase is the "or metrics" half of the
+// detection (a spamming reflector can rotate the 401 storm out of
+// the last tail lines between sweeps). "" is clean; an error means
+// BOTH channels failed — inconclusive.
 func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 	pod *corev1.Pod) (string, error) {
 
@@ -199,19 +201,23 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 			return ksmLogTailWedge(ctx, p.CS, pod)
 		}
 	}
-	reason, err := probe(ctx, pod)
-	if err != nil {
-		return "", fmt.Errorf("log tail: %w", err)
-	}
+	var logErr error
+	reason, logErr := probe(ctx, pod)
 	if reason != "" {
 		return reason, nil
 	}
 	errs, err := p.ksmReflectorErrorIncrease(ctx, pod)
 	if err != nil {
+		if logErr != nil {
+			return "", fmt.Errorf("log tail: %w (prometheus: %v)", logErr, err)
+		}
 		return "", fmt.Errorf("prometheus: %w", err)
 	}
 	if errs > 0 {
 		return leaseReasonKSMReflectorErrors, nil
+	}
+	if logErr != nil {
+		return "", fmt.Errorf("log tail: %w", logErr)
 	}
 	return "", nil
 }

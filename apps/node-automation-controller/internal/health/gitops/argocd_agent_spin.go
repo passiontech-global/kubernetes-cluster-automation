@@ -36,7 +36,9 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // argoCDAgentSpinCheck is the argocd-agent reconnect hot-loop
@@ -133,6 +135,14 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: err}
 	}
+	// The CPU channel's instant query runs ONCE per sweep — querying
+	// inside the pod loop would stamp N identical PromQL evaluations
+	// for the same series set.
+	series, cpuErr := p.PromQuery(ctx, argocdAgentCPUQuery)
+	if cpuErr != nil {
+		log.Info("WARN: argocd-agent spin — cpu channel unavailable",
+			"error", cpuErr)
+	}
 	var rep probefw.SweepReport
 	live := map[string]bool{}
 	for i := range pods {
@@ -145,7 +155,7 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 			continue // a fresh pod has no spin history worth reading
 		}
 		reason := ""
-		if p.cpuSpin(ctx, pod) {
+		if p.cpuSpin(series, pod) {
 			reason = "cpu"
 		} else if p.logSpin(ctx, log, pod) {
 			reason = "logs"
@@ -164,26 +174,25 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 		if !seenBefore || now.Sub(first) < argocdAgentWindow {
 			continue // first sighting — the window decides next sweep
 		}
+		// Cooldown keys on the pod's controller, not the pod name —
+		// a Deployment recreates the agent pod under a fresh random
+		// suffix, and a "ns/pod" key would let the replacement pod
+		// bypass the 30m delete cooldown on its very first spin.
 		p.DeletePodHeal(ctx, log, CheckNameArgoCDAgentSpin,
-			"agent/"+key, pod, argocdAgentCool, now)
+			"agent/"+kube.PodControllerKey(pod), pod, argocdAgentCool, now)
 	}
 	p.seen.Prune(func(k string) bool { return live[k] })
 	return rep.Result(&p.emitted, argocdAgentSpinGauge.DeleteLabelValues,
 		"argocd-agent spin pods: ", ", ")
 }
 
-// cpuSpin is channel (a): the per-pod 15m CPU rate from the shared
-// instant-query client. A Prometheus outage is inconclusive, not
-// clean — false with the failure logged at WARN, the same posture
-// the metrics-backed nethealth checks document.
-func (p *argoCDAgentSpinCheck) cpuSpin(ctx context.Context, pod *corev1.Pod) bool {
-	series, err := p.PromQuery(ctx, argocdAgentCPUQuery)
-	if err != nil {
-		logf.FromContext(ctx).Info(
-			"WARN: argocd-agent spin — cpu channel unavailable",
-			"pod", pod.Name, "error", err)
-		return false
-	}
+// cpuSpin is channel (a): the per-pod 15m CPU rate from the sweep's
+// single instant-query result. A failed query (series nil, logged at
+// WARN by Run) is inconclusive, not clean — the same posture the
+// metrics-backed nethealth checks document.
+func (p *argoCDAgentSpinCheck) cpuSpin(
+	series []promq.Sample, pod *corev1.Pod) bool {
+
 	for _, s := range series {
 		if s.Label("pod") == pod.Name && s.Value > argocdAgentCPU {
 			return true
@@ -207,8 +216,10 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	defer cancel()
 	tail := int64(argocdAgentTail)
 	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{TailLines: &tail}).
-		Stream(lctx)
+		&corev1.PodLogOptions{
+			Container: probefw.ResolveDefaultContainer(pod, ""),
+			TailLines: &tail,
+		}).Stream(lctx)
 	if err != nil {
 		log.Info("WARN: argocd-agent spin — log channel unavailable",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)

@@ -161,6 +161,13 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	p.clearOLMResolvedStamps(ctx, log, scan)
 	rep.Close(&p.olmEmitted, olmUnhealthyResourcesGauge.DeleteLabelValues)
 
+	// W20-CP3 durable patches — independent of the unhealthy gauge:
+	// CSV spec re-assertions (argocd-operator probes, NMO
+	// --leader-elect strip) and the everest InstallPlan approver.
+	// Tolerated sub-failures: each logs + IncErrors internally.
+	p.autoPatchOperatorCSVs(ctx, log)
+	p.autoApproveStuckInstallPlans(ctx, log, now)
+
 	if len(healReasons) > 0 {
 		reasons := make([]string, 0, len(healReasons))
 		for r := range healReasons {

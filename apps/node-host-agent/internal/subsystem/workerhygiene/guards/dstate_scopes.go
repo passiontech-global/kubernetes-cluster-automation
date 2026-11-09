@@ -274,10 +274,12 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 // bookkeeping of already-dead units).
 
 // ScopesCheck is the systemd-scopes failed-scope reaper as a Check; it owns
-// the 30m sweep stamp (ex-Hygiene.lastScopeScan).
+// the 30m sweep stamp (ex-Hygiene.lastScopeScan) and the consecutive-sweep
+// streak for units wedged in `deactivating` (W20-KR1).
 type ScopesCheck struct {
-	d        *wdeps.Deps
-	lastScan time.Time
+	d           *wdeps.Deps
+	lastScan    time.Time
+	deactStreak int
 }
 
 // Name returns the check label / WD_SIG key.
@@ -317,6 +319,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			n++
 		}
 	}
+	c.checkDeactivating(ctx)
 	if n == 0 {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
@@ -330,6 +333,46 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			rerr, strings.TrimSpace(rout)))
 	} else {
 		c.d.Actions.WithLabelValues(wdeps.CheckSysScopes, "reset_failed").Inc()
+	}
+	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
+}
+
+// checkDeactivating is the W20-KR1 deactivating wedge detector:
+// cri-containerd-*.scope units stuck in `deactivating` across
+// consecutive sweeps mean container teardown is wedged inside
+// systemd PID 1 (stop-sigterm/sigkill never completing) —
+// reset-failed cannot clear these, so they are diagnose-only.
+// The streak must survive ≥2 sweeps (~1h) before alerting so a
+// normal stop-in-progress transient never pages. Runs even when no
+// failed scopes exist — a node can wedge on deactivating alone.
+func (c *ScopesCheck) checkDeactivating(ctx context.Context) {
+	dout, derr := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
+		"--type=scope", "--state=deactivating", "--no-legend", "--plain",
+		"cri-containerd-*.scope")
+	if derr != nil {
+		// Inconclusive — leave the streak untouched rather than
+		// resetting on a transient D-Bus failure.
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: systemd-scopes deactivating list-units failed: %v (%s) — streak kept",
+			derr, strings.TrimSpace(dout)))
+	} else {
+		dn := 0
+		for _, line := range strings.Split(dout, "\n") {
+			if f := strings.Fields(line); len(f) > 0 &&
+				strings.HasSuffix(f[0], ".scope") {
+				dn++
+			}
+		}
+		if dn == 0 {
+			c.deactStreak = 0
+		} else {
+			c.deactStreak++
+			if c.deactStreak >= 2 {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: systemd-scopes deactivating count=%d streak=%d",
+					dn, c.deactStreak))
+			}
+		}
 	}
 	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 }

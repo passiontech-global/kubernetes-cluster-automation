@@ -52,6 +52,19 @@ const (
 var (
 	aioNrFile  = defaultAIONrFile
 	aioMaxFile = defaultAIOMaxFile
+	// maxUserNSFile is the user.max_user_namespaces read seam —
+	// same fixture-override contract as the aio pair.
+	maxUserNSFile = "/proc/sys/user/max_user_namespaces"
+)
+
+const (
+	// W20-KR2 runtime AIO bump bounds: past aioUsedRatioBump of the
+	// table the collector doubles aio-max-nr on the spot (direct
+	// sysctl write, capped at aioMaxTarget) instead of waiting for
+	// hostconfig's convergence pass — io_setup() EAGAIN surfaces as
+	// generic "storage slow" long before either runs.
+	aioUsedRatioBump = 0.75
+	aioMaxTarget     = uint64(4194304)
 )
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
@@ -156,6 +169,10 @@ var (
 		"node_host_agent_aio_used_ratio",
 		"aio-nr / aio-max-nr (0 when the max reads 0; emitted only when both parse).",
 		[]string{"node"}, nil)
+	descMaxUserNS = prometheus.NewDesc(
+		"node_host_agent_max_user_namespaces",
+		"/proc/sys/user/max_user_namespaces — userns creation ceiling (W20-KR2).",
+		[]string{"node"}, nil)
 )
 
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
@@ -168,6 +185,7 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 	// file-nr early return below (a node with no file-nr view must
 	// still export its AIO table).
 	c.collectAIO(ch)
+	c.collectUserNS(ch)
 	if f, err := os.Open(c.cfg.MountinfoFile); err == nil {
 		entries := 0.0
 		sc := bufio.NewScanner(f)
@@ -209,6 +227,29 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
 	mx, mxOK := hostutil.ReadUintFile(aioMaxFile)
+	if nrOK && mxOK {
+		// W20-KR2 — runtime aio-max-nr bump: past 75% of the table
+		// with headroom left, double the limit in place (direct
+		// sysctl write — /proc/sys rejects atomic-rename writes)
+		// so io_setup() does not EAGAIN while hostconfig's
+		// convergence pass is still pending. A failed write is
+		// silent: the gauges below still report the truth. Runs
+		// BEFORE the maximum emit so the series shows the bumped
+		// ceiling, not the pre-bump one.
+		if mx > 0 && mx < aioMaxTarget &&
+			float64(nr)/float64(mx) > aioUsedRatioBump {
+			bumped := mx * 2
+			if bumped > aioMaxTarget {
+				bumped = aioMaxTarget
+			}
+			if hostutil.WriteFileDirect(aioMaxFile,
+				strconv.FormatUint(bumped, 10)) == nil {
+				if v, ok := hostutil.ReadUintFile(aioMaxFile); ok {
+					mx = v
+				}
+			}
+		}
+	}
 	if nrOK {
 		ch <- prometheus.MustNewConstMetric(descAIOAllocated,
 			prometheus.GaugeValue, float64(nr), c.cfg.NodeName)
@@ -225,6 +266,18 @@ func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descAIORatio,
 			prometheus.GaugeValue, ratio, c.cfg.NodeName)
 	}
+}
+
+// collectUserNS emits node_host_agent_max_user_namespaces — the
+// userns creation ceiling hostconfig converges to 65536 (W20-KR2).
+// Absent file (kernel without USER_NS) emits nothing.
+func (c *Collector) collectUserNS(ch chan<- prometheus.Metric) {
+	v, ok := hostutil.ReadUintFile(maxUserNSFile)
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(descMaxUserNS,
+		prometheus.GaugeValue, float64(v), c.cfg.NodeName)
 }
 
 // collectSockstat parses /proc/1/net/sockstat — section lines of

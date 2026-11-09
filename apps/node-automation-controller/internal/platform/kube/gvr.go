@@ -109,6 +109,10 @@ var (
 		Group: "velero.io", Version: "v1", Resource: "backupstoragelocations"}
 	GVVeleroPodVolumeBackup = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "podvolumebackups"}
+	// GVVeleroPodVolumeRestore is the restore-side twin —
+	// velero-inflight-audit's W20-ST3 wedge scan.
+	GVVeleroPodVolumeRestore = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v1", Resource: "podvolumerestores"}
 	// GVVeleroBackupRepository is the restic/kopia BackupRepository —
 	// velero-backup-auditor's backup-health repo health/maintenance scan.
 	GVVeleroBackupRepository = schema.GroupVersionResource{
@@ -225,6 +229,10 @@ var (
 		Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
 	GVRVeleroDataDownload = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
+	// GVRVeleroBackup is the velero.io/v1 Backup the operator
+	// watchdog watches for the never-reconciled signature (W20).
+	GVRVeleroBackup = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v1", Resource: "backups"}
 
 	// ---------------------------------------------------------------
 	// Shipwright (failed-jobs-janitor BuildRuns; cluster-health-probes
@@ -291,6 +299,10 @@ var (
 		Group: "networking.liqo.io", Version: "v1beta1", Resource: "gatewayclients"}
 	GVRLiqoGatewayServer = schema.GroupVersionResource{
 		Group: "networking.liqo.io", Version: "v1beta1", Resource: "gatewayservers"}
+	// GVRLiqoForeignCluster is the core.liqo.io/v1beta1 ForeignCluster
+	// the liqo-controller-manager watchdog watches (W20).
+	GVRLiqoForeignCluster = schema.GroupVersionResource{
+		Group: "core.liqo.io", Version: "v1beta1", Resource: "foreignclusters"}
 	GVRCiliumNode = schema.GroupVersionResource{
 		Group: "cilium.io", Version: "v2", Resource: "ciliumnodes"}
 

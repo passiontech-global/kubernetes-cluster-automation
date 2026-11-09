@@ -145,7 +145,8 @@ var HeartbeatSweptNames = []string{
 // HeartbeatSweptNames (agent-latched). The precordon gates on
 // LastTransitionTime, not the heartbeat.
 var HangPreCordonNames = []string{
-	KernelHungTasks, FilesystemReadOnly, KubeletRuntimeStall,
+	KernelHungTasks, FilesystemReadOnly, ReadonlyFilesystem, KernelDeadlock,
+	KubeletRuntimeStall,
 	KubeletWatchWedge, PodTeardownWedged, InodePressure,
 	MemoryPSIThrashing, KernelSlabLeak, KernelResourceExhaustion,
 	CgroupDyingLeak, CiliumAgentDown, CiliumInitStuck,
@@ -191,6 +192,8 @@ var StormGateNames = []string{
 	CiliumEnvoyDown, CiliumWGStale, "CiliumLRPDegraded",
 	CiliumMTUDrift, ConntrackPressure, JournaldUnreadable,
 	ControlPlaneCertReloadStale, DiskSlowIO,
+	ClocksourceUnstable, KernelNetShimDegraded,
+	ReadonlyFilesystem, KernelDeadlock,
 }
 
 // PartitionNames are the network-partition conditions the

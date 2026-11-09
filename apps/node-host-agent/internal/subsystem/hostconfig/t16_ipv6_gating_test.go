@@ -96,8 +96,8 @@ func TestT16PairsAIOMaxGated(t *testing.T) {
 			found = kv[1]
 		}
 	}
-	if found != "1048576" {
-		t.Fatalf("fs.aio-max-nr pair = %q want \"1048576\" with the knob present", found)
+	if found != "4194304" {
+		t.Fatalf("fs.aio-max-nr pair = %q want \"4194304\" with the knob present (W20-KR2)", found)
 	}
 	// Knob removed → the pair must drop (unless the REAL host /proc
 	// exposes aio, which is out of the test's control).

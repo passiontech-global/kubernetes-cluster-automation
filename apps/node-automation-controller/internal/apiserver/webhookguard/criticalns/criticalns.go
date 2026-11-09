@@ -22,15 +22,18 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// criticalSelfHealingNamespaces are the four namespaces that run CNI,
-// DNS, the kubelet heartbeat, and the node self-healing stack itself —
-// a fail-closed admission webhook that matches any of them can
-// deadlock recovery when its own backend dies (critical-ns-audit, mirroring
-// check-webhook-guard.sh at runtime). kube-node-lease joined
-// later: its Lease objects ARE the kubelet node heartbeat, so a
-// webhook that intercepts lease writes can flap every node NotReady
-// on its own.
-var criticalSelfHealingNamespaces = []string{"kube-system", "kube-node-lease", "node-ops", "medik8s"}
+// criticalSelfHealingNamespaces are the namespaces that run CNI,
+// DNS, the kubelet heartbeat, the OLM operator stack, and the node
+// self-healing stack itself — a fail-closed admission webhook that
+// matches any of them can deadlock recovery when its own backend
+// dies (critical-ns-audit, mirroring check-webhook-guard.sh at
+// runtime). kube-node-lease joined later: its Lease objects ARE the
+// kubelet node heartbeat, so a webhook that intercepts lease writes
+// can flap every node NotReady on its own. operators joined with it:
+// every OLM Subscription/CSV/operator pod lives there, so a webhook
+// that can wedge pod creation in operators wedges the entire
+// operator-driven remediation fleet at once.
+var criticalSelfHealingNamespaces = []string{"kube-system", "kube-node-lease", "node-ops", "medik8s", "operators"}
 
 // webhookHeartbeatResources is the rule-resource set on the node/pod
 // lifecycle heartbeat path — the runtime twin of check-webhook-guard.sh's
@@ -44,6 +47,20 @@ var webhookHeartbeatResources = map[string]bool{
 	"pods/status":   true,
 	"pods/eviction": true,
 	"leases":        true,
+	"*":             true,
+	"*/*":           true,
+}
+
+// heartbeatClusterScopedResources are the heartbeat hits a
+// namespaceSelector can NEVER exclude: nodes/status is cluster-scoped
+// (the API server does not consult namespaceSelector for it at all),
+// pods/eviction wedges every drain in EVERY namespace, and the
+// wildcards cover both by definition. auditHeartbeat flags these
+// unconditionally; pods/status and leases stay namespaced and keep
+// the critical-namespace match requirement.
+var heartbeatClusterScopedResources = map[string]bool{
+	"nodes/status":  true,
+	"pods/eviction": true,
 	"*":             true,
 	"*/*":           true,
 }
@@ -240,7 +257,7 @@ func mergeExclusion(sel *metav1.LabelSelector) map[string]any {
 // node_automation_webhook_missing_critical_ns_exclusion=1 when the
 // sub-webhook's namespaceSelector matches any of the critical
 // self-healing namespaces (kube-system, kube-node-lease, node-ops,
-// medik8s).
+// medik8s, operators).
 //
 // auditExclusions adds the optional auto-patch (WEBHOOK_CRITICAL_NS_ENFORCE_
 // ENABLED=true): each flagged webhook outside the allowlist gets the
@@ -381,14 +398,19 @@ func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 
 // auditHeartbeat audits live Mutating/Validating admission
 // sub-webhooks with failurePolicy=Fail (or the nil default) whose
-// rules[].resources intercept a heartbeat-path resource while the
-// namespaceSelector still matches a critical self-healing namespace,
-// emitting node_automation_webhook_heartbeat_resource_exposed
+// rules[].resources intercept a heartbeat-path resource, emitting
+// node_automation_webhook_heartbeat_resource_exposed
 // {kind,name,webhook,resource}=1 per matched rule resource (the
 // literal — wildcards stay wildcards, matching the static guard's
-// grammar). A selector that already excludes the critical namespaces
-// emits nothing: the webhook can still wedge itself, but it can no
-// longer wedge the cluster's self-healing path.
+// grammar). The namespaceSelector split is resource-aware: hits on
+// cluster-scoped or every-namespace paths (nodes/status — the API
+// server never consults namespaceSelector for it — pods/eviction,
+// and the wildcards) flag regardless of the selector, while the
+// namespaced hits (pods/status, leases) only flag when the selector
+// still matches a critical self-healing namespace. A selector that
+// already excludes the critical namespaces silences the namespaced
+// half: the webhook can still wedge itself, but it can no longer
+// wedge the cluster's self-healing path.
 func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 	s.heartbeatEmitted.Begin() // drop any aborted sweep's leftover emissions
 	matchesCriticalNS, ok := matcher(snap)
@@ -398,11 +420,14 @@ func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 	// emitWebhook flags one webhook: each rule's resources are matched
 	// against the heartbeat set GROUP-AWARE (see heartbeatRuleHits) and
 	// each hit becomes a series keyed "kind/name/webhook/resource".
-	emitWebhook := func(kind, cfgName, hookName string, rules []admissionv1.RuleWithOperations) {
+	// nsOK is the selector verdict for THIS webhook — consulted only
+	// for the namespaced heartbeat resources.
+	emitWebhook := func(kind, cfgName, hookName string,
+		rules []admissionv1.RuleWithOperations, nsOK bool) {
 		seen := map[string]bool{}
 		for _, rule := range rules {
 			for _, res := range heartbeatRuleHits(rule) {
-				if seen[res] {
+				if seen[res] || (!nsOK && !heartbeatClusterScopedResources[res]) {
 					continue
 				}
 				seen[res] = true
@@ -414,10 +439,10 @@ func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 	}
 	forEachConfig(snap, func(kind, cfgName string, hooks []hookView) {
 		for _, w := range hooks {
-			if !guardstate.FailClosed(w.fp) || !matchesCriticalNS(w.sel) {
+			if !guardstate.FailClosed(w.fp) {
 				continue
 			}
-			emitWebhook(kind, cfgName, w.name, w.rules)
+			emitWebhook(kind, cfgName, w.name, w.rules, matchesCriticalNS(w.sel))
 		}
 	})
 	s.heartbeatEmitted.Prune(metrics.WebhookHeartbeatResourceExposed.DeleteLabelValues)

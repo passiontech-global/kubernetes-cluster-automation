@@ -84,6 +84,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "velero.io", Version: "v1", Kind: "Backup"},
 	{Group: "velero.io", Version: "v1", Kind: "BackupStorageLocation"},
 	{Group: "velero.io", Version: "v1", Kind: "PodVolumeBackup"},
+	// PodVolumeRestore — velero-inflight-audit's W20-ST3 restore-side
+	// wedge scan; "podvolumerestores" pluralizes via trailing-"e" +"s".
+	{Group: "velero.io", Version: "v1", Kind: "PodVolumeRestore"},
 	// BackupRepository — velero-backup-auditor's backup-health repo scan;
 	// BackupRepository -> "backuprepositories" pluralizes correctly
 	// via the trailing-"y" -> "ies" rule.
@@ -95,9 +98,12 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Application"},
 	{Group: "argoproj.io", Version: "v1beta1", Kind: "ArgoCD"},
 
-	// olm (clusterhealthprobes' subscription-health check).
+	// olm (clusterhealthprobes' subscription-health check + the
+	// W20-CP3 InstallPlan auto-approver — InstallPlan ->
+	// "installplans" pluralizes via the trailing-"n" -> +"s" rule).
 	{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "ClusterServiceVersion"},
 	{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription"},
+	{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "InstallPlan"},
 
 	// percona operator clusters (clusterhealthprobes) + the postgres
 	// WAL guard's CNPG scan.
@@ -128,6 +134,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "Connection"},
 	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "GatewayClient"},
 	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "GatewayServer"},
+	// liqo foreign-cluster CR — operator-watchdog's liqo target
+	// signature scan (core.liqo.io, not networking.liqo.io).
+	{Group: "core.liqo.io", Version: "v1beta1", Kind: "ForeignCluster"},
 
 	// medik8s self-node-remediation family (deadnodesweeper,
 	// clusterhealthprobes' nodehealthchecks scan).

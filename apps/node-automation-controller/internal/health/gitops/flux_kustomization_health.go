@@ -46,6 +46,10 @@ type fluxKustomizationHealthCheck struct {
 	// patch leaves behind (heal.PersistedCooledDown reads the wider
 	// of the two, so `flux reconcile` stamps count too).
 	reconcileHealed state.CooldownSet
+	// sourceNudgeHealed is the same cooldown shape for the W20-GO2
+	// source-side nudge — keyed per source object, since one source
+	// artifact failure fans out to every consumer Kustomization.
+	sourceNudgeHealed state.CooldownSet
 	// emitted is the emitted-gauge ledger — a tuple that stops being
 	// reported gets DeleteLabelValues'd rather than leaking a stale 1.
 	emitted state.GaugeLedger[string]
@@ -188,6 +192,15 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	log logr.Logger, kust *unstructured.Unstructured, reason string, now time.Time) {
 
 	key := kust.GetNamespace() + "/" + kust.GetName()
+	// W20-GO2: an ArtifactFailed signature usually means the SOURCE
+	// object's cached artifact is corrupt (source-controller pod
+	// restart mid-fetch) — stamping requestedAt on the Kustomization
+	// alone re-reads the same bad tarball. The source-side nudge is
+	// independent of the dependsOn chain: a broken upstream artifact
+	// is the source's problem, not the consumer's.
+	if reason == "ArtifactFailed" {
+		p.nudgeFluxSourceArtifact(ctx, log, kust, now)
+	}
 	if !p.fluxKustDepsReady(ctx, kust) {
 		return
 	}
@@ -251,6 +264,60 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	}
 	log.Info("PATCH: flux kustomization reconcile requestedAt",
 		"kustomization", key, "reason", reason)
+}
+
+// nudgeFluxSourceArtifact stamps reconcile.fluxcd.io/requestedAt on
+// the Kustomization's spec.sourceRef object (GitRepository /
+// OCIRepository / Bucket) so source-controller refetches the artifact
+// instead of serving the corrupt cached tarball that produced the
+// ArtifactFailed signature. Same 30m cooldown + maintenance-mutex +
+// heal-budget gate as the consumer nudge, keyed per source so N
+// consumers of one broken source do not stamp it N times.
+func (p *fluxKustomizationHealthCheck) nudgeFluxSourceArtifact(ctx context.Context,
+	log logr.Logger, kust *unstructured.Unstructured, now time.Time) {
+
+	kind, ns, name, ok := kube.FluxConsumerSourceRef(kust)
+	if !ok {
+		return
+	}
+	gvr, ok := kube.FluxSourceGVR(kind)
+	if !ok {
+		return
+	}
+	src, err := p.Dyn.Resource(gvr).Namespace(ns).
+		Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		log.V(1).Info("source artifact nudge — source lookup failed",
+			"kind", kind, "source", ns+"/"+name, "error", err)
+		return
+	}
+	ck := probefw.SelfHealKey(CheckNameFluxKustomizationHealth,
+		"source/"+kind+"/"+ns+"/"+name)
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.sourceNudgeHealed, src,
+		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
+		return
+	}
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.Dyn.Resource(gvr).Namespace(ns).
+				Patch(ctx, name, types.MergePatchType,
+					data, metav1.PatchOptions{})
+			return err
+		},
+		kube.AnnoFluxRequestedAt, &p.sourceNudgeHealed, ck, now); err != nil {
+		metrics.IncError(p.Name)
+		log.Error(err, "flux source requestedAt patch failed",
+			"source", kind+"/"+ns+"/"+name)
+		return
+	}
+	log.Info("PATCH: flux source reconcile requestedAt (artifact refetch)",
+		"source", kind+"/"+ns+"/"+name)
 }
 
 // fluxSourceNudgeFresh reports whether the Kustomization's Flux

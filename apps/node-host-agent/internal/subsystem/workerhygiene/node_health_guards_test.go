@@ -112,8 +112,8 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	// Past the interval the sweep runs again.
 	e.Now = e.Now.Add(31 * time.Minute)
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if len(e.SDCmds) != before+2 { // list + reset again
-		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+2)
+	if len(e.SDCmds) != before+3 { // list + deactivating-list + reset again
+		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+3)
 	}
 }
 

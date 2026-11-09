@@ -25,6 +25,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -44,7 +45,6 @@ import (
 func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	backups *unstructured.UnstructuredList) error {
 	a.seenStuckBackup.Begin() // drop any aborted sweep's leftover emissions
-	a.seenWedgedPVB.Begin()   // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
@@ -68,59 +68,89 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	}
 	a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 
-	// --- PodVolumeBackups: mark + conditional cleanup ---
-	pvbs, err := a.veleroList(ctx, veleroPVBGVR)
+	// --- PodVolumeBackups + PodVolumeRestores: mark + conditional
+	// cleanup (W20-ST3 added the restore side — same lost-thread
+	// signature, same node-agent bounce) ---
+	if err := a.auditWedgedTransferKind(ctx, veleroPVBGVR, "pvb",
+		metrics.VeleroPodVolumeBackupWedged, &a.seenWedgedPVB); err != nil {
+		return err
+	}
+	if err := a.auditWedgedTransferKind(ctx, veleroPVRGVR, "pvr",
+		metrics.VeleroPodVolumeRestoreWedged, &a.seenWedgedPVR); err != nil {
+		return err
+	}
+	// Cooldown hygiene once per cycle: a stamp past the window can
+	// never cool again, so expired entries are dead weight in an
+	// otherwise append-only ledger. pvbHealed is shared across both
+	// kinds — the cooldown key is the node-agent's node either way.
+	a.pvbHealed.Prune(func(_ string, last time.Time) bool {
+		return now.Sub(last) < veleroPVBCleanupCooldown
+	})
+	return nil
+}
+
+// auditWedgedTransferKind is the per-GVR body of the
+// velero-inflight-audit wedge sweep shared by PodVolumeBackup and
+// PodVolumeRestore (W20-ST3): every object held InProgress|Deleting
+// past veleroStuckMaxAge (6h) has lost its node-agent thread —
+// Backups are mark-only, but a wedged volume transfer whose agent
+// provably died gets deleted AND its node-agent pod bounced so the
+// next backup/restore is not blocked behind it. CRD absence prunes
+// the kind's series and stops quietly.
+func (a *veleroBackupAuditor) auditWedgedTransferKind(ctx context.Context,
+	gvr schema.GroupVersionResource, kind string,
+	gauge *prometheus.GaugeVec, seen *state.GaugeLedger[pausedKey]) error {
+
+	seen.Begin() // drop any aborted sweep's leftover emissions
+	log := logf.FromContext(ctx)
+	now := a.now.Now()
+
+	items, err := a.veleroList(ctx, gvr)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — clear any stale wedge series and stop.
-		a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
+		seen.Prune(gauge.DeleteLabelValues)
 		return nil
 	case err != nil:
-		return fmt.Errorf("list velero podvolumebackups: %w", err)
+		return fmt.Errorf("list velero %s: %w", gvr.Resource, err)
 	}
 
 	cleaned := 0
-	for i := range pvbs.Items {
-		pvb := &pvbs.Items[i]
-		phase, _ := kube.NestedString(pvb.Object, "status", "phase")
+	for i := range items.Items {
+		obj := &items.Items[i]
+		phase, _ := kube.NestedString(obj.Object, "status", "phase")
 		if phase != "InProgress" && phase != "Deleting" {
 			continue
 		}
-		since := inFlightSince(pvb)
+		since := inFlightSince(obj)
 		if now.Sub(since) <= veleroStuckMaxAge {
 			continue
 		}
-		ns, name := pvb.GetNamespace(), pvb.GetName()
+		ns, name := obj.GetNamespace(), obj.GetName()
 		k := pausedKey{ns, name}
-		a.seenWedgedPVB.Set(metrics.VeleroPodVolumeBackupWedged, 1, k, ns, name)
-		log.Info("velero podvolumebackup wedged in-flight >6h",
-			"pvb", ns+"/"+name, "phase", phase)
+		seen.Set(gauge, 1, k, ns, name)
+		log.Info("velero transfer object wedged in-flight >6h",
+			"kind", kind, "object", ns+"/"+name, "phase", phase)
 
-		// Only an InProgress PVB is a cleanup candidate — a
+		// Only an InProgress object is a cleanup candidate — a
 		// Deleting one is already on its way out.
 		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
 			continue
 		}
-		// The cleanup cooldown is keyed on the NODE, not the PVB:
+		// The cleanup cooldown is keyed on the NODE, not the object:
 		// the destructive half is the node-agent pod bounce, and
-		// several wedged PVBs can share one agent — per-PVB keys
-		// would bounce the same pod once per wedged backup.
-		coolKey := "node-agent/" + pvbNode(pvb)
+		// several wedged transfers can share one agent — per-object
+		// keys would bounce the same pod once per wedged transfer.
+		coolKey := "node-agent/" + pvbNode(obj)
 		if a.pvbHealed.CooledDown(coolKey, veleroPVBCleanupCooldown, now) {
 			continue
 		}
-		if a.cleanWedgedPVB(ctx, pvb, since, now) {
+		if a.cleanWedgedTransfer(ctx, gvr, obj, since, now, kind) {
 			a.pvbHealed.Stamp(coolKey, now)
 			cleaned++
 		}
 	}
-	a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
-	// Cooldown hygiene once per cycle: a stamp past the window can
-	// never cool again, so expired entries are dead weight in an
-	// otherwise append-only ledger.
-	a.pvbHealed.Prune(func(_ string, last time.Time) bool {
-		return now.Sub(last) < veleroPVBCleanupCooldown
-	})
+	seen.Prune(gauge.DeleteLabelValues)
 	return nil
 }
 
@@ -228,26 +258,29 @@ func inFlightSince(u *unstructured.Unstructured) time.Time {
 	return since
 }
 
-// cleanWedgedPVB decides whether the PVB's node-agent provably lost
-// its Kopia thread and, if so, deletes the PVB and bounces the agent
-// pod. The delete phase is destructive on TWO counts — a CR object
-// and a LIVE pod — so it gates on heal.AllowedV (cooldown +
-// maintenance mutex, fail closed on unverifiable) before any write.
-// Returns true when the cleanup ran (cooldown-worthy).
-func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
-	pvb *unstructured.Unstructured, pvbStart, now time.Time) bool {
+// cleanWedgedTransfer decides whether the transfer object's
+// node-agent provably lost its Kopia thread and, if so, deletes the
+// object and bounces the agent pod. kind is "pvb" or "pvr" — it only
+// feeds log fields and the cleaned-counter action label. The delete
+// phase is destructive on TWO counts — a CR object and a LIVE pod —
+// so it gates on heal.AllowedV (cooldown + maintenance mutex, fail
+// closed on unverifiable) before any write. Returns true when the
+// cleanup ran (cooldown-worthy).
+func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
+	gvr schema.GroupVersionResource, obj *unstructured.Unstructured,
+	objStart, now time.Time, kind string) bool {
 	log := logf.FromContext(ctx)
-	agent, err := a.pvbAgentPod(ctx, pvb)
+	agent, err := a.pvbAgentPod(ctx, obj)
 	if err != nil {
-		log.Error(err, "pvb agent pod lookup failed — cleanup skipped",
-			"pvb", pvb.GetNamespace()+"/"+pvb.GetName())
+		log.Error(err, "transfer agent pod lookup failed — cleanup skipped",
+			"kind", kind, "object", obj.GetNamespace()+"/"+obj.GetName())
 		metrics.IncError(a.queue)
 		return false
 	}
-	if !pvbAgentWedged(pvbStart, agent) {
+	if !pvbAgentWedged(objStart, agent) {
 		return false // agent still owns the thread — not provably wedged
 	}
-	ns, name := pvb.GetNamespace(), pvb.GetName()
+	ns, name := obj.GetNamespace(), obj.GetName()
 	// The whole delete phase (PVB object + node-agent pod bounce)
 	// defers while deliberate maintenance is in flight — a cordon or
 	// k0s upgrade already removes agent pods, and an unverifiable
@@ -255,7 +288,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	// cooldown key is the node-agent's node — the same key the
 	// caller stamped under.
 	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs, a.dyn,
-		&a.pvbHealed, "node-agent/"+pvbNode(pvb), veleroPVBCleanupCooldown, now)
+		&a.pvbHealed, "node-agent/"+pvbNode(obj), veleroPVBCleanupCooldown, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(a.queue)
@@ -263,17 +296,19 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	case !proceed:
 		return false
 	}
-	uid := pvb.GetUID()
-	if err := a.dyn.Resource(veleroPVBGVR).Namespace(ns).Delete(ctx, name,
+	uid := obj.GetUID()
+	if err := a.dyn.Resource(gvr).Namespace(ns).Delete(ctx, name,
 		kube.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "wedged pvb delete failed", "pvb", ns+"/"+name)
+		log.Error(err, "wedged transfer delete failed",
+			"kind", kind, "object", ns+"/"+name)
 		metrics.IncError(a.queue)
 		return false
 	}
 	metrics.VeleroWedgedObjectsCleanedTotal.
-		WithLabelValues(ns, "pvb_deleted").Inc()
-	log.Info("ACTION: deleted wedged podvolumebackup",
-		"pvb", ns+"/"+name, "agentPod", agentPodName(agent))
+		WithLabelValues(ns, kind+"_deleted").Inc()
+	log.Info("ACTION: deleted wedged velero transfer object",
+		"kind", kind, "object", ns+"/"+name,
+		"agentPod", agentPodName(agent))
 
 	// Bounce the node-agent pod so its next scheduled backup starts
 	// clean — the DaemonSet recreates it. A missing agent pod needs

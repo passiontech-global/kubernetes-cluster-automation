@@ -73,8 +73,13 @@ type Deps struct {
 	Actions   *prometheus.CounterVec // check, action
 	RVGap     prometheus.Gauge
 	KineConns prometheus.Gauge
-	OOMWindow prometheus.Gauge
-	Feeding   prometheus.Gauge
+	// KineStuckConns counts kine's DB-port sockets wedged in
+	// CLOSE_WAIT/FIN_WAIT2 or retransmitting (W20-CP2) — the
+	// orphaned-connection half of the pool guard the conn count
+	// alone cannot see.
+	KineStuckConns prometheus.Gauge
+	OOMWindow      prometheus.Gauge
+	Feeding        prometheus.Gauge
 	// Etcdguard gauges — only set when <K0sDir>/bin/etcdctl +
 	// pki/etcd/ca.crt exist (embedded-etcd controllers).
 	EtcdDBSize  prometheus.Gauge

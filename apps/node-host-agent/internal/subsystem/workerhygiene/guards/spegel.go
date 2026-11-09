@@ -6,6 +6,7 @@ package guards
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"time"
 
@@ -19,6 +20,12 @@ import (
 
 const (
 	spegelMinPodAge = 3 * time.Minute
+	// spegelContainerdSock is the host socket the spegel pod
+	// bind-mounts for its containerd registry mirror; a
+	// k0sworker/containerd restart replaces the inode while the
+	// pod keeps serving the dead one (W20-KR3).
+	spegelContainerdSock  = "/run/k0s/containerd.sock"
+	spegelSockStaleMargin = 2 * time.Minute
 )
 
 var (
@@ -59,10 +66,50 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		sp = p
 		break
 	}
-	if sp == nil || wdeps.PodReady(sp) {
-		// No spegel DS on this node, or the pod is healthy — either
-		// way the mirror datapath isn't our problem; clear stale
-		// evidence like wdeps.CheckCilium's no-agent path.
+	if sp == nil {
+		// No spegel DS on this node — clear stale evidence like
+		// wdeps.CheckCilium's no-agent path.
+		c.Fails = 0
+		c.d.State.Exit(latchdefs.LatchSpegelMirrorDegraded, nil)
+		c.d.CycleResult(wdeps.CheckSpegel, "ok")
+		return
+	}
+	// W20-KR3 stale socket inode: the pod can read Ready while its
+	// bind-mounted /run/k0s/containerd.sock points at a dead inode —
+	// k0sworker/containerd restarted AFTER the pod started, so the
+	// mirror serves a socket that no longer exists. ModTime newer
+	// than pod creation + margin is the proof; a missing/unreadable
+	// socket is inconclusive and skips (pod-mode agents without a
+	// host /run view land here too).
+	if spegelSocketStale(sp.CreationTimestamp.Time) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: spegel-mirror %s/%s holds stale containerd.sock inode (socket recreated after pod start)",
+			sp.Namespace, sp.Name))
+		if !c.d.State.RateTrySpend("last-spegel-restart",
+			c.d.Cfg.MinRestartInterval) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: spegel stale socket but restart in cooldown (<30m), skip"))
+			c.d.CycleResult(wdeps.CheckSpegel, "ok")
+			return
+		}
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: spegel-mirror deleted pod %s/%s - stale containerd.sock inode (k0sworker/containerd restarted under it)",
+			sp.Namespace, sp.Name))
+		if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
+			metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: spegel-mirror delete %s/%s failed: %v",
+				sp.Namespace, sp.Name, err))
+		} else {
+			c.Fails = 0
+			c.d.Actions.WithLabelValues(wdeps.CheckSpegel, "pod_delete").Inc()
+		}
+		c.d.CycleResult(wdeps.CheckSpegel, "ok")
+		return
+	}
+	if wdeps.PodReady(sp) {
+		// Pod healthy and socket fresh — the mirror datapath isn't
+		// our problem; clear stale evidence.
 		c.Fails = 0
 		c.d.State.Exit(latchdefs.LatchSpegelMirrorDegraded, nil)
 		c.d.CycleResult(wdeps.CheckSpegel, "ok")
@@ -97,4 +144,18 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Actions.WithLabelValues(wdeps.CheckSpegel, "pod_delete").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckSpegel, "ok")
+}
+
+// spegelSocketStale reports whether the host's containerd socket was
+// recreated after the spegel pod started — ModTime newer than pod
+// creation plus spegelSockStaleMargin proves k0sworker/containerd
+// restarted under the pod, leaving it bound to a dead inode. Any
+// stat failure (no host /run view, socket absent mid-restart) is
+// inconclusive → false, never a false-positive delete.
+func spegelSocketStale(podCreated time.Time) bool {
+	fi, err := os.Stat(spegelContainerdSock)
+	if err != nil {
+		return false
+	}
+	return fi.ModTime().After(podCreated.Add(spegelSockStaleMargin))
 }

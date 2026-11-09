@@ -63,6 +63,9 @@ var ciliumDatapathQueries = []struct {
 	{"invalid_identity_drops",
 		`sum(rate(cilium_drop_count_total{reason=~"Invalid identity|Unknown L3 target address"}[5m])) > 1`,
 		"drops from stale ipcache identities"},
+	{"nat_ct_map_exhaustion",
+		`sum by (node, reason) (rate(cilium_drop_count_total{reason=~"(?i).*nat.*|.*ct.*"}[5m])) > 1`,
+		"drops from NAT/CT map exhaustion (SNAT port or conntrack table full)"},
 }
 
 var (

@@ -504,6 +504,70 @@ var operatorTargets = []operatorTarget{
 				stuck: gatewayStatusStuck, owns: cftOwnsRouteParent},
 		},
 	},
+	{
+		// cloudnative-pg (W20): the CNPG instance operator in
+		// cnpg-system — Cluster CRs whose status.observedGeneration
+		// lags while the manager lease renews are the same
+		// wedged-queue signature the other typed operators carry.
+		name:          "cloudnative-pg",
+		leaseNS:       "cnpg-system",
+		leaseNames:    []string{"cnpg-controller-manager", "cloudnative-pg"},
+		podSelector:   "app.kubernetes.io/name=cloudnative-pg",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr:    kube.GVRCNPGCluster,
+			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+		}},
+	},
+	{
+		// velero (W20): the backup controller in velero — a Backup
+		// whose status.phase never lands means the controller never
+		// picked the object up (the in-flight backup audit owns the
+		// stuck-InProgress class; this row owns never-reconciled).
+		name:          "velero",
+		leaseNS:       "velero",
+		leaseNames:    []string{"velero", "velero-leader-election"},
+		podSelector:   "app.kubernetes.io/name=velero",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr:    kube.GVRVeleroBackup,
+			reason: opReasonNoPhase, stuck: emptyStatusPhase,
+		}},
+	},
+	{
+		// fence-agents-remediation (W20): the FAR operator in
+		// operators — medik8s election ids are per-operator hashes
+		// (e1f13584/547f6cb6.medik8s.io for NHC/SNR) and FAR's is not
+		// pinned here, so the leaseOptional Running-pod fallback is
+		// the liveness proof; the CR signature is the same sparse-
+		// status medik8s variant noStatusAtAll covers.
+		name:          "fence-agents-remediation-operator",
+		leaseNS:       "operators",
+		podSelector:   "app.kubernetes.io/name=fence-agents-remediation-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr:    kube.GVRFenceAgentsRemediation,
+			reason: opReasonNoStatus, stuck: noStatusAtAll,
+		}},
+	},
+	{
+		// liqo-controller-manager (W20): the Liqo control plane in
+		// liqo — ForeignCluster CRs whose status.conditions never
+		// land mean the peering controller never reconciled them.
+		name:          "liqo-controller-manager",
+		leaseNS:       "liqo",
+		leaseNames:    []string{"liqo-controller-manager"},
+		podSelector:   "app.kubernetes.io/name=liqo-controller-manager",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr:    kube.GVRLiqoForeignCluster,
+			reason: opReasonNoConditions, stuck: noStatusConditions,
+		}},
+	},
 }
 
 // cftGatewayClassName is the GatewayClass the cloudflare-tunnel
