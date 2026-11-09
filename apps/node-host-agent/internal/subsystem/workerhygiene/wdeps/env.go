@@ -37,7 +37,7 @@ type EnvDeps struct {
 // in the package, not in cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_HYGIENE) plus the node-name-empty and
 // kube-client-build checks stay in the caller. Fields wiring never
-// set (KubeletHealthzURL, the T15 feeder knobs, the wave-2/7/8/9/10
+// set (KubeletHealthzURL, the T15 feeder knobs, the subsystem
 // defaults, …) stay zero — New's applyDefaults fills them exactly as
 // before.
 func ConfigFromEnv(d EnvDeps) Config {

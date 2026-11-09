@@ -181,7 +181,7 @@ func TestFluxKustHealthCheckFailedGate(t *testing.T) {
 	}
 }
 
-// The W18-5 Rollout twin of the HealthCheckFailed gate: the applied
+// The argo-rollout-gates Rollout twin of the HealthCheckFailed gate: the applied
 // argoproj.io Rollout corroborates the failure — a ready Rollout
 // admits the nudge, an unready one does not.
 func TestFluxKustHealthCheckFailedGateRollout(t *testing.T) {

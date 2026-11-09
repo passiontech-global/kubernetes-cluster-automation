@@ -1,4 +1,4 @@
-// pod_bounce.go — the W9-CP1 stage-1 remediation behind the C1
+// pod_bounce.go — the circuit-breaker-bounce stage-1 remediation behind the C1
 // circuit breaker: a webhook backend whose Ready endpoints ALL fail
 // the TCP+TLS handshake has hung pods, not partitioned ones, so the
 // sweep deletes the oldest Ready backing pod for its controller to
@@ -22,7 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// bounceHungWebhookPods is the W9-CP1 stage-1 remediation: for every
+// bounceHungWebhookPods is the circuit-breaker-bounce stage-1 remediation: for every
 // Service referenced by a webhook config whose census verdict is
 // "unresponsive" (Ready endpoints on healthy nodes, ALL probed IPs
 // failing TCP+TLS), delete the oldest Ready backing pod — its owner

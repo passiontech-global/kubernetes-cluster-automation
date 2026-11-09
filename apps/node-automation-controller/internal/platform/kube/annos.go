@@ -117,12 +117,12 @@ const (
 	// AnnoFirstSeenStormGateHold is descheduler-storm-gate's persisted
 	// first-seen stamp for a passiontech.dev/storm-gate-hold="true"
 	// hold — the hold annotation carries no timestamp of its own, so
-	// the W18-9 MaintenanceHoldStale warning (>2h continuous hold)
+	// the maintenance-hold-stale MaintenanceHoldStale warning (>2h continuous hold)
 	// measures from this map on the descheduler Deployment.
 	AnnoFirstSeenStormGateHold = "passiontech.dev/first-seen-storm-gate-hold"
 	// AnnoFirstSeenNHCPause is the same persisted first-seen window
 	// for a NodeHealthCheck whose spec.pauseRequests has been
-	// non-empty — the W18-9 MaintenanceHoldStale warning rides this
+	// non-empty — the maintenance-hold-stale MaintenanceHoldStale warning rides this
 	// map on the NHC object itself.
 	AnnoFirstSeenNHCPause = "passiontech.dev/first-seen-nhc-pause"
 	// AnnoLastLinkerdOpaquePatch is linkerd-protocol-detection-stall's

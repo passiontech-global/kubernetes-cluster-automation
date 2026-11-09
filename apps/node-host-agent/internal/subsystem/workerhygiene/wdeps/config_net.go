@@ -10,8 +10,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// NetConfig groups the network knobs: the W9 orphan cni-* netns
-// reaper root and the W7-H3 node-local-dns datapath probe.
+// NetConfig groups the network knobs: the orphan cni-* netns
+// reaper root and the envoy-xds-lrp node-local-dns datapath probe.
 type NetConfig struct {
 	NetnsDir          string // host /run/netns — orphan cni-* netns files
 	LocalDNSProbeAddr string // node-local-dns :53 probe target (169.254.20.10:53)
@@ -30,11 +30,11 @@ func (n *NetConfig) applyDefaults() {
 	}
 }
 
-// envKnobs returns the network domain's env rows — the W7 local-dns
+// envKnobs returns the network domain's env rows — the local-dns
 // probe pair (empty env → in-package defaults).
 func (n *NetConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
-		// W7 knobs — empty env → in-package defaults.
+		// env knobs — empty env → in-package defaults.
 		envx.StringKnob(envnames.EnvLocaldnsProbeAddr, &n.LocalDNSProbeAddr, ""),
 		envx.StringKnob(envnames.EnvLocaldnsProbeName, &n.LocalDNSProbeName, ""),
 	}

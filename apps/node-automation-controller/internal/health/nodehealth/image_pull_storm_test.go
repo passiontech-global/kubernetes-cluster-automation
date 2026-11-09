@@ -1,5 +1,5 @@
 // image_pull_storm_test.go — coverage for the image-pull-storm
-// check (W10-GI5): first-seen persistence window, single-namespace
+// check (image-pull-storm): first-seen persistence window, single-namespace
 // vs registry-outage classification, healthy pass.
 package nodehealth
 

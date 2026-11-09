@@ -1,5 +1,5 @@
 // olm_subscription_health_test.go — coverage for the
-// olm-subscription-health check (W7-C5): absent-CRD quiet, stuck
+// olm-subscription-health check (olm-subscription-health): absent-CRD quiet, stuck
 // CSV heal, unhealthy subscription, cert-rotation overdue.
 package datastore
 
@@ -27,7 +27,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W7-C5 — olm-subscription-health
+// olm-subscription-health — olm-subscription-health
 // ---------------------------------------------------------------------------
 
 // olmUnstructured builds an OLM object with the fields the check
@@ -396,7 +396,7 @@ func olmAnnoKeys(obj *unstructured.Unstructured) map[string]string {
 }
 
 // ---------------------------------------------------------------------------
-// W17 — the olm-operator heal budget.
+// heal-budget — the olm-operator heal budget.
 // ---------------------------------------------------------------------------
 
 // At most ONE olm-operator pod is deleted per cycle even when two

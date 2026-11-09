@@ -1,10 +1,10 @@
-// pidfd.go — W10-KR2 updatePidFDPressure: pid/thread/fd utilization
+// pidfd.go — pid-fd-pressure updatePidFDPressure: pid/thread/fd utilization
 // ratios → state-pid-fd-pressure (KernelResourceExhaustion) + the
-// node_agent_*_utilization_ratio textfile gauges (the W10 metric
+// node_agent_*_utilization_ratio textfile gauges (the node_agent metric
 // channel — same convention the controllerhygiene textfile channel
 // uses — adding a prometheus desc means a row in the parent's
 // domains.go domainTable, and the textfile channel needs no
-// registry change). The Wave-10 contract overview lives in
+// registry change). The kernelfail contract overview lives in
 // kernelfail.go.
 package kernelfail
 
@@ -40,7 +40,7 @@ var textfileDirOverride string
 // shared because the engine cannot import its parent.
 var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
 
-// --- W10-KR2: pid/thread/fd exhaustion ---
+// --- pid-fd-pressure: pid/thread/fd exhaustion ---
 
 // kernelProcRatios computes the three utilization ratios the
 // state-pid-fd-pressure latch and the node_agent_* textfile gauges
@@ -104,7 +104,7 @@ func (r *Runner) readProcFloat(elem string) (float64, bool) {
 	return v, true
 }
 
-// updatePidFDPressure drives state-pid-fd-pressure (W10-KR2 →
+// updatePidFDPressure drives state-pid-fd-pressure (pid-fd-pressure →
 // KernelResourceExhaustion): the WORST of the pid/thread/fd ratios
 // above 0.90 for kernelProcPressureNeeded consecutive latch ticks.
 // The count persists in the state dir so an agent restart keeps the
@@ -160,7 +160,7 @@ func (r *Runner) updatePidFDPressure() {
 	r.deps.Store.Exit(latchdefs.LatchPIDFDPressure, nil)
 }
 
-// --- W10 textfile metrics (node-exporter channel) ---
+// --- node_agent textfile metrics (node-exporter channel) ---
 
 // textfileDir resolves the node-exporter textfile drop dir —
 // <HostRoot>/var/lib/node-exporter/textfile (the controllerhygiene
@@ -174,7 +174,7 @@ func (r *Runner) textfileDir() string {
 		"var", "lib", "node-exporter", "textfile")
 }
 
-// writeKernelUtilProm emits the W10-KR2 utilization gauges —
+// writeKernelUtilProm emits the pid-fd-pressure utilization gauges —
 // node_agent_{pids,threads,file_nr}_utilization_ratio. Each series
 // appears only when its source parsed (no fake 0s — the
 // collectFileFD rule). promfile.Write stages + renames so

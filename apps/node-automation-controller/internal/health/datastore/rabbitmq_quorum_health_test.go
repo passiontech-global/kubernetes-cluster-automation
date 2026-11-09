@@ -1,5 +1,5 @@
 // rabbitmq_quorum_health_test.go — coverage for the
-// rabbitmq-quorum-health check (W10-ST3): alarm FAIL, stuck-
+// rabbitmq-quorum-health check (rabbitmq-quorum-health): alarm FAIL, stuck-
 // unready heal with quorum, healthy pass.
 package datastore
 
@@ -206,7 +206,7 @@ func TestRabbitMQQuorumHealthyPasses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12 P0-2 — the quorum-breaking delete fixes.
+// rabbitmq-quorum-heal — the quorum-breaking delete fixes.
 // ---------------------------------------------------------------------------
 
 // Sub-bug (a): the Ready census is per RabbitmqCluster, not per
@@ -419,7 +419,7 @@ func rabbitMQMemberPod(ns, name string, ready bool) *corev1.Pod {
 // RabbitmqCluster — the operator stamps app.kubernetes.io/name with
 // the owning CR's name next to the part-of/component labels
 // isRabbitMQPod matches on; the per-cluster census keys on it
-// (W12 P0-2a).
+// (rabbitmq-quorum-heal).
 func rabbitMQClusterPod(ns, cluster, name string, ready bool) *corev1.Pod {
 	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, ready, time.Hour)
 	pod.Labels = map[string]string{
@@ -432,7 +432,7 @@ func rabbitMQClusterPod(ns, cluster, name string, ready bool) *corev1.Pod {
 
 // rabbitMQOwnedPod builds a member pod WITHOUT the
 // app.kubernetes.io/name label — the census falls back to
-// controller-owner grouping by StatefulSet UID (W12 P0-2a).
+// controller-owner grouping by StatefulSet UID (rabbitmq-quorum-heal).
 func rabbitMQOwnedPod(ns, name string, ready bool, ownerUID string) *corev1.Pod {
 	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, ready, time.Hour)
 	pod.Labels = map[string]string{
@@ -444,7 +444,7 @@ func rabbitMQOwnedPod(ns, name string, ready bool, ownerUID string) *corev1.Pod 
 	return pod
 }
 
-// W16-ST3 — a member whose rabbitmq_raft_role series exist but sum
+// quorum-raft-health — a member whose rabbitmq_raft_role series exist but sum
 // to 0 has lost leadership on every replicated quorum queue: the
 // quorum_leaderless reason FAILs the check, flags the gauge, and —
 // deliberately NOT healable — never deletes the pod (deleting a
@@ -532,9 +532,9 @@ func TestRabbitMQQuorumLeaderWithRolesPasses(t *testing.T) {
 	}
 }
 
-// W16-ST3 — quorum_skew pools raft terms per RabbitmqCLUSTER, never
+// quorum-raft-health — quorum_skew pools raft terms per RabbitmqCLUSTER, never
 // per namespace: a second cluster sharing the namespace must not
-// judge the first cluster's terms (W12 P0-2a hazard), and a member
+// judge the first cluster's terms (rabbitmq-quorum-heal hazard), and a member
 // genuinely lagging its OWN cluster's max term by >= 2 flags.
 func TestRabbitMQQuorumSkewClusterScoped(t *testing.T) {
 	// Cluster alpha (term 10 across members) and cluster beta
@@ -619,7 +619,7 @@ func TestRabbitMQQuorumSkewFlagsLaggingMember(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W17 — the per-cluster heal budget.
+// heal-budget — the per-cluster heal budget.
 // ---------------------------------------------------------------------------
 
 // At most ONE member pod per RabbitmqCluster is deleted per sweep,

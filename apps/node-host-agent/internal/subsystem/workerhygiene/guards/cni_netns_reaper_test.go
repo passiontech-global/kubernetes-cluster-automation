@@ -1,4 +1,4 @@
-// netns_w12_test.go — W12-KR2 coverage for the orphan
+// cni_netns_reaper_test.go — orphan-sandbox-netns coverage for the orphan
 // /run/netns/cni-* reaper: the file-mtime qualifier, the
 // containerd live-task cross-check (fail closed on an unreadable
 // task map) and the 10-per-cycle reap cap.
@@ -18,10 +18,10 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// netnsW12Fixture points the reaper at a tempdir netns root inside
+// netnsReaperFixture points the reaper at a tempdir netns root inside
 // the proc tree (same filesystem → hardlinks work for the
 // live-inode tests) and returns the dir.
-func netnsW12Fixture(t *testing.T, e *env) string {
+func netnsReaperFixture(t *testing.T, e *env) string {
 	t.Helper()
 	dir := filepath.Join(e.ProcDir, "netns")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -54,7 +54,7 @@ func armOrphan(t *testing.T, e *env, dir, name string) string {
 // (empty here) missed it.
 func TestOrphanNetnsLiveTaskProtected(t *testing.T) {
 	e := fixture(t)
-	dir := netnsW12Fixture(t, e)
+	dir := netnsReaperFixture(t, e)
 	p := armOrphan(t, e, dir, "cni-heldbytask")
 	e.SDReply["umount"] = ""
 	// The pid sweep sees nothing, but a live task init (8001)
@@ -90,7 +90,7 @@ func TestOrphanNetnsLiveTaskProtected(t *testing.T) {
 // closed and retries next cycle.
 func TestOrphanNetnsIncompleteTaskMapSkips(t *testing.T) {
 	e := fixture(t)
-	dir := netnsW12Fixture(t, e)
+	dir := netnsReaperFixture(t, e)
 	p := armOrphan(t, e, dir, "cni-unknownmap")
 	e.SDReply["umount"] = ""
 	wdepstest.Check[*guards.CNINetnsCheck](e.H, wdeps.CheckCNINetns).Run(
@@ -112,7 +112,7 @@ func TestOrphanNetnsIncompleteTaskMapSkips(t *testing.T) {
 // intact).
 func TestOrphanNetnsReapCap(t *testing.T) {
 	e := fixture(t)
-	dir := netnsW12Fixture(t, e)
+	dir := netnsReaperFixture(t, e)
 	for i := 0; i < 12; i++ {
 		armOrphan(t, e, dir, fmt.Sprintf("cni-orphan%02d", i))
 	}
@@ -151,7 +151,7 @@ func TestOrphanNetnsReapCap(t *testing.T) {
 // or the sweep raced a CNI ADD) is never unmounted.
 func TestOrphanNetnsFreshMtimeProtected(t *testing.T) {
 	e := fixture(t)
-	dir := netnsW12Fixture(t, e)
+	dir := netnsReaperFixture(t, e)
 	p := filepath.Join(dir, "cni-toofresh")
 	wdepstest.WriteFile(t, p, "") // fresh mtime ~ now
 	wdepstest.WriteFile(t, filepath.Join(e.StateDir,

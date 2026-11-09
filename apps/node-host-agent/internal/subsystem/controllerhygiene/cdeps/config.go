@@ -123,14 +123,14 @@ const (
 	// (1600+ lines), drowning the watchdog tail.
 	defaultSuspectLogCadence = time.Hour
 
-	// W8-CP3 defaults: 3 consecutive healthz failures, or a KCM that
+	// cp-freeze-heal defaults: 3 consecutive healthz failures, or a KCM that
 	// is leader yet carries zero queued work for >10m — while the
 	// peer apiserver still answers — restarts k0scontroller under a
 	// 2h budget.
 	defaultCPFreezeCycles     = 3
 	defaultCPFreezeQuietFor   = 10 * time.Minute
 	defaultCPFreezeMinRestart = 2 * time.Hour
-	// W8-CP4: an on-disk cert newer than the socket-presented cert
+	// pki-cert-drift: an on-disk cert newer than the socket-presented cert
 	// for 2 consecutive cycles → restart the owning unit (1h budget).
 	defaultPKIDriftCycles     = 2
 	defaultPKIRestartInterval = time.Hour
@@ -229,10 +229,10 @@ type Config struct {
 	// EtcdGuard is the embedded-etcd quota self-defence
 	// (NODE_HOST_AGENT_ETCD_*).
 	EtcdGuard EtcdGuardConfig
-	// CPFreeze is the W8-CP3 KCM/scheduler freeze auto-heal — no env
+	// CPFreeze is the cp-freeze-heal KCM/scheduler freeze auto-heal — no env
 	// wiring; package defaults unless set programmatically.
 	CPFreeze CPFreezeConfig
-	// PKIDrift is the W8-CP4 on-disk-vs-served PKI cert drift check —
+	// PKIDrift is the pki-cert-drift on-disk-vs-served PKI cert drift check —
 	// no env wiring; package defaults unless set programmatically.
 	PKIDrift PKIDriftConfig
 	// TotalControllers is the spof-streak topology override: >0 pins

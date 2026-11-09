@@ -38,7 +38,7 @@ const (
 	cgroupReclaimBytes = "256M\n"
 	// cgroupDyingChildThreshold is the per-slice
 	// nr_dying_descendants count that earns a targeted
-	// memory.reclaim write (W12-KR-C) — a dying-descendant pile
+	// memory.reclaim write (targeted-memory-reclaim) — a dying-descendant pile
 	// concentrates in a few first-level kubepods.slice children
 	// (one noisy pod slice, a QoS slice), and reclaiming the
 	// offender directly works far better than asking the
@@ -154,7 +154,7 @@ func (c *CgroupDyingCheck) reclaim(root string, dying int64) {
 				rec, err))
 		}
 	}
-	// W12-KR-C: targeted reclaim on the first-level kubepods.slice
+	// targeted-memory-reclaim: targeted reclaim on the first-level kubepods.slice
 	// children whose own nr_dying_descendants exceeds
 	// cgroupDyingChildThreshold — the dying pile concentrates in a
 	// few pod/QoS slices, and reclaiming the offender's subtree

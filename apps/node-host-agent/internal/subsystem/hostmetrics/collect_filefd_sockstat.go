@@ -28,7 +28,7 @@ const (
 	// sockstat uses, and hostPID makes it the host view anyway).
 	defaultNetstatFile = "/proc/1/net/netstat"
 	defaultSNMPFile    = "/proc/1/net/snmp"
-	// W12-KR3 sources: the ephemeral source-port range the
+	// conntrack-port-pressure sources: the ephemeral source-port range the
 	// sockstat saturation ratio divides by, and the per-socket
 	// tables the CLOSE_WAIT count scans (host netns via /proc/1).
 	defaultLocalPortRangeFile = "/proc/sys/net/ipv4/ip_local_port_range"
@@ -39,7 +39,7 @@ const (
 	// the sysctl itself can't be read (hostconfig widens it to
 	// 10240-65535 = 55296).
 	defaultEphemeralPortWidth = 28232
-	// W16-KR4 AIO sources — the kernel aio table the DB nodes'
+	// aio-pressure AIO sources — the kernel aio table the DB nodes'
 	// io_uring/aio engines exhaust (EAGAIN masquerading as slow
 	// storage). Path seam vars (not Config fields) so tests can
 	// point them at fixture files without touching config.go.
@@ -47,7 +47,7 @@ const (
 	defaultAIOMaxFile = "/proc/sys/fs/aio-max-nr"
 )
 
-// W16-KR4 AIO path seams — package vars overridden per-test
+// aio-pressure AIO path seams — package vars overridden per-test
 // (fixtureSeams precedent), never per-node config.
 var (
 	aioNrFile  = defaultAIONrFile
@@ -85,13 +85,13 @@ var (
 		"node_host_agent_sockstat_sockets_used",
 		"sockstat 'sockets: used' — total sockets in use across protocols.",
 		[]string{"node"}, nil)
-	// W8: TCP close_wait — sockets stuck half-closed waiting for
+	// TCP close_wait — sockets stuck half-closed waiting for
 	// local close().
 	descSockTCPCW = prometheus.NewDesc(
 		"node_host_agent_sockstat_tcp_close_wait",
 		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
 		[]string{"node"}, nil)
-	// W12-KR3: ephemeral source-port saturation — (inuse + tw) over
+	// conntrack-port-pressure: ephemeral source-port saturation — (inuse + tw) over
 	// the ip_local_port_range width. Past ~0.8 every new connect()
 	// risks EADDRNOTAVAIL, which applications report as generic
 	// "network is down" (the Cloudflare/Haplon/Envoy incident shape).
@@ -99,7 +99,7 @@ var (
 		"node_sockstat_ephemeral_port_saturation_ratio",
 		"sockstat TCP inuse+tw divided by the ip_local_port_range width — ephemeral source-port pool saturation.",
 		[]string{"node"}, nil)
-	// W12-KR3: the per-socket CLOSE_WAIT count. sockstat doesn't
+	// conntrack-port-pressure: the per-socket CLOSE_WAIT count. sockstat doesn't
 	// break the state out on every kernel, so /proc/1/net/tcp{,6}
 	// is scanned directly — a growing count is a userspace
 	// connection leak (linkerd-proxy/cilium-envoy class).
@@ -141,7 +141,7 @@ var (
 		"node_host_agent_snmp_udp_rcvbuf_errors_total",
 		"Udp RcvbufErrors — UDP datagrams dropped on a full receive buffer.",
 		[]string{"node"}, nil)
-	// W16-KR4: kernel AIO table pressure — aio-nr climbing against
+	// aio-pressure: kernel AIO table pressure — aio-nr climbing against
 	// aio-max-nr ends in EAGAIN from io_setup/io_submit, which
 	// applications report as generic slow-storage errors.
 	descAIOAllocated = prometheus.NewDesc(
@@ -164,7 +164,7 @@ var (
 // line count rides the same family — emitted only when
 // the file reads (no fake 0 on an unreadable /proc view).
 func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
-	// W16-KR4 AIO gauges ride this domain — emitted before the
+	// aio-pressure AIO gauges ride this domain — emitted before the
 	// file-nr early return below (a node with no file-nr view must
 	// still export its AIO table).
 	c.collectAIO(ch)
@@ -204,7 +204,7 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 }
 
 // collectAIO reads /proc/sys/fs/aio-nr and /proc/sys/fs/aio-max-nr
-// (W16-KR4). Each gauge emits only when its own file parses; the
+// (aio-pressure). Each gauge emits only when its own file parses; the
 // used ratio emits 0 when the max is 0 rather than divide by zero.
 func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
@@ -233,7 +233,7 @@ func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 // emits only when its key parsed — a node missing a section keeps
 // that series absent rather than 0.
 func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
-	// W12-KR3: the CLOSE_WAIT count comes from the per-socket
+	// conntrack-port-pressure: the CLOSE_WAIT count comes from the per-socket
 	// tables, NOT sockstat — it must emit even when the sockstat
 	// file itself is absent, so it runs before the early return.
 	// ok=false only when NO family table read (a node with neither
@@ -282,7 +282,7 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 				tcpTW, tcpTWOK = v, true
 			}
 			// close_wait/cw — kernels that report it carry hung
-			// half-closed sockets here (W8-KR3 companion metric).
+			// half-closed sockets here (kernel-keys-pressure companion metric).
 			if v, ok := kv["close_wait"]; ok {
 				tcpCW, tcpCWOK = v, true
 			} else if v, ok := kv["cw"]; ok {
@@ -314,7 +314,7 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descSockTCPCW,
 			prometheus.GaugeValue, tcpCW, c.cfg.NodeName)
 	}
-	// W12-KR3: ephemeral source-port saturation. The ratio needs
+	// conntrack-port-pressure: ephemeral source-port saturation. The ratio needs
 	// both sockstat legs (inuse + tw) — a partial read stays absent
 	// rather than emit a falsely-low value. An unreadable sysctl
 	// falls back to the kernel's stock 28232-wide range so the

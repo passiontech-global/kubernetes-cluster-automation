@@ -71,7 +71,7 @@ type controllerLeaseGuardCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	// thrashEmitted is the W12-SC2 twin for the thrashing tuples.
+	// thrashEmitted is the stateful-split-brain twin for the thrashing tuples.
 	emitted       state.GaugeLedger[string]
 	thrashEmitted state.GaugeLedger[string]
 
@@ -104,7 +104,7 @@ const (
 	leaseFlapMinTransitions = int32(5)
 	leaseFlapWindow         = 15 * time.Minute
 
-	// W12-SC2 — thrashing: the tighter early-warning under the flap
+	// stateful-split-brain — thrashing: the tighter early-warning under the flap
 	// threshold. >=4 transitions inside 10m is election churn the
 	// 15m window hasn't proven yet.
 	leaseThrashMinTransitions = int32(4)
@@ -146,7 +146,7 @@ var (
 		Help: "1 while a control-plane Lease flaps or sits expired with running pods, or a kube-state-metrics pod is wedged.",
 	}, []string{"namespace", "lease", "reason"})
 
-	// W12-SC2 — the thrashing early-warning: 1 while a lease's
+	// stateful-split-brain — the thrashing early-warning: 1 while a lease's
 	// leaseTransitions counter jumped >=4 inside 10m — election
 	// churn below the flap threshold.
 	controllerLeaseThrashingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -226,7 +226,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 				p.emitUnhealthy(&rep, ns, lease.Name, leaseReasonFlapping)
 				rep.Find(key + "(" + leaseReasonFlapping + ")")
 			}
-			// W12-SC2 — the tighter early-warning under the flap
+			// stateful-split-brain — the tighter early-warning under the flap
 			// threshold: >=4 transitions inside 10m is election
 			// churn the 15m window hasn't proven yet.
 			if p.leaseThrashing(key, now) {

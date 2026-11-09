@@ -1,5 +1,5 @@
 // node_hang_precordon_test.go — coverage for the
-// node-hang-precordon check (W8-ST2/W9-CP3/W10-KR6): cordon
+// node-hang-precordon check (node-hang-precordon/clock-skew-precordon/kubelet-watch-wedge): cordon
 // stamping, auto-uncordon, foreign-cordon safety, clock-skew fuse,
 // and the expanded latch set.
 package nodehealth
@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
-// W8-ST2 — a hung worker gets spec.unschedulable patched; an already-
+// node-hang-precordon — a hung worker gets spec.unschedulable patched; an already-
 // cordoned worker is left alone.
 func TestCheckNodeHangPreCordon(t *testing.T) {
 	cs := fake.NewSimpleClientset(
@@ -47,7 +47,7 @@ func TestCheckNodeHangPreCordon(t *testing.T) {
 	}
 }
 
-// W8-ST2 — a latch that is too fresh does not trigger the cordon.
+// node-hang-precordon — a latch that is too fresh does not trigger the cordon.
 func TestCheckNodeHangPreCordonTooFresh(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		probetest.ReadyWorkerNode("w1", "FilesystemReadOnly", time.Minute, false),
@@ -63,7 +63,7 @@ func TestCheckNodeHangPreCordonTooFresh(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W8-ST2 — pre-cordon annotation + auto-uncordon (W9 additions)
+// node-hang-precordon — pre-cordon annotation + auto-uncordon (clock-skew additions)
 // ---------------------------------------------------------------------------
 
 // A sustained hang latch cordons AND stamps the node so the
@@ -171,7 +171,7 @@ func TestCheckNodeHangStaleStampCleanup(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-CP3 — ClockUnsynchronized pre-cordon
+// clock-skew-precordon — ClockUnsynchronized pre-cordon
 // ---------------------------------------------------------------------------
 
 // ClockUnsynchronized past the 10m fuse cordons with the same stamp;
@@ -196,7 +196,7 @@ func TestCheckNodeHangClockSkewCordon(t *testing.T) {
 	}
 }
 
-// W12-1.4 — ClockSkewDetected (chrony synced but >2s offset) rides
+// node-hang-extra-conds — ClockSkewDetected (chrony synced but >2s offset) rides
 // the same 10m clock fuse as ClockUnsynchronized.
 func TestCheckNodeHangClockSkewDetectedCordon(t *testing.T) {
 	cs := fake.NewSimpleClientset(
@@ -251,7 +251,7 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 // InodePressure split (plan Component 2)
 // ---------------------------------------------------------------------------
 
-// InodePressure is agent-latched since W18-1 (hostmetrics
+// InodePressure is agent-latched since inode-pressure (hostmetrics
 // state-inode-pressure) and lives in both precordon sets — a
 // sustained inode storm starves the node like any other latch
 // (nodecond.HangPreCordonNames, gated on LastTransitionTime) and a
@@ -465,7 +465,7 @@ func precordonedWorkerNode(name string, unschedulable bool) *corev1.Node {
 }
 
 // ---------------------------------------------------------------------------
-// 35% cap — off-by-one fix (W18-2) + first-cordon exception
+// 35% cap — off-by-one fix (clocksource-unstable) + first-cordon exception
 // ---------------------------------------------------------------------------
 
 // Two-worker cluster: floor(0.35*2)=0, so the ratio math alone would

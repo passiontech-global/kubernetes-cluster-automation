@@ -1,4 +1,4 @@
-// kubeconfig_cert_expiry.go — W10-CP5 embedded kubeconfig client
+// kubeconfig_cert_expiry.go — kubeconfig-cert-expiry embedded kubeconfig client
 // certificate expiry:
 //
 //	Parses client-certificate-data out of the k0s admin/ccm/
@@ -23,7 +23,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
-// KubeconfigCertMinDays is the W10-CP5 warn window (plan: <14d).
+// KubeconfigCertMinDays is the kubeconfig-cert-expiry warn window (plan: <14d).
 var KubeconfigCertMinDays = 14.0
 
 const (
@@ -48,7 +48,7 @@ func (c *KubeCertCheck) kubeconfigCertPaths() []string {
 	}
 }
 
-// KubeCertCheck is the W10-CP5 embedded kubeconfig client-cert
+// KubeCertCheck is the kubeconfig-cert-expiry embedded kubeconfig client-cert
 // expiry check as a Check — stateless (the warn window needs no
 // streak bookkeeping). Like kineStorageCheck it rides cpFreezeCheck's
 // ungated slot rather than holding its own dispatch-table entry.

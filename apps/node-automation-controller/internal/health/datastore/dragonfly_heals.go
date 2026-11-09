@@ -1,5 +1,5 @@
 // dragonfly_heals.go — the dragonfly auto-heals of the
-// stateful-masterless-services check (W6.2 step 1 + W7-C3 step 2):
+// stateful-masterless-services check (stateful-masterless-services step 1 + dual-replica-deadlock step 2):
 // the dragonfly-operator leader delete forcing master re-election,
 // and the dual-replica deadlock heal deleting the lowest-ordinal
 // STS pod once the operator bounce demonstrably failed to re-elect.
@@ -27,7 +27,7 @@ import (
 )
 
 var (
-	// W7-C3 — dragonfly STS ordinal-0 pods deleted to force master
+	// dual-replica-deadlock — dragonfly STS ordinal-0 pods deleted to force master
 	// re-election after a dual-replica deadlock. Counts delivered
 	// heals only.
 	dragonflyMasterlessPodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -65,7 +65,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// drHealed keys are checked inside the delete loop, not here, so
 	// only the annotation half of the cooldown applies. Never kill an
 	// operator mid-drain/upgrade — "cannot verify" fails closed like
-	// healOperatorLeader (W5.8).
+	// healOperatorLeader (operator-workqueue-watchdog).
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 		nil, sig.sts, dragonflyHealAnno, stsKey,
@@ -184,8 +184,8 @@ func smallestOrdinalPod(pods []*corev1.Pod, stsName string) *corev1.Pod {
 	return best
 }
 
-// healDragonflyReplicaDeadlock is the W7-C3 step-2 heal: the
-// dragonfly-operator leader was already bounced (step 1, W6.2) but
+// healDragonflyReplicaDeadlock is the dual-replica-deadlock step-2 heal: the
+// dragonfly-operator leader was already bounced (step 1, stateful-masterless-services) but
 // the masterless streak outlived it — the dual-replica deadlock
 // where every pod holds role=replica (each still executing
 // REPLICAOF <old-dead-ip>) and an operator restart alone cannot

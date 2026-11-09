@@ -242,7 +242,7 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 	got := r.CycleWithErrors(context.Background())
 	// EXACT count — one noteErr per counted invocation:
 	// nodelocaldns nft apply + host-internal-ports nft apply
-	// (W6.1, same groupNLD) + nodeip_cpu nebula drop-in. (coredns
+	// (host-internal-ports, same groupNLD) + nodeip_cpu nebula drop-in. (coredns
 	// self-gates here: nebula disabled → derive() leaves no
 	// DNSResolvers.) The coredump drop-in's daemon-reload
 	// is deliberately best-effort (warn-only) so the base group

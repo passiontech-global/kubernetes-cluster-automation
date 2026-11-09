@@ -105,12 +105,12 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "pgv2.percona.com", Version: "v2", Kind: "PerconaPGCluster"},
 	{Group: "psmdb.percona.com", Version: "v1", Kind: "PerconaServerMongoDB"},
 	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"},
-	// W16-ST1 — CNPG backup audit (velerobackupauditor/cnpg_audit.go):
+	// cnpg-backup-audit — CNPG backup audit (velerobackupauditor/cnpg_audit.go):
 	// ScheduledBackup -> "scheduledbackups" pluralizes correctly via
 	// the trailing-"y" -> "ies" rule.
 	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "ScheduledBackup"},
 	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Backup"},
-	// W16-ST1 — velero data-mover transfers (velerobackupauditor
+	// cnpg-backup-audit — velero data-mover transfers (velerobackupauditor
 	// in-flight audit).
 	{Group: "velero.io", Version: "v2alpha1", Kind: "DataUpload"},
 	{Group: "velero.io", Version: "v2alpha1", Kind: "DataDownload"},
@@ -149,7 +149,7 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "operator.shipwright.io", Version: "v1alpha1", Kind: "ShipwrightBuild"},
 
 	// the remaining watched operators (clusterhealthprobes) + the
-	// wave-12 scans (kargo promotion health, argo analysisrun zombie
+	// health-check scans (kargo promotion health, argo analysisrun zombie
 	// guard, percona quorum).
 	{Group: "rabbitmq.com", Version: "v1beta1", Kind: "RabbitmqCluster"},
 	{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"},
@@ -157,10 +157,10 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Warehouse"},
 	{Group: "kargo.akuity.io", Version: "v1alpha1", Kind: "Promotion"},
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "AnalysisRun"},
-	// W18-5: gateway downscaler verdicts, keda zero-rescue and flux
+	// argo-rollout-gates: gateway downscaler verdicts, keda zero-rescue and flux
 	// workload readiness also census the Rollout GVR.
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout"},
-	// W16-G1: api-object-sprawl-report-gc also GCs completed Rollouts
+	// rollout-scale-flap: api-object-sprawl-report-gc also GCs completed Rollouts
 	// Experiments — the sweep fake must serve their List kinds.
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Experiment"},
 	{Group: "scylla.scylladb.com", Version: "v1", Kind: "ScyllaCluster"},

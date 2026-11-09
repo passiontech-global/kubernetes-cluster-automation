@@ -87,7 +87,7 @@ func TestPostgresHealthyClusterPasses(t *testing.T) {
 	}
 }
 
-// W12-ST2 — an inactive replication slot retaining past 5GiB of WAL
+// percona-degraded-quorum — an inactive replication slot retaining past 5GiB of WAL
 // fires the dedicated bloat gauge carrying the slot name and the
 // retained byte count, alongside the existing inactive_slot reason
 // on the unhealthy gauge.
@@ -345,7 +345,7 @@ func TestCNPGRecoveryPrunesSeries(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W17 — bounded log read + cluster-scoped volume pressure.
+// heal-budget — bounded log read + cluster-scoped volume pressure.
 // ---------------------------------------------------------------------------
 
 // The pod-log read is bounded BOTH by TailLines and SinceSeconds —

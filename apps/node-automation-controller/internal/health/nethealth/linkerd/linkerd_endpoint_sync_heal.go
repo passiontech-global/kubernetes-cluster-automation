@@ -1,5 +1,5 @@
 // linkerd_endpoint_sync_heal.go — the desync heal of the
-// linkerd-endpoint-sync check (W10-FIX7): delete the provably-stale
+// linkerd-endpoint-sync check (endpoint-sync-heal): delete the provably-stale
 // endpointslice-controller-owned slices, then bounce the oldest
 // linkerd-destination pod so its endpoint table rebuilds — 1h
 // per-service cooldown, maintenance-gated, UID-preconditioned.
@@ -20,7 +20,7 @@ import (
 )
 
 // healLinkerdDestination repairs a desynced Service on two
-// fronts (W10-FIX7):
+// fronts (endpoint-sync-heal):
 //
 //  1. DELETE the provably-stale endpointslice-controller-owned
 //     EndpointSlices staleLinkerdSlices flagged — a bounce only

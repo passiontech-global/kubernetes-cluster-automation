@@ -168,7 +168,7 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 // rescueZeroTarget lifts a wedged-at-zero scale target back to
 // max(minReplicaCount, 1). Deployment/StatefulSet targets resolve
 // through the typed censuses; argoproj.io Rollout targets ride the
-// unstructured census + dynamic patch (W18-5) — the apiext kinds
+// unstructured census + dynamic patch (argo-rollout-gates) — the apiext kinds
 // KEDA can scale beyond those carry no typed handle here. A target
 // the downscaler parked (any downscaler/* annotation on a 0-replica
 // spec) is skipped: that zero
@@ -223,7 +223,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		}
 	}
 	if kind == "" {
-		// W18-5 — argoproj.io Rollout fallback: KEDA scales Rollouts
+		// argo-rollout-gates — argoproj.io Rollout fallback: KEDA scales Rollouts
 		// the same way (scaleTargetRef kind Rollout). Unstructured CR
 		// — spec.replicas comes off the census object; a failed
 		// census stays inconclusive, not "not at zero".

@@ -1,5 +1,5 @@
 // konnectivity_tunnel_health.go — the konnectivity-tunnel-health
-// check (W12-CP3): the konnectivity-agent half-open tunnel watchdog.
+// check (konnectivity-tunnel-health): the konnectivity-agent half-open tunnel watchdog.
 // A konnectivity-agent pod can keep a "connected" gRPC session to
 // FEWER konnectivity-servers than there are Ready control-plane
 // nodes — a stale HTTP/2 stream pinned in conntrack, or a CP whose
@@ -30,7 +30,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// konnectivityTunnelHealthCheck is the W12-CP3 half-open tunnel
+// konnectivityTunnelHealthCheck is the konnectivity-tunnel-health half-open tunnel
 // watchdog.
 type konnectivityTunnelHealthCheck struct {
 	*probefw.Deps
@@ -47,7 +47,7 @@ type konnectivityTunnelHealthCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewKonnectivityTunnelHealthCheck builds the W12-CP3 check — its
+// NewKonnectivityTunnelHealthCheck builds the konnectivity-tunnel-health check — its
 // state is the seen/emitted ledgers (zero value usable); pod-delete
 // cooldowns ride the shared Deps.Heals set via DeletePodHeal.
 func NewKonnectivityTunnelHealthCheck(d *probefw.Deps) probefw.Check {
@@ -57,7 +57,7 @@ func NewKonnectivityTunnelHealthCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameKonnectivityTunnelHealth = "konnectivity-tunnel-health"
 
-	// W12-CP3 — konnectivity-tunnel-health knobs.
+	// konnectivity-tunnel-health — konnectivity-tunnel-health knobs.
 	konnHalfOpenMinAge = 10 * time.Minute
 	konnHealCool       = 30 * time.Minute
 	konnAgentNS        = "kube-system"
@@ -65,12 +65,12 @@ const (
 )
 
 var (
-	// W12-CP3 — a konnectivity-agent pod holding fewer open server
+	// konnectivity-tunnel-health — a konnectivity-agent pod holding fewer open server
 	// connections than there are Ready control-plane nodes past the
 	// persistence window.
 	konnAgentHalfOpenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_konnectivity_agent_half_open",
-		Help: "1 while a konnectivity-agent pod holds fewer open server connections than Ready control-plane nodes for >=10m — W12-CP3.",
+		Help: "1 while a konnectivity-agent pod holds fewer open server connections than Ready control-plane nodes for >=10m — konnectivity-tunnel-health.",
 	}, []string{"pod", "node"})
 )
 

@@ -1,10 +1,10 @@
-// kmsg.go — W10-KR1 checkKernelDmesg: the /dev/kmsg + dmesg
+// kmsg.go — kernel-dmesg checkKernelDmesg: the /dev/kmsg + dmesg
 // kernel-log drain plumbing (session/cursor, marker writes, the
 // sysctl bump) → stateDir evidence markers. The classifier half —
 // the detector regexes and the line→detector dispatch — lives in
 // kmsg_rules.go. workerhygiene consumes the OOM markers for the
 // SystemOOMVictim node event; this file owns the latches + counters.
-// The Wave-10 contract overview lives in kernelfail.go.
+// The kernelfail contract overview lives in kernelfail.go.
 package kernelfail
 
 import (
@@ -22,7 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
 
-// --- kmsg/dmesg drain constants (W10-KR1) ---
+// --- kmsg/dmesg drain constants (kernel-dmesg) ---
 
 const (
 	// conntrackBumpEvery rate-limits the nf_conntrack_max doubling —
@@ -444,7 +444,7 @@ func (r *Runner) maybeBumpConntrackMax() {
 		"from", cur, "to", next)
 }
 
-// --- dmesg fallback (W10-KR1) ---
+// --- dmesg fallback (kernel-dmesg) ---
 
 // drainDmesg is the no-/dev/kmsg path: `dmesg -T` carries parseable
 // timestamps (cursor = last unix ts + same-second consumed count);

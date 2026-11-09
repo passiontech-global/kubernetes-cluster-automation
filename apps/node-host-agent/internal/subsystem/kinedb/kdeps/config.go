@@ -149,7 +149,7 @@ type Config struct {
 	FrozenRetainedMin int64 // ...and retained > this
 	AdvisoryLockID    int64 // pg advisory lock key
 	// MaxStepRevisions caps how far one compact-guard cycle may
-	// advance compact_rev (W16-CP1). 0/absent = disabled = the
+	// advance compact_rev (compact-step-cap). 0/absent = disabled = the
 	// unbounded head-Tail step (env NODE_HOST_AGENT_KINEDB_GUARD_
 	// MAX_STEP_REVISIONS).
 	MaxStepRevisions int64
@@ -158,7 +158,7 @@ type Config struct {
 	RepackDeadPct      int64 // dead-tuple % → repack candidate
 	RepackMinHeapBytes int64 // heap bytes → repack candidate
 	// PGDataDir is the in-container postgres data dir whose free
-	// space gates pg_repack (W8-CP2); "" → /var/lib/postgresql/data.
+	// space gates pg_repack (kinedb-maintenance); "" → /var/lib/postgresql/data.
 	PGDataDir string
 
 	// backup-health physical-backup verifier: BackupDir is the
@@ -277,7 +277,7 @@ func (c *Config) ApplyDefaults() error {
 	if c.AdvisoryLockID == 0 {
 		c.AdvisoryLockID = defaultAdvisoryLockID
 	}
-	// W16-CP1: NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS
+	// compact-step-cap: NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS
 	// overrides the step cap when set to a positive integer —
 	// 0/unset/garbage keeps MaxStepRevisions disabled (the
 	// unbounded head-Tail step).
@@ -328,7 +328,7 @@ func (c *Config) ApplyDefaults() error {
 	return nil
 }
 
-// applyStepRevisionEnv is the W16-CP1 step-cap env rule shared by
+// applyStepRevisionEnv is the compact-step-cap step-cap env rule shared by
 // ConfigFromEnv's knob and ApplyDefaults (a directly-constructed
 // Config never sees the knob): a positive NODE_HOST_AGENT_KINEDB_
 // GUARD_MAX_STEP_REVISIONS becomes the cap; unset/0/garbage stays

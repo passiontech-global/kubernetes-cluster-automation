@@ -62,7 +62,7 @@ const (
 	// StatefulSet as the involved object.
 	stsFlapCreateReason = "SuccessfulCreate"
 	stsFlapDeleteReason = "SuccessfulDelete"
-	// W16-G1 — the Argo Rollouts controller's scale event reasons.
+	// rollout-scale-flap — the Argo Rollouts controller's scale event reasons.
 	// The Rollouts controller never emits ScalingReplicaSet (it
 	// creates its ReplicaSets directly): its scale-ups/downs surface
 	// as RolloutScaledUp/RolloutScaledDown on the parent Rollout
@@ -184,7 +184,7 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 			up = e.Reason == stsFlapCreateReason
 			down = e.Reason == stsFlapDeleteReason
 		case rolloutFlapUpReason, rolloutFlapDownReason:
-			// W16-G1 — the reason IS the direction; the message
+			// rollout-scale-flap — the reason IS the direction; the message
 			// re-check keeps the count honest under silent-selector
 			// fakes the same way the Deployment path does. The
 			// involvedObject kind is the parent Rollout (GVRArgoRollout).

@@ -1,8 +1,8 @@
 // replicated_secret_audit.go — Check E of cert-drift-auditor
-// (W7-C6): diffs each replicator.v1.mittwald.de/replicated-from TLS
+// (replicator-cert-drift): diffs each replicator.v1.mittwald.de/replicated-from TLS
 // copy's tls.crt against its source. A mismatch that persists for
 // replicationDriftScans consecutive sweeps flags
-// replicated_secret_drift=1 and (W8-NM2) strips the
+// replicated_secret_drift=1 and (issuer-serial-watch) strips the
 // replicated-from-version stamp to force a kubernetes-replicator
 // resync — rate-limited to once per destination per hour.
 package certdriftauditor
@@ -22,7 +22,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Check E — kubernetes-replicator sync drift (W7-C6)
+// Check E — kubernetes-replicator sync drift (replicator-cert-drift)
 // ---------------------------------------------------------------------------
 
 // replStreakKey flattens the replicationMetricKey tuple into the
@@ -98,7 +98,7 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 		log.Info("replicated tls secret drifted from source across scans",
 			"secret", d.namespace+"/"+d.name, "source", d.source,
 			"consecutiveScans", a.replicationMismatch.Count(replStreakKey(k)))
-		// W8-NM2: a confirmed drift means the replicator missed the
+		// issuer-serial-watch: a confirmed drift means the replicator missed the
 		// update — stripping the replicated-from-version stamp
 		// makes it resync on its next reconcile (1h cooldown).
 		a.forceReplicationResync(ctx, d, k)

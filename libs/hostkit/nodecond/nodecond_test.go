@@ -77,7 +77,7 @@ func TestConstantsNonEmptyAndUnique(t *testing.T) {
 
 func TestListLengths(t *testing.T) {
 	// HeartbeatSweptNames: 41 latch-backed (incl. InodePressure,
-	// agent-latched since W18-1) + ReadonlyFilesystem; KernelDeadlock
+	// agent-latched since inode-pressure) + ReadonlyFilesystem; KernelDeadlock
 	// (permanent) excluded.
 	if got, want := len(HeartbeatSweptNames), 42; got != want {
 		t.Errorf("len(HeartbeatSweptNames) = %d, want %d", got, want)
@@ -150,7 +150,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 		swept[name] = true
 	}
 	// The 7 monitor/kubelet-owned names split: ReadonlyFilesystem and
-	// InodePressure in (the agent latches InodePressure since W18-1 and
+	// InodePressure in (the agent latches InodePressure since inode-pressure and
 	// kubelet never emits the type), everything else out.
 	for _, name := range notHeartbeatManaged {
 		if swept[name] {
@@ -161,7 +161,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 		t.Error("HeartbeatSweptNames must contain ReadonlyFilesystem (NPD mount monitor rides the heartbeat)")
 	}
 	if !swept[InodePressure] {
-		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, W18-1)")
+		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
 	// Every remaining constant — exactly the 41 latch-backed — in.
 	latchBacked := 0

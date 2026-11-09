@@ -1,4 +1,4 @@
-// spegel.go — the W7-H4 spegel-mirror guard: a Ready=False spegel
+// spegel.go — the spegel-mirror spegel-mirror guard: a Ready=False spegel
 // mirror pod whose containerd mirror points at a wedged peer gets
 // deleted (0s grace) so the DaemonSet rebuilds it.
 package guards
@@ -22,11 +22,11 @@ const (
 )
 
 var (
-	// W7 pod matchers — anchored like konnPodRe/dnsPodRe.
+	// pod matchers — anchored like konnPodRe/dnsPodRe.
 	spegelPodRe = regexp.MustCompile(`^spegel-[a-z0-9]+$`) // H4 P2P mirror
 )
 
-// SpegelCheck is the W7-H4 mirror-peer guard as a Check; it owns
+// SpegelCheck is the spegel-mirror mirror-peer guard as a Check; it owns
 // the Ready=False streak (ex-Hygiene.spegelFails).
 type SpegelCheck struct {
 	d     *wdeps.Deps

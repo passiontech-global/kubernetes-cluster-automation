@@ -4,7 +4,7 @@
 // policy blocking pod-IP traffic from node-ops) or the pod has no
 // IP at all — through the apiserver pods/<name>:<port>/proxy
 // subresource, which reaches the sidecar through kubelet and is
-// immune to pod netpol (W10-FIX3). A sidecar that honors the call
+// immune to pod netpol (sidecar-shutdown-fallback). A sidecar that honors the call
 // exits cleanly and kubelet transitions the pod itself.
 package zombiesidecarreaper
 
@@ -27,7 +27,7 @@ import (
 
 const (
 	// zombieSidecarShutdownTimeout bounds the admin call — a
-	// wedged proxy must not stall the sweep. W10-FIX3: 2s per the
+	// wedged proxy must not stall the sweep. sidecar-shutdown-fallback: 2s per the
 	// plan; shared by the direct HTTP POST and the apiserver pod
 	// proxy fallback.
 	zombieSidecarShutdownTimeout = 2 * time.Second
@@ -50,7 +50,7 @@ var zombieSidecarHTTPClient = &http.Client{Timeout: zombieSidecarShutdownTimeout
 
 // shutdownPod runs the graceful sidecar shutdown: the direct
 // pod-IP admin call first, then — when the dial fails or times out
-// (e.g. Cilium default-deny ingress from node-ops, W10-FIX3) or the
+// (e.g. Cilium default-deny ingress from node-ops, sidecar-shutdown-fallback) or the
 // pod carries no IP — the apiserver pods/<name>:<port>/proxy
 // subresource, which reaches the sidecar through kubelet regardless
 // of pod-ingress NetworkPolicy.

@@ -55,7 +55,7 @@ const (
 	// Disk/mount rows: the mountinfo-hygiene check's /proc/1/mountinfo view,
 	// the writable-layer snapshot root and coredump dir, and
 	// the writable-layer Warning threshold (5 GiB default —
-	// separate from the 15 GiB W6.3 eviction threshold).
+	// separate from the 15 GiB disk-bloat eviction threshold).
 	EnvMountinfoFile             = "NODE_HOST_AGENT_MOUNTINFO_FILE"
 	EnvWLayerSnapshotsDir        = "NODE_HOST_AGENT_WLAYER_SNAPSHOTS_DIR"
 	EnvCoredumpDir               = "NODE_HOST_AGENT_COREDUMP_DIR"

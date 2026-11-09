@@ -14,13 +14,13 @@ func NewZombieStorm(d *wdeps.Deps) *ZombieStormCheck {
 	return &ZombieStormCheck{d: d, streaks: map[ZombieParent]int{}}
 }
 
-// NewDstate returns the W7-H1 D-state storm detector.
+// NewDstate returns the d-state-storm D-state storm detector.
 func NewDstate(d *wdeps.Deps) *DstateCheck { return &DstateCheck{d: d} }
 
-// NewScopes returns the W7-H2 abandoned cri-containerd-*.scope sweep.
+// NewScopes returns the systemd-scopes abandoned cri-containerd-*.scope sweep.
 func NewScopes(d *wdeps.Deps) *ScopesCheck { return &ScopesCheck{d: d} }
 
-// NewPSIThrash returns the W2 PSI memory-thrash evictor.
+// NewPSIThrash returns the psi-memory-thrash PSI memory-thrash evictor.
 func NewPSIThrash(d *wdeps.Deps) *PSIThrashCheck {
 	return &PSIThrashCheck{d: d}
 }
@@ -30,13 +30,13 @@ func NewJournald(d *wdeps.Deps) *JournaldCheck {
 	return &JournaldCheck{d: d, ig: newJournaldIntegrity(d)}
 }
 
-// NewSpegel returns the W7-H4 spegel-mirror guard.
+// NewSpegel returns the spegel-mirror spegel-mirror guard.
 func NewSpegel(d *wdeps.Deps) *SpegelCheck { return &SpegelCheck{d: d} }
 
-// NewCalico returns the W7-H7 calico-hygiene guard.
+// NewCalico returns the calico-hygiene calico-hygiene guard.
 func NewCalico(d *wdeps.Deps) *CalicoCheck { return &CalicoCheck{d: d} }
 
-// NewCNINetns returns the W9 orphan cni-* netns reaper.
+// NewCNINetns returns the orphan /run/netns/cni-* reaper.
 func NewCNINetns(d *wdeps.Deps) *CNINetnsCheck {
 	return &CNINetnsCheck{d: d}
 }

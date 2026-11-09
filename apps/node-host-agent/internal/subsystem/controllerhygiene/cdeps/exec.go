@@ -144,7 +144,7 @@ func (d *Deps) UnitActiveState(ctx context.Context, unit string) string {
 
 // SSKill runs `ss -K sport = :6443` — kills the apiserver's hung
 // HTTP/2 watch streams in the host network namespace before a wedge
-// restart (W8-CP1), so the restart (and the post-restart reconnect)
+// restart (cp-component-restart), so the restart (and the post-restart reconnect)
 // starts clean. It goes through the shared client (host ss binary +
 // host netns) rather than relying on an ss binary inside the agent
 // image — the old raw exec only worked because the pod is

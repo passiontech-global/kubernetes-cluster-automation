@@ -1,4 +1,4 @@
-// operator_watchdog_targets_w16_test.go — coverage for the W16-G1
+// operator_watchdog_targets_rollout_gateway_test.go — coverage for the rollout-scale-flap
 // operatorTargets rows: the argo-rollouts row tracks the Rollout GVR
 // with the generic stale-generation signature, and the
 // cloudflare-tunnel-gateway-controller row scopes its gateway/route
@@ -19,8 +19,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// w16Target finds one watched-operator row by name.
-func w16Target(t *testing.T, name string) operatorTarget {
+// operatorTargetByName finds one watched-operator row by name.
+func operatorTargetByName(t *testing.T, name string) operatorTarget {
 	t.Helper()
 	for _, tgt := range operatorTargets {
 		if tgt.name == name {
@@ -35,7 +35,7 @@ func w16Target(t *testing.T, name string) operatorTarget {
 // staleObservedGeneration signature — no custom predicate, same
 // shape as the other typed-operator rows.
 func TestArgoRolloutsTargetRow(t *testing.T) {
-	tgt := w16Target(t, "argo-rollouts-controller")
+	tgt := operatorTargetByName(t, "argo-rollouts-controller")
 	if tgt.leaseNS != "argo-rollouts" {
 		t.Fatalf("leaseNS = %q, want argo-rollouts", tgt.leaseNS)
 	}
@@ -76,7 +76,7 @@ func TestCftOwnsGatewayObject(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W5.8 — reason-keyed FirstSeen + ExternalSecret v1beta1 dedup
+// operator-workqueue-watchdog — reason-keyed FirstSeen + ExternalSecret v1beta1 dedup
 // ---------------------------------------------------------------------------
 
 // Distinct stuck reasons on the same object carry DISTINCT first-seen

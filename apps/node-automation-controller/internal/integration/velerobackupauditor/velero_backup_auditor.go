@@ -31,10 +31,10 @@
 //
 // Layout: this file holds the shared keys/state, the Setup + run
 // entry point and the paged-list helpers; schedule_audit.go the
-// per-Schedule rot checks, everest_audit.go the W9-ST3 Percona
-// Everest audit, cnpg_audit.go the W16-ST1 CloudNativePG backup
-// audit, inflight_pvb_audit.go the W10-ST6 wedged-transfer
-// audit + PVB cleanup (+ W16-ST1 DataUpload/DataDownload scan).
+// per-Schedule rot checks, everest_audit.go the backup-posture-audit Percona
+// Everest audit, cnpg_audit.go the cnpg-backup-audit CloudNativePG backup
+// audit, inflight_pvb_audit.go the velero-inflight-audit wedged-transfer
+// audit + PVB cleanup (+ cnpg-backup-audit DataUpload/DataDownload scan).
 package velerobackupauditor
 
 import (
@@ -70,7 +70,7 @@ var (
 	veleroScheduleGVR = kube.GVVeleroSchedule
 	veleroBackupGVR   = kube.GVVeleroBackup
 	veleroBSLGVR      = kube.GVVeleroBackupStorageLocation
-	// W10-ST6 — podvolumebackups.velero.io: per-volume snapshots
+	// velero-inflight-audit — podvolumebackups.velero.io: per-volume snapshots
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
 	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
@@ -78,12 +78,12 @@ var (
 	// each BSL's snapshots land in; its phase and maintenance clock
 	// say whether a restore can actually read them.
 	veleroRepoGVR = kube.GVVeleroBackupRepository
-	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
+	// backup-posture-audit — Percona Everest operator CRDs: the DatabaseCluster
 	// declares spec.backup.enabled and the DatabaseClusterBackup
 	// carries spec.dbClusterName + status.state.
 	everestDBClusterGVR = kube.GVREverestDatabaseCluster
 	everestDBBackupGVR  = kube.GVREverestDatabaseClusterBackup
-	// W16-ST1 — CloudNativePG CRDs: the ScheduledBackup declares
+	// cnpg-backup-audit — CloudNativePG CRDs: the ScheduledBackup declares
 	// spec.clusterName + spec.schedule and the Backup carries
 	// spec.clusterName + status.phase.
 	cnpgScheduledBackupGVR = kube.GVRCNPGScheduledBackup
@@ -94,7 +94,7 @@ var (
 // signatures — a backup Failed, PartiallyFailed or FailedValidation
 // is a data-protection failure worth surfacing, and InProgress or
 // Deleting held past veleroStuckMaxAge means the velero server lost
-// the thread (W8-ST1).
+// the thread (velero-bsl-audit).
 var veleroStuckPhases = map[string]string{
 	"Failed":           "failed",
 	"PartiallyFailed":  "failed",
@@ -123,13 +123,13 @@ func (a *veleroBackupAuditor) veleroList(ctx context.Context,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 }
 
-// veleroMissingBackupMaxAge is the W10-FIX6 zero-backup threshold:
+// veleroMissingBackupMaxAge is the zero-backup-guard zero-backup threshold:
 // a Schedule (or backup-enabled DatabaseCluster) older than 36h
 // that has produced ZERO backup objects is silently unprotected —
 // same horizon as the Everest stale check.
 const veleroMissingBackupMaxAge = 36 * time.Hour
 
-// veleroPVBCleanup* bound the W10-ST6 wedged-PVB cleaner: only
+// veleroPVBCleanup* bound the velero-inflight-audit wedged-PVB cleaner: only
 // InProgress PVBs past the 6h stuck window are candidates, at most
 // this many are cleaned per sweep, and a cleaned PVB name cools down
 // so a still-broken agent cannot be delete-looped.
@@ -138,7 +138,7 @@ const (
 	veleroPVBCleanupCooldown  = 30 * time.Minute
 )
 
-// W9-ST3 — Everest backup health thresholds: a backup still
+// backup-posture-audit — Everest backup health thresholds: a backup still
 // Running/Starting after 6h lost the thread (same window as the
 // Velero in-flight check), and the newest Succeeded backup older
 // than 36h means the schedule stopped producing restorable points.
@@ -202,16 +202,16 @@ type veleroBackupAuditor struct {
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
 	seenEverest state.GaugeLedger[everestKey]
-	// seenCNPG: series ledger for the W16-ST1 CNPG half of
+	// seenCNPG: series ledger for the cnpg-backup-audit CNPG half of
 	// DBBackupUnhealthy — its own ledger so the Everest sweep's
 	// prune never deletes CNPG series (the two audits assert
 	// disjoint key sets on the same gauge vec).
 	seenCNPG state.GaugeLedger[everestKey]
-	// seenDataMovement: series ledger for the W16-ST1
+	// seenDataMovement: series ledger for the cnpg-backup-audit
 	// DataUpload/DataDownload wedge gauge — keys "kind/ns/name".
 	seenDataMovement state.GaugeLedger[string]
 	// seenStuckBackup / seenWedgedPVB: series ledgers for the
-	// W10-ST6 in-flight gauges — same prune-on-resolve contract.
+	// velero-inflight-audit in-flight gauges — same prune-on-resolve contract.
 	seenStuckBackup state.GaugeLedger[pausedKey]
 	seenWedgedPVB   state.GaugeLedger[pausedKey]
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
@@ -249,12 +249,12 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	a.seenRepo.Begin()   // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
-	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
+	// backup-posture-audit — the Everest DB-backup audit is independent of Velero:
 	// a cluster can run the Percona operator with no Velero at all,
 	// so it runs before (and regardless of) the schedule 404 early
 	// return below. Its error joins the run's, never masks it.
 	everestErr := a.auditEverestBackups(ctx)
-	// W16-ST1 — the CNPG backup audit is likewise independent of
+	// cnpg-backup-audit — the CNPG backup audit is likewise independent of
 	// Velero (CNPG runs fine with no Velero installed); its error
 	// joins the same way.
 	cnpgErr := a.auditCNPGBackups(ctx)
@@ -310,7 +310,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// Check 2 — the latest schedule-owned Backup empty/errored.
 		b := latest[ns+"/"+name]
 		if b == nil {
-			// W10-FIX6 — zero Backup objects is not "nothing to
+			// zero-backup-guard — zero Backup objects is not "nothing to
 			// judge" once the Schedule itself is old enough to have
 			// produced some. A paused Schedule is exempt: it
 			// legitimately stops producing (check 1 already covers
@@ -333,7 +333,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	a.firstSeenPaused.Prune(func(lk string) bool { return pausedNow[lk] })
 	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
 
-	// W8-ST1 — BackupStorageLocation availability: a BSL not
+	// velero-bsl-audit — BackupStorageLocation availability: a BSL not
 	// phase=Available means backups run to an unreachable bucket and
 	// the next restore has nothing to read.
 	bsls, err := a.veleroList(ctx, veleroBSLGVR)
@@ -404,7 +404,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	a.seenRepo.Prune(metrics.VeleroRepoUnhealthy.DeleteLabelValues)
 
-	// W10-ST6 — in-flight transfer audit: mark Backups/PVBs wedged
+	// velero-inflight-audit — in-flight transfer audit: mark Backups/PVBs wedged
 	// InProgress|Deleting >6h, and clean up PVBs whose node-agent
 	// provably lost the Kopia thread. Runs on the already-listed
 	// backups plus its own PVB/pod reads; independent of the
@@ -413,7 +413,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// cooldown so decommissioned nodes' stamps cannot accumulate.
 	a.pvbHealed.PruneExpired(a.now.Now(), veleroPVBCleanupCooldown)
 	stuckErr := a.auditInFlightTransfers(ctx, backups)
-	// W16-ST1 — the data-mover half of the in-flight audit: mark-only
+	// cnpg-backup-audit — the data-mover half of the in-flight audit: mark-only
 	// scan of DataUpload/DataDownload wedges.
 	dmErr := a.auditDataMovement(ctx)
 

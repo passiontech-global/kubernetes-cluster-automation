@@ -184,7 +184,7 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string,
 		default:
 			return fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
 		}
-		// W5.2: `disable server` stops NEW traffic but every
+		// haproxy-disable-server: `disable server` stops NEW traffic but every
 		// long-lived session already pinned to the server survives —
 		// the kubelet/cilium HTTP/2 watch streams ride the 24h
 		// client timeout, so a wedged apiserver keeps feeding stale
@@ -198,7 +198,7 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string,
 }
 
 // shutdownSessions issues `shutdown sessions server <be>/<name>` on
-// the admin socket — the W5.2 complement of a disable: closes every
+// the admin socket — the haproxy-disable-server complement of a disable: closes every
 // session still stuck to the drained backend. Best-effort like the
 // companion replies above (the shell ignored every socket reply): a
 // failed shutdown must not veto a drain that already landed, and a

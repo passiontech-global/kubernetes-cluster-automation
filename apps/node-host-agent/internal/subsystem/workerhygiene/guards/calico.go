@@ -1,4 +1,4 @@
-// calico.go — the W7-H7 calico-hygiene guard: orphan cali* veth
+// calico.go — the calico-hygiene calico-hygiene guard: orphan cali* veth
 // leak detection + GC, and the felix :9099/readiness wedge detector
 // with the calico-node pod restart remedy. Dormant on cilium nodes.
 package guards
@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	// Wave-8 knobs: felix restart after the latch persisted this
+	// Guard knobs: felix restart after the latch persisted this
 	// many consecutive failed cycles, and the orphan-veth down-age
 	// for the cali* GC.
 	CalicoFelixRestartFails = 3
@@ -33,11 +33,11 @@ const (
 )
 
 var (
-	// W7 pod matchers — anchored like konnPodRe/dnsPodRe.
+	// pod matchers — anchored like konnPodRe/dnsPodRe.
 	calicoNodePodRe = regexp.MustCompile(`^calico-node-[a-z0-9]+$`) // H7 felix
 )
 
-// --- Check: calico-hygiene (W7-H7) ---
+// --- Check: calico-hygiene (calico-hygiene) ---
 // The cicd cluster runs Calico, not Cilium — the cilium guard
 // family above is all dormant there, while calico has its own leak
 // modes: orphan cali* veth pairs left by failed CNI DELs (classic
@@ -69,7 +69,7 @@ func calicoIfaceCount(d *wdeps.Deps) int {
 	return n
 }
 
-// CalicoCheck is the W7-H7 calico guard as a Check; it owns the
+// CalicoCheck is the calico-hygiene calico guard as a Check; it owns the
 // veth-leak and felix readiness streaks (ex-Hygiene.calicoVethFails/
 // .calicoFelixFails).
 type CalicoCheck struct {
@@ -130,7 +130,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.VethFails = 0
 		c.d.State.Exit(latchdefs.LatchCalicoVethLeak, nil)
 	}
-	// Check 1b — orphan-veth GC (W8-NM3): while the leak latch is
+	// Check 1b — orphan-veth GC (mesh-net-guards): while the leak latch is
 	// set, reap cali* host veths that stayed DOWN (carrier 0) for
 	// calicoVethGCMinAge. Live veths always answer carrier=1; a
 	// leaked one from a failed CNI DEL is DOWN forever. The
@@ -172,7 +172,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		c.d.State.Enter(latchdefs.LatchCalicoFelixDown,
 			fmt.Sprintf("readiness_probe_fails=%d", c.felixFails))
-		// W8-NM3: a felix datapath whose readiness stayed dark
+		// mesh-net-guards: a felix datapath whose readiness stayed dark
 		// across CalicoFelixRestartFails consecutive cycles is a
 		// real wedge, not a flap — delete the calico-node pod so
 		// the DaemonSet rebuilds it (last-calico-restart budget).

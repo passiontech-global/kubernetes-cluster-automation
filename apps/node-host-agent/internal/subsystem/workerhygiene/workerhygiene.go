@@ -10,16 +10,16 @@
 //     33 dns-resolv)
 //   - ctr/     — ctr_tasks.go (31 tasks), ctr_images.go (37 image
 //     healer), ctr_ingest_gc.go (39 ingest GC), ctr_shims.go (shared
-//     shim scope) + ctr_meta.go (W10-KR3 meta.db corruption)
+//     shim scope) + ctr_meta.go (meta-db-corruption meta.db corruption)
 //   - cilium/  — cilium_*.go (32 agent, 35 init-stuck, 38 IPAM, B1
-//     envoy, B4 MTU, W5.6 WG peers, W7-H3 LRP DNS)
-//   - guards/  — dstate_scopes.go (A2 zombie, W7-H1 D-state, W7-H2
-//     scopes), psi_thrash.go (W2), journald.go (A5),
-//     spegel.go / calico.go / cni_netns.go (W7-H4/H7, W9 netns)
+//     envoy, B4 MTU, cilium-wg-peer-gc WG peers, envoy-xds-lrp LRP DNS)
+//   - guards/  — dstate_scopes.go (A2 zombie, d-state-storm D-state, systemd-scopes
+//     scopes), psi_thrash.go (psi-memory-thrash), journald.go (A5),
+//     spegel.go / calico.go / cni_netns.go (spegel-mirror/calico-hygiene, cni-netns-gc)
 //   - runtime/ — runtime_<name>.go (the eight runtime-resource
 //     guards, one file each — see runtime_common.go for the family
 //     overview),
-//     disk_bloat.go (W6.3), deep_failure_checks.go (W10-KR1/ST2)
+//     disk_bloat.go (disk-bloat), deep_failure_checks.go (deep-failure-checks)
 //   - wdeps/   — the shared dependency surface (Config/Seams, Deps,
 //     CycleEnv, Check, the CtrTask machinery, the journal tracker,
 //     the node_agent_* textfile writer). The Config domain groups
@@ -407,7 +407,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		WalkOnce:     walkOnce,
 	}
 	checks.Dispatch(ctx, sigOn, h.Cycles, h.groups)
-	// W10 node_agent_* gauges — one textfile per cycle carrying the
+	// node_agent_* gauges — one textfile per cycle carrying the
 	// OOM/conntrack counters and the orphan-hostpath measurements
 	// the checks above just refreshed.
 	h.WriteNodeAgentPromTextfile()

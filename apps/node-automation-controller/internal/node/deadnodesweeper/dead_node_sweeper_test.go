@@ -351,7 +351,7 @@ func TestDeadNodeSweeperFenceAgentsCR(t *testing.T) {
 	}
 }
 
-// W12 P0-7 — medik8s NHC v0.6+ names remediation CRs
+// medik8s NHC v0.6+ names remediation CRs
 // "<nodeName>-<templateName>" under escalatingRemediations /
 // multi-template setups, and may carry the target in
 // remediation.medik8s.io/node-name. Both shapes are fencing

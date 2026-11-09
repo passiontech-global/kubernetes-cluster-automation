@@ -99,7 +99,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// must be kept (inconclusive, never a flap).
 	shimEscalated := false
 	killCapHit := false
-	// W16-KR2: every shim id scoped to OUR containerd this round —
+	// cri-sandbox-reaper: every shim id scoped to OUR containerd this round —
 	// a sandbox dir whose id a live shim holds is not an orphan,
 	// whatever the task-dir scan says.
 	shimIDs := map[string]bool{}
@@ -135,7 +135,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if c.d.ProcAge(pid) < 5*time.Minute {
 			continue
 		}
-		// W12-KR2: an orphan shim already wedged in D
+		// orphan-sandbox-netns: an orphan shim already wedged in D
 		// (uninterruptible) or Z (zombie whose reaper never ran)
 		// state cannot be SIGKILLed away — the signal pends inside
 		// the kernel or lands on a corpse. Escalate the confirmed
@@ -280,7 +280,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		nClean++
 		c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "rm_dir").Inc()
 	}
-	// W16-KR2 — orphan CRI sandbox reaper: SandboxCtlRoot dirs with
+	// cri-sandbox-reaper — orphan CRI sandbox reaper: SandboxCtlRoot dirs with
 	// neither a task dir under CtrTaskRoot nor a live shim holding
 	// the id. Two-phase like the wedged dirs — sandbox-orphan-seen-<id>
 	// marker on first observation, removal only once the marker is

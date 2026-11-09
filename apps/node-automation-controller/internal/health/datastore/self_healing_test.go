@@ -1,6 +1,6 @@
 // self_healing_test.go — the datastore self-healing checks
-// (W6.2 stateful-masterless guard, W6.4 rabbitmq suspended-listener
-// healer, W10-ST5 percona quorum) driven through the fake
+// (stateful-masterless-services stateful-masterless guard, rabbitmq-suspended-listener rabbitmq suspended-listener
+// healer, percona-cluster-quorum percona quorum) driven through the fake
 // clientset + fake dynamic client.
 package datastore
 
@@ -25,7 +25,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W6.2 — stateful-masterless-services
+// stateful-masterless-services — stateful-masterless-services
 // ---------------------------------------------------------------------------
 
 // shSTS builds a ready StatefulSet with pod-template labels.
@@ -66,7 +66,7 @@ func shStatefulZeroGauge(t *testing.T, ns, svc, sts string) (float64, bool) {
 	return m.GetGauge().GetValue(), true
 }
 
-// shOperatorPod builds the dragonfly-operator leader pod the W6.2
+// shOperatorPod builds the dragonfly-operator leader pod the stateful-masterless-services
 // step-1 bounce targets — Running and ReplicaSet-owned, the live
 // shape healDragonflyOperator's candidate filter requires (a
 // terminating/not-Running/controller-less pod is never a leader to
@@ -341,7 +341,7 @@ func TestCheckStatefulMasterlessNonCandidates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W6.4 — rabbitmq-suspended-listener
+// rabbitmq-suspended-listener — rabbitmq-suspended-listener
 // ---------------------------------------------------------------------------
 
 // shRabbitPod builds a rabbitmq-labeled pod in the suspended-listener
@@ -569,7 +569,7 @@ func TestCheckRabbitMQSuspendedCooldown(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-ST5 — percona-cluster-quorum
+// percona-cluster-quorum — percona-cluster-quorum
 // ---------------------------------------------------------------------------
 
 func TestCheckPerconaClusterQuorum(t *testing.T) {

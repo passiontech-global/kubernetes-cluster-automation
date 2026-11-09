@@ -22,7 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
-// EndpointProber is the W9-CP1 brownout probe seam — a TCP connect +
+// EndpointProber is the circuit-breaker-bounce brownout probe seam — a TCP connect +
 // TLS handshake against a Ready endpoint IP on the webhook port.
 // Injectable for tests; a nil Guard.EndpointProber falls back to
 // tcpTLSEndpointProber.
@@ -30,7 +30,7 @@ type EndpointProber func(ctx context.Context, ip string, port int32) bool
 
 // Guard bundles the deps every webhookguard duty shares — the direct
 // clientset, the dynamic client (autopilot-Plan signal of the
-// maintenance mutex, W7-C1), the ops queue name every IncError label
+// maintenance mutex, unmeshed-pod-auditor), the ops queue name every IncError label
 // is stamped from, the clock seam, the brownout probe seam, and the
 // verdict memoizing the maintenance-mutex evaluation the pod-kill
 // paths share within a run. The facade embeds it so the sweep state
@@ -43,10 +43,10 @@ type Guard struct {
 	// a scripted now to reach past the dead threshold. A nil Clock
 	// reads as system time (shared.Clock.Now is nil-safe).
 	Now shared.Clock
-	// EndpointProber is the W9-CP1 brownout probe — injectable for
+	// EndpointProber is the circuit-breaker-bounce brownout probe — injectable for
 	// tests; nil falls back to tcpTLSEndpointProber.
 	EndpointProber EndpointProber
-	// Verdict memoizes the maintenance-mutex evaluation the W7-C1
+	// Verdict memoizes the maintenance-mutex evaluation the unmeshed-pod-auditor
 	// gates (pod bounce + unmeshed remediation) share within a run —
 	// one evaluation per Verdict TTL instead of three API reads per
 	// consumer.
@@ -80,7 +80,7 @@ type Snapshot struct {
 	CRDs   []unstructured.Unstructured
 	CRDErr error
 
-	// UnhealthyNodes is the W5.5 node census: nodes whose Ready
+	// UnhealthyNodes is the endpoint-census node census: nodes whose Ready
 	// endpoints cannot actually serve webhook traffic (NotReady,
 	// partitioned, kubelet-unresponsive, unreachable/out-of-service
 	// taints, or an explicit NetworkPartitioned condition). The
@@ -108,7 +108,7 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
 	s.VWC, s.VWCErr = g.CS.AdmissionregistrationV1().
 		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	// W5.5 — the node census feeds the effective-ready math: a
+	// endpoint-census — the node census feeds the effective-ready math: a
 	// "Ready" webhook pod on a partitioned node cannot be called by
 	// the apiserver, so it must not count toward backend health.
 	s.UnhealthyNodes = map[string]bool{}
@@ -181,7 +181,7 @@ func (s *Snapshot) ReadyCounts() (EndpointCensus, error) {
 	return s.ready, s.readyErr
 }
 
-// MaintenanceActive runs the cluster maintenance mutex (W7-C1) — the
+// MaintenanceActive runs the cluster maintenance mutex (unmeshed-pod-auditor) — the
 // shared three-signal check (node cordon + kured lock + autopilot
 // Plan), exactly like every other deferring module, memoized through
 // the Guard's Verdict. An earlier version carried a nil-dyn degraded

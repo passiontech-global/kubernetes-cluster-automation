@@ -344,7 +344,7 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"ACTION zombie-storm: pod_uid=11111111-2222-3333-4444-555555555555 zombies=640 ppid=777", "ZombieProcessStorm"},
 		{"ACTION cilium-mtu-drift: cilium=1500 nebula=1300", "CiliumMTUExceedsOverlay"},
 		{"ACTION d-state-storm: count=7 runtime=3 wchan=runc=umount_tree", "KernelHungTasks"},
-		// Wave-8 latch→event surface — one Event per STATE-ENTER of
+		// infra latch→event surface — one Event per STATE-ENTER of
 		// a latch that maps to a permanent NodeCondition.
 		{"STATE-ENTER: nebula-degraded relays_only", "NebulaDegraded"},
 		{"STATE-ENTER: cilium-envoy-down admin_ready_fails=2", "CiliumEnvoyDown"},
@@ -356,7 +356,7 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"STATE-ENTER: kernel-keys-pressure usage=0.96", "KernelKeysPressure"},
 		{"STATE-ENTER: cp-cert-reload-stale reload_age=7200s", "ControlPlaneCertReloadStale"},
 		{"ACTION psi-memory-thrash: psi_full_avg60=30.0 mem_free=0.050 fails=2", "NodeMemoryPSIThrashing"},
-		// Wave-9 latch→event surface.
+		// leak-pressure latch→event surface.
 		{"STATE-ENTER: kernel-slab-leak sunreclaim_ratio=0.412", "KernelSlabLeak"},
 		{"STATE-ENTER: nebula-pmtu-blackhole target=10.8.0.1 df_size=1200", "NebulaPMTUBlackhole"},
 		// kernel/host deep-failure + hygiene latch→event surface.
@@ -611,7 +611,7 @@ func TestRotationFreshLinesAreNotReplay(t *testing.T) {
 	}
 }
 
-// TestInodePressureEvents: the W18-1 inode-pressure latch's
+// TestInodePressureEvents: the inode-pressure inode-pressure latch's
 // STATE-ENTER line emits a Warning Event (reason InodePressure, note
 // carries the offending mount + ratio) and its STATE-EXIT line emits
 // an informational (Normal) Event for the clean episode end.

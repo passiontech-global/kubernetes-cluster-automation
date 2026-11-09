@@ -21,7 +21,7 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-// --- W10-FIX1: apiserver.KCMQueueSnapshot / apiserver.KCMQueueStalled ---
+// --- kcm-queue-stall: apiserver.KCMQueueSnapshot / apiserver.KCMQueueStalled ---
 
 func TestParseKCMQueueSnapshot(t *testing.T) {
 	body := "leader_election_master_status 1\n" +
@@ -177,7 +177,7 @@ func TestKCMQueueStalled(t *testing.T) {
 // --- cdeps.CheckCPFreeze ---
 
 // stalledKCMBody is a metrics body that reads leader + a deep,
-// flat-adds backlog — the W10-FIX1 stall signature (never the old
+// flat-adds backlog — the kcm-queue-stall stall signature (never the old
 // leader+zero-depth idle false-positive).
 const stalledKCMBody = "leader_election_master_status 1\n" +
 	"workqueue_depth{name=\"a\"} 60\n" +
@@ -273,7 +273,7 @@ func TestCPFreezeWorkqueueStalledPastGrace(t *testing.T) {
 	}
 }
 
-// TestCPFreezeHealthyIdleNeverRestarts is the W10-FIX1 regression:
+// TestCPFreezeHealthyIdleNeverRestarts is the kcm-queue-stall regression:
 // leader + depthSum==0 across many cycles and well past the old
 // quiet grace must produce ZERO restarts — the old kcmLeaderIdle
 // fired on exactly this body every hour.
@@ -293,7 +293,7 @@ func TestCPFreezeHealthyIdleNeverRestarts(t *testing.T) {
 		e.Now = e.Now.Add(61 * time.Second)
 	}
 	if e.RstN() != 0 {
-		t.Fatal("restart fired on healthy idle cluster (W10-FIX1 regression)")
+		t.Fatal("restart fired on healthy idle cluster (kcm-queue-stall regression)")
 	}
 	if e.HasState("cp-component-frozen") {
 		t.Fatal("cp-component-frozen latched on healthy idle cluster")

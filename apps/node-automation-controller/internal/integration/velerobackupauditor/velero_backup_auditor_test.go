@@ -370,7 +370,7 @@ func TestVeleroBackupAuditorClearsResolvedSeries(t *testing.T) {
 	}
 }
 
-// W8-ST1 — Failed/partial backups and wedged in-flight phases flag
+// velero-bsl-audit — Failed/partial backups and wedged in-flight phases flag
 // on their own reason series; BSLs not phase=Available raise the
 // unavailable gauge.
 func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
@@ -402,7 +402,7 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-ST3 — Everest DatabaseCluster backup auditor
+// backup-posture-audit — Everest DatabaseCluster backup auditor
 // ---------------------------------------------------------------------------
 
 // everestDBCluster builds a DatabaseCluster — backupEnabled toggles
@@ -534,7 +534,7 @@ func TestVeleroAuditorEverestClearsResolved(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-FIX6 — zero-backup blind spot
+// zero-backup-guard — zero-backup blind spot
 // ---------------------------------------------------------------------------
 
 // A Schedule older than 36h that has produced ZERO Backup objects
@@ -585,7 +585,7 @@ func TestVeleroAuditorEverestMissingBackups(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-ST6 — wedged in-flight Backup / PodVolumeBackup audit
+// velero-inflight-audit — wedged in-flight Backup / PodVolumeBackup audit
 // ---------------------------------------------------------------------------
 
 // veleroPVB builds a PodVolumeBackup — phase + startTimestamp drive

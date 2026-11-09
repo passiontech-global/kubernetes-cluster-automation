@@ -72,7 +72,7 @@ backend api_local_back
     # on-marked-down shutdown-sessions: khi tcp-check danh dau backend
     # DOWN, haproxy dong NGAY moi session TCP dai han (watch stream 24h)
     # dinh vao no — kubelet/cilium reconnect sang backend song thay vi
-    # cho timeout client 24h (W5.2).
+    # cho timeout client 24h (haproxy-disable-server).
     default-server on-marked-down shutdown-sessions
 {% for b in api_lb_backends
    if not (b.probe | default(false)) or b.name in (api_lb_probe_reachable | default([])) %}
@@ -92,7 +92,7 @@ frontend {{ lane.name }}_local
 backend {{ lane.name }}_local_back
     option tcp-check
     tcp-check connect
-    # W5.2: nhu api_local_back — backend DOWN phai giai phong moi
+    # haproxy-disable-server: nhu api_local_back — backend DOWN phai giai phong moi
     # long-lived stream dang ket dinh vao no.
     default-server on-marked-down shutdown-sessions
 {% for b in api_lb_backends

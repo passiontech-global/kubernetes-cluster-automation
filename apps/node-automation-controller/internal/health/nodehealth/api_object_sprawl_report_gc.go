@@ -83,7 +83,7 @@ var sprawlReportKinds = []struct {
 	{kube.GVRPolicyReport, "policyreport", "policyreports"},
 }
 
-// sprawlCIKinds is the census half plus, since W16-G1, the
+// sprawlCIKinds is the census half plus, since rollout-scale-flap, the
 // completed-CR GC half: CI/CD CRs that pile up when their operators
 // run without retention (Tekton prune keep cap unset, Shipwright
 // succeededLimit/failedLimit absent). Counted into the same
@@ -99,7 +99,7 @@ var sprawlCIKinds = []struct {
 	kind     string
 	resource string
 	// gcCompleted marks kinds whose terminal-phase objects are GC'd
-	// past sprawlOrphanMinAge (W16-G1: argo AnalysisRun/Experiment).
+	// past sprawlOrphanMinAge (rollout-scale-flap: argo AnalysisRun/Experiment).
 	gcCompleted bool
 }{
 	{kube.GVRTektonPipelineRun, "pipelinerun", "pipelineruns", false},
@@ -242,7 +242,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			obj := &items[i]
 			perNS[obj.GetNamespace()]++
 			ciTotal++
-			// W16-G1 — terminal-phase argo records past the retention
+			// rollout-scale-flap — terminal-phase argo records past the retention
 			// threshold GC like the orphan reports: same budget, same
 			// UID-preconditioned delete, same evidence surface. The
 			// phase test gates it — a Running/Pending analysis is a
@@ -346,7 +346,7 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	return gone
 }
 
-// deleteOrphanReport removes one orphaned report (or, since W16-G1,
+// deleteOrphanReport removes one orphaned report (or, since rollout-scale-flap,
 // one completed argo analysis/experiment) with a UID precondition —
 // the "delete the object I vetted" shape every reaper in this
 // codebase uses.
@@ -364,7 +364,7 @@ func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
 	case apierrors.IsNotFound(err):
 		return true // already gone — GC achieved, budget consumed
 	case apierrors.IsForbidden(err):
-		// Expected until the RBAC wave grants delete on the report
+		// Expected until the RBAC rollout grants delete on the report
 		// CRDs — log and skip without burning a run error.
 		log.Info("WARN: orphan report delete forbidden (RBAC pending)",
 			"kind", rk.kind, "object", obj.GetNamespace()+"/"+obj.GetName())

@@ -18,7 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W5.6 pure parsers ---
+// --- cilium-wg-peer-gc pure parsers ---
 
 func TestParseWGAllowedIPs(t *testing.T) {
 	out := "peer1key=\t10.0.0.1/32\n" +
@@ -60,7 +60,7 @@ func TestParseCiliumEncryptPeers(t *testing.T) {
 	}
 }
 
-// --- W5.6 check ---
+// --- cilium-wg-peer-gc check ---
 
 func TestCheckCiliumWGPeers(t *testing.T) {
 	e := fixture(t)
@@ -143,7 +143,7 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 	}
 }
 
-// --- W6.3 walk + check ---
+// --- disk-bloat walk + check ---
 
 func TestWalkBytesBoundsAndSizes(t *testing.T) {
 	root := t.TempDir()

@@ -156,7 +156,7 @@ const (
 	cjFastPoll          = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
 	cjSlowPoll          = 10 * time.Second // drain/ready waits (bash `sleep 10`)
 
-	// W16-CI1 — stalled / Garden max-containers recovery. A worker
+	// concourse-worker-stall — stalled / Garden max-containers recovery. A worker
 	// pod Running+Ready this long is steady-state; only a TSA or
 	// Garden fault on such a pod justifies a wipe despite an
 	// under-cap cache. Under 15m the pod may still be finishing
@@ -394,7 +394,7 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// (fail-open).
 	if s.workdirOK && s.workdirGiB <= cjMaxWorkdirGiB &&
 		s.nodefsOK && s.pct < cjMinNodefsPct {
-		// W16-CI1 — a steady-state (Ready >= 15m) worker can still be
+		// concourse-worker-stall — a steady-state (Ready >= 15m) worker can still be
 		// dead: the TSA records it `stalled`, or Garden hit
 		// max-containers / baggageclaim ran out of volume space. Such
 		// a worker takes no builds while the cache looks perfectly
@@ -561,7 +561,7 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 }
 
 // ---------------------------------------------------------------------------
-// W16-CI1 — stalled / Garden max-containers recovery. Detection only:
+// concourse-worker-stall — stalled / Garden max-containers recovery. Detection only:
 // the recovery itself is the standard drain → delete → prune →
 // waitReady chain processPod already runs.
 // ---------------------------------------------------------------------------

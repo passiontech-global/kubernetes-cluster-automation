@@ -1,5 +1,5 @@
 // operator_workqueue_watchdog.go — the operator-workqueue-watchdog
-// check (W5.8): the lease-holding zombie detector generalized to
+// check (operator-workqueue-watchdog): the lease-holding zombie detector generalized to
 // third-party operators — a controller renewing its leader-election
 // Lease while its target CRs sit unreconciled past the stuck
 // threshold, auto-healed by a leader-pod delete once the signature
@@ -28,14 +28,14 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// operatorWorkqueueCheck is the W5.8 lease-holding zombie detector
+// operatorWorkqueueCheck is the operator-workqueue-watchdog lease-holding zombie detector
 // generalized to third-party operators — a controller holding a
 // renewing Lease while its target CRs stay unreconciled past the
 // stuck threshold, with leader-pod-delete auto-heal.
 type operatorWorkqueueCheck struct {
 	*probefw.Deps
 
-	// W5.8 watchdog state (serial sweep — unguarded):
+	// operator-workqueue-watchdog watchdog state (serial sweep — unguarded):
 	//   - opFirstSeen: "operator/<gvr>/<ns>/<name>" → first sweep
 	//     that saw the stuck signature; it must persist the
 	//     operator's stuckMinAge before the gauge fires. The window
@@ -61,20 +61,20 @@ type operatorWorkqueueCheck struct {
 	gwClassAt   time.Time
 }
 
-// newOperatorWorkqueueCheck builds the W5.8 watchdog — the ledgers
+// newOperatorWorkqueueCheck builds the operator-workqueue-watchdog watchdog — the ledgers
 // arm lazily on first use (gwClassCtlr stays lazily populated on
 // first resolve).
 func NewOperatorWorkqueueCheck(d *probefw.Deps) probefw.Check {
 	return &operatorWorkqueueCheck{Deps: d}
 }
 
-// W5.8 — operator-workqueue-watchdog knobs. The signature-side
+// operator-workqueue-watchdog — operator-workqueue-watchdog knobs. The signature-side
 // knobs (stuck windows, reason labels) live with the table in
 // operator_watchdog_targets.go; the heal cooldown lives with the
 // heal path in operator_leader_heal.go.
 const (
 	// CheckNameOperatorWorkqueue is the check's kuberhealthy_check
-	// label value — W5.8; like the KCM watchdog it is not a ported
+	// label value — operator-workqueue-watchdog; like the KCM watchdog it is not a ported
 	// HealthCheck but reports under its own check name so the
 	// generic FAIL alerting path covers it.
 	CheckNameOperatorWorkqueue = "operator-workqueue-watchdog"
@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	// W5.8 — the stuck-operator signal: 1 while the operator renews
+	// operator-workqueue-watchdog — the stuck-operator signal: 1 while the operator renews
 	// its Lease but its CRs stay unreconciled past the stuck
 	// threshold. operator/reason identify the stall.
 	operatorWorkqueueFrozenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{

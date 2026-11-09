@@ -1,5 +1,5 @@
 // linkerd_protocol_detection_stall_heal.go — the pod-side heal of
-// the linkerd-protocol-detection-stall check (W10-NM3): cooldown +
+// the linkerd-protocol-detection-stall check (linkerd-protocol-detection-stall): cooldown +
 // maintenance gate, then only when the owning workload's template
 // took the opaque-ports annotation, delete the pod so the
 // replacement proxy starts with the corrected config — and patch

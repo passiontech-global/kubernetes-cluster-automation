@@ -123,7 +123,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// Node list first — "at least one cordoned node" is a cluster-wide
 	// input to the per-PDB verdict. Failing to read it must abort the
 	// run: treating it as "no cordon" would silently clear every
-	// cordoned_node_blocked series mid-incident. W10-FIX5:
+	// cordoned_node_blocked series mid-incident. pinned-volume-guard:
 	// NodeActivelyCordoned — a statically-cordoned node past the
 	// cordon-active window is deliberate state, not a drain in
 	// flight, and must not pin cordoned_node_blocked forever.

@@ -25,7 +25,7 @@ func (h *Hygiene) initChecks() {
 	// Group 1 — ungated. etcdguard sits with the 60s-timer
 	// guards: an embedded etcd that hit quota during boot needs
 	// the guard BEFORE the 20min wedge grace, and hosts without
-	// etcdctl no-op. W8-CP3/CP4 are ungated like the guards too —
+	// etcdctl no-op. cp-freeze-heal/pki-cert-drift are ungated like the guards too —
 	// a frozen KCM/scheduler or a stale PKI reload must not wait
 	// out the module-22 boot grace; both probes are read-only
 	// until their own consecutive-cycle + rate budgets pass.
@@ -37,7 +37,7 @@ func (h *Hygiene) initChecks() {
 	add(storelocal.NewPool(h.Deps), &ungated)
 	add(oom.NewLoop(h.Deps), &ungated)
 	add(etcd.NewGuard(h.Deps), &ungated)
-	// The W10-CP2/W10-CP5 ride-alongs share the cp-freeze dispatch
+	// The kine-storage/kubeconfig-cert-expiry ride-alongs share the cp-freeze dispatch
 	// slot — FreezeCheck.Run invokes them before its own probe so
 	// they keep the pre-uptime-gate position they had as inlined
 	// calls (same pre-Check order). They are registered in h.checks

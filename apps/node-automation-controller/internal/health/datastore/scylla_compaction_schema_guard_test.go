@@ -92,7 +92,7 @@ func TestScyllaUniformVersionsPass(t *testing.T) {
 	}
 }
 
-// W12-ST3 — a pod whose busiest shard is saturated (0.99) while the
+// scylla-shard-imbalance — a pod whose busiest shard is saturated (0.99) while the
 // shard-average idles (~0.43) is the hot-partition skew: tracked on
 // first sight, gauge + FAIL past the 10m window.
 func TestScyllaShardImbalancePersists(t *testing.T) {
@@ -148,7 +148,7 @@ func TestScyllaUniformHotShardsNoSkew(t *testing.T) {
 	}
 }
 
-// W12-ST3 — a stall counter climbing between sweeps is a live
+// scylla-shard-imbalance — a stall counter climbing between sweeps is a live
 // overload stall: first scrape only stores the baseline, second
 // scrape with +12 read timeouts emits the delta.
 func TestScyllaOverloadStallDelta(t *testing.T) {

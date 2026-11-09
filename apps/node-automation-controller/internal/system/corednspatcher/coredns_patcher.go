@@ -29,7 +29,7 @@
 // disables the pin (the Deployment keeps its own .spec.replicas) so
 // a cluster can re-enable the standalone CPA without being fought.
 //
-// Corefile negative-cache guard (W12-NM4b): the kube-system/coredns
+// Corefile negative-cache guard (negative-cache-guard): the kube-system/coredns
 // ConfigMap is k0s-managed and drifts back to a bare `cache 30`,
 // which negative-caches NXDOMAIN for the full SOA TTL — a Job pod
 // that outraces endpointslice-controller at deploy time eats a
@@ -342,7 +342,7 @@ func corednsPatchBody(zoneWhen string, minDomains int, wantReplicas int32) ([]by
 }
 
 // ---------------------------------------------------------------------------
-// Corefile negative-cache reconcile (W12-NM4b)
+// Corefile negative-cache reconcile (negative-cache-guard)
 // ---------------------------------------------------------------------------
 
 const (

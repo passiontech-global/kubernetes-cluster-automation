@@ -1,4 +1,4 @@
-// inflight_pvb_audit.go — W10-ST6 of velero-backup-auditor: the
+// inflight_pvb_audit.go — velero-inflight-audit of velero-backup-auditor: the
 // in-flight transfer audit. Backups and PodVolumeBackups held
 // InProgress|Deleting past veleroStuckMaxAge have lost the thread —
 // Backups are mark-only (a delete can abort a real backup); a PVB
@@ -28,10 +28,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-ST6 — in-flight Backup / PodVolumeBackup wedge audit
+// velero-inflight-audit — in-flight Backup / PodVolumeBackup wedge audit
 // ---------------------------------------------------------------------------
 
-// auditInFlightTransfers is the W10-ST6 sweep: every Backup and
+// auditInFlightTransfers is the velero-inflight-audit sweep: every Backup and
 // PodVolumeBackup held InProgress or Deleting past veleroStuckMaxAge
 // (6h) has lost the thread — the velero server or node-agent that
 // owned it is gone. Backups are mark-only (deleting a Backup CR can
@@ -125,13 +125,13 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 }
 
 // ---------------------------------------------------------------------------
-// W16-ST1 — velero.io/v2alpha1 DataUpload / DataDownload wedge audit
+// cnpg-backup-audit — velero.io/v2alpha1 DataUpload / DataDownload wedge audit
 // ---------------------------------------------------------------------------
 
 // dataMovementStuckPhases are the in-flight phases of the velero
 // data-mover CRDs — a DataUpload/DataDownload held in any of these
 // past veleroStuckMaxAge has lost its node-agent thread, same wedge
-// shape as a PodVolumeBackup (W16-ST1).
+// shape as a PodVolumeBackup (cnpg-backup-audit).
 var dataMovementStuckPhases = map[string]bool{
 	"InProgress": true,
 	"Accepted":   true,
@@ -146,7 +146,7 @@ var dataMovementStuckPhases = map[string]bool{
 // wedged object pages and waits for operator/velero cleanup.
 var veleroDataMovementWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_velero_data_movement_wedged",
-	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — W16-ST1.",
+	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — cnpg-backup-audit.",
 }, []string{"namespace", "name", "kind"})
 
 func init() {

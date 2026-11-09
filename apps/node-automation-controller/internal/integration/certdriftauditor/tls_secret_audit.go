@@ -1,9 +1,9 @@
 // tls_secret_audit.go — Check B of cert-drift-auditor: days-until-
 // expiry for every kubernetes.io/tls Secret's tls.crt (the paged
-// sweep that also feeds the W7-C6 replicator diff in
+// sweep that also feeds the replicator-cert-drift replicator diff in
 // replicated_secret_audit.go), plus the linkerd-identity-issuer
 // serial fingerprint watch that stamps a rollout restart on
-// linkerd-identity when cert-manager rotates the issuer (W8-NM2).
+// linkerd-identity when cert-manager rotates the issuer (issuer-serial-watch).
 package certdriftauditor
 
 import (
@@ -33,7 +33,7 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	a.seenSecrets.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
-	// W7-C6 — the sweep collects two extra payloads on the same
+	// replicator-cert-drift — the sweep collects two extra payloads on the same
 	// paged read: tlsData snapshots every TLS secret's raw tls.crt
 	// (parseable or not — drift is a byte comparison, not a cert
 	// parse), and replicated holds every destination carrying the
@@ -104,7 +104,7 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	// last sweep — otherwise /metrics keeps reporting a dead secret.
 	a.seenSecrets.Prune(metrics.TLSSecretDaysToExpiry.DeleteLabelValues)
 
-	// W7-C6 — the replicator drift diff rides the same read: every
+	// replicator-cert-drift — the replicator drift diff rides the same read: every
 	// replicated destination's tls.crt is compared against its
 	// source (the TLS map first, a direct Get for non-TLS sources).
 	a.auditReplicatedSecrets(ctx, tlsData, replicated)

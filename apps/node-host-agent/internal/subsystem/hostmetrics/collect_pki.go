@@ -1,5 +1,5 @@
 // collect_pki.go — on-disk PKI cert expiry (2.4): days-left per
-// *.crt/*.pem under the k0s/kine PKI dirs, plus the W12-CP4a
+// *.crt/*.pem under the k0s/kine PKI dirs, plus the sa-pub-key-fingerprint
 // ServiceAccount token signer key fingerprint (sa.pub SHA-256) on
 // control-plane nodes. Split out of hostmetrics.go.
 package hostmetrics
@@ -39,7 +39,7 @@ var descPKIDays = prometheus.NewDesc(
 
 // defaultSAPubHostPath is the sa.pub path relative to HostRoot —
 // the ServiceAccount token signer public key every control-plane
-// node must share byte-for-byte (W12-CP4a).
+// node must share byte-for-byte (sa-pub-key-fingerprint).
 const defaultSAPubHostPath = "var/lib/k0s/pki/sa.pub"
 
 // saPubHashHelp is the HELP text shared with the controllerhygiene
@@ -69,7 +69,7 @@ func sha256FileHex(path string) (string, error) {
 }
 
 // collectSAPubFingerprint emits node_k0s_sa_pub_fingerprint_hash on
-// control-plane nodes — W12-CP4a: when one CP node's sa.pub diverges
+// control-plane nodes — sa-pub-key-fingerprint: when one CP node's sa.pub diverges
 // (rotation not propagated, or the file never reloaded), tokens the
 // TokenRequest API mints there 401 on the other apiservers (~33/66%
 // of requests behind the CP load balancer). The hash rides a label
@@ -174,7 +174,7 @@ func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, days, c.cfg.NodeName, label)
 		}
 	}
-	// W12-CP4a: the sa.pub fingerprint rides the pki domain — same
+	// sa-pub-key-fingerprint: the sa.pub fingerprint rides the pki domain — same
 	// PKI surface, same control-plane-only emission policy.
 	c.collectSAPubFingerprint(ch)
 }

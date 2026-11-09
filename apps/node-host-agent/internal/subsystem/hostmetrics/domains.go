@@ -13,7 +13,7 @@
 // Now a domain is ONE row here: the emit entry point plus every
 // series family it can produce.
 //
-// The W10 textfile-only channels (node_agent_*_utilization_ratio in
+// The textfile-only channels (node_agent_*_utilization_ratio in
 // kernelfail/pidfd.go, the steal/entropy gauges in
 // kernelfail/steal_entropy.go) are deliberately NOT rows: they ride
 // promfile.Builder on the latch ticker, not the

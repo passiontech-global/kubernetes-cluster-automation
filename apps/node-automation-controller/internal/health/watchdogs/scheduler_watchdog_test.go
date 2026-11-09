@@ -1,5 +1,5 @@
 // scheduler_watchdog_test.go — coverage for the
-// scheduler-watchdog check (W8-CP3 + W12-SC1).
+// scheduler-watchdog check (cp-freeze-heal + preemption-cascade-signal).
 package watchdogs
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
-// W8-CP3 — a pod Pending >5m with no PodScheduled condition while
+// cp-freeze-heal — a pod Pending >5m with no PodScheduled condition while
 // Ready workers exist fails the check and raises the frozen gauge;
 // a healthy shape passes and clears it.
 func TestCheckSchedulerFrozen(t *testing.T) {
@@ -46,7 +46,7 @@ func TestCheckSchedulerFrozenHealthy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-SC1 — PriorityClass preemption cascade
+// preemption-cascade-signal — PriorityClass preemption cascade
 // ---------------------------------------------------------------------------
 
 // preemptedEvent builds a recent reason=Preempted event — the

@@ -598,7 +598,7 @@ func TestStormGateZombieHeartbeatDoesNotGate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-SC1 — PriorityClass preemption cascade
+// preemption-cascade-signal — PriorityClass preemption cascade
 // ---------------------------------------------------------------------------
 
 // preemptedEvent builds a recent reason=Preempted corev1.Event.
@@ -687,7 +687,7 @@ func TestStormGatePreemptionListError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W18-8 — image-pull storm (storm signal (e))
+// image-pull-storm-gate — image-pull storm (storm signal (e))
 // ---------------------------------------------------------------------------
 
 // stalledPod builds a pod whose app container is currently waiting
@@ -795,7 +795,7 @@ func TestStormGateImagePullListError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W18-9 — forgotten maintenance holds (MaintenanceHoldStale)
+// maintenance-hold-stale — forgotten maintenance holds (MaintenanceHoldStale)
 // ---------------------------------------------------------------------------
 
 // drainMaintenanceHoldStale counts the recorder's queued

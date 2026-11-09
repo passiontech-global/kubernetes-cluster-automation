@@ -78,7 +78,7 @@ func InjectorHealthy(snap *Snapshot) (bool, error) {
 				continue
 			}
 			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
-			// W9-CP1 brownout guard: an effective-ready endpoint set
+			// circuit-breaker-bounce brownout guard: an effective-ready endpoint set
 			// that was probed AND failed every TCP+TLS handshake is
 			// hung, not healthy — evicting unmeshed pods now would
 			// only recreate them unmeshed again. A service that was

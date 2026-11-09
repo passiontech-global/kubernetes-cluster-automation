@@ -1,6 +1,6 @@
 // collect_psi_cpu.go — PSI pressure signals and the cpu-delivered
 // probe: the cpu some avg60 gauge + state-node-overloaded latch
-// (the runner's overload signal), the W5.7 memory/io some+full
+// (the runner's overload signal), the psi-swap-thrash memory/io some+full
 // avg60 gauges + vmstat swap-thrash counters, and the busy-loop
 // hypervisor-steal canary. Split out of hostmetrics.go.
 package hostmetrics
@@ -255,7 +255,7 @@ func (c *Collector) collectCPUDelivered(ch chan<- prometheus.Metric) {
 		prometheus.GaugeValue, wall)
 }
 
-// --- W5.7: PSI memory/IO pressure + vmstat swap-thrash counters ---
+// --- psi-swap-thrash: PSI memory/IO pressure + vmstat swap-thrash counters ---
 
 // The memory/io PSI descs carry the node label so a federated store
 // can attribute them back to the agent host — same convention as the
@@ -322,7 +322,7 @@ func psiAvg60Full(path string) (some, full float64, someOK, fullOK bool) {
 }
 
 // vmstatCounters extracts the named cumulative counters from
-// /proc/vmstat — "key value" per line (pswpin/pswpout for W5.7).
+// /proc/vmstat — "key value" per line (pswpin/pswpout for psi-swap-thrash).
 // Missing keys are simply absent from the map.
 func vmstatCounters(path string, keys ...string) map[string]uint64 {
 	want := make(map[string]bool, len(keys))

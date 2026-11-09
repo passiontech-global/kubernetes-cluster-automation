@@ -1,4 +1,4 @@
-// collect_procs_cgroup_test.go — Wave-2 zombie count, cgroup pids ratio, and MTU-drift series.
+// collect_procs_cgroup_test.go — zombie count, cgroup pids ratio, and MTU-drift series.
 
 package hostmetrics
 
@@ -125,7 +125,7 @@ func TestMTUDriftAbsentWhenNoSources(t *testing.T) {
 	}
 }
 
-// --- Wave-9: cilium_wg0 double-encap MTU + OpenEBS LocalPV bytes ---
+// --- cilium_wg0 double-encap MTU + OpenEBS LocalPV bytes ---
 
 // TestMTUDriftWG0Encap: cilium_wg0 must stay <= nebula-60 — the WG
 // header overhead inside the overlay. Above that the double-encap
@@ -170,7 +170,7 @@ func TestMTUDriftWG0AbsentNoVote(t *testing.T) {
 	}
 }
 
-// --- W16-NM4: pod lxc* veth MTU drift ---
+// --- lxc-mtu-drift: pod lxc* veth MTU drift ---
 
 // TestMTUDriftPodLxc: a stale pod veth (lxc<hex>, MTU 1500) drifts
 // against neb1 1300 even with every cilium_* datapath iface aligned;

@@ -241,7 +241,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		return false, nil // nothing to roll
 	}
 
-	// W18-9 image-pull gate: an owned pod waiting in
+	// maintenance-hold-stale image-pull gate: an owned pod waiting in
 	// ImagePullBackOff/ErrImagePull means the PREVIOUS replacement
 	// never finished landing its image — evicting the next member
 	// stacks a second stuck pod on the set (and the replacement

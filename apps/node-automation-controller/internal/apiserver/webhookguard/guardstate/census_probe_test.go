@@ -1,4 +1,4 @@
-// census_probe_test.go — coverage for the W9-CP1 census/probe plumbing:
+// census_probe_test.go — coverage for the circuit-breaker-bounce census/probe plumbing:
 // the ready-endpoint census, the webhook backend probe set, the
 // slice-port preference, the probe-candidate collector and the
 // production TCP+TLS prober.

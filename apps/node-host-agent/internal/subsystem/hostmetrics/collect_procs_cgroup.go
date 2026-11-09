@@ -1,6 +1,6 @@
 // collect_procs_cgroup.go — A2 zombie/d-state counts, cgroup
-// pids/memory.events pressure (W7-H2/H6), the kubepods
-// cri-containerd scope footprint, and B4/W9 MTU drift. Split out
+// pids/memory.events pressure (systemd-scopes/memory-events-reclaim), the kubepods
+// cri-containerd scope footprint, and B4/overlay-MTU drift. Split out
 // of hostmetrics.go.
 package hostmetrics
 
@@ -31,7 +31,7 @@ var defaultCgroupPidsSlices = []string{
 }
 
 // defaultCgroupMemUnits are the system.slice units whose
-// memory.events feed the W7-H6 reclaim-throttling counters — the
+// memory.events feed the memory-events-reclaim reclaim-throttling counters — the
 // k0s daemons whose freeze-under-high is the classic gray failure.
 var defaultCgroupMemUnits = []string{
 	"k0scontroller.service",
@@ -45,7 +45,7 @@ var (
 		"node_host_agent_processes_zombie_count",
 		"Processes in state Z under the host proc root (emitted only when the scan succeeds).",
 		[]string{"node"}, nil)
-	// W7-H1: uninterruptible-sleep count — the same /proc walk.
+	// d-state-storm: uninterruptible-sleep count — the same /proc walk.
 	descDState = prometheus.NewDesc(
 		"node_host_agent_dstate_processes",
 		"Processes in state D (uninterruptible sleep) under the host proc root (emitted only when the scan succeeds).",
@@ -66,7 +66,7 @@ func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
 		switch ps.state {
 		case 'Z':
 			n++
-		case 'D': // W7-H1: uninterruptible-sleep count, same scan
+		case 'D': // d-state-storm: uninterruptible-sleep count, same scan
 			dstate++
 		}
 	}
@@ -117,8 +117,8 @@ var descMTUDrift = prometheus.NewDesc(
 	[]string{"node"}, nil)
 
 // wgEncapOverheadBytes is the WireGuard encapsulation overhead the
-// cilium_wg0 MTU must leave under the nebula overlay MTU (W9
-// double-encap guard — same constant as workerhygiene).
+// cilium_wg0 MTU must leave under the nebula overlay MTU (double-encap
+// guard — same constant as workerhygiene).
 const wgEncapOverheadBytes = 60
 
 // collectMTUDrift emits 1 when a pod-datapath MTU exceeds what the
@@ -127,7 +127,7 @@ const wgEncapOverheadBytes = 60
 // cilium_net (sysfs, falling back to agent-runtime-config.json)
 // must stay <= neb, and cilium_wg0 must stay <= neb-60 to leave
 // room for the WG header inside the double-encapsulated path, and
-// (W16-NM4) the MAX pod lxc* veth MTU must stay <= neb — a stale
+// (lxc-mtu-drift) the MAX pod lxc* veth MTU must stay <= neb — a stale
 // pod veth dies on FRAG_NEEDED even with aligned datapath ifaces.
 // The series emits when the overlay MTU resolves AND at least one
 // datapath or pod-veth MTU resolves; absent interfaces simply don't
@@ -155,15 +155,15 @@ func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 		prometheus.GaugeValue, drift, c.cfg.NodeName)
 }
 
-// --- W7: systemd scope footprint, ARP entries, cgroup memory.events ---
+// --- systemd scope footprint, ARP entries, cgroup memory.events ---
 
 var (
-	// W7-H2: the abandoned cri-containerd scope footprint.
+	// systemd-scopes: the abandoned cri-containerd scope footprint.
 	descSystemdScopes = prometheus.NewDesc(
 		"node_host_agent_systemd_scopes_count",
 		"cri-containerd-*.scope dirs under the kubepods cgroup slice — the abandoned-scope footprint slowing PID 1 D-Bus.",
 		[]string{"node"}, nil)
-	// W7-H6: memory.events reclaim-throttling counters.
+	// memory-events-reclaim: memory.events reclaim-throttling counters.
 	descCgMemHigh = prometheus.NewDesc(
 		"node_host_agent_cgroup_memory_high_events_total",
 		"memory.events `high` of the unit — direct-reclaim throttling episodes (freeze, not OOMKill).",
@@ -175,7 +175,7 @@ var (
 )
 
 // collectSystemdScopes counts cri-containerd-*.scope dirs under the
-// kubepods cgroup slice (W7-H2): a leaking abandoned-scope
+// kubepods cgroup slice (systemd-scopes): a leaking abandoned-scope
 // footprint is what slows every PID 1 D-Bus call down before
 // systemctl-level symptoms appear. Counted directly in the cgroup
 // fs — no systemctl fork per scrape. Emits only when the slice
@@ -203,7 +203,7 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 }
 
 // collectCgroupMemEvents reads memory.events of the configured
-// system.slice units (W7-H6): a climbing `high` count is
+// system.slice units (memory-events-reclaim): a climbing `high` count is
 // direct-reclaim throttling evidence — the unit freezes without an
 // OOMKill, the classic healthcheck-timeout-with-no-logs gray
 // failure; `oom_kill` counts the kills that do happen. Each series

@@ -33,7 +33,7 @@ type EnvDeps struct {
 // New error path stay in the caller. Fields wiring never set
 // (Hub.SelfEndpoint, KineTTL.MinProcAge, KinePool.DBPortFallback,
 // OOMLoop shield adjs, the Feeder probe/remediate cadence knobs,
-// EtcdGuard.MinRun, the W8 CPFreeze/PKIDrift knobs, …) stay zero —
+// EtcdGuard.MinRun, the CPFreeze/PKIDrift knobs, …) stay zero —
 // New's applyDefaults fills them exactly as before.
 //
 // d.PathJoin (the nil-safe HostPath join) — NOT the package

@@ -1,5 +1,5 @@
 // konnectivity_tunnel_health_test.go — coverage for the
-// konnectivity-tunnel-health check (W12-CP3): the half-open deficit
+// konnectivity-tunnel-health check (konnectivity-tunnel-health): the half-open deficit
 // persisting past the window heals the agent, an all-agents-down
 // shape never heals (server-side outage), and the no-CP /
 // no-Prometheus postures pass clean.

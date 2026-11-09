@@ -1,5 +1,5 @@
 // operator_watchdog_targets.go — the watched-operator table of the
-// operator-workqueue-watchdog check (W5.8): the opStuckResource /
+// operator-workqueue-watchdog check (operator-workqueue-watchdog): the opStuckResource /
 // operatorTarget wiring and the operatorTargets rows binding each
 // operator's leader-election Lease + pod selector to its CRD
 // signature set. The generic per-CRD stuck predicates live in
@@ -37,20 +37,20 @@ const (
 	// opReasonNoConditions is the never-reconciled signature for CR
 	// types that carry no observedGeneration — their controller
 	// stamps status.conditions on the first reconcile pass, so an
-	// absent/empty list means it never picked the object up (W7-C2).
+	// absent/empty list means it never picked the object up (operator-watchdog-targets).
 	opReasonNoConditions = "no_status_conditions"
 	// opReasonNoPhase is the same signature for CR types that report
 	// a status.phase (argocd): an empty phase means the operator
-	// never reconciled the object (W7-C2).
+	// never reconciled the object (operator-watchdog-targets).
 	opReasonNoPhase = "no_status_phase"
 	// opReasonNoStatus is the medik8s variant: status.phase AND
 	// status.conditions both absent — the operator never completed
-	// a reconcile pass on either channel (W10-CP3).
+	// a reconcile pass on either channel (operator-workqueue-watchdog).
 	opReasonNoStatus = "no_status_at_all"
 )
 
 // ---------------------------------------------------------------------------
-// operator-workqueue-watchdog (W5.8) — lease-holding zombie detector
+// operator-workqueue-watchdog (operator-workqueue-watchdog) — lease-holding zombie detector
 // + auto-healer.
 // ---------------------------------------------------------------------------
 
@@ -84,12 +84,12 @@ type opStuckResource struct {
 //
 // podNS overrides the namespace pods are looked up in when it differs
 // from the Lease's namespace — the cert-manager chart elects leaders
-// in kube-system while its pods live in cert-manager (W10-FIX2).
+// in kube-system while its pods live in cert-manager (operator-watchdog-leases).
 //
 // leaseOptional marks operators that legitimately run without a
 // leader-election Lease (external-secrets runs replicas:1 with
 // leaderElect:false, dragonfly-operator has --leader-elect patched
-// out — W10-FIX2): when no candidate Lease is found the watchdog
+// out — operator-watchdog-leases): when no candidate Lease is found the watchdog
 // falls back to a Running pod matching podSelector as the liveness
 // proof — a live pod whose CRs still sit unreconciled is the same
 // zombie shape the Lease renewTime proves for electing operators.
@@ -180,7 +180,7 @@ var operatorTargets = []operatorTarget{
 			reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen,
 		}},
 	},
-	// W7-C2 — the ten additional leader-electing operators: every one
+	// operator-watchdog-targets — the ten additional leader-electing operators: every one
 	// a controller-runtime leader whose zombie-leader gray failure
 	// would wedge a whole slice of the stack (gitops sources, cert
 	// issuance, secret sync, autoscaling, stateful operands).
@@ -219,7 +219,7 @@ var operatorTargets = []operatorTarget{
 		leaseNames: []string{"cert-manager-controller"},
 		// The chart elects in kube-system but runs its pods in the
 		// release namespace — pod lookups must not scan kube-system
-		// (W10-FIX2).
+		// (operator-watchdog-leases).
 		podNS:       "cert-manager",
 		podSelector: "app.kubernetes.io/name=cert-manager",
 		stuckMinAge: operatorStuckMinAge,
@@ -336,7 +336,7 @@ var operatorTargets = []operatorTarget{
 	},
 
 	// ------------------------------------------------------------------
-	// W10-CP3 — the remaining operators whose stuck queues still gate
+	// operator-workqueue-watchdog — the remaining operators whose stuck queues still gate
 	// the self-healing path. Lease ids, namespaces, pod selectors and
 	// CRD anchors were verified against the cluster's Flux manifests
 	// and upstream kubebuilder scaffolds (medik8s election ids
@@ -388,7 +388,7 @@ var operatorTargets = []operatorTarget{
 		// Each ships multiple election-id generations across
 		// releases, so leaseNames carries every candidate and
 		// leaseOptional lets the pod fallback cover a total id
-		// rotation (W10-CP3).
+		// rotation (operator-workqueue-watchdog).
 		name:          "percona-xtradb-cluster-operator",
 		leaseNS:       "everest",
 		leaseNames:    []string{"90888d0c.percona.com", "percona-xtradb-cluster-operator-lock"},
@@ -461,7 +461,7 @@ var operatorTargets = []operatorTarget{
 		}},
 	},
 	{
-		// W16-G1 — argo-rollouts: the Rollouts controller reconciles
+		// rollout-scale-flap — argo-rollouts: the Rollouts controller reconciles
 		// argoproj.io/v1alpha1 Rollouts (the cluster runs the official
 		// chart in the argo-rollouts namespace — infrastructure/base/
 		// helm/helm-releases/argo-rollouts). A stalled observedGeneration
@@ -479,7 +479,7 @@ var operatorTargets = []operatorTarget{
 		}},
 	},
 	{
-		// W16-G1 — cloudflare-tunnel-gateway-controller (lexfrei chart,
+		// rollout-scale-flap — cloudflare-tunnel-gateway-controller (lexfrei chart,
 		// cloudflare-tunnel-system ns — infrastructure/base/helm/
 		// helm-releases/cloudflare-tunnel-gateway-controller). The
 		// controller owns NO CRD of its own: it reconciles Gateway API
@@ -488,7 +488,7 @@ var operatorTargets = []operatorTarget{
 		// cftOwns* filters below. The chart may or may not leader-elect
 		// depending on replica count — leaseOptional lets a live pod
 		// prove liveness when no Lease exists (dragonfly-operator's
-		// W10-FIX2 posture).
+		// operator-watchdog-leases posture).
 		name:          "cloudflare-tunnel-gateway-controller",
 		leaseNS:       "cloudflare-tunnel-system",
 		leaseNames:    []string{"cloudflare-tunnel-gateway-controller"},

@@ -127,7 +127,7 @@ func TestNebulaSlowpathAndSiteedge(t *testing.T) {
 	}
 }
 
-// --- W12-NM2: targeted per-peer conntrack flush on degraded/siteedge ---
+// --- nebula-conntrack-flush: targeted per-peer conntrack flush on degraded/siteedge ---
 
 // nebulaStaticMapEnv wires a HostRoot carrying a rendered
 // /etc/nebula/interdc/config.yaml static_host_map — the dead-marker
@@ -290,7 +290,7 @@ func TestNebulaUnderlayPeersParsesStaticHostMap(t *testing.T) {
 	}
 }
 
-// --- W12-NM2: clock latch → systemd-timesyncd restart ---
+// --- nebula-conntrack-flush: clock latch → systemd-timesyncd restart ---
 
 func TestNebulaClockLatchRestartsTimesyncd(t *testing.T) {
 	e := nebulaEnv(t, nil)

@@ -127,7 +127,7 @@ type poolStats struct {
 	serverConns int64 // sum of every sv_* column (bash parity)
 	clWaiting   int64
 	// maxWaitSec is the `maxwait` column — the age in seconds of the
-	// oldest client queued for a server conn (W12-CP1 starvation
+	// oldest client queued for a server conn (pgbouncer-pool-starvation starvation
 	// signal; maxwait_us's fractional part adds nothing the guard
 	// needs).
 	maxWaitSec int64
@@ -277,7 +277,7 @@ func (p *Probe) RunChecks(ctx context.Context) *Result {
 		if !credOK {
 			note(fmt.Sprintf("missing .env creds (%s)", p.d.Cfg.EnvFile))
 		} else {
-			// W8-CP2: reap stuck sessions each probe round —
+			// kinedb-maintenance: reap stuck sessions each probe round —
 			// idle-in-transaction >5m or a non-maintenance active
 			// query >10m holds locks the compact guard needs.
 			p.reapStuckSessions(ctx, pg, user, pass, note)
@@ -286,11 +286,11 @@ func (p *Probe) RunChecks(ctx context.Context) *Result {
 			// census each round (idle-in-tx, dead tuples, XID age,
 			// pg_wal/archiver/slots) plus the gated remediations.
 			p.pgHygiene(ctx, pg, user, pass, res, note)
-			// W8-CP2: pgbouncer saturation/auth wedge — deep
+			// kinedb-maintenance: pgbouncer saturation/auth wedge — deep
 			// client queue, or e2e auth failing while the raw
 			// backend still logs in, means the pooler itself is
 			// the wedge → container restart (15m cooldown).
-			// W12-CP1 rides the same check: a starved wait queue
+			// pgbouncer-pool-starvation rides the same check: a starved wait queue
 			// (maxwait>10s / cl_waiting with sv_active==0) while
 			// the backend idles below the pool's conn count →
 			// RECONNECT the stalled server conns first.
@@ -493,7 +493,7 @@ func (p *Probe) emitProbe(res *Result) {
 		b.Gauge("kine_db_pgbouncer_clients_waiting",
 			"cl_waiting of the postgres pool — deep queue = client spiral",
 			float64(res.pool.clWaiting))
-		// W12-CP1 alert contract series (plan names — kept separate
+		// pgbouncer-pool-starvation alert contract series (plan names — kept separate
 		// from the kine_db_* family above so the old dashboards do
 		// not double-count the same number under two names).
 		b.Gauge("kine_pgbouncer_client_waiting_connections",
@@ -574,7 +574,7 @@ func (p *Probe) emitProbe(res *Result) {
 				float64(h.slotRetained))
 			p.d.M.InactiveSlot.Set(float64(h.slotRetained))
 		}
-		// W12-CP2 item 7 — invalid-index census + seq-scan
+		// invalid-index-reaper item 7 — invalid-index census + seq-scan
 		// regression counters. The seq_* series are cumulative
 		// pg_stat counters → TYPE counter, like the rollback total
 		// in the xact textfile.

@@ -1,5 +1,5 @@
 // nats_jetstream_health.go — the nats-jetstream-health check
-// (W12-ST1): NATS JetStream wedge signatures the Ready gate cannot
+// (nats-jetstream-health): NATS JetStream wedge signatures the Ready gate cannot
 // see. Core NATS pub/sub keeps answering on :4222 while the
 // JetStream Raft layer is brain-dead, so member pods report
 // Ready=True through every one of the signatures below. The check
@@ -34,7 +34,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// natsJetstreamHealthCheck is the W12-ST1 JetStream wedge watchdog.
+// natsJetstreamHealthCheck is the nats-jetstream-health JetStream wedge watchdog.
 type natsJetstreamHealthCheck struct {
 	*probefw.Deps
 
@@ -49,7 +49,7 @@ type natsJetstreamHealthCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// NewNatsJetstreamHealthCheck builds the W12-ST1 check — its state
+// NewNatsJetstreamHealthCheck builds the nats-jetstream-health check — its state
 // is the seen/emitted ledgers (zero value usable); pod-delete
 // cooldowns ride the shared Deps.Heals set via DeletePodHeal.
 func NewNatsJetstreamHealthCheck(d *probefw.Deps) probefw.Check {
@@ -62,7 +62,7 @@ const (
 	// The per-pod log-scan fan-out cap (Component 3 worker pool).
 	natsLogScanWorkers = 4
 
-	// W12-ST1 — nats-jetstream-health knobs.
+	// nats-jetstream-health — nats-jetstream-health knobs.
 	natsAppLabelValue    = "nats" // app.kubernetes.io/name
 	natsWedgeMinAge      = 10 * time.Minute
 	natsLogScanMinPodAge = 5 * time.Minute
@@ -77,7 +77,7 @@ const (
 	natsReasonNoMetaLeader       = "no_meta_leader"
 	natsReasonRaftLostLeadership = "raft_lost_leadership"
 	natsReasonConsumerAckFloor   = "consumer_ack_floor"
-	// W16-ST2 — a JetStream stream (or its raft group) lost its
+	// stream-leaderless — a JetStream stream (or its raft group) lost its
 	// leader: replicas report the stream-leader gauge but none holds
 	// leadership, so publishes to the stream stall while the server
 	// itself stays Ready.
@@ -93,7 +93,7 @@ var natsHealableReasons = map[string]bool{
 	natsReasonJetStreamDisabled:  true,
 	natsReasonNoMetaLeader:       true,
 	natsReasonRaftLostLeadership: true,
-	// W16-ST2 — a member that lost its stream leaders recovers them
+	// stream-leaderless — a member that lost its stream leaders recovers them
 	// by rejoining the raft groups on a fresh start. Still gated on
 	// the >=2-Ready-siblings quorum census below.
 	natsReasonStreamLeaderless: true,
@@ -105,7 +105,7 @@ var natsLogMarkers = []struct{ marker, reason string }{
 	{"jetstream not enabled", natsReasonJetStreamDisabled},
 	{"no meta leader", natsReasonNoMetaLeader},
 	{"raft: lost leadership", natsReasonRaftLostLeadership},
-	// W16-ST2 — stream-level leader loss: the server keeps serving
+	// stream-leaderless — stream-level leader loss: the server keeps serving
 	// core NATS while every replica of a stream group reports no
 	// leader.
 	{"stream has no leader", natsReasonStreamLeaderless},
@@ -113,13 +113,13 @@ var natsLogMarkers = []struct{ marker, reason string }{
 }
 
 var (
-	// W12-ST1 — one series per (namespace, pod, reason) wedge. The
+	// nats-jetstream-health — one series per (namespace, pod, reason) wedge. The
 	// pod label is empty for namespace-scope findings
 	// (meta_leaderless) and consumer findings whose owner pod the
 	// series cannot resolve.
 	natsJetstreamUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_nats_jetstream_unhealthy",
-		Help: "1 while a NATS JetStream pod/cluster reports a wedge signature (jetstream_disabled, meta_leaderless, stream_leaderless, no_meta_leader, raft_lost_leadership, consumer_ack_floor) — W12-ST1/W16-ST2.",
+		Help: "1 while a NATS JetStream pod/cluster reports a wedge signature (jetstream_disabled, meta_leaderless, stream_leaderless, no_meta_leader, raft_lost_leadership, consumer_ack_floor) — nats-jetstream-health/stream-leaderless.",
 	}, []string{"namespace", "pod", "reason"})
 )
 
@@ -156,7 +156,7 @@ func natsLogReason(line string) string {
 	return ""
 }
 
-// checkNatsJetstreamHealth runs the W12-ST1 sweep: StatefulSet
+// checkNatsJetstreamHealth runs the nats-jetstream-health sweep: StatefulSet
 // discovery (absence tolerated — no NATS on this cluster is a clean
 // pass), then Prometheus for the disabled/meta-leaderless/ack-floor
 // signatures, then the Running-member log scan. Prometheus-derived
@@ -468,7 +468,7 @@ func (p *natsJetstreamHealthCheck) natsPromSignals(ctx context.Context,
 		}
 	}
 
-	// (b2) W16-ST2 — stream leader loss: members publish the
+	// (b2) stream-leaderless — stream leader loss: members publish the
 	// per-stream nats_jetstream_stream_leader gauge; a namespace
 	// whose series exist but sum to 0 has lost the leader of every
 	// tracked stream group. Diffed client-side across the same two

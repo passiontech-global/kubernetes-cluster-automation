@@ -8,7 +8,7 @@
 // and unfreezes the dependsOn domino chain.
 //
 // Parity note: the HelmRelease twin of this signature is
-// flux-helmrelease-retries (W10-CP4); the domino incident this covers
+// flux-helmrelease-retries (flux-helmrelease-retries); the domino incident this covers
 // is a stuck `wait: true` Kustomization leaving every downstream
 // Kustomization parked at DependencyNotReady.
 package gitops
@@ -350,7 +350,7 @@ func (p *fluxKustomizationHealthCheck) fluxKustWorkloadsReady(ctx context.Contex
 		case "StatefulSet":
 			ready = p.fluxStatefulSetReady(ctx, ns, name)
 		case "Rollout":
-			// W18-5 — argoproj.io Rollouts land in the inventory the
+			// argo-rollout-gates — argoproj.io Rollouts land in the inventory the
 			// same way; same ready-replicas corroboration, read off
 			// the unstructured CR.
 			ready = p.fluxRolloutReady(ctx, ns, name)
@@ -401,7 +401,7 @@ func (p *fluxKustomizationHealthCheck) fluxDeploymentReady(ctx context.Context,
 	return false
 }
 
-// fluxRolloutReady is the argoproj.io Rollout twin (W18-5): the
+// fluxRolloutReady is the argoproj.io Rollout twin (argo-rollout-gates): the
 // same ready-replicas cover check over the unstructured Rollout
 // census — status.readyReplicas vs spec.replicas (absent spec
 // replicas means the apiserver default of 1; a replicas:0

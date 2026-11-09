@@ -194,7 +194,7 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // KubeletPLEGUnhealthy early; a healthy scrape clears both.
 
 // plegSample is one parsed scrape of the PLEG series plus the
-// W12-KR4 storage-operation error counter the same :10250
+// disk-slow-io storage-operation error counter the same :10250
 // exposition carries.
 type plegSample struct {
 	relistSum      float64 // relist_duration_seconds_sum (lifetime)
@@ -266,7 +266,7 @@ func parsePLEGMetrics(body string) plegSample {
 		case "kubelet_pleg_discard_events":
 			s.discard, s.hasDiscard = int64(v), true
 		case "storage_operation_errors_total":
-			// W12-KR4: mount/attach/device-operation failures
+			// disk-slow-io: mount/attach/device-operation failures
 			// kubelet reports per volume_plugin+operation —
 			// every labelled sample sums into the one node-level
 			// counter (node_kubelet_storage_operation_errors_total).
@@ -307,7 +307,7 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 		return
 	}
 	s := parsePLEGMetrics(body)
-	// W12-KR4: the storage error counter exports even when the
+	// disk-slow-io: the storage error counter exports even when the
 	// PLEG family is absent — the series is independent of PLEG
 	// health.
 	if s.hasStorageErrs {

@@ -1,5 +1,5 @@
 // cilium_node_ipam_exhaustion.go — the
-// cilium-node-ipam-exhaustion check (W10-NM6): node pod-IP free
+// cilium-node-ipam-exhaustion check (cilium-node-ipam-exhaustion): node pod-IP free
 // ratio below the threshold (Prometheus
 // cilium_operator_ipam_{used,available}_ips vs podCIDR, pod-count
 // fallback) FAILs the check and reaps terminal pods on the node so
@@ -35,7 +35,7 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newCiliumNodeIPAMExhaustionCheck builds the W10-NM6 check — its
+// newCiliumNodeIPAMExhaustionCheck builds the cilium-node-ipam-exhaustion check — its
 // only state is the emitted-gauge ledger; reap cooldowns ride the
 // shared Deps.Heals set.
 func NewCiliumNodeIPAMExhaustionCheck(d *probefw.Deps) probefw.Check {
@@ -45,16 +45,16 @@ func NewCiliumNodeIPAMExhaustionCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameCiliumNodeIPAM = "cilium-node-ipam-exhaustion"
 
-	// W10-NM6 — cilium-node-ipam-exhaustion knobs.
+	// cilium-node-ipam-exhaustion — cilium-node-ipam-exhaustion knobs.
 	ciliumIPAMNodeCool = 30 * time.Minute
 	ciliumIPAMMaxReaps = 50
 )
 
 var (
-	// W10-NM6 — free pod-IP ratio per node.
+	// cilium-node-ipam-exhaustion — free pod-IP ratio per node.
 	ciliumIPAMFreeRatioGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_cilium_ipam_free_ratio",
-		Help: "Free pod-IP ratio (0..1) per node — W10-NM6; <0.15 fails the check.",
+		Help: "Free pod-IP ratio (0..1) per node — cilium-node-ipam-exhaustion; <0.15 fails the check.",
 	}, []string{"node"})
 )
 

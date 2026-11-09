@@ -1,4 +1,4 @@
-// split_brain.go — the W12-SC2(i) multi-master split-brain
+// split_brain.go — the stateful-split-brain(i) multi-master split-brain
 // signature of the stateful-masterless-services check: a
 // master-role Service carrying >1 Ready endpoint two consecutive
 // sweeps (an operator relabeling flap settles inside one) raises
@@ -16,13 +16,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// W12-SC2 — split-brain: a master-role Service carrying >1
+// stateful-split-brain — split-brain: a master-role Service carrying >1
 // Ready endpoint must hold this many consecutive sweeps — an
 // operator relabeling flap settles inside one.
 const statefulMultiMasterMinStreak = 2
 
 var (
-	// W12-SC2 — the split-brain signal: 1 while a master-role
+	// stateful-split-brain — the split-brain signal: 1 while a master-role
 	// Service routes to more than one Ready pod for two consecutive
 	// sweeps (two pods answering the master role at once).
 	statefulServiceMultipleMastersGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -36,7 +36,7 @@ func init() {
 		statefulServiceMultipleMastersGauge)
 }
 
-// splitBrainWatch is the W12-SC2(i) multi-master signature's
+// splitBrainWatch is the stateful-split-brain(i) multi-master signature's
 // watchdog state (serial sweep — unguarded):
 //   - streak: "ns/svc/sts" → consecutive sweeps the master-role
 //     Service showed >1 Ready endpoints — a split-brain must hold
@@ -57,7 +57,7 @@ type splitBrainWatch struct {
 // signature's ledger.
 func (w *splitBrainWatch) eval(c masterSvc, key string, nReady int,
 	sigRep *probefw.SweepReport) {
-	// W12-SC2(i) — multi-master split brain: >1 Ready endpoint
+	// stateful-split-brain(i) — multi-master split brain: >1 Ready endpoint
 	// on the master role two sweeps running. A relabeling flap
 	// settles inside one sweep; two pods answering the role at
 	// once is an election split.

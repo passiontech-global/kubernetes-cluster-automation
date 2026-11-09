@@ -1,4 +1,4 @@
-// olm_subscription_health.go — the W7-C5 olm-subscription-health
+// olm_subscription_health.go — the olm-subscription-health olm-subscription-health
 // check: the OLM CSV / webhook-cert / subscription guard plus the
 // olm-operator auto-heal.
 package datastore
@@ -26,12 +26,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// olmHealthCheck is the W7-C5 OLM CSV / webhook cert / subscription
+// olmHealthCheck is the olm-subscription-health OLM CSV / webhook cert / subscription
 // guard plus the olm-operator auto-heal.
 type olmHealthCheck struct {
 	*probefw.Deps
 
-	// W7-C5 watchdog state (serial sweep — unguarded):
+	// olm-subscription-health watchdog state (serial sweep — unguarded):
 	//   - olmFirstSeen: "kind/ns/name/reason" → first sweep the
 	//     unhealthy signature showed; it must persist
 	//     olmUnhealthyMinAge before the gauge fires (>= olmHealMinAge
@@ -48,21 +48,21 @@ type olmHealthCheck struct {
 	olmHealed    state.CooldownSet
 }
 
-// newOlmHealthCheck builds the W7-C5 check — the ledgers arm
+// newOlmHealthCheck builds the olm-subscription-health check — the ledgers arm
 // lazily on first use (the GaugeLedger zero value is ready).
 func NewOlmHealthCheck(d *probefw.Deps) probefw.Check {
 	return &olmHealthCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
-// olm-subscription-health (W7-C5) — OLM CSV / webhook cert /
+// olm-subscription-health (olm-subscription-health) — OLM CSV / webhook cert /
 // subscription guard + olm-operator auto-heal.
 // ---------------------------------------------------------------------------
 
-// W7-C5 — olm-subscription-health knobs.
+// olm-subscription-health — olm-subscription-health knobs.
 const (
 	// CheckNameOLMHealth is the check's kuberhealthy_check label
-	// value — W7; not a ported HealthCheck but reports under its
+	// value — agent-added; not a ported HealthCheck but reports under its
 	// own check name so the generic FAIL alerting path covers it.
 	CheckNameOLMHealth = "olm-subscription-health"
 	// olmUnhealthyMinAge: an unhealthy CSV/Subscription signature
@@ -98,7 +98,7 @@ var (
 )
 
 var (
-	// W7-C5 — the OLM-unhealthy signal: 1 while the CSV/Subscription
+	// olm-subscription-health — the OLM-unhealthy signal: 1 while the CSV/Subscription
 	// reports an unhealthy phase/condition past the audit threshold.
 	// kind is ClusterServiceVersion | Subscription.
 	olmUnhealthyResourcesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -106,7 +106,7 @@ var (
 		Help: "1 while the OLM resource reports an unhealthy phase/condition past the audit threshold.",
 	}, []string{"kind", "namespace", "name", "reason"})
 
-	// W7-C5 — olm-operator pods deleted to unstick wedged CSV/cert-
+	// olm-subscription-health — olm-operator pods deleted to unstick wedged CSV/cert-
 	// rotation reconciliation, by detected reason. Counts delivered
 	// heals only.
 	olmOperatorHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

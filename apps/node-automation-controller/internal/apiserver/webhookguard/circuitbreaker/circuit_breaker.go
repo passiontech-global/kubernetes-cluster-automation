@@ -4,7 +4,7 @@
 // cooldowns, test-seam thresholds) and Sweep is the per-sweep entry
 // the facade calls — it runs every webhook config through
 // circuitPatch (circuit_patch.go), lands the strategic-merge
-// patches, invokes the W9-CP1 pod bounce (pod_bounce.go) and prunes
+// patches, invokes the circuit-breaker-bounce pod bounce (pod_bounce.go) and prunes
 // the emitted series. The trip thresholds, the hot-reloaded
 // Enabled() ops lever and the hookView projection shared with
 // pod_bounce.go live here too; the CRD conversion-backend duty
@@ -35,13 +35,13 @@ const (
 	DeadThreshold = 5 * time.Minute
 	// PartitionedThreshold is the faster trip window used when
 	// the Service still reports Ready endpoints but EVERY one sits on
-	// a partitioned/unresponsive node (W5.5): those pods cannot serve
+	// a partitioned/unresponsive node (endpoint-census): those pods cannot serve
 	// the apiserver's webhook calls, so the deadlock is real now — 90s
 	// of that condition is already an outage, no need to wait out the
 	// full dead-backend window.
 	PartitionedThreshold = 90 * time.Second
 
-	// W9-CP1 — one pod bounce per service per BounceCooldown so a
+	// circuit-breaker-bounce — one pod bounce per service per BounceCooldown so a
 	// wedged pod cannot be restarted every sweep; admission and
 	// conversion backends share the ledger on purpose: one hung
 	// Service is one bounce per cooldown regardless of which duty
@@ -256,7 +256,7 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		circuitMetrics(&b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
 	}
 
-	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
+	// circuit-breaker-bounce stage 1 — rolling pod bounce: a webhook backend whose
 	// Ready endpoints ALL fail the TCP+TLS handshake has a hung pod,
 	// not a partitioned one. Bounce the oldest Ready backing pod so
 	// its controller recreates it fresh — this runs even while the

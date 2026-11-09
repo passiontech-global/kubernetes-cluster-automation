@@ -1,9 +1,9 @@
 // stateful_masterless_services.go — the
-// stateful-masterless-services check (W6.2): a master-role Service
+// stateful-masterless-services check (stateful-masterless-services): a master-role Service
 // routing to a ready StatefulSet's pods reporting 0 Ready endpoints
 // past the gauge window — the operator that assigns the role wedged.
 // The dragonfly auto-heals live in dragonfly_heals.go, the generic
-// db-operator heal in db_operator_heals.go, and the W12-SC2
+// db-operator heal in db_operator_heals.go, and the stateful-split-brain
 // split-brain/site-skew signatures in split_brain.go/site_skew.go.
 package datastore
 
@@ -29,13 +29,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// statefulMasterlessCheck is the W6.2 masterless service guard plus
-// the W12-SC2 signature watches; the Dragonfly/db-operator
+// statefulMasterlessCheck is the stateful-masterless-services masterless service guard plus
+// the stateful-split-brain signature watches; the Dragonfly/db-operator
 // auto-heals live in dragonfly_heals.go / db_operator_heals.go.
 type statefulMasterlessCheck struct {
 	*probefw.Deps
 
-	// W6.2 watchdog state (serial sweep — unguarded):
+	// stateful-masterless-services watchdog state (serial sweep — unguarded):
 	//   - stsZeroSince: "ns/svc/sts" → first sweep the master-role
 	//     Service showed 0 Ready endpoints.
 	//   - stsZeroEmitted: the emitted-gauge ledger for
@@ -47,10 +47,10 @@ type statefulMasterlessCheck struct {
 	//     annotation stamp is the durable half).
 	//   - drPodHealed: "ns/sts" → last ordinal-0 pod delete — the
 	//     in-RAM half of the 30m dual-replica-deadlock cooldown
-	//     (W7-C3; the STS annotation is the durable half).
+	//     (dual-replica-deadlock; the STS annotation is the durable half).
 	//   - drOpHealed: "ns/sts" -> newest drHealed stamp for THAT
 	//     StatefulSet — the in-RAM half of "when did step 1 last
-	//     land" for the W7-C3 settle gate; CooldownSet.Last reports
+	//     land" for the dual-replica-deadlock settle gate; CooldownSet.Last reports
 	//     the stamp back, which a plain CooledDown gate cannot. Keyed
 	//     per-STS: a single shared stamp let a second Dragonfly STS ride
 	//     on an unrelated STS's operator bounce and skip its settle
@@ -60,22 +60,22 @@ type statefulMasterlessCheck struct {
 	drHealed       state.CooldownSet
 	drPodHealed    state.CooldownSet
 	drOpHealed     state.CooldownSet
-	// W12-SC2 signature watches — each owns its ledgers (see
+	// stateful-split-brain signature watches — each owns its ledgers (see
 	// split_brain.go / site_skew.go).
 	splitBrain splitBrainWatch
 	siteSkew   siteSkewWatch
 }
 
-// newStatefulMasterlessCheck builds the W6.2 check — the ledgers
+// newStatefulMasterlessCheck builds the stateful-masterless-services check — the ledgers
 // arm lazily on first use (the GaugeLedger zero value is ready).
 func NewStatefulMasterlessCheck(d *probefw.Deps) probefw.Check {
 	return &statefulMasterlessCheck{Deps: d}
 }
 
-// W6.2 — stateful-masterless-services knobs.
+// stateful-masterless-services — stateful-masterless-services knobs.
 const (
 	// CheckNameStatefulMasterless is the check's kuberhealthy_check
-	// label value — W6.2; not a ported HealthCheck but reports
+	// label value — stateful-masterless-services; not a ported HealthCheck but reports
 	// under its own check name so the generic FAIL alerting path
 	// covers it.
 	CheckNameStatefulMasterless = "stateful-masterless-services"
@@ -95,7 +95,7 @@ const (
 	// the restart-proof half of the cooldown.
 	dragonflyHealAnno = kube.AnnoLastDragonflyOperatorHeal
 
-	// W7-C3 — dual-replica deadlock: past this zero-endpoint streak
+	// dual-replica-deadlock — dual-replica deadlock: past this zero-endpoint streak
 	// the operator restart (step 1) demonstrably failed to re-elect
 	// a master, so the STS ordinal-0 pod is deleted to force the
 	// whole election from scratch.
@@ -116,7 +116,7 @@ const (
 )
 
 var (
-	// W6.2 — the masterless-service signal: 1 while the master-role
+	// stateful-masterless-services — the masterless-service signal: 1 while the master-role
 	// Service of a ready StatefulSet reports 0 Ready endpoints.
 	statefulServiceZeroEndpointsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_stateful_service_zero_endpoints",
@@ -130,7 +130,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// stateful-masterless-services (W6.2) — masterless service guard +
+// stateful-masterless-services (stateful-masterless-services) — masterless service guard +
 // dragonfly auto-heal.
 // ---------------------------------------------------------------------------
 
@@ -191,7 +191,7 @@ type masterSvc struct {
 }
 
 // masterlessDue pairs a master-role service past the heal window
-// with the moment its zero-endpoint streak began — the W7-C3
+// with the moment its zero-endpoint streak began — the dual-replica-deadlock
 // deadlock heal needs the streak length, not just "past 5m".
 type masterlessDue struct {
 	svc   masterSvc
@@ -240,7 +240,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// endpoint censuses converge on (service-name label binding,
 	// nil ready counts as ready — kube.ReadyEndpointsByService). A
 	// list error skips the whole check: "0 ready" is
-	// indistinguishable from "no data". W12-SC2 keeps the endpoint
+	// indistinguishable from "no data". stateful-split-brain keeps the endpoint
 	// detail (zone/node/targetRef) the rollup captures so the
 	// split-brain and site-skew signatures can place each endpoint.
 	// The census rides the per-sweep snapshot — this check was the
@@ -251,7 +251,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	}
 	ready := kube.ReadyEndpointsByService(esSlices)
 
-	// W12-SC2(ii) — arm the cross-DC site-skew sweep: the census
+	// stateful-split-brain(ii) — arm the cross-DC site-skew sweep: the census
 	// reads, the multi-zone gate and the trigger bookkeeping live
 	// in site_skew.go.
 	skew := p.siteSkew.begin(ctx, log, p.Deps)
@@ -303,7 +303,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 			return err
 		}
 		eps := ready[c.ns+"/"+c.svc]
-		// W12-SC2(i)/(ii) — the split-brain streak and the cross-DC
+		// stateful-split-brain(i)/(ii) — the split-brain streak and the cross-DC
 		// pin accounting, one signature per file.
 		p.splitBrain.eval(c, key, len(eps), &multiRep)
 		skew.evalMaster(c, key, eps, &rep)
@@ -326,7 +326,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 		seen[key] = true
 		// The zero-endpoint streak gates the dragonfly/db-operator
-		// bounce and the W7-C3 ordinal-0 pod delete, so it runs the
+		// bounce and the dual-replica-deadlock ordinal-0 pod delete, so it runs the
 		// persisted (annotation-backed) variant — the stamp on the
 		// STS survives an operator restart that would otherwise
 		// re-arm the gauge and heal windows mid-wedge.
@@ -358,13 +358,13 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// window bounces the operator leader to force re-election (step
 	// 1); past the deadlock window and >=3m after that bounce the
 	// dual-replica heal deletes the lowest-ordinal pod to restart
-	// the election from scratch (step 2, W7-C3). A non-dragonfly
+	// the election from scratch (step 2, dual-replica-deadlock). A non-dragonfly
 	// masterless STS gets per-pod role diagnostics instead — its
 	// election contract is operand-specific and a generic pod kill
 	// is not safe to automate.
 	for _, d := range due {
 		if !dragonflyOwned(d.svc.sts) {
-			// W4: a masterless stateful service owned by a known db
+			// va-stuck-terminating: a masterless stateful service owned by a known db
 			// operator gets the operator pod bounced to force
 			// re-election — the same re-election nudge as the
 			// dragonfly heal, on its own per-operator 30m cooldown.
@@ -384,7 +384,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// Zero-endpoints and split-brain are OPPOSITE signatures (0
 	// ready masters vs >1) — each renders under its own verdict
 	// wording instead of the split-brain findings hiding behind the
-	// "0 ready endpoints" prefix (W17 verdict-detail fix).
+	// "0 ready endpoints" prefix (heal-budget verdict-detail fix).
 	res := rep.Verdict(fmt.Sprintf(
 		"master-role services at 0 ready endpoints >=%s: ",
 		masterlessZeroMinAge), ", ")
@@ -419,7 +419,7 @@ func podMasterRole(pod *corev1.Pod) bool {
 }
 
 // logStatefulPodRoles dumps per-pod role-label diagnostics for a
-// masterless non-dragonfly StatefulSet — the W7-C3 pod-delete heal
+// masterless non-dragonfly StatefulSet — the dual-replica-deadlock pod-delete heal
 // is dragonfly-only (its election contract is operator-driven), so
 // for Percona/PostgreSQL/NATS the check leaves this evidence trail
 // for the on-call engineer instead of acting on it. Diagnostics

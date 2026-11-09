@@ -1,5 +1,5 @@
 // operator_leader_heal.go — the leader-pod heal path of the
-// operator-workqueue-watchdog check (W5.8): once an operator's CRs
+// operator-workqueue-watchdog check (operator-workqueue-watchdog): once an operator's CRs
 // stay unreconciled past the stuck window, healOperatorLeader deletes
 // the leader pod to force re-election (1h cooldown, wider of the
 // in-RAM ledger and the persisted passiontech.dev/last-operator-heal Lease
@@ -41,7 +41,7 @@ const (
 )
 
 var (
-	// W5.8 — stuck-operator leader pods deleted to force
+	// operator-workqueue-watchdog — stuck-operator leader pods deleted to force
 	// re-election, by detected stall reason. Counts delivered heals
 	// only (the counter increments after a delete landed).
 	operatorWorkqueueHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

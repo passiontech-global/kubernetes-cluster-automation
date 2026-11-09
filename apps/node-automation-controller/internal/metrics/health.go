@@ -34,9 +34,9 @@ var healthCheckSecondsSinceSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts
 
 // ControlPlanePodHealsTotal counts control-plane/operator pods deleted
 // by the cluster-health mesh watchdogs — cilium-operator on
-// CiliumIPAMExhausted (W8-NM2), linkerd-destination/identity on the
-// wedged-watch signature (W8-NM3), and db operator pods deleted to
-// force master re-election for a masterless StatefulSet (W4
+// CiliumIPAMExhausted (issuer-serial-watch), linkerd-destination/identity on the
+// wedged-watch signature (mesh-net-guards), and db operator pods deleted to
+// force master re-election for a masterless StatefulSet (va-stuck-terminating
 // stateful-masterless extension). Shared: several health packages
 // (and probefw's DeletePodHeal helper) all Inc it under their own
 // component label, so it cannot colocate into one check file.

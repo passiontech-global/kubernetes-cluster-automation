@@ -388,7 +388,7 @@ func TestStuckTerminatingAuditListError(t *testing.T) {
 	}
 }
 
-// W4 — a PVC stuck Terminating >2h whose only finalizer is
+// va-stuck-terminating — a PVC stuck Terminating >2h whose only finalizer is
 // pvc-protection and which no live pod references gets the finalizer
 // stripped.
 func TestAuditStuckPVCFinalizerStrip(t *testing.T) {
@@ -447,7 +447,7 @@ func TestAuditStuckPVCReferencedKept(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-GO2 — Shipwright BuildRun TTL sweep
+// buildrun-ttl-sweep — Shipwright BuildRun TTL sweep
 // ---------------------------------------------------------------------------
 
 // fjjBuildRun builds a BuildRun — succeeded is the Succeeded condition
@@ -540,7 +540,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 	}
 }
 
-// W12-GO2 — Tekton PipelineRuns and TaskRuns share the same 24h
+// run-workspace-reaper — Tekton PipelineRuns and TaskRuns share the same 24h
 // retention horizon: terminal past-TTL objects are reaped while
 // running/fresh/unresolved ones stay.
 func TestFailedJobsJanitorTektonRunTTL(t *testing.T) {
@@ -650,7 +650,7 @@ func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-GO2 — orphaned run-workspace PVC reaper
+// run-workspace-reaper — orphaned run-workspace PVC reaper
 // ---------------------------------------------------------------------------
 
 // fjjWorkspacePVC builds a PVC age old carrying the given

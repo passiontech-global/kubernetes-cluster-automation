@@ -7,7 +7,7 @@
 // proxy whose identity cert expired keeps serving "running" while
 // every new connection fails TLS validation.
 //
-// W12-NM3 adds the outbound failure-accrual lockout: a client proxy
+// linkerd-h2-stream-guard adds the outbound failure-accrual lockout: a client proxy
 // whose balancer holds endpoints for a Service but NONE in
 // state="ready" (outbound_http_balancer_endpoints) is circuit-broken
 // long after the destination recovered — detected via Prometheus,
@@ -46,7 +46,7 @@ type linkerdH2StreamGuardCheck struct {
 	// usable; the serial sweep needs no lock).
 	emitted         state.GaugeLedger[string]
 	identityEmitted state.GaugeLedger[string]
-	// W12-NM3 — balancerEmitted/oomEmitted are the emitted-gauge
+	// linkerd-h2-stream-guard — balancerEmitted/oomEmitted are the emitted-gauge
 	// ledgers for the outbound-balancer wedge and proxy-OOMKilled
 	// gauges; balancerSeen tracks each wedged
 	// "ns/pod/target_addr" tuple's first sighting for the >=10m
@@ -72,7 +72,7 @@ const (
 	// scan runs on a small pool instead of serially.
 	linkerdH2LogWorkers = 8
 
-	// W12-NM3 — a balancer with no ready endpoint must hold that
+	// linkerd-h2-stream-guard — a balancer with no ready endpoint must hold that
 	// shape this long before it counts as failure-accrual lockout
 	// rather than ordinary failover churn.
 	linkerdBalancerWedgeMinAge = 10 * time.Minute
@@ -93,7 +93,7 @@ var (
 		Help: "1 while the meshed pod's linkerd-proxy log shows an mTLS identity leaf-certificate expiry or issuance-loop signature.",
 	}, []string{"namespace", "pod"})
 
-	// W12-NM3 — pods whose linkerd-proxy container last terminated
+	// linkerd-h2-stream-guard — pods whose linkerd-proxy container last terminated
 	// on OOMKilled: an OOM'd proxy loses its connection table and
 	// balancer state on restart, the silent wedge seed.
 	linkerdProxyOOMKilledGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -150,7 +150,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := pod.Namespace + "/" + pod.Name
 		lv := []string{pod.Namespace, pod.Name}
-		// W12-NM3 — an OOM-killed linkerd-proxy loses its whole
+		// linkerd-h2-stream-guard — an OOM-killed linkerd-proxy loses its whole
 		// connection table and balancer state on restart: report
 		// the restart shape even when the replacement is already
 		// serving (it is the silent wedge seed, and the restart
@@ -233,7 +233,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	identityRep.Close(&p.identityEmitted, linkerdProxyIdentityStalledGauge.DeleteLabelValues)
 	oomRep.Close(&p.oomEmitted, linkerdProxyOOMKilledGauge.DeleteLabelValues)
 
-	// W12-NM3 — outbound balancer lockout: the client-side proxies
+	// linkerd-h2-stream-guard — outbound balancer lockout: the client-side proxies
 	// whose failure-accrual kept a target dead after it recovered.
 	p.scanOutboundBalancers(ctx, log, now, pods, readyByOwner,
 		&rep, &balancerRep)

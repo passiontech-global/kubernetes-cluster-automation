@@ -1,4 +1,4 @@
-// everest_audit.go — W9-ST3 of velero-backup-auditor: the Percona
+// everest_audit.go — backup-posture-audit of velero-backup-auditor: the Percona
 // Everest DatabaseCluster backup audit. Backup-enabled, unpaused
 // DatabaseClusters are judged against their DatabaseClusterBackups
 // (matched on spec.dbClusterName in the same namespace) for the
@@ -23,7 +23,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W9-ST3 — Everest (Percona) DatabaseCluster backup auditor
+// backup-posture-audit — Everest (Percona) DatabaseCluster backup auditor
 // ---------------------------------------------------------------------------
 
 // auditEverestBackups evaluates every unpaused DatabaseCluster with
@@ -97,7 +97,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 		clusterBackups := byCluster[ns+"/"+name]
 		reasons := everestBackupReasons(clusterBackups, now)
-		// W10-FIX6 — same zero-backup blind spot as the Velero
+		// zero-backup-guard — same zero-backup blind spot as the Velero
 		// Schedule check: a backup-enabled DatabaseCluster older
 		// than 36h with ZERO DatabaseClusterBackups is silently
 		// unprotected. Caller-side because the age clock belongs to

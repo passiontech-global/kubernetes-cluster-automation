@@ -59,12 +59,12 @@ type Series struct {
 	KubeletPLEGLastSeenAgeSec float64
 	KubeletPLEGDiscardEvents  int64
 	// PodCgroupMemoryThrottled counts pod cgroups caught in
-	// memory.high throttle (W12-KR1), PodCgroupPIDsMaxUtilRatio is
+	// memory.high throttle (cgroup-pod-throttle), PodCgroupPIDsMaxUtilRatio is
 	// the worst pids.current/pids.max across pod cgroups.
 	PodCgroupMemoryThrottled  int64
 	PodCgroupPIDsMaxUtilRatio float64
 	// KubeletStorageOperationErrors is the
-	// storage_operation_errors_total counter passthrough (W12-KR4)
+	// storage_operation_errors_total counter passthrough (disk-slow-io)
 	// — summed across the volume_plugin/operation labels of the
 	// kubelet :10250/metrics scrape.
 	KubeletStorageOperationErrors int64
@@ -139,7 +139,7 @@ type Deps struct {
 	// on persistent blindness while journal storage exists.
 	JournalReads journalwatch.Tracker
 
-	// Series — the W10 node_agent_* textfile surface (see the type
+	// Series — the node_agent_* textfile surface (see the type
 	// doc). Embedded, not named, so guards keep writing
 	// d.<Field> and tests keep reading h.<Field>.
 	Series
@@ -158,7 +158,7 @@ type Deps struct {
 	// restart. Cycle resets it before the checks run.
 	CiliumAgentKilled bool
 
-	// Wave-10 ST2 gauge values — shared between OrphanHPCheck
+	// orphan-hostpath gauge values — shared between OrphanHPCheck
 	// (writes them each cycle) and WriteNodeAgentPromTextfile
 	// (reads them at end of Cycle); tests poke them too.
 	OrphanHostPathBytes int64

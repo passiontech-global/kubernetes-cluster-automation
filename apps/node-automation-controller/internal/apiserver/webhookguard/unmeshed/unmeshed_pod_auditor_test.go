@@ -519,7 +519,7 @@ func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W7-C1 — Eviction API, PDB deferral & maintenance mutex
+// unmeshed-pod-auditor — Eviction API, PDB deferral & maintenance mutex
 // ---------------------------------------------------------------------------
 
 // A PDB-refused eviction (HTTP 429 — disruptionsAllowed==0) is a

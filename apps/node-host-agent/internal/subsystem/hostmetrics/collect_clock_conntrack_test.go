@@ -166,7 +166,7 @@ func TestConntrackMalformedSkipped(t *testing.T) {
 	}
 }
 
-// --- W12-KR3: node_exporter-named nf_conntrack stat series ---
+// --- conntrack-port-pressure: node_exporter-named nf_conntrack stat series ---
 
 // The per-CPU stat table carries insert_failed + drop + early_drop
 // hex columns; the node_exporter-named twins emit insert_failed

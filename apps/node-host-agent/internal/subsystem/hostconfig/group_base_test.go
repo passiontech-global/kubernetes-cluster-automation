@@ -13,7 +13,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// ---------- W18-7: host-level protection files ----------
+// ---------- host-protection-drop-ins: host-level protection files ----------
 
 func TestGroupBaseHostProtectionFilesConverge(t *testing.T) {
 	vars := writeVarsDir(t, "")

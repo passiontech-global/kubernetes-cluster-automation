@@ -1,4 +1,4 @@
-// operator_selfheal_test.go — the W5.8 operator-workqueue watchdog
+// operator_selfheal_test.go — the operator-workqueue-watchdog operator-workqueue watchdog
 // driven through the fake clientset + fake dynamic client (the
 // self-healing checks half of the old self_healing_checks_test.go).
 package watchdogs
@@ -83,7 +83,7 @@ func shOpHealsCount(t *testing.T, operator, reason string) float64 {
 }
 
 // ---------------------------------------------------------------------------
-// W5.8 — stuck predicates
+// operator-workqueue-watchdog — stuck predicates
 // ---------------------------------------------------------------------------
 
 func TestOperatorStuckPredicates(t *testing.T) {
@@ -145,7 +145,7 @@ func TestOperatorStuckPredicates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W5.8 — operator-workqueue-watchdog
+// operator-workqueue-watchdog — operator-workqueue-watchdog
 // ---------------------------------------------------------------------------
 
 // No Lease at all → nothing to judge, the check stays quiet.
@@ -447,7 +447,7 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-FIX2 — podNS override + leaseOptional + multi-candidate leases
+// operator-watchdog-leases — podNS override + leaseOptional + multi-candidate leases
 // ---------------------------------------------------------------------------
 
 // cert-manager elects its leader in kube-system but runs its pods in
@@ -554,7 +554,7 @@ func TestOperatorLeaseCandidateFallback(t *testing.T) {
 	}
 }
 
-// A W10-CP3 target end-to-end: node-healthcheck-operator's renewing
+// A operator-workqueue-watchdog target end-to-end: node-healthcheck-operator's renewing
 // lease plus a never-reconciled NodeHealthCheck freezes the gauge.
 func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "node-healthcheck-operator", opReasonNoStatus)

@@ -1,5 +1,5 @@
 // config_ctr.go — the containerd knobs: CtrConfig and its defaults
-// (the 31-ctr-tasks caps, the A3 ingest GC, the W9 prune budget and
+// (the 31-ctr-tasks caps, the A3 ingest GC, the content-store prune budget and
 // the KR3 meta.db probe all read this group). The socket itself
 // promoted to the top-level Config (ctr + kubelet both read it) —
 // its NODE_HOST_AGENT_CONTAINERD_SOCKET env row moved to
@@ -12,7 +12,7 @@ import (
 )
 
 // CtrConfig groups the containerd knobs: the 31-ctr-tasks per-cycle
-// cleanup caps, the A3 ingest GC, the W9 content prune budget and
+// cleanup caps, the A3 ingest GC, the content prune budget and
 // the KR3 meta.db journal probe.
 type CtrConfig struct {
 	IngestDir          string        // containerd content ingest dir (39)

@@ -457,7 +457,7 @@ func TestCoreDNSPatcherMissingDeployment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM4b — Corefile negative-cache (denial 9984 5) reconcile
+// negative-cache-guard — Corefile negative-cache (denial 9984 5) reconcile
 // ---------------------------------------------------------------------------
 
 // corefileConfigMap builds the kube-system/coredns ConfigMap fixture —

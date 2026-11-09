@@ -1,5 +1,5 @@
 // mesh_controlplane_watchdog_test.go — coverage for the
-// mesh-controlplane-watchdog check (W8-NM2/NM3): wedged linkerd
+// mesh-controlplane-watchdog check (issuer-serial-watch/mesh-net-guards): wedged linkerd
 // control-plane pod heal and the healNamedPod maintenance gate.
 package watchdogs
 
@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// W8-NM3 — a wedged linkerd pod (started, never Ready, >5m) is
+// mesh-net-guards — a wedged linkerd pod (started, never Ready, >5m) is
 // deleted to force a re-roll, matching Deployment-suffixed pod names.
 func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	started := true
@@ -53,7 +53,7 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// healNamedPod — maintenance gate (W8-ST2)
+// healNamedPod — maintenance gate (node-hang-precordon)
 // ---------------------------------------------------------------------------
 
 // A wedged control-plane pod is NOT deleted while maintenance is in
@@ -105,10 +105,10 @@ func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W8-NM3 — linkerd wedge scan list failure (fail-closed parity)
+// mesh-net-guards — linkerd wedge scan list failure (fail-closed parity)
 // ---------------------------------------------------------------------------
 
-// The linkerd pod list is the W8-NM3 wedge scan's only input: a list
+// The linkerd pod list is the mesh-net-guards wedge scan's only input: a list
 // failure must be COUNTED like every swallowed infra error in the
 // heal path — without it an apiserver flap reads as a clean sweep
 // while the scan silently no-ops. The skipped scan must not
@@ -138,7 +138,7 @@ func TestCheckMeshLinkerdPodListInfraCounted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W8 — one HealAllowed evaluation per heal attempt
+// mesh-controlplane — one HealAllowed evaluation per heal attempt
 // ---------------------------------------------------------------------------
 
 // healComponentPod no longer pre-gates: the cooldown/maintenance

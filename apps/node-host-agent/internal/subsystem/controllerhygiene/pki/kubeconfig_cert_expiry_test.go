@@ -47,7 +47,7 @@ func textfileSample(t *testing.T, dir, file, metric string) (float64, bool) {
 	return 0, false
 }
 
-// --- W10-CP5: checkKubeconfigCertExpiry ---
+// --- kubeconfig-cert-expiry: checkKubeconfigCertExpiry ---
 
 // testClientCertPEM mints a self-signed ECDSA cert PEM with the
 // given NotAfter — fast enough for tests (P256, no RSA).

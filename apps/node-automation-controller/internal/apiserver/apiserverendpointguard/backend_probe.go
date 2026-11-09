@@ -80,7 +80,7 @@ func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeR
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("cache rv: %w", err)}
 	}
-	// W12-CP4b: the JWKS kid set is best-effort — a fetch failure
+	// jwks-kid-skew: the JWKS kid set is best-effort — a fetch failure
 	// yields "" and simply skips that backend in the skew census
 	// (inconclusive, never a wedge signal by itself).
 	kids, _ := fetchJWKSKIDs(ctx, client, ip)
@@ -192,7 +192,7 @@ func fetchListRV(ctx context.Context, client *http.Client, ip, path string) (int
 
 // fetchJWKSKIDs GETs /openid/v1/jwks on one backend and returns its
 // keys[].kid set sorted and space-joined — identical sets compare
-// equal as strings (W12-CP4b sa.pub/sa.key rotation-skew audit).
+// equal as strings (jwks-kid-skew sa.pub/sa.key rotation-skew audit).
 func fetchJWKSKIDs(ctx context.Context, client *http.Client, ip string) (string, error) {
 	var body struct {
 		Keys []struct {
@@ -268,7 +268,7 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 	if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
 		st.frozenStreak++
 	} else if res.cacheRV < res.liveRV {
-		// W8-CP1: the cache still trails the quorum RV — a
+		// cp-component-restart: the cache still trails the quorum RV — a
 		// quiet cycle (cache advanced a little, or nothing
 		// changed) must KEEP the frozen streak instead of
 		// re-arming it, or a slowly-lagging cache never
@@ -290,7 +290,7 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 	return o
 }
 
-// jwksCensus runs the W12-CP4b JWKS kid-set skew census: majority vote
+// jwksCensus runs the jwks-kid-skew JWKS kid-set skew census: majority vote
 // across backends that returned a kid set — the most common set wins,
 // a dissenting backend accumulates kidSkewStreak and >=3 cycles means
 // its sa.pub/sa.key pair is out of rotation step (random 401s through
@@ -400,7 +400,7 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 		results[ip] = foldStreaks(log, st, probed[i], ctx, quarantinedIPs[ip])
 	}
 
-	// ---- JWKS kid-set skew census (W12-CP4b) -------------------------
+	// ---- JWKS kid-set skew census (jwks-kid-skew) -------------------------
 	jwksCensus(log, allIPs, g.backends)
 
 	// Prune streak STATE for IPs that left the controller set — the
@@ -468,7 +468,7 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 		toRemove = append(toRemove, ip)
 	}
 	if len(toRemove) > 0 {
-		// W8-CP1: quarantining the IP only protects NEW dials —
+		// cp-component-restart: quarantining the IP only protects NEW dials —
 		// pooled keep-alive connections to the wedged backend stay
 		// pinned until they break. Drop them so the very next probe
 		// (and anything sharing this transport) re-dials onto a

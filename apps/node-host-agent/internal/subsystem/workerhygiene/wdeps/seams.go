@@ -58,12 +58,12 @@ type Probe struct {
 	// containerd-socket hang probe (A4). Seam.
 	ProbeUnixSock func(ctx context.Context, socket string, timeout time.Duration) error
 	// HTTPGetBody GETs a plain-HTTP endpoint and returns the body —
-	// the envoy admin stats page (W7-H3 xDS NACK guard). Seam.
+	// the envoy admin stats page (envoy-xds-lrp xDS NACK guard). Seam.
 	HTTPGetBody func(ctx context.Context, url string, timeout time.Duration) ([]byte, error)
 	// DNSProbe sends one UDP DNS query for a fixed cluster name to
 	// addr and reports whether a well-formed answer returns before
 	// the deadline — the node-local-dns :53 datapath probe
-	// (W7-H3). Seam.
+	// (envoy-xds-lrp). Seam.
 	DNSProbe func(addr, name string, timeout time.Duration) bool
 	// PodLogFn returns a tail of one pod's current log — the
 	// clock-jump healer's konnectivity evidence read. Default the
@@ -159,7 +159,7 @@ func (s *Ctr) RmIngest(ctx context.Context, ref string) error {
 }
 
 // PruneContent runs the store-wide content GC — `k0s ctr -n k8s.io
-// content prune` over the Exec seam (W9). It only fires while
+// content prune` over the Exec seam. It only fires while
 // /var/lib/k0s sits above the high watermark, on the
 // last-content-gc 6h budget.
 func (s *Ctr) PruneContent(ctx context.Context) error {
@@ -260,7 +260,7 @@ type Cilium struct {
 // WGAllowedIPs returns how many cilium_wg0 peers carry a real
 // allowed-ips set — `wg show cilium_wg0 allowed-ips` through the
 // systemd exec wrapper (sd is Config.Systemd), ParseWGAllowedIPs'd
-// (peers at "(none)" are wiped). The W5.6 check's derived read —
+// (peers at "(none)" are wiped). The cilium-wg-peer-gc check's derived read —
 // tests drive it through the systemd exec fake.
 func (s *Cilium) WGAllowedIPs(ctx context.Context, sd *systemd.Client) (int, error) {
 	if sd == nil {

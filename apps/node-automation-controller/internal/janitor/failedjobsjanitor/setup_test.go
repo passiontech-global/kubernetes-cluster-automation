@@ -17,7 +17,7 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
-	// dyn is only used by the W9-GO2 BuildRun sweep — nil is fine for
+	// dyn is only used by the buildrun-ttl-sweep BuildRun sweep — nil is fine for
 	// the registration check.
 	if err := Setup(shared.Deps{Name: "failed-jobs-janitor",
 		Mgr: m,

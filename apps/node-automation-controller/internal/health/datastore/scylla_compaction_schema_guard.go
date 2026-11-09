@@ -3,7 +3,7 @@
 // pod's :9180/metrics for a compaction backlog (>100 pending) and a
 // coordinator schema-version split across members of the same
 // cluster — both signatures the ScyllaCluster CR status can't see.
-// W12-ST3 adds the Seastar shared-nothing signatures the same scrape
+// scylla-shard-imbalance adds the Seastar shared-nothing signatures the same scrape
 // already carries: a per-shard reactor-utilization skew (hot
 // partition / tombstone avalanche saturating one shard while the
 // pod stays Ready) and the per-sweep delta of the coordinator/
@@ -38,9 +38,9 @@ type scyllaCompactionSchemaGuardCheck struct {
 	// emittedBacklog/emittedSplit are the emitted-gauge ledgers —
 	// tuples that stop being reported get DeleteLabelValues'd rather
 	// than leaking stale values (zero value usable; the serial sweep
-	// needs no lock). emittedShard/emittedOverload are the W12-ST3
+	// needs no lock). emittedShard/emittedOverload are the scylla-shard-imbalance
 	// twins for the shard-imbalance and overload-stall gauges.
-	// shardImbalanceSeen is the W12-ST3 first-seen ledger —
+	// shardImbalanceSeen is the scylla-shard-imbalance first-seen ledger —
 	// "ns/pod" → first sweep the hot-partition skew showed; it must
 	// persist scyllaShardImbalanceMinAge before the gauge fires.
 	// overloadLast is the per-pod counter baseline —
@@ -77,7 +77,7 @@ const (
 	// The per-pod metrics-scrape fan-out cap (Component 3 pool).
 	scyllaScrapeWorkers = 4
 
-	// W12-ST3 — shard-imbalance signature: a Scylla pod's busiest
+	// scylla-shard-imbalance — shard-imbalance signature: a Scylla pod's busiest
 	// shard saturated while the average shard idles is the
 	// hot-partition / tombstone-skew shape (a shard-per-core pod can
 	// stall 1/8th of its coordinator work while staying Ready).
@@ -86,7 +86,7 @@ const (
 	scyllaShardImbalanceMinAge  = 10 * time.Minute
 	scyllaShardImbalanceMinSets = 2 // need >=2 shards for a skew to exist
 
-	// W12-ST3 — overload stall counter names, all scraped off the
+	// scylla-shard-imbalance — overload stall counter names, all scraped off the
 	// same :9180/metrics body: coordinator read timeouts, the
 	// sstable read queue's overload drops and the querier cache's
 	// drops. These are cumulative counters — a positive delta
@@ -109,7 +109,7 @@ var (
 		Help: "1 while members of the cluster report divergent coordinator schema versions.",
 	}, []string{"namespace", "cluster"})
 
-	// W12-ST3 — a member pod whose hottest shard is saturated while
+	// scylla-shard-imbalance — a member pod whose hottest shard is saturated while
 	// the average shard idles: the hot-partition / tombstone skew
 	// that stalls a fraction of coordinator work on a Ready pod.
 	scyllaShardImbalanceGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -117,7 +117,7 @@ var (
 		Help: "1 while a Scylla pod's max per-shard reactor utilization >=0.98 with shard-average <=0.50 for >=10m.",
 	}, []string{"namespace", "pod"})
 
-	// W12-ST3 — overload stalls in progress: per-sweep delta of the
+	// scylla-shard-imbalance — overload stalls in progress: per-sweep delta of the
 	// coordinator/sstable/querier-cache stall counters.
 	scyllaOverloadStallGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_scylla_overload_stall",
@@ -134,7 +134,7 @@ func init() {
 }
 
 // scyllaScrape is everything one :9180/metrics fetch yields for a
-// member pod — the W12-ST3 additions read off the SAME body, so the
+// member pod — the scylla-shard-imbalance additions read off the SAME body, so the
 // pod pays zero extra HTTP calls for the shard/overload signatures.
 type scyllaScrape struct {
 	backlog  float64            // max scylla_compaction_manager_pending_compactions
@@ -181,7 +181,7 @@ func (p *scyllaCompactionSchemaGuardCheck) scyllaPodMetrics(ctx context.Context,
 		"scylla_storage_proxy_coordinator_schema_version") {
 		sc.versions[v] = true
 	}
-	// W12-ST3 — same body, per-shard reactor utilization and the
+	// scylla-shard-imbalance — same body, per-shard reactor utilization and the
 	// overload stall counters.
 	sc.shards = scyllaShardValues(text, "scylla_reactor_utilization", "shard")
 	sc.overload = scyllaOverloadSample{
@@ -307,7 +307,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			backlogRep.Find(fmt.Sprintf(
 				"%s/%s=%.0f", pod.Namespace, pod.Name, sc.backlog))
 		}
-		// W12-ST3 — hot-partition skew: the busiest shard saturated
+		// scylla-shard-imbalance — hot-partition skew: the busiest shard saturated
 		// while the pod's average shard idles, persisting 10m.
 		if max, avg, n := shardSkew(sc.shards); n >= scyllaShardImbalanceMinSets &&
 			max >= scyllaShardHotUtil && avg <= scyllaShardAvgUtilMax {
@@ -320,7 +320,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 						pod.Namespace, pod.Name, max, avg))
 			}
 		}
-		// W12-ST3 — stall counters: a positive delta since the last
+		// scylla-shard-imbalance — stall counters: a positive delta since the last
 		// scrape is a stall in progress; a drop means the pod
 		// restarted its counters, not evidence either way.
 		p.scyllaOverloadDelta(&overloadRep, pod, sc.overload)
@@ -377,7 +377,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 }
 
 // shardSkew folds a pod's per-shard reactor utilization into
-// (max, avg, count) — the caller compares against the W12-ST3 hot /
+// (max, avg, count) — the caller compares against the scylla-shard-imbalance hot /
 // idle thresholds.
 func shardSkew(shards map[string]float64) (max, avg float64, n int) {
 	for _, u := range shards {

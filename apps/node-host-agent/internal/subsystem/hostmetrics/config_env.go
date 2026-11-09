@@ -64,7 +64,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.StringKnob(envnames.EnvPsiFile, &cfg.PSIFile, defaultPSIFile),
 		envx.DurationKnob(envnames.EnvCPUDeliveredInterval,
 			&cfg.CPUDeliveredInterval, defaultCPUDeliveredIn),
-		// W7-H5/H6 telemetry files.
+		// conntrack-arp-pressure/memory-events-reclaim telemetry files.
 		envx.StringKnob(envnames.EnvConntrackStatFile, &cfg.ConntrackStatFile,
 			defaultConntrackStatFile),
 		envx.StringKnob(envnames.EnvArpTableFile, &cfg.ARPTableFile,

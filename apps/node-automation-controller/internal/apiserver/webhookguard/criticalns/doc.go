@@ -1,5 +1,5 @@
 // Package criticalns — the critical-namespace audit duties behind the
-// admission-webhook-guard run (W12-CP-B): it flags live
+// admission-webhook-guard run (critical-ns-audit): it flags live
 // Mutating/Validating admission sub-webhooks whose failurePolicy fails
 // closed while their namespaceSelector still matches one of the
 // critical self-healing namespaces (kube-system, kube-node-lease,

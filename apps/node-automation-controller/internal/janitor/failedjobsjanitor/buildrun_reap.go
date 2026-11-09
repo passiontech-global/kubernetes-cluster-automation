@@ -1,4 +1,4 @@
-// buildrun_reap.go — duty 2 of failed-jobs-janitor: the W9-GO2/W12-GO2
+// buildrun_reap.go — duty 2 of failed-jobs-janitor: the buildrun-ttl-sweep/run-workspace-reaper
 // completed-run retention sweep plus the orphaned run-workspace PVC
 // reaper.
 //
@@ -16,7 +16,7 @@
 // the object it points at) is gone or terminal, which no non-terminal
 // pod mounts, and which is older than 6h is pure ResourceQuota/disk
 // waste — on the cicd cluster these pile up until every new build
-// pends (W12-GO2).
+// pends (run-workspace-reaper).
 package failedjobsjanitor
 
 import (
@@ -43,7 +43,7 @@ import (
 
 const (
 	// completedRunTTL is the shared retention window for terminal CI
-	// runs — the original W9-GO2 BuildRun horizon, now covering the
+	// runs — the original buildrun-ttl-sweep BuildRun horizon, now covering the
 	// Tekton run kinds too.
 	completedRunTTL = 24 * time.Hour
 
@@ -215,7 +215,7 @@ func runFinishedAt(obj *unstructured.Unstructured) (time.Time, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-GO2 — orphaned run-workspace PVC reaper
+// run-workspace-reaper — orphaned run-workspace PVC reaper
 // ---------------------------------------------------------------------------
 
 // workspacePVCRef is one owning-run pointer harvested from a PVC — an
@@ -323,7 +323,7 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 }
 
 // claimedPVCNames lists the claim names non-terminal pods in ns still
-// reference — the same per-namespace scan the W4 pvc-protection
+// reference — the same per-namespace scan the va-stuck-terminating pvc-protection
 // unstick runs (Succeeded/Failed pods released their volumes; every
 // other phase — including Pending pods not yet mounted — counts as a
 // claimant, fail closed). Generic ephemeral volumes count too: their

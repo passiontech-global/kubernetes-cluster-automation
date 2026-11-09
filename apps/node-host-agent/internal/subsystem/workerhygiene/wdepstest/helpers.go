@@ -55,7 +55,7 @@ func DeleteActions(cs *fake.Clientset) []k8stesting.DeleteAction {
 // EvictActions returns the pod names evicted through the
 // policy/v1 Eviction subresource — the fake clientset records them
 // as create actions on pods/eviction carrying the *policyv1.Eviction
-// object (W9: the PSI evictor uses the eviction API so PDBs are
+// object (the PSI evictor uses the eviction API so PDBs are
 // enforced, not raw deletes).
 func EvictActions(cs *fake.Clientset) []string {
 	var out []string

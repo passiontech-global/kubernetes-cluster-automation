@@ -434,7 +434,7 @@ func TestApplyDefaultsAndValidation(t *testing.T) {
 	}
 }
 
-// W16-CP1: the compact step-cap env (NODE_HOST_AGENT_KINEDB_GUARD_MAX_
+// compact-step-cap: the compact step-cap env (NODE_HOST_AGENT_KINEDB_GUARD_MAX_
 // STEP_REVISIONS) — set to a positive integer it becomes the compact
 // step cap; unset/0/garbage stays disabled.
 func TestMaxStepRevisionsEnv(t *testing.T) {

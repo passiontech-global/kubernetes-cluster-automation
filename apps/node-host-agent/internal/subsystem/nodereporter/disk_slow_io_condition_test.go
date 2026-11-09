@@ -1,4 +1,4 @@
-// disk_slow_io_condition_test.go — W12-KR4 latch→condition wiring:
+// disk_slow_io_condition_test.go — disk-slow-io latch→condition wiring:
 // state-disk-slow-io must flip the DiskSlowIO permanent
 // NodeCondition, False without the latch.
 package nodereporter

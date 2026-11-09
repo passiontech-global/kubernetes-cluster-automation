@@ -726,7 +726,7 @@ func TestPartitionEvictorLeavesPodsOnHealthyNodes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-FIX5 — node-pinned volumes are never evicted.
+// pinned-volume-guard — node-pinned volumes are never evicted.
 // ---------------------------------------------------------------------------
 
 // pePVC builds a PVC bound to a storage class; sc "" leaves
@@ -883,7 +883,7 @@ func TestPartitionEvictorPVCListErrorSkipsEviction(t *testing.T) {
 	}
 }
 
-// W9-CP3 — NebulaPMTUBlackhole (the node-host-agent PMTU latch) flags
+// clock-skew-precordon — NebulaPMTUBlackhole (the node-host-agent PMTU latch) flags
 // the node for partition eviction exactly like NebulaIsolated.
 func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")

@@ -1,4 +1,4 @@
-// Package kernelfail is the Wave-10 kernel deep-failure engine the
+// Package kernelfail is the kernel deep-failure engine the
 // hostmetrics latch ticker drives. It lives in a subpackage because
 // it produces NO prometheus series — every check below writes the
 // watchdog state-dir contract (state-* latches, evidence markers,
@@ -8,23 +8,23 @@
 //
 // The contract the checks implement:
 //
-//   - W10-KR1 checkKernelDmesg (kmsg.go): /dev/kmsg drain (dmesg -T
+//   - kernel-dmesg checkKernelDmesg (kmsg.go): /dev/kmsg drain (dmesg -T
 //     fallback) classifying filesystem/block errors, nf_conntrack
 //     table-full drops and host-level OOM kills into stateDir
 //     evidence markers. workerhygiene consumes the OOM markers for
 //     the SystemOOMVictim node event; kmsg.go owns the latches +
 //     counters.
-//   - W10-KR2 updatePidFDPressure (pidfd.go): pid/thread/fd
+//   - pid-fd-pressure updatePidFDPressure (pidfd.go): pid/thread/fd
 //     utilization ratios → state-pid-fd-pressure
 //     (KernelResourceExhaustion) + the node_agent_*_utilization_ratio
-//     textfile gauges (the W10 metric channel — same convention the
+//     textfile gauges (the node_agent metric channel — same convention the
 //     controllerhygiene textfile channel uses; a new prometheus desc
 //     would mean a domainTable row in the parent's domains.go, the
 //     textfile channel needs no registry change).
-//   - W10-KR5 checkClockSkew (clockskew.go): chronyc tracking
+//   - clock-skew checkClockSkew (clockskew.go): chronyc tracking
 //     (adjtimex offset fallback) → state-clock-skew
 //     (ClockSkewDetected) + a rate-limited `chronyc makestep`.
-//   - W10-ST1 updateFSReadonlyEvidence (fsreadonly.go): ro
+//   - fs-readonly updateFSReadonlyEvidence (fsreadonly.go): ro
 //     ext4/xfs/btrfs mounts under the PVC provisioner roots parsed
 //     out of /proc/<pid>/mounts → state-fs-readonly
 //     (FilesystemReadOnly) ahead of statfs.
@@ -110,7 +110,7 @@ type Deps struct {
 	// package, so it crosses as a bound closure over cfg (late
 	// stubs via cfg.adjtimexFn still land).
 	Adjtimex func(*unix.Timex) (int, error)
-	// RunHostCmd executes a host binary for the Wave-10 probes
+	// RunHostCmd executes a host binary for the deep-failure probes
 	// that have no Config seam (chronyc, dmesg). Nil selects
 	// defaultRunHostCmd — the 30s-cap hostexec.RunCombined
 	// convention nethealth shares.
@@ -122,7 +122,7 @@ type Deps struct {
 }
 
 // Runner is the per-Collector kernel-failure engine. It owns the
-// two pieces of cross-tick state the W10 checks carry — the kmsg
+// two pieces of cross-tick state the kernelfail checks carry — the kmsg
 // tail session + cross-line OOM pairing, and the cpu-steal jiffie
 // baseline — which is why New() builds it once on the Collector
 // rather than inside the recreated-per-call Latches wrapper: a
@@ -164,7 +164,7 @@ func New(d Deps) *Runner {
 	return &Runner{deps: d}
 }
 
-// Refresh runs the W10 latch-maintenance block once — the same
+// Refresh runs the deep-failure latch-maintenance block once — the same
 // order refreshLatches ran pre-split: the kmsg drain FIRST (it
 // writes the kmsg-fs-error / conntrack-drop / host-OOM /
 // page-alloc evidence the later steps consume — workerhygiene's

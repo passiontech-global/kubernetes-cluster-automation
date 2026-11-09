@@ -1,4 +1,4 @@
-// criticalns.go — the critical-namespace audit duties (W12-CP-B):
+// criticalns.go — the critical-namespace audit duties (critical-ns-audit):
 // Sweeper owns the two emitted-series ledgers — the facade
 // holds one Sweeper across runs so fixed or removed webhooks have
 // their series pruned — and the audits share the namespaceSelector
@@ -25,7 +25,7 @@ import (
 // criticalSelfHealingNamespaces are the four namespaces that run CNI,
 // DNS, the kubelet heartbeat, and the node self-healing stack itself —
 // a fail-closed admission webhook that matches any of them can
-// deadlock recovery when its own backend dies (W12-CP-B, mirroring
+// deadlock recovery when its own backend dies (critical-ns-audit, mirroring
 // check-webhook-guard.sh at runtime). kube-node-lease joined
 // later: its Lease objects ARE the kubelet node heartbeat, so a
 // webhook that intercepts lease writes can flap every node NotReady
@@ -234,7 +234,7 @@ func mergeExclusion(sel *metav1.LabelSelector) map[string]any {
 	return patch
 }
 
-// auditExclusions (W12-CP-B) audits live Mutating/Validating admission
+// auditExclusions (critical-ns-audit) audits live Mutating/Validating admission
 // sub-webhooks with failurePolicy=Fail (or nil, which defaults to
 // Fail) and emits
 // node_automation_webhook_missing_critical_ns_exclusion=1 when the

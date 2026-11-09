@@ -119,7 +119,7 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"flux-kustomization-health",
 		"workload-scale-flapping",
 		"imagepull-secret-auditor",
-		// W16-G3 — the argocd-agent spin healer is the newest row.
+		// argocd-agent-spin — the argocd-agent spin healer is the newest row.
 		"argocd-agent-spin",
 	}
 	var got []string

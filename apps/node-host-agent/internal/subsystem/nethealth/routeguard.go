@@ -146,7 +146,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // short backoff after each exit keeps a crash-looping guard from
 // spawn-storming.
 func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
-	// W10-NM4: the MTU-blackhole prober shares this spawn point —
+	// nebula-mtu-blackhole: the MTU-blackhole prober shares this spawn point —
 	// Run calls spawnRouteGuard every tick, so a dead prober
 	// re-arms exactly like the guard itself. Single-flight inside.
 	n.spawnMTUProber(ctx)

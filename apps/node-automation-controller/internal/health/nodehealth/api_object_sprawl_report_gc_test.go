@@ -69,7 +69,7 @@ func helmSecret(ns, release string, version int, status string) *corev1.Secret {
 }
 
 // sprawlDyn builds a dynamic fake covering the shared CRD table plus
-// the argo rollouts kinds the W16-G1 census/GC reads (the shared
+// the argo rollouts kinds the rollout-scale-flap census/GC reads (the shared
 // OpDyn table predates them).
 func sprawlDyn(objs ...runtime.Object) dynamic.Interface {
 	kinds := maps.Clone(testutil.DynListKinds())
@@ -128,7 +128,7 @@ func sprawlArgoCR(gvr schema.GroupVersionResource, kind, ns, name string,
 	return obj
 }
 
-// W16-G1 — terminal-phase AnalysisRuns past the retention threshold
+// rollout-scale-flap — terminal-phase AnalysisRuns past the retention threshold
 // are GC'd (the Rollouts controller never prunes them); Running ones
 // and records inside the window survive.
 func TestSprawlGCCollectsCompletedAnalysisRuns(t *testing.T) {
@@ -160,7 +160,7 @@ func TestSprawlGCCollectsCompletedAnalysisRuns(t *testing.T) {
 	}
 }
 
-// W16-G1 — the same GC covers Experiments: only the terminal phases
+// rollout-scale-flap — the same GC covers Experiments: only the terminal phases
 // (Successful/Failed/Error/Inconclusive) age out.
 func TestSprawlGCCollectsCompletedExperiments(t *testing.T) {
 	done := sprawlArgoCR(kube.GVRArgoExperiment, "Experiment",

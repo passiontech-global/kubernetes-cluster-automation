@@ -1,4 +1,4 @@
-// connect_pod_heal.go — the W9-GO1 1Password Connect auto-heal of
+// connect_pod_heal.go — the externalsecret-storm-guard 1Password Connect auto-heal of
 // externalsecret-nudge: when a ClusterSecretStore outage or an
 // ExternalSecret failure storm persists past esConnectHealMinAge, the
 // oldest running onepassword-connect pod is deleted — maintenance-
@@ -23,7 +23,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W9-GO1 — 1Password Connect auto-heal
+// externalsecret-storm-guard — 1Password Connect auto-heal
 // ---------------------------------------------------------------------------
 
 // maybeHealConnect bounces a onepassword-connect pod when the ESO

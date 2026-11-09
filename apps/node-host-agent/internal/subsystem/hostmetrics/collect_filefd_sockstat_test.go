@@ -168,7 +168,7 @@ func TestSockstatMissingAndMalformedSections(t *testing.T) {
 	}
 }
 
-// --- W12-KR3: ephemeral port saturation + CLOSE_WAIT count ---
+// --- conntrack-port-pressure: ephemeral port saturation + CLOSE_WAIT count ---
 
 func TestEphemeralPortSaturationRatio(t *testing.T) {
 	cfg, _ := fixture(t)
@@ -341,7 +341,7 @@ func TestNetstatSNMPMissingAndMalformedSections(t *testing.T) {
 	}
 }
 
-// --- W16-KR4: kernel AIO table gauges ---
+// --- aio-pressure: kernel AIO table gauges ---
 
 // TestCollectAIO: aio-nr/aio-max-nr gauges plus the used ratio; the
 // ratio is 0 when the max reads 0 (never a division by zero) and

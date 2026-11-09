@@ -41,7 +41,7 @@
 //     gauges them (kine_db_orphan_prepared_xacts) and rolls them
 //     back automatically (ROLLBACK PREPARED), counting releases in
 //     kine_db_orphan_prepared_xacts_rolled_back_total.
-//  7. Invalid-index census + seq-scan regression guard (W12-CP2) —
+//  7. Invalid-index census + seq-scan regression guard (invalid-index-reaper) —
 //     kine_db_invalid_indexes counts pg_index rows with
 //     indisvalid=false (dead *_ccnew/*_ccold shells an interrupted
 //     REINDEX CONCURRENTLY leaves behind — they cost every INSERT
@@ -100,7 +100,7 @@ const (
 	// success is this old (seconds).
 	archiveStaleSecs = 1800
 
-	// seqTupReadDeltaMax — W12-CP2: tuples-read-by-seq-scan growth
+	// seqTupReadDeltaMax — invalid-index-reaper: tuples-read-by-seq-scan growth
 	// between probe rounds that marks a planner regression to
 	// sequential scan (the kine table is supposed to answer
 	// LIST/WATCH via kine_name_prev_revision_uindex / kine_id_idx).
@@ -149,7 +149,7 @@ type hygieneResult struct {
 	preparedXacts  int64
 	preparedSeen   bool
 	preparedRolled int64 // rolled back THIS round
-	// Item 7 (W12-CP2 invalid-index census + seq-scan guard).
+	// Item 7 (invalid-index-reaper invalid-index census + seq-scan guard).
 	invalidIdx   int64
 	invalidSeen  bool
 	seqScans     int64
@@ -255,7 +255,7 @@ func (p *Probe) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
 	}
 }
 
-// hygieneInvalidIndexes — item 7a (W12-CP2): indexes with
+// hygieneInvalidIndexes — item 7a (invalid-index-reaper): indexes with
 // indisvalid=false across pg_index. An invalid index is dead
 // weight — every INSERT still maintains it but the planner never
 // uses it, and the next REINDEX CONCURRENTLY errors or silently
@@ -283,7 +283,7 @@ func (p *Probe) hygieneInvalidIndexes(ctx context.Context, pg, user, pass string
 	h.invalidIdx, h.invalidSeen = v, true
 }
 
-// hygieneSeqScan — item 7b (W12-CP2): seq_scan / seq_tup_read of the
+// hygieneSeqScan — item 7b (invalid-index-reaper): seq_scan / seq_tup_read of the
 // kine table from pg_stat_user_tables. A planner regression to
 // sequential scan (stale statistics after a churn burst, or a
 // poisoned index) shows as a seq_tup_read spike BEFORE the CPU

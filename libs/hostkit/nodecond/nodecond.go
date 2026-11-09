@@ -85,7 +85,7 @@ const (
 // KernelDeadlock and ReadonlyFilesystem are the NPD monitor ports
 // the nodereporter evaluates from kmsg signatures and the host
 // mount table; InodePressure is kubelet-native (nodefs/imagefs
-// inode exhaustion) and since W18-1 also agent-latched (hostmetrics'
+// inode exhaustion) and since inode-pressure also agent-latched (hostmetrics'
 // state-inode-pressure maps onto the same name); the four network
 // spellings are the NPD network-monitor condition names the
 // controller's partition/storm-gate consumers act on (no agent
@@ -94,7 +94,7 @@ const (
 const (
 	KernelDeadlock         = "KernelDeadlock"         // PERMANENT: hung-task/soft-lockup/RCU-stall, latches True for the agent lifetime
 	ReadonlyFilesystem     = "ReadonlyFilesystem"     // watched mountpoints mounted read-only
-	InodePressure          = "InodePressure"          // kubelet-native inode exhaustion + agent inode-pressure latch (W18-1)
+	InodePressure          = "InodePressure"          // kubelet-native inode exhaustion + agent inode-pressure latch (inode-pressure)
 	HostNetworkProblems    = "HostNetworkProblems"    // NPD host network monitor
 	ClusterNetworkProblems = "ClusterNetworkProblems" // NPD cluster network monitor
 	HostNetworkProblem     = "HostNetworkProblem"     // singular upstream spelling, still live
@@ -105,7 +105,7 @@ const (
 // and re-stamps LastHeartbeatTime on each cycle while alive: all 41
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
-// W18-1: the hostmetrics inode-pressure latch sets/clears it and
+// inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
 // kubelet itself never emits a condition of this type, so a frozen
 // heartbeat on it can only be a dead reporter's zombie. Deliberately
 // NOT here: KernelDeadlock — the permanent latch that never
@@ -141,7 +141,7 @@ var HeartbeatSweptNames = []string{
 // NHC reboot. The clock conditions are deliberately NOT here: they
 // carry their own longer fuse and live in ClockSkewPreCordonNames.
 // InodePressure stays in the set (an inode storm starves the node
-// the same way a latch would); since W18-1 it is also in
+// the same way a latch would); since inode-pressure it is also in
 // HeartbeatSweptNames (agent-latched). The precordon gates on
 // LastTransitionTime, not the heartbeat.
 var HangPreCordonNames = []string{
@@ -156,7 +156,7 @@ var HangPreCordonNames = []string{
 // ClockSkewPreCordonNames are the clock-health conditions on the
 // precordon's longer fuse — ClockUnsynchronized (chrony has no
 // sync source), ClockSkewDetected (synchronized but >2s off), and
-// ClocksourceUnstable (W18-2: the underlying clocksource itself is
+// ClocksourceUnstable (clocksource-unstable: the underlying clocksource itself is
 // drifting/unstable — with it, the other two fire and the node's
 // whole timebase is untrustworthy, so it precordons on the same
 // longer fuse).
@@ -221,7 +221,7 @@ var heartbeatSweptSet = func() map[string]struct{} {
 // taints, evictions or cordons. Kubelet-native conditions
 // (MemoryPressure, DiskPressure, …) and the permanent KernelDeadlock
 // latch answer false — their LastHeartbeatTime is not the
-// reporter's liveness signal. (InodePressure IS managed: since W18-1
+// reporter's liveness signal. (InodePressure IS managed: since inode-pressure
 // the agent latches it and kubelet never emits the type.)
 func AgentHeartbeatManaged(cond string) bool {
 	_, ok := heartbeatSweptSet[cond]

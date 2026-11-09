@@ -173,7 +173,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		"JournaldUnreadable":  {"JournaldReadable", "journald journal reads return entries"},
 		"FilesystemReadOnly":  {"FilesystemReadWrite", "all probed filesystems are read-write"},
 		"KernelHungTasks":     {"KernelTasksRunOk", "no D-state task storm (uninterruptible sleep below threshold)"},
-		// Wave-8 latch→condition surface.
+		// infra latch→condition surface.
 		"NebulaIsolated":              {"NebulaMeshHealthy", "all nebula peers handshake normally"},
 		"NebulaDegraded":              {"NebulaDataplaneOk", "nebula dataplane healthy (no relay/latency degradation)"},
 		"CiliumEnvoyDown":             {"CiliumEnvoyReady", "cilium-envoy admin /ready OK"},
@@ -187,11 +187,11 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KernelKeysPressure":          {"KernelKeysNormal", "kernel keyring quota below pressure threshold"},
 		"ControlPlaneCertReloadStale": {"ControlPlaneCertReloadFresh", "control-plane cert reload markers fresh"},
 		"MemoryPSIThrashing":          {"MemoryPSINormal", "memory PSI full avg60 <= 25% or free memory >= 8%"},
-		// Wave-9 latch→condition surface.
+		// leak-pressure latch→condition surface.
 		"ClockUnsynchronized": {"ClockSynchronized", "kernel clock disciplined (adjtimex synced, esterror <= 500ms)"},
 		"KernelSlabLeak":      {"KernelSlabNormal", "unreclaimable kernel slab below pressure threshold"},
 		"NebulaPMTUBlackhole": {"NebulaPMTUOk", "nebula overlay passes DF probes at probe size"},
-		// Wave-10 latch→condition surface.
+		// deep-failure latch→condition surface.
 		"KernelResourceExhaustion": {"KernelResourcesNormal", "kernel threads/pids and fd table below exhaustion threshold"},
 		"ClockSkewDetected":        {"ClockSkewOk", "clock offset within 2.0s of NTP source"},
 		// kernel/host deep-failure + hygiene latch→condition surface.
@@ -200,7 +200,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		"CgroupDyingLeak":        {"CgroupDyingNormal", "cgroup dying descendants below pressure threshold"},
 		"SystemdSessionBloat":    {"SystemdSessionsNormal", "logind session count and D-Bus latency healthy"},
 		"KubeletPLEGUnhealthy":   {"KubeletPLEGHealthy", "kubelet PLEG relist latency and last-seen lag healthy"},
-		// Wave-12 latch→condition surface.
+		// gray-failure latch→condition surface.
 		"DiskSlowIO":            {"DiskIONormal", "disk write await and io PSI within normal bounds"},
 		"KernelNetShimDegraded": {"KernelNetShimNormal", "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds"},
 		// Clocksource latch→condition surface.
@@ -208,7 +208,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		// workerhygiene cilium latch→condition surface.
 		"CiliumMTUDrift": {"CiliumMTUAligned", "cilium datapath MTU matches nebula overlay (no drift)"},
 		"CiliumWGStale":  {"CiliumWGPeersOk", "cilium_wg0 live peers match expected encryption peers (no stale state)"},
-		// W18-1 inode-pressure latch→condition surface.
+		// inode-pressure inode-pressure latch→condition surface.
 		"InodePressure": {"FilesystemInodesHealthy", "all monitored filesystems below inode-pressure thresholds"},
 	}
 	conds := e.node(t).Status.Conditions
@@ -264,10 +264,10 @@ func TestLatchSetsConditionTrue(t *testing.T) {
 	}
 }
 
-// TestClockSlabPMTULatchConditions: the three Wave-9 state-* latches each
+// TestClockSlabPMTULatchConditions: the three leak-pressure state-* latches each
 // flip their permanent NodeCondition to True with the problem
 // reason — clock-unsync (nethealth H1), kernel-slab-leak
-// (workerhygiene W9-KR3), nebula-pmtu-blackhole (nethealth W9-NM1).
+// (workerhygiene kernel-slab-leak), nebula-pmtu-blackhole (nethealth overlay-mtu-guard).
 func TestClockSlabPMTULatchConditions(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("state-clock-unsync", "1700000001\n")
@@ -674,7 +674,7 @@ func TestKubeletRuntimeStallA4Latches(t *testing.T) {
 	}
 }
 
-// TestInfraLatchConditions: every Wave-8 latch maps 1:1 to its
+// TestInfraLatchConditions: every infra latch maps 1:1 to its
 // permanent NodeCondition — the NHC→SNR chain and the
 // problem_gauge series cover the full latch set.
 func TestInfraLatchConditions(t *testing.T) {

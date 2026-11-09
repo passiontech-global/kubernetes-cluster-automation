@@ -344,7 +344,7 @@ func TestNoOrphanPreparedXacts(t *testing.T) {
 	}
 }
 
-// --- item 7: W12-CP2 invalid-index census + seq-scan guard ---
+// --- item 7: invalid-index-reaper invalid-index census + seq-scan guard ---
 
 func TestProbeInvalidIndexCensusEmits(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),

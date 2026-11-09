@@ -515,7 +515,7 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 	mixedDataBroken := esObj("apps", "es-mixed-data-broken", "False", time.Hour)
 	esStoreRef(mixedDataBroken, "ClusterSecretStore", "css1")
 	esDataStoreRef(mixedDataBroken, "ClusterSecretStore", "css2")
-	// W9-GO1 storm guard: this fixture carries 10 failing ESs — enough
+	// externalsecret-storm-guard storm guard: this fixture carries 10 failing ESs — enough
 	// to trip the >=5 && >=50% storm signature and suppress every
 	// stamp. Pad the population with healthy ESs so the failing ratio
 	// stays under half and the per-store gating assertions below still
@@ -587,7 +587,7 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-GO1 — storm guard + 1Password Connect auto-heal
+// externalsecret-storm-guard — storm guard + 1Password Connect auto-heal
 // ---------------------------------------------------------------------------
 
 // esNudgeDynFake builds the dyn fake with every ESO GVR plus the
@@ -722,7 +722,7 @@ func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-GO3 — empty/whitespace-key audit + empty-skeleton Secret reaper
+// empty-key-audit — empty/whitespace-key audit + empty-skeleton Secret reaper
 // ---------------------------------------------------------------------------
 
 // esDataKeys declares spec.data[] entries pulling each key — the

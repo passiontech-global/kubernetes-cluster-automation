@@ -1,4 +1,4 @@
-// superseded_secret_prune.go — the W9-CP2 Kine bloat guard of
+// superseded_secret_prune.go — the kine-bloat-guard Kine bloat guard of
 // helmrelease-unlocker: caps superseded helm release secrets per
 // release (helm writes one sh.helm.release.v1 Secret per revision,
 // each embedding the full compressed chart, and never GCs them).
@@ -20,7 +20,7 @@ import (
 
 const (
 	// maxSupersededSecrets caps the superseded helm release secrets
-	// kept per release (W9-CP2 — Kine bloat guard): every revision
+	// kept per release (kine-bloat-guard — Kine bloat guard): every revision
 	// secret embeds the full compressed chart and helm never GCs
 	// them, so a hot release grows Kine without bound.
 	maxSupersededSecrets = 10

@@ -232,7 +232,7 @@ func healthyCanaryName(nodes []corev1.Node) string {
 // stamps on remediation CRs it names "<nodeName>-<templateName>"
 // (escalatingRemediations / multi-template setups) — the CR name no
 // longer equals the node name, so the annotation carries the
-// fencing target (W12 P0-7).
+// fencing target (medik8s-nhc-cr-names).
 const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
 
 // remediationCache memoizes the once-per-sweep remediation CR

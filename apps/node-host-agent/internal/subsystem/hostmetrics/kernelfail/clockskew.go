@@ -1,6 +1,6 @@
-// clockskew.go — W10-KR5 checkClockSkew: chronyc tracking (adjtimex
+// clockskew.go — clock-skew checkClockSkew: chronyc tracking (adjtimex
 // offset fallback) → state-clock-skew (ClockSkewDetected) + a
-// rate-limited `chronyc makestep`. The Wave-10 contract overview
+// rate-limited `chronyc makestep`. The kernelfail contract overview
 // lives in kernelfail.go.
 package kernelfail
 
@@ -20,7 +20,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
-// clockSkew thresholds (W10-KR5): makestep fires above 0.5s or
+// clockSkew thresholds (clock-skew): makestep fires above 0.5s or
 // on "Not synchronised"; the latch needs >2.0s for 5 ticks.
 const (
 	clockSkewStepOffset  = 0.5
@@ -36,7 +36,7 @@ const (
 	clockSteppedMarkerFile = "clock-stepped-at"
 )
 
-// --- W10-KR5: clock skew ---
+// --- clock-skew: clock skew ---
 
 // clockSkewProbe returns (offsetSeconds, synchronized, ok). Primary
 // source is `chronyc tracking` — its "System time" offset is the
@@ -89,7 +89,7 @@ func parseChronycTracking(out string) (float64, bool, bool) {
 	return off, synced, true
 }
 
-// checkClockSkew drives state-clock-skew (W10-KR5 →
+// checkClockSkew drives state-clock-skew (clock-skew →
 // ClockSkewDetected): |offset| > 2.0s for clockSkewLatchNeeded
 // consecutive ticks. A >0.5s offset OR an unsynchronised clock earns
 // a `chronyc makestep` — rate-limited to one per 10m. Inconclusive

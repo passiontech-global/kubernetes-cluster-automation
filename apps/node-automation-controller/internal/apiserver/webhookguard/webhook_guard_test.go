@@ -2,7 +2,7 @@
 // admission-webhook circuit breaker driven through the facade's
 // run(): dead-backend streaks, failurePolicy Fail↔Ignore trips and
 // restores, the circuit-broken annotation record, node-health
-// endpoint discounting, the W9-CP1 brownout probe and pod bounce,
+// endpoint discounting, the circuit-breaker-bounce brownout probe and pod bounce,
 // and the missing-critical-namespace warning series.
 package webhookguard
 
@@ -430,7 +430,7 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 		"endpointslices":                  1,
 		"pods":                            1,
 		"services":                        1,
-		// W5.5 — the node census feeds the effective-ready math.
+		// endpoint-census — the node census feeds the effective-ready math.
 		"nodes": 1,
 	} {
 		if counts[res] != want {
@@ -439,7 +439,7 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 	}
 }
 
-// W12-CP-B: fail-closed webhooks whose namespaceSelector still matches
+// critical-ns-audit: fail-closed webhooks whose namespaceSelector still matches
 // kube-system/kube-node-lease/node-ops/medik8s emit
 // node_automation_webhook_missing_critical_ns_exclusion=1;
 // webhooks with NotIn exclusion, opt-in matchLabels, or failurePolicy=Ignore do not,
@@ -475,7 +475,7 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 		}},
 	}
 	vwc := &admissionv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{Name: "w12-cpb-vwc"},
+		ObjectMeta: metav1.ObjectMeta{Name: "cpb-vwc"},
 		Webhooks: []admissionv1.ValidatingWebhook{
 			{
 				Name:              "missing-nil.example.com",
@@ -523,7 +523,7 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 	t.Cleanup(func() {
 		for _, wh := range vwc.Webhooks {
 			metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues(
-				guardstate.KindValidating, "w12-cpb-vwc", wh.Name)
+				guardstate.KindValidating, "cpb-vwc", wh.Name)
 		}
 	})
 	if err := g.run(ctx); err != nil {
@@ -531,13 +531,13 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 	}
 	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com", "lease-exposed.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 1 {
+			guardstate.KindValidating, "cpb-vwc", wh)); got != 1 {
 			t.Fatalf("expected missing_critical_ns_exclusion=1 for %s, got %v", wh, got)
 		}
 	}
 	for _, wh := range []string{"excluded-notin.example.com", "excluded-optin.example.com", "ignore-policy.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			guardstate.KindValidating, "cpb-vwc", wh)); got != 0 {
 			t.Fatalf("expected missing_critical_ns_exclusion=0 for %s, got %v", wh, got)
 		}
 	}
@@ -556,7 +556,7 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 	}
 	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com", "lease-exposed.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			guardstate.KindValidating, "cpb-vwc", wh)); got != 0 {
 			t.Fatalf("expected pruned series=0 for %s after fix, got %v", wh, got)
 		}
 	}

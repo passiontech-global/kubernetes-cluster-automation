@@ -4,7 +4,7 @@
 // of the reap.Sweep delete loop in zombie_sidecar_reaper.go.
 // Deleting a pod whose Job has not counted its exit-0
 // completion makes the job-controller recreate it and re-run the
-// Job (BUG-C1); the backoffLimit==0 exemption (W10-FIX3) exists
+// Job (BUG-C1); the backoffLimit==0 exemption (sidecar-shutdown-fallback) exists
 // because such a Job can spawn no replacement.
 package zombiesidecarreaper
 
@@ -51,7 +51,7 @@ func allZeroExit(p *corev1.Pod) bool {
 // controller can recreate the pod — safe to reap; any other Get
 // failure is "cannot verify" and fails closed.
 //
-// W10-FIX3 exception: a Job with spec.backoffLimit==0 spawns NO
+// sidecar-shutdown-fallback exception: a Job with spec.backoffLimit==0 spawns NO
 // replacement pod once its single pod terminates, so the BUG-C1
 // re-run hazard cannot happen — once a shutdown attempt already ran
 // (shutdownAttempted: this cycle's failed call counted only from

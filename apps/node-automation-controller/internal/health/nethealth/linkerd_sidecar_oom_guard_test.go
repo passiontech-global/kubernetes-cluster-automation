@@ -77,7 +77,7 @@ func TestLinkerdSidecarOOMGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W16-NM2 — linkerdInitSidecarDeadlock
+// linkerd-init-deadlock — linkerdInitSidecarDeadlock
 // ---------------------------------------------------------------------------
 
 // deadlockPod builds a Pending pod with the injected init order
@@ -221,7 +221,7 @@ func TestLinkerdInitDeadlockFlagsAndClears(t *testing.T) {
 	}
 }
 
-// Regression (W16-NM2): the 5m first-seen window must mature ACROSS
+// Regression (linkerd-init-deadlock): the 5m first-seen window must mature ACROSS
 // sweeps — the sweep-end ledger prune keys on the shape-match set,
 // not the fired set. Pre-fix, the prune deleted the stamp every
 // sweep and the detector could never fire without a test seeder.

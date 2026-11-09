@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// --- W5.7 parsers ---
+// --- psi-swap-thrash parsers ---
 
 func TestPSIAvg60Full(t *testing.T) {
 	dir := t.TempDir()
@@ -38,7 +38,7 @@ func TestVMStatCounters(t *testing.T) {
 	}
 }
 
-// --- W5.3 latch ---
+// --- filesystem-readonly latch ---
 
 func TestFSReadonlyLatch(t *testing.T) {
 	dir := t.TempDir()

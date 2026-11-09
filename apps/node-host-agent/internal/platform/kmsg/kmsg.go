@@ -1,5 +1,5 @@
 // Package kmsg holds the /dev/kmsg drain machinery shared by the two
-// kernel-log consumers — hostmetrics' W10-KR1 kernel classifier and
+// kernel-log consumers — hostmetrics' kernel-dmesg kernel classifier and
 // nodereporter's NPD kernel-monitor port. Both tail the kernel ring
 // buffer the way the ported shell watchdog modules did: candidate
 // device paths under a host root, an O_NONBLOCK read handle, a

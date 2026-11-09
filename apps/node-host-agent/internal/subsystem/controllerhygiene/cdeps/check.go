@@ -28,9 +28,9 @@ const (
 	CheckOOMLoop     = "oomloop"
 	CheckFeeder      = "feeder"
 	CheckEtcd        = "etcd-quota" // etcdguard
-	CheckCPFreeze    = "cp-freeze"  // W8-CP3 KCM/scheduler freeze auto-heal
+	CheckCPFreeze    = "cp-freeze"  // cp-freeze-heal KCM/scheduler freeze auto-heal
 	CheckKineStorage = "kine-storage"
-	CheckPKIDrift    = "cp-cert-drift" // W8-CP4 PKI reload drift
+	CheckPKIDrift    = "cp-cert-drift" // pki-cert-drift PKI reload drift
 	CheckKubeCert    = "kubeconfig-cert"
 	// CheckJournal is the pseudo-check label the journal-unreadable
 	// blindness accounting counts under — journald readability is a
@@ -54,10 +54,10 @@ const (
 	// journal-grep check is blind until it clears (suspectLog's
 	// last-suspect- budget drops with the latch via stateExit).
 	StateJournalUnreadable = latchdefs.LatchJournalUnreadable
-	// StateCPComponentFrozen is the W8-CP3 latch: a KCM/scheduler
+	// StateCPComponentFrozen is the cp-freeze-heal latch: a KCM/scheduler
 	// component frozen while the peer apiserver stays healthy.
 	StateCPComponentFrozen = latchdefs.LatchCPComponentFrozen
-	// StatePKIReloadStale is the W8-CP4 latch: an on-disk PKI cert
+	// StatePKIReloadStale is the pki-cert-drift latch: an on-disk PKI cert
 	// newer than what the live socket presents — the daemon never
 	// reloaded the rotated cert.
 	StatePKIReloadStale = latchdefs.LatchCPCertReloadStale
@@ -96,7 +96,7 @@ const (
 	FileOOMKills        = "oomloop-kills"
 	FileOOMShielded     = "oomloop-shielded"
 	FileFeederLastRst   = "last-restart" // under FeederStateDir
-	// W8-CP3 (KCM/scheduler freeze auto-heal) + W8-CP4 (PKI reload
+	// cp-freeze-heal (KCM/scheduler freeze auto-heal) + pki-cert-drift (PKI reload
 	// drift) bookkeeping.
 	FileRateCPRestart  = "last-cp-restart"
 	FileRatePKIRestart = "last-cp-cert-restart"
@@ -104,7 +104,7 @@ const (
 	FileCtrKCMQuiet    = "consecutive-kcm-quiet"
 	FileCtrPKIDriftPre = "consecutive-cp-cert-stale-"
 	// FileKCMQueueSnap is the persisted KCM workqueue snapshot under
-	// WatchdogStateDir (W10 bookkeeping).
+	// WatchdogStateDir (guard bookkeeping).
 	FileKCMQueueSnap = "kcm-queue-snapshot.json"
 	// FileRateKineCheckpoint is the WAL-checkpoint cooldown file
 	// under WatchdogStateDir.

@@ -1,4 +1,4 @@
-// lxc_mtu.go — W16-NM4: pod lxc* interface MTU scan. A pod created
+// lxc_mtu.go — lxc-mtu-drift: pod lxc* interface MTU scan. A pod created
 // before the overlay MTU change keeps its old MTU on its host-side
 // veth (named lxc<hex> by Cilium) and dies silently on FRAG_NEEDED
 // even when every cilium_* datapath interface is aligned. The drift

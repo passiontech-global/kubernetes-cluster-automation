@@ -1,11 +1,11 @@
 // config_cpfreeze.go — the CPFreeze domain knobs: CPFreezeConfig
-// (the W8-CP3 KCM/scheduler freeze auto-heal — no env wiring) and
+// (the cp-freeze-heal KCM/scheduler freeze auto-heal — no env wiring) and
 // its applyDefaults block lifted out of config.go.
 package cdeps
 
 import "time"
 
-// CPFreezeConfig is the W8-CP3 KCM/scheduler freeze auto-heal. No env
+// CPFreezeConfig is the cp-freeze-heal KCM/scheduler freeze auto-heal. No env
 // wiring — package defaults unless set programmatically.
 type CPFreezeConfig struct {
 	// KCMHealthURL/SchedHealthURL are the healthz endpoints of the

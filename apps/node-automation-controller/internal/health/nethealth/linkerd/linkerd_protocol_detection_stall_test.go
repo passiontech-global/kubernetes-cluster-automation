@@ -1,5 +1,5 @@
 // linkerd_protocol_detection_stall_test.go — coverage for the
-// linkerd-protocol-detection-stall check (W10-NM3): opaque-ports
+// linkerd-protocol-detection-stall check (linkerd-protocol-detection-stall): opaque-ports
 // heal patch + pod re-roll, skip-inbound coverage, port-set
 // parsing.
 package linkerd
@@ -27,7 +27,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W10-NM3 — linkerd-protocol-detection-stall
+// linkerd-protocol-detection-stall — linkerd-protocol-detection-stall
 // ---------------------------------------------------------------------------
 
 // The heal patches the workload template and leaves the pod running —
@@ -104,7 +104,7 @@ func TestLinkerdSkipInboundCoversPort(t *testing.T) {
 	}
 }
 
-// W12-P0-6: skip-outbound-ports is the client-side escape — a meshed
+// template-patch-stamp: skip-outbound-ports is the client-side escape — a meshed
 // pod INITIATING to a binary port with only that annotation must not
 // read as missing (the static gate and VAP both accept it).
 func TestLinkerdSkipOutboundCoversPort(t *testing.T) {
@@ -144,7 +144,7 @@ func TestLinkerdTemplatePatchStampsWorkload(t *testing.T) {
 	}
 }
 
-// W12-P0-6: a GitOps-managed (Flux kustomization-labeled) Deployment
+// template-patch-stamp: a GitOps-managed (Flux kustomization-labeled) Deployment
 // that ALREADY carries the patch stamp yet lost opaque-ports again is
 // drift — the check must NOT re-patch, must NOT delete the pod, and
 // must emit node_automation_linkerd_gitops_opaque_drift.
@@ -269,7 +269,7 @@ func TestLinkerdNonBinaryPortPasses(t *testing.T) {
 	}
 }
 
-// W16-G1 — a Rollout-owned ReplicaSet resolves to the parent Rollout:
+// rollout-scale-flap — a Rollout-owned ReplicaSet resolves to the parent Rollout:
 // the opaque-ports merge-patch lands on the Rollout's pod template via
 // the dynamic client, with the same durable stamp on the Rollout.
 func TestLinkerdTemplatePatchPatchesRollout(t *testing.T) {

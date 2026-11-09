@@ -1,5 +1,5 @@
 // localpv_heals.go — the maintenance-gated auto-heals of the
-// localpv-stranded-pods check (W7-C4): the ephemeral PVC+pod rescue
+// localpv-stranded-pods check (localpv-stranded-pods): the ephemeral PVC+pod rescue
 // for workloads stranded on a confirmed-dead node, and the wedged
 // openebs-localpv-provisioner bounce for stalled hostpath claims.
 // Split out of localpv_stranded_pods.go — see that file for the

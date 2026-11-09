@@ -318,7 +318,7 @@ func TestAPIServiceGuardListsOncePerRun(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// (c) W10-CP1 — dead-APIService unblocker
+// (c) namespace-terminating-wedged — dead-APIService unblocker
 // ---------------------------------------------------------------------------
 
 // asgStuckNS builds a namespace stuck in Terminating for `age`,

@@ -781,7 +781,7 @@ func TestCoreDNSProbeFQDNCacheSkipsInconclusive(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // headlessProbeTarget builds the headless Service + EndpointSlice the
-// W8-NM5 fallback picks: zero creationTimestamp keeps the <10m
+// coredns-probe-fallback fallback picks: zero creationTimestamp keeps the <10m
 // Service path — whose want-set is nil — from claiming it, and the
 // fallback's want-set IS the ready endpoint pod IPs, exactly the set
 // a CoreDNS pod roll invalidates.

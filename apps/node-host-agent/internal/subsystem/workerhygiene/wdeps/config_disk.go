@@ -1,7 +1,7 @@
 // config_disk.go — the disk knobs: DiskConfig and its defaults (the
-// /var/lib/k0s watermark that triggers the ingest GC, the W6.3
+// /var/lib/k0s watermark that triggers the ingest GC, the disk-bloat
 // disk-bloat runaway detector, the /var/log/pods walk and the
-// W10-ST2 orphan-hostPath roots). K0sDataDir itself promoted to the
+// orphan-hostpath orphan-hostPath roots). K0sDataDir itself promoted to the
 // top-level Config (ctr + runtime both read it). The domain reads no
 // env rows of its own.
 package wdeps
@@ -14,11 +14,11 @@ import (
 )
 
 // DiskConfig groups the disk knobs: the /var/lib/k0s watermark that
-// triggers the ingest GC, the W6.3 disk-bloat runaway detector, the
-// /var/log/pods walk (BUG-H8) and the W10-ST2 orphan-hostPath roots.
+// triggers the ingest GC, the disk-bloat disk-bloat runaway detector, the
+// /var/log/pods walk (BUG-H8) and the orphan-hostpath orphan-hostPath roots.
 type DiskConfig struct {
 	HighWatermark float64 // /var/lib/k0s used ratio triggering GC
-	// W6.3 disk-bloat runaway detector: above BloatWatermark
+	// disk-bloat disk-bloat runaway detector: above BloatWatermark
 	// the bounded emptyDir/snapshot walk runs (gated by
 	// BloatScanInterval — the walk costs IO on the disk that is
 	// already full); above BloatCriticalWatermark a
@@ -60,7 +60,7 @@ type DiskConfig struct {
 	CoredumpDir        string
 	// WLayerBloatThresholdBytes is the writable-layer scan's
 	// Warning threshold (default 5 GiB) — deliberately separate from
-	// BloatPodThresholdBytes, which stays the W6.3 eviction path's
+	// BloatPodThresholdBytes, which stays the disk-bloat eviction path's
 	// threshold so the plan's parity does not alter eviction
 	// behavior.
 	WLayerBloatThresholdBytes int64

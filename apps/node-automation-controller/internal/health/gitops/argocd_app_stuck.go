@@ -1,4 +1,4 @@
-// argocd_app_stuck.go — the argocd-app-stuck check (W10-CP6):
+// argocd_app_stuck.go — the argocd-app-stuck check (argocd-app-stuck):
 // ArgoCD Applications stuck Progressing or carrying
 // ComparisonError/InvalidSpecError conditions get a
 // refresh=hard patch; >=2 simultaneous ComparisonErrors
@@ -60,7 +60,7 @@ type argoCDAppStuckCheck struct {
 	downscaledSeen map[string]bool
 }
 
-// newArgoCDAppStuckCheck builds the W10-CP6 check — its state is the
+// newArgoCDAppStuckCheck builds the argocd-app-stuck check — its state is the
 // seen/emitted ledgers (zero value usable); heal cooldowns ride the
 // shared Deps.Heals set.
 func NewArgoCDAppStuckCheck(d *probefw.Deps) probefw.Check {
@@ -70,7 +70,7 @@ func NewArgoCDAppStuckCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameArgoCDAppStuck = "argocd-app-stuck"
 
-	// W10-CP6 — argocd-app-stuck knobs.
+	// argocd-app-stuck — argocd-app-stuck knobs.
 	argocdAppProgressingMinAge = 45 * time.Minute
 	argocdConditionMinAge      = 5 * time.Minute
 	argocdRefreshCooldown      = 30 * time.Minute
@@ -78,21 +78,21 @@ const (
 	argocdRefreshAnno          = "argocd.argoproj.io/refresh"
 )
 
-// argoCDAppGVR is the Application CRD the W10-CP6 auditor reads —
+// argoCDAppGVR is the Application CRD the argocd-app-stuck auditor reads —
 // argoproj.io/v1alpha1 (distinct from the argoproj.io/v1beta1
 // ArgoCD cluster CR the operator watchdog already scans).
 var argocdAppGVR = kube.GVRArgoCDApplication
 
-// rolloutZeroReplicas backs the W16-G1 Rollout branch of
+// rolloutZeroReplicas backs the rollout-scale-flap Rollout branch of
 // argocdWorkloadDownscaled: unstructured Rollouts carry no typed
 // *int32, so the zero-replica check needs a shared zero.
 var rolloutZeroReplicas = int32(0)
 
 var (
-	// W10-CP6 — ArgoCD Application stuck.
+	// argocd-app-stuck — ArgoCD Application stuck.
 	argoCDAppStuckGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_argocd_app_stuck",
-		Help: "1 while the ArgoCD Application reports Progressing >45m or an error condition — W10-CP6.",
+		Help: "1 while the ArgoCD Application reports Progressing >45m or an error condition — argocd-app-stuck.",
 	}, []string{"namespace", "name", "reason"})
 )
 
@@ -318,7 +318,7 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	case "StatefulSet":
 		v = p.statefulSetDownscaled(ctx, ns, name)
 	case "Rollout":
-		// W16-G1 — Argo Rollouts workloads in the Application's
+		// rollout-scale-flap — Argo Rollouts workloads in the Application's
 		// resource tree carry the same downscaled semantics: a
 		// Rollout parked at spec.replicas:0 with downscaler/*
 		// annotations is sleep, not stuck evidence. Rollouts are

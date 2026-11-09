@@ -1,5 +1,5 @@
 // linkerd_endpoint_sync_test.go — coverage for the
-// linkerd-endpoint-sync check (W9-NM2/W10-FIX7): healthy/desync
+// linkerd-endpoint-sync check (netns-endpoint-sync/endpoint-sync-heal): healthy/desync
 // census, oldest-destination bounce, gauge cleanup, and the
 // stale-EndpointSlice delete selection.
 package linkerd
@@ -22,7 +22,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W9-NM2 — linkerd-endpoint-sync
+// netns-endpoint-sync — linkerd-endpoint-sync
 // ---------------------------------------------------------------------------
 
 // Synced headless service: Ready pod IP == Ready EndpointSlice
@@ -558,7 +558,7 @@ func TestStaleLinkerdSlices(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-FIX7 — stale EndpointSlice deletion inside linkerd-endpoint-sync
+// endpoint-sync-heal — stale EndpointSlice deletion inside linkerd-endpoint-sync
 // ---------------------------------------------------------------------------
 
 // A managed EndpointSlice missing a >3m-Ready pod IP is deleted once
@@ -889,7 +889,7 @@ func driveEndpointDesync(t *testing.T, p *probetest.Prober, base time.Time) prob
 }
 
 // ---------------------------------------------------------------------------
-// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit
+// socket-lb-vs-linkerd — Cilium socket-LB vs Linkerd compatibility audit
 // ---------------------------------------------------------------------------
 
 // ciliumConfig builds the kube-system/cilium-config ConfigMap the

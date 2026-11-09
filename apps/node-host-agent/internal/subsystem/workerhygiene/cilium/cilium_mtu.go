@@ -1,5 +1,5 @@
 // cilium_mtu.go — B4 MTU-drift check (CiliumMTUCheck): the cilium
-// datapath (or the W9 double-encap cilium_wg0) running an MTU above
+// datapath (or the double-encap cilium_wg0) running an MTU above
 // the nebula overlay → latch state-cilium-mtu-drift for NPD.
 package cilium
 
@@ -46,13 +46,13 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if !cilOK {
 		cil, cilOK = hostutil.RuntimeConfigMTU(c.d.Cfg.Cilium.RuntimeConfig)
 	}
-	// W9 double-encap guard: on the WireGuard datapath cilium_wg0
+	// double-encap guard: on the WireGuard datapath cilium_wg0
 	// carries pod traffic INSIDE the nebula overlay — its MTU must
 	// leave room for the WG header (~60B) under the overlay MTU.
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
 	wg, wgOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
-	// W16-NM4: pod lxc* veths. A pod created before the MTU change
+	// lxc-mtu-drift: pod lxc* veths. A pod created before the MTU change
 	// keeps its stale MTU on its host-side veth even when every
 	// cilium_* datapath iface is aligned — the same FRAG_NEEDED
 	// blackhole, so the pod veth MAX votes on the same latch.

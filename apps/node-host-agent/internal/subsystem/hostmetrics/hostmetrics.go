@@ -132,11 +132,11 @@ const (
 	// hostPID:true (the pod's /proc is the host's); the inotify
 	// fdinfo and zombie scans walk it.
 	defaultProcRoot = "/proc"
-	// W8-KR3: /proc/key-users — kernel keyring quota pressure.
+	// kernel-keys-pressure: /proc/key-users — kernel keyring quota pressure.
 	defaultKeyUsersFile = "/proc/key-users"
 	// kernelKeysPressureRatio arms state-kernel-keys-pressure.
 	kernelKeysPressureRatio = 0.80
-	// W18-1 inode-pressure hysteresis: any monitored mount at or
+	// inode-pressure inode-pressure hysteresis: any monitored mount at or
 	// above inodePressureEnterRatio of its inode table latches
 	// state-inode-pressure; the latch clears only once EVERY
 	// monitored mount sits at or below inodePressureClearRatio —
@@ -184,7 +184,7 @@ type Collector struct {
 	lpv  localpvCache      // collect_localpv.go — du walk cache
 	ebpf ebpfCache         // collect_ebpf.go — prog/map id sweep cache
 	proc procScanCache     // collect_procs_scan.go — shared /proc walk (daemon-fd + zombies)
-	// kf is the W10 kernel deep-failure engine (kernelfail
+	// kf is the kernel deep-failure engine (kernelfail
 	// subpackage) — the kmsg tail session + the steal jiffie
 	// baseline live inside it. Owned by the Collector directly:
 	// the Latches wrapper is recreated per call, so a keyed
@@ -311,7 +311,7 @@ func (c *Collector) WriteTextfile(dir string) error {
 			continue
 		}
 		// Counters land on dm.Counter, gauges on dm.Gauge — the
-		// vmstat swap-thrash series (W5.7) are the first counters in
+		// vmstat swap-thrash series (psi-swap-thrash) are the first counters in
 		// the set; skipping non-gauges would silently drop them from
 		// node-watchdog.prom on standalone VMs.
 		val, isCounter := float64(0), false

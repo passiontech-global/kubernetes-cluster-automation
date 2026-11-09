@@ -1,7 +1,7 @@
 // gateway_route_health_verdicts.go — the backend-verdict helpers of
 // the gateway-route-health check: unresolved vs zero-endpoints — the
 // lazy Service lookup + pinned-port match, the ReferenceGrant census
-// and permit check (W12-NM4b), the Ready-endpoint census, and the
+// and permit check (negative-cache-guard), the Ready-endpoint census, and the
 // go-kube-downscaler "asleep on purpose" exemption.
 package nethealth
 
@@ -219,7 +219,7 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		}
 	}
 	// argoproj.io Rollouts are first-class workload backends too
-	// (W18-5): a Rollout the downscaler parked at zero reads the same
+	// (argo-rollout-gates): a Rollout the downscaler parked at zero reads the same
 	// asleep-on-purpose exemption. Unstructured CR — template labels,
 	// annotations and spec.replicas come off the unstructured object
 	// through the per-sweep snapshot census; a failed census is the

@@ -259,7 +259,7 @@ func TestMaintenanceActiveMedik8sRemediation(t *testing.T) {
 	}
 }
 
-// W12 P0-1 — a node cordoned BY node-hang-precordon (the defensive
+// node-hang-precordon — a node cordoned BY node-hang-precordon (the defensive
 // quarantine, stamped AnnoPreCordonedBy) is not maintenance: its
 // fresh unschedulable taint must not hold the mutex, or every
 // heal.AllowedV-gated remediation freezes for 45m exactly while the

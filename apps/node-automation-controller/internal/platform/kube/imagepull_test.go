@@ -1,4 +1,4 @@
-// imagepull_test.go — the W18-8/W18-9 stall predicate and cluster
+// imagepull_test.go — the image-pull-storm-gate/maintenance-hold-stale stall predicate and cluster
 // census: only CURRENT container waiting states count, all three
 // container slots are scanned, and the census counts pods and
 // distinct namespaces.

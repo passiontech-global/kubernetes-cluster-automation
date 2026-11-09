@@ -1,4 +1,4 @@
-// collect_inotify_test.go — Wave-2 A1 inotify instance/watch ratios (proc fd sweep).
+// collect_inotify_test.go — A1 inotify instance/watch ratios (proc fd sweep).
 
 package hostmetrics
 

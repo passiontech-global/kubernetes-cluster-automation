@@ -130,21 +130,21 @@ var logRules = []logRule{
 	{"CorruptedImageRemoved", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionCorruptedImageRemove))},
 	{"ZombieProcessStorm", latchdefs.ActionEntryRe(latchdefs.LatchZombieStorm)},
 	{"CiliumMTUExceedsOverlay", latchdefs.ActionEntryRe(latchdefs.LatchCiliumMTUDrift)},
-	// W5.6: workerhygiene's cilium WireGuard peer-gc drift healer —
+	// cilium-wg-peer-gc: workerhygiene's cilium WireGuard peer-gc drift healer —
 	// "ACTION: killed cilium-agent container - cilium_wg0 has N
 	// allowed-ip peers while expected M".
 	{"CiliumWireGuardPeerDrift", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionCiliumWGKill))},
-	// W6.3: disk-bloat runaway detector —
+	// disk-bloat: disk-bloat runaway detector —
 	// "ACTION disk-bloat: target=... bytes=... used_pct=...".
 	{"DiskBloatRunaway", latchdefs.ActionEntryRe(latchdefs.LatchDiskBloat)},
 	// journalwatch blindness latch — STATE-ENTER only (one event per
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).
 	{nodecond.JournaldUnreadable, latchdefs.StateEnterRe(latchdefs.LatchJournalUnreadable)},
-	// W7-H1: workerhygiene's d-state-storm latch-entry line —
+	// d-state-storm: workerhygiene's d-state-storm latch-entry line —
 	// "ACTION d-state-storm: count=N runtime=M wchan=...".
 	{nodecond.KernelHungTasks, latchdefs.ActionEntryRe(latchdefs.LatchDStateStorm)},
-	// --- Wave-8 latch→event surface ---
+	// --- infra latch→event surface ---
 	// One Event per STATE-ENTER of a latch that maps to a permanent
 	// NodeCondition (conditions.go). Latches already covered by an
 	// older rule (nebula-isolated → NebulaIsolatedEnter,
@@ -161,13 +161,13 @@ var logRules = []logRule{
 	{nodecond.ControlPlaneCertReloadStale, latchdefs.StateEnterRe(latchdefs.LatchCPCertReloadStale)},
 	// Clocksource: the kernel clocksource-unstable evidence latch —
 	// STATE-ENTER only (one Event per latch entry, like the other
-	// Wave-8 latch→event rules).
+	// infra latch→event rules).
 	{nodecond.ClocksourceUnstable, latchdefs.StateEnterRe(latchdefs.LatchClocksourceUnstable)},
-	// W2: workerhygiene's psi-memory-thrash latch-entry line —
+	// psi-memory-thrash: workerhygiene's psi-memory-thrash latch-entry line —
 	// "ACTION psi-memory-thrash: avg60=... free=...".
 	{"NodeMemoryPSIThrashing", latchdefs.ActionEntryRe(latchdefs.LatchPSIMemoryThrash)},
-	// --- Wave-9 latch→event surface ---
-	// workerhygiene's W9-KR3 slab-leak guard + nethealth's W9-NM1
+	// --- leak-pressure latch→event surface ---
+	// workerhygiene's kernel-slab-leak slab-leak guard + nethealth's overlay-mtu-guard
 	// DF PMTU probe — one Event per STATE-ENTER (clock-unsync is
 	// already covered by the ClockUnsynchronized rule above).
 	{nodecond.KernelSlabLeak, latchdefs.StateEnterRe(latchdefs.LatchKernelSlabLeak)},
@@ -179,8 +179,8 @@ var logRules = []logRule{
 	// FilesystemReadOnly respectively); the rest own their condition
 	// type 1:1.
 	{"ContainerdCorrupt", latchdefs.StateEnterRe(latchdefs.LatchContainerdCorrupt)},
-	// FilesystemReadOnly is fed by TWO latches: the W5.3 statfs
-	// latch (filesystem-readonly) and the W10 evidence latch
+	// FilesystemReadOnly is fed by TWO latches: the filesystem-readonly statfs
+	// latch (filesystem-readonly) and the kernelfail evidence latch
 	// (fs-readonly) — both registered tokens map to the one reason.
 	{nodecond.FilesystemReadOnly, latchdefs.StateEnterRe(
 		latchdefs.LatchFSReadonly, latchdefs.LatchFilesystemReadonly)},
@@ -190,13 +190,13 @@ var logRules = []logRule{
 	{nodecond.CPUStealPressure, latchdefs.StateEnterRe(latchdefs.LatchCPUStealPressure)},
 	{nodecond.CgroupDyingLeak, latchdefs.StateEnterRe(latchdefs.LatchCgroupDyingLeak)},
 	{nodecond.SystemdSessionBloat, latchdefs.StateEnterRe(latchdefs.LatchSystemdSessionBloat)},
-	// W11/W12 latches that had conditions (conditions.go) but no
+	// recent-latches latches that had conditions (conditions.go) but no
 	// filelog rule — kubelet-pleg-unhealthy and disk-slow-io
 	// previously entered without ever emitting an Event.
 	{nodecond.KubeletPLEGUnhealthy, latchdefs.StateEnterRe(latchdefs.LatchKubeletPLEGUnhealthy)},
 	{nodecond.DiskSlowIO, latchdefs.StateEnterRe(latchdefs.LatchDiskSlowIO)},
 	{nodecond.KernelNetShimDegraded, latchdefs.StateEnterRe(latchdefs.LatchKernelNetShim)},
-	// W18-1: hostmetrics' inode-pressure latch — a Warning on entry
+	// inode-pressure: hostmetrics' inode-pressure latch — a Warning on entry
 	// (the STATE-ENTER line carries the offending mount + ratio); the
 	// clean end of the episode earns an informational Event via
 	// exitLogRules below.
@@ -212,7 +212,7 @@ var logRules = []logRule{
 // as a Warning. The counter for a matched exit still rides the shared
 // problem_counter surface (reason = the episode's healthy reason).
 var exitLogRules = []logRule{
-	// W18-1: inode-pressure cleared — every monitored mount back to
+	// inode-pressure: inode-pressure cleared — every monitored mount back to
 	// <=90% inode usage.
 	{"FilesystemInodesHealthy", latchdefs.StateExitRe(latchdefs.LatchInodePressure)},
 }

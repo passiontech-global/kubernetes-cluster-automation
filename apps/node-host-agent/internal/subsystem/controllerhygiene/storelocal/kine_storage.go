@@ -1,4 +1,4 @@
-// kine_storage.go — W10-CP2 Kine store health:
+// kine_storage.go — kine-storage Kine store health:
 //
 //	Sizes the SQLite state.db(+ -wal) — or the etcd/JetStream
 //	filestore on non-SQLite backends — into
@@ -73,7 +73,7 @@ type KineLargeObject struct {
 	Bytes int64
 }
 
-// StorageCheck is the W10-CP2 Kine store health check as a Check
+// StorageCheck is the kine-storage Kine store health check as a Check
 // — stateless: the checkpoint cadence lives in the
 // last-kine-wal-checkpoint budget. It is not its own dispatch-table
 // entry: it rides cpFreezeCheck's ungated slot (check.go).

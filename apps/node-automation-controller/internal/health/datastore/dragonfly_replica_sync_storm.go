@@ -1,5 +1,5 @@
 // dragonfly_replica_sync_storm.go — the
-// dragonfly-replica-sync-storm check (W10-ST4): sustained
+// dragonfly-replica-sync-storm check (dragonfly-replica-sync-storm): sustained
 // master-link-down + sync-full storm — restart ONLY the desynced
 // replica pod, never the master.
 package datastore
@@ -37,7 +37,7 @@ type dragonflyReplicaSyncStormCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newDragonflyReplicaSyncStormCheck builds the W10-ST4 check — its
+// newDragonflyReplicaSyncStormCheck builds the dragonfly-replica-sync-storm check — its
 // state is the seen/emitted ledgers (zero value usable); heal
 // cooldowns ride the shared Deps.Heals set via deletePodHeal.
 func NewDragonflyReplicaSyncStormCheck(d *probefw.Deps) probefw.Check {
@@ -47,16 +47,16 @@ func NewDragonflyReplicaSyncStormCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameDragonflySyncStorm = "dragonfly-replica-sync-storm"
 
-	// W10-ST4 — dragonfly-replica-sync-storm knobs.
+	// dragonfly-replica-sync-storm — dragonfly-replica-sync-storm knobs.
 	dragonflyLinkMinAge   = 5 * time.Minute
 	dragonflySyncHealCool = 30 * time.Minute
 )
 
 var (
-	// W10-ST4 — Dragonfly/Valkey replica sync storm.
+	// dragonfly-replica-sync-storm — Dragonfly/Valkey replica sync storm.
 	dragonflyReplicaSyncStormGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_dragonfly_replica_sync_storm",
-		Help: "1 while the replica pod shows sustained master-link-down during a sync storm — W10-ST4.",
+		Help: "1 while the replica pod shows sustained master-link-down during a sync storm — dragonfly-replica-sync-storm.",
 	}, []string{"namespace", "pod"})
 )
 

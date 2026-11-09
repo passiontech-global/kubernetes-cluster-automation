@@ -258,7 +258,7 @@ func (c *cyc) groupPulls() {
 				{"kubeAPIQPS", apiQPS},
 				{"kubeAPIBurst", apiBurst},
 				{"podPidsLimit", pids},
-				// W18-7: k0sworker-profile parity — graceful node
+				// host-protection-drop-ins: k0sworker-profile parity — graceful node
 				// shutdown must have a kubelet window to drain in,
 				// fitting logind's InhibitDelayMaxSec=65
 				// (group_base.go). Values come from the node-config-agent

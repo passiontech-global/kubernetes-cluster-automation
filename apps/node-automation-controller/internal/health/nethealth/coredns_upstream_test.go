@@ -1,5 +1,5 @@
 // coredns_upstream_test.go — coverage for the coredns-upstream
-// check (W10-NM5): isolated-failure pod delete, fleet-wide
+// check (coredns-upstream): isolated-failure pod delete, fleet-wide
 // detection-only, readiness fallback.
 package nethealth
 

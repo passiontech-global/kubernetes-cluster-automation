@@ -1,4 +1,4 @@
-// latches.go — W8 latch maintenance (BUG-H5/H6, W8-KR3).
+// latches.go — latch maintenance (BUG-H5/H6, kernel-keys-pressure).
 //
 // hostmetrics was a pure scrape-time collector: the watchdog-state
 // file contract (state-node-overloaded, state-filesystem-readonly,
@@ -17,7 +17,7 @@
 // Collector: the latch updaters share the collector's cfg + probe
 // seams (probeFS, psiAvg60, nebulaCertDaysLeft, the hoststate
 // Store), so the split keeps the same package — Latches reaches
-// them via l.c. The Wave-10 kernel deep-failure block (kmsg drain,
+// them via l.c. The kernel deep-failure block (kmsg drain,
 // pid/fd pressure, steal/entropy, clock skew, fs-readonly evidence)
 // delegates to l.c.kf — the kernelfail subpackage engine, which
 // produces latch/marker files rather than scrape series.
@@ -40,7 +40,7 @@ import (
 // Latches is the agent.Subsystem half of hostmetrics — the
 // scrape-independent latch-maintenance ticker. The Collector keeps
 // the prometheus.Collector role; the scrape-shared latch updaters
-// share its cfg and probe seams via l.c, and the W10 kernel
+// share its cfg and probe seams via l.c, and the kernel
 // deep-failure checks delegate to l.c.kf (the kernelfail engine).
 type Latches struct{ c *Collector }
 
@@ -76,7 +76,7 @@ func (l *Latches) refreshLatches() {
 	}
 	days, certOK := c.nebulaCertDaysLeft()
 	c.updateCertLatch(days, certOK)
-	// Filesystem read-only + W18-1 inode pressure: probe each target
+	// Filesystem read-only + inode-pressure inode pressure: probe each target
 	// like collectFilesystem but only for the latches (metrics are
 	// scrape-side).
 	anyRO, probed := false, false
@@ -94,11 +94,11 @@ func (l *Latches) refreshLatches() {
 	}
 	c.updateFSReadonlyLatch(anyRO, probed)
 	c.updateInodePressureLatch(ie)
-	// W8-KR3: kernel keyring quota pressure.
+	// kernel-keys-pressure: kernel keyring quota pressure.
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)
 	}
-	// W10-KR1/KR2/KR5 + W10-ST1 + cpu-steal-guard: the kernel
+	// checkKernelDmesg/updatePidFDPressure/checkClockSkew + fs-readonly + cpu-steal-guard: the kernel
 	// deep-failure block — the kmsg drain (evidence markers
 	// kmsg-fs-error, kmsg-conntrack-drops, kmsg-host-oom-* the
 	// fs-readonly latch and workerhygiene's SystemOOMVictim /
@@ -115,7 +115,7 @@ func (l *Latches) refreshLatches() {
 		latchdefs.LatchNebulaCertExpiring,
 		latchdefs.LatchKernelKeysPressure,
 		latchdefs.LatchInodePressure,
-		// W10 maintained latches — same reap protection.
+		// kernelfail maintained latches — same reap protection.
 		latchdefs.LatchFSReadonly,
 		latchdefs.LatchPIDFDPressure,
 		latchdefs.LatchClockSkew,
@@ -173,7 +173,7 @@ func snapStaleLatchPaths(dir string) []string {
 	return paths
 }
 
-// --- W8-KR3: /proc/key-users kernel keyring quota ---
+// --- kernel-keys-pressure: /proc/key-users kernel keyring quota ---
 
 // kernelKeysUsedRatio returns the highest fill ratio across the
 // per-UID rows of /proc/key-users ("uid: usage nkeys nikeys maxkeys
@@ -210,7 +210,7 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 	return best, true
 }
 
-// updateKernelKeysLatch drives state-kernel-keys-pressure (W8-KR3):
+// updateKernelKeysLatch drives state-kernel-keys-pressure (kernel-keys-pressure):
 // set above 0.80 of the enforced quota — a full keyring fails
 // keyctl_join/add_key silently for new sessions. Enter/Exit carry
 // the STATE-ENTER/STATE-EXIT lines nodereporter's KernelKeysPressure
@@ -229,7 +229,7 @@ var descKernelKeys = prometheus.NewDesc(
 	"Highest per-UID keyring fill ratio from /proc/key-users (instantiated/max; >0.80 latches state-kernel-keys-pressure).",
 	[]string{"node"}, nil)
 
-// collectKernelKeys emits the W8-KR3 used-ratio gauge — absent when
+// collectKernelKeys emits the kernel-keys-pressure used-ratio gauge — absent when
 // the file doesn't parse (no fake 0).
 func (c *Collector) collectKernelKeys(ch chan<- prometheus.Metric) {
 	ratio, ok := c.kernelKeysUsedRatio()

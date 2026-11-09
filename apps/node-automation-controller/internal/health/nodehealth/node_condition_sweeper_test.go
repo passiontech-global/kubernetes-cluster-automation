@@ -131,7 +131,7 @@ func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 	}
 }
 
-// InodePressure is agent-latched since W18-1 (hostmetrics
+// InodePressure is agent-latched since inode-pressure (hostmetrics
 // state-inode-pressure) and kubelet never emits a condition of this
 // type — a frozen heartbeat on it can only be a dead reporter's
 // zombie, so the sweeper clears it like any other HeartbeatSweptNames
@@ -198,7 +198,7 @@ func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
 // TestNodeCondSweeperSweepsEveryAgentEmittedCondition proves the
 // allowlist covers EVERY condition nodereporter emits and re-stamps:
 // each nodecond.HeartbeatSweptNames entry — including the 20 that
-// joined in W18 (NodeOverloaded, WatchdogStale, DnsFallbackActive,
+// joined as agent-added conditions (NodeOverloaded, WatchdogStale, DnsFallbackActive,
 // DnsResolvStale, JournaldUnreadable, NebulaDegraded,
 // CiliumIPAMExhausted, CiliumBPFMapPressure, SpegelMirrorDegraded,
 // CalicoVethLeak, Fail2banDown, ConntrackPressure,
@@ -235,7 +235,7 @@ func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
 	}
 	// And nothing outside the allowlist: the agent-carried-but-
 	// permanent KernelDeadlock latch must NOT appear in the swept
-	// set (InodePressure is in since W18-1 — pinned by the sweep
+	// set (InodePressure is in since inode-pressure — pinned by the sweep
 	// loop above).
 	for _, c := range nodeCondSweptConds {
 		if c == "KernelDeadlock" {

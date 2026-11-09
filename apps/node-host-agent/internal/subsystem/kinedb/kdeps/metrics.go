@@ -53,12 +53,12 @@ type Metrics struct {
 	WalArchStale   prometheus.Gauge
 	InactiveSlot   prometheus.Gauge
 
-	// W12-CP1 pgbouncer starvation series (plan-mandated names —
+	// pgbouncer-pool-starvation pgbouncer starvation series (plan-mandated names —
 	// sibling of ClientsWaiting, not a rename).
 	PgbClientWaiting prometheus.Gauge // kine_pgbouncer_client_waiting_connections
 	PgbMaxWait       prometheus.Gauge // kine_pgbouncer_maxwait_seconds
 
-	// W12-CP2 invalid-index census + seq-scan regression series.
+	// invalid-index-reaper invalid-index census + seq-scan regression series.
 	// SeqScans/SeqTupRead report counter type (the _total
 	// contract) via CounterFuncs over the last probe read — a
 	// skipped probe round keeps serving the real last value

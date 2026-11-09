@@ -1,7 +1,7 @@
 // probe_target.go — layer-2 probe-target selection for
 // coredns-stale-watchdog: pick the newest Service <10m old with a
 // ready EndpointSlice (its delta certainly crossed a healthy watch),
-// else the W8-NM5 fallback — the most-recently-changed EndpointSlice
+// else the coredns-probe-fallback fallback — the most-recently-changed EndpointSlice
 // plus its owning Service's expected answer set.
 package corednswatchdog
 
@@ -25,7 +25,7 @@ import (
 // <name>.<ns>.svc.cluster.local FQDN plus nil wantIPs (any answer
 // proves freshness).
 //
-// W8-NM5 fallback: on a quiet cluster no Service is <10m old, so the
+// coredns-probe-fallback fallback: on a quiet cluster no Service is <10m old, so the
 // old code skipped layer 2 entirely — exactly the steady-state where a
 // frozen watch rots longest. The fallback picks the most-recently-
 // CHANGED EndpointSlice (highest resourceVersion) that still carries a
@@ -90,7 +90,7 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 	return w.probeFQDNFromSlices(ctx)
 }
 
-// probeFQDNFromSlices is the W8-NM5 fallback target: the
+// probeFQDNFromSlices is the coredns-probe-fallback fallback target: the
 // most-recently-changed EndpointSlice (highest resourceVersion —
 // slice objects carry no change timestamp, so the apiserver's RV is
 // the recency proxy) with at least one ready endpoint. The answer set

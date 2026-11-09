@@ -1,5 +1,5 @@
 // Package circuitbreaker is the C1 admission-webhook self-deadlock
-// circuit breaker plus the W9-CP1 brownout probe/pod-bounce and the
+// circuit breaker plus the circuit-breaker-bounce brownout probe/pod-bounce and the
 // CRD conversion-webhook backend health check — two of the four
 // independent duties behind the admission-webhook-guard sweep. The
 // sweep trips fail-closed sub-webhooks whose backend Service has

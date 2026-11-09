@@ -81,7 +81,7 @@ func TestKedaGuardFlagsUnhealthyPastWindowAndRescuesZero(t *testing.T) {
 	}
 }
 
-// The W18-5 Rollout twin: a ScaledObject targeting a wedged-at-zero
+// The argo-rollout-gates Rollout twin: a ScaledObject targeting a wedged-at-zero
 // argoproj.io Rollout gets the same rescue, patched through the
 // dynamic client.
 func TestKedaGuardRescuesZeroRollout(t *testing.T) {

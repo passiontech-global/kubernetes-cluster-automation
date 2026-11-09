@@ -1,5 +1,5 @@
 // scylla_cluster_health_test.go — coverage for the
-// scylla-cluster-health check (W9-ST1): degraded CR condition,
+// scylla-cluster-health check (scylla-cluster-health): degraded CR condition,
 // member-service desync, gossip/raft stall log signatures.
 package datastore
 
@@ -18,7 +18,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// W9-ST1 — scylla-cluster-health
+// scylla-cluster-health — scylla-cluster-health
 // ---------------------------------------------------------------------------
 
 // degraded_condition: Degraded=True past 15m on the CR fails the
@@ -135,7 +135,7 @@ func TestCheckScyllaHealthGossipStall(t *testing.T) {
 	}
 }
 
-// W12-ST3 — a troubled member whose log tail carries the tombstone-
+// scylla-shard-imbalance — a troubled member whose log tail carries the tombstone-
 // avalanche signature reports under tombstone_overload_stall after
 // the same persistence window.
 func TestCheckScyllaHealthTombstoneStall(t *testing.T) {

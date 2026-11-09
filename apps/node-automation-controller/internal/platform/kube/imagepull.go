@@ -1,4 +1,4 @@
-// imagepull.go — the W18-8/W18-9 image-pull stall census: the
+// imagepull.go — the image-pull-storm-gate/maintenance-hold-stale image-pull stall census: the
 // pod-shape predicate (any container status.waiting.reason in
 // ImagePullBackOff/ErrImagePull) and the cluster-wide count behind
 // the descheduler-storm-gate's storm signal (e) — a pull storm means
@@ -6,7 +6,7 @@
 // unrunnable pods across more nodes. The statefulset-ondelete-roller
 // runs the same predicate per owned pod to defer a set whose member
 // cannot pull its (possibly new) image — deleting the next member on
-// top stacks a second stuck pod. W10-GI5's alerting health check
+// top stacks a second stuck pod. image-pull-storm's alerting health check
 // (health/nodehealth/image_pull_storm) keeps its own richer scan
 // (registry-outage markers, per-namespace classification, first-seen
 // windows); this is the cheap predicate+census the GATING modules

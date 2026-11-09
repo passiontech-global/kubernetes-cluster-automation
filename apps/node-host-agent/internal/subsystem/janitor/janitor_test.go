@@ -424,7 +424,7 @@ func TestIgnoresNonMonitorIPCommands(t *testing.T) {
 	}
 }
 
-// The wave-2 latches (A4/B1/B4/A2) must be registered in
+// The base latches (A4/B1/B4/A2) must be registered in
 // knownLatchNames — sweepLatches deletes unregistered state-* files
 // immediately, so a missing entry would eat the latch the moment a
 // check writes it.
@@ -447,7 +447,7 @@ func TestRuntimeDatapathLatchesAreKnown(t *testing.T) {
 	}
 }
 
-// The wave-8 latches must be registered in knownLatchNames —
+// The infra latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
 func TestPressureFleetLatchesAreKnown(t *testing.T) {
@@ -474,7 +474,7 @@ func TestPressureFleetLatchesAreKnown(t *testing.T) {
 	}
 }
 
-// The wave-9 latches must be registered in knownLatchNames —
+// The leak-pressure latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
 func TestClockKernelNebulaLatchesAreKnown(t *testing.T) {

@@ -1,5 +1,5 @@
 // rabbitmq_quorum_health.go — the rabbitmq-quorum-health check
-// (W10-ST3): RabbitMQ alarms / Mnesia partition signals from
+// (rabbitmq-quorum-health): RabbitMQ alarms / Mnesia partition signals from
 // Prometheus plus the stuck-unready pod heal while >=2 siblings
 // stay Ready.
 package datastore
@@ -38,7 +38,7 @@ type rabbitMQQuorumHealthCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newRabbitMQQuorumHealthCheck builds the W10-ST3 check — its state
+// newRabbitMQQuorumHealthCheck builds the rabbitmq-quorum-health check — its state
 // is the seen/emitted ledgers (zero value usable); heal cooldowns
 // ride the shared Deps.Heals set via deletePodHeal.
 func NewRabbitMQQuorumHealthCheck(d *probefw.Deps) probefw.Check {
@@ -48,16 +48,16 @@ func NewRabbitMQQuorumHealthCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameRabbitMQQuorum = "rabbitmq-quorum-health"
 
-	// W10-ST3 — rabbitmq-quorum-health knobs.
+	// rabbitmq-quorum-health — rabbitmq-quorum-health knobs.
 	rabbitUnreadyMinAge  = 10 * time.Minute
 	rabbitQuorumHealCool = 30 * time.Minute
 )
 
 var (
-	// W10-ST3 — RabbitMQ quorum/partition signal.
+	// rabbitmq-quorum-health — RabbitMQ quorum/partition signal.
 	rabbitMQQuorumUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_rabbitmq_quorum_unhealthy",
-		Help: "1 while the RabbitMQ pod/cluster reports an alarm, partition, stuck-unready, quorum-leaderless or term-skew signature — W10-ST3/W16-ST3.",
+		Help: "1 while the RabbitMQ pod/cluster reports an alarm, partition, stuck-unready, quorum-leaderless or term-skew signature — rabbitmq-quorum-health/quorum-raft-health.",
 	}, []string{"namespace", "pod", "reason"})
 )
 
@@ -80,7 +80,7 @@ func isRabbitMQPod(pod *corev1.Pod) bool {
 // stamps with the owning CR's name. "" when the label is absent:
 // those pods fall back to controller-owner grouping (ReadyByOwner)
 // so two clusters sharing a namespace still never pool their Ready
-// members (W12 P0-2a).
+// members (rabbitmq-quorum-heal).
 func rabbitClusterKey(pod *corev1.Pod) string {
 	if name := pod.Labels["app.kubernetes.io/name"]; name != "" {
 		return pod.Namespace + "/" + name
@@ -90,10 +90,10 @@ func rabbitClusterKey(pod *corev1.Pod) string {
 
 // rabbitHealableReasons is the whitelist of findings that justify a
 // member-pod delete — each clears on a fresh start. NOT
-// disk_watermark_alarm (W12 P0-2c): a pod delete cannot free the
+// disk_watermark_alarm (rabbitmq-quorum-heal): a pod delete cannot free the
 // PVC, and the restart replays the quorum-queue WAL onto a
 // still-full disk; a future unknown reason defaults to alert-only
-// too. W16-ST3's quorum_leaderless / quorum_skew land in that same
+// too. quorum-raft-health's quorum_leaderless / quorum_skew land in that same
 // alert-only bucket on purpose: a leaderless quorum queue's
 // membership is already degraded, and deleting a term-skewed member
 // can drop the queue under its own Raft quorum (the operator, not a
@@ -121,7 +121,7 @@ func rabbitHealableFindings(reasons map[string]bool) bool {
 // the gray-failure guard: a member under a Prometheus alarm keeps
 // reporting Ready, and counting it would let a 3-node cluster at
 // 2/3 Ready approve a delete that drops it to 1/3 — Raft quorum
-// loss (W12 P0-2b). An unlabeled pod resolves through its
+// loss (rabbitmq-quorum-heal). An unlabeled pod resolves through its
 // controller owner; unlabeled AND unowned reads 0 — no provable
 // siblings, fail closed.
 func rabbitReadySiblings(readyByCluster map[string]int,
@@ -222,7 +222,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// W16-ST3 — quorum-queue Raft health, beyond the alarm queries:
+	// quorum-raft-health — quorum-queue Raft health, beyond the alarm queries:
 	//
 	// quorum_leaderless — a member publishes rabbitmq_raft_role
 	// series for the quorum queues it replicates; when a member's
@@ -283,7 +283,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		// Pool the max term per RabbitmqCLUSTER, not per namespace —
 		// two clusters sharing one namespace must not judge each
 		// other's terms (same hazard as the Ready-sibling census
-		// below, W12 P0-2a): the younger cluster's whole membership
+		// below, rabbitmq-quorum-heal): the younger cluster's whole membership
 		// would lag the older cluster's term and false-flag skew.
 		// Pods we cannot group cluster-wise fall back to the
 		// namespace bucket (fail-safe, may over-flag) rather than
@@ -341,7 +341,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	// precondition for every heal below (>=2 OTHER members Ready).
 	// Grouping by namespace would pool the Ready members of two
 	// clusters sharing one namespace into a single tally and "prove"
-	// quorum that does not exist (W12 P0-2a). The primary grouping
+	// quorum that does not exist (rabbitmq-quorum-heal). The primary grouping
 	// is the operator's app.kubernetes.io/name label; pods missing
 	// it fall back to controller-owner grouping via ReadyByOwner,
 	// and an unlabeled AND unowned pod cannot prove siblings at all
@@ -355,7 +355,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	readyByOwner := probefw.ReadyByOwner(unlabeledPods)
 
-	// W17 heal budget — at most ONE member pod per RabbitmqCluster
+	// heal-budget heal budget — at most ONE member pod per RabbitmqCluster
 	// per sweep, and the Ready census is decremented the moment a
 	// delete lands: a later candidate in the SAME sweep must see the
 	// quorum the first delete actually left behind, not the census
@@ -450,8 +450,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 			now, kube.PodMergePatcher(p.CS, pod)) {
 			continue
 		}
-		// disk_watermark_alarm is deliberately non-healable (W12
-		// P0-2c): deleting the pod cannot free its PVC, and the
+		// disk_watermark_alarm is deliberately non-healable (rabbitmq-quorum-heal): deleting the pod cannot free its PVC, and the
 		// restart replays the quorum-queue WAL onto a still-full
 		// disk. The finding still FAILs the check and emits the
 		// gauge below — it just never deletes.
@@ -462,7 +461,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		// alarmed pod may itself still report Ready (the
 		// gray-failure shape), and counting it would let a 3-node
 		// cluster at 2/3 Ready approve a delete that drops it to
-		// 1/3 — Raft quorum loss (W12 P0-2b).
+		// 1/3 — Raft quorum loss (rabbitmq-quorum-heal).
 		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
 			tryQuorumHeal(pod)
 		}

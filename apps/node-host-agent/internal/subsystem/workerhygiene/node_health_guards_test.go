@@ -21,7 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
-// --- W7-H1: d-state-storm ---
+// --- d-state-storm: d-state-storm ---
 
 func TestDStateRuntimeComm(t *testing.T) {
 	for comm, want := range map[string]bool{
@@ -88,7 +88,7 @@ func TestCheckDStateRuntimeMinTrigger(t *testing.T) {
 	}
 }
 
-// --- W7-H2: systemd-scopes ---
+// --- systemd-scopes: systemd-scopes ---
 
 func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	e := fixture(t)
@@ -126,7 +126,7 @@ func TestCheckSystemdScopesClean(t *testing.T) {
 	}
 }
 
-// --- W7-H3: envoy xDS NACK + node-local-dns LRP ---
+// --- envoy-xds-lrp: envoy xDS NACK + node-local-dns LRP ---
 
 func TestParseEnvoyXDSRejected(t *testing.T) {
 	body := []byte(
@@ -385,7 +385,7 @@ func TestParseCiliumServiceBackends(t *testing.T) {
 	}
 }
 
-// --- W7-H4: spegel-mirror ---
+// --- spegel-mirror: spegel-mirror ---
 
 func TestCheckSpegelMirror(t *testing.T) {
 	e := fixture(t, &corev1.Pod{
@@ -436,7 +436,7 @@ func TestCheckSpegelMirrorTooYoung(t *testing.T) {
 	}
 }
 
-// --- W7-H7: calico-hygiene ---
+// --- calico-hygiene: calico-hygiene ---
 
 func TestCheckCalicoHygieneVethLeak(t *testing.T) {
 	e := fixture(t)

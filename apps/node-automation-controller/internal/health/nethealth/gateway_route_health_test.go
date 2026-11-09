@@ -53,7 +53,7 @@ func routeCond(condType, status string) map[string]any {
 }
 
 // routeCondReason is one status condition entry carrying a reason —
-// ResolvedRefs/RefNotPermitted is the W12-NM4b signature.
+// ResolvedRefs/RefNotPermitted is the negative-cache-guard signature.
 func routeCondReason(condType, status, reason string) map[string]any {
 	return map[string]any{"type": condType, "status": status, "reason": reason}
 }
@@ -185,7 +185,7 @@ func TestGatewayRouteHealthResolvedRefsFalse(t *testing.T) {
 // A cross-namespace backendRef with NO permitting ReferenceGrant in
 // the backend's namespace flags ref_not_permitted — the controller
 // drops the ref silently, so the static grant cross-check is the
-// only way to see it before ResolvedRefs catches up (W12-NM4b).
+// only way to see it before ResolvedRefs catches up (negative-cache-guard).
 func TestGatewayRouteHealthCrossNSRefNotPermitted(t *testing.T) {
 	t.Run("no grant", func(t *testing.T) {
 		route := routeFixture("HTTPRoute", "apps", "xns-route")
@@ -273,7 +273,7 @@ func TestGatewayRouteHealthRefNotPermittedReason(t *testing.T) {
 }
 
 // The dedicated 5m zero-endpoints gauge fires BEFORE the 10m
-// unhealthy signature — same blackhole, earlier edge (W12-NM4b).
+// unhealthy signature — same blackhole, earlier edge (negative-cache-guard).
 func TestGatewayRouteHealthZeroEndpointsGaugeAt5m(t *testing.T) {
 	base := time.Now()
 	route := routeFixture("HTTPRoute", "apps", "zero5m-route")
@@ -426,7 +426,7 @@ func TestGatewayRouteHealthSkipsDownscaledBackend(t *testing.T) {
 	}
 }
 
-// downscaledRollout builds an argoproj.io Rollout (W18-5) the
+// downscaledRollout builds an argoproj.io Rollout (argo-rollout-gates) the
 // go-kube-downscaler parked at replicas:0 whose pod template the
 // service selector matches — the unstructured twin of
 // downscaledDeployment.

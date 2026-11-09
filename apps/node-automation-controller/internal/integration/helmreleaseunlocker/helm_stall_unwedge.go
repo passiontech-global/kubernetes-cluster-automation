@@ -112,7 +112,7 @@ const (
 	// token value, so all three are stamped in one patch.
 	fluxResetAnno = kube.AnnoFluxResetAt
 	fluxForceAnno = kube.AnnoFluxForceAt
-	// W8-GO2 — the stall-unwedge retry cycle: max 2 attempts per
+	// helm-stall-unwedge — the stall-unwedge retry cycle: max 2 attempts per
 	// lastAttemptedRevision, each at least 6h apart.
 	stallMaxAttemptsPerRevision = 2
 	stallAttemptCooldown        = 6 * time.Hour
@@ -186,7 +186,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 					helmUnlockCooldown))
 			continue
 		}
-		// W8-GO2 — cap the retry cycle: at most
+		// helm-stall-unwedge — cap the retry cycle: at most
 		// stallMaxAttemptsPerRevision unwedges for one
 		// lastAttemptedRevision, each at least
 		// stallAttemptCooldown apart. A revision change re-arms —
@@ -301,7 +301,7 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 			dep.Namespace, plan.target.Name, err)
 	}
 
-	// W8-GO2: the failed upgrade usually left a Failed helm-hook Job
+	// helm-stall-unwedge: the failed upgrade usually left a Failed helm-hook Job
 	// behind in the release namespace — helm refuses to re-run a
 	// hook while its Job object still exists, so the retry would
 	// wedge identically. Reap it BEFORE the requestedAt cycle; the

@@ -1,4 +1,4 @@
-// events.go — the corev1.Event helpers shared by the W12-SC1
+// events.go — the corev1.Event helpers shared by the preemption-cascade-signal
 // preemption-storm detectors (scheduler-watchdog and
 // descheduler-storm-gate both count recent reason=Preempted events
 // to spot a PriorityClass cascade — the Monzo/Zalando domino

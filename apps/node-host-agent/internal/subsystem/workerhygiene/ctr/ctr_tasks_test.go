@@ -910,7 +910,7 @@ func counterValue(c prometheus.Counter) (float64, error) {
 	return m.GetCounter().GetValue(), nil
 }
 
-// --- W16-KR2: orphan CRI sandbox reaper ---
+// --- cri-sandbox-reaper: orphan CRI sandbox reaper ---
 
 // TestCtrTasksOrphanSandboxTwoPhase: a SandboxCtlRoot dir with no
 // task dir and no shim gets the sandbox-orphan-seen marker on first

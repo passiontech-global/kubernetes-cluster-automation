@@ -100,7 +100,7 @@ Queue names below are what `shell_operator_hook_run_errors_total{queue}` /
   `node_automation_volumeattachments_cleaned_total`, `node_automation_cilium_identities_collected_total`,
   `node_automation_webhook_ca_bundle_mismatch`, `node_automation_tls_secret_days_to_expiry`,
   `node_automation_kcm_workqueue_frozen`, plus `kuberhealthy_check` /
-  `kuberhealthy_check_seconds_since_success`. Waves 1–3 add:
+  `kuberhealthy_check_seconds_since_success`. Later modules add:
   `node_automation_apiservice_unavailable{name,service_namespace,service_name}`,
   `node_automation_webhook_ca_bundle_days_to_expiry{kind,name,webhook}`,
   `node_automation_trust_bundle_days_to_expiry{namespace,name}`,

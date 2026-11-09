@@ -2,7 +2,7 @@
 // every HTTPRoute and GRPCRoute (gateway.networking.k8s.io) for
 // attachment and backend-health failures — a parent Accepted=False
 // or ResolvedRefs=False condition, a cross-namespace backendRef the
-// ReferenceGrants do not permit (W12-NM4b — resolved_refs_false's
+// ReferenceGrants do not permit (negative-cache-guard — resolved_refs_false's
 // RefNotPermitted reason plus the static grant cross-check for
 // controllers that never write status), a backendRef pointing at a
 // missing Service or a port the Service does not carry, and a
@@ -13,7 +13,7 @@
 // is a page. The dedicated zero-endpoints gauge fires at 5m — the
 // earlier, less noisy edge of the same blackhole signal. When the
 // blackhole is VIP-wide (every backend of an L2-announced Service
-// dark at once), cilium-l2-lease-guard (W16-NM1) watches the other
+// dark at once), cilium-l2-lease-guard (cilium-l2-lease-guard) watches the other
 // end: a stale cilium-l2announce Lease holder announcing the VIP
 // from a node that cannot answer ARP.
 package nethealth
@@ -96,13 +96,13 @@ var (
 		Name: "node_automation_gateway_route_unhealthy",
 		Help: "1 while the HTTPRoute/GRPCRoute carries an unhealthy signature (accepted_false, resolved_refs_false, backend_unresolved, backend_zero_endpoints) past the persistence window.",
 	}, []string{"kind", "namespace", "name", "reason"})
-	// W12-NM4b — one series per (route, backend Service) whose
+	// negative-cache-guard — one series per (route, backend Service) whose
 	// backendRef has zero Ready endpoints past the earlier 5m
 	// window: the Envoy/cloudflared blackhole signal without the
 	// unhealthy-reason split.
 	gatewayRouteZeroEndpointsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_gateway_route_zero_endpoints",
-		Help: "1 while a route backendRef Service has zero Ready endpoints past the 5m window (W12-NM4b).",
+		Help: "1 while a route backendRef Service has zero Ready endpoints past the 5m window (negative-cache-guard).",
 	}, []string{"kind", "namespace", "name", "service_namespace", "service"})
 )
 
@@ -202,7 +202,7 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 		flag(reason)
 	}
 	for _, b := range routeBackendRefs(route) {
-		// W12-NM4b ReferenceGrant gate: a cross-namespace ref without
+		// negative-cache-guard ReferenceGrant gate: a cross-namespace ref without
 		// a permitting grant is RefNotPermitted — the gateway
 		// controller silently drops it, so the route blackholes even
 		// while ResolvedRefs still reads True (status lag, or a

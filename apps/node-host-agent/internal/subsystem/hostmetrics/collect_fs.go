@@ -1,5 +1,5 @@
 // collect_fs.go — filesystem inode stats + the hung-mount statfs
-// probe (H3/H7) and the state-filesystem-readonly latch (W5.3).
+// probe (H3/H7) and the state-filesystem-readonly latch (filesystem-readonly).
 // Split out of hostmetrics.go.
 package hostmetrics
 
@@ -159,12 +159,12 @@ var (
 // boring" stays distinguishable from "never probed". Inode gauges
 // emit only on a successful statfs — a failed/hung probe emits no
 // fake numbers. A successful probe also exports the ST_RDONLY flag
-// (W5.3): one read-only mount latches state-filesystem-readonly for
+// (filesystem-readonly): one read-only mount latches state-filesystem-readonly for
 // nodereporter's FilesystemReadOnly condition.
 func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 	anyRO := false
 	probed := false        // at least one statfs answered — the latch's evidence base
-	var ie fsInodeEvidence // W18-1 inode-pressure verdict for this pass
+	var ie fsInodeEvidence // inode-pressure inode-pressure verdict for this pass
 	for _, mount := range c.cfg.FilesystemTargets {
 		st, stalled, ok := c.probeFS(mount)
 		v := 0.0
@@ -217,7 +217,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 	c.updateInodePressureLatch(ie)
 }
 
-// updateFSReadonlyLatch drives state-filesystem-readonly (W5.3):
+// updateFSReadonlyLatch drives state-filesystem-readonly (filesystem-readonly):
 // set when ANY successfully probed mount carries ST_RDONLY, cleared
 // once every probed mount is rw again. probed=false (every statfs
 // failed or stalled) leaves the latch untouched — inconclusive
@@ -235,7 +235,7 @@ func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
 	}
 }
 
-// --- W18-1: filesystem inode-pressure hysteresis ---
+// --- inode-pressure: filesystem inode-pressure hysteresis ---
 
 // fsInodeEvidence is one pass's inode-pressure verdict over the
 // configured filesystem targets — the input both the scrape path
@@ -283,7 +283,7 @@ func (e fsInodeEvidence) inodePressureClear() bool {
 		e.worstRatio <= inodePressureClearRatio
 }
 
-// updateInodePressureLatch drives state-inode-pressure (W18-1): an
+// updateInodePressureLatch drives state-inode-pressure (inode-pressure): an
 // exhausted inode table makes kubelet's own imagefs/nodefs GC and
 // every pod's tmpfs write fail before DiskPressure ever fires — the
 // condition surfaces as nodecond.InodePressure with the offending

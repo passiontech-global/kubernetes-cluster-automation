@@ -225,10 +225,10 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 		t.Fatalf("pod-status FAIL gauge = %v, want 1 on List error", v)
 	}
 	// The two pod checks, the rabbitmq-suspended-listener sweep, the
-	// localpv-stranded-pods scan, the W8-CP3 scheduler-watchdog
-	// pending-pods List AND the W9-ST1 scylla-cluster-health census
+	// localpv-stranded-pods scan, the cp-freeze-heal scheduler-watchdog
+	// pending-pods List AND the scylla-cluster-health scylla-cluster-health census
 	// all hit the same cluster-wide pods List error -> six run
-	// errors, plus five W10 checks that also census pods:
+	// errors, plus five checks that also census pods:
 	// linkerd-protocol-detection-stall, cilium-node-ipam-exhaustion
 	// (pod-count fallback), rabbitmq-quorum-health,
 	// coredns-upstream (readiness fallback), image-pull-storm, plus
@@ -242,8 +242,8 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// onepassword-connect-sync-probe and linkerd-sidecar-oom-guard
 	// (pod censuses), cilium-datapath-map-guard and
 	// observability-pipeline-guard (their Prometheus queries die on
-	// the health-text stub), plus the W8-NM3 mesh-controlplane scan
-	// whose pod list is its only input (W8-NM3 no longer swallows
+	// the health-text stub), plus the mesh-net-guards mesh-controlplane scan
+	// whose pod list is its only input (mesh-net-guards no longer swallows
 	// the failure) -> twenty-four total.
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and

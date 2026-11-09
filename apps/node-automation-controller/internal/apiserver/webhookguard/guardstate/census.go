@@ -1,4 +1,4 @@
-// census.go — the W5.5/W9-CP1 endpoint census: the once-per-run
+// census.go — the endpoint-census/circuit-breaker-bounce endpoint census: the once-per-run
 // EndpointSlice ready count (raw + node-health-discounted effective),
 // the webhook-backend probe set, the TCP+TLS brownout probe and the
 // backing-pod refs the stage-1 bounce deletes. Shared by the circuit
@@ -44,7 +44,7 @@ var CustomResourceDefinitionGVR = schema.GroupVersionResource{
 	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
 
 const (
-	// W9-CP1 — Admission Webhook gray-failure TCP/TLS brownout
+	// circuit-breaker-bounce — Admission Webhook gray-failure TCP/TLS brownout
 	// probe: a webhook backend whose EndpointSlice still reports
 	// Ready endpoints on healthy nodes but whose pods all fail the
 	// TCP+TLS handshake is hung, not partitioned. The probe dials
@@ -59,12 +59,12 @@ const (
 	probeWorkers = 4
 )
 
-// EndpointCensus is the W5.5 dual ready-endpoint count: raw counts
+// EndpointCensus is the endpoint-census dual ready-endpoint count: raw counts
 // every Ready endpoint; effective excludes the Ready endpoints whose
 // pod sits on an unhealthy node (partitioned/unresponsive — reachable
 // in the API sense but dead for webhook traffic).
 //
-// W9-CP1 adds the brownout fields, populated ONLY for services a
+// circuit-breaker-bounce adds the brownout fields, populated ONLY for services a
 // webhook config's clientConfig.service references (the probeSet in
 // webhookBackendServices — probing every Service cluster-wide would
 // be a dial storm):
@@ -94,7 +94,7 @@ type PodRef struct{ Namespace, Name string }
 
 // readyEndpointCounts builds the ns/service → Ready-endpoint census
 // from the cluster-wide EndpointSlice list (paged — see ListPageSize),
-// in TWO counts (W5.5): raw counts every Ready endpoint; effective
+// in TWO counts (endpoint-census): raw counts every Ready endpoint; effective
 // drops the endpoints whose NodeName is flagged unhealthy by the
 // node census — a "Ready" pod on a partitioned node still fails every
 // apiserver webhook call. The kubernetes.io/service-name label binds
@@ -116,7 +116,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 		Probed:      map[string]bool{},
 		Responsive:  map[string]bool{},
 	}
-	// W9-CP1 — only Services a webhook config actually calls get
+	// circuit-breaker-bounce — only Services a webhook config actually calls get
 	// probed: the brownout check exists to keep admission webhooks
 	// honest, and dialing every Service in the cluster would be a
 	// handshake storm for zero signal. A missing config list (API
@@ -153,7 +153,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 						if effective {
 							ready.Effective[key]++
 						}
-						// W9-CP1 — collect probe candidates and backing
+						// circuit-breaker-bounce — collect probe candidates and backing
 						// pod refs ONLY for effective-ready endpoints on
 						// webhook backends: endpoints stranded on
 						// unhealthy nodes are already discounted, and
@@ -170,7 +170,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	if err != nil {
 		return EndpointCensus{}, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
 	}
-	// W9-CP1 — TCP+TLS brownout probe, up to probeMaxPerSvc
+	// circuit-breaker-bounce — TCP+TLS brownout probe, up to probeMaxPerSvc
 	// Ready endpoint IPs per webhook backend, fanned out through a
 	// bounded worker pool (probeWorkers dials at most four handshakes
 	// at once — a cluster with dozens of webhook backends must not
@@ -234,7 +234,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 // webhook-config kinds PLUS every CRD spec.conversion webhook's
 // service to the declared SERVICE ports the referencing webhooks
 // carry (clientConfig.service.port, nil → the apiserver default
-// 443) — the only services the W9-CP1 probe dials, and the input the
+// 443) — the only services the circuit-breaker-bounce probe dials, and the input the
 // slice-port preference resolves through spec.ports. Nil config
 // lists and a failed CRD list (API flap) contribute nothing.
 func webhookBackendServices(snap *Snapshot) map[string][]int32 {
@@ -364,7 +364,7 @@ func pickSlicePort(s *discoveryv1.EndpointSlice, pref slicePortPref) int32 {
 // collectProbeCandidates records one effective-ready endpoint's
 // address (up to probeMaxPerSvc distinct IPs) and its backing
 // Pod ref (up to probeMaxPodRefs) for service key — the probe
-// and bounce inputs of the W9-CP1 brownout path.
+// and bounce inputs of the circuit-breaker-bounce brownout path.
 func collectProbeCandidates(ready *EndpointCensus,
 	key string, s *discoveryv1.EndpointSlice, ep *discoveryv1.Endpoint,
 	pref slicePortPref) {

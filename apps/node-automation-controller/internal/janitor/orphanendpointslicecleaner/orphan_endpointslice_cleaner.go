@@ -73,7 +73,7 @@ type orphanEndpointSliceCleaner struct {
 	// come from one place.
 	queue string
 	// dyn is accepted for Setup-signature parity with the other
-	// wave modules — EndpointSlices are typed via cs.DiscoveryV1().
+	// janitor modules — EndpointSlices are typed via cs.DiscoveryV1().
 	dyn dynamic.Interface
 	// now is the clock seam — tests pin it so the >15m age gate
 	// is deterministic. nil → time.Now.

@@ -1,4 +1,4 @@
-// cilium_envoy.go — B1/W7-H3 cilium-envoy guard (CiliumEnvoyCheck):
+// cilium_envoy.go — B1/envoy-xds-lrp cilium-envoy guard (CiliumEnvoyCheck):
 // envoy admin /ready down or xDS update_rejected deltas climbing →
 // latch + restart the envoy container — plus the healthz-subsystem
 // walker and the /stats update_rejected parser it reads.
@@ -48,7 +48,7 @@ func ciliumUnhealthySubsystems(body []byte) []string {
 	return bad
 }
 
-// CiliumEnvoyCheck is the B1/W7-H3 envoy guard as a Check. It owns
+// CiliumEnvoyCheck is the B1/envoy-xds-lrp envoy guard as a Check. It owns
 // the /ready fail streak and the xDS NACK bookkeeping
 // (ex-Hygiene.envoyFails/.envoyXDS*). The ciliumAgentKilled flag
 // stays on deps — it's shared state: any of the cilium,
@@ -106,7 +106,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
-	// W7-H3: xDS NACK guard — envoy can answer /ready=200 while
+	// envoy-xds-lrp: xDS NACK guard — envoy can answer /ready=200 while
 	// rejecting every config push (cds/lds/rds update_rejected
 	// climbing → Gateway/Gateway API routes 404/503 while their API
 	// objects report Accepted:True). Positive deltas for

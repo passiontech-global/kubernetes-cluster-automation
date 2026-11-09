@@ -88,7 +88,7 @@ func cgroupInitPID(scopeDir string) (int, bool) {
 }
 
 // oomMemStatMiB reads memory.stat of the container cgroup at OOM
-// confirmation time and formats the W16-KR1 tmpfs breakdown
+// confirmation time and formats the subproc-oom-breakdown tmpfs breakdown
 // "anon=XMiB shmem=YMiB file=ZMiB" (bytes / 1024 / 1024, rounded
 // to nearest). A big `shmem` is the tmpfs/emptyDir{medium:Memory}
 // fingerprint — the page cache `file` is reclaimable, anon+shmem
@@ -211,7 +211,7 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 // report emits the ContainerSubprocessOOMKilled Warning event on
 // the owning Pod and bumps the counter — events.v1 shape like the
-// SystemOOMVictim emitter. memStat carries the W16-KR1 memory.stat
+// SystemOOMVictim emitter. memStat carries the subproc-oom-breakdown memory.stat
 // breakdown ("anon=XMiB shmem=YMiB file=ZMiB"), appended to both
 // the event note and the log lines when non-empty.
 func (c *SubprocOOMCheck) report(ctx context.Context, uid string,

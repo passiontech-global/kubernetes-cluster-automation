@@ -140,7 +140,7 @@ func TestLinkerdOutlierDetected(t *testing.T) {
 	})
 }
 
-// W16-G1 — a stable Rollout cohort (one rollouts-pod-template-hash,
+// rollout-scale-flap — a stable Rollout cohort (one rollouts-pod-template-hash,
 // `rollout` metric label) is protected like a Deployment's: the
 // gray-failed member flags, membership and uniformity resolve via
 // the rollouts hash label.
@@ -149,7 +149,7 @@ func TestLinkerdOutlierRolloutCohortDetected(t *testing.T) {
 	bad := outlierDeployPod("apps", "api", "h1", "api-bad", true, owner)
 	sib := outlierDeployPod("apps", "api", "h1", "api-sib", true, owner)
 	// Swap the Deployment hash label for the Rollouts one — the
-	// membership/uniformity tests must accept it (W16-G1).
+	// membership/uniformity tests must accept it (rollout-scale-flap).
 	bad.Labels = map[string]string{"rollouts-pod-template-hash": "h1"}
 	sib.Labels = map[string]string{"rollouts-pod-template-hash": "h1"}
 	cs := fake.NewSimpleClientset(bad, sib)
@@ -175,7 +175,7 @@ func TestLinkerdOutlierRolloutCohortDetected(t *testing.T) {
 	})
 }
 
-// W16-G1 — a Rollout mid-canary (>1 distinct rollouts-pod-template-
+// rollout-scale-flap — a Rollout mid-canary (>1 distinct rollouts-pod-template-
 // hash) has no valid control group: stand down, no flag, no evict.
 func TestLinkerdOutlierRolloutCanaryStandsDown(t *testing.T) {
 	owner := types.UID("rs-api-h1")

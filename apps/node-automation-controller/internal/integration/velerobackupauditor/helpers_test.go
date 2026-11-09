@@ -12,7 +12,7 @@ import (
 var ctx = context.Background()
 
 // newDynFake seeds the Velero types the auditor lists — schedules,
-// backups, and the W8-ST1 backupstoragelocations — plus the W9-ST3
+// backups, and the velero-bsl-audit backupstoragelocations — plus the backup-posture-audit
 // Everest DatabaseCluster/DatabaseClusterBackup GVRs and the
 // autopilot Plan GVR the maintenance mutex reads inside
 // heal.AllowedV (the fake PANICS on a List for an unregistered GVR,

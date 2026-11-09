@@ -1,4 +1,4 @@
-// image_pull_storm.go — the image-pull-storm check (W10-GI5):
+// image_pull_storm.go — the image-pull-storm check (image-pull-storm):
 // containers waiting in ImagePullBackOff/ErrImagePull/
 // RegistryUnavailable past the window — single-namespace vs
 // cluster-registry-outage classification.
@@ -35,7 +35,7 @@ type imagePullStormCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newImagePullStormCheck builds the W10-GI5 check — its state is
+// newImagePullStormCheck builds the image-pull-storm check — its state is
 // the first-seen persistence ledger and the emitted-gauge ledger
 // (both zero-value usable).
 func NewImagePullStormCheck(d *probefw.Deps) probefw.Check {
@@ -45,7 +45,7 @@ func NewImagePullStormCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameImagePullStorm = "image-pull-storm"
 
-	// W10-GI5 — image-pull-storm knobs.
+	// image-pull-storm — image-pull-storm knobs.
 	imagePullMinAge = 10 * time.Minute
 )
 
@@ -68,16 +68,16 @@ var registryOutageMarkers = []string{
 }
 
 var (
-	// W10-GI5 — per-pod image-pull backoff.
+	// image-pull-storm — per-pod image-pull backoff.
 	imagePullBackoffPodsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_image_pull_backoff",
-		Help: "1 while the pod has a container waiting in an image-pull failure >10m — W10-GI5.",
+		Help: "1 while the pod has a container waiting in an image-pull failure >10m — image-pull-storm.",
 	}, []string{"namespace", "pod"})
 
-	// W10-GI5 — cluster-wide registry/pull outage latch.
+	// image-pull-storm — cluster-wide registry/pull outage latch.
 	registryPullOutageGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_automation_registry_pull_outage",
-		Help: "1 while image-pull failures span >=2 namespaces or carry a registry-outage signature — W10-GI5.",
+		Help: "1 while image-pull failures span >=2 namespaces or carry a registry-outage signature — image-pull-storm.",
 	})
 )
 

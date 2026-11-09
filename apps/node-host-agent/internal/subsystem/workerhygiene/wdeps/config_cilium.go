@@ -9,8 +9,8 @@ import (
 )
 
 // CiliumConfig groups the cilium knobs: the 32 agent healthz/socket,
-// the 35/38 unix-socket consumers, the B1 envoy probes, the B4/W5.6
-// MTU + WireGuard iface knobs and the W8-NM3 BPF map latch ratio.
+// the 35/38 unix-socket consumers, the B1 envoy probes, the B4/cilium-wg-peer-gc
+// MTU + WireGuard iface knobs and the mesh-net-guards BPF map latch ratio.
 type CiliumConfig struct {
 	HealthzURL      string  // cilium-agent :9879 probe (32)
 	Socket          string  // cilium agent unix socket (35)
@@ -56,7 +56,7 @@ func (cl *CiliumConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 	return []envx.Knob{
 		envx.StringKnob(envnames.EnvCiliumSocket, &cl.Socket,
 			hostPath("/run/cilium/cilium.sock")),
-		// W7 knob — empty env → in-package default.
+		// env knob — empty env → in-package default.
 		envx.StringKnob(envnames.EnvCiliumEnvoyAdminURL, &cl.EnvoyAdminURL, ""),
 	}
 }

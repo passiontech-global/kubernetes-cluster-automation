@@ -1,5 +1,5 @@
 // db_operator_heals.go — the generic db-operator heal of the
-// stateful-masterless-services check (W4): a masterless StatefulSet
+// stateful-masterless-services check (va-stuck-terminating): a masterless StatefulSet
 // owned by a known db operator gets that operator's pod bounced to
 // force re-election — dbOperatorFor attributes the STS to its
 // operator, dbOperatorPodPrefixes resolves the Deployment/pod-name
@@ -23,7 +23,7 @@ import (
 // dbOperatorNames are the operators whose role-assignment wedge this
 // check heals — matched against the StatefulSet's labels, pod-template
 // labels and ownerReferences. The long Percona deployment names sit
-// alongside the short chart aliases (W10-FIX4): an STS owned by the
+// alongside the short chart aliases (dbOperatorPodPrefixes): an STS owned by the
 // percona-xtradb-cluster-operator Deployment labels itself with the
 // long name, while older charts/labels still carry pxc-operator.
 var dbOperatorNames = []string{
@@ -34,7 +34,7 @@ var dbOperatorNames = []string{
 }
 
 // dbOperatorDeploymentAliases groups the Deployment/pod-name spellings
-// one logical db operator answers to (W10-FIX4): the short chart alias
+// one logical db operator answers to (dbOperatorPodPrefixes): the short chart alias
 // (pxc-operator) and the long upstream Deployment name
 // (percona-xtradb-cluster-operator) produce DIFFERENT pod name
 // prefixes, so a heal keyed on whichever spelling dbOperatorFor
@@ -99,14 +99,14 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 // the operator pod's namespace is not fixed across installs — and the
 // UID-preconditioned delete + census invalidate + heal count under
 // the operator name); the pick keeps the oldest-Running-target choice
-// and the W10-FIX4 alias-prefix match local.
+// and the dbOperatorPodPrefixes alias-prefix match local.
 func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, operator string, now time.Time) {
 	const dbOperatorHealCooldown = 30 * time.Minute
 	deleted := p.BounceOperatorPod(ctx, log, operator, "",
 		func(pods []corev1.Pod) []*corev1.Pod {
 			// The Percona operators answer to two Deployment
-			// spellings (W10-FIX4) — every alias prefix is tried so
+			// spellings (dbOperatorPodPrefixes) — every alias prefix is tried so
 			// a short-name match still finds the long-named pods.
 			target := heal.OldestRunningPod(pods,
 				dbOperatorPodPrefixes(operator)...)

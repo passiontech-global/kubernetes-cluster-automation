@@ -38,7 +38,7 @@ var linkerdIdentityStallMarkers = []string{
 	"certificateexpired",
 	"certificate_expired",
 	"invalidcertificate(expired)",
-	// W12-NM3 — the not-yet-valid leaf (issued-at skew) and the
+	// linkerd-h2-stream-guard — the not-yet-valid leaf (issued-at skew) and the
 	// unknown-issuer (trust-root rotation skew) spellings stall the
 	// identity exactly like an expiry: every new connection fails
 	// validation while the pod stays Ready.

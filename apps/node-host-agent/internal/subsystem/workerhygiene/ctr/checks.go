@@ -22,7 +22,7 @@ func NewIngestGC(d *wdeps.Deps) *IngestGCCheck {
 	return &IngestGCCheck{d: d}
 }
 
-// NewCtrMeta returns the W10-KR3 containerd meta.db corruption guard.
+// NewCtrMeta returns the meta-db-corruption containerd meta.db corruption guard.
 func NewCtrMeta(d *wdeps.Deps) *CtrMetaCheck {
 	return &CtrMetaCheck{d: d}
 }

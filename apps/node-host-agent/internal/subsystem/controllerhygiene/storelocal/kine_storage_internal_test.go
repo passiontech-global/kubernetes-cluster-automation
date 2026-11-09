@@ -1,5 +1,5 @@
 // kine_storage_internal_test.go — the sqlite3 exec plumbing behind
-// the W10-CP2 store-health seams: the bounded filestore walk and the
+// the kine-storage store-health seams: the bounded filestore walk and the
 // two sqlite3 CLI runners (argv contract, NOTIFY_SOCKET/WATCHDOG_*
 // env scrub, separate error wrapping, ErrNoSQLite3 detection).
 // Internal test package: the seams are unexported package funcs.

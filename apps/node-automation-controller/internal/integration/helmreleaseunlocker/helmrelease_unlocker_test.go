@@ -1272,7 +1272,7 @@ func TestFluxSourceSeriesPrunedWhenConsumerVanishes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W9-CP2 — superseded helm release secret pruner
+// kine-bloat-guard — superseded helm release secret pruner
 // ---------------------------------------------------------------------------
 
 // A release with more than maxSupersededSecrets superseded secrets

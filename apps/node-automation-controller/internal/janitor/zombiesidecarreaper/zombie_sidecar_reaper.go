@@ -18,7 +18,7 @@
 //     default-deny ingress policy blocking pod-IP traffic from
 //     node-ops) or the pod has no IP at all — the apiserver
 //     pods/<name>:<port>/proxy subresource, which reaches the
-//     sidecar through kubelet and is immune to pod netpol (W10-FIX3).
+//     sidecar through kubelet and is immune to pod netpol (sidecar-shutdown-fallback).
 //     A sidecar that honors it exits cleanly and kubelet
 //     transitions the pod itself; the pod is recorded in the
 //     `poked` ledger and left alone for exactly one cycle.
@@ -87,7 +87,7 @@ type zombieSidecarReaper struct {
 	// come from one place.
 	queue string
 	// dyn is accepted for Setup-signature parity with the other
-	// wave modules — the reaper only needs typed Pod access today.
+	// janitor modules — the reaper only needs typed Pod access today.
 	dyn dynamic.Interface
 	// now is the clock seam — tests pin it so the >5m
 	// termination window is deterministic. nil → time.Now.
@@ -99,7 +99,7 @@ type zombieSidecarReaper struct {
 	// zombieSidecarShutdown.
 	shutdownFn func(ctx context.Context, podIP, sidecar string) error
 	// proxyFn POSTs the same admin endpoint through the apiserver
-	// pods/<name>:<port>/proxy subresource — the W10-FIX3 fallback
+	// pods/<name>:<port>/proxy subresource — the sidecar-shutdown-fallback fallback
 	// for when the direct dial is blocked (pod-ingress netpol) or
 	// the pod has no IP. nil → (*zombieSidecarReaper).proxyShutdown.
 	proxyFn func(ctx context.Context, pod *corev1.Pod, sidecar string) error
@@ -109,7 +109,7 @@ type zombieSidecarReaper struct {
 	poked map[string]bool
 	// tried records "ns/name/uid" of pods for which ANY shutdown
 	// attempt (direct or proxy, success or failure) already ran —
-	// W10-FIX3 lets jobAllowsReap force a backoffLimit==0 reap only
+	// sidecar-shutdown-fallback lets jobAllowsReap force a backoffLimit==0 reap only
 	// after one full attempt cycle, never on first sight.
 	tried map[string]bool
 }
@@ -158,7 +158,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// zombieTarget is a pod that reached the delete step this cycle —
 	// either poked last cycle and still stuck, or freshly attempted
 	// with both shutdown paths failing. attempted records whether a
-	// shutdown call already ran (the W10-FIX3 backoffLimit==0
+	// shutdown call already ran (the sidecar-shutdown-fallback backoffLimit==0
 	// exemption needs it); reason feeds the DELETE log line.
 	type zombieTarget struct {
 		pod       *corev1.Pod
@@ -199,7 +199,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		shutdownAttempts++
 		// Graceful path: direct pod-IP admin call, then the apiserver
 		// pods/<name>:<port>/proxy fallback when the direct dial is
-		// unreachable (netpol) or the pod has no IP (W10-FIX3). A pod
+		// unreachable (netpol) or the pod has no IP (sidecar-shutdown-fallback). A pod
 		// with no podIP skips straight to the proxy attempt.
 		attemptedBefore := r.tried[key]
 		err := r.shutdownPod(ctx, p, sidecar)

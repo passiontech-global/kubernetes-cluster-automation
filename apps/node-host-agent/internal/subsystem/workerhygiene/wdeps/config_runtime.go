@@ -1,8 +1,8 @@
 // config_runtime.go — the runtime-resource guard paths:
 // RuntimeConfig, its defaults and its NODE_HOST_AGENT_CGROUP_ROOT /
 // NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR env rows (the cgroup-v2
-// unified hierarchy root and the logind session dir the six W10
-// guards scan).
+// unified hierarchy root and the logind session dir the six
+// runtime-resource guards scan).
 package wdeps
 
 import (
@@ -44,7 +44,7 @@ func (r *RuntimeConfig) applyDefaults() {
 	}
 }
 
-// envKnobs returns the W10 runtime-resource guard env rows —
+// envKnobs returns the runtime-resource guard env rows —
 // hostPath defaults like the wiring block (the package defaults are
 // unprefixed host-absolute paths; the "/host" prefix is the
 // DaemonSet's, not the constant's).

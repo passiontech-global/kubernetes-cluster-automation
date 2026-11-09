@@ -96,16 +96,16 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		// svcEffective < 0 marks "not Service-backed" — URL webhooks
 		// and malformed refs are unmeasurable, the breaker never
 		// trips them. Effective excludes Ready endpoints sitting on
-		// partitioned/unresponsive nodes (W5.5); Raw keeps them for
+		// partitioned/unresponsive nodes (endpoint-census); Raw keeps them for
 		// the threshold pick.
 		svcEffective, svcRaw := -1, -1
 		svc := ""
-		// unresponsive is the W9-CP1 brownout verdict: the Service
+		// unresponsive is the circuit-breaker-bounce brownout verdict: the Service
 		// reports Ready endpoints on healthy nodes but EVERY probed
 		// endpoint IP failed the TCP+TLS handshake — the pods are
 		// hung, which is as dead for admission as a partition. It is
 		// only ever true when svcEffective > 0 (effective==0 is
-		// already covered by the W5.5 path) and the service was
+		// already covered by the endpoint-census path) and the service was
 		// actually probed this run.
 		unresponsive := false
 		if h.svc != nil && h.svc.Namespace != "" && h.svc.Name != "" {
@@ -146,7 +146,7 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 			// RECOVER confirmed — Endpoints on partitioned nodes did
 			// NOT count toward the streak (they still fail every
 			// apiserver call), and neither did endpoints whose pods
-			// are still failing the handshake (W9-CP1): "Ready" in
+			// are still failing the handshake (circuit-breaker-bounce): "Ready" in
 			// the EndpointSlice is not "serving".
 			b.clearHealthyStreak(key)
 			flip(h, admissionv1.Fail)
@@ -194,7 +194,7 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 			changed = true
 			switch {
 			case unresponsive:
-				// W9-CP1 — every probed Ready endpoint failed the
+				// circuit-breaker-bounce — every probed Ready endpoint failed the
 				// TCP+TLS handshake: hung pods, not a partition.
 				// svcRaw > 0 keeps the 90s partition threshold.
 				log.Info("CIRCUIT-TRIP: unresponsive — all probed ready endpoints fail TCP+TLS handshake — patching failurePolicy=Ignore",

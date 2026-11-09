@@ -240,7 +240,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	return true
 }
 
-// certReadyFalse reports the Ready=False half of the W8 CR candidacy.
+// certReadyFalse reports the Ready=False half of the stuck-CR candidacy.
 func certReadyFalse(cert *unstructured.Unstructured) bool {
 	c, _ := kube.ConditionOf(cert.Object, "Ready")
 	return c.Status == "False"

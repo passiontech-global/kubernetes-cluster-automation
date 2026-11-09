@@ -19,7 +19,7 @@ import (
 
 const (
 	psiEvictInterval = 15 * time.Minute // last-psi-evict budget
-	// Wave-9 slab-leak guard thresholds (SUnreclaim/MemTotal
+	// Slab-leak guard thresholds (SUnreclaim/MemTotal
 	// enter/clear hysteresis + the drop_caches budget).
 	slabLeakEnterRatio     = 0.35
 	slabLeakClearRatio     = 0.25
@@ -69,7 +69,7 @@ type memInfo struct {
 
 // readMeminfo parses <ProcRoot>/meminfo once for every consumer —
 // MemTotal/MemAvailable drive the free-ratio floor, SUnreclaim the
-// W9-KR3 slab-leak guard. ok=false semantics live on the callers:
+// kernel-slab-leak slab-leak guard. ok=false semantics live on the callers:
 // a missing MemTotal or MemAvailable means "unreadable".
 func readMeminfo(d *wdeps.Deps) memInfo {
 	var m memInfo
@@ -104,7 +104,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 	return m
 }
 
-// guardKernelSlabLeak is the W9-KR3 kernel slab-leak guard: while
+// guardKernelSlabLeak is the kernel-slab-leak kernel slab-leak guard: while
 // SUnreclaim/MemTotal sits above slabLeakEnterRatio the
 // state-kernel-slab-leak latch is held and a 1h-budgeted
 // drop_caches write ("2" — dentries+inodes) tries to hand the
@@ -254,7 +254,7 @@ func carriesDBQuorumLabel(p *corev1.Pod) bool {
 
 // highestRSSPod returns the eviction victim for the
 // psi-memory-thrash guard: the eligible non-system pod on this node
-// whose summed /proc VmRSS is largest, subject to the W8-W1 safety
+// whose summed /proc VmRSS is largest, subject to the psi-thrash-victim-selection safety
 // rails —
 //
 //   - MinEvictRSSBytes floor: no candidate >= 512 MiB RSS → no
@@ -326,7 +326,7 @@ func highestRSSPod(d *wdeps.Deps, pods []corev1.Pod, pids []int) (victim *corev1
 	return nil, 0
 }
 
-// PSIThrashCheck is the W2 memory-thrash evictor as a Check; it
+// PSIThrashCheck is the psi-memory-thrash memory-thrash evictor as a Check; it
 // owns the thrash streak (ex-Hygiene.psiThrashFails).
 type PSIThrashCheck struct {
 	d     *wdeps.Deps
@@ -350,7 +350,7 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "abort")
 		return
 	}
-	// W9-KR3: the slab-leak guard runs on EVERY readable-meminfo
+	// kernel-slab-leak: the slab-leak guard runs on EVERY readable-meminfo
 	// cycle — its latch is this check's eviction circuit breaker,
 	// and it must arm even on kernels without PSI or while PSI is
 	// quiet (a kernel slab leak is a kernel problem, not a PSI one).

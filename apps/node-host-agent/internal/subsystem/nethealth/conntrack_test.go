@@ -238,7 +238,7 @@ func TestPeerConntrackFlushBestEffort(t *testing.T) {
 	}
 }
 
-// --- W12-KR3: insert_failed/drop spike → whole-UDP flush ---
+// --- conntrack-port-pressure: insert_failed/drop spike → whole-UDP flush ---
 
 // ranExactCmd reports whether the fake executed argv joined EXACTLY
 // as cmd — "conntrack -D -p udp" must not match the longer

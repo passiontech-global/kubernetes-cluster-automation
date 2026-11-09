@@ -321,7 +321,7 @@ func TestWatchdogPodListError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-NM2 — wedged cloudflared connector healer.
+// cloudflared-wedge-heal — wedged cloudflared connector healer.
 // ---------------------------------------------------------------------------
 
 // staleUnreadyProxyPod is proxyPod plus a Ready=False condition whose
@@ -793,7 +793,7 @@ func TestSetupCFTunnelProxyWatchdogPeriodic(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W16-CI2 — gateway controller sync-error audit
+// cf-gateway-sync-error — gateway controller sync-error audit
 // ---------------------------------------------------------------------------
 
 // gatewayCtrlPod builds a cloudflare-tunnel-gateway-controller pod

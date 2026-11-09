@@ -1,4 +1,4 @@
-// runtime_cgroup_throttle_test.go — W12-KR1 cgroup-pod-throttle
+// runtime_cgroup_throttle_test.go — cgroup-pod-throttle cgroup-pod-throttle
 // guard coverage: pod memory.pressure/memory.events throttle
 // detection (suppressed while the node-wide PSI thrash latch is
 // active), the pids.max utilization gauge and the pids.events:max
@@ -81,7 +81,7 @@ func TestCgroupThrottleDetectsMemoryHigh(t *testing.T) {
 	}
 }
 
-// TestCgroupThrottleSuppressedUnderNodePSI: while the W2 node-wide
+// TestCgroupThrottleSuppressedUnderNodePSI: while the psi-memory-thrash node-wide
 // psi-memory-thrash latch is active the pod-level counter stays
 // put — the node event already owns the signal.
 func TestCgroupThrottleSuppressedUnderNodePSI(t *testing.T) {

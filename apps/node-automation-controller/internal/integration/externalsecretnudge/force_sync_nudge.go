@@ -5,9 +5,9 @@
 // backoff. Rate-limited to one stamp per esNudgeCooldown by the
 // persisted stamps esNudgeStamp reads back — durable across restarts,
 // so no in-RAM ledger is needed.
-// Also carries the W9-GO1 storm census: a mass-failure storm
+// Also carries the externalsecret-storm-guard storm census: a mass-failure storm
 // suppresses every stamp and feeds the connect auto-heal — and the
-// W12-GO3 hygiene pair: the empty/whitespace-key audit on Ready=True
+// empty-key-audit hygiene pair: the empty/whitespace-key audit on Ready=True
 // ExternalSecrets, plus the empty-skeleton Secret delete that runs
 // right before each delivered stamp.
 package externalsecretnudge
@@ -40,7 +40,7 @@ import (
 // store is currently Ready=True — with neither it and no recovery
 // edge there is nobody to poke, so the sweep is a no-op census.
 //
-// W9-GO1 storm guard: when >=esStormMinFailing ExternalSecrets are
+// externalsecret-storm-guard storm guard: when >=esStormMinFailing ExternalSecrets are
 // Ready=False AND they are at least half the population, the failure
 // is an upstream ESO/1Password outage, not N independent wedged ESs —
 // stamping force-sync on all of them would amplify the outage, so the
@@ -65,7 +65,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	}
 	now := n.now.Now()
 
-	// W9-GO1 — storm census over the WHOLE population: totalES is
+	// externalsecret-storm-guard — storm census over the WHOLE population: totalES is
 	// every ExternalSecret, failingES every Ready=False one. The
 	// ratio clause keeps a big healthy fleet from tripping on a
 	// handful of unrelated failures.
@@ -91,11 +91,11 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		n.stormSince = time.Time{}
 	}
 
-	// W9-GO1 — connect auto-heal runs on every census, storm or not:
+	// externalsecret-storm-guard — connect auto-heal runs on every census, storm or not:
 	// a ClusterSecretStore down >=15m is itself a trigger.
 	n.maybeHealConnect(ctx, storm, now)
 
-	// W12-GO3 — the empty-key audit runs on every census too: it reads
+	// empty-key-audit — the empty-key audit runs on every census too: it reads
 	// Ready=True ESs only, so a storm (or a total store outage) must
 	// not blind it — the early returns below come after it.
 	n.auditEmptySecretKeys(ctx, list)
@@ -140,7 +140,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
 			continue
 		}
-		// W12-GO3 — clear the empty skeleton BEFORE stamping: ESO can
+		// empty-key-audit — clear the empty skeleton BEFORE stamping: ESO can
 		// leave a len(Data)==0 target Secret behind after a failed
 		// sync, and the forced reconcile recreates it populated.
 		n.deleteEmptySkeletonSecret(ctx, es)
@@ -197,7 +197,7 @@ func esNudgeStamp(es *unstructured.Unstructured) (time.Time, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// W12-GO3 — empty/whitespace-key audit + empty-skeleton Secret reaper
+// empty-key-audit — empty/whitespace-key audit + empty-skeleton Secret reaper
 // ---------------------------------------------------------------------------
 
 // auditEmptySecretKeys flags every empty credential ESO reports as

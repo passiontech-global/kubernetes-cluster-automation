@@ -21,7 +21,7 @@ const (
 	conntrackExitRatio  = 0.80
 	// conntrackDropSpike is the per-cycle delta of
 	// insert_failed+drop+early_drop that counts as a conntrack
-	// refuse spike (W12-KR3): a table refusing NEW flow insertions
+	// refuse spike (conntrack-port-pressure): a table refusing NEW flow insertions
 	// at this rate pins NATed UDP tuples (the A+AAAA DNS race
 	// class) — the remedy is evicting stale UDP entries.
 	conntrackDropSpike = 50
@@ -72,7 +72,7 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 	n.cycles.WithLabelValues(checkCT, "ok").Inc()
 }
 
-// --- W12-KR3: conntrack insert_failed/drop spike → stale-UDP flush ---
+// --- conntrack-port-pressure: conntrack insert_failed/drop spike → stale-UDP flush ---
 
 // conntrackStatSum parses /proc/net/stat/nf_conntrack — a header of
 // column names then one HEX row per CPU — and returns the sum of the
@@ -115,7 +115,7 @@ func conntrackStatSum(path string, keys ...string) (uint64, bool) {
 	return sum, true
 }
 
-// checkConntrackDropSpike — W12-KR3: the fill-ratio gauge above only
+// checkConntrackDropSpike — conntrack-port-pressure: the fill-ratio gauge above only
 // sees a nearly-FULL table; insert_failed/drop climb while the table
 // still has headroom when stale UDP tuples collide with new
 // insertions (the A+AAAA source-port race) or the table evicts live

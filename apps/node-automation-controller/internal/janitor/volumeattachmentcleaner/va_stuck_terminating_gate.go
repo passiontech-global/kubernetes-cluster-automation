@@ -1,5 +1,5 @@
 // va_stuck_terminating_gate.go — gate 3 of the volumeattachment-cleaner:
-// the stuck-Terminating finalizer strip (W4). A VA already carrying a
+// the stuck-Terminating finalizer strip (va-stuck-terminating). A VA already carrying a
 // DeletionTimestamp past vaStuckTerminatingAge whose attacher-side
 // cleanup is dead can never drain its own finalizer, so the cleaner
 // strips it to free the PV. Two proof shapes survive the plain-delete
@@ -31,7 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// stuckTerminatingNodeDead is the W4 wedged-detach gate: the VA's
+// stuckTerminatingNodeDead is the va-stuck-terminating wedged-detach gate: the VA's
 // node is gone outright, or carries the out-of-service taint while a
 // live pod List proves zero non-DaemonSet pods remain — in both
 // shapes the external-attacher has no live node to report the detach

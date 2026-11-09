@@ -1,4 +1,4 @@
-// Wave-9-NM1 tests — the Nebula DF PMTU probe: small-packet overlay
+// overlay-MTU tests — the Nebula DF PMTU probe: small-packet overlay
 // pings keep passing while a 1200-byte don't-fragment probe
 // blackholes (double-encapsulation path MTU below the overlay MTU).
 // The probe only runs while nebula is the active overlay AND at
@@ -17,7 +17,7 @@ import (
 )
 
 // dfProbeRan reports whether the DF ping ran against target — the
-// exact argv the W9 probe emits.
+// exact argv the overlay-MTU probe emits.
 func dfProbeRan(e *env, target string) bool {
 	for _, c := range e.host.Cmds() {
 		j := strings.Join(c, " ")

@@ -1,5 +1,5 @@
 // schedule_audit.go — the per-Schedule rot checks of
-// velero-backup-auditor: flagMissingBackups (W10-FIX6 — a Schedule
+// velero-backup-auditor: flagMissingBackups (zero-backup-guard — a Schedule
 // older than veleroMissingBackupMaxAge that produced ZERO Backup
 // objects is silently unprotected) and flagBadBackup (the latest
 // schedule-owned Backup's empty/errored/wedged signatures on
@@ -17,7 +17,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// flagMissingBackups is the W10-FIX6 zero-backup check: a Schedule
+// flagMissingBackups is the zero-backup-guard zero-backup check: a Schedule
 // older than veleroMissingBackupMaxAge (36h) that has produced ZERO
 // Backup objects is silently unprotected — the schedule fires, the
 // backups vanish (or never ran), and every other check sees
@@ -50,7 +50,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	b *unstructured.Unstructured, ns, schedule string) {
 	log := logf.FromContext(ctx)
 	phase, _ := kube.NestedString(b.Object, "status", "phase")
-	// W8-ST1 — terminal failures and wedged in-flight phases are
+	// velero-bsl-audit — terminal failures and wedged in-flight phases are
 	// flagged on their own reason series before the Completed path
 	// runs: Failed/PartiallyFailed/FailedValidation flag immediately,
 	// InProgress/Deleting only past 6h (measured from

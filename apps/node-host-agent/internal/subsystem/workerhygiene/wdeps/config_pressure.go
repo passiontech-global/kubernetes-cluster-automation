@@ -1,7 +1,7 @@
 // config_pressure.go — the leak/pressure-guard knobs:
 // PressureConfig, its defaults and its
-// NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD env row (the W7-H1 D-state
-// storm + A2 zombie storm thresholds and the W2 PSI memory-thrash
+// NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD env row (the d-state-storm D-state
+// storm + A2 zombie storm thresholds and the psi-memory-thrash PSI memory-thrash
 // guard all read this group).
 package wdeps
 
@@ -10,8 +10,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// PressureConfig groups the leak/pressure guard knobs: the W7-H1
-// D-state storm + A2 zombie storm thresholds and the W2 PSI
+// PressureConfig groups the leak/pressure guard knobs: the d-state-storm
+// D-state storm + A2 zombie storm thresholds and the psi-memory-thrash PSI
 // memory-thrash guard — latch when /proc/pressure/memory `full
 // avg60` exceeds PSIFullAvg60 (percent) AND MemAvailable/MemTotal
 // drops under MemFreeMinRatio for ConsecNeeded cycles.
@@ -37,7 +37,7 @@ func (p *PressureConfig) applyDefaults() {
 	}
 }
 
-// envKnobs returns the pressure domain's env row — the W7 D-state
+// envKnobs returns the pressure domain's env row — the D-state
 // storm threshold (empty env → in-package default).
 func (p *PressureConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
