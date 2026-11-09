@@ -88,6 +88,7 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		evidence += fmt.Sprintf("%d orphan shim(s) ppid=1", orphans)
 	}
+	c.measureMetaDBSize()
 	if evidence != "" {
 		c.fails++
 		c.d.State.AppendLog(fmt.Sprintf(
@@ -101,6 +102,22 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.Exit(latchdefs.LatchContainerdCorrupt, nil)
 	}
 	c.d.CycleResult(wdeps.CheckCtrMeta, "ok")
+}
+
+// ctrMetaDBRel is meta.db's path under K0sDataDir — the bbolt store
+// every containerd metadata op serializes through.
+const ctrMetaDBRel = "containerd/io.containerd.metadata.v1.bolt/meta.db"
+
+// measureMetaDBSize stats the bbolt store and publishes its size on
+// node_agent_ctr_metadb_bytes (W19-K3). A missing file (fresh node,
+// non-k0s layout) leaves the last value — never a fake 0.
+func (c *CtrMetaCheck) measureMetaDBSize() {
+	fi, err := os.Stat(filepath.Join(
+		c.d.Cfg.K0sDataDir, ctrMetaDBRel))
+	if err != nil {
+		return
+	}
+	c.d.CtrMetaDBBytes = fi.Size()
 }
 
 // countMetaOrphanShims counts containerd-shim-runc-v2 processes that

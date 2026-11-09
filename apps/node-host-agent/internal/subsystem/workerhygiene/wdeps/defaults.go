@@ -99,6 +99,7 @@ const (
 	// systemd.Exec runs nsenter -m wrapped).
 	localPVQuotaRatio       = 1.5
 	defaultHostRunDir       = "/run"
+	defaultHostShmDir       = "/dev/shm"
 	defaultJournalVacuumDir = "/run/log/journal"
 	// Disk-guard defaults: the active overlayfs snapshotter root the
 	// writable-layer scan walks (plan-mandated /run path — the env

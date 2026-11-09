@@ -120,6 +120,9 @@ var ciliumBPFMapCritical = map[string]bool{
 	"cilium_ct_any4_global":   true,
 	"cilium_snat_v4_external": true,
 	"cilium_lb4_services_v2":  true,
+	// W19-C1: per-pod endpoint/identity maps — exhaustion here
+	// blackholes new pod datapath even when conntrack looks fine.
+	"cilium_lxc": true,
 }
 
 // ParseCiliumBPFMaps extracts name → [used, max] from a /v1/map

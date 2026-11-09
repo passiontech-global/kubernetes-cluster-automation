@@ -288,6 +288,13 @@ type FreezeCheck struct {
 	// In-memory like kcmQuietSince: a restart simply re-baselines
 	// on the first scrape (inconclusive, never fires).
 	apfPrevRejected map[APFSeriesKey]float64
+	// apiserverRSS/apiserverRSSSeen carry the last scrape's
+	// process_resident_memory_bytes into EmitAPFMetrics — the
+	// node_host_agent_apiserver_rss_bytes series (W19-PI2) lets
+	// Prometheus watch kube-apiserver RSS growth without a
+	// go_gc or cgroup scrape of the static pod.
+	apiserverRSS     float64
+	apiserverRSSSeen bool
 
 	// konnBadCycles is the konnectivity-server unhealthy streak —
 	// cycles where the UDS was missing or the :8091 scrape returned

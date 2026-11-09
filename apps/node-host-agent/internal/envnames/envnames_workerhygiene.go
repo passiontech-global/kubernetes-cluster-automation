@@ -51,6 +51,7 @@ const (
 	EnvSATokenMinTTLSec = "NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S"
 	EnvLocalPVQuotaDir  = "NODE_HOST_AGENT_LOCALPV_QUOTA_DIR"
 	EnvHostRunDir       = "NODE_HOST_AGENT_HOST_RUN_DIR"
+	EnvDevShmDir        = "NODE_HOST_AGENT_DEV_SHM_DIR"
 
 	// Disk/mount rows: the mountinfo-hygiene check's /proc/1/mountinfo view,
 	// the writable-layer snapshot root and coredump dir, and

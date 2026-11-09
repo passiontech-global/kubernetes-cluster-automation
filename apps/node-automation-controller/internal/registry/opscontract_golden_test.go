@@ -192,6 +192,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_linkerd_proxy_identity_stalled",
 	"node_automation_linkerd_proxy_oomkilled",
 	"node_automation_linkerd_sidecar_oom",
+	"node_automation_linkerd_trust_anchor_skew",
 	"node_automation_liqo_peer_unhealthy",
 	"node_automation_localpv_ephemeral_heals_total",
 	"node_automation_localpv_stranded_pods",
@@ -251,6 +252,8 @@ var goldenMetricFamilies = []string{
 	"node_automation_webhook_ca_bundle_days_to_expiry",
 	"node_automation_webhook_ca_bundle_mismatch",
 	"node_automation_webhook_circuit_breaker_trips_total",
+	// bootwebhooks — medik8s boot fail-open enforcement (not alphabetical, new row).
+	"node_automation_boot_webhook_failopen_total",
 	"node_automation_webhook_circuit_broken",
 	"node_automation_webhook_heartbeat_resource_exposed",
 	"node_automation_webhook_missing_critical_ns_exclusion",

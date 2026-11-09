@@ -220,6 +220,15 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_agent_run_tmpfs_cleanups_total",
 		"journal vacuum + orphan .tmp sweeps run by the /run tmpfs guard — run-tmpfs.",
 		d.Series.RunTmpfsCleanups)
+	b.Gauge("node_agent_dev_shm_used_ratio",
+		"/dev/shm tmpfs fill ratio, max of bytes and inode usage — dev-shm.",
+		d.Series.DevShmUsedRatio)
+	b.Gauge("node_agent_ctr_metadb_bytes",
+		"containerd meta.db (bbolt store) size in bytes — ctr-meta.",
+		float64(d.Series.CtrMetaDBBytes))
+	b.Gauge("node_agent_pagetables_bytes",
+		"PageTables+SecPageTables kernel memory in bytes — psi-memory-thrash.",
+		float64(d.Series.PageTablesBytes))
 	// kernel-net-shim-hygiene series — kernel socket/softnet drop
 	// counters (raw accumulating values straight out of /proc) and
 	// the containerd shim RSS measurements.

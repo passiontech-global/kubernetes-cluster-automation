@@ -61,10 +61,11 @@ func psiMemoryFullAvg60(d *wdeps.Deps) (float64, bool) {
 // memInfo holds the <ProcRoot>/meminfo fields the memory checks
 // consume — all values in kB as reported by the kernel.
 type memInfo struct {
-	totalKB     int64
-	availKB     int64
-	slabUnrecKB int64 // SUnreclaim — slab the kernel cannot reclaim
-	parsed      bool  // at least MemTotal + MemAvailable seen
+	totalKB      int64
+	availKB      int64
+	slabUnrecKB  int64 // SUnreclaim — slab the kernel cannot reclaim
+	pageTablesKB int64 // PageTables + SecPageTables (W19-K4)
+	parsed       bool  // at least MemTotal + MemAvailable seen
 }
 
 // readMeminfo parses <ProcRoot>/meminfo once for every consumer —
@@ -77,7 +78,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 	if err != nil {
 		return m
 	}
-	var total, avail, slab int64
+	var total, avail, slab, pageTables int64
 	var sawTotal, sawAvail bool
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
@@ -95,12 +96,18 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 			avail, sawAvail = v, true
 		case "SUnreclaim:":
 			slab = v
+		case "PageTables:", "SecPageTables":
+			// W19-K4: page-table memory is kernel memory outside
+			// SUnreclaim — a leaking/mapping-heavy workload grows it
+			// invisibly to the slab ratio.
+			pageTables += v
 		}
 	}
 	if !sawTotal || !sawAvail || total <= 0 {
 		return m
 	}
-	m.totalKB, m.availKB, m.slabUnrecKB, m.parsed = total, avail, slab, true
+	m.totalKB, m.availKB, m.slabUnrecKB, m.pageTablesKB, m.parsed =
+		total, avail, slab, pageTables, true
 	return m
 }
 
@@ -115,7 +122,11 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 // (and its drop-caches cadence) simply persists. Returns true while
 // the latch is held.
 func guardKernelSlabLeak(d *wdeps.Deps, m memInfo) bool {
-	ratio := float64(m.slabUnrecKB) / float64(m.totalKB)
+	// W19-K4: PageTables/SecPageTables count toward the kernel-memory
+	// numerator — they are unreclaimable-by-drop_caches kernel memory
+	// like SUnreclaim, and a pagetable leak must trip the same latch.
+	kernelKB := m.slabUnrecKB + m.pageTablesKB
+	ratio := float64(kernelKB) / float64(m.totalKB)
 	latched := d.State.Exists(latchdefs.LatchKernelSlabLeak)
 	switch {
 	case ratio > slabLeakEnterRatio:
@@ -350,6 +361,10 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "abort")
 		return
 	}
+	// W19-K4: publish the page-table footprint for
+	// node_agent_pagetables_bytes — set before the PSI early-outs so
+	// the series stays live on PSI-less kernels too.
+	c.d.PageTablesBytes = m.pageTablesKB * 1024
 	// kernel-slab-leak: the slab-leak guard runs on EVERY readable-meminfo
 	// cycle — its latch is this check's eviction circuit breaker,
 	// and it must arm even on kernels without PSI or while PSI is

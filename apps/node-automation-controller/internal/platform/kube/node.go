@@ -83,6 +83,16 @@ func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
 	if !n.Spec.Unschedulable {
 		return false
 	}
+	// W19-T2: a node fenced by remediation (SNR reclaim, nodehealth
+	// hang verdict, partition-evictor, cpu-steal) carries BOTH the
+	// unschedulable spec flag and a remediation taint — that is NOT
+	// an operator drain, and counting it as one freezes every
+	// heal.AllowedV-gated remediation for 45m exactly while the node
+	// needs recovery. Only remediation taints exempt; the plain
+	// out-of-service unschedulable taint still counts as cordon.
+	if HasRemediationTaint(n) {
+		return false
+	}
 	if n.Annotations[AnnoPreCordonedBy] != "" {
 		return false
 	}

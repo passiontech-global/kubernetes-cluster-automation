@@ -178,7 +178,26 @@ const (
 	// sustained hypervisor steal pressure — PreferNoSchedule, drains
 	// new placements only.
 	TaintCPUSteal = "passiontech.dev/cpu-steal"
+	// TaintNodeHangPreCordon is nodehealth's node-hang pre-cordon
+	// mark — stamped while the deeper hang verdict is still being
+	// confirmed so the scheduler stops packing new pods onto a node
+	// that is about to be fenced.
+	TaintNodeHangPreCordon = "passiontech.dev/node-hang-precordon"
 )
+
+// RemediationTaints is the canonical list of EVERY remediation
+// taint this platform stamps — kubelet-reaper, partition-evictor,
+// nodehealth (node-hang pre-cordon), and cpu-steal-taint-sync.
+// Callers that must survive or reason about remediation nodes
+// (storm gate census, Cilium L2 stale-holder checks, fencing
+// decisions) iterate this single list so adding a new remediation
+// taint touches one place — mirrors the 4-key REQUIRED_TAINTS
+// list in passiontech-fluxcd scripts/check-taint-sync.sh, which is
+// its own static gate across descheduler/node-ops/SNR manifests.
+var RemediationTaints = []string{
+	TaintKubeletUnresponsive, TaintNetworkPartitioned,
+	TaintNodeHangPreCordon, TaintCPUSteal,
+}
 
 // ---------------------------------------------------------------------------
 // EXTERNAL contracts — keys owned by tooling outside this controller.

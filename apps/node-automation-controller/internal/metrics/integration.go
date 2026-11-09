@@ -66,6 +66,17 @@ var TrustBundleDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Days until the earliest certificate in the trust bundle expires.",
 }, []string{"namespace", "name"})
 
+// LinkerdTrustAnchorSkew is 1 while the linkerd-identity-issuer
+// certificate fails X.509 verification (CheckSignatureFrom) or
+// AKI/SKI matching against every cert in the
+// linkerd-identity-trust-roots bundle (cert-drift-auditor, W19-NM2)
+// — workload proxies then reject the issuer's certificates and new
+// mTLS handshakes silently fail while existing connections live.
+var LinkerdTrustAnchorSkew = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "node_automation_linkerd_trust_anchor_skew",
+	Help: "1 while the linkerd identity issuer cert does not chain to the trust roots.",
+})
+
 // FluxSourceReconcilesTriggeredTotal counts reconcile requests patched
 // onto Flux source objects when a consumer reported a stale/missing
 // artifact (Flux source healer, C1).
@@ -223,6 +234,7 @@ var integrationCollectors = []prometheus.Collector{
 	HelmHookJobsCleanedTotal,
 	WebhookCABundleMismatch, TLSSecretDaysToExpiry,
 	WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
+	LinkerdTrustAnchorSkew,
 	FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
 	VeleroSchedulePaused, VeleroBackupEmptyOrErrored,
 	ReplicatedSecretDrift,

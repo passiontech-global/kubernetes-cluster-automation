@@ -82,6 +82,19 @@ type Series struct {
 	MemoryCompactionRuns   int64
 	RunTmpfsUsedRatio      float64
 	RunTmpfsCleanups       int64
+	// DevShmUsedRatio is the /dev/shm tmpfs fill ratio the dev-shm
+	// guard measures each cycle (W19-K2) — surfaced as
+	// node_agent_dev_shm_used_ratio.
+	DevShmUsedRatio float64
+	// CtrMetaDBBytes is the containerd meta.db (bbolt store) size
+	// the ctr-meta guard stats each cycle (W19-K3) — surfaced as
+	// node_agent_ctr_metadb_bytes; bloat past ~256MiB slows every
+	// containerd metadata op.
+	CtrMetaDBBytes int64
+	// PageTablesBytes is PageTables+SecPageTables from meminfo in
+	// bytes — surfaced as node_agent_pagetables_bytes (W19-K4); a
+	// monotonic climb is a mapping/pagetable leak signature.
+	PageTablesBytes int64
 	// The kernel-net-shim-hygiene family: kernel socket/softnet drop
 	// counters from /proc/net/{netstat,softnet_stat} (accumulating
 	// kernel counters, not deltas) plus the containerd-shim RSS

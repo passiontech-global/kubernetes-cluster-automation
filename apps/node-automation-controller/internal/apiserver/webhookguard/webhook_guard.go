@@ -61,10 +61,26 @@
 // refusing the disruption) is a deferral, not an error: the pod is
 // kept and the next candidate is tried.
 //
+// bootwebhooks — the medik8s boot fail-open enforcement. The medik8s
+// operators ensure their default config/template CRs at manager
+// startup through their OWN validating webhooks (failurePolicy=Fail
+// from the CSV webhookdefinitions); a stale/wrong endpoint set at that
+// moment i/o-times the call and the manager exit-1s into a crash loop
+// (incident 2026-11-08: stale pod IP reassigned to a passiontech pod,
+// SYN blackholed by network policy, both SNR managers down ~3d). The
+// duty enforces Ignore, ONE-WAY, on validating entries whose rules
+// reference only the selfnoderemediationconfigs / selfnoderemediationtemplates
+// resources of the medik8s group — one-way because a restore-to-Fail
+// would re-arm the fatality at the next operator restart. OLM
+// re-asserts Fail from the CSV on reconcile/upgrade; the sweep re-heals
+// that drift every cycle. Mutating configs, the remediation-CR entry
+// and every non-medik8s webhook are untouched. Gate:
+// MEDIK8S_BOOT_FAIL_OPEN_ENABLED (on unless "false").
+//
 // The package is split into leaf subpackages — guardstate (shared
 // deps + run snapshot + endpoint census), orphansweep, circuitbreaker,
-// criticalns and unmeshed — each owning one duty; this facade keeps
-// only the registry-facing Setup and the errors.Join sweep
+// criticalns, unmeshed and bootwebhooks — each owning one duty; this
+// facade keeps only the registry-facing Setup and the errors.Join sweep
 // orchestration.
 package webhookguard
 
@@ -75,6 +91,7 @@ import (
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/bootwebhooks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/criticalns"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
@@ -108,6 +125,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		logf.Log.WithName(d.Name).Info("registered",
 			"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
+			"bootFailOpen", bootwebhooks.Enabled(),
 			"unmeshedRemediation", unmeshed.RemediationEnabled())
 		// The bookkeeping ledgers inside the duty structs (deadSince,
 		// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
@@ -139,10 +157,14 @@ func (g *webhookGuard) run(ctx context.Context) error {
 		breakerErr = g.breaker.Sweep(ctx, snap)
 	}
 	conversionErr := g.breaker.SweepCRDConversionBackends(ctx, snap)
+	// The medik8s boot fail-open enforcement runs on the same shared
+	// snapshot — it only reads the validating list the census already
+	// fetched.
+	bootErr := bootwebhooks.Sweep(ctx, snap)
 	// The critical-ns audits run here — where they sat at the top of
 	// the unmeshed sweep before the duty moved to its own leaf
 	// subpackage — so they read post-breaker webhook state.
 	g.critical.Sweep(snap)
 	unmeshedErr := g.auditor.Sweep(ctx, snap)
-	return errors.Join(orphanErr, breakerErr, conversionErr, unmeshedErr)
+	return errors.Join(orphanErr, breakerErr, conversionErr, bootErr, unmeshedErr)
 }

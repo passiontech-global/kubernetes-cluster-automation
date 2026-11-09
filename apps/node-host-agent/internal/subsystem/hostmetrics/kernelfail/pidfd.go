@@ -49,13 +49,15 @@ var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
 //	pids    — live /proc/<pid> dirs / pid_max
 //	threads — loadavg "running/total" entities / threads-max
 //	filefd  — file-nr allocated / max
+//	pty     — pty/nr over pty/max (W19-K1 — pty exhaustion wedges
+//	          every new TTY/session open cluster-wide)
 //
 // Each ratio carries its own ok flag — a source that didn't parse
 // must not emit a fake 0 gauge (the collectFileFD rule); ok=false
 // overall means NO source parsed — inconclusive evidence must not
 // move the latch (the kernelKeysUsedRatio rule).
-func (r *Runner) kernelProcRatios() (pids, threads, filefd float64,
-	pidsOK, threadsOK, fdOK, ok bool) {
+func (r *Runner) kernelProcRatios() (pids, threads, filefd, pty float64,
+	pidsOK, threadsOK, fdOK, ptyOK, ok bool) {
 	seen := false
 	if entries, err := os.ReadDir(r.deps.ProcRoot); err == nil {
 		tasks := 0
@@ -88,7 +90,16 @@ func (r *Runner) kernelProcRatios() (pids, threads, filefd float64,
 			}
 		}
 	}
-	return pids, threads, filefd, pidsOK, threadsOK, fdOK, seen
+	// W19-K1: /dev/ptmx exhaustion is the same class as fd pressure
+	// — nr pseudo-terminals in use over the pty.max ceiling. Both
+	// files are sysctl-tunable; a missing pair is inconclusive, not
+	// zero.
+	if nr, nok := r.readProcFloat("sys/kernel/pty/nr"); nok {
+		if max, mok := r.readProcFloat("sys/kernel/pty/max"); mok && max > 0 {
+			pty, ptyOK, seen = nr/max, true, true
+		}
+	}
+	return pids, threads, filefd, pty, pidsOK, threadsOK, fdOK, ptyOK, seen
 }
 
 // readProcFloat reads one numeric file under ProcRoot.
@@ -112,17 +123,20 @@ func (r *Runner) readProcFloat(elem string) (float64, bool) {
 // The node_agent_*_utilization_ratio gauges ride the same evaluation
 // into the node-exporter textfile.
 func (r *Runner) updatePidFDPressure() {
-	pids, threads, filefd, pidsOK, threadsOK, fdOK, ok := r.kernelProcRatios()
+	pids, threads, filefd, pty, pidsOK, threadsOK, fdOK, ptyOK, ok :=
+		r.kernelProcRatios()
 	if !ok {
 		return // inconclusive — leave count, latch and gauges alone
 	}
-	r.writeKernelUtilProm(pids, threads, filefd, pidsOK, threadsOK, fdOK)
+	r.writeKernelUtilProm(pids, threads, filefd, pty,
+		pidsOK, threadsOK, fdOK, ptyOK)
 	worst, what := -1.0, ""
 	for _, v := range []struct {
 		v    float64
 		ok   bool
 		name string
-	}{{pids, pidsOK, "pids"}, {threads, threadsOK, "threads"}, {filefd, fdOK, "file-nr"}} {
+	}{{pids, pidsOK, "pids"}, {threads, threadsOK, "threads"},
+		{filefd, fdOK, "file-nr"}, {pty, ptyOK, "pty"}} {
 		if v.ok && v.v > worst {
 			worst, what = v.v, v.name
 		}
@@ -180,8 +194,8 @@ func (r *Runner) textfileDir() string {
 // collectFileFD rule). promfile.Write stages + renames so
 // node_exporter never reads a partial file. Failures log at Warn
 // (converged with the other textfile emitters):
-func (r *Runner) writeKernelUtilProm(pids, threads, filefd float64,
-	pidsOK, threadsOK, fdOK bool) {
+func (r *Runner) writeKernelUtilProm(pids, threads, filefd, pty float64,
+	pidsOK, threadsOK, fdOK, ptyOK bool) {
 	var b promfile.Builder
 	if pidsOK {
 		b.Gauge("node_agent_pids_utilization_ratio",
@@ -194,6 +208,10 @@ func (r *Runner) writeKernelUtilProm(pids, threads, filefd float64,
 	if fdOK {
 		b.Gauge("node_agent_file_nr_utilization_ratio",
 			"file-nr allocated over maximum — fd table pressure.", filefd)
+	}
+	if ptyOK {
+		b.Gauge("node_agent_pty_utilization_ratio",
+			"kernel.pty.nr over kernel.pty.max — pty exhaustion pressure.", pty)
 	}
 	dir := r.textfileDir()
 	_ = promfile.WriteLogged(dir,

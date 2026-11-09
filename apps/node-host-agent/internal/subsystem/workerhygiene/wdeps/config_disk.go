@@ -44,6 +44,12 @@ type DiskConfig struct {
 	// (/host/run in the DaemonSet) — the run-tmpfs guard statfs's it
 	// and sweeps orphan .tmp files under it.
 	HostRunDir string
+	// HostShmDir is the host /dev/shm tmpfs as the agent sees it
+	// (/host/dev/shm in the DaemonSet) — the dev-shm guard statfs's
+	// it for the node_agent_dev_shm_used_ratio series (W19-K2: a
+	// full shm wedges every new IPC/shm_open cluster-wide while
+	// disk watermarks stay green).
+	HostShmDir string
 	// JournalVacuumDir is the journal directory passed to
 	// `journalctl --directory= --vacuum-size` by the /run guard —
 	// the HOST view (/run/log/journal): the systemd exec seam runs
@@ -103,6 +109,9 @@ func (d *DiskConfig) applyDefaults() {
 	if d.HostRunDir == "" {
 		d.HostRunDir = defaultHostRunDir
 	}
+	if d.HostShmDir == "" {
+		d.HostShmDir = defaultHostShmDir
+	}
 	if d.JournalVacuumDir == "" {
 		d.JournalVacuumDir = defaultJournalVacuumDir
 	}
@@ -124,6 +133,8 @@ func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 		envx.StringKnob(envnames.EnvLocalPVQuotaDir, &d.LocalPVQuotaDir, ""),
 		envx.StringKnob(envnames.EnvHostRunDir, &d.HostRunDir,
 			hostPath("/run")),
+		envx.StringKnob(envnames.EnvDevShmDir, &d.HostShmDir,
+			hostPath("/dev/shm")),
 		envx.StringKnob(envnames.EnvWLayerSnapshotsDir, &d.WLayerSnapshotsDir,
 			hostPath("/run/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots")),
 		envx.StringKnob(envnames.EnvCoredumpDir, &d.CoredumpDir,

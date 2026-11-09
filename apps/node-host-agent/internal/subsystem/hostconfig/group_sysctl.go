@@ -124,6 +124,23 @@ func (c *cyc) t16Pairs() [][2]string {
 		}
 		p = append(p, v6...)
 	}
+	// pty-exhaustion-guard (W19-KR1): /dev/pts PTY table ceiling — the
+	// stock kernel.pty.max=4096 starves kubectl exec/tty pods and sshd
+	// under churn while the node still reports Ready. Only when the
+	// kernel exposes the pty sysctl (pty compiled out leaves no node;
+	// an unconditional key would fail sysctl --system). Value comes
+	// from the pty_max var (defaults.yaml) with a hardcoded fallback
+	// so an older vars bundle still gets the tuning.
+	if c.r.fileExists("/proc/sys/kernel/pty/max") ||
+		fileExistsNoRoot("/proc/sys/kernel/pty/max") {
+		ptyMax := "16384"
+		if c.t != nil {
+			if v := strings.TrimSpace(c.t.Vars.StrDef("pty_max", "")); v != "" {
+				ptyMax = v
+			}
+		}
+		p = append(p, [2]string{"kernel.pty.max", ptyMax})
+	}
 	return p
 }
 

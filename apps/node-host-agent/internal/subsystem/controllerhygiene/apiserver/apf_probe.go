@@ -47,6 +47,10 @@ const (
 	// apiserver_terminated_watchers_total — the relist-storm 410-Gone
 	// relist-storm signature (watch clients relisting en masse).
 	terminatedWatchersMetric = "node_host_agent_apiserver_terminated_watchers"
+	// apiserverRSSMetric mirrors the local apiserver's
+	// process_resident_memory_bytes (W19-PI2) — kube-apiserver RSS
+	// growth/leak visibility without scraping the static pod.
+	apiserverRSSMetric = "node_host_agent_apiserver_rss_bytes"
 	// logKeyAPFStarve keys the suspectLog dedupe budget for the
 	// reject-growth lines — no dedicated latch, same role as
 	// cdeps.LogKeyDeadFallbk.
@@ -84,6 +88,10 @@ var (
 	// terminated-watch counter (all label variants summed).
 	terminatedWatchersRe = regexp.MustCompile(
 		`(?m)^apiserver_terminated_watchers_total(\{[^}]*\})?\s+([0-9.eE+-]+)`)
+	// apiserverRSSRe extracts process_resident_memory_bytes — the
+	// apiserver's own RSS gauge (W19-PI2).
+	apiserverRSSRe = regexp.MustCompile(
+		`(?m)^process_resident_memory_bytes(\{[^}]*\})?\s+([0-9.eE+-]+)`)
 )
 
 // apfLabel extracts one label value from a `{...}` label set — ""
@@ -136,6 +144,24 @@ func ParseTerminatedWatchers(body string) (total float64, seen bool) {
 		seen = true
 	}
 	return total, seen
+}
+
+// ParseApiserverRSS returns the largest
+// process_resident_memory_bytes sample in the /metrics body — the
+// apiserver exposes one per listener/process label set, so the max
+// is the process's real RSS. seen=false when the family is absent.
+func ParseApiserverRSS(body string) (rss float64, seen bool) {
+	for _, m := range apiserverRSSRe.FindAllStringSubmatch(body, -1) {
+		v, err := strconv.ParseFloat(m[2], 64)
+		if err != nil {
+			continue
+		}
+		if !seen || v > rss {
+			rss = v
+		}
+		seen = true
+	}
+	return rss, seen
 }
 
 // apfKeysSorted returns the map keys in a stable order — the
@@ -202,6 +228,7 @@ func (c *FreezeCheck) apfMetrics(ctx context.Context) (string, error) {
 func (c *FreezeCheck) ProbeAPF(ctx context.Context) {
 	body, err := c.apfMetrics(ctx)
 	if err != nil {
+		c.apiserverRSSSeen = false // blind scrape drops the series
 		c.EmitAPFMetrics(nil, nil, 0, false)
 		logger().Debug("controllerhygiene: apf metrics scrape failed",
 			"error", err)
@@ -209,6 +236,8 @@ func (c *FreezeCheck) ProbeAPF(ctx context.Context) {
 	}
 	rejected, inqueue := ParseAPFMetrics(body)
 	tw, twOK := ParseTerminatedWatchers(body)
+	rss, rssOK := ParseApiserverRSS(body)
+	c.apiserverRSS, c.apiserverRSSSeen = rss, rssOK
 	c.EmitAPFMetrics(rejected, inqueue, tw, twOK)
 
 	// Reject deltas vs the previous scrape — the APF counters are
@@ -301,6 +330,15 @@ func (c *FreezeCheck) EmitAPFMetrics(rejected, inqueue map[APFSeriesKey]float64,
 		p.Line(fmt.Sprintf("%s %s", terminatedWatchersMetric,
 			strconv.FormatFloat(terminatedWatchers, 'f', -1, 64)))
 		c.d.TerminatedWatchersVal.Store(math.Float64bits(terminatedWatchers))
+	}
+	// W19-PI2: apiserver RSS — headers-only when the scrape lacked
+	// the family so a blind scrape drops the series.
+	rssHelp := "kube-apiserver process_resident_memory_bytes " +
+		"mirrored from the local apiserver — RSS growth/leak watch."
+	if !c.apiserverRSSSeen {
+		p.Header(apiserverRSSMetric, rssHelp)
+	} else {
+		p.Gauge(apiserverRSSMetric, rssHelp, c.apiserverRSS)
 	}
 	c.d.WriteTextfileProm(APFPromFile, p.String())
 }
