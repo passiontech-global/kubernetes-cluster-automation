@@ -231,6 +231,56 @@ func TestFluxKustHealthCheckFailedGateRollout(t *testing.T) {
 	}
 }
 
+// The StatefulSet twin of the HealthCheckFailed gate: a ready
+// StatefulSet in the inventory corroborates the failure and admits
+// the nudge; an unready one does not.
+func TestFluxKustHealthCheckFailedGateStatefulSet(t *testing.T) {
+	base := time.Now()
+	mk := func() *unstructured.Unstructured {
+		k := shKust("flux-system", "apps", "False", "HealthCheckFailed",
+			base.Add(-20*time.Minute))
+		_ = unstructured.SetNestedSlice(k.Object, []any{
+			map[string]any{"id": "apps_db_apps_StatefulSet", "v": "v1"},
+		}, "status", "inventory", "entries")
+		return k
+	}
+	readySTS := func(replicas, ready int32) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "db"},
+			Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+			Status:     appsv1.StatefulSetStatus{ReadyReplicas: ready},
+		}
+	}
+
+	// StatefulSet ready → nudge lands.
+	p := testProberDyn(fake.NewSimpleClientset(readySTS(3, 3)),
+		probetest.OpDyn(mk()))
+	p.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck Kustomization must FAIL")
+	}
+	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); !found {
+		t.Fatal("HealthCheckFailed with a ready StatefulSet should be nudged")
+	}
+
+	// StatefulSet unready → no nudge.
+	p = testProberDyn(fake.NewSimpleClientset(readySTS(3, 1)),
+		probetest.OpDyn(mk()))
+	p.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck Kustomization must FAIL")
+	}
+	got, _ = p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
+		Get(ctx, "apps", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); found {
+		t.Fatal("HealthCheckFailed with an unready StatefulSet must not be nudged")
+	}
+}
+
 // Non-nudgeable reasons emit but never patch.
 func TestFluxKustHealthOtherReasonNoNudge(t *testing.T) {
 	base := time.Now()

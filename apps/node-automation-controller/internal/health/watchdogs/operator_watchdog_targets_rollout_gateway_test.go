@@ -75,6 +75,77 @@ func TestCftOwnsGatewayObject(t *testing.T) {
 	}
 }
 
+// cftOwnsRouteParent is the ciliumOwnsRouteParent shape keyed on the
+// Gateway's spec.gatewayClassName directly (the class NAME is the
+// stable identifier — the controller string is chart-version
+// dependent). false requires at least one resolved parent AND none
+// of them cloudflare-tunnel-classed; every failure mode (no refs,
+// missing Gateway, foreign kind/group) keeps the route.
+func TestCftOwnsRouteParent(t *testing.T) {
+	// Parent resolves to a cloudflare-tunnel-class Gateway → owned.
+	p := newGatewayClassAwareProber()
+	putGateway(t, p.Dyn, gwFixture("apps", "gw-cft", cftGatewayClassName, 1))
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, []any{map[string]any{"name": "gw-cft"}})) {
+		t.Fatal("route attached to a cloudflare-tunnel Gateway must be owned by the cft row")
+	}
+
+	// Parent resolves to a foreign-class Gateway → proven foreign.
+	p = newGatewayClassAwareProber()
+	putGateway(t, p.Dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
+	if cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, []any{map[string]any{"name": "gw-cilium"}})) {
+		t.Fatal("route attached to a cilium-class Gateway must NOT be owned by the cft row")
+	}
+
+	// ParentRef names a Gateway that does not exist — attribution
+	// unresolvable → kept.
+	p = newGatewayClassAwareProber()
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, []any{map[string]any{"name": "missing-gw"}})) {
+		t.Fatal("unresolvable parent Gateway must keep the route")
+	}
+
+	// No parentRefs at all → nothing to attribute → kept.
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, nil)) {
+		t.Fatal("route without parentRefs must keep the route")
+	}
+
+	// A parentRef may point across namespaces — the ref's own
+	// namespace field is honored over the route's.
+	p = newGatewayClassAwareProber()
+	putGateway(t, p.Dyn, gwFixture("infra", "gw-cft", cftGatewayClassName, 1))
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1,
+			[]any{map[string]any{"name": "gw-cft", "namespace": "infra"}})) {
+		t.Fatal("cross-namespace cloudflare-tunnel parent must keep the route")
+	}
+
+	// Mixed parents — a foreign parent resolved first must not
+	// short-circuit: one cft parent anywhere wins ownership.
+	p = newGatewayClassAwareProber()
+	putGateway(t, p.Dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
+	putGateway(t, p.Dyn, gwFixture("apps", "gw-cft", cftGatewayClassName, 1))
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, []any{
+			map[string]any{"name": "gw-cilium"},
+			map[string]any{"name": "gw-cft"},
+		})) {
+		t.Fatal("one cloudflare-tunnel parent among resolved parents must keep the route")
+	}
+
+	// Non-Gateway parent kinds (kind/group filters) are skipped
+	// entirely — a Service-only parentRef proves nothing → kept.
+	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+		routeFixture("apps", "r", 1, []any{
+			map[string]any{"name": "backend", "kind": "Service"},
+			map[string]any{"name": "other", "group": "example.io"},
+		})) {
+		t.Fatal("non-Gateway parentRefs must not disprove cft ownership")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // operator-workqueue-watchdog — reason-keyed FirstSeen + ExternalSecret v1beta1 dedup
 // ---------------------------------------------------------------------------

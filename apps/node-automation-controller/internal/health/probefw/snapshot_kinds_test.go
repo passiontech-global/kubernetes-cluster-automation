@@ -19,10 +19,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -414,4 +416,115 @@ func (r *countingNodeReader) List(_ context.Context, list client.ObjectList, _ .
 	nl := list.(*corev1.NodeList)
 	nl.Items = append([]corev1.Node(nil), r.nodes...)
 	return nil
+}
+
+// AllUnstructuredFirst is the multi-served-version census: candidates
+// try in order through the same per-GVR memoizer — a NotFound/NoMatch
+// GVR is "not served" and falls through to the next, the first
+// success wins, and a REAL failure is preferred over benign misses
+// when nothing lists (the caller tells "CRD absent" from "API
+// broken" off the returned error).
+func TestAllUnstructuredFirst(t *testing.T) {
+	hrV2 := schema.GroupVersionResource{
+		Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
+	hrV2beta2 := schema.GroupVersionResource{
+		Group: "helm.toolkit.fluxcd.io", Version: "v2beta2", Resource: "helmreleases"}
+
+	newDeps := func(t *testing.T, objs ...runtime.Object) (*Deps, *int) {
+		t.Helper()
+		dyn := testhelp.NewDynamicClient(objs...)
+		lists := new(int)
+		dyn.PrependReactor("list", "helmreleases",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				*lists++
+				return false, nil, nil
+			})
+		return &Deps{CS: fake.NewSimpleClientset(), Dyn: dyn}, lists
+	}
+
+	hr := testUnstructured(hrV2.GroupVersion().WithKind("HelmRelease"),
+		"flux-system", "web")
+
+	t.Run("first serving GVR wins", func(t *testing.T) {
+		d, lists := newDeps(t, hr)
+		items, gvr, err := d.AllUnstructuredFirst(
+			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2, hrV2beta2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gvr != hrV2 || len(items) != 1 || items[0].GetName() != "web" {
+			t.Fatalf("AllUnstructuredFirst = gvr %v items %v, want v2/web", gvr, items)
+		}
+		if *lists != 1 {
+			t.Fatalf("helmrelease lists = %d, want 1 — v2beta2 must not be probed", *lists)
+		}
+	})
+
+	t.Run("NotFound falls through to the next version", func(t *testing.T) {
+		d, _ := newDeps(t, hr)
+		// v2beta2 not served on this cluster — the v1beta1-style
+		// upgrade shape the fallback exists for. The version-aware
+		// reactor sits in FRONT of the shared counter, so count the
+		// per-version attempts here.
+		attempts := map[string]int{}
+		real := d.Dyn.(*dynamicfake.FakeDynamicClient)
+		real.PrependReactor("list", "helmreleases",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				attempts[a.GetResource().Version]++
+				if a.GetResource().Version == "v2beta2" {
+					return true, nil, apierrors.NewNotFound(
+						schema.GroupResource{Group: "helm.toolkit.fluxcd.io",
+							Resource: "helmreleases"}, "")
+				}
+				return false, nil, nil
+			})
+		items, gvr, err := d.AllUnstructuredFirst(
+			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gvr != hrV2 || len(items) != 1 {
+			t.Fatalf("fallback = gvr %v items %v, want v2", gvr, items)
+		}
+		if attempts["v2beta2"] != 1 || attempts["v2"] != 1 {
+			t.Fatalf("per-version list attempts = %v, want one each", attempts)
+		}
+	})
+
+	t.Run("all versions absent surfaces the benign error", func(t *testing.T) {
+		d, _ := newDeps(t)
+		real := d.Dyn.(*dynamicfake.FakeDynamicClient)
+		real.PrependReactor("list", "helmreleases",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewNotFound(
+					schema.GroupResource{Group: "helm.toolkit.fluxcd.io",
+						Resource: "helmreleases"}, "")
+			})
+		_, _, err := d.AllUnstructuredFirst(
+			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("all-absent error = %v, want NotFound", err)
+		}
+	})
+
+	t.Run("a real failure beats benign misses", func(t *testing.T) {
+		d, _ := newDeps(t)
+		real := d.Dyn.(*dynamicfake.FakeDynamicClient)
+		real.PrependReactor("list", "helmreleases",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				switch a.GetResource().Version {
+				case "v2beta2":
+					return true, nil, apierrors.NewNotFound(
+						schema.GroupResource{Group: "helm.toolkit.fluxcd.io",
+							Resource: "helmreleases"}, "")
+				default:
+					return true, nil, errors.New("apiserver blew up")
+				}
+			})
+		_, _, err := d.AllUnstructuredFirst(
+			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+		if err == nil || apierrors.IsNotFound(err) {
+			t.Fatalf("mixed-failure error = %v, want the real (non-NotFound) error", err)
+		}
+	})
 }

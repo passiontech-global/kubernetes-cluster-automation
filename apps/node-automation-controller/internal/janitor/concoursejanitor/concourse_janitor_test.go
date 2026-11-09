@@ -1282,3 +1282,40 @@ func TestATCClientReLoginFailureErrors(t *testing.T) {
 			s.tokenPOSTs, len(s.workerCalls))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// fetchWorkerLogTail — the production workerLogTail seam: a bounded
+// GetLogs tail of the concourse-worker container. The fake clientset's
+// get/pods/log reactor serves the body; a fetch failure propagates so
+// the caller reads inconclusive, never "no fault".
+// ---------------------------------------------------------------------------
+
+func TestFetchWorkerLogTail(t *testing.T) {
+	pod := cjWorkerPod("worker-1", "uid-1", "node-a", true, nil)
+
+	t.Run("returns the log tail", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+			"line one\nbaggageclaim: failed to create volume: no space\n", nil))
+		j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor",
+			cs: cs, cfg: cjConfig{reqTimeout: 10 * time.Second}}
+		logs, err := j.fetchWorkerLogTail(ctx, pod)
+		if err != nil {
+			t.Fatalf("fetchWorkerLogTail: %v", err)
+		}
+		if !strings.Contains(logs, "baggageclaim") {
+			t.Fatalf("log tail = %q, want the worker log body", logs)
+		}
+	})
+
+	t.Run("fetch failure propagates", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+			"", errors.New("kubelet log read boom")))
+		j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor",
+			cs: cs, cfg: cjConfig{reqTimeout: 10 * time.Second}}
+		if _, err := j.fetchWorkerLogTail(ctx, pod); err == nil {
+			t.Fatal("log fetch failure must propagate")
+		}
+	})
+}

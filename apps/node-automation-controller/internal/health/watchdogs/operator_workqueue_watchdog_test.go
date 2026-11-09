@@ -23,6 +23,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -300,5 +301,66 @@ func TestOperatorCRScanPagesListRequests(t *testing.T) {
 		if !scan.live["cert-manager/certificates/apps/tls/"+reason] {
 			t.Fatalf("stuck Certificate not judged live under %q: %v", reason, scan.live)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// opFrozenFlipZero / carryFrozen — the emitted-ledger prune action and
+// the carry-forward the skip paths re-assert
+// ---------------------------------------------------------------------------
+
+// opFrozenFlipZero is the GaugeLedger delete func: a held "operator/
+// reason" series that stopped being emitted flips to 0 rather than
+// disappearing — the resolved edge stays visible on /metrics.
+func TestOpFrozenFlipZero(t *testing.T) {
+	const (
+		op     = "unit-test-operator"
+		reason = "unit-test-reason"
+	)
+	defer testutil.CleanupMetric(t,
+		operatorWorkqueueFrozenGauge, op, reason)
+	operatorWorkqueueFrozenGauge.WithLabelValues(op, reason).Set(1)
+
+	if !opFrozenFlipZero(op, reason) {
+		t.Fatal("flip must report the series handled (return true)")
+	}
+	m := probetest.FindMetric(t, "node_automation_operator_workqueue_frozen",
+		map[string]string{"operator": op, "reason": reason})
+	if m == nil || m.GetGauge().GetValue() != 0 {
+		t.Fatalf("frozen gauge = %v, want a 0-valued series", m)
+	}
+}
+
+// carryFrozen re-registers one operator's held tuples on the sweep
+// report so the sweep-end prune keeps them — an operator skipped
+// before evaluation (lease read error, dead pod) must not read as
+// "resolved" and flap its series to 0.
+func TestCarryFrozen(t *testing.T) {
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn())
+	chk := probetest.MustCheck[*operatorWorkqueueCheck](t, p)
+
+	// Seed the ledger's emitted set the way a prior sweep's
+	// Reconcile leaves it: two operators' frozen tuples.
+	chk.opFrozen.Reconcile(map[string][]string{
+		"op-a/no_status": {"op-a", "no_status"},
+		"op-b/stale_gen": {"op-b", "stale_gen"},
+	}, func(...string) bool { return true })
+
+	var rep probefw.SweepReport
+	chk.carryFrozen(&rep, "op-a")
+
+	// Only op-a's tuple may be carried — op-b's was never evaluated
+	// either, but carryFrozen is scoped to the skipped operator.
+	if rep.Flagged() != 1 {
+		t.Fatalf("carried tuples = %d, want 1", rep.Flagged())
+	}
+	var ledger state.GaugeLedger[string]
+	rep.Result(&ledger, func(...string) bool { return true }, "", ", ")
+	last := ledger.Last()
+	if _, ok := last["op-a/no_status"]; !ok {
+		t.Fatalf("op-a tuple not carried into the ledger: %v", last)
+	}
+	if _, ok := last["op-b/stale_gen"]; ok {
+		t.Fatalf("op-b tuple leaked into the report: %v", last)
 	}
 }
