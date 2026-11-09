@@ -171,29 +171,3 @@ func TestReadyCountsMemoized(t *testing.T) {
 		t.Fatalf("memoized error differs: %v vs %v", err1, err2)
 	}
 }
-
-func TestMaintenanceActive(t *testing.T) {
-	// A statically-cordoned node (unschedulable, no pre-cordon marker)
-	// holds the mutex.
-	cordoned := gsReadyNodeForSnapshot("n-cordoned")
-	cordoned.Spec.Unschedulable = true
-	g := &Guard{CS: fake.NewSimpleClientset(cordoned), Dyn: testhelp.NewDynWithCRDs(),
-		Now: func() time.Time { return time.Now() }}
-	held, why, err := g.MaintenanceActive(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !held || why == "" {
-		t.Fatalf("cordoned node must hold the mutex: held=%v why=%q", held, why)
-	}
-
-	// A nil dynamic client fails closed — the mutex is unverifiable.
-	gNil := &Guard{CS: fake.NewSimpleClientset(), Now: func() time.Time { return time.Now() }}
-	held, _, err = gNil.MaintenanceActive(context.Background())
-	if err == nil {
-		t.Fatal("nil dyn must fail closed, not report the mutex state")
-	}
-	if held {
-		t.Fatal("unverifiable verdict must not report maintenance active")
-	}
-}

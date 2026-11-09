@@ -101,90 +101,6 @@ type Config struct {
 	Disabled map[string]bool
 }
 
-// parseScalar strips surrounding single/double quotes.
-func parseScalar(v string) string {
-	if len(v) >= 2 {
-		if (v[0] == '"' && v[len(v)-1] == '"') ||
-			(v[0] == '\'' && v[len(v)-1] == '\'') {
-			return v[1 : len(v)-1]
-		}
-	}
-	return v
-}
-
-// parseValue cuts a raw VALUE at the first '#' that opens a bash
-// comment — outside quotes and at a word boundary (value start or
-// after whitespace). A '#' inside quotes or glued to the previous
-// word is literal (KEY="a # b" → `a # b`, KEY=a#b → `a#b`), and a
-// comment after a quoted value is stripped too (KEY="a b" # note →
-// `a b`) — bash `source` parity.
-//
-// Quote characters are consumed as they open/close — bash quote
-// removal happens per word, so KEY="a"#tail yields `a#tail` (the
-// mid-word '#' stays literal) rather than the raw `"a"#tail` a
-// whole-value quote-strip could never see.
-func parseValue(val string) string {
-	var out strings.Builder
-	out.Grow(len(val))
-	var quote byte
-	wordStart := true // the value itself begins a word
-	for i := 0; i < len(val); i++ {
-		ch := val[i]
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
-				continue // closing quote consumed
-			}
-			out.WriteByte(ch)
-			continue
-		}
-		switch ch {
-		case '"', '\'':
-			quote = ch
-			wordStart = false
-			// opening quote consumed — content follows
-		case ' ', '\t':
-			wordStart = true
-			out.WriteByte(ch)
-		case '#':
-			if wordStart {
-				return strings.TrimSpace(out.String())
-			}
-			out.WriteByte(ch)
-		default:
-			wordStart = false
-			out.WriteByte(ch)
-		}
-	}
-	return strings.TrimSpace(out.String())
-}
-
-// parseKV parses shell-style KEY=VALUE lines into a map. An inline
-// `#` comment ends an unquoted value (bash parity); a `#` inside
-// quotes is literal.
-func parseKV(data string) map[string]string {
-	vars := map[string]string{}
-	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if v, ok := strings.CutPrefix(line, "export "); ok {
-			line = strings.TrimSpace(v)
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		vars[key] = parseScalar(parseValue(strings.TrimSpace(val)))
-	}
-	return vars
-}
-
 func wordList(v string) []string {
 	var out []string
 	out = append(out, strings.Fields(v)...)
@@ -265,7 +181,7 @@ func Load(path string) (*Config, error) {
 // shared vars map. Sequencing them in file order keeps the outcome
 // identical to the previous single-pass body.
 func Parse(data []byte) (*Config, error) {
-	vars := parseKV(string(data))
+	vars := fileconf.ParseShellKV(string(data))
 	c := &Config{Disabled: map[string]bool{}}
 	parseOverlayBlock(vars, c)
 	parseDNSBlock(vars, c)

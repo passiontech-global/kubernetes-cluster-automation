@@ -39,7 +39,7 @@ import (
 // closed (the mount may still be real).
 func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
-	livePods map[string]podProbe, stuckReadyPrior map[string]bool,
+	livePods map[string]podListProbe, stuckReadyPrior map[string]bool,
 	now time.Time) bool {
 	log := logf.FromContext(ctx)
 	node, ok := nodeByName[va.Spec.NodeName]
@@ -168,12 +168,35 @@ func (c *volumeAttachmentCleaner) forgetSettledStuckReady(
 // read fails closed.
 
 // podListProbe caches one node's full pod LIST for the cycle —
-// several VAs share a node and the ready-node gate inspects pod
-// volumes, not just counts. reported marks an already-metered err.
+// several VAs share a node, the ready-node gate inspects pod
+// volumes rather than just counts, and the fenced gate's live count
+// reads the same slice. reported marks an already-metered err.
 type podListProbe struct {
 	pods     []corev1.Pod
 	err      error
 	reported bool
+}
+
+// nodePodList is the single per-cycle pod list every gate reads —
+// one apiserver ListAll per node per sweep, however many gates
+// (fenced live-count, stuck-Terminating mounted-claim scan) consume
+// it. Error is cached with the probe: a failed list fails every
+// consumer closed for the cycle without re-hitting the apiserver.
+func (c *volumeAttachmentCleaner) nodePodList(ctx context.Context,
+	cache map[string]podListProbe, node string) (podListProbe, error) {
+	if pr, ok := cache[node]; ok {
+		return pr, pr.err
+	}
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + node,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(c.cs, metav1.NamespaceAll))
+	if err != nil {
+		err = fmt.Errorf("list pods on %s: %w", node, err)
+	}
+	pr := podListProbe{pods: pods, err: err}
+	cache[node] = pr
+	return pr, err
 }
 
 // pvcProbe caches one PVC's bound spec.volumeName for the cycle —
@@ -232,19 +255,8 @@ func (c *volumeAttachmentCleaner) podsUsingVolume(ctx context.Context,
 	nodePods map[string]podListProbe, pvcPVs map[string]pvcProbe,
 	node, pvName string, log logr.Logger) (int, error) {
 
-	pr, ok := nodePods[node]
-	if !ok {
-		pods, err := kube.ListAll(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + node,
-			Limit:         kube.DefaultListPageSize,
-		}, kube.Pods(c.cs, metav1.NamespaceAll))
-		if err != nil {
-			err = fmt.Errorf("list pods on %s: %w", node, err)
-		}
-		pr = podListProbe{pods: pods, err: err}
-		nodePods[node] = pr
-	}
-	if pr.err != nil {
+	pr, err := c.nodePodList(ctx, nodePods, node)
+	if err != nil {
 		if !pr.reported {
 			pr.reported = true
 			nodePods[node] = pr

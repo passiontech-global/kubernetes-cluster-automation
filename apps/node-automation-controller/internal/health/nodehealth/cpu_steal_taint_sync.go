@@ -120,7 +120,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 		// zombie — never taint on it. The latch reads as cleared (the
 		// untaint path's own 10m clear window still applies before
 		// the taint lifts).
-		if !condHeartbeatLive(c, now) {
+		if !kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 			continue
 		}
 		condTrue[n.Name] = true
@@ -257,7 +257,8 @@ func (p *cpuStealTaintSyncCheck) stealHealthyWorkers(nodes []corev1.Node, exclud
 			continue
 		}
 		if c := kube.NodeCondition(w, cpuStealCond); c != nil &&
-			c.Status == corev1.ConditionTrue && condHeartbeatLive(c, now) {
+			c.Status == corev1.ConditionTrue &&
+			kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 			continue // pressured at any age is not healthy headroom
 		}
 		n++

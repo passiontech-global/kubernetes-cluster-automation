@@ -26,12 +26,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -222,24 +222,19 @@ func (c *FreezeCheck) loadKCMSnapshot() *KCMQueueSnapshot {
 	return &s
 }
 
-// saveKCMSnapshot persists the scrape atomically (tmp+rename — the
-// writeEpochFile contract; a torn JSON just reads as "no baseline"
-// next cycle).
+// saveKCMSnapshot persists the scrape atomically — the
+// hostutil.WriteFileAtomic contract (a torn JSON just reads as
+// "no baseline" next cycle; the shared primitive adds the payload
+// fsync + dir sync the hand-rolled tmp+rename lacked).
 func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
 	b, err := json.Marshal(s)
 	if err != nil {
 		return
 	}
-	dir := c.d.State.Dir
-	tmp := filepath.Join(dir, ".tmp-"+cdeps.FileKCMQueueSnap)
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	path := filepath.Join(c.d.State.Dir, cdeps.FileKCMQueueSnap)
+	if err := hostutil.WriteFileAtomicBytes(path, b); err != nil {
 		logger().Warn("controllerhygiene: kcm snapshot write failed",
-			"path", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, cdeps.FileKCMQueueSnap)); err != nil {
-		logger().Warn("controllerhygiene: kcm snapshot install failed",
-			"error", err)
+			"path", path, "error", err)
 	}
 }
 

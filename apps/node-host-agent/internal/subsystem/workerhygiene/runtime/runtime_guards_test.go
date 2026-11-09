@@ -323,7 +323,7 @@ func TestLocalPVQuotaThrottle(t *testing.T) {
 		TasksOnce: func() (map[string][]wdeps.CtrTask, bool) {
 			return tasks, true
 		}}
-	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).Run(ctx, ce)
+	wdepstest.Check[*runtime.LocalPVQuotaCheck](h, wdeps.CheckLocalPVQuota).Run(ctx, ce)
 	if !reniced[7777] || !ioniced[7777] {
 		t.Fatalf("tasks not deprioritized: renice=%v ionice=%v", reniced, ioniced)
 	}
@@ -342,7 +342,7 @@ func TestLocalPVQuotaThrottle(t *testing.T) {
 	}
 	// Below-pressure run must not re-throttle the ledger entry.
 	e.DiskUsed = 0.50
-	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).Run(ctx, ce)
+	wdepstest.Check[*runtime.LocalPVQuotaCheck](h, wdeps.CheckLocalPVQuota).Run(ctx, ce)
 	if h.LocalPVQuotaThrottled != 1 {
 		t.Fatalf("throttled=%d want 1 (ledger)", h.LocalPVQuotaThrottled)
 	}
@@ -377,7 +377,7 @@ func TestLocalPVQuotaNoDirsSkipsAPI(t *testing.T) {
 		}
 		return pvN, pvcN
 	}
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(),
+	e.H.Check(wdeps.CheckLocalPVQuota).Run(context.Background(),
 		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
 	if pvN, pvcN := lists(); pvN != 0 || pvcN != 0 {
 		t.Fatalf("no-dir cycle issued API lists: pv=%d pvc=%d", pvN, pvcN)
@@ -388,7 +388,7 @@ func TestLocalPVQuotaNoDirsSkipsAPI(t *testing.T) {
 		filepath.Join(e.H.Cfg.Disk.LocalPVQuotaDir, "pvc-abc123"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(),
+	e.H.Check(wdeps.CheckLocalPVQuota).Run(context.Background(),
 		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
 	pvN, pvcN := lists()
 	if pvN != 1 || pvcN != 1 {
@@ -425,7 +425,7 @@ func TestRunTmpfsGuard(t *testing.T) {
 	_ = os.Chtimes(old, past, past)
 
 	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: false}
-	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).Run(ctx, ce)
+	wdepstest.Check[*runtime.RunTmpfsCheck](h, wdeps.CheckRunTmpfs).Run(ctx, ce)
 	if h.RunTmpfsUsedRatio < 0.84 {
 		t.Fatalf("RunTmpfsUsedRatio=%v want ~0.85", h.RunTmpfsUsedRatio)
 	}
@@ -443,7 +443,7 @@ func TestRunTmpfsGuard(t *testing.T) {
 	}
 	// 15m cooldown: second cycle does not re-vacuum.
 	nCmds := len(e.SDCmds)
-	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).Run(ctx, ce)
+	wdepstest.Check[*runtime.RunTmpfsCheck](h, wdeps.CheckRunTmpfs).Run(ctx, ce)
 	if len(e.SDCmds) != nCmds {
 		t.Fatal("vacuum re-ran inside the 15m budget")
 	}
@@ -493,7 +493,7 @@ func TestRunTmpfsGuardSkipsOpenFD(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).
+	wdepstest.Check[*runtime.RunTmpfsCheck](h, wdeps.CheckRunTmpfs).
 		Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: false})
 	if _, err := os.Stat(held); err != nil {
 		t.Fatalf("open .tmp swept despite held fd: %v", err)

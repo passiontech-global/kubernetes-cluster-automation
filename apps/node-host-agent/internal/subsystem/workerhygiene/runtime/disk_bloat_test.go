@@ -156,7 +156,7 @@ func TestWLayerSnapshotBloatEmitsEvent(t *testing.T) {
 	small := filepath.Join(snapRoot, "43", "fs")
 	wdepstest.WriteFile(t, filepath.Join(small, "tiny"), "x")
 
-	chk := e.H.Check(wdeps.CheckDiskBloat)
+	chk := e.H.Check(wdeps.CheckWritableLayer)
 	chk.Run(context.Background(), &wdeps.CycleEnv{
 		Pods:  []corev1.Pod{wlayerPod("nolimit", "uid-aaaa", false)},
 		APIOK: true, WorkerActive: true,
@@ -200,7 +200,7 @@ func TestWLayerPodScopedEventAndLimitExempt(t *testing.T) {
 
 	pod := wlayerPod("nolimit", uid, false)
 	limPod := wlayerPod("limit", limUID, true)
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
+	e.H.Check(wdeps.CheckWritableLayer).Run(context.Background(), &wdeps.CycleEnv{
 		Pods:  []corev1.Pod{pod, limPod},
 		APIOK: true, WorkerActive: true,
 	})
@@ -222,7 +222,7 @@ func TestWLayerPodVolumeBloatEmitsEvent(t *testing.T) {
 		"kubernetes.io~empty-dir", "cache")
 	wdepstest.WriteFile(t, filepath.Join(vol, "big"), strings.Repeat("x", 200))
 
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
+	e.H.Check(wdeps.CheckWritableLayer).Run(context.Background(), &wdeps.CycleEnv{
 		Pods:  []corev1.Pod{wlayerPod("volpod", uid, false)},
 		APIOK: true, WorkerActive: true,
 	})
@@ -247,8 +247,8 @@ func TestWLayerScanIntervalBudgeted(t *testing.T) {
 		Pods:  []corev1.Pod{wlayerPod("nolimit", "uid-zzzz", false)},
 		APIOK: true, WorkerActive: true,
 	}
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(), ce)
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(), ce)
+	e.H.Check(wdeps.CheckWritableLayer).Run(context.Background(), ce)
+	e.H.Check(wdeps.CheckWritableLayer).Run(context.Background(), ce)
 	evs, _ := e.CS.EventsV1().Events("default").List(context.Background(),
 		metav1.ListOptions{})
 	if len(evs.Items) != 1 {
@@ -256,7 +256,7 @@ func TestWLayerScanIntervalBudgeted(t *testing.T) {
 	}
 	// Past the budget a fresh event is allowed again.
 	e.Now = e.Now.Add(16 * time.Minute)
-	e.H.Check(wdeps.CheckDiskBloat).Run(context.Background(), ce)
+	e.H.Check(wdeps.CheckWritableLayer).Run(context.Background(), ce)
 	evs, _ = e.CS.EventsV1().Events("default").List(context.Background(),
 		metav1.ListOptions{})
 	if len(evs.Items) != 2 {

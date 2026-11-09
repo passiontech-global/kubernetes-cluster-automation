@@ -210,7 +210,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// cached too (nil pods + err): without it every VA on one
 	// fenced node would re-issue the same failing List and each
 	// bump IncError.
-	livePods := map[string]podProbe{}
+	livePods := map[string]podListProbe{}
 	// nodePods caches the full per-node pod LIST for the Ready-node
 	// unused-volume gate (a pod's volumes — not just its count —
 	// must be inspected). pvcPVs/pvNames memoize the per-cycle PVC

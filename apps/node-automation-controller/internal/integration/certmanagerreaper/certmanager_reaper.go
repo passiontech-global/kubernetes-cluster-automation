@@ -137,7 +137,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	r.orderCache = map[string]*orderIndex{}
 	now := r.now.Now()
 
-	certs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+	certs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list certificates: %w", err)

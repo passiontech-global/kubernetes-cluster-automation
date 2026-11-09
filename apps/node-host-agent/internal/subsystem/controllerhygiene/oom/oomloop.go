@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -237,14 +238,9 @@ func (c *LoopCheck) pruneKills(killsPath string, now int64) int {
 	if len(kept) > 0 {
 		content = strings.Join(kept, "\n") + "\n"
 	}
-	tmp := killsPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+	if err := hostutil.WriteFileAtomic(killsPath, content); err != nil {
 		c.d.State.AppendLogWarn(fmt.Sprintf(
 			"oomloop: kills file %s rewrite failed: %v — stale entries persist",
-			killsPath, err))
-	} else if err := os.Rename(tmp, killsPath); err != nil {
-		c.d.State.AppendLogWarn(fmt.Sprintf(
-			"oomloop: kills file %s install failed: %v — stale entries persist",
 			killsPath, err))
 	}
 	return len(kept)

@@ -34,17 +34,24 @@ const (
 	CheckCiliumMTU   = "cilium-mtu"         // B4
 	CheckCiliumWG    = "cilium-wg-peers"    // cilium-wg-peer-gc
 	CheckDiskBloat   = "disk-bloat"
-	CheckDState      = "d-state-storm"
-	CheckSysScopes   = "systemd-scopes"
-	CheckCiliumLRP   = "cilium-lrp-dns" // envoy-xds-lrp
-	CheckSpegel      = "spegel-mirror"
-	CheckCalico      = "calico-hygiene"
-	CheckCiliumBPF   = "cilium-bpf-maps" // mesh-net-guards (inside CheckCilium)
-	CheckPSIThrash   = "psi-memory-thrash"
-	CheckCNINetns    = "cni-netns-gc"    // orphan /run/netns/cni-* reaper
-	CheckCtrMeta     = "containerd-meta" // meta-db-corruption meta.db corruption + orphan shims
-	CheckHostOOM     = "host-oom"        // kernel-dmesg SystemOOMVictim event + metric
-	CheckOrphanHP    = "orphan-hostpath" // orphan-hostpath orphaned pvc-* hostPath dirs
+	// Disk side-guards — each its own check so WD_SIG_<NAME> and
+	// cycles{check,result} can gate/report them independently.
+	CheckRunTmpfs      = "run-tmpfs-guard"
+	CheckDevShm        = "dev-shm"
+	CheckLocalPVQuota  = "localpv-quota"
+	CheckCoredumpGC    = "coredump-gc"
+	CheckWritableLayer = "writable-layer-scan"
+	CheckDState        = "d-state-storm"
+	CheckSysScopes     = "systemd-scopes"
+	CheckCiliumLRP     = "cilium-lrp-dns" // envoy-xds-lrp
+	CheckSpegel        = "spegel-mirror"
+	CheckCalico        = "calico-hygiene"
+	CheckCiliumBPF     = "cilium-bpf-maps" // mesh-net-guards (inside CheckCilium)
+	CheckPSIThrash     = "psi-memory-thrash"
+	CheckCNINetns      = "cni-netns-gc"    // orphan /run/netns/cni-* reaper
+	CheckCtrMeta       = "containerd-meta" // meta-db-corruption meta.db corruption + orphan shims
+	CheckHostOOM       = "host-oom"        // kernel-dmesg SystemOOMVictim event + metric
+	CheckOrphanHP      = "orphan-hostpath" // orphan-hostpath orphaned pvc-* hostPath dirs
 	// Runtime-resource guards (runtime package).
 	CheckCgroupDying       = "cgroup-dying-reclaim"        // nr_dying_descendants reclaim
 	CheckSystemdSessions   = "systemd-session-hygiene"     // logind session janitor

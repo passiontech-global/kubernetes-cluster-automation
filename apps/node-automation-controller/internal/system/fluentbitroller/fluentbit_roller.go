@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -250,6 +251,9 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		return res, nil
 	}
 	restartPatch, err := restartWithHashPatch(r.now.Now(), hash)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("render restart patch: %w", err)
+	}
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
@@ -296,7 +300,7 @@ func restartWithHashPatch(ts time.Time, hash string) ([]byte, error) {
 	meta, _ := tmpl["metadata"].(map[string]any)
 	annos, _ := meta["annotations"].(map[string]any)
 	if annos == nil {
-		return nil, fmt.Errorf("restart template patch: unexpected shape (missing pod-template annotations)")
+		return nil, errors.New("restart template patch: unexpected shape (missing pod-template annotations)")
 	}
 	annos[kube.AnnoRolledConfigHash] = hash
 	return json.Marshal(doc)

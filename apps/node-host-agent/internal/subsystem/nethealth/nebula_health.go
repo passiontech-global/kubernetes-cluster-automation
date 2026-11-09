@@ -178,165 +178,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	// Dataplane probes — ONLY while nebula is the active overlay.
 	if reason == "" && wd.OverlayActive == "nebula" &&
 		(len(wd.OverlayProbeTargets)+len(wd.OverlayProbeMarkers)) > 0 {
-		count := wd.OverlayProbeCount
-		if count <= 0 {
-			count = 3
-		}
-		wait := wd.OverlayProbeWait
-		if wait <= 0 {
-			wait = 4
-		}
-		// Parallel fanout like wd_ping_fanout — serial pings would
-		// blow the check budget on a large mesh.
-		targets := append(append(append([]string{},
-			wd.OverlayProbeTargets...),
-			wd.OverlayProbeMarkers...),
-			wd.OverlaySiteMarkers...)
-		results := map[string]pingResult{}
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for _, t := range targets {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				ok, rtt := n.cfg.ping(ctx, t, count, wait, false)
-				mu.Lock()
-				results[t] = pingResult{ok, rtt}
-				mu.Unlock()
-			}()
-		}
-		wg.Wait()
-
-		dpAlive, dpTotal := 0, 0
-		// nebula-conntrack-flush: record WHICH peers failed this round — the
-		// degraded/siteedge remediation needs the dead set to evict
-		// only their conntrack tuples, never a live peer's.
-		var deadUnderlay, deadOverlay []string
-		for _, t := range wd.OverlayProbeTargets {
-			dpTotal++
-			if results[t].ok {
-				dpAlive++
-			} else {
-				deadUnderlay = append(deadUnderlay, t)
-			}
-		}
-		mkAlive, mkTotal := 0, 0
-		var slowpath []string
-		slowSet := map[string]bool{}
-		for _, t := range wd.OverlaySlowpathMarkers {
-			slowSet[t] = true
-		}
-		for _, t := range wd.OverlayProbeMarkers {
-			mkTotal++
-			r := results[t]
-			if !r.ok {
-				deadOverlay = append(deadOverlay, t)
-				continue
-			}
-			mkAlive++
-			if slowSet[t] && r.rtt >= 0 && r.rtt > wd.OverlaySlowpathRTTms {
-				slowpath = append(slowpath, fmt.Sprintf("%s=%.1fms", t, r.rtt))
-			}
-		}
-		if len(slowpath) > 0 {
-			n.state.SuspectLog(latchdefs.LatchNebulaSlowpath, "suspect: "+
-				latchdefs.ReasonNebulaDataplaneSlowpath+" (reroute via remote site) "+
-				strings.Join(slowpath, " "), suspectLogCadence)
-			n.state.Enter(latchdefs.LatchNebulaSlowpath, strings.Join(slowpath, " "))
-		} else {
-			n.stateExit(latchdefs.LatchNebulaSlowpath)
-		}
-		if len(wd.OverlaySiteMarkers) > 0 {
-			var siteedge []string
-			for _, t := range wd.OverlaySiteMarkers {
-				r := results[t]
-				if !r.ok {
-					siteedge = append(siteedge, t+"=dead")
-					deadOverlay = append(deadOverlay, t)
-					continue
-				}
-				if r.rtt >= 0 && r.rtt > wd.OverlaySiteedgeRTTms {
-					siteedge = append(siteedge, fmt.Sprintf("%s=%.1fms", t, r.rtt))
-				}
-			}
-			if len(siteedge) > 0 {
-				// The siteedge latch still arms on the first
-				// detection (a lost site edge is urgent evidence);
-				// nebulaSiteedgeRun is the nebula-conntrack-flush confirmation
-				// counter the per-peer flush waits on — same
-				// ConsecNeeded gate the degraded path carries.
-				n.nebulaSiteedgeRun++
-				n.state.SuspectLog(latchdefs.LatchNebulaSiteedge, "suspect: "+
-					latchdefs.ReasonNebulaSiteedgeDegraded+" (site-mesh edge lost) "+
-					strings.Join(siteedge, " "), suspectLogCadence)
-				n.state.Enter(latchdefs.LatchNebulaSiteedge, strings.Join(siteedge, " "))
-			} else {
-				n.nebulaSiteedgeRun = 0
-				n.stateExit(latchdefs.LatchNebulaSiteedge)
-			}
-		} else {
-			n.nebulaSiteedgeRun = 0
-		}
-		switch {
-		case (dpTotal > 0 && dpAlive == 0) || (mkTotal > 0 && mkAlive == 0):
-			reason = fmt.Sprintf("nebula-dataplane-dead pub=%d/%d marker=%d/%d",
-				dpAlive, dpTotal, mkAlive, mkTotal)
-			dpFail = true
-			n.nebulaDeg = 0
-			n.stateExit(latchdefs.LatchNebulaDegraded)
-			if !n.state.Exists(latchdefs.LatchNebulaIsolated) {
-				// B3: on the isolation edge the conntrack entries
-				// learned on the dead path keep the tunnel blackholed
-				// — drop each affected peer's udp/<nebula-port>
-				// entries to force re-handshake immediately. The peer
-				// set is the FULL known set on purpose: whole-node
-				// isolation means every peer's conntrack is stale.
-				// NB: the disk latch means the edge won't refire
-				// after an agent restart while already isolated —
-				// acceptable (restart clears in-memory state but the
-				// stale flows have long expired by then).
-				n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
-			}
-			n.state.Enter(latchdefs.LatchNebulaIsolated, "dataplane dead")
-		case dpTotal-dpAlive >= 2 || mkTotal-mkAlive >= 2:
-			n.nebulaDeg++
-			need := wd.NebulaDegradedConsec
-			if need <= 0 {
-				need = 2
-			}
-			n.state.SuspectLog(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
-				"suspect: "+latchdefs.ReasonNebulaDataplaneDegraded+
-					" pub=%d/%d marker=%d/%d (run %d/%d)",
-				dpAlive, dpTotal, mkAlive, mkTotal, n.nebulaDeg, need),
-				suspectLogCadence)
-			if n.nebulaDeg >= need {
-				n.state.Enter(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
-					"pub=%d/%d marker=%d/%d", dpAlive, dpTotal, mkAlive, mkTotal))
-			}
-		default:
-			n.nebulaDeg = 0
-			n.stateExit(latchdefs.LatchNebulaDegraded)
-			n.stateExit(latchdefs.LatchNebulaIsolated)
-		}
-		// nebula-conntrack-flush: a partially-dead dataplane leaves the dead
-		// peers' udp/<nebula-port> conntrack pinning the tunnel
-		// long after the underlay recovers — the old code only
-		// latched and waited for full isolation before any flush.
-		// Only the degraded/siteedge (partial death) case applies
-		// here — the dataplane-dead branch above owns the
-		// all-dead full-set flush already.
-		isolated := (dpTotal > 0 && dpAlive == 0) ||
-			(mkTotal > 0 && mkAlive == 0)
-		if !isolated {
-			n.flushDeadNebulaPeers(ctx, wd, deadUnderlay, deadOverlay)
-		}
-		// overlay-mtu-guard: small-packet pings can pass while a DF probe at
-		// near-MTU size blackholes — the double-encap path MTU
-		// sits below the overlay's. Only evaluated when at least
-		// one overlay target answered the small pings; total
-		// overlay failure belongs to the isolated/degraded
-		// verdicts above, not to a PMTU latch.
-		n.checkNebulaPMTU(ctx, targets, results)
+		targets, results := n.probeNebulaOverlay(ctx, wd)
+		reason, dpFail = n.evalNebulaOverlay(ctx, wd, targets, results)
 	} else {
 		// overlay != nebula (or no probe config): don't probe through
 		// the other overlay — clear leftover dataplane states.
@@ -382,6 +225,228 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			reason, *fails, n.cfg.ConsecNeeded), suspectLogCadence)
 	}
 	n.cycles.WithLabelValues(checkNebula, "ok").Inc()
+}
+
+// nebulaOverlayStats is the aggregated dataplane-probe outcome the
+// latch/verdict/remediate phases consume: per-class alive/total
+// counts, the dead-peer sets (nebula-conntrack-flush evicts only
+// these), and the slowpath/siteedge evidence strings.
+type nebulaOverlayStats struct {
+	dpAlive, dpTotal int
+	mkAlive, mkTotal int
+	deadUnderlay     []string
+	deadOverlay      []string
+	slowpath         []string
+	siteedge         []string
+}
+
+// probeNebulaOverlay runs the parallel dataplane fanout — serial
+// pings would blow the check budget on a large mesh (wd_ping_fanout
+// parity). Returns the probed target list (PMTU consumes it) and
+// the per-target pingResult map.
+func (n *NetHealth) probeNebulaOverlay(ctx context.Context,
+	wd *watchdogconf.Config) ([]string, map[string]pingResult) {
+
+	count := wd.OverlayProbeCount
+	if count <= 0 {
+		count = 3
+	}
+	wait := wd.OverlayProbeWait
+	if wait <= 0 {
+		wait = 4
+	}
+	targets := append(append(append([]string{},
+		wd.OverlayProbeTargets...),
+		wd.OverlayProbeMarkers...),
+		wd.OverlaySiteMarkers...)
+	results := map[string]pingResult{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, rtt := n.cfg.ping(ctx, t, count, wait, false)
+			mu.Lock()
+			results[t] = pingResult{ok, rtt}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return targets, results
+}
+
+// aggregateNebulaOverlay folds the fanout results into per-class
+// counts + dead-peer sets + the slowpath/siteedge evidence lists.
+func aggregateNebulaOverlay(wd *watchdogconf.Config,
+	results map[string]pingResult) *nebulaOverlayStats {
+
+	st := &nebulaOverlayStats{}
+	for _, t := range wd.OverlayProbeTargets {
+		st.dpTotal++
+		if results[t].ok {
+			st.dpAlive++
+		} else {
+			st.deadUnderlay = append(st.deadUnderlay, t)
+		}
+	}
+	slowSet := map[string]bool{}
+	for _, t := range wd.OverlaySlowpathMarkers {
+		slowSet[t] = true
+	}
+	for _, t := range wd.OverlayProbeMarkers {
+		st.mkTotal++
+		r := results[t]
+		if !r.ok {
+			st.deadOverlay = append(st.deadOverlay, t)
+			continue
+		}
+		st.mkAlive++
+		if slowSet[t] && r.rtt >= 0 && r.rtt > wd.OverlaySlowpathRTTms {
+			st.slowpath = append(st.slowpath,
+				fmt.Sprintf("%s=%.1fms", t, r.rtt))
+		}
+	}
+	for _, t := range wd.OverlaySiteMarkers {
+		r := results[t]
+		if !r.ok {
+			st.siteedge = append(st.siteedge, t+"=dead")
+			st.deadOverlay = append(st.deadOverlay, t)
+			continue
+		}
+		if r.rtt >= 0 && r.rtt > wd.OverlaySiteedgeRTTms {
+			st.siteedge = append(st.siteedge,
+				fmt.Sprintf("%s=%.1fms", t, r.rtt))
+		}
+	}
+	return st
+}
+
+// latchNebulaOverlayPaths applies the path-quality evidence
+// latches — slowpath and siteedge arm on first detection (a lost
+// site edge is urgent evidence) while the degraded/isolated
+// verdicts live in nebulaOverlayVerdict.
+func (n *NetHealth) latchNebulaOverlayPaths(wd *watchdogconf.Config,
+	st *nebulaOverlayStats) {
+
+	if len(st.slowpath) > 0 {
+		n.state.SuspectLog(latchdefs.LatchNebulaSlowpath, "suspect: "+
+			latchdefs.ReasonNebulaDataplaneSlowpath+" (reroute via remote site) "+
+			strings.Join(st.slowpath, " "), suspectLogCadence)
+		n.state.Enter(latchdefs.LatchNebulaSlowpath, strings.Join(st.slowpath, " "))
+	} else {
+		n.stateExit(latchdefs.LatchNebulaSlowpath)
+	}
+	if len(wd.OverlaySiteMarkers) > 0 {
+		if len(st.siteedge) > 0 {
+			// nebulaSiteedgeRun is the nebula-conntrack-flush confirmation
+			// counter the per-peer flush waits on — same
+			// ConsecNeeded gate the degraded path carries.
+			n.nebulaSiteedgeRun++
+			n.state.SuspectLog(latchdefs.LatchNebulaSiteedge, "suspect: "+
+				latchdefs.ReasonNebulaSiteedgeDegraded+" (site-mesh edge lost) "+
+				strings.Join(st.siteedge, " "), suspectLogCadence)
+			n.state.Enter(latchdefs.LatchNebulaSiteedge, strings.Join(st.siteedge, " "))
+		} else {
+			n.nebulaSiteedgeRun = 0
+			n.stateExit(latchdefs.LatchNebulaSiteedge)
+		}
+	} else {
+		n.nebulaSiteedgeRun = 0
+	}
+}
+
+// nebulaOverlayVerdict is the isolated/degraded/healthy switch —
+// returns the failure reason + dpFail flag (which failure counter
+// owns the streak) + whether the dataplane is fully isolated (the
+// dead-peer flush gate).
+func (n *NetHealth) nebulaOverlayVerdict(ctx context.Context,
+	wd *watchdogconf.Config, st *nebulaOverlayStats) (reason string,
+	dpFail, isolated bool) {
+
+	switch {
+	case (st.dpTotal > 0 && st.dpAlive == 0) ||
+		(st.mkTotal > 0 && st.mkAlive == 0):
+		reason = fmt.Sprintf("nebula-dataplane-dead pub=%d/%d marker=%d/%d",
+			st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal)
+		dpFail = true
+		isolated = true
+		n.nebulaDeg = 0
+		n.stateExit(latchdefs.LatchNebulaDegraded)
+		if !n.state.Exists(latchdefs.LatchNebulaIsolated) {
+			// B3: on the isolation edge the conntrack entries
+			// learned on the dead path keep the tunnel blackholed
+			// — drop each affected peer's udp/<nebula-port>
+			// entries to force re-handshake immediately. The peer
+			// set is the FULL known set on purpose: whole-node
+			// isolation means every peer's conntrack is stale.
+			// NB: the disk latch means the edge won't refire
+			// after an agent restart while already isolated —
+			// acceptable (restart clears in-memory state but the
+			// stale flows have long expired by then).
+			n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
+		}
+		n.state.Enter(latchdefs.LatchNebulaIsolated, "dataplane dead")
+	case st.dpTotal-st.dpAlive >= 2 || st.mkTotal-st.mkAlive >= 2:
+		n.nebulaDeg++
+		need := wd.NebulaDegradedConsec
+		if need <= 0 {
+			need = 2
+		}
+		n.state.SuspectLog(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
+			"suspect: "+latchdefs.ReasonNebulaDataplaneDegraded+
+				" pub=%d/%d marker=%d/%d (run %d/%d)",
+			st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal,
+			n.nebulaDeg, need), suspectLogCadence)
+		if n.nebulaDeg >= need {
+			n.state.Enter(latchdefs.LatchNebulaDegraded, fmt.Sprintf(
+				"pub=%d/%d marker=%d/%d",
+				st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal))
+		}
+	default:
+		n.nebulaDeg = 0
+		n.stateExit(latchdefs.LatchNebulaDegraded)
+		n.stateExit(latchdefs.LatchNebulaIsolated)
+	}
+	return reason, dpFail, isolated
+}
+
+// remediateNebulaOverlay runs the partial-death remediation —
+// nebula-conntrack-flush evicts ONLY the dead peers' udp/<port>
+// tuples (a live peer's flows are never touched), and the
+// overlay-mtu-guard PMTU probe runs only when at least one
+// overlay target answered the small pings.
+func (n *NetHealth) remediateNebulaOverlay(ctx context.Context,
+	wd *watchdogconf.Config, targets []string,
+	results map[string]pingResult, st *nebulaOverlayStats,
+	isolated bool) {
+
+	// Only the degraded/siteedge (partial death) case applies
+	// here — the dataplane-dead branch owns the all-dead
+	// full-set flush already.
+	if !isolated {
+		n.flushDeadNebulaPeers(ctx, wd, st.deadUnderlay, st.deadOverlay)
+	}
+	// overlay-mtu-guard: small-packet pings can pass while a DF
+	// probe at near-MTU size blackholes — the double-encap path
+	// MTU sits below the overlay's. Total overlay failure belongs
+	// to the isolated/degraded verdicts above, not to a PMTU latch.
+	n.checkNebulaPMTU(ctx, targets, results)
+}
+
+// evalNebulaOverlay is the dataplane evaluation pipeline:
+// aggregate → path latches → isolated/degraded verdict →
+// partial-death remediation. Returns the failure reason + dpFail
+// flag for the caller's restart/suspect tail.
+func (n *NetHealth) evalNebulaOverlay(ctx context.Context,
+	wd *watchdogconf.Config, targets []string,
+	results map[string]pingResult) (reason string, dpFail bool) {
+
+	st := aggregateNebulaOverlay(wd, results)
+	n.latchNebulaOverlayPaths(wd, st)
+	reason, dpFail, isolated := n.nebulaOverlayVerdict(ctx, wd, st)
+	n.remediateNebulaOverlay(ctx, wd, targets, results, st, isolated)
+	return reason, dpFail
 }
 
 // checkNebulaPMTU is the overlay-mtu-guard double-encapsulation PMTU probe:

@@ -290,99 +290,14 @@ func (r *Reporter) syncLogEvents(ctx context.Context) error {
 // partial line (the .1 tail continues it).
 func (r *Reporter) readNewLogLines() ([][]byte, int, error) {
 	replayAll := !r.logScanned
-	fi, err := os.Stat(r.cfg.WatchdogLogFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, 0, nil
-		}
-		return nil, 0, fmt.Errorf("stat %s: %w", r.cfg.WatchdogLogFile, err)
+	win, err := r.readLogWindow()
+	if err != nil || win == nil {
+		return nil, 0, err
 	}
-	var tail []byte // unread bytes of the rotated .1 generation
-	rotated, noTail := false, false
-	if fi.Size() < r.logOffset {
-		rotated = true
-		logger().Debug("nodereporter: watchdog log rotated — draining "+
-			"the .1 tail, offset reset", "file", r.cfg.WatchdogLogFile,
-			"oldOffset", r.logOffset, "size", fi.Size())
-		// The .1 tail continues r.logPending (the partial line the
-		// old generation never terminated) — read it BEFORE clearing
-		// anything. The carry survives only when the tail actually
-		// carries its continuation; an absent/empty tail (in-place
-		// rewrite, .1 already gone or fully consumed) means the
-		// partial line can never complete — keeping it would
-		// concatenate the fresh file's first line onto a dead
-		// fragment.
-		tail = readTailBytes(r.cfg.WatchdogLogFile+".1",
-			r.logOffset, maxLogReadBytes)
-		if len(tail) == 0 {
-			r.logPending = nil
-			noTail = true // wholesale rewrite — nothing is attributable
-		}
-		r.logOffset = 0
-	}
-	// First scan of an oversized file: jump to the last
-	// maxLogReadBytes and drop the partial line at the cut — the cap
-	// exists so a log that outgrew the ~1MB watchdog cap (broken
-	// rotation, flood) is never slurped whole into RAM.
-	midSeek := false
-	if r.logOffset == 0 && fi.Size() > maxLogReadBytes {
-		r.logOffset = fi.Size() - maxLogReadBytes
-		r.logPending = nil
-		midSeek = true
-	}
-	f, err := os.Open(r.cfg.WatchdogLogFile)
-	if err != nil {
-		return nil, 0, fmt.Errorf("open %s: %w", r.cfg.WatchdogLogFile, err)
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.Seek(r.logOffset, io.SeekStart); err != nil {
-		return nil, 0, fmt.Errorf("seek %s: %w", r.cfg.WatchdogLogFile, err)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxLogReadBytes))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read %s: %w", r.cfg.WatchdogLogFile, err)
-	}
-	// Bytes consumed from the LIVE file — captured before any cut or
-	// tail-prepend mangles data (the mid-file seek's discarded head
-	// WAS consumed; the .1 tail was not).
-	rawLen := int64(len(data))
-	// A mid-file seek lands inside a line — discard everything up to
-	// the first newline; the head of that line was never read.
-	if midSeek {
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			data = data[i+1:]
-		} else {
-			data = nil
-		}
-	}
-	if len(tail) > 0 {
-		// Rotated-generation bytes precede the fresh file's — the
-		// events they map onto must not be reordered behind it.
-		data = append(tail, data...)
-	}
-	// oldGenBuf is the length of the OLD-generation prefix of buf:
-	// the carried partial line (it began in the old generation) plus
-	// the drained .1 tail. Only meaningful for a rename rotation —
-	// the replay boundary the fresh file's lines start behind.
-	oldGenBuf := 0
-	if rotated && !noTail {
-		oldGenBuf = len(r.logPending) + len(tail)
-	}
-	// The tail was fully read — this successful pass counts as the
-	// replay scan even if it yielded no complete lines yet. Arming
-	// the flag any earlier (on open) would let a failed first read
-	// disarm the lookback filter and dump the entire history next
-	// cycle.
-	r.logScanned = true
-	// Offset tracks bytes actually consumed from the LIVE file — not
-	// fi.Size(), so lines appended between Stat and Read aren't
-	// double-read next cycle, and the drained .1 tail's length is
-	// excluded (those bytes belong to the old generation's
-	// coordinates).
-	r.logOffset += rawLen
 
-	buf := append(r.logPending, data...)
+	pending := r.logPending
 	r.logPending = nil
+	buf := append(pending, win.data...)
 	if len(buf) == 0 {
 		return nil, 0, nil
 	}
@@ -421,9 +336,19 @@ func (r *Reporter) readNewLogLines() ([][]byte, int, error) {
 	// the boundary began in the old generation — its completion
 	// rides the fresh bytes, but it is still old-gen content).
 	switch {
-	case replayAll, noTail:
+	case replayAll, win.noTail:
 		return lines, len(lines), nil
 	default:
+		// oldGenBuf is the length of the OLD-generation prefix of
+		// buf: the carried partial line (it began in the old
+		// generation) plus the drained .1 tail — only meaningful
+		// for a rename rotation, the replay boundary the fresh
+		// file's lines start behind. No rotation → no old
+		// generation → nothing replays.
+		oldGenBuf := 0
+		if win.rotated {
+			oldGenBuf = len(pending) + win.oldGenTail
+		}
 		replayCount := 0
 		pos := 0
 		for _, ln := range lines {
@@ -435,6 +360,105 @@ func (r *Reporter) readNewLogLines() ([][]byte, int, error) {
 		}
 		return lines, replayCount, nil
 	}
+}
+
+// logWindow is one read cycle's byte window plus the rotation
+// metadata the replay attribution needs: data is the .1 tail
+// prepended to the fresh file's bytes, oldGenTail the drained
+// tail's length, rotated/noTail the shrink classification.
+type logWindow struct {
+	data       []byte
+	oldGenTail int
+	rotated    bool
+	noTail     bool
+}
+
+// readLogWindow performs the stat/rotate/mid-seek/open/read half of
+// a scan and returns the consumed byte window. It owns the offset
+// bookkeeping — r.logOffset advances by bytes actually consumed
+// from the LIVE file (not fi.Size(), so lines appended between
+// Stat and Read aren't double-read next cycle, and the drained .1
+// tail's length is excluded), and r.logScanned arms only after a
+// successful read so a failed first pass can't disarm the lookback
+// filter. nil window = the log file is absent (not an error).
+func (r *Reporter) readLogWindow() (*logWindow, error) {
+	fi, err := os.Stat(r.cfg.WatchdogLogFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat %s: %w", r.cfg.WatchdogLogFile, err)
+	}
+	var tail []byte // unread bytes of the rotated .1 generation
+	win := &logWindow{}
+	if fi.Size() < r.logOffset {
+		win.rotated = true
+		logger().Debug("nodereporter: watchdog log rotated — draining "+
+			"the .1 tail, offset reset", "file", r.cfg.WatchdogLogFile,
+			"oldOffset", r.logOffset, "size", fi.Size())
+		// The .1 tail continues r.logPending (the partial line the
+		// old generation never terminated) — read it BEFORE clearing
+		// anything. The carry survives only when the tail actually
+		// carries its continuation; an absent/empty tail (in-place
+		// rewrite, .1 already gone or fully consumed) means the
+		// partial line can never complete — keeping it would
+		// concatenate the fresh file's first line onto a dead
+		// fragment.
+		tail = readTailBytes(r.cfg.WatchdogLogFile+".1",
+			r.logOffset, maxLogReadBytes)
+		if len(tail) == 0 {
+			r.logPending = nil
+			win.noTail = true // wholesale rewrite — nothing is attributable
+		}
+		r.logOffset = 0
+	}
+	// First scan of an oversized file: jump to the last
+	// maxLogReadBytes and drop the partial line at the cut — the cap
+	// exists so a log that outgrew the ~1MB watchdog cap (broken
+	// rotation, flood) is never slurped whole into RAM.
+	midSeek := false
+	if r.logOffset == 0 && fi.Size() > maxLogReadBytes {
+		r.logOffset = fi.Size() - maxLogReadBytes
+		r.logPending = nil
+		midSeek = true
+	}
+	f, err := os.Open(r.cfg.WatchdogLogFile)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", r.cfg.WatchdogLogFile, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Seek(r.logOffset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek %s: %w", r.cfg.WatchdogLogFile, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxLogReadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", r.cfg.WatchdogLogFile, err)
+	}
+	// Bytes consumed from the LIVE file — captured before any cut or
+	// tail-prepend mangles data (the mid-file seek's discarded head
+	// WAS consumed; the .1 tail was not).
+	rawLen := int64(len(data))
+	// A mid-file seek lands inside a line — discard everything up to
+	// the first newline; the head of that line was never read.
+	if midSeek {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		} else {
+			data = nil
+		}
+	}
+	if len(tail) > 0 {
+		// Rotated-generation bytes precede the fresh file's — the
+		// events they map onto must not be reordered behind it.
+		data = append(tail, data...)
+	}
+	win.data = data
+	win.oldGenTail = len(tail)
+	// The tail was fully read — this successful pass counts as the
+	// replay scan even if it yielded no complete lines yet.
+	r.logScanned = true
+	r.logOffset += rawLen
+	return win, nil
 }
 
 // readTailBytes drains up to max bytes of path starting at offset —

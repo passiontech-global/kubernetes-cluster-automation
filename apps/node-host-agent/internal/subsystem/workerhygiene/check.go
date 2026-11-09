@@ -62,19 +62,27 @@ func (h *Hygiene) initChecks() {
 	add(cilium.NewCiliumEnvoy(d)) // wdeps.CheckCiliumEnvoy
 	add(cilium.NewCiliumMTU(d))   // wdeps.CheckCiliumMTU
 	add(cilium.NewCiliumWG(d))    // wdeps.CheckCiliumWG
-	add(runtime.NewDiskBloat(d))  // wdeps.CheckDiskBloat
-	add(guards.NewZombieStorm(d)) // wdeps.CheckZombieStorm
-	add(guards.NewJournald(d))    // wdeps.CheckJournald
-	add(guards.NewDstate(d))      // wdeps.CheckDState
-	add(guards.NewScopes(d))      // wdeps.CheckSysScopes
-	add(cilium.NewCiliumLRP(d))   // wdeps.CheckCiliumLRP
-	add(guards.NewSpegel(d))      // wdeps.CheckSpegel
-	add(guards.NewCalico(d))      // wdeps.CheckCalico
-	add(guards.NewCNINetns(d))    // wdeps.CheckCNINetns
-	add(guards.NewPSIThrash(d))   // wdeps.CheckPSIThrash
-	add(ctr.NewCtrMeta(d))        // wdeps.CheckCtrMeta
-	add(runtime.NewHostOOM(d))    // wdeps.CheckHostOOM
-	add(runtime.NewOrphanHP(d))   // wdeps.CheckOrphanHP
+	// Disk side-guards keep the intra-Run order they had inside
+	// DiskBloatCheck.Run: run-tmpfs → dev-shm → localpv-quota →
+	// coredump-gc → writable-layer-scan → disk-bloat walk.
+	add(runtime.NewRunTmpfs(d))      // wdeps.CheckRunTmpfs
+	add(runtime.NewDevShm(d))        // wdeps.CheckDevShm
+	add(runtime.NewLocalPVQuota(d))  // wdeps.CheckLocalPVQuota
+	add(runtime.NewCoredumpGC(d))    // wdeps.CheckCoredumpGC
+	add(runtime.NewWritableLayer(d)) // wdeps.CheckWritableLayer
+	add(runtime.NewDiskBloat(d))     // wdeps.CheckDiskBloat
+	add(guards.NewZombieStorm(d))    // wdeps.CheckZombieStorm
+	add(guards.NewJournald(d))       // wdeps.CheckJournald
+	add(guards.NewDstate(d))         // wdeps.CheckDState
+	add(guards.NewScopes(d))         // wdeps.CheckSysScopes
+	add(cilium.NewCiliumLRP(d))      // wdeps.CheckCiliumLRP
+	add(guards.NewSpegel(d))         // wdeps.CheckSpegel
+	add(guards.NewCalico(d))         // wdeps.CheckCalico
+	add(guards.NewCNINetns(d))       // wdeps.CheckCNINetns
+	add(guards.NewPSIThrash(d))      // wdeps.CheckPSIThrash
+	add(ctr.NewCtrMeta(d))           // wdeps.CheckCtrMeta
+	add(runtime.NewHostOOM(d))       // wdeps.CheckHostOOM
+	add(runtime.NewOrphanHP(d))      // wdeps.CheckOrphanHP
 	// Runtime-resource guards run last: they consume only
 	// their own host-side evidence (cgroup.stat, sessions dir,
 	// diskstats, sysctls, the pod LIST) so nothing downstream

@@ -242,7 +242,16 @@ func parseFor(stmt string) (*forNode, error) {
 	inIdx := inIdxs[0]
 	var names []string
 	for _, nm := range strings.Split(restStmt[:inIdx], ",") {
-		names = append(names, strings.TrimSpace(nm))
+		nm = strings.TrimSpace(nm)
+		// A garbage loop name (`x y` from a missing comma) binds at
+		// render time and reads back as Undefined — body `{{ x }}`
+		// then renders empty into a converged config file. The
+		// {% set %} target carries the same isIdentifier gate; the
+		// for targets must not be looser than set.
+		if !isIdentifier(nm) {
+			return nil, fmt.Errorf("for: invalid loop variable %q", nm)
+		}
+		names = append(names, nm)
 	}
 	rest := restStmt[inIdx+2:]
 	// Sequence expr runs up to the first top-level `if`; every further
@@ -535,6 +544,12 @@ func (p *parser) parseCompare() (expr, error) {
 					args = append(args, a)
 					if p.at(",") {
 						p.next()
+					} else if !p.at(")") {
+						// `default('n/a' 0)` must not silently
+						// bind 0 as the second argument — a
+						// missing comma changes which
+						// positional slot each value lands in.
+						return nil, fmt.Errorf("is: expected ',' or ')' between arguments, got %q", p.peek().val)
 					}
 				}
 				p.next()
@@ -636,6 +651,8 @@ func (p *parser) parsePostfix() (expr, error) {
 					}
 					if p.at(",") {
 						p.next()
+					} else if !p.at(")") {
+						return nil, fmt.Errorf("filter: expected ',' or ')' between arguments, got %q", p.peek().val)
 					}
 				}
 				p.next()
@@ -682,6 +699,8 @@ func (p *parser) parsePostfix() (expr, error) {
 				}
 				if p.at(",") {
 					p.next()
+				} else if !p.at(")") {
+					return nil, fmt.Errorf("call: expected ',' or ')' between arguments, got %q", p.peek().val)
 				}
 			}
 			p.next()

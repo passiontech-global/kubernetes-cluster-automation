@@ -4,7 +4,7 @@ name: Release app (reusable)
 # .github/workflows/release-<app>.yml — do not run directly.
 #
 # Flow: resolve version -> git-cliff semver bump (conventional commits,
-# scoped to apps/<app>) -> moon vet/test/build -> ko push to GHCR ->
+# scoped to apps/<app>) -> moon lint/vet/test/build -> ko push to GHCR ->
 # GitHub Release tagged "<app>/vX.Y.Z".
 
 on:
@@ -61,9 +61,17 @@ jobs:
 
       - name: Compute version and changelog
         id: rel
+        env:
+          # Workflow-dispatch inputs are interpolated into the job's
+          # bash BEFORE parsing — `${{ inputs.* }}` inline in `run:`
+          # would let a crafted value escape the quoted context and
+          # execute in a job holding contents:write. Route every
+          # input through env indirection instead.
+          VERSION_INPUT: ${{ inputs.version }}
+          LEGACY_V_TAGS: ${{ inputs.legacy_v_tags }}
         run: |
           set -euo pipefail
-          version_in="${{ inputs.version }}"
+          version_in="$VERSION_INPUT"
 
           # Latest release tag for this app. Tag scheme: "<app>/vX.Y.Z";
           # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z"
@@ -74,7 +82,7 @@ jobs:
           # bare version (v0.1.0-rc.1 < v0.1.0) — without it an rc tag
           # sorts HIGHER than the stable release and wins "latest".
           last_tag=$(git -c versionsort.suffix=- tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
-          if [ -z "$last_tag" ] && [ "${{ inputs.legacy_v_tags }}" = "true" ]; then
+          if [ -z "$last_tag" ] && [ "$LEGACY_V_TAGS" = "true" ]; then
             last_tag=$(git -c versionsort.suffix=- tag -l "v[0-9]*" --sort=-v:refname | head -1)
           fi
           if [ -z "$last_tag" ]; then
@@ -184,8 +192,8 @@ jobs:
           echo "rel_version=$rel_version" >>"$GITHUB_OUTPUT"
           echo "rel_tag=$rel_tag" >>"$GITHUB_OUTPUT"
 
-      - name: Vet and test
-        run: moon run "$APP:vet" "$APP:test"
+      - name: Lint, vet and test
+        run: moon run "$APP:lint" "$APP:vet" "$APP:test"
 
       - name: Build static binary
         env:

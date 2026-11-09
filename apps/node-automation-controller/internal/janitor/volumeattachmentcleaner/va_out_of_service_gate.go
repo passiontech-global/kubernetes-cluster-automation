@@ -18,11 +18,9 @@ package volumeattachmentcleaner
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -55,19 +53,8 @@ func (c *volumeAttachmentCleaner) pruneVanishedNodes(nodeByName map[string]*core
 // carries the fencing taint AND has been not-Ready past the window
 // AND provably hosts zero non-terminal pods. Any failed check keeps
 // the VA — the volume may still be mounted by something real.
-// podProbe caches one node's live-pod verdict for the cycle: a
-// successful count, or the list error (fail closed either way on
-// retry within the same sweep). reported marks that err already
-// bumped IncError — N VAs sharing one fenced node must not fire N
-// error bumps off the single cached failure.
-type podProbe struct {
-	count    int
-	err      error
-	reported bool
-}
-
 func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
-	node *corev1.Node, livePods map[string]podProbe, now time.Time) bool {
+	node *corev1.Node, livePods map[string]podListProbe, now time.Time) bool {
 	log := logf.FromContext(ctx)
 	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
 		return false // not fenced — NotReady alone is never a verdict
@@ -110,33 +97,27 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 	return true
 }
 
-// livePodCount lists pods bound to node and returns how many
-// WORKLOAD pods are non-terminal (not Succeeded/Failed) — the "is
-// anyone still potentially writing" check. DaemonSet and static
-// mirror pods don't count: they run on every node, hold no PVC
-// mounts, and on a fenced node are force-deleted + recreated as
-// Pending by the controller — counting them would keep this gate
-// permanently closed and the feature dead. Terminating workload
-// pods count as live: a pod wedged in Terminating on a fenced node
-// is the node controller's force-delete problem, and until it
-// finishes the mount may still exist. Counts are cached per cycle.
+// livePodCount returns how many WORKLOAD pods on node are
+// non-terminal (not Succeeded/Failed) — the "is anyone still
+// potentially writing" check. DaemonSet and static mirror pods don't
+// count: they run on every node, hold no PVC mounts, and on a fenced
+// node are force-deleted + recreated as Pending by the controller —
+// counting them would keep this gate permanently closed and the
+// feature dead. Terminating workload pods count as live: a pod
+// wedged in Terminating on a fenced node is the node controller's
+// force-delete problem, and until it finishes the mount may still
+// exist. The underlying list is cached per cycle via nodePodList —
+// the fenced gate's count and the stuck-Terminating gate's
+// mounted-claim scan share ONE apiserver list per node per sweep.
 func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
-	cache map[string]podProbe, node string) (int, error) {
-	if pr, ok := cache[node]; ok {
-		return pr.count, pr.err
-	}
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + node,
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(c.cs, metav1.NamespaceAll))
+	cache map[string]podListProbe, node string) (int, error) {
+	pr, err := c.nodePodList(ctx, cache, node)
 	if err != nil {
-		err = fmt.Errorf("list pods on %s: %w", node, err)
-		cache[node] = podProbe{err: err}
 		return 0, err
 	}
 	live := 0
-	for i := range pods {
-		p := &pods[i]
+	for i := range pr.pods {
+		p := &pr.pods[i]
 		// Fake clientsets ignore field selectors — the spec.nodeName
 		// filter is applied in code too, same convention as the
 		// phase filters elsewhere in this codebase.
@@ -162,6 +143,5 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 		}
 		live++
 	}
-	cache[node] = podProbe{count: live}
 	return live, nil
 }

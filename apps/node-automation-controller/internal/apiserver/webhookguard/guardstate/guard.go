@@ -180,15 +180,3 @@ func (s *Snapshot) ReadyCounts() (EndpointCensus, error) {
 	})
 	return s.ready, s.readyErr
 }
-
-// MaintenanceActive runs the cluster maintenance mutex (unmeshed-pod-auditor) — the
-// shared three-signal check (node cordon + kured lock + autopilot
-// Plan), exactly like every other deferring module, memoized through
-// the Guard's Verdict. An earlier version carried a nil-dyn degraded
-// copy that checked spec.unschedulable instead of
-// kube.NodeActivelyCordoned — a statically-cordoned node would then
-// have held the mutex forever; the shared implementation fails
-// closed on a missing dyn instead.
-func (g *Guard) MaintenanceActive(ctx context.Context) (bool, string, error) {
-	return g.Verdict.Active(ctx, g.CS, g.Dyn, g.Now.Now())
-}

@@ -151,19 +151,7 @@ const (
 // node-problem-detector/kubelet/CNI latches that make rebalancing
 // actively harmful — same posture as the existing network-problem
 // conditions.
-var stormConds = condTypes(nodecond.StormGateNames)
-
-// condTypes converts a nodecond name list into the
-// corev1.NodeConditionType slice the verdict compares against —
-// nodecond keeps the names as untyped strings so libs/hostkit stays
-// stdlib-only.
-func condTypes(names []string) []corev1.NodeConditionType {
-	out := make([]corev1.NodeConditionType, len(names))
-	for i, name := range names {
-		out[i] = corev1.NodeConditionType(name)
-	}
-	return out
-}
+var stormConds = kube.CondTypes(nodecond.StormGateNames)
 
 // stormCondHeartbeatMaxAge is how old a nodereporter-owned storm
 // condition's lastHeartbeatTime may be before its True stops gating
@@ -171,14 +159,6 @@ func condTypes(names []string) []corev1.NodeConditionType {
 // frozen or absent stamp means the value is a zombie left by a dead
 // agent (same 10m convention as nodehealth's precordon gate).
 const stormCondHeartbeatMaxAge = 10 * time.Minute
-
-// condHeartbeatLive reports whether a condition's lastHeartbeatTime
-// is fresh enough to trust the value — mirror of nodehealth's
-// condHeartbeatLive.
-func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
-	return !c.LastHeartbeatTime.IsZero() &&
-		now.Sub(c.LastHeartbeatTime.Time) < stormCondHeartbeatMaxAge
-}
 
 // stormTaints mirrors STORM_TAINTS — now driven by
 // kube.RemediationTaints so all four remediation taints (incl.
@@ -314,7 +294,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			// CiliumLRPDegraded spelling are not agent-managed and
 			// keep gating on status alone.
 			if nodecond.AgentHeartbeatManaged(string(c.Type)) &&
-				!condHeartbeatLive(&c, now) {
+				!kube.CondHeartbeatLive(&c, stormCondHeartbeatMaxAge, now) {
 				continue
 			}
 			bad = append(bad, n.Name+" "+string(c.Type))
