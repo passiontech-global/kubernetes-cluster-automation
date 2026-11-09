@@ -512,3 +512,56 @@ func emptyStatefulSet(ns, name string) *appsv1.StatefulSet {
 		},
 	}
 }
+
+// The DaemonSet branch of the owner-kind dispatch resolves the pod's
+// owner through the shared DaemonSet census (findDaemonSet) and
+// patches the daemonset template exactly like the StatefulSet path.
+func TestLinkerdOpaquePortsHealPatchesDaemonSetTemplate(t *testing.T) {
+	ds := emptyDaemonSet("kube-system", "linkerd-cni")
+	pod := meshedPodWithPorts("kube-system", "linkerd-cni-abc", []int32{6379, 8080}, "", "")
+	setPodOwnerDaemonSet(pod, "linkerd-cni")
+	cs := fake.NewSimpleClientset(ds, pod)
+	p := testProber(cs)
+
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("unannotated binary port must fail: %+v", res)
+	}
+	got, err := cs.AppsV1().DaemonSets("kube-system").Get(ctx, "linkerd-cni", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Template.Annotations["config.linkerd.io/opaque-ports"] != "6379" {
+		t.Fatalf("daemonset template opaque-ports = %q, want 6379",
+			got.Spec.Template.Annotations["config.linkerd.io/opaque-ports"])
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "linkerd-cni-abc", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod must NOT be mass-deleted — the controller rolls it: %v", err)
+	}
+}
+
+// setPodOwnerDaemonSet gives the pod a controller ownerRef to a
+// DaemonSet — the mesh's node-local workloads (linkerd-cni) take
+// this branch of the heal dispatch.
+func setPodOwnerDaemonSet(pod *corev1.Pod, dsName string) {
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "DaemonSet",
+		Name:       dsName,
+		Controller: ptr.To(true),
+	}}
+}
+
+// emptyDaemonSet builds a bare DaemonSet with an empty pod template —
+// the heal target for the linkerd opaque-ports patch.
+func emptyDaemonSet(ns, name string) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+			},
+		},
+	}
+}

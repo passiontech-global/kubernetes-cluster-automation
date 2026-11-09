@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +19,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---- subprocess tests for main() -------------------------------------
@@ -388,4 +392,52 @@ func TestDefaultCacheTransform(t *testing.T) {
 			t.Fatal("managedFields not stripped on a non-Node object")
 		}
 	})
+}
+
+// emitCircuitOpenEvent stamps the RemediationCircuitBreakerOpen
+// Warning Event on the target Node — the events.k8s.io/v1 shape
+// (Regarding+Action, deprecated corev1 fields unset) kubelet-style
+// node events use. The fake clientset serves the create; a create
+// failure is best-effort and only logs.
+func TestEmitCircuitOpenEvent(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	emitCircuitOpenEvent(cs, "coredns-stale-watchdog", "worker-7",
+		"3 heals in 30m")
+
+	events, err := cs.EventsV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events.Items) != 1 {
+		t.Fatalf("events created = %d, want 1", len(events.Items))
+	}
+	ev := events.Items[0]
+	if ev.Reason != eventReasonRemediationCircuitBreakerOpen ||
+		ev.Type != corev1.EventTypeWarning {
+		t.Fatalf("event reason/type = %q/%q", ev.Reason, ev.Type)
+	}
+	if ev.Regarding.Name != "worker-7" || ev.Regarding.Kind != "Node" {
+		t.Fatalf("event regarding = %+v, want Node/worker-7", ev.Regarding)
+	}
+	if ev.ReportingInstance != "coredns-stale-watchdog" ||
+		ev.ReportingController != "node-automation-controller" {
+		t.Fatalf("reporting fields = %q/%q",
+			ev.ReportingInstance, ev.ReportingController)
+	}
+	if !strings.Contains(ev.Note, "3 heals in 30m") {
+		t.Fatalf("event note missing the reason: %q", ev.Note)
+	}
+}
+
+// A failed event create is best-effort — logged, never escalated
+// (the HealTargetCircuitBrokenTotal counter is the guaranteed
+// signal). The reactor forces the create error; the call must not
+// panic or surface it.
+func TestEmitCircuitOpenEventCreateFailure(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("create", "events",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("events write denied")
+		})
+	emitCircuitOpenEvent(cs, "module-x", "worker-9", "why")
 }

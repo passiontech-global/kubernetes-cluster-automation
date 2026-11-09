@@ -168,6 +168,50 @@ func TestArgoCDAppStuckSkipsDownscaledRollout(t *testing.T) {
 	}
 }
 
+// statefulSetDownscaled is the Deployment twin over the shared
+// StatefulSet census — a StatefulSet the go-kube-downscaler parked
+// at replicas:0 is sleep, not stuck evidence.
+func TestArgoCDAppStuckSkipsDownscaledStatefulSet(t *testing.T) {
+	app := argoCDApplication("argocd", "sts-app", "Progressing")
+	app.Object["status"].(map[string]any)["resources"] = []any{
+		map[string]any{
+			"kind":      "StatefulSet",
+			"namespace": "data",
+			"name":      "db",
+			"health":    map[string]any{"status": "Suspended"},
+		},
+	}
+	dyn := testutil.NewDynamicClient(app)
+	zero := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "data", Name: "db",
+			Annotations: map[string]string{"downscaler/downtime": "22:00-06:00"},
+		},
+		Spec: appsv1.StatefulSetSpec{Replicas: &zero},
+	}
+	cs := fake.NewSimpleClientset(sts)
+	p := testProberDyn(cs, dyn)
+	base := time.Now()
+	probetest.FreezeNow(p.Deps, base)
+
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-StatefulSet-only app must pass: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-StatefulSet-only app must pass past the window: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "sts-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
+		t.Fatal("downscaled StatefulSet app got a refresh patch")
+	}
+}
+
 // The same Progressing roll-up IS real evidence when the zero-
 // replica workload carries no downscaler/* annotation — a replicas:0
 // nobody claims is a genuine stall.

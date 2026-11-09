@@ -5,6 +5,7 @@
 package nethealth
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -256,4 +257,50 @@ func TestLiqoCRNoPeerMatchMultiGatewaySkipsBounce(t *testing.T) {
 			t.Fatalf("unattributable finding must not bounce gateway %s: %v", gw.Name, err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// cfTunnelLogQUICStorm — the log-tail fallback when :2000/metrics is
+// unreachable: QUIC edge-dial markers mean a dead tunnel behind a
+// live Ready gate; a clean tail or a fetch error is not a storm.
+// ---------------------------------------------------------------------------
+
+func TestCfTunnelLogQUICStorm(t *testing.T) {
+	pod := cfPod("cf", "cf-1", "10.0.0.1", types.UID("rs-cf"))
+
+	t.Run("QUIC edge-dial marker hits", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+			"2026-11-10T00:00:00Z ERR failed to dial to edge with quic: timeout\n", nil))
+		p := testProber(cs)
+		storm, err := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p).
+			cfTunnelLogQUICStorm(ctx, pod)
+		if err != nil || !storm {
+			t.Fatalf("cfTunnelLogQUICStorm = (%v,%v), want (true,nil)", storm, err)
+		}
+	})
+
+	t.Run("clean tail is not a storm", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+			"2026-11-10T00:00:00Z INF tunnel registered\n", nil))
+		p := testProber(cs)
+		storm, err := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p).
+			cfTunnelLogQUICStorm(ctx, pod)
+		if err != nil || storm {
+			t.Fatalf("cfTunnelLogQUICStorm = (%v,%v), want (false,nil)", storm, err)
+		}
+	})
+
+	t.Run("fetch failure is inconclusive", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+			"", errors.New("kubelet log read boom")))
+		p := testProber(cs)
+		storm, err := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p).
+			cfTunnelLogQUICStorm(ctx, pod)
+		if err == nil || storm {
+			t.Fatalf("cfTunnelLogQUICStorm = (%v,%v), want (false,err)", storm, err)
+		}
+	})
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // TestIncErrorIncrementsBothCounters pins the dual-metric contract:
@@ -118,5 +119,57 @@ func TestForgetAPIBackend(t *testing.T) {
 	}
 	if apiBackendQuarantined.DeleteLabelValues(ip) {
 		t.Fatal("quarantined series still present after ForgetAPIBackend")
+	}
+}
+
+// TestObserveAPIBackendJWKSSkew pins the jwks-kid-skew gauge: the
+// majority-verdict bool maps to 0/1 under the backend-IP label.
+func TestObserveAPIBackendJWKSSkew(t *testing.T) {
+	const ip = "10.7.7.7"
+
+	ObserveAPIBackendJWKSSkew(ip, false)
+	if got := testutil.ToFloat64(apiBackendJWKSKIDSkew.WithLabelValues(ip)); got != 0 {
+		t.Fatalf("jwksKidSkew = %v, want 0", got)
+	}
+	ObserveAPIBackendJWKSSkew(ip, true)
+	if got := testutil.ToFloat64(apiBackendJWKSKIDSkew.WithLabelValues(ip)); got != 1 {
+		t.Fatalf("jwksKidSkew = %v, want 1", got)
+	}
+}
+
+// TestPredeclareQueue pins the eager-emission contract: after
+// PredeclareQueue both error counters carry a 0-valued series for the
+// module BEFORE any IncError — /metrics must expose every registered
+// module's series from boot (shell-operator parity), including
+// gated-off modules.
+func TestPredeclareQueue(t *testing.T) {
+	const name = "predeclared-unit-queue"
+	PredeclareQueue(name)
+
+	fams, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]string{
+		"shell_operator_hook_run_errors_total":   "queue",
+		"node_automation_reconcile_errors_total": "controller",
+	}
+	for family, label := range want {
+		found := false
+		for _, f := range fams {
+			if f.GetName() != family {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				for _, l := range m.GetLabel() {
+					if l.GetName() == label && l.GetValue() == name {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing predeclared series for %q", family, name)
+		}
 	}
 }

@@ -495,12 +495,21 @@ func TestHelmStallUnwedgeDisabledGate(t *testing.T) {
 func TestHelmStallUnwedgeListFallback(t *testing.T) {
 	hr, objs := stallFixture()
 	// Scrub the explicit Deployment/<name> token from every message.
-	if conds, ok, _ := unstructured.NestedSlice(hr.Object, "status", "conditions"); ok {
-		for _, c := range conds {
-			if m, ok := c.(map[string]any); ok {
-				m["message"] = "upgrade retries exhausted — no workload named"
-			}
+	// NestedSlice deep-copies — the scrubbed conditions must be
+	// written back or the token survives and the explicit-name path
+	// (not the fallback this test exists for) resolves the workload.
+	conds, ok, _ := unstructured.NestedSlice(hr.Object, "status", "conditions")
+	if !ok {
+		t.Fatal("fixture HR carries no status.conditions")
+	}
+	for _, c := range conds {
+		if m, ok := c.(map[string]any); ok {
+			m["message"] = "upgrade retries exhausted — no workload named"
 		}
+	}
+	if err := unstructured.SetNestedSlice(hr.Object, conds,
+		"status", "conditions"); err != nil {
+		t.Fatalf("write back scrubbed conditions: %v", err)
 	}
 	dyn := newDynFake(hr)
 	cs := kfake.NewSimpleClientset(objs...)
