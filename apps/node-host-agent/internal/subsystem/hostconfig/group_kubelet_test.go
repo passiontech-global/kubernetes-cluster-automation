@@ -159,6 +159,50 @@ func TestGroupPullsUnterminatedExtraArgsQuote(t *testing.T) {
 	}
 }
 
+// TestGroupPullsRefusesNewlineInCfgScalar — a vars value carrying a
+// newline rendered verbatim into KubeletConfiguration would inject an
+// arbitrary key (kubelet parses the file wholesale). The refused key
+// is skipped with a counted error while the REST of the YAML (and the
+// containerd toml, whose scalars are clean) still converges.
+func TestGroupPullsRefusesNewlineInCfgScalar(t *testing.T) {
+	vars := writeVarsDir(t, "kubelet_api_qps: \"100\ninjectedKey: evil\"\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/var/lib/k0s/kubelet-config.yaml",
+		"kind: KubeletConfiguration\nevictionHard:\n  memory.available: \"500Mi\"\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupPulls()
+
+	if c.errs == 0 {
+		t.Fatal("newline-bearing kubelet_api_qps not counted")
+	}
+	kf := hostRead(t, r, "/var/lib/k0s/kubelet-config.yaml")
+	if strings.Contains(kf, "injectedKey") || strings.Contains(kf, "kubeAPIQPS") {
+		t.Fatalf("injected/refused key landed in the kubelet cfg:\n%s", kf)
+	}
+	// The remaining scalars still converge untouched.
+	for _, want := range []string{
+		"maxParallelImagePulls: 4", "kubeAPIBurst: 50", "podPidsLimit: 4096",
+		"shutdownGracePeriod: 60s", "shutdownGracePeriodCriticalPods: 20s",
+	} {
+		if !strings.Contains(kf, want) {
+			t.Fatalf("rest of kubelet cfg lost %q after refusing one scalar:\n%s", want, kf)
+		}
+	}
+	// containerd toml unaffected — its scalars (maxPar/dl) are clean.
+	t90 := hostRead(t, r, "/etc/k0s/containerd.d/90-parallel-pulls.toml")
+	if !strings.Contains(t90, "max_concurrent_downloads = 5") {
+		t.Fatalf("containerd toml collateral damage:\n%s", t90)
+	}
+}
+
 // TestT7AppendExtraArgsUnterminated — direct check of the ok flag on
 // open-quote values vs properly quoted/bare ones.
 func TestT7AppendExtraArgsUnterminated(t *testing.T) {

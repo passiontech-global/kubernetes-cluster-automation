@@ -595,6 +595,52 @@ func (c *cyc) shPort(what, s string) bool {
 	return false
 }
 
+// cfgScalar is the rendered-config sibling of shToken: it gates a
+// vars-derived value rendered verbatim as a plain scalar into a
+// config file (kubelet KubeletConfiguration YAML, containerd toml).
+// A refused value counts a cycle error and skips its own render —
+// the remaining lines converge untouched.
+func (c *cyc) cfgScalar(what, s string) bool {
+	if converge.CfgScalar(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe value refused for config render",
+		"what", what, "value", s)
+	return false
+}
+
+// cfgSysctlKey / cfgSysctlVal gate the /etc/sysctl.d pair renders —
+// a newline-bearing value would splice further `key = value` lines
+// into the drop-in, applied verbatim by `sysctl --system`.
+func (c *cyc) cfgSysctlKey(what, s string) bool {
+	if converge.CfgSysctlKey(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe sysctl key refused", "what", what, "value", s)
+	return false
+}
+
+func (c *cyc) cfgSysctlVal(what, s string) bool {
+	if converge.CfgSysctlVal(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe sysctl value refused", "what", what, "value", s)
+	return false
+}
+
+// cfgLimitNOFILE gates the systemd LimitNOFILE= drop-in assignments —
+// a value systemd cannot parse is dropped at daemon-reload and the
+// unit silently keeps stock fd limits, so a refused value skips the
+// drop-in write entirely.
+func (c *cyc) cfgLimitNOFILE(what, s string) bool {
+	if converge.CfgLimitNOFILE(s) {
+		return true
+	}
+	c.err("hostconfig: invalid LimitNOFILE refused for drop-in render",
+		"what", what, "value", s)
+	return false
+}
+
 // The *Req variants are the same gates for slots where the value is
 // REQUIRED: an empty value there cannot inject, but it still emits a
 // malformed command (`ip route replace default dev neb1 src <blank>`,

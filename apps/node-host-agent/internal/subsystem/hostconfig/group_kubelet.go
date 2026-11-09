@@ -185,6 +185,16 @@ func (c *cyc) groupPulls() {
 	shutdownGrace := defStr(c.v("kubelet_shutdown_grace_period"), "60s")
 	shutdownGraceCritical := defStr(c.v("kubelet_shutdown_grace_period_critical_pods"), "20s")
 
+	// Rendered-config charset gates (the non-shell sibling of
+	// flagsOK below): these scalars land verbatim in the kubelet
+	// KubeletConfiguration YAML and the containerd toml, where a
+	// newline/colon in a var would inject an arbitrary key the
+	// consuming daemon parses wholesale. maxPar renders into BOTH
+	// files, dl into the toml — gate each once at derivation so a
+	// refusal skips both renders with one counted error per scalar.
+	maxParOK := c.cfgScalar("kubelet_max_parallel_image_pulls", maxPar)
+	dlOK := c.cfgScalar("containerd_max_concurrent_downloads", dl)
+
 	// Flags go INSIDE --kubelet-extra-args with literal \x20
 	// separators — a real space would turn them into bare k0s argv.
 	// qps/burst land raw inside ExecStart — a vars value carrying
@@ -252,22 +262,37 @@ func (c *cyc) groupPulls() {
 		} else {
 			s := string(kf)
 			// Scalar keys: lineinfile regexp '^key:' replace /
-			// insertafter '^kind: KubeletConfiguration'.
-			for _, kv := range [][2]string{
-				{"maxParallelImagePulls", maxPar},
-				{"kubeAPIQPS", apiQPS},
-				{"kubeAPIBurst", apiBurst},
-				{"podPidsLimit", pids},
+			// insertafter '^kind: KubeletConfiguration'. Each value is
+			// charset-gated (see maxParOK above) — kubelet parses the
+			// file wholesale, so a newline in a var would inject an
+			// arbitrary key into KubeletConfiguration. A refused
+			// value skips ONLY its own line; the remaining keys
+			// converge untouched.
+			for _, kv := range []struct {
+				key string
+				val string
+				ok  bool
+			}{
+				{"maxParallelImagePulls", maxPar, maxParOK},
+				{"kubeAPIQPS", apiQPS, c.cfgScalar("kubelet_api_qps", apiQPS)},
+				{"kubeAPIBurst", apiBurst, c.cfgScalar("kubelet_api_burst", apiBurst)},
+				{"podPidsLimit", pids, c.cfgScalar("kubelet_pod_pids_limit", pids)},
 				// host-protection-drop-ins: k0sworker-profile parity — graceful node
-				// shutdown must have a kubelet window to drain in,
-				// fitting logind's InhibitDelayMaxSec=65
-				// (group_base.go). Values come from the node-config-agent
-				// defaults (kubelet_shutdown_grace_period*) and match
-				// the k0sctl worker profiles.
-				{"shutdownGracePeriod", shutdownGrace},
-				{"shutdownGracePeriodCriticalPods", shutdownGraceCritical},
+				// shutdown must have a kubelet window to drain in;
+				// group_base.go derives logind's InhibitDelayMaxSec
+				// from the same kubelet_shutdown_grace_period var.
+				// Values come from the node-config-agent defaults
+				// (kubelet_shutdown_grace_period*) and match the
+				// k0sctl worker profiles.
+				{"shutdownGracePeriod", shutdownGrace,
+					c.cfgScalar("kubelet_shutdown_grace_period", shutdownGrace)},
+				{"shutdownGracePeriodCriticalPods", shutdownGraceCritical,
+					c.cfgScalar("kubelet_shutdown_grace_period_critical_pods", shutdownGraceCritical)},
 			} {
-				s = lineInFile(s, "(?m)^"+kv[0]+":", kv[0]+": "+kv[1],
+				if !kv.ok {
+					continue
+				}
+				s = lineInFile(s, "(?m)^"+kv.key+":", kv.key+": "+kv.val,
 					`(?m)^kind: KubeletConfiguration`)
 			}
 			// evictionMinimumReclaim is a nested MAP — normalize the
@@ -285,16 +310,21 @@ func (c *cyc) groupPulls() {
 	}
 
 	// containerd drop-ins — containerd-2.x plugin paths
-	// ([plugins.'io.containerd.cri.v1.images']). NO restart.
+	// ([plugins.'io.containerd.cri.v1.images']). NO restart. The two
+	// rendered scalars are the gates computed at derivation above; a
+	// refusal skips the whole file (both values are assignments in
+	// it) with the error already counted.
 	_ = r.ensureDir("/etc/k0s/containerd.d", 0o755)
-	_, _ = r.writeManaged("/etc/k0s/containerd.d/90-parallel-pulls.toml", []byte(fmt.Sprintf(
-		`# Managed by node-config-agent - T7 parallel image pulls.
+	if maxParOK && dlOK {
+		_, _ = r.writeManaged("/etc/k0s/containerd.d/90-parallel-pulls.toml", []byte(fmt.Sprintf(
+			`# Managed by node-config-agent - T7 parallel image pulls.
 # Cap concurrent layer downloads now that kubelet has
 # serializeImagePulls off — bounds pull-storm bandwidth;
 # pairs with maxParallelImagePulls=%s at the kubelet.
 [plugins.'io.containerd.cri.v1.images']
   max_concurrent_downloads = %s
 `, maxPar, dl)), 0o644)
+	}
 	_, _ = r.writeManaged("/etc/k0s/containerd.d/91-registry-mirror.toml", []byte(
 		`# Managed by node-config-agent - T7 spegel P2P mirror prep.
 # The spegel init container writes /etc/containerd/certs.d/*/hosts.toml

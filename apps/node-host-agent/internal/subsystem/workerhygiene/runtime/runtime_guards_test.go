@@ -449,6 +449,63 @@ func TestRunTmpfsGuard(t *testing.T) {
 	}
 }
 
+// TestRunTmpfsGuardSkipsOpenFD — the orphan .tmp sweep must not
+// unlink a *.tmp file that a live process still holds open:
+// unlinking would orphan the writer's inode (no space regained,
+// data lost at close). Regression: the sweep's only guard used to
+// be the .tmp suffix + 2h mtime. The fd is represented by a
+// symlink under the fake /proc (<pid>/fd/3 → file), the same
+// shape os.Readlink sees on a real host; the test also keeps a
+// real os.Open handle to mirror the writer.
+func TestRunTmpfsGuardSkipsOpenFD(t *testing.T) {
+	e := fixture(t)
+	h := e.H
+	ctx := context.Background()
+	runDir := t.TempDir()
+	h.Cfg.Disk.HostRunDir = runDir
+	h.Cfg.Seams.Host.StatfsFn = func(path string, st *unix.Statfs_t) error {
+		st.Blocks = 100
+		st.Files = 100
+		st.Ffree = 50
+		if path == runDir {
+			st.Bavail = 15 // 85% used — sweep fires
+		} else {
+			st.Bavail = 100 - uint64(e.DiskUsed*100)
+		}
+		return nil
+	}
+	held := filepath.Join(runDir, "spool.tmp")
+	wdepstest.WriteFile(t, held, "in-flight spool data")
+	past := e.Now.Add(-3 * time.Hour)
+	_ = os.Chtimes(held, past, past)
+	// Real open handle — the writer's side of the contract.
+	f, err := os.Open(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// Fake /proc: pid 4242's fd table carries the same file.
+	fdDir := filepath.Join(e.ProcDir, "4242", "fd")
+	if err := os.MkdirAll(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(held, filepath.Join(fdDir, "3")); err != nil {
+		t.Fatal(err)
+	}
+
+	wdepstest.Check[*runtime.DiskBloatCheck](h, wdeps.CheckDiskBloat).
+		Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: false})
+	if _, err := os.Stat(held); err != nil {
+		t.Fatalf("open .tmp swept despite held fd: %v", err)
+	}
+	if b, rerr := os.ReadFile(held); rerr != nil || string(b) != "in-flight spool data" {
+		t.Fatalf("held .tmp content clobbered: %q err=%v", b, rerr)
+	}
+	if !e.SDRan("vacuum-size=16M") {
+		t.Fatalf("journal vacuum not exec'd: %v", e.SDCmds)
+	}
+}
+
 // --- kernel-pressure: page-alloc-failure → compact_memory ---
 
 func TestPageAllocCompaction(t *testing.T) {

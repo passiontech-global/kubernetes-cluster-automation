@@ -4,8 +4,10 @@
 package hostconfig
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -149,8 +151,35 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 		c.err("swap: chmod 0600 failed", "path", path, "error", err)
 		return
 	}
-	out, _ := r.run(ctx, "blkid", "-o", "value", "-s", "TYPE", path)
+	// blkid answers three ways: "swap" (signature present), the
+	// documented exit-2 no-signature (a fresh file — mkswap is the
+	// remedy), or a probe failure. The old `out, _ :=` swallowed the
+	// failure arm, so a broken probe fell through to mkswap — which
+	// rewrites the signature of LIVE swap (UUID churn, page-state
+	// corruption) whenever the swapon probe above missed the active
+	// entry. Exit 2 on a real ExitError is the ONLY trusted
+	// "unsigned"; every other failure skips the cycle fail-closed,
+	// exactly like the swapon --show probe above.
+	out, err := r.run(ctx, "blkid", "-o", "value", "-s", "TYPE", path)
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 2 {
+			c.err("swap: blkid failed — cannot verify swap signature; skipping cycle",
+				"path", path, "error", err)
+			return
+		}
+	}
 	if strings.TrimSpace(out) != "swap" {
+		// mkswap is only ever legitimate on an INACTIVE file: an
+		// active file carries a signature by construction, so
+		// "active but unsigned" means the two probes disagree and
+		// rewriting it would pull live swap out from under the
+		// kernel. Skip the cycle instead of guessing.
+		if active {
+			c.err("swap: blkid reports no swap signature on an active swapfile — skipping cycle",
+				"path", path)
+			return
+		}
 		if _, err := r.run(ctx, "mkswap", path); err != nil {
 			c.err("swap: mkswap failed", "path", path, "error", err)
 			return
@@ -183,6 +212,14 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 			c.err("swap: swapon failed — file exists but swap not active",
 				"path", path, "error", err)
 		}
+	}
+	// Swappiness drop-in + live apply. The value renders into a
+	// sysctl.d file AND the `sysctl -w` argv — same charset gate as
+	// every other sysctl render; a refused value skips only this
+	// tail, the swapfile itself is already converged above (the
+	// refusal is counted by the gate).
+	if !c.cfgSysctlVal("swap_swappiness", sw) {
+		return
 	}
 	_, _ = r.writeManaged("/etc/sysctl.d/99-kine-swap.conf",
 		[]byte("# Managed by node-config-agent - swap safety-net (node_tuning_swap.yaml)\n"+

@@ -24,7 +24,23 @@ func sysctlFile(pairs [][2]string, header string) []byte {
 func (c *cyc) sysctlPairs(varName string) [][2]string {
 	var out [][2]string
 	for _, it := range c.vl(varName) {
-		out = append(out, [2]string{strOf(it, "name"), strOf(it, "value")})
+		k, v := strOf(it, "name"), strOf(it, "value")
+		if k == "" || v == "" {
+			// Unset/degenerate var entry — render nothing rather than
+			// a valueless `key = ` line sysctl --system would choke
+			// on; an absent var is not an error.
+			continue
+		}
+		// Charset gate BEFORE the render (rendered-config hardening):
+		// a newline in a var value would splice further `key = value`
+		// lines into the drop-in, applied verbatim by the next
+		// `sysctl --system`. A refused pair is skipped — the file
+		// converges with the remaining pairs, the refusal is counted
+		// per dropped pair.
+		if !c.cfgSysctlKey(varName, k) || !c.cfgSysctlVal(varName, v) {
+			continue
+		}
+		out = append(out, [2]string{k, v})
 	}
 	return out
 }

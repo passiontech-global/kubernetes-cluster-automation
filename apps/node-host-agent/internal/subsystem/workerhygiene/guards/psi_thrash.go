@@ -96,7 +96,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 			avail, sawAvail = v, true
 		case "SUnreclaim:":
 			slab = v
-		case "PageTables:", "SecPageTables":
+		case "PageTables:", "SecPageTables:":
 			// W19-K4: page-table memory is kernel memory outside
 			// SUnreclaim — a leaking/mapping-heavy workload grows it
 			// invisibly to the slab ratio.

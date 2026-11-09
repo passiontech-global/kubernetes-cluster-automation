@@ -56,6 +56,129 @@ func TestGroupBaseHostProtectionFilesConverge(t *testing.T) {
 	}
 }
 
+// TestGroupBaseLogindInhibitTracksGraceVar — InhibitDelayMaxSec must
+// derive from the SAME kubelet_shutdown_grace_period var groupPulls
+// renders into shutdownGracePeriod (+5s buffer, floor 65): the old
+// hardcoded 65 left a 120s kubelet window outside logind's inhibit
+// delay, so systemd killed the node mid-drain. The first write must
+// also reload systemd-logind — the drop-in is inert until logind
+// re-parses logind.conf — and a clean second cycle must not reload
+// again.
+func TestGroupBaseLogindInhibitTracksGraceVar(t *testing.T) {
+	vars := writeVarsDir(t, "kubelet_shutdown_grace_period: \"120s\"\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	logind := hostRead(t, r, "/etc/systemd/logind.conf.d/99-k8s-shutdown.conf")
+	if !strings.Contains(logind, "InhibitDelayMaxSec=125") { // 120s + 5s buffer
+		t.Fatalf("InhibitDelayMaxSec must track the 120s grace var (+5s):\n%s", logind)
+	}
+	if n := len(sr.CallsMatching("systemctl reload systemd-logind.service")); n != 1 {
+		t.Fatalf("logind reload after drop-in change = %d, want 1", n)
+	}
+	// Second cycle: byte-identical drop-in → no rewrite, no reload.
+	c.groupBase()
+	if n := len(sr.CallsMatching("systemctl reload systemd-logind.service")); n != 1 {
+		t.Fatalf("logind reload re-run despite identical drop-in (%d reloads)", n)
+	}
+}
+
+// TestGroupBaseLogindReloadFailureWarnOnly — a failed logind reload
+// must NOT count a cycle error: the declared state is already on disk
+// and lands at the next reload/reboot (coredump daemon-reload
+// warn-only parity; a restart would tear down sessions, so it is
+// reload-or-nothing).
+func TestGroupBaseLogindReloadFailureWarnOnly(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, map[string]bool{
+		"systemctl reload systemd-logind.service": true,
+	})
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	if c.errs != 0 {
+		t.Fatalf("failed logind reload counted %d cycle errors, want warn-only", c.errs)
+	}
+	if logind := hostRead(t, r, "/etc/systemd/logind.conf.d/99-k8s-shutdown.conf"); logind == "" {
+		t.Fatal("logind drop-in missing despite failed reload")
+	}
+}
+
+// TestGroupBaseLimitNOFILEConverges — the limits drop-in renders the
+// vars value verbatim plus one daemon-reload; a second cycle is
+// byte-identical (no rewrite, no second reload).
+func TestGroupBaseLimitNOFILEConverges(t *testing.T) {
+	vars := writeVarsDir(t, "k0sworker_limit_nofile: \"1048576\"\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	lim := hostRead(t, r, "/etc/systemd/system/k0sworker.service.d/10-limits.conf")
+	if !strings.Contains(lim, "LimitNOFILE=1048576") {
+		t.Fatalf("LimitNOFILE not rendered from var:\n%s", lim)
+	}
+	n := len(sr.CallsMatching("systemctl daemon-reload"))
+	if n == 0 {
+		t.Fatal("daemon-reload missing after drop-in change")
+	}
+	c.groupBase()
+	if len(sr.CallsMatching("systemctl daemon-reload")) != n {
+		t.Fatal("daemon-reload re-run despite identical drop-ins")
+	}
+}
+
+// TestGroupBaseRefusesUnsafeLimitNOFILE — the drop-in value is a
+// systemd assignment rendered verbatim: a newline-bearing var would
+// inject a SECOND directive systemd applies (and an unparsable one is
+// dropped at daemon-reload, silently keeping stock fd limits). The
+// refused value must count an error and leave the drop-in unwritten.
+func TestGroupBaseRefusesUnsafeLimitNOFILE(t *testing.T) {
+	vars := writeVarsDir(t, "k0sworker_limit_nofile: \"1048576\nTasksMax=2\"\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	if c.errs == 0 {
+		t.Fatal("newline-bearing LimitNOFILE not counted")
+	}
+	if hostExists(r, "/etc/systemd/system/k0sworker.service.d/10-limits.conf") {
+		t.Fatal("limits drop-in written from a refused value")
+	}
+}
+
 // ---------- Coredump: coredump.conf.d disable drop-in ----------
 
 func TestGroupBaseCoredumpDropInConverges(t *testing.T) {
