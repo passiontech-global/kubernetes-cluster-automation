@@ -17,9 +17,7 @@ package pki
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -27,6 +25,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
@@ -45,19 +44,6 @@ const (
 		"control-plane nodes is signer key skew (TokenRequest 401s)."
 )
 
-// sha256FileHex returns the hex SHA-256 of a file's raw bytes —
-// sa.pub is hashed whole (not parsed): a drifted file must change
-// the fingerprint even when the drift is a stray byte, not a
-// different key.
-func sha256FileHex(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
 // emitSAPubFingerprint — sa-pub-key-fingerprint: write
 // node_k0s_sa_pub_fingerprint_hash{sha256=...} to the textfile
 // channel every cycle. The whole subsystem only runs on
@@ -66,7 +52,10 @@ func sha256FileHex(path string) (string, error) {
 // emits headers-only — the series goes absent, never a fake hash.
 func (c *DriftCheck) emitSAPubFingerprint() {
 	var p promfile.Builder
-	sum, err := sha256FileHex(filepath.Join(c.d.Cfg.K0sDir, "pki", "sa.pub"))
+	// sa.pub is hashed whole (not parsed): a drifted file must
+	// change the fingerprint even when the drift is a stray byte,
+	// not a different key.
+	sum, err := pagecache.Sha256File(filepath.Join(c.d.Cfg.K0sDir, "pki", "sa.pub"))
 	if err != nil {
 		p.Header(SAPubMetric, saPubHashHelp)
 	} else {

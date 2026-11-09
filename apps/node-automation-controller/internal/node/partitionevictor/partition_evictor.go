@@ -99,19 +99,7 @@ var partitionNodePinnedStorageClasses = map[string]bool{
 // packets dropped — same unreachable-from-peers shape). The names
 // come from nodecond.PartitionNames, the source of truth shared with
 // the node-host-agent so the two apps cannot drift.
-var partitionCondTypes = condTypes(nodecond.PartitionNames)
-
-// condTypes converts a nodecond name list into the
-// corev1.NodeConditionType slice the detection loop compares —
-// nodecond keeps the names as untyped strings so libs/hostkit stays
-// stdlib-only.
-func condTypes(names []string) []corev1.NodeConditionType {
-	out := make([]corev1.NodeConditionType, len(names))
-	for i, name := range names {
-		out[i] = corev1.NodeConditionType(name)
-	}
-	return out
-}
+var partitionCondTypes = kube.CondTypes(nodecond.PartitionNames)
 
 // partitionCondHeartbeatMaxAge is how old an agent-emitted partition
 // latch's lastHeartbeatTime may be before its True stops flagging the
@@ -119,14 +107,6 @@ func condTypes(names []string) []corev1.NodeConditionType {
 // or absent stamp means the value is a zombie left by a dead agent
 // (same 10m convention as nodehealth's precordon gate).
 const partitionCondHeartbeatMaxAge = 10 * time.Minute
-
-// condHeartbeatLive reports whether a condition's lastHeartbeatTime
-// is fresh enough to trust the value — mirror of nodehealth's
-// condHeartbeatLive.
-func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
-	return !c.LastHeartbeatTime.IsZero() &&
-		now.Sub(c.LastHeartbeatTime.Time) < partitionCondHeartbeatMaxAge
-}
 
 type partitionEvictor struct {
 	cs kubernetes.Interface
@@ -217,7 +197,8 @@ func nodePartitioned(n *corev1.Node, now time.Time) bool {
 			now.Sub(c.LastTransitionTime.Time) <= partitionMinAge {
 			continue
 		}
-		if nodecond.AgentHeartbeatManaged(string(t)) && !condHeartbeatLive(c, now) {
+		if nodecond.AgentHeartbeatManaged(string(t)) &&
+			!kube.CondHeartbeatLive(c, partitionCondHeartbeatMaxAge, now) {
 			continue // zombie latch — the reporter cannot vouch for it
 		}
 		return true

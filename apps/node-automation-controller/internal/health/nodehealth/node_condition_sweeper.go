@@ -49,7 +49,7 @@ const CheckNameNodeCondSweeper = "node-condition-sweeper"
 // KernelDeadlock, the permanent latch whose frozen heartbeat means
 // nothing. The sweeper only reconciles conditions whose writer is a
 // node agent that re-stamps lastHeartbeatTime every ~2m while alive.
-var nodeCondSweptConds = condTypes(nodecond.HeartbeatSweptNames)
+var nodeCondSweptConds = kube.CondTypes(nodecond.HeartbeatSweptNames)
 
 var nodeCondSweepsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_node_condition_sweeps_total",
@@ -71,7 +71,7 @@ func condZombie(c *corev1.NodeCondition, now time.Time) bool {
 	if c.Status != corev1.ConditionTrue {
 		return false
 	}
-	if condHeartbeatLive(c, now) {
+	if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 		return false
 	}
 	return !c.LastTransitionTime.IsZero() &&

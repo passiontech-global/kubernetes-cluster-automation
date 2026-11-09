@@ -48,6 +48,7 @@ func TestScanBloatAndWLayerShareWalkCache(t *testing.T) {
 		cfg.Seams.Host.Clock, func() *slog.Logger { return slog.Default() })
 	f.Bind(d)
 	c := &DiskBloatCheck{d: d}
+	w := &WritableLayerCheck{d: d}
 
 	for _, id := range []string{"1", "2", "3"} {
 		wdepstest.WriteFile(t,
@@ -71,7 +72,7 @@ func TestScanBloatAndWLayerShareWalkCache(t *testing.T) {
 		},
 	}
 	c.scanBloat(e, nil)
-	c.writableLayerScan(context.Background(), e)
+	w.writableLayerScan(context.Background(), e)
 
 	seen := map[string]bool{}
 	for _, root := range walked {

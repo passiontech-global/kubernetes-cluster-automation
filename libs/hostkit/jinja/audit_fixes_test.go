@@ -699,3 +699,64 @@ func TestBinOpIntegerFastPathExcludesFloats(t *testing.T) {
 		}
 	}
 }
+
+// {% for %}: loop-variable names must be plain identifiers — a
+// missing comma (`for x y in items`) must error, not bind a garbage
+// "x y" name whose body reads back Undefined (rendered empty into a
+// converged config). Well-formed loops keep rendering.
+func TestForTagStrictness(t *testing.T) {
+	got, err := renderBounded(t, `{% for x in ['a','b'] %}{{ x }}{% endfor %}`, nil)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if got != "ab" {
+		t.Fatalf("well-formed loop = %q want %q", got, "ab")
+	}
+	// Garbage / unsupported loop-variable shapes must error.
+	for _, tpl := range []string{
+		"{% for x y in items %}{{ x }}{% endfor %}", // missing comma
+		"{% for 1x in items %}{{ x }}{% endfor %}",  // leading digit
+		"{% for x.y in items %}{{ x }}{% endfor %}", // dotted name
+		"{% for in items %}{{ x }}{% endfor %}",     // no name at all
+	} {
+		if _, err := renderBounded(t, tpl, nil); err == nil {
+			t.Fatalf("render %q succeeded — want for-tag error", tpl)
+		}
+	}
+}
+
+// Call/test/filter argument lists must demand a ',' or ')' between
+// arguments: `default('n/a' 0)` used to bind 0 as the second
+// (boolean-mode) positional without warning, silently inverting the
+// filter's semantics.
+func TestArgListCommaStrictness(t *testing.T) {
+	for _, tpl := range []string{
+		"{{ nosuch | default('n/a' 0) }}",
+		"{{ nosuch | default('n/a' 'b') }}",
+		"{{ x is equalto('a' 'b') }}",
+		"{{ missing('a' 'b') }}",
+	} {
+		if _, err := renderBounded(t, tpl, nil); err == nil {
+			t.Fatalf("render %q succeeded — want arg-list comma error", tpl)
+		}
+	}
+	// Comma-separated and keyword arguments keep parsing. default's
+	// fallback fires on UNDEFINED, not on an empty-but-defined value.
+	cases := map[string]string{
+		`{{ nosuch | default('n/a', true) }}`: "n/a",
+		`{{ nosuch | default('ok') }}`:        "ok",
+	}
+	for tpl, want := range cases {
+		got, err := renderBounded(t, tpl, nil)
+		if err != nil {
+			t.Fatalf("render %q: %v", tpl, err)
+		}
+		if got != want {
+			t.Fatalf("render %q = %q want %q", tpl, got, want)
+		}
+	}
+	ctx := map[string]any{"x": ""}
+	if got, err := renderBounded(t, `{{ x is equalto('') }}`, ctx); err != nil || got != "True" {
+		t.Fatalf("equalto('') = %q err=%v, want True", got, err)
+	}
+}

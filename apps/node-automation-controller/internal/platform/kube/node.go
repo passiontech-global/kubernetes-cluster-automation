@@ -210,5 +210,5 @@ func PatchNodeLabels(ctx context.Context, cs kubernetes.Interface, name string, 
 // get/list/watch on nodes). Paged like every cluster-wide list —
 // Node objects are the fattest typed payload any module pulls.
 func ListNodes(ctx context.Context, cs kubernetes.Interface) ([]corev1.Node, error) {
-	return ListAll(ctx, metav1.ListOptions{Limit: 500}, nodes(cs))
+	return ListAll(ctx, metav1.ListOptions{Limit: DefaultListPageSize}, nodes(cs))
 }

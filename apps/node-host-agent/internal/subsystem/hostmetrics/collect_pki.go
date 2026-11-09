@@ -5,9 +5,7 @@
 package hostmetrics
 
 import (
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"math"
 	"os"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
 // defaultPKIHostPaths are the PKI sources scanned for *.crt/*.pem —
@@ -55,19 +55,6 @@ var descSAPubHash = prometheus.NewDesc(
 	saPubHashHelp,
 	[]string{"node", "sha256"}, nil)
 
-// sha256FileHex returns the hex SHA-256 of a file's raw bytes —
-// sa.pub is hashed whole (not parsed): a drifted file must change
-// the fingerprint even when the drift is a stray byte, not a
-// different key.
-func sha256FileHex(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
 // collectSAPubFingerprint emits node_k0s_sa_pub_fingerprint_hash on
 // control-plane nodes — sa-pub-key-fingerprint: when one CP node's sa.pub diverges
 // (rotation not propagated, or the file never reloaded), tokens the
@@ -81,7 +68,10 @@ func (c *Collector) collectSAPubFingerprint(ch chan<- prometheus.Metric) {
 	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
 		return // not a k0s controller → no series
 	}
-	sum, err := sha256FileHex(filepath.Join(
+	// sa.pub is hashed whole (not parsed): a drifted file must
+	// change the fingerprint even when the drift is a stray byte,
+	// not a different key.
+	sum, err := pagecache.Sha256File(filepath.Join(
 		c.cfg.HostRoot, defaultSAPubHostPath))
 	if err != nil {
 		return

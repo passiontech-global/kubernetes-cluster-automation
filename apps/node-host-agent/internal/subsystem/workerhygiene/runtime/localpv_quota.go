@@ -1,7 +1,8 @@
 // localpv_quota.go — the localpv-quota LocalPV hard-quota
-// enforcer side-guard that rides the DiskBloatCheck cycle slot
-// (pvc-* over 1.5x capacity under disk pressure → deprioritize
-// the owning pod's tasks).
+// enforcer check (wdeps.CheckLocalPVQuota): pvc-* dirs over 1.5x
+// capacity under disk pressure get their owning pod's tasks
+// deprioritized. Promoted out of DiskBloatCheck into its own
+// wdeps.Check — per-guard WD_SIG kill switch + cycles series.
 package runtime
 
 import (
@@ -30,9 +31,35 @@ import (
 // localPVThrottled ledger — one throttle per agent lifetime; the
 // deprioritization is sticky until the pod restarts anyway.
 
+// LocalPVQuotaCheck is the localpv-quota enforcer as a Check.
+type LocalPVQuotaCheck struct {
+	d *wdeps.Deps
+	// localPVThrottled is the per-PVC throttle ledger — a pod is
+	// deprioritized once per process lifetime (the throttle is
+	// sticky until the pod restarts anyway).
+	localPVThrottled map[string]bool
+}
+
+// NewLocalPVQuota builds the localpv-quota check.
+func NewLocalPVQuota(d *wdeps.Deps) *LocalPVQuotaCheck {
+	return &LocalPVQuotaCheck{d: d}
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *LocalPVQuotaCheck) Name() string { return wdeps.CheckLocalPVQuota }
+
+// Run executes one localpv-quota round under its own gate.
+func (c *LocalPVQuotaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
+	if c.d.Gated(e, wdeps.CheckLocalPVQuota) {
+		return
+	}
+	c.localPVQuota(ctx, e)
+	c.d.CycleResult(wdeps.CheckLocalPVQuota, "ok")
+}
+
 // localPVScanRoots returns the roots the quota scan walks —
 // LocalPVQuotaDir when configured, else the ST2 provisioner roots.
-func (c *DiskBloatCheck) localPVScanRoots() []string {
+func (c *LocalPVQuotaCheck) localPVScanRoots() []string {
 	if c.d.Cfg.Disk.LocalPVQuotaDir != "" {
 		return []string{c.d.Cfg.Disk.LocalPVQuotaDir}
 	}
@@ -42,7 +69,7 @@ func (c *DiskBloatCheck) localPVScanRoots() []string {
 // localPVQuota runs one localpv-quota round: over-quota pvc-* dirs under
 // disk pressure get their owning pod's tasks deprioritized and a
 // LocalPVQuotaExceeded event emitted.
-func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
+func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
 	if !e.APIOK || c.d.Cfg.Client == nil {
 		return // PV/PVC resolution needs the apiserver
 	}
@@ -138,7 +165,7 @@ func (c *DiskBloatCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
 // io.max variant is deliberately NOT written — an absolute byte
 // rate has no safe value without device knowledge; io.weight
 // achieves the same relative starvation (documented deviation).
-func (c *DiskBloatCheck) throttlePVTasks(ctx context.Context,
+func (c *LocalPVQuotaCheck) throttlePVTasks(ctx context.Context,
 	e *wdeps.CycleEnv, pod *corev1.Pod, dir string, size, cap int64) {
 
 	uid := string(pod.UID)
@@ -182,12 +209,12 @@ func (c *DiskBloatCheck) throttlePVTasks(ctx context.Context,
 	c.localPVThrottled[dir] = true
 	c.d.LocalPVQuotaThrottled++
 	c.emitPVQuotaEvent(ctx, pod, dir, size, cap, throttled)
-	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "localpv_throttle").Inc()
+	c.d.Actions.WithLabelValues(wdeps.CheckLocalPVQuota, "localpv_throttle").Inc()
 }
 
 // emitPVQuotaEvent creates the LocalPVQuotaExceeded Warning event
 // on the throttled pod.
-func (c *DiskBloatCheck) emitPVQuotaEvent(ctx context.Context,
+func (c *LocalPVQuotaCheck) emitPVQuotaEvent(ctx context.Context,
 	pod *corev1.Pod, dir string, size, cap int64, throttled int) {
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{

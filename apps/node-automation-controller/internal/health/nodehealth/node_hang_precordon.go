@@ -155,25 +155,13 @@ const (
 // The clock conditions are deliberately NOT here: they carry their
 // own longer fuse (nodeClockSkewCordonAge) and are checked
 // separately.
-var nodeHangConds = condTypes(nodecond.HangPreCordonNames)
+var nodeHangConds = kube.CondTypes(nodecond.HangPreCordonNames)
 
 // nodeClockSkewConds are the clock-health latches on the longer
 // fuse (nodecond.ClockSkewPreCordonNames) — ClockUnsynchronized
 // (no sync source) and ClockSkewDetected (synchronized but >2s
 // offset, node-hang-extra-conds).
-var nodeClockSkewConds = condTypes(nodecond.ClockSkewPreCordonNames)
-
-// condTypes converts a nodecond name list into the
-// corev1.NodeConditionType slices the check loops compare —
-// nodecond keeps the names as untyped strings so libs/hostkit stays
-// stdlib-only.
-func condTypes(names []string) []corev1.NodeConditionType {
-	out := make([]corev1.NodeConditionType, len(names))
-	for i, name := range names {
-		out[i] = corev1.NodeConditionType(name)
-	}
-	return out
-}
+var nodeClockSkewConds = kube.CondTypes(nodecond.ClockSkewPreCordonNames)
 
 var (
 	// node-hang-precordon — worker nodes patched spec.unschedulable after a
@@ -222,7 +210,7 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 	}
 	for _, t := range nodeHangConds {
 		if c := fused(t, nodeHangCondMinAge); c != nil {
-			if condHeartbeatLive(c, now) {
+			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 				return string(t), stale
 			}
 			if stale == "" {
@@ -232,7 +220,7 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 	}
 	for _, t := range nodeClockSkewConds {
 		if c := fused(t, nodeClockSkewCordonAge); c != nil {
-			if condHeartbeatLive(c, now) {
+			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 				return string(t), stale
 			}
 			if stale == "" {
@@ -241,16 +229,6 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 		}
 	}
 	return "", stale
-}
-
-// condHeartbeatLive reports whether a condition's
-// lastHeartbeatTime is fresh enough to trust the value: the writer
-// (nodereporter, kubelet) re-stamps it while alive, so a heartbeat
-// older than nodeHangCondHeartbeatMaxAge — or never set — means the
-// condition may be a zombie left by a dead reporter.
-func condHeartbeatLive(c *corev1.NodeCondition, now time.Time) bool {
-	return !c.LastHeartbeatTime.IsZero() &&
-		now.Sub(c.LastHeartbeatTime.Time) < nodeHangCondHeartbeatMaxAge
 }
 
 // nodeHangLatchActive reports whether ANY hang latch is currently

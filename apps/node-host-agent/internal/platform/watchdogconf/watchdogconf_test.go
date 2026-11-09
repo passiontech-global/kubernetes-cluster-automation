@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/fileconf"
 )
 
 func TestParseListsAndScalars(t *testing.T) {
@@ -158,7 +160,7 @@ QHASH="a#b" # trailing
 	// Re-parse through vars path: spot-check via new key fields and
 	// a parse of the raw map.
 	for k, want := range vars {
-		if got := parseKV("X_" + k + "=" + map[string]string{
+		if got := fileconf.ParseShellKV("X_" + k + "=" + map[string]string{
 			"FOO":   `"a b" # note`,
 			"BAR":   `'x y' # note`,
 			"BAZ":   `plain # note`,
@@ -279,7 +281,7 @@ func TestPickFallsBackOnEmptyPrimary(t *testing.T) {
 // Bash quote removal happens per word: KEY="a"#tail → `a#tail`
 // (mid-word '#' is literal), not the raw `"a"#tail`.
 func TestParseQuotedThenHashTail(t *testing.T) {
-	vars := parseKV("A=\"a\"#comment\nB=\"a\" # comment\nC=x'y'z\nD=''#x\n")
+	vars := fileconf.ParseShellKV("A=\"a\"#comment\nB=\"a\" # comment\nC=x'y'z\nD=''#x\n")
 	for k, want := range map[string]string{
 		"A": "a#comment", // '#' glued to the closing quote is literal
 		"B": "a",         // '#' after whitespace opens the comment

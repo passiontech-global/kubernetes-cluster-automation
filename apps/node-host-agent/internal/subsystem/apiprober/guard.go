@@ -156,79 +156,9 @@ func parseStaticBackend(entry string) (StaticBackend, bool) {
 	return StaticBackend{Name: name, Addr: addr}, true
 }
 
-// parseShellKV parses shell-style KEY=VALUE lines (the same grammar
-// watchdogconf uses — quotes honoured, `#` comments, `export `
-// prefixes tolerated). Duplicated here because watchdogconf's parser
-// is package-private and the guard conf is an apiprober input.
+// parseShellKV parses the guard conf's shell-style KEY=VALUE lines
+// — the shared fileconf grammar (quotes honoured, `#` comments,
+// `export ` prefixes tolerated), identical to watchdogconf's.
 func parseShellKV(data string) map[string]string {
-	vars := map[string]string{}
-	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if v, ok := strings.CutPrefix(line, "export "); ok {
-			line = strings.TrimSpace(v)
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		vars[key] = guardScalar(guardValue(strings.TrimSpace(val)))
-	}
-	return vars
-}
-
-// guardScalar strips surrounding single/double quotes.
-func guardScalar(v string) string {
-	if len(v) >= 2 {
-		if (v[0] == '"' && v[len(v)-1] == '"') ||
-			(v[0] == '\'' && v[len(v)-1] == '\'') {
-			return v[1 : len(v)-1]
-		}
-	}
-	return v
-}
-
-// guardValue cuts a raw VALUE at the first `#` that opens a bash
-// comment — outside quotes and at a word boundary. A `#` inside
-// quotes or glued to the previous word is literal (bash `source`
-// parity — same semantics as watchdogconf's parser).
-func guardValue(val string) string {
-	var out strings.Builder
-	out.Grow(len(val))
-	var quote byte
-	wordStart := true
-	for i := 0; i < len(val); i++ {
-		ch := val[i]
-		if quote != 0 {
-			out.WriteByte(ch)
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		switch ch {
-		case '"', '\'':
-			quote = ch
-			wordStart = false
-			out.WriteByte(ch)
-		case ' ', '\t':
-			wordStart = true
-			out.WriteByte(ch)
-		case '#':
-			if wordStart {
-				return strings.TrimSpace(out.String())
-			}
-			out.WriteByte(ch)
-		default:
-			wordStart = false
-			out.WriteByte(ch)
-		}
-	}
-	return strings.TrimSpace(out.String())
+	return fileconf.ParseShellKV(data)
 }

@@ -277,7 +277,10 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 
 	// Bounce the node-agent pod so its next scheduled backup starts
 	// clean — the DaemonSet recreates it. A missing agent pod needs
-	// no bounce (it is already gone).
+	// no bounce (it is already gone). A FAILED bounce reports
+	// not-healed: the caller skips the cooldown stamp, so the next
+	// sweep retries the half-done heal (the PVB delete tolerates
+	// NotFound on retry) instead of parking it for 30m wedged.
 	if agent != nil {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
@@ -285,6 +288,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 			log.Error(err, "node-agent bounce failed",
 				"pod", agent.Namespace+"/"+agent.Name)
 			metrics.IncError(a.queue)
+			return false
 		} else {
 			metrics.VeleroWedgedObjectsCleanedTotal.
 				WithLabelValues(ns, "pod_restarted").Inc()
