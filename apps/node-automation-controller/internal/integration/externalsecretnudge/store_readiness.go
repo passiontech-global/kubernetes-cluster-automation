@@ -8,8 +8,6 @@ package externalsecretnudge
 import (
 	"context"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,65 +17,23 @@ import (
 
 // listFirst lists the first working GVR of a candidate set — the ESO
 // API serves v1 on current installs and v1beta1 on older ones; a
-// not-installed candidate is skipped, the first listable wins.
+// not-installed candidate is skipped, the first listable wins. The
+// benign/real error split is kube.ListFirstGVR's: a v1beta1
+// NotFound/NoMatch fallback never masks a genuine API failure on
+// another candidate GVR.
 func (n *externalSecretNudge) listFirst(ctx context.Context,
 	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
-	var benignErr, realErr error
-	for _, gvr := range gvrs {
-		list, err := kube.ListAllUnstructured(ctx, n.dyn.Resource(gvr),
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
-		if err == nil {
-			return list, nil
-		}
-		// A NotFound/NoMatch candidate is the "not installed"
-		// shape — remember it as the fallback error, never as the
-		// verdict when a REAL API failure (RBAC, throttling,
-		// timeout) also happened: the real failure must win so the
-		// sweep reports the actual problem instead of quietly
-		// skipping on the last candidate's benign 404.
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			if benignErr == nil {
-				benignErr = err
-			}
-			continue
-		}
-		if realErr == nil {
-			realErr = err
-		}
-	}
-	if realErr != nil {
-		return nil, realErr
-	}
-	return nil, benignErr
+	list, _, err := kube.ListFirstUnstructured(ctx, n.dyn, gvrs,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	return list, err
 }
 
-// gvrForPatch returns the GVR the ES list answered on — patches must
-// land on the same served version.
+// listES is listFirst bound to the ExternalSecret GVR set — it also
+// returns the GVR the list answered on so patches land on the same
+// served version.
 func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
-	var benignErr, realErr error
-	for _, gvr := range externalSecretGVRs {
-		list, err := kube.ListAllUnstructured(ctx, n.dyn.Resource(gvr),
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
-		if err == nil {
-			return list, gvr, nil
-		}
-		// Same real-error rule as listFirst: a v1beta1
-		// NotFound/NoMatch fallback must never mask a genuine API
-		// failure on another candidate GVR.
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			if benignErr == nil {
-				benignErr = err
-			}
-			continue
-		}
-		if realErr == nil {
-			realErr = err
-		}
-	}
-	if realErr != nil {
-		return nil, schema.GroupVersionResource{}, realErr
-	}
-	return nil, schema.GroupVersionResource{}, benignErr
+	return kube.ListFirstUnstructured(ctx, n.dyn, externalSecretGVRs,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 }
 
 // esStoreReady reports whether every store the ES can pull from is

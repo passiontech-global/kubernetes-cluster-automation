@@ -34,19 +34,15 @@ package partitionevictor
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -303,256 +299,36 @@ func podOnNodePinnedPVC(p *corev1.Pod, pinned map[string]struct{}) bool {
 	return false
 }
 
+// run sequences one sweep: census the cached nodes, re-confirm the
+// flagged ones live, untaint recovered nodes, then — unless the
+// mesh-wide guard aborts — fence the flagged nodes and evict their
+// eligible pods. The phases live in partition_evictor_sweep.go.
 func (e *partitionEvictor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-
-	nodes, err := kube.ListNodesCached(ctx, e.nodeReader, e.cs)
-	if err != nil {
-		return fmt.Errorf("list nodes: %w", err)
+	s := &partitionSweep{e: e, log: log, now: e.now.Now()}
+	if err := s.census(ctx); err != nil {
+		return err
 	}
-	byName := make(map[string]*corev1.Node, len(nodes))
-	flagged := map[string]bool{}
-	total := 0
-	now := e.now.Now()
-	for i := range nodes {
-		byName[nodes[i].Name] = &nodes[i]
-		if kube.IsControlPlane(&nodes[i]) {
-			// k0s control planes run no kubelet and no evictable
-			// workload — a partition condition there must neither
-			// taint nor count toward the mesh-wide guard (counting
-			// them would dilute the denominator and mask a
-			// fully-partitioned workforce).
-			continue
-		}
-		total++
-		if nodePartitioned(&nodes[i], now) {
-			flagged[nodes[i].Name] = true
-		}
-	}
+	s.confirmLive(ctx)
+	s.untaintRecovered(ctx)
 
-	// Re-confirm every flagged node against the LIVE API before
-	// anything acts on it. The census above rides the informer cache —
-	// watch-fresh in the happy path, but seconds-to-minutes behind
-	// under backlog — and eviction is destructive: a partition that
-	// healed inside the lag window must not cost live pods. Detection
-	// stays on the cache; the action set does not trust it.
-	action := make(map[string]bool, len(flagged))
-	for name := range flagged {
-		live, err := e.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			// Fail closed: no live confirmation, no eviction this
-			// sweep. The node stays in `flagged`, so an
-			// unconfirmable suspect still counts toward the
-			// mesh-wide guard below.
-			metrics.IncError(e.queue)
-			log.Error(err, "live node get failed — skipping node this sweep", "node", name)
-			continue
-		}
-		if nodePartitioned(live, now) {
-			action[name] = true
-			continue
-		}
-		// Live truth overrides the cache: drop the node from
-		// `flagged` so the recovery untaint below (and the
-		// mesh-wide guard) see it healed.
-		delete(flagged, name)
-		// Partition healed — the node's own convergence evidence:
-		// clear its breaker history now rather than waiting out the
-		// window.
-		heal.RecordTargetHealthy(e.queue, name)
-		log.Info("partition healed — skipping evict", "node", name)
-	}
-
-	// Lift the taint on nodes that recovered — before the early exits,
-	// exactly like bash. A node the cache still showed flagged but the
-	// live Get disproved is recovered too: the loop above removed it
-	// from `flagged`, so this existing path untaints it.
-	for i := range nodes {
-		n := &nodes[i]
-		if kube.HasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
-			if err := kube.UntaintNode(ctx, e.cs, n.Name, partitionTaintKey); err != nil {
-				metrics.IncError(e.queue)
-				log.Error(err, "untaint failed", "node", n.Name)
-				continue
-			}
-			log.Info("UNTAINT: network partition cleared", "node", n.Name)
-			// Recovery untainted — the episode converged: clear the
-			// node's breaker history so the next partition starts
-			// from zero instead of tripping a circuit half filled by
-			// the last one.
-			heal.RecordTargetHealthy(e.queue, n.Name)
-		}
-	}
-
-	nFlagged := len(flagged)
+	nFlagged := len(s.flagged)
 	if nFlagged == 0 {
 		log.Info("OK: no partitioned nodes")
 		return nil
 	}
 
-	flaggedNames := make([]string, 0, nFlagged)
-	for name := range flagged {
-		flaggedNames = append(flaggedNames, name)
-	}
-	sort.Strings(flaggedNames)
-
 	// Mesh-wide guard: >50% of EVICTABLE nodes flagged means the
 	// partition is not node-local — evicting just churns pods
 	// between broken nodes. Live-healed nodes left the set above;
 	// unconfirmable ones (live Get failed) deliberately still count.
-	if nFlagged*2 > total {
+	if nFlagged*2 > s.total {
 		log.Info("ABORT: nodes flagged — mesh-wide partition, no evict",
-			"flagged", nFlagged, "total", total, "nodes", flaggedNames)
+			"flagged", nFlagged, "total", s.total, "nodes", s.sortedFlagged())
 		return nil
 	}
 
-	// The taint/evict loops act only on LIVE-confirmed nodes.
-	names := make([]string, 0, len(action))
-	for name := range action {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	// Resolve the eviction set once per run: the Setup-parsed env
-	// allow-list plus the annotation opt-in (checked per pod inside
-	// the loop). One node-scoped cluster-wide list per flagged node
-	// beats 1+len(namespaces) namespaced lists — RBAC already grants
-	// cluster-wide pod list (dead-node-sweeper reads the same way).
-	namespaces := e.evictNamespaces()
-
-	// Taint EVERY flagged node before any eviction — the cap below
-	// bounds pod churn, not fencing. Breaking out of a combined loop
-	// on cap would leave later flagged nodes schedulable until the
-	// next run while their pods sit on a blackholed node.
-	for _, name := range names {
-		node := byName[name]
-		if !kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
-			// Per-target non-convergent circuit breaker — a node the
-			// controller already acted on limit times inside the
-			// window defers the re-taint. A FRESHLY flagged node has
-			// no history and always fences on the first sweep: the
-			// breaker never blocks first-line fencing, only the
-			// re-patch churn of a node that will not converge (each
-			// recovery untaint clears the history — see above).
-			// Defer semantics: log, skip this node, never an error.
-			if allowed, reason := heal.TryAcquireTarget(e.queue, name, now); !allowed {
-				log.Info("DEFER: heal target circuit open — taint skipped",
-					"node", name, "reason", reason)
-				continue
-			}
-			if err := kube.TaintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
-				metrics.IncError(e.queue)
-				log.Error(err, "taint failed", "node", name)
-			} else {
-				log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
-			}
-		}
-	}
-
-	// pinned-volume-guard — resolve the node-pinned PVC set once per run: pods
-	// mounted to local-path / openebs-hostpath volumes can only run
-	// on the node holding the data, so evicting them off a
-	// partitioned node is useless churn. A PVC list failure skips
-	// the whole eviction pass (fail closed — taints above still
-	// fence new scheduling).
-	pinnedPVCs, err := e.nodePinnedPVCs(ctx)
-	if err != nil {
-		metrics.IncError(e.queue)
-		log.Error(err, "pvc list failed — pod eviction skipped this run")
-		return nil
-	}
-
-	// Maintenance mutex + global heal budget — evictions kill LIVE
-	// pods, so they defer while a cordon/drain/kured reboot or a k0s
-	// upgrade is in flight (the taints above still fence the flagged
-	// nodes — fencing is not destructive). heal.Gate runs the
-	// nil-heals-ledger preamble: this module's pacing is partitionEvictCap,
-	// not a CooldownSet — its mutex and budget gates are what apply,
-	// shared via e.verdict so the sweep pays one evaluation.
-	// Unverifiable fails closed and IncErrors the queue like every
-	// other tolerated sub-failure.
-	if e.dyn != nil {
-		proceed, unverifiable := heal.Gate(ctx, log, &e.verdict,
-			e.cs, e.dyn, "partition-evictor", now)
-		if unverifiable {
-			metrics.IncError(e.queue)
-			return nil
-		}
-		if !proceed {
-			return nil
-		}
-	}
-
-	evicted := 0
-loop:
-	for _, name := range names {
-		pods, err := kube.ListAll(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + name,
-			Limit:         kube.DefaultListPageSize,
-		}, kube.Pods(e.cs, metav1.NamespaceAll))
-		if err != nil {
-			metrics.IncError(e.queue)
-			log.Error(err, "list pods failed", "node", name)
-			continue
-		}
-		// Per-target breaker charge state for this node's pass —
-		// spent lazily on the first real victim below, so a sweep
-		// with nothing to evict never banks against the node.
-		charged := false
-		for i := range pods {
-			p := &pods[i]
-			if evicted >= partitionEvictCap {
-				log.Info("SKIP rest: cap reached", "cap", partitionEvictCap,
-					"node", name)
-				break loop
-			}
-			// Belt: the spec.nodeName field selector scopes the
-			// server-side list, but fake clientsets ignore field
-			// selectors — and a dropped/broken selector must never
-			// turn a node-local sweep into a cluster-wide eviction.
-			if p.Spec.NodeName != name {
-				continue
-			}
-			if !partitionEvictable(p, namespaces) {
-				continue
-			}
-			// Node-pinned volume — the pod can only ever run on
-			// this node again; deleting it just recreates the same
-			// stranded pod (or a Pending one) on the broken host.
-			if podOnNodePinnedPVC(p, pinnedPVCs) {
-				continue
-			}
-			// Per-target non-convergent circuit breaker, eviction
-			// side: a sweep that evicts off a node spends ONE grant
-			// (the batch is one heal of the target), charged lazily
-			// on the first real victim. Past limit evicting sweeps
-			// inside the window the rest defer — pods keep sitting
-			// on a fenced node rather than the controller churning
-			// them off it forever. Defer, never an error.
-			if !charged {
-				if allowed, reason := heal.TryAcquireTarget(e.queue, name, now); !allowed {
-					log.Info("DEFER: heal target circuit open — evictions skipped",
-						"node", name, "reason", reason)
-					continue loop
-				}
-				charged = true
-			}
-			log.Info("EVICT: pod off partitioned node",
-				"pod", p.Namespace+"/"+p.Name, "node", name)
-			// UID precondition: the listed pod could be replaced by a
-			// same-named fresh pod before the delete lands — never
-			// kill the replacement. NotFound is already the goal
-			// state (another actor finished the eviction first) —
-			// tolerated, no error accounting.
-			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-				kube.UIDDeleteOptions(p.UID, "")); err != nil && !apierrors.IsNotFound(err) {
-				metrics.IncError(e.queue)
-				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
-					"node", name)
-			}
-			evicted++ // bash counts the attempt against the cap too
-		}
-	}
-	log.Info("sweep done", "evicted", evicted, "flaggedNodes", nFlagged)
+	s.taintFlagged(ctx)
+	s.evictPods(ctx)
 	return nil
 }

@@ -87,8 +87,8 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			sp.Namespace, sp.Name))
 		if !c.d.State.RateTrySpend("last-spegel-restart",
 			c.d.Cfg.MinRestartInterval) {
-			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: spegel stale socket but restart in cooldown (<30m), skip"))
+			c.d.State.AppendLog(
+				"suspect: spegel stale socket but restart in cooldown (<30m), skip")
 			c.d.CycleResult(wdeps.CheckSpegel, "ok")
 			return
 		}

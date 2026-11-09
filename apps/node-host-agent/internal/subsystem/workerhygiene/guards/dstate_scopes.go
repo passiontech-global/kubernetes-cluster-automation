@@ -374,7 +374,8 @@ func (c *ScopesCheck) checkDeactivating(ctx context.Context) {
 			}
 		}
 	}
-	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
+	// No CycleResult here — Run owns the per-sweep cycle accounting;
+	// a second "ok" from this helper would double-count every scan.
 }
 
 // --- Check: cilium-envoy xDS NACK + node-local-dns LRP (envoy-xds-lrp) ---

@@ -248,8 +248,8 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		c.wgFails = 0
 		return
 	}
-	if c.d.StreakPending(&c.wgFails, fmt.Sprintf(
-		"suspect: calico-hygiene wireguard.cali down/no-carrier")) {
+	if c.d.StreakPending(&c.wgFails,
+		"suspect: calico-hygiene wireguard.cali down/no-carrier") {
 		return
 	}
 	if felix == nil {
@@ -259,11 +259,11 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 	}
 	switch {
 	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: calico-hygiene wireguard.cali down but node overloaded — skip pod restart"))
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene wireguard.cali down but node overloaded — skip pod restart")
 	case !c.d.State.RateTrySpend("last-calico-restart", c.d.Cfg.MinRestartInterval):
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: calico-hygiene wireguard.cali down but pod restart in cooldown (<30m), skip"))
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene wireguard.cali down but pod restart in cooldown (<30m), skip")
 	default:
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: calico-hygiene deleted pod %s/%s - wireguard.cali down/no-carrier",

@@ -19,8 +19,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -145,348 +143,23 @@ func rabbitReadySiblings(readyByCluster map[string]int,
 // watermarks, erlang dist node_state != connected) and the
 // stuck-unready pod signature — a rabbitmq pod unready >=10m while
 // >=2 siblings stay Ready gets deleted (30m cooldown) so the
-// cluster re-forms quorum around it.
+// cluster re-forms quorum around it. The sweep is collect
+// (rabbitmq_quorum_collect.go) → heal (rabbitmq_quorum_heals.go) →
+// report; Run below is only the orchestration.
 func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	pods, err := p.AllPods(ctx)
+	census, err := collectRabbitCensus(ctx, p.Deps, log)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	// A RabbitmqCluster the go-kube-downscaler parked at
-	// spec.replicas:0 is asleep on purpose — its members' absence
-	// and any lingering alarm series are intent, not a quorum
-	// failure. A list failure fails open (empty set): the pod
-	// signatures keep their normal posture.
-	crs, err := p.AllUnstructured(ctx, kube.GVRRabbitMQCluster)
-	downscaled, err := downscaledClusterCRs(crs, err)
-	if err != nil {
-		log.Info("WARN: list rabbitmqclusters failed — downscaler awareness off",
-			"error", err)
-	}
-	rabbitByName := map[string]*corev1.Pod{}
-	rabbitByPodName := map[string]*corev1.Pod{}
-	var memberPods []*corev1.Pod
-	var unlabeledPods []corev1.Pod
-	for i := range pods {
-		pod := &pods[i]
-		if !isRabbitMQPod(pod) ||
-			downscaledMemberPod(pod.Namespace, pod.Name, downscaled) {
-			continue
-		}
-		rabbitByName[pod.Namespace+"/"+pod.Name] = pod
-		rabbitByPodName[pod.Name] = pod // ns fallback for series w/o namespace label
-		memberPods = append(memberPods, pod)
-		if rabbitClusterKey(pod) == "" {
-			unlabeledPods = append(unlabeledPods, *pod)
-		}
-	}
+	findings := rabbitPromFindings(ctx, p.Deps, log, census)
 
-	// Prometheus alarm/partition signals.
-	type sig struct{ q, reason string }
-	queries := []sig{
-		{`rabbitmq_alarms_file_descriptor_limit == 1`, "fd_limit_alarm"},
-		{`rabbitmq_alarms_memory_used_watermark == 1`, "memory_watermark_alarm"},
-		{`rabbitmq_alarms_free_disk_space_watermark == 1`, "disk_watermark_alarm"},
-		{`erlang_vm_dist_node_state != 3`, "mnesia_partition"},
-	}
-	findings := map[string]map[string]bool{} // "ns/pod" -> reasons
-	for _, q := range queries {
-		series, err := p.PromQuery(ctx, q.q)
-		if err != nil {
-			log.Info("WARN: rabbitmq prom query failed — signal skipped",
-				"query", q.q, "error", err)
-			continue
-		}
-		for _, s := range series {
-			podName := s.Label("pod", "pod_name")
-			// Fail-closed: a series without a namespace label cannot
-			// be attributed — a bare pod name is ambiguous across
-			// namespaces, and guessing would heal the wrong cluster's
-			// pod on a name collision.
-			ns := s.Metric["namespace"]
-			if ns == "" {
-				continue
-			}
-			if podName != "" &&
-				downscaledMemberPod(ns, podName, downscaled) {
-				continue // parked cluster — stale series, not quorum evidence
-			}
-			key := ns + "/" + podName
-			if podName == "" {
-				key = "cluster/" + q.reason
-			}
-			if findings[key] == nil {
-				findings[key] = map[string]bool{}
-			}
-			findings[key][q.reason] = true
-		}
-	}
-
-	// quorum-raft-health — quorum-queue Raft health, beyond the alarm queries:
-	//
-	// quorum_leaderless — a member publishes rabbitmq_raft_role
-	// series for the quorum queues it replicates; when a member's
-	// series exist but its sum is 0, none of those queues currently
-	// sees it (or anyone, from this member's view) as leader — the
-	// queue cannot accept writes. Diffed client-side across two
-	// instant queries (the literal `and` form never matches: a ==0
-	// comparison produces an empty vector on the leader side, and
-	// PromQL `and` intersects it away) — same shape as the NATS
-	// meta-leaderless check.
-	counts, errC := p.PromQuery(ctx,
-		`count by (namespace, pod) (rabbitmq_raft_role)`)
-	sums, errS := p.PromQuery(ctx,
-		`sum by (namespace, pod) (rabbitmq_raft_role)`)
-	if errC != nil || errS != nil {
-		log.Info("WARN: rabbitmq raft-role queries failed — quorum_leaderless signal skipped",
-			"countErr", errC, "sumErr", errS)
-	} else {
-		sumByPod := map[string]float64{}
-		for _, s := range sums {
-			sumByPod[s.Label("namespace")+"/"+s.Label("pod", "pod_name")] = s.Value
-		}
-		for _, s := range counts {
-			podName := s.Label("pod", "pod_name")
-			// Fail-closed like the alarm loop: no namespace label →
-			// unattributable series, never resolved by bare pod name.
-			ns := s.Metric["namespace"]
-			if ns == "" {
-				continue
-			}
-			if podName == "" || s.Value <= 0 {
-				continue
-			}
-			if sumByPod[ns+"/"+podName] != 0 {
-				continue // at least one queue leadership role held — healthy
-			}
-			if downscaledMemberPod(ns, podName, downscaled) {
-				continue // parked cluster — stale series, not quorum evidence
-			}
-			key := ns + "/" + podName
-			if findings[key] == nil {
-				findings[key] = map[string]bool{}
-			}
-			findings[key]["quorum_leaderless"] = true
-		}
-	}
-
-	// quorum_skew — severe Raft-term lag: a member whose max
-	// rabbitmq_raft_term lags the namespace's highest term by >= 2
-	// missed >= 2 elections — its WAL view is far behind the
-	// cluster's, and its queue replicas cannot vote meaningfully.
-	terms, errT := p.PromQuery(ctx,
-		`max by (namespace, pod) (rabbitmq_raft_term)`)
-	if errT != nil {
-		log.Info("WARN: rabbitmq raft-term query failed — quorum_skew signal skipped",
-			"error", errT)
-	} else {
-		// Pool the max term per RabbitmqCLUSTER, not per namespace —
-		// two clusters sharing one namespace must not judge each
-		// other's terms (same hazard as the Ready-sibling census
-		// below, rabbitmq-quorum-heal): the younger cluster's whole membership
-		// would lag the older cluster's term and false-flag skew.
-		// Pods we cannot group cluster-wise fall back to the
-		// namespace bucket (fail-safe, may over-flag) rather than
-		// being skipped silently.
-		maxTermByCluster := map[string]float64{}
-		for _, s := range terms {
-			podName := s.Label("pod", "pod_name")
-			ns := s.Metric["namespace"]
-			pod := rabbitByPodName[podName]
-			if ns == "" && pod != nil {
-				ns = pod.Namespace
-			}
-			ck := ns
-			if pod != nil {
-				if k := rabbitClusterKey(pod); k != "" {
-					ck = k
-				}
-			}
-			if s.Value > maxTermByCluster[ck] {
-				maxTermByCluster[ck] = s.Value
-			}
-		}
-		for _, s := range terms {
-			podName := s.Label("pod", "pod_name")
-			ns := s.Metric["namespace"]
-			pod := rabbitByPodName[podName]
-			if ns == "" && pod != nil {
-				ns = pod.Namespace
-			}
-			if podName == "" || s.Value <= 0 {
-				continue
-			}
-			ck := ns
-			if pod != nil {
-				if k := rabbitClusterKey(pod); k != "" {
-					ck = k
-				}
-			}
-			// Only judge members of clusters with a real term spread.
-			if maxTermByCluster[ck]-s.Value < 2 {
-				continue
-			}
-			if downscaledMemberPod(ns, podName, downscaled) {
-				continue
-			}
-			key := ns + "/" + podName
-			if findings[key] == nil {
-				findings[key] = map[string]bool{}
-			}
-			findings[key]["quorum_skew"] = true
-		}
-	}
-
-	// Ready-sibling census per RabbitmqCluster — the quorum
-	// precondition for every heal below (>=2 OTHER members Ready).
-	// Grouping by namespace would pool the Ready members of two
-	// clusters sharing one namespace into a single tally and "prove"
-	// quorum that does not exist (rabbitmq-quorum-heal). The primary grouping
-	// is the operator's app.kubernetes.io/name label; pods missing
-	// it fall back to controller-owner grouping via ReadyByOwner,
-	// and an unlabeled AND unowned pod cannot prove siblings at all
-	// (0 — fail closed).
-	readyByCluster := map[string]int{}
-	for _, pod := range memberPods {
-		if key := rabbitClusterKey(pod); key != "" &&
-			probefw.PodRunningReady(pod) {
-			readyByCluster[key]++
-		}
-	}
-	readyByOwner := probefw.ReadyByOwner(unlabeledPods)
-
-	// heal-budget heal budget — at most ONE member pod per RabbitmqCluster
-	// per sweep, and the Ready census is decremented the moment a
-	// delete lands: a later candidate in the SAME sweep must see the
-	// quorum the first delete actually left behind, not the census
-	// taken before it. The cooldown keys on the CLUSTER (the
-	// operator's app.kubernetes.io/name label), falling back to the
-	// pod's controller key for unlabeled members — a pod-name key
-	// dies with the pod, so a re-created member would re-heal every
-	// sweep. The Heals stamp only lands on a DELIVERED delete
-	// (heal.DeletePod's contract), so the missing→fresh stamp
-	// transition is how success reads.
-	healedCluster := map[string]bool{}
-	tryQuorumHeal := func(pod *corev1.Pod) {
-		ck := rabbitClusterKey(pod)
-		if ck == "" {
-			ck = kube.PodControllerKey(pod)
-		}
-		if healedCluster[ck] {
-			return // one pod per cluster per sweep
-		}
-		hk := probefw.SelfHealKey(CheckNameRabbitMQQuorum, ck)
-		before, _ := p.Heals.Last(hk)
-		p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
-			ck, pod, rabbitQuorumHealCool, now)
-		if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
-			healedCluster[ck] = true
-			// Only discount a pod the census counted Ready
-			// (PodRunningReady): pass-1 deletes of already-unready
-			// members never entered the tally, and decrementing
-			// anyway would erase a Ready sibling that still exists —
-			// the next candidate would then see a quorum that is
-			// one short of reality and defer a legitimate heal.
-			if probefw.PodRunningReady(pod) {
-				if rck := rabbitClusterKey(pod); rck != "" {
-					if readyByCluster[rck] > 0 {
-						readyByCluster[rck]--
-					}
-				} else if ref := metav1.GetControllerOf(pod); ref != nil {
-					if readyByOwner[ref.UID] > 0 {
-						readyByOwner[ref.UID]--
-					}
-				}
-			}
-		}
-	}
-
-	// Stuck-unready pod signature — independent of Prometheus.
-	seenKeep := map[string]bool{}
-	for _, pod := range memberPods {
-		if pod.DeletionTimestamp != nil ||
-			pod.Status.Phase == corev1.PodSucceeded ||
-			pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		since, unready := probefw.PodUnreadySince(pod)
-		if !unready {
-			continue
-		}
-		key := pod.Namespace + "/" + pod.Name
-		if now.Sub(since) < rabbitUnreadyMinAge {
-			continue
-		}
-		if findings[key] == nil {
-			findings[key] = map[string]bool{}
-		}
-		findings[key]["stuck_unready"] = true
-		// Heal only when quorum survives: >=2 OTHER members of the
-		// SAME cluster Ready — the unready pod itself is never
-		// Ready, so the sibling count already excludes it.
-		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
-			tryQuorumHeal(pod)
-		}
-	}
-
-	// Prometheus-flagged pods (alarm / Mnesia partition) get the same
-	// heal once the signal persists >=10m and quorum survives — a
-	// partitioned-but-Ready member is exactly the "partitioned >10m"
-	// shape the plan calls out. The shared cooldown key dedupes pods
-	// already healed via the unready path.
-	for key := range findings {
-		pod, ok := rabbitByName[key]
-		if !ok || pod.DeletionTimestamp != nil {
-			continue
-		}
-		sig := "prom/" + key
-		seenKeep[sig] = true
-		// The alarm/partition window gates a pod delete, so it runs
-		// the persisted (annotation-backed) variant — the stamp on
-		// the pod survives an operator restart that would otherwise
-		// re-arm the full 10m while the signature still held.
-		if !heal.FirstSeenPersisted(ctx, log, &p.seen, pod,
-			kube.AnnoFirstSeenRabbitQuorum, sig, rabbitUnreadyMinAge,
-			now, kube.PodMergePatcher(p.CS, pod)) {
-			continue
-		}
-		// disk_watermark_alarm is deliberately non-healable (rabbitmq-quorum-heal): deleting the pod cannot free its PVC, and the
-		// restart replays the quorum-queue WAL onto a still-full
-		// disk. The finding still FAILs the check and emits the
-		// gauge below — it just never deletes.
-		if !rabbitHealableFindings(findings[key]) {
-			continue
-		}
-		// >=2 OTHER members of the same cluster Ready — the
-		// alarmed pod may itself still report Ready (the
-		// gray-failure shape), and counting it would let a 3-node
-		// cluster at 2/3 Ready approve a delete that drops it to
-		// 1/3 — Raft quorum loss (rabbitmq-quorum-heal).
-		if rabbitReadySiblings(readyByCluster, readyByOwner, pod) >= 2 {
-			tryQuorumHeal(pod)
-		}
-	}
-	// A member pod whose signal went quiet drops its persisted stamp
-	// so a recurrence re-arms the full window — a stale stamp would
-	// fast-trip the heal. Terminating pods are skipped (the stamp
-	// dies with them); a clear failure is a tolerated sub-failure —
-	// the ledger Forget already landed, the annotation retry is
-	// Warn-only. The stuck_unready path's window is pod-carried
-	// (PodUnreadySince) and needs no clear.
-	for key, pod := range rabbitByName {
-		if findings[key] != nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if err := heal.ClearPersistedFirstSeen(ctx, log, &p.seen, pod,
-			kube.AnnoFirstSeenRabbitQuorum, "prom/"+key,
-			kube.PodMergePatcher(p.CS, pod)); err != nil {
-			log.Info("WARN: rabbitmq quorum first-seen clear failed",
-				"pod", key, "error", err)
-		}
-	}
-	p.seen.Prune(func(k string) bool { return seenKeep[k] })
+	hp := newRabbitHealPass(p, log, now, census, findings)
+	hp.scanUnready(ctx)
+	hp.healPromFindings(ctx)
+	hp.clearQuiet(ctx)
 
 	var rep probefw.SweepReport
 	for key, reasons := range findings {
@@ -497,7 +170,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		sort.Strings(rs)
 		parts := strings.SplitN(key, "/", 2)
 		ns := parts[0]
-		if pod, ok := rabbitByName[key]; ok {
+		if pod, ok := census.byName[key]; ok {
 			joined := strings.Join(rs, "+")
 			rep.Flag(rabbitMQQuorumUnhealthyGauge, key+"/"+joined,
 				[]string{ns, pod.Name, joined})

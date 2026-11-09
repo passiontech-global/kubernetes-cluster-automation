@@ -62,11 +62,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/util/flowcontrol"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -311,23 +308,7 @@ func main() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	cfg := ctrl.GetConfigOrDie()
-	// client-go defaults (QPS 5 / Burst 10) are sized for one
-	// controller — ~35 modules share this rest.Config, so every
-	// sweep and reconcile queue fought for the same 10-token
-	// bucket and throttled client-side. 50/100 matches the
-	// aggregate rate the fleet actually issues; both are
-	// env-overridable for clusters whose apiserver wants a lower
-	// ceiling.
-	cfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50, 1))
-	cfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100, 1)
-	// ONE token bucket for every client built off this config:
-	// rest.Config carries the RateLimiter interface by reference
-	// through NewForConfig/CopyConfig, so installing it here makes
-	// the manager's client, the typed clientset and the dynamic
-	// client draw from the same 50/100 bucket. Left nil, each of the
-	// three constructors builds its own limiter and the fleet's real
-	// ceiling silently triples to 150 QPS / 300 burst.
-	cfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(cfg.QPS, cfg.Burst)
+	tuneClientConfig(cfg)
 
 	mgr, err := ctrl.NewManager(cfg,
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
@@ -337,10 +318,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Direct (uncached) clientset — RBAC intentionally grants no watch
-	// on most types (pods/services/jobs/webhookconfigs/...), so all
-	// reads outside the informer types go through this.
-	//
 	// The endpoint-guard warning filter is attached BEFORE the
 	// clients are built: the guard writes the deprecated Endpoints
 	// object deliberately on hosted planes, and installing the
@@ -349,58 +326,13 @@ func main() {
 	// duplicate the http.Transport and its TLS connection pool just
 	// to silence one warning header.
 	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
-	// The direct clients also get a per-request Timeout: the serial
-	// sweep loops issue plain REST calls with no sub-context
-	// deadline, so a dead TCP/conntrack path would hang a whole
-	// module forever without one. It is set on a COPY, not the shared
-	// cfg — rest.Config.Timeout becomes http.Client.Timeout, which
-	// would also bound the informer WATCH streams the manager opens
-	// off cfg and churn every watch into a 30s reconnect loop.
-	directCfg := rest.CopyConfig(cfg)
-	directCfg.Timeout = envx.GetenvDuration(
-		"NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT", 30*time.Second)
-	cs, err := kubernetes.NewForConfig(directCfg)
+	clients, err := buildKubeClients(cfg)
 	if err != nil {
-		log.Error(err, "unable to create clientset")
+		log.Error(err, "unable to create kube clients")
 		os.Exit(1)
 	}
-	// Dynamic client for CRD types (helmreleases, cert-manager,
-	// externalsecrets, medik8s, cilium) — no typed clients in-tree.
-	dyn, err := dynamic.NewForConfig(directCfg)
-	if err != nil {
-		log.Error(err, "unable to create dynamic client")
-		os.Exit(1)
-	}
-
-	// SECOND client for the latency-sensitive probes (apiserver-
-	// endpoint-guard, kubelet-liveness-reaper, dead-node-sweeper —
-	// the Module.ProbeClients registry rows). The shared bucket above
-	// is sized for the whole fleet, and the janitors own its biggest
-	// bursts: an evicted-pod/failed-jobs sweep deleting hundreds of
-	// objects per cycle drains it and leaves a probe waiting on
-	// client-go's queue-delay exactly while a wedge is in progress —
-	// the moment its verdict latency matters most. probeCfg is a COPY
-	// of the direct config with a FRESH RateLimiter (rest.Config
-	// carries the limiter interface by reference through CopyConfig,
-	// so the field must be replaced, not left shared) and its own
-	// env-overridable ceiling. The per-request Timeout inherited from
-	// directCfg keeps the same hung-call posture; the informer WATCH
-	// streams stay on the manager's config, untouched.
-	probeCfg := rest.CopyConfig(directCfg)
-	probeCfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_QPS", 20, 1))
-	probeCfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40, 1)
-	probeCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
-		probeCfg.QPS, probeCfg.Burst)
-	probeCS, err := kubernetes.NewForConfig(probeCfg)
-	if err != nil {
-		log.Error(err, "unable to create probe clientset")
-		os.Exit(1)
-	}
-	probeDyn, err := dynamic.NewForConfig(probeCfg)
-	if err != nil {
-		log.Error(err, "unable to create probe dynamic client")
-		os.Exit(1)
-	}
+	cs, dyn := clients.cs, clients.dyn
+	probeCS, probeDyn := clients.probeCS, clients.probeDyn
 
 	// The global heal budget — the aggregate blast-radius cap every
 	// heal-gated module shares (platform/heal consults it inside

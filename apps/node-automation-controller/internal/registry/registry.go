@@ -235,7 +235,7 @@ var Modules = []shared.Module{
 	{Name: "flux-kustomization-health", Group: groupHealth, GateEnv: "NODE_AUTOMATION_FLUX_KUSTOMIZATION_HEALTH_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck}},
 	{Name: "workload-scale-flapping", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_SCALE_FLAPPING_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameWorkloadScaleFlapping, New: gitops.NewWorkloadScaleFlappingCheck}},
 	{Name: "imagepull-secret-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGEPULL_SECRET_AUDITOR_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck}},
-	{Name: "cluster-health-probes", Group: groupHealth, GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.Setup},
+	{Name: "cluster-health-probes", Group: groupHealth, GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, ConsumesCheckRegs: true, Setup: clusterhealthprobes.Setup},
 	// argocd-agent-spin — the argocd-agent reconnect hot-loop auto-healer closes
 	// the roster after the gated block.
 	{Name: "argocd-agent-spin", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameArgoCDAgentSpin, New: gitops.NewArgoCDAgentSpinCheck}},
@@ -383,7 +383,15 @@ func SetupModules(deps shared.Deps, mods []shared.Module) error {
 	for _, m := range mods {
 		d := deps
 		d.Name = m.Name
-		d.CheckRegs = regs
+		// The collected roster is stamped ONLY on the row that
+		// consumes it (Module.ConsumesCheckRegs — today just
+		// cluster-health-probes): handing the whole check list to
+		// every module's Deps would invite a second consumer to
+		// grow around the sweep's private contract.
+		d.CheckRegs = nil
+		if m.ConsumesCheckRegs {
+			d.CheckRegs = regs
+		}
 		// Latency-sensitive probe rows swap in the probe-rate-limited
 		// clients before Setup ever runs — the module code still reads
 		// d.CS/d.Dyn, it just draws from the probe token bucket (own

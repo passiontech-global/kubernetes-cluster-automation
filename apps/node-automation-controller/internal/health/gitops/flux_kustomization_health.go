@@ -132,6 +132,9 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 	// object — bound the map so decommissioned names' stamps cannot
 	// accumulate (pruned every sweep, not only on a stuck hit).
 	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
+	// sourceNudgeHealed is the W20-GO2 ArtifactFailed source-side
+	// twin — same append-only ledger, same prune cadence.
+	p.sourceNudgeHealed.PruneExpired(now, fluxKustHealCooldown)
 	var rep probefw.SweepReport
 	// The snapshot's per-GVR census memoizes the RAW error — the
 	// IsNotFound/NoMatch "Flux not installed" interpretation stays
