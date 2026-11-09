@@ -58,8 +58,9 @@ func newJournalDeps(t *testing.T) (d *Deps,
 			prometheus.CounterOpts{Name: "t_cycles"},
 			[]string{"check", "result"}),
 	}
-	d.JournalReads = journalwatch.NewUnreadableTracker(st, d.Cfg.JournalDirs,
-		d.Cfg.JournalUnreadableNeeded)
+	d.JournalReads = journalwatch.NewUnreadableTrackerForOwner(st,
+		d.Cfg.JournalDirs, d.Cfg.JournalUnreadableNeeded,
+		journalwatch.OwnerControllerHygiene)
 
 	var (
 		answers struct {

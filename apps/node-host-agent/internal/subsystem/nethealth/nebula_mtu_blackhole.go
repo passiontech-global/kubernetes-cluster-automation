@@ -173,6 +173,19 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		}
 		n.stateExit(latchdefs.LatchNebulaMTUBlackhole)
 		n.unclampMSSOn(ctx, dev)
+		// maybeClampNebulaMSS clamped cilium_wg0 alongside the
+		// overlay dev — recovery must remove that rule too, or the
+		// double-encapsulation path keeps its clamp forever. The
+		// exception is wgClampKnown: the rule then belongs to the
+		// cilium_wg0 MTU invariant (config drift — iptables can't
+		// fix sysfs), which stays installed and is re-checked every
+		// probe cycle; unclamping it would just re-clamp next tick.
+		st.mu.Lock()
+		wgKnown := st.wgClampKnown
+		st.mu.Unlock()
+		if !wgKnown {
+			n.unclampMSSOn(ctx, "cilium_wg0")
+		}
 		st.mu.Lock()
 		st.lastClamp = time.Time{} // a re-latch clamps immediately
 		st.mu.Unlock()

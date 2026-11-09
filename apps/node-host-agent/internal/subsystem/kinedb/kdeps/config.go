@@ -26,7 +26,14 @@ import (
 const (
 	defaultProbeInterval = 2 * time.Minute
 	defaultGuardInterval = 10 * time.Minute
-	defaultMaintInterval = 24 * time.Hour
+
+	// DefaultMaintInterval is the maint cadence default (24h) —
+	// exported because maint's epoch skip window derives from it
+	// (maintEpochWindow = DefaultMaintInterval - maintEpochGrace):
+	// the window must stay tied to the SAME constant the cadence
+	// reads, or the boundary math silently drifts apart.
+	DefaultMaintInterval = 24 * time.Hour
+	defaultMaintInterval = DefaultMaintInterval
 
 	defaultTextfileDir   = "/var/lib/node-exporter/textfile"
 	defaultGuardStateDir = "/var/lib/kine-compact-guard"

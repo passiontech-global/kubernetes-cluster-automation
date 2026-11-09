@@ -179,10 +179,11 @@ func BoundOp(ctx context.Context, log *slog.Logger, nc net.Conn,
 
 // BoundOpCtx sets a conn deadline covering a whole ctx-scoped op —
 // the session body a caller runs after a BoundOp-bounded channel
-// open. The bound is the ctx deadline itself (the caller's op
-// budget — hubsync's per-target converge timeout), falling back to
-// now+timeout on a deadline-less ctx: a CombinedOutput/io.Copy/Wait
-// blocked on a blackholed transport then fails AT the op budget
+// open. The bound is min(now+timeout, ctx deadline) — exactly like
+// BoundOp/Handshake: a deadline-less ctx (or one expiring LATER than
+// the op budget) falls back to now+timeout, while an earlier-expiring
+// ctx deadline wins. A CombinedOutput/io.Copy/Wait blocked on a
+// blackholed transport then fails AT the earlier of the two bounds
 // instead of hanging forever (Session.Close only writes a
 // channel-close, which a dead transport never drains). The returned
 // func clears the deadline; a rejected SetDeadline leaves the op
@@ -193,9 +194,9 @@ func BoundOpCtx(ctx context.Context, log *slog.Logger, nc net.Conn,
 	if log == nil {
 		log = logger()
 	}
-	dl, ok := ctx.Deadline()
-	if !ok {
-		dl = time.Now().Add(timeout)
+	dl := time.Now().Add(timeout)
+	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
+		dl = cdl
 	}
 	if err := nc.SetDeadline(dl); err != nil {
 		log.Warn("sshclient: conn deadline rejected — op unbounded", "error", err)

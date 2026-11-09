@@ -131,7 +131,7 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "condition sweeper patch failed", "node", n.Name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // node status changed — drop the snapshot
+		p.InvalidateNodes(ctx) // node status changed — drop the node census, arm a CS re-read
 		for _, c := range stale {
 			nodeCondSweepsTotal.WithLabelValues(n.Name, string(c.Type)).Inc()
 			rep.Find(n.Name + ":" + string(c.Type))

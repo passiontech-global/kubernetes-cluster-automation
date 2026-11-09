@@ -60,7 +60,7 @@ func TestAppendLogEmptyLogFileIsSlogOnly(t *testing.T) {
 }
 
 // TestAppendLogConcurrentRotationLosesNoGeneration: the rotate
-// decision+rename must be mutually exclusive (s.mu) — racing appends
+// decision+rename must be mutually exclusive (the shared mu) — racing appends
 // that both stat an oversized log used to be able to BOTH rename, the
 // second rename replacing the .1 generation (and the fresh file's
 // early lines) wholesale. Every appended line must survive in the

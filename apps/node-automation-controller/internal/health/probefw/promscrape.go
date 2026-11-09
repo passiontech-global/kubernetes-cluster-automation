@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -91,7 +92,10 @@ func ParseMetricValue(line, name string) (float64, bool) {
 	}
 	raw, _, _ = strings.Cut(raw, " ")
 	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
+	// NaN and ±Inf parse cleanly but are not samples — Prometheus
+	// emits them for stale/absent series and every consumer treats
+	// them as "no data" (ok=false), never as a live reading.
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0, false
 	}
 	return v, true

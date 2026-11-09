@@ -8,11 +8,13 @@ package cilium
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -247,5 +249,63 @@ func TestCiliumEnvoyXDSBookkeepingResets(t *testing.T) {
 	}
 	if !killed {
 		t.Fatalf("envoy pid not SIGKILLed: %+v", f.Kills)
+	}
+}
+
+// TestCiliumEnvoyXDSKillSkipsReadyProbe: when the xDS NACK streak
+// crosses ConsecNeeded, killCiliumEnvoy must END the cycle. The
+// missing return made Run fall through to the /ready probe of the
+// process it had just SIGKILLed — probing the corpse burns a /ready
+// fail on a restart the check itself ordered (and risks a second
+// kill on a streak the restart was meant to clear). /ready stays
+// HEALTHY here so the only ready-probe calls are the pre-kill
+// cycles': a third call proves the fall-through.
+func TestCiliumEnvoyXDSKillSkipsReadyProbe(t *testing.T) {
+	d, f := cDeps(t)
+	f.MkTask(t, wdepstest.UIDF, "cilium-envoy", 555)
+	f.Live[555] = true
+
+	// A growing update_rejected sum: the first read only baselines,
+	// ConsecNeeded (2) positive deltas then fire the kill on the
+	// 3rd Run.
+	var pushes int
+	d.Cfg.Seams.Probe.HTTPGetBody = func(_ context.Context, _ string,
+		_ time.Duration) ([]byte, error) {
+		pushes++
+		return []byte(fmt.Sprintf(
+			"cluster_manager.cds.update_rejected: %d\n"+
+				"cluster_manager.lds.update_rejected: %d\n",
+			pushes*5, pushes*3)), nil
+	}
+	readyCalls := 0
+	origReady := d.Cfg.Seams.Probe.ProbeHTTPStatus
+	d.Cfg.Seams.Probe.ProbeHTTPStatus = func(ctx context.Context,
+		url, bearer string, timeout time.Duration) (int, error) {
+		readyCalls++
+		return origReady(ctx, url, bearer, timeout)
+	}
+
+	c := &CiliumEnvoyCheck{d: d}
+	env := &wdeps.CycleEnv{WorkerActive: true}
+	c.Run(context.Background(), env) // baseline
+	c.Run(context.Background(), env) // delta 1 → xdsFails=1, still probes
+	if readyCalls != 2 || c.xdsFails != 1 {
+		t.Fatalf("pre-kill cycles: readyCalls=%d xdsFails=%d want 2/1",
+			readyCalls, c.xdsFails)
+	}
+	c.Run(context.Background(), env) // delta 2 → xdsFails=2 → kill + return
+
+	killed := false
+	for _, k := range f.Kills {
+		if k.PID == 555 && k.Sig == syscall.SIGKILL {
+			killed = true
+		}
+	}
+	if !killed {
+		t.Fatalf("xDS streak must SIGKILL the envoy task: %+v", f.Kills)
+	}
+	if readyCalls != 2 {
+		t.Fatalf("ready probe ran %d times — the kill cycle must return "+
+			"before probing the just-killed process", readyCalls)
 	}
 }

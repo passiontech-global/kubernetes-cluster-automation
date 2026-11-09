@@ -14,7 +14,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -249,12 +251,14 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 // InodePressure split (plan Component 2)
 // ---------------------------------------------------------------------------
 
-// InodePressure is kubelet-native but stays in the precordon set
-// (nodecond.HangPreCordonNames) — a sustained inode storm starves the
-// node like any other latch. The condition-SWEEPER is the one gate
-// that must never touch it: kubelet conditions are outside
-// nodecond.HeartbeatSweptNames (see node_condition_sweeper_test.go).
-func TestNodeHangPreCordonInodePressureNotSwept(t *testing.T) {
+// InodePressure is agent-latched since W18-1 (hostmetrics
+// state-inode-pressure) and lives in both precordon sets — a
+// sustained inode storm starves the node like any other latch
+// (nodecond.HangPreCordonNames, gated on LastTransitionTime) and a
+// frozen heartbeat on it is a dead reporter's zombie the
+// condition-SWEEPER must reconcile (nodecond.HeartbeatSweptNames,
+// see node_condition_sweeper_test.go).
+func TestNodeHangPreCordonInodePressure(t *testing.T) {
 	found := false
 	for _, c := range nodeHangConds {
 		if c == "InodePressure" {
@@ -263,11 +267,6 @@ func TestNodeHangPreCordonInodePressureNotSwept(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("InodePressure left the precordon set")
-	}
-	for _, c := range nodeCondSweptConds {
-		if c == "InodePressure" {
-			t.Fatal("InodePressure must not be swept — kubelet-owned")
-		}
 	}
 	cs := fake.NewSimpleClientset(
 		probetest.ReadyWorkerNode("w-inode", "InodePressure", 5*time.Minute, false),
@@ -544,5 +543,76 @@ func TestCheckNodeHangPreCordonCapBoundary(t *testing.T) {
 				tc.alreadyCordoned, n.Spec.Unschedulable, tc.hungCordoned)
 		}
 		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-hang")
+	}
+}
+
+// All three patch paths — uncordon, stale-stamp clear, cordon — must
+// invalidate ONLY the node census: a sweep-wide InvalidateSweep here
+// wiped the pod/... caches a node spec/annotation patch cannot stale,
+// re-listing the whole snapshot for every later check.
+func TestNodeHangPatchInvalidatesNodesOnly(t *testing.T) {
+	held := precordonedWorkerNode("w-held", true)                                        // stamped + cordon, latch cleared → uncordon
+	stamp := precordonedWorkerNode("w-stamp", false)                                     // stamped + schedulable → stale-stamp clear
+	hung := probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false) // live latch → cordon
+	cs := fake.NewSimpleClientset(held, stamp, hung,
+		probetest.PendingUnscheduledPod("apps", "witness", time.Minute, true))
+	var podLists, nodeLists int
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			podLists++
+			return false, nil, nil
+		})
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			nodeLists++
+			return false, nil, nil
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*nodeHangCheck](t, p)
+	sweepCtx := probefw.WithSweepSnapshot(ctx)
+	if _, err := chk.AllPods(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chk.AllNodes(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 1 || nodeLists != 1 {
+		t.Fatalf("warm-up lists pods=%d nodes=%d, want 1/1", podLists, nodeLists)
+	}
+	if res := chk.Run(sweepCtx); res.Pass {
+		t.Fatalf("sustained hang latch did not fail the check: %+v", res)
+	}
+	// Three node patches landed; re-reading the pod census must hit
+	// the memoized snapshot — a sweep-wide wipe would re-LIST here.
+	if _, err := chk.AllPods(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 1 {
+		t.Fatalf("node patches re-listed pods %d time(s) — sweep-wide wipe, want 0", podLists-1)
+	}
+	// The next node census is the armed direct-CS re-read carrying
+	// every patch: uncordon, stamp clears, and the fresh cordon.
+	fresh, err := chk.AllNodes(sweepCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeLists != 2 {
+		t.Fatalf("node census reads=%d, want 2 (memo + one armed re-read)", nodeLists)
+	}
+	got := map[string]*corev1.Node{}
+	for i := range fresh {
+		got[fresh[i].Name] = &fresh[i]
+	}
+	if got["w-held"].Spec.Unschedulable {
+		t.Fatal("post-patch census still carries the held cordon")
+	}
+	if _, ok := got["w-held"].Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("post-patch census still carries the lifted stamp")
+	}
+	if _, ok := got["w-stamp"].Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("post-patch census still carries the stale stamp")
+	}
+	if !got["w-hang"].Spec.Unschedulable {
+		t.Fatal("post-patch census misses the fresh cordon")
 	}
 }

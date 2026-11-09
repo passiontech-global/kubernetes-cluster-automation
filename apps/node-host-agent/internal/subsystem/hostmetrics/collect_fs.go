@@ -163,7 +163,7 @@ var (
 // nodereporter's FilesystemReadOnly condition.
 func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 	anyRO := false
-	probed := false // at least one statfs answered — the latch's evidence base
+	probed := false        // at least one statfs answered — the latch's evidence base
 	var ie fsInodeEvidence // W18-1 inode-pressure verdict for this pass
 	for _, mount := range c.cfg.FilesystemTargets {
 		st, stalled, ok := c.probeFS(mount)

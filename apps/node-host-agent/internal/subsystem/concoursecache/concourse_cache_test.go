@@ -260,10 +260,20 @@ func TestGoBuildSizeCap(t *testing.T) {
 	mid := ccFile(t, filepath.Join(dir, "f2"), 100, 44*time.Hour)
 	newest := ccFile(t, filepath.Join(dir, "f3"), 100, 34*time.Hour)
 
+	// The trim accumulator moves in ALLOCATED BLOCKS (entryBlocks) —
+	// the same units as diskUsage and the marks — not apparent size.
+	// 100B fixtures round up to one FS block per file, so the need is
+	// computed off the files' footprints: low = sz − 2 footprints frees
+	// exactly the two oldest, by mtime.
+	fi, err := os.Lstat(oldest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perFile := int64(entryBlocks(fi))
 	sz := int64(diskUsage(dir))
 	p := ccPruner(t, func(c *Config) {
-		c.GoBuildHighMark = 1       // always over the cap
-		c.GoBuildLowMark = sz - 150 // need 150B → frees exactly 2×100B
+		c.GoBuildHighMark = 1             // always over the cap
+		c.GoBuildLowMark = sz - 2*perFile // need = exactly 2 files
 	})
 	if err := p.Sweep(context.Background(), root); err != nil {
 		t.Fatal(err)

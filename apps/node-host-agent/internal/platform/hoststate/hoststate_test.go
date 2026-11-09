@@ -1,6 +1,7 @@
 package hoststate
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -377,34 +378,72 @@ func TestAppendLogRotates(t *testing.T) {
 	}
 }
 
-// TestSharedStorePerCanonicalDir: Shared returns ONE process-wide
-// Store per canonical dir — the multi-owner registry and the
-// rotation mutex are only cross-subsystem if every subsystem holds
-// the same handle. A later non-empty logFile fills an empty one
-// (readers-only callers pass ""); it never clobbers a named log.
-func TestSharedStorePerCanonicalDir(t *testing.T) {
+// TestSharedStoreSharesSyncStatePerDir: Shared hands every caller a
+// Store whose SYNC STATE (owners registry + mutex) is the per-dir
+// singleton, while the Store's LogFile/Now/Log stay the CALLER'S OWN
+// — the first construction must not impose its logger/clock/log
+// file on later subsystems (hostmetrics used to win the subsystem
+// label for every later package's watchdog lines; nodereporter's
+// readers-only empty LogFile used to mute the shared handle).
+func TestSharedStoreSharesSyncStatePerDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wd")
-	logFile := filepath.Join(t.TempDir(), "node-watchdog.log")
+	logA := filepath.Join(t.TempDir(), "a-watchdog.log")
 
-	a := Shared(dir, logFile, nil, nil)
-	b := Shared(filepath.Join(dir, "..", filepath.Base(dir)), logFile, nil, nil)
-	if a != b {
-		t.Fatal("Shared must collapse equivalent dir spellings onto one Store")
+	a := Shared(dir, logA, nil, nil)
+	// Same dir, differently spelled — the canonical key collapses it.
+	b := Shared(filepath.Join(dir, "..", filepath.Base(dir)), "", nil, nil)
+
+	// Per-caller config: b's empty logFile must NOT inherit a's —
+	// nodereporter (LogFile "") and an appending subsystem coexist.
+	if a.LogFile != logA {
+		t.Fatalf("a.LogFile = %q, want its own %q", a.LogFile, logA)
 	}
-	if a.LogFile != logFile {
-		t.Fatalf("shared LogFile = %q, want %q", a.LogFile, logFile)
+	if b.LogFile != "" {
+		t.Fatalf("b.LogFile = %q, want the caller's own empty handle", b.LogFile)
 	}
-	// "" logFile inherits instead of clearing.
-	if c := Shared(dir, "", nil, nil); c != a || c.LogFile != logFile {
-		t.Fatal("empty logFile must inherit, not clear")
+	// Per-caller Now: each store stamps with its OWN clock.
+	clkA := &testClock{now: time.Unix(1700000000, 0)}
+	clkB := &testClock{now: time.Unix(1700005000, 0)}
+	sa := Shared(dir, "", clkA.fn, nil)
+	sb := Shared(dir, "", clkB.fn, nil)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	// A different dir is its own instance.
+	sa.StampLastRun()
+	if got := sb.Epoch(filepath.Join(sb.Dir, "last-run")); got != 1700000000 {
+		t.Fatalf("sb observed sa's stamp as %d — Now must stay per-caller", got)
+	}
+	// Per-caller Log: each store resolves its own logger func.
+	useA := false
+	c := Shared(dir, "", nil, func() *slog.Logger {
+		useA = true
+		return slog.Default()
+	})
+	c.AppendLog("via-c")
+	if !useA {
+		t.Fatal("AppendLog must resolve the store's OWN Log func")
+	}
+
+	// SHARED sync state: an owner registered through a must be
+	// visible to b — the multi-owner latch outlives a release that
+	// goes through a DIFFERENT Store instance over the same dir.
+	name := "shared-latch"
+	a.EnterFrom(name, "workerhygiene", "")
+	b.ExitFrom(name, "workerhygiene", nil)
+	if a.Exists(name) {
+		t.Fatal("b's release did not see a's registered hold — owners registry not shared")
+	}
+
+	// A different dir is its own sync state.
 	other := Shared(filepath.Join(t.TempDir(), "kinedb-guard"), "", nil, nil)
-	if other == a {
-		t.Fatal("a different dir must not share the instance")
+	other.EnterFrom("shared-latch", "pod-teardown", "")
+	if a.shared == other.shared {
+		t.Fatal("a different dir must not share the sync state")
 	}
-	if other.LogFile != "" {
-		t.Fatalf("other store LogFile = %q, want empty", other.LogFile)
+	// New() stays private: two New copies over one dir do NOT share.
+	p1, p2 := New(dir, "", nil, nil), New(dir, "", nil, nil)
+	if p1.shared == p2.shared {
+		t.Fatal("hand-built New stores must keep private sync cores")
 	}
 }
 

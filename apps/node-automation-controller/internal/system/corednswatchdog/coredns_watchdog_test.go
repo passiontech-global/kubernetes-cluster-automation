@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -772,6 +773,154 @@ func TestCoreDNSProbeFQDNCacheSkipsInconclusive(t *testing.T) {
 	}
 	if got := *lists; got != 2 {
 		t.Fatalf("inconclusive pick cached — %d lists across 2 runs, want 2", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Layer-2 stale cached want-set — re-probe once before concluding
+// ---------------------------------------------------------------------------
+
+// headlessProbeTarget builds the headless Service + EndpointSlice the
+// W8-NM5 fallback picks: zero creationTimestamp keeps the <10m
+// Service path — whose want-set is nil — from claiming it, and the
+// fallback's want-set IS the ready endpoint pod IPs, exactly the set
+// a CoreDNS pod roll invalidates.
+func headlessProbeTarget(rv, a1, a2 string) (*corev1.Service, *discoveryv1.EndpointSlice) {
+	ready := true
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "headless-svc", Namespace: "app-ns"},
+		Spec:       corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone},
+	}
+	es := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "headless-svc-eps",
+			Namespace:       "app-ns",
+			ResourceVersion: rv,
+			Labels:          map[string]string{discoveryv1.LabelServiceName: "headless-svc"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			Addresses:  []string{a1, a2},
+		}},
+	}
+	return svc, es
+}
+
+// A cached want-set that predates a CoreDNS roll must not fail the
+// fleet: the rolled replicas answer from NEW IPs the stale set
+// rejects, and two such cycles deleted healthy pods. The failed
+// cached run must drop the cache, re-pick a target (fresh
+// EndpointSlice read → fresh want-set) and re-probe ONCE — the fresh
+// run's answers reset the streaks, nothing is deleted, and the
+// re-cached target carries the NEW endpoint set.
+func TestCoreDNSWatchdogStaleCachedWantReprobes(t *testing.T) {
+	svc, es := headlessProbeTarget("100", "10.0.0.1", "10.0.0.2")
+	cs := fake.NewSimpleClientset(
+		cdnsPod("cdns-a", "10.0.0.1"),
+		cdnsPod("cdns-b", "10.0.0.2"),
+		cdnsDeployment(2, 2, nil),
+		svc, es)
+	w := newCDNSWatchdog(cs)
+	var probes atomic.Int32
+	rolled := false
+	w.dnsFn = func(_ context.Context, _, _ string) ([]string, error) {
+		probes.Add(1)
+		if rolled {
+			// The rolled fleet answers from its NEW IP set.
+			return []string{"10.0.1.1", "10.0.1.2"}, nil
+		}
+		return []string{"10.0.0.1", "10.0.0.2"}, nil
+	}
+
+	// Run 1 — fresh pick, want matches the answers: all fresh, one
+	// probe per pod.
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.cachedFQDN; got != "headless-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("probe fqdn=%q", got)
+	}
+	if len(w.cachedWant) != 2 || !w.cachedWant["10.0.0.1"] || !w.cachedWant["10.0.0.2"] {
+		t.Fatalf("cached want-set = %v, want the pre-roll endpoints", w.cachedWant)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("run 1 probes=%d, want 2", got)
+	}
+	for _, p := range []string{"cdns-a", "cdns-b"} {
+		if got := w.streak.Count(p); got != 0 {
+			t.Fatalf("%s streak=%d after a fresh pick, want 0", p, got)
+		}
+	}
+
+	// Roll: the slice carries the new ready set; the replicas answer
+	// from it. The cache still holds the pre-roll want-set.
+	rolled = true
+	newES := es.DeepCopy()
+	newES.ResourceVersion = "200"
+	newES.Endpoints[0].Addresses = []string{"10.0.1.1", "10.0.1.2"}
+	if _, err := cs.DiscoveryV1().EndpointSlices("app-ns").Update(ctx, newES, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 2 — the cached want fails the rolled fleet, so the cycle
+	// must drop the cache and re-probe ONCE with a fresh pick: 2
+	// (discarded cached run) + 2 (fresh re-probe) this run.
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := probes.Load(); got != 6 {
+		t.Fatalf("run 2 probes=%d total, want 6 (cached run + one re-probe)", got)
+	}
+	if w.cachedFQDN == "" || len(w.cachedWant) != 2 ||
+		!w.cachedWant["10.0.1.1"] || !w.cachedWant["10.0.1.2"] ||
+		w.cachedWant["10.0.0.1"] {
+		t.Fatalf("cache not refreshed to the rolled endpoint set: fqdn=%q want=%v",
+			w.cachedFQDN, w.cachedWant)
+	}
+	for _, p := range []string{"cdns-a", "cdns-b"} {
+		if got := w.streak.Count(p); got != 0 {
+			t.Fatalf("%s streak=%d — the stale cached want leaked a verdict", p, got)
+		}
+		if !cdnsPodExists(t, cs, p) {
+			t.Fatalf("healthy rolled pod %s deleted", p)
+		}
+	}
+	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
+		t.Fatal("recovery stamped on a healthy rolled fleet")
+	}
+}
+
+// A FRESH pick that still fails pods is a real failure — the re-probe
+// path is reserved for cached targets: exactly one probe run per
+// cycle, streak evidence lands as before.
+func TestCoreDNSWatchdogFreshPickFailsOnce(t *testing.T) {
+	ready := true
+	svc, es := cdnsProbeService("fresh-svc", "app-ns", 0, &ready)
+	cs := fake.NewSimpleClientset(
+		cdnsPod("cdns-a", "10.0.0.1"),
+		cdnsPod("cdns-b", "10.0.0.2"),
+		cdnsDeployment(2, 2, nil),
+		svc, es)
+	w := newCDNSWatchdog(cs)
+	var probes atomic.Int32
+	w.dnsFn = func(_ context.Context, podIP, _ string) ([]string, error) {
+		probes.Add(1)
+		if podIP == "10.0.0.1" {
+			return nil, nil // cdns-a genuinely serves NODATA
+		}
+		return []string{"10.1.2.3"}, nil
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("fresh-pick run re-probed: %d probes, want 2", got)
+	}
+	if got := w.streak.Count("cdns-a"); got != 1 {
+		t.Fatalf("fresh-pick failure streak=%d, want 1", got)
+	}
+	if !cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("pod deleted on streak 1 — recovery fired too early")
 	}
 }
 

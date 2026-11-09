@@ -105,6 +105,58 @@ func TestRabbitMQQuorumStuckUnreadyHeal(t *testing.T) {
 	}
 }
 
+// The Ready census is decremented only for a pod it actually counted
+// (PodRunningReady): the pass-1 stuck-unready delete below must not
+// shrink the tally the pass-2 partitioned-Ready candidate's quorum
+// gate reads — and the one-heal-per-cluster guard still caps the
+// sweep at a single delete.
+func TestRabbitMQQuorumUnreadyDeleteKeepsReadyCensus(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "dist_node_state") {
+			// Partitioned-but-Ready member: node_state != 3.
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-3"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	r1 := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	r2 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	unready := rabbitMQMemberPod("mq", "rabbitmq-server-2", false)
+	unready.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		base.Add(-15 * time.Minute))
+	partitioned := rabbitMQMemberPod("mq", "rabbitmq-server-3", true)
+	partitioned.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-3":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(r1, r2, unready, partitioned)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("stuck-unready + mnesia partition must FAIL")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-server-2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stuck-unready member must be healed first, err=%v", err)
+	}
+	// The partitioned-Ready member survives: its quorum gate reads
+	// the census the unready delete did not decrement, and the
+	// one-per-cluster guard blocks the second same-sweep heal.
+	for _, name := range []string{
+		"rabbitmq-server-0", "rabbitmq-server-1", "rabbitmq-server-3"} {
+		if _, err := cs.CoreV1().Pods("mq").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("ready census member %s must survive: %v", name, err)
+		}
+	}
+}
+
 // A RabbitmqCluster parked at spec.replicas:0 by the
 // go-kube-downscaler — lingering alarm series and a still-present
 // unready member are sleep, not quorum evidence: nothing flags,

@@ -103,22 +103,33 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	var rep probefw.SweepReport
 
-	// W12-SC1 — PriorityClass preemption cascade. The count ignores
-	// reason alone (kube.CountRecentEvents re-checks it) so a
-	// supported-field-selector variant can never over-report.
-	preempted, err := kube.CountRecentEvents(ctx, p.CS,
-		kube.PreemptedEventReason, schedulerPreemptionWindow, now)
+	// W12-SC1 — PriorityClass preemption cascade. The count reads the
+	// sweep's shared event census (EventsWithReason filters the
+	// reason client-side — the apiserver cannot field-select reasons
+	// on most versions anyway, so this is the same filter the
+	// per-check LIST did) instead of paying a second cluster-wide
+	// events LIST per sweep, then windows it on the last-observed
+	// event clock.
+	preemptedEvents, err := p.EventsWithReason(ctx, kube.PreemptedEventReason)
 	if err != nil {
 		log.Info("WARN: preempted events list failed — preemption-storm signal inconclusive",
 			"error", err)
 		rep.InfraErr(fmt.Errorf("list preempted events: %w", err))
-	} else if preempted > schedulerPreemptionMax {
-		schedulerPreemptionStormGauge.Set(1)
-		rep.Find(fmt.Sprintf(
-			"preemption storm: %d Preempted events in %s (>%d)",
-			preempted, schedulerPreemptionWindow, schedulerPreemptionMax))
 	} else {
-		schedulerPreemptionStormGauge.Set(0)
+		preempted := 0
+		for i := range preemptedEvents {
+			if now.Sub(kube.EventTime(&preemptedEvents[i])) <= schedulerPreemptionWindow {
+				preempted++
+			}
+		}
+		if preempted > schedulerPreemptionMax {
+			schedulerPreemptionStormGauge.Set(1)
+			rep.Find(fmt.Sprintf(
+				"preemption storm: %d Preempted events in %s (>%d)",
+				preempted, schedulerPreemptionWindow, schedulerPreemptionMax))
+		} else {
+			schedulerPreemptionStormGauge.Set(0)
+		}
 	}
 
 	nodes, err := p.AllNodes(ctx)
@@ -132,12 +143,6 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 			schedulable = true
 			break
 		}
-	}
-	if !schedulable {
-		schedulerFrozenGauge.Set(0)
-		// nowhere to schedule — the freeze signal is ambiguous, but
-		// the preemption-storm finding above still reports.
-		return rep.Verdict("scheduler fault signatures: ", ", ")
 	}
 
 	pods, err := p.AllPods(ctx)
@@ -169,11 +174,15 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 			rep.Find(pod.Namespace + "/" + pod.Name)
 		}
 	}
-	if pending == 0 {
+	// Nowhere to schedule (or nothing stuck pending) — the freeze
+	// signal is ambiguous, and a "(0 pods pending >=5m...)" verdict
+	// would misread an all-clear as a stuck scheduler; the
+	// preemption-storm finding above still reports either way.
+	if !schedulable || pending == 0 {
 		schedulerFrozenGauge.Set(0)
-	} else {
-		schedulerFrozenGauge.Set(1)
+		return rep.Verdict("scheduler fault signatures: ", ", ")
 	}
+	schedulerFrozenGauge.Set(1)
 	return rep.Verdict(fmt.Sprintf(
 		"scheduler fault signatures (%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers): ",
 		pending, schedulerPendingMinAge), ", ")

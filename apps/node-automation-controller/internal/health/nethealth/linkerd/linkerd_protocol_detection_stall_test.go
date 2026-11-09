@@ -15,10 +15,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -312,6 +315,112 @@ func TestLinkerdTemplatePatchPatchesRollout(t *testing.T) {
 	}
 	if _, ok := kube.AnnoTime(got, kube.AnnoLastLinkerdOpaquePatch); !ok {
 		t.Fatal("durable patch stamp missing on the Rollout")
+	}
+}
+
+// setPodOwnerReplicaSet gives the pod a controller ownerRef to a
+// ReplicaSet — the production shape for Deployment pods (the RS hop
+// patchLinkerdTemplate resolves to its parent Deployment).
+func setPodOwnerReplicaSet(pod *corev1.Pod, rsName string) {
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "ReplicaSet",
+		Name:       rsName,
+		Controller: ptr.To(true),
+	}}
+}
+
+func replicaSetOf(ns, name, depName string) *appsv1.ReplicaSet {
+	return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: ns, Name: name,
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: depName, UID: types.UID("uid-" + depName), Controller: ptr.To(true)}},
+	}}
+}
+
+// Two stalled pods of ONE Deployment in the same sweep: the first
+// lands the template patch and stamps the controller-keyed cooldown —
+// the second must be refused at that cooldown, spending exactly ONE
+// budget token and issuing exactly ONE patch. Without the stamp the
+// second pod passed the un-stamped cooldown, spent a second token and
+// re-PATCHed the Deployment from the snapshot's stale pre-write copy.
+func TestLinkerdOpaquePortsSecondStalledPodSpendsOneToken(t *testing.T) {
+	heal.ConfigureBudget(2, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	dep := emptyDeployment("apps", "web", nil, nil)
+	podA := meshedPodWithPorts("apps", "web-abc12-x1", []int32{5432}, "", "")
+	setPodOwnerDeployment(podA, "web")
+	podB := meshedPodWithPorts("apps", "web-abc12-x2", []int32{5432}, "", "")
+	setPodOwnerDeployment(podB, "web")
+	cs := fake.NewSimpleClientset(dep, podA, podB)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p)
+
+	// Under a sweep snapshot the Deployment census memoizes — the
+	// serial sweep reads no apiserver echo of pod A's patch, exactly
+	// the production shape this pins.
+	sweepCtx := probefw.WithSweepSnapshot(ctx)
+	if res := chk.Run(sweepCtx); res.Pass {
+		t.Fatalf("stalled pods must fail: %+v", res)
+	}
+	patches := 0
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "patch" && a.GetResource().Resource == "deployments" {
+			patches++
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("deployment patches = %d, want exactly 1 — the second pod must ride the stamped cooldown", patches)
+	}
+	if _, ok := chk.Heals.Last(probefw.SelfHealKey(
+		CheckNameLinkerdOpaqueStall, "apps/web")); !ok {
+		t.Fatal("patched path must stamp the controller-keyed cooldown")
+	}
+}
+
+// The in-memory mirror: the second stalled pod rides a DIFFERENT
+// ReplicaSet of the same Deployment (the mid-rollout two-RS shape) —
+// a different controller key evades the stamped cooldown, so the
+// mirrored template annotation must make patchTemplatePorts report
+// the template covered WITHOUT a second patch, re-rolling only the
+// stale pod.
+func TestLinkerdOpaquePortsMirrorCoversSecondReplicaSet(t *testing.T) {
+	dep := emptyDeployment("apps", "web", nil, nil)
+	podA := meshedPodWithPorts("apps", "web-abc12-x1", []int32{5432}, "", "")
+	setPodOwnerReplicaSet(podA, "web-abc12")
+	podB := meshedPodWithPorts("apps", "web-def34-x1", []int32{5432}, "", "")
+	setPodOwnerReplicaSet(podB, "web-def34")
+	cs := fake.NewSimpleClientset(dep,
+		replicaSetOf("apps", "web-abc12", "web"),
+		replicaSetOf("apps", "web-def34", "web"),
+		podA, podB)
+	p := testProber(cs)
+
+	// Under a sweep snapshot the Deployment census memoizes — the
+	// second RS's pod must be judged against the mirrored in-memory
+	// annotation, not a fresh apiserver read.
+	sweepCtx := probefw.WithSweepSnapshot(ctx)
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(sweepCtx); res.Pass {
+		t.Fatalf("stalled pods must fail: %+v", res)
+	}
+	patches := 0
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "patch" && a.GetResource().Resource == "deployments" {
+			patches++
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("deployment patches = %d, want exactly 1 — the mirrored annotation must cover the second RS's pod", patches)
+	}
+	if _, err := cs.CoreV1().Pods("apps").
+		Get(ctx, podB.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale second-RS pod should be re-rolled on the covered template, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("apps").
+		Get(ctx, podA.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("the patch-path pod must stay running (workload controller rolls it): %v", err)
 	}
 }
 

@@ -66,6 +66,93 @@ func TestNebulaMTUBlackholeLatch(t *testing.T) {
 	}
 }
 
+// TestNebulaMTUBlackholeRecoveryUnclampsCiliumWG: the blackhole
+// remediation clamps cilium_wg0 alongside the overlay dev
+// (maybeClampNebulaMSS) — recovery must remove BOTH rules, or the
+// double-encapsulation path keeps forcing clamp-mss-to-pmtu forever
+// after the fault cleared. The cilium_wg0 rule here came from the
+// blackhole path (wgClampKnown false — the MTU invariant never fired
+// in this fixture).
+func TestNebulaMTUBlackholeRecoveryUnclampsCiliumWG(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	e.pingOK["10.128.0.2|false"] = true
+	e.host.FailOn("-M do -s 1252", errCmdFail)
+	// The fake answers "rule already present" by default — make the
+	// -C probes fail so the latch phase actually INSTALLS (-A) on
+	// both devs, like a host without the rules.
+	e.host.FailOn("-C POSTROUTING", errCmdFail)
+	for range mtuBlackholeNeeded {
+		n.checkNebulaMTUBlackhole(ctx, st)
+	}
+	if _, err := os.Stat(filepath.Join(e.state,
+		"state-nebula-mtu-blackhole")); err != nil {
+		t.Fatal("latch missing after DF fails")
+	}
+	// The blackhole clamp covered BOTH devs.
+	if !e.host.Ran("-A POSTROUTING -o neb1") ||
+		!e.host.Ran("-A POSTROUTING -o cilium_wg0") {
+		t.Fatal("blackhole clamp did not cover neb1 + cilium_wg0")
+	}
+
+	// Recovery with the invariant bit unset: both rules go.
+	st.mu.Lock()
+	st.wgClampKnown = false
+	st.mu.Unlock()
+	e.host.On("-C POSTROUTING -o neb1", "ok\n")       // rule present → -D
+	e.host.On("-C POSTROUTING -o cilium_wg0", "ok\n") // rule present → -D
+	e.host.Clear("-M do -s 1252")
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if _, err := os.Stat(filepath.Join(e.state,
+		"state-nebula-mtu-blackhole")); !os.IsNotExist(err) {
+		t.Fatal("latch not cleared after DF ping recovers")
+	}
+	if !e.host.Ran("-D POSTROUTING -o neb1") {
+		t.Fatal("neb1 clamp rule not removed on recovery")
+	}
+	if !e.host.Ran("-D POSTROUTING -o cilium_wg0") {
+		t.Fatal("cilium_wg0 clamp rule not removed on blackhole recovery")
+	}
+}
+
+// TestNebulaMTUBlackholeRecoveryKeepsInvariantClamp: when
+// wgClampKnown is set the cilium_wg0 rule belongs to the MTU
+// invariant (config drift that outlives the blackhole episode) —
+// recovery unclamps the overlay dev ONLY and must not fork iptables
+// against cilium_wg0 (the invariant re-installs the rule next probe
+// cycle anyway).
+func TestNebulaMTUBlackholeRecoveryKeepsInvariantClamp(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	e.pingOK["10.128.0.2|false"] = true
+	e.host.FailOn("-M do -s 1252", errCmdFail)
+	e.host.FailOn("-C POSTROUTING", errCmdFail)
+	for range mtuBlackholeNeeded {
+		n.checkNebulaMTUBlackhole(ctx, st)
+	}
+	if !e.host.Ran("-A POSTROUTING -o cilium_wg0") {
+		t.Fatal("blackhole clamp did not cover cilium_wg0")
+	}
+
+	st.mu.Lock()
+	st.wgClampKnown = true // the invariant owns the cilium_wg0 rule
+	st.mu.Unlock()
+	e.host.On("-C POSTROUTING -o neb1", "ok\n")
+	e.host.ClearLog()
+	e.host.Clear("-M do -s 1252")
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if e.host.Ran("cilium_wg0") {
+		t.Fatal("recovery touched the invariant-owned cilium_wg0 rule")
+	}
+	if !e.host.Ran("-D POSTROUTING -o neb1") {
+		t.Fatal("neb1 clamp rule not removed on recovery")
+	}
+}
+
 func TestNebulaMTUBlackholeNeedsSmallOK(t *testing.T) {
 	e := mtuEnv(t)
 	n := e.n

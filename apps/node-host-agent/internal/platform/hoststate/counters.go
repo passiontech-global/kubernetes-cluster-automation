@@ -25,8 +25,8 @@ func (s *Store) Counter(name string) int {
 // controllerhygiene's cycle and its feeder-side journal reads), so
 // an unlocked check-then-write can drop a concurrent increment.
 func (s *Store) Incr(name string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
 	n := s.Counter(name) + 1
 	if !s.WriteEpochFile(filepath.Join(s.Dir, name), int64(n)) {
 		return 0
@@ -34,7 +34,14 @@ func (s *Store) Incr(name string) int {
 	return n
 }
 
-// ResetCounter removes a consecutive-* file.
+// ResetCounter removes a consecutive-* file. The remove runs under
+// the same mutex as Incr: a reset racing a concurrent increment
+// must not reorder against it (reset-after-incr must observe the
+// written file, and an incr landing after a reset must not be
+// deleted by it — the streak files are shared with the feeder
+// goroutine just like the Incr path).
 func (s *Store) ResetCounter(name string) {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
 	_ = os.Remove(filepath.Join(s.Dir, name))
 }

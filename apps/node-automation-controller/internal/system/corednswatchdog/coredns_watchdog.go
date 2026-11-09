@@ -139,20 +139,93 @@ type coreDNSWatchdog struct {
 // inconclusive pick must re-list on the next sweep instead of
 // latching "no target" for 10 minutes.
 func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]bool) {
+	fqdn, want, _ := w.probeFQDNState(ctx)
+	return fqdn, want
+}
+
+// probeFQDNState is probeFQDN plus whether the returned target came
+// from the TTL cache — the cycle needs that to distrust a cached
+// want-set when the probe run fails (see invalidateFQDNCache).
+func (w *coreDNSWatchdog) probeFQDNState(ctx context.Context) (string, map[string]bool, bool) {
 	w.fqdnMu.Lock()
 	fqdn, want, at := w.cachedFQDN, w.cachedWant, w.cachedAt
 	w.fqdnMu.Unlock()
 	if fqdn != "" && w.now.Now().Sub(at) < corednsFQDNCacheTTL {
-		return fqdn, want
+		return fqdn, want, true
 	}
 	fqdn, want = w.probeFQDNUncached(ctx)
 	if fqdn == "" {
-		return "", nil
+		return "", nil, false
 	}
 	w.fqdnMu.Lock()
 	w.cachedFQDN, w.cachedWant, w.cachedAt = fqdn, want, w.now.Now()
 	w.fqdnMu.Unlock()
-	return fqdn, want
+	return fqdn, want, false
+}
+
+// invalidateFQDNCache drops the cached probe target mid-cycle. The
+// cached want-set is a pick-time snapshot of the target's endpoint
+// IPs: CoreDNS pods that roll inside the 10m TTL come back on NEW
+// IPs, healthy replicas answer from the new set, and the stale
+// want-set then marks every one of them failed — two such cycles
+// would delete healthy pods. A failed probe run against a CACHED
+// target clears the cache and re-probes once against a freshly-picked
+// target (fresh EndpointSlice read → fresh want-set) before any
+// verdict lands.
+func (w *coreDNSWatchdog) invalidateFQDNCache() {
+	w.fqdnMu.Lock()
+	w.cachedFQDN, w.cachedWant, w.cachedAt = "", nil, time.Time{}
+	w.fqdnMu.Unlock()
+}
+
+// dnsProbeResults is one layer-2 pool probe's per-pod outcome. The
+// cached-target re-probe (layer 2 in run) may run the pool twice in
+// one cycle; verdicts — streak resets and hits — are applied exactly
+// once, from the FINAL results, in run's deterministic pass, so the
+// discarded cached run leaves no ledger evidence.
+type dnsProbeResults struct {
+	names    []string       // probe order, sorted
+	fresh    map[string]int // pod -> answer count, fresh answers only
+	failed   []string       // sorted — transport error or off-set answer
+	answered int
+}
+
+// dnsLayerProbe dials fqdn on every probeable pod through the bounded
+// worker pool and classifies each answer against wantIPs. Pods
+// already proven stale by layer 1 and pods without a podIP never
+// reach the pool (their DNS fn must never fire). Each dial can hold a
+// multi-second timeout on UDP+TCP, so the pool bounds the sweep
+// wall-clock without unbounded fan-out. It writes NOTHING to the
+// streak ledgers — classification only; run concludes.
+func (w *coreDNSWatchdog) dnsLayerProbe(ctx context.Context, podIP map[string]string, stale map[string]bool, fqdn string, wantIPs map[string]bool) dnsProbeResults {
+	log := logf.FromContext(ctx)
+	log.Info("dns: probing each coredns pod", "fqdn", fqdn, "wantIPs", len(wantIPs))
+	names := make([]string, 0, len(podIP))
+	for name := range podIP {
+		if stale[name] || podIP[name] == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	type dnsVerdict struct {
+		ips []string
+		err error
+	}
+	results := make([]dnsVerdict, len(names))
+	boundedForEach(names, func(i int) {
+		results[i].ips, results[i].err = w.dnsFn(ctx, podIP[names[i]], fqdn)
+	})
+	res := dnsProbeResults{names: names, fresh: make(map[string]int, len(names))}
+	for i, name := range names {
+		if err := results[i].err; err == nil && dnsAnswerFresh(results[i].ips, wantIPs) {
+			res.answered++
+			res.fresh[name] = len(results[i].ips)
+		} else {
+			res.failed = append(res.failed, name)
+		}
+	}
+	return res
 }
 
 func Setup(d shared.Deps) error {
@@ -248,54 +321,46 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	}
 
 	// ===== Layer 2: active freshness query =====
-	fqdn, wantIPs := w.probeFQDN(ctx)
+	fqdn, wantIPs, fromCache := w.probeFQDNState(ctx)
 	if fqdn == "" {
 		log.Info("dns: skip layer 2 — no service <10m old and no usable endpointslice (inconclusive)")
 	} else {
-		log.Info("dns: probing each coredns pod", "fqdn", fqdn, "wantIPs", len(wantIPs))
-		// Probe the pods through the bounded worker pool — each
-		// dnsFn dial can hold a multi-second timeout on UDP+TCP, so
-		// the pool bounds the sweep wall-clock without unbounded
-		// fan-out. Pods already proven stale by layer 1 and pods
-		// without a podIP never reach the pool (their DNS fn must
-		// never fire). Verdicts (streak hits/resets, fleet-wide
-		// abort) stay SEQUENTIAL below: one deterministic pass over
-		// the sorted results, no ledger writes from inside the pool.
-		names := make([]string, 0, len(podIP))
-		for name := range podIP {
-			if stale[name] || podIP[name] == "" {
-				continue
-			}
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		type dnsVerdict struct {
-			ips []string
-			err error
-		}
-		results := make([]dnsVerdict, len(names))
-		boundedForEach(names, func(i int) {
-			results[i].ips, results[i].err = w.dnsFn(ctx, podIP[names[i]], fqdn)
-		})
-		answered := 0
-		var failed []string
-		for i, name := range names {
-			if err := results[i].err; err == nil && dnsAnswerFresh(results[i].ips, wantIPs) {
-				answered++
-				w.streak.Reset(name)
-				log.Info("dns: fresh", "pod", name, "answers", len(results[i].ips))
+		res := w.dnsLayerProbe(ctx, podIP, stale, fqdn, wantIPs)
+		if len(res.failed) > 0 && fromCache {
+			// The cached want-set is a pick-time snapshot of the
+			// target's endpoint IPs: CoreDNS pods that rolled inside
+			// the 10m TTL answer from their NEW IP set, so a stale
+			// want-set fails every healthy replica — two such cycles
+			// would delete healthy pods. Drop the cache, re-pick a
+			// target with a fresh EndpointSlice read, and re-probe
+			// ONCE. Never conclude twice in one cycle: verdicts are
+			// ledger writes in the single deterministic pass below,
+			// so the discarded cached run leaves no streak evidence.
+			log.Info("dns: cached probe target failed pods — want-set may predate a pod roll, re-picking fresh",
+				"fqdn", fqdn, "failed", len(res.failed))
+			w.invalidateFQDNCache()
+			if fresh, freshWant := w.probeFQDN(ctx); fresh == "" {
+				log.Info("dns: skip layer 2 re-probe — fresh pick inconclusive")
+				res = dnsProbeResults{}
 			} else {
-				failed = append(failed, name)
+				fqdn, wantIPs = fresh, freshWant
+				res = w.dnsLayerProbe(ctx, podIP, stale, fqdn, wantIPs)
 			}
 		}
-		if answered == 0 && len(failed) > 0 {
+		if res.answered == 0 && len(res.failed) > 0 {
 			// Every probe failed — our path to podIPs is likely broken
 			// (CNI partition, netpol). Do NOT bump streaks: flagging
 			// the whole fleet would restart healthy coredns while the
 			// probe path itself is severed.
 			log.Info("dns: ABORT layer 2 — no pod answered, probe path to podIP likely broken (inconclusive)")
 		} else {
-			for _, name := range failed {
+			for _, name := range res.names {
+				if n, ok := res.fresh[name]; ok {
+					w.streak.Reset(name)
+					log.Info("dns: fresh", "pod", name, "answers", n)
+				}
+			}
+			for _, name := range res.failed {
 				s := w.streak.Hit(name)
 				if s >= corednsStreakMax {
 					stale[name] = true

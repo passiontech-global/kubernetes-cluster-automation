@@ -150,18 +150,15 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		// not the service: two desynced services must not bounce the
 		// same singleton linkerd-destination Deployment back-to-back
 		// inside one sweep (the ladder tier scales it with the
-		// per-service cooldown).
+		// per-service cooldown). Cooldown-ONLY — the budget token for
+		// this heal was granted up front by HealAllowedPersisted
+		// above, so a second HealAllowed here would double-spend for
+		// one delete (and a fresh mutex evaluation is pointless: the
+		// preamble already cleared it moments ago).
 		ck := "linkerd/linkerd-destination"
-		proceed, unverifiable := p.HealAllowed(ctx, log,
-			&p.Heals, ck, linkerdDestHealEscalation[fails], now)
-		if unverifiable {
-			metrics.IncError(p.Name)
-			if healed {
-				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
-			}
-			return
-		}
-		if !proceed {
+		if p.Heals.CooledDown(ck, linkerdDestHealEscalation[fails], now) {
+			log.Info("skip linkerd-destination bounce: inside bounce cooldown",
+				"service", svcKey)
 			if healed {
 				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
 			}

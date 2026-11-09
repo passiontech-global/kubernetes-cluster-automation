@@ -37,8 +37,9 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 		if ctx.Err() != nil || acc >= need {
 			break
 		}
-		// Selected on apparent size (find -printf %s) exactly like
-		// the awk accumulator — removal failure does not re-run.
+		// Selected on allocated blocks (entryBlocks) in the same du-style
+		// units as the high/low marks and the `sz` above — removal
+		// failure does not re-run.
 		acc += f.size
 		if err := os.Remove(f.path); err == nil {
 			freed += f.size
@@ -276,7 +277,12 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 		if err := os.Remove(path); err == nil {
 			nlocks++
 			p.filesDeleted.WithLabelValues("node-deps").Inc()
-			p.bytesFreed.Add(float64(info.Size()))
+			// st.Blocks×512, not Size(): bytesFreed is "what the disk
+			// actually got back" — the same du-style units the caps
+			// and every other bytesFreed site report (a sparse or
+			// tail-packed lock file's Size() can wildly exceed or
+			// fall short of its footprint).
+			p.bytesFreed.Add(float64(entryBlocks(info)))
 		} else {
 			lockFailed++
 			lockErr = err

@@ -17,6 +17,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -226,6 +227,47 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("linkerd-destination pod not bounced on the resumed window")
+	}
+}
+
+// The destination bounce gate is cooldown-ONLY — the heal's budget
+// token was already granted by HealAllowedPersisted up front. With
+// the whole sweep budget at ONE grant the bounce must still deliver:
+// a second HealAllowed at the bounce site would find the budget spent
+// and skip the delete (the double-spend this pins).
+func TestLinkerdDestinationBounceSpendsOneBudgetToken(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	base := time.Now()
+	dest := linkerdDestinationPod(kube.LinkerdDestinationName+"-old-111", 2*time.Hour)
+	sibling := linkerdDestinationPod(kube.LinkerdDestinationName+"-sib-999", time.Hour)
+	svc := probetest.HeadlessService("app", "budget-svc", map[string]string{"app": "x"})
+	svc.Annotations = map[string]string{
+		kube.AnnoFirstSeenLinkerdEndpointSync: `{"app/budget-svc":"` +
+			base.Add(-20*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		svc,
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		// EndpointSlice holds a stale IP — the Ready pod IP is missing.
+		probetest.EndpointSliceForService("app", "budget-svc", "10.244.0.9"),
+		dest, sibling,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted desync must fail")
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("destination bounce must deliver on a 1-grant budget — the bounce gate spends no token of its own")
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, sibling.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("only the oldest destination pod may be bounced: %v", err)
 	}
 }
 

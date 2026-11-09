@@ -366,7 +366,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon uncordon patch failed", "node", name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
+		p.InvalidateNodes(ctx) // node spec changed — drop the node census, arm a CS re-read
 		cordoned--
 		nodeHangUncordonsTotal.WithLabelValues(name).Inc()
 		p.hangCounters.mark(name)
@@ -392,7 +392,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon stale-stamp patch failed", "node", name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // node annotations changed — drop the snapshot
+		p.InvalidateNodes(ctx) // node annotations changed — drop the node census, arm a CS re-read
 		log.Info("CORDON STAMP CLEARED: schedulable node carried a stale pre-cordon annotation",
 			"node", name)
 	}
@@ -445,7 +445,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon patch failed", "node", name)
 			continue
 		}
-		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
+		p.InvalidateNodes(ctx) // node spec changed — drop the node census, arm a CS re-read
 		cordoned++
 		nodeHangCordonsTotal.WithLabelValues(name).Inc()
 		p.hangCounters.mark(name)

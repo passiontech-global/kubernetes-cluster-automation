@@ -248,9 +248,12 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// (linkerd-endpoint-sync skips its pod census entirely when no
 	// namespace carries linkerd.io/inject=enabled, and
 	// linkerd-outlier-guard bails on the failed Prometheus query
-	// before ever listing pods.)
-	if got := errCount() - before; got != 24 {
-		t.Fatalf("run errors delta = %v, want 24", got)
+	// before ever listing pods.) The dragonfly-operator leader-bounce
+	// heal rides the shared AllPods census now (was a namespaced
+	// list this pods-outage fake never hit), so it meters the same
+	// failure — twenty-five total.
+	if got := errCount() - before; got != 25 {
+		t.Fatalf("run errors delta = %v, want 25", got)
 	}
 }
 

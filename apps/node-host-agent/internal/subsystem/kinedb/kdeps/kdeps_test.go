@@ -350,8 +350,13 @@ func TestPsqlArgsAndPassEnv(t *testing.T) {
 	if got := d.PsqlArgs("pg", "u", true); !strings.Contains(strings.Join(got, " "), "exec -i -e PGPASSWORD") {
 		t.Fatalf("interactive PsqlArgs=%v", got)
 	}
-	if got := PsqlPassEnv("s3cret"); len(got) != 1 || got[0] != "PGPASSWORD=s3cret" {
+	if got := PsqlPassEnv("s3cret"); len(got) != 2 ||
+		got[0] != "PGPASSWORD=s3cret" || got[1] != "PGAPPNAME="+PGAPPNAME {
 		t.Fatalf("PsqlPassEnv=%v", got)
+	}
+	if PGAPPNAME != "node_host_agent_maint" {
+		t.Fatalf("PGAPPNAME=%q — the reaper's exemption list must match it",
+			PGAPPNAME)
 	}
 }
 
@@ -369,8 +374,10 @@ func TestPsqlQueryAndScript(t *testing.T) {
 		t.Fatalf("query argv missing -tAc: %s", joined)
 	}
 	envs := fr.Envs()
-	if len(envs) == 0 || len(envs[len(envs)-1]) != 1 || envs[len(envs)-1][0] != "PGPASSWORD=pw" {
-		t.Fatalf("query child env=%v", envs)
+	lastEnv := envs[len(envs)-1]
+	if len(envs) == 0 || len(lastEnv) != 2 ||
+		lastEnv[0] != "PGPASSWORD=pw" || lastEnv[1] != "PGAPPNAME="+PGAPPNAME {
+		t.Fatalf("query child env=%v", lastEnv)
 	}
 	out, err = d.PsqlScript(context.Background(), "kine-postgres", "postgres", "pw2", "LOCK; VACUUM;")
 	if err != nil || out != "done\n" {

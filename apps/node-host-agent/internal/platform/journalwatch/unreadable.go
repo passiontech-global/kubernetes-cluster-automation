@@ -31,8 +31,8 @@ const (
 	OwnerControllerHygiene = "controllerhygiene"
 )
 
-// NewUnreadableTracker returns the persistence-wired Tracker for the
-// state-journal-unreadable latch:
+// NewUnreadableTrackerForOwner returns the persistence-wired Tracker
+// for the state-journal-unreadable latch, BOUND to one producer id:
 //
 //   - each owner's consecutive-failure streak persists to
 //     <state.Dir>/consecutive-journal-unreadable-<owner>, so an agent
@@ -40,24 +40,42 @@ const (
 //     zero — a restart during a broken-journald episode used to
 //     silently reset the budget and delay the latch by another full
 //     Needed streak;
+//   - the binding scopes every streak read/increment/reset to THAT
+//     owner's file, so workerhygiene's healthy journal read can
+//     never reset controllerhygiene's failure count while they share
+//     the state-journal-unreadable latch episode (and vice versa) —
+//     an owner-less tracker would collapse both producers onto one
+//     counter and defeat the owner-scoped EnterFrom/ExitFrom calls
+//     in wdeps/cdeps;
 //   - LatchedSeed seeds latched iff the state-journal-unreadable
 //     latch file exists, so a restart while latched resumes latched
 //     and the first healthy read releases through Store.ExitFrom +
 //     clears the stale state-* file instead of it lingering to the
 //     janitor's 24h reap.
 //
+// owner is OwnerWorkerHygiene or OwnerControllerHygiene — it MUST be
+// non-empty and the constructor refuses "" (a wiring error, not a
+// runtime condition: the owner-less form is no longer producible).
 // needed is the consecutive-failure budget (<=0 → DefaultNeeded);
 // dirs are the HOST-visible journal storage roots Present probes.
 // The tracker does NOT touch the latch file: callers drive it
 // through state.EnterFrom(name, owner, …) / state.ExitFrom(name,
 // owner, …) on the tracker's Enter/Exit edges so BOTH hygienes'
-// holds register on the one shared Store instance (hoststate.Shared).
-func NewUnreadableTracker(state *hoststate.Store, dirs []string, needed int) Tracker {
+// holds register on the one shared Store sync state
+// (hoststate.Shared).
+func NewUnreadableTrackerForOwner(state *hoststate.Store, dirs []string,
+	needed int, owner string) Tracker {
+	if owner == "" {
+		panic("journalwatch: NewUnreadableTrackerForOwner requires a " +
+			"non-empty owner — an owner-less tracker collapses both " +
+			"hygienes' streaks onto one counter")
+	}
 	return Tracker{
 		Needed:      needed,
 		Dirs:        dirs,
 		Counter:     state,
 		CounterName: UnreadableCounter,
+		Owner:       owner,
 		LatchedSeed: func() bool {
 			return state.Exists(latchdefs.LatchJournalUnreadable)
 		},

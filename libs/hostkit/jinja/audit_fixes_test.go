@@ -346,8 +346,8 @@ func TestFloorDivisionAndModulo(t *testing.T) {
 			t.Fatalf("%v %s %v = %#v want %#v", tc.l, tc.op, tc.r, got, want)
 		}
 	}
-	// Through the renderer (int path governs float values with int
-	// parts — pinned behavior).
+	// Through the renderer (integer literals keep the integer
+	// fast-path — same results as the binOp cases above).
 	tplCases := map[string]string{
 		`{{ -7 // 2 }}`: "-4",
 		`{{ 7 // -2 }}`: "-4",
@@ -575,6 +575,127 @@ func TestPyFormatSpecValidation(t *testing.T) {
 	} {
 		if _, err := renderBounded(t, tpl, nil); err == nil {
 			t.Fatalf("render %q succeeded — want spec-validation error", tpl)
+		}
+	}
+}
+
+// binOp's integer fast-path used to capture float operands: ToInt
+// truncates every float64 (5.5 → 5, ok=true), so `5.5 * 2.0` ran
+// int64 math and lost the fraction (10 instead of 11), and
+// `5.5 % 2.0` gave 1 instead of 1.5. The fast-path now requires
+// genuinely integer-typed operands; any float64 takes the float
+// path. The integer path also guards the one int64 division whose
+// quotient overflows (MinInt64 // -1, % -1) — the hardware divide
+// would raise SIGFPE there.
+func TestBinOpIntegerFastPathExcludesFloats(t *testing.T) {
+	i := func(v int64) any { return v }
+	cases := []struct {
+		op   string
+		l, r any
+		want any
+	}{
+		// floats keep their fraction — and their TYPE: every
+		// result below must be float64, not a truncated int64.
+		{"*", 5.5, 2.0, 11.0},
+		{"*", 5.5, i(2), 11.0}, // mixed float/int → float path
+		{"+", 5.5, 2.0, 7.5},
+		{"-", 5.5, 2.0, 3.5},
+		{"/", 5.5, 2.0, 2.75},
+		{"//", 5.5, 2.0, 2.0},  // floored
+		{"//", 5.5, 2.25, 2.0}, // floor(2.44)
+		{"%", 5.5, 2.0, 1.5},
+		{"%", -5.5, 2.0, 0.5}, // remainder takes divisor's sign
+		{"%", 5.5, -2.0, -0.5},
+		// int64 operands stay on the integer fast-path — and keep
+		// returning int64 (pinned by TestFloorDivisionAndModulo
+		// through the renderer too).
+		{"*", i(3), i(4), i(12)},
+		{"+", i(3), i(4), i(7)},
+		{"-", i(3), i(4), i(-1)},
+		{"//", i(7), i(2), i(3)},
+		{"//", i(-7), i(2), i(-4)},
+		{"%", i(-7), i(2), i(1)},
+		// bools count as integer-typed (python True == 1).
+		{"*", true, i(4), i(4)},
+		// comparisons never used ToInt — float order is exact.
+		{"<", 5.5, 2.0, false},
+		{">=", 5.5, 2.0, true},
+		{"<", i(5), 5.5, true},
+	}
+	for _, tc := range cases {
+		got, err := binOp(tc.op, tc.l, tc.r)
+		if err != nil {
+			t.Fatalf("%v %s %v: %v", tc.l, tc.op, tc.r, err)
+		}
+		var ok bool
+		switch w := tc.want.(type) {
+		case float64:
+			var f float64
+			f, ok = got.(float64)
+			if ok && f != w {
+				t.Fatalf("%v %s %v = %v want %v", tc.l, tc.op, tc.r, f, w)
+			}
+		case int64:
+			var n int64
+			n, ok = got.(int64)
+			if ok && n != w {
+				t.Fatalf("%v %s %v = %v want %v", tc.l, tc.op, tc.r, n, w)
+			}
+		case bool:
+			var b bool
+			b, ok = got.(bool)
+			if ok && b != w {
+				t.Fatalf("%v %s %v = %v want %v", tc.l, tc.op, tc.r, b, w)
+			}
+		}
+		if !ok {
+			t.Fatalf("%v %s %v = %T(%#v), want %T", tc.l, tc.op, tc.r, got, got, tc.want)
+		}
+	}
+
+	// MinInt64 // -1 and % -1: the quotient overflows int64 and the
+	// hardware divide raises SIGFPE — no panic, exact answers.
+	mi := int64(math.MinInt64)
+	q, err := binOp("//", mi, i(-1))
+	if err != nil {
+		t.Fatalf("MinInt64 // -1: %v", err)
+	}
+	qf, ok := q.(float64)
+	if !ok || qf != 9223372036854775808.0 {
+		t.Fatalf("MinInt64 // -1 = %#v, want float64 9223372036854775808", q)
+	}
+	m, err := binOp("%", mi, i(-1))
+	if err != nil {
+		t.Fatalf("MinInt64 %% -1: %v", err)
+	}
+	if m != i(0) {
+		t.Fatalf("MinInt64 %% -1 = %#v, want int64 0", m)
+	}
+
+	// Through the renderer: float literals take the float path,
+	// integer literals the integer path, and the guard survives
+	// context-fed int64 values.
+	tplCases := map[string]string{
+		`{{ 5.5 * 2.0 }}`:  "11",
+		`{{ 5.5 + 2.0 }}`:  "7.5",
+		`{{ 5.5 - 2.0 }}`:  "3.5",
+		`{{ 5.5 // 2.0 }}`: "2",
+		`{{ 5.5 % 2.0 }}`:  "1.5",
+		`{{ 5.5 * 2 }}`:    "11", // mixed operands → float path
+		`{{ 2 * 3 }}`:      "6",
+		`{{ 7 // 2 }}`:     "3",
+		`{{ -7 // 2 }}`:    "-4",
+		`{{ -7 % 2 }}`:     "1",
+		`{{ a % b }}`:      "0", // MinInt64 % -1 via context
+	}
+	for tpl, want := range tplCases {
+		ctx := map[string]any{"a": mi, "b": i(-1)}
+		got, err := renderBounded(t, tpl, ctx)
+		if err != nil {
+			t.Fatalf("render %q: %v", tpl, err)
+		}
+		if got != want {
+			t.Fatalf("render %q = %q want %q", tpl, got, want)
 		}
 	}
 }

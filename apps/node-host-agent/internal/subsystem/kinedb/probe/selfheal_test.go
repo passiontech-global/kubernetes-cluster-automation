@@ -284,3 +284,44 @@ func TestStuckSessionPredicateExemptions(t *testing.T) {
 		}
 	}
 }
+
+// TestProbePsqlSessionsCarryAppName: every psql session the probe
+// loop spawns must present the exempted application_name — the
+// predicate matches on application_name, not on pid, so a session
+// without kdeps.PGAPPNAME shows up as 'psql' in pg_stat_activity
+// and the reaper would terminate our own long-running maintenance /
+// remediation statements. PsqlPassEnv pins the marker; this walks
+// the recorded child envs of one full probe cycle.
+func TestProbePsqlSessionsCarryAppName(t *testing.T) {
+	k, fr, _ := fixture(t, kdepstest.ProbeOKRules)
+	fr.On("pg_stat_activity", "0\n")
+	k.Cycle(context.Background())
+
+	envs := fr.Envs()
+	if len(envs) == 0 {
+		t.Fatal("probe cycle spawned no exec children")
+	}
+	seenPG := false
+	for _, env := range envs {
+		hasPass := false
+		hasAppName := false
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "PGPASSWORD=") {
+				hasPass = true
+			}
+			if kv == "PGAPPNAME="+kdeps.PGAPPNAME {
+				hasAppName = true
+			}
+		}
+		if hasPass {
+			seenPG = true
+			if !hasAppName {
+				t.Fatalf("psql child env missing PGAPPNAME=%s: %v",
+					kdeps.PGAPPNAME, env)
+			}
+		}
+	}
+	if !seenPG {
+		t.Fatal("probe cycle spawned no psql child (fixture drift)")
+	}
+}

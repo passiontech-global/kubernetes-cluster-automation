@@ -10,8 +10,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
@@ -230,12 +233,81 @@ func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
 			t.Errorf("%s: zombie condition = %+v, want Status=False swept", name, c)
 		}
 	}
-	// And nothing outside the allowlist: kubelet-native InodePressure
-	// (pinned above) plus the agent-carried-but-permanent
-	// KernelDeadlock latch must NOT appear in the swept set.
+	// And nothing outside the allowlist: the agent-carried-but-
+	// permanent KernelDeadlock latch must NOT appear in the swept
+	// set (InodePressure is in since W18-1 — pinned by the sweep
+	// loop above).
 	for _, c := range nodeCondSweptConds {
 		if c == "KernelDeadlock" {
 			t.Error("KernelDeadlock must not be swept — permanent latch")
+		}
+	}
+}
+
+// The post-patch invalidation must be node-scoped: the cleared zombie
+// drops the NODE census (and arms the next AllNodes to re-read d.CS
+// past the informer cache) but must NOT wipe the rest of the sweep
+// snapshot — a node status patch cannot stale pods, and a sweep-wide
+// InvalidateSweep here forced every later check to re-LIST the whole
+// census for nothing.
+func TestNodeCondSweeperPatchInvalidatesNodesOnly(t *testing.T) {
+	n := probetest.ReadyWorkerNode("w-zombie", "KubeletPLEGUnhealthy",
+		nodeHangCondHeartbeatMaxAge+time.Minute, false)
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(n,
+		probetest.ReadyWorkerNode("w-ok", "", 0, false),
+		probetest.PendingUnscheduledPod("apps", "witness", time.Minute, true))
+	var podLists, nodeLists int
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			podLists++
+			return false, nil, nil
+		})
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			nodeLists++
+			return false, nil, nil
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*nodeCondSweepCheck](t, p)
+	sweepCtx := probefw.WithSweepSnapshot(ctx)
+	// Warm the snapshot: one pod census, one node census.
+	if _, err := chk.AllPods(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chk.AllNodes(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 1 || nodeLists != 1 {
+		t.Fatalf("warm-up lists pods=%d nodes=%d, want 1/1", podLists, nodeLists)
+	}
+	if res := chk.Run(sweepCtx); res.Pass {
+		t.Fatal("zombie condition did not fail the check")
+	}
+	// The patch landed; re-reading the pod census must hit the
+	// memoized snapshot — a sweep-wide wipe would re-LIST here.
+	if _, err := chk.AllPods(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+	if podLists != 1 {
+		t.Fatalf("node patch re-listed pods %d time(s) — sweep-wide wipe, want 0", podLists-1)
+	}
+	// The next node census is the armed direct-CS re-read — it must
+	// carry the PATCHED node, not a lagging informer copy.
+	fresh, err := chk.AllNodes(sweepCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeLists != 2 {
+		t.Fatalf("node census reads=%d, want 2 (memo + one armed re-read)", nodeLists)
+	}
+	for i := range fresh {
+		if fresh[i].Name != "w-zombie" {
+			continue
+		}
+		if c := kube.NodeCondition(&fresh[i], "KubeletPLEGUnhealthy"); c == nil || c.Status != corev1.ConditionFalse {
+			t.Fatalf("post-patch census carries the stale pre-patch copy: %+v", c)
 		}
 	}
 }

@@ -5,6 +5,7 @@ package watchdogs
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,30 @@ func TestCheckSchedulerPreemptionStorm(t *testing.T) {
 		map[string]string{})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("preemption_storm=%v, want 1", m)
+	}
+}
+
+// The storm verdict must never read "0 pods pending >=5m..." — with
+// nothing stuck pending the all-clear wording carries the storm
+// finding alone (the count phrase would misread an all-clear as a
+// stuck scheduler).
+func TestCheckSchedulerStormZeroPendingVerdict(t *testing.T) {
+	objs := []runtime.Object{probetest.ReadyWorkerNode("w1", "", 0, false)}
+	for i := range schedulerPreemptionMax + 1 {
+		objs = append(objs,
+			preemptedEvent("apps", fmt.Sprintf("ev-%d", i), time.Minute))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("preemption storm must fail: %+v", res)
+	}
+	if strings.Contains(res.Why, "0 pods pending") {
+		t.Fatalf("verdict must not read a 0-pending count: %q", res.Why)
+	}
+	if !strings.Contains(res.Why, "preemption storm") {
+		t.Fatalf("verdict must still carry the storm finding: %q", res.Why)
 	}
 }
 

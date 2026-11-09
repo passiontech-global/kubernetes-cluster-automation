@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -150,7 +151,8 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	// for its removed member pods are intent, never storm evidence.
 	// A list failure fails open: the signatures keep their normal
 	// posture.
-	downscaled, err := downscaledClusterCRs(ctx, p.Dyn, kube.GVRDragonfly)
+	crs, err := p.AllUnstructured(ctx, kube.GVRDragonfly)
+	downscaled, err := downscaledClusterCRs(crs, err)
 	if err != nil {
 		log.Info("WARN: list dragonflies failed — downscaler awareness off",
 			"error", err)
@@ -224,6 +226,14 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		if !stormActive ||
 			(!stormGlobal && !stormNS[ns] && !stormPods[key]) {
 			continue // sustained link-down alone FAILs but doesn't restart
+		}
+		// A controller-less pod would be deleted PERMANENTLY — no
+		// owner recreates it — and the cooldown keys on that very
+		// controller, so without one there is no heal to deliver.
+		if metav1.GetControllerOf(pod) == nil {
+			log.Info("skip heal: pod has no controller owner — delete would not be recreated",
+				"pod", key)
+			continue
 		}
 		// The cooldown keys on the pod's CONTROLLER — the deleted
 		// replica is recreated under a fresh suffix, so a pod-name

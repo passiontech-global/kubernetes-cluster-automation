@@ -173,12 +173,15 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	// cfg.Clock.Set is observed by it
 	// (hoststate.Store.Now contract).
 	d.State = cfg.Store(logger)
-	// Shared-streak contract lives in journalwatch.NewUnreadableTracker:
-	// both hygienes bump the SAME consecutive-journal-unreadable file
-	// and seed from the same state-journal-unreadable latch — a
-	// failed read on either subsystem counts toward the one episode.
-	d.JournalReads = journalwatch.NewUnreadableTracker(
-		d.State, cfg.JournalDirs, cfg.JournalUnreadableNeeded)
+	// Streak contract lives in journalwatch.NewUnreadableTrackerForOwner:
+	// each hygiene persists its OWN consecutive-journal-unreadable-<owner>
+	// streak file and holds the shared state-journal-unreadable latch
+	// under its own id — one side's failed read never inflates or
+	// resets the other's count, while the latch FILE still arbitrates
+	// the single shared episode (Store's multi-owner ExitFrom).
+	d.JournalReads = journalwatch.NewUnreadableTrackerForOwner(
+		d.State, cfg.JournalDirs, cfg.JournalUnreadableNeeded,
+		journalwatch.OwnerControllerHygiene)
 	if cfg.HTTPClient != nil {
 		d.Client = cfg.HTTPClient
 	}

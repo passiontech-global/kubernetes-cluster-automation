@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -357,9 +358,56 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 			"kind", kind, "workload", ns+"/"+name, "error", patchErr)
 		return false, false
 	}
+	// Mirror the landed patch into the snapshot's in-memory workload
+	// copy — the serial sweep sees no apiserver echo, so a second
+	// stalled pod of the same workload must read the template
+	// annotation (and the patch stamp) this call just wrote instead
+	// of re-deriving the write from the stale pre-patch copy and
+	// re-patching. mergeTemplateAnnos also allocates a missing
+	// template-annotation map through the concrete workload: the
+	// caller's `existing` binding cannot write nil back.
+	probefw.MergeAnnoPatchLocally(obj, payload)
+	mergeTemplateAnnos(obj, anno)
 	log.Info("PATCH: linkerd opaque-ports added to workload template",
 		"kind", kind, "workload", ns+"/"+name, "ports", value)
 	return true, true
+}
+
+// mergeTemplateAnnos writes anno into obj's pod-template annotation
+// map in memory — the snapshot censuses alias these structs, so this
+// is the apiserver echo the serial sweep never gets. Job/CronJob
+// templates nest under jobTemplate; the unstructured Rollout goes
+// through SetNestedMap (replacing the whole map is safe — it only
+// runs when the template carried no annotations at all, the case the
+// in-place update through `existing` cannot express).
+func mergeTemplateAnnos(obj metav1.Object, anno map[string]string) {
+	set := func(meta *metav1.ObjectMeta) {
+		if meta.Annotations == nil {
+			meta.Annotations = map[string]string{}
+		}
+		for k, v := range anno {
+			meta.Annotations[k] = v
+		}
+	}
+	switch w := obj.(type) {
+	case *appsv1.Deployment:
+		set(&w.Spec.Template.ObjectMeta)
+	case *appsv1.StatefulSet:
+		set(&w.Spec.Template.ObjectMeta)
+	case *appsv1.DaemonSet:
+		set(&w.Spec.Template.ObjectMeta)
+	case *batchv1.Job:
+		set(&w.Spec.Template.ObjectMeta)
+	case *batchv1.CronJob:
+		set(&w.Spec.JobTemplate.Spec.Template.ObjectMeta)
+	case *unstructured.Unstructured:
+		m := make(map[string]any, len(anno))
+		for k, v := range anno {
+			m[k] = v
+		}
+		_ = unstructured.SetNestedMap(w.Object, m,
+			"spec", "template", "metadata", "annotations")
+	}
 }
 
 // find{Deployment,StatefulSet,DaemonSet} resolve ns/name inside a
