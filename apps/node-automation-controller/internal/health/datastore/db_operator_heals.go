@@ -64,13 +64,21 @@ func dbOperatorPodPrefixes(operator string) []string {
 }
 
 // dbOperatorFor returns the db operator name owning this StatefulSet,
-// or "" — matching any label value on the STS or its pod template
-// containing the operator name (managed-by/part-of/created-by and
-// operator-specific labels all end up containing it), plus
-// ownerReference names.
+// or "" — matching ONLY the label keys operators actually stamp their
+// identity on (app.kubernetes.io/managed-by, app.kubernetes.io/part-of
+// and app.kubernetes.io/name) plus controller ownerReference names.
+// Matching every label VALUE was wrong: an image tag or chart name
+// containing e.g. "pg-operator" would attribute an unrelated STS to
+// that operator and let the check bounce its pods.
 func dbOperatorFor(sts *appsv1.StatefulSet) string {
+	operatorLabelKeys := []string{
+		"app.kubernetes.io/managed-by",
+		"app.kubernetes.io/part-of",
+		"app.kubernetes.io/name",
+	}
 	for _, lbls := range []map[string]string{sts.Labels, sts.Spec.Template.Labels} {
-		for _, v := range lbls {
+		for _, key := range operatorLabelKeys {
+			v := lbls[key]
 			for _, op := range dbOperatorNames {
 				if strings.Contains(v, op) {
 					return op

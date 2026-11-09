@@ -139,7 +139,12 @@ func emitCircuitOpenEvent(cs kubernetes.Interface, module, target, reason string
 			Name:       target,
 		},
 	}
-	if _, err := cs.EventsV1().Events(metav1.NamespaceAll).
+	// events.k8s.io/v1 Event is a NAMESPACED resource — NamespaceAll
+	// would POST to the cluster-scoped collection path and the create
+	// is rejected. The kubelet convention for node-scoped events is
+	// the "default" namespace; the ClusterRole already grants events
+	// create cluster-wide.
+	if _, err := cs.EventsV1().Events("default").
 		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
 		ctrl.Log.Error(err, "RemediationCircuitBreakerOpen event create failed",
 			"module", module, "node", target)
@@ -313,8 +318,8 @@ func main() {
 	// aggregate rate the fleet actually issues; both are
 	// env-overridable for clusters whose apiserver wants a lower
 	// ceiling.
-	cfg.QPS = float32(envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50))
-	cfg.Burst = envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100)
+	cfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50, 1))
+	cfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100, 1)
 	// ONE token bucket for every client built off this config:
 	// rest.Config carries the RateLimiter interface by reference
 	// through NewForConfig/CopyConfig, so installing it here makes
@@ -382,8 +387,8 @@ func main() {
 	// directCfg keeps the same hung-call posture; the informer WATCH
 	// streams stay on the manager's config, untouched.
 	probeCfg := rest.CopyConfig(directCfg)
-	probeCfg.QPS = float32(envx.GetenvInt("NODE_AUTOMATION_PROBE_CLIENT_QPS", 20))
-	probeCfg.Burst = envx.GetenvInt("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40)
+	probeCfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_QPS", 20, 1))
+	probeCfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40, 1)
 	probeCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
 		probeCfg.QPS, probeCfg.Burst)
 	probeCS, err := kubernetes.NewForConfig(probeCfg)

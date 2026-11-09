@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -219,6 +220,132 @@ func TestDeletePodNilHeals(t *testing.T) {
 	cs := fake.NewSimpleClientset(p)
 	if deleted, err := DeletePod(ctx, cs, nil, "k", p, time.Now()); err != nil || !deleted {
 		t.Fatalf("DeletePod nil heals = (%v,%v)", deleted, err)
+	}
+}
+
+// emulateEviction teaches the fake clientset the apiserver's
+// pods/eviction contract — same emulation shape as every domain
+// package's copy: the fake tracker records a pods/eviction CREATE
+// but never deletes the pod, so tests asserting the pod is gone wire
+// the delete themselves. PDB budget enforcement stays apiserver-side.
+func emulateEviction(cs *fake.Clientset) {
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil // a real pod create — let the tracker take it
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
+		})
+}
+
+// A delivered eviction stamps the ledger and removes the pod — the
+// same delivered-only contract DeletePod pins.
+func TestEvictPodStampsOnDelivery(t *testing.T) {
+	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
+	cs := fake.NewSimpleClientset(p)
+	emulateEviction(cs)
+	var heals state.CooldownSet
+	now := time.Now()
+
+	evicted, refused, err := EvictPod(ctx, cs, &heals, "k", p, now)
+	if err != nil || refused || !evicted {
+		t.Fatalf("EvictPod = (%v,%v,%v), want (true,false,nil)", evicted, refused, err)
+	}
+	if _, err := cs.CoreV1().Pods("ns1").Get(ctx, "op-abc-1",
+		metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("delivered eviction left the pod behind: %v", err)
+	}
+	if !heals.CooledDown("k", time.Hour, now) {
+		t.Fatal("delivered eviction did not stamp the ledger")
+	}
+}
+
+// The eviction carries the UID precondition on its DeleteOptions —
+// "kill the pod I vetted, not a same-named recreate" — with no
+// propagation policy, matching DeletePod's wire shape.
+func TestEvictPodUIDPrecondition(t *testing.T) {
+	p := pod("ns1", "op-abc-1", "uid-42", corev1.PodRunning, time.Now())
+	cs := fake.NewSimpleClientset(p)
+	var got metav1.DeleteOptions
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			got = *ca.GetObject().(*policyv1.Eviction).DeleteOptions
+			return true, nil, nil
+		})
+	if _, _, err := EvictPod(ctx, cs, nil, "k", p, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Preconditions == nil || got.Preconditions.UID == nil ||
+		*got.Preconditions.UID != types.UID("uid-42") {
+		t.Fatalf("Eviction DeleteOptions = %+v, want UID precondition uid-42", got)
+	}
+	if got.PropagationPolicy != nil {
+		t.Fatalf("PropagationPolicy = %v, want unset (apiserver default)",
+			*got.PropagationPolicy)
+	}
+}
+
+// A PDB with disruptionsAllowed==0 refuses the eviction with HTTP
+// 429 — a DEFERRAL, not a failure: (false, true, nil) so the caller
+// keeps the pod, counts no error and stamps no ledger.
+func TestEvictPodPDBRefusalDefers(t *testing.T) {
+	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
+	cs := fake.NewSimpleClientset(p)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewTooManyRequests(
+				"pdb allows no disruptions", 0)
+		})
+	var heals state.CooldownSet
+	now := time.Now()
+
+	evicted, refused, err := EvictPod(ctx, cs, &heals, "k", p, now)
+	if evicted || !refused || err != nil {
+		t.Fatalf("EvictPod 429 = (%v,%v,%v), want (false,true,nil)", evicted, refused, err)
+	}
+	if heals.CooledDown("k", time.Hour, now) {
+		t.Fatal("PDB refusal stamped the ledger")
+	}
+	if _, err := cs.CoreV1().Pods("ns1").Get(ctx, "op-abc-1",
+		metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB-refused pod must stay, get err = %v", err)
+	}
+}
+
+// Any other API failure is (false, false, err) and does NOT stamp —
+// the caller meters it and the next sweep retries.
+func TestEvictPodFailurePassthrough(t *testing.T) {
+	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
+	cs := fake.NewSimpleClientset(p)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, errors.New("api down")
+		})
+	var heals state.CooldownSet
+	now := time.Now()
+
+	evicted, refused, err := EvictPod(ctx, cs, &heals, "k", p, now)
+	if evicted || refused || err == nil {
+		t.Fatalf("EvictPod failure = (%v,%v,%v), want (false,false,err)", evicted, refused, err)
+	}
+	if heals.CooledDown("k", time.Hour, now) {
+		t.Fatal("failed eviction stamped the ledger")
 	}
 }
 

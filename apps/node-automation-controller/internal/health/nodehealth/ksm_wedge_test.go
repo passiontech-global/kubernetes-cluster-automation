@@ -40,15 +40,18 @@ func ksmPod(ns, name string) *corev1.Pod {
 // The log tail is the primary signal: each wedge marker classifies
 // to its reason, and a reflector line whose root cause is the 401
 // still reads as the auth wedge (the table is ordered
-// most-specific-first — a "failed to watch … Unauthorized" line is
-// an auth wedge, not a generic reflector flake).
+// most-specific-first — a "failed to watch … 401 Unauthorized" line
+// is an auth wedge, not a generic reflector flake). Bare
+// "unauthorized" is no longer a marker — the generic word shadowed
+// the full-phrase 401 spells — so a bare "Unauthorized" tail now
+// classifies reflector, and the full phrases carry the auth verdict.
 func TestKSMWedgeLogSignatures(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		log  string
 		want string
 	}{
-		{"401 unauthorized", `E0101 reflector.go:1] Failed to watch *v1.Pod: Unauthorized` + "\n",
+		{"401 unauthorized", `E0101 reflector.go:1] Failed to watch *v1.Pod: 401 Unauthorized` + "\n",
 			leaseReasonKSMUnauthorized},
 		{"expired sa token", `the server has asked for the client to provide credentials` + "\n",
 			leaseReasonKSMUnauthorized},
@@ -60,10 +63,13 @@ func TestKSMWedgeLogSignatures(t *testing.T) {
 			leaseReasonKSMReflectorErrors},
 		{"unable to sync caches", `unable to sync caches for *v1.Pod` + "\n",
 			leaseReasonKSMReflectorErrors},
+		{"bare unauthorized without phrase is reflector",
+			`E0101 reflector.go:1] Failed to watch *v1.Pod: Unauthorized` + "\n",
+			leaseReasonKSMReflectorErrors},
 		{"reflector line caused by 401 classifies auth",
 			`failed to watch *v1.Pod: the server has asked for the client to provide credentials` + "\n",
 			leaseReasonKSMUnauthorized},
-		{"uppercase marker still matches", `FAILED TO LIST *v1.Pod UNAUTHORIZED` + "\n",
+		{"uppercase marker still matches", `FAILED TO LIST *v1.Pod: 401 UNAUTHORIZED` + "\n",
 			leaseReasonKSMUnauthorized},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,6 +86,29 @@ func TestKSMWedgeLogSignatures(t *testing.T) {
 				t.Fatalf("ksmWedgeReason = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Bare "unauthorized" is no longer a signature: a tail that merely
+// carries the word — no 401/token phrase, no reflector marker — must
+// read clean (the missing error-counter series confirms it), never
+// bounce the pod as an auth wedge on the wrong cause.
+func TestKSMWedgeBareUnauthorizedReadsClean(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t,
+		func(string) []probetest.PromTestSample { return nil })
+	pod := ksmPod("monitoring", "kube-state-metrics-bare")
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"auth middleware logged 3 unauthorized requests\n", nil))
+	p, ch := leaseGuardProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	got, err := ch.ksmWedgeReason(ctx, pod)
+	if err != nil {
+		t.Fatalf("ksmWedgeReason err = %v, want clean", err)
+	}
+	if got != "" {
+		t.Fatalf(`ksmWedgeReason = %q, want clean — bare "unauthorized" must not match`, got)
 	}
 }
 
@@ -297,7 +326,7 @@ func TestKSMWedgeRealTailBouncesAndReports(t *testing.T) {
 				UTC().Format(time.RFC3339) + `"}`}
 	cs := fake.NewSimpleClientset(pod)
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
-		`E0101 reflector.go:1] Failed to watch *v1.Pod: Unauthorized`+"\n", nil))
+		`E0101 reflector.go:1] Failed to watch *v1.Pod: 401 Unauthorized`+"\n", nil))
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
 	t.Cleanup(func() {

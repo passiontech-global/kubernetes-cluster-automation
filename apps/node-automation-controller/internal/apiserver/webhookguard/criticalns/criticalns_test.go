@@ -77,6 +77,18 @@ func cpValidatingHook(name string, sel *metav1.LabelSelector,
 	return w
 }
 
+// cpCoordLeasesRule builds an admission rule serving resources in the
+// coordination.k8s.io group — the group real Lease heartbeat writes
+// live in.
+func cpCoordLeasesRule(resources []string) admissionv1.RuleWithOperations {
+	return admissionv1.RuleWithOperations{
+		Operations: []admissionv1.OperationType{admissionv1.Create, admissionv1.Update},
+		Rule: admissionv1.Rule{
+			APIGroups: []string{"coordination.k8s.io"}, APIVersions: []string{"v1"}, Resources: resources,
+		},
+	}
+}
+
 func cpFullExclusion() *metav1.LabelSelector {
 	return &metav1.LabelSelector{
 		MatchExpressions: []metav1.LabelSelectorRequirement{{
@@ -144,11 +156,18 @@ func TestWebhookHeartbeatResourceExposedDetection(t *testing.T) {
 			}},
 		}},
 	}
+	// multi carries a core pods/status rule plus a coordination.k8s.io
+	// leases rule — both remain heartbeat-path after the group-aware
+	// fix; crd-leases is the regression case: a foreign "leases"
+	// resource served by the CORE group is not the kubelet heartbeat.
+	multi := cpValidatingHook("multi.example.com", nil, admissionv1.Fail, []string{"pods/status"})
+	multi.Rules = append(multi.Rules, cpCoordLeasesRule([]string{"leases"}))
 	vwc := &admissionv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "heartbeat-vwc"},
 		Webhooks: []admissionv1.ValidatingWebhook{
 			cpValidatingHook("node-status.example.com", nil, admissionv1.Fail, []string{"nodes/status"}),
-			cpValidatingHook("multi.example.com", nil, admissionv1.Fail, []string{"leases", "pods/status"}),
+			multi,
+			cpValidatingHook("crd-leases.example.com", nil, admissionv1.Fail, []string{"leases"}),
 			cpValidatingHook("wildcard-star.example.com", nil, admissionv1.Fail, []string{"*"}),
 			cpValidatingHook("wildcard-slashstar.example.com", nil, admissionv1.Fail, []string{"*/*"}),
 			cpValidatingHook("excluded.example.com", cpFullExclusion(), admissionv1.Fail, []string{"leases"}),
@@ -191,6 +210,10 @@ func TestWebhookHeartbeatResourceExposedDetection(t *testing.T) {
 		{guardstate.KindValidating, "heartbeat-vwc", "excluded.example.com", "leases"},
 		// An Ignore webhook cannot wedge admission.
 		{guardstate.KindValidating, "heartbeat-vwc", "ignore-policy.example.com", "*"},
+		// A foreign group's "leases" resource (CRD grammar reuse) is
+		// not the kubelet heartbeat — the group-aware fix must not
+		// flag it.
+		{guardstate.KindValidating, "heartbeat-vwc", "crd-leases.example.com", "leases"},
 		// pods (no subresource) and configmaps are not heartbeat-path.
 		{guardstate.KindValidating, "heartbeat-vwc", "innocent.example.com", "pods"},
 		{guardstate.KindValidating, "heartbeat-vwc", "innocent.example.com", "configmaps"},

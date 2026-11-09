@@ -229,15 +229,24 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 				"store", key)
 		}
 	}
+	// Missing Ready condition (store not yet reconciled) must not start
+	// the down clock — absence is not a False, and starting it would
+	// bounce the connect pod on a freshly created store.
 	for i := range stores.Items {
 		s := &stores.Items[i]
-		c, _ := kube.ConditionOf(s.Object, "Ready")
+		c, ok := kube.ConditionOf(s.Object, "Ready")
+		if !ok {
+			continue
+		}
 		track("ClusterSecretStore", "", s.GetName(), c.Status == "True")
 	}
 	if namespacedStores != nil {
 		for i := range namespacedStores.Items {
 			s := &namespacedStores.Items[i]
-			c, _ := kube.ConditionOf(s.Object, "Ready")
+			c, ok := kube.ConditionOf(s.Object, "Ready")
+			if !ok {
+				continue
+			}
 			track("SecretStore", s.GetNamespace(), s.GetName(), c.Status == "True")
 		}
 	}

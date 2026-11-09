@@ -55,7 +55,9 @@ const (
 // availability metric; it scopes which backends the unblock healer
 // may restart. W19-CP2 added keda/cert-manager/prometheus-operator —
 // aggregated adapters whose outage stalls HPA scaling, cert
-// issuance and Prometheus scraping respectively.
+// issuance and Prometheus scraping respectively — plus operators:
+// OLM installs KEDA there, so v1beta1.external.metrics.k8s.io's
+// spec.service.namespace is "operators", not "keda".
 var apiServiceProtectedNamespaces = map[string]bool{
 	"kube-system":         true,
 	"linkerd":             true,
@@ -64,6 +66,7 @@ var apiServiceProtectedNamespaces = map[string]bool{
 	"keda":                true,
 	"cert-manager":        true,
 	"prometheus-operator": true,
+	"operators":           true,
 }
 
 // unblockHealer owns the namespace-terminating-wedged sweep's per-sweep state — embedded
@@ -101,10 +104,10 @@ type unblockCandidate struct {
 //	    events reference the APIService's API group.
 //
 // The heal is a backing-pod restart: the aggregated-apiserver pods
-// behind spec.service are deleted (UID-preconditioned, capped) so
-// their controllers recreate them — the least destructive action
-// that clears a wedged aggregation without touching the
-// operator-owned APIService object itself.
+// behind spec.service are evicted (UID-preconditioned,
+// PDB-respecting, capped) so their controllers recreate them — the
+// least destructive action that clears a wedged aggregation without
+// touching the operator-owned APIService object itself.
 func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapshot) error {
 	g := snap.g
 	now := g.now.Now()
@@ -151,9 +154,8 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		return err
 	}
 	if len(stuck) == 0 {
-		// W19-CP2: no Terminating-namespace wedge — fall through to
-		// the standalone pass: a protected APIService dead >=30m
-		// still gets its backing pods restarted (KEDA/cert-manager/
+		// W19-CP2: no Terminating-namespace wedge — the standalone
+		// pass heals every candidate dead >=30m (KEDA/cert-manager/
 		// prometheus-operator adapters stall their consumers
 		// silently without ever wedging a namespace deletion).
 		return u.sweepStandaloneUnblock(ctx, snap, cands, now)
@@ -162,11 +164,16 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	for _, c := range cands {
 		var refs []string
 		for ns, corpus := range stuck {
-			if strings.Contains(corpus, c.group) {
+			if corpusHasToken(corpus, c.group) {
 				refs = append(refs, ns)
 			}
 		}
 		if len(refs) == 0 {
+			// No stuck namespace references THIS group — the wedge
+			// evidence cannot fire, but an unrelated namespace
+			// wedged Terminating must not mask a dead adapter:
+			// fall back to the standalone gate per candidate.
+			u.standaloneHealCandidate(ctx, snap, c, now)
 			continue
 		}
 		u.healCandidate(ctx, snap, c.svc, c.group, &u.unblocked,
@@ -184,22 +191,35 @@ func (u *unblockHealer) sweepStandaloneUnblock(ctx context.Context,
 	snap *apiServiceSnapshot, cands []unblockCandidate, now time.Time) error {
 
 	for _, c := range cands {
-		unavailSince, _ := apiServiceUnavailableSince(c.svc)
-		if now.Sub(unavailSince) < apiServiceStandaloneUnblockMinAge {
-			continue
-		}
-		u.healCandidate(ctx, snap, c.svc, c.group,
-			&u.standaloneUnblocked, apiServiceStandaloneUnblockCooldown,
-			now, nil)
+		u.standaloneHealCandidate(ctx, snap, c, now)
 	}
 	return nil
 }
 
+// standaloneHealCandidate applies the W19-CP2 standalone gate to one
+// candidate — unavailability >= apiServiceStandaloneUnblockMinAge —
+// then runs the shared heal tail under the standalone cooldown
+// ledger. Shared by sweepStandaloneUnblock (no Terminating
+// namespaces at all) and the wedge-evidence loop (a candidate whose
+// group no stuck namespace references — an unrelated wedged
+// namespace must not mask it).
+func (u *unblockHealer) standaloneHealCandidate(ctx context.Context,
+	snap *apiServiceSnapshot, c unblockCandidate, now time.Time) {
+
+	unavailSince, _ := apiServiceUnavailableSince(c.svc)
+	if now.Sub(unavailSince) < apiServiceStandaloneUnblockMinAge {
+		return
+	}
+	u.healCandidate(ctx, snap, c.svc, c.group,
+		&u.standaloneUnblocked, apiServiceStandaloneUnblockCooldown,
+		now, nil)
+}
+
 // healCandidate runs the shared heal tail for one candidate:
 // resolve live backing pods → heal.AllowedV preamble (per-name
-// cooldown + maintenance mutex) → capped UID-preconditioned delete
+// cooldown + maintenance mutex) → capped UID-preconditioned eviction
 // → stamp + metric + ACTION log only when a pod was actually
-// deleted. refs carries the wedge-evidence namespace names for the
+// evicted. refs carries the wedge-evidence namespace names for the
 // log (nil on the standalone path).
 func (u *unblockHealer) healCandidate(ctx context.Context,
 	snap *apiServiceSnapshot, svc *unstructured.Unstructured,
@@ -259,6 +279,44 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 		return true
 	}
 	return false
+}
+
+// corpusHasToken reports whether the lowercased namespace corpus
+// references the candidate's API group as a WHOLE token: the byte
+// immediately before a match must be a space, newline or quote (or
+// the match starts the corpus). Plain strings.Contains is not
+// enough: a stale event naming the full APIService name — failed
+// calling webhook "v1beta1.metrics.k8s.io" — substring-matches the
+// candidate group metrics.k8s.io inside the longer name (the dot
+// before "metrics" is not a boundary), and one unrelated webhooks
+// incident would then license restarting up to
+// apiServiceUnblockPodCap healthy metric-adapter pods. Genuine
+// evidence names the bare group with a token boundary (quoted or
+// space-delimited), which still matches.
+func corpusHasToken(corpus, token string) bool {
+	if token == "" {
+		return false
+	}
+	for start := 0; start < len(corpus); {
+		rel := strings.Index(corpus[start:], token)
+		if rel < 0 {
+			return false
+		}
+		idx := start + rel
+		if idx == 0 || isTokenBoundary(corpus[idx-1]) {
+			return true
+		}
+		start = idx + 1
+	}
+	return false
+}
+
+// isTokenBoundary reports whether b ends a token inside the
+// stuck-namespace corpus — the corpus joins conditions/events with
+// spaces and newlines, and quoted references (failed calling webhook
+// "<group>") keep their quotes after lowercasing.
+func isTokenBoundary(b byte) bool {
+	return b == ' ' || b == '\n' || b == '"'
 }
 
 // stuckTerminatingNamespaces returns "<ns name>" -> lowercased
@@ -362,10 +420,17 @@ func (u *unblockHealer) backingPodTargets(ctx context.Context,
 	return targets, nil
 }
 
-// deleteBackingPods deletes the pre-resolved restart targets, capped
-// per call. NotFound races are quiet no-ops; any other delete failure
-// is metered and logged with the pod's own context. Caller holds the
-// maintenance-mutex verdict: these are LIVE pods.
+// deleteBackingPods evicts the pre-resolved restart targets, capped
+// per call. The kill rides the policy/v1 Eviction API (heal.EvictPod)
+// — the same PDB-respecting actuation the unmeshed path runs on: a
+// raw Delete would bypass every PodDisruptionBudget and could take
+// the backend's last Ready replica mid-outage. A PDB refusal (429) is
+// a deferral — the pod stays, nothing is metered, and `deleted`
+// staying 0 keeps healCandidate from stamping the cooldown or logging
+// an unblock that did not happen. NotFound races are quiet no-ops;
+// any other eviction failure is metered and logged with the pod's own
+// context. Caller holds the maintenance-mutex verdict: these are LIVE
+// pods.
 func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 	g *apiServiceGuard, targets []corev1.Pod, now time.Time) int {
 	log := logf.FromContext(ctx)
@@ -375,17 +440,23 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 			break
 		}
 		p := &targets[i]
-		// heal.DeletePod carries the UID precondition the module
-		// hand-rolled here before — a same-named pod recreated
-		// between the list and the delete is not ours to restart.
-		// The nil ledger leaves stamping to the caller: the
-		// cooldown key is the APIService, not the pod.
-		if _, err := heal.DeletePod(ctx, g.cs, nil, "", p, now); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
+		// heal.EvictPod carries the UID precondition — a same-named
+		// pod recreated between the list and the evict is not ours
+		// to restart — and answers refusals through the PDB-aware
+		// Eviction API instead of a raw Delete. The nil ledger
+		// leaves stamping to the caller: the cooldown key is the
+		// APIService, not the pod.
+		_, refused, err := heal.EvictPod(ctx, g.cs, nil, "", p, now)
+		switch {
+		case refused:
+			log.Info("DEFER: PDB refused backing pod eviction — keeping pod alive",
+				"pod", p.Namespace+"/"+p.Name)
+			continue
+		case apierrors.IsNotFound(err):
+			continue
+		case err != nil:
 			metrics.IncError(g.queue)
-			log.Error(err, "backing pod delete failed",
+			log.Error(err, "backing pod eviction failed",
 				"pod", p.Namespace+"/"+p.Name)
 			continue
 		}

@@ -216,3 +216,44 @@ func TestLiqoConnectedPeerPasses(t *testing.T) {
 		t.Fatalf("connected peer must pass: %+v", res)
 	}
 }
+
+// A CR finding that matches no gateway in a namespace holding SEVERAL
+// gateways (multi-peer topology) must not fall back to bouncing any
+// of them — an unattributable bounce kills a healthy peer's tunnel.
+// Fallback to the namespace gateway is allowed only when the
+// namespace holds exactly one gateway.
+func TestLiqoCRNoPeerMatchMultiGatewaySkipsBounce(t *testing.T) {
+	// Connection CR carries remote-cluster-id label peer-x — matches
+	// neither gateway pod (peer-a / peer-b names and labels).
+	conn := testutil.Unstructured(
+		kube.GVRLiqoConnection.GroupVersion().WithKind("Connection"),
+		"liqo-tenant", "conn-peer-x",
+		map[string]any{
+			"metadata": map[string]any{
+				"namespace": "liqo-tenant", "name": "conn-peer-x",
+				"labels": map[string]any{
+					"networking.liqo.io/remote-cluster-id": "peer-x"},
+			},
+			"status": map[string]any{
+				"conditions": []any{map[string]any{
+					"type":   "Connected",
+					"status": "False",
+					"lastTransitionTime": time.Now().
+						Add(-20 * time.Minute).UTC().Format(time.RFC3339)}},
+			}})
+	gwA := probetest.PodWithPhase("liqo-tenant",
+		"liqo-gateway-wireguard-peer-a-0", corev1.PodRunning, true, 2*time.Hour)
+	gwB := probetest.PodWithPhase("liqo-tenant",
+		"liqo-gateway-wireguard-peer-b-0", corev1.PodRunning, true, time.Hour)
+	cs := fake.NewSimpleClientset(gwA, gwB)
+	p := testProberDyn(cs, probetest.OpDyn(conn))
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("dead peer with no matching gateway must fail (finding)")
+	}
+	for _, gw := range []*corev1.Pod{gwA, gwB} {
+		if _, err := cs.CoreV1().Pods("liqo-tenant").
+			Get(ctx, gw.Name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("unattributable finding must not bounce gateway %s: %v", gw.Name, err)
+		}
+	}
+}

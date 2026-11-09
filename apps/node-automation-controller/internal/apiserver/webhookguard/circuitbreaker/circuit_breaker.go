@@ -71,6 +71,34 @@ func Enabled() bool {
 	return envx.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
 }
 
+// probeBlind reports the sweep's handshake probes as monitor-blind:
+// at least one backend Service was probed and NONE answered the
+// TCP+TLS handshake from this pod. A webhook namespace locked down to
+// kube-apiserver-only ingress (the standard NetworkPolicy posture), a
+// CNI fault on the controller's node, or an egress deny reads exactly
+// like every webhook pod hanging at once — from one vantage point the
+// two are indistinguishable and the probe source itself is the
+// likelier culprit. The unresponsive verdict (breaker trip, pod
+// bounce, conversion gauge/bounce) must not act on it: tripping would
+// silently disable admission enforcement cluster-wide and bouncing
+// would kill healthy Ready pods. Apiserver-truth signals (Raw /
+// Effective endpoint counts) are unaffected — a Service whose
+// endpoints genuinely vanish still trips, and a monitor that sees at
+// least one responsive backend is not blind.
+func probeBlind(ready guardstate.EndpointCensus) bool {
+	probed, responsive := 0, 0
+	for svc, wasProbed := range ready.Probed {
+		if !wasProbed {
+			continue
+		}
+		probed++
+		if ready.Responsive[svc] {
+			responsive++
+		}
+	}
+	return probed > 0 && responsive == 0
+}
+
 // Breaker owns the circuit-breaker sweep's per-sweep state — the
 // facade holds one across runs so the ledgers and cooldowns persist.
 // Shared deps (CS/Dyn/Now/EndpointProber/Verdict) are reached through
@@ -128,6 +156,26 @@ type Breaker struct {
 // it always evaluates post-prune state; a patch failure on one config
 // is logged and the sweep continues with the rest.
 func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
+	return b.sweep(ctx, snap, true)
+}
+
+// RestoreOnly runs the sweep's recover half with new trips and pod
+// bounces disabled. The kill-switch (WEBHOOK_CIRCUIT_BREAKER_ENABLED
+// =false) must not strand state: the circuit-broken annotation and
+// the failurePolicy=Ignore flips live ON the config objects, so
+// skipping the sweep entirely while levered off leaves every tripped
+// entry enforcement-off forever — even after its backend recovers,
+// and across controller restarts. Restore mode still confirms
+// recoveries (RecoverConfirmSweeps), still re-asserts Ignore on
+// externally reverted broken entries and still emits the broken
+// series — it just never trips a new entry, never tracks a deadSince
+// window and never bounces a pod.
+func (b *Breaker) RestoreOnly(ctx context.Context, snap *guardstate.Snapshot) error {
+	return b.sweep(ctx, snap, false)
+}
+
+func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
+	allowTrips bool) error {
 	b.brokenEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
 	log := logf.FromContext(ctx)
@@ -223,7 +271,8 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	}
 	for _, job := range jobs {
 		payload, trips, recovered, stillBroken, dropped := b.circuitPatch(log, g.Queue,
-			job.kind, job.name, job.anno, job.views, ready, now, seen, recoverSeen)
+			job.kind, job.name, job.anno, job.views, ready, now, seen, recoverSeen,
+			allowTrips)
 		if payload == nil {
 			// Nothing to write — the still-broken re-asserts read
 			// verified live state (the annotation already lists
@@ -261,8 +310,11 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// not a partitioned one. Bounce the oldest Ready backing pod so
 	// its controller recreates it fresh — this runs even while the
 	// breaker holds the entry open, because a pod that never comes
-	// back would keep the webhook circuit-broken forever.
-	b.bounceHungWebhookPods(ctx, snap, ready)
+	// back would keep the webhook circuit-broken forever. Restore
+	// mode (kill-switch on) is deliberately passive — no pod kills.
+	if allowTrips {
+		b.bounceHungWebhookPods(ctx, snap, ready)
+	}
 
 	// Prune broken series whose label tuple was not re-seen — a config
 	// deleted while broken, recreated without the annotation, or an

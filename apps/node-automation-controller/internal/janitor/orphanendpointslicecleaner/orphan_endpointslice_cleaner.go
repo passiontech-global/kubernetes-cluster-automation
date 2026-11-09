@@ -64,6 +64,13 @@ const (
 	// be absent before the slice is reaped — a single bad snapshot
 	// can never delete.
 	orphanEndpointSliceStreak = 2
+	// orphanEndpointSliceDeleteCap bounds delete attempts per sweep —
+	// a mass Service teardown (namespace deletion) can orphan
+	// hundreds of slices at once, and one uncapped sweep is exactly
+	// the apiserver churn every sibling janitor caps. The streak +
+	// age ledgers are per-slice, so capped survivors simply reap
+	// across the following cycles.
+	orphanEndpointSliceDeleteCap = 50
 )
 
 type orphanEndpointSliceCleaner struct {
@@ -182,6 +189,16 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	slices = nil
 
 	deleted, _, _ := reap.Sweep(ctx, log, targets, reap.Options[target]{
+		// Deterministic victims: ns/name order, so a capped sweep
+		// reaps the same candidates every cycle instead of whichever
+		// order the apiserver returned.
+		Less: func(a, b target) bool {
+			if a.ns != b.ns {
+				return a.ns < b.ns
+			}
+			return a.name < b.name
+		},
+		Cap: orphanEndpointSliceDeleteCap,
 		// Streak + age gates passed — re-confirm against the live
 		// apiserver before deleting (a List can lag a Get).
 		Confirm: func(ctx context.Context, t target) (bool, error) {

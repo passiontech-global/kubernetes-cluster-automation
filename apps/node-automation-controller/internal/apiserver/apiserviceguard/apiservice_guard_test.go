@@ -8,6 +8,7 @@ import (
 
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -67,7 +68,10 @@ func asgExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, name string) bo
 // namespace, the Terminating namespace naming `group` (stuck for
 // nsAge), and the APIService backend Service plus one Pod per
 // podNames entry — every identity an explicit parameter so each
-// test shows which object it varies.
+// test shows which object it varies. The clientset emulates the
+// pods/eviction contract because the unblock heal evicts through
+// policy/v1 (a bare fake records the eviction CREATE without
+// deleting the pod).
 func asgUnblockCS(ns, group, svcName, svcShort string, nsAge time.Duration, podNames ...string) *fake.Clientset {
 	objs := []runtime.Object{
 		testutil.Namespace(ns),
@@ -77,7 +81,9 @@ func asgUnblockCS(ns, group, svcName, svcShort string, nsAge time.Duration, podN
 	for _, name := range podNames {
 		objs = append(objs, asgBackendPod(ns, name, svcShort))
 	}
-	return fake.NewSimpleClientset(objs...)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	return cs
 }
 
 func asgGuard(cs *fake.Clientset, dyn *dynamicfake.FakeDynamicClient) *apiServiceGuard {
@@ -323,7 +329,12 @@ func TestAPIServiceGuardListsOncePerRun(t *testing.T) {
 
 // asgStuckNS builds a namespace stuck in Terminating for `age`,
 // carrying one NamespaceContentRemaining condition whose message
-// references `groupRef`.
+// references `groupRef` as a standalone quoted token. The reference
+// MUST carry a token boundary (quote/space, not "apiservices."+group)
+// because the wedge matcher only accepts whole-token matches since
+// the substring false-positive incident — a dot-joined full-name
+// reference would never wedge-match, and the fixture must model
+// evidence the matcher genuinely fires on.
 func asgStuckNS(name string, age time.Duration, groupRef string) *corev1.Namespace {
 	return &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -336,7 +347,7 @@ func asgStuckNS(name string, age time.Duration, groupRef string) *corev1.Namespa
 				Type:    corev1.NamespaceContentRemaining,
 				Status:  corev1.ConditionTrue,
 				Reason:  "ContentRemaining",
-				Message: "some resources are remaining: APIservices." + groupRef + " cannot be deleted",
+				Message: "some resources are remaining: \"" + groupRef + "\" cannot be deleted",
 			}},
 		},
 	}
@@ -420,6 +431,7 @@ func TestAPIServiceGuardUnblockStandaloneRestarts(t *testing.T) {
 		testutil.Namespace("keda"),
 		asgBackendSvc("keda", "keda-operator", "keda-operator"),
 		asgBackendPod("keda", "keda-operator-0", "keda-operator"))
+	emulateEviction(cs) // the heal evicts through policy/v1
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -456,10 +468,13 @@ func TestAPIServiceGuardUnblockStandaloneTooYoungSkipped(t *testing.T) {
 }
 
 // A Terminating namespace referencing a DIFFERENT API group does
-// not unblock this APIService.
+// not unblock this APIService. The APIService is 20m dead — above
+// the 15m wedge-evidence bar but below the 30m standalone bar — so
+// neither heal path can fire and the wrong-group corpus is the only
+// thing under test.
 func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
-	asgUnavailable(apiSvc, 30*time.Minute)
+	asgUnavailable(apiSvc, 20*time.Minute)
 	cs := asgUnblockCS("kube-system", "other.example.com", "metrics-server", "metrics-server", 20*time.Minute, "ms-0")
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
@@ -469,6 +484,55 @@ func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 	}
 	if !asgPodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("backing pod deleted for an unrelated API group")
+	}
+}
+
+// W19-CP2 fallback: a Terminating namespace wedged on an UNRELATED
+// API group must not mask the standalone unblock — the dead
+// APIService still gets its backing pods restarted once it crosses
+// the 30m standalone bar, under the standalone cooldown ledger.
+func TestAPIServiceGuardUnblockStandaloneFallbackOnUnrelatedWedge(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 45*time.Minute)
+	cs := asgUnblockCS("kube-system", "other.example.com", "metrics-server", "metrics-server", 20*time.Minute, "ms-0")
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("unrelated wedged namespace masked the standalone unblock")
+	}
+	if _, stamped := g.unblockHealer.standaloneUnblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
+		t.Fatal("standalone unblock did not stamp its own cooldown ledger")
+	}
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
+		t.Fatal("wedge-evidence ledger stamped without wedge evidence")
+	}
+}
+
+// W19-CP2: KEDA installs via OLM into the "operators" namespace —
+// v1beta1.external.metrics.k8s.io's spec.service.namespace is
+// "operators", not "keda". The protected-namespace set must cover
+// it or the standalone unblock filters the candidate out.
+func TestAPIServiceGuardUnblockOperatorsNamespace(t *testing.T) {
+	apiSvc := asgObj("v1beta1.external.metrics.k8s.io", "operators",
+		"keda-operator-metrics-apiserver")
+	asgUnavailable(apiSvc, 45*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("operators"),
+		asgBackendSvc("operators", "keda-operator-metrics-apiserver", "keda-operator-metrics-apiserver"),
+		asgBackendPod("operators", "keda-metrics-apiserver-0", "keda-operator-metrics-apiserver"))
+	emulateEviction(cs) // the heal evicts through policy/v1
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if asgPodExists(t, cs, "operators", "keda-metrics-apiserver-0") {
+		t.Fatal("operators-backed APIService skipped — namespace not protected")
 	}
 }
 
@@ -597,6 +661,7 @@ func TestAPIServiceGuardUnblockDeletesOnlyLivePods(t *testing.T) {
 		term,
 		asgBackendPod("kube-system", "ms-live", "metrics-server"),
 	)
+	emulateEviction(cs) // the heal evicts through policy/v1
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
@@ -611,5 +676,110 @@ func TestAPIServiceGuardUnblockDeletesOnlyLivePods(t *testing.T) {
 	}
 	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
 		t.Fatal("delivered heal did not stamp the cooldown")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// (d) wedge-evidence matching + PDB-respecting eviction
+// ---------------------------------------------------------------------------
+
+// corpusHasToken's whole-token rule, unit-pinned: a dot-joined longer
+// name must not match the candidate group inside it; a quoted,
+// space-delimited or corpus-leading group must.
+func TestCorpusHasTokenBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		corpus string
+		want   bool
+	}{
+		{"full APIService name does not match the group inside it",
+			"some resources are remaining: apiservices.v1beta1.metrics.k8s.io cannot be deleted",
+			false},
+		{"stale webhook event naming a different full name",
+			`failed calling webhook "v1beta1.metrics.k8s.io": timed out`,
+			false},
+		{"quoted bare group matches",
+			`failed calling webhook "metrics.k8s.io": timed out`,
+			true},
+		{"space-delimited group matches",
+			"discovery of group metrics.k8s.io failed",
+			true},
+		{"group at corpus start matches",
+			"metrics.k8s.io content remaining",
+			true},
+		{"unrelated corpus",
+			"other.example.com content remaining",
+			false},
+	} {
+		if got := corpusHasToken(tc.corpus, "metrics.k8s.io"); got != tc.want {
+			t.Fatalf("%s: corpusHasToken = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The incident: a stale event naming the FULL APIService name
+// (v1beta1.metrics.k8s.io) substring-matched the candidate GROUP
+// (metrics.k8s.io) under plain strings.Contains and restarted up to
+// 10 healthy metric-adapter pods off an unrelated webhooks incident.
+// The matcher now requires whole-token references — the dot before
+// "metrics" is not a boundary — so the wedge evidence cannot fire,
+// and the candidate is only 20m dead (under the 30m standalone bar)
+// so nothing else can kill the pod either.
+func TestAPIServiceGuardUnblockFullNameReferenceNoMatch(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 20*time.Minute)
+	// The stuck namespace's corpus names the full APIService name —
+	// the exact false-positive shape.
+	cs := asgUnblockCS("kube-system", "v1beta1.metrics.k8s.io",
+		"metrics-server", "metrics-server", 20*time.Minute, "ms-0")
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("full-name corpus reference matched the candidate group — pod restarted off stale evidence")
+	}
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
+		t.Fatal("wedge ledger stamped without whole-token evidence")
+	}
+}
+
+// A covering PDB with disruptionsAllowed==0 refuses the eviction
+// (HTTP 429) — a DEFERRAL, not a failure: the backing pod stays,
+// nothing is metered (no IncError) and the wedge cooldown is NOT
+// stamped (a refusal must not open the 15m suppression window for a
+// heal that never happened).
+func TestAPIServiceGuardUnblockPDBRefusalDefers(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	cs := asgUnblockCS("kube-system", "metrics.k8s.io",
+		"metrics-server", "metrics-server", 20*time.Minute, "ms-0")
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewTooManyRequests(
+				"pdb allows no disruptions", 0)
+		})
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+	g.queue = "apiservice-guard" // the IncError label the assertion reads
+
+	before := testutil.QueueErrorCount(t, "apiservice-guard")
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("PDB-refused backing pod was evicted anyway")
+	}
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
+		t.Fatal("PDB refusal stamped the wedge cooldown — deferral must not open the window")
+	}
+	if got := testutil.QueueErrorCount(t, "apiservice-guard") - before; got != 0 {
+		t.Fatalf("PDB refusal metered as an error: delta = %v, want 0", got)
 	}
 }

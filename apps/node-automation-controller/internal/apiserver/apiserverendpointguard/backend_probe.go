@@ -483,13 +483,28 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 	}
 
 	// ---- Decide re-adds --------------------------------------------------
+	// okStreak proves the HOST answers :6443, not that the backend is
+	// still a member of default/kubernetes: a decommissioned backend
+	// whose node keeps serving TLS passes every probe (okStreak climbs
+	// forever, errStreak stays 0) while the endpoints reconciler keeps
+	// dropping its address — re-adding on streak alone made the guard
+	// re-write the IP into default/kubernetes every 10s cycle against
+	// the reconciler, and kube-proxy flapped the kubernetes.default
+	// route cluster-wide. So re-add only IPs the reconciler still
+	// lists; an absent quarantined IP leaves via expireQuarantine's
+	// decommission evidence instead of this loop.
 	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
-		if g.backends[ip].okStreak >= endpointGuardRecoverCyc {
-			toAdd = append(toAdd, ip)
-		} else {
+		if g.backends[ip].okStreak < endpointGuardRecoverCyc {
 			log.Info("quarantined backend still recovering",
 				"ip", ip, "okStreak", g.backends[ip].okStreak, "need", endpointGuardRecoverCyc)
+			continue
 		}
+		if !slices.Contains(activeIPs, ip) {
+			log.Info("SKIP-RE-ADD: recovered backend absent from current endpoints — not re-added",
+				"ip", ip, "okStreak", g.backends[ip].okStreak)
+			continue
+		}
+		toAdd = append(toAdd, ip)
 	}
 	return toRemove, toAdd, healthyActive
 }

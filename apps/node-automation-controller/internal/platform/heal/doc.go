@@ -6,7 +6,9 @@
 //	per-key cooldown on the heals ledger
 //	-> maintenance mutex, FAIL CLOSED (unverifiable counts as held)
 //	-> pick the target (OldestRunningPod for the operator-pod shape)
-//	-> UID-preconditioned delete
+//	-> UID-preconditioned delete (raw Delete via DeletePod, or the
+//	   policy/v1 Eviction via EvictPod when the pod may sit under a
+//	   PodDisruptionBudget)
 //	-> stamp the ledger ONLY when the delete is delivered
 //
 // heal is a leaf platform package: it imports only platform/kube and

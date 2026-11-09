@@ -479,14 +479,16 @@ func (p *liqoTunnelHealthCheck) bounceLiqoGateways(ctx context.Context,
 				peerCands = append(peerCands, pod)
 			}
 		}
-		// Prefer the peer-matched gateway; a CR finding with no
-		// peer-matching pod in its namespace still bounces the
-		// namespace's gateway (the namespace IS the peer scope). A
-		// namespace-less virtual-node finding needs an explicit peer
-		// match — an unattributable bounce skips.
+		// Prefer the peer-matched gateway. Fallback to the namespace's
+		// gateway ONLY when that namespace holds a single gateway pod
+		// — then the namespace itself is the peer scope. With several
+		// gateways (multi-peer topology) an unattributable finding
+		// must not bounce a HEALTHY peer's gateway; keep the finding
+		// only. A namespace-less virtual-node finding needs an
+		// explicit peer match — an unattributable bounce skips.
 		target := liqoOldestPod(peerCands)
-		if target == nil && f.ns != "" {
-			target = liqoOldestPod(nsCands)
+		if target == nil && f.ns != "" && len(nsCands) == 1 {
+			target = nsCands[0]
 		}
 		if target == nil {
 			log.Info("no liqo-gateway pod matched the dead peer — bounce skipped",

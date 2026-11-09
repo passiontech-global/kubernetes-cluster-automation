@@ -164,9 +164,10 @@ type pendingState struct {
 // cooldown (also persisted via passiontech.dev/last-helm-stall-unwedge),
 // alerted the once-per-cooldown alert dedup shared by "re-stalled
 // after unwedge" and "signature matched but a guard refused", and
-// attempts the helm-stall-unwedge retry-cycle cap. CooldownSets are zero-value
-// ready and deliberately unbounded: stamps past the window read
-// uncooled and entries for vanished HRs are dead weight.
+// attempts the helm-stall-unwedge retry-cycle cap. CooldownSets are
+// zero-value ready and bounded per sweep — Run PruneExpired's each
+// at the cooldown it serves, so vanished or aged-out HR entries
+// cannot accumulate.
 type stallState struct {
 	enabled   bool
 	firstSeen state.FirstSeenLedger

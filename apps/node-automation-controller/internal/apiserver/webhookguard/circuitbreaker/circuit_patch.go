@@ -71,9 +71,18 @@ func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 // annotation no longer justifies.
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
-	seen, recoverSeen map[string]bool) (payload []byte, trips, recovered, stillBroken, dropped []string) {
+	seen, recoverSeen map[string]bool, allowTrips bool) (payload []byte, trips, recovered, stillBroken, dropped []string) {
 
 	broken := guardstate.ParseCircuitAnnotation(annoVal)
+	// One probe source is the culprit when every probed backend
+	// failed the handshake (probeBlind): the monitor — not the fleet
+	// — is then the likely cause, so the unresponsive verdict is
+	// silenced (no unresponsive trip, no bounce elsewhere) and broken
+	// entries FREEZE: a blind sweep cannot verify recovery either, so
+	// the healthy streak must not advance ("can't tell" holds the
+	// annotation, the SSOT). Apiserver-truth verdicts (0 effective
+	// endpoints) are unaffected.
+	blind := probeBlind(ready)
 	// present holds every live sub-webhook name — the staleness check
 	// below compares the annotation against it (a freshly tripped name
 	// is present even though it was not in the annotation yet).
@@ -113,10 +122,10 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 			svcEffective = ready.Effective[svc]
 			svcRaw = ready.Raw[svc]
 			unresponsive = svcEffective > 0 &&
-				ready.Probed[svc] && !ready.Responsive[svc]
+				ready.Probed[svc] && !ready.Responsive[svc] && !blind
 		}
 		switch {
-		case isBroken && svcEffective != 0 && !unresponsive:
+		case isBroken && svcEffective != 0 && !unresponsive && !blind:
 			// The Service has >= 1 reachable Ready endpoint again (or
 			// the entry was repointed off its Service entirely —
 			// svcEffective < 0, which the breaker cannot measure and
@@ -169,7 +178,7 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 				changed = true
 			}
 			stillBroken = append(stillBroken, h.name)
-		case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.fp):
+		case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.fp) && allowTrips:
 			seen[key] = true
 			first, tracked := b.deadSince.Observe(key, now)
 			if !tracked {

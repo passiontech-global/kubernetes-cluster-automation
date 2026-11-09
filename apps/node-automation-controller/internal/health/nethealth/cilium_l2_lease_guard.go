@@ -247,8 +247,15 @@ func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
 			pod.Spec.NodeName == "" || !onNode[pod.Spec.NodeName] {
 			continue
 		}
+		// The agent pod is the DaemonSet pod — `k8s-app=cilium`
+		// (upstream helm) or a `cilium-*` name on installs that drop
+		// the label. `cilium-operator-*` shares the name prefix but
+		// is a DIFFERENT workload: its not-Ready window during an
+		// operator restart/upgrade must not poison the per-node
+		// agent streak into deleting a healthy holder's lease.
 		agent := pod.Labels["k8s-app"] == "cilium" ||
-			strings.HasPrefix(pod.Name, "cilium-")
+			(strings.HasPrefix(pod.Name, "cilium-") &&
+				!strings.HasPrefix(pod.Name, "cilium-operator-"))
 		if !agent || pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -257,6 +264,16 @@ func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
 			continue
 		}
 		p.agentNotReadyStreak[pod.Spec.NodeName]++
+	}
+	// A node that vanished while not-Ready is never revisited — its
+	// agent pod is gone with it, so the loop above can neither reset
+	// nor delete the key. Prune against the live node census (the
+	// same caller-prune contract every state ledger carries) so the
+	// map stays bounded by cluster size.
+	for node := range p.agentNotReadyStreak {
+		if !onNode[node] {
+			delete(p.agentNotReadyStreak, node)
+		}
 	}
 	return p.agentNotReadyStreak
 }

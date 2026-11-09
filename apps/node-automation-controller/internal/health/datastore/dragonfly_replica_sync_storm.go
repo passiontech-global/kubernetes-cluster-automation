@@ -120,10 +120,11 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	// Storm evidence is scoped per namespace when the series carry
 	// one — a sync storm in ns A must not authorize restarts of
 	// desynced replicas in ns B. Series WITHOUT a namespace label
-	// are cluster-wide evidence (can't disprove locality).
+	// are DROPPED (fail-closed): treating them as cluster-wide
+	// evidence would let one unscoped series restart replicas in
+	// every namespace.
 	stormNS := map[string]bool{}
 	stormPods := map[string]bool{}
-	stormGlobal := false
 	stormActive := false
 	if errS != nil {
 		log.Info("WARN: dragonfly sync-storm query failed — storm unconfirmed",
@@ -131,17 +132,13 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	} else {
 		stormActive = len(stormSeries) > 0
 		for _, s := range stormSeries {
-			if ns := s.Label("namespace"); ns != "" {
-				stormNS[ns] = true
+			ns := s.Label("namespace")
+			if ns == "" {
+				continue // unattributable — not storm evidence
 			}
+			stormNS[ns] = true
 			if pn := s.Label("pod", "pod_name"); pn != "" {
-				if ns := s.Label("namespace"); ns != "" {
-					stormPods[ns+"/"+pn] = true
-				} else {
-					stormGlobal = true // pod label w/o ns — can't scope
-				}
-			} else if s.Label("namespace") == "" {
-				stormGlobal = true
+				stormPods[ns+"/"+pn] = true
 			}
 		}
 	}
@@ -224,8 +221,8 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 			continue
 		}
 		if !stormActive ||
-			(!stormGlobal && !stormNS[ns] && !stormPods[key]) {
-			continue // sustained link-down alone FAILs but doesn't restart
+			(!stormNS[ns] && !stormPods[key]) {
+			continue // link-down alone, or storm unproven in THIS ns, doesn't restart
 		}
 		// A controller-less pod would be deleted PERMANENTLY — no
 		// owner recreates it — and the cooldown keys on that very

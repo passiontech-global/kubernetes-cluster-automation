@@ -347,6 +347,38 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	s.exclusionEmitted.Prune(metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues)
 }
 
+// heartbeatRuleHits returns the rule's resource literals that land on
+// the heartbeat path, checked against the rule's APIGroups — the
+// literal alone lies, because a CRD group can serve its own "leases"
+// resource without ever touching the kubelet heartbeat. leases demands
+// coordination.k8s.io; nodes/status, pods/status and pods/eviction are
+// core-group subresources so a wildcard APIGroups ["*"] must not claim
+// them (only the wildcard RESOURCES "*", "*/*" cover every group); a
+// wildcard group behind a typed resource is exactly the false-positive
+// shape this check exists to avoid.
+func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
+	var hits []string
+	for _, res := range rule.Resources {
+		if !webhookHeartbeatResources[res] {
+			continue
+		}
+		switch {
+		case res == "leases":
+			if !slices.Contains(rule.APIGroups, "coordination.k8s.io") {
+				continue
+			}
+		case res == "*" || res == "*/*":
+			// Wildcard resources cover every group by definition.
+		default:
+			if !slices.Contains(rule.APIGroups, "") {
+				continue
+			}
+		}
+		hits = append(hits, res)
+	}
+	return hits
+}
+
 // auditHeartbeat audits live Mutating/Validating admission
 // sub-webhooks with failurePolicy=Fail (or the nil default) whose
 // rules[].resources intercept a heartbeat-path resource while the
@@ -363,14 +395,14 @@ func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 	if !ok {
 		return
 	}
-	// emitWebhook flags one webhook: the webhook's deduped rule
-	// resources are matched against the heartbeat set and each hit
-	// becomes a series keyed "kind/name/webhook/resource".
+	// emitWebhook flags one webhook: each rule's resources are matched
+	// against the heartbeat set GROUP-AWARE (see heartbeatRuleHits) and
+	// each hit becomes a series keyed "kind/name/webhook/resource".
 	emitWebhook := func(kind, cfgName, hookName string, rules []admissionv1.RuleWithOperations) {
 		seen := map[string]bool{}
 		for _, rule := range rules {
-			for _, res := range rule.Resources {
-				if !webhookHeartbeatResources[res] || seen[res] {
+			for _, res := range heartbeatRuleHits(rule) {
+				if seen[res] {
 					continue
 				}
 				seen[res] = true

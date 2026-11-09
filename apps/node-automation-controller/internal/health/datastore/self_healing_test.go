@@ -238,6 +238,74 @@ func TestDragonflyOperatorHealSkipsUnreadyPods(t *testing.T) {
 	}
 }
 
+// The 1-per-cycle cap: mid-rollout the operator runs two ReplicaSet
+// generations side by side and the per-controller cooldown only dedups
+// pods of the SAME RS, so a sweep that deleted every prefix match
+// would reap the whole operator at once. Exactly ONE pod — the
+// deterministic OLDEST — is deleted per sweep, and the persisted STS
+// stamp keeps the remaining replicas untouched inside the cooldown
+// window (the cap is not a rolling deletion that eats replica after
+// replica sweep after sweep).
+func TestDragonflyOperatorHealDeletesOnePodPerSweep(t *testing.T) {
+	testutil.CleanupMetric(t, statefulServiceZeroEndpointsGauge, "db", "dragonfly-master", "dragonfly")
+	base := time.Now()
+	sts := shSTS("db", "dragonfly", 3,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	// Two pods of the outgoing ReplicaSet generation and one of the
+	// incoming one — the mid-rollout shape — all valid bounce
+	// candidates (Running, RS-owned, same prefix).
+	opPod := func(name, rs string, created time.Time) *corev1.Pod {
+		pod := shOperatorPod()
+		pod.Name = dragonflyOperatorPodPrefix + "-" + name
+		pod.UID = types.UID("uid-" + name)
+		pod.CreationTimestamp = metav1.NewTime(created)
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet",
+			Name: dragonflyOperatorPodPrefix + "-" + rs,
+			UID:  types.UID("dr-op-rs-" + rs), Controller: ptr.To(true),
+		}}
+		return pod
+	}
+	old1 := opPod("aaaaa-old1", "oldrs", base.Add(-2*time.Hour))
+	old2 := opPod("bbbbb-old2", "oldrs", base.Add(-1*time.Hour))
+	new1 := opPod("ccccc-new1", "newrs", base.Add(-30*time.Minute))
+	cs := fake.NewSimpleClientset(sts, svc, old1, old2, new1)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	// Seed the zero-endpoint streak past the 5m heal window.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+		Observe("db/dragonfly-master/dragonfly", base.Add(-6*time.Minute))
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("masterless streak must still FAIL")
+	}
+	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+		Get(ctx, old1.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the oldest operator pod must be the one deleted, err=%v", err)
+	}
+	for _, survivor := range []*corev1.Pod{old2, new1} {
+		if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+			Get(ctx, survivor.Name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("sweep must delete exactly one operator pod, %s gone: %v",
+				survivor.Name, err)
+		}
+	}
+
+	// A follow-up sweep inside the cooldown window deletes nothing
+	// further — one pod per cycle, never a rolling wipe.
+	p.Now = func() time.Time { return base.Add(time.Minute) }
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	for _, survivor := range []*corev1.Pod{old2, new1} {
+		if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
+			Get(ctx, survivor.Name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("cooldown must hold the sweep to one pod, %s deleted: %v",
+				survivor.Name, err)
+		}
+	}
+}
+
 // A masterless non-Dragonfly service fires the gauge but never
 // touches any operator pod.
 func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {

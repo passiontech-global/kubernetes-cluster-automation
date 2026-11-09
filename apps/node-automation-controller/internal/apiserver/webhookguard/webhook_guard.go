@@ -155,6 +155,14 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	var breakerErr error
 	if circuitbreaker.Enabled() {
 		breakerErr = g.breaker.Sweep(ctx, snap)
+	} else {
+		// Kill-switch must not strand state: the circuit-broken
+		// annotation + failurePolicy=Ignore live on the config
+		// objects, so skipping the sweep entirely leaves every
+		// tripped entry Ignore forever — across backend recovery and
+		// controller restarts. RestoreOnly runs the recover half
+		// only: no new trips, no deadSince windows, no pod bounces.
+		breakerErr = g.breaker.RestoreOnly(ctx, snap)
 	}
 	conversionErr := g.breaker.SweepCRDConversionBackends(ctx, snap)
 	// The medik8s boot fail-open enforcement runs on the same shared

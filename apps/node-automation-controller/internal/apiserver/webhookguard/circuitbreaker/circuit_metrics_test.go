@@ -94,12 +94,16 @@ func cbConversionCRD() *unstructured.Unstructured {
 
 // cbFixture builds the cluster a conversion-backend sweep reads: the
 // CRD on the dynamic fake, the given typed objects on the clientset.
+// The clientset emulates the pods/eviction contract because the
+// conversion bounce evicts through policy/v1 (heal.EvictPod) — a
+// bare fake records the eviction CREATE without deleting the pod.
 func cbFixture(t *testing.T, extra ...runtime.Object) (*guardstate.Guard, *Breaker) {
 	t.Helper()
 	crd := cbConversionCRD()
 	dyn := testutil.NewDynWithCRDs(crd)
 	objs := append([]runtime.Object{}, extra...)
 	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
 	g := &guardstate.Guard{
 		CS:  cs,
 		Dyn: dyn,
@@ -202,8 +206,38 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 
 	t.Run("tls probe failed bounces the wedged pod", func(t *testing.T) {
 		cleanup(t)
-		g, b := cbFixture(t, svc, eps(true), pod)
-		g.EndpointProber = func(context.Context, string, int32) bool { return false }
+		// A healthy conversion backend rides alongside so the probe
+		// census is NOT monitor-blind (probeBlind): one responsive
+		// backend proves the controller can reach webhook pods,
+		// licensing the unresponsive verdict on the other.
+		okCRD := testutil.Unstructured(
+			guardstate.CustomResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+			"", "gadgets.example.com", nil)
+		_ = unstructured.SetNestedField(okCRD.Object, "Webhook",
+			"spec", "conversion", "strategy")
+		_ = unstructured.SetNestedMap(okCRD.Object,
+			map[string]any{"namespace": "backend", "name": "ok-svc", "port": int64(9443)},
+			"spec", "conversion", "webhook", "clientConfig", "service")
+		up := true
+		okSlice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: svcNS, Name: "ok-svc-slice",
+				Labels: map[string]string{discoveryv1.LabelServiceName: "ok-svc"},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses:  []string{"10.10.0.2"},
+				Conditions: discoveryv1.EndpointConditions{Ready: &up},
+			}},
+		}
+		g, b := cbFixture(t, svc, eps(true), pod,
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: svcNS, Name: "ok-svc"}},
+			okSlice)
+		// cbFixture wires only widgets.example.com on the dyn fake —
+		// add the healthy CRD so its backend is measured too.
+		g.Dyn = testutil.NewDynWithCRDs(cbConversionCRD(), okCRD)
+		g.EndpointProber = func(_ context.Context, ip string, _ int32) bool {
+			return ip == "10.10.0.2" // ok-svc answers; conv-svc wedged
+		}
 		if err := b.SweepCRDConversionBackends(ctx, g.TakeSnapshot(ctx)); err != nil {
 			t.Fatal(err)
 		}

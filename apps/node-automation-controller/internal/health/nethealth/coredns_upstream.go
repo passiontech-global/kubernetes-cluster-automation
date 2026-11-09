@@ -120,15 +120,20 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		if !isDNSPod(pod) {
 			continue
 		}
-		dnsByName[pod.Name] = pod
+		// Keyed ns/name: bare pod names collide across namespaces and
+		// a cross-ns collision would silently drop the flag below.
+		dnsByName[pod.Namespace+"/"+pod.Name] = pod
 		dnsByNS[pod.Namespace] = append(dnsByNS[pod.Namespace], pod)
 	}
 
 	flagged := map[string]string{} // "ns/name" -> reason detail
 	record := func(podName, nsHint, detail string) {
 		ns := nsHint
-		if pod := dnsByName[podName]; pod != nil {
-			ns = pod.Namespace // census wins over the series label
+		// Census (keyed ns/name) wins over the series label only when
+		// the series' own namespace agrees — otherwise fall back to
+		// the label, then empty.
+		if nsHint != "" && dnsByName[nsHint+"/"+podName] != nil {
+			ns = nsHint
 		}
 		if ns == "" {
 			ns = "unknown"
@@ -158,8 +163,8 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 	for _, key := range flaggedKeys {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
-		pod := dnsByName[name]
-		if pod != nil && pod.Namespace == ns {
+		pod := dnsByName[ns+"/"+name]
+		if pod != nil {
 			rep.Flag(coreDNSUpstreamFailingGauge, key, []string{ns, name})
 			rep.Find(key + "(" + flagged[key] + ")")
 		}

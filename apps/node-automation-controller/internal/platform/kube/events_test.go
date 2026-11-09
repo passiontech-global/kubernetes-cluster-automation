@@ -76,3 +76,26 @@ func TestCountRecentEvents(t *testing.T) {
 		t.Fatalf("CountRecentEvents = %d, want 3 (2 fresh + ev-5)", got)
 	}
 }
+
+// A future event timestamp (clock skew) must not count as recent — a
+// negative now.Sub would previously fall inside the window.
+func TestCountRecentEventsSkipsFutureTimestamp(t *testing.T) {
+	now := time.Now()
+	future := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "ev-future",
+			CreationTimestamp: metav1.NewTime(now.Add(time.Hour)),
+		},
+		Reason:        "Preempted",
+		LastTimestamp: metav1.NewTime(now.Add(time.Hour)),
+	}
+	cs := fake.NewSimpleClientset(future)
+	got, err := CountRecentEvents(context.Background(), cs,
+		"Preempted", 5*time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0 {
+		t.Fatalf("CountRecentEvents = %d, want 0 — future timestamp counted as recent", got)
+	}
+}

@@ -82,7 +82,7 @@ type crdConversionKey struct{ crd, service, reason string }
 // touches the CRD object — and bounces the oldest wedged backend pod
 // so the controller recreates it serving (the same stage-1 heal as
 // the admission path: BounceCooldown, the shared maintenance
-// mutex via heal.AllowedV, UID-preconditioned delete).
+// mutex via heal.AllowedV, UID-preconditioned eviction).
 //
 // Series hygiene: a complete sweep emits the current tuple per
 // unhealthy CRD and prunes whatever was not re-seen — a stale
@@ -171,6 +171,12 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		return false, true, nil
 	}
 
+	// probeBlind — the same fleet-blind gate as the admission path:
+	// when every probed backend failed the handshake the monitor is
+	// the likely culprit, so the tls_probe_failed verdict must not
+	// emit fresh or drive a bounce (the apiserver-truth reasons —
+	// missing_service, zero_endpoints — stay live).
+	blind := probeBlind(ready)
 	var hung []string
 	bounceSeen := map[string]bool{}
 	for i := range snap.CRDs {
@@ -204,6 +210,20 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 			log.Info("UNHEALTHY: CRD conversion webhook backend has 0 effective-ready endpoints",
 				"crd", crd.GetName(), "service", svcKey)
 		case ready.Probed[svcKey] && !ready.Responsive[svcKey]:
+			if blind {
+				// Monitor-blind — the handshake verdict is
+				// unverifiable from this vantage point: carry the
+				// CRD's last tuple forward ("can't tell", the same
+				// contract as the Service-get flap above) instead of
+				// emitting a fresh tls_probe_failed or queueing a
+				// bounce against possibly healthy pods.
+				for k, lv := range b.crdUnhealthyEmitted.Last() {
+					if k.crd == crd.GetName() {
+						b.crdUnhealthyEmitted.Emit(k, lv...)
+					}
+				}
+				continue
+			}
 			reason = CRDReasonTLSProbeFailed
 			log.Info("UNHEALTHY: CRD conversion webhook backend fails TCP+TLS probe on every endpoint — pods wedged",
 				"crd", crd.GetName(), "service", svcKey)
