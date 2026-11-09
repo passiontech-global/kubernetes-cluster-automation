@@ -4,6 +4,7 @@
 package hostconfig
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -151,5 +152,52 @@ k0scontroller_cpu_weight_by_host:
 	}
 	if c.errs != 0 {
 		t.Fatalf("errs = %d — converge-only paths must not count errors", c.errs)
+	}
+}
+
+// ---------- strListVar: list-ish var reads ----------
+
+func TestStrListVar(t *testing.T) {
+	vars := writeVarsDir(t, `str_list_ok:
+  - 10.0.0.1
+  - 10.0.0.2
+str_list_scalar: "10.0.0.1, 10.0.0.2"
+str_list_chars:
+  - a
+  - b
+str_list_empty: []
+`)
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+
+	// A real YAML list passes through untouched.
+	if got := strListVar(c, "str_list_ok"); !slices.Equal(got,
+		[]string{"10.0.0.1", "10.0.0.2"}) {
+		t.Fatalf("strListVar(list)=%v", got)
+	}
+	// A jinja scalar rendered to a STRING must not go through
+	// Vars.List — ToIter would iterate it rune-by-rune; the
+	// char-split fallback reparses the scalar on whitespace/commas.
+	if got := strListVar(c, "str_list_scalar"); !slices.Equal(got,
+		[]string{"10.0.0.1", "10.0.0.2"}) {
+		t.Fatalf("strListVar(scalar)=%v", got)
+	}
+	// A genuine list of 1-char entries trips the same char-split
+	// guard and reparses via Stringify ("[a, b]" → a, b).
+	if got := strListVar(c, "str_list_chars"); !slices.Equal(got,
+		[]string{"a", "b"}) {
+		t.Fatalf("strListVar(chars)=%v", got)
+	}
+	if got := strListVar(c, "str_list_empty"); len(got) != 0 {
+		t.Fatalf("strListVar(empty)=%v want empty", got)
+	}
+	if got := strListVar(c, "no_such_var"); got != nil {
+		t.Fatalf("strListVar(unset)=%v want nil", got)
 	}
 }

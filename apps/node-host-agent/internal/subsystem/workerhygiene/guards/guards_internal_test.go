@@ -272,6 +272,86 @@ func TestDropKernelCachesSuccessAndFailure(t *testing.T) {
 	}
 }
 
+func TestPsiMemoryFullAvg60(t *testing.T) {
+	d, _ := gDeps(t)
+	psiPath := filepath.Join(d.Cfg.ProcRoot, "pressure", "memory")
+
+	// Missing file — PSI disabled / unreadable procfs → not ok.
+	if v, ok := psiMemoryFullAvg60(d); ok || v != 0 {
+		t.Fatalf("missing pressure file: got %v,%v want 0,false", v, ok)
+	}
+
+	write := func(body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(psiPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(psiPath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// some-line only, no full row → not ok.
+	write("some avg10=1.00 avg60=9.99 avg300=0.10 total=1\n")
+	if _, ok := psiMemoryFullAvg60(d); ok {
+		t.Fatal("some-only PSI file must not report ok")
+	}
+
+	// full row present — avg60 extracted, some's avg60 ignored.
+	write("some avg10=0.10 avg60=9.99 avg300=0.10 total=1\n" +
+		"full avg10=0.20 avg60=26.10 avg300=0.30 total=2\n")
+	if v, ok := psiMemoryFullAvg60(d); !ok || v != 26.10 {
+		t.Fatalf("psiMemoryFullAvg60=%v,%v want 26.10,true", v, ok)
+	}
+
+	// Malformed avg60 on the full row → not ok (no silent 0).
+	write("full avg10=0.20 avg60=bogus avg300=0.30 total=2\n")
+	if _, ok := psiMemoryFullAvg60(d); ok {
+		t.Fatal("unparseable avg60 must not report ok")
+	}
+}
+
+func TestReadMeminfo(t *testing.T) {
+	d, _ := gDeps(t)
+	memPath := filepath.Join(d.Cfg.ProcRoot, "meminfo")
+
+	// Missing file → parsed=false.
+	if m := readMeminfo(d); m.parsed {
+		t.Fatal("missing meminfo must not parse")
+	}
+
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(memPath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("MemTotal:       16384000 kB\n" +
+		"MemFree:         1024000 kB\n" +
+		"MemAvailable:    8192000 kB\n" +
+		"SUnreclaim:       512000 kB\n" +
+		"PageTables:        64000 kB\n" +
+		"SecPageTables:      8000 kB\n")
+	m := readMeminfo(d)
+	if !m.parsed || m.totalKB != 16384000 || m.availKB != 8192000 ||
+		m.slabUnrecKB != 512000 || m.pageTablesKB != 72000 {
+		t.Fatalf("readMeminfo=%+v want parsed totals/slab/pageTables", m)
+	}
+
+	// Missing MemAvailable → unreadable.
+	write("MemTotal:       16384000 kB\nSUnreclaim:       512000 kB\n")
+	if m := readMeminfo(d); m.parsed {
+		t.Fatal("meminfo without MemAvailable must not parse")
+	}
+
+	// Zero MemTotal → unreadable (division-by-zero guard upstream).
+	write("MemTotal:             0 kB\nMemAvailable:    8192000 kB\n")
+	if m := readMeminfo(d); m.parsed {
+		t.Fatal("zero MemTotal must not parse")
+	}
+}
+
 // --- dstate_scopes.go ---
 
 func TestProcWchan(t *testing.T) {
@@ -551,5 +631,48 @@ func TestCheckDeactivating(t *testing.T) {
 	if log := f.LogLines(t); !strings.Contains(log,
 		"deactivating count=1 streak=2") {
 		t.Fatalf("want deactivating suspect line, log=%q", log)
+	}
+}
+
+// --- spegel.go ---
+
+func TestSpegelSocketStale(t *testing.T) {
+	podCreated := time.Now().Add(-10 * time.Minute)
+
+	// Missing socket — inconclusive, never a false-positive delete.
+	if spegelSocketStale(filepath.Join(t.TempDir(), "absent.sock"), podCreated) {
+		t.Fatal("missing socket must report not-stale")
+	}
+
+	sock := filepath.Join(t.TempDir(), "containerd.sock")
+	if err := os.WriteFile(sock, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Socket older than pod creation + margin → fresh bind-mount.
+	old := podCreated.Add(-time.Hour)
+	if err := os.Chtimes(sock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if spegelSocketStale(sock, podCreated) {
+		t.Fatal("socket older than pod start must report not-stale")
+	}
+
+	// Socket recreated after pod start + margin → stale inode.
+	recent := podCreated.Add(spegelSockStaleMargin + time.Minute)
+	if err := os.Chtimes(sock, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+	if !spegelSocketStale(sock, podCreated) {
+		t.Fatal("socket recreated after pod start must report stale")
+	}
+
+	// Exactly at the margin boundary — After is strict → not stale.
+	edge := podCreated.Add(spegelSockStaleMargin)
+	if err := os.Chtimes(sock, edge, edge); err != nil {
+		t.Fatal(err)
+	}
+	if spegelSocketStale(sock, podCreated) {
+		t.Fatal("socket at exactly podCreated+margin must report not-stale")
 	}
 }

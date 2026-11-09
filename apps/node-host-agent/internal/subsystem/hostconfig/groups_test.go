@@ -532,3 +532,51 @@ func TestShRequiredGatesCountEmpty(t *testing.T) {
 		t.Fatalf("errs = %d, want 2", c.errs)
 	}
 }
+
+// TestCfgGatesRefuseUnsafe — the rendered-config gates backing the
+// sysctl.d / kubelet-config / containerd.toml / LimitNOFILE drop-in
+// renders: every refused value counts one cycle error.
+func TestCfgGatesRefuseUnsafe(t *testing.T) {
+	for name, tc := range map[string]struct {
+		gate func(*cyc, string) bool
+		in   []string
+		want []bool
+	}{
+		"cfgSysctlKey": {
+			gate: func(c *cyc, s string) bool { return c.cfgSysctlKey("x", s) },
+			in:   []string{"net.ipv4.ip_forward", "fs.aio-max-nr", "bad key", "a=b", "", "nl\nkey"},
+			want: []bool{true, true, false, false, false, false},
+		},
+		"cfgSysctlVal": {
+			gate: func(c *cyc, s string) bool { return c.cfgSysctlVal("x", s) },
+			in:   []string{"1", "10240 65535", "1\n2", "", "tab\there"},
+			want: []bool{true, true, false, false, false},
+		},
+		"cfgScalar": {
+			gate: func(c *cyc, s string) bool { return c.cfgScalar("x", s) },
+			in:   []string{"100", "60s", "a:b", "a#b", "line\nbreak", ""},
+			want: []bool{true, true, false, false, false, false},
+		},
+		"cfgLimitNOFILE": {
+			gate: func(c *cyc, s string) bool { return c.cfgLimitNOFILE("x", s) },
+			in:   []string{"1048576", "1024:2048", "infinity", "max", "1:2:3", "abc", ""},
+			want: []bool{true, true, true, true, false, false, false},
+		},
+	} {
+		c := &cyc{}
+		for i, in := range tc.in {
+			if got := tc.gate(c, in); got != tc.want[i] {
+				t.Fatalf("%s(%q)=%v want %v", name, in, got, tc.want[i])
+			}
+		}
+		var refused int
+		for _, w := range tc.want {
+			if !w {
+				refused++
+			}
+		}
+		if c.errs != refused {
+			t.Fatalf("%s: errs=%d want %d (one per refused value)", name, c.errs, refused)
+		}
+	}
+}
