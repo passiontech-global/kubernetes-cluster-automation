@@ -1,7 +1,7 @@
 // node.go — Node helpers shared by several modules: condition/role
 // reads, taint predicates and the JSON-merge taint/label patchers,
-// plus the single place node listing happens (ListNodes) and the
-// storm-gate census built on it (CountNotReadyNodes).
+// plus the single place direct node listing happens (ListNodes; the
+// storm-gate census rides the cached twin in nodes_cached.go).
 package kube
 
 import (
@@ -201,20 +201,4 @@ func PatchNodeLabels(ctx context.Context, cs kubernetes.Interface, name string, 
 // Node objects are the fattest typed payload any module pulls.
 func ListNodes(ctx context.Context, cs kubernetes.Interface) ([]corev1.Node, error) {
 	return ListAll(ctx, metav1.ListOptions{Limit: 500}, nodes(cs))
-}
-
-// CountNotReadyNodes returns how many nodes are not Ready=True —
-// the shared "storm-gate" check used by several modules.
-func CountNotReadyNodes(ctx context.Context, cs kubernetes.Interface) (int, error) {
-	nodes, err := ListNodes(ctx, cs)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for i := range nodes {
-		if !NodeReady(&nodes[i]) {
-			n++
-		}
-	}
-	return n, nil
 }

@@ -56,6 +56,12 @@ type fluentBitRoller struct {
 	// nil (tests, StubManager) falls back to the direct CS read; the
 	// destructive restart still confirms the drift on CS either way.
 	secretReader kube.CachedObjectReader
+	// nodeReader is the informer-cache client for the storm-gate
+	// node census (CountNotReadyNodesCached) — same cache discipline
+	// as secretReader: read-only verdicts ride the cache, the
+	// destructive restart still confirms on CS. nil (tests,
+	// StubManager) falls back to the direct read.
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the controller name and every IncError label
 	// come from one place.
@@ -88,6 +94,7 @@ func Setup(d shared.Deps) error {
 		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
 		if d.Mgr != nil {
 			r.secretReader = d.Mgr.GetClient()
+			r.nodeReader = d.Mgr.GetClient()
 		}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
@@ -150,7 +157,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 
 	// Storm gate: never restart the DS while nodes are down — adds
 	// churn; positionDB guarantees resume once stable.
-	notReady, err := kube.CountNotReadyNodes(ctx, r.cs)
+	notReady, err := kube.CountNotReadyNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
