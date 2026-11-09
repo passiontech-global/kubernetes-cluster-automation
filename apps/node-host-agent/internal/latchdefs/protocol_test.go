@@ -49,6 +49,25 @@ func TestStateEnterRe(t *testing.T) {
 	}
 }
 
+// TestStateExitRe: the exit-line mirror of StateEnterRe — same
+// alternation over StateExitPrefix, and it must NOT match enter
+// lines (the episode-end rules depend on the distinction).
+func TestStateExitRe(t *testing.T) {
+	re := StateExitRe(LatchDiskSlowIO, "filesystem-readonly")
+	if !re.MatchString(StateExitPrefix + LatchDiskSlowIO) {
+		t.Errorf("re misses %q", StateExitPrefix+LatchDiskSlowIO)
+	}
+	if !re.MatchString(StateExitPrefix + "filesystem-readonly remounted rw") {
+		t.Error("re misses an exit line with a trailing note")
+	}
+	if re.MatchString(StateExitPrefix + "fs-readonly") {
+		t.Error("re matched an unregistered alias")
+	}
+	if re.MatchString(StateEnterPrefix + LatchDiskSlowIO) {
+		t.Error("exit re matched a STATE-ENTER line")
+	}
+}
+
 // TestActionEntryRe: both lib.sh spellings keep matching, exact
 // names only, and multi-name alternation works.
 func TestActionEntryRe(t *testing.T) {

@@ -396,3 +396,160 @@ func TestGcCalicoOrphanVethsDeletesViaSystemd(t *testing.T) {
 		t.Fatal("marker for vanished iface must be pruned")
 	}
 }
+
+// --- calico.go: checkWireguardCali (W20-NM3) ---
+
+// wgIface writes the wireguard.cali sysfs pair the detector reads.
+func wgIface(t *testing.T, d *wdeps.Deps, operstate, carrier string) {
+	t.Helper()
+	dir := filepath.Join(d.Cfg.SysClassNet, "wireguard.cali")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if operstate != "" {
+		wdepstest.WriteFile(t, filepath.Join(dir, "operstate"), operstate+"\n")
+	}
+	if carrier != "" {
+		wdepstest.WriteFile(t, filepath.Join(dir, "carrier"), carrier+"\n")
+	}
+}
+
+func TestCheckWireguardCaliAbsentAndHealthy(t *testing.T) {
+	d, _ := gDeps(t)
+	c := &CalicoCheck{d: d}
+	ctx := context.Background()
+
+	// No wireguard.cali dir — not a Calico-WireGuard node, not a
+	// fault; the streak stays cleared.
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 0 {
+		t.Fatalf("absent iface wgFails=%d want 0", c.wgFails)
+	}
+
+	// operstate=up + carrier=1 — the datapath is alive.
+	wgIface(t, d, "up", "1")
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 0 {
+		t.Fatalf("healthy iface wgFails=%d want 0", c.wgFails)
+	}
+
+	// Neither sysfs file readable — inconclusive: the streak is
+	// kept untouched rather than reset on a partial read.
+	if err := os.RemoveAll(filepath.Join(d.Cfg.SysClassNet, "wireguard.cali")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(d.Cfg.SysClassNet, "wireguard.cali"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.wgFails = 3 // pre-existing streak must survive the inconclusive read
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 3 {
+		t.Fatalf("unreadable iface wgFails=%d want streak kept at 3", c.wgFails)
+	}
+}
+
+func TestCheckWireguardCaliStreakAndRemedy(t *testing.T) {
+	d, f := gDeps(t)
+	c := &CalicoCheck{d: d}
+	ctx := context.Background()
+	wgIface(t, d, "down", "1")
+
+	// ConsecNeeded=2: the first down read only arms the streak.
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 1 {
+		t.Fatalf("first down read wgFails=%d want 1", c.wgFails)
+	}
+	// Confirmed down with no Running calico-node pod — diagnose
+	// only, no restart possible.
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 2 {
+		t.Fatalf("second down read wgFails=%d want 2", c.wgFails)
+	}
+	if log := f.LogLines(t); !strings.Contains(log,
+		"wireguard.cali down but no Running calico-node pod") {
+		t.Fatalf("want no-pod skip line, log=%q", log)
+	}
+
+	// carrier=0 alone also counts as down.
+	wgIface(t, d, "up", "0")
+	// Seed the felix pod in the fake clientset so the delete lands.
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "calico-node-abc", Namespace: "kube-system"}}
+	if _, err := f.CS.CoreV1().Pods("kube-system").Create(
+		ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Third confirmed read spends the last-calico-restart budget →
+	// ACTION line + pod delete.
+	c.checkWireguardCali(ctx, pod)
+	if log := f.LogLines(t); !strings.Contains(log,
+		"ACTION: calico-hygiene deleted pod kube-system/calico-node-abc"+
+			" - wireguard.cali down/no-carrier") {
+		t.Fatalf("want ACTION delete line, log=%q", log)
+	}
+	if _, err := f.CS.CoreV1().Pods("kube-system").Get(
+		ctx, "calico-node-abc", metav1.GetOptions{}); err == nil {
+		t.Fatal("calico-node pod must be deleted by the remedy")
+	}
+
+	// The budget is spent — the next confirmed read hits the
+	// cooldown skip instead of a second delete.
+	c.checkWireguardCali(ctx, pod)
+	if log := f.LogLines(t); !strings.Contains(log,
+		"wireguard.cali down but pod restart in cooldown") {
+		t.Fatalf("want cooldown skip line, log=%q", log)
+	}
+}
+
+// --- dstate_scopes.go: checkDeactivating (W20-KR1) ---
+
+func TestCheckDeactivating(t *testing.T) {
+	d, f := gDeps(t)
+	c := &ScopesCheck{d: d}
+	ctx := context.Background()
+
+	// list-units failure (no SDReply stub → ENOENT): inconclusive —
+	// the streak is kept, not reset, and no count is logged.
+	c.deactStreak = 5
+	c.checkDeactivating(ctx)
+	if c.deactStreak != 5 {
+		t.Fatalf("exec failure deactStreak=%d want kept at 5", c.deactStreak)
+	}
+	if log := f.LogLines(t); !strings.Contains(log,
+		"deactivating list-units failed") {
+		t.Fatalf("want list-units failure line, log=%q", log)
+	}
+
+	// Empty output → streak resets.
+	f.SDReply["state=deactivating"] = "\n"
+	c.checkDeactivating(ctx)
+	if c.deactStreak != 0 {
+		t.Fatalf("empty list deactStreak=%d want 0", c.deactStreak)
+	}
+
+	// Non-.scope lines don't count toward the wedge.
+	f.SDReply["state=deactivating"] =
+		"some.service loaded active deactivating stopping\n" +
+			"not-a-scope loaded active deactivating\n"
+	c.checkDeactivating(ctx)
+	if c.deactStreak != 0 {
+		t.Fatalf("non-scope lines deactStreak=%d want 0", c.deactStreak)
+	}
+
+	// One wedged scope: streak 1 stays silent (alert needs ≥2).
+	f.SDReply["state=deactivating"] =
+		"cri-containerd-abc123.scope loaded active deactivating stopping\n"
+	c.checkDeactivating(ctx)
+	if c.deactStreak != 1 {
+		t.Fatalf("first wedged sweep deactStreak=%d want 1", c.deactStreak)
+	}
+	// Second consecutive sweep → the diagnose-only suspect line.
+	c.checkDeactivating(ctx)
+	if c.deactStreak != 2 {
+		t.Fatalf("second wedged sweep deactStreak=%d want 2", c.deactStreak)
+	}
+	if log := f.LogLines(t); !strings.Contains(log,
+		"deactivating count=1 streak=2") {
+		t.Fatalf("want deactivating suspect line, log=%q", log)
+	}
+}
