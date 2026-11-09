@@ -165,3 +165,20 @@ func TestSeamsExecClosureCapturesClient(t *testing.T) {
 		t.Fatalf("combined argv=%v", combArgv)
 	}
 }
+
+// TestStatfsFreeBytes — the StatFSFn production default: real
+// syscall.Statfs on the path's filesystem, sane byte counts, and
+// an error for a path that does not exist.
+func TestStatfsFreeBytes(t *testing.T) {
+	free, total, err := statfsFreeBytes(t.TempDir())
+	if err != nil {
+		t.Fatalf("statfsFreeBytes: %v", err)
+	}
+	if total <= 0 || free <= 0 || free > total {
+		t.Fatalf("free=%d total=%d — implausible statfs counts", free, total)
+	}
+	if _, _, err := statfsFreeBytes(
+		filepath.Join(t.TempDir(), "no-such-path")); err == nil {
+		t.Fatal("statfsFreeBytes on missing path returned nil error")
+	}
+}

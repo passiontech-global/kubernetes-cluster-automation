@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -86,5 +89,25 @@ func TestScanBloatAndWLayerShareWalkCache(t *testing.T) {
 	}
 	if len(walked) != 3 {
 		t.Fatalf("real walks=%d, want 3 (one per snapshot dir, shared across both scans)", len(walked))
+	}
+}
+
+// TestDiskBloatOwnedByStatefulSet — the critical-band rail: a pod
+// owned by a StatefulSet holds identity-bound storage and must not
+// be churned by disk-bloat eviction.
+func TestDiskBloatOwnedByStatefulSet(t *testing.T) {
+	p := &corev1.Pod{}
+	if diskBloatOwnedByStatefulSet(p) {
+		t.Fatal("no ownerReferences must be false")
+	}
+	p.OwnerReferences = []metav1.OwnerReference{
+		{Kind: "ReplicaSet"}, {Kind: "Deployment"}}
+	if diskBloatOwnedByStatefulSet(p) {
+		t.Fatal("non-StatefulSet owners must be false")
+	}
+	p.OwnerReferences = append(p.OwnerReferences,
+		metav1.OwnerReference{Kind: "StatefulSet"})
+	if !diskBloatOwnedByStatefulSet(p) {
+		t.Fatal("StatefulSet owner must be true")
 	}
 }

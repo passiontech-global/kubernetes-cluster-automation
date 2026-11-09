@@ -2,6 +2,7 @@ package probee
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -266,6 +267,103 @@ func TestDNSQuery(t *testing.T) {
 	// Silence (nothing answering) must fail — the wedge verdict.
 	if DNSQuery("127.0.0.1:1", "example.test", 300*time.Millisecond) {
 		t.Fatal("DNSQuery: dead listener reported true")
+	}
+}
+
+// tcpDNSFake is the TCP twin of udpDNSFake: it accepts connections,
+// reads the 2-byte length-prefixed query and answers with the same
+// frame carrying the query back — QR bit set when qr=true, echoed
+// unchanged otherwise. mode steers the broken-server cases:
+// "" is the healthy echo, "badlen" sends an out-of-range length
+// prefix, "short" truncates the frame mid-message, "wrongid"
+// rewrites the echoed id, "silent" never replies.
+func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("tcp listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				hdr := make([]byte, 2)
+				if _, err := io.ReadFull(c, hdr); err != nil {
+					return
+				}
+				if mode == "badlen" {
+					// n=4097 — one past the probe's frame cap, so the
+					// length check rejects before any body read.
+					_, _ = c.Write([]byte{0x10, 0x01})
+					return
+				}
+				n := int(hdr[0])<<8 | int(hdr[1])
+				q := make([]byte, n)
+				if _, err := io.ReadFull(c, q); err != nil {
+					return
+				}
+				switch mode {
+				case "silent":
+					return
+				case "short":
+					// Declared length honest, body cut short — the
+					// client's ReadFull must fail.
+					_, _ = c.Write([]byte{hdr[0], byte(n >> 8 & 0xff)})
+					return
+				case "wrongid":
+					if len(q) >= 2 {
+						q[0] ^= 0xff
+						q[1] ^= 0xff
+					}
+				}
+				if qr && len(q) >= 3 {
+					q[2] |= 0x80
+				}
+				resp := []byte{byte(len(q) >> 8), byte(len(q))}
+				resp = append(resp, q...)
+				_, _ = c.Write(resp)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestDNSQueryTCP(t *testing.T) {
+	name := "kubernetes.default.svc.cluster.local"
+	if !DNSQueryTCP(tcpDNSFake(t, true, ""), name, 2*time.Second) {
+		t.Fatal("DNSQueryTCP: responding listener reported false")
+	}
+	// A length-prefixed echo without the QR bit is a query, not a
+	// response — same contract as the UDP probe.
+	if DNSQueryTCP(tcpDNSFake(t, false, ""), name, 2*time.Second) {
+		t.Fatal("DNSQueryTCP: QR-less echo reported true")
+	}
+	// An echoed frame with a different id is a stray datagram.
+	if DNSQueryTCP(tcpDNSFake(t, true, "wrongid"), name, 2*time.Second) {
+		t.Fatal("DNSQueryTCP: wrong-id reply reported true")
+	}
+	// An out-of-range length prefix is rejected before the body
+	// read — a malformed peer must not wedge the probe.
+	if DNSQueryTCP(tcpDNSFake(t, true, "badlen"), name, 2*time.Second) {
+		t.Fatal("DNSQueryTCP: oversized length prefix reported true")
+	}
+	// A truncated frame fails the exact-length read.
+	if DNSQueryTCP(tcpDNSFake(t, true, "short"), name, 2*time.Second) {
+		t.Fatal("DNSQueryTCP: truncated frame reported true")
+	}
+	// A listener that accepts but never answers hits the deadline.
+	if DNSQueryTCP(tcpDNSFake(t, true, "silent"), name, 300*time.Millisecond) {
+		t.Fatal("DNSQueryTCP: silent listener reported true")
+	}
+	// Nothing listening at all — the wedge verdict.
+	if DNSQueryTCP("127.0.0.1:1", name, 300*time.Millisecond) {
+		t.Fatal("DNSQueryTCP: dead listener reported true")
 	}
 }
 

@@ -230,6 +230,39 @@ func TestExecBudgetsAndPiping(t *testing.T) {
 	d.Cfg.Run = fr.RunStdin
 }
 
+// TestExecLongWrapper — ExecLong is the nil-env, stdin-passing
+// convenience over ExecLongEnv the compact/vacuum/repack paths
+// call: it must ride the LONG budget, never the short one.
+func TestExecLongWrapper(t *testing.T) {
+	d, _, _ := fixture(t, nil)
+	var gotEnv []string
+	var gotStdin, gotArgv string
+	var gotBudget time.Duration
+	d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		gotEnv, gotStdin, gotArgv = env, stdin, strings.Join(argv, " ")
+		dl, _ := ctx.Deadline()
+		gotBudget = time.Until(dl)
+		return "ok", nil
+	}
+	out, err := d.ExecLong(context.Background(),
+		[]string{"podman", "exec", "pg", "vacuumdb"}, "sql-body")
+	if err != nil || out != "ok" {
+		t.Fatalf("ExecLong=%q err=%v", out, err)
+	}
+	if gotArgv != "podman exec pg vacuumdb" {
+		t.Fatalf("argv=%q", gotArgv)
+	}
+	if gotEnv != nil {
+		t.Fatalf("ExecLong env=%v want nil", gotEnv)
+	}
+	if gotStdin != "sql-body" {
+		t.Fatalf("stdin=%q want sql-body", gotStdin)
+	}
+	if gotBudget <= d.Cfg.CmdTimeout {
+		t.Fatalf("budget=%v — ExecLong must ride LongCmdTimeout, not CmdTimeout", gotBudget)
+	}
+}
+
 func TestDiscoverContainerFallbacks(t *testing.T) {
 	// Preferred exists → returned without scanning ps.
 	d, fr, _ := fixture(t, []testutil.ExecRule{

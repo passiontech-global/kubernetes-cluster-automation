@@ -180,3 +180,113 @@ func TestSHPortReq(t *testing.T) {
 		}
 	}
 }
+
+// ---------- rendered-config gates ----------
+
+func TestCfgScalar(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		// Empty is NOT a scalar — printableASCII requires ≥1 byte.
+		{"", false},
+		// Plain scalars, including the space a YAML value may hold.
+		{"value", true},
+		{"a b c", true},
+		{"1.5", true},
+		{"true", true},
+		// ':' and '#' reopen the file's mapping/comment syntax.
+		{"a:b", false},
+		{"a#b", false},
+		// Control bytes — first of all '\n' — would splice extra
+		// keys/lines into the rendered file.
+		{"a\nb", false},
+		{"a\tb", false},
+		{"a\x00b", false},
+		{"a\rb", false},
+		// Non-ASCII bytes are outside the printable range.
+		{"café", false},
+		{"✓", false},
+	} {
+		if got := CfgScalar(tc.in); got != tc.want {
+			t.Errorf("CfgScalar(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCfgSysctlKey(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"net.ipv4.tcp_tw_reuse", true},
+		{"fs.aio-max-nr", true},
+		{"kernel.pid_max", true},
+		{"net.ipv4.ip_forward", true},
+		{"vm.swappiness", true},
+		// The regex requires ≥1 char and the procfs-key charset.
+		{"", false},
+		{"net ipv4", false},
+		{"net.ipv4;id", false},
+		{"net.ipv4\ninjected", false},
+		{"net.ipv4=tcp", false},
+		{"café.key", false},
+	} {
+		if got := CfgSysctlKey(tc.in); got != tc.want {
+			t.Errorf("CfgSysctlKey(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCfgSysctlVal(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"1", true},
+		{"1024 2048", true}, // space-separated lists are legal
+		{"tcp mem", true},
+		// Empty and control bytes fail — a newline would render
+		// further `key = value` lines sysctl --system applies
+		// verbatim. Unlike CfgScalar, ':' and '#' are printable and
+		// allowed here.
+		{"", false},
+		{"a\nb", false},
+		{"a\tb", false},
+		{"a:b#c", true},
+		{"café", false},
+	} {
+		if got := CfgSysctlVal(tc.in); got != tc.want {
+			t.Errorf("CfgSysctlVal(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCfgLimitNOFILE(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"1048576", true},
+		{"1024:4096", true}, // soft:hard pair
+		{"infinity", true},  // unit's own specials
+		{"max", true},
+		{"unset", true},
+		{"1024:infinity", true}, // specials mix with digits
+		{"infinity:max", true},
+		// Empty and malformed shapes — systemd drops these at
+		// daemon-reload and the unit silently keeps stock limits.
+		{"", false},
+		{"1024:", false},
+		{":1024", false},
+		{"1024:4096:8192", false},
+		{"-1", false},
+		{"abc", false},
+		{"1024x", false},
+		{"1024 4096", false},
+	} {
+		if got := CfgLimitNOFILE(tc.in); got != tc.want {
+			t.Errorf("CfgLimitNOFILE(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

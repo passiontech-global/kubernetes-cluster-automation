@@ -309,3 +309,57 @@ func TestCiliumEnvoyXDSKillSkipsReadyProbe(t *testing.T) {
 			"before probing the just-killed process", readyCalls)
 	}
 }
+
+// TestCiliumUnhealthySubsystems — the healthz walk behind the
+// envoy-xds-lrp check: nested subsystem maps resolve to dotted
+// paths, Ok/Disabled are healthy, invalid JSON is inconclusive.
+func TestCiliumUnhealthySubsystems(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "all healthy",
+			body: `{"cluster":{"cilium":{"state":"Ok"},"operator":{"state":"Disabled"}}}`,
+			want: nil,
+		},
+		{
+			name: "nested failure",
+			body: `{"cluster":{"cilium":{"state":"Failure"}}}`,
+			want: []string{"cluster.cilium=Failure"},
+		},
+		{
+			name: "multiple bad sorted",
+			body: `{"b":{"state":"Warning"},"a":{"state":"Failure"}}`,
+			want: []string{"a=Failure", "b=Warning"},
+		},
+		{
+			name: "state at top level",
+			body: `{"state":"Ok","sub":{"state":"Stale"}}`,
+			want: []string{"sub=Stale"},
+		},
+		{
+			name: "invalid json",
+			body: `{not json`,
+			want: nil,
+		},
+		{
+			name: "non-map json",
+			body: `["state","Failure"]`,
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ciliumUnhealthySubsystems([]byte(tc.body))
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
