@@ -4,6 +4,7 @@
 package hostconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -174,6 +175,72 @@ node-z:
 	if !strings.Contains(z, "IN NS ns1.test.internal.") ||
 		!strings.Contains(z, "IN A 172.29.0.10") {
 		t.Fatalf("marker hub records missing:\n%s", z)
+	}
+}
+
+// TestCoreDNSBinarySwapRestartsService — same contract as nebula:
+// a version-pin binary install must restart coredns.service even
+// when the Corefile is unchanged. Phase A seeds with the probe at
+// the pin; phase B flips it stale and serves a tarball.
+func TestCoreDNSBinarySwapRestartsService(t *testing.T) {
+	url, sum := tarballServer(t, map[string]string{
+		"coredns": "#!/bin/sh\n# fake coredns\n",
+	})
+	vars := writeVarsDir(t, "")
+	dp := filepath.Join(vars, "defaults.yaml")
+	db, err := os.ReadFile(dp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db = []byte(strings.ReplaceAll(string(db),
+		`interdc_coredns_url: "https://example/coredns.tgz"`,
+		fmt.Sprintf(`interdc_coredns_url: "%s"`, url)))
+	db = []byte(strings.ReplaceAll(string(db),
+		`interdc_coredns_sha256: "deadbeef"`,
+		fmt.Sprintf(`interdc_coredns_sha256: "%s"`, sum)))
+	if err := os.WriteFile(dp, db, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hostRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostRoot, "usr/local/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dl := t.TempDir()
+
+	srA := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+		"dig @127.0.0.1":                  "10.0.1.10",
+	}, nil)
+	rA, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+		VarsDir: vars, Runner: srA, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cA := loadCyc(t, rA, vars, "node-b")
+	cA.groupCoreDNS()
+	if !hostExists(rA, "/etc/coredns/Corefile") {
+		t.Fatal("phase A did not seed the Corefile")
+	}
+	if entries, _ := os.ReadDir(dl); len(entries) > 0 {
+		t.Fatal("phase A downloaded despite the pin matching")
+	}
+
+	srB := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-1.13.0",
+		"dig @127.0.0.1":                  "10.0.1.10",
+	}, nil)
+	rB, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+		VarsDir: vars, Runner: srB, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cB := loadCyc(t, rB, vars, "node-b")
+	cB.groupCoreDNS()
+	if !hostExists(rB, "/usr/local/bin/coredns") {
+		t.Fatal("coredns binary not installed under HostRoot")
+	}
+	if len(srB.CallsMatching("systemctl restart coredns.service")) == 0 {
+		t.Fatalf("binary swap did not restart coredns.service: %v", srB.Calls())
 	}
 }
 

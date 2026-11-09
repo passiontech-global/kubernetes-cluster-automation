@@ -48,7 +48,7 @@ func (c *cyc) groupCoreDNS() {
 		return // T9 gates entirely on interdc_dns_resolvers | length > 0
 	}
 
-	c.corednsInstallBinary()
+	binChanged := c.corednsInstallBinary()
 	_ = r.ensureDir("/etc/coredns", 0o755)
 
 	var corefile, desc string
@@ -139,7 +139,7 @@ WantedBy=multi-user.target
 		r.daemonReload(ctx)
 	}
 	r.ensureService(ctx, "coredns.service", true, true)
-	if cfgChanged {
+	if cfgChanged || binChanged {
 		r.restartService(ctx, "coredns.service")
 	}
 
@@ -408,18 +408,23 @@ func jsonPlain(v any) any {
 	}
 }
 
-func (c *cyc) corednsInstallBinary() {
+// corednsInstallBinary mirrors nebulaInstallBinary: returns true when
+// the coredns binary file was actually replaced this cycle so the
+// caller can restart the service — a version-pin bump with an
+// unchanged Corefile must still bounce the daemon onto the new image.
+func (c *cyc) corednsInstallBinary() bool {
 	ver := c.t.Vars.StrDef("interdc_coredns_version", "")
 	if ver == "" {
 		// Same empty-pin rule as nebula: "CoreDNS-"+"" matches every
 		// -version output (never upgrades) and download("") is a
 		// counted bogus fetch. Not pinned = not installed.
 		c.err("T9: interdc_coredns_version not pinned — coredns not installed")
-		return
+		return false
 	}
 	tgz := c.v("interdc_coredns_tgz")
 	sum := c.v("interdc_coredns_sha256")
 	url := c.v("interdc_coredns_url")
+	installed := false
 	c.installManagedBinary(managedBinarySpec{
 		name:     "T9",
 		artifact: "coredns tgz",
@@ -440,5 +445,9 @@ func (c *cyc) corednsInstallBinary() {
 			c.err("T9: coredns install failed — stub will not run",
 				"file", local, "error", err)
 		},
+		onInstalled: func(c *cyc, _ string) {
+			installed = true
+		},
 	})
+	return installed
 }

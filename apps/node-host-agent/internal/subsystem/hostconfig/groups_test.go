@@ -5,6 +5,9 @@
 package hostconfig
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -140,6 +143,39 @@ func hostRead(t *testing.T, r *Reconciler, path string) string {
 func hostExists(r *Reconciler, path string) bool {
 	_, err := os.Stat(filepath.Join(r.cfg.HostRoot, path))
 	return err == nil
+}
+
+// tarballServer serves a real .tar.gz built from members (name →
+// content) and returns its URL + hex sha256 for the *_url/_sha256
+// vars pins — installManagedBinary verifies the hash as it streams.
+func tarballServer(t *testing.T, members map[string]string) (url, sum string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	for name, content := range members {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o755, Size: int64(len(content)),
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum256 := sha256.Sum256(buf.Bytes())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/artifact.tgz", fmt.Sprintf("%x", sum256)
 }
 
 // TestKineServiceTLSAndTCPReadiness — the Phase-3 mTLS cutover:
