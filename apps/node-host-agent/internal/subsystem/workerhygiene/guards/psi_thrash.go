@@ -24,6 +24,16 @@ const (
 	slabLeakEnterRatio     = 0.35
 	slabLeakClearRatio     = 0.25
 	slabDropCachesInterval = time.Hour
+	// W24 negative-dentry reclaim thresholds: /proc/sys/fs/dentry-state
+	// nr_unused above 1.5M with >3GiB of reclaimable slab and memory
+	// already under 15% available means the kernel is about to PSI-
+	// thrash on dentries it could have dropped — drop_caches=2 hands
+	// them back BEFORE the thrash latch arms. The 30m budget keeps a
+	// permanently dentry-heavy node from write-looping the sysctl.
+	dentryUnusedMin     = 1_500_000
+	dentryReclaimMinKB  = 3 * 1024 * 1024 // 3 GiB of SReclaimable
+	dentryMemAvailRatio = 0.15
+	dentryDropInterval  = 30 * time.Minute
 )
 
 // psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
@@ -64,6 +74,7 @@ type memInfo struct {
 	totalKB      int64
 	availKB      int64
 	slabUnrecKB  int64 // SUnreclaim — slab the kernel cannot reclaim
+	slabRecKB    int64 // SReclaimable — dentries/inodes the kernel CAN reclaim (W24)
 	pageTablesKB int64 // PageTables + SecPageTables (W19-K4)
 	parsed       bool  // at least MemTotal + MemAvailable seen
 }
@@ -78,7 +89,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 	if err != nil {
 		return m
 	}
-	var total, avail, slab, pageTables int64
+	var total, avail, slab, slabRec, pageTables int64
 	var sawTotal, sawAvail bool
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
@@ -96,6 +107,8 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 			avail, sawAvail = v, true
 		case "SUnreclaim:":
 			slab = v
+		case "SReclaimable:":
+			slabRec = v
 		case "PageTables:", "SecPageTables:":
 			// W19-K4: page-table memory is kernel memory outside
 			// SUnreclaim — a leaking/mapping-heavy workload grows it
@@ -106,8 +119,8 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 	if !sawTotal || !sawAvail || total <= 0 {
 		return m
 	}
-	m.totalKB, m.availKB, m.slabUnrecKB, m.pageTablesKB, m.parsed =
-		total, avail, slab, pageTables, true
+	m.totalKB, m.availKB, m.slabUnrecKB, m.slabRecKB, m.pageTablesKB, m.parsed =
+		total, avail, slab, slabRec, pageTables, true
 	return m
 }
 
@@ -172,6 +185,70 @@ func dropKernelCaches(d *wdeps.Deps) {
 	}
 	d.State.AppendLog("ACTION: kernel-slab-leak wrote 2 to sys/vm/drop_caches")
 	d.Actions.WithLabelValues(wdeps.CheckPSIThrash, "drop_caches").Inc()
+}
+
+// dentryStateUnused reads <ProcRoot>/sys/fs/dentry-state field 2
+// (nr_unused — dentries the kernel has already unlinked but not yet
+// reclaimed). The file carries six counters
+// (nr_dentry nr_unused age_limit want_pages nr_negative
+// nr_unused_negative); a short/unparseable read reports -1 so the
+// caller can tell "no data" from "zero unused".
+func dentryStateUnused(d *wdeps.Deps) int64 {
+	data, err := os.ReadFile(filepath.Join(
+		d.Cfg.ProcRoot, "sys", "fs", "dentry-state"))
+	if err != nil {
+		return -1
+	}
+	f := strings.Fields(string(data))
+	if len(f) < 2 {
+		return -1
+	}
+	n, err := strconv.ParseInt(f[1], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// guardNegativeDentry is the W24 negative-dentry SLAB reclaim: churn
+// workloads (build pods, log shippers, volume mounts) leave millions
+// of unlinked dentries/inodes sitting in reclaimable slab. While
+// nr_unused is past dentryUnusedMin AND the kernel still holds
+// >3GiB of SReclaimable AND MemAvailable already sits under 15% of
+// MemTotal, the node is one allocation burst away from PSI thrash
+// the slab could have prevented — drop_caches=2 frees dentries and
+// inodes (NOT pagecache, so no re-read storm) on a 30m budget.
+//
+// The gauge (node_agent_dentry_unused_count) publishes EVERY
+// readable cycle — the alert watches the pressure even when the
+// reclaim gate stays shut. A missing dentry-state (non-Linux test
+// host, odd kernel) leaves the last value, never a fake 0.
+func guardNegativeDentry(d *wdeps.Deps, m memInfo) {
+	n := dentryStateUnused(d)
+	if n < 0 {
+		return
+	}
+	d.Series.DentryUnusedCount = n
+	availRatio := float64(m.availKB) / float64(m.totalKB)
+	if n <= dentryUnusedMin ||
+		m.slabRecKB <= dentryReclaimMinKB ||
+		availRatio >= dentryMemAvailRatio {
+		return
+	}
+	if !d.State.RateTrySpend("last-dentry-drop-caches", dentryDropInterval) {
+		return
+	}
+	p := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+	if err := os.WriteFile(p, []byte("2\n"), 0o644); err != nil {
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: negative-dentry drop_caches write %s failed: %v",
+			p, err))
+		return
+	}
+	d.State.AppendLog(fmt.Sprintf(
+		"ACTION: negative-dentry wrote 2 to sys/vm/drop_caches — nr_unused=%d sreclaimable_kb=%d memavail_ratio=%.3f",
+		n, m.slabRecKB, availRatio))
+	d.Actions.WithLabelValues(wdeps.CheckPSIThrash, "dentry_drop_caches").Inc()
 }
 
 // procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
@@ -415,6 +492,10 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// and it must arm even on kernels without PSI or while PSI is
 	// quiet (a kernel slab leak is a kernel problem, not a PSI one).
 	slabLeaking := guardKernelSlabLeak(c.d, m)
+	// W24: the negative-dentry reclaim rides the same readable-
+	// meminfo gate — it needs SReclaimable + MemAvailable, and a
+	// kernel without PSI still has dentries worth dropping.
+	guardNegativeDentry(c.d, m)
 	if !psiOK {
 		// PSI disabled on this kernel — the whole thrash check is
 		// dormant, but the slab guard above still evaluated.

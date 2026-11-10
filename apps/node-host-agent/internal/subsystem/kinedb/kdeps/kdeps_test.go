@@ -566,6 +566,7 @@ func TestNewMetricsCollectors(t *testing.T) {
 	m.MaintOK.WithLabelValues("reindex").Set(1)
 	m.MaintRelBytes.WithLabelValues("heap").Set(1)
 	m.TopChurn.WithLabelValues("pods").Set(1)
+	m.TopHotkey.WithLabelValues("apps/v1/ConfigMap/ns/cm").Set(1)
 	m.Cycles.WithLabelValues("probe", "ok").Inc()
 	if m == nil {
 		t.Fatal("nil metrics")
@@ -588,7 +589,8 @@ func TestNewMetricsCollectors(t *testing.T) {
 		"kine_db_probe_ok", "kine_db_head_revision", "kine_db_guard_ok",
 		"kine_db_maint_ok", "node_agent_kine_pg_idle_in_tx_terminated_total",
 		"kine_db_seq_scans_total", "kine_db_seq_tuples_read_total",
-		"kine_db_top_churn_revisions_5m", "kine_db_backup_valid",
+		"kine_db_top_churn_revisions_5m", "kine_db_top_hotkey_revisions_5m",
+		"kine_db_backup_valid",
 		"node_host_agent_kinedb_cycles_total",
 	} {
 		if !names[want] {

@@ -26,11 +26,15 @@ func TestEmitGuardChurn(t *testing.T) {
 	k.d.ChurnTop = []kdeps.ChurnEntry{
 		{Resource: "pods", Revs: 120}, {Resource: "leases", Revs: 40},
 	}
+	k.d.ChurnKeys = []kdeps.ChurnKeyEntry{
+		{Key: "apps/v1/ConfigMap/ns/cm", Revs: 140},
+	}
 	k.emitGuard(&Result{})
 	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
 	for _, want := range []string{
 		`kine_db_top_churn_revisions_5m{resource="pods"} 120`,
 		`kine_db_top_churn_revisions_5m{resource="leases"} 40`,
+		`kine_db_top_hotkey_revisions_5m{key="apps/v1/ConfigMap/ns/cm"} 140`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("churn series missing %q:\n%s", want, content)

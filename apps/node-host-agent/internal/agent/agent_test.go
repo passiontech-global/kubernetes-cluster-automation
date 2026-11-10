@@ -65,6 +65,46 @@ func TestProbeEndpoints(t *testing.T) {
 	}
 }
 
+// W24: a subsystem pinned at the supervisor's max backoff flips
+// /readyz to 503 while /healthz stays 200 — kubelet must not
+// restart the pod and kill the healthy subsystems.
+func TestReadyzDegradedOnMaxBackoff(t *testing.T) {
+	a := New(Config{NodeName: "node-a"})
+	srv := httptest.NewServer(a.probeMux())
+	defer srv.Close()
+
+	a.ready.Store(true)
+	a.maxBackoffSubs.Store(1)
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("readyz with max-backoff subsystem: got %d, want 503",
+			resp.StatusCode)
+	}
+	resp, err = http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz with max-backoff subsystem: got %d, want 200",
+			resp.StatusCode)
+	}
+
+	a.maxBackoffSubs.Store(0)
+	resp, err = http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("readyz after recovery: got %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	a := New(Config{NodeName: "node-a", PodName: "pod-1", Namespace: "node-ops", Version: "test"})
 	a.started.Store(time.Now().UnixNano())

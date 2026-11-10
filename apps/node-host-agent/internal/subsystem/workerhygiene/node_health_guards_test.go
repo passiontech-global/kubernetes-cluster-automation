@@ -112,8 +112,8 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	// Past the interval the sweep runs again.
 	e.Now = e.Now.Add(31 * time.Minute)
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if len(e.SDCmds) != before+3 { // list + deactivating-list + reset again
-		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+3)
+	if len(e.SDCmds) != before+4 { // list + deactivating-list + abandoned-list + reset again
+		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+4)
 	}
 }
 
@@ -123,6 +123,91 @@ func TestCheckSystemdScopesClean(t *testing.T) {
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if e.SDRan("reset-failed cri-containerd-") {
 		t.Fatal("reset-failed ran with zero failed scopes")
+	}
+}
+
+// TestCheckSystemdScopesAbandonedReap covers the W24 abandoned-scope
+// reaper: an abandoned scope whose container id is absent from every
+// Running pod's container set is stopped; one still owned by a live
+// pod is diagnose-only.
+func TestCheckSystemdScopesAbandonedReap(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["list-units --type=scope --state=failed"] = ""
+	e.SDReply["list-units --type=scope --state=deactivating"] = ""
+	e.SDReply["list-units --type=scope --state=abandoned"] =
+		"cri-containerd-de01.scope loaded active abandoned abandoned\n" +
+			"cri-containerd-li02.scope loaded active abandoned abandoned\n"
+	e.SDReply["stop cri-containerd-"] = ""
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:        "app",
+				ContainerID: "containerd://li02",
+			}},
+		},
+	}
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
+		context.Background(), &wdeps.CycleEnv{
+			Pods: []corev1.Pod{*live}, WorkerActive: true})
+	if !e.SDRan("stop cri-containerd-de01.scope") {
+		t.Fatal("orphaned abandoned scope not stopped")
+	}
+	if e.SDRan("stop cri-containerd-li02.scope") {
+		t.Fatal("live-pod-owned abandoned scope stopped — diagnose-only violated")
+	}
+	if !strings.Contains(e.LogLines(t),
+		"ACTION: systemd-scopes abandoned reap unit=cri-containerd-de01.scope") {
+		t.Fatalf("missing abandoned reap ACTION line:\n%s", e.LogLines(t))
+	}
+}
+
+// TestCheckSystemdScopesAbandonedCap pins the 10-stops-per-sweep
+// budget: a larger orphan pile is reaped in batches across sweeps,
+// never in one unbounded stop storm.
+func TestCheckSystemdScopesAbandonedCap(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["list-units --type=scope --state=failed"] = ""
+	e.SDReply["list-units --type=scope --state=deactivating"] = ""
+	var b strings.Builder
+	for i := 0; i < 12; i++ {
+		fmt.Fprintf(&b,
+			"cri-containerd-c%02d.scope loaded active abandoned abandoned\n", i)
+	}
+	e.SDReply["list-units --type=scope --state=abandoned"] = b.String()
+	e.SDReply["stop cri-containerd-"] = ""
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
+		context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	stops := 0
+	for _, c := range e.SDCmds {
+		if strings.HasPrefix(strings.Join(c, " "), "systemctl stop ") {
+			stops++
+		}
+	}
+	if stops != 10 {
+		t.Fatalf("abandoned stops=%d want 10 (cap)", stops)
+	}
+	if !strings.Contains(e.LogLines(t), "cap 10/sweep reached") {
+		t.Fatalf("missing cap suspect line:\n%s", e.LogLines(t))
+	}
+}
+
+// TestCheckSystemdScopesAbandonedListFail: a failed abandoned
+// list-units is inconclusive — suspect logged, no stops attempted.
+func TestCheckSystemdScopesAbandonedListFail(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["list-units --type=scope --state=failed"] = ""
+	e.SDReply["list-units --type=scope --state=deactivating"] = ""
+	// abandoned list-units left unstubbed → ENOENT.
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
+		context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if e.SDRan("stop cri-containerd-") {
+		t.Fatal("stop attempted after abandoned list-units failure")
+	}
+	if !strings.Contains(e.LogLines(t), "abandoned list-units failed") {
+		t.Fatalf("missing abandoned list-units failure line:\n%s",
+			e.LogLines(t))
 	}
 }
 

@@ -560,6 +560,45 @@ func TestVeleroAuditorScheduleMissingBackups(t *testing.T) {
 	}
 }
 
+// W24 Schrödinger's-backup: a Schedule whose newest Completed backup
+// is older than 36h flags reason=stale — UNLESS the cron is weekly
+// or monthly, where an old newest backup is the normal cadence.
+func TestVeleroAuditorScheduleStaleBackup(t *testing.T) {
+	now := time.Now()
+	daily := veleroSchedule("velero", "daily", false, 30*24*time.Hour)
+	// The builder's spec carries only paused — add the cron.
+	daily.Object["spec"].(map[string]any)["schedule"] = "0 2 * * *"
+	weekly := veleroSchedule("velero", "weekly", false, 30*24*time.Hour)
+	weekly.Object["spec"].(map[string]any)["schedule"] = "0 2 * * 0"
+	monthly := veleroSchedule("velero", "monthly", false, 30*24*time.Hour)
+	monthly.Object["spec"].(map[string]any)["schedule"] = "0 2 1 * *"
+	oldDailyBackup := veleroBackup("velero", "b-daily", "daily",
+		"Completed", 48*time.Hour, 1, 1, 0, 0)
+	oldWeeklyBackup := veleroBackup("velero", "b-weekly", "weekly",
+		"Completed", 96*time.Hour, 1, 1, 0, 0)
+	oldMonthlyBackup := veleroBackup("velero", "b-monthly", "monthly",
+		"Completed", 40*24*time.Hour, 1, 1, 0, 0)
+	freshDailyBackup := veleroBackup("velero", "b-fresh", "daily-fresh",
+		"Completed", 2*time.Hour, 1, 1, 0, 0)
+	freshSched := veleroSchedule("velero", "daily-fresh", false, 30*24*time.Hour)
+	freshSched.Object["spec"].(map[string]any)["schedule"] = "0 2 * * *"
+
+	a := newVeleroAuditor(newDynFake(
+		daily, weekly, monthly, freshSched,
+		oldDailyBackup, oldWeeklyBackup, oldMonthlyBackup, freshDailyBackup), now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := badSeries(t, "velero", "daily", "stale"); !ok || v != 1 {
+		t.Fatalf("daily schedule with 48h-old completed backup must flag stale, got %v,%v", v, ok)
+	}
+	for _, s := range []string{"weekly", "monthly", "daily-fresh"} {
+		if _, ok := badSeries(t, "velero", s, "stale"); ok {
+			t.Fatalf("%s must not flag stale", s)
+		}
+	}
+}
+
 // The same zero-backup check applies to backup-enabled Everest
 // DatabaseClusters: >36h old with zero DatabaseClusterBackups.
 func TestVeleroAuditorEverestMissingBackups(t *testing.T) {

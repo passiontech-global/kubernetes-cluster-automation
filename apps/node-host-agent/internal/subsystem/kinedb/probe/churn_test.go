@@ -94,6 +94,40 @@ func TestProbeTopChurnQueryFailKeepsWindow(t *testing.T) {
 	_ = fr
 }
 
+// The W24 hot-key half: the same window GROUP BYs the full Kine
+// key, strips the /registry/ prefix and stores ChurnKeys for the
+// guard's textfile emission.
+func TestProbeTopHotkeys(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "HAVING COUNT", Out: "/registry/apps/v1/ConfigMap/ns/cm|140\n/registry/policy/v1/PodDisruptionBudget/ns/pdb|75\n"},
+	})
+	k.probeTopHotkeys(context.Background(), "pg", "postgres", "secret", 8000,
+		func(string) {})
+	keys := k.d.ChurnKeys
+	if len(keys) != 2 || keys[0].Key != "apps/v1/ConfigMap/ns/cm" ||
+		keys[0].Revs != 140 || keys[1].Key != "policy/v1/PodDisruptionBudget/ns/pdb" {
+		t.Fatalf("churnKeys=%+v", keys)
+	}
+}
+
+// A failed hot-key query keeps the previous sample — no fabricated
+// zero series, and a note records the miss.
+func TestProbeTopHotkeysQueryFailKeepsSample(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "HAVING COUNT", Err: errors.New("connection reset")},
+	})
+	k.d.ChurnKeys = []kdeps.ChurnKeyEntry{{Key: "apps/v1/ConfigMap/ns/cm", Revs: 90}}
+	var notes []string
+	k.probeTopHotkeys(context.Background(), "pg", "postgres", "secret", 8000,
+		func(s string) { notes = append(notes, s) })
+	if len(notes) != 1 || !strings.Contains(notes[0], "top-hotkey-query-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+	if len(k.d.ChurnKeys) != 1 || k.d.ChurnKeys[0].Revs != 90 {
+		t.Fatalf("churnKeys clobbered on failure: %+v", k.d.ChurnKeys)
+	}
+}
+
 // resHead answers 0 on a failed head read — callers treat it as "no
 // data" rather than an error.
 func TestResHeadQueryFailZeros(t *testing.T) {

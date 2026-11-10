@@ -123,6 +123,19 @@ func (a *veleroBackupAuditor) auditCNPGBackups(ctx context.Context) error {
 				now.Sub(sbCreated.Time) > veleroMissingBackupMaxAge {
 				reasons = append(reasons, "missing")
 			}
+		} else if !cnpgHasCompleted(clusterBackups) {
+			// W24 Schrödinger's-backup: backup objects EXIST but
+			// none ever reached phase=completed — every attempt
+			// failed (or is wedged) and the newest may sit in
+			// "running" forever, so the in-list stale check (which
+			// keys on the newest COMPLETED) sees nothing. Past the
+			// 36h horizon the schedule is effectively unprotected.
+			// Caller-side because the age clock is the schedule's.
+			sbCreated := sb.GetCreationTimestamp()
+			if !sbCreated.IsZero() &&
+				now.Sub(sbCreated.Time) > veleroMissingBackupMaxAge {
+				reasons = append(reasons, "stale")
+			}
 		}
 		for _, reason := range reasons {
 			k := everestKey{ns, cluster, reason}
@@ -178,6 +191,9 @@ func cnpgBackupReasons(backups []*unstructured.Unstructured,
 	// measured from status.stoppedAt when present (the moment the
 	// restorable point actually landed), else startedAt, else
 	// creationTimestamp — same convention as the Everest stale check.
+	// The same pass judges the newest completed backup's restore
+	// metadata (W24 empty_metadata — a "green shell, red heart"
+	// backup that cannot PITR/restore).
 	for _, b := range sorted {
 		phase, _ := kube.NestedString(b.Object, "status", "phase")
 		if phase != "completed" {
@@ -186,9 +202,50 @@ func cnpgBackupReasons(backups []*unstructured.Unstructured,
 		if now.Sub(cnpgBackupDone(b)) > cnpgBackupStaleMaxAge {
 			reasons = append(reasons, "stale")
 		}
+		if cnpgBackupEmptyMetadata(b) {
+			reasons = append(reasons, "empty_metadata")
+		}
 		break // newest completed decides — older ones are history
 	}
 	return reasons
+}
+
+// cnpgHasCompleted reports whether any backup in the cluster's
+// history reached phase=completed — the zero-completed-history half
+// of the W24 stale check (caller-side: it needs the schedule's age).
+func cnpgHasCompleted(backups []*unstructured.Unstructured) bool {
+	for _, b := range backups {
+		if phase, _ := kube.NestedString(
+			b.Object, "status", "phase"); phase == "completed" {
+			return true
+		}
+	}
+	return false
+}
+
+// cnpgBackupEmptyMetadata reports whether a completed CNPG backup
+// carries no usable restore metadata — the "xanh vỏ đỏ lòng" (green
+// shell, red heart) signature: phase=completed but the object
+// cannot actually restore. Two shapes flag:
+//
+//   - status.error non-empty — CNPG recorded a completion-time
+//     error on the backup;
+//   - Barman-method backups (status.method != "volumeSnapshot")
+//     with BOTH status.backupId and status.beginWal empty — no WAL
+//     range was ever registered, so PITR has nothing to replay.
+//     volumeSnapshot backups restore from the snapshot itself and
+//     legitimately carry neither field.
+func cnpgBackupEmptyMetadata(b *unstructured.Unstructured) bool {
+	if e, _ := kube.NestedString(b.Object, "status", "error"); e != "" {
+		return true
+	}
+	method, _ := kube.NestedString(b.Object, "status", "method")
+	if method == "volumeSnapshot" {
+		return false
+	}
+	backupID, _ := kube.NestedString(b.Object, "status", "backupId")
+	beginWal, _ := kube.NestedString(b.Object, "status", "beginWal")
+	return backupID == "" && beginWal == ""
 }
 
 // cnpgBackupStart is the running-age clock: status.startedAt when

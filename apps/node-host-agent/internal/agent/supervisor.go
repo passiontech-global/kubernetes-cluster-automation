@@ -88,6 +88,16 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	// with 5.1s runs reset the ladder every round and stay pinned
 	// at a 5s restart cadence forever.
 	backoff := superviseBackoffInitial
+	// atMax tracks whether THIS goroutine currently counts toward
+	// a.maxBackoffSubs — the /readyz degraded signal (W24). The
+	// counter moves only on transitions so concurrent subsystems
+	// never double-count.
+	atMax := false
+	defer func() {
+		if atMax {
+			a.maxBackoffSubs.Add(-1)
+		}
+	}()
 	// Reusable backoff timer. A Run that outlives the armed wait —
 	// the normal healthy case: the timer fires 5s into every run
 	// longer than the backoff — leaves the fired tick QUEUED in
@@ -118,6 +128,21 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		restarts.Inc()
 		if superviseHealthyRun(time.Since(began), backoff) {
 			backoff = superviseBackoffInitial
+		}
+		// W24: a subsystem whose restart penalty sits at the 5m cap
+		// is crash-looping hard enough that readiness should report
+		// degraded — /healthz stays 200 so kubelet does not restart
+		// the pod and kill the subsystems that ARE healthy. The
+		// counter flips on transitions only; a healthy run resets
+		// backoff to initial and clears the flag on this same pass.
+		nowAtMax := backoff >= superviseBackoffMax
+		if nowAtMax != atMax {
+			if nowAtMax {
+				a.maxBackoffSubs.Add(1)
+			} else {
+				a.maxBackoffSubs.Add(-1)
+			}
+			atMax = nowAtMax
 		}
 		// Run returned while ctx is live (panic recovered, or
 		// a silent early return) — restart after backoff
