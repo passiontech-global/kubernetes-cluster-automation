@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -95,7 +96,8 @@ func TestPostgresInactiveSlotWALBloat(t *testing.T) {
 	testutil.CleanupMetric(t, postgresInactiveSlotWALGauge, "db", "pg-main", "replica1")
 	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "inactive_slot")
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "pg_replication_slots_retained_bytes") {
+		if strings.Contains(query, "pg_replication_slots_retained_bytes") &&
+			!strings.Contains(query, "cnpg_pg_") {
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "db",
 					"postgres_cluster": "pg-main", "slot_name": "replica1"},
@@ -140,7 +142,8 @@ func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
 	testutil.CleanupMetric(t, postgresInactiveSlotWALGauge, "db", "pg-main", "stale-slot")
 	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "inactive_slot")
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "pg_replication_slots_active") {
+		if strings.Contains(query, "pg_replication_slots_active") &&
+			!strings.Contains(query, "cnpg_pg_") {
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "db",
 					"pod": "pg-main", "slot_name": "stale-slot"},
@@ -440,5 +443,200 @@ func TestPostgresWALWorkerPoolBound(t *testing.T) {
 	}
 	if scyllaScrapeWorkers != 4 || scyllaStallLogWorkers != 4 {
 		t.Fatal("scylla scrape/log workers must be 4")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pgWALConditionUnhealthy — the exact-match gate (benign custom
+// conditions must NOT flag; the operators' real types must)
+// ---------------------------------------------------------------------------
+
+func TestPgWALConditionUnhealthyExactMatch(t *testing.T) {
+	now := time.Now()
+	cond := func(typ string, age time.Duration) kube.Condition {
+		return kube.Condition{Type: typ, Status: "False",
+			LastTransitionTime: now.Add(-age)}
+	}
+	cnpg := []string{"ContinuousArchiving", "LastBackupSucceeded"}
+	percona := []string{"ReadyForBackup", "PGBackRestManualBackupSuccessful"}
+	cases := []struct {
+		name     string
+		c        kube.Condition
+		conds    []string
+		fallback bool
+		want     bool
+	}{
+		{"cnpg archiving stale", cond("ContinuousArchiving", time.Hour), cnpg, false, true},
+		{"cnpg last backup stale", cond("LastBackupSucceeded", time.Hour), cnpg, false, true},
+		{"cnpg benign custom backup type", cond("BackupScheduleConfigured", time.Hour), cnpg, false, false},
+		{"cnpg custom wal-ish type", cond("WALRolloutInProgress", time.Hour), cnpg, false, false},
+		{"percona readyforbackup stale", cond("ReadyForBackup", time.Hour), percona, false, true},
+		{"percona manual backup stale", cond("PGBackRestManualBackupSuccessful", time.Hour), percona, false, true},
+		// Real Percona type, but NOT in the set the old substring net
+		// ever matched ("pgbackrest..." does not contain "backup") —
+		// pinned so the exact list stays prior-coverage-preserving.
+		{"percona out-of-set real type", cond("PGBackRestRepoHostReady", time.Hour), percona, false, false},
+		{"young condition", cond("ContinuousArchiving", time.Minute), cnpg, false, false},
+		{"true condition", func() kube.Condition {
+			c := cond("ContinuousArchiving", time.Hour)
+			c.Status = "True"
+			return c
+		}(), cnpg, false, false},
+		{"absent transition", kube.Condition{Type: "ContinuousArchiving",
+			Status: "False"}, cnpg, false, false},
+		// The bare substring net survives ONLY on the family that
+		// opted in (Everest — condition types not a documented closed
+		// enum): an undocumented wal type flags, AND so does a benign
+		// custom backup type there — that is the documented
+		// trade-off, detection-only check.
+		{"everest fallback undocumented wal type", cond("WalArchiveDraining", time.Hour), nil, true, true},
+		{"everest fallback custom backup type", cond("BackupScheduleConfigured", time.Hour), nil, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pgWALConditionUnhealthy(c.c, c.conds, c.fallback, now); got != c.want {
+				t.Fatalf("pgWALConditionUnhealthy(%s) = %v, want %v",
+					c.c.Type, got, c.want)
+			}
+		})
+	}
+}
+
+// scanCRConditions level: the family wiring — a benign custom
+// "backup" condition on a documented family (CNPG) emits nothing, the
+// family's real types flag, and the Everest bare-net family still
+// surfaces an undocumented wal type.
+func TestPostgresWALScanCRConditionFamilies(t *testing.T) {
+	base := time.Now()
+	stale := base.Add(-time.Hour).UTC().Format(time.RFC3339)
+	benign := cnpgCluster("db", "pg-benign", time.Hour)
+	benign.Object["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{
+			"type": "BackupScheduleConfigured", "status": "False",
+			"lastTransitionTime": stale}}
+	known := cnpgCluster("db", "pg-known", time.Hour) // ContinuousArchiving=False
+	everest := testutil.Unstructured(
+		kube.GVREverestDatabaseCluster.GroupVersion().WithKind("DatabaseCluster"),
+		"db", "ev1", map[string]any{"status": map[string]any{
+			"conditions": []any{map[string]any{
+				"type": "WalArchiveDraining", "status": "False",
+				"lastTransitionTime": stale}}}})
+	p := testProberDyn(fake.NewSimpleClientset(),
+		probetest.OpDyn(benign, known, everest))
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+	var rep probefw.SweepReport
+	s := newWALGuardSweep(chk, logr.Discard(), base, &rep)
+	if _, err := s.scanCRConditions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit := s.findings["db/pg-benign/archive_condition"]; hit {
+		t.Fatal("benign custom backup condition flagged")
+	}
+	if _, hit := s.findings["db/pg-known/archive_condition"]; !hit {
+		t.Fatal("known ContinuousArchiving condition did not flag")
+	}
+	if _, hit := s.findings["db/ev1/archive_condition"]; !hit {
+		t.Fatal("undocumented everest wal condition did not flag " +
+			"(bare-net fallback family)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// scanPromSignals — the two per-family OR queries + the series
+// classification
+// ---------------------------------------------------------------------------
+
+// The slot/archiver signals collapse to TWO instant queries — one per
+// exporter family, each ORing that family's archiver branch with its
+// two inactive-slot spellings — plus the volume query. The exact
+// strings are pinned: threshold, the `on(...)` join labels and the
+// per-family metric names are the semantics contract.
+func TestPostgresWALPromQueryStrings(t *testing.T) {
+	var queries []string
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		queries = append(queries, query)
+		return nil
+	})
+	pod := pgPod("db", "pg-main-1", "pg-main")
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"INFO archive-push ok\n", nil))
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("no series — sweep must pass quietly: %+v", res)
+	}
+	const wantPG = `(increase(pg_stat_archiver_failed_count[30m]) > 0) or ` +
+		`(pg_replication_slots_retained_bytes{active="false"} > 5368709120) or ` +
+		`(pg_replication_slots_active == 0 and on(namespace, pod, slot_name) ` +
+		`(pg_replication_slots_pg_wal_lsn_diff > 5368709120 or ` +
+		`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > 5368709120))`
+	const wantCNPG = `(increase(cnpg_pg_stat_archiver_failed_count[30m]) > 0) or ` +
+		`(cnpg_pg_replication_slots_retained_bytes{active="false"} > 5368709120) or ` +
+		`(cnpg_pg_replication_slots_active == 0 and on(namespace, pod, slot_name) ` +
+		`(cnpg_pg_replication_slots_retained_bytes > 5368709120 or ` +
+		`cnpg_pg_replication_slots_pg_wal_lsn_diff > 5368709120))`
+	if len(queries) != 3 {
+		t.Fatalf("prom queries = %d (%v), want 3 (pg family, cnpg family, volume)",
+			len(queries), queries)
+	}
+	if queries[0] != wantPG {
+		t.Fatalf("postgres_exporter family query drifted:\n got %s\nwant %s",
+			queries[0], wantPG)
+	}
+	if queries[1] != wantCNPG {
+		t.Fatalf("cnpg exporter family query drifted:\n got %s\nwant %s",
+			queries[1], wantCNPG)
+	}
+	if !strings.Contains(queries[2], "kubelet_volume_stats") {
+		t.Fatalf("third query is not the volume query: %s", queries[2])
+	}
+}
+
+// The archiver branch is a range-function call — increase() DROPS
+// __name__ — so the classifier reads slot identity: a series with a
+// slot_name label (or a replication_slots name) is inactive_slot +
+// slot-bloat; everything else is archiver_failing. A nameless,
+// slot-less archiver sample must NOT leak into the slot-bloat gauge.
+func TestPostgresWALPromArchiverClassified(t *testing.T) {
+	testutil.CleanupMetric(t, postgresWALUnhealthyGauge, "db", "pg-main", "archiver_failing")
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "stat_archiver") &&
+			!strings.Contains(query, "cnpg_pg_") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{
+					"__name__":  "pg_stat_archiver_failed_count",
+					"namespace": "db", "cluster": "pg-main"},
+				Value: 3,
+			}}
+		}
+		return nil
+	})
+	pod := pgPod("db", "pg-main-1", "pg-main")
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"INFO archive-push ok\n", nil))
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("archiver-failure series must fail the check")
+	}
+	if !strings.Contains(res.Why, "archiver_failing") {
+		t.Fatalf("why missing archiver_failing: %q", res.Why)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_postgres_wal_archive_unhealthy",
+		map[string]string{"namespace": "db", "cluster": "pg-main",
+			"reason": "archiver_failing"}); !ok || v != 1 {
+		t.Fatalf("archiver_failing gauge = %v,%v want 1,true", v, ok)
+	}
+	if m := probetest.FindMetric(t, "node_automation_postgres_inactive_slot_wal_bloat",
+		map[string]string{"namespace": "db", "cluster": "pg-main", "slot": "-"}); m != nil {
+		t.Fatal("archiver sample leaked into the slot-bloat gauge")
 	}
 }

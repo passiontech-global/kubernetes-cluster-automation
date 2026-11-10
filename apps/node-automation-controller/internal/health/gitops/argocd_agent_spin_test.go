@@ -15,6 +15,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -140,5 +141,124 @@ func TestArgoCDAgentSpinRecoveredLogsPass(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("recovered pod deleted: %v", err)
+	}
+}
+
+// cpuSpin is pure: the pod-matched series above argocdAgentCPU (0.5,
+// strictly) is spin; the exact boundary, a series for another pod and
+// an empty channel are not.
+func TestArgoCDAgentSpinCPUPredicate(t *testing.T) {
+	pod := agentPod("argocd-agent-agent-7f9c", time.Now().Add(-time.Hour))
+	for _, tc := range []struct {
+		name   string
+		series []promq.Sample
+		want   bool
+	}{
+		{"above threshold", []promq.Sample{
+			{Metric: map[string]string{"pod": pod.Name}, Value: 0.6}}, true},
+		{"exactly at threshold is not spin", []promq.Sample{
+			{Metric: map[string]string{"pod": pod.Name}, Value: 0.5}}, false},
+		{"other pod's series", []promq.Sample{
+			{Metric: map[string]string{"pod": "argocd-agent-agent-other"}, Value: 2}}, false},
+		{"no series", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := probetest.NewCheckProber(fake.NewSimpleClientset(),
+				testutil.NewDynamicClient(), NewArgoCDAgentSpinCheck)
+			chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
+			if got := chk.cpuSpin(tc.series, pod); got != tc.want {
+				t.Fatalf("cpuSpin = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Guard-branch skips: pods without the argocd-agent-agent- prefix,
+// pods already terminating and non-Running pods are never tracked —
+// the FirstSeenLedger stays empty and the check passes.
+func TestArgoCDAgentSpinGuardBranchesSkip(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		func() *corev1.Pod {
+			p := agentPod("argocd-server-abc", base.Add(-time.Hour))
+			return p
+		}(),
+		func() *corev1.Pod {
+			p := agentPod("argocd-agent-agent-gone", base.Add(-time.Hour))
+			now := metav1.NewTime(base)
+			p.DeletionTimestamp = &now
+			return p
+		}(),
+		func() *corev1.Pod {
+			p := agentPod("argocd-agent-agent-pend", base.Add(-time.Hour))
+			p.Status.Phase = corev1.PodPending
+			return p
+		}())
+	cs.PrependReactor("get", "pods", agentLogReactor(spinLogBody(50, false)))
+	p := probetest.NewCheckProber(cs, testutil.NewDynamicClient(),
+		NewArgoCDAgentSpinCheck)
+	probetest.FreezeNow(p.Deps, base)
+	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
+
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("unqualified pods must pass: %+v", res)
+	}
+	if keys := probetest.LedgerKeys(&chk.seen); len(keys) != 0 {
+		t.Fatalf("unqualified pods were tracked: %v", keys)
+	}
+}
+
+// The 30m per-controller delete cooldown: after a delivered delete,
+// a same-named replacement pod showing the same spin signature is
+// detected but NOT re-deleted inside argocdAgentCool — the heals
+// ledger suppresses the bounce.
+func TestArgoCDAgentSpinDeleteCooldown(t *testing.T) {
+	base := time.Now()
+	testutil.CleanupMetric(t, argocdAgentSpinGauge,
+		"argocd", "argocd-agent-agent-7f9c", "logs")
+	pod := agentPod("argocd-agent-agent-7f9c", base.Add(-30*time.Minute))
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", agentLogReactor(spinLogBody(20, false)))
+	p := probetest.NewCheckProber(cs, testutil.NewDynamicClient(),
+		NewArgoCDAgentSpinCheck)
+	probetest.FreezeNow(p.Deps, base)
+	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
+
+	// Detection at t0, delivered delete at t0+11m (past the window).
+	chk.Run(ctx)
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("sustained spin must FAIL: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("original pod was not deleted past the window")
+	}
+
+	// Replacement pod (same controller key) spins again 9m later —
+	// inside the 30m cooldown: detected, but not re-deleted.
+	probetest.FreezeNow(p.Deps, base.Add(20*time.Minute))
+	repl := agentPod("argocd-agent-agent-7f9c", base.Add(19*time.Minute))
+	if _, err := cs.CoreV1().Pods("argocd").Create(ctx, repl, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	// The sweep may PASS here (the gauge series is already 1 and
+	// re-emitting dedupes) — what matters is that the spin is still
+	// detected and the replacement is NOT bounced inside the cooldown.
+	if m := probetest.FindMetric(t, "node_automation_argocd_agent_spin",
+		map[string]string{"namespace": "argocd",
+			"pod": repl.Name, "reason": "logs"}); m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("replacement spin not detected")
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, repl.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("replacement bounced inside the 30m cooldown")
+	}
+
+	// Past the cooldown the replacement is fair game again.
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute+argocdAgentCool+11*time.Minute))
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("sustained spin past cooldown must FAIL: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, repl.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("replacement not deleted after the cooldown expired")
 	}
 }

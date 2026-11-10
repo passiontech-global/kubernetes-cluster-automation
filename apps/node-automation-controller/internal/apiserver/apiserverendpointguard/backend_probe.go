@@ -267,12 +267,14 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 	}
 	if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
 		st.frozenStreak++
-	} else if res.cacheRV < res.liveRV {
+	} else if res.cacheRV == st.lastCacheRV && res.liveRV > res.cacheRV {
 		// cp-component-restart: the cache still trails the quorum RV — a
 		// quiet cycle (cache advanced a little, or nothing
 		// changed) must KEEP the frozen streak instead of
 		// re-arming it, or a slowly-lagging cache never
-		// reaches the wedge threshold.
+		// reaches the wedge threshold. A cacheRV that ADVANCED
+		// (res.cacheRV != st.lastCacheRV) is a fresh watch revision,
+		// not a frozen cache — reset regardless of the liveRV gap.
 	} else {
 		st.frozenStreak = 0
 	}
@@ -452,7 +454,12 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 	// zero routable addresses (notReady suspects are still probed and
 	// quarantined above; only the healthy-peer accounting changes).
 	for ip := range routableIPs {
-		if results[ip].healthy {
+		// An IP already under quarantine must not count as a healthy
+		// active backend — the apiserver may transiently re-list it
+		// (okStreak 1 < 2) but the reconcile pass pulls it right
+		// back out, so vouching with it could quarantine the last
+		// genuinely healthy backend.
+		if results[ip].healthy && !quarantinedIPs[ip] {
 			healthyActive++
 		}
 	}
@@ -466,6 +473,12 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 			continue
 		}
 		toRemove = append(toRemove, ip)
+		// A routable IP that was counted healthy but is now being
+		// pulled must not keep vouching for later removals in the
+		// same sweep.
+		if results[ip].healthy && !quarantinedIPs[ip] {
+			healthyActive--
+		}
 	}
 	if len(toRemove) > 0 {
 		// cp-component-restart: quarantining the IP only protects NEW dials —

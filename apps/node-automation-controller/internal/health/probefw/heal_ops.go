@@ -127,13 +127,11 @@ func (d *Deps) BounceOperatorPod(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (deleted int) {
 
-	proceed, unverifiable := d.HealAllowed(ctx, log, heals, key,
-		cooldown, now)
-	if unverifiable {
-		metrics.IncError(d.Name)
-		return 0
-	}
-	if !proceed {
+	// Confirm a heal target EXISTS before spending the global heal
+	// budget: a selector that matches nothing (rollout in flight,
+	// stale census) must not burn one of the cluster-wide tokens.
+	// The in-RAM cooldown check is free and runs first.
+	if heals != nil && heals.CooledDown(key, cooldown, now) {
 		return 0
 	}
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
@@ -156,6 +154,18 @@ func (d *Deps) BounceOperatorPod(ctx context.Context, log logr.Logger,
 			targets = append(targets, &pods[i])
 		}
 	}
+	if len(targets) == 0 {
+		return 0
+	}
+	proceed, unverifiable := d.HealAllowed(ctx, log, heals, key,
+		cooldown, now)
+	if unverifiable {
+		metrics.IncError(d.Name)
+		return 0
+	}
+	if !proceed {
+		return 0
+	}
 	for _, pod := range targets {
 		if _, err := heal.DeletePod(ctx, d.CS, heals, key, pod, now); err != nil {
 			metrics.IncError(d.Name)
@@ -163,11 +173,13 @@ func (d *Deps) BounceOperatorPod(ctx context.Context, log logr.Logger,
 				"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
-		d.InvalidatePods(ctx) // pod gone — drop the census
 		metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 		deleted++
 		log.Info("DELETE: pod heal — forcing operator resync",
 			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+	}
+	if deleted > 0 {
+		d.InvalidatePods(ctx) // pods gone — drop the census once
 	}
 	return deleted
 }

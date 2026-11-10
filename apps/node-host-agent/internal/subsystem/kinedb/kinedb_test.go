@@ -285,3 +285,56 @@ func TestRunCountsPanics(t *testing.T) {
 		t.Fatalf("no panic cycles counted (%v)", fams)
 	}
 }
+
+// New must surface a rejected config (non-identifier table) as an
+// error, not a partially-wired KineDB.
+func TestNewRejectsBadTable(t *testing.T) {
+	cfg, _, _ := kdepstest.Config(t, nil)
+	cfg.Table = "kine; DROP TABLE kine"
+	if k, err := New(cfg, nil); err == nil || k != nil {
+		t.Fatalf("k=%v err=%v want error and nil k", k, err)
+	}
+}
+
+// TestDetectHostRootDefaultHostnameMatch: hostRoot "" means "/" —
+// the .env fast path probes the live filesystem root and falls
+// through to the cluster.yaml match against this host's real
+// hostname (read from /etc/hostname on the DB VM, os.Hostname
+// fallback in containers).
+func TestDetectHostRootDefaultHostnameMatch(t *testing.T) {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		t.Skip("no hostname")
+	}
+	vars := t.TempDir()
+	cluster := "node_exporter_extra_hosts:\n" +
+		"  - { name: " + hostname + ", kine_db: true }\n"
+	if err := os.WriteFile(filepath.Join(vars, "cluster.yaml"),
+		[]byte(cluster), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !Detect("", vars) {
+		t.Fatal("hostRoot \"\" must default to / and match the hostname")
+	}
+}
+
+// A malformed cluster.yaml parses as no entries — detection stays
+// fail-quiet instead of panicking on operator YAML drift.
+func TestDetectBadYAMLIsQuiet(t *testing.T) {
+	root := t.TempDir() // no .env → falls through to vars
+	vars := t.TempDir()
+	if err := os.WriteFile(filepath.Join(vars, "cluster.yaml"),
+		[]byte("node_exporter_extra_hosts: [oops\n\t- broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Detect(root, vars) {
+		t.Fatal("unparseable cluster.yaml must read as no kine_db host")
+	}
+}
+
+// An empty varsDir skips the cluster.yaml half entirely.
+func TestDetectEmptyVarsDir(t *testing.T) {
+	if Detect(t.TempDir(), "") {
+		t.Fatal("empty varsDir must not detect")
+	}
+}

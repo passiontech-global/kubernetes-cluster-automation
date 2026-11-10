@@ -8,6 +8,8 @@ package controllerhygiene
 import (
 	"context"
 	"io"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/etcdmaint"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
@@ -56,6 +59,11 @@ func TestShouldRun(t *testing.T) {
 	if !ShouldRun(root) {
 		t.Fatal("expected true with unit file")
 	}
+	// Empty hostRoot IS the host binary — it must alias "/" and read
+	// the same unit-file gate.
+	if ShouldRun("") != ShouldRun("/") {
+		t.Fatal("empty hostRoot must alias the host root /")
+	}
 }
 
 func TestCycleGated(t *testing.T) {
@@ -90,6 +98,49 @@ func TestSelfAPIStaysEmptyWhenUnset(t *testing.T) {
 	}
 	if h.Cfg.Hub.SelfAPI != "" {
 		t.Fatalf("SelfAPI=%q want empty (no loopback default)", h.Cfg.Hub.SelfAPI)
+	}
+}
+
+// The injected HTTPClient seam must be adopted verbatim into
+// Deps.Client — the rv LIST probe dials through it (EnsureClient
+// returns d.Client whenever the cfg field is set).
+func TestNewUsesInjectedHTTPClient(t *testing.T) {
+	f := cdepstest.New(t)
+	client := &http.Client{}
+	f.Cfg.HTTPClient = client
+	h, err := New(f.Cfg, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Deps.Client != client {
+		t.Fatal("New did not adopt cfg.HTTPClient into Deps.Client")
+	}
+}
+
+// Registering the subsystem's metrics twice on one registry must
+// surface as New's wrapped error, not a panic at the scrape.
+func TestNewDuplicateRegistrationFails(t *testing.T) {
+	f := cdepstest.New(t)
+	reg := prometheus.NewRegistry()
+	if _, err := New(f.Cfg, reg); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(f.Cfg, reg)
+	if err == nil || !strings.Contains(err.Error(), "register controllerhygiene metrics") {
+		t.Fatalf("second New on a shared registry: err=%v want "+
+			"a wrapped duplicate-registration error", err)
+	}
+}
+
+// The mirrored terminated-watchers series is a CounterFunc over the
+// last scraped value — a collect must serve that reading, not a
+// fabricated zero (a scrape losing the family keeps the real last
+// one).
+func TestTerminatedWatchersMirrorsLastScrape(t *testing.T) {
+	e := fixture(t)
+	e.H.TerminatedWatchersVal.Store(math.Float64bits(4321))
+	if got := promtest.ToFloat64(e.H.TerminatedWatchers); got != 4321 {
+		t.Fatalf("terminated_watchers=%v want 4321 (the last scrape)", got)
 	}
 }
 

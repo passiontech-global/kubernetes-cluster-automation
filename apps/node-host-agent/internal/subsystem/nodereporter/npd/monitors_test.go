@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -648,5 +649,148 @@ func TestReadonlyMissingMounts(t *testing.T) {
 	}
 	if !e.m.readonlyFS {
 		t.Fatal("readonlyFS cleared on read error — must keep previous state")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sink error paths + kernel read edges
+// ---------------------------------------------------------------------------
+
+// errSink records like fakeSink but fails every EmitEvent — the
+// monitors must log the failure and keep counting, never panic.
+type errSink struct{ fakeSink }
+
+func newErrSink() *errSink {
+	return &errSink{fakeSink{counters: map[string]int{}, latches: map[string]string{}}}
+}
+
+func (s *errSink) EmitEvent(_ context.Context, reason, note string) error {
+	_ = s.fakeSink.EmitEvent(context.Background(), reason, note) // still record
+	return errors.New("event emit refused")
+}
+
+// TestKubeletJournalEmitErrorKeepsCounting: a refused Event emit must
+// neither drop the counter bump nor fail the scan.
+func TestKubeletJournalEmitErrorKeepsCounting(t *testing.T) {
+	e := fixture(t)
+	s := newErrSink()
+	e.journalFetch = func(_ context.Context, args ...string) (string, error) {
+		return journalJSON(e.now.UnixMicro(), `err="node \"n1\" not found"`), nil
+	}
+	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
+		t.Fatalf("sink errors must not fail the sync: %v", err)
+	}
+	if got := s.counter("KubeletNodeNotFound"); got != 1 {
+		t.Fatalf("counter = %v, want 1", got)
+	}
+}
+
+// TestKernelReadErrorDropsHandleAndRecovers: a mid-stream read
+// failure (kmsg file replaced by a DIRECTORY — the open succeeds,
+// the read returns EISDIR) surfaces as an error and drops the
+// handle; the next sync recovers on the file source.
+func TestKernelReadErrorDropsHandleAndRecovers(t *testing.T) {
+	e := fixture(t)
+	dir := filepath.Join(e.cfg.HostRoot, "kmsg-dir")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.cfg.KmsgFile = dir
+	if err := e.m.SyncKernelMonitor(context.Background(), e.sink); err == nil {
+		t.Fatal("read error swallowed")
+	}
+	// Back to the file source — the dropped handle re-opens cleanly.
+	e.cfg.KmsgFile = e.kmsg
+	if err := e.m.SyncKernelMonitor(context.Background(), e.sink); err != nil {
+		t.Fatalf("sync after recovery failed: %v", err)
+	}
+	if got := len(e.sink.events); got != 0 {
+		t.Fatalf("recovery classified %d events from an empty ring", got)
+	}
+}
+
+// TestKernelReplayNeedsUptime: with the lookback armed (first drain)
+// and /proc/uptime unreadable, a record that WOULD pass the age
+// filter must still be dropped — an unanchorable age never replays
+// as live.
+func TestKernelReplayNeedsUptime(t *testing.T) {
+	e := fixture(t)
+	// ~60s before the fixture uptime (3600s) — inside the 5m lookback.
+	e.appendKmsg(t, "6,1,3540000000,-;EXT4-fs error (device vda1): fresh")
+	if err := os.Remove(e.uptime); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.m.SyncKernelMonitor(context.Background(), e.sink); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.sink.counter("Ext4Error"); got != 0 {
+		t.Fatalf("Ext4Error=%v want 0 (replay without an uptime anchor)", got)
+	}
+}
+
+// TestKernelReplayInLookbackClassifies: the mirrored case — the same
+// fresh record WITH a readable uptime IS classified on the first
+// (backlog) scan.
+func TestKernelReplayInLookbackClassifies(t *testing.T) {
+	e := fixture(t)
+	e.appendKmsg(t, "6,1,3540000000,-;EXT4-fs error (device vda1): fresh")
+	if err := e.m.SyncKernelMonitor(context.Background(), e.sink); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.sink.counter("Ext4Error"); got != 1 {
+		t.Fatalf("Ext4Error=%v want 1 (fresh replay inside the lookback)", got)
+	}
+}
+
+// TestKernelDeadlockEmitErrorStillLatches: a refused Event emit must
+// not block the permanent latch — the deadlock is latched once, the
+// second identical record never re-emits.
+func TestKernelDeadlockEmitErrorStillLatches(t *testing.T) {
+	e := fixture(t)
+	s := newErrSink()
+	deadlock := "INFO: task jbd2/vda1-8:1 blocked for more than 120 seconds."
+	e.appendKmsg(t, "6,1,3540000000,-;"+deadlock)
+	if err := e.m.SyncKernelMonitor(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if !e.m.kernelDeadlock {
+		t.Fatal("KernelDeadlock not latched despite the sink error")
+	}
+	if got := len(s.eventsByReason("KernelDeadlock")); got != 1 {
+		t.Fatalf("KernelDeadlock events = %d, want exactly the transition", got)
+	}
+	if c := condFor(t, e.m, "KernelDeadlock"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("KernelDeadlock = %s, want True", c.Status)
+	}
+
+	// A repeat signature refreshes nothing event-wise.
+	e.appendKmsg(t, "6,2,3545000000,-;"+deadlock)
+	if err := e.m.SyncKernelMonitor(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.eventsByReason("KernelDeadlock")); got != 1 {
+		t.Fatalf("KernelDeadlock events after repeat = %d, want 1", got)
+	}
+}
+
+// TestReadonlyMountsEmitErrorKeepsCondition: a refused transition
+// Event must not block the condition flip.
+func TestReadonlyMountsEmitErrorKeepsCondition(t *testing.T) {
+	e := fixture(t)
+	s := newErrSink()
+	if err := os.WriteFile(e.mounts, []byte(
+		"proc /proc proc rw,nosuid 0 0\n"+
+			"/dev/vda1 / ext4 ro,relatime 0 0\n"+
+			"/dev/vdb1 /var/lib/k0s ext4 rw,relatime 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.m.SyncReadonlyMounts(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if !e.m.readonlyFS {
+		t.Fatal("readonly flip lost to the sink error")
+	}
+	if c := condFor(t, e.m, "ReadonlyFilesystem"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("ReadonlyFilesystem = %s, want True", c.Status)
 	}
 }

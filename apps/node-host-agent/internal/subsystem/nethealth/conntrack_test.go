@@ -349,3 +349,119 @@ func TestConntrackFlushRateLimited(t *testing.T) {
 		t.Fatalf("flush not re-armed past cooldown (%d → %d)", n, got)
 	}
 }
+
+// Unparseable count/max must abort the cycle WITHOUT touching the
+// latch — a garbled sysfs read must not clear a real pressure
+// incident, and a junk value must not arm one either.
+func TestConntrackUnparseableValuesAbort(t *testing.T) {
+	e := fixture(t, nil)
+	testutil.WriteFile(t, e.ctcount, "not-a-number\n")
+	testutil.WriteFile(t, e.ctmax, "262144\n")
+	e.n.Cycle(context.Background())
+	if stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch armed on unparseable count")
+	}
+	if !strings.Contains(logLines(t, e), "unparseable conntrack values") {
+		t.Fatalf("missing parse-abort suspect line:\n%s", logLines(t, e))
+	}
+	// max <= 0 is equally unusable.
+	testutil.WriteFile(t, e.ctcount, "100\n")
+	testutil.WriteFile(t, e.ctmax, "0\n")
+	e.n.Cycle(context.Background())
+	if stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch armed on zero max")
+	}
+}
+
+// conntrackStatSum unit contract: unreadable file and header
+// without the wanted columns both read as "detector idles"; a
+// malformed CPU row is skipped without poisoning the sum.
+func TestConntrackStatSumParsing(t *testing.T) {
+	if _, ok := conntrackStatSum(filepath.Join(t.TempDir(), "absent"),
+		"insert_failed"); ok {
+		t.Fatal("missing file must not parse")
+	}
+	dir := t.TempDir()
+	noCols := filepath.Join(dir, "nocols")
+	testutil.WriteFile(t, noCols, "entries searched found\n1 2 3\n")
+	if _, ok := conntrackStatSum(noCols, "insert_failed"); ok {
+		t.Fatal("header without wanted columns must not parse")
+	}
+	// Header-only file: not enough lines for a per-CPU table.
+	testutil.WriteFile(t, noCols, "entries insert_failed\n")
+	if _, ok := conntrackStatSum(noCols, "insert_failed"); ok {
+		t.Fatal("header-only file must not parse")
+	}
+	// Row 2 has the wrong field count → skipped; row 3 counts.
+	mixed := filepath.Join(dir, "mixed")
+	testutil.WriteFile(t, mixed,
+		"entries insert_failed drop\n"+
+			"aa 00000010\n"+ // malformed — dropped
+			"aa 00000010 00000005\n"+ // 16 + 5
+			"aa 00000004 00000000\n") // + 4 = 25
+	sum, ok := conntrackStatSum(mixed, "insert_failed", "drop")
+	if !ok || sum != 25 {
+		t.Fatalf("sum=%d ok=%v want 25 true", sum, ok)
+	}
+}
+
+// The whole-table UDP flush honours the shared last-conntrack-flush
+// cooldown: a spike landing inside an earlier flush's window is a
+// no-op, and a failed `conntrack -D` is logged and absorbed.
+func TestConntrackFlushAllCooldownAndFailure(t *testing.T) {
+	e := fixture(t, nil)
+	ctx := context.Background()
+	// First call spends the 15m budget and runs the delete.
+	e.n.flushStaleUDPConntrackAll(ctx, checkCT)
+	if !ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatalf("flush-all did not exec conntrack: %v", e.host.Cmds())
+	}
+	// Inside the cooldown: no second exec.
+	e.host.ClearLog()
+	e.n.flushStaleUDPConntrackAll(ctx, checkCT)
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("flush-all refired inside the cooldown")
+	}
+	// Past the cooldown but the binary fails: logged, no crash, no
+	// metric — and the next window can retry.
+	e.now = e.now.Add(conntrackFlushCooldown + time.Minute)
+	e.host.FailOn("conntrack -D -p udp", errCmdFail)
+	e.host.ClearLog()
+	e.n.flushStaleUDPConntrackAll(ctx, checkCT)
+	if !ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("flush-all not attempted past the cooldown")
+	}
+	if !strings.Contains(logLines(t, e), "conntrack udp flush skipped") {
+		t.Fatalf("missing flush-failure log:\n%s", logLines(t, e))
+	}
+}
+
+// The per-peer flush defaults to the shared 45670 nebula port when
+// the conf carries none, and skips blank/duplicate peers instead of
+// fork-storming identical deletes. The conf is un-normalized
+// (post-New) so the NebulaPort fallback actually runs.
+func TestPeerConntrackFlushDefaultsAndDedup(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.Watchdog = &watchdogconf.Config{} // NebulaPort unset
+	e.n.flushPeerNebulaConntrack(context.Background(), checkCT,
+		"", "10.0.0.2", " 10.0.0.2 ", "10.0.0.2")
+	// One peer, two tuple directions, default port.
+	delFor := func(sel string) int {
+		n := 0
+		for _, c := range e.host.Cmds() {
+			joined := strings.Join(c, " ")
+			if strings.Contains(joined, "--dport 45670") &&
+				strings.Contains(joined, sel) {
+				n++
+			}
+		}
+		return n
+	}
+	if delFor("-d 10.0.0.2") != 1 || delFor("-s 10.0.0.2") != 1 {
+		t.Fatalf("expected exactly one -d and one -s delete for 10.0.0.2, cmds=%v",
+			e.host.Cmds())
+	}
+	if strings.Contains(e.host.Joined(), "--dport 53") {
+		t.Fatal("peer flush must not use the :53 tuple")
+	}
+}

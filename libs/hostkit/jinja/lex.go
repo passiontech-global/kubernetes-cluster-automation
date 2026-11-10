@@ -46,7 +46,10 @@ func lex(src string) ([]tok, error) {
 			i = j + 1
 		case c >= '0' && c <= '9':
 			j := i
-			for j < len(src) && (src[j] >= '0' && src[j] <= '9' || src[j] == '.' || src[j] == 'x' || src[j] >= 'a' && src[j] <= 'f' || src[j] >= 'A' && src[j] <= 'F') {
+			// x/X/o/O cover the 0x/0X/0o/0O literal prefixes (b/B and
+			// the hex digits a-f/A-F are already in range); '.' and
+			// e-notation digits ride along for floats.
+			for j < len(src) && (src[j] >= '0' && src[j] <= '9' || src[j] == '.' || src[j] == 'x' || src[j] == 'X' || src[j] == 'o' || src[j] == 'O' || src[j] >= 'a' && src[j] <= 'f' || src[j] >= 'A' && src[j] <= 'F') {
 				j++
 			}
 			out = append(out, tok{"num", src[i:j]})

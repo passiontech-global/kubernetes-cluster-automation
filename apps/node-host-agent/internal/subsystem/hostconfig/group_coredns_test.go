@@ -66,6 +66,40 @@ test.internal {
 	}
 }
 
+// TestCoreDNSInjectionFailsClosed: a quote/newline in an upstream,
+// marker or resolver value would inject arbitrary Corefile
+// directives (bind/forward interpolate the scalars verbatim). The
+// group must fail CLOSED — counted error, warn, no Corefile/unit/
+// resolv.conf write.
+func TestCoreDNSInjectionFailsClosed(t *testing.T) {
+	for name, poisoned := range map[string]string{
+		"quote":   `interdc_stub_public_upstream: '1.1.1.1"; bad'`,
+		"newline": "interdc_stub_public_upstream: |-\n  1.1.1.1\n  9.9.9.9",
+	} {
+		t.Run(name, func(t *testing.T) {
+			vars := writeVarsDir(t, "")
+			poisonVars(t, vars, poisoned)
+			sr := newScripted(map[string]string{
+				"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+			}, nil)
+			r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+				VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+				DownloadDir: t.TempDir()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := loadCyc(t, r, vars, "node-b")
+			c.groupCoreDNS()
+			if hostExists(r, "/etc/coredns/Corefile") {
+				t.Fatalf("Corefile written despite refused %s value", name)
+			}
+			if c.errs == 0 {
+				t.Fatal("refused value not counted as a cycle error")
+			}
+		})
+	}
+}
+
 func TestCoreDNSSkipsResolvConfWhenDigFails(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"}, map[string]bool{"dig @127.0.0.1": true})

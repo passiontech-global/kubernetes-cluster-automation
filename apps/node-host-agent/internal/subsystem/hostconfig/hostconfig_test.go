@@ -57,9 +57,14 @@ func TestAtomicWriteIdempotent(t *testing.T) {
 	if sha256.Sum256(b) != sha256.Sum256([]byte("world")) {
 		t.Fatal("bad hash")
 	}
-	// tmp file must not linger (converge.Host's staging suffix)
-	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot, "etc/test.conf.converge.tmp")); !os.IsNotExist(err) {
-		t.Fatal("tmp file lingered")
+	// No staging file may linger (converge.Host stages uniquely as
+	// "<base>.converge.tmp-<rand>" — sweep the ".converge.tmp" infix).
+	matches, err := filepath.Glob(filepath.Join(r.cfg.HostRoot, "etc", "*converge.tmp*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("staging files lingered: %v", matches)
 	}
 }
 
@@ -169,6 +174,54 @@ func TestDirWatcherChangedWithoutPoll(t *testing.T) {
 	}
 	if w.Changed() {
 		t.Fatal("Changed fired twice for the same file without Poll")
+	}
+}
+
+// TestDirWatcherFingerprintFastPath: the (size, mtime) fast path —
+// a stat-unchanged scan must NOT re-read/re-hash file contents, a
+// same-size rewrite with a DIFFERENT mtime must still be detected
+// (content hash fallback), and a same-size same-mtime rewrite is
+// trusted as unchanged (documented residual risk).
+func TestDirWatcherFingerprintFastPath(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f")
+	if err := os.WriteFile(p, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := &DirWatcher{Dirs: []string{dir}}
+	fp1 := w.fingerprint() // seeds the stat cache
+
+	reads := 0
+	prev := readFile
+	readFile = func(name string) ([]byte, error) {
+		reads++
+		return prev(name)
+	}
+	defer func() { readFile = prev }()
+
+	if fp2 := w.fingerprint(); fp2 != fp1 {
+		t.Fatal("fingerprint moved without any file change")
+	}
+	if reads != 0 {
+		t.Fatalf("stat-unchanged scan re-read content %d time(s)", reads)
+	}
+
+	// Same size, different mtime, different content → must re-hash
+	// and move the fingerprint.
+	if err := os.WriteFile(p, []byte("world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, time.Unix(1_000_000_000, 0), time.Unix(1_000_000_000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if fp3 := w.fingerprint(); fp3 == fp1 {
+		t.Fatal("same-size different-mtime rewrite NOT detected")
+	}
+	if reads != 1 {
+		t.Fatalf("changed stat must re-read exactly once, got %d reads", reads)
+	}
+	if w.fingerprint() == fp1 || reads != 1 {
+		t.Fatal("rescan after change must reuse the fresh cache")
 	}
 }
 

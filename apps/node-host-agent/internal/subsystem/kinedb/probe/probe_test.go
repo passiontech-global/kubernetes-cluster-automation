@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -283,5 +285,147 @@ func TestProbeLogScanQuoting(t *testing.T) {
 	if !strings.Contains(fr.Joined(),
 		"'podman' logs --since 301s 'kine-pgbouncer' 2>&1") {
 		t.Fatalf("log scan argv unquoted:\n%s", fr.Joined())
+	}
+}
+
+// A failed `logs` read is inconclusive: log_errors stays 0, the
+// check is excluded from the success verdict (logScanned false), and
+// the failure is noted — a scan failure must not read as a clean log.
+func TestProbeLogScanFailure(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "logs --since", Err: errors.New("container gone")},
+	})
+	res := k.Cycle(context.Background())
+	if res.logScanned {
+		t.Fatal("failed scan must not read scanned")
+	}
+	if res.Checks[CheckLogErrors] != 0 {
+		t.Fatalf("log errors=%d want 0", res.Checks[CheckLogErrors])
+	}
+	found := false
+	for _, n := range res.notes {
+		if strings.Contains(n, "log-scan-fail") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no log-scan-fail note: %v", res.notes)
+	}
+}
+
+// New fills the wire seam with the real Go v3 StartupMessage probe
+// when the config left it unset — and the default seam answers false
+// on a refused dial.
+func TestProbeNewDefaultsWireFn(t *testing.T) {
+	cfg, _, _ := kdepstest.Config(t, nil)
+	cfg.WireFn = nil
+	p := New(kdepstest.Deps(t, cfg))
+	if p.d.Cfg.WireFn == nil {
+		t.Fatal("New did not install the default wire seam")
+	}
+	if p.d.Cfg.WireFn(context.Background(), "127.0.0.1:1") {
+		t.Fatal("refused dial reported alive")
+	}
+}
+
+// A pooler that takes the StartupMessage and hangs up without a
+// reply is broken — the probe's one-byte read must fail.
+func TestPGWireProbeReadFail(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// Drain the exact StartupMessage (41 bytes for
+		// postgres/postgres), then close with no answer.
+		buf := make([]byte, len(pgStartupMessage("postgres", "postgres")))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+	}()
+	if pgWireProbe(context.Background(), ln.Addr().String(), 2*time.Second) {
+		t.Fatal("connection closed without a reply reported alive")
+	}
+	<-done
+}
+
+// A pooler that resets right after the dial (RST before the write)
+// must also read as broken. The exact failure point is racy — write
+// error vs read error — so only the false verdict is asserted.
+func TestPGWireProbeReset(t *testing.T) {
+	for range 3 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0) // close → RST, no FIN
+			}
+			_ = conn.Close()
+		}()
+		alive := pgWireProbe(context.Background(), ln.Addr().String(), 2*time.Second)
+		_ = ln.Close()
+		if alive {
+			t.Fatal("RST connection reported alive")
+		}
+	}
+}
+
+// A failed SHOW POOLS read (primary AND in-container fallback) and
+// a failed revision query each note their own inconclusive shape and
+// zero their checks — the probe reads failed, not clean.
+func TestProbeCyclePoolAndRevisionQueryFail(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "SHOW POOLS", Err: errors.New("console unreachable")},
+		// The fallback psql (stats_users from pgbouncer.ini) fails too.
+		{Substr: "userlist.txt", Err: errors.New("no such file")},
+		{Substr: "COALESCE((SELECT n_live_tup", Err: errors.New("connection reset")},
+		{Substr: "select 1", Out: "1\n"},
+	})
+	res := k.Cycle(context.Background())
+	if res.Checks[CheckPools] != 0 || res.Checks[CheckRevision] != 0 {
+		t.Fatalf("checks=%v want pools+revision zeroed", res.Checks)
+	}
+	if res.succeeded {
+		t.Fatal("probe must fail with pools+revision inconclusive")
+	}
+	joined := strings.Join(res.notes, "\n")
+	if !strings.Contains(joined, "show-pools-fail") {
+		t.Fatalf("notes=%v want show-pools-fail", res.notes)
+	}
+	if !strings.Contains(joined, "revision-query-fail") {
+		t.Fatalf("notes=%v want revision-query-fail", res.notes)
+	}
+}
+
+// parseShowPools skips malformed rows (too few fields for the
+// header, non-numeric cells) but still aggregates the good ones.
+func TestParseShowPoolsSkipsMalformedRows(t *testing.T) {
+	out := "database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode\n" +
+		"postgres|truncated|3\n" + // short row → skipped
+		"postgres|postgres|x|0|1|1|0|0|0|0|0|transaction\n" + // bad int → cell skipped
+		"postgres|postgres|4|0|1|2|0|0|0|0|0|transaction\n"
+	st, ok := parseShowPools(out, "postgres")
+	if !ok {
+		t.Fatal("a valid row among malformed ones must parse")
+	}
+	if st.serverConns != 5 { // 1+1 from row 2, 1+2 from row 3
+		t.Fatalf("serverConns=%d want 5", st.serverConns)
 	}
 }

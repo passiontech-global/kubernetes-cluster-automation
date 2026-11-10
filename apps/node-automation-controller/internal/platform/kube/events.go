@@ -27,6 +27,12 @@ const PreemptedEventReason = "Preempted"
 // its latest hit, not its birth) — a zero time only when every
 // field is unset.
 func EventTime(e *corev1.Event) time.Time {
+	// events.k8s.io series events report the latest hit on
+	// Series.LastObservedTime — prefer it so a recurring event
+	// reads by its most recent occurrence, not its first.
+	if e.Series != nil && !e.Series.LastObservedTime.IsZero() {
+		return e.Series.LastObservedTime.Time
+	}
 	if !e.LastTimestamp.IsZero() {
 		return e.LastTimestamp.Time
 	}

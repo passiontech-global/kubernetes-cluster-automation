@@ -44,6 +44,25 @@ const (
 	// that a plan mid-resolution is never touched.
 	olmInstallPlanApproveMinAge = 15 * time.Minute
 
+	// olmInstallPlanApproveCooldown / olmCSVPatchCooldown bound the
+	// two write-heals below to one write per object per 30m — both
+	// run through the maintenance mutex + heal budget like every
+	// other write-heal, and the cooldown keeps an OLM flip-flop from
+	// spending a budget grant per sweep. 30m matches the flux/
+	// argocd annotation-nudge cooldowns.
+	olmInstallPlanApproveCooldown = 30 * time.Minute
+	olmCSVPatchCooldown           = 30 * time.Minute
+
+	// olmInstallPlanApproveAnno / olmCSVPatchHealAnno persist the
+	// last approve / durable-spec patch moment on the InstallPlan /
+	// CSV the heal acted on — the restart-proof half of the 30m
+	// cooldowns (HealAllowedPersisted reads them via kube.AnnoTime).
+	// Kept local like olmInstallPlanGVR: single-writer stamps, and
+	// the shared passiontech.dev/last-* home (kube/annos.go) is
+	// outside this check's ownership.
+	olmInstallPlanApproveAnno = "passiontech.dev/last-installplan-approve"
+	olmCSVPatchHealAnno       = "passiontech.dev/last-olm-csv-spec-patch"
+
 	// olmArgocdStartupFailureThreshold/Period reproduce the manual
 	// patch's startupProbe shape: 10s period x 180 failures ~ 30m of
 	// startup runway for the slow-cache-sync manager.
@@ -66,9 +85,14 @@ var olmInstallPlanGVR = schema.GroupVersionResource{
 // operators/*.yaml manifests document as manual in-cluster edits.
 // Each mutation is idempotent — a CSV already carrying the patch is
 // left untouched, so the sweep only writes on real drift (OLM CSV
-// upgrade re-asserting the upstream bundle).
+// upgrade re-asserting the upstream bundle). The write is gated like
+// every other write-heal (Deps.HealAllowedPersisted →
+// heal.AllowedVPersisted): the cooldown is the wider of the in-RAM
+// ledger and the passiontech.dev/last-olm-csv-spec-patch stamp the
+// patch itself leaves on the CSV, and only after it clears do the
+// maintenance mutex + global heal budget evaluate (fail closed).
 func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
-	log logr.Logger) {
+	log logr.Logger, now time.Time) {
 
 	csvs, err := p.AllUnstructured(ctx, olmCSVGVR)
 	switch {
@@ -91,14 +115,37 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		if !changed {
 			continue
 		}
+		// Gate: per-CSV cooldown + persisted CSV stamp + maintenance
+		// mutex (memoized on the Deps-wide verdict), fail closed on
+		// unverifiable. Drift that re-appears mid-cooldown (OLM
+		// re-asserting the bundle) waits out the window — an OLM
+		// upgrade is exactly when the mutex/budget protection is for.
+		key := csv.GetNamespace() + "/" + csv.GetName()
+		proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+			&p.csvPatched, csv, olmCSVPatchHealAnno, key,
+			olmCSVPatchCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
+			continue
+		}
+		if !proceed {
+			continue
+		}
 		// Patch (not Update): the controller's RBAC on
 		// clusterserviceversions is get/list/patch — an Update call
 		// would 403 every sweep. A merge patch carrying the WHOLE
 		// mutated spec is equivalent here because the unstructured
 		// object already holds the complete spec — nothing is
-		// invented or dropped.
+		// invented or dropped. The cooldown stamp rides the SAME
+		// merge patch (RFC 7386 folds metadata.annotations into the
+		// existing map, sibling keys survive) so one write lands the
+		// heal and its persisted cooldown together.
 		spec, _ := csv.Object["spec"].(map[string]any)
-		patch, err := json.Marshal(map[string]any{"spec": spec})
+		patch, err := json.Marshal(map[string]any{
+			"spec": spec,
+			"metadata": map[string]any{"annotations": map[string]any{
+				olmCSVPatchHealAnno: now.UTC().Format(time.RFC3339)}},
+		})
 		if err != nil {
 			metrics.IncError(p.Name)
 			continue
@@ -111,6 +158,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 				"csv", csv.GetNamespace()+"/"+csv.GetName())
 			continue
 		}
+		p.csvPatched.Stamp(key, now) // delivered-only contract
 		log.Info("PATCH: olm csv durable spec patch re-applied",
 			"csv", csv.GetNamespace()+"/"+csv.GetName())
 	}
@@ -285,11 +333,19 @@ func stripManagerLeaderElect(obj map[string]any) bool {
 // that have sat unapproved past olmInstallPlanApproveMinAge — the
 // OpenEverest DB-operator subscriptions carry
 // installPlanApproval: Manual and no human reviews them, so their
-// plans would otherwise wait forever. A plan carrying a
-// ResolutionFailed condition is left alone: approving a broken plan
-// just moves the failure later. Production's intentional Manual gate
-// on the medik8s subscriptions lives in the operators namespace and
-// is out of scope by construction.
+// plans would otherwise wait forever. Approval is granted via
+// spec.approved=true (spec.approval is the Automatic|Manual policy
+// enum, not the granted state — patching it is a silent no-op), so
+// an already-approved plan is skipped and the guard reads the same
+// field the patch writes. A plan carrying a ResolutionFailed
+// condition is left alone: approving a broken plan just moves the
+// failure later. Production's intentional Manual gate on the medik8s
+// subscriptions lives in the operators namespace and is out of scope
+// by construction. The write is gated like every other write-heal
+// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): per-plan 30m
+// cooldown, the wider of the in-RAM ledger and the
+// passiontech.dev/last-installplan-approve stamp the patch leaves,
+// then maintenance mutex + heal budget, fail closed on unverifiable.
 func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
@@ -307,10 +363,9 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		if plan.GetNamespace() != "everest" {
 			continue
 		}
-		approval, _, _ := unstructured.NestedString(plan.Object,
-			"spec", "approval")
-		if approval == "Approved" {
-			continue
+		if approved, _, _ := unstructured.NestedBool(
+			plan.Object, "spec", "approved"); approved {
+			continue // already approved — nothing to heal
 		}
 		if now.Sub(plan.GetCreationTimestamp().Time) <
 			olmInstallPlanApproveMinAge {
@@ -319,8 +374,26 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		if resolutionFailed(plan.Object) {
 			continue
 		}
+		key := plan.GetNamespace() + "/" + plan.GetName()
+		proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+			&p.plansApproved, plan, olmInstallPlanApproveAnno, key,
+			olmInstallPlanApproveCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
+			continue
+		}
+		if !proceed {
+			continue
+		}
+		// The approve and its cooldown stamp land in ONE merge patch
+		// (RFC 7386 folds metadata.annotations in, sibling keys
+		// survive) — a delivered approve is never un-cooled by a
+		// failed second write.
 		patch, err := json.Marshal(map[string]any{
-			"spec": map[string]any{"approval": "Approved"}})
+			"spec": map[string]any{"approved": true},
+			"metadata": map[string]any{"annotations": map[string]any{
+				olmInstallPlanApproveAnno: now.UTC().Format(time.RFC3339)}},
+		})
 		if err != nil {
 			metrics.IncError(p.Name)
 			continue
@@ -333,6 +406,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 				"installplan", plan.GetNamespace()+"/"+plan.GetName())
 			continue
 		}
+		p.plansApproved.Stamp(key, now) // delivered-only contract
 		log.Info("PATCH: everest installplan auto-approved",
 			"installplan", plan.GetNamespace()+"/"+plan.GetName())
 	}

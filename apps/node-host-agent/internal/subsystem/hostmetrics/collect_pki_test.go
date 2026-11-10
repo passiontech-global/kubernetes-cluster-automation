@@ -194,3 +194,51 @@ func TestSAPubFingerprintAbsentWhenFileMissing(t *testing.T) {
 		t.Fatal("fingerprint emitted for a missing sa.pub")
 	}
 }
+
+// TestPemDaysLeftNonCertBlockSurvives: a PEM bundle carrying a
+// non-certificate block (a public key, truncated DER) must not kill
+// the file — the earliest CERT still wins.
+func TestPemDaysLeftNonCertBlockSurvives(t *testing.T) {
+	now := time.Now().Unix()
+	cert := mkTestCertPEM(t, time.Unix(now+10*86400, 0))
+	junk := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: []byte("not a certificate"),
+	})
+	bundled := append(append([]byte{}, cert...), junk...)
+
+	days, ok := pemDaysLeft(bundled, now)
+	if !ok || days < 9 || days > 11 {
+		t.Fatalf("bundled days=%v ok=%v want ~10 (junk block skipped)", days, ok)
+	}
+	if _, ok := pemDaysLeft(junk, now); ok {
+		t.Fatal("a non-cert-only bundle parsed as a cert")
+	}
+}
+
+// TestPKICertFilePathEntry: a PKICertPaths entry naming a FILE (not
+// a dir) is taken as-is, and the path label strips the HostRoot
+// prefix like the dir-walk entries do.
+func TestPKICertFilePathEntry(t *testing.T) {
+	cfg, _ := fixture(t)
+	now := time.Now()
+	root := t.TempDir()
+	certFile := filepath.Join(root, "etc", "kubernetes", "pki", "apiserver.crt")
+	if err := os.MkdirAll(filepath.Dir(certFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, certFile, string(mkTestCertPEM(t, now.Add(30*24*time.Hour))))
+	cfg.PKICertPaths = []string{certFile}
+	cfg.HostRoot = root
+	c := New(cfg)
+
+	want := "/etc/kubernetes/pki/apiserver.crt"
+	v, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a", "path": want})
+	if !ok {
+		t.Fatalf("file-entry series absent (want path=%s)", want)
+	}
+	if v < 29 || v > 31 {
+		t.Fatalf("file-entry days=%v want ~30", v)
+	}
+}

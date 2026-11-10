@@ -383,3 +383,157 @@ func TestLatchStaleRefreshesHeldMtime(t *testing.T) {
 		t.Fatalf("latch content changed on re-latch: %q → %q", first, got)
 	}
 }
+
+// --- best-effort file faults: logged, never fatal ---
+
+// The gap file write is best-effort: an unwritable target dir warns
+// and moves on (the probe verdict must not depend on watchdog files).
+func TestWriteGapFileWriteFailureTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	p := &Prober{}
+	p.writeGapFile(filepath.Join(t.TempDir(), "absent"), // dir never created
+		backend{Name: "hub1", Addr: "10.0.0.1:6443"}, 5)
+	if !strings.Contains(buf.String(), "gap file write failed") {
+		t.Fatalf("write failure not logged:\n%s", buf.String())
+	}
+}
+
+// clearStale tolerates a remove failure (read-only state dir) —
+// state_exit must not crash the cycle, the latch simply survives.
+func TestClearStaleRemoveFailureTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	dir := t.TempDir()
+	b := backend{Name: "hub1", Addr: "10.0.0.1:6443"}
+	p := &Prober{}
+	p.latchStale(dir, b)
+	f := staleFilePath(dir, b.Addr)
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	p.clearStale(dir, b)
+	if !strings.Contains(buf.String(), "stale latch remove failed") {
+		t.Fatalf("remove failure not logged:\n%s", buf.String())
+	}
+	if _, err := os.Stat(f); err != nil {
+		t.Fatalf("latch removed despite read-only dir: %v", err)
+	}
+}
+
+// pruneWatchdogFiles: a missing state dir warns once and skips the
+// prune (the dir is created lazily by the first latch/gap write).
+func TestPruneWatchdogFilesScanFailureTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	p := &Prober{}
+	p.pruneWatchdogFiles(filepath.Join(t.TempDir(), "absent"),
+		[]backend{{Name: "hub1", Addr: "10.0.0.1:6443"}})
+	if !strings.Contains(buf.String(), "state dir scan failed") {
+		t.Fatalf("scan failure not logged:\n%s", buf.String())
+	}
+}
+
+// A matching file that cannot be removed (a retired backend's stale
+// latch now a non-empty directory) logs the fault and lets the rest
+// of the prune carry on.
+func TestPruneWatchdogFilesRemoveFailureTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	dir := t.TempDir()
+	kept := []backend{{Name: "hub1", Addr: "10.0.0.1:6443"}}
+	testutil.WriteFile(t, filepath.Join(dir, "apibe-gap-9-9-9-9"), "1\n")
+	wedged := staleFilePath(dir, "8.8.8.8:6443")
+	if err := os.Mkdir(wedged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(wedged, "child"), "x")
+
+	p := &Prober{}
+	p.pruneWatchdogFiles(dir, kept)
+
+	if !strings.Contains(buf.String(), "stale file prune failed") {
+		t.Fatalf("prune failure not logged:\n%s", buf.String())
+	}
+	if _, err := os.Stat(wedged); err != nil {
+		t.Fatalf("wedged latch removed after all: %v", err)
+	}
+	// The plain retired gap file still went, and the live backend's
+	// files survive.
+	if _, err := os.Stat(filepath.Join(dir, "apibe-gap-9-9-9-9")); !os.IsNotExist(err) {
+		t.Fatalf("retired gap file not pruned: %v", err)
+	}
+	if _, err := os.Stat(gapFilePath(dir, "10.0.0.1:6443")); err == nil {
+		t.Fatal("kept backend's (absent) gap file should not exist")
+	}
+}
+
+// The stale latch create is best-effort too — an unwritable target
+// dir warns and the cycle carries on (state_enter must not crash).
+func TestLatchStaleWriteFailureTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	p := &Prober{}
+	p.latchStale(filepath.Join(t.TempDir(), "absent"),
+		backend{Name: "hub1", Addr: "10.0.0.1:6443"})
+	if !strings.Contains(buf.String(), "stale latch write failed") {
+		t.Fatalf("latch write failure not logged:\n%s", buf.String())
+	}
+}
+
+// The apibe-* state family shares the best-effort contract: a write
+// into an absent dir and a remove that fails for a real reason (the
+// path is a non-empty directory) warn and move on.
+func TestStateFileWriteRemoveFailuresTolerated(t *testing.T) {
+	p := &Prober{}
+
+	buf := captureSlog(t)
+	p.writeStateFile(filepath.Join(t.TempDir(), "absent", "apibe-ok-hub1"), "3")
+	if !strings.Contains(buf.String(), "state file write failed") {
+		t.Fatalf("state write failure not logged:\n%s", buf.String())
+	}
+
+	buf = captureSlog(t)
+	wedged := filepath.Join(t.TempDir(), "apibe-ok-hub1")
+	if err := os.Mkdir(wedged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(wedged, "child"), "x")
+	p.removeStateFile(wedged)
+	if !strings.Contains(buf.String(), "state file remove failed") {
+		t.Fatalf("state remove failure not logged:\n%s", buf.String())
+	}
+}
+
+// loadState: the loaded/dir gates short-circuit (RAM authoritative,
+// watchdog disabled), and a folded load restores the prevcache
+// baseline (hasPrev) plus the drained marker alongside the counters.
+func TestLoadStateGatesAndPrevCacheRestore(t *testing.T) {
+	dir := t.TempDir()
+	key := "hub1"
+	testutil.WriteFile(t, filepath.Join(dir, "apibe-qfail-"+key), "3\n")
+	testutil.WriteFile(t, filepath.Join(dir, "apibe-prevcache-"+key), "777\n")
+	testutil.WriteFile(t, filepath.Join(dir, "apibe-drained-"+key), "1700000000\n")
+	p := &Prober{}
+
+	// Already-loaded state is never re-folded (RAM authoritative).
+	st := &backendState{loaded: true}
+	p.loadState(dir, key, st)
+	if st.qfail != 0 || !st.loaded {
+		t.Fatalf("re-load mutated a loaded state: %+v", st)
+	}
+
+	// Watchdog disabled ("" dir) is a pure no-op — not even the
+	// loaded flag flips (the callers' dir != "" gate does the work).
+	stDisabled := &backendState{}
+	p.loadState("", key, stDisabled)
+	if stDisabled.loaded || stDisabled.qfail != 0 {
+		t.Fatalf("empty-dir load wrong: %+v", stDisabled)
+	}
+
+	// Fresh load folds the whole family in.
+	stFull := &backendState{}
+	p.loadState(dir, key, stFull)
+	if stFull.qfail != 3 || !stFull.drained {
+		t.Fatalf("counters/drained not restored: %+v", stFull)
+	}
+	if !stFull.hasPrev || stFull.prevCache != 777 {
+		t.Fatalf("prevcache baseline not restored: %+v", stFull)
+	}
+}

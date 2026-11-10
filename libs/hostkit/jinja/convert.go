@@ -60,6 +60,21 @@ func jsonValueAt(v any, depth int, steps *int) (any, error) {
 			out[i] = cv
 		}
 		return out, nil
+	case map[string]any:
+		// Recurse: values may hold *OMap/*List/Undefined which
+		// json.Marshal cannot represent — same reason *OMap is
+		// unwrapped above.
+		m := make(map[string]any, len(t))
+		for k, vv := range t {
+			cv, err := jsonValueAt(vv, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = cv
+		}
+		return m, nil
+	case map[string]string:
+		return t, nil
 	case Undefined:
 		return nil, nil
 	default:
@@ -87,8 +102,10 @@ func fromJSON(v any) any {
 		}
 		return &List{out}
 	case float64:
-		if t == float64(int64(t)) {
-			return int64(t)
+		// floatToInt64, not int64(t): NaN/±Inf/out-of-range floats
+		// truncate into platform garbage (usually MinInt64).
+		if i, ok := floatToInt64(t); ok && t == float64(i) {
+			return i
 		}
 		return t
 	default:
@@ -145,6 +162,20 @@ func toPlainAt(v any, depth int, steps *int) (any, error) {
 			out[i] = pv
 		}
 		return out, nil
+	case map[string]any:
+		// Same recursion as jsonValueAt — nested *OMap/*List values
+		// must unwrap before yaml.Marshal sees them.
+		m := make(map[string]any, len(t))
+		for k, vv := range t {
+			pv, err := toPlainAt(vv, depth+1, steps)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = pv
+		}
+		return m, nil
+	case map[string]string:
+		return t, nil
 	case Undefined:
 		return nil, nil
 	default:

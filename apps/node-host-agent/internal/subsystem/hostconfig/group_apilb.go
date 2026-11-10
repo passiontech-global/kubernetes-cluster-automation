@@ -95,14 +95,16 @@ func (c *cyc) groupAPILB() {
 				c.err("T12: haproxy deb download",
 					"url", url, "deb", hostDeb, "error", err)
 			},
-			install: func(c *cyc, _ string) {
+			install: func(c *cyc, _ string) error {
 				// runLong: dep resolution on slow egress outlives the
 				// interactive budget.
-				if _, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-					"apt-get", "install", "-y", hostDeb); err != nil {
-					c.err("T12: haproxy deb install failed — continuing with installed version",
-						"deb", hostDeb, "error", err)
-				}
+				_, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+					"apt-get", "install", "-y", hostDeb)
+				return err
+			},
+			installErr: func(c *cyc, _ string, err error) {
+				c.err("T12: haproxy deb install failed — api-local-lb setup skipped",
+					"deb", hostDeb, "error", err)
 			},
 		}); !ok {
 			return

@@ -36,6 +36,14 @@ type partitionSweep struct {
 	flagged map[string]bool
 	total   int
 	action  map[string]bool
+	// taintedNode/breakerCharged carry the taint pass's outcome into
+	// the eviction pass: a node is evictable only once its
+	// NoSchedule fence actually landed (pods deleted off an
+	// unfenced node would just reschedule back onto it), and a
+	// node whose taint already spent a breaker grant must not pay
+	// a second one for the same sweep's evictions.
+	taintedNode    map[string]bool
+	breakerCharged map[string]bool
 }
 
 // census lists the nodes (informer cache when wired) and flags the
@@ -76,6 +84,18 @@ func (s *partitionSweep) confirmLive(ctx context.Context) {
 	for name := range s.flagged {
 		live, err := s.e.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// Node deleted between census and confirm — nothing
+				// left to evict or untaint. Drop it from `flagged`
+				// and move on without error accounting: it must not
+				// count toward the mesh-wide guard, and a vanished
+				// node is not an error. (Whatever taint the cache
+				// still shows is dead state; untaintRecovered's live
+				// Get skips the node the same way.)
+				delete(s.flagged, name)
+				s.log.Info("node gone since census — nothing to evict", "node", name)
+				continue
+			}
 			// Fail closed: no live confirmation, no eviction this
 			// sweep. The node stays in `flagged`, so an
 			// unconfirmable suspect still counts toward the
@@ -104,23 +124,53 @@ func (s *partitionSweep) confirmLive(ctx context.Context) {
 // before the early exits, exactly like bash. A node the cache
 // still showed flagged but the live Get disproved is recovered
 // too: confirmLive removed it from `flagged`, so this existing
-// path untaints it.
+// path untaints it. The cached spec is stale by the same
+// seconds-to-minutes lag confirmLive exists for, so the untaint
+// mirrors the confirmLive discipline: live Get first, and a node
+// that vanished, still reports any partition condition True live
+// (vouched or zombie — see livePartitionTrue), or fails to confirm
+// is left fenced this sweep. Untainting off stale cache could
+// un-fence a node that is in fact still blackholed, the mirror
+// image of evicting on a healed partition.
 func (s *partitionSweep) untaintRecovered(ctx context.Context) {
 	for i := range s.nodes {
 		n := &s.nodes[i]
-		if kube.HasTaint(n.Spec.Taints, partitionTaintKey) && !s.flagged[n.Name] {
-			if err := kube.UntaintNode(ctx, s.e.cs, n.Name, partitionTaintKey); err != nil {
-				metrics.IncError(s.e.queue)
-				s.log.Error(err, "untaint failed", "node", n.Name)
-				continue
-			}
-			s.log.Info("UNTAINT: network partition cleared", "node", n.Name)
-			// Recovery untainted — the episode converged: clear the
-			// node's breaker history so the next partition starts
-			// from zero instead of tripping a circuit half filled by
-			// the last one.
-			heal.RecordTargetHealthy(s.e.queue, n.Name)
+		if !kube.HasTaint(n.Spec.Taints, partitionTaintKey) || s.flagged[n.Name] {
+			continue
 		}
+		live, err := s.e.cs.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			// Node deleted since census — its taint died with it;
+			// nothing to lift.
+			continue
+		}
+		if err != nil {
+			// Fail closed: unconfirmable means the fence stays up
+			// this sweep — the next run retries.
+			metrics.IncError(s.e.queue)
+			s.log.Error(err, "live node get failed — untaint skipped this sweep", "node", n.Name)
+			continue
+		}
+		if livePartitionTrue(live) {
+			// The live API still reports a partition condition True —
+			// still partitioned, or a zombie/fresh latch nobody can
+			// vouch for. Either way the cache aged the flag out but
+			// the partition has not provably healed: keep the fence,
+			// skip this sweep.
+			s.log.Info("partition condition still True live — untaint skipped", "node", n.Name)
+			continue
+		}
+		if err := kube.UntaintNode(ctx, s.e.cs, n.Name, partitionTaintKey); err != nil {
+			metrics.IncError(s.e.queue)
+			s.log.Error(err, "untaint failed", "node", n.Name)
+			continue
+		}
+		s.log.Info("UNTAINT: network partition cleared", "node", n.Name)
+		// Recovery untainted — the episode converged: clear the
+		// node's breaker history so the next partition starts
+		// from zero instead of tripping a circuit half filled by
+		// the last one.
+		heal.RecordTargetHealthy(s.e.queue, n.Name)
 	}
 }
 
@@ -152,36 +202,47 @@ func (s *partitionSweep) sortedAction() []string {
 // on cap would leave later flagged nodes schedulable until the
 // next run while their pods sit on a blackholed node.
 func (s *partitionSweep) taintFlagged(ctx context.Context) {
+	s.taintedNode = map[string]bool{}
+	s.breakerCharged = map[string]bool{}
 	for _, name := range s.sortedAction() {
 		node := s.byName[name]
-		if !kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
-			// Per-target non-convergent circuit breaker — a node the
-			// controller already acted on limit times inside the
-			// window defers the re-taint. A FRESHLY flagged node has
-			// no history and always fences on the first sweep: the
-			// breaker never blocks first-line fencing, only the
-			// re-patch churn of a node that will not converge (each
-			// recovery untaint clears the history — see above).
-			// Defer semantics: log, skip this node, never an error.
-			if allowed, reason := heal.TryAcquireTarget(s.e.queue, name, s.now); !allowed {
-				s.log.Info("DEFER: heal target circuit open — taint skipped",
-					"node", name, "reason", reason)
-				continue
-			}
-			if err := kube.TaintNode(ctx, s.e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
-				metrics.IncError(s.e.queue)
-				s.log.Error(err, "taint failed", "node", name)
-			} else {
-				s.log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
-			}
+		if kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
+			// Already fenced — evictions may proceed without a new
+			// grant (the fence predates this sweep).
+			s.taintedNode[name] = true
+			continue
+		}
+		// Per-target non-convergent circuit breaker — a node the
+		// controller already acted on limit times inside the
+		// window defers the re-taint. A FRESHLY flagged node has
+		// no history and always fences on the first sweep: the
+		// breaker never blocks first-line fencing, only the
+		// re-patch churn of a node that will not converge (each
+		// recovery untaint clears the history — see above).
+		// Defer semantics: log, skip this node, never an error.
+		if allowed, reason := heal.TryAcquireTarget(s.e.queue, name, s.now); !allowed {
+			s.log.Info("DEFER: heal target circuit open — taint skipped",
+				"node", name, "reason", reason)
+			continue
+		}
+		s.breakerCharged[name] = true // grant consumed — evict rides it
+		if err := kube.TaintNode(ctx, s.e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
+			metrics.IncError(s.e.queue)
+			s.log.Error(err, "taint failed", "node", name)
+		} else {
+			s.taintedNode[name] = true
+			s.log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
 		}
 	}
 }
 
 // evictPods runs the pod-eviction pass: resolve the pinned-volume
-// set, pass the maintenance mutex + global heal budget, then delete
-// eligible pods off each live-confirmed node under partitionEvictCap.
-// Every tolerated sub-failure IncErrors the queue and continues —
+// set, pass the maintenance mutex + global heal budget, then evict
+// eligible pods off each live-confirmed node under partitionEvictCap
+// — through the policy/v1 Eviction API (heal.EvictPod), never a raw
+// Delete, so a covering PodDisruptionBudget holds: its 429 refusal
+// is a DEFERRAL (no error metering, no cap spend). Every other
+// tolerated sub-failure IncErrors the queue and continues —
 // the pass never returns an error.
 func (s *partitionSweep) evictPods(ctx context.Context) {
 	names := s.sortedAction()
@@ -230,6 +291,13 @@ func (s *partitionSweep) evictPods(ctx context.Context) {
 	evicted := 0
 loop:
 	for _, name := range names {
+		// Never evict off a node whose NoSchedule fence did not
+		// land this sweep — the taint API error or a closed breaker
+		// leaves the node schedulable, and deleted pods would be
+		// rescheduled straight back onto the blackholed host.
+		if !s.taintedNode[name] {
+			continue
+		}
 		pods, err := kube.ListAll(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
 			Limit:         kube.DefaultListPageSize,
@@ -240,9 +308,9 @@ loop:
 			continue
 		}
 		// Per-target breaker charge state for this node's pass —
-		// spent lazily on the first real victim below, so a sweep
-		// with nothing to evict never banks against the node.
-		charged := false
+		// inherited from the taint step: a node fenced AND evicted
+		// in the same sweep spends ONE grant, not two.
+		charged := s.breakerCharged[name]
 		for i := range pods {
 			p := &pods[i]
 			if evicted >= partitionEvictCap {
@@ -283,18 +351,39 @@ loop:
 			}
 			s.log.Info("EVICT: pod off partitioned node",
 				"pod", p.Namespace+"/"+p.Name, "node", name)
-			// UID precondition: the listed pod could be replaced by a
-			// same-named fresh pod before the delete lands — never
+			// policy/v1 Eviction, never a raw Delete: the apiserver
+			// enforces any covering PodDisruptionBudget and consumes
+			// a disruption slot atomically, where a raw Delete
+			// bypasses every PDB and could take a workload's last
+			// Ready replica. heal.EvictPod is the shared
+			// UID-preconditioned implementation; the heals ledger is
+			// nil — this module paces via partitionEvictCap, not a
+			// CooldownSet (nil skips the stamp, the documented
+			// DeletePod/EvictPod contract). The UID precondition
+			// stands: the listed pod could be replaced by a
+			// same-named fresh pod before the eviction lands — never
 			// kill the replacement. NotFound is already the goal
 			// state (another actor finished the eviction first) —
 			// tolerated, no error accounting.
-			if err := s.e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-				kube.UIDDeleteOptions(p.UID, "")); err != nil && !apierrors.IsNotFound(err) {
+			_, refused, err := heal.EvictPod(ctx, s.e.cs, nil, name, p, s.now)
+			switch {
+			case refused:
+				// HTTP 429 — a PDB with disruptionsAllowed==0 refused
+				// the eviction. A deferral, never an error: no
+				// IncError, and the attempt must NOT consume the cap
+				// — it made no progress, and spending the cap on
+				// refusals would starve the real victims queued
+				// behind them. The next sweep retries once
+				// disruptions free up.
+				s.log.Info("DEFER: PDB refused eviction — pod stays until disruptions free up",
+					"pod", p.Namespace+"/"+p.Name, "node", name)
+				continue
+			case err != nil && !apierrors.IsNotFound(err):
 				metrics.IncError(s.e.queue)
 				s.log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)
 			}
-			evicted++ // bash counts the attempt against the cap too
+			evicted++ // every attempt but a 429 refusal counts against the cap
 		}
 	}
 	s.log.Info("sweep done", "evicted", evicted, "flaggedNodes", len(s.flagged))

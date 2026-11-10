@@ -4,6 +4,8 @@
 package hostconfig
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -199,5 +201,56 @@ str_list_empty: []
 	}
 	if got := strListVar(c, "no_such_var"); got != nil {
 		t.Fatalf("strListVar(unset)=%v want nil", got)
+	}
+}
+
+// poisonVars appends a poisoned scalar to defaults.yaml and returns
+// the appended raw value.
+func poisonVars(t *testing.T, varsDir, line string) {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(varsDir, "defaults.yaml"),
+		os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWatchdogConfInjectionFailsClosed: a quote or newline in a
+// vars-derived value would inject arbitrary conf/shell directives
+// into /etc/node-watchdog.conf (the watchdog scripts source it
+// wholesale). The render must fail CLOSED — counted error, warn, and
+// NO conf write (the previous on-disk file keeps serving).
+func TestWatchdogConfInjectionFailsClosed(t *testing.T) {
+	for name, poisoned := range map[string]string{
+		"quote":    `interdc_slowpath_rtt_ms: '100"; rm -rf /'`,
+		"newline":  "interdc_slowpath_rtt_ms: |-\n  100\n  200",
+		"expand":   `interdc_slowpath_rtt_ms: '$(id)'`,
+		"backtick": "interdc_slowpath_rtt_ms: '`id`'",
+	} {
+		t.Run(name, func(t *testing.T) {
+			vars := writeVarsDir(t, "")
+			poisonVars(t, vars, poisoned)
+			sr := newScripted(nil, nil)
+			r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+				VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+				WatchdogScriptsDir: t.TempDir()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := loadCyc(t, r, vars, "node-b")
+			c.groupWatchdog()
+			if hostExists(r, "/etc/node-watchdog.conf") {
+				t.Fatalf("conf written despite refused %s value", name)
+			}
+			if c.errs == 0 {
+				t.Fatal("refused value not counted as a cycle error")
+			}
+		})
 	}
 }

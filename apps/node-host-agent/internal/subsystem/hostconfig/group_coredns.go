@@ -42,10 +42,44 @@ func (c *cyc) groupCoreDNS() {
 		afterUnit = "tinc@" + defStr(c.v("interdc_tinc_net"), "interdc") + ".service"
 	}
 	marker := t.Markers[t.MeshName]
+	// Every scalar interpolated into the Corefile (bind/forward),
+	// the unit's After= and the resolv.conf repoint passes cfgScalar
+	// — the same gate the kubelet/containerd renders use. A quote,
+	// newline or ':' would inject arbitrary Corefile directives (or
+	// resolv.conf lines). ONE refusal fails the whole group closed:
+	// nothing is written, the previous config keeps serving, the
+	// refusals are already counted per value.
+	cfgOK := true
+	cgate := func(what, v string) string {
+		if !c.cfgScalar("coredns: "+what, v) {
+			cfgOK = false
+			return ""
+		}
+		return v
+	}
+	zone = cgate("zone", zone)
+	upstream = cgate("interdc_stub_public_upstream", upstream)
+	pub1 = cgate("interdc_stub_public_upstream[0]", pub1)
+	// net is consumed only through afterUnit (rendered above, gated
+	// there) — gate it for the refusal accounting without re-binding
+	// the variable (an assignment nothing reads is a lint failure).
+	if !c.cfgScalar("coredns: interdc_nebula_net", net) {
+		cfgOK = false
+	}
+	afterUnit = cgate("overlay unit", afterUnit)
 
 	isHub := t.AmLighthouse
+	// marker is interpolated ONLY in the hub Corefile (bind line) —
+	// workers legitimately carry no marker and don't reference it.
+	if isHub {
+		marker = cgate("marker", marker)
+	}
 	if !isHub && len(t.DNSResolvers) == 0 {
 		return // T9 gates entirely on interdc_dns_resolvers | length > 0
+	}
+	if !cfgOK {
+		logger().Warn("coredns: render skipped — unsafe value refused, keeping previous config")
+		return
 	}
 
 	binChanged := c.corednsInstallBinary()
@@ -77,6 +111,10 @@ func (c *cyc) groupCoreDNS() {
 	} else {
 		desc = "CoreDNS local stub (" + zone + " + cache)"
 		resolvers := strings.Join(t.DNSResolvers, " ")
+		if !c.cfgScalar("coredns: interdc_dns_resolvers", resolvers) {
+			logger().Warn("coredns: render skipped — unsafe value refused, keeping previous config")
+			return
+		}
 		corefile = fmt.Sprintf(`# Managed by node-config-agent (T9) - local stub, domain-aware
 # routing: %s -> mesh resolvers; "." -> public
 # upstreams, then the mesh (rescue via tinc).

@@ -43,9 +43,19 @@ type olmHealthCheck struct {
 	//     olm-operator pod delete — the in-RAM half of the 1h
 	//     cooldown (the passiontech.dev/last-olm-operator-heal stamp
 	//     on the olm-operator Deployment is the durable half).
-	olmFirstSeen state.FirstSeenLedger
-	olmEmitted   state.GaugeLedger[string]
-	olmHealed    state.CooldownSet
+	//   - csvPatched: "ns/name" → last durable CSV spec patch — the
+	//     in-RAM half of the 30m patch cooldown (the
+	//     passiontech.dev/last-olm-csv-spec-patch stamp on the CSV is
+	//     the durable half).
+	//   - plansApproved: "ns/name" → last everest InstallPlan approve —
+	//     the in-RAM half of the 30m approve cooldown (the
+	//     passiontech.dev/last-installplan-approve stamp on the plan is
+	//     the durable half).
+	olmFirstSeen  state.FirstSeenLedger
+	olmEmitted    state.GaugeLedger[string]
+	olmHealed     state.CooldownSet
+	csvPatched    state.CooldownSet
+	plansApproved state.CooldownSet
 }
 
 // newOlmHealthCheck builds the olm-subscription-health check — the ledgers arm
@@ -148,6 +158,12 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	p.olmHealed.PruneExpired(now, olmHealCooldown)
+	// The W20 write-heal ledgers ride InstallPlan names that rotate
+	// with every operator upgrade — same ephemeral-key leak bound as
+	// olmHealed (the durable halves live on the objects' annotations).
+	p.csvPatched.PruneExpired(now, olmCSVPatchCooldown)
+	p.plansApproved.PruneExpired(now, olmInstallPlanApproveCooldown)
 
 	// The CSV and Subscription scans — a list-level infra failure
 	// (other than "OLM not installed") is a run-level Infra verdict.
@@ -165,7 +181,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	// CSV spec re-assertions (argocd-operator probes, NMO
 	// --leader-elect strip) and the everest InstallPlan approver.
 	// Tolerated sub-failures: each logs + IncErrors internally.
-	p.autoPatchOperatorCSVs(ctx, log)
+	p.autoPatchOperatorCSVs(ctx, log, now)
 	p.autoApproveStuckInstallPlans(ctx, log, now)
 
 	if len(healReasons) > 0 {

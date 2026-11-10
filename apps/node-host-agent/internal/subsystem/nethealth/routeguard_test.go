@@ -725,3 +725,233 @@ func TestRouteGuardNoScriptNeverOpensSocket(t *testing.T) {
 		t.Fatal("socket bound without nebula-up.sh")
 	}
 }
+
+// --- shared helpers ---
+
+// watchdogConf reads through the WatchdogSrc reloader when wired —
+// off-Cycle goroutines (route guard, MTU prober) must never touch
+// the Cycle-owned conf field.
+func TestWatchdogConfReadsReloader(t *testing.T) {
+	e := routeGuardFixture(t)
+	wdSrc := watchdogconf.NewReloader(filepath.Join(t.TempDir(), "wd.conf"),
+		&watchdogconf.Config{NebulaNet: "interdc", NebulaDev: "neb1"})
+	e.n.cfg.Watchdog = nil // the field must NOT be consulted
+	e.n.cfg.WatchdogSrc = wdSrc
+	got := e.n.watchdogConf()
+	if got == nil || got.NebulaNet != "interdc" || got.NebulaDev != "neb1" {
+		t.Fatalf("watchdogConf through reloader = %+v", got)
+	}
+}
+
+// sleepCtx sleeps the window or reports the cancel.
+func TestSleepCtx(t *testing.T) {
+	if !sleepCtx(context.Background(), time.Millisecond) {
+		t.Fatal("sleepCtx reported cancel on a live context")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepCtx(ctx, time.Hour) {
+		t.Fatal("sleepCtx slept through a cancelled context")
+	}
+}
+
+// trimRunErr clips captured output for the log line: hard clip at
+// 200 bytes, then trailing newline/space trim.
+func TestTrimRunErr(t *testing.T) {
+	long := strings.Repeat("x", 250) + "\n  \n"
+	got := trimRunErr(long)
+	if len(got) != 200 {
+		t.Fatalf("trimRunErr len=%d want 200", len(got))
+	}
+	if got := trimRunErr("ok\n\n \n"); got != "ok" {
+		t.Fatalf("trimRunErr=%q want ok", got)
+	}
+	if got := trimRunErr(""); got != "" {
+		t.Fatalf("trimRunErr=%q want empty", got)
+	}
+}
+
+// --- spawn gating ---
+
+// A terminal setns failure keeps the guard dead: spawnRouteGuard
+// returns before the CAS, no goroutine spawns, and the MTU prober
+// (which shares the spawn point) still arms.
+func TestSpawnRouteGuardSetnsDeadGate(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.n.cfg.TextfileDir = t.TempDir()
+	e.n.routeGuardSetnsDead.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.n.spawnRouteGuard(ctx)
+	if e.n.routeGuardRunning.Load() {
+		t.Fatal("guard spawned although setns is terminally dead")
+	}
+	// The prober DID arm — wait for its gauge write to land, then
+	// stop it so cleanup races nothing.
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.cycle >= 1
+	})
+	cancel()
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return !st.running
+	})
+}
+
+// The setns failure is a terminal environment property: the guard
+// exits with the setns_dead metric + log line, and later spawn
+// attempts keep refusing instead of churning OS threads.
+func TestRouteGuardSetnsDeadExits(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.n.cfg.TextfileDir = t.TempDir()
+	e.n.cfg.openRouteSocket = func() (int, error) {
+		return -1, routewatch.ErrSetns
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.n.routeGuard(ctx)
+	}()
+	waitForCond(t, 2*time.Second, func() bool {
+		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
+			checkRouteGuard, "setns_dead")) >= 1
+	})
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
+	if !strings.Contains(logLines(t, e), "setns into the host netns failed") {
+		t.Fatalf("missing setns-dead log:\n%s", logLines(t, e))
+	}
+	// Spawning after the latch must stay a no-op for the guard (the
+	// prober still arms; quiesce it before the test returns).
+	e.n.spawnRouteGuard(ctx)
+	if e.n.routeGuardRunning.Load() {
+		t.Fatal("guard respawned after a terminal setns failure")
+	}
+	cancel()
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return !st.running
+	})
+	wg.Wait()
+}
+
+// A bind that keeps failing loops with the retry backoff (the bash
+// `sleep 2` parity): at least one full retry proves the loop
+// continues instead of dying on the first error.
+func TestRouteGuardBindFailureLoopRetries(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.n.cfg.TextfileDir = t.TempDir()
+	e.n.cfg.routeMinRestore = time.Hour // one gated restore is enough
+	e.n.cfg.openRouteSocket = func() (int, error) {
+		return -1, errors.New("netlink denied")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.n.routeGuard(ctx)
+	}()
+	waitForCond(t, 6*time.Second, func() bool {
+		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
+			checkRouteGuard, "open_error")) >= 2
+	})
+	cancel()
+	wg.Wait()
+}
+
+// The default socket opener (openRouteSocket nil) composes
+// routewatch.Bind over HostRoot — whatever the environment answers
+// (direct bind, setns, or refusal), the guard must route through it
+// and unwind cleanly on cancel.
+func TestRouteGuardDefaultOpen(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.n.cfg.TextfileDir = t.TempDir()
+	e.n.cfg.openRouteSocket = nil // the production default
+	e.n.cfg.routeDebounce = 20 * time.Millisecond
+	e.n.cfg.routeMinRestore = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.n.routeGuard(ctx)
+	}()
+	// Any of the three environment outcomes must be observable —
+	// and none may hang or crash.
+	waitForCond(t, 3*time.Second, func() bool {
+		return restoredCount(e) >= 1 ||
+			promtest.ToFloat64(e.n.cycles.WithLabelValues(
+				checkRouteGuard, "setns_dead")) >= 1 ||
+			promtest.ToFloat64(e.n.cycles.WithLabelValues(
+				checkRouteGuard, "open_error")) >= 1
+	})
+	cancel()
+	wg.Wait()
+}
+
+// --- filter wiring edge cases ---
+
+// A zero-value NetHealth has no conf at all — the filter still arms
+// with the script's pub-table constant (a missing conf must not
+// blind the guard to pub-table deletes).
+func TestNebulaRouteFilterNilConf(t *testing.T) {
+	n := &NetHealth{}
+	f := n.nebulaRouteFilter()
+	if !f.tables[routeGuardTablePub] || !f.tables[routeGuardTableMark] || len(f.tables) != 2 {
+		t.Fatalf("tables=%v want {100,101}", f.tables)
+	}
+	if f.nebIf != 0 {
+		t.Fatalf("nebIf=%d want 0", f.nebIf)
+	}
+}
+
+// A conf whose OVERLAY_EGRESS_TABLE is unset (0 — an un-normalized
+// hand-built Config) falls back to the pub constant instead of
+// arming table 0.
+func TestNebulaRouteFilterZeroPubTable(t *testing.T) {
+	n := &NetHealth{}
+	n.cfg.Watchdog = &watchdogconf.Config{NebulaDev: "neb1"}
+	n.cfg.sysClassNet = t.TempDir()
+	f := n.nebulaRouteFilter()
+	if !f.tables[routeGuardTablePub] || f.tables[0] || len(f.tables) != 2 {
+		t.Fatalf("tables=%v want {100,101} without table 0", f.tables)
+	}
+}
+
+// --- restore gates ---
+
+// No systemd client → the restore fails closed: an unanswerable
+// manager must not resurrect a possibly-stopped unit.
+func TestRouteGuardRestoreNilSystemd(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.n.cfg.Systemd = nil
+	e.n.restoreRouteGuard(context.Background())
+	if execCount(e, "nebula-up.sh") != 0 {
+		t.Fatalf("restore ran without a systemd client: %v", e.host.Cmds())
+	}
+}
+
+// A deliberately stopped unit is not resurrected by its own delete
+// events — is-active "inactive" skips the exec.
+func TestRouteGuardRestoreInactiveUnit(t *testing.T) {
+	e := routeGuardFixture(t)
+	e.sd.On("is-active nebula@interdc", "inactive\n")
+	e.n.restoreRouteGuard(context.Background())
+	if execCount(e, "nebula-up.sh") != 0 {
+		t.Fatalf("restore resurrected a stopped unit: %v", e.host.Cmds())
+	}
+	if got := restoredCount(e); got != 0 {
+		t.Fatalf("restored=%v want 0", got)
+	}
+}

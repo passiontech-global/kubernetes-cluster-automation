@@ -40,15 +40,15 @@ type AtomicOpts struct {
 	// Stage opens the staging file the rename will promote to path.
 	// It must create the file in the dir it is handed (the target's
 	// parent — same filesystem is what makes the rename atomic).
-	// Two shapes are in use:
+	// The one shape in use:
 	//
 	//   - StageTempPattern: CreateTemp with a "*" pattern — a
 	//     private random staging name per concurrent writer (the
 	//     state files workerhygiene / controllerhygiene / nethealth /
-	//     hostmetrics all stamp, and promfile's glob-avoidance
-	//     ".<name>.*" shape).
-	//   - StageFixed: one fixed staging name (converge's
-	//     ".converge.tmp" — a documented name tests and ops sweep).
+	//     hostmetrics all stamp, promfile's glob-avoidance
+	//     ".<name>.*" shape, and converge's managed-file writes —
+	//     a fixed staging name would let a crash-restart's two
+	//     writers truncate each other's stage mid-write).
 	Stage func(dir string) (*os.File, error)
 	// Mode is forced onto the staging file before sync+rename —
 	// CreateTemp stages 0600 and an OpenFile create-mode is
@@ -80,16 +80,6 @@ type AtomicOpts struct {
 // (CreateTemp replaces it with a random suffix).
 func StageTempPattern(pattern string) func(string) (*os.File, error) {
 	return func(dir string) (*os.File, error) { return os.CreateTemp(dir, pattern) }
-}
-
-// StageFixed returns a Stage that opens one fixed staging name in
-// dir — for consumers whose staging path is a documented name
-// (swept by tests/ops), not a glob-avoidance concern.
-func StageFixed(name string) func(string) (*os.File, error) {
-	return func(dir string) (*os.File, error) {
-		return os.OpenFile(filepath.Join(dir, name),
-			os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	}
 }
 
 // WriteAtomic installs content at path via a same-dir staging file

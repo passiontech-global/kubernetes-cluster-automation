@@ -98,6 +98,12 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	// need it this sweep pays the API reads, every later caller
 	// within the Verdict TTL reuses the verdict.
 	podKey := kube.PodControllerKey(&pods[0])
+	// Free in-RAM cooldown first — the target pod is already
+	// confirmed (pods[0] above), so a stamped key defers without
+	// touching the persisted read, mutex verdict, or heal budget.
+	if p.opHealed.CooledDown(podKey, operatorHealCooldown, now) {
+		return
+	}
 	var leaseObj metav1.Object
 	if lease != nil {
 		leaseObj = lease

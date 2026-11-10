@@ -110,6 +110,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	p.warehouseRefreshHealed.PruneExpired(now, kargoWarehouseRefreshCool)
 
 	var promRep, whRep, arRep probefw.SweepReport
 

@@ -3,6 +3,7 @@ package maint
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -485,4 +486,258 @@ func TestMaintEpochGraceRunsNearBoundary(t *testing.T) {
 	if ls := fr2.LastStdin(); ls != "" {
 		t.Fatalf("heavy script ran inside the skip window:\n%s", ls)
 	}
+}
+
+// --- Cycle gate paths: creds, read-only stamp suppression ---
+
+// A missing/unreadable .env short-circuits the whole cycle with a
+// note — no psql session may run.
+func TestMaintCycleCredsMissing(t *testing.T) {
+	k, fr, dir := fixture(t, nil)
+	if err := os.WriteFile(filepath.Join(dir, ".env"),
+		[]byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := k.Cycle(context.Background())
+	if !containsNote(res.notes, "missing .env creds") {
+		t.Fatalf("notes=%v want missing-creds note", res.notes)
+	}
+	// Container discovery still runs, but no psql session may.
+	if fr.Ran("psql") {
+		t.Fatalf("cycle ran queries without creds:\n%s", fr.Joined())
+	}
+}
+
+// The check-kine-db contract: a read-only maint cycle runs the work
+// (diagnostics) but never stamps the heavy-block epoch — a CLI round
+// must not park the daemon's daily block for 24h.
+func TestMaintReadOnlySkipsEpochStamp(t *testing.T) {
+	k, _, dir := fixture(t, maintBloatRules)
+	k.d.Cfg.ReadOnly = true
+	res := k.Cycle(context.Background())
+	if !res.okReindex || res.repackState != "done" {
+		t.Fatalf("read-only cycle did not run: %+v", res)
+	}
+	if _, err := kdeps.ReadIntFile(epochPath(t, dir)); !os.IsNotExist(err) {
+		t.Fatalf("read-only cycle stamped the epoch (err=%v)", err)
+	}
+}
+
+// --- repack gate paths: headroom fallback vacuum, lock probe, lookup, extension ---
+
+// A failed VACUUM fallback after the headroom skip notes and keeps
+// okRepack semantics (skipped-headroom, not a repack failure).
+func TestMaintFallbackVacuumFail(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
+		{Substr: "pg_ls_waldir", Out: "50000000\n"},
+		{Substr: "df", Out: "Avail\n800000000\n"},
+		{Substr: "datfrozenxid", Out: "1000000\n"},
+	})
+	k.d.Cfg.Run = failOn(k.d.Cfg.Run, `VACUUM (ANALYZE) "kine"`)
+	res := k.Cycle(context.Background())
+	if res.repackState != "skipped-headroom" {
+		t.Fatalf("repackState=%s", res.repackState)
+	}
+	if !containsNote(res.notes, "fallback-vacuum-fail") {
+		t.Fatalf("notes=%v want fallback-vacuum-fail", res.notes)
+	}
+}
+
+// The advisory-lock probe failing is best-effort: note, then the
+// repack still runs this cycle.
+func TestMaintLockProbeFailContinues(t *testing.T) {
+	k, fr, _ := fixture(t, maintBloatRules)
+	fr.FailOn("ON_ERROR_STOP", errors.New("psql died"))
+	res := k.Cycle(context.Background())
+	if res.repackState != "done" || !res.okRepack {
+		t.Fatalf("res=%+v", res)
+	}
+	if !containsNote(res.notes, "repack-lock-probe-fail") {
+		t.Fatalf("notes=%v want repack-lock-probe-fail", res.notes)
+	}
+}
+
+// A busy compact-guard lock skips ONLY the repack — heavy script
+// untouched, repack state skipped-lock-busy, okRepack stays true.
+func TestMaintLockBusySkipsRepack(t *testing.T) {
+	k, fr, _ := fixture(t, maintBloatRules)
+	fr.On("ON_ERROR_STOP", kdeps.LockBusyMarker+"\n")
+	res := k.Cycle(context.Background())
+	if res.repackState != "skipped-lock-busy" || !res.okRepack {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	if strings.Contains(fr.Joined(), "--no-superuser-check") {
+		t.Fatalf("pg_repack ran while the guard lock was busy:\n%s", fr.Joined())
+	}
+	if !containsNote(res.notes, "compact-guard advisory lock busy") {
+		t.Fatalf("notes=%v", res.notes)
+	}
+}
+
+// A failed repackGlob lookup reads like a missing binary — noted,
+// no-binary state, okRepack stays true.
+func TestMaintRepackLookupFail(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
+		{Substr: "pg_ls_waldir", Out: "0\n"},
+		{Substr: "df", Out: "Avail\n107374182400\n"},
+		{Substr: "datfrozenxid", Out: "1000000\n"},
+	})
+	fr.FailOn("sh -c", errors.New("no such file"))
+	res := k.Cycle(context.Background())
+	if res.repackState != "no-binary" || !res.okRepack {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	if !containsNote(res.notes, "repack-lookup-fail") {
+		t.Fatalf("notes=%v want repack-lookup-fail", res.notes)
+	}
+}
+
+// The pg_repack extension creation failing aborts the repack phase
+// with repackState=fail and okRepack=false — the binary attempt
+// would fail identically and only double the error noise.
+func TestMaintRepackExtensionFail(t *testing.T) {
+	k, fr, _ := fixture(t, maintBloatRules)
+	fr.FailOn("CREATE EXTENSION", errors.New("permission denied"))
+	res := k.Cycle(context.Background())
+	if res.okRepack || res.repackState != "fail" {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	if !containsNote(res.notes, "repack-ext-fail") {
+		t.Fatalf("notes=%v want repack-ext-fail", res.notes)
+	}
+	if strings.Contains(fr.Joined(), "--no-superuser-check") {
+		t.Fatal("pg_repack ran without its extension")
+	}
+}
+
+// A garbage sizes row notes sizes-unparsed and keeps the gauges
+// unseen — no fabricated zeros, repack stays below-threshold.
+func TestMaintSizesUnparsed(t *testing.T) {
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "garbage\n"},
+		{Substr: "datfrozenxid", Out: "1000000\n"},
+	})
+	res := k.Cycle(context.Background())
+	if !containsNote(res.notes, "sizes-unparsed") {
+		t.Fatalf("notes=%v want sizes-unparsed", res.notes)
+	}
+	if res.heapBytes != 0 || res.statsOK {
+		t.Fatalf("res=%+v want unseen gauges", res)
+	}
+	content := kdepstest.ReadText(t, dir, "kine-db-maint.prom")
+	if strings.Contains(content, "kine_db_maint_relation_bytes") {
+		t.Fatalf("fabricated relation_bytes:\n%s", content)
+	}
+}
+
+// --- invalid-index reaper edge paths ---
+
+// An unsafe index name is skipped untouched; a failed DROP of a
+// _ccnew shell is noted and retried next round.
+func TestMaintInvalidIndexUnsafeNameAndDropFail(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "indisvalid", Out: "weird name; DROP TABLE\nkine_id_idx_ccnew\nkine_other_idx\n"},
+		{Substr: "DROP INDEX CONCURRENTLY", Err: errors.New("tuple locked")},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+		{Substr: "datfrozenxid", Out: "1000000\n"},
+	})
+	res := k.Cycle(context.Background())
+	if res.invalidDropped != 0 || res.invalidKept != 1 {
+		t.Fatalf("res=%+v", res)
+	}
+	if !containsNote(res.notes, `invalid-index "weird name; DROP TABLE" skipped (unsafe name)`) {
+		t.Fatalf("notes=%v want unsafe-name skip", res.notes)
+	}
+	if !containsNote(res.notes, "drop-index-kine_id_idx_ccnew-fail") {
+		t.Fatalf("notes=%v want drop failure note", res.notes)
+	}
+}
+
+// --- freeze.go failure paths (direct calls) ---
+
+// readXidAge: a failed or unparseable age read leaves xidSeen false
+// and returns no-freeze.
+func TestReadXidAgeFailurePaths(t *testing.T) {
+	ctx := context.Background()
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "datfrozenxid", Err: errors.New("connection reset")},
+	})
+	h := &Result{}
+	var notes []string
+	if k.readXidAge(ctx, "pg", "postgres", "secret", h,
+		func(s string) { notes = append(notes, s) }) {
+		t.Fatal("failed read must not trigger the freeze")
+	}
+	if h.xidSeen || len(notes) != 1 || !strings.Contains(notes[0], "xid-age-fail") {
+		t.Fatalf("h=%+v notes=%v", h, notes)
+	}
+}
+
+// repackHeadroom: every inconclusive shape must read ok=false (DON'T
+// repack) with its own note.
+func TestRepackHeadroomFailurePaths(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		rules []testutil.ExecRule
+		want  string
+	}{
+		{"wal query fail", []testutil.ExecRule{
+			{Substr: "pg_ls_waldir", Err: errors.New("down")},
+		}, "wal-size-fail"},
+		{"wal unparsed", []testutil.ExecRule{
+			{Substr: "pg_ls_waldir", Out: "abc\n"},
+		}, "wal-size-unparsed"},
+		{"df fail", []testutil.ExecRule{
+			{Substr: "pg_ls_waldir", Out: "0\n"},
+			{Substr: "--output=avail", Err: errors.New("down")},
+		}, "df-fail"},
+		{"df unparsed", []testutil.ExecRule{
+			{Substr: "pg_ls_waldir", Out: "0\n"},
+			{Substr: "--output=avail", Out: "Avail\nnot-a-number\n"},
+		}, "df-unparsed"},
+	}
+	for _, tc := range cases {
+		k, _, _ := fixture(t, tc.rules)
+		var notes []string
+		free, wal, ok := k.repackHeadroom(ctx, "pg", "postgres", "secret",
+			300000000, func(s string) { notes = append(notes, s) })
+		if ok || free != 0 || wal != 0 {
+			t.Fatalf("%s: free=%d wal=%d ok=%v want inconclusive", tc.name, free, wal, ok)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], tc.want) {
+			t.Fatalf("%s: notes=%v want %q", tc.name, notes, tc.want)
+		}
+	}
+}
+
+// failOn wraps a run seam so any command whose joined argv carries
+// substr fails — the direct-failure knob for paths fr.On cannot
+// target without collateral matches.
+func failOn(next kdeps.Runner, substr string) kdeps.Runner {
+	return func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), substr) {
+			return "", fmt.Errorf("forced failure: %s", substr)
+		}
+		return next(ctx, env, argv, stdin)
+	}
+}
+
+func containsNote(notes []string, substr string) bool {
+	for _, n := range notes {
+		if strings.Contains(n, substr) {
+			return true
+		}
+	}
+	return false
 }

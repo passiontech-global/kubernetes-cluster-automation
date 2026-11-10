@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -140,6 +141,7 @@ func TestPartitionEvictorEvictionCap(t *testing.T) {
 		objs = append(objs, pePod("flux-system", "p1", fmt.Sprintf("pod-%02d", i)))
 	}
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -169,6 +171,7 @@ func TestPartitionEvictorLeavesOtherNamespaces(t *testing.T) {
 	}
 	objs = append(objs, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -195,6 +198,7 @@ func TestPartitionEvictorMultipleFlaggedUnderHalf(t *testing.T) {
 	}
 	objs = append(objs, peHealthyNodes("h", 3)...) // 2/5 flagged < 50%
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -227,6 +231,7 @@ func TestPartitionEvictorTaintsAllFlaggedBeforeCap(t *testing.T) {
 	}
 	objs = append(objs, pePod("flux-system", "p2", "pod-p2"))
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -299,9 +304,12 @@ func TestPartitionEvictorMeshGuardIgnoresControlPlanes(t *testing.T) {
 	}
 }
 
-// The pod delete carries a UID precondition — a same-named pod
-// recreated after the list must never be killed in the victim's place.
-func TestPartitionEvictorDeleteCarriesUIDPrecondition(t *testing.T) {
+// The eviction carries a UID precondition in its DeleteOptions — a
+// same-named pod recreated after the list must never be killed in
+// the victim's place. It must also travel through the policy/v1
+// pods/eviction subresource, not a raw pod Delete: the apiserver
+// enforces PodDisruptionBudgets on the subresource only.
+func TestPartitionEvictorEvictsViaPolicyV1WithUIDPrecondition(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")
 	victim := pePod("flux-system", "p1", "victim")
 	victim.UID = "uid-victim-123"
@@ -310,12 +318,14 @@ func TestPartitionEvictorDeleteCarriesUIDPrecondition(t *testing.T) {
 		victim,
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+	var subresource string
 	var got *metav1.Preconditions
-	cs.PrependReactor("delete", "pods",
+	cs.PrependReactor("create", "pods",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
-			if da, ok := a.(ktesting.DeleteAction); ok {
-				opts := da.GetDeleteOptions()
-				got = opts.Preconditions
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				subresource = ca.GetSubresource()
+				got = ca.GetObject().(*policyv1.Eviction).DeleteOptions.Preconditions
 			}
 			return false, nil, nil
 		})
@@ -323,8 +333,14 @@ func TestPartitionEvictorDeleteCarriesUIDPrecondition(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if subresource != "eviction" {
+		t.Fatalf("eviction traveled as subresource %q, want pods/eviction", subresource)
+	}
 	if got == nil || got.UID == nil || *got.UID != victim.UID {
-		t.Fatalf("delete missing UID precondition, got %+v", got)
+		t.Fatalf("eviction missing UID precondition, got %+v", got)
+	}
+	if pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod still exists — eviction never landed")
 	}
 }
 
@@ -383,6 +399,7 @@ func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
 	}
 	objs = append(objs, peHealthyNodes("h", 3)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	// The fake ignores spec.nodeName field selectors — emulate them
 	// (helper shared with the cilium-taint-reaper tests) so a failure
 	// scoped to p1 cannot leak p2's pods into p1's list result.
@@ -418,49 +435,58 @@ func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
 	}
 }
 
-// A failed pod delete is tolerated (logged, counted) — the run must
-// not error and the taint is still applied.
-func TestPartitionEvictorPodDeleteErrorTolerated(t *testing.T) {
+// A failing eviction (non-429, non-NotFound API error) is tolerated
+// (logged, counted) — the run must not error, the pod stays and the
+// taint is still applied.
+func TestPartitionEvictorEvictionErrorTolerated(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := append([]runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 		pePod("flux-system", "p1", "undeletable"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
-	cs.PrependReactor("delete", "pods",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, errors.New("finalizer wedged")
+	peEmulateEviction(cs)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				return true, nil, errors.New("apiserver wedged")
+			}
+			return false, nil, nil
 		})
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
-		t.Fatalf("a pod delete failure must not error the run: %v", err)
+		t.Fatalf("an eviction failure must not error the run: %v", err)
 	}
 	if !pePodExists(t, cs, "flux-system", "undeletable") {
-		t.Fatal("pod deleted despite the failing delete call")
+		t.Fatal("pod evicted despite the failing eviction call")
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("flagged node not tainted")
 	}
 }
 
-// A NotFound pod delete is already the goal state (another actor
+// A NotFound eviction is already the goal state (another actor
 // finished the eviction first) — tolerated without error accounting,
 // the run continues and the taint still lands.
-func TestPartitionEvictorNotFoundDeleteTolerated(t *testing.T) {
+func TestPartitionEvictorNotFoundEvictionTolerated(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := append([]runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 		pePod("flux-system", "p1", "already-gone"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
-	cs.PrependReactor("delete", "pods",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, apierrors.NewNotFound(
-				corev1.Resource("pods"), "already-gone")
+	peEmulateEviction(cs)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				return true, nil, apierrors.NewNotFound(
+					corev1.Resource("pods"), "already-gone")
+			}
+			return false, nil, nil
 		})
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
-		t.Fatalf("a NotFound pod delete must not error the run: %v", err)
+		t.Fatalf("a NotFound eviction must not error the run: %v", err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("flagged node not tainted")
@@ -488,9 +514,10 @@ func TestPartitionEvictorUntaintErrorTolerated(t *testing.T) {
 }
 
 // A failed partition taint is logged ("taint failed") and the node
-// still gets its pod sweep — the pod list afterwards must not be
-// skipped by the taint error.
-func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
+// is excluded from the pod sweep — without the NoSchedule fence
+// landed, evicted pods would reschedule straight back onto the
+// blackholed host.
+func TestPartitionEvictorTaintErrorSkipsPodEviction(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := append(
 		[]runtime.Object{
@@ -510,8 +537,8 @@ func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
 	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("taint applied despite the rejected patch")
 	}
-	if pePodExists(t, cs, "flux-system", "src-ctrl") {
-		t.Fatal("pod on partitioned node not evicted after the taint failure")
+	if !pePodExists(t, cs, "flux-system", "src-ctrl") {
+		t.Fatal("pod evicted off an unfenced node — no taint, no eviction")
 	}
 }
 
@@ -575,6 +602,7 @@ func TestPartitionEvictorAnnotatedPodInUnlistedNamespace(t *testing.T) {
 		pePod("flux-system", "p1", "listed-victim"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -651,6 +679,7 @@ func TestPartitionEvictorCapCoversAnnotatedPods(t *testing.T) {
 		objs = append(objs, p)
 	}
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -681,6 +710,7 @@ func TestPartitionEvictorEnvAllowListReplacesDefault(t *testing.T) {
 		pePod("default", "p1", "still-unlisted"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -711,6 +741,7 @@ func TestPartitionEvictorLeavesPodsOnHealthyNodes(t *testing.T) {
 		optedIn,
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -775,6 +806,7 @@ func TestPartitionEvictorSkipsNodePinnedPVC(t *testing.T) {
 	}
 	objs = append(objs, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -843,6 +875,7 @@ func TestPartitionEvictorSkipsEphemeralAndHostPathPods(t *testing.T) {
 		pePod("flux-system", "p1", "movable"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -892,6 +925,7 @@ func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 		pePod("flux-system", "p1", "victim"),
 	}, peHealthyNodes("h", 2)...)
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -927,6 +961,7 @@ func TestPartitionEvictorZombieHeartbeatNotFlagged(t *testing.T) {
 		pePod("flux-system", "p2", "nwpd-victim"),
 	}, peHealthyNodes("h", 4)...) // 2/6 flagged < 50%
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
@@ -1045,7 +1080,8 @@ func TestPartitionEvictorLiveGetFailClosedSkipsNode(t *testing.T) {
 		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
 			t.Fatal("node patched (taint/untaint) without live confirmation")
 		}
-		if a.GetResource().Resource == "pods" && a.GetVerb() == "delete" {
+		if ca, ok := a.(ktesting.CreateAction); ok &&
+			a.GetResource().Resource == "pods" && ca.GetSubresource() == "eviction" {
 			t.Fatal("pod evicted without live confirmation of the partition")
 		}
 	}
@@ -1108,5 +1144,253 @@ func TestPartitionEvictorRecoveryUntaintUnderOpenCircuit(t *testing.T) {
 	if ok, _ := heal.TryAcquireTarget("partition-pod-evictor", "p1",
 		now.Add(time.Minute)); !ok {
 		t.Fatal("recovery untaint did not clear the node's breaker history")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// evictNamespaces — the Setup-stamped allow-list and its lazy fallback.
+// ---------------------------------------------------------------------------
+
+// A literally-built fixture with a nil namespaces field resolves the
+// env allow-list lazily instead of silently evicting nothing; a
+// stamped field is passed through untouched (env ignored).
+func TestPartitionEvictorEvictNamespacesLazyFallbackAndPassThrough(t *testing.T) {
+	t.Setenv(partitionNSsEnv, " apps ,monitoring ")
+
+	// Stamped field wins — env drift must not redefine Setup's list.
+	stamped := &partitionEvictor{namespaces: map[string]struct{}{"stamped": {}}}
+	got := stamped.evictNamespaces()
+	if len(got) != 1 || !nsSetHas(got, "stamped") {
+		t.Fatalf("stamped allow-list not passed through: got %v", got)
+	}
+
+	// Nil field falls back to the env parse.
+	lazy := &partitionEvictor{}
+	got = lazy.evictNamespaces()
+	if !nsSetHas(got, "apps") || !nsSetHas(got, "monitoring") {
+		t.Fatalf("nil-field fallback ignored PARTITION_EVICT_NAMESPACES: got %v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("env parse produced phantom namespaces: %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// nodePinnedPVCs failure — the eviction pass fails closed.
+// ---------------------------------------------------------------------------
+
+// A PVC list failure skips the whole eviction pass — but the taints
+// above still fence the flagged nodes and the sweep returns nil (the
+// bash best-effort contract, no error to the periodic).
+func TestPartitionEvictorPVCListErrorSkipsEvictionKeepsTaint(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePod("flux-system", "p1", "victim"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("list", "persistentvolumeclaims",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	e := &partitionEvictor{cs: cs, queue: "partition-pod-evictor"}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("PVC list failure must not error the sweep: %v", err)
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted despite the PVC list failing — pass must fail closed")
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("flagged node not tainted — fencing must survive the eviction skip")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// policy/v1 eviction — PDB refusal semantics (deferral, no cap, no error).
+// ---------------------------------------------------------------------------
+
+// A PDB with disruptionsAllowed==0 refuses the eviction (HTTP 429) —
+// a deferral, never a failure: every pod on the flagged node is still
+// ATTEMPTED (a refusal must not consume the per-sweep cap — an
+// attempt that made no progress must not starve the victims behind
+// it), no pod is deleted, nothing is metered (no IncError), and the
+// run stays nil.
+func TestPartitionEvictorPDBRefusalDefersWithoutCapOrError(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := []runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+	}
+	objs = append(objs, peHealthyNodes("h", 2)...)
+	for i := range partitionEvictCap + 1 {
+		objs = append(objs, pePod("flux-system", "p1", fmt.Sprintf("pod-%02d", i)))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+	attempts := 0
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				attempts++
+				return true, nil, apierrors.NewTooManyRequests(
+					"Too many disruptions", 0)
+			}
+			return false, nil, nil
+		})
+	before := testutil.QueueErrorCount(t, "partition-pod-evictor")
+	e := &partitionEvictor{cs: cs, queue: "partition-pod-evictor"}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("PDB refusals must not error the run: %v", err)
+	}
+	if attempts != partitionEvictCap+1 {
+		t.Fatalf("eviction attempts = %d, want all %d — a refusal consumed the cap",
+			attempts, partitionEvictCap+1)
+	}
+	for i := range partitionEvictCap + 1 {
+		if !pePodExists(t, cs, "flux-system", fmt.Sprintf("pod-%02d", i)) {
+			t.Fatalf("pod-%02d was deleted despite the 429 refusal", i)
+		}
+	}
+	if got := testutil.QueueErrorCount(t, "partition-pod-evictor") - before; got != 0 {
+		t.Fatalf("PDB refusal metered %v errors — a deferral counts no error", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// confirmLive / untaintRecovered — the live-confirmation disciplines.
+// ---------------------------------------------------------------------------
+
+// A node deleted between census and confirm drops out of `flagged`
+// and is left alone: no taint patch, no eviction, no error metering —
+// a vanished node has nothing to evict or untaint and must not
+// inflate the mesh-wide guard either.
+func TestPartitionEvictorConfirmGetNotFoundDropsFlagged(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	stale := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute)
+	objs := append([]runtime.Object{pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+	// The live Get of p1 404s; everything else answers normally.
+	cs.PrependReactor("get", "nodes",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ga, ok := a.(ktesting.GetAction); ok && ga.GetName() == "p1" {
+				return true, nil, apierrors.NewNotFound(
+					corev1.Resource("nodes"), "p1")
+			}
+			return false, nil, nil
+		})
+	before := testutil.QueueErrorCount(t, "partition-pod-evictor")
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: append([]runtime.Object{stale}, peHealthyNodes("h", 2)...)},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("a node gone since census must not error the sweep: %v", err)
+	}
+	if got := testutil.QueueErrorCount(t, "partition-pod-evictor") - before; got != 0 {
+		t.Fatalf("a node gone since census metered %v errors", got)
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted off a node deleted since the census")
+	}
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
+			t.Fatal("node gone since census still patched (taint/untaint)")
+		}
+		if ca, ok := a.(ktesting.CreateAction); ok &&
+			a.GetResource().Resource == "pods" && ca.GetSubresource() == "eviction" {
+			t.Fatal("eviction attempted against a node gone since census")
+		}
+	}
+}
+
+// The recovery untaint is live-confirmed: a node the cache aged out
+// of `flagged` but whose LIVE API still reports the partition
+// condition True keeps its fence this sweep.
+func TestPartitionEvictorUntaintSkippedWhenStillPartitionedLive(t *testing.T) {
+	partitionTaint := corev1.Taint{
+		Key: partitionTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule,
+	}
+	// Cache says healed (condition cleared) but the live API still
+	// reports HostNetworkProblems True — a stale-cache flip must not
+	// un-fence a live partition.
+	stale := testutil.Node("p1", corev1.ConditionTrue, nil, partitionTaint)
+	live := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint)
+	cs := fake.NewSimpleClientset(live)
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: []runtime.Object{stale}},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("untaint landed although the live node still reports the partition")
+	}
+}
+
+// A zombie agent latch (True condition, frozen heartbeat) blocks the
+// untaint too: the wedged reporter cannot vouch for the healing
+// either way, so the fence stays up this sweep — the mirror image of
+// not evicting on a zombie partition.
+func TestPartitionEvictorUntaintSkippedOnZombieLatch(t *testing.T) {
+	partitionTaint := corev1.Taint{
+		Key: partitionTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule,
+	}
+	zombie := pePartitionedNode("p1", "NebulaIsolated", 20*time.Minute, partitionTaint)
+	for i := range zombie.Status.Conditions {
+		if zombie.Status.Conditions[i].Type == "NebulaIsolated" {
+			zombie.Status.Conditions[i].LastHeartbeatTime =
+				metav1.NewTime(time.Now().Add(-2 * partitionCondHeartbeatMaxAge))
+		}
+	}
+	// Cache snapshot predates the latch: it shows the node untainted
+	// and healthy, so the untaint path is reached.
+	stale := testutil.Node("p1", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(zombie)
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: []runtime.Object{stale}},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("untaint landed on a zombie partition latch nobody can vouch for")
+	}
+}
+
+// A node deleted since the census skips the untaint quietly: the live
+// Get 404s, no patch is attempted, no error is metered — the taint
+// died with the node.
+func TestPartitionEvictorUntaintSkippedForGoneNode(t *testing.T) {
+	partitionTaint := corev1.Taint{
+		Key: partitionTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule,
+	}
+	stale := testutil.Node("p1", corev1.ConditionTrue, nil, partitionTaint)
+	cs := fake.NewSimpleClientset() // live API has no p1 at all
+	cs.PrependReactor("get", "nodes",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ga, ok := a.(ktesting.GetAction); ok && ga.GetName() == "p1" {
+				return true, nil, apierrors.NewNotFound(
+					corev1.Resource("nodes"), "p1")
+			}
+			return false, nil, nil
+		})
+	before := testutil.QueueErrorCount(t, "partition-pod-evictor")
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: []runtime.Object{stale}},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("a gone node must not error the sweep: %v", err)
+	}
+	if got := testutil.QueueErrorCount(t, "partition-pod-evictor") - before; got != 0 {
+		t.Fatalf("a gone node metered %v errors", got)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
+			t.Fatal("untaint attempted against a node gone since census")
+		}
 	}
 }

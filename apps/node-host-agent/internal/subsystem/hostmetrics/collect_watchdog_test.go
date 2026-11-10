@@ -219,3 +219,66 @@ func TestWatchdogLegacyAlias(t *testing.T) {
 		t.Fatalf("node_watchdog_state{fail2ban-down}=%v ok=%v want 0 after clear", v, ok)
 	}
 }
+
+// TestWatchdogUnreadableDirServesPrevious: a ReadDir failure that is
+// NOT NotExist (the dir path placed under a regular file → ENOTDIR)
+// must neither stamp latches cleared nor emit false 0s — the previous
+// values are served unchanged and the bookkeeping is untouched (no
+// manufactured TTL eviction).
+func TestWatchdogUnreadableDirServesPrevious(t *testing.T) {
+	cfg, dirs := fixture(t)
+	now := time.Now()
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	blocker := filepath.Join(filepath.Dir(dirs["state"]), "not-a-dir")
+	testutil.WriteFile(t, blocker, "x\n")
+
+	live := filepath.Join(dirs["state"], "state-live")
+	testutil.WriteFile(t, live, "1730000000\n")
+	c := New(cfg)
+	liveLabels := map[string]string{"node": "node-a", "state": "live"}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", liveLabels); !ok || v != 1 {
+		t.Fatalf("live latch=%v ok=%v want 1", v, ok)
+	}
+	// Clear it: the book stamps the first cleared scrape.
+	if err := os.Remove(live); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", liveLabels); !ok || v != 0 {
+		t.Fatalf("cleared latch=%v ok=%v want 0", v, ok)
+	}
+	// A fresh live latch alongside the cleared one.
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-fresh"), "1730000001\n")
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "fresh"}); !ok || v != 1 {
+		t.Fatalf("fresh latch=%v ok=%v want 1", v, ok)
+	}
+	before := make(map[string]time.Time, len(c.seen.m))
+	for k, ts := range c.seen.m {
+		before[k] = ts
+	}
+
+	// ENOTDIR scrape: `fresh` keeps its 1, the cleared `live` keeps
+	// its emit-0, and no bookkeeping entry is touched.
+	c.cfg.WatchdogStateDir = filepath.Join(blocker, "state")
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", liveLabels); !ok || v != 0 {
+		t.Fatalf("unreadable dir: cleared latch=%v ok=%v want previous 0", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "fresh"}); !ok || v != 1 {
+		t.Fatalf("unreadable dir: fresh latch=%v ok=%v want previous 1", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_watchdog_state",
+		map[string]string{"signal": "fresh"}); !ok || v != 1 {
+		t.Fatalf("unreadable dir: legacy alias=%v ok=%v want previous 1", v, ok)
+	}
+	if len(c.seen.m) != len(before) {
+		t.Fatalf("seen book grew/shrank during the unreadable scrape: %d → %d",
+			len(before), len(c.seen.m))
+	}
+	for k, ts := range before {
+		if got, ok := c.seen.m[k]; !ok || !got.Equal(ts) {
+			t.Fatalf("seen[%q] mutated by the unreadable scrape: %v → %v,%v",
+				k, ts, got, ok)
+		}
+	}
+}

@@ -18,6 +18,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -904,5 +905,301 @@ func TestVACleanerDeleteConflictNotMetered(t *testing.T) {
 	}
 	if !vaExists(t, cs, "va-raced") {
 		t.Fatal("VA vanished despite the rejected delete")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// uniqueVolumeName / volumeOnNode — kubelet ledger shapes
+// ---------------------------------------------------------------------------
+
+// uniqueVolumeName resolves CSI and Local PVs to the kubelet unique
+// volume name; any other PV shape (HostPath, NFS, ...) is
+// unresolvable — the caller must fail closed, not guess.
+func TestUniqueVolumeNameShapes(t *testing.T) {
+	csi := vacPV("pv-csi", "csi.test", "vol-1")
+	local := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-local"},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				Local: &corev1.LocalVolumeSource{Path: "/mnt/disks/x"}}}}
+	hostPath := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-host"},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: "/data"}}}}
+	nfs := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-nfs"},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				NFS: &corev1.NFSVolumeSource{Server: "srv", Path: "/exp"}}}}
+
+	tt := []struct {
+		name   string
+		pv     *corev1.PersistentVolume
+		want   string
+		wantOK bool
+	}{
+		{"csi", csi, "kubernetes.io/csi/csi.test^vol-1", true},
+		{"local", local, "kubernetes.io/local-volume/pv-local", true},
+		{"hostpath", hostPath, "", false},
+		{"nfs", nfs, "", false},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := uniqueVolumeName(tc.pv)
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("uniqueVolumeName = (%q, %v), want (%q, %v)",
+					got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// A Local PV resolves to "kubernetes.io/local-volume/<pv.Name>" and
+// is matched against the node's VolumesInUse/Attached ledger — present
+// blocks the strip; absent proves it unused. An unresolvable shape
+// (HostPath) is never verifiable: the gate must fail closed.
+func TestVolumeOnNodeResolvesLocalPV(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pv-local"},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					Local: &corev1.LocalVolumeSource{Path: "/mnt/disks/x"}}}},
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pv-host"},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/data"}}}},
+	)
+	c := newVACleaner(cs, time.Now)
+	log := logf.FromContext(ctx)
+	node := vacNode("w1", corev1.ConditionTrue)
+	node.Status.VolumesInUse = []corev1.UniqueVolumeName{
+		"kubernetes.io/local-volume/pv-local"}
+	cache := map[string]pvProbe{}
+
+	inUse, verifiable := c.volumeOnNode(ctx, cache, node, "pv-local", log)
+	if !inUse || !verifiable {
+		t.Fatalf("local PV in VolumesInUse = (%v, %v), want (true, true)", inUse, verifiable)
+	}
+	node.Status.VolumesInUse = nil
+	cache = map[string]pvProbe{} // fresh cycle cache
+	inUse, verifiable = c.volumeOnNode(ctx, cache, node, "pv-local", log)
+	if inUse || !verifiable {
+		t.Fatalf("local PV absent from ledger = (%v, %v), want (false, true)", inUse, verifiable)
+	}
+	cache = map[string]pvProbe{}
+	inUse, verifiable = c.volumeOnNode(ctx, cache, node, "pv-host", log)
+	if inUse || verifiable {
+		t.Fatalf("hostpath PV = (%v, %v), want (false, false) — fail closed", inUse, verifiable)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pvcBoundVolume — fail-closed memoized claim lookup
+// ---------------------------------------------------------------------------
+
+// A PVC bound to a different PV resolves to that PV name; a NotFound
+// claim reads as "" with no error; a non-NotFound Get failure fails
+// closed, is metered exactly ONCE (the memoized probe carries the
+// reported flag), and keeps returning the error on re-reads.
+func TestPVCBoundVolumeVerdicts(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		vacNode("alive", corev1.ConditionTrue),
+		vacClaim("data", "claim-bound", "pv-other"))
+	c := newVACleaner(cs, func() time.Time { return now })
+	log := logf.FromContext(ctx)
+
+	vol, err := c.pvcBoundVolume(ctx, map[string]pvcProbe{}, "data", "claim-bound", log)
+	if err != nil || vol != "pv-other" {
+		t.Fatalf("bound claim = (%q, %v), want (pv-other, nil)", vol, err)
+	}
+	vol, err = c.pvcBoundVolume(ctx, map[string]pvcProbe{}, "data", "claim-gone", log)
+	if err != nil || vol != "" {
+		t.Fatalf("missing claim = (%q, %v), want (\"\", nil)", vol, err)
+	}
+
+	cs.PrependReactor("get", "persistentvolumeclaims",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.(ktesting.GetAction).GetName() == "claim-broken" {
+				return true, nil, errors.New("api down")
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	cache := map[string]pvcProbe{}
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
+	vol, err = c.pvcBoundVolume(ctx, cache, "data", "claim-broken", log)
+	if err == nil || vol != "" {
+		t.Fatalf("broken claim = (%q, %v), want (\"\", error)", vol, err)
+	}
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
+		t.Fatalf("pvc lookup failure not metered exactly once: delta = %v, want 1", got)
+	}
+	// Memoized: the second read returns the cached error without a
+	// second metering.
+	if _, err = c.pvcBoundVolume(ctx, cache, "data", "claim-broken", log); err == nil {
+		t.Fatal("memoized error lost on re-read")
+	}
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
+		t.Fatalf("memoized pvc error re-metered: delta = %v, want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// confirmLiveNode — the three-way destructive verdict
+// ---------------------------------------------------------------------------
+
+// NotFound stands (gone=true), a live node wins (gone=false with the
+// node handed back), and a failed confirm reports the error with
+// gone=false so callers keep the VA fail-closed.
+func TestConfirmLiveNodeVerdicts(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(vacNode("present", corev1.ConditionTrue))
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	node, gone, err := c.confirmLiveNode(ctx, "present")
+	if err != nil || gone || node == nil || node.Name != "present" {
+		t.Fatalf("live node = (%v, %v, %v), want (node, false, nil)", node, gone, err)
+	}
+	node, gone, err = c.confirmLiveNode(ctx, "absent")
+	if err != nil || !gone || node != nil {
+		t.Fatalf("absent node = (%v, %v, %v), want (nil, true, nil)", node, gone, err)
+	}
+	cs.PrependReactor("get", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	node, gone, err = c.confirmLiveNode(ctx, "present")
+	if err == nil || gone || node != nil {
+		t.Fatalf("failed confirm = (%v, %v, %v), want (nil, false, error)", node, gone, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stripFinalizers — patch verdict metering
+// ---------------------------------------------------------------------------
+
+// A successful strip clears the finalizers and increments
+// VolumeAttachmentFinalizersRemovedTotal for the VA's node.
+func TestStripFinalizersSuccess(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-strip", "n-strip", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	cs := fake.NewSimpleClientset(va)
+	c := newVACleaner(cs, func() time.Time { return now })
+	testutil.CleanupMetric(t, metrics.VolumeAttachmentFinalizersRemovedTotal, "n-strip")
+
+	before := promtest.ToFloat64(
+		metrics.VolumeAttachmentFinalizersRemovedTotal.WithLabelValues("n-strip"))
+	if err := c.stripFinalizers(ctx, va); err != nil {
+		t.Fatalf("stripFinalizers: %v", err)
+	}
+	if got := promtest.ToFloat64(
+		metrics.VolumeAttachmentFinalizersRemovedTotal.WithLabelValues("n-strip")) - before; got != 1 {
+		t.Fatalf("finalizer-removed counter delta = %v, want 1", got)
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-strip", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) != 0 {
+		t.Fatalf("finalizers not cleared by the patch: %v", got.Finalizers)
+	}
+}
+
+// A failed patch is metered (IncError) and reported — the finalizers
+// must survive for the next sweep's retry.
+func TestStripFinalizersPatchError(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-strip", "n-strip", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	cs := fake.NewSimpleClientset(va)
+	c := newVACleaner(cs, func() time.Time { return now })
+	cs.PrependReactor("patch", "volumeattachments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
+	if err := c.stripFinalizers(ctx, va); err == nil {
+		t.Fatal("expected the patch failure to be reported")
+	}
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
+		t.Fatalf("patch failure not metered: error delta = %v, want 1", got)
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-strip", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizers lost despite the failed patch")
+	}
+}
+
+// The strip counter's series is bounded by the node census:
+// stripFinalizers records the tuple it Inc'd, each sweep's
+// carry-forward re-arms the tuples whose node this census still
+// lists, and the end-of-sweep Prune retires the series once the node
+// is gone — node-pool rotation must not grow the vec for the process
+// lifetime (the deadnodesweeper's fencedWithoutSNREmitted shape).
+func TestRunPrunesRemovedFinalizerSeriesWhenNodeGone(t *testing.T) {
+	now := time.Now()
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	mkStrip := func(name, node string) *storagev1.VolumeAttachment {
+		va := vacAttachment(name, node, now.Add(-time.Hour))
+		va.DeletionTimestamp = &termAt
+		va.Finalizers = []string{"external-attacher/csi-test"}
+		return va
+	}
+	va := mkStrip("va-strip", "n-gone")
+	cs := fake.NewSimpleClientset(vacNode("alive", corev1.ConditionTrue), va)
+	c := newVACleaner(cs, func() time.Time { return now })
+	testutil.CleanupMetric(t, metrics.VolumeAttachmentFinalizersRemovedTotal, "n-gone")
+	testutil.CleanupMetric(t, metrics.VolumeAttachmentFinalizersRemovedTotal, "alive")
+
+	// A strip already counted for a node the NEXT census may not list
+	// ("alive" stays listed; this is the pre-seeded live series the
+	// carry-forward must keep).
+	c.finalizersRemovedEmitted.Emit("alive", "alive")
+	metrics.VolumeAttachmentFinalizersRemovedTotal.WithLabelValues("alive").Inc()
+	c.finalizersRemovedEmitted.Prune(func(...string) bool { return false })
+
+	// Sweep 1: the stuck-Terminating VA on the gone node is stripped
+	// (nodeByName misses → confirmLiveNode NotFound → strip) and its
+	// tuple recorded; "alive" is carried forward.
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := promtest.ToFloat64(
+		metrics.VolumeAttachmentFinalizersRemovedTotal.WithLabelValues("n-gone")); got != 1 {
+		t.Fatalf("strip counter delta = %v, want 1", got)
+	}
+	if _, ok := c.finalizersRemovedEmitted.Last()["alive"]; !ok {
+		t.Fatal("carry-forward dropped the tuple of a node the census still lists")
+	}
+
+	// Sweep 2: the VA is gone and "n-gone" is still absent from the
+	// census — its series must be retired, "alive"'s kept.
+	if err := cs.StorageV1().VolumeAttachments().Delete(ctx, "va-strip",
+		metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.VolumeAttachmentFinalizersRemovedTotal.DeleteLabelValues("n-gone") {
+		t.Fatal("series of a census-gone node survived the end-of-sweep prune")
+	}
+	if _, ok := c.finalizersRemovedEmitted.Last()["alive"]; !ok {
+		t.Fatal("prune dropped the tuple of a node the census still lists")
+	}
+	if _, ok := c.finalizersRemovedEmitted.Last()["n-gone"]; ok {
+		t.Fatal("ledger kept the tuple of a census-gone node")
 	}
 }

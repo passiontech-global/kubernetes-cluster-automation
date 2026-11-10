@@ -278,6 +278,44 @@ func TestArgoCDAppStuckPersistedFirstSeenResume(t *testing.T) {
 	}
 }
 
+// Restart-resume, the persisted half of the refresh cooldown: a fresh
+// check process (empty in-RAM ledger) reads the
+// passiontech.dev/last-argocd-app-refresh stamp the previous refresh
+// patch left ON the Application and holds off inside the 30m window
+// even though the first-seen window is long tripped — the app still
+// FAILs (detection is independent), only the patch is suppressed.
+// The in-RAM-only cooldown this replaces re-fired refresh=hard for
+// every stuck app after a controller restart.
+func TestArgoCDRefreshPersistedCooldownGate(t *testing.T) {
+	base := time.Now()
+	app := argoCDApplication("argocd", "cooled-app", "Progressing")
+	app.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/cooled-app":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`,
+		argoCDRefreshHealAnno: base.Add(-10 * time.Minute).
+			UTC().Format(time.RFC3339),
+	})
+	dyn := testutil.NewDynamicClient(app)
+	cs := fake.NewSimpleClientset()
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	testutil.CleanupMetric(t, argoCDAppStuckGauge,
+		"argocd", "cooled-app", "progressing>45m0s")
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("stuck app must still FAIL inside the refresh cooldown: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "cooled-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
+		t.Fatal("refresh=hard re-fired inside the persisted cooldown")
+	}
+}
+
 func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	cond := func() map[string]any {
 		return map[string]any{

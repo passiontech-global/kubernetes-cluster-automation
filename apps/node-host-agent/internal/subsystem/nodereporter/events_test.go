@@ -2,14 +2,20 @@ package nodereporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	eventsv1 "k8s.io/api/events/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // appendLog appends one watchdog log line: "<rfc3339> <msg>\n" —
@@ -638,5 +644,186 @@ func TestInodePressureEvents(t *testing.T) {
 	}
 	if healthy[0].Type != "Normal" {
 		t.Fatalf("exit event type = %s, want Normal", healthy[0].Type)
+	}
+}
+
+// --- dedup failure semantics (emitEvent's patch/create error paths) ---
+
+// patchEventsReactor fails every Events patch with the given error.
+func patchEventsReactor(e *env, err error) {
+	e.cs.Fake.PrependReactor("patch", "events",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, err
+		})
+}
+
+func createsCount(t *testing.T, e *env) int {
+	t.Helper()
+	n := 0
+	for _, a := range e.cs.Actions() {
+		if a.GetVerb() == "create" && a.GetResource().Resource == "events" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEmitEventPatchFailureKeepsEntry: a persistent non-NotFound
+// patch failure reports the error and KEEPS the dedup entry —
+// recreating a fresh object per occurrence would spam unbounded
+// Events for as long as the failure lasts.
+func TestEmitEventPatchFailureKeepsEntry(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	if err := e.r.emitEvent(ctx, "X", "same note", "Warning"); err != nil {
+		t.Fatal(err)
+	}
+	patchEventsReactor(e, errors.New("apiserver wedged"))
+	if err := e.r.emitEvent(ctx, "X", "same note", "Warning"); err == nil {
+		t.Fatal("patch failure not reported")
+	}
+	if _, ok := e.r.emittedEvts["X\x1fsame note"]; !ok {
+		t.Fatal("dedup entry dropped on a non-NotFound patch failure")
+	}
+	if n := createsCount(t, e); n != 1 {
+		t.Fatalf("creates = %d, want 1 (no recreate under a patch failure)", n)
+	}
+}
+
+// TestEmitEventNotFoundRecreates: a NotFound patch failure means the
+// Event TTL'd away — the stale entry is dropped and the next
+// occurrence recreates.
+func TestEmitEventNotFoundRecreates(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	if err := e.r.emitEvent(ctx, "X", "same note", "Warning"); err != nil {
+		t.Fatal(err)
+	}
+	patchEventsReactor(e, apierrors.NewNotFound(
+		schema.GroupResource{Group: "events.k8s.io", Resource: "events"}, "gone"))
+	if err := e.r.emitEvent(ctx, "X", "same note", "Warning"); err != nil {
+		t.Fatalf("NotFound recreate failed: %v", err)
+	}
+	if n := createsCount(t, e); n != 2 {
+		t.Fatalf("creates = %d, want 2 (stale entry recreated)", n)
+	}
+	if _, ok := e.r.emittedEvts["X\x1fsame note"]; !ok {
+		t.Fatal("recreated event not tracked for dedup")
+	}
+}
+
+// TestEmitEventCreateError: a failed create reports the error and
+// stores no dedup entry — the next occurrence retries the create.
+func TestEmitEventCreateError(t *testing.T) {
+	e := fixture(t)
+	e.cs.Fake.PrependReactor("create", "events",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("quota exceeded")
+		})
+	err := e.r.emitEvent(context.Background(), "X", "note", "Warning")
+	if err == nil || !strings.Contains(err.Error(), "create event") {
+		t.Fatalf("create error = %v, want a wrapped create failure", err)
+	}
+	if len(e.r.emittedEvts) != 0 {
+		t.Fatalf("failed create stored dedup entries: %v", e.r.emittedEvts)
+	}
+}
+
+// TestEventNoteTruncated: notes past maxEventNote are truncated
+// BEFORE keying, so oversized watchdog lines cannot fail the create
+// or fork unbounded dedup entries.
+func TestEventNoteTruncated(t *testing.T) {
+	e := fixture(t)
+	big := strings.Repeat("y", 3*maxEventNote)
+	if err := e.r.emitEvent(context.Background(), "X", big, "Warning"); err != nil {
+		t.Fatal(err)
+	}
+	evs := eventsByReason(t, e, "X")
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if len(evs[0].Note) != maxEventNote {
+		t.Fatalf("note len = %d, want %d", len(evs[0].Note), maxEventNote)
+	}
+}
+
+// --- log-tail mechanics ---
+
+// TestProcessLogLineReplayRules: an empty line is a no-op; on the
+// replay scan unparseable timestamps are skipped (a restart must not
+// re-report history it cannot date), while live mode accepts the
+// same undated line.
+func TestProcessLogLineReplayRules(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+
+	e.r.processLogLine(ctx, nil, false) // empty — no-op, no panic
+
+	e.r.processLogLine(ctx, []byte("not-a-timestamp node-overloaded hard"), true)
+	if n := len(e.events(t)); n != 0 {
+		t.Fatalf("replay emitted %d events from an undated line", n)
+	}
+	e.r.processLogLine(ctx, []byte("not-a-timestamp node-overloaded hard"), false)
+	if n := len(e.events(t)); n != 1 {
+		t.Fatalf("live undated line events = %d, want 1", n)
+	}
+}
+
+// TestReadTailBytesEdges: the .1-generation drain is strictly
+// best-effort — absence, a fully-consumed offset and an empty read
+// all degrade to nil.
+func TestReadTailBytesEdges(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "log.1")
+	if got := readTailBytes(f, 0, 1024); got != nil {
+		t.Fatalf("absent tail = %q, want nil", got)
+	}
+	if err := os.WriteFile(f, []byte("tail line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTailBytes(f, 0, 1024); string(got) != "tail line\n" {
+		t.Fatalf("tail = %q", got)
+	}
+	// Offset at/over the size → nothing unread.
+	if got := readTailBytes(f, int64(len("tail line\n")), 1024); got != nil {
+		t.Fatalf("consumed tail = %q, want nil", got)
+	}
+	if got := readTailBytes(f, 1<<20, 1024); got != nil {
+		t.Fatalf("past-EOF tail = %q, want nil", got)
+	}
+}
+
+// TestReadLogWindowStatError: a log path whose parent is a regular
+// file surfaces as a stat error, not a silent empty window.
+func TestReadLogWindowStatError(t *testing.T) {
+	e := fixture(t)
+	blocker := filepath.Join(e.root, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.r.cfg.WatchdogLogFile = filepath.Join(blocker, "log")
+	if _, err := e.r.readLogWindow(); err == nil || !strings.Contains(err.Error(), "stat ") {
+		t.Fatalf("err = %v, want a wrapped stat error", err)
+	}
+}
+
+// TestReadLogWindowMidSeekNoNewline: the first scan of an oversized
+// file with NO newline at all attributes nothing — the whole window
+// is one unterminated partial line.
+func TestReadLogWindowMidSeekNoNewline(t *testing.T) {
+	e := fixture(t)
+	if err := os.WriteFile(e.log,
+		[]byte(strings.Repeat("z", maxLogReadBytes+10)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	win, err := e.r.readLogWindow()
+	if err != nil || win == nil {
+		t.Fatalf("readLogWindow = %v, %v", win, err)
+	}
+	if len(win.data) != 0 {
+		t.Fatalf("mid-seek kept %d bytes of an unterminated line", len(win.data))
+	}
+	if !e.r.logScanned {
+		t.Fatal("first scan did not mark the replay scan done")
 	}
 }

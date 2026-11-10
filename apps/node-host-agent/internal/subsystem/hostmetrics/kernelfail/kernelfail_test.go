@@ -6,12 +6,15 @@ package kernelfail
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
@@ -443,4 +446,404 @@ func TestKmsgEmptyFirstOpenWritesNoCursor(t *testing.T) {
 	if !strings.Contains(string(b), "kmsg testboot 7 ") {
 		t.Fatalf("cursor=%q want seq 7", b)
 	}
+}
+
+// TestCheckKernelDmesgFallsBackToDmesg: an unopenable /dev/kmsg
+// drops the session and drains `dmesg -T` on the SAME tick — the
+// fallback must not wait for the next one, and the failed session
+// must not leak.
+func TestCheckKernelDmesgFallsBackToDmesg(t *testing.T) {
+	f := kfixture(t) // no kmsgFixture — the device path is missing
+	t1 := time.Now().Truncate(time.Second)
+	f.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+		if len(argv) > 1 && argv[1] == "-T" {
+			return dmesgLine(t1, "EXT4-fs error (dev sda1) in x"), nil
+		}
+		return "", errors.New("plain dmesg unexpected")
+	}
+	f.r.deps.RunHostCmd = f.deps.RunHostCmd
+
+	f.r.checkKernelDmesg()
+	// Tick 1 only PRIMES the dmesg cursor (the retained ring is
+	// history, not news) and drops the failed kmsg session.
+	if f.r.kscan.sess != nil {
+		t.Fatal("kmsg session kept after the read failure")
+	}
+	b, err := os.ReadFile(f.r.statePath(kmsgCursorFile))
+	if err != nil {
+		t.Fatalf("cursor not primed by the fallback: %v", err)
+	}
+	if !strings.HasPrefix(string(b), "dmesgT ") {
+		t.Fatalf("cursor=%q want a dmesgT anchor", b)
+	}
+	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); !os.IsNotExist(err) {
+		t.Fatalf("history classified on the priming tick (err=%v)", err)
+	}
+
+	// Tick 2: a fresh fs-error line past the anchor classifies.
+	t2 := t1.Add(time.Minute)
+	f.r.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+		if len(argv) > 1 && argv[1] == "-T" {
+			return dmesgLine(t1, "routine") + "\n" + dmesgLine(t2, "EXT4-fs error (dev sda1) in x"), nil
+		}
+		return "", errors.New("plain dmesg unexpected")
+	}
+	f.r.checkKernelDmesg()
+	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); err != nil {
+		t.Fatalf("fs-error marker missing after the dmesg fallback: %v", err)
+	}
+}
+
+// TestReadKmsgCursorShapes pins every cursor generation the state
+// file carries: kmsg/dmesgT/dmesgRaw parse (including the legacy
+// two-field dmesgT shape), while empty, short and unknown modes are
+// unusable — the drain then re-primes instead of resuming.
+func TestReadKmsgCursorShapes(t *testing.T) {
+	f := kfixture(t)
+	if f.r.readKmsgCursor() != nil {
+		t.Fatal("cursor parsed from a missing file")
+	}
+	write := func(content string) {
+		testutil.WriteFile(t, f.r.statePath(kmsgCursorFile), content)
+	}
+	for _, garbage := range []string{"", "\n", "bogus 1 2", "kmsg boot 5"} {
+		write(garbage)
+		if cur := f.r.readKmsgCursor(); cur != nil {
+			t.Fatalf("cursor %q parsed to %+v", garbage, cur)
+		}
+	}
+
+	write("kmsg boot 5 1234\n")
+	cur := f.r.readKmsgCursor()
+	if cur == nil || cur.mode != "kmsg" || cur.bootID != "boot" ||
+		cur.seq != 5 || cur.usec != 1234 {
+		t.Fatalf("kmsg cursor = %+v", cur)
+	}
+
+	write("dmesgT 1700000000\n")
+	cur = f.r.readKmsgCursor()
+	if cur == nil || cur.unixTS != 1700000000 || cur.lines != -1 {
+		t.Fatalf("legacy dmesgT cursor = %+v, want lines -1", cur)
+	}
+
+	write("dmesgT 1700000000 7\n")
+	cur = f.r.readKmsgCursor()
+	if cur == nil || cur.unixTS != 1700000000 || cur.lines != 7 {
+		t.Fatalf("dmesgT cursor = %+v", cur)
+	}
+
+	write("dmesgRaw 3\n")
+	cur = f.r.readKmsgCursor()
+	if cur == nil || cur.lines != 3 || cur.hash != 0 {
+		t.Fatalf("dmesgRaw cursor = %+v", cur)
+	}
+
+	write("dmesgRaw 3 99\n")
+	cur = f.r.readKmsgCursor()
+	if cur == nil || cur.lines != 3 || cur.hash != 99 {
+		t.Fatalf("dmesgRaw cursor = %+v", cur)
+	}
+}
+
+// TestMaybeBumpConntrackMaxBounds pins the bump's guards: the
+// ceiling stops growth, doubling caps at the ceiling, the rate
+// budget allows one bump per window, and a failed sysctl write
+// neither spends the budget nor rewrites.
+func TestMaybeBumpConntrackMaxBounds(t *testing.T) {
+	// At the ceiling: no write at all.
+	f := kfixture(t)
+	testutil.WriteFile(t, f.deps.ConntrackMaxFile, "4194304\n")
+	f.r.maybeBumpConntrackMax()
+	if got := strings.TrimSpace(testutil.ReadFile(t, f.deps.ConntrackMaxFile)); got != "4194304" {
+		t.Fatalf("ceiling value rewritten: %q", got)
+	}
+
+	// Doubling past the ceiling caps at conntrackMaxCeiling.
+	f2 := kfixture(t)
+	testutil.WriteFile(t, f2.deps.ConntrackMaxFile, "3000000\n")
+	f2.r.maybeBumpConntrackMax()
+	if got := strings.TrimSpace(testutil.ReadFile(t, f2.deps.ConntrackMaxFile)); got != "4194304" {
+		t.Fatalf("capped bump=%q want %d", got, conntrackMaxCeiling)
+	}
+
+	// The rate budget blocks an immediate second bump.
+	f2.r.maybeBumpConntrackMax()
+	if got := strings.TrimSpace(testutil.ReadFile(t, f2.deps.ConntrackMaxFile)); got != "4194304" {
+		t.Fatalf("rate-limited bump rewrote: %q", got)
+	}
+
+	// A failed write leaves the value and does not spend the budget.
+	// os.WriteFile targets the sysctl file directly — write access to
+	// the FILE is what it needs, so strip the file's write bits.
+	f3 := kfixture(t)
+	roFile := f3.deps.ConntrackMaxFile
+	testutil.WriteFile(t, roFile, "262144\n")
+	if err := os.Chmod(roFile, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roFile, 0o644) })
+	f3.r.maybeBumpConntrackMax()
+	if got := strings.TrimSpace(testutil.ReadFile(t, roFile)); got != "262144" {
+		t.Fatalf("failed bump rewrote: %q", got)
+	}
+}
+
+// TestNewSeamDefaults: a bare Deps gets the exec/device defaults and
+// the tick interval — New itself performs no host I/O.
+func TestNewSeamDefaults(t *testing.T) {
+	r := New(Deps{})
+	if r.deps.RunHostCmd == nil || r.deps.KmsgDevicePaths == nil {
+		t.Fatal("seam defaults not applied")
+	}
+	if r.deps.TickInterval != defaultTickInterval {
+		t.Fatalf("TickInterval=%v want %v", r.deps.TickInterval, defaultTickInterval)
+	}
+	if got := r.deps.KmsgDevicePaths("/host"); len(got) != 2 {
+		t.Fatalf("default device candidates = %v", got)
+	}
+}
+
+// TestKmsgEvidenceTruncation: the 200-byte evidence cap keeps a
+// flooded kernel ring from writing unbounded marker/latch evidence.
+func TestKmsgEvidenceTruncation(t *testing.T) {
+	f := kfixture(t)
+	long := strings.Repeat("x", 500)
+
+	f.r.noteKernelFsError(long) // a single 500-byte token
+	b, err := os.ReadFile(f.r.statePath(kmsgFsErrorFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := strings.Fields(string(b))
+	if len(detail) != 2 || len(detail[1]) != 200 {
+		t.Fatalf("fs-error evidence fields=%d len=%d want 2 fields, 200-byte detail",
+			len(detail), len(detail[1]))
+	}
+
+	f2 := kfixture(t)
+	pageMsg := "page allocation failure: " + long
+	f2.r.notePageAllocFailure(pageMsg)
+	logData, err := os.ReadFile(f2.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), pageMsg[:200]) ||
+		strings.Contains(string(logData), pageMsg[:201]) {
+		t.Fatalf("page-alloc evidence not capped at 200 bytes:\n%s", logData)
+	}
+
+	f3 := kfixture(t)
+	clockMsg := "clocksource unstable: " + long
+	f3.r.noteClocksourceUnstable(clockMsg)
+	logData, err = os.ReadFile(f3.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), clockMsg[:200]) ||
+		strings.Contains(string(logData), clockMsg[:201]) {
+		t.Fatalf("clocksource evidence not capped at 200 bytes:\n%s", logData)
+	}
+}
+
+// TestEnsureStateLatchWriteFailure: an unwritable latch path is a
+// silent no-op — the next tick retries, nothing panics or logs a
+// STATE-ENTER for a latch that does not exist.
+func TestEnsureStateLatchWriteFailure(t *testing.T) {
+	f := kfixture(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	testutil.WriteFile(t, blocker, "x\n")
+	f.r.ensureStateLatch(filepath.Join(blocker, "state-x"),
+		latchdefs.LatchFilePrefix+"x", "evidence")
+	if _, err := os.Stat(filepath.Join(blocker, "state-x")); err == nil {
+		t.Fatal("latch materialized under a regular file")
+	}
+	if logData, err := os.ReadFile(f.log); err == nil &&
+		strings.Contains(string(logData), "STATE-ENTER") {
+		t.Fatalf("STATE-ENTER logged for a latch that was never written:\n%s", logData)
+	}
+}
+
+// TestKernelUtilPromPartialSources: only the ratios whose sources
+// parsed land in the node-exporter textfile — no fake zeros for the
+// missing loadavg/file-nr/pty sysctls.
+func TestKernelUtilPromPartialSources(t *testing.T) {
+	f := kfixture(t)
+	dir := t.TempDir()
+	textfileDirOverride = dir
+	t.Cleanup(func() { textfileDirOverride = "" })
+
+	// pid dirs 7 and 9 + pid_max → only the pids ratio parses.
+	for _, pid := range []string{"7", "9"} {
+		if err := os.MkdirAll(filepath.Join(f.deps.ProcRoot, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sysDir := filepath.Join(f.deps.ProcRoot, "sys", "kernel")
+	if err := os.MkdirAll(sysDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(sysDir, "pid_max"), "100\n")
+
+	f.r.updatePidFDPressure()
+	b, err := os.ReadFile(filepath.Join(dir, "node-agent-kernel.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	if !strings.Contains(text, "node_agent_pids_utilization_ratio 0.02") {
+		t.Fatalf("pids ratio missing/wrong:\n%s", text)
+	}
+	for _, absent := range []string{
+		"node_agent_threads_utilization_ratio",
+		"node_agent_file_nr_utilization_ratio",
+		"node_agent_pty_utilization_ratio",
+	} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("%s emitted without its source:\n%s", absent, text)
+		}
+	}
+}
+
+// TestClockSkewAdjtimexFallback: no chronyc on the host → the
+// read-only adjtimex still yields offset + sync state. A FAILED
+// makestep writes no clock-stepped marker — it stepped nothing —
+// and the over-threshold offset still feeds the latch streak.
+func TestClockSkewAdjtimexFallback(t *testing.T) {
+	f := kfixture(t)
+	f.deps.RunHostCmd = func(context.Context, ...string) (string, error) {
+		return "", errors.New("chronyc missing")
+	}
+	f.r.deps.RunHostCmd = f.deps.RunHostCmd
+	f.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
+		tx.Offset = 3_000_000 // µs — 3s, over both step and latch bounds
+		tx.Status = 0         // STA_UNSYNC clear → synchronised
+		return 0, nil
+	}
+	f.r.deps.Adjtimex = f.deps.Adjtimex
+
+	f.r.checkClockSkew()
+	if _, err := os.Stat(f.r.statePath(clockSteppedMarkerFile)); !os.IsNotExist(err) {
+		t.Fatal("clock-stepped marker written for a failed makestep")
+	}
+	b, err := os.ReadFile(f.r.statePath(clockSkewCountFile))
+	if err != nil {
+		t.Fatalf("skew count not armed: %v", err)
+	}
+	if strings.TrimSpace(string(b)) != "1" {
+		t.Fatalf("skew count=%q want 1", b)
+	}
+	// Inconclusive probes (adjtimex failing too) leave everything.
+	f.r.deps.Adjtimex = func(*unix.Timex) (int, error) { return 0, unix.ENOSYS }
+	f.r.checkClockSkew()
+	b, _ = os.ReadFile(f.r.statePath(clockSkewCountFile))
+	if strings.TrimSpace(string(b)) != "1" {
+		t.Fatalf("inconclusive probe moved the count: %q", b)
+	}
+}
+
+// TestClockWarpPromInstallFailure: a failed textfile install is a
+// Warn — the detector keeps running and the event count stays put.
+func TestClockWarpPromInstallFailure(t *testing.T) {
+	f := kfixture(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	testutil.WriteFile(t, blocker, "x\n")
+	textfileDirOverride = filepath.Join(blocker, "textfile")
+	t.Cleanup(func() { textfileDirOverride = "" })
+
+	now := time.Now()
+	f.deps.Clock.Set(func() time.Time { return now })
+	f.r.checkClockWarp() // first tick: primes prev, prom write fails
+	if f.r.warp.events != 0 {
+		t.Fatalf("warp events = %d on a quiet first tick", f.r.warp.events)
+	}
+	f.r.checkClockWarp() // second tick: still no warp, still no panic
+	if f.r.warp.events != 0 {
+		t.Fatalf("warp events = %d without a wall-vs-mono gap", f.r.warp.events)
+	}
+}
+
+// TestFSReadonlyEvidenceEdges: a TTL-expired kmsg marker is pruned
+// (not latched), while a fresh marker AND an ro PVC mount combine
+// into one evidence line.
+func TestFSReadonlyEvidenceEdges(t *testing.T) {
+	f := kfixture(t)
+	old := f.deps.Clock.Now().Add(-fsErrorLatchTTL - time.Minute).Unix()
+	testutil.WriteFile(t, f.r.statePath(kmsgFsErrorFile),
+		strconv.FormatInt(old, 10)+" ancient\n")
+	f.r.updateFSReadonlyEvidence()
+	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); !os.IsNotExist(err) {
+		t.Fatal("TTL-expired kmsg marker not pruned")
+	}
+	if _, err := os.Stat(f.deps.Store.Path(latchdefs.LatchFSReadonly)); !os.IsNotExist(err) {
+		t.Fatal("expired marker latched fs-readonly")
+	}
+
+	// Fresh marker + ro PVC mount → combined evidence, one latch.
+	f2 := kfixture(t)
+	now := f2.deps.Clock.Now().Unix()
+	testutil.WriteFile(t, f2.r.statePath(kmsgFsErrorFile),
+		strconv.FormatInt(now, 10)+" fresh\n")
+	proc1 := filepath.Join(f2.deps.ProcRoot, "1")
+	if err := os.MkdirAll(proc1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(proc1, "mounts"),
+		"/dev/vda1 / ext4 rw,relatime 0 0\n"+
+			"/dev/sdb1 /var/openebs/local/pvc-def xfs ro,relatime 0 0\n")
+	f2.r.updateFSReadonlyEvidence()
+	logData, err := os.ReadFile(f2.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData),
+		"STATE-ENTER: fs-readonly (kernel-fs-error + ro-mount: /var/openebs/local/pvc-def (xfs))") {
+		t.Fatalf("combined evidence line missing:\n%s", logData)
+	}
+}
+
+// TestUnwritableStateDirKeepsDraining: a read-only state dir fails
+// the cursor + marker writes silently — the drain still runs, no
+// panic, and the next writable tick retries.
+func TestUnwritableStateDirKeepsDraining(t *testing.T) {
+	f := kfixture(t)
+	kmsgFixture(t, f.deps, "EXT4-fs error (dev sda1): aborted journal")
+	if err := os.Chmod(f.deps.StateDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.deps.StateDir, 0o755) })
+
+	f.r.checkKernelDmesg() // classify runs; cursor + marker writes fail
+
+	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); !os.IsNotExist(err) {
+		t.Fatalf("marker materialized through a read-only state dir: %v", err)
+	}
+	if got := strings.TrimSpace(testutil.ReadFile(t,
+		filepath.Join(f.deps.StateDir, kmsgCursorFile))); got != "kmsg testboot 0 0" {
+		t.Fatalf("cursor rewritten through a read-only state dir: %q", got)
+	}
+}
+
+// TestKernelPromWritersSurviveBrokenTextfileDir: the node-exporter
+// textfile writers log their install failures and keep the latch
+// logic running.
+func TestKernelPromWritersSurviveBrokenTextfileDir(t *testing.T) {
+	f := kfixture(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	testutil.WriteFile(t, blocker, "x\n")
+	textfileDirOverride = filepath.Join(blocker, "textfile")
+	t.Cleanup(func() { textfileDirOverride = "" })
+
+	// pid/fd domain: one parsed source walks the writer; entropy
+	// parses for the steal domain — both textfile installs fail.
+	sysDir := filepath.Join(f.deps.ProcRoot, "sys", "kernel", "random")
+	if err := os.MkdirAll(sysDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(f.deps.ProcRoot, "7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(f.deps.ProcRoot, "sys/kernel/pid_max"), "10\n")
+	testutil.WriteFile(t, filepath.Join(sysDir, "entropy_avail"), "256\n")
+	f.r.updatePidFDPressure() // pids ratio parses → textfile install fails
+	f.r.updateStealEntropy()  // entropy parses → textfile install fails
 }

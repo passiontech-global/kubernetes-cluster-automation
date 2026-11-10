@@ -77,6 +77,12 @@ type sharedState struct {
 	// owners is the RAM-side multi-owner latch registry — see the
 	// Store.shared comment.
 	owners map[string]map[string]bool
+	// active is the set of producer ids RegisterActiveOwner has
+	// declared live on this node — ExitFrom intersects it with a
+	// latch's declared owners when seeding the post-restart owner
+	// set, so a worker-only node does not seed phantom holds for
+	// producers that never run here.
+	active map[string]bool
 }
 
 // New returns a Store for dir/logFile. now and log may be nil. The
@@ -183,18 +189,8 @@ func (s *Store) Exists(name string) bool {
 // (appendFile re-enters the shared mu for the rotation decision; sync.Mutex
 // is not reentrant).
 func (s *Store) Enter(name, extra string) {
-	p := s.Path(name)
 	s.shared.mu.Lock()
-	if _, err := os.Stat(p); err == nil {
-		now := s.Now()
-		if cerr := os.Chtimes(p, now, now); cerr != nil {
-			s.log().Debug("state latch touch failed",
-				"state", name, "path", p, "error", cerr)
-		}
-		s.shared.mu.Unlock()
-		return
-	}
-	written := s.WriteEpochFile(p, s.Now().Unix())
+	written := s.enterLocked(name)
 	s.shared.mu.Unlock()
 	if !written {
 		return
@@ -204,6 +200,43 @@ func (s *Store) Enter(name, extra string) {
 	} else {
 		s.AppendLog(latchdefs.StateEnterPrefix + name)
 	}
+}
+
+// enterLocked performs the stat→(touch|create) half of Enter — the
+// caller HOLDS s.shared.mu. true only when the latch file was
+// (re)written this call; an existing file is touched and reports
+// false (no STATE-ENTER transition to log).
+func (s *Store) enterLocked(name string) bool {
+	p := s.Path(name)
+	if _, err := os.Stat(p); err == nil {
+		now := s.Now()
+		if cerr := os.Chtimes(p, now, now); cerr != nil {
+			s.log().Debug("state latch touch failed",
+				"state", name, "path", p, "error", cerr)
+		}
+		return false
+	}
+	return s.WriteEpochFile(p, s.Now().Unix())
+}
+
+// RegisterActiveOwner declares that producer id runs on this node —
+// subsystems call it from New for every EnterFrom/ExitFrom owner id
+// they can emit. ExitFrom consults the set when seeding the
+// post-restart owner registry for a latch file found on disk: the
+// seed is the INTERSECTION of the latch's declared owners and the
+// registered active producers, so state-journal-unreadable held by
+// {workerhygiene, controllerhygiene} on a worker-only node seeds
+// just {workerhygiene} and releases as soon as that producer's
+// journal recovers instead of waiting 24h for janitor reap. Stores
+// with no registrations (hand-built unit-test stores) keep the
+// legacy seed of the full declared set.
+func (s *Store) RegisterActiveOwner(owner string) {
+	s.shared.mu.Lock()
+	if s.shared.active == nil {
+		s.shared.active = map[string]bool{}
+	}
+	s.shared.active[owner] = true
+	s.shared.mu.Unlock()
 }
 
 // Exit removes state-<name> if present and logs the transition —
@@ -267,8 +300,20 @@ func (s *Store) EnterFrom(name, owner, extra string) {
 		s.shared.owners[name] = set
 	}
 	set[owner] = true
+	// The owner registration and the latch file create must be ONE
+	// critical section: releasing the lock before Enter let a racing
+	// ExitFrom observe the new owner set, delete the file, and leave
+	// the registry claiming a hold on a latch that no longer exists.
+	written := s.enterLocked(name)
 	s.shared.mu.Unlock()
-	s.Enter(name, extra)
+	if !written {
+		return
+	}
+	if extra != "" {
+		s.AppendLog(fmt.Sprintf(latchdefs.StateEnterPrefix+"%s %s", name, extra))
+	} else {
+		s.AppendLog(latchdefs.StateEnterPrefix + name)
+	}
 }
 
 // ExitFrom releases one owner's hold on a shared latch: the
@@ -300,6 +345,17 @@ func (s *Store) ExitFrom(name, owner string, cleanup func()) {
 		set := make(map[string]bool, len(declared))
 		for _, o := range declared {
 			set[o] = true
+		}
+		// Post-restart seed: when this node has registered which
+		// producers actually run here, intersect — a worker-only
+		// node must not seed a phantom controllerhygiene hold that
+		// nothing on the node will ever release.
+		if len(s.shared.active) > 0 {
+			for o := range set {
+				if !s.shared.active[o] {
+					delete(set, o)
+				}
+			}
 		}
 		delete(set, owner)
 		held = len(set) > 0

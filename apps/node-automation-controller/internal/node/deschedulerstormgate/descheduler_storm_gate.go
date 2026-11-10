@@ -188,6 +188,16 @@ type deschedulerStormGate struct {
 	holdWarned state.SeenSet
 	nhcSeen    state.FirstSeenLedger
 	nhcWarned  state.SeenSet
+	// maintVerdict memoizes the maintenance-mutex evaluation (the
+	// exact kube.Verdict pattern partition-evictor hangs on its
+	// sweep): the Node watch fans every storm-signal flip into this
+	// single-key sweep, and without the memo each node-event
+	// reconcile re-paid the mutex's 3+ dynamic API reads (kured get,
+	// autopilot Plan list, medik8s remediation lists). One
+	// evaluation per verdict TTL (~1m, kube.verdictTTL), error
+	// verdicts sticky for the window too — fail closed. Zero value
+	// ready (expired — evaluates on first use).
+	maintVerdict kube.Verdict
 	// now is the clock seam — tests pin it so the cordon-window and
 	// decision-stamp reads are deterministic. nil → time.Now.
 	now shared.Clock
@@ -297,11 +307,22 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	// 2.7 maintenance mutex (signals b + c — signal a is the
 	// `cordoned` list inside nodeStormSignals): deliberate
 	// maintenance gates the descheduler exactly like a storm does.
-	maintenance, err := r.maintenanceEvidence(ctx)
+	// Memoized on the reconciler (r.maintVerdict, ~1m TTL): a node
+	// storm-signal flip fans one of these sweeps into the queue, so
+	// without the memo every node-event reconcile re-paid the
+	// mutex's 3+ dynamic reads. Active returns the canonical
+	// first-signal evidence (why) — the decision annotation carries
+	// that one string rather than the old full multi-signal list,
+	// the same evidence every other deferring module records. A nil
+	// dyn client or a real API failure still errors the reconcile
+	// (fail closed) and is sticky for the TTL window.
+	held, why, err := r.maintVerdict.Active(ctx, r.cs, r.dyn, now)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	ev.maintenance = maintenance
+	if held {
+		ev.maintenance = []string{why}
+	}
 
 	// The cluster-wide storm reads run AFTER the deployment-exists
 	// skip so a cluster without descheduler never pays for (or fails
@@ -322,32 +343,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 // NodeActivelyCordoned scan inside Reconcile).
 // ---------------------------------------------------------------------------
 
-// maintenanceEvidence returns the human-readable evidence strings for
-// maintenance-mutex signals (b) kured lock, (c) active autopilot
-// Plan and (d) in-flight medik8s remediations (SNR/FAR/
-// NodeMaintenance) — an empty slice means "no maintenance in
-// flight". The checks themselves are the shared mutex helpers (one
-// implementation for every deferring module): a missing kured
-// DaemonSet or an absent autopilot/medik8s CRD is not evidence;
-// real API failures — including a nil dynamic client — are errors,
-// so a "clear" verdict is never computed on blind data.
-func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]string, error) {
-	kured, err := kube.KuredLockEvidence(ctx, r.cs)
-	if err != nil {
-		return nil, err
-	}
-	plans, err := kube.AutopilotPlanEvidence(ctx, r.dyn)
-	if err != nil {
-		return nil, err
-	}
-	remediations, err := kube.Medik8sRemediationEvidence(ctx, r.dyn)
-	if err != nil {
-		return nil, err
-	}
-	return append(append(kured, plans...), remediations...), nil
-}
-
-// ---------------------------------------------------------------------------
 // maintenance-hold-stale — forgotten maintenance holds (MaintenanceHoldStale).
 // ---------------------------------------------------------------------------
 

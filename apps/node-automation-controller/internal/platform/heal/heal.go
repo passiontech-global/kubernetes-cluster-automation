@@ -79,7 +79,10 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 	// exactly like a held mutex (see budget.go for why the aggregate
 	// ceiling exists and why the deny is (false,false), not
 	// unverifiable: an exhausted budget is normal operation, not a
-	// check the caller should IncError).
+	// check the caller should IncError). The grant this gate hands
+	// out is paired with the actuation by EvictPodV, which hands it
+	// back when the eviction is PDB-refused — a refusal delivered no
+	// heal, so it must not spend a fleet grant.
 	if !budgetGate(now) {
 		log.Info("heal budget exhausted — heal deferred",
 			"target", key)
@@ -133,7 +136,9 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 // its replica floor, so the caller keeps the pod, counts no error and
 // stamps no ledger — the next sweep retries once disruptions free up.
 // Any other API failure is (false, false, err) — the caller IncErrors
-// its own queue and logs err in its own wording.
+// its own queue and logs err in its own wording. Budget-gated callers
+// (AllowedV preamble consumed the grant) should call EvictPodV
+// instead — the pairing refunds the grant on a refusal.
 func EvictPod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (evicted bool, refused bool, err error) {
@@ -157,6 +162,56 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 		heals.Stamp(key, now)
 	}
 	return true, false, nil
+}
+
+// EvictPodV is the budget-safe EvictPod: the full preamble→actuation
+// pair every budget-gated eviction repeats — AllowedV (per-key
+// cooldown + maintenance mutex + the fleet-wide heal budget grant)
+// and then the PDB-respecting eviction — folded into ONE call so a
+// caller cannot consume the grant in one function and spend it in
+// another. The pairing closes a burn path the split shape leaves
+// open: the budget is deliberately a grant-time counter (see
+// budget.go), but a PDB refusal (HTTP 429) delivers no heal for the
+// grant it consumed, so a backend wedged behind a PodDisruptionBudget
+// at its replica floor would burn one fleet grant per sweep forever
+// (budget: 10/5min) and starve every other heal-gated module. On
+// refused=true this wrapper hands the grant back (budgetRefund —
+// Budget.Refund un-consumes the window's stamp symmetrically), while
+// every other contract is unchanged: refused stays a DEFERRAL, never
+// an error (err nil, no IncError owed, no ledger stamp, the pod
+// stays); a DELIVERED eviction keeps its grant AND stamps the cooldown
+// exactly as EvictPod always did — one grant per delivered heal
+// remains the accounting (the linkerd endpoint-sync pin holds). An
+// API failure (err != nil) does NOT refund: the eviction was
+// attempted and failed, which is the documented "a grant whose delete
+// then fails simply spent a cheap token" case.
+//
+// Returns AllowedV's pair followed by EvictPod's triple: proceed=false
+// is a defer the preamble already logged (cooldown, held mutex, spent
+// budget — nothing consumed, triple all-zero); unverifiable=true is
+// fail-closed and the CALLER IncErrors its queue (platform must not
+// import internal/metrics). v/heals/key/cooldown pass through to
+// AllowedV unchanged (nil v = fresh mutex evaluation, nil heals = no
+// cooldown gate — a manual-stamp caller pairs this with its own
+// Stamp-on-delivered).
+func EvictPodV(ctx context.Context, log logr.Logger, v *kube.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	pod *corev1.Pod, now time.Time) (proceed, unverifiable bool,
+	evicted, refused bool, err error) {
+
+	proceed, unverifiable = AllowedV(ctx, log, v, cs, dyn,
+		heals, key, cooldown, now)
+	if !proceed {
+		return proceed, unverifiable, false, false, nil
+	}
+	evicted, refused, err = EvictPod(ctx, cs, heals, key, pod, now)
+	if refused {
+		// PDB refusal — the grant delivered no heal; give it back so
+		// a PDB-hung target cannot starve the rest of the fleet.
+		budgetRefund(now)
+	}
+	return proceed, unverifiable, evicted, refused, err
 }
 
 // OldestRunningPod returns the oldest Running, non-terminating pod

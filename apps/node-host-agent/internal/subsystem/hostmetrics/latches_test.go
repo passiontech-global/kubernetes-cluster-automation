@@ -187,3 +187,41 @@ func TestInodePressureHysteresis(t *testing.T) {
 		t.Fatal("inode-pressure latch appeared on a healthy pass")
 	}
 }
+
+// TestKernelKeysGaugeEmitAndExit: the scrape-side gauge emits only
+// while /proc/key-users parses, and the latch releases once the
+// worst per-UID ratio falls back under the threshold.
+func TestKernelKeysGaugeEmitAndExit(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.KeyUsersFile = filepath.Join(t.TempDir(), "key-users")
+	testutil.WriteFile(t, cfg.KeyUsersFile,
+		"  1000: 42 82000 90000 100000 2500000\n")
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_kernel_keys_used_ratio",
+		map[string]string{"node": "node-a"}); !ok || v != 0.9 {
+		t.Fatalf("kernel keys ratio=%v ok=%v want 0.9", v, ok)
+	}
+
+	l := c.Latches()
+	latch := filepath.Join(cfg.WatchdogStateDir, "state-kernel-keys-pressure")
+	l.updateKernelKeysLatch(0.9)
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("kernel-keys-pressure latch missing above the threshold")
+	}
+	l.updateKernelKeysLatch(0.1)
+	if _, err := os.Stat(latch); !os.IsNotExist(err) {
+		t.Fatal("kernel-keys-pressure latch not released under the threshold")
+	}
+}
+
+// TestSnapStaleLatchPathsEmptyDir: an empty state dir must not glob
+// against the process CWD — the family lookup returns nil.
+func TestSnapStaleLatchPathsEmptyDir(t *testing.T) {
+	if got := snapStaleLatchPaths(""); got != nil {
+		t.Fatalf(`snapStaleLatchPaths("") = %v, want nil`, got)
+	}
+	// A malformed glob (unclosed "[") errors — nil, never a panic.
+	if got := snapStaleLatchPaths(filepath.Join(t.TempDir(), "[")); got != nil {
+		t.Fatalf("bad-pattern glob = %v, want nil", got)
+	}
+}

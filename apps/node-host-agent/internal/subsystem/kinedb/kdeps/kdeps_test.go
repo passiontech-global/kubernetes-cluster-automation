@@ -375,12 +375,12 @@ func TestCreds(t *testing.T) {
 func TestPsqlArgsAndPassEnv(t *testing.T) {
 	d, _, _ := fixture(t, nil)
 	argv := d.PsqlArgs("kine-postgres", "postgres", false, "-tAc", "select 1")
-	want := []string{"podman", "exec", "-e", "PGPASSWORD", "kine-postgres",
+	want := []string{"podman", "exec", "-e", "PGPASSWORD", "-e", "PGAPPNAME", "kine-postgres",
 		"psql", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres", "-tAc", "select 1"}
 	if strings.Join(argv, " ") != strings.Join(want, " ") {
 		t.Fatalf("PsqlArgs=%v", argv)
 	}
-	if got := d.PsqlArgs("pg", "u", true); !strings.Contains(strings.Join(got, " "), "exec -i -e PGPASSWORD") {
+	if got := d.PsqlArgs("pg", "u", true); !strings.Contains(strings.Join(got, " "), "exec -i -e PGPASSWORD -e PGAPPNAME") {
 		t.Fatalf("interactive PsqlArgs=%v", got)
 	}
 	if got := PsqlPassEnv("s3cret"); len(got) != 2 ||

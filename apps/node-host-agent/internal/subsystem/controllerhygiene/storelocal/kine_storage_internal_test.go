@@ -119,6 +119,13 @@ exit 1`)
 			t.Fatalf("ordinary env dropped: %s", err)
 		}
 	})
+	t.Run("success", func(t *testing.T) {
+		bin := fakeSqlite3(t, `exit 0`)
+		t.Setenv("PATH", filepath.Dir(bin))
+		if err := sqlite3WALCheckpoint(ctx, "/db/state.db"); err != nil {
+			t.Fatalf("err=%v want nil", err)
+		}
+	})
 }
 
 func TestSqlite3KineLargeObjects(t *testing.T) {
@@ -137,6 +144,7 @@ func TestSqlite3KineLargeObjects(t *testing.T) {
 printf '/registry/configmaps/default/small|100\n'
 printf 'garbage-no-pipe\n'
 printf 'bad|notanumber\n'
+printf 'before-blank\n\n/registry/pods/default/x|33\n'
 printf '\n'
 exit 0`)
 		t.Setenv("PATH", filepath.Dir(bin))
@@ -147,6 +155,7 @@ exit 0`)
 		want := []KineLargeObject{
 			{Name: "/registry/secrets/default/big", Bytes: 600000},
 			{Name: "/registry/configmaps/default/small", Bytes: 100},
+			{Name: "/registry/pods/default/x", Bytes: 33},
 		}
 		if len(rows) != len(want) {
 			t.Fatalf("rows=%+v want %+v", rows, want)

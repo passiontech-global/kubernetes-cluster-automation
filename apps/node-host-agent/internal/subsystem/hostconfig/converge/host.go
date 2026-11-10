@@ -55,16 +55,24 @@ func (h Host) WriteManaged(path string, content []byte, mode os.FileMode) (bool,
 	}
 	// The stage→write→fsync→rename sequence is hostutil.WriteAtomic —
 	// one implementation shared with WriteFileAtomic/promfile.Write.
-	// The staging name stays the FIXED ".converge.tmp" contract (a
-	// documented name tests and ops sweep, not a glob-avoidance
-	// shape); the mode is the caller's — or the existing file's —
-	// perm bits; AfterSync evicts the just-written pages so a staged
+	// The staging name is a UNIQUE per-write CreateTemp draw under the
+	// target dir ("<base>.converge.tmp-<random>" — files.go's
+	// installMember pattern): a FIXED stage name let two concurrent
+	// writers (agent crash-restart mid-cycle — old process between
+	// open and rename while the new process starts) open/truncate the
+	// SAME tmp, and the old process's fsync+rename would then publish
+	// the new process's partial bytes. Unique stages make each writer
+	// rename only bytes it wrote itself; last rename wins cleanly, and
+	// a crashed writer's leaked stage is still recognizable for the
+	// ".converge.tmp" sweep (tests/ops glob that infix, not a fixed
+	// name). Mode is the caller's — or the existing file's — perm
+	// bits; AfterSync evicts the just-written pages so a staged
 	// binary's cache charge does not outlive the write (see pagecache
 	// doc; post-Sync the pages are clean, so DONTNEED drops them
 	// outright). DirSync failure now surfaces as an error (the shared
 	// core reports it; this verb used to swallow it).
 	if err := hostutil.WriteAtomic(dst, content, hostutil.AtomicOpts{
-		Stage:     hostutil.StageFixed(filepath.Base(dst) + ".converge.tmp"),
+		Stage:     hostutil.StageTempPattern(filepath.Base(dst) + ".converge.tmp-*"),
 		Mode:      mode,
 		AfterSync: pagecache.Drop,
 		DirSync:   true,

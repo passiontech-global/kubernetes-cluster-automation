@@ -137,6 +137,12 @@ func (a *veleroBackupAuditor) auditWedgedTransferKind(ctx context.Context,
 		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
 			continue
 		}
+		// A PVB the controller has not assigned a node yet owns no
+		// node-agent to bounce — skipping beats keying the cooldown
+		// (and the heal) on the bogus "node-agent/" target.
+		if pvbNode(obj) == "" {
+			continue
+		}
 		// The cleanup cooldown is keyed on the NODE, not the object:
 		// the destructive half is the node-agent pod bounce, and
 		// several wedged transfers can share one agent — per-object

@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,6 +59,15 @@ type argoCDAppStuckCheck struct {
 	// one lookup per distinct workload. Reset at the top of every
 	// Run (ownerSeen's shape in api-object-sprawl-report-gc).
 	downscaledSeen map[string]bool
+	// depIndex/stsIndex are the per-sweep ns/name indexes over the
+	// shared Deployment/StatefulSet censuses — without them each
+	// distinct workload linear-scanned the full census slice
+	// (O(workloads×census) per sweep). Built once on first lookup
+	// (the census LIST is already memoized per sweep), reset with
+	// downscaledSeen; a census read failure returns nil uncached so
+	// later lookups retry rather than poisoning the sweep.
+	depIndex map[string]*appsv1.Deployment
+	stsIndex map[string]*appsv1.StatefulSet
 }
 
 // newArgoCDAppStuckCheck builds the argocd-app-stuck check — its state is the
@@ -76,6 +86,10 @@ const (
 	argocdRefreshCooldown      = 30 * time.Minute
 	argocdRepoServerCool       = 30 * time.Minute
 	argocdRefreshAnno          = "argocd.argoproj.io/refresh"
+	// argoCDRefreshHealAnno persists the last refresh=hard moment on
+	// the Application — the durable half of the 30m refresh cooldown
+	// (single-writer stamp, kept local like argocdRefreshAnno).
+	argoCDRefreshHealAnno = "passiontech.dev/last-argocd-app-refresh"
 )
 
 // argoCDAppGVR is the Application CRD the argocd-app-stuck auditor reads —
@@ -136,6 +150,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	var rep probefw.SweepReport
 	comparisonErrors := 0
 	p.downscaledSeen = map[string]bool{} // per-sweep memo, reset each Run
+	p.depIndex, p.stsIndex = nil, nil    // census indexes rebuilt lazily
 	for i := range apps {
 		app := &apps[i]
 		ns, name := app.GetNamespace(), app.GetName()
@@ -354,55 +369,103 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	return v
 }
 
+// deploymentIndex builds (once per sweep) the ns/name index over the
+// shared Deployment census — AllDeployments already memoizes the
+// cluster-wide LIST, so the map turns each distinct workload lookup
+// O(1) instead of a full-slice scan. A census read failure returns
+// nil UNCACHED: the next lookup retries the read rather than pinning
+// a poisoned empty index for the whole sweep.
+func (p *argoCDAppStuckCheck) deploymentIndex(
+	ctx context.Context) map[string]*appsv1.Deployment {
+	if p.depIndex != nil {
+		return p.depIndex
+	}
+	deps, err := p.AllDeployments(ctx)
+	if err != nil {
+		return nil
+	}
+	idx := make(map[string]*appsv1.Deployment, len(deps))
+	for i := range deps {
+		idx[deps[i].Namespace+"/"+deps[i].Name] = &deps[i]
+	}
+	p.depIndex = idx
+	return idx
+}
+
+// statefulSetIndex is deploymentIndex's StatefulSet twin.
+func (p *argoCDAppStuckCheck) statefulSetIndex(
+	ctx context.Context) map[string]*appsv1.StatefulSet {
+	if p.stsIndex != nil {
+		return p.stsIndex
+	}
+	stss, err := p.AllStatefulSets(ctx)
+	if err != nil {
+		return nil
+	}
+	idx := make(map[string]*appsv1.StatefulSet, len(stss))
+	for i := range stss {
+		idx[stss[i].Namespace+"/"+stss[i].Name] = &stss[i]
+	}
+	p.stsIndex = idx
+	return idx
+}
+
 // deploymentDownscaled resolves one workload against the sweep's
-// shared Deployment census — absent (or unreadable) reads false:
-// not proven downscaled is stuck evidence, the fail-closed posture.
+// shared Deployment census — via the per-sweep ns/name index (one
+// LIST, O(1) per distinct workload). Absent (or unreadable) reads
+// false: not proven downscaled is stuck evidence, the fail-closed
+// posture.
 func (p *argoCDAppStuckCheck) deploymentDownscaled(ctx context.Context,
 	ns, name string) bool {
 
-	deps, err := p.AllDeployments(ctx)
-	if err != nil {
+	idx := p.deploymentIndex(ctx)
+	if idx == nil {
 		return false
 	}
-	for i := range deps {
-		if deps[i].Namespace == ns && deps[i].Name == name {
-			return kube.IsIntentionallyDownscaled(
-				deps[i].Annotations, deps[i].Spec.Replicas)
-		}
+	dep, ok := idx[ns+"/"+name]
+	if !ok {
+		return false
 	}
-	return false
+	return kube.IsIntentionallyDownscaled(dep.Annotations, dep.Spec.Replicas)
 }
 
-// statefulSetDownscaled is the StatefulSet twin.
+// statefulSetDownscaled is the StatefulSet twin over the shared
+// per-sweep census index.
 func (p *argoCDAppStuckCheck) statefulSetDownscaled(ctx context.Context,
 	ns, name string) bool {
 
-	stss, err := p.AllStatefulSets(ctx)
-	if err != nil {
+	idx := p.statefulSetIndex(ctx)
+	if idx == nil {
 		return false
 	}
-	for i := range stss {
-		if stss[i].Namespace == ns && stss[i].Name == name {
-			return kube.IsIntentionallyDownscaled(
-				stss[i].Annotations, stss[i].Spec.Replicas)
-		}
+	sts, ok := idx[ns+"/"+name]
+	if !ok {
+		return false
 	}
-	return false
+	return kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas)
 }
 
 // refreshArgoCDApp patches argocd.argoproj.io/refresh=hard on a
 // stuck Application — the shared heal preamble gates it like every
-// other heal: 30m per-app cooldown on the shared ledger, then the
-// maintenance mutex + global heal budget (a refresh patch during a
-// drain re-triggers reconciliation churn exactly like a pod delete;
-// "cannot verify" fails closed).
+// other heal (Deps.HealAllowedPersisted → heal.AllowedVPersisted):
+// the 30m per-app cooldown is the wider of the in-RAM ledger and the
+// passiontech.dev/last-argocd-app-refresh stamp persisted on the
+// Application itself (a restart re-firing refresh=hard for every
+// stuck app is the churn the persisted half exists to stop), then
+// the maintenance mutex + global heal budget (a refresh patch during
+// a drain re-triggers reconciliation churn exactly like a pod delete;
+// "cannot verify" fails closed). The cooldown stamp rides the SAME
+// merge patch as the refresh annotation — kube.MergePatchAnnos is
+// RFC 7386, so sibling annotation keys survive, and one write lands
+// the heal and its persisted cooldown together. ArgoCD consumes the
+// refresh key once processed; the last-* stamp stays.
 func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	log logr.Logger, app *unstructured.Unstructured, now time.Time) {
 
 	ck := probefw.SelfHealKey(CheckNameArgoCDAppStuck,
 		"refresh/"+app.GetNamespace()+"/"+app.GetName())
-	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals, ck,
-		argocdRefreshCooldown, now)
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log, &p.Heals,
+		app, argoCDRefreshHealAnno, ck, argocdRefreshCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -411,7 +474,8 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 		return
 	}
 	payload, err := kube.MergePatchAnnos(map[string]any{
-		argocdRefreshAnno: "hard",
+		argocdRefreshAnno:     "hard",
+		argoCDRefreshHealAnno: now.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		log.Error(err, "marshal argocd refresh patch failed",

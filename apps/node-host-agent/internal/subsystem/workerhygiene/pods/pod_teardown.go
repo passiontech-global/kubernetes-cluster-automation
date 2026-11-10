@@ -193,7 +193,13 @@ func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod
 			continue
 		}
 		if err := d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-			metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+			metav1.DeleteOptions{
+				GracePeriodSeconds: ptr.To[int64](0),
+				// UID precondition: the listing→delete window can
+				// outlive this pod — a same-named recycle (DS churn)
+				// is not ours to grace-0 kill.
+				Preconditions: &metav1.Preconditions{UID: &p.UID},
+			}); err != nil {
 			d.State.AppendLog(fmt.Sprintf(
 				"suspect: konnectivity pod delete %s/%s failed: %v",
 				p.Namespace, p.Name, err))

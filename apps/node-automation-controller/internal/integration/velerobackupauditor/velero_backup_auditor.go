@@ -310,10 +310,10 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// after the schedule checks; a list failure short-circuits the
 	// remaining audits exactly as the inline code did.
 	if err := a.auditBSLs(ctx, log); err != nil {
-		return errors.Join(everestErr, err)
+		return errors.Join(dbErr, err)
 	}
 	if err := a.auditBackupRepositories(ctx, log); err != nil {
-		return errors.Join(everestErr, err)
+		return errors.Join(dbErr, err)
 	}
 
 	// velero-inflight-audit — in-flight transfer audit: mark Backups/PVBs wedged
@@ -324,6 +324,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// leave the fleet — bound the map once per sweep at the cleanup
 	// cooldown so decommissioned nodes' stamps cannot accumulate.
 	a.pvbHealed.PruneExpired(a.now.Now(), veleroPVBCleanupCooldown)
+	a.repoHealed.PruneExpired(a.now.Now(), veleroRepoHealedCooldown)
 	stuckErr := a.auditInFlightTransfers(ctx, backups)
 	// cnpg-backup-audit — the data-mover half of the in-flight audit: mark-only
 	// scan of DataUpload/DataDownload wedges.

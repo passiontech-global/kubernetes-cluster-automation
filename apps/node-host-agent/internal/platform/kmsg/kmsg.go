@@ -149,6 +149,40 @@ func SplitLines(pending, data []byte) (lines [][]byte, rest []byte) {
 // when the erroring read delivered nothing, otherwise the bytes read
 // so far accompany the error — partial-output-vs-fatal is the
 // caller's policy.
+// readKmsgChunk performs one raw read step on the kmsg source. An
+// *os.File opened O_NONBLOCK goes through the runtime netpoller on
+// EAGAIN: os.File.Read parks in poll.FD.WaitRead waiting for a
+// readiness event /dev/kmsg never raises, hanging the drain goroutine
+// until maxBytes is somehow satisfied. Reading through syscall.Conn's
+// RawConn issues the read(2) directly so EAGAIN surfaces immediately.
+// Test fakes that do not implement syscall.Conn keep plain r.Read.
+func readKmsgChunk(r io.Reader, dst []byte) (int, error) {
+	sc, ok := r.(syscall.Conn)
+	if !ok {
+		return r.Read(dst)
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return r.Read(dst)
+	}
+	var (
+		n    int
+		rerr error
+	)
+	if cerr := rc.Read(func(fd uintptr) bool {
+		for {
+			n, rerr = syscall.Read(int(fd), dst)
+			if rerr == syscall.EINTR {
+				continue
+			}
+			return true // never park in runtime netpoller on EAGAIN
+		}
+	}); cerr != nil {
+		return 0, cerr
+	}
+	return n, rerr
+}
+
 func Drain(r io.Reader, maxBytes int) (data []byte, caughtUp bool, err error) {
 	if maxBytes <= 0 {
 		return nil, false, nil
@@ -158,7 +192,7 @@ func Drain(r io.Reader, maxBytes int) (data []byte, caughtUp bool, err error) {
 	var out []byte
 	tmp := make([]byte, 32*1024)
 	for len(out) <= maxBytes {
-		n, rerr := r.Read(tmp)
+		n, rerr := readKmsgChunk(r, tmp)
 		if n > 0 {
 			out = append(out, tmp[:n]...)
 		}

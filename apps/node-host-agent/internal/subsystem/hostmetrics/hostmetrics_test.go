@@ -417,3 +417,38 @@ func TestWriteTextfileIncludesNewMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteTextfileCounters: the vmstat swap-thrash counters are the
+// set's counters — the renderer must type them counter and emit
+// their samples, not silently drop them as non-gauges; undeclared
+// vmstat keys never leak into the file.
+func TestWriteTextfileCounters(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.VMStatFile = filepath.Join(t.TempDir(), "vmstat")
+	testutil.WriteFile(t, cfg.VMStatFile,
+		"pgfree 12345\npswpin 21\npswpout 34\n")
+	c := New(cfg)
+
+	dir := filepath.Join(t.TempDir(), "textfile")
+	if err := c.WriteTextfile(dir); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, TextfileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"# TYPE node_host_agent_vmstat_pswpin_total counter",
+		`node_host_agent_vmstat_pswpin_total{node="node-a"} 21`,
+		"# TYPE node_host_agent_vmstat_pswpout_total counter",
+		`node_host_agent_vmstat_pswpout_total{node="node-a"} 34`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("textfile missing %q\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "pgfree") {
+		t.Fatalf("undeclared vmstat key leaked into the textfile\n%s", text)
+	}
+}

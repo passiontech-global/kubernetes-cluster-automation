@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -181,5 +183,128 @@ func TestOOMShieldReassertsKineAfterRespawn(t *testing.T) {
 	}
 	if v := readAdj(t, e, 2001); v != "-800" {
 		t.Fatalf("apiserver shield lost across respawn: adj=%s", v)
+	}
+}
+
+// --- early gates ---
+
+// No memory.events file — not a cgroup-v2 controller — exits 0 the
+// same way the shell did: counted, silent, nothing latched.
+func TestOOMNoEventsFileNoop(t *testing.T) {
+	e := fixture(t) // the fixture never writes CG
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckOOMLoop, "no_events")); got != 1 {
+		t.Fatalf("cycles{no_events}=%v want 1", got)
+	}
+	if e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("missing memory.events latched an OOM loop")
+	}
+}
+
+// An events file without an `oom_kill` row parses as "no counter" —
+// the probe closes as ok instead of reading a phantom value.
+func TestOOMEventsWithoutKillRowNoop(t *testing.T) {
+	e := fixture(t)
+	testutil.WriteFile(t, e.CG, "low 0\nhigh 0\nmax 0\noom 0\n")
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckOOMLoop, "ok")); got != 1 {
+		t.Fatalf("cycles{ok}=%v want 1", got)
+	}
+	if e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("counterless memory.events latched an OOM loop")
+	}
+}
+
+// An oom_kill row whose counter overflows int64 is no parseable
+// counter either — re-baseline semantics must not fire on it.
+func TestOOMKillCounterOverflowNoop(t *testing.T) {
+	e := fixture(t)
+	testutil.WriteFile(t, e.CG,
+		"low 0\nhigh 0\nmax 0\noom 0\noom_kill 99999999999999999999\noom_group_kill 0\n")
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckOOMLoop, "ok")); got != 1 {
+		t.Fatalf("cycles{ok}=%v want 1 — unparseable counter is no counter", got)
+	}
+	if e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("overflowing oom_kill counter latched an OOM loop")
+	}
+}
+
+// A kills-file append failure must be surfaced, not swallowed — the
+// window then undercounts and the latch can silently stop firing.
+func TestOOMKillsAppendFailWarns(t *testing.T) {
+	e := fixture(t)
+	// Seed a parseable baseline, then make the kills "file" a
+	// directory — the O_APPEND open fails with EISDIR.
+	testutil.WriteFile(t, filepath.Join(e.State, cdeps.FileOOMSeen), "0\n")
+	if err := os.Mkdir(filepath.Join(e.State, cdeps.FileOOMKills), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeEvents(t, e, 2) // baseline 0 → 2 new kills to append
+	e.H.Cycle(context.Background())
+	if !strings.Contains(e.LogLines(), "append failed") {
+		t.Fatalf("kills append failure not logged:\n%s", e.LogLines())
+	}
+	if !strings.Contains(e.LogLines(), "2 new memcg OOM kill") {
+		t.Fatalf("kill delta not announced:\n%s", e.LogLines())
+	}
+}
+
+// Dry-run mode confirms the loop but only rules — the DRY-RUN line,
+// the dryrun_shield action counter, and neither a latch nor a pin.
+func TestOOMDryRunLogsOnly(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.OOMLoop.Mode = cdeps.ModeDryRun
+	e.MkProc(t, 2001, "kube-apiserver", []string{"kube-apiserver"}, 5000)
+	e.MkProc(t, 2002, "kine", []string{"kine"}, 5000)
+	writeEvents(t, e, 0)
+	e.H.Cycle(context.Background())
+	writeEvents(t, e, 3)
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("dry-run did not latch the loop state")
+	}
+	if !strings.Contains(e.LogLines(), "DRY-RUN") {
+		t.Fatalf("dry-run verdict not logged:\n%s", e.LogLines())
+	}
+	if got := promtest.ToFloat64(e.H.Actions.WithLabelValues(cdeps.CheckOOMLoop, "dryrun_shield")); got != 1 {
+		t.Fatalf("actions{dryrun_shield}=%v want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(e.State, cdeps.FileOOMShielded)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run wrote a shield latch: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.Proc, "2001", "oom_score_adj")); !os.IsNotExist(err) {
+		t.Fatalf("dry-run pinned kube-apiserver oom_score_adj: %v", err)
+	}
+}
+
+// A swallowed oom_score_adj write failure would leave the shield
+// half-applied and invisible — every enforce cycle re-pins, so the
+// failure must land in the log while the rest of the shield holds.
+func TestOOMShieldWriteFailLogged(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 2001, "kube-apiserver", []string{"kube-apiserver"}, 5000)
+	e.MkProc(t, 2002, "kine", []string{"kine"}, 5000)
+	writeEvents(t, e, 0)
+	e.H.Cycle(context.Background())
+	writeEvents(t, e, 3)
+	e.H.Cycle(context.Background()) // latched + shielded
+	// Lock the apiserver adj file read-only: the next enforce cycle's
+	// reassert must warn about kube-apiserver while kine re-pins fine.
+	adj := filepath.Join(e.Proc, "2001", "oom_score_adj")
+	if err := os.Chmod(adj, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	writeEvents(t, e, 4) // still latched (in-window kill)
+	e.H.Cycle(context.Background())
+	if !strings.Contains(e.LogLines(), "write oom_score_adj") ||
+		!strings.Contains(e.LogLines(), "comm=kube-apiserver") {
+		t.Fatalf("adj write failure not logged:\n%s", e.LogLines())
+	}
+	if v := readAdj(t, e, 2002); v != "500" {
+		t.Fatalf("kine re-shield failed despite apiserver write error: adj=%s", v)
+	}
+	if v := readAdj(t, e, 2001); v != "-800" {
+		t.Fatalf("apiserver adj mutated on a failed write: %s", v)
 	}
 }

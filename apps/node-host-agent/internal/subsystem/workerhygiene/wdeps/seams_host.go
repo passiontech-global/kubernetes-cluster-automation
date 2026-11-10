@@ -6,6 +6,7 @@ package wdeps
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -37,6 +38,11 @@ type Host struct {
 	// StatfsFn reads fs usage for the ingest-GC disk trigger (A3).
 	// Seam for tests (default unix.Statfs).
 	StatfsFn func(string, *unix.Statfs_t) error
+	// StatFn stats one host path — the spegel stale-containerd-sock
+	// staleness read (/run/k0s/containerd.sock lives on the HOST, a
+	// path tests cannot create). Default os.Stat; tests point it at
+	// a temp file. Seam.
+	StatFn func(path string) (os.FileInfo, error)
 	// ReniceFn drops one pid to the lowest CPU scheduling priority
 	// (renice +19) — the io-pressure throttler's CPU half. Default
 	// syscall.Setpriority; tests record instead of renicing.
@@ -88,6 +94,9 @@ func (s *Host) applyDefaults(c *Config) {
 	}
 	if s.StatfsFn == nil {
 		s.StatfsFn = unix.Statfs
+	}
+	if s.StatFn == nil {
+		s.StatFn = os.Stat
 	}
 	if s.ReniceFn == nil {
 		s.ReniceFn = func(pid int) error {

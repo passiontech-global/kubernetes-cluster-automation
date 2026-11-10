@@ -63,11 +63,9 @@ func pyFormat(format string, args []any) (string, error) {
 				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
 			}
 			if strings.Contains(spec, "-") {
-				width := 0
-				_, _ = fmt.Sscanf(strings.TrimLeft(spec, "-+0"), "%d", &width)
-				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(width)+"d", iv))
+				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(specWidth(spec))+"d", iv))
 			} else {
-				b.WriteString(fmt.Sprintf("%"+spec+"d", iv))
+				b.WriteString(fmt.Sprintf("%"+safeFmtSpec(spec)+"d", iv))
 			}
 		case 'x', 'X':
 			iv, ok := ToInt(a)
@@ -77,7 +75,7 @@ func pyFormat(format string, args []any) (string, error) {
 			if !validFmtSpec(spec, true) {
 				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
 			}
-			b.WriteString(fmt.Sprintf("%"+spec+string(conv), iv))
+			b.WriteString(fmt.Sprintf("%"+safeFmtSpec(spec)+string(conv), iv))
 		case 'f', 'F', 'e', 'E', 'g', 'G':
 			fv, ok := toFloat(a)
 			if !ok {
@@ -86,7 +84,7 @@ func pyFormat(format string, args []any) (string, error) {
 			if !validFmtSpec(spec, true) {
 				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
 			}
-			b.WriteString(fmt.Sprintf("%"+spec+string(conv), fv))
+			b.WriteString(fmt.Sprintf("%"+safeFmtSpec(spec)+string(conv), fv))
 		case 'c':
 			// %c takes flags/width only — no precision.
 			if !validFmtSpec(spec, false) {
@@ -111,17 +109,16 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 			sv := Stringify(a)
 			// %.Ns truncates the string form (python precision
-			// semantics on %s).
-			if dot := strings.IndexByte(spec, '.'); dot >= 0 {
-				if n, err := strconv.Atoi(spec[dot+1:]); err == nil && n >= 0 {
+			// semantics on %s) — clamped like width so a huge
+			// precision can't force an absurd rune slice.
+			if digits, ok := specPrecDigits(spec); ok {
+				if n := clampSpecNum(digits); n >= 0 {
 					if rs := []rune(sv); len(rs) > n {
 						sv = string(rs[:n])
 					}
 				}
 			}
-			num := strings.TrimLeft(spec, "-")
-			width := 0
-			_, _ = fmt.Sscanf(num, "%d", &width)
+			width := specWidth(spec)
 			if strings.Contains(spec, "-") {
 				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(width)+"s", sv))
 			} else if width > 0 {
@@ -136,6 +133,84 @@ func pyFormat(format string, args []any) (string, error) {
 		return "", fmt.Errorf("format: not all arguments converted (%d given)", len(args))
 	}
 	return b.String(), nil
+}
+
+// specDigits returns spec[i:j] — the run of characters satisfying
+// pred starting at i — used to isolate the width/precision digit
+// fields of a validated printf spec.
+func specDigits(spec string, i int, pred func(byte) bool) string {
+	j := i
+	for j < len(spec) && pred(spec[j]) {
+		j++
+	}
+	return spec[i:j]
+}
+
+func isDigitByte(c byte) bool { return c >= '0' && c <= '9' }
+func isFlagByte(c byte) bool {
+	return strings.ContainsRune("-+ #0", rune(c))
+}
+
+// specWidthDigits extracts the width digits of a validated spec —
+// leading flag chars ("-+ #0") and any .precision are excluded.
+func specWidthDigits(spec string) string {
+	i := 0
+	for i < len(spec) && isFlagByte(spec[i]) {
+		i++
+	}
+	return specDigits(spec, i, isDigitByte)
+}
+
+// specPrecDigits extracts the precision digits (after '.') of a
+// validated spec; ok=false when the spec carries no precision.
+func specPrecDigits(spec string) (digits string, ok bool) {
+	dot := strings.IndexByte(spec, '.')
+	if dot < 0 {
+		return "", false
+	}
+	return specDigits(spec, dot+1, isDigitByte), true
+}
+
+// clampSpecNum converts a spec digit field to int, capped at
+// maxIndentWidth. Leading zeros are stripped first so "000001"
+// isn't mistaken for a huge width; an absurd digit count short-
+// circuits to the cap instead of overflowing Atoi.
+func clampSpecNum(digits string) int {
+	digits = strings.TrimLeft(digits, "0")
+	if digits == "" {
+		return 0
+	}
+	if len(digits) > 5 {
+		return maxIndentWidth
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n > maxIndentWidth {
+		return maxIndentWidth
+	}
+	return n
+}
+
+// specWidth is the clamped numeric width of a validated spec.
+func specWidth(spec string) int { return clampSpecNum(specWidthDigits(spec)) }
+
+// safeFmtSpec rebuilds a validated spec with width/precision clamped
+// to maxIndentWidth — passing the raw spec to fmt.Sprintf let
+// "%999999999f" allocate ~1GB of output (OOM).
+func safeFmtSpec(spec string) string {
+	i := 0
+	for i < len(spec) && isFlagByte(spec[i]) {
+		i++
+	}
+	var b strings.Builder
+	b.WriteString(spec[:i])
+	if w := specWidth(spec); w > 0 {
+		b.WriteString(strconv.Itoa(w))
+	}
+	if digits, ok := specPrecDigits(spec); ok {
+		b.WriteByte('.')
+		b.WriteString(strconv.Itoa(clampSpecNum(digits)))
+	}
+	return b.String()
 }
 
 // validFmtSpec reports whether spec (between % and the conversion

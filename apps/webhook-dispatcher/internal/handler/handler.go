@@ -68,12 +68,27 @@ var resourceTypeForEvent = map[string]string{
 type payload struct {
 	Action     string `json:"action"`
 	RefType    string `json:"ref_type"`
+	Deleted    bool   `json:"deleted"`
+	After      string `json:"after"`
 	Repository struct {
 		FullName string `json:"full_name"`
 		SSHURL   string `json:"ssh_url"`
 		CloneURL string `json:"clone_url"`
 		HTMLURL  string `json:"html_url"`
 	} `json:"repository"`
+}
+
+// actionablePRActions are the pull_request actions that can change
+// what a github-pr resource checks out. Every other action (labeled,
+// closed, edited, assigned, ...) is acknowledged without touching the
+// index — they would only burn a forced-refresh slot against
+// MinRefreshInterval.
+var actionablePRActions = map[string]bool{
+	"opened":           true,
+	"synchronize":      true,
+	"reopened":         true,
+	"ready_for_review": true,
+	"unlocked":         true,
 }
 
 // summary is the JSON response body for accepted deliveries: how many
@@ -223,6 +238,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"delivery", delivery, "event", event,
 			"action", p.Action, "ref_type", p.RefType)
 		writeJSON(w, http.StatusAccepted, summary{})
+		return
+	}
+
+	// Filter deliveries that can never match a resource check BEFORE
+	// the index lookup: a non-actionable pull_request action or a
+	// branch deletion would otherwise burn a forced Refresh slot
+	// (MinRefreshInterval-throttled, so every skipped delivery delays
+	// a real one behind it). payload.Action == "" keeps synthetic
+	// test payloads (repository-only bodies) on the matching path.
+	if event == "pull_request" && p.Action != "" && !actionablePRActions[p.Action] {
+		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
+		logger().Info("webhook delivery ignored: non-actionable pull_request action",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", event, "action", p.Action)
+		writeSkipped(w, "action")
+		return
+	}
+	// A deleted branch (or the all-zero "after" sha GitHub sends for
+	// deletions) has no commit for git resources to check.
+	if event == "push" &&
+		(p.Deleted || p.After == "0000000000000000000000000000000000000000") {
+		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
+		logger().Info("webhook delivery ignored: branch deletion",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", event,
+			"deleted", p.Deleted, "after", p.After)
+		writeSkipped(w, "deleted")
 		return
 	}
 
@@ -423,4 +465,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeSkipped acknowledges an authenticated delivery that was
+// filtered before the index lookup — 200 (not 202) with the skip
+// reason so operators can tell "matched nothing" from "never
+// checked".
+func writeSkipped(w http.ResponseWriter, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"matched": 0,
+		"skipped": reason,
+	})
 }

@@ -63,6 +63,21 @@ func (c *TTLCheck) Run(ctx context.Context) {
 		kage = 0
 	}
 	since := now.Add(-time.Duration(kage) * time.Second)
+	// Bound the journalctl --since window: on a node up for days a
+	// healthy long-lived kine pid would otherwise dump tens of MiB of
+	// old unit logs into hostexec's 16 MiB head buffer and lose the
+	// newest tail — the TTL verdict only needs the boot window. While
+	// StateKineTTLDead is latched FOR THIS pid the full pid-age window
+	// stays: confirming the boot-time error line may still require
+	// reading back to process start.
+	const maxLookback = 15 * time.Minute
+	deadForThisPid := c.d.State.Exists(cdeps.StateKineTTLDead) &&
+		c.d.ReadState(cdeps.FileTTLWedgedPID) == strconv.Itoa(kpid)
+	if !deadForThisPid {
+		if floor := now.Add(-maxLookback); since.Before(floor) {
+			since = floor
+		}
+	}
 	ttlDead := cdeps.CountMatches(ttlErrRe, c.d.JournalText(ctx, since)) > 0
 	if !ttlDead {
 		// Pid living clean past the seed window → loop broken:

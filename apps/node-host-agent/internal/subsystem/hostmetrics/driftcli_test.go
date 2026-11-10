@@ -163,3 +163,66 @@ func TestScanK0sDriftCustomSets(t *testing.T) {
 		t.Fatalf("default removed flag leaked: %+v", scan.Findings)
 	}
 }
+
+// TestScanK0sDriftConfigDefaults: nil slice fields select the
+// repo-pinned defaults and the scan result carries the NORMALIZED
+// config (callers print these paths, not their raw input). An empty
+// non-nil ExpectedKeys is honored as "expect nothing" — every node
+// key reports as extra — and an empty RemovedFlags disables the
+// removed check.
+func TestScanK0sDriftConfigDefaults(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "k0scontroller.service")
+	testutil.WriteFile(t, unit, "[Unit]\nDescription=controller\n")
+
+	scan := ScanK0sDrift(K0sDriftConfig{UnitFile: unit})
+	if scan.NotController {
+		t.Fatal("existing unit gated the scan off")
+	}
+	if scan.Config.ConfigFile != defaultK0sConfigFile {
+		t.Fatalf("ConfigFile=%q want the default", scan.Config.ConfigFile)
+	}
+	if scan.Config.UnitFile != unit {
+		t.Fatalf("UnitFile=%q want the given path", scan.Config.UnitFile)
+	}
+	if !slices.Equal(scan.Config.ExpectedKeys, defaultExpectedKCMArgs) {
+		t.Fatalf("ExpectedKeys=%v want the repo-pinned set", scan.Config.ExpectedKeys)
+	}
+	if !slices.Equal(scan.Config.RemovedFlags, defaultRemovedFlags) {
+		t.Fatalf("RemovedFlags=%v want the defaults", scan.Config.RemovedFlags)
+	}
+
+	// Empty non-nil overrides: no expected keys, no removed flags —
+	// the node's flag can only be an extra.
+	cfgFile := filepath.Join(dir, "k0s.yaml")
+	testutil.WriteFile(t, cfgFile,
+		"spec:\n  controllerManager:\n    extraArgs:\n      concurrent-service-syncs: \"4\"\n")
+	scan2 := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile:   cfgFile,
+		UnitFile:     unit,
+		ExpectedKeys: []string{},
+		RemovedFlags: []string{},
+	})
+	if got := findingKeys(scan2, "extra-key"); !slices.Equal(got, []string{"concurrent-service-syncs"}) {
+		t.Fatalf("extra-key findings=%v want the node key", got)
+	}
+	if len(findingKeys(scan2, "removed-flag")) != 0 {
+		t.Fatalf("removed check ran despite an empty RemovedFlags: %+v", scan2.Findings)
+	}
+	if len(findingKeys(scan2, "missing-key")) != 0 {
+		t.Fatalf("missing-key reported with an empty expected set: %+v", scan2.Findings)
+	}
+
+	// A fully bare config: defaults applied, the missing default
+	// unit gate skips the scan — no findings, no panic.
+	scan3 := ScanK0sDrift(K0sDriftConfig{})
+	if !scan3.NotController {
+		t.Fatal("bare config ran without a controller unit")
+	}
+	if scan3.Config.UnitFile != defaultK0sUnitFile {
+		t.Fatalf("UnitFile=%q want the default", scan3.Config.UnitFile)
+	}
+	if len(scan3.Findings) != 0 {
+		t.Fatalf("gated scan produced findings: %+v", scan3.Findings)
+	}
+}

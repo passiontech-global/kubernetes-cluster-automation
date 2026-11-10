@@ -8,6 +8,8 @@ package cilium
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -361,5 +363,93 @@ func TestCiliumUnhealthySubsystems(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIPAMCountShapes — the healthz ipam value reader accepts a bare
+// number, an array or an object (counted by length); null, empty and
+// unparseable values report not-found.
+func TestIPAMCountShapes(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		want   int
+		wantOK bool
+	}{
+		{`7`, 7, true},
+		{`3.9`, 3, true}, // JSON numbers are floats — the count truncates
+		{`[{"ip":1},{"ip":2},{"ip":3}]`, 3, true},
+		{`{"10.0.0.1":"pod-a","10.0.0.2":""}`, 2, true},
+		{`null`, 0, false},
+		{`   `, 0, false},
+		{`garbage`, 0, false},
+		{`{"nope"`, 0, false},
+		{`[{"nope"`, 0, false},
+	} {
+		got, ok := ipamCount(json.RawMessage(tc.in))
+		if got != tc.want || ok != tc.wantOK {
+			t.Fatalf("ipamCount(%q)=%d,%v want %d,%v", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+// TestFreeIPAMPoolShapes — pool-mode allocations: empty owner strings
+// are the free markers (string OR {"owner": ""} wire shapes), an
+// all-owned map is indistinguishable from an allocated-only dump →
+// not-found, and a missing map is not-found.
+func TestFreeIPAMPoolShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		m      map[string]json.RawMessage
+		want   int
+		wantOK bool
+	}{
+		{"empty map", map[string]json.RawMessage{}, 0, false},
+		{"all owned", map[string]json.RawMessage{
+			"10.0.0.1": json.RawMessage(`"pod-a"`),
+			"10.0.0.2": json.RawMessage(`"node-x"`),
+		}, 0, false},
+		{"mixed string owners", map[string]json.RawMessage{
+			"10.0.0.1": json.RawMessage(`"pod-a"`),
+			"10.0.0.2": json.RawMessage(`""`),
+		}, 1, true},
+		{"object owner shapes", map[string]json.RawMessage{
+			"10.0.0.1": json.RawMessage(`{"owner":""}`),
+			"10.0.0.2": json.RawMessage(`{"owner":"pod-b"}`),
+		}, 1, true},
+		{"garbage value skipped", map[string]json.RawMessage{
+			"10.0.0.1": json.RawMessage(`garbage`),
+		}, 0, false},
+	} {
+		got, ok := freeIPAMPool(tc.m)
+		if got != tc.want || ok != tc.wantOK {
+			t.Fatalf("%s: freeIPAMPool=%d,%v want %d,%v", tc.name, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+// TestEvalEnvoyXDSPagesInconclusive — an unconfigured admin URL and
+// an unreadable stats page are inconclusive: the baseline stays
+// unestablished and no reject verdict is claimed.
+func TestEvalEnvoyXDSPagesInconclusive(t *testing.T) {
+	// Empty admin URL → inconclusive without touching the seam.
+	d, _ := cDeps(t)
+	d.Cfg.Cilium.EnvoyAdminURL = ""
+	c := &CiliumEnvoyCheck{d: d}
+	if _, incon := c.evalEnvoyXDS(context.Background()); !incon {
+		t.Fatal("empty admin URL must read inconclusive")
+	}
+	if c.xdsInit {
+		t.Fatal("inconclusive read must not establish the baseline")
+	}
+
+	// Stats page unreachable → inconclusive, baseline still unset.
+	d, f := cDeps(t)
+	f.MkTask(t, wdepstest.UIDF, "cilium-envoy", 555)
+	f.Live[555] = true
+	d.Cfg.Seams.Probe.HTTPGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
+		return nil, errors.New("connection refused")
+	}
+	if _, incon := c.evalEnvoyXDS(context.Background()); !incon {
+		t.Fatal("unreadable stats page must read inconclusive")
 	}
 }

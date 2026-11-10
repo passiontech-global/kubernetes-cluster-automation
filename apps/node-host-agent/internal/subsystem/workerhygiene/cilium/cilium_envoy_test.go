@@ -5,6 +5,7 @@ package cilium_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -62,5 +63,53 @@ func TestCiliumEnvoyKilledWithAgent(t *testing.T) {
 	}
 	if !killed[444] || !killed[555] {
 		t.Fatalf("agent kill must restart envoy too; kills=%v", e.Kills)
+	}
+}
+
+// TestCiliumEnvoyCooldownSkipsKill: the last-cilium-envoy-restart
+// budget bounds the bounce — after one kill the next unready streak
+// only logs the cooldown skip.
+func TestCiliumEnvoyCooldownSkipsKill(t *testing.T) {
+	e := fixture(t)
+	e.SDReply["is-active k0sworker.service"] = "active"
+	mkCiliumContainer(t, e, "cilium-envoy", 556)
+	e.Status["http://127.0.0.1:9964/ready"] = 503
+	for i := 0; i < 2; i++ {
+		e.H.Cycle(context.Background())
+	}
+	kills := 0
+	for _, k := range e.Kills {
+		if k.PID == 556 && k.Sig == syscall.SIGKILL {
+			kills++
+		}
+	}
+	if kills != 1 {
+		t.Fatalf("kills=%d want exactly 1 after the first confirmed streak", kills)
+	}
+	for i := 0; i < 2; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if !strings.Contains(e.LogLines(t), "restart cooldown (<30m)") {
+		t.Fatalf("missing cooldown skip line:\n%s", e.LogLines(t))
+	}
+	if got := len(e.Kills); got != 1 {
+		t.Fatalf("a second kill fired inside the cooldown: kills=%v", e.Kills)
+	}
+}
+
+// TestCiliumEnvoyNoLiveTaskKillSkipped: a task dir whose init is gone
+// leaves the restart nothing to signal — the suspect line replaces it.
+func TestCiliumEnvoyNoLiveTaskKillSkipped(t *testing.T) {
+	e := fixture(t)
+	e.MkTask(t, wdepstest.UIDE, "cilium-envoy", 557) // pid never live
+	e.Status["http://127.0.0.1:9964/ready"] = 503
+	for i := 0; i < 2; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v against a dead task", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(t), "no running task to kill") {
+		t.Fatalf("missing no-kill line:\n%s", e.LogLines(t))
 	}
 }

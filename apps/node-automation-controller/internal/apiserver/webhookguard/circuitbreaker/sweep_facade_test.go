@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -1251,6 +1253,121 @@ func TestWebhookCircuitBreakerBouncePDBRefusalDefers(t *testing.T) {
 	}
 	if got := testutil.QueueErrorCount(t, "webhook-guard") - before; got != 0 {
 		t.Fatalf("PDB refusal metered as an error: delta = %v, want 0", got)
+	}
+}
+
+// The refused bounce's budget grant comes back: the preamble and the
+// eviction are ONE heal.EvictPodV call now, so a backend wedged
+// behind a drained disruptionsAllowed cannot burn the fleet budget
+// (10/5min) one grant per sweep and starve every other heal-gated
+// module. The refused sweeps therefore keep reaching the eviction API
+// (attempts advance every sweep — the pre-fix split shape deferred at
+// the exhausted budget gate after the first refusal), and the grant a
+// DELIVERED bounce consumes stays spent.
+func TestWebhookCircuitBreakerRefusedBounceRefundsBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "pdb-brownout"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "hung.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "hung-svc"),
+			},
+		}, {
+			Name:          "ok.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "ok-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "hung-svc"),
+		wgHungSlice("backend", "hung-svc", "wh-old"),
+		wgService("backend", "ok-svc"),
+		wgEndpointSlice("backend", "ok-svc", 1, 0),
+		wgPod("backend", "wh-old", 48*time.Hour),
+		mwc)
+	// The PDB stand-in flips to delivered on demand — the refusal
+	// phase proves the refund, the delivery phase proves the granted
+	//-and-kept accounting on the same budget.
+	attempts := 0
+	refuse := true
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			attempts++
+			if refuse {
+				return true, nil, apierrors.NewTooManyRequests(
+					"pdb allows no disruptions", 0)
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
+		})
+	now := time.Unix(1_700_000_000, 0)
+	b := &Breaker{}
+	g := &guardstate.Guard{
+		CS: cs, Dyn: wgDyn(),
+		Now: func() time.Time { return now },
+		EndpointProber: func(_ context.Context, ip string, _ int32) bool {
+			return ip == "10.10.0.1" // ok-svc answers; hung-svc wedged
+		}}
+
+	// Sweep 1: the bounce reaches the eviction API and is refused.
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("first sweep attempts = %d, want 1", attempts)
+	}
+	// Sweep 2: the refund let the budget admit a fresh grant — the
+	// eviction is attempted again (pre-fix the spent grant made this
+	// sweep defer at the budget gate and attempts stayed 1).
+	now = now.Add(time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("refused sweep must reach the eviction API again: attempts = %d, want 2", attempts)
+	}
+	if _, stamped := b.bounceAt.Last("backend/hung-svc"); stamped {
+		t.Fatal("PDB refusal stamped bounceAt")
+	}
+	// Sweep 3: disruptions freed up — the bounce DELIVERS, consumes a
+	// grant of its own and stamps the cooldown (delivered contract
+	// unchanged by the refund wiring).
+	refuse = false
+	now = now.Add(time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("delivery sweep attempts = %d, want 3", attempts)
+	}
+	if _, stamped := b.bounceAt.Last("backend/hung-svc"); !stamped {
+		t.Fatal("delivered bounce did not stamp bounceAt")
+	}
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-old",
+		metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("delivered bounce left the pod behind: %v", err)
+	}
+	// The delivered grant stays spent: a 1-grant budget has no room
+	// left for another key, and the exhaustion counter says so.
+	denials := 0
+	heal.SetBudgetExhaustedHook(func() { denials++ })
+	t.Cleanup(func() { heal.SetBudgetExhaustedHook(nil) })
+	heal.AllowedV(ctx, logr.Discard(), nil, cs, wgDyn(), nil, "other-key",
+		0, now.Add(time.Minute))
+	if denials != 1 {
+		t.Fatalf("delivered bounce kept no grant: denials = %d, want 1", denials)
 	}
 }
 

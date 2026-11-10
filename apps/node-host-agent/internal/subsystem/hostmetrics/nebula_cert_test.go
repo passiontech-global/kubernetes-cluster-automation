@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"encoding/pem"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -161,5 +162,58 @@ func TestNebulaCertStatePersistsZeroAfterRemoval(t *testing.T) {
 	}
 	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
 		t.Fatal("cert_days_left emitted after cert removal")
+	}
+}
+
+// TestReadVarintAndSkipWireEdges pins the wire-format guards the
+// cert parsers rely on: truncated/overflowing varints, the fixed
+// wire types' length windows and the rejected group wire types.
+func TestReadVarintAndSkipWireEdges(t *testing.T) {
+	if v, n := readVarint(nil); n != 0 || v != 0 {
+		t.Fatalf("readVarint(nil)=%d,%d want 0,0", v, n)
+	}
+	// Ten continuation bytes → overflow, not a value.
+	if _, n := readVarint([]byte{
+		0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}); n != 0 {
+		t.Fatal("all-continuation varint accepted")
+	}
+	// The 10th byte may carry only its lowest bit.
+	if _, n := readVarint([]byte{
+		0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02}); n != 0 {
+		t.Fatal("10th byte carrying more than one bit accepted")
+	}
+	// The maximal 10-byte encoding decodes to MaxUint64.
+	if v, n := readVarint([]byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}); n != 10 || v != math.MaxUint64 {
+		t.Fatalf("max varint=%d n=%d want MaxUint64,10", v, n)
+	}
+
+	// fixed64 (wire 1): exactly 8 bytes, else truncated.
+	if n, ok := skipWire([]byte{1, 2, 3, 4, 5, 6, 7, 8}, 1); !ok || n != 8 {
+		t.Fatalf("skipWire(fixed64)=%d,%v want 8,true", n, ok)
+	}
+	if _, ok := skipWire([]byte{1, 2, 3}, 1); ok {
+		t.Fatal("short fixed64 accepted")
+	}
+	// fixed32 (wire 5): exactly 4 bytes.
+	if n, ok := skipWire([]byte{1, 2, 3, 4}, 5); !ok || n != 4 {
+		t.Fatalf("skipWire(fixed32)=%d,%v want 4,true", n, ok)
+	}
+	if _, ok := skipWire([]byte{1}, 5); ok {
+		t.Fatal("short fixed32 accepted")
+	}
+	// Group/deprecated wire types are unparseable, not guessed.
+	for _, w := range []int{3, 4, 6} {
+		if _, ok := skipWire([]byte{0xff, 0xff}, w); ok {
+			t.Fatalf("wire type %d accepted", w)
+		}
+	}
+	// Length-delimited: a declared length past the buffer is a
+	// truncation; an exact fit returns the full field span.
+	if _, ok := skipWire([]byte{0x05, 'a', 'b'}, 2); ok {
+		t.Fatal("overlong length-delimited field accepted")
+	}
+	if n, ok := skipWire([]byte{0x02, 'a', 'b'}, 2); !ok || n != 3 {
+		t.Fatalf("skipWire(LEN)=%d,%v want 3,true", n, ok)
 	}
 }

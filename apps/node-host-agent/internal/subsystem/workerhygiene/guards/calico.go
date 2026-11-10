@@ -189,12 +189,17 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 					"suspect: calico-felix-down %dx but pod restart in cooldown (<30m), skip", c.felixFails))
 			default:
 				// Budget spent atomically BEFORE the delete.
+				// Preconditions{UID} closes the listing→delete race:
+				// DaemonSet churn recycling the pod name between the
+				// CycleEnv list and this call must 409, not kill the
+				// unrelated replacement pod.
 				c.d.State.AppendLog(fmt.Sprintf(
 					"ACTION: calico-hygiene deleted pod %s/%s - felix readiness down %dx",
 					felix.Namespace, felix.Name, c.felixFails))
 				if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
 					ctx, felix.Name, metav1.DeleteOptions{
-						GracePeriodSeconds: ptr.To[int64](0)}); derr != nil {
+						GracePeriodSeconds: ptr.To[int64](0),
+						Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
 					c.d.State.AppendLog(fmt.Sprintf(
 						"suspect: calico-hygiene delete %s/%s failed: %v",
 						felix.Namespace, felix.Name, derr))
@@ -268,9 +273,12 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: calico-hygiene deleted pod %s/%s - wireguard.cali down/no-carrier",
 			felix.Namespace, felix.Name))
+		// Same UID precondition as the felix remedy above — the
+		// name-reuse race applies identically here.
 		if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
 			ctx, felix.Name, metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](0)}); derr != nil {
+				GracePeriodSeconds: ptr.To[int64](0),
+				Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene delete %s/%s failed: %v",
 				felix.Namespace, felix.Name, derr))

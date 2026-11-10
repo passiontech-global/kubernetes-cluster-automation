@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -239,6 +240,11 @@ const verdictTTL = time.Minute
 // error verdict is sticky for the window too, matching the
 // fail-closed contract of a fresh check.
 type Verdict struct {
+	// mu guards the memo fields — several module goroutines share
+	// one Verdict (Deps.verdict) and may evaluate Active
+	// concurrently; an unguarded read-modify-write could tear the
+	// (at, held, why, err) tuple mid-sweep.
+	mu   sync.Mutex
 	at   time.Time
 	held bool
 	why  string
@@ -251,6 +257,8 @@ type Verdict struct {
 // than the verdict TTL.
 func (v *Verdict) Active(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, now time.Time) (bool, string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if now.Sub(v.at) < verdictTTL {
 		return v.held, v.why, v.err
 	}

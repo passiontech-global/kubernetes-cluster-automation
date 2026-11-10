@@ -867,3 +867,49 @@ func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
 		t.Fatalf("check calls=%d want 0 (budget-expired targets must not POST)", got)
 	}
 }
+
+// Non-actionable pull_request actions and branch deletions are
+// acknowledged before the index lookup — they must not consume a
+// Refresh slot or an index fetch.
+func TestSkippedDeliveriesBypassIndex(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusOK}
+	h := New(testSecret, b)
+
+	prSkipped := `{"action":"labeled","repository":{"full_name":"org/repo"}}`
+	for _, action := range []string{"closed", "labeled", "edited", "assigned"} {
+		body := strings.Replace(prSkipped, "labeled", action, 1)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "pull_request", body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("action=%s status=%d want 200", action, rec.Code)
+		}
+		var s map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+			t.Fatal(err)
+		}
+		if s["skipped"] != "action" {
+			t.Fatalf("action=%s body=%v want skipped=action", action, s)
+		}
+	}
+	// Actionable actions still reach the index path (202).
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "pull_request",
+		`{"action":"synchronize","repository":{"full_name":"org/repo"}}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("synchronize status=%d want 202", rec.Code)
+	}
+
+	for _, body := range []string{
+		`{"deleted":true,"repository":{"full_name":"org/repo"}}`,
+		`{"after":"0000000000000000000000000000000000000000","repository":{"full_name":"org/repo"}}`,
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push body=%s status=%d want 200", body, rec.Code)
+		}
+	}
+	if n := b.refreshCount(); n != 0 {
+		t.Fatalf("Refresh calls=%d want 0 (all deliveries skipped or matched)", n)
+	}
+}

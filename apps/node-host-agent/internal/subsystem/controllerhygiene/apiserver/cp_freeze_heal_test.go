@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -191,7 +192,7 @@ func TestCPFreezeRestartsAfterThreeDeadCycles(t *testing.T) {
 		return "leader_election_master_status 1\nworkqueue_depth{name=\"a\"} 1\n", nil
 	}
 	e.Alive["https://10.0.0.2:6443/readyz"] = true // peer healthy
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		e.H.Cycle(context.Background())
 	}
 	if e.RstN() == 0 {
@@ -209,7 +210,7 @@ func TestCPFreezeGatedByDeadPeer(t *testing.T) {
 		return "", nil
 	}
 	// PeerAPI default is alive[...] → false: peer dead → no restart.
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		e.H.Cycle(context.Background())
 	}
 	if e.RstN() != 0 {
@@ -288,7 +289,7 @@ func TestCPFreezeHealthyIdleNeverRestarts(t *testing.T) {
 			"workqueue_adds_total{name=\"b\"} 20\n", nil
 	}
 	e.Alive["https://10.0.0.2:6443/readyz"] = true
-	for i := 0; i < 15; i++ {
+	for range 15 {
 		e.H.Cycle(context.Background())
 		e.Now = e.Now.Add(61 * time.Second)
 	}
@@ -647,7 +648,7 @@ func TestKonnectivityNoWorkerSuppressesHeal(t *testing.T) {
 	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 0}}
 	e.MkProc(t, 4242, "konnectivity-se",
 		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		e.H.Cycle(context.Background())
 	}
 	if len(e.Kills) != 0 {
@@ -664,6 +665,632 @@ func TestKonnectivityNoWorkerSuppressesHeal(t *testing.T) {
 	if v := promtest.ToFloat64(e.H.KonnReadyBackends); v != -1 {
 		t.Fatalf("scrape-failed gauge=%v want -1", v)
 	}
+}
+
+// --- parser edge branches ---
+
+func TestParseAPFMetricsEdges(t *testing.T) {
+	// Unparseable sample values are skipped, not poisoned in.
+	r, i := apiserver.ParseAPFMetrics(
+		"apiserver_flowcontrol_rejected_requests_total{flow_schema=\"a\"," +
+			"priority_level=\"b\"} 1.2.3\n")
+	if len(r) != 0 || len(i) != 0 {
+		t.Fatalf("unparseable sample parsed: %v %v", r, i)
+	}
+	// A series with NO label set at all — both apfLabel lookups miss
+	// and the key groups under ("", "").
+	r, _ = apiserver.ParseAPFMetrics(
+		"apiserver_flowcontrol_rejected_requests_total 9\n")
+	if r[apiserver.APFSeriesKey{}] != 9 {
+		t.Fatalf("bare sample key missing: %v", r)
+	}
+	// Labels that match neither label regex also land under ("","").
+	_, i = apiserver.ParseAPFMetrics(
+		"apiserver_flowcontrol_current_inqueue_requests{other=\"x\"} 4\n")
+	if i[apiserver.APFSeriesKey{}] != 4 {
+		t.Fatalf("unlabelled inqueue sample missing: %v", i)
+	}
+}
+
+func TestParseTerminatedWatchersEdges(t *testing.T) {
+	// A sample whose value is not a float is skipped — the family is
+	// only "seen" when at least one sample parses.
+	total, seen := apiserver.ParseTerminatedWatchers(
+		"apiserver_terminated_watchers_total 1.2.3\n" +
+			"apiserver_terminated_watchers_total{reason=\"x\"} 4..5\n")
+	if seen || total != 0 {
+		t.Fatalf("unparseable family seen=%v total=%v", seen, total)
+	}
+}
+
+// TestEmitAPFMetricsSortedKeys pins the byte-stable textfile order:
+// flow_schema ascending, priority_level breaking ties.
+func TestEmitAPFMetricsSortedKeys(t *testing.T) {
+	e := fixture(t)
+	c := apiserver.NewFreeze(e.H.Deps, nil, nil)
+	dir := t.TempDir()
+	cdeps.TextfileDirOverride = dir
+	defer func() { cdeps.TextfileDirOverride = "" }()
+	c.EmitAPFMetrics(map[apiserver.APFSeriesKey]float64{
+		{"b", "p2"}: 1,
+		{"b", "p1"}: 2,
+		{"a", "z"}:  3,
+	}, nil, 0, false)
+	b, err := os.ReadFile(filepath.Join(dir, apiserver.APFPromFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	ia := strings.Index(s, `flow_schema="a",priority_level="z"}`)
+	ib1 := strings.Index(s, `flow_schema="b",priority_level="p1"`)
+	ib2 := strings.Index(s, `flow_schema="b",priority_level="p2"`)
+	if ia < 0 || ib1 < 0 || ib2 < 0 || !(ia < ib1 && ib1 < ib2) {
+		t.Fatalf("textfile not schema-then-level sorted:\n%s", s)
+	}
+}
+
+// TestAPFMetricsDefaultSeamErrors drives the non-Fn path of
+// apfMetrics — the mTLS client seam the rv probe shares — through
+// every failure shape: no creds, transport error, non-200, and a
+// body read error. All degrade to headers-only emission.
+func TestAPFMetricsDefaultSeamErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(e *env)
+	}{
+		{"no_creds", func(e *env) {
+			e.H.Cfg.HTTPClient = nil
+			e.H.Client = nil // creds files missing → EnsureClient nil
+		}},
+		{"transport_error", func(e *env) {}}, // rvTransport fails /metrics
+		{"status_503", func(e *env) {
+			tr := errBodyTransport{status: http.StatusServiceUnavailable}
+			e.H.Cfg.HTTPClient = &http.Client{Transport: tr}
+			e.H.Client = e.H.Cfg.HTTPClient
+		}},
+		{"body_read_error", func(e *env) {
+			tr := errBodyTransport{status: http.StatusOK, bodyErr: true}
+			e.H.Cfg.HTTPClient = &http.Client{Transport: tr}
+			e.H.Client = e.H.Cfg.HTTPClient
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			cdeps.TextfileDirOverride = t.TempDir()
+			defer func() { cdeps.TextfileDirOverride = "" }()
+			tc.mut(e)
+			cdepstest.Check[*apiserver.FreezeCheck](
+				e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background())
+			prom, err := os.ReadFile(filepath.Join(
+				cdeps.TextfileDirOverride, apiserver.APFPromFile))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(prom),
+				"# TYPE "+apiserver.APFRejectedMetric) {
+				t.Fatalf("headers missing:\n%s", prom)
+			}
+			if strings.Contains(string(prom),
+				apiserver.APFRejectedMetric+"{") {
+				t.Fatalf("stale sample emitted:\n%s", prom)
+			}
+			// A real sample line starts with the metric name — the
+			// # HELP/# TYPE header lines never do.
+			if strings.Contains(string(prom), "\nnode_host_agent_apiserver_rss_bytes") {
+				t.Fatalf("stale RSS sample emitted:\n%s", prom)
+			}
+		})
+	}
+}
+
+// errBodyTransport answers /metrics with a fixed status; with
+// bodyErr set the body fails mid-read (a truncated TLS stream's
+// shape) so io.ReadAll errors after the 200.
+type errBodyTransport struct {
+	status  int
+	bodyErr bool
+}
+
+func (t errBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(req.URL.Path, "/metrics") {
+		return nil, errors.New("errBodyTransport: unexpected " + req.URL.String())
+	}
+	var body io.ReadCloser = io.NopCloser(strings.NewReader("partial"))
+	if t.bodyErr {
+		body = io.NopCloser(errReader{})
+	}
+	return &http.Response{
+		Status: strconv.Itoa(t.status), StatusCode: t.status,
+		Header: make(http.Header), Body: body, Request: req,
+	}, nil
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("read: connection reset by peer")
+}
+
+// A successful default-seam scrape carries the RSS sample into the
+// textfile (W19-PI2) and the new-key + sampling offender branches.
+func TestAPFProbeDefaultSeamEmitAndSampling(t *testing.T) {
+	e := fixture(t)
+	cdeps.TextfileDirOverride = t.TempDir()
+	defer func() { cdeps.TextfileDirOverride = "" }()
+
+	// Scrape 1: baseline with an RSS sample — the gauge must appear.
+	base := "process_resident_memory_bytes{instance=\"a:6443\"} 1.5e8\n"
+	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).
+		ProbeAPF(context.Background())
+	// Default seam fails /metrics via rvTransport — use APFMetricsFn
+	// for the content-bearing scrapes instead.
+	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).APFMetricsFn =
+		func(context.Context) (string, error) {
+			return base + apfBody(
+				map[string]float64{"a/b": 100, "c/d": 100, "e/f": 100,
+					"g/h": 100, "i/j": 100, "k/l": 100, "m/n": 100},
+				nil), nil
+			// deliberately unused
+		}
+	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background())
+	prom, err := os.ReadFile(filepath.Join(
+		cdeps.TextfileDirOverride, apiserver.APFPromFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prom), "node_host_agent_apiserver_rss_bytes"+" 1.5e+08") &&
+		!strings.Contains(string(prom), "node_host_agent_apiserver_rss_bytes"+" 150000000") {
+		t.Fatalf("RSS series missing:\n%s", prom)
+	}
+
+	// Scrape 2: every baseline key grows AND a brand-new key appears —
+	// the new key has no baseline (skipped), the rest overflow the
+	// 5-offender sample cap after the delta sort.
+	grow := map[string]float64{"a/b": 110, "c/d": 120, "e/f": 130,
+		"g/h": 140, "i/j": 150, "k/l": 160, "m/n": 170, "new/one": 999}
+	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).APFMetricsFn =
+		func(context.Context) (string, error) {
+			return apfBody(grow, nil), nil
+		}
+	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background())
+	log := e.LogLines()
+	if n := strings.Count(log, "flow_schema="); n == 0 || n > 5 {
+		t.Fatalf("offender count %d, want 1-5 (sample cap):\n%s", n, log)
+	}
+	if strings.Contains(log, "flow_schema=new") {
+		t.Fatalf("baseline-less key treated as an offender:\n%s", log)
+	}
+}
+
+// --- KCM parser/snapshot edges ---
+
+func TestParseKCMQueueSnapshotEdges(t *testing.T) {
+	// Bare series (no labels) → "" key; labels without name="..." →
+	// the raw label text; unparseable values skipped.
+	body := "leader_election_master_status{name=\"kcm\"} 1\n" +
+		"workqueue_depth 5\n" +
+		"workqueue_adds_total{queue=\"x\"} 7\n" +
+		"workqueue_retries_total{name=\"q\"} 1.2.3\n"
+	snap, ok := apiserver.ParseKCMQueueSnapshot(body, 1)
+	if !ok {
+		t.Fatal("parsed=false on edge body with leader present")
+	}
+	if snap.Depths[""] != 5 || snap.Adds["{queue=\"x\"}"] != 7 {
+		t.Fatalf("edge keys wrong: %+v", snap)
+	}
+	if len(snap.Retries) != 0 {
+		t.Fatalf("unparseable retry sample parsed: %+v", snap.Retries)
+	}
+}
+
+func TestKCMQueueStalledEdges(t *testing.T) {
+	// Retries counter reset across the window → inconclusive (arm (b)
+	// can never run its delta math).
+	prev := kcmSnap(100, true,
+		map[string]float64{"q": 25},
+		map[string]float64{"q": 10},
+		map[string]float64{"q": 500})
+	cur := kcmSnap(160, true,
+		map[string]float64{"q": 25},
+		map[string]float64{"q": 10},
+		map[string]float64{"q": 5}) // retries went backwards
+	if apiserver.KCMQueueStalled(prev, cur) {
+		t.Fatal("stalled=true across a retries counter reset")
+	}
+	// Queue deep + retries storming but absent from the previous
+	// depth map — no baseline to prove non-drain → inconclusive.
+	prevNoDepth := kcmSnap(100, true,
+		map[string]float64{},
+		map[string]float64{},
+		map[string]float64{"q": 100})
+	curStall := kcmSnap(160, true,
+		map[string]float64{"q": 25},
+		map[string]float64{"q": 10},
+		map[string]float64{"q": 350})
+	if apiserver.KCMQueueStalled(prevNoDepth, curStall) {
+		t.Fatal("stalled=true with no baseline depth for the queue")
+	}
+}
+
+// A corrupt persisted snapshot reads as "no baseline" — inconclusive,
+// never a restart on the first post-corruption scrape.
+func TestKCMSnapshotCorruptReadsAsNoBaseline(t *testing.T) {
+	e := fixture(t)
+	os.WriteFile(filepath.Join(e.State, cdeps.FileKCMQueueSnap),
+		[]byte("{not json"), 0o644)
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return true }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return stalledKCMBody, nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	e.H.Cycle(context.Background()) // corrupt prev → inconclusive
+	if e.RstN() != 0 {
+		t.Fatal("restart on a corrupt baseline")
+	}
+	// The bad file was overwritten with valid JSON for the next cycle.
+	b, err := os.ReadFile(filepath.Join(e.State, cdeps.FileKCMQueueSnap))
+	if err != nil || !strings.Contains(string(b), `"depth_sum":60`) {
+		t.Fatalf("snapshot not re-persisted: %q %v", b, err)
+	}
+}
+
+// When the snapshot path is a directory the atomic write fails —
+// the failure must warn, not panic, and the cycle continues.
+func TestKCMSnapshotWriteFailureWarns(t *testing.T) {
+	e := fixture(t)
+	if err := os.MkdirAll(filepath.Join(e.State, cdeps.FileKCMQueueSnap), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return true }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return stalledKCMBody, nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	e.H.Cycle(context.Background()) // must not panic
+	if e.CountLogLines("kcm snapshot write failed") == 0 {
+		t.Fatalf("snapshot write failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// A NaN sample never reaches the parser — the workqueue value
+// regex only admits numeric text, so the series is skipped and the
+// snapshot persists with an empty depth map (inconclusive, never a
+// stall input).
+func TestKCMSnapshotNaNMarshalSkips(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return true }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return "leader_election_master_status 1\n" +
+			"workqueue_depth{name=\"a\"} NaN\n", nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	e.H.Cycle(context.Background()) // must not panic
+	b, err := os.ReadFile(filepath.Join(e.State, cdeps.FileKCMQueueSnap))
+	if err != nil {
+		t.Fatalf("snapshot not persisted: %v", err)
+	}
+	if !strings.Contains(string(b), `"depth_sum":0`) {
+		t.Fatalf("NaN sample leaked into snapshot: %s", b)
+	}
+}
+
+// --- healFreeze gating branches ---
+
+// After a cp-freeze restart the rate budget is spent — the next
+// frozen episode must land in the cooldown branch, not burn a second
+// restart inside MinRestart.
+func TestCPFreezeRestartCooldown(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return false }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if e.RstN() != 1 {
+		t.Fatalf("precondition: restarts=%d", e.RstN())
+	}
+	for range 3 {
+		e.H.Cycle(context.Background()) // re-freeze inside cooldown
+	}
+	if e.RstN() != 1 {
+		t.Fatalf("cooldown not honored: restarts=%d", e.RstN())
+	}
+	if e.CountLogLines("in restart cooldown") == 0 {
+		t.Fatalf("cooldown not logged:\n%s", e.LogLines())
+	}
+}
+
+// A failing restart unit is logged as a suspect warn, not swallowed.
+func TestCPFreezeRestartFailureWarns(t *testing.T) {
+	e := fixture(t)
+	oldExec := e.H.Cfg.HostExecFn
+	e.H.Cfg.HostExecFn = func(ctx context.Context, quiet bool, d time.Duration,
+		name string, args ...string) (string, error) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "restart" {
+			return "", errors.New("systemctl:Job failed")
+		}
+		return oldExec(ctx, quiet, d, name, args...)
+	}
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return false }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if !strings.Contains(e.LogLines(),
+		"suspect: restart k0scontroller.service failed") {
+		t.Fatalf("restart failure not warned:\n%s", e.LogLines())
+	}
+}
+
+func TestCPFreezeDryRunLogsNoRestart(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Sig13.Mode = cdeps.ModeDryRun
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return false }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if e.RstN() != 0 {
+		t.Fatalf("dry-run restarted: %v", e.RstAt(0))
+	}
+	if !strings.Contains(e.LogLines(),
+		"DRY-RUN: would restart k0scontroller - cp-component-frozen") {
+		t.Fatalf("dry-run action not logged:\n%s", e.LogLines())
+	}
+}
+
+// --- konnectivity-server edge branches ---
+
+// A healthy cycle after a bad one must reset the streak and refresh
+// the gauge — bad→good→bad never reaches the 3-cycle gate.
+func TestKonnectivityHealthyCycleResetsStreak(t *testing.T) {
+	e := fixture(t)
+	runDir := t.TempDir()
+	e.H.Cfg.K0sRunDir = runDir
+	sock := filepath.Join(runDir, "konnectivity-server", "konnectivity-server.sock")
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	for range 2 { // bad, bad — below the gate
+		e.H.Cycle(context.Background())
+	}
+	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sock, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 2\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Cycle(context.Background()) // healthy — streak resets, gauge=2
+	if v := promtest.ToFloat64(e.H.KonnReadyBackends); v != 2 {
+		t.Fatalf("gauge=%v want 2", v)
+	}
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cycle(context.Background()) // bad again — only 1 of 3
+	e.H.Cycle(context.Background()) // 2 of 3
+	if len(e.Kills) != 0 {
+		t.Fatalf("kill fired before the streak rebuilt: %v", e.Kills)
+	}
+}
+
+// Unhealthy past the gate but the supervisor child is gone — the
+// heal must log and stand down instead of killing pid 0.
+func TestKonnectivityNoProcessToKill(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad every cycle
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("kill without a process: %v", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(),
+		"konnectivity-server process not found") {
+		t.Fatalf("missing-process not logged:\n%s", e.LogLines())
+	}
+}
+
+// A failing kill is a suspect warn — the streak stays spent but no
+// success action is recorded.
+func TestKonnectivityKillFailureWarns(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir()
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	oldKill := e.H.Cfg.KillFn
+	e.H.Cfg.KillFn = func(int, syscall.Signal) error {
+		return errors.New("no such process")
+	}
+	defer func() { e.H.Cfg.KillFn = oldKill }()
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("failed kill recorded as fired: %v", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(),
+		"konnectivity-server kill pid=4242 failed") {
+		t.Fatalf("kill failure not warned:\n%s", e.LogLines())
+	}
+}
+
+// The pid sweep failing wholesale (procfs unreadable) reads as "no
+// process" — heal stands down.
+func TestKonnectivityProcRootUnreadable(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory mode bits")
+	}
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir()
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	for range 2 { // build the streak with a readable procfs
+		e.H.Cycle(context.Background())
+	}
+	if err := os.Chmod(e.Proc, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(e.Proc, 0o755) }()
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("kill fired with unreadable procfs: %v", e.Kills)
+	}
+}
+
+// ParseKonnectivityReadyBackends: a HELP-style continuation line and
+// a bare metric name with no value are inconclusive, never 0.
+func TestParseKonnectivityReadyBackendsEdges(t *testing.T) {
+	if v, ok := apiserver.ParseKonnectivityReadyBackends(
+		"konnectivity_network_proxy_server_ready_backend_connections\n" +
+			"other_metric 1\n"); ok {
+		t.Fatalf("valueless sample parsed: %v", v)
+	}
+	if v, ok := apiserver.ParseKonnectivityReadyBackends(
+		"# konnectivity_network_proxy_server_ready_backend_connections 3\n"); ok {
+		t.Fatalf("comment line parsed: %v", v)
+	}
+}
+
+// The pid sweep skips pids with an empty/missing cmdline — a decoy
+// process without argv must not shadow the real konnectivity-server
+// child, and the lowest matching pid wins.
+func TestKonnectivityPIDSkipsEmptyCmdline(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir()
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	// A higher-pid second server must be ignored; the empty-argv decoy
+	// must be skipped without stopping the sweep.
+	e.MkProc(t, 4343, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	e.MkProc(t, 4300, "decoy", nil, 600)
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 1 || e.Kills[0].PID != 4242 {
+		t.Fatalf("kills=%v want lowest matching pid 4242", e.Kills)
+	}
+}
+
+// readyWorkers: no client credentials, a master-labeled-only node
+// list, and undecodable JSON all read as zero — heal suppressed.
+func TestKonnectivityReadyWorkersEdges(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(e *env)
+	}{
+		{"no_client", func(e *env) {
+			e.H.Cfg.HTTPClient = nil
+			e.H.Client = nil
+		}},
+		{"master_only", func(e *env) {
+			e.H.Client = &http.Client{Transport: masterTransport{}}
+		}},
+		{"bad_json", func(e *env) {
+			e.H.Client = &http.Client{Transport: rawTransport{body: "{oops"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.K0sRunDir = t.TempDir()
+			e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+				if url == "http://127.0.0.1:8091/metrics" {
+					return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+				}
+				return "", errors.New("unexpected scrape " + url)
+			}
+			e.MkProc(t, 4242, "konnectivity-se",
+				[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+			tc.mut(e)
+			for range 4 {
+				e.H.Cycle(context.Background())
+			}
+			if len(e.Kills) != 0 {
+				t.Fatalf("%s: heal fired with zero usable workers: %v",
+					tc.name, e.Kills)
+			}
+		})
+	}
+}
+
+// masterTransport answers the node list with one Ready node that is
+// master-labeled (legacy clusters) — not a worker.
+type masterTransport struct{}
+
+func (masterTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(
+			`{"items":[{"metadata":{"labels":` +
+				`{"node-role.kubernetes.io/master":""}},` +
+				`"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}`)),
+		Request: req,
+	}, nil
+}
+
+// rawTransport answers every request with a fixed body.
+type rawTransport struct{ body string }
+
+func (t rawTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Header:  make(http.Header),
+		Body:    io.NopCloser(strings.NewReader(t.body)),
+		Request: req,
+	}, nil
 }
 
 // Off and dry-run modes must not burn the 30-minute konn restart

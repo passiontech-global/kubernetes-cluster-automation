@@ -458,3 +458,229 @@ func TestProbeSeqScanDegradesOnQueryFailure(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeHygieneReadOnlyDiagnostics: the check-kine-db contract —
+// every mutating hygiene path stays read-only. Orphaned prepared
+// xacts are only counted, the dead-tuple VACUUM is suppressed, an
+// oversized inactive slot is only reported, the churn watermark and
+// seq-scan baseline are not rebased, and kine-db-xact.prom is never
+// written.
+func TestProbeHygieneReadOnlyDiagnostics(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	k.d.Cfg.ReadOnly = true
+	fr.On("pg_prepared_xacts", "gid-one\ngid-two\n")
+	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
+	fr.On("pg_replication_slots", "slot-orphan|16106127360\n") // 15GiB > 10GiB gate
+	fr.On("SHOW POOLS", `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
+postgres|postgres|4|50|3|7|0|0|0|0|0|transaction
+`)
+	res := k.Cycle(context.Background())
+	// Saturation legitimately zeroes the pools check — containers,
+	// wire, e2e and backend_env must still pass.
+	if res.Checks[CheckContainers] != 1 || res.Checks[CheckWire] != 1 ||
+		res.Checks[CheckE2EAuth] != 1 || res.Checks[CheckBackendEnv] != 1 {
+		t.Fatalf("checks=%v", res.Checks)
+	}
+	h := res.hyg
+	if h.preparedXacts != 2 || h.preparedRolled != 0 {
+		t.Fatalf("prepared=%+v want counted-not-rolled", h)
+	}
+	if h.vacuumFired {
+		t.Fatal("read-only probe fired the dead-tuple VACUUM")
+	}
+	if h.slotsDropped != 0 {
+		t.Fatal("read-only probe dropped a slot")
+	}
+	joined := strings.Join(res.notes, "\n")
+	for _, want := range []string{
+		"read-only: 2 orphaned prepared xact(s) left in place",
+		"read-only: dead-tuple VACUUM (ANALYZE) suppressed",
+		"read-only: inactive slot slot-orphan pins",
+		"read-only: pgbouncer saturated cl_waiting=50>20",
+		"pool-queue=50>20",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("notes missing %q:\n%s", want, joined)
+		}
+	}
+	j := fr.Joined()
+	for _, absent := range []string{
+		"ROLLBACK PREPARED", "pg_drop_replication_slot", "pg_terminate_backend",
+		"split_part(name", // churn watermark must not be sampled
+	} {
+		if strings.Contains(j, absent) {
+			t.Fatalf("read-only probe ran mutating/forbidden %q:\n%s", absent, j)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "textfile", xactPromFile)); !os.IsNotExist(err) {
+		t.Fatal("read-only probe wrote kine-db-xact.prom")
+	}
+}
+
+// hygieneSeqScan in read-only mode: the delta is reported but the
+// baseline file is not rebased and no ANALYZE runs.
+func TestProbeSeqScanReadOnlyKeepsBaseline(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	k.d.Cfg.ReadOnly = true
+	fr.On("seq_tup_read", "120|100000\n")
+	res := k.Cycle(context.Background())
+	if !res.hyg.seqSeen || res.hyg.seqTupRead != 100000 {
+		t.Fatalf("seq=%+v", res.hyg)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "guard", seqTupReadFile)); !os.IsNotExist(err) {
+		t.Fatal("read-only probe rebased the seq-scan baseline")
+	}
+	if fr.Ran(`ANALYZE "kine"`) {
+		t.Fatal("read-only probe ran ANALYZE")
+	}
+}
+
+// A failed ANALYZE exec is noted and analyzeFired stays false — the
+// next probe retries (the budget was spent on the attempt).
+func TestProbeSeqScanAnalyzeFailure(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	fr.On("seq_tup_read", "120|100000\n")
+	k.Cycle(context.Background()) // baseline
+	fr.On("seq_tup_read", "180|700000\n")
+	fr.FailOn(`ANALYZE "kine"`, errors.New("statement timeout"))
+	res := k.Cycle(context.Background())
+	if res.hyg.analyzeFired {
+		t.Fatal("analyzeFired set despite the failed exec")
+	}
+	found := false
+	for _, n := range res.notes {
+		if strings.Contains(n, "kine-analyze-fail") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no analyze-fail note: %v", res.notes)
+	}
+}
+
+// Query failures in the remaining hygiene items each note and gate
+// only their own series — driven per item so the failure rule cannot
+// hit a sibling query sharing a prefix.
+func TestHygieneItemQueryFailures(t *testing.T) {
+	ctx := context.Background()
+	errDown := errors.New("connection reset")
+	cases := []struct {
+		name string
+		rule string
+		want string
+		run  func(*Probe, *hygieneResult, func(string))
+	}{
+		{"prepared", "pg_prepared_xacts", "prepared-xacts-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygienePreparedXacts(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"idle", "idle in transaction", "idle-tx-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneIdleInTx(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"dead", "n_dead_tup, n_live_tup", "dead-tuple-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneDeadTuple(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"xid", "datfrozenxid", "xid-age-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneXID(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"slots", "pg_replication_slots", "slots-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"wal-df", "--output=size", "wal-df-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"wal-df-unparsed", "--output=size", "wal-df-unparsed",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
+			}},
+	}
+	for _, tc := range cases {
+		k, fr, _ := fixture(t, hygieneRules)
+		switch tc.name {
+		case "wal-df":
+			fr.FailOn(tc.rule, errDown)
+		case "wal-df-unparsed":
+			fr.On(tc.rule, "Size\nnot-a-number\n")
+		default:
+			fr.FailOn(tc.rule, errDown)
+		}
+		h := &hygieneResult{}
+		var notes []string
+		tc.run(k, h, func(s string) { notes = append(notes, s) })
+		if len(notes) != 1 || !strings.Contains(notes[0], tc.want) {
+			t.Fatalf("%s: notes=%v want %q", tc.name, notes, tc.want)
+		}
+	}
+}
+
+// A past-threshold inactive slot whose drop statement fails is noted
+// and retried next round — slotRetained already counted the bytes.
+func TestInactiveSlotDropFailure(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	fr.On("pg_replication_slots", "slot-old|16106127360\n")
+	fr.FailOn("pg_drop_replication_slot", errors.New("replication in use"))
+	res := k.Cycle(context.Background())
+	h := res.hyg
+	if h.slotsDropped != 0 || h.slotRetained != 16106127360 {
+		t.Fatalf("slots=%+v", h)
+	}
+	found := false
+	for _, n := range res.notes {
+		if strings.Contains(n, "drop-slot-slot-old-fail") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no drop-fail note: %v", res.notes)
+	}
+}
+
+// A failed vacuum script session notes and reads not-fired — the
+// next probe past the cooldown retries.
+func TestDeadTupleVacuumScriptFailure(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
+	fr.FailOn("ON_ERROR_STOP", errors.New("vacuum aborted"))
+	var notes []string
+	if k.deadTupleVacuum(context.Background(), "pg", "postgres", "secret",
+		func(s string) { notes = append(notes, s) }) {
+		t.Fatal("failed script must not read fired")
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "dead-tuple-vacuum-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+}
+
+// emitXactTextfile with nothing seen: the HELP/TYPE headers still
+// land (a vanished series breaks scrapes) but no fabricated samples.
+func TestEmitXactTextfileHeadersWithoutSamples(t *testing.T) {
+	k, _, dir := fixture(t, nil)
+	k.emitXactTextfile(&hygieneResult{})
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	for _, want := range []string{
+		"# HELP kine_db_multixact_age_transactions",
+		"# HELP kine_db_orphan_prepared_xacts",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+	// Header only: no sample line may carry a value (the counter's
+	// longer name contains the gauge's name as a prefix — match the
+	// "name value" line shape, not a bare substring).
+	for _, name := range []string{
+		"kine_db_multixact_age_transactions",
+		"kine_db_orphan_prepared_xacts",
+	} {
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, name+" ") {
+				t.Fatalf("sample %q emitted without aSeen flag:\n%s", line, content)
+			}
+		}
+	}
+}

@@ -361,6 +361,7 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
 	idx *jobDedupeIndex) bool {
 	key := cj.Namespace + "/" + cj.Name
+	now := c.now.Now()
 	// Fail CLOSED: an unverifiable dedupe must skip the replay —
 	// double-firing the workload is strictly worse than a missed
 	// catch-up the next 15m sweep retries.
@@ -377,9 +378,20 @@ func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
 			"cronjob", key, "active", len(cj.Status.Active))
 		return true
 	}
-	if job, ok := idx.labeled[key]; ok {
+	// The dedupe window is per-CronJob: max(catchupDedupeAge, period)
+	// — a weekly/monthly job's catch-up label must keep deduping for
+	// its whole period or the next sweep would spawn a duplicate.
+	dedupeWindow := catchupDedupeAge
+	if sched, ok := c.parseSchedule(log, cj); ok {
+		if next := sched.Next(now); !next.IsZero() {
+			if p := sched.Next(next).Sub(next); p > dedupeWindow {
+				dedupeWindow = p
+			}
+		}
+	}
+	if lj, ok := idx.labeled[key]; ok && now.Sub(lj.created) < dedupeWindow {
 		log.Info("skip: a catch-up job already exists",
-			"cronjob", key, "job", job)
+			"cronjob", key, "job", lj.name)
 		return true
 	}
 	if job, ok := idx.activeOwner[key]; ok {
@@ -388,6 +400,13 @@ func (c *cronJobCatchup) deduped(log logr.Logger, cj *batchv1.CronJob,
 		return true
 	}
 	return false
+}
+
+// labeledJob is one catch-up-labeled Job's dedupe record — the name
+// for the skip log and the creation time deduped() windows against.
+type labeledJob struct {
+	name    string
+	created time.Time
 }
 
 // jobDedupeIndex is the per-sweep cluster-wide Job snapshot behind
@@ -402,9 +421,9 @@ type jobDedupeIndex struct {
 	// exactly once per sweep.
 	failed bool
 	// labeled: the catch-up label's VALUE is the CronJob name —
-	// "ns/cronjob" → the name of a labeled Job younger than
-	// catchupDedupeAge (first in list order wins; any hit dedupes).
-	labeled map[string]string
+	// "ns/cronjob" → the labeled Job and its creation time (first in
+	// list order wins; deduped() applies the per-CronJob window).
+	labeled map[string]labeledJob
 	// activeOwner: "ns/cronjob" → the name of a Job whose controller
 	// ownerRef points at that CronJob and which is still active.
 	activeOwner map[string]string
@@ -449,18 +468,19 @@ func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 			"error", err)
 		return &jobDedupeIndex{failed: true}
 	}
-	now := c.now.Now()
 	idx := &jobDedupeIndex{
-		labeled:     map[string]string{},
+		labeled:     map[string]labeledJob{},
 		activeOwner: map[string]string{},
 	}
 	for i := range jobs {
 		j := &jobs[i]
-		if label := j.Labels[catchupLabel]; label != "" &&
-			now.Sub(j.CreationTimestamp.Time) < catchupDedupeAge {
+		if label := j.Labels[catchupLabel]; label != "" {
 			key := j.Namespace + "/" + label
 			if _, ok := idx.labeled[key]; !ok {
-				idx.labeled[key] = j.Name
+				idx.labeled[key] = labeledJob{
+					name:    j.Name,
+					created: j.CreationTimestamp.Time,
+				}
 			}
 		}
 		if jobStillActive(j) {

@@ -18,6 +18,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // wgFixture wires a fixture with a live cilium-agent task, the
@@ -215,5 +217,175 @@ func TestWGAllowedIPsFallbackStillWorks(t *testing.T) {
 	}
 	if !strings.Contains(wgLog(t, e), "allowed_ips=1 expected=2") {
 		t.Fatal("expected the cilium-wg-peer-gc allowed-ips deficit evidence in the log")
+	}
+}
+
+// --- Run gates and resets (bare CycleEnv rounds) ---
+
+// TestWGAPIUnreachableAborts: an inconclusive LIST keeps the deficit
+// streak evidence without counting it.
+func TestWGAPIUnreachableAborts(t *testing.T) {
+	e := fixture(t)
+	e.MkCiliumTask(t, 4243)
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 2
+	wg.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if wg.Fails != 2 {
+		t.Fatalf("Fails=%d want 2 — abort keeps evidence", wg.Fails)
+	}
+}
+
+// TestWGNoWG0DropsStaleEvidence: no WireGuard datapath → streak,
+// per-peer zombie state and latch all reset (nothing to heal here).
+func TestWGNoWG0DropsStaleEvidence(t *testing.T) {
+	e := fixture(t) // no cilium_wg0
+	e.H.State.Enter(latchdefs.LatchCiliumWGPeerWipe, "stale")
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 5
+	wg.Run(context.Background(), &wdeps.CycleEnv{APIOK: true, WorkerActive: true})
+	if wg.Fails != 0 || e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatalf("Fails=%d latch=%v want both cleared without a wg datapath",
+			wg.Fails, e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe))
+	}
+}
+
+// TestWGTaskRootUnreachableAborts: ctr unreachable is inconclusive —
+// never a verdict.
+func TestWGTaskRootUnreachableAborts(t *testing.T) {
+	e, env, dump, _ := wgFixture(t)
+	e.H.Cfg.CtrTaskRoot = filepath.Join(e.CtrDir, "gone")
+	_ = dump
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 1
+	wg.Run(context.Background(), env)
+	if wg.Fails != 1 {
+		t.Fatalf("Fails=%d want 1 after the unreachable-root abort", wg.Fails)
+	}
+}
+
+// TestWGAgentDeadResetsStreak: no live cilium-agent — sig9 owns the
+// agent-down verdict, the peer streak stands down.
+func TestWGAgentDeadResetsStreak(t *testing.T) {
+	e := fixture(t)
+	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4244) // pid never live
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 4
+	wg.Run(context.Background(), &wdeps.CycleEnv{APIOK: true, WorkerActive: true})
+	if wg.Fails != 0 {
+		t.Fatalf("Fails=%d want 0 with the agent down", wg.Fails)
+	}
+}
+
+// TestWGExpectedFromReadyNodeFallback: the agent healthz carries no
+// node list → the expected count falls back to Ready real nodes − 1
+// (virtual + control-plane nodes excluded), and a below-expected
+// peer count still escalates to the restart.
+func TestWGExpectedFromReadyNodeFallback(t *testing.T) {
+	e := fixture(t,
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "w1"},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "w2"},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "w3"},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp1",
+				Labels: map[string]string{"node-role.kubernetes.io/control-plane": ""}},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "virt",
+				Labels: map[string]string{"type": "virtual-kubelet"}},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+	)
+	e.MkCiliumTask(t, 4245)
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.UnixBody = []byte(`{}`) // healthz without cluster.nodes → fallback
+	// Bind's WGDump stub errors → allowed-ips path → unconfigured in
+	// SDReply → the probe fails → inconclusive abort (evidence kept).
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 2
+	wg.Run(context.Background(), &wdeps.CycleEnv{APIOK: true, WorkerActive: true})
+	if wg.Fails != 2 {
+		t.Fatalf("Fails=%d want 2 after the allowed-ips probe failure", wg.Fails)
+	}
+	if !strings.Contains(wgLog(t, e), "wg allowed-ips probe failed") {
+		t.Fatalf("missing inconclusive line:\n%s", wgLog(t, e))
+	}
+}
+
+// TestWGLatchSkipsKillWhenOverloaded: the deficit latches for NPD but
+// the restart is gated by the node-overloaded latch.
+func TestWGLatchSkipsKillWhenOverloaded(t *testing.T) {
+	e, env, dump, now := wgFixture(t)
+	e.H.State.Enter(latchdefs.LatchNodeOverloaded, "")
+	*dump = wgPeer("pub1", "10.244.0.0/16", now.Unix(), 100, 100) // 1 of 2 expected
+	for range 2 {
+		*now = now.Add(time.Minute)
+		wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), env)
+	}
+	if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatal("peer-wipe latch missing under node-overloaded")
+	}
+	if !strings.Contains(wgLog(t, e), "node overloaded — skip kill") {
+		t.Fatalf("missing overload skip line:\n%s", wgLog(t, e))
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v under node-overloaded", e.Kills)
+	}
+}
+
+// TestWGLatchSkipsKillInCooldown: the shared last-cilium-restart
+// budget bounds the restart — the latch arms, the kill waits.
+func TestWGLatchSkipsKillInCooldown(t *testing.T) {
+	e, env, dump, now := wgFixture(t)
+	e.H.State.RateSpend("last-cilium-restart") // budget inside the 30m window
+	*dump = wgPeer("pub1", "10.244.0.0/16", now.Unix(), 100, 100)
+	for range 2 {
+		*now = now.Add(time.Minute)
+		wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), env)
+	}
+	if !strings.Contains(wgLog(t, e), "restart cooldown — skip kill") {
+		t.Fatalf("missing cooldown skip line:\n%s", wgLog(t, e))
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v inside the restart cooldown", e.Kills)
+	}
+}
+
+// TestWGHealthyCountClearsLatch: dump peers at/over the expectation
+// reset the streak and release the latch.
+func TestWGHealthyCountClearsLatch(t *testing.T) {
+	e, env, dump, now := wgFixture(t)
+	e.H.State.Enter(latchdefs.LatchCiliumWGPeerWipe, "stale")
+	wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+	wg.Fails = 1
+	*dump = wgPeer("pub1", "10.244.0.0/16", now.Unix(), 100, 100) +
+		wgPeer("pub2", "10.244.1.0/24", now.Unix(), 100, 100) // 2 of 2
+	*now = now.Add(time.Minute)
+	wg.Run(context.Background(), env)
+	if wg.Fails != 0 || e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatalf("Fails=%d latch=%v want both cleared at the expected count",
+			wg.Fails, e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe))
 	}
 }

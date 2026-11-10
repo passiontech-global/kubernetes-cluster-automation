@@ -109,7 +109,7 @@ func (d *Deps) PsqlArgs(pg, user string, interactive bool, extra ...string) []st
 	if interactive {
 		argv = append(argv, "-i")
 	}
-	argv = append(argv, "-e", "PGPASSWORD", pg,
+	argv = append(argv, "-e", "PGPASSWORD", "-e", "PGAPPNAME", pg,
 		"psql", "-h", "127.0.0.1", "-U", user, "-d", "postgres")
 	return append(argv, extra...)
 }

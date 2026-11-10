@@ -504,3 +504,53 @@ func fixtureExt(t *testing.T, ha *fakeHAProxy, mode string,
 	}
 	return p
 }
+
+// refreshClient rebuilds the TLS client only when the effective CA
+// actually changed: a conf edit to an unreadable bundle keeps the
+// last-good client (retry next cycle), a rotated valid bundle
+// rebuilds (and drops the old pool), an identical bundle is a no-op.
+func TestRefreshClientRebuildsOnCARotation(t *testing.T) {
+	mkCA := func() string {
+		srv := httptest.NewTLSServer(
+			http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		t.Cleanup(srv.Close)
+		pemFile := filepath.Join(t.TempDir(), "ca.pem")
+		der := srv.TLS.Certificates[0].Certificate[0]
+		if err := os.WriteFile(pemFile,
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return pemFile
+	}
+	ca1, ca2 := mkCA(), mkCA()
+	p, err := New(Config{InsecureTLS: false, CAFile: ca1}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	origClient, origKey := p.client, p.caKey
+
+	// Unreadable bundle → keep the last-good client.
+	p.eff.caFile = filepath.Join(t.TempDir(), "garbage.pem")
+	p.refreshClient()
+	if p.client != origClient || p.caKey != origKey {
+		t.Fatal("CA load failure must keep the previous TLS client")
+	}
+
+	// Rotated (different, valid) bundle → rebuild + swap the cache key.
+	p.eff.caFile = ca2
+	p.refreshClient()
+	if p.client == origClient {
+		t.Fatal("rotated CA must rebuild the TLS client")
+	}
+	if p.caKey == origKey {
+		t.Fatalf("caKey %q unchanged after rotation", p.caKey)
+	}
+	rotated := p.client
+
+	// Same bundle again → no churn.
+	p.eff.caFile = ca2
+	p.refreshClient()
+	if p.client != rotated {
+		t.Fatal("identical CA must not rebuild the client")
+	}
+}

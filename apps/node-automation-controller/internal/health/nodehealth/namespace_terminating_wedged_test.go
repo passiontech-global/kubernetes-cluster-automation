@@ -26,6 +26,71 @@ import (
 // namespace-terminating-wedged — namespace-terminating-wedged
 // ---------------------------------------------------------------------------
 
+// nsStuckDiagnostic — the why-string format pins the exact template:
+// name(terminatingFor=Xm,conditions=[...],finalizers=[...]), duration
+// truncated to whole minutes, empty lists render [], order preserved.
+func TestNsStuckDiagnostic(t *testing.T) {
+	now := time.Now()
+	build := func(name string, termAge time.Duration,
+		conds []corev1.NamespaceCondition, fins []corev1.FinalizerName) *corev1.Namespace {
+		return &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				DeletionTimestamp: &metav1.Time{Time: now.Add(-termAge)},
+			},
+			Spec:   corev1.NamespaceSpec{Finalizers: fins},
+			Status: corev1.NamespaceStatus{Conditions: conds},
+		}
+	}
+	t.Run("exact format, minutes truncated, order preserved", func(t *testing.T) {
+		ns := build("dead-app", 25*time.Minute+40*time.Second,
+			[]corev1.NamespaceCondition{
+				{Type: corev1.NamespaceDeletionContentFailure, Status: corev1.ConditionTrue},
+				{Type: corev1.NamespaceContentRemaining, Status: corev1.ConditionTrue},
+			},
+			[]corev1.FinalizerName{"kubernetes", "example.com/fx"})
+		want := "dead-app(terminatingFor=25m0s,conditions=[" +
+			"NamespaceDeletionContentFailure=True,NamespaceContentRemaining=True]," +
+			"finalizers=[kubernetes,example.com/fx])"
+		if got := nsStuckDiagnostic(ns, now); got != want {
+			t.Fatalf("nsStuckDiagnostic =\n%q\nwant\n%q", got, want)
+		}
+	})
+	t.Run("empty lists render []", func(t *testing.T) {
+		ns := build("bare", 2*time.Minute, nil, nil)
+		if got, want := nsStuckDiagnostic(ns, now),
+			"bare(terminatingFor=2m0s,conditions=[],finalizers=[])"; got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+}
+
+// protectedFinalizer — the never-strip list: the foreground-deletion
+// marker, every kubernetes.io/ finalizer, the external-attacher/
+// family; anything else (including the bare "kubernetes.io" prefix
+// without the slash) is strippable.
+func TestProtectedFinalizer(t *testing.T) {
+	cases := []struct {
+		f    string
+		want bool
+	}{
+		{"foregroundDeletion", true},
+		{"kubernetes.io/pvc-protection", true},
+		{"kubernetes.io/pv-protection", true},
+		{"external-attacher/csi-driver", true},
+		{"example.com/x", false},
+		{"kubernetes.io", false}, // HasPrefix("kubernetes.io/") — bare prefix, no slash, not protected
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.f, func(t *testing.T) {
+			if got := protectedFinalizer(tc.f); got != tc.want {
+				t.Fatalf("protectedFinalizer(%q) = %v, want %v", tc.f, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNamespaceTerminatingWedged(t *testing.T) {
 	now := time.Now()
 	wedged := &corev1.Namespace{

@@ -562,14 +562,33 @@ func (p *parser) parseCompare() (expr, error) {
 	return l, nil
 }
 
-func (p *parser) parseConcat() (expr, error) { return p.parseAdd() }
+// parseConcat handles `~` string concatenation at LOWER precedence
+// than `+`/`-` (jinja2/ansible semantics): each operand is a full
+// additive expression, so "node-" ~ i + 1 computes i + 1 first and
+// concatenates "node-3" — previously ~ shared +/'s precedence level
+// and evaluated left-to-right with them.
+func (p *parser) parseConcat() (expr, error) {
+	l, err := p.parseAdd()
+	if err != nil {
+		return nil, err
+	}
+	for p.at("~") {
+		p.next()
+		r, err := p.parseAdd()
+		if err != nil {
+			return nil, err
+		}
+		l = binExpr{"~", l, r}
+	}
+	return l, nil
+}
 
 func (p *parser) parseAdd() (expr, error) {
 	l, err := p.parseMul()
 	if err != nil {
 		return nil, err
 	}
-	for p.at("+") || p.at("-") || p.at("~") {
+	for p.at("+") || p.at("-") {
 		op := p.next().val
 		r, err := p.parseMul()
 		if err != nil {
@@ -717,7 +736,19 @@ func (p *parser) parsePrimary() (expr, error) {
 	case "str":
 		return litExpr{t.val}, nil
 	case "num":
-		if i, err := strconv.ParseInt(t.val, 0, 64); err == nil {
+		// Base-0 (0x/0o/0b prefixes) only for explicitly-prefixed
+		// literals — a LEADING ZERO decimal like 08/09/010 must parse
+		// base-10: base-0 reads the 0 as octal (010→8) and rejects
+		// 08/09 outright, then the float fallback silently changed
+		// the literal's type.
+		base := 10
+		if len(t.val) > 2 && t.val[0] == '0' &&
+			(t.val[1] == 'x' || t.val[1] == 'X' ||
+				t.val[1] == 'o' || t.val[1] == 'O' ||
+				t.val[1] == 'b' || t.val[1] == 'B') {
+			base = 0
+		}
+		if i, err := strconv.ParseInt(t.val, base, 64); err == nil {
 			return litExpr{i}, nil
 		}
 		if f, err := strconv.ParseFloat(t.val, 64); err == nil {

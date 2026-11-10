@@ -81,7 +81,8 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// than pod creation + margin is the proof; a missing/unreadable
 	// socket is inconclusive and skips (pod-mode agents without a
 	// host /run view land here too).
-	if spegelSocketStale(spegelContainerdSock, sp.CreationTimestamp.Time) {
+	if spegelSocketStale(c.d.Cfg.Seams.Host.StatFn,
+		spegelContainerdSock, sp.CreationTimestamp.Time) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s holds stale containerd.sock inode (socket recreated after pod start)",
 			sp.Namespace, sp.Name))
@@ -95,8 +96,14 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: spegel-mirror deleted pod %s/%s - stale containerd.sock inode (k0sworker/containerd restarted under it)",
 			sp.Namespace, sp.Name))
+		// Preconditions{UID} closes the listing→delete race: the
+		// DaemonSet recycling the pod name between the CycleEnv list
+		// and this call must 409, not kill the replacement pod (same
+		// precondition the calico remedies carry).
 		if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
-			metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+			metav1.DeleteOptions{
+				GracePeriodSeconds: ptr.To[int64](0),
+				Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: spegel-mirror delete %s/%s failed: %v",
 				sp.Namespace, sp.Name, err))
@@ -135,7 +142,9 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		"ACTION: spegel-mirror deleted pod %s/%s - Ready=False %dx (containerd mirror points at a wedged peer)",
 		sp.Namespace, sp.Name, c.Fails))
 	if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
-		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+		metav1.DeleteOptions{
+			GracePeriodSeconds: ptr.To[int64](0),
+			Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror delete %s/%s failed: %v",
 			sp.Namespace, sp.Name, err))
@@ -149,13 +158,16 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // spegelSocketStale reports whether the host's containerd socket was
 // recreated after the spegel pod started — ModTime newer than pod
 // creation plus spegelSockStaleMargin proves k0sworker/containerd
-// restarted under the pod, leaving it bound to a dead inode. sockPath
-// is a parameter (not the const) so tests can point the stat at a
-// temp file. Any stat failure (no host /run view, socket absent
+// restarted under the pod, leaving it bound to a dead inode. The
+// stat rides the Seams.Host.StatFn seam and sockPath is a parameter
+// (not the const) so tests can point the read at a temp file — the
+// real socket lives on the HOST, a path rootless tests cannot
+// create. Any stat failure (no host /run view, socket absent
 // mid-restart) is inconclusive → false, never a false-positive
 // delete.
-func spegelSocketStale(sockPath string, podCreated time.Time) bool {
-	fi, err := os.Stat(sockPath)
+func spegelSocketStale(stat func(string) (os.FileInfo, error),
+	sockPath string, podCreated time.Time) bool {
+	fi, err := stat(sockPath)
 	if err != nil {
 		return false
 	}

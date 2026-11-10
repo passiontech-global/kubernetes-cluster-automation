@@ -1222,3 +1222,126 @@ func TestDEADLogCarriesErrorDetail(t *testing.T) {
 		}
 	}
 }
+
+// A probe-side fault (auth reject) withholds the verdict; when the
+// SAME backend later fails apiserver-side, the withheld probeErr
+// must clear and real evidence start counting (qfail, query split).
+func TestProbeSideErrorsClearOnApiserverSideFault(t *testing.T) {
+	stub := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", stub.addr()})
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	// Cycle 1: 401 on both paths — credential fault, verdict withheld.
+	stub.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	p.Cycle(context.Background())
+	if p.states["hub1"].probeErr == "" {
+		t.Fatal("probe-side fault did not latch probeErr")
+	}
+	if got := promtest.ToFloat64(p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 1 {
+		t.Fatalf("probe_error=%v want 1", got)
+	}
+
+	// Cycle 2: the cache answers but the consistent read 503s —
+	// apiserver evidence at last: probeErr clears, qfail starts.
+	stub.setStatus(0, http.StatusServiceUnavailable)
+	buf := captureSlog(t)
+	p.Cycle(context.Background())
+	if p.states["hub1"].probeErr != "" {
+		t.Fatalf("probeErr not cleared on apiserver-side fault: %q",
+			p.states["hub1"].probeErr)
+	}
+	if !strings.Contains(buf.String(), "probe-side errors cleared") {
+		t.Fatalf("clear transition not logged:\n%s", buf.String())
+	}
+	if got := promtest.ToFloat64(p.probeFailures.WithLabelValues("hub1", "query")); got != 1 {
+		t.Fatalf("query failures=%v want 1", got)
+	}
+	// qfail 1 < FailCycles(2) — no drain yet.
+	if got := countCmd(ha.commands(), "disable server kube_apiserver/hub1"); got != 0 {
+		t.Fatalf("premature disable (%d), cmds=%v", got, ha.commands())
+	}
+}
+
+// reapplyDrains: a drained backend that HAProxy forgot while the
+// whole fleet is probe-side down (fresh == 0, drained backend NOT
+// stale) must NOT be re-disabled — the last-standing fence covers
+// the re-apply pass too, not just the drain phase.
+func TestReapplyDrainsFencedWhenNoFreshBackend(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	// Drain hub1 (query-dead), hub2 stays fresh.
+	bad.setFail(true)
+	good.set(50, 50)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background())
+	if !p.states["hub1"].drained {
+		t.Fatal("hub1 not drained")
+	}
+
+	// HAProxy forgets the disable (restart), and BOTH backends go
+	// probe-side down: hub1 is drained but inconclusive (not stale),
+	// fresh == 0 → the fence holds the re-apply.
+	ha.mu.Lock()
+	ha.disabled["hub1"] = false
+	ha.mu.Unlock()
+	bad.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	good.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	p.Cycle(context.Background())
+
+	if got := countCmd(ha.commands(), "disable server kube_apiserver/hub1"); got != 1 {
+		t.Fatalf("fenced re-apply re-disabled (%d disables), cmds=%v", got, ha.commands())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("drained flag lost")
+	}
+}
+
+// The non-stale re-apply pass (drained backend, HAProxy forgot it,
+// other backends fresh) issues the disable — and a socket rejection
+// there is logged, drained kept, actions untouched.
+func TestReapplyDrainsErrorKeepsDrained(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.setFail(true)
+	good.set(50, 50)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background())
+	if countCmd(ha.commands(), "disable server kube_apiserver/hub1") != 1 {
+		t.Fatalf("expected 1 drain disable, cmds=%v", ha.commands())
+	}
+
+	// HAProxy forgets the disable and now rejects re-disables; hub1
+	// goes probe-side down (inconclusive → NOT stale → reapplyDrains
+	// owns the pass) while hub2 stays fresh (no fence).
+	ha.mu.Lock()
+	ha.disabled["hub1"] = false
+	ha.failReply = map[string]string{
+		"disable server kube_apiserver/hub1": "permission denied\n",
+	}
+	ha.mu.Unlock()
+	bad.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	buf := captureSlog(t)
+	p.Cycle(context.Background())
+
+	if !strings.Contains(buf.String(), "re-apply disable failed") {
+		t.Fatalf("re-apply error not logged:\n%s", buf.String())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("drained flag cleared despite failed re-apply")
+	}
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+		t.Fatalf("actions disable=%v want 1 (re-apply failed)", got)
+	}
+}

@@ -28,6 +28,174 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
+// ---------------------------------------------------------------------------
+// pure helpers — leaseStaleWindow / controllerRunningPods / pruneTransitions
+// ---------------------------------------------------------------------------
+
+// The wedge window is [10m, 2h): nil renewTime can't be judged, and
+// the 2h ceiling excludes an abandoned corpse.
+func TestLeaseStaleWindowBoundaries(t *testing.T) {
+	now := time.Now()
+	build := func(renewAge time.Duration) *coordinationv1.Lease {
+		l := cpLease("kube-system", "l", "h", renewAge, 0, now)
+		if renewAge < 0 { // negative → nil renewTime
+			l.Spec.RenewTime = nil
+		}
+		return l
+	}
+	cases := []struct {
+		name      string
+		renewAge  time.Duration
+		nilRenew  bool
+		wantStale bool
+	}{
+		{"nil renewTime", 0, true, false},
+		{"exactly 10m — window opens inclusive", 10 * time.Minute, false, true},
+		{"9m59s — still fresh", 9*time.Minute + 59*time.Second, false, false},
+		{"exactly 2h — max excluded (corpse)", 2 * time.Hour, false, false},
+		{"2h minus 1s — inside window", 2*time.Hour - time.Second, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var l *coordinationv1.Lease
+			if tc.nilRenew {
+				l = build(-1)
+			} else {
+				l = build(tc.renewAge)
+			}
+			if got := leaseStaleWindow(l, now); got != tc.wantStale {
+				t.Fatalf("leaseStaleWindow = %v, want %v", got, tc.wantStale)
+			}
+		})
+	}
+}
+
+// controllerRunningPods attributes Running pods to the lease's
+// controller: holder named directly (verbatim and "<pod>_<uuid>"
+// stripped), siblings via the shared controller owner UID, the
+// "<lease>-*" fallback when the holder pod is gone — and refuses
+// mirror-annotated, Pending and terminating pods.
+func TestControllerRunningPodsAttribution(t *testing.T) {
+	lease := cpLease("kube-system", "kube-controller-manager", "kube-controller-manager-pod_abc-123", 0, 0, time.Now())
+
+	holder := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "kube-controller-manager-pod", UID: "pod-uid",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs",
+			UID: "rs-uid", Controller: ptr.To(true),
+		}},
+	}}
+	holder.Status.Phase = corev1.PodRunning
+	sibling := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "kube-controller-manager-pod-xyz", UID: "sib-uid",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs",
+			UID: "rs-uid", Controller: ptr.To(true),
+		}},
+	}}
+	sibling.Status.Phase = corev1.PodRunning
+	otherController := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "unrelated", UID: "other-uid",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "other",
+			UID: "other-rs-uid", Controller: ptr.To(true),
+		}},
+	}}
+	mirror := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "kube-controller-manager-node1", Annotations: map[string]string{
+			"kubernetes.io/config.mirror": "true",
+		},
+	}}
+	pending := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "kube-controller-manager-pending"}}
+	pending.Status.Phase = corev1.PodPending
+	terminating := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:              "kube-controller-manager-dying",
+		DeletionTimestamp: &metav1.Time{Time: time.Now()},
+	}}
+	unrelatedFallback := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "kube-controller-manager-orphan"}}
+	unrelatedFallback.Status.Phase = corev1.PodRunning
+
+	pods := []corev1.Pod{holder, sibling, otherController, mirror,
+		pending, terminating, unrelatedFallback}
+
+	got := controllerRunningPods(lease, pods)
+	names := map[string]bool{}
+	for _, p := range got {
+		names[p.Name] = true
+	}
+	for _, want := range []string{"kube-controller-manager-pod", "kube-controller-manager-pod-xyz",
+		"kube-controller-manager-orphan"} {
+		if !names[want] {
+			t.Fatalf("controller pod %s missing from %v", want, names)
+		}
+	}
+	for _, unwant := range []string{"unrelated", "kube-controller-manager-node1",
+		"kube-controller-manager-pending", "kube-controller-manager-dying"} {
+		if names[unwant] {
+			t.Fatalf("pod %s must not be attributed (got %v)", unwant, names)
+		}
+	}
+	// The "<lease>-*" prefix fallback fires by name shape alone —
+	// "orphan" rides it even while the holder pod still resolves.
+
+	// Holder pod gone: pods named "<lease name>-*" are still the
+	// wedged controller's targets.
+	gone := controllerRunningPods(lease, []corev1.Pod{unrelatedFallback, mirror})
+	if len(gone) != 1 || gone[0].Name != "kube-controller-manager-orphan" {
+		t.Fatalf("holder-gone fallback = %v, want only the <lease>-* pod", gone)
+	}
+
+	// Verbatim holder identity without the "_<uuid>" suffix matches.
+	verbatimLease := cpLease("kube-system", "l", "pod_abc-123", 0, 0, time.Now())
+	plainPod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod_abc-123", UID: "u"}}
+	plainPod.Status.Phase = corev1.PodRunning
+	if got := controllerRunningPods(verbatimLease, []corev1.Pod{plainPod}); len(got) != 1 {
+		t.Fatalf("verbatim holder identity not matched: %v", got)
+	}
+
+	// Empty/nil holder identity and no "<lease>-*" pods → nothing.
+	emptyLease := cpLease("kube-system", "empty", "", 0, 0, time.Now())
+	if got := controllerRunningPods(emptyLease, pods); len(got) != 0 {
+		t.Fatalf("empty holder identity attributed pods: %v", got)
+	}
+}
+
+// pruneTransitions drops only keys absent from the live set; a nil
+// live map clears everything (live[k] is false for all keys).
+func TestPruneTransitions(t *testing.T) {
+	t.Run("stale removed, live retained", func(t *testing.T) {
+		p := &controllerLeaseGuardCheck{transitions: map[string][]leaseTransitionSample{
+			"gone":  {{transitions: 1}},
+			"alive": {{transitions: 2}},
+		}}
+		p.pruneTransitions(map[string]bool{"alive": true})
+		if _, ok := p.transitions["gone"]; ok {
+			t.Fatal("stale entry not pruned")
+		}
+		if _, ok := p.transitions["alive"]; !ok {
+			t.Fatal("live entry pruned")
+		}
+	})
+	t.Run("empty live map clears history", func(t *testing.T) {
+		p := &controllerLeaseGuardCheck{transitions: map[string][]leaseTransitionSample{
+			"a": {}, "b": {},
+		}}
+		p.pruneTransitions(map[string]bool{})
+		if len(p.transitions) != 0 {
+			t.Fatalf("empty live map must clear history, kept %v", p.transitions)
+		}
+	})
+	t.Run("nil live map behaves as empty (clears)", func(t *testing.T) {
+		p := &controllerLeaseGuardCheck{transitions: map[string][]leaseTransitionSample{
+			"a": {},
+		}}
+		p.pruneTransitions(nil)
+		if len(p.transitions) != 0 {
+			t.Fatalf("nil live map must clear history, kept %v", p.transitions)
+		}
+	})
+}
+
 // leaseGuardProber builds the prober carrying ONLY this check — the
 // package's shared testProber list stays untouched while the check
 // still rides the standard Deps/OpDyn wiring.

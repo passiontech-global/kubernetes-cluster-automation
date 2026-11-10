@@ -101,3 +101,24 @@ func TestReadLeafCertPrefersNonCA(t *testing.T) {
 		t.Fatal("non-PEM file must error")
 	}
 }
+
+// A CERTIFICATE block whose DER does not parse (truncated rotation
+// write) is skipped; a valid leaf after it is still returned.
+func TestReadLeafCertSkipsUndecodableBlock(t *testing.T) {
+	junk := pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: []byte("not der")})
+	leaf := mkRealCertPEM(t, false, 7)
+	p := filepath.Join(t.TempDir(), "torn.pem")
+	if err := os.WriteFile(p, append(append([]byte{}, junk...), leaf...),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	crt, err := readLeafCert(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if crt.SerialNumber.Int64() != 7 {
+		t.Fatalf("serial=%v want 7 (valid leaf after junk block)",
+			crt.SerialNumber)
+	}
+}

@@ -173,6 +173,11 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	// cfg.Clock.Set is observed by it
 	// (hoststate.Store.Now contract).
 	d.State = cfg.Store(logger)
+	// Declare the journal-unreadable producer id this subsystem can
+	// emit so a post-restart ExitFrom seeds only live owners (on a
+	// controller node workerhygiene is absent — its phantom hold
+	// must not pin the shared latch).
+	d.State.RegisterActiveOwner(journalwatch.OwnerControllerHygiene)
 	// Streak contract lives in journalwatch.NewUnreadableTrackerForOwner:
 	// each hygiene persists its OWN consecutive-journal-unreadable-<owner>
 	// streak file and holds the shared state-journal-unreadable latch

@@ -338,6 +338,17 @@ func stripPubArmor(s string) string {
 // where hubsync's strOf/strMap/omStr drop it — so the shims stay
 // per-package rather than being exported from topology.
 
+// jstr coerces a resolved template var to its string form. string /
+// int64 / float64 keep their dedicated formatting, bool keeps
+// true→"true" / false→"" (the flag-off renders empty, the difference
+// from hubsync's strOf). Everything else NON-NIL that is not a
+// container prints via fmt: a hubsign host/port var can arrive in
+// any JSON-decode kind (int, uint64, json.Number … depending on the
+// decode path) and must render its value — the old fallthrough
+// silently rendered "" and wrote an empty host/port into the signed
+// config instead of failing visibly. Containers (maps/slices,
+// including the jinja OMap/List wrappers — flattening a whole map
+// into one string was never meaningful) and nil still render "".
 func jstr(v any) string {
 	switch t := v.(type) {
 	case string:
@@ -350,8 +361,11 @@ func jstr(v any) string {
 		if t {
 			return "true"
 		}
+		return ""
+	case nil, map[string]any, []any, *jinja.OMap, *jinja.List:
+		return ""
 	}
-	return ""
+	return fmt.Sprint(v)
 }
 
 func omStr(m *jinja.OMap, key string) string {

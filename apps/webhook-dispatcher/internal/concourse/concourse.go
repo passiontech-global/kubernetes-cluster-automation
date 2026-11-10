@@ -82,6 +82,19 @@ type fetchFlight struct {
 	done chan struct{}
 }
 
+// statusError carries the HTTP status of a failed ATC call so callers
+// can distinguish 404 (the object is gone — e.g. a pipeline deleted
+// between the listing and its resource fetch) from transient failures
+// that must keep last-known data.
+type statusError struct {
+	status int
+	path   string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("GET %s: unexpected status %d", e.path, e.status)
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -214,42 +227,62 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 // Resources; it installs its own flight, so cold-start Resources
 // callers arriving mid-refresh share this fetch's result instead of
 // starting a duplicate one.
+//
+// A fetch already in flight is JOINED, not duplicated: the waiter
+// blocks on the flight's done channel and re-runs the cache checks —
+// it neither overwrites c.flight, nor is rejected by
+// MinRefreshInterval, nor fires a second index rebuild at the ATC.
+// Only when no fetch is running does the throttle apply.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
-	c.mu.Lock()
-	// The throttle watches lastForceRefreshAt only: lastAttemptAt
-	// belongs to Resources' backoff and must not gate the forced path.
-	if time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
-		index := c.index
+	for {
+		c.mu.Lock()
+		if f := c.flight; f != nil {
+			c.mu.Unlock()
+			select {
+			case <-f.done:
+				// The joined fetch settled — loop back and serve
+				// whatever it published (or start our own forced
+				// fetch if it failed and left nothing).
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		// The throttle watches lastForceRefreshAt only: lastAttemptAt
+		// belongs to Resources' backoff and must not gate the forced path.
+		if time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
+			index := c.index
+			c.mu.Unlock()
+			return index, nil
+		}
+		// Stamp before the fetch so concurrent Refresh callers take the
+		// throttle branch instead of queueing a second doomed fetch behind
+		// this one; a failure keeps that stamp so the next forced refresh
+		// inside the throttle window still serves the cached index instead
+		// of immediately re-fetching a just-failed ATC.
+		c.lastForceRefreshAt = time.Now()
+		flight := &fetchFlight{done: make(chan struct{})}
+		c.flight = flight
+		prev := append([]Resource(nil), c.index...)
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			if c.flight == flight {
+				c.flight = nil
+			}
+			close(flight.done)
+			c.mu.Unlock()
+		}()
+
+		index, err := c.fetchIndex(ctx, prev)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.index, c.fetchedAt = index, time.Now()
 		c.mu.Unlock()
 		return index, nil
 	}
-	// Stamp before the fetch so concurrent Refresh callers take the
-	// throttle branch instead of queueing a second doomed fetch behind
-	// this one; a failure keeps that stamp so the next forced refresh
-	// inside the throttle window still serves the cached index instead
-	// of immediately re-fetching a just-failed ATC.
-	c.lastForceRefreshAt = time.Now()
-	flight := &fetchFlight{done: make(chan struct{})}
-	c.flight = flight
-	prev := append([]Resource(nil), c.index...)
-	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		if c.flight == flight {
-			c.flight = nil
-		}
-		close(flight.done)
-		c.mu.Unlock()
-	}()
-
-	index, err := c.fetchIndex(ctx, prev)
-	if err != nil {
-		return nil, err
-	}
-	c.mu.Lock()
-	c.index, c.fetchedAt = index, time.Now()
-	c.mu.Unlock()
-	return index, nil
 }
 
 // fetchIndexWorkers bounds how many pipeline resource listings run
@@ -307,6 +340,14 @@ func (c *Client) fetchIndex(ctx context.Context,
 			}
 			path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
 			if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
+				var se *statusError
+				if errors.As(err, &se) && se.status == http.StatusNotFound {
+					// The pipeline was deleted between the pipeline
+					// listing and this fetch — it has no resources.
+					// Carrying prevByPipeline entries over would keep
+					// ghost resources of a dead pipeline in the index.
+					return
+				}
 				// One unreadable pipeline must not lose the whole
 				// index — and must not lose its own resources either:
 				// retain the previous index's entries for it (the
@@ -431,7 +472,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	if resp.StatusCode/100 != 2 {
 		// Drain (bounded) so the keep-alive connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
+		return &statusError{status: resp.StatusCode, path: path}
 	}
 	// Bound the decode: without LimitReader a 2xx body longer than
 	// maxJSONBody (an ATC streaming forever) would be buffered whole.

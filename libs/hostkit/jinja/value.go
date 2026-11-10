@@ -4,11 +4,66 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 // ---------------- value helpers ----------------
+
+// asInt64 normalizes every Go integer type to int64 — contexts feed
+// the engine plain Go values (int, uint32, ...) that used to fall
+// through every numeric branch and compare/stringify as garbage.
+// uint64 (and uint on 64-bit) only converts while it fits int64;
+// float64 is deliberately NOT here — it keeps its own (truncating,
+// range-checked) path via floatToInt64.
+func asInt64(v any) (int64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return t, true
+	case int:
+		return int64(t), true
+	case int32:
+		return int64(t), true
+	case int16:
+		return int64(t), true
+	case int8:
+		return int64(t), true
+	case uint64:
+		if t <= math.MaxInt64 {
+			return int64(t), true
+		}
+	case uint:
+		if uint64(t) <= math.MaxInt64 {
+			return int64(t), true
+		}
+	case uint32:
+		return int64(t), true
+	case uint16:
+		return int64(t), true
+	case uint8:
+		return int64(t), true
+	}
+	return 0, false
+}
+
+// asUint64 normalizes unsigned integer types for stringify — a
+// uint64 above MaxInt64 still prints exactly.
+func asUint64(v any) (uint64, bool) {
+	switch t := v.(type) {
+	case uint64:
+		return t, true
+	case uint:
+		return uint64(t), true
+	case uint32:
+		return uint64(t), true
+	case uint16:
+		return uint64(t), true
+	case uint8:
+		return uint64(t), true
+	}
+	return 0, false
+}
 
 func Truthy(v any) bool {
 	switch t := v.(type) {
@@ -30,6 +85,16 @@ func Truthy(v any) bool {
 		return len(t.V) > 0
 	case *OMap:
 		return t.Len() > 0
+	case map[string]any:
+		return len(t) > 0
+	case map[string]string:
+		return len(t) > 0
+	}
+	if i, ok := asInt64(v); ok {
+		return i != 0
+	}
+	if u, ok := asUint64(v); ok {
+		return u != 0
 	}
 	return true
 }
@@ -86,8 +151,10 @@ func stringifyAt(v any, depth int, steps *int) string {
 	case int64:
 		return strconv.FormatInt(t, 10)
 	case float64:
-		if t == float64(int64(t)) {
-			return strconv.FormatInt(int64(t), 10)
+		// floatToInt64, not int64(t): NaN/±Inf/out-of-range used to
+		// truncate into platform garbage (usually MinInt64).
+		if i, ok := floatToInt64(t); ok && t == float64(i) {
+			return strconv.FormatInt(i, 10)
 		}
 		return strconv.FormatFloat(t, 'g', -1, 64)
 	case string:
@@ -107,8 +174,33 @@ func stringifyAt(v any, depth int, steps *int) string {
 			parts = append(parts, "'"+k+"': "+stringifyAt(vv, depth+1, steps))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
+	case map[string]any:
+		return stringifyStringMap(t, depth, steps)
+	case map[string]string:
+		return stringifyStringMap(t, depth, steps)
+	}
+	if i, ok := asInt64(v); ok {
+		return strconv.FormatInt(i, 10)
+	}
+	if u, ok := asUint64(v); ok {
+		return strconv.FormatUint(u, 10)
 	}
 	return fmt.Sprint(v)
+}
+
+// stringifyStringMap renders a plain Go string map like an *OMap —
+// keys sorted for deterministic output (Go map order is random).
+func stringifyStringMap[V any](m map[string]V, depth int, steps *int) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, "'"+k+"': "+stringifyAt(m[k], depth+1, steps))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 func ToIter(v any) []any {
@@ -123,6 +215,10 @@ func ToIter(v any) []any {
 			out = append(out, k)
 		}
 		return out
+	case map[string]any:
+		return sortedMapKeys(t)
+	case map[string]string:
+		return sortedMapKeys(t)
 	case string:
 		out := make([]any, 0, len(t))
 		for _, r := range t {
@@ -131,6 +227,22 @@ func ToIter(v any) []any {
 		return out
 	}
 	return nil
+}
+
+// sortedMapKeys yields a plain Go map's keys in sorted order — jinja
+// iterates a mapping's keys, and Go's random map order would make
+// `for k in map` / `| join` / `| sort` output nondeterministic.
+func sortedMapKeys[V any](m map[string]V) []any {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]any, len(keys))
+	for i, k := range keys {
+		out[i] = k
+	}
+	return out
 }
 
 // boundMethod wraps obj.method calls (items/append/endswith/...).
@@ -165,6 +277,11 @@ func getAttr(v any, key string) any {
 			return val
 		}
 		return Undefined{key}
+	case map[string]string:
+		if val, ok := t[key]; ok {
+			return val
+		}
+		return Undefined{key}
 	case []any:
 		if methodNames[key] {
 			return boundMethod{v, key}
@@ -178,6 +295,16 @@ func getIndex(v any, k any) (any, error) {
 	switch t := v.(type) {
 	case *OMap:
 		if val, ok := t.Get(Stringify(k)); ok {
+			return val, nil
+		}
+		return Undefined{Stringify(k)}, nil
+	case map[string]any:
+		if val, ok := t[Stringify(k)]; ok {
+			return val, nil
+		}
+		return Undefined{Stringify(k)}, nil
+	case map[string]string:
+		if val, ok := t[Stringify(k)]; ok {
 			return val, nil
 		}
 		return Undefined{Stringify(k)}, nil
@@ -217,7 +344,9 @@ func ToInt(v any) (int64, bool) {
 	case int64:
 		return t, true
 	case float64:
-		return int64(t), true
+		// floatToInt64, not int64(t): NaN/±Inf/out-of-range used to
+		// return platform garbage (usually MinInt64) with ok=true.
+		return floatToInt64(t)
 	case bool:
 		if t {
 			return 1, true
@@ -228,6 +357,9 @@ func ToInt(v any) (int64, bool) {
 		// OCTAL ("010"→8, "08"→error) — python's int('010') is 10.
 		i, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
 		return i, err == nil
+	}
+	if i, ok := asInt64(v); ok {
+		return i, true
 	}
 	return 0, false
 }
@@ -256,6 +388,9 @@ func toFloat(v any) (float64, bool) {
 		}
 		return f, true
 	}
+	if i, ok := asInt64(v); ok {
+		return float64(i), true
+	}
 	return 0, false
 }
 
@@ -266,12 +401,15 @@ func numNeg(v any) (any, error) {
 	case float64:
 		return -t, nil
 	}
+	if i, ok := asInt64(v); ok {
+		return -i, nil
+	}
 	return nil, fmt.Errorf("cannot negate %v", v)
 }
 
-// numAsFloat converts only plain, finite numbers (int64/float64) —
-// no strings, no bools. numEq uses it to keep bool==number numeric
-// (python True == 1) while bool==string stays unequal.
+// numAsFloat converts only plain, finite numbers — no strings, no
+// bools. numEq uses it to keep bool==number numeric (python
+// True == 1) while bool==string stays unequal.
 func numAsFloat(v any) (float64, bool) {
 	switch t := v.(type) {
 	case int64:
@@ -281,6 +419,9 @@ func numAsFloat(v any) (float64, bool) {
 			return 0, false
 		}
 		return t, true
+	}
+	if i, ok := asInt64(v); ok {
+		return float64(i), true
 	}
 	return 0, false
 }
@@ -331,6 +472,14 @@ func numEq(l, r any) bool {
 			return ls == rs
 		}
 	}
+	// Integer-typed pairs compare on int64 — routing them through
+	// float64 rounds both sides to the same value past 2^53
+	// (9007199254740993 == 9007199254740992 used to be true).
+	if ai, aok := asInt64(l); aok {
+		if bi, bok := asInt64(r); bok {
+			return ai == bi
+		}
+	}
 	lf, lok := toFloat(l)
 	rf, rok := toFloat(r)
 	if lok && rok {
@@ -379,20 +528,27 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 		}
 		r = rt.V
 	}
-	switch lt := l.(type) {
-	case *OMap:
-		rt, ok := r.(*OMap)
-		if !ok || lt.Len() != rt.Len() {
+	// Mappings compare order-insensitively across *OMap,
+	// map[string]any and map[string]string — a vars-file OMap and a
+	// Go-native map with the same entries are the same value.
+	if lm, lok := asMapping(l); lok {
+		rm, rok := asMapping(r)
+		if !rok || lm.n != rm.n {
 			return false
 		}
-		for _, k := range lt.Keys() {
-			lv, _ := lt.Get(k)
-			rv, ok := rt.Get(k)
+		for _, k := range lm.keys {
+			lv, _ := lm.get(k)
+			rv, ok := rm.get(k)
 			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
 				return false
 			}
 		}
 		return true
+	}
+	if _, rok := asMapping(r); rok {
+		return false
+	}
+	switch lt := l.(type) {
 	case []any:
 		rt, ok := r.([]any)
 		if !ok || len(lt) != len(rt) {
@@ -413,6 +569,58 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 		return uok
 	}
 	return numEq(l, r)
+}
+
+// mappingView is the Len/Get surface shared by *OMap, map[string]any
+// and map[string]string for order-insensitive deep equality.
+type mappingView struct {
+	n    int
+	keys []string
+	get  func(string) (any, bool)
+}
+
+// isMappingValue reports whether v is any mapping shape the engine
+// understands (*OMap, map[string]any, map[string]string) — used by
+// the for-loop unpack guards.
+func isMappingValue(v any) bool {
+	_, ok := asMapping(v)
+	return ok
+}
+
+func asMapping(v any) (mappingView, bool) {
+	switch t := v.(type) {
+	case *OMap:
+		return mappingView{n: t.Len(), keys: t.Keys(), get: t.Get}, true
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return mappingView{
+			n:    len(t),
+			keys: keys,
+			get: func(k string) (any, bool) {
+				x, ok := t[k]
+				return x, ok
+			},
+		}, true
+	case map[string]string:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return mappingView{
+			n:    len(t),
+			keys: keys,
+			get: func(k string) (any, bool) {
+				x, ok := t[k]
+				return x, ok
+			},
+		}, true
+	}
+	return mappingView{}, false
 }
 
 func IsNilOrUndef(v any) bool {
@@ -566,17 +774,23 @@ func binOp(op string, l, r any) (any, error) {
 		return !deepEq(l, r), nil
 	case "<", "<=", ">", ">=":
 		if isNum(l) && isNum(r) {
-			lf, _ := toFloat(l)
-			rf, _ := toFloat(r)
+			c, ok := numCmp(l, r)
+			if !ok {
+				// A NaN/±Inf operand makes EVERY ordering
+				// comparison false (IEEE-754 / python) — falling
+				// through to the string branch would compare
+				// "NaN" < "5" lexically and answer nonsense.
+				return false, nil
+			}
 			switch op {
 			case "<":
-				return lf < rf, nil
+				return c < 0, nil
 			case "<=":
-				return lf <= rf, nil
+				return c <= 0, nil
 			case ">":
-				return lf > rf, nil
+				return c > 0, nil
 			case ">=":
-				return lf >= rf, nil
+				return c >= 0, nil
 			}
 		}
 		ls, rs := Stringify(l), Stringify(r)
@@ -621,7 +835,8 @@ func isNum(v any) bool {
 	case bool:
 		return true
 	}
-	return false
+	_, ok := asInt64(v)
+	return ok
 }
 
 // isFloatNum reports whether v is a float64 — the one numeric type
@@ -633,14 +848,45 @@ func isFloatNum(v any) bool {
 	return ok
 }
 
+// numCmp orders two numeric operands: integer-typed pairs compare on
+// int64 (exact past 2^53), everything else on finite floats. ok=false
+// means at least one side isn't a usable number (NaN/±Inf) — the
+// caller falls back to string ordering instead of silently treating
+// the rejected value as 0.0 (the old `lf, _ := toFloat(l)` did).
+func numCmp(a, b any) (int, bool) {
+	if ai, aok := asInt64(a); aok {
+		if bi, bok := asInt64(b); bok {
+			switch {
+			case ai < bi:
+				return -1, true
+			case ai > bi:
+				return 1, true
+			}
+			return 0, true
+		}
+	}
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if !aok || !bok {
+		return 0, false
+	}
+	switch {
+	case af < bf:
+		return -1, true
+	case af > bf:
+		return 1, true
+	}
+	return 0, true
+}
+
 // minMaxLess is the min/max comparator: numeric when both operands
 // are numbers, lexical on the string form otherwise — a non-numeric
 // list used to keep the first element untouched (never comparing).
 func minMaxLess(a, b any) bool {
 	if isNum(a) && isNum(b) {
-		af, _ := toFloat(a)
-		bf, _ := toFloat(b)
-		return af < bf
+		if c, ok := numCmp(a, b); ok {
+			return c < 0
+		}
 	}
 	return Stringify(a) < Stringify(b)
 }

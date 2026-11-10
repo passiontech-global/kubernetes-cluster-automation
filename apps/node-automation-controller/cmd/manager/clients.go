@@ -75,7 +75,25 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	directCfg := rest.CopyConfig(cfg)
 	directCfg.Timeout = envx.GetenvDuration(
 		"NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT", 30*time.Second)
-	cs, err := kubernetes.NewForConfig(directCfg)
+	// The typed clientsets negotiate protobuf: every sweep's Lists
+	// (the fleet's dominant traffic — full Pod/Node/Deployment censuses
+	// every few minutes across ~35 modules) decode 5-10x faster and
+	// transfer several times less than JSON. Protobuf is only offered,
+	// never forced: the apiserver answers 406 for resources with no
+	// registered scheme, and kubernetes.Interface covers built-in
+	// groups only (verified — no aggregated/metrics clientsets are
+	// built off this config), where the scheme always exists. Patches
+	// are unaffected: typed Patch calls set their own merge-patch
+	// content type regardless of the config. The DYNAMIC clients must
+	// NOT inherit this: they read CRDs (helmreleases, cert-manager,
+	// externalsecrets, medik8s, cilium), which have no protobuf
+	// schemas — negotiation there would 406 every read — so dyn
+	// stays on the JSON default. Tests run against the fake
+	// clientset, which never negotiates; production wiring is the
+	// only observer of this flag.
+	directTypedCfg := rest.CopyConfig(directCfg)
+	directTypedCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	cs, err := kubernetes.NewForConfig(directTypedCfg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create clientset: %w", err)
 	}
@@ -91,7 +109,9 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	probeCfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40, 1)
 	probeCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
 		probeCfg.QPS, probeCfg.Burst)
-	probeCS, err := kubernetes.NewForConfig(probeCfg)
+	probeTypedCfg := rest.CopyConfig(probeCfg)
+	probeTypedCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	probeCS, err := kubernetes.NewForConfig(probeTypedCfg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create probe clientset: %w", err)
 	}

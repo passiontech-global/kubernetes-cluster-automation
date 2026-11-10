@@ -554,11 +554,15 @@ func TestCheckWireguardCaliStreakAndRemedy(t *testing.T) {
 	wgIface(t, d, "up", "0")
 	// Seed the felix pod in the fake clientset so the delete lands.
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "calico-node-abc", Namespace: "kube-system"}}
+		Name: "calico-node-abc", Namespace: "kube-system",
+		UID: types.UID("uid-wg")}}
 	if _, err := f.CS.CoreV1().Pods("kube-system").Create(
 		ctx, pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// The remedy delete must carry the pod's UID as its precondition
+	// (reactor-captured) — the name-reuse race applies here too.
+	gotUID := deleteUIDPrecondition(f)
 	// Third confirmed read spends the last-calico-restart budget →
 	// ACTION line + pod delete.
 	c.checkWireguardCali(ctx, pod)
@@ -566,6 +570,9 @@ func TestCheckWireguardCaliStreakAndRemedy(t *testing.T) {
 		"ACTION: calico-hygiene deleted pod kube-system/calico-node-abc"+
 			" - wireguard.cali down/no-carrier") {
 		t.Fatalf("want ACTION delete line, log=%q", log)
+	}
+	if gotUID == nil || *gotUID != types.UID("uid-wg") {
+		t.Fatalf("wireguard remedy delete precondition UID=%v want uid-wg", gotUID)
 	}
 	if _, err := f.CS.CoreV1().Pods("kube-system").Get(
 		ctx, "calico-node-abc", metav1.GetOptions{}); err == nil {
@@ -640,7 +647,7 @@ func TestSpegelSocketStale(t *testing.T) {
 	podCreated := time.Now().Add(-10 * time.Minute)
 
 	// Missing socket — inconclusive, never a false-positive delete.
-	if spegelSocketStale(filepath.Join(t.TempDir(), "absent.sock"), podCreated) {
+	if spegelSocketStale(os.Stat, filepath.Join(t.TempDir(), "absent.sock"), podCreated) {
 		t.Fatal("missing socket must report not-stale")
 	}
 
@@ -654,7 +661,7 @@ func TestSpegelSocketStale(t *testing.T) {
 	if err := os.Chtimes(sock, old, old); err != nil {
 		t.Fatal(err)
 	}
-	if spegelSocketStale(sock, podCreated) {
+	if spegelSocketStale(os.Stat, sock, podCreated) {
 		t.Fatal("socket older than pod start must report not-stale")
 	}
 
@@ -663,7 +670,7 @@ func TestSpegelSocketStale(t *testing.T) {
 	if err := os.Chtimes(sock, recent, recent); err != nil {
 		t.Fatal(err)
 	}
-	if !spegelSocketStale(sock, podCreated) {
+	if !spegelSocketStale(os.Stat, sock, podCreated) {
 		t.Fatal("socket recreated after pod start must report stale")
 	}
 
@@ -672,7 +679,7 @@ func TestSpegelSocketStale(t *testing.T) {
 	if err := os.Chtimes(sock, edge, edge); err != nil {
 		t.Fatal(err)
 	}
-	if spegelSocketStale(sock, podCreated) {
+	if spegelSocketStale(os.Stat, sock, podCreated) {
 		t.Fatal("socket at exactly podCreated+margin must report not-stale")
 	}
 }

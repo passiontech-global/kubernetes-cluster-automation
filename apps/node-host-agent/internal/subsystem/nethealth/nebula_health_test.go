@@ -4,11 +4,15 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -368,5 +372,289 @@ func TestMinRTTKeepsSmallestSample(t *testing.T) {
 	}
 	if got := minRTT("time=notanumber"); got != -1.0 {
 		t.Fatalf("minRTT on garbage sample=%v want -1", got)
+	}
+}
+
+// --- nebula-direct-tcp: the pref-1499 bypass-rule guard ---
+
+// directTCPEnv wires a host with the nebula script deployed (the
+// check's only deployment gate) and empty rule listings.
+func directTCPEnv(t *testing.T) *env {
+	t.Helper()
+	e := fixture(t, &watchdogconf.Config{NebulaNet: "interdc"})
+	root := t.TempDir()
+	e.n.cfg.HostRoot = root
+	testutil.WriteFile(t, filepath.Join(root, "etc/nebula/interdc/nebula-up.sh"),
+		"#!/bin/bash\nexit 0\n")
+	e.host.On("rule list pref 1499", "")
+	return e
+}
+
+// An unanswerable `ip rule list pref 1499` aborts the cycle — rules
+// must never be re-added on a blind read.
+func TestDirectTCPRuleListFailureAborts(t *testing.T) {
+	e := directTCPEnv(t)
+	e.host.FailOn("rule list pref 1499", errCmdFail)
+	e.n.checkNebulaDirectTCP(context.Background())
+	if e.host.Ran("rule add pref 1499") {
+		t.Fatalf("rule added on a failed listing: %v", e.host.Cmds())
+	}
+	if got := promtest.ToFloat64(e.n.cycles.WithLabelValues(
+		checkNebTCP, "open_error")); got != 1 {
+		t.Fatalf("open_error metric=%v want 1", got)
+	}
+}
+
+// Ports outside 1..65535 are skipped without touching ip; in-range
+// missing ports get their rule.
+func TestDirectTCPSkipsInvalidPorts(t *testing.T) {
+	e := directTCPEnv(t)
+	e.n.cfg.NebulaDirectTCPPorts = []int{0, -22, 70000, 22}
+	e.n.checkNebulaDirectTCP(context.Background())
+	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 22 lookup main") {
+		t.Fatalf("in-range port not enforced: %v", e.host.Cmds())
+	}
+	for _, c := range e.host.Cmds() {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "dport 0") ||
+			strings.Contains(joined, "dport 70000") ||
+			strings.Contains(joined, "dport -22") {
+			t.Fatalf("invalid port reached ip: %v", c)
+		}
+	}
+}
+
+// A port whose rule already shows in the listing is not re-added;
+// a missing sibling port still is (the fold-in keeps one listing).
+func TestDirectTCPSkipsPresentRules(t *testing.T) {
+	e := directTCPEnv(t)
+	e.host.On("rule list pref 1499",
+		"1499:\tfrom all ipproto tcp dport 22 lookup main\n")
+	e.n.cfg.NebulaDirectTCPPorts = []int{22, 6443}
+	e.n.checkNebulaDirectTCP(context.Background())
+	if e.host.Ran("dport 22") {
+		t.Fatal("already-present dport 22 rule re-added")
+	}
+	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 6443 lookup main") {
+		t.Fatalf("missing dport 6443 rule not added: %v", e.host.Cmds())
+	}
+}
+
+// A failed rule add is logged and attributed (restore_error) — and
+// the remaining ports still get their attempt.
+func TestDirectTCPAddFailureLogged(t *testing.T) {
+	e := directTCPEnv(t)
+	e.host.FailOn("rule add pref 1499", errCmdFail)
+	e.n.cfg.NebulaDirectTCPPorts = []int{22, 6443}
+	e.n.checkNebulaDirectTCP(context.Background())
+	if got := strings.Count(e.host.Joined(), "rule add pref 1499"); got != 2 {
+		t.Fatalf("rule add attempts=%d want 2 (per port)", got)
+	}
+	if got := promtest.ToFloat64(e.n.cycles.WithLabelValues(
+		checkNebTCP, "restore_error")); got != 2 {
+		t.Fatalf("restore_error metric=%v want 2", got)
+	}
+	if !strings.Contains(logLines(t, e), "dport 22 failed") {
+		t.Fatalf("missing add-failure log:\n%s", logLines(t, e))
+	}
+}
+
+// --- nebula-health reason strings ---
+
+// A bound socket with an unaddressed tun names the tun in the
+// restart evidence — the operator sees WHICH leg died.
+func TestNebulaNoTunAddrReason(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.host.On("addr show dev neb1", "") // interface up, no inet addr
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !e.sd.Ran("restart nebula@interdc") {
+		t.Fatal("nebula not restarted on missing tun addr")
+	}
+	if !strings.Contains(logLines(t, e), "nebula-no-tun-addr dev=neb1") {
+		t.Fatalf("missing no-tun-addr reason:\n%s", logLines(t, e))
+	}
+}
+
+// A dead stats endpoint names the URL in the restart evidence.
+func TestNebulaStatsDeadReason(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.httpErr[e.n.cfg.Watchdog.NebulaStatsURL] = errors.New("refused")
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !e.sd.Ran("restart nebula@interdc") {
+		t.Fatal("nebula not restarted on dead stats endpoint")
+	}
+	if !strings.Contains(logLines(t, e), "nebula-stats-dead") {
+		t.Fatalf("missing stats-dead reason:\n%s", logLines(t, e))
+	}
+}
+
+// nebulaRestart without a systemd client is a throttled skip — the
+// latch/suspect machinery above it still records the failure.
+func TestNebulaRestartNilSystemd(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.n.cfg.Systemd = nil
+	e.n.nebulaRestart(context.Background())
+	if !strings.Contains(logLines(t, e), "nebula restart skipped — no systemd client") {
+		t.Fatalf("missing nil-systemd suspect line:\n%s", logLines(t, e))
+	}
+}
+
+// probeNebulaOverlay fills unset OVERLAY_PROBE_COUNT/WAIT with the
+// wd_ping_fanout defaults (3 probes, 4s wait) — the fanout calls
+// must carry both, not zeroed values. The conf is deliberately
+// UN-normalized (assigned post-New) — applyDefaults' Normalize would
+// pre-fill the fields and mask the fallback.
+func TestProbeNebulaOverlayDefaults(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.Watchdog = &watchdogconf.Config{
+		OverlayProbeTargets: []string{"10.8.0.1", "10.8.0.2"},
+		OverlayProbeMarkers: []string{"10.8.1.1"},
+	}
+	type call struct {
+		count, wait int
+	}
+	var mu sync.Mutex
+	var got []call
+	e.n.cfg.ping = func(_ context.Context, _ string, count, wait int, _ bool) (bool, float64) {
+		mu.Lock()
+		got = append(got, call{count, wait})
+		mu.Unlock()
+		return true, 1
+	}
+	targets, results := e.n.probeNebulaOverlay(context.Background(), e.n.cfg.Watchdog)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(targets) != 3 || len(results) != len(targets) {
+		t.Fatalf("targets=%v results=%v", targets, results)
+	}
+	for _, c := range got {
+		if c.count != 3 || c.wait != 4 {
+			t.Fatalf("probe args count=%d wait=%d want 3/4", c.count, c.wait)
+		}
+	}
+}
+
+// Site-edge recovery: the marker set answering again resets the
+// confirmation counter and exits the siteedge latch.
+func TestSiteedgeRecoveryResetsAndExits(t *testing.T) {
+	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
+		wd.OverlaySiteMarkers = []string{"10.9.0.1"}
+	})
+	e.pingOK["10.9.0.1|false"] = true
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-siteedge"), "1\n")
+	e.n.nebulaSiteedgeRun = 3
+	wd := e.n.cfg.Watchdog
+	_, results := e.n.probeNebulaOverlay(context.Background(), wd)
+	st := aggregateNebulaOverlay(wd, results)
+	e.n.latchNebulaOverlayPaths(wd, st)
+	if e.n.nebulaSiteedgeRun != 0 {
+		t.Fatalf("siteedge run counter=%d want 0 on recovery", e.n.nebulaSiteedgeRun)
+	}
+	if stateExists(e, "nebula-siteedge") {
+		t.Fatal("siteedge latch kept after markers recovered")
+	}
+}
+
+// A degraded run under the DEFAULT NebulaDegradedConsec (0 → 2)
+// enters the latch on the second consecutive run — the shell's
+// CONSEC default. The conf is un-normalized (post-New) so the
+// `need <= 0` fallback actually runs.
+func TestNebulaDegradedDefaultConsec(t *testing.T) {
+	e := fixture(t, nil)
+	wd := &watchdogconf.Config{
+		OverlayActive:       "nebula",
+		OverlayProbeTargets: []string{"10.8.0.1", "10.8.0.2", "10.8.0.3"},
+	}
+	e.n.cfg.Watchdog = wd
+	results := map[string]pingResult{
+		"10.8.0.1": {ok: true, rtt: 5},
+		"10.8.0.2": {ok: false},
+		"10.8.0.3": {ok: false},
+	}
+	st := aggregateNebulaOverlay(wd, results)
+	// The degraded verdict arms its own latch — it does NOT produce
+	// a check-failure reason (a half-alive mesh is not a nebula
+	// restart trigger; only full dataplane death is).
+	reason, dpFail, isolated := e.n.nebulaOverlayVerdict(context.Background(), wd, st)
+	if reason != "" || dpFail || isolated {
+		t.Fatalf("verdict reason=%q dpFail=%v isolated=%v want silent degraded", reason, dpFail, isolated)
+	}
+	if stateExists(e, "nebula-degraded") {
+		t.Fatal("degraded latch armed on run 1 of default 2")
+	}
+	_, _, _ = e.n.nebulaOverlayVerdict(context.Background(), wd, st)
+	if !stateExists(e, "nebula-degraded") {
+		t.Fatal("degraded latch missing after 2 runs of default consec")
+	}
+}
+
+// nebulaUnderlayPeers: empty net name → empty map; unreadable and
+// unparseable yaml files degrade to an empty map with a suspect
+// line (the flush then skips unresolvable markers, never guesses).
+func TestNebulaUnderlayPeersDegradedInputs(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{NebulaNet: "interdc"})
+	if m := e.n.nebulaUnderlayPeers(""); len(m) != 0 {
+		t.Fatalf("empty net name map=%v want empty", m)
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "etc", "nebula", "interdc")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.n.cfg.HostRoot = root
+	// A directory squatting a *.yaml name — ReadFile fails, skipped.
+	if err := os.MkdirAll(filepath.Join(dir, "brokendir.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(dir, "garbage.yaml"), "static_host_map: [unclosed\n")
+	if m := e.n.nebulaUnderlayPeers("interdc"); len(m) != 0 {
+		t.Fatalf("degraded inputs map=%v want empty", m)
+	}
+	if !strings.Contains(logLines(t, e), "static_host_map parse failed") {
+		t.Fatalf("missing parse-failure suspect line:\n%s", logLines(t, e))
+	}
+}
+
+// underlayHost extracts the conntrack-selectable host half of a
+// static_host_map endpoint, bracketed v6 included; junk yields "".
+func TestUnderlayHostParsing(t *testing.T) {
+	for addr, want := range map[string]string{
+		"203.0.113.11:45670": "203.0.113.11",
+		"[fd00::1]:45670":    "fd00::1",
+		"  10.8.0.9:10000  ": "10.8.0.9",
+		"203.0.113.20":       "203.0.113.20",
+		"[fd00::2]":          "fd00::2",
+		"":                   "",
+		"   ":                "",
+	} {
+		if got := underlayHost(addr); got != want {
+			t.Fatalf("underlayHost(%q)=%q want %q", addr, got, want)
+		}
+	}
+}
+
+// The nebula clock-latch timesyncd bounce folds a nil systemd
+// client and a dormant timesyncd to no-ops — never a restart of a
+// unit that isn't the node's daemon.
+func TestTimesyncdClockLatchGates(t *testing.T) {
+	ctx := context.Background()
+	// Clock-skew (the hostmetrics latch) also arms the path —
+	// with no systemd client it stops right there.
+	e := fixture(t, nil)
+	testutil.WriteFile(t, filepath.Join(e.state, "state-clock-skew"), "1\n")
+	e.n.cfg.Systemd = nil
+	e.n.restartTimesyncdOnClockLatch(ctx)
+	if e.sd.Ran("restart") {
+		t.Fatal("restart without a systemd client")
+	}
+	// With a client but a dormant timesyncd (disabled AND inactive —
+	// chrony node), the restart must not fire either.
+	e2 := fixture(t, nil)
+	testutil.WriteFile(t, filepath.Join(e2.state, "state-clock-unsync"), "1\n")
+	e2.n.restartTimesyncdOnClockLatch(ctx)
+	if e2.sd.Ran("restart") {
+		t.Fatalf("dormant timesyncd restarted, cmds=%v", e2.sd.Cmds())
 	}
 }

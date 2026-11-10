@@ -130,3 +130,27 @@ func TestEBPFScanCache(t *testing.T) {
 		t.Fatalf("post-expiry progs=%d want 1", progs)
 	}
 }
+
+// TestScanBPFIDLinesJunk: fdinfo lines that are not exactly
+// "<name> <id>" (headers, truncated rows, non-numeric ids, unknown
+// object names) are skipped — only prog_id:/map_id: count.
+func TestScanBPFIDLinesJunk(t *testing.T) {
+	progs, maps := map[uint64]bool{}, map[uint64]bool{}
+	scanBPFIDLines([]byte(
+		"pos:\t0\n"+ // single field
+			"prog_id: notanumber\n"+ // non-numeric id
+			"prog_id:\t42 extra\n"+ // three fields
+			"link_id:\t9\n"+ // unknown object name
+			"map_id:\t7\n"+
+			"prog_id:\t42\n"), progs, maps) // dup — dedup must hold
+	if len(progs) != 1 || !progs[42] {
+		t.Fatalf("progs=%v want {42}", progs)
+	}
+	if len(maps) != 1 || !maps[7] {
+		t.Fatalf("maps=%v want {7}", maps)
+	}
+	scanBPFIDLines(nil, progs, maps) // empty input is a no-op
+	if len(progs) != 1 || len(maps) != 1 {
+		t.Fatal("empty input mutated the sets")
+	}
+}

@@ -297,3 +297,89 @@ func TestKineStorageLargeObjectGaugeAbsentUntilScanned(t *testing.T) {
 		t.Fatalf("gauge header missing:\n%s", prom)
 	}
 }
+
+// A failed wal_checkpoint spends the cooldown and warns — the retry
+// happens after the budget window, not the next cycle.
+func TestKineStorageCheckpointFailureSpendsCooldown(t *testing.T) {
+	e := fixture(t)
+	calls := setupKineStore(t, e, 50, 200) // wal 200 > 100 threshold
+	oldFn := storelocal.CheckpointFn
+	storelocal.CheckpointFn = func(context.Context, string) error {
+		*calls++
+		return errors.New("disk full")
+	}
+	t.Cleanup(func() { storelocal.CheckpointFn = oldFn })
+
+	runStorage(t, e)
+	if *calls != 1 {
+		t.Fatalf("checkpoint calls=%d want 1", *calls)
+	}
+	if n := e.CountLogLines("wal_checkpoint failed"); n != 1 {
+		t.Fatalf("checkpoint-failure warn lines=%d want 1", n)
+	}
+
+	// Inside the cooldown → no retry.
+	runStorage(t, e)
+	if *calls != 1 {
+		t.Fatalf("failure did not spend the cooldown: calls=%d", *calls)
+	}
+}
+
+// No SQLite backend at all → the first existing non-SQLite store dir
+// (embedded etcd, then NATS JetStream) is summed with the bounded
+// walk onto db_bytes; wal_bytes stays 0 and no sqlite3 seam fires.
+func TestKineStorageNonSQLiteStoreDir(t *testing.T) {
+	e := fixture(t)
+	root := t.TempDir()
+	k0s := filepath.Join(root, "k0s")
+	writeTreeFile(t, filepath.Join(k0s, "etcd", "member", "db"), 300)
+	writeTreeFile(t, filepath.Join(k0s, "etcd", "wal"), 25)
+	// etcd wins over nats (first existing dir).
+	writeTreeFile(t, filepath.Join(k0s, "nats", "store", "jetstream"), 999)
+	e.H.Cfg.K0sDir = k0s
+
+	oldTD := cdeps.TextfileDirOverride
+	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
+	t.Cleanup(func() { cdeps.TextfileDirOverride = oldTD })
+
+	cpCalls := new(int)
+	oldCP := storelocal.CheckpointFn
+	storelocal.CheckpointFn = func(context.Context, string) error {
+		*cpCalls++
+		return nil
+	}
+	t.Cleanup(func() { storelocal.CheckpointFn = oldCP })
+	loCalls := new(int)
+	oldLO := storelocal.LargeObjectsFn
+	storelocal.LargeObjectsFn = func(context.Context, string) ([]storelocal.KineLargeObject, error) {
+		*loCalls++
+		return nil, nil
+	}
+	t.Cleanup(func() { storelocal.LargeObjectsFn = oldLO })
+
+	runStorage(t, e)
+	prom := readProm(t)
+	for _, want := range []string{
+		"node_agent_kine_db_bytes 325",
+		"node_agent_kine_wal_bytes 0",
+	} {
+		if !strings.Contains(prom, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, prom)
+		}
+	}
+	if *cpCalls != 0 || *loCalls != 0 {
+		t.Fatalf("sqlite3 seams fired on a non-SQLite store: cp=%d lo=%d",
+			*cpCalls, *loCalls)
+	}
+}
+
+// writeTreeFile writes a path with n zero bytes, mkdir-ing parents.
+func writeTreeFile(t *testing.T, path string, n int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, n), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

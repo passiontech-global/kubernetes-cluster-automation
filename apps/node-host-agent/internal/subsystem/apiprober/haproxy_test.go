@@ -505,3 +505,61 @@ func TestSocketCmdCapsReplyRead(t *testing.T) {
 		t.Fatalf("reply = %d bytes, over the cap", len(out))
 	}
 }
+
+// A companion whose DIAL fails (socket outage) must not veto the
+// primary's command — only the primary's failure propagates as an
+// error; the companion fault is Warn-logged and the loop moves on.
+func TestHaproxyServerCompanionDialErrorTolerated(t *testing.T) {
+	buf := captureSlog(t)
+	inner := pipeDial("")
+	dials := 0
+	p, err := New(Config{
+		DialSocket: func(ctx context.Context, path string) (net.Conn, error) {
+			dials++
+			// Per-disable dial order: primary, its shutdown-sessions
+			// follow-up, then the companion — only the last one fails.
+			if dials > 2 {
+				return nil, errors.New("companion socket refused")
+			}
+			return inner(ctx, path)
+		},
+		HTTPClient:        newAPIStub(t).srv.Client(),
+		CompanionBackends: []string{"comp_be"},
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.haproxyServer(context.Background(), "disable", "hub1", false); err != nil {
+		t.Fatalf("haproxyServer(companion dial fail)=%v want nil (tolerated)", err)
+	}
+	if !strings.Contains(buf.String(), "companion backend command failed") {
+		t.Fatalf("companion fault not logged:\n%s", buf.String())
+	}
+}
+
+// shutdownSessions is best-effort like its callers: a dial/write
+// fault and a rejection reply are both Warn'd, never fatal, and a
+// "No such server" answer stays silent (the companion-parity no-op).
+func TestShutdownSessionsToleratedFaults(t *testing.T) {
+	buf := captureSlog(t)
+	p := &Prober{cfg: Config{DialSocket: func(context.Context, string) (net.Conn, error) {
+		return nil, errors.New("socket gone")
+	}}}
+	p.shutdownSessions(context.Background(), "kube_apiserver", "hub1")
+	if !strings.Contains(buf.String(), "shutdown sessions failed") {
+		t.Fatalf("dial fault not logged:\n%s", buf.String())
+	}
+
+	buf = captureSlog(t)
+	// TCPTimeout must be set for the reply path — socketCmd stamps a
+	// conn deadline from it, and a zero deadline would time the pipe
+	// write out before the reply arrives.
+	p = &Prober{cfg: Config{
+		DialSocket: pipeDial("permission denied\n"),
+		TCPTimeout: 2 * time.Second,
+	}}
+	p.shutdownSessions(context.Background(), "kube_apiserver", "hub1")
+	if !strings.Contains(buf.String(), "shutdown sessions rejected") {
+		t.Fatalf("rejection not logged:\n%s", buf.String())
+	}
+}

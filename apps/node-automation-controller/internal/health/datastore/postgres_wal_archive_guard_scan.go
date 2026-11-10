@@ -10,6 +10,7 @@ package datastore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -86,7 +87,8 @@ func (s *walGuardSweep) scanCRConditions(ctx context.Context) (
 				cnpgClusters = append(cnpgClusters, cr)
 			}
 			for _, c := range kube.Conditions(cr.Object, "status", "conditions") {
-				if pgWALConditionUnhealthy(c, s.now) {
+				if pgWALConditionUnhealthy(c, rk.pgWALConds,
+					rk.pgCondBareFallback, s.now) {
 					s.emit(cr.GetNamespace(), cr.GetName(), "archive_condition")
 				}
 			}
@@ -156,76 +158,87 @@ func (s *walGuardSweep) scanPodLogs(ctx context.Context) error {
 }
 
 // scanPromSignals runs front (c): the Prometheus archiver-failure
-// counters, the retained/inactive replication-slot WAL families
-// (four spellings — retained_bytes, lsn-diff, the active-flag
-// joins and the CNPG exporter variant), and the data-volume fill
-// ratio. A dead Prometheus is inconclusive (http-content-check owns
-// liveness), never a false FAIL — every query failure warns and
-// skips its own signal.
+// counters and the retained/inactive replication-slot WAL families,
+// plus the data-volume fill ratio. The slot/archiver signals run as
+// TWO instant queries — one per exporter family (the
+// postgres_exporter "pg_*" prefix and the CNPG exporter's "cnpg_pg_*"
+// twin), each ORing that family's archiver branch with its two
+// inactive-slot spellings — instead of one query per signal: four
+// per-sweep round-trips collapsed to two, with the result set
+// unchanged (each branch keeps its own series name and label set, so
+// the top-level `or` is a pure set-union across disjoint metric
+// names). Returned series are classified by slot identity:
+// replication_slots-named or slot_name-labeled series →
+// inactive_slot + the slot-bloat gauge, everything else (the
+// increase() archiver branch — a range-function call that drops
+// __name__) → archiver_failing. A dead Prometheus is
+// inconclusive (http-content-check owns liveness), never a false
+// FAIL — every query failure warns and skips its own signal.
 func (s *walGuardSweep) scanPromSignals(ctx context.Context) {
-	if series, qerr := s.p.PromQuery(ctx,
-		`(increase(pg_stat_archiver_failed_count[30m]) > 0) or `+
-			`(increase(cnpg_pg_stat_archiver_failed_count[30m]) > 0)`); qerr != nil {
-		s.log.Info("WARN: pg_stat_archiver query failed — archiver evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, series := range series {
-			s.emit(series.Label("namespace"),
-				series.Label("cluster", "postgres_cluster", "pod"), "archiver_failing")
-		}
+	// The per-family query templates. The two spellings differ only
+	// where the exporters differ: the CNPG active-flag join reads
+	// cnpg_pg_replication_slots_retained_bytes (no
+	// confirmed_flush_lsn variant that family publishes) while the
+	// postgres_exporter join reads its lsn-diff pair.
+	family := func(prefix, slotJoin string) string {
+		return fmt.Sprintf(
+			`(increase(%[1]sstat_archiver_failed_count[30m]) > 0) or `+
+				`(%[1]sreplication_slots_retained_bytes{active="false"} > %[2]d) or `+
+				`(%[1]sreplication_slots_active == 0 and on(namespace, pod, slot_name) %[3]s)`,
+			prefix, pgWALSlotRetainMax, slotJoin)
 	}
-	if series, qerr := s.p.PromQuery(ctx, fmt.Sprintf(
-		`(pg_replication_slots_retained_bytes{active="false"} > %d) or `+
-			`(cnpg_pg_replication_slots_retained_bytes{active="false"} > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		s.log.Info("WARN: replication slot query failed — slot evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, series := range series {
-			s.emit(series.Label("namespace"),
-				series.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			s.p.emitSlotBloat(&s.slotRep, s.rep, series)
-		}
-	}
-	// percona-degraded-quorum — the postgres_exporter spelling of the same
-	// signature: the active flag and the retained-bytes diff live on
-	// separate series joined by the slot labels. `and` returns the
-	// active==0 samples themselves (value 0) — the bloat gauge
-	// flags 1 since this exporter family can't give a byte count.
-	if series, qerr := s.p.PromQuery(ctx, fmt.Sprintf(
-		`(pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
+	promFamilies := []struct {
+		query string
+	}{
+		// postgres_exporter family: retained-bytes OR the active-flag
+		// join (the active flag and the retained-bytes diff live on
+		// separate series joined by the slot labels; `and` returns
+		// the active==0 samples themselves, value 0).
+		{query: family("pg_", fmt.Sprintf(
 			`(pg_replication_slots_pg_wal_lsn_diff > %d or `+
-			`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		s.log.Info("WARN: active-flag slot query failed — slot-bloat evidence incomplete",
-			"error", qerr)
-	} else {
-		for _, series := range series {
-			s.emit(series.Label("namespace"),
-				series.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			s.p.emitSlotBloat(&s.slotRep, s.rep, series)
-		}
-	}
-	// W20-ST2 — the CNPG exporter's own spelling of the same
-	// signature: cnpg_pg_replication_slots_active==0 joined to high
-	// retained WAL catches the inactive slot even while WAL
-	// archiving still reports green (the retained_bytes{active=
-	// "false"} branch above only sees slots the exporter already
-	// marks inactive; this one catches the lag between the active
-	// gauge and the retained-bytes label). `and` returns the
-	// active==0 samples (value 0) — emitSlotBloat flags 1.
-	if series, qerr := s.p.PromQuery(ctx, fmt.Sprintf(
-		`(cnpg_pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
+				`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > %d)`,
+			pgWALSlotRetainMax, pgWALSlotRetainMax))},
+		// CNPG exporter family: same shape — the cnpg exporter's own
+		// spelling catches the inactive slot even while WAL archiving
+		// still reports green (the retained_bytes{active="false"}
+		// branch only sees slots the exporter already marks inactive).
+		{query: family("cnpg_pg_", fmt.Sprintf(
 			`(cnpg_pg_replication_slots_retained_bytes > %d or `+
-			`cnpg_pg_replication_slots_pg_wal_lsn_diff > %d)`,
-		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
-		s.log.Info("WARN: cnpg active-flag slot query failed — slot-bloat evidence incomplete",
-			"error", qerr)
-	} else {
+				`cnpg_pg_replication_slots_pg_wal_lsn_diff > %d)`,
+			pgWALSlotRetainMax, pgWALSlotRetainMax))},
+	}
+	for _, fam := range promFamilies {
+		series, qerr := s.p.PromQuery(ctx, fam.query)
+		if qerr != nil {
+			s.log.Info("WARN: archiver/slot query failed — evidence incomplete",
+				"error", qerr)
+			continue
+		}
 		for _, series := range series {
+			// Slot evidence carries the slot identity — the
+			// active-flag join is `on(..., slot_name)` and the
+			// retained_bytes series label the slot by exporter
+			// contract — either as the slot_name/slot label or in a
+			// kept __name__ (..._replication_slots_...). The archiver
+			// branch can ONLY be recognized negatively: increase()
+			// is a range-function call and DROPS __name__, so a
+			// nameless, slot-less sample is the archiver signature.
+			if strings.Contains(series.Metric["__name__"],
+				"replication_slots") ||
+				series.Label("slot_name", "slot") != "" {
+				s.emit(series.Label("namespace"),
+					series.Label("cluster", "postgres_cluster", "pod"),
+					"inactive_slot")
+				// The `and`-joined active-flag spelling returns the
+				// value-0 LHS samples (no byte count) — emitSlotBloat
+				// flags 1 for them; the retained_bytes spelling
+				// carries the retained count.
+				s.p.emitSlotBloat(&s.slotRep, s.rep, series)
+				continue
+			}
 			s.emit(series.Label("namespace"),
-				series.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
-			s.p.emitSlotBloat(&s.slotRep, s.rep, series)
+				series.Label("cluster", "postgres_cluster", "pod"),
+				"archiver_failing")
 		}
 	}
 	// Volume pressure: the data volume a postgres pod mounts above
