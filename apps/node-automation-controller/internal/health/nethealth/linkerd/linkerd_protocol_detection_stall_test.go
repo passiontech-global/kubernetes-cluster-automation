@@ -565,3 +565,26 @@ func emptyDaemonSet(ns, name string) *appsv1.DaemonSet {
 		},
 	}
 }
+
+// When patchLinkerdTemplate returns covered=false (e.g. the pod's
+// owner Deployment does not exist), healLinkerdStalledPod still stamps
+// the controller cooldown so subsequent sweeps inside the window do
+// not burn additional fleet budget tokens.
+func TestLinkerdOpaquePortsUncoveredTemplateStampsCooldown(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	pod := meshedPodWithPorts("apps", "orphan-abc12-x1", []int32{5432}, "", "")
+	setPodOwnerDeployment(pod, "missing-web")
+	cs := fake.NewSimpleClientset(pod)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p)
+
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("stalled pod must fail: %+v", res)
+	}
+	if _, ok := chk.Heals.Last(probefw.SelfHealKey(
+		CheckNameLinkerdOpaqueStall, "apps/missing-web")); !ok {
+		t.Fatal("uncovered template path did not stamp the controller cooldown")
+	}
+}

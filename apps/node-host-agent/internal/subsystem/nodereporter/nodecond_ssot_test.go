@@ -5,7 +5,7 @@
 // (controller side) reconciles when a frozen heartbeat says the
 // reporter died. A def missing from the swept set is a zombie
 // condition nothing will ever clear: the 2026-11-09 InodePressure
-// W18-1 ownership flip left exactly this gap between the two apps'
+// inode-pressure-latch ownership flip left exactly this gap between the two apps'
 // lists and one stale test on the far side never noticed.
 package nodereporter
 

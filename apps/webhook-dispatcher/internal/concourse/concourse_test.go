@@ -352,9 +352,13 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	// it from Resources for an hour.
 	stub.setRoute("/api/v1/teams/main/pipelines/p2/resources",
 		`[{"name":"new","type":"git","source":{"uri":"org/new"}}]`)
-	// Past the forced-refresh throttle window — it keys on
-	// lastForceRefreshAt, Refresh's own clock.
+	// Past BOTH throttle windows — lastForceRefreshAt (Refresh's own
+	// clock) and fetchedAt (a successful fetch moments ago already
+	// IS the fresh index Refresh exists to produce).
 	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Unlock()
 
 	fresh, err := c.Refresh(context.Background())
 	if err != nil {
@@ -372,6 +376,9 @@ func TestRefreshBypassesTTL(t *testing.T) {
 
 	// A failed refresh keeps the previous index.
 	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if _, err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh(500) want error")
@@ -518,13 +525,17 @@ func TestRefreshFailedAttemptBacksOff(t *testing.T) {
 	stub := newATCStub(t, stubRoutes())
 	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
 
-	// Warm the index, then age the last forced-refresh attempt out of
-	// the throttle window and break the ATC: the next Refresh hits the
-	// network, fails, and stamps lastForceRefreshAt.
+	// Warm the index, then age the last forced-refresh attempt AND the
+	// fetch timestamp out of their throttle windows and break the ATC:
+	// the next Refresh hits the network, fails, and stamps
+	// lastForceRefreshAt.
 	if _, err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if _, err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh(500) want error")
@@ -962,6 +973,12 @@ func TestFetchIndexPipeline404DropsGhosts(t *testing.T) {
 	// 404s. The refreshed index must drop p2's ghost resources
 	// entirely — not carry them over, and not fail the fetch.
 	stub.fail("/api/v1/teams/main/pipelines/p2/resources", http.StatusNotFound)
+	// Age fetchedAt past the forced-refresh throttle — a fetch that
+	// just succeeded would otherwise satisfy Refresh without a
+	// network call.
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Unlock()
 	index, err := c.Refresh(context.Background())
 	if err != nil {
 		t.Fatalf("Refresh err=%v want nil (404 is not a fetch failure)", err)

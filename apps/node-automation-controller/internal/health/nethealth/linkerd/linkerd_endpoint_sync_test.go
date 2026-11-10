@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1060,5 +1061,37 @@ func TestLinkerdAuditedService(t *testing.T) {
 				t.Fatalf("linkerdAuditedService = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// When len(stale) == 0 (only unmanaged EndpointSlices) and no
+// linkerd-destination pod has a Ready sibling, healEndpointDesync
+// returns before HealAllowedPersisted without spending a budget token.
+func TestLinkerdEndpointSyncNoDestinationAndNoStaleSliceSpendsNoBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	base := time.Now()
+	// Unmanaged EndpointSlice (no managed-by=endpointslice-controller.k8s.io)
+	// so staleLinkerdSlices is empty, and only 1 linkerd-destination pod
+	// (no Ready sibling) so bounceOK is false.
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		probetest.HeadlessService("app", "headless-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.9"),
+		linkerdDestinationPod(kube.LinkerdDestinationName+"-solo", 2*time.Hour),
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "headless-svc")
+
+	if res := driveEndpointDesync(t, p, base); res.Pass {
+		t.Fatal("desync must fail")
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, probetest.OpDyn(), "probe", base)
+	if !proceed || unverifiable {
+		t.Fatalf("no-op healEndpointDesync spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

@@ -124,7 +124,7 @@ func (a *veleroBackupAuditor) auditCNPGBackups(ctx context.Context) error {
 				reasons = append(reasons, "missing")
 			}
 		} else if !cnpgHasCompleted(clusterBackups) {
-			// W24 Schrödinger's-backup: backup objects EXIST but
+			// selfheal-alert-coverage Schrödinger's-backup: backup objects EXIST but
 			// none ever reached phase=completed — every attempt
 			// failed (or is wedged) and the newest may sit in
 			// "running" forever, so the in-list stale check (which
@@ -192,7 +192,7 @@ func cnpgBackupReasons(backups []*unstructured.Unstructured,
 	// restorable point actually landed), else startedAt, else
 	// creationTimestamp — same convention as the Everest stale check.
 	// The same pass judges the newest completed backup's restore
-	// metadata (W24 empty_metadata — a "green shell, red heart"
+	// metadata (selfheal-alert-coverage empty_metadata — a "green shell, red heart"
 	// backup that cannot PITR/restore).
 	for _, b := range sorted {
 		phase, _ := kube.NestedString(b.Object, "status", "phase")
@@ -212,7 +212,7 @@ func cnpgBackupReasons(backups []*unstructured.Unstructured,
 
 // cnpgHasCompleted reports whether any backup in the cluster's
 // history reached phase=completed — the zero-completed-history half
-// of the W24 stale check (caller-side: it needs the schedule's age).
+// of the selfheal-alert-coverage stale check (caller-side: it needs the schedule's age).
 func cnpgHasCompleted(backups []*unstructured.Unstructured) bool {
 	for _, b := range backups {
 		if phase, _ := kube.NestedString(

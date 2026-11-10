@@ -45,7 +45,7 @@ type OrphanHPCheck struct {
 	d *wdeps.Deps
 	// orphanPVNames/orphanPVAt cache the live PV-name set for
 	// orphanHPCacheTTL so the cluster-scope LIST does not run every
-	// cycle (W19-HP1). A stale entry only delays detecting a
+	// cycle (orphan-hostpath-fast-gc). A stale entry only delays detecting a
 	// brand-new PV by one refresh — the 24h dir-age gate covers it.
 	orphanPVNames map[string]bool
 	orphanPVAt    time.Time
@@ -88,7 +88,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
 		return
 	}
-	// W19-HP1 fast path: when the PV-name cache is fresh AND every
+	// orphan-hostpath-fast-gc fast path: when the PV-name cache is fresh AND every
 	// local pvc-* dir maps to a live PV, there can be no orphan —
 	// clear the gauges and skip both the apiserver LIST and the
 	// per-dir stat/walk entirely.

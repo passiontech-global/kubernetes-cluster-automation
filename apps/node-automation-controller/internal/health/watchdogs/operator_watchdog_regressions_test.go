@@ -271,7 +271,7 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// operatorTargets — W21-R5 selector/lease regressions
+// operatorTargets — operator-watchdog-targeting selector/lease regressions
 // ---------------------------------------------------------------------------
 
 // The three medik8s-family/shipwright targets must carry selectors

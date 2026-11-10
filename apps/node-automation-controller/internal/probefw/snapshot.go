@@ -54,6 +54,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -155,6 +156,11 @@ type sweepSnapshot struct {
 	daemonSets    []appsv1.DaemonSet
 	daemonSetsErr error
 	daemonSetsSet bool
+
+	muLeases  sync.Mutex
+	leases    []coordinationv1.Lease
+	leasesErr error
+	leasesSet bool
 
 	muCRDs  sync.Mutex
 	crds    []unstructured.Unstructured

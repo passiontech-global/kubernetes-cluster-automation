@@ -48,7 +48,7 @@ func DNSQuery(addr, name string, timeout time.Duration) bool {
 		buf[2]&0x80 != 0
 }
 
-// DNSQueryTCP is the W20-NM1 TCP :53 twin of DNSQuery: the same
+// DNSQueryTCP is the server-speaks-first-ports TCP :53 twin of DNSQuery: the same
 // minimal A-record query carried over TCP, where every DNS message
 // is prefixed with a 2-byte length (RFC 1035 §4.2.2). UDP :53 can
 // stay alive while the TCP listener wedges — the TC=1 truncation

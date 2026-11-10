@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -130,6 +131,11 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 				"version", cand.v, "supersededTotal", len(superseded))
 			if err := u.cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
 				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, "")); err != nil {
+				if apierrors.IsNotFound(err) {
+					// Already gone — another actor won the race;
+					// the prune goal is met, not an error.
+					continue
+				}
 				metrics.IncError(u.queue)
 				log.Error(err, "superseded secret delete failed",
 					"secret", cand.s.Namespace+"/"+cand.s.Name)

@@ -58,6 +58,7 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/mise.toml'
     outputs:
       - 'bin/node-automation-controller'
 
@@ -73,5 +74,6 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/mise.toml'
     options:
       cache: false

@@ -29,7 +29,7 @@ func (c *DevShmCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckDevShm, "ok")
 }
 
-// --- dev-shm: host /dev/shm tmpfs fill gauge (W19-K2) ---
+// --- dev-shm: host /dev/shm tmpfs fill gauge (devshm-fill-guard) ---
 //
 // /dev/shm is a small tmpfs (typically half of RAM) that IPC-heavy
 // workloads — postgres shared buffers, JVM heaps, chrome/chromium

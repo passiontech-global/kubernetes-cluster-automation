@@ -120,6 +120,7 @@ func (d *Deps) StateFileExists(name string) bool {
 // this pod still around", replacing `ctr tasks ls` so no ctr socket
 // is needed inside the agent pod.
 type CtrTask struct {
+	ID   string // task dir name — the containerd container/sandbox id cri-containerd-*.scope units are named after
 	UID  string // io.kubernetes.pod.uid annotation
 	Name string // io.kubernetes.container.name annotation ("pause"/"POD" = sandbox infra)
 	PID  int    // init.pid contents
@@ -171,7 +172,7 @@ func (d *Deps) BuildTaskMap() (map[string][]CtrTask, bool) {
 			if um == nil {
 				continue
 			}
-			t := CtrTask{UID: string(um[1])}
+			t := CtrTask{ID: e.Name(), UID: string(um[1])}
 			if nm := ContainerNameRe.FindSubmatch(cfgData); nm != nil {
 				t.Name = string(nm[1])
 			}

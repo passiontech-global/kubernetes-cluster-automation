@@ -58,7 +58,7 @@ var (
 )
 
 const (
-	// W20-KR2 runtime AIO bump bounds: past aioUsedRatioBump of the
+	// kernel-resource-table-tuning runtime AIO bump bounds: past aioUsedRatioBump of the
 	// table the collector doubles aio-max-nr on the spot (direct
 	// sysctl write, capped at aioMaxTarget) instead of waiting for
 	// hostconfig's convergence pass — io_setup() EAGAIN surfaces as
@@ -171,7 +171,7 @@ var (
 		[]string{"node"}, nil)
 	descMaxUserNS = prometheus.NewDesc(
 		"node_host_agent_max_user_namespaces",
-		"/proc/sys/user/max_user_namespaces — userns creation ceiling (W20-KR2).",
+		"/proc/sys/user/max_user_namespaces — userns creation ceiling (kernel-resource-table-tuning).",
 		[]string{"node"}, nil)
 )
 
@@ -228,7 +228,7 @@ func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
 	mx, mxOK := hostutil.ReadUintFile(aioMaxFile)
 	if nrOK && mxOK {
-		// W20-KR2 — runtime aio-max-nr bump: past 75% of the table
+		// kernel-resource-table-tuning — runtime aio-max-nr bump: past 75% of the table
 		// with headroom left, double the limit in place (direct
 		// sysctl write — /proc/sys rejects atomic-rename writes)
 		// so io_setup() does not EAGAIN while hostconfig's
@@ -269,7 +269,7 @@ func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 }
 
 // collectUserNS emits node_host_agent_max_user_namespaces — the
-// userns creation ceiling hostconfig converges to 65536 (W20-KR2).
+// userns creation ceiling hostconfig converges to 65536 (kernel-resource-table-tuning).
 // Absent file (kernel without USER_NS) emits nothing.
 func (c *Collector) collectUserNS(ch chan<- prometheus.Metric) {
 	v, ok := hostutil.ReadUintFile(maxUserNSFile)

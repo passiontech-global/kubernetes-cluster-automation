@@ -36,7 +36,14 @@ func cdnsPod(name, ip string) *corev1.Pod {
 			Namespace: corednsNS,
 			Labels:    map[string]string{"k8s-app": "kube-dns"},
 		},
-		Status: corev1.PodStatus{PodIP: ip},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: ip,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
 	}
 }
 
@@ -535,7 +542,7 @@ func TestCoreDNSRecover(t *testing.T) {
 	})
 }
 
-// W21-G4: a fresh ApiserverWatchCacheWedged=True on any node defers
+// watch-cache-wedge-gate: a fresh ApiserverWatchCacheWedged=True on any node defers
 // the WHOLE recovery — surgical pod deletes and the whole-fleet
 // rollout restart alike — while the apiserver serves stale
 // watch-cache reads. A frozen heartbeat is a dead reporter's zombie

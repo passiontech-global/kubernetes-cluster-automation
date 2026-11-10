@@ -69,7 +69,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 
 	// --- PodVolumeBackups + PodVolumeRestores: mark + conditional
-	// cleanup (W20-ST3 added the restore side — same lost-thread
+	// cleanup (velero-restore-wedge-audit added the restore side — same lost-thread
 	// signature, same node-agent bounce) ---
 	if err := a.auditWedgedTransferKind(ctx, veleroPVBGVR, "pvb",
 		metrics.VeleroPodVolumeBackupWedged, &a.seenWedgedPVB); err != nil {
@@ -91,7 +91,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 
 // auditWedgedTransferKind is the per-GVR body of the
 // velero-inflight-audit wedge sweep shared by PodVolumeBackup and
-// PodVolumeRestore (W20-ST3): every object held InProgress|Deleting
+// PodVolumeRestore (velero-restore-wedge-audit): every object held InProgress|Deleting
 // past veleroStuckMaxAge (6h) has lost its node-agent thread —
 // Backups are mark-only, but a wedged volume transfer whose agent
 // provably died gets deleted AND its node-agent pod bounced so the
@@ -209,9 +209,11 @@ func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // CRD absent — nothing to scan, stale series still prune below
 		case err != nil:
-			err = fmt.Errorf("list velero %s: %w", kind, err)
-			a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
-			return err
+			// List failed — return WITHOUT pruning: the last-emitted
+			// wedge series must stay up (a transient API flap is not
+			// evidence the objects resolved), and the next successful
+			// sweep re-asserts or prunes them itself.
+			return fmt.Errorf("list velero %s: %w", kind, err)
 		}
 		for i := range items.Items {
 			u := &items.Items[i]
@@ -316,15 +318,25 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 		"kind", kind, "object", ns+"/"+name,
 		"agentPod", agentPodName(agent))
 
-	// Bounce the node-agent pod so its next scheduled backup starts
-	// clean — the DaemonSet recreates it. A missing agent pod needs
-	// no bounce (it is already gone). A FAILED bounce reports
-	// not-healed and skips the cooldown stamp: the wedged transfer
-	// object itself is already gone, so the skip leaves only the
-	// agent restart undelivered — visible in the error log and the
-	// IncError, but there is nothing left to re-drive the retry
-	// against (the census will not list the deleted PVB/PVR again).
-	if agent != nil {
+	// Bounce the node-agent pod ONLY when it is not already a fresh
+	// incarnation. pvbAgentWedged proves the wedge through evidence
+	// that POST-DATES the transfer start — the pod's StartTime or a
+	// container StartedAt/LastTerminationState after objStart — so a
+	// Running agent reaching here already restarted past the wedge:
+	// its Kopia thread is dead AND its process is clean, making the
+	// bounce pure harm. With several wedged transfers sharing one
+	// node, each cooldown-spaced cycle would otherwise kill the same
+	// healthy agent pod (interrupting NEW backups) once per leftover
+	// PVB. A non-Running agent still gets bounced — the delete makes
+	// the DaemonSet recreate a working pod now rather than after its
+	// restart backoff; a missing agent needs no bounce (already gone).
+	// A FAILED bounce reports not-healed and skips the cooldown
+	// stamp: the wedged transfer object itself is already gone, so
+	// the skip leaves only the agent restart undelivered — visible in
+	// the error log and the IncError, but there is nothing left to
+	// re-drive the retry against (the census will not list the
+	// deleted PVB/PVR again).
+	if agent != nil && agent.Status.Phase != corev1.PodRunning {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
 			kube.UIDDeleteOptions(agentUID, "")); err != nil && !apierrors.IsNotFound(err) {

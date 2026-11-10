@@ -23,7 +23,6 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -130,7 +129,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	// slice walk) for collectProbeCandidates to pick against.
 	probePrefs := make(map[string]slicePortPref, len(probeSet))
 	for key, svcPorts := range probeSet {
-		probePrefs[key] = resolveSlicePortPref(ctx, g.CS, key, svcPorts)
+		probePrefs[key] = resolveSlicePortPref(snap, key, svcPorts)
 	}
 	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: ListPageSize},
@@ -306,7 +305,7 @@ var webhookPortNames = map[string]bool{"https": true, "webhook": true, "tls": tr
 // port is the SERVICE port; the slice carries TARGET ports, so the
 // Service object is the only honest translation). An unresolvable
 // Service degrades to name matching alone.
-func resolveSlicePortPref(ctx context.Context, cs kubernetes.Interface,
+func resolveSlicePortPref(snap *Snapshot,
 	key string, svcPorts []int32) slicePortPref {
 	pref := slicePortPref{names: map[string]bool{}, numbers: map[int32]bool{}}
 	for n := range webhookPortNames {
@@ -316,8 +315,18 @@ func resolveSlicePortPref(ctx context.Context, cs kubernetes.Interface,
 	if !ok {
 		return pref
 	}
-	svc, err := cs.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
+	// The snapshot's paged Services census replaces the per-backend
+	// Get — a missing service or a failed census degrades to name
+	// matching alone, same as the old Get-error path.
+	var svc *corev1.Service
+	for i := range snap.Services {
+		if snap.Services[i].Namespace == ns &&
+			snap.Services[i].Name == name {
+			svc = &snap.Services[i]
+			break
+		}
+	}
+	if svc == nil {
 		return pref // cannot resolve — the named-port preference still applies
 	}
 	for _, sp := range svc.Spec.Ports {

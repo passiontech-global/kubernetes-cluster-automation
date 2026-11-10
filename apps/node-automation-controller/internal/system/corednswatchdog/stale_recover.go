@@ -64,7 +64,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 			"pods", suspects, "notReady", notReady)
 		return nil
 	}
-	// Watch-cache wedge gate (W21-G4): a fresh
+	// Watch-cache wedge gate (watch-cache-wedge-gate): a fresh
 	// ApiserverWatchCacheWedged=True on any node means the apiserver
 	// is serving stale watch-cache data — deleting coredns pods or
 	// restarting the Deployment would strip the last DNS answers

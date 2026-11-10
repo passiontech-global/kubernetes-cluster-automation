@@ -63,11 +63,11 @@ func cnpgPhaseKey(phase string) string {
 //     serves, a second failure loses the write quorum.
 //   - archiving_disabled: the ContinuousArchiving condition False —
 //     PITR silently dead while scheduled snapshots keep "succeeding".
-//   - primary_mismatch (W19-ST1): with status.instances > 0, an
+//   - primary_mismatch (cnpg-cluster-health): with status.instances > 0, an
 //     empty status.currentPrimary (no elected primary) or a
 //     current/target disagreement — a switchover that never lands
 //     or a split-brain the operator is still reconciling.
-//   - fenced_instances (W19-ST1): the cnpg.io/fencedInstances
+//   - fenced_instances (cnpg-cluster-health): the cnpg.io/fencedInstances
 //     annotation non-empty — instances the operator fenced after
 //     losing contact. Detection persists minAge via the
 //     first-seen ledger; the heal half below auto-unfences an
@@ -149,7 +149,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 			}
 		}
 
-		// (4) W19-ST1 primary_mismatch: with instances declared, an
+		// (4) cnpg-cluster-health primary_mismatch: with instances declared, an
 		// empty currentPrimary (no elected primary — read-only or
 		// stuck init) or a current/target disagreement (a switchover
 		// that never lands, split-brain still reconciling) held past
@@ -171,7 +171,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 		}
 	}
 
-	// (5) W19-ST1 fenced_instances: detect + safe auto-unfence. The
+	// (5) cnpg-cluster-health fenced_instances: detect + safe auto-unfence. The
 	// pod/node census is fetched lazily — only when at least one
 	// cluster carries the annotation.
 	p.checkCNPGFencedInstances(ctx, log, clusters, now, minAge,
@@ -185,7 +185,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 }
 
 // ---------------------------------------------------------------------------
-// cnpg fenced_instances — detect + safe auto-unfence (W19-ST1)
+// cnpg fenced_instances — detect + safe auto-unfence (cnpg-cluster-health)
 // ---------------------------------------------------------------------------
 
 // cnpgFencedInstancesAnno is the CNPG operator's fenced-instance
@@ -413,11 +413,20 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	if err != nil {
 		return err
 	}
-	if _, err := p.Dyn.Resource(kube.GVRCNPGCluster).
+	patched, err := p.Dyn.Resource(kube.GVRCNPGCluster).
 		Namespace(cr.GetNamespace()).Patch(
 		ctx, cr.GetName(), types.MergePatchType, data,
-		metav1.PatchOptions{}); err != nil {
+		metav1.PatchOptions{})
+	if err != nil {
 		return err
+	}
+	// The pinned resourceVersion is now stale — the apiserver
+	// bumped it on this patch. Refresh the in-memory object so a
+	// SECOND unfence of the same cluster in this sweep preconditions
+	// on the fresh RV instead of eating a guaranteed 409 Conflict
+	// (which also burned a heal-budget token for nothing).
+	if patched != nil {
+		cr.SetResourceVersion(patched.GetResourceVersion())
 	}
 	return nil
 }

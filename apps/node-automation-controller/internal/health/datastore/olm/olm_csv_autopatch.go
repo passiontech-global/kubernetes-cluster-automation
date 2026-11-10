@@ -1,4 +1,4 @@
-// olm_csv_autopatch.go — the W20-CP3 durable-patch duties of the
+// olm_csv_autopatch.go — the olm-csv-autopatch durable-patch duties of the
 // olm-subscription-health check: two CSV spec mutations that used to
 // live only as manual in-cluster `kubectl patch csv` notes in
 // infrastructure/base/operators/*.yaml, plus the everest

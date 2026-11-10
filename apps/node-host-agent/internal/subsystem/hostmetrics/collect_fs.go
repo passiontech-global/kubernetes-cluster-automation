@@ -37,35 +37,54 @@ type fsResult struct {
 	err error
 }
 
+// fsFlight is one in-flight statfs probe shared by every concurrent
+// probeFS caller for the same mount (singleflight): the leader's
+// statfs goroutine publishes its result into res then closes done —
+// close broadcasts to EVERY waiter, where a single-element channel
+// would hand the result to exactly one sharer and strand the rest
+// on the deadline (a fabricated stalled=true). Each waiter races
+// done against the FLIGHT's deadline (start + fsProbeTimeout), not
+// a fresh per-caller timer. Sharing the verdict is what keeps a
+// scrape landing mid-probe from dropping the mount's
+// inode/bytes metrics (ok=false used to mean "someone else is
+// probing") and — worse — from feeding updateFSReadonlyLatch a
+// probed=true/anyRO=false pass that cleared
+// state-filesystem-readonly while the read-only mount's own probe
+// was still in flight.
+type fsFlight struct {
+	start time.Time
+	done  chan struct{}
+	res   fsResult
+}
+
 // fsProbeState is the hung-mount probe domain — one slice of what
 // used to be the Collector's shared mu-guarded fields. inflight
-// holds the start time of each mount's in-kernel statfs probe — a
-// hung syscall can't be cancelled, so a scrape that finds an
-// in-flight probe reports stalled only once the deadline has
-// elapsed, WITHOUT spawning another (bounds stuck goroutines at one
-// per mount). stalledLogged edge-triggers the hung-mount Warn: the
-// stall logs once per mount per episode instead of once per scrape
-// for the whole outage. The mutex is private — the fs domain
-// shares no state with the other collect domains.
+// holds each mount's live fsFlight — a hung syscall can't be
+// cancelled, so a scrape that finds an in-flight probe reports
+// stalled only once the flight's deadline has elapsed, WITHOUT
+// spawning another (bounds stuck goroutines at one per mount).
+// stalledLogged edge-triggers the hung-mount Warn: the stall logs
+// once per mount per episode instead of once per scrape for the
+// whole outage. The mutex is private — the fs domain shares no
+// state with the other collect domains.
 type fsProbeState struct {
 	mu            sync.Mutex
-	inflight      map[string]time.Time
+	inflight      map[string]*fsFlight
 	stalledLogged map[string]bool
 }
 
-// probeStart registers a fresh in-flight probe for mount stamped at
-// now and reports true — or, when a probe is already in flight,
-// returns its start and false so the caller serves the running
-// probe's deadline verdict instead of piling up a second statfs
-// goroutine.
-func (s *fsProbeState) probeStart(mount string, now time.Time) (time.Time, bool) {
+// probeStart returns mount's live flight — or, when none is in
+// flight, registers a fresh one stamped at now and reports
+// leader=true so the caller spawns the statfs goroutine.
+func (s *fsProbeState) probeStart(mount string, now time.Time) (*fsFlight, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if start, inflight := s.inflight[mount]; inflight {
-		return start, false
+	if f, inflight := s.inflight[mount]; inflight {
+		return f, false
 	}
-	s.inflight[mount] = now
-	return now, true
+	f := &fsFlight{start: now, done: make(chan struct{})}
+	s.inflight[mount] = f
+	return f, true
 }
 
 // probeDone clears mount's in-flight stamp — the statfs goroutine's
@@ -94,37 +113,54 @@ func (s *fsProbeState) noteStall(mount string, stalled bool) (wasLogged bool) {
 // probeFS statfs's one mount under the fsProbeTimeout deadline. A
 // hung mount blocks the syscall in uninterruptible sleep — it can't
 // be cancelled — so the call runs on a goroutine and the scrape
-// moves on after the deadline. stalled=true means the deadline
-// passed with the syscall still stuck (or an earlier probe of the
-// same mount has been in the kernel past the deadline — at most one
-// goroutine per mount is allowed to pile up). A scrape that lands
-// while a still-fresh probe is in flight reports stalled=0, not 1:
-// "probe running" is not "probe hung", and two overlapping scrapers
-// must not manufacture a hung-mount alert. ok=true only when statfs
-// completed without error.
+// moves on after the deadline. stalled=true means the flight's
+// deadline passed with the syscall still stuck (or an earlier probe
+// of the same mount has been in the kernel past the deadline — at
+// most one goroutine per mount is allowed to pile up). Concurrent
+// callers share the in-flight flight's result: "probe running" is
+// not "probe hung", and two overlapping scrapers must not
+// manufacture a hung-mount alert — nor a fabricated ok=false that
+// drops the mount's metrics or clears its read-only latch. ok=true
+// only when statfs completed without error.
 func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
-	start, fresh := c.fs.probeStart(mount, c.cfg.Clock.Now())
-	if !fresh {
-		return unix.Statfs_t{},
-			c.cfg.Clock.Now().Sub(start) >= c.cfg.fsProbeTimeout, false
+	flight, leader := c.fs.probeStart(mount, c.cfg.Clock.Now())
+	if leader {
+		go func() {
+			var r fsResult
+			r.err = c.cfg.statfsFn(mount, &r.st)
+			c.fs.probeDone(mount)
+			flight.res = r
+			close(flight.done) // wakes every sharer, not just one
+		}()
 	}
 
-	res := make(chan fsResult, 1)
-	go func() {
-		var r fsResult
-		r.err = c.cfg.statfsFn(mount, &r.st)
-		c.fs.probeDone(mount)
-		res <- r // buffered — never blocks after a timed-out scrape
-	}()
-
-	timer := time.NewTimer(c.cfg.fsProbeTimeout)
-	defer timer.Stop()
+	// A result already published wins even past the deadline — the
+	// flight answered, it just landed late relative to a waiter
+	// that arrived near the wire.
 	select {
-	case r := <-res:
-		if r.err != nil {
+	case <-flight.done:
+		if flight.res.err != nil {
 			return unix.Statfs_t{}, false, false
 		}
-		return r.st, false, true
+		return flight.res.st, false, true
+	default:
+	}
+
+	// Wait out the FLIGHT's remaining deadline — every sharer gets
+	// the same stalled verdict the leader would have produced.
+	wait := flight.start.Add(c.cfg.fsProbeTimeout).
+		Sub(c.cfg.Clock.Now())
+	if wait <= 0 {
+		return unix.Statfs_t{}, true, false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-flight.done:
+		if flight.res.err != nil {
+			return unix.Statfs_t{}, false, false
+		}
+		return flight.res.st, false, true
 	case <-timer.C:
 		return unix.Statfs_t{}, true, false
 	}

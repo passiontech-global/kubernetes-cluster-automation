@@ -59,7 +59,7 @@ type Agent struct {
 	started atomic.Int64 // unixnano — read by the scrape-time GaugeFunc
 	ready   atomic.Bool
 	// maxBackoffSubs counts subsystems pinned at the supervisor's
-	// 5m restart-backoff cap (W24) — supervisor.go maintains it.
+	// 5m restart-backoff cap (selfheal-alert-coverage) — supervisor.go maintains it.
 	// /readyz reports 503 while it is non-zero so kube_pod_status_ready
 	// reflects the degraded state; /healthz stays 200 so the pod is
 	// not restarted and the healthy subsystems keep running.
@@ -159,7 +159,7 @@ func (a *Agent) probeMux() *http.ServeMux {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		// W24 supervisor-aware readiness: listeners bound (ready)
+		// selfheal-alert-coverage supervisor-aware readiness: listeners bound (ready)
 		// AND no subsystem pinned at the 5m crash-loop backoff.
 		// /healthz above deliberately ignores maxBackoffSubs — a
 		// degraded subsystem must not get the whole pod restarted.

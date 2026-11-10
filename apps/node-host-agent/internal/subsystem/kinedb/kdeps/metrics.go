@@ -72,7 +72,7 @@ type Metrics struct {
 
 	// kine-churn/backup-health: top-churn + physical-backup verifier series.
 	TopChurn    *prometheus.GaugeVec // resource
-	TopHotkey   *prometheus.GaugeVec // key — W24 per-object SSA ping-pong
+	TopHotkey   *prometheus.GaugeVec // key — selfheal-alert-coverage per-object SSA ping-pong
 	BackupAge   prometheus.Gauge
 	BackupValid prometheus.Gauge
 

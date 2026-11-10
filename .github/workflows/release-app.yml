@@ -69,6 +69,9 @@ jobs:
           # input through env indirection instead.
           VERSION_INPUT: ${{ inputs.version }}
           LEGACY_V_TAGS: ${{ inputs.legacy_v_tags }}
+          # gh release view below needs API auth to catch a release
+          # that exists without its git tag locally.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           version_in="$VERSION_INPUT"
@@ -169,6 +172,21 @@ jobs:
           # git/GitHub release tag keeps the canonical semver form.
           rel_docker_version="${rel_version/+/-}"
           rel_tag="$APP/$rel_version"
+
+          # Fail BEFORE the image push: re-releasing an existing
+          # version used to build and overwrite :vX.Y.Z/:latest on
+          # GHCR first, then die at `gh release create` — leaving the
+          # registry mutated by a release that never published.
+          # fetch-depth: 0 makes every remote tag visible locally;
+          # the gh check also catches a release whose tag was deleted.
+          if git rev-parse -q --verify "refs/tags/$rel_tag" >/dev/null; then
+            echo "::error::tag $rel_tag already exists — pick a new version" >&2
+            exit 1
+          fi
+          if gh release view "$rel_tag" >/dev/null 2>&1; then
+            echo "::error::GitHub release $rel_tag already exists — pick a new version" >&2
+            exit 1
+          fi
 
           git-cliff --unreleased --tag "$rel_tag" \
             --config "apps/$APP/cliff.toml" \

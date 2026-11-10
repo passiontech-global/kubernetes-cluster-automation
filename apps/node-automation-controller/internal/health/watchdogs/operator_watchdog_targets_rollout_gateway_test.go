@@ -98,12 +98,12 @@ func TestCftOwnsRouteParent(t *testing.T) {
 		t.Fatal("route attached to a cilium-class Gateway must NOT be owned by the cft row")
 	}
 
-	// ParentRef names a Gateway that does not exist — attribution
-	// unresolvable → kept.
+	// ParentRef names a Gateway that does not exist — orphan route,
+	// no gateway controller will ever write status.parents → dropped.
 	p = newGatewayClassAwareProber()
-	if !cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+	if cftOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
 		routeFixture("apps", "r", 1, []any{map[string]any{"name": "missing-gw"}})) {
-		t.Fatal("unresolvable parent Gateway must keep the route")
+		t.Fatal("unresolvable parent Gateway must drop the orphan route")
 	}
 
 	// No parentRefs at all → nothing to attribute → kept.

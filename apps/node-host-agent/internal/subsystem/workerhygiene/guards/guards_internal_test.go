@@ -528,7 +528,7 @@ func TestGcCalicoOrphanVethsDeletesViaSystemd(t *testing.T) {
 	}
 }
 
-// --- calico.go: checkWireguardCali (W20-NM3) ---
+// --- calico.go: checkWireguardCali (calico-wireguard-datapath-guard) ---
 
 // wgIface writes the wireguard.cali sysfs pair the detector reads.
 func wgIface(t *testing.T, d *wdeps.Deps, operstate, carrier string) {
@@ -639,7 +639,7 @@ func TestCheckWireguardCaliStreakAndRemedy(t *testing.T) {
 	}
 }
 
-// --- dstate_scopes.go: checkDeactivating (W20-KR1) ---
+// --- dstate_scopes.go: checkDeactivating (deactivating-unit-detector) ---
 
 func TestCheckDeactivating(t *testing.T) {
 	d, f := gDeps(t)
@@ -692,7 +692,7 @@ func TestCheckDeactivating(t *testing.T) {
 	}
 }
 
-// TestReapDeactivatingOrphanedScopes — W21-G3: a cri-containerd
+// TestReapDeactivatingOrphanedScopes — deactivating-scope-reaper: a cri-containerd
 // scope wedged in `deactivating` across ≥2 sweeps whose container
 // id belongs to NO Running pod is force-stopped (SIGKILL + stop);
 // a scope still owned by a live pod stays diagnose-only.
@@ -720,7 +720,7 @@ func TestReapDeactivatingOrphanedScopes(t *testing.T) {
 			}},
 		},
 	}
-	ce := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}}
+	ce := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}, APIOK: true}
 
 	// Sweep 1 — streak 1, the per-unit ledger is still empty: no reap.
 	c.checkDeactivating(ctx, ce)

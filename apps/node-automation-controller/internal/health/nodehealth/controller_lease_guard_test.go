@@ -127,20 +127,21 @@ func TestControllerRunningPodsAttribution(t *testing.T) {
 	for _, p := range got {
 		names[p.Name] = true
 	}
-	for _, want := range []string{"kube-controller-manager-pod", "kube-controller-manager-pod-xyz",
-		"kube-controller-manager-orphan"} {
+	for _, want := range []string{"kube-controller-manager-pod", "kube-controller-manager-pod-xyz"} {
 		if !names[want] {
 			t.Fatalf("controller pod %s missing from %v", want, names)
 		}
 	}
 	for _, unwant := range []string{"unrelated", "kube-controller-manager-node1",
-		"kube-controller-manager-pending", "kube-controller-manager-dying"} {
+		"kube-controller-manager-pending", "kube-controller-manager-dying",
+		"kube-controller-manager-orphan"} {
 		if names[unwant] {
 			t.Fatalf("pod %s must not be attributed (got %v)", unwant, names)
 		}
 	}
-	// The "<lease>-*" prefix fallback fires by name shape alone —
-	// "orphan" rides it even while the holder pod still resolves.
+	// When Pass 1 positively attributes the holder pod, the "<lease>-*"
+	// prefix fallback does not run — "orphan" is excluded until the
+	// holder pod is gone.
 
 	// Holder pod gone: pods named "<lease name>-*" are still the
 	// wedged controller's targets — a single-owner fallback set is

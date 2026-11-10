@@ -206,7 +206,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	d.KineStuckConns = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_kine_stuck_conns",
 		Help: "Kine process DB-port sockets wedged in CLOSE_WAIT/" +
-			"FIN_WAIT2 or retransmitting (W20-CP2 orphaned-conn " +
+			"FIN_WAIT2 or retransmitting (kine-orphaned-conn-watch orphaned-conn " +
 			"signature).",
 	})
 	d.OOMWindow = prometheus.NewGauge(prometheus.GaugeOpts{

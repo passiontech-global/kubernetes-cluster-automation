@@ -48,7 +48,7 @@ const (
 	// relist-storm signature (watch clients relisting en masse).
 	terminatedWatchersMetric = "node_host_agent_apiserver_terminated_watchers"
 	// apiserverRSSMetric mirrors the local apiserver's
-	// process_resident_memory_bytes (W19-PI2) — kube-apiserver RSS
+	// process_resident_memory_bytes (apiserver-rss-gauge) — kube-apiserver RSS
 	// growth/leak visibility without scraping the static pod.
 	apiserverRSSMetric = "node_host_agent_apiserver_rss_bytes"
 	// logKeyAPFStarve keys the suspectLog dedupe budget for the
@@ -89,7 +89,7 @@ var (
 	terminatedWatchersRe = regexp.MustCompile(
 		`(?m)^apiserver_terminated_watchers_total(\{[^}]*\})?\s+([0-9.eE+-]+)`)
 	// apiserverRSSRe extracts process_resident_memory_bytes — the
-	// apiserver's own RSS gauge (W19-PI2).
+	// apiserver's own RSS gauge (apiserver-rss-gauge).
 	apiserverRSSRe = regexp.MustCompile(
 		`(?m)^process_resident_memory_bytes(\{[^}]*\})?\s+([0-9.eE+-]+)`)
 )
@@ -331,7 +331,7 @@ func (c *FreezeCheck) EmitAPFMetrics(rejected, inqueue map[APFSeriesKey]float64,
 			strconv.FormatFloat(terminatedWatchers, 'f', -1, 64)))
 		c.d.TerminatedWatchersVal.Store(math.Float64bits(terminatedWatchers))
 	}
-	// W19-PI2: apiserver RSS — headers-only when the scrape lacked
+	// apiserver-rss-gauge: apiserver RSS — headers-only when the scrape lacked
 	// the family so a blind scrape drops the series.
 	rssHelp := "kube-apiserver process_resident_memory_bytes " +
 		"mirrored from the local apiserver — RSS growth/leak watch."

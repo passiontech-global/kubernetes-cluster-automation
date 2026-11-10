@@ -15,13 +15,17 @@ WORKDIR /src
 COPY libs/hostkit/go.* libs/hostkit/
 COPY apps/webhook-dispatcher/go.mod apps/webhook-dispatcher/go.sum apps/webhook-dispatcher/
 WORKDIR /src/apps/webhook-dispatcher
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 # Full source only after deps are cached. ARG VERSION sits just above
 # `go build` so bumping it invalidates the link layer, not the downloads.
 COPY libs/hostkit/ /src/libs/hostkit/
 COPY apps/webhook-dispatcher/ /src/apps/webhook-dispatcher/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/webhook-dispatcher ./cmd/dispatcher
 

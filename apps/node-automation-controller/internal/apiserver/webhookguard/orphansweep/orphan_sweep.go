@@ -14,7 +14,6 @@ import (
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -54,24 +53,20 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		return errors.New("kube-system absent from namespace list (API flap) — abort")
 	}
 
-	// Service snapshot feeds only the WARN branch — a failure here
-	// degrades to namespace-only checking, it must not block orphans.
-	// Paged like every cluster-wide list in this module.
+	// Service census feeds only the WARN branch — a failure here
+	// degrades to namespace-only checking, it must not block
+	// orphans. Read from the shared snapshot's paged LIST instead of
+	// paying a second cluster-wide services list per run.
 	haveSvc := true
 	services := map[string]bool{}
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: guardstate.ListPageSize},
-		kube.Services(g.CS, metav1.NamespaceAll),
-		func(items []corev1.Service) error {
-			for i := range items {
-				services[items[i].Namespace+"/"+items[i].Name] = true
-			}
-			return nil
-		})
-	if err != nil {
+	if snap.ServicesErr != nil {
 		metrics.IncError(g.Queue)
-		log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", err)
+		log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", snap.ServicesErr)
 		haveSvc = false
+	} else {
+		for i := range snap.Services {
+			services[snap.Services[i].Namespace+"/"+snap.Services[i].Name] = true
+		}
 	}
 
 	if snap.MWCErr != nil {

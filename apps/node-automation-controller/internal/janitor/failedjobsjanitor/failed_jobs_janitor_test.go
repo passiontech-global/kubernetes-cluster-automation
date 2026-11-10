@@ -257,7 +257,7 @@ func TestStuckTerminatingAuditMarksStuck(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "live-ns"}},
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "data", Name: "stuck-pvc", DeletionTimestamp: &old,
-			Finalizers: []string{"kubernetes.io/pvc-protection"}}},
+			Finalizers: []string{"external-provisioner/test"}}},
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "data", Name: "fresh-pvc", DeletionTimestamp: &fresh}},
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{

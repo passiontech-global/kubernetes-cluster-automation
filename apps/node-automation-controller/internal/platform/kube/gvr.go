@@ -116,7 +116,7 @@ var (
 	GVVeleroPodVolumeBackup = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "podvolumebackups"}
 	// GVVeleroPodVolumeRestore is the restore-side twin —
-	// velero-inflight-audit's W20-ST3 wedge scan.
+	// velero-inflight-audit's velero-restore-wedge-audit wedge scan.
 	GVVeleroPodVolumeRestore = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "podvolumerestores"}
 	// GVVeleroBackupRepository is the restic/kopia BackupRepository —

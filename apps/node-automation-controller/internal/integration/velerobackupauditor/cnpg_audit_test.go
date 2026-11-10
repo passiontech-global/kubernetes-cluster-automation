@@ -46,7 +46,7 @@ func cnpgScheduledBackup(ns, name, cluster string, suspend bool,
 // status.phase, age backs creationTimestamp, started/stopped are
 // status.startedAt / status.stoppedAt (RFC3339, "" omits them).
 // Completed backups get healthy Barman restore metadata by default
-// (method + backupId + beginWal) so the W24 empty_metadata check
+// (method + backupId + beginWal) so the selfheal-alert-coverage empty_metadata check
 // stays quiet — tests for that signature strip the fields after
 // building.
 func cnpgBackup(ns, name, cluster, phase string, age time.Duration,
@@ -177,7 +177,7 @@ func TestCNPGBackupReasonsMatrix(t *testing.T) {
 		}
 	})
 
-	// W24 empty_metadata — a completed backup with no usable restore
+	// selfheal-alert-coverage empty_metadata — a completed backup with no usable restore
 	// metadata: status.error set, or a Barman backup missing BOTH
 	// backupId and beginWal. volumeSnapshot backups legitimately
 	// carry neither WAL field.
@@ -252,7 +252,7 @@ func TestVeleroAuditorCNPGBackupHealth(t *testing.T) {
 	if err := a.auditCNPGBackups(ctx); err != nil {
 		t.Fatalf("audit: %v", err)
 	}
-	// W24: db-failed and db-stuck hold backup objects but NONE ever
+	// selfheal-alert-coverage: db-failed and db-stuck hold backup objects but NONE ever
 	// completed — past the 36h schedule age they co-flag stale
 	// (zero-completed-history) beside their primary reason.
 	for cluster, want := range map[string][]string{

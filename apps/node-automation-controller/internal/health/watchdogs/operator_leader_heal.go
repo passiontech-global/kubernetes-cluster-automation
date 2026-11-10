@@ -104,6 +104,24 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	if p.opHealed.CooledDown(podKey, operatorHealCooldown, now) {
 		return
 	}
+	// Filter to controller-owned pods BEFORE the gated preamble: a
+	// pod with no controller owner reference would NOT be recreated
+	// after the delete — deleting a lone operator pod that nothing
+	// restarts turns a stuck operator into a missing one — so it is
+	// never a heal target. Discovering that inside the gated loop
+	// burned a fleet budget grant on a heal that could not happen.
+	targets := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		if metav1.GetControllerOf(&pods[i]) == nil {
+			log.Info("operator pod has no controller owner — delete skipped",
+				"operator", op.name, "pod", pods[i].Namespace+"/"+pods[i].Name)
+			continue
+		}
+		targets = append(targets, pods[i])
+	}
+	if len(targets) == 0 {
+		return
+	}
 	var leaseObj metav1.Object
 	if lease != nil {
 		leaseObj = lease
@@ -120,18 +138,8 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	}
 
 	deleted := false
-	for i := range pods {
-		pod := &pods[i]
-		// A pod with no controller owner reference would NOT be
-		// recreated after the delete — deleting a lone operator
-		// pod that nothing restarts turns a stuck operator into a
-		// missing one. Only a controller-owned pod (Deployment /
-		// StatefulSet / DaemonSet managed) is a safe delete.
-		if metav1.GetControllerOf(pod) == nil {
-			log.Info("operator pod has no controller owner — delete skipped",
-				"operator", op.name, "pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
+	for i := range targets {
+		pod := &targets[i]
 		// The UID precondition inside heal.DeletePod closes the
 		// list→delete TOCTOU: a same-named replacement pod is not
 		// ours to reap.

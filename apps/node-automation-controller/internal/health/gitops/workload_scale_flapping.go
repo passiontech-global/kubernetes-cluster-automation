@@ -33,6 +33,17 @@ type workloadScaleFlappingCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops being
 	// reported gets DeleteLabelValues'd rather than leaking a stale 1.
 	emitted state.GaugeLedger[string]
+
+	// stsRolloutSeen records the last sweep each StatefulSet was
+	// observed mid-rollout (currentRevision != updateRevision).
+	// The revision-equality gate alone re-opens the moment a rolling
+	// update COMPLETES — but the create/delete churn it produced
+	// still sits inside the 1h event window and would read as scale
+	// tug-of-war. Remembering the last mismatch keeps those events
+	// excluded for one full window past the rollout's end. In-RAM
+	// like emitted: a controller restart re-arms the gate (the safe
+	// direction is a delayed flap alert, never a false one).
+	stsRolloutSeen map[string]time.Time
 }
 
 // NewWorkloadScaleFlappingCheck builds the scale-flap check — the
@@ -143,8 +154,20 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 	stsMidRollout := make(map[string]bool, len(stss))
 	for i := range stss {
 		sts := &stss[i]
+		key := sts.Namespace + "/" + sts.Name
 		if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
-			stsMidRollout[sts.Namespace+"/"+sts.Name] = true
+			stsMidRollout[key] = true
+			if p.stsRolloutSeen == nil {
+				p.stsRolloutSeen = map[string]time.Time{}
+			}
+			p.stsRolloutSeen[key] = now
+		}
+	}
+	// Forget rollouts whose last observed mismatch has aged out of
+	// the event window — their churn can no longer be in the census.
+	for key, seen := range p.stsRolloutSeen {
+		if now.Sub(seen) >= scaleFlapWindow {
+			delete(p.stsRolloutSeen, key)
 		}
 	}
 
@@ -194,6 +217,12 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 			}
 			up = e.Reason == rolloutFlapUpReason
 			down = e.Reason == rolloutFlapDownReason
+			// Same ReplicaSet-name separation as the Deployment path:
+			// a canary's alternating scale-up/down lands on DIFFERENT
+			// ReplicaSets (stable vs canary), and without the rs tag
+			// the pair-exclusion below cannot tell that rollout
+			// cadence from a real tug-of-war.
+			rs = scalingRSName(e.Message)
 		}
 		if !up && !down {
 			continue
@@ -211,10 +240,15 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		// its new-revision twin — one create/delete pair PER POD,
 		// alternating directions, zero scale intent. Gate them out:
 		// only a settled STS (revisions equal) can show real
-		// scale-up/down tug-of-war through these reasons.
+		// scale-up/down tug-of-war through these reasons — and only
+		// until its rollout's churn ages out of the window (a STS
+		// seen mid-rollout within the last scaleFlapWindow keeps
+		// the gate even after the revisions re-converge).
+		stsKey := ns + "/" + io.Name
 		if (e.Reason == stsFlapCreateReason ||
 			e.Reason == stsFlapDeleteReason) &&
-			stsMidRollout[ns+"/"+io.Name] {
+			(stsMidRollout[stsKey] ||
+				now.Sub(p.stsRolloutSeen[stsKey]) < scaleFlapWindow) {
 			continue
 		}
 		k := flapKey{ns: ns, kind: io.Kind, name: io.Name}

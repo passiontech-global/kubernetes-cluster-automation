@@ -86,7 +86,7 @@ func TestCgroupThrottleDetectsMemoryHigh(t *testing.T) {
 	}
 }
 
-// TestCgroupThrottlePodMemoryHighThrottledEvent — W21-G2: the
+// TestCgroupThrottlePodMemoryHighThrottledEvent — pod-cgroup-oomkill-metrics: the
 // throttle verdict also lands a PodMemoryHighThrottled Warning on
 // the owning Pod, deduped per pod slice and re-armed by a
 // conclusive non-throttle cycle.

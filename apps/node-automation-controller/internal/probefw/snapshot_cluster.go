@@ -7,6 +7,7 @@ package probefw
 import (
 	"context"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -103,4 +104,42 @@ func (d *Deps) EventsWithReason(ctx context.Context, reason string) ([]corev1.Ev
 		}
 	}
 	return out, nil
+}
+
+// AllLeases is the coordination.k8s.io census — the leader-election
+// objects ~40 health checks used to GET one-by-one per sweep
+// (operator-workqueue ~35 GETs, mesh/kcm watchdogs, lease guards,
+// percona quorum). One paged cluster LIST per sweep replaces them
+// all; callers find their Lease by namespace+name in the result.
+func (d *Deps) AllLeases(ctx context.Context) ([]coordinationv1.Lease, error) {
+	s := sweepSnap(ctx)
+	s.muLeases.Lock()
+	defer s.muLeases.Unlock()
+	if !s.leasesSet {
+		s.leasesSet = true
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		s.leases, s.leasesErr = kube.ListAll(lctx,
+			metav1.ListOptions{Limit: HealthListPageSize},
+			kube.Leases(d.CS, metav1.NamespaceAll))
+	}
+	return s.leases, s.leasesErr
+}
+
+// Lease finds one Lease in the AllLeases census — the snapshot
+// equivalent of `Leases(ns).Get(ctx, name)`: a hit returns the
+// listed object, a miss returns nil (callers treat absent the same
+// as a NotFound GET). List errors propagate so callers keep their
+// fail-open/closed semantics.
+func (d *Deps) Lease(ctx context.Context, ns, name string) (*coordinationv1.Lease, error) {
+	leases, err := d.AllLeases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range leases {
+		if leases[i].Namespace == ns && leases[i].Name == name {
+			return &leases[i], nil
+		}
+	}
+	return nil, nil
 }

@@ -2,7 +2,7 @@
 // velero-backup-auditor: auditBSLs (velero-bsl-audit — a
 // BackupStorageLocation not phase=Available means backups run to an
 // unreachable bucket) and auditBackupRepositories (backup-health —
-// the restic/kopia repo every snapshot lands in, plus the W19-ST2
+// the restic/kopia repo every snapshot lands in, plus the velero-repo-reinit-heal
 // re-init heal for repos wedged NotReady >=30m).
 package velerobackupauditor
 
@@ -59,7 +59,7 @@ func (a *veleroBackupAuditor) auditBSLs(ctx context.Context,
 // stopped — both leave "successful" backups unrestorable.
 // reason=phase_not_ready | maintenance_stale. A repo held at
 // phase=NotReady for the full veleroRepoNotReadyMinAge window gets
-// re-initialized via reinitStaleRepo (W19-ST2).
+// re-initialized via reinitStaleRepo (velero-repo-reinit-heal).
 func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 	log logr.Logger) error {
 	repos, err := a.veleroList(ctx, veleroRepoGVR)
@@ -81,7 +81,7 @@ func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 					ns, name, "phase_not_ready")
 				log.Info("velero backup repository not Ready — repo cannot be opened",
 					"repo", ns+"/"+name, "phase", phase)
-				// W19-ST2 — a repo wedged NotReady >=30m gets
+				// velero-repo-reinit-heal — a repo wedged NotReady >=30m gets
 				// deleted so Velero re-initializes the Kopia/
 				// Restic connection (heal-gated + cooled down).
 				if phase == "NotReady" {

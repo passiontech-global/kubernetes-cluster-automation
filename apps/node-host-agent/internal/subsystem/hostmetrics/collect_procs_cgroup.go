@@ -212,7 +212,7 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 // OOMKill, the classic healthcheck-timeout-with-no-logs gray
 // failure; `oom_kill` counts the kills that do happen and
 // `oom_group_kill` the whole-cgroup ones. Each series emits only
-// when its own field parses. W21-G2 adds the whole pod-workload
+// when its own field parses. pod-cgroup-oomkill-metrics adds the whole pod-workload
 // slice alongside the k0s daemons — pod-level high/oom_kill/
 // oom_group_kill counts were invisible while only system.slice
 // units were watched; the unit label spells it "kubepods.slice".

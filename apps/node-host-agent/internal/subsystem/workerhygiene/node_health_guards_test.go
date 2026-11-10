@@ -126,7 +126,7 @@ func TestCheckSystemdScopesClean(t *testing.T) {
 	}
 }
 
-// TestCheckSystemdScopesAbandonedReap covers the W24 abandoned-scope
+// TestCheckSystemdScopesAbandonedReap covers the selfheal-alert-coverage abandoned-scope
 // reaper: an abandoned scope whose container id is absent from every
 // Running pod's container set is stopped; one still owned by a live
 // pod is diagnose-only.
@@ -150,7 +150,7 @@ func TestCheckSystemdScopesAbandonedReap(t *testing.T) {
 	}
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
 		context.Background(), &wdeps.CycleEnv{
-			Pods: []corev1.Pod{*live}, WorkerActive: true})
+			Pods: []corev1.Pod{*live}, APIOK: true, WorkerActive: true})
 	if !e.SDRan("stop cri-containerd-de01.scope") {
 		t.Fatal("orphaned abandoned scope not stopped")
 	}
@@ -178,7 +178,7 @@ func TestCheckSystemdScopesAbandonedCap(t *testing.T) {
 	e.SDReply["list-units --type=scope --state=abandoned"] = b.String()
 	e.SDReply["stop cri-containerd-"] = ""
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
-		context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+		context.Background(), &wdeps.CycleEnv{APIOK: true, WorkerActive: true})
 	stops := 0
 	for _, c := range e.SDCmds {
 		if strings.HasPrefix(strings.Join(c, " "), "systemctl stop ") {

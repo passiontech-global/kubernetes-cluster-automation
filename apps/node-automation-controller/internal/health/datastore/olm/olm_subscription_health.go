@@ -13,7 +13,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -177,7 +176,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	p.clearOLMResolvedStamps(ctx, log, scan)
 	rep.Close(&p.olmEmitted, olmUnhealthyResourcesGauge.DeleteLabelValues)
 
-	// W20-CP3 durable patches — independent of the unhealthy gauge:
+	// olm-csv-autopatch durable patches — independent of the unhealthy gauge:
 	// CSV spec re-assertions (argocd-operator probes, NMO
 	// --leader-elect strip) and the everest InstallPlan approver.
 	// Tolerated sub-failures: each logs + IncErrors internally.
@@ -219,17 +218,19 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	// there is nothing to annotate and the gate degrades to the
 	// ledger-only shape (AllowedVPersisted's nil-obj contract).
 	var obj metav1.Object
-	dep, err := p.CS.AppsV1().Deployments(olmOperatorNS).
-		Get(ctx, olmOperatorPodPrefix, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		obj = dep
-	case apierrors.IsNotFound(err):
-	default:
+	deps, err := p.AllDeployments(ctx)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: read olm-operator deployment failed — heal deferred",
 			"error", err)
 		return
+	}
+	for i := range deps {
+		if deps[i].Namespace == olmOperatorNS &&
+			deps[i].Name == olmOperatorPodPrefix {
+			obj = &deps[i]
+			break
+		}
 	}
 
 	// Pick ONE candidate from the sweep's pod snapshot before the

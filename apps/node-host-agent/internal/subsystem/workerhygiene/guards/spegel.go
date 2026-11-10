@@ -23,7 +23,7 @@ const (
 	// spegelContainerdSock is the host socket the spegel pod
 	// bind-mounts for its containerd registry mirror; a
 	// k0sworker/containerd restart replaces the inode while the
-	// pod keeps serving the dead one (W20-KR3).
+	// pod keeps serving the dead one (spegel-stale-socket-guard).
 	spegelContainerdSock  = "/run/k0s/containerd.sock"
 	spegelSockStaleMargin = 2 * time.Minute
 )
@@ -74,7 +74,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSpegel, "ok")
 		return
 	}
-	// W20-KR3 stale socket inode: the pod can read Ready while its
+	// spegel-stale-socket-guard stale socket inode: the pod can read Ready while its
 	// bind-mounted /run/k0s/containerd.sock points at a dead inode —
 	// k0sworker/containerd restarted AFTER the pod started, so the
 	// mirror serves a socket that no longer exists. ModTime newer

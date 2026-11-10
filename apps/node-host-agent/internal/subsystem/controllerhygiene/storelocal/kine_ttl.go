@@ -70,7 +70,14 @@ func (c *TTLCheck) Run(ctx context.Context) {
 	// StateKineTTLDead is latched FOR THIS pid the full pid-age window
 	// stays: confirming the boot-time error line may still require
 	// reading back to process start.
-	const maxLookback = 15 * time.Minute
+	//
+	// maxLookback MUST exceed the uptime gate (MinUptimeSeconds =
+	// 20m) plus one cycle of slack: this check's FIRST run happens at
+	// uptime ≥20m, so a TTL error logged in the first minutes of boot
+	// is already ~20m old — a 15m window slid past it before the
+	// check ever ran and the wedge was missed forever.
+	const maxLookback = time.Duration(cdeps.MinUptimeSeconds)*time.Second +
+		5*time.Minute
 	deadForThisPid := c.d.State.Exists(cdeps.StateKineTTLDead) &&
 		c.d.ReadState(cdeps.FileTTLWedgedPID) == strconv.Itoa(kpid)
 	if !deadForThisPid {

@@ -49,7 +49,7 @@ var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
 //	pids    — live /proc/<pid> dirs / pid_max
 //	threads — loadavg "running/total" entities / threads-max
 //	filefd  — file-nr allocated / max
-//	pty     — pty/nr over pty/max (W19-K1 — pty exhaustion wedges
+//	pty     — pty/nr over pty/max (pty-exhaustion-guard — pty exhaustion wedges
 //	          every new TTY/session open cluster-wide)
 //
 // Each ratio carries its own ok flag — a source that didn't parse
@@ -90,7 +90,7 @@ func (r *Runner) kernelProcRatios() (pids, threads, filefd, pty float64,
 			}
 		}
 	}
-	// W19-K1: /dev/ptmx exhaustion is the same class as fd pressure
+	// pty-exhaustion-guard: /dev/ptmx exhaustion is the same class as fd pressure
 	// — nr pseudo-terminals in use over the pty.max ceiling. Both
 	// files are sysctl-tunable; a missing pair is inconclusive, not
 	// zero.

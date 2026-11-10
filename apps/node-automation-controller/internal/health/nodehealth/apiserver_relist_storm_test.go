@@ -16,12 +16,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
@@ -437,5 +439,34 @@ func TestRelistStormSumSamples(t *testing.T) {
 	got := sumSamples([]promq.Sample{{Value: 2}, {Value: 3.5}})
 	if got != 5.5 {
 		t.Fatalf("sumSamples = %v, want 5.5", got)
+	}
+}
+
+// When no CronJob in the cluster is an unsuspended opted-in target,
+// suspendOptedInCronJobs stamps the relief cooldown without consulting
+// the fleet heal budget.
+func TestRelistStormNoOptedInCronJobsSpendsNoBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	cs := fake.NewSimpleClientset()
+	p := relistStormProber(t, cs, 20, 9,
+		[]probetest.PromTestSample{
+			{Labels: map[string]string{"client": "popeye", "resource": "pods"}, Value: 30}})
+	base := time.Now()
+	ch := relistStormCheck(t, p)
+	ch.seen.Seed("storm", base.Add(-relistStormMinAge-time.Minute))
+	probetest.FreezeNow(p.Deps, base)
+	t.Cleanup(func() {
+		apiserverRelistStormGauge.DeleteLabelValues("popeye", "pods")
+	})
+
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("proven storm must fail")
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, probetest.OpDyn(), "probe", base)
+	if !proceed || unverifiable {
+		t.Fatalf("relist storm with 0 opted-in CronJobs spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

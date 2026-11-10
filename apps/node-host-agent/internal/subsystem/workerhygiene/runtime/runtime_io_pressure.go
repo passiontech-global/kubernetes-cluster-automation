@@ -114,7 +114,7 @@ func parseDiskstats(data []byte) map[string]diskIOStat {
 		// Field 12 (f[11]) is "ios in progress" — the number of I/O
 		// requests sitting in the block queue RIGHT NOW. Unlike the
 		// cumulative counters it is instantaneous, so it is read
-		// without a delta (W20-KR3 inflight-freeze detector).
+		// without a delta (disk-inflight-freeze-watch inflight-freeze detector).
 		if v, err := strconv.ParseUint(f[11], 10, 64); err == nil {
 			s.inflight = v
 		}
@@ -160,7 +160,7 @@ func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
 // IOPressureCheck is the disk-IO starvation guard as a Check. It
 // keeps the previous diskstats snapshot for the delta math, the
 // pid→comm throttle ledger (pid reuse protection), the disk-slow-io
-// consecutive-cycle disk-slow-io streak and the W20-KR3
+// consecutive-cycle disk-slow-io streak and the disk-inflight-freeze-watch
 // inflight-freeze streak.
 type IOPressureCheck struct {
 	d                   *wdeps.Deps
@@ -187,7 +187,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	cur := parseDiskstats(data)
 	util, await, maxAwait := 0.0, 0.0, 0.0
-	// freezeDisks counts the per-disk W20-KR3 inflight-freeze votes —
+	// freezeDisks counts the per-disk disk-inflight-freeze-watch inflight-freeze votes —
 	// it only means anything once a previous snapshot exists.
 	var freezeDisks int
 	var freezeInflight uint64
@@ -212,7 +212,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 				if s.wrIOS >= prev.wrIOS {
 					dDiskIO += s.wrIOS - prev.wrIOS
 				}
-				// W20-KR3 per-disk freeze vote: THIS disk has
+				// disk-inflight-freeze-watch per-disk freeze vote: THIS disk has
 				// requests inflight and completed ZERO of them
 				// since the last snapshot — a wedged spindle or
 				// hung controller. Evaluated per device, NOT on
@@ -283,7 +283,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// mass-reboot the fleet).
 	slowCond := maxAwait > diskWriteAwaitHighMs && psiOK &&
 		avg60 >= ioPSIFullHigh
-	// W20-KR3 inflight freeze: a whole disk holding ios-in-progress
+	// disk-inflight-freeze-watch inflight freeze: a whole disk holding ios-in-progress
 	// >0 while completing ZERO I/Os since the last snapshot means
 	// the block queue is wedged — requests sit inflight forever
 	// (dead spindle, hung SCSI/SAS path, frozen device-mapper leg).

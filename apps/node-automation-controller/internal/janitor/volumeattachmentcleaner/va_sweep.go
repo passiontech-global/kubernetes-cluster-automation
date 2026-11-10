@@ -260,8 +260,21 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 	// destructive branch against it.
 	if t.strip {
 		liveNodes := map[string]*corev1.Node{t.va.Spec.NodeName: live}
-		return c.stuckTerminatingNodeDead(ctx, t.va, liveNodes,
-			cyc.livePods, cyc.stuckReadyPrior, now), nil
+		if !c.stuckTerminatingNodeDead(ctx, t.va, liveNodes,
+			cyc.livePods, cyc.stuckReadyPrior, now) {
+			return false, nil
+		}
+		// Ready-node branch: the two-cycle unused-volume sighting ran
+		// against the informer snapshot — a pod may have mounted the
+		// volume since. Re-run the proof against the LIVE node so its
+		// Status.VolumesInUse/VolumesAttached (and the pod census)
+		// decide, never the stale copy.
+		if kube.NodeReady(live) &&
+			!kube.HasTaint(live.Spec.Taints, vaOutOfServiceTaint) {
+			return c.stuckReadyUnused(ctx, t.va, liveNodes,
+				cyc.nodePods, cyc.pvcPVs, cyc.pvNames, log), nil
+		}
+		return true, nil
 	}
 	if t.reason == "missing_node" {
 		// The node object exists on the live apiserver —

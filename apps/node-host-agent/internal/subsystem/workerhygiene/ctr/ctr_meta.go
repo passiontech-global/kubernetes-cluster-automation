@@ -109,9 +109,9 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 const ctrMetaDBRel = "containerd/io.containerd.metadata.v1.bolt/meta.db"
 
 // measureMetaDBSize stats the bbolt store and publishes its size on
-// node_agent_ctr_metadb_bytes (W19-K3), then times the lightest
+// node_agent_ctr_metadb_bytes (containerd-meta-guard), then times the lightest
 // metadata read containerd serves — `k0s ctr -n k8s.io namespaces
-// ls -q` — onto node_agent_ctr_meta_probe_latency_seconds (W24). A
+// ls -q` — onto node_agent_ctr_meta_probe_latency_seconds (selfheal-alert-coverage). A
 // meta.db whose freelist fragmented under churn answers this probe
 // in seconds before it starts failing task operations outright —
 // the latency series is the early-warning the size gauge cannot

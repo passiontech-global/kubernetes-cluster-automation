@@ -48,9 +48,33 @@ func lex(src string) ([]tok, error) {
 			j := i
 			// x/X/o/O cover the 0x/0X/0o/0O literal prefixes (b/B and
 			// the hex digits a-f/A-F are already in range); '.' and
-			// e-notation digits ride along for floats.
-			for j < len(src) && (src[j] >= '0' && src[j] <= '9' || src[j] == '.' || src[j] == 'x' || src[j] == 'X' || src[j] == 'o' || src[j] == 'O' || src[j] >= 'a' && src[j] <= 'f' || src[j] >= 'A' && src[j] <= 'F') {
-				j++
+			// e-notation digits ride along for floats. A '+'/'-'
+			// rides along ONLY directly after e/E — the exponent
+			// sign in 1e-5/1e+5 — so "1e-5" stays one number while
+			// "1+2" still lexes as num,op,num. The e/E check must
+			// not fire inside a based literal: in 0x1e the 'e' is a
+			// hex DIGIT, so "0x1e+1" is num,op,num — absorbing the
+			// sign would mint the invalid literal "0x1e+1".
+			based := i+1 < len(src) && src[i] == '0' &&
+				(src[i+1] == 'x' || src[i+1] == 'X' ||
+					src[i+1] == 'o' || src[i+1] == 'O')
+			for j < len(src) {
+				cj := src[j]
+				if cj == '+' || cj == '-' {
+					if !based && j > i &&
+						(src[j-1] == 'e' || src[j-1] == 'E') {
+						j++
+						continue
+					}
+					break
+				}
+				if cj >= '0' && cj <= '9' || cj == '.' ||
+					cj == 'x' || cj == 'X' || cj == 'o' || cj == 'O' ||
+					cj >= 'a' && cj <= 'f' || cj >= 'A' && cj <= 'F' {
+					j++
+					continue
+				}
+				break
 			}
 			out = append(out, tok{"num", src[i:j]})
 			i = j

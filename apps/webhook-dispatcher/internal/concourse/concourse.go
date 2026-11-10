@@ -77,9 +77,16 @@ type Client struct {
 // fetchFlight tracks one in-flight index fetch. done is closed by the
 // fetch that installed the flight, exactly once, when that fetch
 // settles — waiters that captured the channel are woken no matter how
-// many later fetches replace the flight pointer in the meantime.
+// many later fetches replace the flight pointer in the meantime. err
+// is the settled fetch's failure, written before done closes: a
+// Refresh waiter that joined the flight reads it to tell "the fetch
+// I waited on failed" apart from "a throttle window is serving the
+// cached index" — without it the waiter loops into the throttle
+// branch and returns stale+nil, hiding the failure the caller asked
+// a forced refresh to surface.
 type fetchFlight struct {
 	done chan struct{}
+	err  error
 }
 
 // statusError carries the HTTP status of a failed ATC call so callers
@@ -194,6 +201,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 
 		c.mu.Lock()
 		if err != nil {
+			flight.err = err
 			if c.index != nil {
 				logger().Warn("resource index refresh failed — serving stale",
 					"concourse_url", c.BaseURL, "team", c.Team,
@@ -240,17 +248,32 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 			c.mu.Unlock()
 			select {
 			case <-f.done:
-				// The joined fetch settled — loop back and serve
-				// whatever it published (or start our own forced
-				// fetch if it failed and left nothing).
+				if f.err != nil {
+					// The fetch we joined failed — report it
+					// rather than looping into the throttle
+					// branch, which would serve the stale index
+					// with a nil error and hide the failure (and
+					// skip the forced retry this call exists for).
+					return nil, f.err
+				}
+				// The joined fetch settled cleanly — loop back
+				// and serve whatever it published.
 				continue
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
 		}
-		// The throttle watches lastForceRefreshAt only: lastAttemptAt
-		// belongs to Resources' backoff and must not gate the forced path.
-		if time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
+		// The throttle watches lastForceRefreshAt AND fetchedAt: a
+		// successful fetch — Resources' opportunistic refresh or a
+		// prior forced Refresh — published moments ago already IS
+		// the fresh index this call exists to produce; rebuilding it
+		// again inside MinRefreshInterval is duplicate ATC load (the
+		// zero-match retry calls Refresh right after Resources just
+		// fetched, and a Refresh that joined an in-flight fetch must
+		// not fire a second rebuild on wake). fetchedAt can't see
+		// failed attempts — lastForceRefreshAt covers those.
+		if time.Since(c.fetchedAt) < c.minRefreshInterval() ||
+			time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
 			index := c.index
 			c.mu.Unlock()
 			return index, nil
@@ -276,6 +299,7 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 
 		index, err := c.fetchIndex(ctx, prev)
 		if err != nil {
+			flight.err = err // before the deferred close(done) — joiners read it
 			return nil, err
 		}
 		c.mu.Lock()
@@ -323,8 +347,14 @@ func (c *Client) fetchIndex(ctx context.Context,
 	// lost[i] records a pipeline whose listing failed with nothing in
 	// the previous index to carry over — the refreshed index would be
 	// silently missing its resources, so the fetch must fail instead
-	// of caching an incomplete view (see below).
+	// of caching an incomplete view (see below). failed[i] records
+	// ANY listing failure (404-deleted pipelines excluded — they are
+	// gone, not unreadable): when every listing fails the "refresh"
+	// learned nothing, and returning the carried-over prev data as a
+	// success would stamp fetchedAt and freeze the stale index for
+	// the whole TTL.
 	lost := make([]string, len(pipelines))
+	failed := make([]bool, len(pipelines))
 	sem := make(chan struct{}, fetchIndexWorkers)
 	var wg sync.WaitGroup
 	for i, p := range pipelines {
@@ -355,6 +385,7 @@ func (c *Client) fetchIndex(ctx context.Context,
 				// Pipelines truly gone drop out via the pipeline list
 				// itself, not through this path.
 				results[i] = append(results[i], prevByPipeline[p.Name]...)
+				failed[i] = true
 				if len(prevByPipeline[p.Name]) == 0 {
 					// Nothing to carry over — the new index would
 					// silently lack this pipeline's resources.
@@ -398,6 +429,26 @@ func (c *Client) fetchIndex(ctx context.Context,
 			strings.Join(missing, ","))
 	}
 
+	// Every pipeline listing failed: the fetch produced nothing but
+	// carried-over prev entries. Returning them as a success would
+	// stamp fetchedAt (and satisfy Refresh's freshness throttle) on
+	// data that never refreshed — the stale index would be served as
+	// "fresh" for the whole TTL. Fail so the callers take the error
+	// path: serve stale through lastAttemptAt backoff and retry.
+	if len(pipelines) > 0 {
+		allFailed := true
+		for _, f := range failed {
+			if !f {
+				allFailed = false
+				break
+			}
+		}
+		if allFailed {
+			return nil, fmt.Errorf(
+				"all %d pipeline resource listings failed", len(pipelines))
+		}
+	}
+
 	var index []Resource
 	for _, rs := range results {
 		index = append(index, rs...)
@@ -425,6 +476,12 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		"?webhook_token=" + url.QueryEscape(c.WebhookToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
+		// url.Parse failures surface as *url.Error embedding the raw
+		// URL — webhook_token included. Unwrap like the Do path.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return 0, ue.Err
+		}
 		return 0, err
 	}
 	resp, err := c.httpClient().Do(req)

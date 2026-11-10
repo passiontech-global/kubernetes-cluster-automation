@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1466,5 +1467,29 @@ func TestPartitionEvictorUntaintSkippedForGoneNode(t *testing.T) {
 		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
 			t.Fatal("untaint attempted against a node gone since census")
 		}
+	}
+}
+
+// A fenced node hosting only non-evictable pods (e.g. an unlisted
+// namespace without the opt-in annotation) never calls heal.Gate and
+// spends zero fleet budget tokens.
+func TestPartitionEvictorNoEligiblePodSpendsNoBudget(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePod("unlisted-ns", "p1", "stay-put"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs, dyn: testutil.NewDynamicClient()}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, testutil.NewDynamicClient(), "probe", time.Now())
+	if !proceed || unverifiable {
+		t.Fatalf("partition sweep with 0 eligible pods spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

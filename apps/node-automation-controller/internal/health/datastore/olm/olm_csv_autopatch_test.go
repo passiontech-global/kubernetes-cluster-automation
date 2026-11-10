@@ -1,4 +1,4 @@
-// olm_csv_autopatch_test.go — coverage for the W20-CP3 durable-patch
+// olm_csv_autopatch_test.go — coverage for the olm-csv-autopatch durable-patch
 // duties: the argocd-operator probe patch, the node-maintenance
 // --leader-elect strip, the InstallPlan ResolutionFailed read, and
 // the int64/float64 number coercion the dynamic client produces —

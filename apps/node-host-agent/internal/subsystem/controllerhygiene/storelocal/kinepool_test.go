@@ -102,7 +102,7 @@ func appendTCPRow(t *testing.T, path, row string) {
 	}
 }
 
-// A FIN_WAIT2 row on a watched inode is the W20-CP2 orphan
+// A FIN_WAIT2 row on a watched inode is the kine-orphaned-conn-watch orphan
 // signature: counted as a conn AND surfaced as stuck on its own
 // suspect line, while the pool stays healthy (2 conns << threshold).
 func TestKinePoolStuckConnSuspect(t *testing.T) {

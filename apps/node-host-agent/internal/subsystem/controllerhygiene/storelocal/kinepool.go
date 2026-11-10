@@ -51,7 +51,7 @@ var (
 // tcpStateListen is the st column of /proc/net/tcp(6) rows in LISTEN.
 const tcpStateListen = "0A"
 
-// W20-CP2 stuck-connection states on the same st column:
+// kine-orphaned-conn-watch stuck-connection states on the same st column:
 // FIN_WAIT2 (05) — we closed, the peer never ACKed our FIN;
 // CLOSE_WAIT (08) — the peer closed, the local app never did.
 // Either held open against the DB port is an orphaned connection
@@ -95,7 +95,7 @@ func (c *PoolCheck) Run(ctx context.Context) {
 		return
 	}
 	dbPort := c.kineDBPort(kpid)
-	// W20-CP2 — one inode∩port scan yields BOTH the conn count and
+	// kine-orphaned-conn-watch — one inode∩port scan yields BOTH the conn count and
 	// the stuck subset: CLOSE_WAIT/FIN_WAIT2 rows are connections the
 	// peer already closed that kine never reaped, and a climbing
 	// retrnsmt counter is a socket retransmitting into a dead
@@ -190,7 +190,7 @@ func (c *PoolCheck) kineDBPort(kpid int) int {
 
 // kineDBConnStats counts pid's TCP sockets whose remote port is
 // dbPort AND how many of those are stuck — the `ss -Htnp dport =
-// :PORT | grep pid=` set intersected with the W20-CP2 orphan
+// :PORT | grep pid=` set intersected with the kine-orphaned-conn-watch orphan
 // signature, from ONE pass over the pid's socket inodes (fd links)
 // and its /proc/net/tcp(+tcp6) view. stuck is always a subset of
 // conns: every stuck row is a non-LISTEN conn to dbPort.
@@ -251,7 +251,7 @@ func (c *PoolCheck) socketInodes(pid int) map[string]bool {
 // classifyConnLine classifies one /proc/net/tcp(6) data row:
 // isConn when its remote port is dbPort, it is not LISTEN and its
 // inode belongs to the watched process (the `ss dport` set);
-// isStuck when that conn additionally shows the W20-CP2 orphan
+// isStuck when that conn additionally shows the kine-orphaned-conn-watch orphan
 // signature — FIN_WAIT2/CLOSE_WAIT state or a retrnsmt counter
 // past the stuck floor. stuck ⊆ conn by construction.
 //

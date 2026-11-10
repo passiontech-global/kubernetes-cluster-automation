@@ -553,3 +553,23 @@ func TestTargetBreakerGlobalForgetHook(t *testing.T) {
 	ConfigureTargetBreaker(0, 0)
 	SetTargetCircuitForgetHook(func(module, target string) { fired++ })
 }
+
+// RefundGrant returns the grant Gate consumed when a batch-gated
+// caller's post-Gate eviction pass lands 0 deletes (e.g. every
+// candidate was PDB-refused).
+func TestRefundGrantGlobalRestoresSlot(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	cs := fake.NewSimpleClientset()
+	now := time.Now()
+
+	proceed, unverifiable := Gate(ctx, logr.Discard(), nil, cs, planAwareDyn(), "k1", now)
+	if !proceed || unverifiable {
+		t.Fatalf("first Gate = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+	RefundGrant(now)
+	proceed, unverifiable = Gate(ctx, logr.Discard(), nil, cs, planAwareDyn(), "k2", now)
+	if !proceed || unverifiable {
+		t.Fatalf("Gate after RefundGrant = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+}

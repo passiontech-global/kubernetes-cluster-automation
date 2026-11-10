@@ -585,11 +585,25 @@ const cftGatewayClassName = "cloudflare-tunnel"
 // class. Unresolvable/absent class names KEEP the object — an
 // unattributable stuck Gateway is still a gateway-API-plane problem
 // (the same fail-open posture ciliumOwnsGatewayObject documents);
-// only a PROVEN foreign class drops it.
-func cftOwnsGatewayObject(_ context.Context, _ *operatorWorkqueueCheck,
+// only a PROVEN foreign class drops it. One exception: a successful
+// class census that lacks the name PROVES the GatewayClass is gone —
+// the Gateway is orphaned and no controller will ever own it, so it
+// must not hold this operator's heal budget (bug #11's shape one
+// level up: name-match alone cannot see a deleted class).
+func cftOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
 	o *unstructured.Unstructured) bool {
 	class, _ := kube.NestedString(o.Object, "spec", "gatewayClassName")
-	return class == "" || class == cftGatewayClassName
+	if class == "" {
+		return true
+	}
+	if p != nil {
+		if m, listed := p.gatewayClassCensus(ctx); listed {
+			if _, known := m[class]; !known {
+				return false
+			}
+		}
+	}
+	return class == cftGatewayClassName
 }
 
 // cftOwnsRouteParent keeps a route in the stuck set when any
@@ -605,6 +619,8 @@ func cftOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		return true
 	}
 	resolved := false
+	sawGatewayRef := false
+	gatewayFound := false
 	for _, ref := range refs {
 		m, ok := ref.(map[string]any)
 		if !ok {
@@ -624,15 +640,24 @@ func cftOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if ns == "" {
 			ns = o.GetNamespace()
 		}
+		sawGatewayRef = true
 		gw, ok := lookupGateway(ctx, p, ns, name)
 		if !ok {
 			continue
 		}
+		gatewayFound = true
 		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")
 		resolved = true
 		if class == cftGatewayClassName {
 			return true
 		}
+	}
+	// A route whose every Gateway parent fails to resolve is an
+	// orphan — no gateway controller will ever write status.parents,
+	// so it must not sit in this operator's stuck set (same rule as
+	// ciliumOwnsRouteParent).
+	if sawGatewayRef && !gatewayFound {
+		return false
 	}
 	return !resolved
 }

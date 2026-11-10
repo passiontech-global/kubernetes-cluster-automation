@@ -65,7 +65,7 @@ func TestProbeEndpoints(t *testing.T) {
 	}
 }
 
-// W24: a subsystem pinned at the supervisor's max backoff flips
+// selfheal-alert-coverage: a subsystem pinned at the supervisor's max backoff flips
 // /readyz to 503 while /healthz stays 200 — kubelet must not
 // restart the pod and kill the healthy subsystems.
 func TestReadyzDegradedOnMaxBackoff(t *testing.T) {

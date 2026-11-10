@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -730,6 +731,35 @@ func TestJobAllowsReapGetErrorFailsClosed(t *testing.T) {
 	}
 	if got := testutil.QueueErrorCount(t, "zombie-sidecar-reaper") - before; got != 1 {
 		t.Fatalf("job lookup failure not metered: error delta = %v, want 1", got)
+	}
+}
+
+// A parallel Job (spec.completions > 1) whose status.succeeded has not
+// yet reached spec.completions is neither complete nor single-completion:
+// even with backoffLimit=0 its exit-0 pod is vetoed until all completions
+// succeed (or JobComplete=True).
+func TestJobAllowsReapParallelJobIncompleteVetoed(t *testing.T) {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "jobs", Name: "job-x"},
+		Spec: batchv1.JobSpec{
+			Completions:  ptr.To(int32(3)),
+			BackoffLimit: ptr.To(int32(0)),
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+	cs := fake.NewSimpleClientset(job)
+	r := zsrReaper(cs, &zsrShutdownProbe{})
+	p := zsrPod("jobs", "parallel-0", 10*time.Minute, 0)
+	if r.jobAllowsReap(ctx, p, false) {
+		t.Fatal("incomplete parallel Job (1/3 succeeded) allowed reap prematurely")
+	}
+
+	job.Status.Succeeded = 3
+	if _, err := cs.BatchV1().Jobs("jobs").UpdateStatus(ctx, job, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.jobAllowsReap(ctx, p, false) {
+		t.Fatal("completed parallel Job (3/3 succeeded) vetoed reap")
 	}
 }
 

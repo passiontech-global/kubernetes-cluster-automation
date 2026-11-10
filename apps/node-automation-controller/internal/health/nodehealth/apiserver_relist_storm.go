@@ -1,5 +1,5 @@
 // apiserver_relist_storm.go — the apiserver-relist-storm-breaker
-// check (W20-CP1): the 410-Gone relist storm signature — a flood of
+// check (apiserver-relist-storm-breaker): the 410-Gone relist storm signature — a flood of
 // clients whose watches die (apiserver_terminated_watchers_total
 // climbing) while cluster-scoped LIST latency blows past 5s
 // (apiserver_request_duration_seconds_bucket p99). Left alone the
@@ -22,6 +22,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -258,13 +259,7 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
 	ck := probefw.SelfHealKey(CheckNameAPIServerRelistStorm, "cronjob-relief")
-	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals,
-		ck, relistStormReliefCooldown, now)
-	switch {
-	case unverifiable:
-		metrics.IncError(CheckNameAPIServerRelistStorm)
-		return
-	case !proceed:
+	if p.Heals.CooledDown(ck, relistStormReliefCooldown, now) {
 		return
 	}
 	cjs, err := kube.ListAll(ctx, metav1.ListOptions{
@@ -275,11 +270,12 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		log.Info("WARN: relist storm cronjob list failed", "error", err)
 		return
 	}
-	// The pass ran — stamp the relief cooldown so the next storm
-	// sweep skips the list+mutex re-check for the window (the
-	// comment on relistStormReliefCooldown promises exactly this;
-	// an unstamped key would re-run every sweep).
-	p.Heals.Stamp(ck, now)
+	// Collect eligible opted-in CronJobs BEFORE consulting the
+	// maintenance mutex / fleet heal budget so a cluster with no
+	// opted-in CronJobs (or all opted-in CronJobs already suspended)
+	// spends zero budget tokens while still stamping the relief
+	// cooldown for the window.
+	var targets []*batchv1.CronJob
 	for i := range cjs {
 		cj := &cjs[i]
 		// spec.suspend is a *bool — nil means "not suspended" (the
@@ -291,6 +287,27 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 			cj.Annotations[kube.AnnoRelistStormSuspendedBy] != "" {
 			continue
 		}
+		targets = append(targets, cj)
+	}
+	if len(targets) == 0 {
+		p.Heals.Stamp(ck, now)
+		return
+	}
+	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals,
+		ck, relistStormReliefCooldown, now)
+	switch {
+	case unverifiable:
+		metrics.IncError(CheckNameAPIServerRelistStorm)
+		return
+	case !proceed:
+		return
+	}
+	// The pass ran — stamp the relief cooldown so the next storm
+	// sweep skips the list+mutex re-check for the window (the
+	// comment on relistStormReliefCooldown promises exactly this;
+	// an unstamped key would re-run every sweep).
+	p.Heals.Stamp(ck, now)
+	for _, cj := range targets {
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":true},"metadata":{"annotations":{%q:%q}}}`,
 			kube.AnnoRelistStormSuspendedBy,

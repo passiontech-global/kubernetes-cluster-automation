@@ -184,7 +184,7 @@ func cnpgClusterHealth(ns, name, phase string, phaseAge time.Duration,
 		"instances":      instances,
 		"readyInstances": ready,
 		// A real cluster with instances always has an elected
-		// primary — W19-ST1 primary_mismatch flags its absence, so
+		// primary — cnpg-cluster-health primary_mismatch flags its absence, so
 		// the healthy fixture must carry one (mismatch tests
 		// override it).
 		"currentPrimary": name + "-1",

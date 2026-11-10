@@ -13,7 +13,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -250,14 +249,14 @@ func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 			fallback = pod
 		}
 	}
-	lease, err := p.CS.CoordinationV1().Leases(ciliumOperatorNS).
-		Get(ctx, ciliumOperatorLease, metav1.GetOptions{})
+	lease, err := p.Lease(ctx, ciliumOperatorNS, ciliumOperatorLease)
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			metrics.IncError(p.Name)
-			log.Info("WARN: get cilium-operator leader lease failed — first Running pod fallback",
-				"lease", ciliumOperatorNS+"/"+ciliumOperatorLease, "error", err)
-		}
+		metrics.IncError(p.Name)
+		log.Info("WARN: get cilium-operator leader lease failed — first Running pod fallback",
+			"lease", ciliumOperatorNS+"/"+ciliumOperatorLease, "error", err)
+		return fallback
+	}
+	if lease == nil {
 		return fallback
 	}
 	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {

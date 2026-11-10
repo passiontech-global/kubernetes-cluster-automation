@@ -188,7 +188,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// only lastAttemptedGeneration, which has no timestamp and cannot
 	// prove recency — so the hook-Job evidence is the gate.) A failed
 	// Job list fails closed: unverifiable means no delete.
-	inProgress, err := u.helmUpgradeInProgress(ctx, hrReleaseNS(hr))
+	inProgress, err := u.helmUpgradeInProgress(ctx, hrReleaseNS(hr), release)
 	if err != nil {
 		return false, fmt.Errorf("list hook jobs in %s for %s: %w",
 			hrReleaseNS(hr), key, err)
@@ -257,12 +257,15 @@ func helmLastUnlock(hr *unstructured.Unstructured) (time.Time, bool) {
 }
 
 // helmUpgradeInProgress reports whether the release namespace holds
-// evidence that a reconcile is genuinely progressing right now: any
-// helm.sh/hook Job still active (or freshly created, pods not yet
-// scheduled). The same paged Job list cleanFailedHookJobs uses feeds
-// this check — one read, two consumers of the namespace's Jobs.
+// evidence that THIS release's reconcile is genuinely progressing
+// right now: any helm.sh/hook Job still active (or freshly created,
+// pods not yet scheduled) AND labeled for this release — a hook Job
+// belonging to a sibling release in the same namespace is that
+// release's business, not proof this one's upgrade is alive (the
+// same release-name filter cleanFailedHookJobs applies). The same
+// paged Job list feeds both consumers — one read, two uses.
 func (u *helmReleaseUnlocker) helmUpgradeInProgress(ctx context.Context,
-	ns string) (bool, error) {
+	ns, release string) (bool, error) {
 	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Jobs(u.cs, ns))
@@ -273,8 +276,11 @@ func (u *helmReleaseUnlocker) helmUpgradeInProgress(ctx context.Context,
 	for i := range jobs {
 		j := &jobs[i]
 		// Only helm's own hook Jobs are reconcile evidence — a plain
-		// batch Job running in the namespace is just a workload.
-		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
+		// batch Job running in the namespace is just a workload, and
+		// a hook Job labeled for ANOTHER release says nothing about
+		// this one's progress.
+		if _, ok := j.Annotations["helm.sh/hook"]; !ok ||
+			j.Labels[helmReleaseNameLabel] != release {
 			continue
 		}
 		if hookJobInProgress(j, now) {

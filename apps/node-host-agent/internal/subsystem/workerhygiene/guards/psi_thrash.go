@@ -24,7 +24,7 @@ const (
 	slabLeakEnterRatio     = 0.35
 	slabLeakClearRatio     = 0.25
 	slabDropCachesInterval = time.Hour
-	// W24 negative-dentry reclaim thresholds: /proc/sys/fs/dentry-state
+	// selfheal-alert-coverage negative-dentry reclaim thresholds: /proc/sys/fs/dentry-state
 	// nr_unused above 1.5M with >3GiB of reclaimable slab and memory
 	// already under 15% available means the kernel is about to PSI-
 	// thrash on dentries it could have dropped — drop_caches=2 hands
@@ -74,8 +74,8 @@ type memInfo struct {
 	totalKB      int64
 	availKB      int64
 	slabUnrecKB  int64 // SUnreclaim — slab the kernel cannot reclaim
-	slabRecKB    int64 // SReclaimable — dentries/inodes the kernel CAN reclaim (W24)
-	pageTablesKB int64 // PageTables + SecPageTables (W19-K4)
+	slabRecKB    int64 // SReclaimable — dentries/inodes the kernel CAN reclaim (selfheal-alert-coverage)
+	pageTablesKB int64 // PageTables + SecPageTables (pagetables-memory-guard)
 	parsed       bool  // at least MemTotal + MemAvailable seen
 }
 
@@ -110,7 +110,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 		case "SReclaimable:":
 			slabRec = v
 		case "PageTables:", "SecPageTables:":
-			// W19-K4: page-table memory is kernel memory outside
+			// pagetables-memory-guard: page-table memory is kernel memory outside
 			// SUnreclaim — a leaking/mapping-heavy workload grows it
 			// invisibly to the slab ratio.
 			pageTables += v
@@ -135,7 +135,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 // (and its drop-caches cadence) simply persists. Returns true while
 // the latch is held.
 func guardKernelSlabLeak(d *wdeps.Deps, m memInfo) bool {
-	// W19-K4: PageTables/SecPageTables count toward the kernel-memory
+	// pagetables-memory-guard: PageTables/SecPageTables count toward the kernel-memory
 	// numerator — they are unreclaimable-by-drop_caches kernel memory
 	// like SUnreclaim, and a pagetable leak must trip the same latch.
 	kernelKB := m.slabUnrecKB + m.pageTablesKB
@@ -210,7 +210,7 @@ func dentryStateUnused(d *wdeps.Deps) int64 {
 	return n
 }
 
-// guardNegativeDentry is the W24 negative-dentry SLAB reclaim: churn
+// guardNegativeDentry is the selfheal-alert-coverage negative-dentry SLAB reclaim: churn
 // workloads (build pods, log shippers, volume mounts) leave millions
 // of unlinked dentries/inodes sitting in reclaimable slab. While
 // nr_unused is past dentryUnusedMin AND the kernel still holds
@@ -483,7 +483,7 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "abort")
 		return
 	}
-	// W19-K4: publish the page-table footprint for
+	// pagetables-memory-guard: publish the page-table footprint for
 	// node_agent_pagetables_bytes — set before the PSI early-outs so
 	// the series stays live on PSI-less kernels too.
 	c.d.PageTablesBytes = m.pageTablesKB * 1024
@@ -492,7 +492,7 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// and it must arm even on kernels without PSI or while PSI is
 	// quiet (a kernel slab leak is a kernel problem, not a PSI one).
 	slabLeaking := guardKernelSlabLeak(c.d, m)
-	// W24: the negative-dentry reclaim rides the same readable-
+	// selfheal-alert-coverage: the negative-dentry reclaim rides the same readable-
 	// meminfo gate — it needs SReclaimable + MemAvailable, and a
 	// kernel without PSI still has dentries worth dropping.
 	guardNegativeDentry(c.d, m)

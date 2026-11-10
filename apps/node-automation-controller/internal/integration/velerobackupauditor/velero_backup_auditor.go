@@ -23,7 +23,7 @@
 // status.lastMaintenanceTime older than 7 days means the scheduled
 // prune/repack maintenance loop stopped — either way the next
 // restore reads an unmaintained or unreachable repo. Both flag on
-// VeleroRepoUnhealthy{namespace,name,reason}. W19-ST2 adds the heal
+// VeleroRepoUnhealthy{namespace,name,reason}. velero-repo-reinit-heal adds the heal
 // half: a repo held at phase=NotReady for >=30m is deleted (UID-
 // preconditioned, heal.AllowedV-gated, 2h cooldown) so Velero's repo
 // controller re-creates it and re-initializes the Kopia/Restic
@@ -40,7 +40,7 @@
 // audit, inflight_pvb_audit.go the velero-inflight-audit wedged-transfer
 // audit + PVB cleanup (+ cnpg-backup-audit DataUpload/DataDownload scan),
 // velero_storage_audit.go the BSL + BackupRepository audits and the
-// W19-ST2 repo re-init heal.
+// velero-repo-reinit-heal repo re-init heal.
 package velerobackupauditor
 
 import (
@@ -80,7 +80,7 @@ var (
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
 	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
-	// W20-ST3 — podvolumerestores.velero.io: the restore-side twin
+	// velero-restore-wedge-audit — podvolumerestores.velero.io: the restore-side twin
 	// of the PVB wedge audit; a restore held InProgress past 6h with
 	// a dead node-agent thread is the same lost-thread signature.
 	veleroPVRGVR = kube.GVVeleroPodVolumeRestore
@@ -130,7 +130,7 @@ const veleroInstallNSDefault = "velero"
 // job) and the next restore reads an unmaintained repo.
 const veleroRepoMaintenanceMaxAge = 7 * 24 * time.Hour
 
-// veleroRepoNotReadyMinAge (W19-ST2) bounds how long a
+// veleroRepoNotReadyMinAge (velero-repo-reinit-heal) bounds how long a
 // BackupRepository may report phase=NotReady before the auditor
 // deletes the CR — Velero's repo controller recreates it and
 // re-initializes the Kopia/Restic connection, which is the only
@@ -248,7 +248,7 @@ type veleroBackupAuditor struct {
 	// velero-inflight-audit in-flight gauges — same prune-on-resolve contract.
 	seenStuckBackup state.GaugeLedger[pausedKey]
 	seenWedgedPVB   state.GaugeLedger[pausedKey]
-	// seenWedgedPVR is the W20-ST3 restore-side twin of seenWedgedPVB.
+	// seenWedgedPVR is the velero-restore-wedge-audit restore-side twin of seenWedgedPVB.
 	seenWedgedPVR state.GaugeLedger[pausedKey]
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
@@ -256,7 +256,7 @@ type veleroBackupAuditor struct {
 	pvbHealed state.CooldownSet
 	// firstSeenRepoNotReady: "ns/name" -> first sweep the repo
 	// reported phase=NotReady — the 30m persistence window the
-	// W19-ST2 re-init heal requires; pruned when the repo leaves
+	// velero-repo-reinit-heal re-init heal requires; pruned when the repo leaves
 	// NotReady so a re-wedge measures fresh.
 	firstSeenRepoNotReady state.FirstSeenLedger
 	// repoHealed: "backuprepository/ns/name" -> last repo re-init —

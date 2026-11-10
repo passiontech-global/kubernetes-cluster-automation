@@ -229,8 +229,8 @@ func TestDescribe(t *testing.T) {
 	//   search_restarts/invalid counters).
 	// + 1 mountinfo desc (mountinfo entries count).
 	// + 3 aio-pressure AIO descs (aio allocated/maximum/used_ratio in the
-	//   filefd domain) + 1 max_user_namespaces desc (W20-KR2).
-	// + 1 cgroup oom_group_kill desc (W21-G2 — kubepods.slice joins the
+	//   filefd domain) + 1 max_user_namespaces desc (kernel-resource-table-tuning).
+	// + 1 cgroup oom_group_kill desc (pod-cgroup-oomkill-metrics — kubepods.slice joins the
 	//   memory.events unit set).
 	if got := len(ch); got != 77 {
 		t.Fatalf("Describe emitted %d descs want 77", got)

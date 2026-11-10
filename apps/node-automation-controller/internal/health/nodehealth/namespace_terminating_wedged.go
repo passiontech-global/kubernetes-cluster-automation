@@ -247,19 +247,21 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 			}
 			gvr := schema.GroupVersionResource{
 				Group: gv.Group, Version: gv.Version, Resource: r.Name}
-			// The sweep census reads the snapshot's per-GVR census
-			// cluster-wide and filters client-side — one paged LIST
-			// per GVR per sweep no matter how many namespaces are
-			// wedged; the raw error is memoized with it.
-			items, err := p.AllUnstructured(ctx, gvr)
+			// Namespace-scoped LIST, not the sweep snapshot's
+			// cluster-wide AllUnstructured: the snapshot memoizes per
+			// GVR but the LIST itself still hauls EVERY namespace's
+			// objects of ~100-200 GVRs into memory just to filter one
+			// namespace client-side — the heap spike behind the
+			// 256Mi OOM incident. A namespaced list returns only this
+			// namespace's objects (usually a handful) and stays cheap
+			// even repeated per wedged namespace per cooldown.
+			list, err := kube.ListAllUnstructured(ctx,
+				p.Dyn.Resource(gvr).Namespace(nsName), metav1.ListOptions{})
 			if err != nil {
 				continue // no permission / absent — not evidence
 			}
-			for i := range items {
-				obj := &items[i]
-				if obj.GetNamespace() != nsName {
-					continue // other namespace's object
-				}
+			for i := range list.Items {
+				obj := &list.Items[i]
 				if obj.GetDeletionTimestamp() == nil ||
 					len(obj.GetFinalizers()) == 0 {
 					continue

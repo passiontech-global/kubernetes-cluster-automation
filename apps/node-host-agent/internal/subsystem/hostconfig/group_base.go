@@ -205,7 +205,7 @@ ManageForeignRoutingPolicyRules=no
 InhibitDelayMaxSec=`+strconv.FormatInt(logindInhibitDelaySecs(grace), 10)+`
 `), 0o644); ch {
 		// The drop-in is INERT until logind re-parses its config
-		// (W18-7: a written delay sat unloaded until the next
+		// (kubelet-graceful-shutdown: a written delay sat unloaded until the next
 		// reboot). `systemctl reload systemd-logind.service` is the
 		// safe apply — the unit is Type=notify-reload with
 		// ReloadSignal=SIGHUP, no session teardown (a restart WOULD
@@ -235,7 +235,7 @@ Unattended-Upgrade::Package-Blacklist {
 Unattended-Upgrade::Automatic-Reboot "false";
 `), 0o644)
 
-	// W19-ST3 multipathd isolation: on hosts where multipath-tools is
+	// multipathd-mount-isolation multipathd isolation: on hosts where multipath-tools is
 	// installed, multipathd claims every new block device it can see —
 	// including /dev/longhorn/*, RBD images and plain sd*/vd*/nvme*
 	// disks the kubelet/CSI layer owns — and wedges MountVolume.SetUp
@@ -250,7 +250,7 @@ Unattended-Upgrade::Automatic-Reboot "false";
 			[]byte(`# Managed by node-config-agent - host-protection-drop-ins multipathd isolation.
 # multipathd must not claim local disks or CSI/RBD/Longhorn block
 # devices — a claimed device wedges kubelet MountVolume.SetUp with
-# "device is already mounted or busy" (W19-ST3).
+# "device is already mounted or busy" (multipathd-mount-isolation).
 blacklist {
     devnode "^(sd[a-z0-9]+|vd[a-z0-9]+|nvme[0-9]+n[0-9]+|longhorn/.*|rbd[0-9]+)$"
 }

@@ -12,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -46,19 +45,26 @@ func (p *gatewayRouteHealthCheck) serviceBackendUnresolved(ctx context.Context,
 	key := b.ns + "/" + b.name
 	svc, ok := c.services[key]
 	if !ok && !c.svcMiss[key] && !c.svcErr[key] {
-		got, err := p.CS.CoreV1().Services(b.ns).
-			Get(ctx, b.name, metav1.GetOptions{})
+		// The sweep-memoized Services census replaces the per-backend
+		// GET — one paged LIST per sweep serves every route verdict.
+		svcs, err := p.AllServices(ctx)
 		switch {
-		case apierrors.IsNotFound(err):
-			c.svcMiss[key] = true
 		case err != nil:
 			c.svcErr[key] = true
 			metrics.IncError(p.Name)
-			log.Info("WARN: gateway route backend service get failed — verdict inconclusive",
+			log.Info("WARN: gateway route backend service list failed — verdict inconclusive",
 				"service", key, "error", err)
 		default:
-			svc = got
-			c.services[key] = svc
+			for i := range svcs {
+				if svcs[i].Namespace == b.ns && svcs[i].Name == b.name {
+					svc = &svcs[i]
+					c.services[key] = svc
+					break
+				}
+			}
+			if svc == nil {
+				c.svcMiss[key] = true
+			}
 		}
 	}
 	switch {

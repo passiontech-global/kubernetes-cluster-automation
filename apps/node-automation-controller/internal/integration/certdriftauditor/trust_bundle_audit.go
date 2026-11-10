@@ -69,7 +69,7 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 		s := &secrets[i]
 		if s.Name == linkerdIssuerSecret {
 			issuerSeen = true
-			// W19-NM2 — the issuer's serving cert is crt.pem;
+			// linkerd-trust-bundle-audit — the issuer's serving cert is crt.pem;
 			// ca.crt/tls.crt are the fallbacks for installs that
 			// key it differently. Detected BEFORE the bundle-empty
 			// skip below: an issuer carrying only tls.crt still
@@ -119,7 +119,7 @@ func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
 }
 
 // ---------------------------------------------------------------------------
-// W19-NM2 — issuer↔trust-roots chain verification
+// linkerd-trust-bundle-audit — issuer↔trust-roots chain verification
 // ---------------------------------------------------------------------------
 
 // auditTrustAnchorSkew lands the skew verdict on

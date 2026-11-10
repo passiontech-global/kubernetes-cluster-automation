@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -277,6 +278,16 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	podUID := map[string]types.UID{}
 	for i := range podItems {
 		p := &podItems[i]
+		// Only a pod that can actually answer :53 belongs in the probe
+		// set — a Pending/Terminating/not-yet-Ready pod already has a
+		// CNI-assigned IP but its resolver is not listening, so probing
+		// it reports a false DNS failure: the watchdog would invalidate
+		// the whole FQDN cache and restart a healthy fleet.
+		if p.DeletionTimestamp != nil ||
+			p.Status.Phase != corev1.PodRunning ||
+			!kube.PodReadyCond(p) {
+			continue
+		}
 		podIP[p.Name] = p.Status.PodIP
 		podUID[p.Name] = p.UID
 	}

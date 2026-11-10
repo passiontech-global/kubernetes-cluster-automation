@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -576,5 +578,41 @@ func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 	if v, _ := shOpFrozenGauge(t, "node-healthcheck-operator",
 		opReasonNoStatus); v != 1 {
 		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// When the resolved leader pod has no controller ownerReference,
+// healStuckOperator filters it out BEFORE HealAllowedPersisted so no
+// fleet budget token is spent on an unowned pod.
+func TestCheckOperatorWorkqueuesUnownedPodSpendsNoBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "scylla-operator", kcmReasonStaleGen)
+
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("scylla-operator", "scylla-operator-lock",
+			"scylla-operator-unowned_uid", 2*time.Second, base),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "scylla-operator", Name: "scylla-operator-unowned",
+			UID:    types.UID("unowned-1"),
+			Labels: map[string]string{"app.kubernetes.io/name": "scylla-operator"},
+		},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
+	stuck := probetest.UnstructuredObj("scylla.scylladb.com/v1", "ScyllaCluster",
+		"scylla", "db", 5, 3)
+	p := testProberDyn(cs, probetest.OpDyn(stuck))
+	p.Now = func() time.Time { return base }
+	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
+
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stuck signature must FAIL")
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, probetest.OpDyn(), "probe", base)
+	if !proceed || unverifiable {
+		t.Fatalf("unowned leader pod spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

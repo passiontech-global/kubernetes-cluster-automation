@@ -175,7 +175,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"warnings", warns)
 	}
-	// W24 Schrödinger's-backup stale check: a Completed backup older
+	// selfheal-alert-coverage Schrödinger's-backup stale check: a Completed backup older
 	// than veleroMissingBackupMaxAge on a daily-or-faster Schedule
 	// means the schedule silently stopped producing fresh restore
 	// points — every other check sees a healthy "Completed" phase.

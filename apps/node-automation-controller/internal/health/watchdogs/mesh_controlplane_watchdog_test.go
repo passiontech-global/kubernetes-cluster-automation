@@ -278,7 +278,7 @@ func TestMeshHealComponentPodRespectsCooldown(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// issuer-serial-watch — CiliumIPAMExhausted heartbeat freshness (W21-R7)
+// issuer-serial-watch — CiliumIPAMExhausted heartbeat freshness (issuer-serial-watch)
 // ---------------------------------------------------------------------------
 
 // ciliumOpPod builds a Running cilium-operator replica with a
@@ -685,7 +685,7 @@ func TestCiliumOperatorLeaderPodLeaseErrorCounted(t *testing.T) {
 	standby := ciliumOpRunning("cilium-operator-aaa")
 	cs := fake.NewSimpleClientset(
 		probetest.ReadyWorkerNode("w1", "", 0, false), standby)
-	cs.PrependReactor("get", "leases",
+	cs.PrependReactor("list", "leases",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})

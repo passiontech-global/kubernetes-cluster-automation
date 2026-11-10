@@ -1,4 +1,4 @@
-// apf_probe_test.go — ParseApiserverRSS: the W19-PI2 RSS gauge
+// apf_probe_test.go — ParseApiserverRSS: the apiserver-rss-gauge RSS gauge
 // extraction — max sample wins, absent family reports unseen, and a
 // token that is not a float is skipped rather than poisoning the max.
 package apiserver_test

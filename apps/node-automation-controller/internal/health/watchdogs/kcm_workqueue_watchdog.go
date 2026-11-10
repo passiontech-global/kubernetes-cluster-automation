@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -127,20 +126,16 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Pass: true}
 	}
 
-	lease, err := p.CS.CoordinationV1().Leases(metav1.NamespaceSystem).
-		Get(ctx, kcmLeaseName, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-		// No leader Lease at all — no elected KCM to judge.
-		p.resetKCMWorkqueue()
-		return probefw.Result{Pass: true}
-	case err != nil:
+	lease, err := p.Lease(ctx, metav1.NamespaceSystem, kcmLeaseName)
+	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("get lease %s/%s: %w",
 			metav1.NamespaceSystem, kcmLeaseName, err)}
-	case lease.Spec.RenewTime == nil ||
-		now.Sub(lease.Spec.RenewTime.Time) > p.Cfg.KCM.LeaseMaxAge:
-		// Stale renewTime = the holder is gone — a dead KCM, not a
-		// frozen one. Stay quiet.
+	}
+	if lease == nil ||
+		lease.Spec.RenewTime == nil ||
+		now.Sub(lease.Spec.RenewTime.Time) > p.Cfg.KCM.LeaseMaxAge {
+		// No leader Lease at all, or a stale renewTime = the holder
+		// is gone — a dead KCM, not a frozen one. Stay quiet.
 		p.resetKCMWorkqueue()
 		return probefw.Result{Pass: true}
 	}

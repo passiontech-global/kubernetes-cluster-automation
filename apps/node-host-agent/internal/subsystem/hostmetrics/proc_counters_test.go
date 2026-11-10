@@ -150,7 +150,7 @@ func TestCollectCgroupMemEvents(t *testing.T) {
 		}
 		testutil.WriteFile(t, filepath.Join(d, "memory.events"), body)
 	}
-	// W21-G2 — the whole pod-workload slice joins the per-unit set.
+	// pod-cgroup-oomkill-metrics — the whole pod-workload slice joins the per-unit set.
 	pods := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
 	if err := os.MkdirAll(pods, 0o755); err != nil {
 		t.Fatal(err)

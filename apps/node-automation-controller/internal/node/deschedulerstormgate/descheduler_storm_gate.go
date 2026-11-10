@@ -159,7 +159,7 @@ const stormCondHeartbeatMaxAge = 10 * time.Minute
 // stormTaints mirrors STORM_TAINTS — now driven by
 // kube.RemediationTaints so all four remediation taints (incl.
 // node-hang-precordon and cpu-steal) count toward the gate and a
-// new remediation taint cannot silently bypass it (W19-T1).
+// new remediation taint cannot silently bypass it (remediation-taint-detect).
 var stormTaints = kube.RemediationTaints
 
 type deschedulerStormGate struct {

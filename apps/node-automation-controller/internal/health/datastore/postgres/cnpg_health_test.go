@@ -1,4 +1,4 @@
-// cnpg_health_test.go — coverage for the W19-ST1 cnpg-health
+// cnpg_health_test.go — coverage for the cnpg-cluster-health cnpg-health
 // additions: the primary_mismatch signature and the
 // fenced_instances detect + safe auto-unfence path.
 package postgres
