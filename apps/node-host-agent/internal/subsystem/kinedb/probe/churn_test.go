@@ -94,7 +94,7 @@ func TestProbeTopChurnQueryFailKeepsWindow(t *testing.T) {
 	_ = fr
 }
 
-// The W24 hot-key half: the same window GROUP BYs the full Kine
+// The selfheal-alert-coverage hot-key half: the same window GROUP BYs the full Kine
 // key, strips the /registry/ prefix and stores ChurnKeys for the
 // guard's textfile emission.
 func TestProbeTopHotkeys(t *testing.T) {

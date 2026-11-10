@@ -402,7 +402,7 @@ func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 
 // Every gate leg is required: a Terminating namespace younger than
 // 15m must not trigger the heal even with a long-dead APIService.
-// The APIService is only 20m dead — under the W19-CP2 30m standalone
+// The APIService is only 20m dead — under the apiservice-standalone-unblock 30m standalone
 // bar — so neither path can fire.
 func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
@@ -419,7 +419,7 @@ func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	}
 }
 
-// W19-CP2 standalone unblock: a protected-namespace APIService dead
+// apiservice-standalone-unblock standalone unblock: a protected-namespace APIService dead
 // >=30m gets its backing pods restarted even with NO namespace
 // stuck Terminating — the KEDA/cert-manager/prometheus-operator
 // adapter deadlock signature.
@@ -487,7 +487,7 @@ func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 	}
 }
 
-// W19-CP2 fallback: a Terminating namespace wedged on an UNRELATED
+// apiservice-standalone-unblock fallback: a Terminating namespace wedged on an UNRELATED
 // API group must not mask the standalone unblock — the dead
 // APIService still gets its backing pods restarted once it crosses
 // the 30m standalone bar, under the standalone cooldown ledger.
@@ -512,7 +512,7 @@ func TestAPIServiceGuardUnblockStandaloneFallbackOnUnrelatedWedge(t *testing.T) 
 	}
 }
 
-// W19-CP2: KEDA installs via OLM into the "operators" namespace —
+// apiservice-standalone-unblock: KEDA installs via OLM into the "operators" namespace —
 // v1beta1.external.metrics.k8s.io's spec.service.namespace is
 // "operators", not "keda". The protected-namespace set must cover
 // it or the standalone unblock filters the candidate out.

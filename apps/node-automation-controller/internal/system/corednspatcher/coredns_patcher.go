@@ -263,7 +263,7 @@ func corednsLivenessThresholdDrifted(c *corev1.Container) bool {
 // corednsStrategyDrifted requires the pinned
 // strategy.rollingUpdate.maxUnavailable=1 — the k8s default 25%
 // can take a quarter of a small fleet down in one rollout while the
-// apiserver is already degraded (the W21-G4 post-mortem class).
+// apiserver is already degraded (the watch-cache-wedge-gate post-mortem class).
 // maxSurge stays unpinned: surge pods are what keep DNS answers
 // flowing mid-rollout. A Recreate strategy is drift too — the pin
 // only exists under RollingUpdate.

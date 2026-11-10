@@ -83,14 +83,20 @@ func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
 	if !n.Spec.Unschedulable {
 		return false
 	}
-	// W19-T2: a node fenced by remediation (SNR reclaim, nodehealth
+	// fenced-node-recovery: a node fenced by remediation (SNR reclaim, nodehealth
 	// hang verdict, partition-evictor, cpu-steal) carries BOTH the
 	// unschedulable spec flag and a remediation taint — that is NOT
 	// an operator drain, and counting it as one freezes every
 	// heal.AllowedV-gated remediation for 45m exactly while the node
-	// needs recovery. Only remediation taints exempt; the plain
-	// out-of-service unschedulable taint still counts as cordon.
-	if HasRemediationTaint(n) {
+	// needs recovery. HasRemediationOrFenceTaint widens the exempt
+	// set to the out-of-service fences (dead-node sweeper's
+	// node.kubernetes.io/out-of-service, medik8s SNR) while still
+	// excluding the plain unschedulable cordon marker — a dead node
+	// fenced while spec.Unschedulable=true would otherwise hold the
+	// mutex forever (no unschedulable TimeAdded to age out, or a
+	// fresh one each sweep). A genuine operator cordon carries only
+	// the unschedulable taint and still counts.
+	if HasRemediationOrFenceTaint(n) {
 		return false
 	}
 	if n.Annotations[AnnoPreCordonedBy] != "" {

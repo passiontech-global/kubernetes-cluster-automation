@@ -114,17 +114,19 @@ func gatewayClassStuck(o *unstructured.Unstructured) bool {
 	return c.ObservedGeneration < o.GetGeneration()
 }
 
-// gatewayClassController resolves a GatewayClass name to its
-// spec.controllerName, caching the class set for a minute so a
-// stuck-object sweep doesn't LIST per object. ok=false means the
-// class set is unavailable or the class is unknown — callers treat
-// that as "cannot disprove ownership" and keep the object.
-func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, class string) (string, bool) {
+// gatewayClassCensus returns the class-name → controllerName map,
+// refreshing it at most once a minute. ok=false means the LIST
+// itself failed — the caller cannot disprove ownership and must
+// keep the object. ok=true with a missing key is different: the
+// class set was successfully listed and does NOT contain the name,
+// so a Gateway referencing it is provably orphaned (same shape as
+// bug #11's deleted-parent route — no controller will ever own it).
+func (p *operatorWorkqueueCheck) gatewayClassCensus(ctx context.Context) (map[string]string, bool) {
 	cached, at := p.gwClassCtlr, p.gwClassAt
 	if cached == nil || p.Now().Sub(at) > time.Minute {
 		list, err := p.AllUnstructured(ctx, kube.GVRGatewayClass)
 		if err != nil {
-			return "", false
+			return nil, false
 		}
 		m := map[string]string{}
 		for i := range list {
@@ -134,7 +136,19 @@ func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, cla
 		p.gwClassCtlr, p.gwClassAt = m, p.Now()
 		cached = m
 	}
-	ctlr, ok := cached[class]
+	return cached, true
+}
+
+// gatewayClassController resolves a GatewayClass name to its
+// spec.controllerName through the shared census. ok=false means the
+// class set is unavailable OR the class is unknown — callers treat
+// that as "cannot disprove ownership" and keep the object.
+func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, class string) (string, bool) {
+	m, ok := p.gatewayClassCensus(ctx)
+	if !ok {
+		return "", false
+	}
+	ctlr, ok := m[class]
 	return ctlr, ok
 }
 
@@ -147,9 +161,22 @@ func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, cla
 func ciliumOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
 	o *unstructured.Unstructured) bool {
 	class, _ := kube.NestedString(o.Object, "spec", "gatewayClassName")
-	ctlr, ok := p.gatewayClassController(ctx, class)
-	if !ok {
-		return true
+	if class == "" {
+		return true // malformed — cannot disprove ownership
+	}
+	m, listed := p.gatewayClassCensus(ctx)
+	if !listed {
+		return true // API flap — cannot disprove ownership
+	}
+	ctlr, known := m[class]
+	if !known {
+		// The class census succeeded and the class is absent — the
+		// Gateway is orphaned (its GatewayClass was deleted or never
+		// created), so NO gateway controller will ever own it. Keeping
+		// it in cilium-operator's stuck set gets the leader pod
+		// bounced on every cooldown for an object nobody can fix —
+		// the same false-positive bug #11 fixed for orphan routes.
+		return false
 	}
 	return ctlr == ciliumGatewayController
 }
@@ -197,6 +224,8 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		return true
 	}
 	resolved := false
+	sawGatewayRef := false
+	gatewayFound := false
 	for _, ref := range refs {
 		m, ok := ref.(map[string]any)
 		if !ok {
@@ -216,10 +245,12 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if ns == "" {
 			ns = o.GetNamespace()
 		}
+		sawGatewayRef = true
 		gw, ok := lookupGateway(ctx, p, ns, name)
 		if !ok {
 			continue
 		}
+		gatewayFound = true
 		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")
 		ctlr, ok := p.gatewayClassController(ctx, class)
 		if !ok {
@@ -229,6 +260,14 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if ctlr == ciliumGatewayController {
 			return true
 		}
+	}
+	// A route whose every Gateway parent fails to resolve is an
+	// orphan — the Gateway was deleted or never created, so NO
+	// gateway controller will ever write status.parents. Keeping it
+	// in every operator's stuck set gets each leader pod killed on
+	// every cooldown for a route nobody owns.
+	if sawGatewayRef && !gatewayFound {
+		return false
 	}
 	return !resolved
 }

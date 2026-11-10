@@ -58,6 +58,18 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 		// would self-blind and clear BOTH linkerd_opaque_port_missing
 		// and linkerd_gitops_opaque_drift while the proxy never got
 		// the fix.
+		//
+		// Stamp the cooldown anyway: every !covered cause is a
+		// slow-moving refusal (the 6h GitOps-drift window, an RBAC
+		// rollout still landing, an unresolvable owner), so retrying
+		// next sweep buys nothing — while an UNSTAMPED refusal let
+		// every stalled pod of the workload re-spend a fleet budget
+		// grant each sweep (same controller key, no stamp) and, across
+		// sweeps, burned the shared heal budget for the whole drift
+		// window. The stamp throttles the retry to once per
+		// linkerdOpaqueHealCool without suppressing the drift gauge —
+		// patchLinkerdTemplate already emitted it this sweep.
+		p.Heals.Stamp(ck, now)
 		log.Info("opaque-ports heal: owning workload template not patched — leaving pod running (annotation alone cannot reach a live proxy)",
 			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
 		return

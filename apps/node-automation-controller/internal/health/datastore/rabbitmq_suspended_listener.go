@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -102,11 +103,21 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 	if owner == nil || owner.Kind != "StatefulSet" {
 		return false, nil // cannot verify peers — do not touch
 	}
-	sts, err := p.CS.AppsV1().StatefulSets(pod.Namespace).
-		Get(ctx, owner.Name, metav1.GetOptions{})
+	stss, err := p.AllStatefulSets(ctx)
 	if err != nil {
-		return false, fmt.Errorf("get statefulset %s/%s: %w",
-			pod.Namespace, owner.Name, err)
+		return false, fmt.Errorf("list statefulsets: %w", err)
+	}
+	var sts *appsv1.StatefulSet
+	for i := range stss {
+		if stss[i].Namespace == pod.Namespace &&
+			stss[i].Name == owner.Name {
+			sts = &stss[i]
+			break
+		}
+	}
+	if sts == nil {
+		return false, fmt.Errorf("statefulset %s/%s: not found",
+			pod.Namespace, owner.Name)
 	}
 	sel, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
 	if err != nil {

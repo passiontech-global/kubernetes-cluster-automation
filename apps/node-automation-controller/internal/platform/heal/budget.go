@@ -160,6 +160,19 @@ func budgetRefund(now time.Time) {
 	}
 }
 
+// RefundGrant is budgetRefund's exported face for BATCH-gated
+// callers: a pass that took one up-front grant via heal.Gate /
+// AllowedV and then had EVERY actuation refused (PDB 429 — a
+// deferral that delivered no heal) hands the grant back, the same
+// contract EvictPodV applies per pod. Callers refund only when
+// nothing was delivered — a pass with even one landed action keeps
+// its grant. No budget configured consumed nothing, so it is a
+// no-op; a refund for an instant that consumed nothing finds no
+// stamp and is itself a no-op.
+func RefundGrant(now time.Time) {
+	budgetRefund(now)
+}
+
 // ---------------------------------------------------------------------------
 // Per-target non-convergent circuit breaker.
 //

@@ -15,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	certificatesv1 "k8s.io/api/certificates/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -286,6 +287,16 @@ func VolumeAttachments(cs kubernetes.Interface) PageFunc[storagev1.VolumeAttachm
 			return cs.StorageV1().VolumeAttachments().List(ctx, o)
 		},
 		func(l *storagev1.VolumeAttachmentList) []storagev1.VolumeAttachment { return l.Items })
+}
+
+// Leases lists coordination.k8s.io Leases in namespace — the
+// leader-election objects ~40 health checks used to GET one-by-one.
+func Leases(cs kubernetes.Interface, namespace string) PageFunc[coordinationv1.Lease] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*coordinationv1.LeaseList, error) {
+			return cs.CoordinationV1().Leases(namespace).List(ctx, o)
+		},
+		func(l *coordinationv1.LeaseList) []coordinationv1.Lease { return l.Items })
 }
 
 // CertificateSigningRequests lists cluster-scoped

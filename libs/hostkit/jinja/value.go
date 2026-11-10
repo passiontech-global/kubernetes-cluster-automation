@@ -276,10 +276,16 @@ func getAttr(v any, key string) any {
 		if val, ok := t[key]; ok {
 			return val
 		}
+		if methodNames[key] {
+			return boundMethod{v, key}
+		}
 		return Undefined{key}
 	case map[string]string:
 		if val, ok := t[key]; ok {
 			return val
+		}
+		if methodNames[key] {
+			return boundMethod{v, key}
 		}
 		return Undefined{key}
 	case []any:
@@ -632,19 +638,38 @@ func IsNilOrUndef(v any) bool {
 	return u
 }
 
+// seqElems unwraps either list representation the engine carries —
+// *List (literals, filters) and []any (DecodeYAML, Go callers) —
+// for the seq+seq concat in binOp.
+func seqElems(v any) ([]any, bool) {
+	switch t := v.(type) {
+	case *List:
+		return t.V, true
+	case []any:
+		return t, true
+	}
+	return nil, false
+}
+
 func binOp(op string, l, r any) (any, error) {
 	switch op {
 	case "~":
 		return Stringify(l) + Stringify(r), nil
 	case "+":
-		if ls, ok := l.(*List); ok {
-			if rs, ok := r.(*List); ok {
-				return &List{append(append([]any{}, ls.V...), rs.V...)}, nil
-			}
-		}
-		if ls, ok := l.([]any); ok {
-			if rs, ok := r.([]any); ok {
-				return append(append([]any{}, ls...), rs...), nil
+		// seq+seq concatenates across BOTH list representations:
+		// DecodeYAML yields []any while list literals and filters
+		// yield *List — `yaml_list + ['a']` used to fall through to
+		// the unsupported-operands error.
+		if ls, ok := seqElems(l); ok {
+			if rs, ok := seqElems(r); ok {
+				out := append(append([]any{}, ls...), rs...)
+				if _, isList := l.(*List); isList {
+					return &List{out}, nil
+				}
+				if _, isList := r.(*List); isList {
+					return &List{out}, nil
+				}
+				return out, nil
 			}
 		}
 		if isStr(l) || isStr(r) {
@@ -914,10 +939,13 @@ type builtinFunc func(args []any, kw map[string]any, s *scope) (any, error)
 func (m boundMethod) call(args []any, _ *scope) (any, error) {
 	switch m.name {
 	case "items":
-		if om, ok := m.obj.(*OMap); ok {
-			pairs := make([]any, 0, om.Len())
-			for _, k := range om.Keys() {
-				v, _ := om.Get(k)
+		// asMapping covers *OMap (insertion order via Keys()) and the
+		// plain map shapes DecodeYAML/Go callers produce (sorted keys)
+		// — .items() on a map[string]any used to be uncallable.
+		if mv, ok := asMapping(m.obj); ok {
+			pairs := make([]any, 0, mv.n)
+			for _, k := range mv.keys {
+				v, _ := mv.get(k)
 				pairs = append(pairs, &List{[]any{k, v}})
 			}
 			return &List{pairs}, nil
@@ -928,28 +956,28 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			return nil, nil
 		}
 	case "keys":
-		if om, ok := m.obj.(*OMap); ok {
-			out := make([]any, 0, om.Len())
-			for _, k := range om.Keys() {
+		if mv, ok := asMapping(m.obj); ok {
+			out := make([]any, 0, mv.n)
+			for _, k := range mv.keys {
 				out = append(out, k)
 			}
 			return &List{out}, nil
 		}
 	case "values":
-		if om, ok := m.obj.(*OMap); ok {
-			out := make([]any, 0, om.Len())
-			for _, k := range om.Keys() {
-				v, _ := om.Get(k)
+		if mv, ok := asMapping(m.obj); ok {
+			out := make([]any, 0, mv.n)
+			for _, k := range mv.keys {
+				v, _ := mv.get(k)
 				out = append(out, v)
 			}
 			return &List{out}, nil
 		}
 	case "get":
-		if om, ok := m.obj.(*OMap); ok {
+		if mv, ok := asMapping(m.obj); ok {
 			if len(args) == 0 {
 				return nil, errors.New("get: missing key argument")
 			}
-			if v, ok := om.Get(Stringify(args[0])); ok {
+			if v, ok := mv.get(Stringify(args[0])); ok {
 				return v, nil
 			}
 			if len(args) > 1 {

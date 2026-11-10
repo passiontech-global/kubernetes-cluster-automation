@@ -46,7 +46,7 @@ type fluxKustomizationHealthCheck struct {
 	// patch leaves behind (heal.PersistedCooledDown reads the wider
 	// of the two, so `flux reconcile` stamps count too).
 	reconcileHealed state.CooldownSet
-	// sourceNudgeHealed is the same cooldown shape for the W20-GO2
+	// sourceNudgeHealed is the same cooldown shape for the flux-source-artifact-heal
 	// source-side nudge — keyed per source object, since one source
 	// artifact failure fans out to every consumer Kustomization.
 	sourceNudgeHealed state.CooldownSet
@@ -132,7 +132,7 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 	// object — bound the map so decommissioned names' stamps cannot
 	// accumulate (pruned every sweep, not only on a stuck hit).
 	p.reconcileHealed.PruneExpired(now, fluxKustHealCooldown)
-	// sourceNudgeHealed is the W20-GO2 ArtifactFailed source-side
+	// sourceNudgeHealed is the flux-source-artifact-heal ArtifactFailed source-side
 	// twin — same append-only ledger, same prune cadence.
 	p.sourceNudgeHealed.PruneExpired(now, fluxKustHealCooldown)
 	var rep probefw.SweepReport
@@ -195,7 +195,7 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	log logr.Logger, kust *unstructured.Unstructured, reason string, now time.Time) {
 
 	key := kust.GetNamespace() + "/" + kust.GetName()
-	// W20-GO2: an ArtifactFailed signature usually means the SOURCE
+	// flux-source-artifact-heal: an ArtifactFailed signature usually means the SOURCE
 	// object's cached artifact is corrupt (source-controller pod
 	// restart mid-fetch) — stamping requestedAt on the Kustomization
 	// alone re-reads the same bad tarball. The source-side nudge is
@@ -378,9 +378,21 @@ func (p *fluxKustomizationHealthCheck) fluxKustDepsReady(ctx context.Context,
 		if ns == "" {
 			ns = kust.GetNamespace()
 		}
-		dep, err := p.Dyn.Resource(fluxKustomizationGVR).Namespace(ns).
-			Get(ctx, name, metav1.GetOptions{})
+		// Same memoized census as the HelmRelease twin — the
+		// dependsOn chain resolves against the paged LIST the
+		// sweep already paid for, not a per-object GET.
+		items, err := p.AllUnstructured(ctx, fluxKustomizationGVR)
 		if err != nil {
+			return false
+		}
+		var dep *unstructured.Unstructured
+		for i := range items {
+			if items[i].GetNamespace() == ns && items[i].GetName() == name {
+				dep = &items[i]
+				break
+			}
+		}
+		if dep == nil {
 			return false
 		}
 		c, ok := kube.ConditionOf(dep.Object, "Ready")

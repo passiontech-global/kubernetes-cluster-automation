@@ -70,6 +70,7 @@ tasks:
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
+      - '/mise.toml'
     outputs:
       - 'bin/node-host-agent'
 
@@ -128,6 +129,7 @@ tasks:
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
+      - '/mise.toml'
     options:
       # script is a multi-line shell snippet — must run via shell.
       shell: true

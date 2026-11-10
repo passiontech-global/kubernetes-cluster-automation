@@ -94,6 +94,26 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 	if len(candidates) == 0 {
 		return // nothing on disk can match a PV — skip the API entirely
 	}
+	// Disk-pressure gate BEFORE the cluster-wide PV/PVC LISTs: the
+	// quota only bites under real disk pressure (over-request-but-
+	// plenty-free is a sizing problem, not a node emergency), and on
+	// a healthy node — the common case — the two LISTs plus every
+	// WalkBytes are pure waste. One statfs per scan root decides it;
+	// the memoized verdict is reused per candidate below.
+	pressured := map[string]bool{}
+	anyPressured := false
+	for _, dir := range candidates {
+		parent := filepath.Dir(dir)
+		if _, seen := pressured[parent]; !seen {
+			pressured[parent] = c.d.DiskUsageAboveWatermark(parent)
+		}
+		if pressured[parent] {
+			anyPressured = true
+		}
+	}
+	if !anyPressured {
+		return
+	}
 	pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -138,14 +158,14 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 		if !ok || cap <= 0 || c.localPVThrottled[dir] {
 			continue
 		}
-		size, _ := c.d.WalkBytes(dir)
-		if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
+		// pressured[] was resolved once per scan root above the API
+		// calls — an unpressured root skips WalkBytes for every
+		// pvc-* dir under it.
+		if !pressured[filepath.Dir(dir)] {
 			continue
 		}
-		// The quota only bites under real disk pressure —
-		// over-request-but-plenty-free is a sizing problem,
-		// not a node emergency.
-		if !c.d.DiskUsageAboveWatermark(filepath.Dir(dir)) {
+		size, _ := c.d.WalkBytes(dir)
+		if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
 			continue
 		}
 		pod := podByPV[name]

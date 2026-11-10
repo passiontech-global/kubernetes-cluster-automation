@@ -71,7 +71,7 @@ func calicoIfaceCount(d *wdeps.Deps) int {
 
 // CalicoCheck is the calico-hygiene calico guard as a Check; it owns the
 // veth-leak, felix readiness and wireguard.cali streaks (ex-Hygiene
-// .calicoVethFails/.calicoFelixFails + the W20-NM3 wg streak).
+// .calicoVethFails/.calicoFelixFails + the calico-wireguard-datapath-guard wg streak).
 type CalicoCheck struct {
 	d          *wdeps.Deps
 	VethFails  int
@@ -209,7 +209,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 	}
-	// W20-NM3 wireguard.cali datapath: Calico's WireGuard backend
+	// calico-wireguard-datapath-guard wireguard.cali datapath: Calico's WireGuard backend
 	// iface exists in sysfs but reads operstate=down or carrier=0
 	// across consecutive cycles — the encrypted datapath is dead
 	// while every pod still looks Running (same invisible-wedge
@@ -220,7 +220,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckCalico, "ok")
 }
 
-// checkWireguardCali is the W20-NM3 WireGuard-backend wedge
+// checkWireguardCali is the calico-wireguard-datapath-guard WireGuard-backend wedge
 // detector. wireguard.cali only exists on Calico nodes running the
 // WireGuard datapath — its absence is not a fault. A present iface
 // reporting down/no-carrier for ConsecNeeded consecutive cycles

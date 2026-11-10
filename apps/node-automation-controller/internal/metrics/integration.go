@@ -69,7 +69,7 @@ var TrustBundleDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 // LinkerdTrustAnchorSkew is 1 while the linkerd-identity-issuer
 // certificate fails X.509 verification (CheckSignatureFrom) or
 // AKI/SKI matching against every cert in the
-// linkerd-identity-trust-roots bundle (cert-drift-auditor, W19-NM2)
+// linkerd-identity-trust-roots bundle (cert-drift-auditor, linkerd-trust-bundle-audit)
 // — workload proxies then reject the issuer's certificates and new
 // mTLS handshakes silently fail while existing connections live.
 var LinkerdTrustAnchorSkew = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -206,7 +206,7 @@ var VeleroPodVolumeBackupWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while a PodVolumeBackup is wedged InProgress past the Kopia criteria.",
 }, []string{"namespace", "pvb"})
 
-// VeleroPodVolumeRestoreWedged is the W20-ST3 restore-side twin of
+// VeleroPodVolumeRestoreWedged is the velero-restore-wedge-audit restore-side twin of
 // VeleroPodVolumeBackupWedged: 1 while a velero.io PodVolumeRestore
 // sits InProgress past the 6h window. Labels: namespace + pvr name.
 var VeleroPodVolumeRestoreWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{

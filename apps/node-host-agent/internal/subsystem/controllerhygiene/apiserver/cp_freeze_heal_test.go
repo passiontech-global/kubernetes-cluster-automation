@@ -812,7 +812,7 @@ func (errReader) Read([]byte) (int, error) {
 }
 
 // A successful default-seam scrape carries the RSS sample into the
-// textfile (W19-PI2) and the new-key + sampling offender branches.
+// textfile (apiserver-rss-gauge) and the new-key + sampling offender branches.
 func TestAPFProbeDefaultSeamEmitAndSampling(t *testing.T) {
 	e := fixture(t)
 	cdeps.TextfileDirOverride = t.TempDir()

@@ -40,7 +40,7 @@ type Deps struct {
 	// ChurnTop is the kine-churn top-5 churn result computed by the
 	// probe loop (churn window watermark lives in GuardStateDir)
 	// and emitted by the guard cycle into kine-compact-guard.prom.
-	// ChurnKeys is the W24 per-object twin: the same window sampled
+	// ChurnKeys is the selfheal-alert-coverage per-object twin: the same window sampled
 	// GROUP BY full key (not the /registry/<group>/<resource>
 	// prefix) so an SSA managedFields ping-pong names its exact
 	// victim object on kine_db_top_hotkey_revisions_5m{key}.

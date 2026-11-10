@@ -55,6 +55,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
@@ -392,6 +393,9 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	}
 	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
 		Evict(ctx, ev); err != nil {
+		if apierrors.IsTooManyRequests(err) {
+			heal.RefundGrant(now)
+		}
 		return false, fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
 	}
 	metrics.StatefulSetOnDeletePodsRolledTotal.

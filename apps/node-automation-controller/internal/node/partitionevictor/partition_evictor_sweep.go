@@ -264,6 +264,22 @@ func (s *partitionSweep) taintFlagged(ctx context.Context) {
 func (s *partitionSweep) evictPods(ctx context.Context) {
 	names := s.sortedAction()
 
+	// Nothing can be evicted until at least one node's NoSchedule
+	// fence landed — when every taint attempt failed (API error or
+	// closed breaker) each loop iteration below would `continue`
+	// anyway, so skip the PVC census and the heal-budget gate
+	// entirely on an all-fence-failed sweep.
+	fenced := 0
+	for _, name := range names {
+		if s.taintedNode[name] {
+			fenced++
+		}
+	}
+	if fenced == 0 {
+		s.log.Info("sweep done", "evicted", 0, "flaggedNodes", len(s.flagged))
+		return
+	}
+
 	// Resolve the eviction set once per run: the Setup-parsed env
 	// allow-list plus the annotation opt-in (checked per pod inside
 	// the loop). One node-scoped cluster-wide list per flagged node
@@ -287,24 +303,21 @@ func (s *partitionSweep) evictPods(ctx context.Context) {
 	// Maintenance mutex + global heal budget — evictions kill LIVE
 	// pods, so they defer while a cordon/drain/kured reboot or a k0s
 	// upgrade is in flight (the taints above still fence the flagged
-	// nodes — fencing is not destructive). heal.Gate runs the
-	// nil-heals-ledger preamble: this module's pacing is partitionEvictCap,
-	// not a CooldownSet — its mutex and budget gates are what apply,
-	// shared via e.verdict so the sweep pays one evaluation.
+	// nodes — fencing is not destructive). The gate is acquired
+	// LAZILY on the first pod that survives every eligibility check
+	// and memoized for the rest of the pass (the mutex verdict is
+	// already memoized on e.verdict; the budget grant is sweep-wide,
+	// matching the old upfront call's one-grant-per-sweep shape).
+	// Spending it up front burned a fleet-wide grant every sweep for
+	// as long as a node sat tainted with nothing evictable on it —
+	// all pods pinned, all system, or the cap already spent by an
+	// earlier node — and the budget exists to unlock a DELIVERED
+	// eviction, which an empty candidate set never produces.
 	// Unverifiable fails closed and IncErrors the queue like every
-	// other tolerated sub-failure.
-	if s.e.dyn != nil {
-		proceed, unverifiable := heal.Gate(ctx, s.log, &s.e.verdict,
-			s.e.cs, s.e.dyn, "partition-evictor", s.now)
-		if unverifiable {
-			metrics.IncError(s.e.queue)
-			return
-		}
-		if !proceed {
-			return
-		}
-	}
-
+	// other tolerated sub-failure; a deny (held mutex or spent
+	// budget) ends the pass — the verdict cannot un-hold and the
+	// budget cannot refill inside one sweep.
+	gateChecked, gateProceed, gateUnverifiable := false, false, false
 	evicted := 0
 loop:
 	for _, name := range names {
@@ -350,6 +363,29 @@ loop:
 			// stranded pod (or a Pending one) on the broken host.
 			if podOnNodePinnedPVC(p, pinnedPVCs) {
 				continue
+			}
+			// First pod that would actually be evicted acquires the
+			// sweep-wide maintenance+budget gate — before the breaker
+			// charge below, so a denied gate cannot spend a
+			// per-target grant on an eviction that will not fire.
+			if !gateChecked {
+				gateChecked = true
+				if s.e.dyn != nil {
+					gateProceed, gateUnverifiable = heal.Gate(ctx, s.log,
+						&s.e.verdict, s.e.cs, s.e.dyn,
+						"partition-evictor", s.now)
+				} else {
+					gateProceed = true // nil dyn — gate skipped, proceed
+				}
+			}
+			if gateUnverifiable {
+				metrics.IncError(s.e.queue)
+				return
+			}
+			if !gateProceed {
+				// Mutex held or budget spent — every later candidate
+				// defers identically this sweep.
+				break loop
 			}
 			// Per-target non-convergent circuit breaker, eviction
 			// side: a sweep that evicts off a node spends ONE grant

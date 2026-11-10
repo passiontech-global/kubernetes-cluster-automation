@@ -16,13 +16,17 @@ WORKDIR /src
 COPY libs/hostkit/go.* libs/hostkit/
 COPY apps/node-automation-controller/go.mod apps/node-automation-controller/go.sum apps/node-automation-controller/
 WORKDIR /src/apps/node-automation-controller
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 # Full source only after deps are cached. ARG VERSION sits just above
 # `go build` so bumping it invalidates the link layer, not the downloads.
 COPY libs/hostkit/ /src/libs/hostkit/
 COPY apps/node-automation-controller/ /src/apps/node-automation-controller/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-automation-controller ./cmd/manager
 

@@ -138,7 +138,7 @@ func (w *siteSkewWatch) begin(ctx context.Context, log logr.Logger,
 // only meaningful on a multi-zone cluster with a live master to
 // place — and records the standby pin for the trigger-B ratio.
 func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
-	eps []kube.ReadyEndpoint, rep *probefw.SweepReport) {
+	eps []kube.ReadyEndpoint) {
 	// stateful-split-brain(ii) — cross-DC pin accounting: only meaningful on
 	// a multi-zone cluster with a live master to place.
 	if !s.multiZone || len(eps) == 0 {
@@ -165,7 +165,11 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 				key+"/"+statefulStandbySiteZone,
 				[]string{c.ns, c.svc, c.workloadName(),
 					statefulStandbySiteZone})
-			rep.Find(key + "(site_skew " + statefulStandbySiteZone +
+			// The finding rides THIS sweep's report — parking it
+			// on the zero-endpoints report would render a healthy
+			// standby-pinned master under the "0 ready endpoints"
+			// verdict prefix.
+			s.rep.Find(key + "(site_skew " + statefulStandbySiteZone +
 				" while datahub replicas ready)")
 			s.emittedSkew[key] = true
 		}
@@ -182,7 +186,7 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 
 // close runs trigger B — the cluster-wide pin ratio — then
 // reconciles the emitted-gauge ledger.
-func (s *siteSkewSweep) close(rep *probefw.SweepReport) {
+func (s *siteSkewSweep) close() {
 	// stateful-split-brain(ii) trigger B — the pin is cluster-wide when >=80% of
 	// evaluated stateful masters live in the standby zone (every
 	// resolved endpoint lanit, none datahub). Flag every pinned
@@ -195,7 +199,7 @@ func (s *siteSkewSweep) close(rep *probefw.SweepReport) {
 			}
 			s.rep.Flag(statefulMasterSiteSkewGauge,
 				key+"/"+statefulStandbySiteZone, lv)
-			rep.Find(fmt.Sprintf("%s(site_skew >=%d%% masters pinned to %s)",
+			s.rep.Find(fmt.Sprintf("%s(site_skew >=%d%% masters pinned to %s)",
 				key, int(statefulSiteSkewMaxPinned*100), statefulStandbySiteZone))
 		}
 	}

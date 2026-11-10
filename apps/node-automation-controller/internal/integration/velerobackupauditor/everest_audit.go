@@ -109,7 +109,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 				reasons = append(reasons, "missing")
 			}
 		} else if !everestHasSucceeded(clusterBackups) {
-			// W24 Schrödinger's-backup: backup objects EXIST but
+			// selfheal-alert-coverage Schrödinger's-backup: backup objects EXIST but
 			// none ever reached state=Succeeded — every attempt
 			// failed (or is wedged in Running) and the in-list
 			// stale check, which keys on the newest SUCCEEDED,
@@ -194,7 +194,7 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 
 // everestHasSucceeded reports whether any backup in the cluster's
 // history reached state=Succeeded — the zero-success-history half
-// of the W24 stale check (caller-side: it needs the cluster's age).
+// of the selfheal-alert-coverage stale check (caller-side: it needs the cluster's age).
 func everestHasSucceeded(backups []*unstructured.Unstructured) bool {
 	for _, b := range backups {
 		if state, _ := kube.NestedString(

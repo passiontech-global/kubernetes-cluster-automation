@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	yaml3 "go.yaml.in/yaml/v3"
 )
@@ -77,7 +78,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "length", "count":
 		switch t := v.(type) {
 		case string:
-			return int64(len(t)), nil
+			// Rune count, not bytes — s[i] indexing and for-loops
+			// already operate in runes, so len() must agree or a
+			// multibyte string reports ~3x its real length.
+			return int64(utf8.RuneCountInString(t)), nil
 		case []any:
 			return int64(len(t)), nil
 		case *List:
@@ -113,9 +117,27 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 					return c < 0
 				}
 			}
-			if lp, ok := l[i].(*List); ok {
-				if rp, ok := l[j].(*List); ok && len(lp.V) > 0 && len(rp.V) > 0 {
-					return Stringify(lp.V[0]) < Stringify(rp.V[0])
+			// Sequence elements compare on their first item —
+			// *List (template literals/filters) and []any
+			// (YAML-decoded vars) are the same value in two
+			// representations, so both must take this branch or a
+			// mixed list sorts []any elements by Stringify.
+			first := func(x any) (any, bool) {
+				switch t := x.(type) {
+				case *List:
+					if len(t.V) > 0 {
+						return t.V[0], true
+					}
+				case []any:
+					if len(t) > 0 {
+						return t[0], true
+					}
+				}
+				return nil, false
+			}
+			if fi, oki := first(l[i]); oki {
+				if fj, okj := first(l[j]); okj {
+					return Stringify(fi) < Stringify(fj)
 				}
 			}
 			return Stringify(l[i]) < Stringify(l[j])
@@ -200,11 +222,16 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "items2dict":
 		m := NewOMap()
 		for _, it := range ToIter(v) {
-			if om, ok := it.(*OMap); ok {
-				k, _ := om.Get("key")
-				vv, _ := om.Get("value")
-				m.Set(Stringify(k), vv)
+			// asMapping accepts *OMap AND the Go-native maps a
+			// vars-file decode produces — items2dict over YAML data
+			// must not silently drop plain-map entries.
+			om, ok := asMapping(it)
+			if !ok {
+				continue
 			}
+			k, _ := om.get("key")
+			vv, _ := om.get("value")
+			m.Set(Stringify(k), vv)
 		}
 		return m, nil
 	case "map":

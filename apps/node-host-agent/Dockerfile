@@ -19,7 +19,9 @@ WORKDIR /src
 COPY libs/hostkit/go.* libs/hostkit/
 COPY apps/node-host-agent/go.mod apps/node-host-agent/go.sum apps/node-host-agent/
 WORKDIR /src/apps/node-host-agent
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 # Full source only after deps are cached. ARG VERSION sits just above
 # `go build` so bumping it invalidates the link layer, not the downloads.
 # Destinations are absolute: WORKDIR is already /src/apps/node-host-agent
@@ -27,7 +29,9 @@ RUN go mod download
 COPY libs/hostkit/ /src/libs/hostkit/
 COPY apps/node-host-agent/ /src/apps/node-host-agent/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-host-agent ./cmd/agent
 

@@ -214,7 +214,7 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 // controller-runtime Runnable that must run on standbys too —
 // NeedLeaderElection()=false is the whole point: the replica that
 // is NOT the leader is exactly the one that must shorten the Lease
-// when the leader's node dies (W24 fast dead-leader preemption).
+// when the leader's node dies (selfheal-alert-coverage fast dead-leader preemption).
 type leasePreemptRunnable struct {
 	preemptor *leaderelect.Preemptor
 	log       logr.Logger
@@ -379,7 +379,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// W24 fast dead-leader lease preemption: without it a leader
+	// selfheal-alert-coverage fast dead-leader lease preemption: without it a leader
 	// whose node dies holds the 180s LeaseDuration while every heal
 	// module on the standby idles. The sweep runs on every replica
 	// and shortens the Lease to 1s only when the holder is provably

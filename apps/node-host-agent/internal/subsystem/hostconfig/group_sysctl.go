@@ -93,7 +93,7 @@ func (c *cyc) t16Pairs() [][2]string {
 	// pairs above.
 	if c.r.fileExists("/proc/sys/fs/aio-max-nr") ||
 		fileExistsNoRoot("/proc/sys/fs/aio-max-nr") {
-		// W20-KR2: 4M slots — the 1M convergence value still starves
+		// kernel-resource-table-tuning: 4M slots — the 1M convergence value still starves
 		// nodes running many DB instances (ScyllaDB/MySQL/CNPG
 		// workers each hold aio contexts); collect_filefd_sockstat's
 		// runtime bump covers the gap before this sysctl lands.
@@ -151,7 +151,7 @@ func (c *cyc) t16Pairs() [][2]string {
 		}
 		p = append(p, v6...)
 	}
-	// pty-exhaustion-guard (W19-KR1): /dev/pts PTY table ceiling — the
+	// pty-exhaustion-guard (pty-exhaustion-guard): /dev/pts PTY table ceiling — the
 	// stock kernel.pty.max=4096 starves kubectl exec/tty pods and sshd
 	// under churn while the node still reports Ready. Only when the
 	// kernel exposes the pty sysctl (pty compiled out leaves no node;

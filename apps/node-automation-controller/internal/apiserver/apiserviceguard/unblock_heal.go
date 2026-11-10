@@ -38,7 +38,7 @@ const (
 	apiServiceUnblockMinAge   = 15 * time.Minute
 	apiServiceUnblockPodCap   = 10
 	apiServiceUnblockCooldown = 15 * time.Minute
-	// W19-CP2 standalone unblock: an aggregated APIService in a
+	// apiservice-standalone-unblock standalone unblock: an aggregated APIService in a
 	// protected namespace that stays Available=False >=30m gets its
 	// backing pods restarted even with NO namespace stuck
 	// Terminating — KEDA/cert-manager/prometheus-operator adapters
@@ -53,7 +53,7 @@ const (
 // APIServices backed in these namespaces are core-ish infra the
 // guard otherwise never touches. Membership here does NOT skip the
 // availability metric; it scopes which backends the unblock healer
-// may restart. W19-CP2 added keda/cert-manager/prometheus-operator —
+// may restart. apiservice-standalone-unblock added keda/cert-manager/prometheus-operator —
 // aggregated adapters whose outage stalls HPA scaling, cert
 // issuance and Prometheus scraping respectively — plus operators:
 // OLM installs KEDA there, so v1beta1.external.metrics.k8s.io's
@@ -79,7 +79,7 @@ type unblockHealer struct {
 	// bounds restart churn on a backend that wedges again right
 	// after its pods are recreated.
 	unblocked state.CooldownSet
-	// standaloneUnblocked is the same ledger for the W19-CP2
+	// standaloneUnblocked is the same ledger for the apiservice-standalone-unblock
 	// standalone path (no Terminating-namespace evidence) — a
 	// separate keyspace so a standalone heal cannot mask or be
 	// masked by a wedge-evidence heal on the same APIService.
@@ -88,7 +88,7 @@ type unblockHealer struct {
 
 // unblockCandidate is one APIService that passed the cheap
 // unavailability+namespace+group gates — the shared input of the
-// wedge-evidence pass and the W19-CP2 standalone pass.
+// wedge-evidence pass and the apiservice-standalone-unblock standalone pass.
 type unblockCandidate struct {
 	svc   *unstructured.Unstructured
 	group string
@@ -154,7 +154,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 		return err
 	}
 	if len(stuck) == 0 {
-		// W19-CP2: no Terminating-namespace wedge — the standalone
+		// apiservice-standalone-unblock: no Terminating-namespace wedge — the standalone
 		// pass heals every candidate dead >=30m (KEDA/cert-manager/
 		// prometheus-operator adapters stall their consumers
 		// silently without ever wedging a namespace deletion).
@@ -182,7 +182,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	return nil
 }
 
-// sweepStandaloneUnblock is the W19-CP2 no-wedge path: every
+// sweepStandaloneUnblock is the apiservice-standalone-unblock no-wedge path: every
 // protected-namespace APIService unavailable for
 // apiServiceStandaloneUnblockMinAge (30m — double the wedge-evidence
 // bar, since there is no Terminating namespace corroborating) gets
@@ -196,7 +196,7 @@ func (u *unblockHealer) sweepStandaloneUnblock(ctx context.Context,
 	return nil
 }
 
-// standaloneHealCandidate applies the W19-CP2 standalone gate to one
+// standaloneHealCandidate applies the apiservice-standalone-unblock standalone gate to one
 // candidate — unavailability >= apiServiceStandaloneUnblockMinAge —
 // then runs the shared heal tail under the standalone cooldown
 // ledger. Shared by sweepStandaloneUnblock (no Terminating
@@ -228,6 +228,14 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 
 	g := snap.g
 	log := logf.FromContext(ctx)
+	// Per-APIService cooldown: an APIService that stays Available=False
+	// must not have its backing pods evicted every sweep — the stamp is
+	// written only on a delivered heal below, so an empty pass never
+	// opens the window. Checking here also skips the target lookup
+	// (Service get + pod list) for the whole cooldown.
+	if cooldown != nil && cooldown.CooledDown(svc.GetName(), cooldownDur, now) {
+		return false
+	}
 	svcNs, svcName, _ := apiServiceBackend(svc)
 	// Confirm a live restart target BEFORE the heal preamble: the
 	// wedge evidence alone doesn't mean anything is left to

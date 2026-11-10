@@ -13,9 +13,9 @@
 // linkerd-proxy response_total vector the destination control plane
 // labels per namespace/deployment/pod):
 //
-//	rps_p  = sum by (namespace, deployment, pod)
+//	rps_p  = sum by (namespace, deployment, rollout, pod)
 //	         (rate(response_total{direction="inbound"}[5m]))
-//	err_p  = sum by (namespace, deployment, pod)
+//	err_p  = sum by (namespace, deployment, rollout, pod)
 //	         (rate(response_total{direction="inbound",
 //	          classification="failure"}[5m])) / rps_p
 //
@@ -283,15 +283,20 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 	if _, err := p.PromEndpoint(); err != nil {
 		return doneFresh()
 	}
+	// `rollout` MUST stay in the sum-by list: dropping it makes
+	// Prometheus collapse Rollout-owned series into unlabeled
+	// aggregates, so linkerdOutlierSamples never sees the label the
+	// rollout fallback reads — Argo Rollouts cohorts would silently
+	// lose outlier protection.
 	rpsSeries, err := p.PromQuery(ctx,
-		`sum by (namespace, deployment, pod) (rate(response_total{direction="inbound"}[5m]))`)
+		`sum by (namespace, deployment, rollout, pod) (rate(response_total{direction="inbound"}[5m]))`)
 	if err != nil {
 		log.Info("WARN: linkerd outlier rps query failed — check inconclusive",
 			"error", err)
 		return doneFresh()
 	}
 	failSeries, err := p.PromQuery(ctx,
-		`sum by (namespace, deployment, pod) (rate(response_total{direction="inbound",classification="failure"}[5m]))`)
+		`sum by (namespace, deployment, rollout, pod) (rate(response_total{direction="inbound",classification="failure"}[5m]))`)
 	if err != nil {
 		log.Info("WARN: linkerd outlier failure-ratio query failed — check inconclusive",
 			"error", err)

@@ -24,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 var (
@@ -144,10 +145,18 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// per-controller cooldown stamped above.
 	if err := heal.StampPersisted(ctx,
 		func(ctx context.Context, data []byte) error {
-			_, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
+			if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
 				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
-					metav1.PatchOptions{})
-			return err
+					metav1.PatchOptions{}); err != nil {
+				return err
+			}
+			// Mirror the landed stamp onto the LISTED STS — several
+			// master Services can share one StatefulSet, and the
+			// serial sweep sees no apiserver echo: without the mirror
+			// a second heal-due candidate reads the pre-patch
+			// annotations and double-heals the same operator.
+			probefw.MergeAnnoPatchLocally(sig.sts, data)
+			return nil
 		},
 		dragonflyHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)
@@ -337,10 +346,16 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	// delete, not the annotation write).
 	if err := heal.StampPersisted(ctx,
 		func(ctx context.Context, data []byte) error {
-			_, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
+			if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
 				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
-					metav1.PatchOptions{})
-			return err
+					metav1.PatchOptions{}); err != nil {
+				return err
+			}
+			// Same listed-copy mirror as the operator heal above —
+			// a shared StatefulSet must not be re-healed by a
+			// sibling Service's candidate later this sweep.
+			probefw.MergeAnnoPatchLocally(sig.sts, data)
+			return nil
 		},
 		dragonflyPodHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)

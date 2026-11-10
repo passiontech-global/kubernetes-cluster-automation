@@ -285,7 +285,7 @@ type FreezeCheck struct {
 	apfPrevRejected map[APFSeriesKey]float64
 	// apiserverRSS/apiserverRSSSeen carry the last scrape's
 	// process_resident_memory_bytes into EmitAPFMetrics — the
-	// node_host_agent_apiserver_rss_bytes series (W19-PI2) lets
+	// node_host_agent_apiserver_rss_bytes series (apiserver-rss-gauge) lets
 	// Prometheus watch kube-apiserver RSS growth without a
 	// go_gc or cgroup scrape of the static pod.
 	apiserverRSS     float64

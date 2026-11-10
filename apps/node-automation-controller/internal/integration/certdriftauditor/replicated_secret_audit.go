@@ -81,7 +81,6 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 				continue
 			}
 		}
-		a.seenReplication.Emit(k, k.namespace, k.name, k.source)
 		if bytes.Equal(d.dest, src) {
 			a.replicationMismatch.Reset(replStreakKey(k))
 			if _, ok := a.seenReplication.Last()[k]; ok {
@@ -90,6 +89,14 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 			}
 			continue
 		}
+		// Mismatch — register the tuple ONLY now: the ledger entry is
+		// what keeps this key in the `live` set the streak Prune
+		// reads, so a warmup streak survives to confirm. Emitting for
+		// HEALTHY secrets too (the old placement) pinned every replica
+		// in the ledger forever — its streak key never pruned and its
+		// DeleteLabelValues re-ran every sweep for a series that does
+		// not exist.
+		a.seenReplication.Emit(k, k.namespace, k.name, k.source)
 		if streak := a.replicationMismatch.Hit(replStreakKey(k)); streak < replicationDriftScans {
 			continue // first mismatch — the replicator may be mid-sync
 		}

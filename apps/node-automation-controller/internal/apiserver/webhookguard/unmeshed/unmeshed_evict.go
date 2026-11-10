@@ -89,7 +89,7 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 	slices.SortFunc(candidates, func(a, b corev1.Pod) int {
 		return strings.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
 	})
-	deleted, attempts := 0, 0
+	deleted, attempts, refused := 0, 0, 0
 	for i := range candidates {
 		p := &candidates[i]
 		if deleted >= unmeshedDeleteCap || attempts >= unmeshedDeleteAttempts {
@@ -123,6 +123,7 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 				// failure: the workload is already at its replica
 				// floor and killing this pod would finish the
 				// outage. Keep it, count no error, move on.
+				refused++
 				log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
 					"pod", p.Namespace+"/"+p.Name)
 				continue
@@ -133,6 +134,16 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 		}
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
 		deleted++
+	}
+	// Every attempt PDB-refused → the pass delivered no heal, so the
+	// up-front heal.Gate grant goes back (the same refund contract
+	// heal.EvictPodV applies per pod): a workload wedged behind a
+	// PodDisruptionBudget at its replica floor must not burn a
+	// fleet-wide budget token every sweep. A pass with even one
+	// landed eviction — or one real API failure, which counts as a
+	// spent grant like everywhere else — keeps it.
+	if attempts > 0 && refused == attempts {
+		heal.RefundGrant(now)
 	}
 	log.Info("unmeshed audit done", "unmeshed", unmeshed,
 		"candidates", len(candidates), "deleted", deleted)

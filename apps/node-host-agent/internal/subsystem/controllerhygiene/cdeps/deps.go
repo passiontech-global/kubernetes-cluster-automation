@@ -74,7 +74,7 @@ type Deps struct {
 	RVGap     prometheus.Gauge
 	KineConns prometheus.Gauge
 	// KineStuckConns counts kine's DB-port sockets wedged in
-	// CLOSE_WAIT/FIN_WAIT2 or retransmitting (W20-CP2) — the
+	// CLOSE_WAIT/FIN_WAIT2 or retransmitting (kine-orphaned-conn-watch) — the
 	// orphaned-connection half of the pool guard the conn count
 	// alone cannot see.
 	KineStuckConns prometheus.Gauge

@@ -1,4 +1,4 @@
-// trust_bundle_audit_test.go — coverage for the W19-NM2
+// trust_bundle_audit_test.go — coverage for the linkerd-trust-bundle-audit
 // issuer↔trust-roots chain verification: verifyLinkerdIssuerChain
 // unit cases plus the auditTrustAnchorSkew gauge wiring.
 package certdriftauditor

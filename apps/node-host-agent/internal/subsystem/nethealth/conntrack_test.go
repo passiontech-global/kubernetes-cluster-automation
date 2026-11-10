@@ -466,7 +466,7 @@ func TestPeerConntrackFlushDefaultsAndDedup(t *testing.T) {
 	}
 }
 
-// --- W21-G7: surgical UNREPLIED udp flush ---
+// --- conntrack-unreplied-udp-flush: surgical UNREPLIED udp flush ---
 
 // unrepliedFlushCmds is the exact argv pair flushUnrepliedUDPConntrack
 // must exec — :53 scoped first, then every unreplied UDP flow; the

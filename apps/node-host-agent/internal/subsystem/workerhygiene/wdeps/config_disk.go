@@ -46,7 +46,7 @@ type DiskConfig struct {
 	HostRunDir string
 	// HostShmDir is the host /dev/shm tmpfs as the agent sees it
 	// (/host/dev/shm in the DaemonSet) — the dev-shm guard statfs's
-	// it for the node_agent_dev_shm_used_ratio series (W19-K2: a
+	// it for the node_agent_dev_shm_used_ratio series (devshm-fill-guard: a
 	// full shm wedges every new IPC/shm_open cluster-wide while
 	// disk watermarks stay green).
 	HostShmDir string

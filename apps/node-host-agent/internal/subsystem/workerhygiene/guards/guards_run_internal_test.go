@@ -377,7 +377,7 @@ func TestSpegelRunStreakThenDelete(t *testing.T) {
 	}
 }
 
-// TestSpegelRunStaleSockDeleteUID exercises the W20-KR3 stale-socket
+// TestSpegelRunStaleSockDeleteUID exercises the spegel-stale-socket-guard stale-socket
 // remedy — the one grace-0 delete no other test reaches (the const
 // host socket path doesn't exist in tests). The StatFn seam points
 // the staleness read at a temp file freshly recreated AFTER pod

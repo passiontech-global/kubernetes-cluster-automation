@@ -235,6 +235,10 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 			continue
 		}
 		ns := series.Label("namespace")
+		if !s.census.namespaces[ns] {
+			continue // stale series from a namespace with no NATS
+			// StatefulSet — same guard the sibling branches apply
+		}
 		podName := series.Label("pod", "pod_name")
 		pod := s.census.resolvePod(ns, podName)
 		lvPod := ""

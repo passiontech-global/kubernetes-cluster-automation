@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -691,5 +693,36 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted while an autopilot plan is in flight")
+	}
+}
+
+// When every candidate eviction is PDB-refused (429), evictCandidates
+// calls heal.RefundGrant(now) so the unused grant is returned to the
+// fleet budget.
+func TestUnmeshedRemediationAllPDBRefusedRefundsBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	now := time.Now()
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				return true, nil, apierrors.NewTooManyRequests("pdb floor", 0)
+			}
+			return false, nil, nil
+		})
+	a := &Auditor{}
+	g := &guardstate.Guard{CS: cs, Dyn: wgDyn(), Now: func() time.Time { return now }}
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, wgDyn(), "after-pdb", now)
+	if !proceed || unverifiable {
+		t.Fatalf("Gate after all-PDB-refused unmeshed sweep = (%v,%v), want (true,false) — grant not refunded",
+			proceed, unverifiable)
 	}
 }

@@ -12,3 +12,6 @@ tasks:
     toolchains: 'system'
     inputs:
       - 'Dockerfile'
+      # hadolint is pinned in mise.toml — a toolchain bump must
+      # invalidate the lint cache.
+      - '/mise.toml'

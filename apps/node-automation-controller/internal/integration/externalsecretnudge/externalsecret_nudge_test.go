@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,6 +22,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -1190,5 +1192,32 @@ func TestExternalSecretNudgeMissingConditionNoDownClock(t *testing.T) {
 	}
 	if _, down := n.storeDownSince.Seen("ClusterSecretStore//css-young", time.Now()); !down {
 		t.Fatal("down clock did not start on a real Ready=False observation")
+	}
+}
+
+// When no Running connect pod exists, healConnectPod resolves the
+// candidate BEFORE AllowedVPersisted and returns without spending a
+// fleet budget token.
+func TestHealConnectPodNoCandidateSpendsNoBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	now := time.Now()
+	cs := kfake.NewSimpleClientset() // no connect pods
+	dyn := esNudgeDynFake(cssObj("store", "False"))
+	n := &externalSecretNudge{
+		queue:      "externalsecret-nudge",
+		cs:         cs,
+		dyn:        dyn,
+		storeReady: map[string]bool{},
+	}
+	n.storeDownSince.Seed("ClusterSecretStore//store", now.Add(-20*time.Minute))
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, dyn, "probe", now)
+	if !proceed || unverifiable {
+		t.Fatalf("healConnectPod with 0 connect pods spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

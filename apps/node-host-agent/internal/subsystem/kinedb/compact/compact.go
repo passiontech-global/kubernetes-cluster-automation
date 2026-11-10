@@ -401,7 +401,7 @@ func (g *Guard) emitGuard(res *Result) {
 			fmt.Sprintf("resource=%q", e.Resource), float64(e.Revs))
 		g.d.M.TopChurn.WithLabelValues(e.Resource).Set(float64(e.Revs))
 	}
-	// W24 hot-key twin: same window, full Kine keys — the SSA
+	// selfheal-alert-coverage hot-key twin: same window, full Kine keys — the SSA
 	// managedFields ping-pong names its victim object. Same
 	// Reset+repopulate contract: a key falling out of the top-5
 	// loses its series instead of pinning a stale value.

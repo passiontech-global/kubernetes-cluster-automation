@@ -54,27 +54,21 @@ jobs:
   binary:
     needs: release
     runs-on: ubuntu-latest
-    env:
-      # committed go.work is for local dev; release builds resolve deps per-module
-      GOWORK: off
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Install toolchain (go pinned in mise.toml)
-        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      - name: Fetch release binary
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build static binary
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # The release job reports the tag it just created via
-          # outputs — re-deriving it from `git tag --sort=-v:refname`
-          # could pick a STALE higher tag (another release racing
-          # ahead). The git lookup stays only as a fallback.
+          # outputs — re-deriving it could pick a STALE higher tag
+          # (another release racing ahead). The git lookup stays
+          # only as a fallback.
           tag="${{ needs.release.outputs.rel_tag }}"
           if [ -z "$tag" ]; then
             # versionsort.suffix=- keeps v0.1.0 ranked above v0.1.0-rc.*
@@ -83,15 +77,26 @@ jobs:
           fi
           test -n "$tag"
           echo "REL_TAG=$tag" >>"$GITHUB_ENV"
-          cd apps/node-host-agent
-          # Same flags as moon's build task (moon.yml) but pinned to
-          # linux/amd64 explicitly — the static release artifact.
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-            -ldflags "-s -w -X main.version=${tag##*/}" \
-            -o node-host-agent-linux-amd64 ./cmd/agent
-          file node-host-agent-linux-amd64
-          ./node-host-agent-linux-amd64 --version
-          sha256sum node-host-agent-linux-amd64 > node-host-agent-linux-amd64.sha256
+          # release-app.yml's moon build already produced the
+          # identical artifact — same CGO_ENABLED=0 -trimpath flags,
+          # same -X main.version ldflag value — and attached it to the
+          # release as node-host-agent-linux-x86_64 inside the dist
+          # bundle. Downloading it replaces a third full compile on a
+          # fresh runner.
+          mkdir -p apps/node-host-agent/dist
+          gh release download "$tag" \
+            --pattern 'node-host-agent-linux-x86_64' \
+            --pattern 'SHA256SUMS.txt' \
+            --dir apps/node-host-agent/dist --clobber
+          cd apps/node-host-agent/dist
+          file node-host-agent-linux-x86_64
+          ./node-host-agent-linux-x86_64 --version
+          mv node-host-agent-linux-x86_64 node-host-agent-linux-amd64
+          # SHA256SUMS.txt was summed over the dist filenames — emit
+          # the amd64-named checksum the attach step uploads.
+          awk '$2 == "node-host-agent-linux-x86_64" {
+            print $1 "  node-host-agent-linux-amd64"
+          }' SHA256SUMS.txt > node-host-agent-linux-amd64.sha256
           cat node-host-agent-linux-amd64.sha256
 
       - name: Attach to GitHub release

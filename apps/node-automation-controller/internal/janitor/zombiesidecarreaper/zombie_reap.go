@@ -11,6 +11,7 @@ package zombiesidecarreaper
 import (
 	"context"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -43,12 +44,16 @@ func allZeroExit(p *corev1.Pod) bool {
 // jobAllowsReap gates the forced-delete paths (shutdown unreachable,
 // still stuck after the graceful call): when every app container
 // exited 0, a still-Running pod may only be deleted once the parent
-// Job already recorded the success — job.Status.Succeeded >= 1.
-// Deleting earlier makes the job-controller recreate the pod and
-// re-run the Job (BUG-C1). A pod with any non-zero app exit needs no
-// such gate: a re-run after a failed exit is the Job's own retry
-// semantics, not a double-success. A missing Job object means no
-// controller can recreate the pod — safe to reap; any other Get
+// Job already recorded the success — JobComplete=True, or
+// Status.Succeeded covering spec.completions. Deleting earlier makes
+// the job-controller recreate the pod and re-run the Job (BUG-C1);
+// on a parallel Job (completions>1) the FIRST finished pod alone
+// must not unlock the reap of its still-Running siblings — the Job
+// controller would count each deleted pod as lost work and spawn
+// replacements that re-run it. A pod with any non-zero app exit
+// needs no such gate: a re-run after a failed exit is the Job's own
+// retry semantics, not a double-success. A missing Job object means
+// no controller can recreate the pod — safe to reap; any other Get
 // failure is "cannot verify" and fails closed.
 //
 // sidecar-shutdown-fallback exception: a Job with spec.backoffLimit==0 spawns NO
@@ -83,10 +88,10 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 		log.Info("WARN: job lookup failed — keeping still-Running exit-0 pod (fail closed)",
 			"pod", p.Namespace+"/"+p.Name, "job", jobName, "error", err)
 		return false
-	case job.Status.Succeeded >= 1:
+	case jobComplete(job):
 		return true
 	case shutdownAttempted && job.Spec.BackoffLimit != nil &&
-		*job.Spec.BackoffLimit == 0:
+		*job.Spec.BackoffLimit == 0 && singleCompletionJob(job):
 		// backoffLimit==0: no replacement pod can spawn, so the
 		// BUG-C1 re-run hazard is impossible — reap the zombie
 		// even though the Job never counted the exit-0 completion.
@@ -99,4 +104,36 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 			"succeeded", job.Status.Succeeded)
 		return false
 	}
+}
+
+// jobComplete reports whether the Job has finished ALL of its work:
+// either the JobComplete condition is True or the succeeded count
+// already covers spec.completions (unset means 1). Status.Succeeded
+// >= 1 alone is NOT enough — a parallel Job keeps scheduling pods
+// until every completion is counted, so reaping a still-Running
+// sibling after the first success would make the job-controller
+// spawn a replacement and re-run work.
+func jobComplete(job *batchv1.Job) bool {
+	want := int32(1)
+	if job.Spec.Completions != nil {
+		want = *job.Spec.Completions
+	}
+	if job.Status.Succeeded >= want {
+		return true
+	}
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// singleCompletionJob reports whether the Job schedules exactly one
+// pod (spec.completions unset or 1) — the shape the backoffLimit==0
+// exemption was designed for. On a parallel Job a deleted pod counts
+// as a failure against backoffLimit, so reaping a zombie sibling
+// would fail the whole Job rather than merely skip a respawn.
+func singleCompletionJob(job *batchv1.Job) bool {
+	return job.Spec.Completions == nil || *job.Spec.Completions <= 1
 }

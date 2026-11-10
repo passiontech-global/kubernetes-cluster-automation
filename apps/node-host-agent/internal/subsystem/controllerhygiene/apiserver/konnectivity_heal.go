@@ -179,7 +179,16 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 	if client == nil {
 		return 0
 	}
-	endpoint := strings.TrimPrefix(c.d.Cfg.Hub.SelfAPI, "https://")
+	// SelfAPI is the advertised apiserver address and stays EMPTY on
+	// single-control-plane hubs that never set API_SELF — fall back
+	// to SelfEndpoint (always populated, loopback probe target) or
+	// the URL collapses to "https:///api/v1/nodes" and the heal is
+	// suppressed forever.
+	endpoint := c.d.Cfg.Hub.SelfAPI
+	if endpoint == "" {
+		endpoint = c.d.Cfg.Hub.SelfEndpoint
+	}
+	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
 	qctx, cancel := context.WithTimeout(ctx, c.d.Cfg.QueryTimeout)
 	defer cancel()

@@ -100,6 +100,23 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		return
 	}
 
+	// Resolve the heal target BEFORE the gated preamble: when the
+	// trigger is a degraded connect-sync, delete the pod CARRYING
+	// the failing container — the oldest pod may be the healthy
+	// replica. Only store-outage/storm triggers (which name no pod)
+	// fall back to the oldest running pod. A trigger with NO running
+	// connect pod behind it can never deliver — discovering that
+	// after the budget grant burned a fleet token every sweep for
+	// the whole outage.
+	pod := degradedPod
+	if pod == nil {
+		pod = n.oldestConnectPod(ctx)
+	}
+	if pod == nil {
+		log.Info("connect heal: no running onepassword-connect pod found")
+		return
+	}
+
 	// Same fail-closed gate as every pod kill in this module, via
 	// the shared persisted-cooldown preamble: nil obj + empty
 	// annoKey (this heal stamps no annotation on any object — the
@@ -118,19 +135,6 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		return
 	}
 
-	// The heal target: when the trigger is a degraded connect-sync,
-	// delete the pod CARRYING the failing container — the oldest
-	// pod may be the healthy replica. Only store-outage/storm
-	// triggers (which name no pod) fall back to the oldest running
-	// pod.
-	pod := degradedPod
-	if pod == nil {
-		pod = n.oldestConnectPod(ctx)
-	}
-	if pod == nil {
-		log.Info("connect heal: no running onepassword-connect pod found")
-		return
-	}
 	if degradedPod != nil {
 		log.Info("ACTION: deleting degraded onepassword-connect pod — "+
 			"connect-sync sustained degraded", "pod",

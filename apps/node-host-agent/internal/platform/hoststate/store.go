@@ -278,6 +278,35 @@ func (s *Store) exitLocked(name string) bool {
 	return true
 }
 
+// seedOwnersLocked returns the post-restart owner set for a shared
+// latch whose file exists on disk but whose RAM registry has no
+// recorded holds: every DECLARED owner (LatchDef.Owners),
+// intersected with the producers RegisterActiveOwner declared live
+// on this node — a worker-only node must not inherit phantom
+// controllerhygiene holds nothing here will ever release. nil when
+// the latch declares no owners or no file exists — nothing to
+// inherit. EnterFrom and ExitFrom share this seed: whichever side
+// observes the latch first after a restart reconstructs the same
+// holder set instead of each inventing its own.
+func (s *Store) seedOwnersLocked(name string) map[string]bool {
+	declared := latchdefs.SharedOwners(name)
+	if declared == nil || !s.Exists(name) {
+		return nil
+	}
+	set := make(map[string]bool, len(declared))
+	for _, o := range declared {
+		set[o] = true
+	}
+	if len(s.shared.active) > 0 {
+		for o := range set {
+			if !s.shared.active[o] {
+				delete(set, o)
+			}
+		}
+	}
+	return set
+}
+
 // EnterFrom is Enter for a latch shared by several producers: the
 // caller registers ITS owner id and the latch file is entered
 // (create + STATE-ENTER only while absent, mtime refresh while
@@ -289,6 +318,14 @@ func (s *Store) exitLocked(name string) bool {
 // its hold every cycle, so the dispatch order inside a Cycle
 // (load-bearing, checks.Group) repopulates it before any ExitFrom
 // can observe a stale empty set.
+//
+// Post-restart: when the file already exists but this process has
+// no recorded holds (first EnterFrom after a restart), the declared
+// owners are seeded in FIRST — the same reconstruction ExitFrom
+// applies — so this owner's hold JOINS the surviving producers'
+// holds instead of replacing them. Without the seed a lone
+// EnterFrom would register {owner} only, and its ExitFrom one cycle
+// later would delete a latch another subsystem still holds.
 func (s *Store) EnterFrom(name, owner, extra string) {
 	s.shared.mu.Lock()
 	if s.shared.owners == nil {
@@ -296,7 +333,10 @@ func (s *Store) EnterFrom(name, owner, extra string) {
 	}
 	set := s.shared.owners[name]
 	if set == nil {
-		set = map[string]bool{}
+		set = s.seedOwnersLocked(name)
+		if set == nil {
+			set = map[string]bool{}
+		}
 		s.shared.owners[name] = set
 	}
 	set[owner] = true
@@ -340,23 +380,12 @@ func (s *Store) ExitFrom(name, owner string, cleanup func()) {
 		if !held {
 			delete(s.shared.owners, name)
 		}
-	} else if declared := latchdefs.SharedOwners(name); declared != nil &&
-		s.Exists(name) {
-		set := make(map[string]bool, len(declared))
-		for _, o := range declared {
-			set[o] = true
-		}
-		// Post-restart seed: when this node has registered which
-		// producers actually run here, intersect — a worker-only
-		// node must not seed a phantom controllerhygiene hold that
-		// nothing on the node will ever release.
-		if len(s.shared.active) > 0 {
-			for o := range set {
-				if !s.shared.active[o] {
-					delete(set, o)
-				}
-			}
-		}
+	} else if set := s.seedOwnersLocked(name); set != nil {
+		// Post-restart seed: the latch file exists with no recorded
+		// holds — reconstruct the declared owners (already
+		// intersected with this node's active producers) and drop
+		// only this owner, so a foreign latch never dies to a check
+		// that never held it.
 		delete(set, owner)
 		held = len(set) > 0
 		if held {

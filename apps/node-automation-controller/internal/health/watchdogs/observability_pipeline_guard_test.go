@@ -78,7 +78,7 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 		}
 	})
 
-	// W21-G5 — the Prometheus→Alertmanager leg: dropped notifications
+	// observability-pipeline-guard — the Prometheus→Alertmanager leg: dropped notifications
 	// and a zero discovered-alertmanager set both degrade even while
 	// the Watchdog heartbeat and every other counter stay quiet.
 	t.Run("prometheus→alertmanager delivery signals degrade", func(t *testing.T) {

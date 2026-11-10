@@ -122,12 +122,22 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 	nsClaims := census.claims()
 	for i := range pvcs {
 		p := &pvcs[i]
-		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
+		// va-stuck-terminating: a PVC wedged past the threshold whose ONLY finalizer is
+		// kubernetes.io/pvc-protection is stuck waiting on the protection
+		// controller to prove no pod uses it — when zero pods in the
+		// namespace still reference it, the finalizer is stripped. The
+		// per-namespace reference scan rides the run-shared census — the
+		// orphan-PVC pass runs the identical pod scan in the same run.
+		// The unstick runs BEFORE mark: a PVC whose finalizer just came
+		// off is draining normally — emitting StuckTerminatingResources=1
+		// for it would hold a false warning for the rest of the hour.
 		if p.DeletionTimestamp != nil &&
 			now.Sub(p.DeletionTimestamp.Time) > stuckTerminatingMaxAge &&
-			len(p.Finalizers) == 1 && p.Finalizers[0] == pvcProtectionFinalizer {
-			j.unstickPVCProtection(ctx, p, nsClaims)
+			len(p.Finalizers) == 1 && p.Finalizers[0] == pvcProtectionFinalizer &&
+			j.unstickPVCProtection(ctx, p, nsClaims) {
+			continue
 		}
+		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
 	}
 	pvcs = nil
 	// VolumeAttachments: the volumeattachment-cleaner refuses to
@@ -206,8 +216,11 @@ func (c *pvcCensus) claims() map[string]pvcUseProbe {
 // whoever fills the census cache — later cache hits (and the audit's
 // other PVCs in that namespace) log the fail-closed verdict without
 // re-counting the same broken list.
+//
+// Returns true only when the finalizer patch landed — the caller
+// uses it to skip the stuck gauge for a PVC that is now draining.
 func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
-	pvc *corev1.PersistentVolumeClaim, cache map[string]pvcUseProbe) {
+	pvc *corev1.PersistentVolumeClaim, cache map[string]pvcUseProbe) bool {
 	log := logf.FromContext(ctx)
 	pr, ok := cache[pvc.Namespace]
 	if !ok {
@@ -221,10 +234,10 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	if pr.err != nil {
 		log.Error(pr.err, "pod list failed — keeping pvc-protection finalizer (fail closed)",
 			"pvc", pvc.Namespace+"/"+pvc.Name, "cached", ok)
-		return
+		return false
 	}
 	if pr.claims[pvc.Name] {
-		return // still referenced — the finalizer is doing its job
+		return false // still referenced — the finalizer is doing its job
 	}
 	// Fresh re-proof right before the destructive patch.
 	freshClaims, err := j.claimedPVCNames(ctx, pvc.Namespace)
@@ -232,12 +245,12 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 		metrics.IncError(j.queue)
 		log.Error(err, "fresh pod re-query failed — keeping pvc-protection finalizer (fail closed)",
 			"pvc", pvc.Namespace+"/"+pvc.Name)
-		return
+		return false
 	}
 	if freshClaims[pvc.Name] {
 		log.Info("SKIP: claim mounted since the audit scan — finalizer stays",
 			"pvc", pvc.Namespace+"/"+pvc.Name)
-		return
+		return false
 	}
 	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
 		"pvc", pvc.Namespace+"/"+pvc.Name,
@@ -250,14 +263,16 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	})
 	if err != nil {
 		metrics.IncError(j.queue)
-		return
+		return false
 	}
 	if _, err := j.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx,
 		pvc.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 		metrics.IncError(j.queue)
 		log.Error(err, "pvc-protection finalizer strip failed",
 			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return false
 	}
+	return true
 }
 
 // nsFinalizerNames renders .spec.finalizers — the list that actually

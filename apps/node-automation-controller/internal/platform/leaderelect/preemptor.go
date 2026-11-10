@@ -1,4 +1,4 @@
-// preemptor.go — the fast dead-leader lease preemptor (W24): a
+// preemptor.go — the fast dead-leader lease preemptor (selfheal-alert-coverage): a
 // NeedLeaderElection=false sweep that runs on EVERY replica —
 // including standbys — and shortens the controller's own
 // leader-election LeaseDuration to 1s when the current holder is

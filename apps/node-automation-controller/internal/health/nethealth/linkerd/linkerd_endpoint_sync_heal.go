@@ -69,6 +69,73 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		return
 	}
 
+	// Pre-flight (read-only, snapshot-cached): prove at least one
+	// heal action can still deliver BEFORE the gated preamble spends
+	// a fleet budget grant. With no stale slices the only remaining
+	// action is the linkerd-destination bounce — resolve its target,
+	// the Ready-sibling floor and the shared bounce cooldown up
+	// front, so a service that can only ever bounce-skip (no
+	// destination pod, no Ready sibling, inside the bounce cooldown)
+	// never touches the mutex verdict or the budget. The pods list
+	// used to run AFTER the slice deletes; moving it ahead also
+	// means a list failure defers the whole heal cleanly instead of
+	// leaving delivered slice deletes unstamped.
+	pods, err := p.PodsIn(ctx, kube.LinkerdNS)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list linkerd pods failed — heal deferred",
+			"error", err)
+		return
+	}
+	// The pod pick stays bespoke — the component matcher is not a
+	// plain name-prefix list (exact name + Deployment prefix +
+	// control-plane-component label, any phase), which
+	// heal.OldestRunningPod's Running-only prefix scan cannot express.
+	var target *corev1.Pod
+	for i := range pods {
+		pod := pods[i]
+		if pod.DeletionTimestamp != nil ||
+			!probefw.LinkerdPodMatchesComponent(pod, kube.LinkerdDestinationName) {
+			continue
+		}
+		if target == nil ||
+			pod.CreationTimestamp.Before(&target.CreationTimestamp) {
+			target = pod
+		}
+	}
+	// The shared bounce cooldown keys the DESTINATION component, not
+	// the service: two desynced services must not bounce the same
+	// singleton linkerd-destination Deployment back-to-back inside
+	// one sweep (the ladder tier scales it with the per-service
+	// cooldown).
+	ck := "linkerd/linkerd-destination"
+	bounceOK := false
+	if target != nil {
+		// A bounce that outlives the workload is a blackhole, not a
+		// heal — the destination must keep a genuinely Ready sibling
+		// (ReadySiblings discounts the target itself when it still
+		// reports Ready).
+		readyByOwner := probefw.ReadyByOwner(ptrDerefPods(pods))
+		switch siblings := probefw.ReadySiblings(readyByOwner, target); {
+		case siblings < 1:
+			log.Info("skip linkerd-destination bounce: no Ready sibling replica — bounce would blackhole the endpoint table",
+				"service", svcKey)
+		case p.Heals.CooledDown(ck, linkerdDestHealEscalation[fails], now):
+			log.Info("skip linkerd-destination bounce: inside bounce cooldown",
+				"service", svcKey)
+		default:
+			bounceOK = true
+		}
+	}
+	if len(stale) == 0 && !bounceOK {
+		// Nothing this call can deliver — no slice deletes pending
+		// and the bounce is impossible or suppressed. Returning here
+		// keeps the sweep from spending a fleet budget grant (and a
+		// mutex evaluation) on a heal that cannot happen; the next
+		// sweep re-derives the same verdict from fresh state.
+		return
+	}
+
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 		&p.linkerdDesyncHealed, svc, linkerdDestHealAnno, svcKey,
 		linkerdDestHealEscalation[fails], now)
@@ -100,75 +167,17 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 
-	pods, err := p.PodsIn(ctx, kube.LinkerdNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list linkerd pods failed — heal deferred",
-			"error", err)
-		if healed {
-			// Slice deletes already landed — stamp them now or an
-			// unstamped sweep re-deletes the slices the
-			// endpointslice-controller just rebuilt.
-			p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
-		}
-		return
-	}
-	// The pod pick stays bespoke — the component matcher is not a
-	// plain name-prefix list (exact name + Deployment prefix +
-	// control-plane-component label, any phase), which
-	// heal.OldestRunningPod's Running-only prefix scan cannot express.
-	var target *corev1.Pod
-	for i := range pods {
-		pod := pods[i]
-		if pod.DeletionTimestamp != nil ||
-			!probefw.LinkerdPodMatchesComponent(pod, kube.LinkerdDestinationName) {
-			continue
-		}
-		if target == nil ||
-			pod.CreationTimestamp.Before(&target.CreationTimestamp) {
-			target = pod
-		}
-	}
-	if target != nil {
-		// A bounce that outlives the workload is a blackhole, not a
-		// heal — the destination must keep a genuinely Ready sibling
-		// (ReadySiblings discounts the target itself when it still
-		// reports Ready).
-		readyByOwner := probefw.ReadyByOwner(ptrDerefPods(pods))
-		if probefw.ReadySiblings(readyByOwner, target) < 1 {
-			log.Info("skip linkerd-destination bounce: no Ready sibling replica — bounce would blackhole the endpoint table",
-				"service", svcKey)
-			if healed {
-				// Slice deletes already landed — stamp them now or an
-				// unstamped sweep re-deletes the slices the
-				// endpointslice-controller just rebuilt.
-				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
-			}
-			return
-		}
-		// The shared bounce cooldown keys the DESTINATION component,
-		// not the service: two desynced services must not bounce the
-		// same singleton linkerd-destination Deployment back-to-back
-		// inside one sweep (the ladder tier scales it with the
-		// per-service cooldown). Cooldown-ONLY — the budget token for
-		// this heal was granted up front by HealAllowedPersisted
-		// above, so a second HealAllowed here would double-spend for
-		// one delete (and a fresh mutex evaluation is pointless: the
-		// preamble already cleared it moments ago).
-		ck := "linkerd/linkerd-destination"
-		if p.Heals.CooledDown(ck, linkerdDestHealEscalation[fails], now) {
-			log.Info("skip linkerd-destination bounce: inside bounce cooldown",
-				"service", svcKey)
-			if healed {
-				p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
-			}
-			return
-		}
-		// The svcKey stamp is NOT this ledger's — svcKey stamps once at
-		// the end when ANY heal action (slice or pod delete) landed;
-		// the shared key stamps here so the NEXT service's heal sees
-		// the destination bounce even though this sweep's stamp
-		// landed first.
+	if target != nil && bounceOK {
+		// Cooldown-ONLY on top of the preamble's grant: the budget
+		// token for this heal was granted up front by
+		// HealAllowedPersisted above, so a second HealAllowed here
+		// would double-spend for one delete (and a fresh mutex
+		// evaluation is pointless: the preamble already cleared it
+		// moments ago). The svcKey stamp is NOT this ledger's —
+		// svcKey stamps once at the end when ANY heal action (slice
+		// or pod delete) landed; the shared key stamps here so the
+		// NEXT service's heal sees the destination bounce even
+		// though this sweep's stamp landed first.
 		if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, target, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "linkerd-destination delete failed",

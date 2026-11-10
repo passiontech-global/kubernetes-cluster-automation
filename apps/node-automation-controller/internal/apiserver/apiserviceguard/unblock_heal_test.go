@@ -9,15 +9,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -204,5 +207,32 @@ func TestDeleteBackingPodsCap(t *testing.T) {
 		if !asgPodExists(t, cs, "kube-system", name) {
 			t.Fatalf("pod %s evicted past the per-APIService cap", name)
 		}
+	}
+}
+
+// A cooled-down APIService skips up front in healCandidate without
+// resolving targets or consuming a fleet budget token.
+func TestHealCandidateCooledDownSkipsBeforeBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	now := time.Now()
+	cs := fake.NewSimpleClientset()
+	g := asgGuard(cs, asgDynFake())
+	u := &unblockHealer{}
+	u.unblocked.Stamp("v1beta1.metrics.k8s.io", now.Add(-time.Minute))
+
+	item := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "v1beta1.metrics.k8s.io"},
+	}}
+	if u.healCandidate(ctx, &apiServiceSnapshot{g: g}, item, "metrics.k8s.io",
+		&u.unblocked, apiServiceUnblockCooldown, now, nil) {
+		t.Fatal("cooled-down healCandidate returned true")
+	}
+
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, asgDynFake(), "probe", now)
+	if !proceed || unverifiable {
+		t.Fatalf("cooled-down healCandidate spent a budget token: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

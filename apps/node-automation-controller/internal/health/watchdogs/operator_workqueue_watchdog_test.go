@@ -61,7 +61,7 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		"tekton-pipelines-controller", "shipwright-operator",
 		// rollout-scale-flap additions.
 		"argo-rollouts-controller", "cloudflare-tunnel-gateway-controller",
-		// W20-CP4 operator-watchdog additions.
+		// cp-observability-metrics operator-watchdog additions.
 		"cloudnative-pg", "velero", "fence-agents-remediation-operator",
 		"liqo-controller-manager",
 	} {

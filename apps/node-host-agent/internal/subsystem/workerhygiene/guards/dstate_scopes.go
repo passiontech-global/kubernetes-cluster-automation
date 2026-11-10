@@ -278,12 +278,12 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 
 // ScopesCheck is the systemd-scopes failed-scope reaper as a Check; it owns
 // the 30m sweep stamp (ex-Hygiene.lastScopeScan) and the consecutive-sweep
-// streak for units wedged in `deactivating` (W20-KR1).
+// streak for units wedged in `deactivating` (deactivating-unit-detector).
 type ScopesCheck struct {
 	d           *wdeps.Deps
 	lastScan    time.Time
 	deactStreak int
-	// prevDeact is the W21-G3 per-unit deactivating ledger — unit
+	// prevDeact is the deactivating-scope-reaper per-unit deactivating ledger — unit
 	// name → was deactivating at the previous sweep. A unit wedged
 	// across ≥2 sweeps whose container id is absent from every
 	// Running pod's container set is an orphaned teardown the
@@ -341,12 +341,12 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 }
 
-// checkDeactivating is the W20-KR1 deactivating wedge detector:
+// checkDeactivating is the deactivating-unit-detector deactivating wedge detector:
 // cri-containerd-*.scope units stuck in `deactivating` across
 // consecutive sweeps mean container teardown is wedged inside
 // systemd PID 1 (stop-sigterm/sigkill never completing) —
 // reset-failed cannot clear these. Units still owned by a Running
-// pod stay diagnose-only; orphaned ones (W21-G3) are force-stopped
+// pod stay diagnose-only; orphaned ones (deactivating-scope-reaper) are force-stopped
 // by reapDeactivating once the streak proves the wedge is real.
 // The streak must survive ≥2 sweeps (~1h) before alerting so a
 // normal stop-in-progress transient never pages. Runs even when no
@@ -388,7 +388,7 @@ func (c *ScopesCheck) checkDeactivating(ctx context.Context, e *wdeps.CycleEnv) 
 	// a second "ok" from this helper would double-count every scan.
 }
 
-// reapDeactivating is the W21-G3 orphaned-teardown reaper: a
+// reapDeactivating is the deactivating-scope-reaper orphaned-teardown reaper: a
 // cri-containerd-*.scope wedged in `deactivating` across ≥2
 // consecutive sweeps (prevDeact[unit] && deactStreak ≥ 2) whose
 // container id is absent from every Running pod's container set is
@@ -402,7 +402,12 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 	if c.deactStreak < 2 || len(c.prevDeact) == 0 {
 		return
 	}
-	live := runningContainerIDs(e)
+	live, verified := liveScopeIDs(e)
+	if !verified {
+		c.d.State.AppendLog(
+			"suspect: systemd-scopes deactivating reap skipped — pod/task ground truth unavailable")
+		return
+	}
 	killed := 0
 	for _, unit := range units {
 		if killed >= 5 {
@@ -433,7 +438,7 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 	}
 }
 
-// checkAbandoned is the W24 abandoned-scope reaper: systemd marks a
+// checkAbandoned is the selfheal-alert-coverage abandoned-scope reaper: systemd marks a
 // scope `abandoned` when its processes all exited while containerd
 // was mid-restart — the unit is already dead but stays registered
 // in PID 1's unit table, and on high-churn nodes the pile-up slows
@@ -462,7 +467,12 @@ func (c *ScopesCheck) checkAbandoned(ctx context.Context, e *wdeps.CycleEnv) {
 	if len(units) == 0 {
 		return
 	}
-	live := runningContainerIDs(e)
+	live, verified := liveScopeIDs(e)
+	if !verified {
+		c.d.State.AppendLog(
+			"suspect: systemd-scopes abandoned reap skipped — pod/task ground truth unavailable")
+		return
+	}
 	stopped := 0
 	for i, unit := range units {
 		if stopped >= 10 {
@@ -509,6 +519,46 @@ func scopeUnitNames(out string) []string {
 func scopeContainerID(unit string) string {
 	return strings.TrimSuffix(
 		strings.TrimPrefix(unit, "cri-containerd-"), ".scope")
+}
+
+// liveScopeIDs builds the "still owned" id set the scope reapers
+// match against, and reports whether that set is VERIFIABLE. The
+// pod-status half alone is not enough on its own:
+//
+//   - !e.APIOK means the pod list is absent/stale — every scope
+//     would read as orphaned and a live container's teardown would
+//     be SIGKILLed (the mass-kill shape this guard exists to
+//     prevent). Fail closed.
+//   - runningContainerIDs only sees CONTAINER statuses; the pod
+//     sandbox (pause) container gets its own cri-containerd-*.scope
+//     but appears in no ContainerStatuses list. The containerd task
+//     map IS the node-side ground truth for those ids — its dir
+//     names are the container/sandbox ids scope units carry, and it
+//     does not depend on API reachability. An incomplete task map
+//     (root unreadable) leaves sandbox ownership unverifiable →
+//     fail closed as well.
+//
+// TasksOnce == nil only happens on hand-built CycleEnvs (unit
+// tests); production always wires the lazy once-per-cycle map.
+func liveScopeIDs(e *wdeps.CycleEnv) ([]string, bool) {
+	if !e.APIOK {
+		return nil, false
+	}
+	ids := runningContainerIDs(e)
+	if e.TasksOnce != nil {
+		tasks, complete := e.TasksOnce()
+		if !complete {
+			return nil, false
+		}
+		for _, list := range tasks {
+			for _, t := range list {
+				if t.Live && t.ID != "" {
+					ids = append(ids, t.ID)
+				}
+			}
+		}
+	}
+	return ids, true
 }
 
 // runningContainerIDs collects the containerd ids of every

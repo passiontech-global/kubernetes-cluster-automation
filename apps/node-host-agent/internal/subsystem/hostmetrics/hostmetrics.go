@@ -201,7 +201,7 @@ func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg}
 	c.seen.m = map[string]time.Time{}
-	c.fs.inflight = map[string]time.Time{}
+	c.fs.inflight = map[string]*fsFlight{}
 	c.fs.stalledLogged = map[string]bool{}
 	c.state = cfg.Store(logger)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))

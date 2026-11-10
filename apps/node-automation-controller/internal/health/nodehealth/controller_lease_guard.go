@@ -211,69 +211,80 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	liveLeases := map[string]bool{}
-	for _, ns := range leaseGuardNamespaces {
-		leases, err := p.CS.CoordinationV1().Leases(ns).
-			List(ctx, metav1.ListOptions{})
-		if err != nil {
-			rep.InfraErr(fmt.Errorf("list leases in %s: %w", ns, err))
+	// One memoized cluster LIST per sweep replaces the per-namespace
+	// lease LISTs — the census is grouped client-side below. A list
+	// failure leaves EVERY guarded namespace unverifiable, so all of
+	// them carry forward rather than silently passing.
+	allLeases, err := p.AllLeases(ctx)
+	if err != nil {
+		rep.InfraErr(fmt.Errorf("list leases: %w", err))
+		for _, ns := range leaseGuardNamespaces {
 			p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
-			continue
 		}
-		// podsNSFailed gates the per-namespace pods-list error
-		// reporting: every stale lease of the namespace shares the
-		// one memoized list (and its error), so the InfraErr and
-		// the carry-forward fire ONCE per namespace, not once per
-		// lease that never got its pods evaluated.
-		podsNSFailed := false
-		for i := range leases.Items {
-			lease := &leases.Items[i]
-			key := ns + "/" + lease.Name
-			liveLeases[key] = true
-			if p.leaseFlapping(key, lease, now) {
-				p.emitUnhealthy(&rep, ns, lease.Name, leaseReasonFlapping)
-				rep.Find(key + "(" + leaseReasonFlapping + ")")
-			}
-			// stateful-split-brain — the tighter early-warning under the flap
-			// threshold: >=4 transitions inside 10m is election
-			// churn the 15m window hasn't proven yet.
-			if p.leaseThrashing(key, now) {
-				thrashRep.Flag(controllerLeaseThrashingGauge, key,
-					[]string{ns, lease.Name})
-				rep.Find(key + "(thrashing)")
-			}
-			if !leaseStaleWindow(lease, now) {
-				continue
-			}
-			pods, err := podsInNS(ns)
-			if err != nil {
-				if !podsNSFailed {
-					podsNSFailed = true
-					rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
-					p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
+	} else {
+		leasesByNS := map[string][]coordinationv1.Lease{}
+		for i := range allLeases {
+			l := allLeases[i]
+			leasesByNS[l.Namespace] = append(leasesByNS[l.Namespace], l)
+		}
+		for _, ns := range leaseGuardNamespaces {
+			leases := leasesByNS[ns]
+			// podsNSFailed gates the per-namespace pods-list error
+			// reporting: every stale lease of the namespace shares the
+			// one memoized list (and its error), so the InfraErr and
+			// the carry-forward fire ONCE per namespace, not once per
+			// lease that never got its pods evaluated.
+			podsNSFailed := false
+			for i := range leases {
+				lease := &leases[i]
+				key := ns + "/" + lease.Name
+				liveLeases[key] = true
+				if p.leaseFlapping(key, lease, now) {
+					p.emitUnhealthy(&rep, ns, lease.Name, leaseReasonFlapping)
+					rep.Find(key + "(" + leaseReasonFlapping + ")")
 				}
-				continue
+				// stateful-split-brain — the tighter early-warning under the flap
+				// threshold: >=4 transitions inside 10m is election
+				// churn the 15m window hasn't proven yet.
+				if p.leaseThrashing(key, now) {
+					thrashRep.Flag(controllerLeaseThrashingGauge, key,
+						[]string{ns, lease.Name})
+					rep.Find(key + "(thrashing)")
+				}
+				if !leaseStaleWindow(lease, now) {
+					continue
+				}
+				pods, err := podsInNS(ns)
+				if err != nil {
+					if !podsNSFailed {
+						podsNSFailed = true
+						rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
+						p.carryNamespace(&rep, &thrashRep, liveLeases, ns)
+					}
+					continue
+				}
+				targets, ambiguous := controllerRunningPods(lease, pods)
+				if len(targets) == 0 {
+					// Holder gone AND no sibling under the same
+					// controller — a dead operator, not a wedged
+					// elector (pod-status checks own that class).
+					continue
+				}
+				p.emitUnhealthy(&rep, ns, lease.Name,
+					leaseReasonExpiredRunningPods)
+				rep.Find(key + "(" + leaseReasonExpiredRunningPods + ")")
+				if ambiguous {
+					// The "<lease>-*" fallback matched pods from more
+					// than one controller — the oldest pod is not
+					// provably the wedged elector's, so no heal this
+					// cycle (a healthy component must not die on a
+					// name-prefix guess).
+					log.Info("skip controller lease heal: fallback pod match spans multiple controllers",
+						"lease", key)
+					continue
+				}
+				p.healStaleLeaseController(ctx, log, lease, targets, now)
 			}
-			targets, ambiguous := controllerRunningPods(lease, pods)
-			if len(targets) == 0 {
-				// Holder gone AND no sibling under the same
-				// controller — a dead operator, not a wedged
-				// elector (pod-status checks own that class).
-				continue
-			}
-			p.emitUnhealthy(&rep, ns, lease.Name,
-				leaseReasonExpiredRunningPods)
-			rep.Find(key + "(" + leaseReasonExpiredRunningPods + ")")
-			if ambiguous {
-				// The "<lease>-*" fallback matched pods from more
-				// than one controller — the oldest pod is not
-				// provably the wedged elector's, so no heal this
-				// cycle (a healthy component must not die on a
-				// name-prefix guess).
-				log.Info("skip controller lease heal: fallback pod match spans multiple controllers",
-					"lease", key)
-				continue
-			}
-			p.healStaleLeaseController(ctx, log, lease, targets, now)
 		}
 	}
 	p.pruneTransitions(liveLeases)
@@ -382,14 +393,13 @@ func leaseStaleWindow(lease *coordinationv1.Lease, now time.Time) bool {
 // controllerRunningPods returns the Running, non-terminating pods in
 // pods attributable to the lease's controller: pods the holderIdentity
 // names directly (client-go's "<pod>_<uuid>", kept verbatim too for
-// electors that don't suffix), pods sharing the controller owner UID
-// of a resolved holder pod, and — the fallback for a holder pod
-// already gone — pods named "<lease name>-*". The second return
-// reports the fallback match set spanning more than one distinct
-// controller owner (ownerReferences kind/name groups): the name-shape
-// guess then has no positive target — an expired cert-manager lease
-// also matches cert-manager-cainjector-*/cert-manager-webhook-*
-// replicas — and the caller must skip the heal this cycle.
+// electors that don't suffix) and pods sharing the controller owner
+// UID of a resolved holder pod. Only when NO pod resolves that way —
+// the holder pod already gone — does the "<lease name>-*" name-shape
+// fallback run; its matches are guesses, so the second return reports
+// the fallback set spanning more than one distinct controller owner
+// (ownerReferences kind/name groups) and the caller must skip the
+// heal this cycle.
 func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) (
 	targets []corev1.Pod, fallbackAmbiguous bool) {
 	holderNames := map[string]bool{}
@@ -408,13 +418,10 @@ func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) (
 			ownerUIDs[ref.UID] = true
 		}
 	}
-	var out []corev1.Pod
-	fallbackOwners := map[string]bool{}
-	for i := range pods {
-		pod := &pods[i]
+	eligible := func(pod *corev1.Pod) bool {
 		if pod.Status.Phase != corev1.PodRunning ||
 			pod.DeletionTimestamp != nil {
-			continue
+			return false
 		}
 		if _, mirror := pod.Annotations["kubernetes.io/config.mirror"]; mirror {
 			// Static control-plane pods (kube-controller-manager,
@@ -422,22 +429,46 @@ func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) (
 			// name and match the "<lease>-*" fallback — but deleting
 			// a mirror pod never restarts the static process, so it
 			// is a no-op heal that would repeat every cooldown.
+			return false
+		}
+		return true
+	}
+	// Pass 1 — positive attribution only: the holderIdentity-named
+	// pod and its controller siblings. When ANY pod resolves this
+	// way the "<lease>-*" name-shape fallback must not run at all:
+	// its matches are guesses, and an expired cert-manager lease
+	// also prefix-matches cert-manager-cainjector-*/
+	// cert-manager-webhook-* replicas — mixing them in either
+	// suppresses the heal as "ambiguous" or, worse, lets an older
+	// sibling win the oldest-pod pick and get deleted instead of
+	// the wedged elector.
+	var out []corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if !eligible(pod) {
 			continue
 		}
 		ref := metav1.GetControllerOf(pod)
 		if holderNames[pod.Name] ||
 			(ref != nil && ownerUIDs[ref.UID]) {
 			out = append(out, *pod)
+		}
+	}
+	if len(out) > 0 {
+		return out, false
+	}
+	// Pass 2 — the holder pod is gone: fall back to the "<lease>-*"
+	// name shape, grouped by controller owner so a set spanning
+	// several controllers reads as ambiguous.
+	fallbackOwners := map[string]bool{}
+	for i := range pods {
+		pod := &pods[i]
+		if !eligible(pod) ||
+			!strings.HasPrefix(pod.Name, lease.Name+"-") {
 			continue
 		}
-		if !strings.HasPrefix(pod.Name, lease.Name+"-") {
-			continue
-		}
-		// The "<lease>-*" name-shape fallback is a guess, not an
-		// attribution: group its matches by controller owner so a
-		// set spanning several controllers reads as ambiguous.
 		out = append(out, *pod)
-		if ref != nil {
+		if ref := metav1.GetControllerOf(pod); ref != nil {
 			fallbackOwners[ref.Kind+"/"+ref.Name] = true
 		} else {
 			fallbackOwners[pod.Name] = true // unattributable — its own group

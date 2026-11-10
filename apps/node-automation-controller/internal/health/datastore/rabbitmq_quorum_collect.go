@@ -70,6 +70,20 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 	return c, nil
 }
 
+// resolvePod maps a Prometheus series' (namespace, pod) labels back
+// to a census member. The namespace-qualified key wins whenever the
+// series carries one — two RabbitMQ clusters in different namespaces
+// can run same-named pods (rabbitmq-server-0), and resolving by bare
+// name alone would pool one cluster's raft terms into the other's
+// skew verdict. The bare-name index serves only series that lack a
+// namespace label entirely.
+func (c *rabbitCensus) resolvePod(ns, name string) *corev1.Pod {
+	if ns != "" {
+		return c.byName[ns+"/"+name]
+	}
+	return c.byPodName[name]
+}
+
 // rabbitPromFindings runs the three Prometheus signal families —
 // the alarm/partition queries, quorum-queue raft role, and raft-term
 // skew — and folds every attributed series into one findings map
@@ -207,7 +221,7 @@ func rabbitSkewFindings(ctx context.Context, d *probefw.Deps,
 	for _, s := range terms {
 		podName := s.Label("pod", "pod_name")
 		ns := s.Metric["namespace"]
-		pod := c.byPodName[podName]
+		pod := c.resolvePod(ns, podName)
 		if ns == "" && pod != nil {
 			ns = pod.Namespace
 		}
@@ -224,7 +238,7 @@ func rabbitSkewFindings(ctx context.Context, d *probefw.Deps,
 	for _, s := range terms {
 		podName := s.Label("pod", "pod_name")
 		ns := s.Metric["namespace"]
-		pod := c.byPodName[podName]
+		pod := c.resolvePod(ns, podName)
 		if ns == "" && pod != nil {
 			ns = pod.Namespace
 		}

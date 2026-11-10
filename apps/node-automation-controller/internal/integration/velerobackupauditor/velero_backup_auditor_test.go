@@ -560,7 +560,7 @@ func TestVeleroAuditorScheduleMissingBackups(t *testing.T) {
 	}
 }
 
-// W24 Schrödinger's-backup: a Schedule whose newest Completed backup
+// selfheal-alert-coverage Schrödinger's-backup: a Schedule whose newest Completed backup
 // is older than 36h flags reason=stale — UNLESS the cron is weekly
 // or monthly, where an old newest backup is the normal cadence.
 func TestVeleroAuditorScheduleStaleBackup(t *testing.T) {
@@ -745,8 +745,8 @@ func TestVeleroAuditorWedgedPVBCleaned(t *testing.T) {
 		t.Fatal("wedged PVB not deleted")
 	}
 	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-aaa",
-		metav1.GetOptions{}); err == nil {
-		t.Fatal("node-agent pod not bounced")
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("already-restarted Running node-agent pod was bounced")
 	}
 	if _, err := cs.CoreV1().Pods("app").Get(ctx, "node-agent-pretender",
 		metav1.GetOptions{}); err != nil {
@@ -998,7 +998,7 @@ func TestVeleroAuditorRepoClearsResolved(t *testing.T) {
 	}
 }
 
-// W19-ST2 — a BackupRepository held at phase=NotReady for the full
+// velero-repo-reinit-heal — a BackupRepository held at phase=NotReady for the full
 // 30m window is deleted so Velero re-initializes the Kopia/Restic
 // connection; a younger NotReady repo is only flagged.
 func TestVeleroAuditorRepoNotReadyReinit(t *testing.T) {

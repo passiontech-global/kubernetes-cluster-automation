@@ -198,13 +198,13 @@ func TestResolveSlicePortPref(t *testing.T) {
 			Spec:       corev1.ServiceSpec{Ports: ports},
 		}
 	}
-	cs := fake.NewSimpleClientset(
-		svc("webhook",
+	snap := &Snapshot{Services: []corev1.Service{
+		*svc("webhook",
 			corev1.ServicePort{Name: "Webhook", Port: 8443, TargetPort: intstr.FromInt32(9443)},
 			corev1.ServicePort{Name: "metrics", Port: 9090, TargetPort: intstr.FromInt32(9090)}),
-		svc("str", corev1.ServicePort{Port: 8443, TargetPort: intstr.FromString("tls-svc")}),
-	)
-	pref := resolveSlicePortPref(context.Background(), cs, "ns/webhook", []int32{8443})
+		*svc("str", corev1.ServicePort{Port: 8443, TargetPort: intstr.FromString("tls-svc")}),
+	}}
+	pref := resolveSlicePortPref(snap, "ns/webhook", []int32{8443})
 	if !pref.names["https"] || !pref.names["webhook"] || !pref.names["tls"] {
 		t.Fatalf("conventional names missing: %v", pref.names)
 	}
@@ -215,12 +215,12 @@ func TestResolveSlicePortPref(t *testing.T) {
 		t.Fatalf("undeclared port leaked into pref: names=%v numbers=%v", pref.names, pref.numbers)
 	}
 	// String targetPort resolves to a name.
-	pref = resolveSlicePortPref(context.Background(), cs, "ns/str", []int32{8443})
+	pref = resolveSlicePortPref(snap, "ns/str", []int32{8443})
 	if !pref.names["tls-svc"] {
 		t.Fatalf("string targetPort not resolved into names: %v", pref.names)
 	}
 	// Unresolvable Service degrades to name matching alone.
-	pref = resolveSlicePortPref(context.Background(), cs, "ns/missing", []int32{8443})
+	pref = resolveSlicePortPref(snap, "ns/missing", []int32{8443})
 	if len(pref.numbers) != 0 || len(pref.names) != len(webhookPortNames) {
 		t.Fatalf("unresolvable service pref = %v/%v, want names-only", pref.names, pref.numbers)
 	}

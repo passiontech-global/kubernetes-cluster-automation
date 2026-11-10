@@ -157,7 +157,7 @@ func TestSubprocOOMKillStormStillConfirms(t *testing.T) {
 	}
 }
 
-// TestSubprocOOMGroupKillEvent — W21-G2: memory.events
+// TestSubprocOOMGroupKillEvent — pod-cgroup-oomkill-metrics: memory.events
 // oom_group_kill advancing emits ContainerCgroupOOMGroupKilled on
 // the owning Pod with the memory.stat breakdown — no confirm
 // window (the whole cgroup is already dead).

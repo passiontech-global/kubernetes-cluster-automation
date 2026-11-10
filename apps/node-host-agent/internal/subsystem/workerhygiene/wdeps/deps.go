@@ -83,25 +83,25 @@ type Series struct {
 	RunTmpfsUsedRatio      float64
 	RunTmpfsCleanups       int64
 	// DevShmUsedRatio is the /dev/shm tmpfs fill ratio the dev-shm
-	// guard measures each cycle (W19-K2) — surfaced as
+	// guard measures each cycle (devshm-fill-guard) — surfaced as
 	// node_agent_dev_shm_used_ratio.
 	DevShmUsedRatio float64
 	// CtrMetaDBBytes is the containerd meta.db (bbolt store) size
-	// the ctr-meta guard stats each cycle (W19-K3) — surfaced as
+	// the ctr-meta guard stats each cycle (containerd-meta-guard) — surfaced as
 	// node_agent_ctr_metadb_bytes; bloat past ~256MiB slows every
 	// containerd metadata op.
 	CtrMetaDBBytes int64
 	// PageTablesBytes is PageTables+SecPageTables from meminfo in
-	// bytes — surfaced as node_agent_pagetables_bytes (W19-K4); a
+	// bytes — surfaced as node_agent_pagetables_bytes (pagetables-memory-guard); a
 	// monotonic climb is a mapping/pagetable leak signature.
 	PageTablesBytes int64
 	// DentryUnusedCount is /proc/sys/fs/dentry-state nr_unused —
-	// surfaced as node_agent_dentry_unused_count (W24); the
+	// surfaced as node_agent_dentry_unused_count (selfheal-alert-coverage); the
 	// negative-dentry reclaim gate reads it every meminfo cycle.
 	DentryUnusedCount int64
 	// CtrMetaProbeLatencySec is the wall time of the lightweight
 	// `k0s ctr namespaces ls -q` metadata probe — surfaced as
-	// node_agent_ctr_meta_probe_latency_seconds (W24); a bbolt
+	// node_agent_ctr_meta_probe_latency_seconds (selfheal-alert-coverage); a bbolt
 	// freelist-fragmented meta.db shows up here long before it
 	// shows up as task failures.
 	CtrMetaProbeLatencySec float64

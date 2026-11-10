@@ -124,10 +124,18 @@ func (p *ciliumL2LeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	leases, err := p.CS.CoordinationV1().Leases("kube-system").
-		List(ctx, metav1.ListOptions{})
+	// The memoized cluster-wide lease census filtered to kube-system
+	// replaces the dedicated LIST — one paged read per sweep shared
+	// with every other lease consumer.
+	allLeases, err := p.AllLeases(ctx)
 	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list kube-system leases: %w", err)}
+		return probefw.Result{Infra: fmt.Errorf("list leases: %w", err)}
+	}
+	var leases []coordinationv1.Lease
+	for i := range allLeases {
+		if allLeases[i].Namespace == "kube-system" {
+			leases = append(leases, allLeases[i])
+		}
 	}
 	nodes, err := p.AllNodes(ctx)
 	if err != nil {
@@ -140,8 +148,8 @@ func (p *ciliumL2LeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 	agentNotReady := p.ciliumAgentStreak(ctx, nodes)
 
 	var rep probefw.SweepReport
-	for i := range leases.Items {
-		lease := &leases.Items[i]
+	for i := range leases {
+		lease := &leases[i]
 		if !strings.HasPrefix(lease.Name, ciliumL2LeasePrefix) {
 			continue
 		}
@@ -191,7 +199,7 @@ func ciliumL2StaleHolderReasons(lease *coordinationv1.Lease,
 	if node.Spec.Unschedulable {
 		reasons = append(reasons, l2ReasonUnschedulable)
 	}
-	// W19-T1: a remediation/out-of-service TAINT flags the holder as
+	// remediation-taint-detect: a remediation/out-of-service TAINT flags the holder as
 	// stale even when spec.Unschedulable is false — cordon alone does
 	// not always precede a fence, and a partitioned/stealing node
 	// still answers L2 announcements while pods are being evicted.

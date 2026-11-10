@@ -424,7 +424,7 @@ func (p *Prober) reapplyDrains(ctx context.Context, stale map[string]bool,
 			continue
 		}
 		svname, inPrimary := actionTarget(b, svnameByAddr)
-		// W19-PI1: same last-standing fence as the drain phase —
+		// apiprober-last-standing-fence: same last-standing fence as the drain phase —
 		// when fresh < 1 a HAProxy restart may have resurrected
 		// this server as the ONLY usable backend; re-disabling it
 		// would take the VIP down with it.
@@ -475,7 +475,7 @@ func (p *Prober) drainStale(ctx context.Context, stale map[string]bool,
 			// backend is a constant "UP" with no HAProxy state to
 			// forget, so re-applying would just repeat the socket
 			// command every cycle.
-			// W19-PI1: fence on fresh < 1 — same last-standing
+			// apiprober-last-standing-fence: fence on fresh < 1 — same last-standing
 			// protection as the drain phase below.
 			if p.eff.mode == ModeEnforce && b.discovered && b.up() &&
 				*fresh >= 1 {

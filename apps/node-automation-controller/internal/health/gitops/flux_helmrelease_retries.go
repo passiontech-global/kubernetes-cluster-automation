@@ -187,9 +187,21 @@ func (p *fluxHRRetriesCheck) fluxHRDepsReady(ctx context.Context,
 		if ns == "" {
 			ns = hr.GetNamespace()
 		}
-		dep, err := p.Dyn.Resource(gvr).Namespace(ns).
-			Get(ctx, name, metav1.GetOptions{})
+		// The sweep-memoized unstructured census for this GVR
+		// replaces the per-dependency GET — dependsOn chains resolve
+		// against the same paged LIST the check already paid for.
+		items, err := p.AllUnstructured(ctx, gvr)
 		if err != nil {
+			return false
+		}
+		var dep *unstructured.Unstructured
+		for i := range items {
+			if items[i].GetNamespace() == ns && items[i].GetName() == name {
+				dep = &items[i]
+				break
+			}
+		}
+		if dep == nil {
 			return false
 		}
 		if st, _, _ := fluxHRReadyStrings(dep); st != "True" {

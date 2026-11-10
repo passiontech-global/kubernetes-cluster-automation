@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	forMu      sync.Mutex
+	forMu      sync.RWMutex
 	forDefault *slog.Logger
 	forCache   = map[string]*slog.Logger{}
 )
@@ -27,6 +27,17 @@ var (
 // by main() is always the one that emits.
 func For(name string) *slog.Logger {
 	def := slog.Default()
+	// Read-lock fast path: logger() is called on every log line in
+	// every subsystem, so the common case (cached name, unchanged
+	// default) must not serialize all goroutines on one mutex.
+	forMu.RLock()
+	if def == forDefault {
+		if l, ok := forCache[name]; ok {
+			forMu.RUnlock()
+			return l
+		}
+	}
+	forMu.RUnlock()
 	forMu.Lock()
 	defer forMu.Unlock()
 	if def != forDefault {

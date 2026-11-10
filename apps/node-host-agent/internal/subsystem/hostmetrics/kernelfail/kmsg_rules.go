@@ -16,7 +16,7 @@ import (
 
 var (
 	// Filesystem/block error signatures — the plan's literal set,
-	// plus the W24 XFS structural-corruption family: "Metadata I/O
+	// plus the selfheal-alert-coverage XFS structural-corruption family: "Metadata I/O
 	// error" alone misses the B+tree/AG corruption verdicts XFS
 	// prints when it force-shuts a filesystem down (the node is
 	// about to go read-only — the latch must arm NOW, not after

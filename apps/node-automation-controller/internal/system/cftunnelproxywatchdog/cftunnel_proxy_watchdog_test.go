@@ -1103,6 +1103,43 @@ func TestWatchdogHealCapPerTarget(t *testing.T) {
 	}
 }
 
+// Multiple wedged pods owned by the SAME ReplicaSet queue at most one
+// fatal_logs delete per sweep, and any fatal_logs match suppresses the
+// all_unready_oldest fallback so a 2-replica Deployment never suffers
+// 2 deletes in one sweep.
+func TestWatchdogOneDeletePerControllerAndSuppressesAllUnready(t *testing.T) {
+	now := time.Now()
+	testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+		cfWatchdogTestNS, "fatal_logs")
+	testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+		cfWatchdogTestNS, "all_unready_oldest")
+
+	rsOwner := []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "proxy-rs-1", Controller: ptr.To(true),
+	}}
+	p1 := staleUnreadyProxyPod("proxy-rs1-a", now.Add(-time.Hour), now.Add(-10*time.Minute))
+	p1.OwnerReferences = rsOwner
+	p2 := staleUnreadyProxyPod("proxy-rs1-b", now.Add(-time.Hour), now.Add(-9*time.Minute))
+	p2.OwnerReferences = rsOwner
+
+	cs := fake.NewSimpleClientset(p1, p2, proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR Couldn't start tunnel: config file error\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+		now: shared.Clock(func() time.Time { return now })}
+	deleted, err := w.healCloudflaredWedges(context.Background())
+	if err != nil {
+		t.Fatalf("heal sweep: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted %d pods of the same ReplicaSet, want 1", deleted)
+	}
+	if got := wedgeDeletedCount(t, "all_unready_oldest"); got != 0 {
+		t.Fatalf("all_unready_oldest = %v when fatal_logs already queued a delete, want 0", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // cf-gateway-sync-error — inconclusive-tail branches
 // ---------------------------------------------------------------------------

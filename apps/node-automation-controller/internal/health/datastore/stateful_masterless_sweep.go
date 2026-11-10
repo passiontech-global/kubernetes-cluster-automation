@@ -191,17 +191,29 @@ func (p *statefulMasterlessCheck) stampTarget(c masterSvc) (metav1.Object,
 
 	if c.sts != nil {
 		return c.sts, func(ctx context.Context, data []byte) error {
-			_, err := p.CS.AppsV1().StatefulSets(c.sts.Namespace).Patch(ctx,
+			if _, err := p.CS.AppsV1().StatefulSets(c.sts.Namespace).Patch(ctx,
 				c.sts.Name, types.MergePatchType, data,
-				metav1.PatchOptions{})
-			return err
+				metav1.PatchOptions{}); err != nil {
+				return err
+			}
+			// Mirror the landed annotation patch onto the LISTED
+			// object — one StatefulSet can back several master-role
+			// Services, and each candidate's stamp reads the shared
+			// copy: without the mirror a second stamp computes its
+			// first-seen map from pre-patch state and drops the
+			// sibling's just-written key.
+			probefw.MergeAnnoPatchLocally(c.sts, data)
+			return nil
 		}
 	}
 	return c.svcObj, func(ctx context.Context, data []byte) error {
-		_, err := p.CS.CoreV1().Services(c.ns).Patch(ctx,
+		if _, err := p.CS.CoreV1().Services(c.ns).Patch(ctx,
 			c.svc, types.MergePatchType, data,
-			metav1.PatchOptions{})
-		return err
+			metav1.PatchOptions{}); err != nil {
+			return err
+		}
+		probefw.MergeAnnoPatchLocally(c.svcObj, data)
+		return nil
 	}
 }
 
@@ -223,7 +235,7 @@ func (s *masterlessSweep) evalCandidates(ctx context.Context) {
 		// stateful-split-brain(i)/(ii) — the split-brain streak and the cross-DC
 		// pin accounting, one signature per file.
 		p.splitBrain.eval(c, key, len(eps), &s.multiRep)
-		s.skew.evalMaster(c, key, eps, &s.rep)
+		s.skew.evalMaster(c, key, eps)
 		if len(eps) > 0 {
 			// Master reachable — the signature resolved on a live
 			// object: drop the persisted stamp so a recurrence
@@ -270,7 +282,7 @@ func (s *masterlessSweep) evalCandidates(ctx context.Context) {
 // re-seen lose their gauge series instead of pinning stale 1s.
 func (s *masterlessSweep) closeReports() {
 	p := s.p
-	s.skew.close(&s.rep)
+	s.skew.close()
 	p.stsZeroSince.Prune(func(k string) bool { return s.seen[k] })
 	p.splitBrain.streak.Prune(func(k string) bool { return s.evaluated[k] })
 	s.rep.Close(&p.stsZeroEmitted, statefulServiceZeroEndpointsGauge.DeleteLabelValues)
@@ -340,6 +352,21 @@ func (s *masterlessSweep) verdict() probefw.Result {
 		}
 		if res.Infra == nil {
 			res.Infra = split.Infra
+		}
+	}
+	// Site-skew findings live on the skew sweep's own report — they
+	// get their own verdict wording instead of masquerading as a
+	// zero-endpoints or split-brain signature.
+	if skew := s.skew.rep.Verdict(
+		"stateful masters pinned to the standby site: ", ", "); skew.Why != "" {
+		if res.Why != "" {
+			res.Why += " | " + skew.Why
+		} else {
+			res.Why = skew.Why
+			res.Pass = false
+		}
+		if res.Infra == nil {
+			res.Infra = skew.Infra
 		}
 	}
 	return res

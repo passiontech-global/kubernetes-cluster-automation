@@ -16,7 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -186,24 +185,24 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 // error on any candidate is returned (errors are per-request, not
 // per-name — RBAC/network failures hit all names equally).
 func (p *operatorWorkqueueCheck) operatorLease(ctx context.Context, op operatorTarget) (*coordinationv1.Lease, error) {
-	var firstErr error
+	// One memoized cluster LIST per sweep (AllLeases) replaces the
+	// per-name GET fan-out — ~35 GETs across all operator targets
+	// collapse into the shared census. Name order is preserved:
+	// the first candidate present in the census wins, same as the
+	// first successful GET did.
+	leases, err := p.AllLeases(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list leases for %s: %w", op.name, err)
+	}
 	for _, name := range op.leaseNames {
-		lease, err := p.CS.CoordinationV1().Leases(op.leaseNS).
-			Get(ctx, name, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(err):
-			continue
-		case err != nil:
-			if firstErr == nil {
-				firstErr = fmt.Errorf("get lease %s/%s (%s): %w",
-					op.leaseNS, name, op.name, err)
+		for i := range leases {
+			if leases[i].Namespace == op.leaseNS &&
+				leases[i].Name == name {
+				return &leases[i], nil
 			}
-			continue
-		default:
-			return lease, nil
 		}
 	}
-	return nil, firstErr
+	return nil, nil
 }
 
 // operatorPodRunning is the leaseOptional liveness fallback: at

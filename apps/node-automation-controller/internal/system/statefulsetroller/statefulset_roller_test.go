@@ -6,16 +6,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	natestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -944,5 +947,38 @@ func TestStatefulSetRollerEvictError(t *testing.T) {
 	}
 	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
 		t.Fatalf("IncError delta = %v, want 1", d)
+	}
+}
+
+// When Evict returns 429 TooManyRequests (a PDB race after the gate-2
+// pre-check), rollStatefulSet calls heal.RefundGrant(now) so the
+// unused grant is returned to the fleet budget.
+func TestStatefulSetRollerPDB429RefundsBudget(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				return true, nil, apierrors.NewTooManyRequests("pdb race", 0)
+			}
+			return false, nil, nil
+		})
+	r := srRoller(cs, t0)
+	r.queue = "statefulset-ondelete-roller"
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, natestutil.NewDynamicClient(), "probe", t0)
+	if !proceed || unverifiable {
+		t.Fatalf("PDB-429 Evict did not refund budget grant: Gate = (%v,%v)",
+			proceed, unverifiable)
 	}
 }

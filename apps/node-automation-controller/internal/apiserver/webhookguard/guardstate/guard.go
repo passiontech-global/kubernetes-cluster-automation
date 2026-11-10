@@ -88,6 +88,15 @@ type Snapshot struct {
 	UnhealthyNodes map[string]bool
 	NodesErr       error
 
+	// Services is the cluster-wide Service census the probe-port
+	// resolver and the ready-endpoint math share — the orphansweep
+	// already pays for the same LIST; taking it once here removes
+	// the per-backend Services(ns).Get fan-out. A list failure is
+	// recorded like every other snapshot input: consumers degrade
+	// to their no-data verdicts.
+	Services    []corev1.Service
+	ServicesErr error
+
 	// readyOnce/ready/readyErr lazily cache the EndpointSlice ready
 	// census — the circuit breaker and the injector-health check
 	// share it, and a run whose breaker is disabled and has no
@@ -132,6 +141,12 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 			metav1.ListOptions{Limit: ListPageSize},
 			kube.DynamicPage(g.Dyn.Resource(CustomResourceDefinitionGVR)))
 	}
+	// Services — paged cluster census shared by the probe-port
+	// resolver (was one Get per webhook backend) and any duty that
+	// needs Service spec data.
+	s.Services, s.ServicesErr = kube.ListAll(ctx,
+		metav1.ListOptions{Limit: ListPageSize},
+		kube.Services(g.CS, metav1.NamespaceAll))
 	return s
 }
 

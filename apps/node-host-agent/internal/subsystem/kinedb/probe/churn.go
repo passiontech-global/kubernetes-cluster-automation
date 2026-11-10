@@ -24,7 +24,7 @@ const (
 	churnTopN          = 5
 	churnFileHead      = "last-churn-head"
 	churnFileTS        = "last-churn-ts"
-	// churnKeyMinRevs is the W24 hot-key floor: below 50 revisions
+	// churnKeyMinRevs is the selfheal-alert-coverage hot-key floor: below 50 revisions
 	// per 5m window a single object is ordinary write volume (a
 	// busy ConfigMap, a frequently-updated CR), not an SSA
 	// managedFields ping-pong worth naming.
@@ -93,7 +93,7 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 	kdeps.WriteIntFile(filepath.Join(dir, churnFileTS), now)
 }
 
-// probeTopHotkeys is the W24 per-object half of the churn sampler:
+// probeTopHotkeys is the selfheal-alert-coverage per-object half of the churn sampler:
 // the same watermark window, GROUP BY the FULL Kine key instead of
 // the /registry/<group>/<resource> prefix, so an SSA managedFields
 // ping-pong names its exact victim object on

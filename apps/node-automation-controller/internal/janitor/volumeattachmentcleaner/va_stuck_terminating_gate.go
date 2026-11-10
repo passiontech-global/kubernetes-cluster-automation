@@ -265,9 +265,12 @@ func (c *volumeAttachmentCleaner) stuckReadyUnused(ctx context.Context,
 }
 
 // podsUsingVolume counts the non-terminal pods on node that mount a
-// volume bound to pvName — via a PVC claim, a generic ephemeral
-// volume's generated claim, or a direct CSI volume whose driver and
-// volumeHandle match the PV's. Any lookup failure fails closed.
+// volume bound to pvName — via a PVC claim or a generic ephemeral
+// volume's generated claim; those are the only pod volume shapes
+// that can bind a PV (a pod-level `csi` volume is a standalone CSI
+// mount with no PV object behind it — corev1.CSIVolumeSource carries
+// no volumeHandle — so it can never be using pvName). Any lookup
+// failure fails closed.
 func (c *volumeAttachmentCleaner) podsUsingVolume(ctx context.Context,
 	nodePods map[string]podListProbe, pvcPVs map[string]pvcProbe,
 	node, pvName string, log logr.Logger) (int, error) {

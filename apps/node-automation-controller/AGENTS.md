@@ -37,7 +37,7 @@ byte-stable with the shell-operator alerts).
   cooldown into the AllowedV preamble for sites that heal against
   a persisted stamp), `reap` (the janitor
   collect-cap-confirm-UID-delete sweep skeleton),
-  `leaderelect` (the W24 fast dead-leader Lease preemption sweep —
+  `leaderelect` (the selfheal-alert-coverage fast dead-leader Lease preemption sweep —
   the standby that must shorten a provably-dead holder's Lease,
   wired as a `NeedLeaderElection()=false` runnable in main.go),
   `testhelp` (leaf-level k8s fakes — importable by platform tests,

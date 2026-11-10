@@ -165,12 +165,26 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 		return nil, nil
 	}
 	var wedges []cfTunnelWedge
+	// seenController enforces the per-controller pacing INSIDE the
+	// sweep: healCooledDown reads the lastHeal stamp, but that stamp is
+	// only written after the deletes land (healCloudflaredWedges), so
+	// two pods of the same ReplicaSet would both pass the cooldown
+	// check here and be deleted together — killing every replica of a
+	// 2-replica Deployment in one cycle. One wedge per controller per
+	// sweep serializes the deletes exactly like the cooldown does
+	// across sweeps (and skips the ReplicaSet GET healCooledDown would
+	// spend on the sibling).
+	seenController := map[string]bool{}
 	// Fatal-signature pods: unready >= 5m AND wedged logs — doomed
 	// pods a config resync cannot revive. Bounded per target per
 	// sweep so a mass-wedge cannot delete the whole fleet at once.
 	for _, p := range unreadyStale {
 		if len(wedges) >= cfTunnelMaxHealsPerTarget {
 			break
+		}
+		key := kube.PodControllerKey(p)
+		if seenController[key] {
+			continue
 		}
 		wedged, err := w.podLogWedged(ctx, p)
 		if err != nil {
@@ -185,12 +199,18 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 			continue
 		}
 		wedges = append(wedges, cfTunnelWedge{pod: p, reason: "fatal_logs"})
+		seenController[key] = true
 	}
 	// readyCount==0 deadlock: every running replica unready — the
 	// resync loop can never converge. Delete the single OLDEST
 	// stale-unready pod (10m cooldown) so its Deployment recreates
-	// it; one per sweep bounds churn during a genuine outage.
-	if ready == 0 && len(wedges) < cfTunnelMaxHealsPerTarget {
+	// it; one per sweep bounds churn during a genuine outage. Runs
+	// only when the fatal-signature pass queued NOTHING: a non-empty
+	// wedges list means this sweep already has deletes in flight (and
+	// `oldest` could be a pod already queued — deleting it twice would
+	// double-count the metric — or the second replica of a Deployment
+	// whose first replica is already being replaced).
+	if ready == 0 && len(wedges) == 0 {
 		oldest := unreadyStale[0]
 		for _, p := range unreadyStale[1:] {
 			if p.CreationTimestamp.Before(&oldest.CreationTimestamp) {

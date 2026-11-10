@@ -366,20 +366,18 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 	// the whole cluster CR could be mid-bootstrap). Vacancy defaults
 	// true: a surface that does not exist cannot hold a lock.
 	leaseVacant, leaseSeen := true, false
-	lease, err := p.CS.CoordinationV1().Leases(ns).Get(ctx,
-		name+"-leader", metav1.GetOptions{})
-	switch {
-	case err == nil:
-		leaseSeen = true
-		leaseVacant = lease.Spec.HolderIdentity == nil ||
-			*lease.Spec.HolderIdentity == ""
-	case apierrors.IsNotFound(err):
-		// absent — stays unseen, vacancy stays default-true
-	default:
+	lease, err := p.Lease(ctx, ns, name+"-leader")
+	if err != nil {
 		leaseVacant = false
 		log.Info("WARN: patroni leader lease fetch failed — lock evidence inconclusive",
 			"lease", ns+"/"+name+"-leader", "error", err)
+	} else if lease != nil {
+		leaseSeen = true
+		leaseVacant = lease.Spec.HolderIdentity == nil ||
+			*lease.Spec.HolderIdentity == ""
 	}
+	// lease == nil is the absent case — stays unseen, vacancy stays
+	// default-true, same as the old IsNotFound branch.
 
 	// DCS surface B: the <cr>-leader Endpoints (endpoints DCS mode) —
 	// same seen/vacant contract as the Lease.

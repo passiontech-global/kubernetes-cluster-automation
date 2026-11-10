@@ -284,8 +284,9 @@ func TestCondMaxObservedGeneration(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Only a Gateway whose class resolves to cilium's controllerName is
-// cilium-operator's responsibility. An unresolvable class keeps the
-// object in the stuck set — ownership cannot be disproven.
+// cilium-operator's responsibility. A class absent from a successful
+// census drops the object (provably orphaned); only an unavailable
+// census keeps it — ownership cannot be disproven on API flap.
 func TestCiliumOwnsGatewayObject(t *testing.T) {
 	classes := []runtime.Object{
 		gwClassFixture("cilium", ciliumGatewayController),
@@ -299,8 +300,11 @@ func TestCiliumOwnsGatewayObject(t *testing.T) {
 	if ciliumOwnsGatewayObject(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p), gwFixture("apps", "gw", "cloudflare-tunnel", 1)) {
 		t.Fatal("foreign-class Gateway must NOT be owned by cilium-operator")
 	}
-	if !ciliumOwnsGatewayObject(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p), gwFixture("apps", "gw", "no-such-class", 1)) {
-		t.Fatal("unresolvable class must keep the object (cannot disprove ownership)")
+	// A class absent from the SUCCESSFUL census is provably orphaned —
+	// its GatewayClass was deleted or never created, so no controller
+	// will ever own the Gateway (bug #11's shape one level up).
+	if ciliumOwnsGatewayObject(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p), gwFixture("apps", "gw", "no-such-class", 1)) {
+		t.Fatal("class absent from a successful census must drop the object (orphaned Gateway)")
 	}
 }
 
@@ -334,12 +338,12 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 		t.Fatal("route attached to a foreign-class Gateway must NOT be owned by cilium")
 	}
 
-	// ParentRef names a Gateway that does not exist — attribution
-	// unresolvable → kept.
+	// ParentRef names a Gateway that does not exist — orphan route,
+	// no gateway controller will ever write status.parents → dropped.
 	p = newGatewayClassAwareProber(classes...)
-	if !ciliumOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
+	if ciliumOwnsRouteParent(ctx, probetest.MustCheck[*operatorWorkqueueCheck](t, p),
 		routeFixture("apps", "r", 1, []any{map[string]any{"name": "missing-gw"}})) {
-		t.Fatal("unresolvable parent Gateway must keep the route")
+		t.Fatal("unresolvable parent Gateway must drop the orphan route")
 	}
 
 	// No parentRefs at all → nothing to attribute → kept.
