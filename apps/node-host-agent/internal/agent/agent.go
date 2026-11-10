@@ -75,8 +75,12 @@ func New(cfg Config) *Agent {
 	// Go runtime + process metrics (go_memstats_*, process_rss, fds,
 	// network) on the shared registry — the memory-triage evidence for
 	// the per-node scan bursts (GOMEMLIMIT sizing, DaemonSet limit).
-	// Same registration as the controller's metrics package so both
-	// endpoints answer the same triage queries.
+	// The controller gets the same families from controller-runtime's
+	// internal metrics init (plus its MetricsAll runtime extras);
+	// this default GoCollector deliberately skips the ~80
+	// go_gc_/go_sched_ series per node scrape while still covering
+	// every triage series the sizing depends on (heap_inuse,
+	// heap_sys, heap_released, RSS, fds).
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
