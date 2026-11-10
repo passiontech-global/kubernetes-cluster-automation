@@ -35,30 +35,34 @@ const (
 	ClocksourceUnstable      = "ClocksourceUnstable"      // clocksource drift/instability guard
 	MemoryPSIThrashing       = "MemoryPSIThrashing"       // memory PSI full avg60 thrash
 	KernelResourceExhaustion = "KernelResourceExhaustion" // pid/fd table exhaustion (pid-fd-pressure latch)
+	KernelPageAllocFailure   = "KernelPageAllocFailure"   // kernel page-allocation failure records (page-alloc-failure latch)
 
 	// workerhygiene — container/CNI/runtime hygiene checks.
-	CiliumAgentDown       = "CiliumAgentDown"       // cilium-agent healthz down
-	CiliumInitStuck       = "CiliumInitStuck"       // cilium endpoints stuck in init
-	CiliumEnvoyDown       = "CiliumEnvoyDown"       // cilium-envoy /ready down
-	CiliumIPAMExhausted   = "CiliumIPAMExhausted"   // cilium IPAM pool exhausted
-	CiliumBPFMapPressure  = "CiliumBPFMapPressure"  // critical BPF maps above 90% capacity
-	CiliumMTUDrift        = "CiliumMTUDrift"        // cilium MTU drift across the overlay
-	CiliumWGStale         = "CiliumWGStale"         // stale wireguard peer state wiped
-	SpegelMirrorDegraded  = "SpegelMirrorDegraded"  // spegel P2P mirror pod not Ready
-	CalicoVethLeak        = "CalicoVethLeak"        // cali* veth leak (CNI DEL missed)
-	CalicoFelixDown       = "CalicoFelixDown"       // calico-felix readiness down
-	ConntrackPressure     = "ConntrackPressure"     // nf_conntrack table at pressure
-	KernelSlabLeak        = "KernelSlabLeak"        // unreclaimable slab above threshold
-	CgroupDyingLeak       = "CgroupDyingLeak"       // cgroup v2 dying descendants leak
-	SystemdSessionBloat   = "SystemdSessionBloat"   // abandoned logind session scopes
-	KubeletPLEGUnhealthy  = "KubeletPLEGUnhealthy"  // PLEG relist latency/lag degrading
-	DiskSlowIO            = "DiskSlowIO"            // disk write await + io PSI gray failure
-	KernelNetShimDegraded = "KernelNetShimDegraded" // socket/softnet drops, shim RSS breach
-	KubeletRuntimeStall   = "KubeletRuntimeStall"   // phantom-pods runtime wedge (+syncloop/healthz/watch alts)
-	KubeletWatchWedge     = "KubeletWatchWedge"     // kubelet pod-assignment watch wedge
-	PodTeardownWedged     = "PodTeardownWedged"     // long-Terminating pod with leftover task
-	DNSResolvStale        = "DnsResolvStale"        // DNS pod resolv.conf drifted from host
-	JournaldUnreadable    = "JournaldUnreadable"    // journalwatch blindness latch
+	CiliumAgentDown        = "CiliumAgentDown"        // cilium-agent healthz down
+	CiliumInitStuck        = "CiliumInitStuck"        // cilium endpoints stuck in init
+	CiliumEnvoyDown        = "CiliumEnvoyDown"        // cilium-envoy /ready down
+	CiliumIPAMExhausted    = "CiliumIPAMExhausted"    // cilium IPAM pool exhausted
+	CiliumBPFMapPressure   = "CiliumBPFMapPressure"   // critical BPF maps above 90% capacity
+	CiliumMTUDrift         = "CiliumMTUDrift"         // cilium MTU drift across the overlay
+	CiliumWGStale          = "CiliumWGStale"          // stale wireguard peer state wiped
+	SpegelMirrorDegraded   = "SpegelMirrorDegraded"   // spegel P2P mirror pod not Ready
+	CalicoVethLeak         = "CalicoVethLeak"         // cali* veth leak (CNI DEL missed)
+	CalicoFelixDown        = "CalicoFelixDown"        // calico-felix readiness down
+	ConntrackPressure      = "ConntrackPressure"      // nf_conntrack table at pressure
+	KernelSlabLeak         = "KernelSlabLeak"         // unreclaimable slab above threshold
+	CgroupDyingLeak        = "CgroupDyingLeak"        // cgroup v2 dying descendants leak
+	SystemdSessionBloat    = "SystemdSessionBloat"    // abandoned logind session scopes
+	KubeletPLEGUnhealthy   = "KubeletPLEGUnhealthy"   // PLEG relist latency/lag degrading
+	DiskSlowIO             = "DiskSlowIO"             // disk write await + io PSI gray failure
+	KernelNetShimDegraded  = "KernelNetShimDegraded"  // socket/softnet drops, shim RSS breach
+	KubeletRuntimeStall    = "KubeletRuntimeStall"    // phantom-pods runtime wedge (+syncloop/healthz/watch alts)
+	KubeletWatchWedge      = "KubeletWatchWedge"      // kubelet pod-assignment watch wedge
+	PodTeardownWedged      = "PodTeardownWedged"      // long-Terminating pod with leftover task
+	DNSResolvStale         = "DnsResolvStale"         // DNS pod resolv.conf drifted from host
+	JournaldUnreadable     = "JournaldUnreadable"     // journalwatch blindness latch
+	KonnectivityIPMismatch = "KonnectivityIPMismatch" // konnectivity-agent stale-identifier guard (pod-teardown)
+	CiliumEnvoyXDSReject   = "CiliumEnvoyXDSReject"   // cilium-envoy xDS update_rejected streak
+	DiskBloatRunaway       = "DiskBloatRunaway"       // disk-bloat runaway detector
 
 	// nethealth — DNS/overlay/nebula/fail2ban/clock guards.
 	DNSFallbackActive   = "DnsFallbackActive"   // /etc/hosts pin fallback engaged
@@ -68,10 +72,19 @@ const (
 	ClockUnsynchronized = "ClockUnsynchronized" // kernel clock undisciplined (no sync source)
 	NebulaPMTUBlackhole = "NebulaPMTUBlackhole" // DF probes blackhole on the overlay
 	ClockSkewDetected   = "ClockSkewDetected"   // synced but >2s off the NTP source
+	NebulaMTUBlackhole  = "NebulaMTUBlackhole"  // routeguard NM4 DF-probe MTU blackhole
+	NebulaSlowpath      = "NebulaSlowpath"      // nebula dataplane relay/latency degraded
+	NebulaSiteedge      = "NebulaSiteedge"      // nebula site-edge peers degraded
 
 	// controllerhygiene — control-plane guards on the node daemons.
 	ControlPlaneCertReloadStale = "ControlPlaneCertReloadStale" // cert reload markers stale
 	KubeconfigCertExpiring      = "KubeconfigCertExpiring"      // node-daemon kubeconfig cert nearing notAfter
+	// ApiserverWatchCacheWedged is the sig13 apiserver watch-cache
+	// wedge latch (state-apiserver-cache-wedged) surfaced as a
+	// condition: the apiserver serves stale watch-cache data while
+	// etcd's revision advances — cluster-side heals (the
+	// coredns-stale-watchdog) defer pod churn on a fresh True.
+	ApiserverWatchCacheWedged = "ApiserverWatchCacheWedged"
 
 	// nodereporter's own probes.
 	WatchdogStale = "WatchdogStale" // node-watchdog last-run older than 20 min
@@ -102,7 +115,7 @@ const (
 )
 
 // HeartbeatSweptNames is every NodeCondition the nodereporter owns
-// and re-stamps LastHeartbeatTime on each cycle while alive: all 41
+// and re-stamps LastHeartbeatTime on each cycle while alive: all 49
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
 // inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
@@ -133,6 +146,10 @@ var HeartbeatSweptNames = []string{
 	ClocksourceUnstable,
 	InodePressure,
 	ReadonlyFilesystem,
+	KonnectivityIPMismatch, CiliumEnvoyXDSReject, DiskBloatRunaway,
+	NebulaMTUBlackhole, NebulaSlowpath, NebulaSiteedge,
+	KernelPageAllocFailure,
+	ApiserverWatchCacheWedged,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -280,6 +282,12 @@ type ScopesCheck struct {
 	d           *wdeps.Deps
 	lastScan    time.Time
 	deactStreak int
+	// prevDeact is the W21-G3 per-unit deactivating ledger — unit
+	// name → was deactivating at the previous sweep. A unit wedged
+	// across ≥2 sweeps whose container id is absent from every
+	// Running pod's container set is an orphaned teardown the
+	// reaper force-stops.
+	prevDeact map[string]bool
 }
 
 // Name returns the check label / WD_SIG key.
@@ -319,7 +327,7 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			n++
 		}
 	}
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, e)
 	if n == 0 {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
@@ -341,41 +349,158 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // cri-containerd-*.scope units stuck in `deactivating` across
 // consecutive sweeps mean container teardown is wedged inside
 // systemd PID 1 (stop-sigterm/sigkill never completing) —
-// reset-failed cannot clear these, so they are diagnose-only.
+// reset-failed cannot clear these. Units still owned by a Running
+// pod stay diagnose-only; orphaned ones (W21-G3) are force-stopped
+// by reapDeactivating once the streak proves the wedge is real.
 // The streak must survive ≥2 sweeps (~1h) before alerting so a
 // normal stop-in-progress transient never pages. Runs even when no
 // failed scopes exist — a node can wedge on deactivating alone.
-func (c *ScopesCheck) checkDeactivating(ctx context.Context) {
+func (c *ScopesCheck) checkDeactivating(ctx context.Context, e *wdeps.CycleEnv) {
 	dout, derr := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
 		"--type=scope", "--state=deactivating", "--no-legend", "--plain",
 		"cri-containerd-*.scope")
 	if derr != nil {
-		// Inconclusive — leave the streak untouched rather than
-		// resetting on a transient D-Bus failure.
+		// Inconclusive — leave the streak AND the per-unit ledger
+		// untouched rather than resetting on a transient D-Bus
+		// failure.
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: systemd-scopes deactivating list-units failed: %v (%s) — streak kept",
 			derr, strings.TrimSpace(dout)))
 	} else {
-		dn := 0
+		var units []string
 		for _, line := range strings.Split(dout, "\n") {
 			if f := strings.Fields(line); len(f) > 0 &&
 				strings.HasSuffix(f[0], ".scope") {
-				dn++
+				units = append(units, f[0])
 			}
 		}
-		if dn == 0 {
+		if len(units) == 0 {
 			c.deactStreak = 0
 		} else {
 			c.deactStreak++
 			if c.deactStreak >= 2 {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: systemd-scopes deactivating count=%d streak=%d",
-					dn, c.deactStreak))
+					len(units), c.deactStreak))
 			}
 		}
+		c.reapDeactivating(ctx, e, units)
+		// Rebuild the per-unit ledger AFTER the reap read it —
+		// prevDeact must hold LAST sweep's set when judging this
+		// sweep's candidates.
+		next := make(map[string]bool, len(units))
+		for _, u := range units {
+			next[u] = true
+		}
+		c.prevDeact = next
 	}
 	// No CycleResult here — Run owns the per-sweep cycle accounting;
 	// a second "ok" from this helper would double-count every scan.
+}
+
+// reapDeactivating is the W21-G3 orphaned-teardown reaper: a
+// cri-containerd-*.scope wedged in `deactivating` across ≥2
+// consecutive sweeps (prevDeact[unit] && deactStreak ≥ 2) whose
+// container id is absent from every Running pod's container set is
+// a dead teardown systemd will never finish — SIGKILL + stop
+// forces the scope closed, capped at 5 units per sweep. A scope
+// still owned by a live pod is diagnose-only: killing it would be
+// a pod kill, which is not this check's remit.
+func (c *ScopesCheck) reapDeactivating(ctx context.Context,
+	e *wdeps.CycleEnv, units []string) {
+
+	if c.deactStreak < 2 || len(c.prevDeact) == 0 {
+		return
+	}
+	live := runningContainerIDs(e)
+	killed := 0
+	for _, unit := range units {
+		if killed >= 5 {
+			break
+		}
+		if !c.prevDeact[unit] || containerIDLive(scopeContainerID(unit), live) {
+			continue
+		}
+		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
+			"kill", "--signal=SIGKILL", unit); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes deactivating kill %s failed: %v (%s)",
+				unit, err, strings.TrimSpace(out)))
+			continue
+		}
+		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
+			"stop", unit); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes deactivating stop %s failed: %v (%s)",
+				unit, err, strings.TrimSpace(out)))
+			continue // the SIGKILL landed; stop retries next sweep
+		}
+		killed++
+		c.d.Actions.WithLabelValues(wdeps.CheckSysScopes, "kill_deactivating").Inc()
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: systemd-scopes deactivating reap unit=%s — orphaned cri-containerd scope force-stopped after %d sweeps",
+			unit, c.deactStreak))
+	}
+}
+
+// scopeContainerID extracts the containerd id out of a
+// cri-containerd-<id>.scope unit name.
+func scopeContainerID(unit string) string {
+	return strings.TrimSuffix(
+		strings.TrimPrefix(unit, "cri-containerd-"), ".scope")
+}
+
+// runningContainerIDs collects the containerd ids of every
+// container status on this node's Running pods — init, ephemeral
+// and regular. The deactivating reaper treats a scope whose id is
+// absent here as orphaned teardown.
+func runningContainerIDs(e *wdeps.CycleEnv) []string {
+	var ids []string
+	for i := range e.Pods {
+		p := &e.Pods[i]
+		if p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for _, cs := range p.Status.ContainerStatuses {
+			ids = append(ids, containerStatusID(cs.ContainerID))
+		}
+		for _, cs := range p.Status.InitContainerStatuses {
+			ids = append(ids, containerStatusID(cs.ContainerID))
+		}
+		for _, cs := range p.Status.EphemeralContainerStatuses {
+			ids = append(ids, containerStatusID(cs.ContainerID))
+		}
+	}
+	return ids
+}
+
+// containerStatusID strips the "<runtime>://" prefix off a pod
+// status containerID — "" when the status carries no id yet
+// (excluded by the caller's empty check via containerIDLive).
+func containerStatusID(id string) string {
+	if i := strings.Index(id, "://"); i >= 0 {
+		return id[i+3:]
+	}
+	return id
+}
+
+// containerIDLive reports whether a scope's container id belongs to
+// a Running pod — exact match or a truncated/prefixed variant
+// (systemd unit-name limits can shorten the id either way).
+func containerIDLive(scopeID string, live []string) bool {
+	if scopeID == "" {
+		return true // unparseable unit — never reap on a guess
+	}
+	for _, lid := range live {
+		if lid == "" {
+			continue
+		}
+		if lid == scopeID || strings.HasPrefix(lid, scopeID) ||
+			strings.HasPrefix(scopeID, lid) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Check: cilium-envoy xDS NACK + node-local-dns LRP (envoy-xds-lrp) ---

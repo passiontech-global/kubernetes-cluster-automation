@@ -517,6 +517,86 @@ func TestJournalLatchLegacyFileSeed(t *testing.T) {
 	}
 }
 
+// TestRegisterActiveOwnerPostRestartSeed: RegisterActiveOwner is what
+// keeps a post-restart ExitFrom from seeding phantom holds for
+// producers that never run on this node. journal-unreadable declares
+// {workerhygiene, controllerhygiene}; on a worker-only node only
+// workerhygiene registers, so the legacy-file seed intersects down to
+// the live set and the worker's release exits the latch instead of
+// leaving a controllerhygiene hold nothing will ever release.
+func TestRegisterActiveOwnerPostRestartSeed(t *testing.T) {
+	name := latchdefs.LatchJournalUnreadable
+
+	t.Run("worker-only node releases cleanly", func(t *testing.T) {
+		s, _, _ := newTestStore(t)
+		s.RegisterActiveOwner("workerhygiene")
+		s.Enter(name, "") // pre-restart file, no recorded owners
+
+		s.ExitFrom(name, "workerhygiene", nil)
+		if s.Exists(name) {
+			t.Fatal("phantom controllerhygiene hold kept the latch " +
+				"past the last live owner's release")
+		}
+	})
+
+	t.Run("both producers keep staged holds", func(t *testing.T) {
+		s, _, _ := newTestStore(t)
+		s.RegisterActiveOwner("workerhygiene")
+		s.RegisterActiveOwner("controllerhygiene")
+		s.Enter(name, "")
+
+		// Worker's release leaves the seeded controllerhygiene hold —
+		// the intersected set is stored back as the owner registry.
+		s.ExitFrom(name, "workerhygiene", nil)
+		if !s.Exists(name) {
+			t.Fatal("latch cleared while registered controllerhygiene holds")
+		}
+		s.ExitFrom(name, "controllerhygiene", nil)
+		if s.Exists(name) {
+			t.Fatal("latch stuck after every registered owner released")
+		}
+	})
+
+	t.Run("unregistered owner cannot release", func(t *testing.T) {
+		s, _, _ := newTestStore(t)
+		s.RegisterActiveOwner("workerhygiene")
+		s.Enter(name, "")
+
+		// A controllerhygiene release on a node where it never
+		// registered must not touch the worker's seeded hold.
+		s.ExitFrom(name, "controllerhygiene", nil)
+		if !s.Exists(name) {
+			t.Fatal("unregistered owner's release cleared the latch")
+		}
+		s.ExitFrom(name, "workerhygiene", nil)
+		if s.Exists(name) {
+			t.Fatal("registered owner's release did not exit the latch")
+		}
+	})
+}
+
+// TestRegisterActiveOwnerSharedAcrossHandles: the active-producer set
+// lives on the per-dir sharedState, so a registration through one
+// Shared handle is visible to every other handle over the same dir —
+// production wires stores through subframe.StoreAt/Shared, never New.
+func TestRegisterActiveOwnerSharedAcrossHandles(t *testing.T) {
+	dir := t.TempDir()
+	clk := &testClock{now: time.Unix(1700000000, 0)}
+	a := Shared(dir, "", clk.fn, nil)
+	b := Shared(dir, "", clk.fn, nil)
+	name := latchdefs.LatchJournalUnreadable
+
+	a.RegisterActiveOwner("workerhygiene")
+	a.Enter(name, "")
+
+	// b never registered anything itself — the release still seeds
+	// only the live producers because a's registration is shared.
+	b.ExitFrom(name, "workerhygiene", nil)
+	if a.Exists(name) {
+		t.Fatal("registration through handle a not visible to handle b")
+	}
+}
+
 func TestTmpNameStaysOutOfStateScan(t *testing.T) {
 	s, _, _ := newTestStore(t)
 	// A failed write must not strand a "state-x.tmp"-shaped file —
@@ -532,5 +612,108 @@ func TestTmpNameStaysOutOfStateScan(t *testing.T) {
 			strings.HasSuffix(e.Name(), ".tmp") {
 			t.Fatalf("tmp file visible to state-* scan: %s", e.Name())
 		}
+	}
+}
+
+// RateOKIn/RateSpendIn with dir="" fall back to the Store's own Dir —
+// the same default RateOK/RateSpend carry (controllerhygiene's
+// rateOK(dir,...) parity for budgets outside Dir).
+func TestRateSpendInEmptyDirUsesStoreDir(t *testing.T) {
+	s, _, _ := newTestStore(t)
+	s.RateSpendIn("", "budget-x")
+	if got := testutil.ReadFile(t, filepath.Join(s.Dir, "budget-x")); got != "1700000000\n" {
+		t.Fatalf("budget content = %q", got)
+	}
+	if s.RateOKIn("", "budget-x", time.Hour) {
+		t.Fatal("just-spent budget must not be ok")
+	}
+	// An explicit dir stays independent of the fallback.
+	if !s.RateOKIn(t.TempDir(), "budget-x", time.Hour) {
+		t.Fatal("budget absent in an explicit dir must be ok")
+	}
+}
+
+// StampLastRun no-ops on an empty Dir — the path helpers produce bare
+// filenames there and a watchdog-less host must not stamp CWD.
+func TestStampLastRunEmptyDirNoop(t *testing.T) {
+	s := New("", "", nil, nil)
+	s.StampLastRun() // must not panic or write
+}
+
+// Incr returns 0 when the epoch write fails — the streak is lost,
+// never invented (ctr_inc parity).
+func TestIncrWriteFailureReturnsZero(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "missing"), "", nil, nil)
+	if got := s.Incr("consecutive-x"); got != 0 {
+		t.Fatalf("Incr = %d want 0 on unwritable dir", got)
+	}
+}
+
+// Heartbeat/InitHeartbeatFiles on a Dir that cannot be created:
+// Heartbeat warns and returns (best-effort, same contract as the
+// MkdirAll-fail branch in appendFile), InitHeartbeatFiles
+// propagates the mkdir error.
+func TestHeartbeatMkdirFailure(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clk := &testClock{now: time.Unix(1700000000, 0)}
+	s := New(filepath.Join(blocker, "sub"), "", clk.fn, nil)
+	s.Heartbeat() // must not panic
+	if err := s.InitHeartbeatFiles(); err == nil ||
+		!strings.Contains(err.Error(), "mkdir") {
+		t.Fatalf("InitHeartbeatFiles err = %v, want mkdir failure", err)
+	}
+}
+
+// A latch path that cannot be removed (a non-empty dir squatting on
+// state-<name>) reports the exit as not-taken — no STATE-EXIT line.
+func TestExitRemoveFailureKeepsLatch(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	s.Enter("real", "") // seed the log so absence is assertable
+	p := s.Path("squat")
+	if err := os.MkdirAll(filepath.Join(p, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if s.Exit("squat", nil) {
+		t.Fatal("Exit reported removal of an unremovable latch")
+	}
+	if strings.Contains(testutil.ReadFile(t, logFile), "STATE-EXIT: squat") {
+		t.Fatal("STATE-EXIT logged for a latch that survived removal")
+	}
+}
+
+// ExitFrom on a latch whose file vanished underneath (removed
+// out-of-band before the last owner released) exits quietly: no
+// STATE-EXIT line, no cleanup run.
+func TestExitFromMissingLatchFile(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	s.EnterFrom("wedged", "a", "")
+	if err := os.Remove(s.Path("wedged")); err != nil {
+		t.Fatal(err)
+	}
+	var cleaned bool
+	s.ExitFrom("wedged", "a", func() { cleaned = true })
+	if cleaned {
+		t.Fatal("cleanup ran on a vanished latch")
+	}
+	if strings.Contains(testutil.ReadFile(t, logFile), "STATE-EXIT: wedged") {
+		t.Fatal("STATE-EXIT logged for a latch that was already gone")
+	}
+}
+
+// ExitFrom passes the cleanup hook through on a real exit — the
+// journal wiring drops its suspect budgets through it.
+func TestExitFromRunsCleanup(t *testing.T) {
+	s, _, logFile := newTestStore(t)
+	s.EnterFrom("wedged", "a", "")
+	var cleaned bool
+	s.ExitFrom("wedged", "a", func() { cleaned = true })
+	if !cleaned {
+		t.Fatal("cleanup hook not run")
+	}
+	if !strings.Contains(testutil.ReadFile(t, logFile), "STATE-EXIT: wedged") {
+		t.Fatal("STATE-EXIT missing after the last owner released")
 	}
 }

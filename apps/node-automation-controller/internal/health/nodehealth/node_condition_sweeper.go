@@ -38,6 +38,17 @@ func NewNodeConditionSweeperCheck(d *probefw.Deps) probefw.Check {
 
 const CheckNameNodeCondSweeper = "node-condition-sweeper"
 
+// nodeCondSweepHeartbeatMaxAge is the sweeper's zombie TTL — how
+// long a managed condition may sit True with a frozen heartbeat
+// before the sweeper calls its writer dead. Deliberately LARGER than
+// the reporters' own ~2m re-stamp cadence, the 900s (15m) hardware/
+// runtime condition thresholds and the 1200s (20m) WatchdogStale
+// window inside the Medik8s NodeHealthCheck: the sweeper must lose
+// to NHC/SNR/FAR remediation, never preempt it — and a node that
+// just went NotReady keeps its conditions for the rescue path
+// (Run skips NotReady nodes outright).
+const nodeCondSweepHeartbeatMaxAge = 25 * time.Minute
+
 // nodeCondSweptConds is the sweeper's allowlist — every condition
 // nodereporter owns and re-stamps lastHeartbeatTime on while alive
 // (nodecond.HeartbeatSweptNames in libs/hostkit, the single source of
@@ -62,7 +73,7 @@ func init() {
 
 // condZombie reports a managed condition that is True but unverifiable:
 // its heartbeat is dead (zero or older than
-// nodeHangCondHeartbeatMaxAge — the reporter re-stamps every ~2m
+// nodeCondSweepHeartbeatMaxAge — the reporter re-stamps every ~2m
 // while alive) AND the True is old enough that a live writer would
 // have re-stamped by now. A fresh True with no heartbeat yet is
 // left alone — a foreign writer that just set it may legitimately
@@ -71,11 +82,11 @@ func condZombie(c *corev1.NodeCondition, now time.Time) bool {
 	if c.Status != corev1.ConditionTrue {
 		return false
 	}
-	if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
+	if kube.CondHeartbeatLive(c, nodeCondSweepHeartbeatMaxAge, now) {
 		return false
 	}
 	return !c.LastTransitionTime.IsZero() &&
-		now.Sub(c.LastTransitionTime.Time) >= nodeHangCondHeartbeatMaxAge
+		now.Sub(c.LastTransitionTime.Time) >= nodeCondSweepHeartbeatMaxAge
 }
 
 // Run patches every zombie managed condition back to False —
@@ -93,6 +104,13 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 	var rep probefw.SweepReport
 	for i := range nodes {
 		n := &nodes[i]
+		// A NotReady node is mid-rescue — NHC/SNR/FAR own its
+		// conditions now; sweeping them would erase the evidence
+		// the remediation path reads.
+		if c := kube.NodeCondition(n, corev1.NodeReady); c != nil &&
+			c.Status != corev1.ConditionTrue {
+			continue
+		}
 		var stale []corev1.NodeCondition
 		for _, t := range nodeCondSweptConds {
 			c := kube.NodeCondition(n, t)

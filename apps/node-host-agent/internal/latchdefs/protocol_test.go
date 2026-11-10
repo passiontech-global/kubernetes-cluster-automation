@@ -23,6 +23,33 @@ func TestSharedOwners(t *testing.T) {
 	}
 }
 
+// TestKnownLatchName: exact names match, parameterized families
+// match by prefix, and near-misses (a def's name minus its trailing
+// dash, unknown names, empty) stay unknown — the janitor's
+// known/unknown reap keys on this.
+func TestKnownLatchName(t *testing.T) {
+	for _, tc := range []struct {
+		suffix string
+		want   bool
+	}{
+		{LatchDiskSlowIO, true},
+		{LatchPodTeardownWedged, true},
+		{"apiserver-backend-stale-10-0-0-1", true}, // prefix family
+		{"apiserver-backend-stale-", true},         // bare prefix still HasPrefix-matches
+		{"cilium-ipam-10-0-0-1", true},
+		{"apiserver-backend-stale", false}, // missing the family's trailing dash
+		{"apiserver-backend", false},       // unrelated prefix
+		{"disk-slow", false},               // truncated exact name
+		{"disk-slow-io-extra", false},      // exact names don't prefix-match
+		{"", false},
+		{"no-such-latch", false},
+	} {
+		if got := KnownLatchName(tc.suffix); got != tc.want {
+			t.Errorf("KnownLatchName(%q) = %v, want %v", tc.suffix, got, tc.want)
+		}
+	}
+}
+
 // TestActionEntryPrefix: the emitted head is "ACTION <name>: " —
 // name between, colon attached (the Go emitter spelling).
 func TestActionEntryPrefix(t *testing.T) {

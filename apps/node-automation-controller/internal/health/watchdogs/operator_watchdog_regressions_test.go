@@ -271,6 +271,51 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// operatorTargets — W21-R5 selector/lease regressions
+// ---------------------------------------------------------------------------
+
+// The three medik8s-family/shipwright targets must carry selectors
+// that match the pods the clusters actually deploy, and FAR must pin
+// its medik8s election lease so the stale-Lease check + cooldown
+// annotation heal apply like NHC/SNR. A drifted selector silently
+// disables the Running-pod liveness fallback; a missing lease name
+// silently downgrades FAR to pod-fallback-only.
+func TestOperatorTargetsW21SelectorsAndLeases(t *testing.T) {
+	byName := map[string]operatorTarget{}
+	for _, op := range operatorTargets {
+		byName[op.name] = op
+	}
+	for _, tc := range []struct {
+		name        string
+		podSelector string
+		leaseNames  []string
+	}{
+		{"self-node-remediation-operator",
+			"app.kubernetes.io/name=self-node-remediation-operator",
+			[]string{"547f6cb6.medik8s.io"}},
+		{"shipwright-operator",
+			"name=shipwright-operator",
+			[]string{"01a9b2d1.shipwright.io"}},
+		{"fence-agents-remediation-operator",
+			"app.kubernetes.io/name=fence-agents-remediation-operator",
+			[]string{"c21c06a5.medik8s.io"}},
+	} {
+		op, ok := byName[tc.name]
+		if !ok {
+			t.Fatalf("%s target missing from operatorTargets", tc.name)
+		}
+		if op.podSelector != tc.podSelector {
+			t.Fatalf("%s podSelector = %q, want %q",
+				tc.name, op.podSelector, tc.podSelector)
+		}
+		if strings.Join(op.leaseNames, ",") != strings.Join(tc.leaseNames, ",") {
+			t.Fatalf("%s leaseNames = %v, want %v",
+				tc.name, op.leaseNames, tc.leaseNames)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // notification-controller — zero CR resources (operator-workqueue-watchdog)
 // ---------------------------------------------------------------------------
 

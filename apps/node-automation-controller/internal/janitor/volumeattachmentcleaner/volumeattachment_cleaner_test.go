@@ -1203,3 +1203,228 @@ func TestRunPrunesRemovedFinalizerSeriesWhenNodeGone(t *testing.T) {
 		t.Fatal("ledger kept the tuple of a census-gone node")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// stuckTerminatingNodeDead — the wedged-detach verdict branches the
+// sweep-level fixtures cannot reach individually
+// ---------------------------------------------------------------------------
+
+// The gate's verdict matrix: node gone strips; a Ready node needs
+// the two-cycle unused proof (stuckReadyPrior); a fenced node must
+// be past the not-Ready window AND prove zero live workload pods —
+// every unverifiable read fails closed.
+func TestStuckTerminatingNodeDeadVerdicts(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-x", "node-1", now.Add(-time.Hour))
+
+	readyNode := vacNode("node-1", corev1.ConditionTrue)
+	fencedNode := vacNode("node-1", corev1.ConditionFalse, outOfService)
+
+	newCleaner := func() *volumeAttachmentCleaner {
+		return newVACleaner(fake.NewSimpleClientset(), func() time.Time { return now })
+	}
+
+	// Node object gone outright — nothing left to detach from.
+	if !newCleaner().stuckTerminatingNodeDead(ctx, va, map[string]*corev1.Node{},
+		map[string]podListProbe{}, nil, now) {
+		t.Fatal("missing node must read dead")
+	}
+	// Ready node, no taints: only the prior-cycle unused proof opens
+	// the strip — first sight stays closed.
+	c := newCleaner()
+	nodes := map[string]*corev1.Node{"node-1": readyNode}
+	if c.stuckTerminatingNodeDead(ctx, va, nodes,
+		map[string]podListProbe{}, map[string]bool{}, now) {
+		t.Fatal("ready node without prior-cycle proof must stay closed")
+	}
+	if !c.stuckTerminatingNodeDead(ctx, va, nodes,
+		map[string]podListProbe{}, map[string]bool{"va-x": true}, now) {
+		t.Fatal("ready node with prior-cycle unused proof must open")
+	}
+	// Untainted but NOT Ready — the fenced window never started, the
+	// plain node-fenced path owns this shape.
+	notReady := vacNode("node-1", corev1.ConditionFalse)
+	if newCleaner().stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": notReady},
+		map[string]podListProbe{}, map[string]bool{"va-x": true}, now) {
+		t.Fatal("unfenced not-ready node must stay closed")
+	}
+	// Fenced but Ready — the taint is stale and the attacher is
+	// live; stripping could detach a mounted volume.
+	fencedAlive := vacNode("node-1", corev1.ConditionTrue, outOfService)
+	if newCleaner().stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedAlive},
+		map[string]podListProbe{}, nil, now) {
+		t.Fatal("fenced-but-Ready node must stay closed")
+	}
+	// Fenced + not-Ready inside the 15m window — the node
+	// controller's own force-detach may still be in flight.
+	c = newCleaner()
+	c.nodeNotReadySince.Observe("node-1", now.Add(-5*time.Minute))
+	if c.stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedNode},
+		map[string]podListProbe{}, nil, now) {
+		t.Fatal("fenced node inside the not-Ready window must stay closed")
+	}
+	// Past the window but a live workload pod remains — the mount
+	// may still be real.
+	c = newCleaner()
+	c.nodeNotReadySince.Observe("node-1", now.Add(-vaOutOfServiceDownFor-time.Minute))
+	livePods := map[string]podListProbe{"node-1": {pods: []corev1.Pod{
+		*vacPVCUser("app", "web-0", "node-1", "claim-1")}}}
+	if c.stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedNode}, livePods, nil, now) {
+		t.Fatal("fenced node with a live pod must stay closed")
+	}
+	// Past the window, zero live pods — the wedged-detach shape.
+	c = newCleaner()
+	c.nodeNotReadySince.Observe("node-1", now.Add(-vaOutOfServiceDownFor-time.Minute))
+	livePods = map[string]podListProbe{"node-1": {pods: []corev1.Pod{
+		*vacPod("app", "web-0", "node-1", corev1.PodSucceeded), // terminal
+		*vacPod("app", "ds-0", "node-1", corev1.PodRunning),    // DaemonSet-owned below
+	}}}
+	livePods["node-1"].pods[1].OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet"}}
+	if !c.stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedNode}, livePods, nil, now) {
+		t.Fatal("fenced node past window with no live pods must open")
+	}
+	// Pod-list failure fails closed — and meters exactly once even
+	// when the same probe is re-read.
+	c = newCleaner()
+	c.nodeNotReadySince.Observe("node-1", now.Add(-vaOutOfServiceDownFor-time.Minute))
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
+	broken := map[string]podListProbe{"node-1": {
+		err: errors.New("apiserver down")}}
+	if c.stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedNode}, broken, nil, now) {
+		t.Fatal("pod-list failure must fail closed")
+	}
+	if c.stuckTerminatingNodeDead(ctx, va,
+		map[string]*corev1.Node{"node-1": fencedNode}, broken, nil, now) {
+		t.Fatal("memoized pod-list failure must stay closed")
+	}
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
+		t.Fatalf("pod-list failure metered %v times, want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// podsUsingVolume — the mounted-claim census branches
+// ---------------------------------------------------------------------------
+
+// podsUsingVolume counts non-terminal pods on the node whose volumes
+// resolve to pvName — through a bound PVC, a generic ephemeral
+// volume's generated claim, or nothing. Terminal pods and pods on
+// other nodes never count; a claim lookup failure fails closed.
+func TestPodsUsingVolumeCountsMounts(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		vacClaim("app", "claim-data", "pv-target"),
+		vacClaim("app", "batch-0-scratch", "pv-target"), // ephemeral claim shape
+		vacClaim("app", "claim-other", "pv-other"))
+	c := newVACleaner(cs, func() time.Time { return now })
+	log := logf.FromContext(ctx)
+	nodePods := map[string]podListProbe{"node-1": {pods: []corev1.Pod{
+		// PVC mount on the target PV — counts.
+		*vacPVCUser("app", "web-0", "node-1", "claim-data"),
+		// Generic ephemeral volume — its claim is <pod>-<volume>.
+		func() corev1.Pod {
+			p := vacPod("app", "batch-0", "node-1", corev1.PodRunning)
+			p.Spec.Volumes = []corev1.Volume{{
+				Name:         "scratch",
+				VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}}}
+			return *p
+		}(),
+		// Terminal pod still holding the claim — nobody writes.
+		func() corev1.Pod {
+			p := vacPVCUser("app", "old-0", "node-1", "claim-data")
+			p.Status.Phase = corev1.PodSucceeded
+			return *p
+		}(),
+		// Same claim on ANOTHER node — fake clientsets ignore the
+		// field selector, so the in-code node filter must skip it.
+		*vacPVCUser("app", "web-9", "node-2", "claim-data"),
+		// A claim bound to a different PV — not this volume.
+		*vacPVCUser("app", "web-1", "node-1", "claim-other"),
+	}}}
+
+	using, err := c.podsUsingVolume(ctx, nodePods, map[string]pvcProbe{},
+		"node-1", "pv-target", log)
+	if err != nil {
+		t.Fatalf("podsUsingVolume: %v", err)
+	}
+	if using != 2 {
+		t.Fatalf("podsUsingVolume=%d, want 2 (pvc + ephemeral mounts)", using)
+	}
+
+	// A broken claim lookup fails the whole count closed.
+	cs.PrependReactor("get", "persistentvolumeclaims",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.(ktesting.GetAction).GetName() == "claim-broken" {
+				return true, nil, errors.New("api down")
+			}
+			return false, nil, nil
+		})
+	brokenPods := map[string]podListProbe{"node-1": {pods: []corev1.Pod{
+		*vacPVCUser("app", "web-2", "node-1", "claim-broken")}}}
+	if _, err := c.podsUsingVolume(ctx, brokenPods, map[string]pvcProbe{},
+		"node-1", "pv-target", log); err == nil {
+		t.Fatal("claim lookup failure must fail closed")
+	}
+	// A pod-list failure propagates as the probe's cached error.
+	listErr := map[string]podListProbe{"node-1": {err: errors.New("list down")}}
+	if _, err := c.podsUsingVolume(ctx, listErr, map[string]pvcProbe{},
+		"node-1", "pv-target", log); err == nil {
+		t.Fatal("pod-list failure must propagate")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// volumeOnNode — the remaining fail-closed branches
+// ---------------------------------------------------------------------------
+
+// A CSI PV's unique name matches VolumesAttached (not just
+// VolumesInUse); a missing PV object reads provably-absent; a PV
+// lookup error fails closed and meters exactly once through the
+// memoized probe.
+func TestVolumeOnNodeAttachedAndLookupFailure(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(vacPV("pv-csi", "csi.driver", "vol-1"))
+	c := newVACleaner(cs, func() time.Time { return now })
+	log := logf.FromContext(ctx)
+	node := vacNode("node-1", corev1.ConditionTrue)
+	node.Status.VolumesAttached = []corev1.AttachedVolume{
+		{Name: corev1.UniqueVolumeName("kubernetes.io/csi/csi.driver^vol-1")}}
+
+	inUse, verifiable := c.volumeOnNode(ctx, map[string]pvProbe{}, node,
+		"pv-csi", log)
+	if !inUse || !verifiable {
+		t.Fatalf("CSI PV in VolumesAttached = (%v,%v), want (true,true)", inUse, verifiable)
+	}
+
+	// PV object gone — provably unattached, still verifiable.
+	inUse, verifiable = c.volumeOnNode(ctx, map[string]pvProbe{}, node,
+		"pv-gone", log)
+	if inUse || !verifiable {
+		t.Fatalf("missing PV = (%v,%v), want (false,true)", inUse, verifiable)
+	}
+
+	// PV lookup error — unresolvable, metered once per cycle.
+	cs.PrependReactor("get", "persistentvolumes",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.(ktesting.GetAction).GetName() == "pv-broken" {
+				return true, nil, errors.New("api down")
+			}
+			return false, nil, nil
+		})
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
+	cache := map[string]pvProbe{}
+	inUse, verifiable = c.volumeOnNode(ctx, cache, node, "pv-broken", log)
+	if inUse || verifiable {
+		t.Fatalf("PV lookup failure = (%v,%v), want (false,false)", inUse, verifiable)
+	}
+	c.volumeOnNode(ctx, cache, node, "pv-broken", log) // memoized re-read
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
+		t.Fatalf("pv lookup failure metered %v times, want 1", got)
+	}
+}

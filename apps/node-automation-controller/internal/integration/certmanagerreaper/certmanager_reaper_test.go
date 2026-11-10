@@ -787,3 +787,84 @@ func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {
 		t.Fatal("second CR reap fired inside the 6h cooldown")
 	}
 }
+
+// certNameForCR resolves the Certificate a CertificateRequest serves:
+// the Certificate ownerRef cert-manager always sets wins; the
+// cert-manager.io/certificate-name label then annotation are the
+// fallback for owner-stripped CRs. ok=false means unattributable —
+// the CR's Orders then match nothing and the reaper leaves it alone.
+func TestCertNameForCR(t *testing.T) {
+	cr := func() *unstructured.Unstructured {
+		return testutil.Unstructured(
+			certificateRequestGVR.GroupVersion().WithKind("CertificateRequest"),
+			"app", "cr-1", nil)
+	}
+	withOwner := func(kind, name string) *unstructured.Unstructured {
+		o := cr()
+		o.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "cert-manager.io/v1", Kind: kind, Name: name}})
+		return o
+	}
+	cases := []struct {
+		name   string
+		obj    *unstructured.Unstructured
+		want   string
+		wantOK bool
+	}{
+		{"certificate owner ref",
+			withOwner("Certificate", "tls-a"), "tls-a", true},
+		{"owner ref wins over labels",
+			func() *unstructured.Unstructured {
+				o := withOwner("Certificate", "tls-a")
+				o.SetLabels(map[string]string{
+					"cert-manager.io/certificate-name": "tls-label"})
+				return o
+			}(), "tls-a", true},
+		{"empty-name owner ref falls through to label",
+			func() *unstructured.Unstructured {
+				o := withOwner("Certificate", "")
+				o.SetLabels(map[string]string{
+					"cert-manager.io/certificate-name": "tls-label"})
+				return o
+			}(), "tls-label", true},
+		{"non-certificate owner ref falls through to label",
+			func() *unstructured.Unstructured {
+				o := withOwner("Order", "ord-1")
+				o.SetLabels(map[string]string{
+					"cert-manager.io/certificate-name": "tls-label"})
+				return o
+			}(), "tls-label", true},
+		{"label fallback",
+			func() *unstructured.Unstructured {
+				o := cr()
+				o.SetLabels(map[string]string{
+					"cert-manager.io/certificate-name": "tls-label"})
+				return o
+			}(), "tls-label", true},
+		{"annotation fallback",
+			func() *unstructured.Unstructured {
+				o := cr()
+				o.SetAnnotations(map[string]string{
+					"cert-manager.io/certificate-name": "tls-anno"})
+				return o
+			}(), "tls-anno", true},
+		{"label beats annotation",
+			func() *unstructured.Unstructured {
+				o := cr()
+				o.SetLabels(map[string]string{
+					"cert-manager.io/certificate-name": "tls-label"})
+				o.SetAnnotations(map[string]string{
+					"cert-manager.io/certificate-name": "tls-anno"})
+				return o
+			}(), "tls-label", true},
+		{"unattributable",
+			cr(), "", false},
+	}
+	for _, tc := range cases {
+		got, ok := certNameForCR(tc.obj)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("%s: certNameForCR=(%q,%v), want (%q,%v)",
+				tc.name, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}

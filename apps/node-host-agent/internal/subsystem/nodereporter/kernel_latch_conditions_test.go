@@ -170,18 +170,28 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 41 {
-		t.Fatalf("conditionDefs has %d defs, want 41 (38 ported + CiliumMTUDrift + CiliumWGStale + inode-pressure InodePressure)",
+	if len(conditionDefs) != 49 {
+		t.Fatalf("conditionDefs has %d defs, want 49 (41 prior + 7 W21 latch→condition surface + ApiserverWatchCacheWedged)",
 			len(conditionDefs))
 	}
-	tail := conditionDefs[len(conditionDefs)-3 : len(conditionDefs)-1]
-	if tail[0].typ != nodecond.CiliumMTUDrift || tail[0].stateKey != latchdefs.LatchCiliumMTUDrift {
-		t.Fatalf("tail def 0 = %s/state-%s, want CiliumMTUDrift/state-%s",
-			tail[0].typ, tail[0].stateKey, latchdefs.LatchCiliumMTUDrift)
+	// The cilium pair sits before the inode-pressure + W21 tail —
+	// locate by typ so later appends cannot shift the check.
+	var mtuDef, wgDef *conditionDef
+	for i := range conditionDefs {
+		switch conditionDefs[i].typ {
+		case nodecond.CiliumMTUDrift:
+			mtuDef = &conditionDefs[i]
+		case nodecond.CiliumWGStale:
+			wgDef = &conditionDefs[i]
+		}
 	}
-	if tail[1].typ != nodecond.CiliumWGStale || tail[1].stateKey != latchdefs.LatchCiliumWGPeerWipe {
-		t.Fatalf("tail def 1 = %s/state-%s, want CiliumWGStale/state-%s",
-			tail[1].typ, tail[1].stateKey, latchdefs.LatchCiliumWGPeerWipe)
+	if mtuDef == nil || mtuDef.stateKey != latchdefs.LatchCiliumMTUDrift {
+		t.Fatalf("CiliumMTUDrift def = %+v, want stateKey %s",
+			mtuDef, latchdefs.LatchCiliumMTUDrift)
+	}
+	if wgDef == nil || wgDef.stateKey != latchdefs.LatchCiliumWGPeerWipe {
+		t.Fatalf("CiliumWGStale def = %+v, want stateKey %s",
+			wgDef, latchdefs.LatchCiliumWGPeerWipe)
 	}
 	e := fixture(t)
 	state := func(key string) {

@@ -157,6 +157,60 @@ func TestSubprocOOMKillStormStillConfirms(t *testing.T) {
 	}
 }
 
+// TestSubprocOOMGroupKillEvent — W21-G2: memory.events
+// oom_group_kill advancing emits ContainerCgroupOOMGroupKilled on
+// the owning Pod with the memory.stat breakdown — no confirm
+// window (the whole cgroup is already dead).
+func TestSubprocOOMGroupKillEvent(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "groupkilled", Namespace: "default",
+			UID: types.UID(wdepstest.UIDA)},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	h := e.H
+	ctx := context.Background()
+	h.Cfg.Runtime.CgroupRoot = t.TempDir()
+	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}}
+	chk := wdepstest.Check[*runtime.SubprocOOMCheck](h, wdeps.CheckSubprocOOM)
+
+	scope := mkOOMScope(t, e, wdepstest.UIDA, "ddd444", 0, 4242)
+	wdepstest.WriteFile(t, filepath.Join(scope, "memory.events"),
+		"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 1\n")
+	wdepstest.WriteFile(t, filepath.Join(scope, "memory.stat"),
+		"anon 104857600\nshmem 52428800\nfile 209715200\n")
+	chk.Run(ctx, ce) // baseline — first sighting, no delta
+	// The group kill advances → event lands immediately.
+	wdepstest.WriteFile(t, filepath.Join(scope, "memory.events"),
+		"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 2\n")
+	chk.Run(ctx, ce)
+	evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 1 ||
+		evs.Items[0].Reason != "ContainerCgroupOOMGroupKilled" {
+		t.Fatalf("events=%+v want one ContainerCgroupOOMGroupKilled", evs.Items)
+	}
+	if evs.Items[0].Regarding.Name != "groupkilled" {
+		t.Fatalf("event regarding=%q want pod groupkilled",
+			evs.Items[0].Regarding.Name)
+	}
+	if !strings.Contains(evs.Items[0].Note, "anon=100MiB") ||
+		!strings.Contains(evs.Items[0].Note, "shmem=50MiB") ||
+		!strings.Contains(evs.Items[0].Note, "file=200MiB") {
+		t.Fatalf("event note missing mem_stat breakdown: %q",
+			evs.Items[0].Note)
+	}
+	// Flat counter → no repeat.
+	chk.Run(ctx, ce)
+	evs, _ = e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if len(evs.Items) != 1 {
+		t.Fatalf("double-reported group kill: %d events", len(evs.Items))
+	}
+}
+
 // --- sa-token-ttl: projected SA token TTL guard ---
 
 // fakeJWT builds a syntactically-valid compact JWT carrying exp.

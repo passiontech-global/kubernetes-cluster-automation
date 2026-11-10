@@ -470,6 +470,100 @@ var conditionDefs = []conditionDef{
 		problemReason:  "FilesystemInodesExhausted",
 		stateKey:       latchdefs.LatchInodePressure,
 	},
+	// --- W21 latch→condition surface ---
+	// The last registered latches without a condition: workerhygiene's
+	// konnectivity stale-identifier guard, cilium-envoy xDS-NACK
+	// streak and disk-bloat runaway detector; nethealth's nebula
+	// MTU-blackhole/slowpath/site-edge degradations; hostmetrics'
+	// kernel page-allocation fragmentation evidence latch.
+	{
+		// workerhygiene's pod-teardown konnectivity guard — the
+		// apiserver-backend identifier the konnectivity-agent
+		// sandbox holds drifted from the node IP (stale after a
+		// node IP change); pods then stall on the stale route.
+		typ:            nodecond.KonnectivityIPMismatch,
+		defaultReason:  "KonnectivityIPOk",
+		defaultMessage: "konnectivity-agent identifiers match node IPs",
+		problemReason:  "KonnectivityIPMismatchDetected",
+		stateKey:       latchdefs.LatchKonnectivityIPMismatch,
+	},
+	{
+		// workerhygiene's cilium-envoy xDS guard — cds/lds/rds
+		// update_rejected deltas climbing across consecutive
+		// cycles: envoy keeps NACKing config pushes, so Gateway
+		// routes 404/503 while their API objects report Accepted.
+		typ:            nodecond.CiliumEnvoyXDSReject,
+		defaultReason:  "CiliumEnvoyXDSOk",
+		defaultMessage: "cilium-envoy xDS updates accepted (no update_rejected deltas)",
+		problemReason:  "CiliumEnvoyXDSRejectDetected",
+		stateKey:       latchdefs.LatchCiliumEnvoyXDSReject,
+	},
+	{
+		// workerhygiene's disk-bloat runaway detector — a target
+		// (PVC backing path or pod writable layer) above the
+		// bloat watermark while the filesystem sits past the
+		// critical band.
+		typ:            nodecond.DiskBloatRunaway,
+		defaultReason:  "DiskBloatNormal",
+		defaultMessage: "no target above the disk-bloat watermark",
+		problemReason:  "DiskBloatRunawayDetected",
+		stateKey:       latchdefs.LatchDiskBloat,
+	},
+	{
+		// nethealth's routeguard NM4 DF-probe guard — small-packet
+		// nebula pings pass but a full-size DF probe blackholes:
+		// the path MTU sits below the overlay MTU (or an
+		// intermediate hop drops fragments).
+		typ:            nodecond.NebulaMTUBlackhole,
+		defaultReason:  "NebulaMTUOk",
+		defaultMessage: "nebula overlay passes DF probes at full size",
+		problemReason:  "NebulaMTUBlackholeDetected",
+		stateKey:       latchdefs.LatchNebulaMTUBlackhole,
+	},
+	{
+		// nethealth's dataplane slowpath guard — nebula relay
+		// selection degraded to slow paths or latency climbed
+		// past the dataplane bound.
+		typ:            nodecond.NebulaSlowpath,
+		defaultReason:  "NebulaFastpathOk",
+		defaultMessage: "nebula dataplane on fast paths within latency bounds",
+		problemReason:  "NebulaSlowpathDetected",
+		stateKey:       latchdefs.LatchNebulaSlowpath,
+	},
+	{
+		// nethealth's site-edge guard — peers at the site edge
+		// (cross-DC relays) unreachable or degraded while the
+		// local mesh stays healthy.
+		typ:            nodecond.NebulaSiteedge,
+		defaultReason:  "NebulaSiteedgeOk",
+		defaultMessage: "nebula site-edge peers reachable",
+		problemReason:  "NebulaSiteedgeDetected",
+		stateKey:       latchdefs.LatchNebulaSiteedge,
+	},
+	{
+		// hostmetrics' kmsg page-alloc evidence latch — the kernel
+		// logged "page allocation failure: order:N": the buddy
+		// allocator cannot serve a contiguous block, fragmentation
+		// is winning (workerhygiene compacts memory off it).
+		typ:            nodecond.KernelPageAllocFailure,
+		defaultReason:  "KernelPageAllocOk",
+		defaultMessage: "no kernel page-allocation failure records",
+		problemReason:  "KernelPageAllocFailureDetected",
+		stateKey:       latchdefs.LatchPageAllocFailure,
+	},
+	{
+		// controllerhygiene's sig13 watch-cache wedge guard — the
+		// apiserver's watch-cache stopped tracking etcd's revision
+		// (rv_now - rv_cache gap). Surfaced so cluster-side heals
+		// (coredns-stale-watchdog) defer pod churn while the
+		// apiserver itself serves stale reads; only controller
+		// nodes carry the latch, workers report False.
+		typ:            nodecond.ApiserverWatchCacheWedged,
+		defaultReason:  "APIServerWatchCacheOk",
+		defaultMessage: "apiserver watch-cache tracks etcd revision",
+		problemReason:  "APIServerWatchCacheWedged",
+		stateKey:       latchdefs.LatchAPIServerCacheWedged,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

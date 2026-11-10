@@ -310,3 +310,101 @@ func TestRuntimeConfigMTU(t *testing.T) {
 		t.Fatal("missing file must read ok=false")
 	}
 }
+
+// TestWriteAtomicStageError: a Stage failure propagates untouched —
+// no staging file exists to sweep.
+func TestWriteAtomicStageError(t *testing.T) {
+	want := errors.New("no space for staging")
+	err := WriteAtomic(filepath.Join(t.TempDir(), "f"), []byte("x"),
+		AtomicOpts{
+			Stage: func(string) (*os.File, error) { return nil, want },
+			Mode:  0o644,
+		})
+	if !errors.Is(err, want) {
+		t.Fatalf("err=%v want the stage error", err)
+	}
+}
+
+// TestWriteAtomicWriteFailureSweepsStage: a staging file opened
+// read-only fails the payload Write — the fail() path must close
+// AND remove the staging file (a leaked stage would sit in the
+// state dir forever).
+func TestWriteAtomicWriteFailureSweepsStage(t *testing.T) {
+	dir := t.TempDir()
+	var stagePath string
+	err := WriteAtomic(filepath.Join(dir, "f"), []byte("payload"),
+		AtomicOpts{
+			Stage: func(d string) (*os.File, error) {
+				p := filepath.Join(d, "stage-ro")
+				stagePath = p
+				if err := os.WriteFile(p, nil, 0o600); err != nil {
+					return nil, err
+				}
+				// O_RDONLY: Chmod still succeeds on the fd, the
+				// payload Write fails EBADF.
+				return os.Open(p)
+			},
+			Mode: 0o644,
+		})
+	if err == nil {
+		t.Fatal("write to a read-only stage want error")
+	}
+	if _, serr := os.Stat(stagePath); !os.IsNotExist(serr) {
+		t.Fatal("staging file leaked after write failure")
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "f")); !os.IsNotExist(serr) {
+		t.Fatal("target installed despite failed write")
+	}
+}
+
+// TestWriteAtomicHooksAndDirSync: AfterSync runs between the
+// payload fsync and Close (converge's pagecache.Drop seam), and
+// DirSync's post-rename directory fsync is part of the contract.
+func TestWriteAtomicHooksAndDirSync(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	var synced bool
+	err := WriteAtomic(path, []byte("x"), AtomicOpts{
+		Stage:   StageTempPattern(".tmp-f-*"),
+		Mode:    0o644,
+		DirSync: true,
+		AfterSync: func(f *os.File) {
+			synced = true
+			if _, err := f.Stat(); err != nil {
+				t.Errorf("AfterSync got a bad file: %v", err)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !synced {
+		t.Fatal("AfterSync never ran")
+	}
+	if got := testutil.ReadFile(t, path); got != "x" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+// TestWriteAtomicRenameFailureSweepsStage: a RenameFile failure
+// (non-EBUSY/EXDEV at this layer — WriteAtomic reports it raw)
+// still removes the staging file.
+func TestWriteAtomicRenameFailureSweepsStage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	stubRename(t, func(string, string) error {
+		return errors.New("rename blew up")
+	})
+	err := WriteAtomic(path, []byte("x"), AtomicOpts{
+		Stage: StageTempPattern(".tmp-f-*"),
+		Mode:  0o644,
+	})
+	if err == nil || !strings.Contains(err.Error(), "rename blew up") {
+		t.Fatalf("err=%v want the rename error", err)
+	}
+	for _, n := range dirNames(t, dir) {
+		if strings.HasPrefix(n, ".tmp-f-") {
+			t.Fatalf("staging file leaked after rename failure: %s", n)
+		}
+	}
+}

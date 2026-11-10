@@ -96,9 +96,13 @@ func FreezeNow(d *probefw.Deps, base time.Time) {
 // OpDyn returns the shared CRD-aware dynamic fake — every GVR the
 // sweep checks scan is already in testutil's dynCRDGVKs table (the
 // fake PANICS on an unregistered GVR List, so the watched-operator
-// roster, OLM/autopilot reads and report CRs all live there).
+// roster, OLM/autopilot reads and report CRs all live there) plus
+// the apiextensions kinds via NewDynamicClientWithCRDs:
+// api-object-sprawl-report-gc's kine large-object census Lists CRDs
+// every cycle, matching the always-served apiextensions API on a
+// real cluster.
 func OpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return testutil.NewDynamicClient(objs...)
+	return testutil.NewDynamicClientWithCRDs(objs...)
 }
 
 // UnstructuredObj builds a CR object carrying a generation and an

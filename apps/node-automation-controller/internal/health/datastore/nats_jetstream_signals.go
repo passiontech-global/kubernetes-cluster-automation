@@ -131,26 +131,29 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 
 	// (b2) stream-leaderless — stream leader loss: members publish the
 	// per-stream nats_jetstream_stream_leader gauge; a namespace
-	// whose series exist but sum to 0 has lost the leader of every
-	// tracked stream group. Diffed client-side across the same two
-	// instant queries as the meta check (the literal `and` form
-	// never matches: a ==0 comparison produces an empty vector on
-	// the leader side, and PromQL `and` intersects it away).
-	// Pod-resolvable findings join the windowed/healable pod-local
-	// path (bounce only under the >=2-Ready-siblings quorum guard);
-	// series whose pod cannot be resolved emit at namespace scope —
-	// a namespace-scope Raft verdict has no single culprit pod.
+	// whose MINIMUM series value is 0 has at least one tracked stream
+	// group that lost its leader — `min by` (not `sum by`) because a
+	// namespace running several streams stays sum-positive while one
+	// stream is leaderless, hiding the partial loss. Diffed
+	// client-side across the same two instant queries as the meta
+	// check (the literal `and` form never matches: a ==0 comparison
+	// produces an empty vector on the leader side, and PromQL `and`
+	// intersects it away). Pod-resolvable findings join the
+	// windowed/healable pod-local path (bounce only under the
+	// >=2-Ready-siblings quorum guard); series whose pod cannot be
+	// resolved emit at namespace scope — a namespace-scope Raft
+	// verdict has no single culprit pod.
 	streamCounts, errSC := s.p.PromQuery(ctx,
 		`nats_jetstream_stream_leader`)
-	streamSums, errSS := s.p.PromQuery(ctx,
-		`sum by (namespace) (nats_jetstream_stream_leader)`)
-	if errSC != nil || errSS != nil {
+	streamMins, errSM := s.p.PromQuery(ctx,
+		`min by (namespace) (nats_jetstream_stream_leader)`)
+	if errSC != nil || errSM != nil {
 		s.log.Info("WARN: nats stream-leader queries failed — stream-leaderless signal skipped",
-			"countErr", errSC, "sumErr", errSS)
+			"countErr", errSC, "minErr", errSM)
 	} else {
-		sumByNS := map[string]float64{}
-		for _, series := range streamSums {
-			sumByNS[series.Label("namespace")] = series.Value
+		minByNS := map[string]float64{}
+		for _, series := range streamMins {
+			minByNS[series.Label("namespace")] = series.Value
 		}
 		podsByNS := map[string][]string{}
 		for _, series := range streamCounts {
@@ -166,8 +169,8 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 			}
 		}
 		for ns, podNames := range podsByNS {
-			if !s.census.namespaces[ns] || sumByNS[ns] != 0 {
-				continue // a stream leader exists — healthy, or not a NATS namespace
+			if !s.census.namespaces[ns] || minByNS[ns] != 0 {
+				continue // every tracked stream has a leader — healthy, or not a NATS namespace
 			}
 			resolved := false
 			for _, podName := range podNames {
@@ -183,7 +186,7 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 				s.rep.Emit(natsJetstreamUnhealthyGauge,
 					ns+"/"+natsReasonStreamLeaderless,
 					[]string{ns, "", natsReasonStreamLeaderless},
-					fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, sum 0)",
+					fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, min 0)",
 						ns, len(podNames)))
 			}
 		}

@@ -36,6 +36,7 @@ type fakeEtcd struct {
 	failPut           bool
 	failDel           bool
 	failStart         bool // systemctl start errors
+	failStop          bool // systemctl stop errors
 
 	// onCall fires before responding — tests use it e.g. to remove
 	// the fake /proc/<pid> dir when `systemctl stop` lands.
@@ -53,6 +54,9 @@ func (f *fakeEtcd) run(_ context.Context, name string,
 	case name == "systemctl":
 		if len(args) > 0 && args[0] == "start" && f.failStart {
 			return nil, errors.New("fake: start failed")
+		}
+		if len(args) > 0 && args[0] == "stop" && f.failStop {
+			return nil, errors.New("fake: stop failed")
 		}
 		return nil, nil
 	case strings.Contains(joined, "endpoint status") &&
@@ -111,12 +115,13 @@ func (f *fakeEtcd) run(_ context.Context, name string,
 // fakeStarter records the standalone-etcd spawn and returns a fake
 // handle that logs its kill into the same call sequence.
 type fakeStarter struct {
-	calls  *[]recordedCall
-	bin    string
-	args   []string
-	log    string
-	err    error // injected Start failure
-	killed bool
+	calls   *[]recordedCall
+	bin     string
+	args    []string
+	log     string
+	err     error // injected Start failure
+	killErr error // injected Kill failure
+	killed  bool
 }
 
 func (s *fakeStarter) start(_ context.Context, bin string,
@@ -135,7 +140,7 @@ func (s *fakeStarter) start(_ context.Context, bin string,
 func (s *fakeStarter) Kill() error {
 	*s.calls = append(*s.calls, recordedCall{name: "temp-etcd:kill"})
 	s.killed = true
-	return nil
+	return s.killErr
 }
 
 func (s *fakeStarter) Wait() error { return nil }
@@ -759,5 +764,169 @@ func TestRunStatusFailureFatal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "endpoint status") {
 		t.Fatalf("err=%v want endpoint status failure", err)
+	}
+}
+
+// --- offlineDefrag failure branches: every early return must still
+// run the deferred `systemctl start` once the service is stopped ---
+
+// offlineRig is runOffline with knobs: forceOff skips the online
+// attempt; dropPidOnStop controls whether waitPidExit sees the old
+// etcd vanish (false → the wait times out).
+func offlineRig(t *testing.T, f *fakeEtcd, starter *fakeStarter,
+	dropPidOnStop bool) (string, error) {
+	t.Helper()
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	pidDir := filepath.Join(procRoot, "4242")
+	f.onCall = func(name string, args []string) {
+		if name == "systemctl" && len(args) > 0 && args[0] == "stop" &&
+			dropPidOnStop {
+			_ = os.RemoveAll(pidDir)
+		}
+	}
+	cfg := testRig(f, starter, procRoot)
+	cfg.ForceOffline = true
+	var out strings.Builder
+	err := Run(context.Background(), cfg, &out)
+	return out.String(), err
+}
+
+// TestRunOfflineStopFails: a failed `systemctl stop` aborts before
+// the service is down — the deferred restart was never armed, so
+// no `systemctl start` may run.
+func TestRunOfflineStopFails(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:    true,
+		failStop:   true,
+		statusJSON: []string{statusJSON(100, 100, 90)},
+	}
+	starter := &fakeStarter{calls: &f.calls}
+	_, err := offlineRig(t, f, starter, true)
+	if err == nil {
+		t.Fatal("Run err=nil want systemctl stop failure")
+	}
+	if !strings.Contains(err.Error(), "systemctl stop") {
+		t.Fatalf("err=%v want the stop failure", err)
+	}
+	if i := callIndex(f.calls, "systemctl start"); i >= 0 {
+		t.Fatalf("start ran although stop failed:\n%v", f.calls)
+	}
+	if i := callIndex(f.calls, "temp-etcd"); i >= 0 {
+		t.Fatalf("standalone spawned although stop failed:\n%v", f.calls)
+	}
+}
+
+// TestRunOfflineWaitPidExitFails: the old etcd pid survives the
+// stop — waitPidExit exhausts its budget, errors, and the deferred
+// start + health-wait still bring the service back.
+func TestRunOfflineWaitPidExitFails(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:    true,
+		statusJSON: []string{statusJSON(100, 100, 90)},
+	}
+	starter := &fakeStarter{calls: &f.calls}
+	_, err := offlineRig(t, f, starter, false) // pid dir stays
+	if err == nil {
+		t.Fatal("Run err=nil want waitPidExit failure")
+	}
+	if !strings.Contains(err.Error(), "did not exit") {
+		t.Fatalf("err=%v want the pid-exit timeout", err)
+	}
+	// The defer armed AFTER stop still ran: start + healthy wait.
+	stop := callIndex(f.calls, "systemctl stop")
+	start := callIndex(f.calls, "systemctl start")
+	if start < 0 || start <= stop {
+		t.Fatalf("start=%d want after stop=%d:\n%v", start, stop, f.calls)
+	}
+	if starter.killed {
+		t.Fatal("standalone killed although it never started")
+	}
+}
+
+// TestRunOfflineStandaloneNeverHealthy: the standalone etcd never
+// passes `endpoint health` — Kill (with a failing Kill tolerated +
+// logged) and Wait still run, the service restarts, and the
+// "never came up" error surfaces.
+func TestRunOfflineStandaloneNeverHealthy(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:    false, // endpoint health always fails
+		statusJSON: []string{statusJSON(100, 100, 90)},
+	}
+	starter := &fakeStarter{
+		calls:   &f.calls,
+		killErr: errors.New("fake: kill failed"),
+	}
+	out, err := offlineRig(t, f, starter, true)
+	if err == nil {
+		t.Fatal("Run err=nil want standalone-health failure")
+	}
+	if !strings.Contains(err.Error(), "never came up") {
+		t.Fatalf("err=%v want the standalone health failure", err)
+	}
+	if !starter.killed {
+		t.Fatal("standalone etcd not killed after health failure")
+	}
+	if !strings.Contains(out, "kill standalone etcd") {
+		t.Fatalf("kill error not logged:\n%s", out)
+	}
+	// Deferred restart still ran despite the mid-block failure.
+	if i := callIndex(f.calls, "systemctl start"); i < 0 {
+		t.Fatalf("service not restarted:\n%v", f.calls)
+	}
+}
+
+// TestRunOfflineRestartFailsAfterSuccess: the offline defrag
+// itself succeeds, but the deferred `systemctl start` fails — the
+// restart error becomes Run's error (the script's set -e tail).
+func TestRunOfflineRestartFailsAfterSuccess(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:    true,
+		failStart:  true,
+		statusJSON: []string{statusJSON(100, 100, 90)},
+	}
+	starter := &fakeStarter{calls: &f.calls}
+	_, err := offlineRig(t, f, starter, true)
+	if err == nil {
+		t.Fatal("Run err=nil want restart failure")
+	}
+	if !strings.Contains(err.Error(), "systemctl start") {
+		t.Fatalf("err=%v want the restart failure", err)
+	}
+	if !starter.killed {
+		t.Fatal("standalone etcd not killed after successful defrag")
+	}
+}
+
+// TestRunOfflineUnhealthyAfterRestart: start succeeds but the
+// k0s-managed etcd never comes back — the deferred health wait
+// surfaces "unhealthy after restart" when nothing earlier failed.
+func TestRunOfflineUnhealthyAfterRestart(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:    true,
+		statusJSON: []string{statusJSON(100, 100, 90)},
+	}
+	starter := &fakeStarter{calls: &f.calls}
+	// Flip healthy→false the moment `systemctl start` lands: the
+	// standalone phase saw a healthy fake, the post-restart wait
+	// does not.
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	pidDir := filepath.Join(procRoot, "4242")
+	f.onCall = func(name string, args []string) {
+		switch {
+		case name == "systemctl" && len(args) > 0 && args[0] == "stop":
+			_ = os.RemoveAll(pidDir)
+		case name == "systemctl" && len(args) > 0 && args[0] == "start":
+			f.healthy = false
+		}
+	}
+	cfg := testRig(f, starter, procRoot)
+	cfg.ForceOffline = true
+	var out strings.Builder
+	err := Run(context.Background(), cfg, &out)
+	if err == nil {
+		t.Fatal("Run err=nil want post-restart health failure")
+	}
+	if !strings.Contains(err.Error(), "unhealthy after") {
+		t.Fatalf("err=%v want the post-restart health failure", err)
 	}
 }

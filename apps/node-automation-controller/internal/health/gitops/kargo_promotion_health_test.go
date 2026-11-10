@@ -5,9 +5,11 @@
 package gitops
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -16,8 +18,10 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // kargoPromotion builds a Promotion CR in the given phase, created
@@ -197,5 +201,31 @@ func TestKargoFamilyAbsenceTolerated(t *testing.T) {
 	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
 	if res.Pass || res.Infra != nil {
 		t.Fatalf("one absent CRD family must not blind the others: %+v", res)
+	}
+}
+
+// maybeRefreshKargoWarehouse's failure half: a failed refresh patch
+// is IncError'd and leaves the cooldown ledger unstamped, so the
+// next sweep retries the nudge rather than cooling down on a write
+// that never landed.
+func TestMaybeRefreshKargoWarehousePatchError(t *testing.T) {
+	now := time.Now()
+	wh := kargoWarehouse("kargo", "wh-bad", "False", now.Add(-45*time.Minute))
+	dyn := probetest.OpDyn(wh)
+	dyn.PrependReactor("patch", "warehouses",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver down")
+		})
+	p := &kargoPromotionHealthCheck{Deps: &probefw.Deps{
+		Name: CheckNameKargoPromotionHealth, Dyn: dyn}}
+	before := testutil.QueueErrorCount(t, CheckNameKargoPromotionHealth)
+	p.maybeRefreshKargoWarehouse(ctx, logr.Discard(), wh,
+		"kargo/wh-bad", now)
+	if got := testutil.QueueErrorCount(t, CheckNameKargoPromotionHealth) - before; got != 1 {
+		t.Fatalf("patch failure metered %v errors, want 1", got)
+	}
+	if p.warehouseRefreshHealed.CooledDown("kargo/wh-bad",
+		kargoWarehouseRefreshCool, now) {
+		t.Fatal("failed patch stamped the cooldown — next sweep would skip the nudge")
 	}
 }

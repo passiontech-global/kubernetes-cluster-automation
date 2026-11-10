@@ -141,7 +141,7 @@ func TestCollectSystemdScopes(t *testing.T) {
 func TestCollectCgroupMemEvents(t *testing.T) {
 	cfg, _ := fixture(t)
 	for unit, body := range map[string]string{
-		"k0sworker.service":     "low 0\nhigh 17\nmax 0\noom 0\noom_kill 2\n",
+		"k0sworker.service":     "low 0\nhigh 17\nmax 0\noom 0\noom_kill 2\noom_group_kill 1\n",
 		"k0scontroller.service": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
 	} {
 		d := filepath.Join(cfg.CgroupRoot, "system.slice", unit)
@@ -150,6 +150,13 @@ func TestCollectCgroupMemEvents(t *testing.T) {
 		}
 		testutil.WriteFile(t, filepath.Join(d, "memory.events"), body)
 	}
+	// W21-G2 — the whole pod-workload slice joins the per-unit set.
+	pods := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
+	if err := os.MkdirAll(pods, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(pods, "memory.events"),
+		"low 0\nhigh 9\nmax 0\noom 0\noom_kill 4\noom_group_kill 3\n")
 	c := New(cfg)
 	v, ok := counterValue(t, c, "node_host_agent_cgroup_memory_high_events_total",
 		map[string]string{"node": "node-a", "unit": "k0sworker.service"})
@@ -160,5 +167,32 @@ func TestCollectCgroupMemEvents(t *testing.T) {
 		map[string]string{"node": "node-a", "unit": "k0sworker.service"})
 	if !ok || v != 2 {
 		t.Fatalf("oom_kill{worker} = %v ok=%v, want 2", v, ok)
+	}
+	v, ok = counterValue(t, c, "node_host_agent_cgroup_memory_oom_group_kill_events_total",
+		map[string]string{"node": "node-a", "unit": "k0sworker.service"})
+	if !ok || v != 1 {
+		t.Fatalf("oom_group_kill{worker} = %v ok=%v, want 1", v, ok)
+	}
+	// kubepods.slice series — pod-workload memory.events now visible.
+	v, ok = counterValue(t, c, "node_host_agent_cgroup_memory_high_events_total",
+		map[string]string{"node": "node-a", "unit": "kubepods.slice"})
+	if !ok || v != 9 {
+		t.Fatalf("memory_high{kubepods.slice} = %v ok=%v, want 9", v, ok)
+	}
+	v, ok = counterValue(t, c, "node_host_agent_cgroup_memory_oom_kill_events_total",
+		map[string]string{"node": "node-a", "unit": "kubepods.slice"})
+	if !ok || v != 4 {
+		t.Fatalf("oom_kill{kubepods.slice} = %v ok=%v, want 4", v, ok)
+	}
+	v, ok = counterValue(t, c, "node_host_agent_cgroup_memory_oom_group_kill_events_total",
+		map[string]string{"node": "node-a", "unit": "kubepods.slice"})
+	if !ok || v != 3 {
+		t.Fatalf("oom_group_kill{kubepods.slice} = %v ok=%v, want 3", v, ok)
+	}
+	// A unit without the oom_group_kill key emits no group-kill series.
+	if _, ok = counterValue(t, c,
+		"node_host_agent_cgroup_memory_oom_group_kill_events_total",
+		map[string]string{"node": "node-a", "unit": "k0scontroller.service"}); ok {
+		t.Fatal("oom_group_kill emitted for a unit lacking the key")
 	}
 }

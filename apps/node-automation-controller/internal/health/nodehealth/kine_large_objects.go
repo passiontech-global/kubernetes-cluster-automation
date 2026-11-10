@@ -1,6 +1,8 @@
 // kine_large_objects.go — the kine large-object audit of the
 // api-object-sprawl-report-gc check: a cluster-wide ConfigMap/Secret
-// size census guarding the kine datastore row size.
+// census plus the CRD-backed kinds (CRDs, OLM CSVs, Argo
+// Applications, Flux HelmCharts) guarding the kine datastore row
+// size.
 package nodehealth
 
 import (
@@ -10,7 +12,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -33,7 +38,7 @@ const kineLargeObjectThreshold = 524288
 // PostgreSQL).
 var kineLargeObjectBytesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_kine_large_object_bytes",
-	Help: "Serialized bytes of ConfigMap/Secret objects above the 512 KiB Kine large-object guard.",
+	Help: "Serialized bytes of objects above the 512 KiB Kine large-object guard.",
 }, []string{"kind", "namespace", "name"})
 
 func init() {
@@ -91,7 +96,47 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("list secrets: %w", err)
 	}
+
+	// CRD-backed kinds — the same row-size guard over the object
+	// shapes that historically produced the giant kine rows the
+	// host-side census keeps finding: CRD OpenAPI schemas, OLM CSV
+	// install descriptors, Argo Application specs and Flux
+	// HelmCharts. These lists are small (tens-to-hundreds of
+	// objects), so every item earns an exact marshal — no
+	// approx-size gate, which cannot see spec-payload bulk on
+	// unstructured content anyway. An absent CRD/API resource
+	// skips quietly (IsNotFound/IsNoMatchError); any other read
+	// failure is infra — the caller bails before the ledger Close
+	// so live series are never pruned on a flap.
+	for _, rk := range kineLargeObjectCRDGVRs {
+		items, err := p.AllUnstructured(ctx, rk.gvr)
+		switch {
+		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			continue // CRD/API absent on this cluster — skip silently
+		case err != nil:
+			return fmt.Errorf("list %s: %w", rk.gvr.Resource, err)
+		}
+		for i := range items {
+			obj := &items[i]
+			p.recordKineLargeObject(ctx, objects, kineRep, rk.kind,
+				obj.GetNamespace(), obj.GetName(), obj)
+		}
+	}
 	return nil
+}
+
+// kineLargeObjectCRDGVRs is the dynamic-client half of the census —
+// the kinds whose serialized size lands in kine rows but which have
+// no typed client in this module. kind is the gauge label value,
+// lowercase like the "configmap"/"secret" labels.
+var kineLargeObjectCRDGVRs = []struct {
+	gvr  schema.GroupVersionResource
+	kind string
+}{
+	{kube.GVRCustomResourceDefinition, "customresourcedefinition"},
+	{kube.GVROLMClusterServiceVersion, "clusterserviceversion"},
+	{kube.GVRArgoCDApplication, "application"},
+	{kube.GVRFluxHelmChart, "helmchart"},
 }
 
 // kineMarshalFloor is the approx-size below which an object cannot

@@ -251,9 +251,11 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// before ever listing pods.) The dragonfly-operator leader-bounce
 	// heal rides the shared AllPods census now (was a namespaced
 	// list this pods-outage fake never hit), so it meters the same
-	// failure — twenty-five total.
-	if got := errCount() - before; got != 25 {
-		t.Fatalf("run errors delta = %v, want 25", got)
+	// failure — twenty-five total. The CNPG masterless candidate
+	// census in stateful-masterless-services lists the same pods —
+	// twenty-six total.
+	if got := errCount() - before; got != 26 {
+		t.Fatalf("run errors delta = %v, want 26", got)
 	}
 }
 

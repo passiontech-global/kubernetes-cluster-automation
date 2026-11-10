@@ -294,6 +294,54 @@ func TestParseQuotedThenHashTail(t *testing.T) {
 	}
 }
 
+// Bare "ip:port" entries (no '=') take the addr as the name too —
+// API_BACKENDS on workers is sometimes written without haproxy
+// names; empty-name and empty-addr halves are skipped.
+func TestParseAPIBackendsBareAndMalformed(t *testing.T) {
+	c, err := Parse([]byte(`API_BACKENDS="10.0.0.9:6443 hub3= name=  =10.0.0.4:6443 ok=10.0.0.5:6443"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []APIBackend{
+		{Name: "10.0.0.9:6443", Addr: "10.0.0.9:6443"},
+		{Name: "ok", Addr: "10.0.0.5:6443"},
+	}
+	if !reflect.DeepEqual(c.APIBackends, want) {
+		t.Fatalf("backends=%+v want %+v", c.APIBackends, want)
+	}
+}
+
+// Normalize applies the shell defaults to a literally-constructed
+// Config — wiring/tests that skip Parse get the same baseline —
+// while explicit values (including deliberate non-positive→default
+// resets only where the field is unset/<=0) survive.
+func TestNormalizeFillsDefaults(t *testing.T) {
+	c := &Config{}
+	c.Normalize()
+	if c.OverlaySlowpathRTTms != 100 || c.OverlaySiteedgeRTTms != 50 ||
+		c.OverlayProbeCount != 3 || c.OverlayProbeWait != 4 ||
+		c.OverlayEgressTable != 100 || c.OverlayActive != "tinc" ||
+		c.NebulaNet != "interdc" || c.NebulaDev != "neb1" ||
+		c.NebulaPort != 45670 || c.NebulaDegradedConsec != 2 ||
+		c.TincNet != "interdc" {
+		t.Fatalf("zero Config normalized to %+v", c)
+	}
+
+	// Explicit values survive — Normalize only fills unset/zero.
+	c = &Config{NebulaPort: 1, OverlayActive: "nebula", NebulaNet: "custom"}
+	c.Normalize()
+	if c.NebulaPort != 1 || c.OverlayActive != "nebula" || c.NebulaNet != "custom" {
+		t.Fatalf("set values clobbered: %+v", c)
+	}
+
+	// Non-positive numerics and empty strings reset to defaults.
+	c = &Config{NebulaPort: -5, OverlayProbeCount: 0, OverlayActive: ""}
+	c.Normalize()
+	if c.NebulaPort != 45670 || c.OverlayProbeCount != 3 || c.OverlayActive != "tinc" {
+		t.Fatalf("non-positive/empty not reset: %+v", c)
+	}
+}
+
 // Bare/bracketed IPv6 backends must keep their full host part —
 // a bare "::1" used to last-colon-chop to ":".
 func TestAPIBackendIPsIPv6(t *testing.T) {
@@ -305,6 +353,20 @@ func TestAPIBackendIPsIPv6(t *testing.T) {
 		{Name: "b5", Addr: "10.0.0.2"},
 	}}
 	want := []string{"::1", "::1", "fe80::1", "10.0.0.1", "10.0.0.2"}
+	if got := c.APIBackendIPs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ips=%v want %v", got, want)
+	}
+}
+
+// APIBackendIPs host extraction, remaining shapes: hostname:port via
+// SplitHostPort, and the last-colon chop for an addr BOTH parsers
+// reject (a malformed multi-colon entry still yields its head).
+func TestAPIBackendIPsHostShapes(t *testing.T) {
+	c := &Config{APIBackends: []APIBackend{
+		{Name: "b1", Addr: "hub1:6443"},
+		{Name: "b2", Addr: "10.0.0.1:6443:9090"},
+	}}
+	want := []string{"hub1", "10.0.0.1:6443"}
 	if got := c.APIBackendIPs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ips=%v want %v", got, want)
 	}

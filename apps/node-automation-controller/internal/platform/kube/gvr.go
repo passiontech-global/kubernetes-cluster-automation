@@ -18,10 +18,16 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 
 var (
 	// ---------------------------------------------------------------
-	// Kubernetes aggregated API (apiservice-guard).
+	// Kubernetes aggregated API (apiservice-guard) + apiextensions.
 	// ---------------------------------------------------------------
 	GVRAPIService = schema.GroupVersionResource{
 		Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices"}
+	// GVRCustomResourceDefinition is the apiextensions/v1 CRD GVR —
+	// cluster-scoped, read through the dynamic client (no typed
+	// client for apiextensions in this module's imports).
+	GVRCustomResourceDefinition = schema.GroupVersionResource{
+		Group: "apiextensions.k8s.io", Version: "v1",
+		Resource: "customresourcedefinitions"}
 
 	// ---------------------------------------------------------------
 	// FluxCD (helmrelease-unlocker, cluster-health-probes).

@@ -135,8 +135,13 @@ func init() {
 
 // masterlessRoleKeys are the label keys marking a Service that routes
 // only to the master/primary of a stateful set — 0 Ready endpoints on
-// it means the workload is leaderless.
-var masterlessRoleKeys = []string{"role", "redis-role", "app.kubernetes.io/role"}
+// it means the workload is leaderless. cnpg.io/instanceRole carries
+// CloudNativePG's primary/replica role; postgres-operator.crunchydata.com/role
+// is the Crunchy/Percona-PGv2 (Everest) master/replica role.
+var masterlessRoleKeys = []string{
+	"role", "redis-role", "app.kubernetes.io/role",
+	"cnpg.io/instanceRole", "postgres-operator.crunchydata.com/role",
+}
 
 // masterlessRoleValues are the role values identifying the master
 // side of a replicated stateful service.
@@ -182,11 +187,27 @@ func selectorMatchesSTS(svc *corev1.Service, podLabels map[string]string) bool {
 	return labels.SelectorFromSet(nonRole).Matches(labels.Set(podLabels))
 }
 
-// masterSvc pairs a master-role Service with the ready StatefulSet
-// whose pod labels its selector matches.
+// masterSvc pairs a master-role Service with the workload whose pods
+// its selector routes to. StatefulSet-backed workloads carry sts; a
+// CloudNativePG Cluster owns bare Pods (no StatefulSet) so cnpg holds
+// the cnpg.io/cluster value as the workload identity, podLabels holds
+// the representative pod labels for dbOperatorForLabels attribution,
+// and svcObj is the stamp target for the persisted first-seen window.
 type masterSvc struct {
-	ns, svc string
-	sts     *appsv1.StatefulSet
+	ns, svc   string
+	sts       *appsv1.StatefulSet
+	svcObj    *corev1.Service
+	cnpg      string
+	podLabels map[string]string
+}
+
+// workloadName is the identity used in keys and gauge labels — the
+// StatefulSet name, or the CNPG cluster name when sts is nil.
+func (c masterSvc) workloadName() string {
+	if c.sts != nil {
+		return c.sts.Name
+	}
+	return c.cnpg
 }
 
 // masterlessDue pairs a master-role service past the heal window
@@ -259,7 +280,13 @@ func podMasterRole(pod *corev1.Pod) bool {
 // for the on-call engineer instead of acting on it. Diagnostics
 // only: a list failure must not escalate into a run error.
 func (p *statefulMasterlessCheck) logStatefulPodRoles(ctx context.Context, log logr.Logger, sig masterSvc) {
-	sel, err := metav1.LabelSelectorAsSelector(sig.sts.Spec.Selector)
+	var sel labels.Selector
+	var err error
+	if sig.sts != nil {
+		sel, err = metav1.LabelSelectorAsSelector(sig.sts.Spec.Selector)
+	} else {
+		sel = labels.SelectorFromSet(labels.Set{"cnpg.io/cluster": sig.cnpg})
+	}
 	if err != nil {
 		return
 	}
@@ -269,7 +296,7 @@ func (p *statefulMasterlessCheck) logStatefulPodRoles(ctx context.Context, log l
 	}
 	for i := range allPods {
 		pod := &allPods[i]
-		if pod.Namespace != sig.sts.Namespace ||
+		if pod.Namespace != sig.ns ||
 			!sel.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
@@ -281,7 +308,7 @@ func (p *statefulMasterlessCheck) logStatefulPodRoles(ctx context.Context, log l
 		}
 		log.Info("masterless service — pod role diagnostic",
 			"service", sig.ns+"/"+sig.svc,
-			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
+			"workload", sig.workloadName(),
 			"pod", pod.Name,
 			"ready", kube.PodReadyCond(pod),
 			"roles", fmt.Sprintf("%v", roles))

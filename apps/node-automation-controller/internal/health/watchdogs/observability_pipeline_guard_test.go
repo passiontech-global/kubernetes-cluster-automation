@@ -77,6 +77,46 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 			t.Fatalf("healthy pipeline must pass: %+v", res)
 		}
 	})
+
+	// W21-G5 — the Prometheus→Alertmanager leg: dropped notifications
+	// and a zero discovered-alertmanager set both degrade even while
+	// the Watchdog heartbeat and every other counter stay quiet.
+	t.Run("prometheus→alertmanager delivery signals degrade", func(t *testing.T) {
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			switch {
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Labels: map[string]string{}, Value: 1}}
+			case strings.Contains(query, "notifications_dropped"):
+				return []probetest.PromTestSample{{Labels: map[string]string{}, Value: 3}}
+			case strings.Contains(query, "alertmanagers_discovered"):
+				return []probetest.PromTestSample{{Labels: map[string]string{}, Value: 0}}
+			}
+			return nil
+		})
+		cs := fake.NewSimpleClientset()
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL
+		p.HTTPClient = srv.Client()
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(ctx)
+		if res.Pass {
+			t.Fatal("dropped notifications + zero discovered alertmanagers must fail the check")
+		}
+		for _, c := range []string{"prometheus_notifications_dropped", "prometheus_alertmanagers_discovered"} {
+			if !obsPipelineDegradedGauge.DeleteLabelValues(c) {
+				t.Fatalf("missing degraded series for %s", c)
+			}
+		}
+		if obsPipelineDegradedGauge.DeleteLabelValues("prometheus_tsdb_wal") {
+			t.Fatal("quiet counter flagged degraded")
+		}
+		evs, err := cs.EventsV1().Events(obsPipelineEventNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 2 {
+			t.Fatalf("warning events = %d, want 2", len(evs.Items))
+		}
+	})
 }
 
 // The connect-sync probe flags a Running onepassword-connect pod whose

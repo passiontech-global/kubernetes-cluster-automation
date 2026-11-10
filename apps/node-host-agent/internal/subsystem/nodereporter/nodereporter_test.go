@@ -210,6 +210,19 @@ func TestAllConditionDefaults(t *testing.T) {
 		"CiliumWGStale":  {"CiliumWGPeersOk", "cilium_wg0 live peers match expected encryption peers (no stale state)"},
 		// inode-pressure inode-pressure latch→condition surface.
 		"InodePressure": {"FilesystemInodesHealthy", "all monitored filesystems below inode-pressure thresholds"},
+		// W21 latch→condition surface — the last 7 latch-backed
+		// conditions (workerhygiene konnectivity/envoy-xds/disk-bloat,
+		// nethealth nebula MTU/slowpath/site-edge, hostmetrics
+		// page-alloc evidence).
+		"KonnectivityIPMismatch": {"KonnectivityIPOk", "konnectivity-agent identifiers match node IPs"},
+		"CiliumEnvoyXDSReject":   {"CiliumEnvoyXDSOk", "cilium-envoy xDS updates accepted (no update_rejected deltas)"},
+		"DiskBloatRunaway":       {"DiskBloatNormal", "no target above the disk-bloat watermark"},
+		"NebulaMTUBlackhole":     {"NebulaMTUOk", "nebula overlay passes DF probes at full size"},
+		"NebulaSlowpath":         {"NebulaFastpathOk", "nebula dataplane on fast paths within latency bounds"},
+		"NebulaSiteedge":         {"NebulaSiteedgeOk", "nebula site-edge peers reachable"},
+		"KernelPageAllocFailure": {"KernelPageAllocOk", "no kernel page-allocation failure records"},
+		// controllerhygiene sig13 watch-cache wedge latch→condition.
+		"ApiserverWatchCacheWedged": {"APIServerWatchCacheOk", "apiserver watch-cache tracks etcd revision"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

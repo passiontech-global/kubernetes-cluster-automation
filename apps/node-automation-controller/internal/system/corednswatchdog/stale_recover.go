@@ -1,5 +1,6 @@
 // stale_recover.go — the heal action of coredns-stale-watchdog:
-// cooldown/storm-gate/maintenance-mutex/rollout gates, then either a
+// cooldown/storm-gate/watch-cache-wedge/maintenance-mutex/rollout
+// gates, then either a
 // Deployment rollout-restart (whole fleet stale) or surgical deletes
 // of only the stale pods, plus stamping the cooldown annotation.
 package corednswatchdog
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -18,14 +20,16 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
-// recover applies cooldown/storm-gate/maintenance-mutex/rollout
-// gates, then either rollout-restarts the Deployment (whole fleet
-// stale) or deletes only the stale pods, and stamps the cooldown
-// annotation. podUID maps pod name → the UID the sweep's pod list
-// saw — the deletes carry it as a UID precondition. Hard API
-// failures are returned so the wrapper counts them.
+// recover applies cooldown/storm-gate/watch-cache-wedge/
+// maintenance-mutex/rollout gates, then either rollout-restarts the
+// Deployment (whole fleet stale) or deletes only the stale pods, and
+// stamps the cooldown annotation. podUID maps pod name → the UID
+// the sweep's pod list saw — the deletes carry it as a UID
+// precondition. Hard API failures are returned so the wrapper
+// counts them.
 func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	podUID map[string]types.UID, nPods int) error {
 	log := logf.FromContext(ctx)
@@ -58,6 +62,25 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		// working as designed.
 		log.Info("SKIP recovery: nodes NotReady — cluster storm",
 			"pods", suspects, "notReady", notReady)
+		return nil
+	}
+	// Watch-cache wedge gate (W21-G4): a fresh
+	// ApiserverWatchCacheWedged=True on any node means the apiserver
+	// is serving stale watch-cache data — deleting coredns pods or
+	// restarting the Deployment would strip the last DNS answers
+	// while the control plane is already degraded. Defer the whole
+	// recovery (pod deletes AND rollout restart) until the wedge
+	// clears; the heartbeat-freshness check keeps a dead reporter's
+	// zombie True from suppressing recovery forever.
+	wedged, err := w.watchCacheWedgedNode(ctx)
+	if err != nil {
+		return fmt.Errorf("check apiserver watch-cache wedge: %w", err)
+	}
+	if wedged != "" {
+		// Legitimate skip — same class as the storm gate: the
+		// cluster is degraded and churn makes it worse.
+		log.Info("SKIP recovery: apiserver watch-cache wedged — deferring DNS pod churn",
+			"pods", suspects, "node", wedged)
 		return nil
 	}
 	// Fleet not fully ready = a rollout is already recreating pods —
@@ -165,4 +188,32 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	}
 	log.Info("sweep done: stale coredns recovery issued", "pods", suspects)
 	return nil
+}
+
+// watchCacheWedgedHeartbeatMax bounds the LastHeartbeatTime age that
+// still counts as live evidence for the watch-cache-wedge gate — the
+// same 10m freshness window the other heartbeat-gated condition
+// consumers use (mesh watchdog's ciliumIPAMCondHeartbeatMax).
+const watchCacheWedgedHeartbeatMax = 10 * time.Minute
+
+// watchCacheWedgedNode returns the name of the first node holding a
+// FRESH ApiserverWatchCacheWedged=True, or "" when none does — the
+// coredns-stale-watchdog's defer signal while the apiserver serves
+// stale watch-cache reads. A frozen heartbeat means the reporter
+// that owned the True is dead (a zombie the node-condition-sweeper
+// clears), so it does not count.
+func (w *coreDNSWatchdog) watchCacheWedgedNode(ctx context.Context) (string, error) {
+	nodes, err := kube.ListNodes(ctx, w.cs)
+	if err != nil {
+		return "", err
+	}
+	now := w.now.Now()
+	for i := range nodes {
+		c := kube.NodeCondition(&nodes[i], nodecond.ApiserverWatchCacheWedged)
+		if c != nil && c.Status == corev1.ConditionTrue &&
+			kube.CondHeartbeatLive(c, watchCacheWedgedHeartbeatMax, now) {
+			return nodes[i].Name, nil
+		}
+	}
+	return "", nil
 }

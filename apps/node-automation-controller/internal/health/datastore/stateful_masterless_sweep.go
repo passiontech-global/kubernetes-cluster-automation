@@ -11,6 +11,7 @@ package datastore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -85,8 +86,15 @@ func (p *statefulMasterlessCheck) beginMasterlessSweep(ctx context.Context) (*ma
 	// in site_skew.go.
 	s.skew = p.siteSkew.begin(ctx, log, p.Deps)
 	// Candidates: a ready STS paired with a master-role Service
-	// routing to its pods.
+	// routing to its pods, plus CNPG Clusters — CloudNativePG owns
+	// bare Pods (no StatefulSet), so its clusters are aggregated from
+	// the pod census's cnpg.io/cluster label instead.
 	s.candidates = masterlessCandidates(stsList, svcList)
+	pods, perr := p.AllPods(ctx)
+	if perr != nil {
+		return nil, fmt.Errorf("list pods: %w", perr)
+	}
+	s.candidates = append(s.candidates, cnpgMasterlessCandidates(pods, svcList)...)
 	return s, nil
 }
 
@@ -119,10 +127,82 @@ func masterlessCandidates(stsList []appsv1.StatefulSet,
 				continue
 			}
 			candidates = append(candidates,
-				masterSvc{ns: svc.Namespace, svc: svc.Name, sts: sts})
+				masterSvc{ns: svc.Namespace, svc: svc.Name, sts: sts, svcObj: svc})
 		}
 	}
 	return candidates
+}
+
+// cnpgClusterLabel is the label CloudNativePG stamps on every Pod of
+// a Cluster — the grouping key the masterless sweep aggregates CNPG
+// workloads by (there is no StatefulSet to pair against).
+const cnpgClusterLabel = "cnpg.io/cluster"
+
+// cnpgMasterlessCandidates aggregates Ready CloudNativePG pods by
+// cnpg.io/cluster and pairs each cluster with the master-role
+// Services routing to its pods — the CNPG twin of
+// masterlessCandidates for an operator that manages bare Pods.
+func cnpgMasterlessCandidates(pods []corev1.Pod,
+	svcList []corev1.Service) []masterSvc {
+	// clusterLabels: "ns/cluster" → representative pod labels (every
+	// pod of a cluster shares cnpg.io/cluster; role labels differ but
+	// selectorMatchesSTS strips them).
+	clusterLabels := map[string]map[string]string{}
+	for i := range pods {
+		pod := &pods[i]
+		cluster := pod.Labels[cnpgClusterLabel]
+		if cluster == "" || pod.DeletionTimestamp != nil ||
+			!kube.PodReadyCond(pod) {
+			continue
+		}
+		key := pod.Namespace + "/" + cluster
+		if _, ok := clusterLabels[key]; !ok {
+			clusterLabels[key] = pod.Labels
+		}
+	}
+	var candidates []masterSvc
+	for key, podLabels := range clusterLabels {
+		ns, cluster, _ := strings.Cut(key, "/")
+		for j := range svcList {
+			svc := &svcList[j]
+			if svc.Namespace != ns ||
+				svc.Spec.ClusterIP == "" ||
+				svc.Spec.ClusterIP == corev1.ClusterIPNone {
+				continue // headless services are deliberately per-pod
+			}
+			if !masterRoleService(svc) ||
+				!selectorMatchesSTS(svc, podLabels) {
+				continue
+			}
+			candidates = append(candidates, masterSvc{
+				ns: svc.Namespace, svc: svc.Name, svcObj: svc,
+				cnpg: cluster, podLabels: podLabels})
+		}
+	}
+	return candidates
+}
+
+// stampTarget returns the object carrying the persisted first-seen
+// annotation plus the merge-patch closure writing it — the
+// StatefulSet for STS-backed workloads, the Service itself for a
+// CNPG Cluster (which has no StatefulSet to stamp).
+func (p *statefulMasterlessCheck) stampTarget(c masterSvc) (metav1.Object,
+	func(ctx context.Context, data []byte) error) {
+
+	if c.sts != nil {
+		return c.sts, func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().StatefulSets(c.sts.Namespace).Patch(ctx,
+				c.sts.Name, types.MergePatchType, data,
+				metav1.PatchOptions{})
+			return err
+		}
+	}
+	return c.svcObj, func(ctx context.Context, data []byte) error {
+		_, err := p.CS.CoreV1().Services(c.ns).Patch(ctx,
+			c.svc, types.MergePatchType, data,
+			metav1.PatchOptions{})
+		return err
+	}
 }
 
 // evalCandidates runs the per-candidate streak + signature eval:
@@ -133,15 +213,12 @@ func masterlessCandidates(stsList []appsv1.StatefulSet,
 func (s *masterlessSweep) evalCandidates(ctx context.Context) {
 	p := s.p
 	for _, c := range s.candidates {
-		key := c.ns + "/" + c.svc + "/" + c.sts.Name
+		key := c.ns + "/" + c.svc + "/" + c.workloadName()
 		s.evaluated[key] = true
-		sts := c.sts
-		patch := func(ctx context.Context, data []byte) error {
-			_, err := p.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx,
-				sts.Name, types.MergePatchType, data,
-				metav1.PatchOptions{})
-			return err
-		}
+		// The persisted first-seen stamp lands on the StatefulSet
+		// when one exists; a CNPG Cluster has no STS so its stamp
+		// rides the Service itself.
+		stampObj, patch := p.stampTarget(c)
 		eps := s.ready[c.ns+"/"+c.svc]
 		// stateful-split-brain(i)/(ii) — the split-brain streak and the cross-DC
 		// pin accounting, one signature per file.
@@ -155,11 +232,11 @@ func (s *masterlessSweep) evalCandidates(ctx context.Context) {
 			// ledger Forget already landed, the annotation retry
 			// is Warn-only.
 			if err := heal.ClearPersistedFirstSeen(ctx, s.log,
-				&p.stsZeroSince, sts,
+				&p.stsZeroSince, stampObj,
 				kube.AnnoFirstSeenStatefulMasterless, key,
 				patch); err != nil {
 				s.log.Info("WARN: masterless first-seen clear failed",
-					"statefulset", sts.Namespace+"/"+sts.Name,
+					"workload", c.workloadName(),
 					"error", err)
 			}
 			continue
@@ -170,13 +247,13 @@ func (s *masterlessSweep) evalCandidates(ctx context.Context) {
 		// persisted (annotation-backed) variant — the stamp on the
 		// STS survives an operator restart that would otherwise
 		// re-arm the gauge and heal windows mid-wedge.
-		if !heal.FirstSeenPersisted(ctx, s.log, &p.stsZeroSince, sts,
+		if !heal.FirstSeenPersisted(ctx, s.log, &p.stsZeroSince, stampObj,
 			kube.AnnoFirstSeenStatefulMasterless, key,
 			masterlessZeroMinAge, s.now, patch) {
 			continue
 		}
 		s.rep.Emit(statefulServiceZeroEndpointsGauge, key,
-			[]string{c.ns, c.svc, c.sts.Name}, key)
+			[]string{c.ns, c.svc, c.workloadName()}, key)
 		// The heal window reads the same streak — Seen never
 		// re-stamps, and reports the WIDER window once
 		// FirstSeenPersisted Seeds a resumed persisted stamp back
@@ -212,21 +289,33 @@ func (s *masterlessSweep) closeReports() {
 func (s *masterlessSweep) healDue(ctx context.Context) {
 	p := s.p
 	for _, d := range s.due {
-		if !dragonflyOwned(d.svc.sts) {
-			// va-stuck-terminating: a masterless stateful service owned by a known db
-			// operator gets the operator pod bounced to force
-			// re-election — the same re-election nudge as the
-			// dragonfly heal, on its own per-operator 30m cooldown.
-			if op := dbOperatorFor(d.svc.sts); op != "" {
-				p.healDBOperator(ctx, s.log, d.svc, op, s.now)
-			} else {
-				p.logStatefulPodRoles(ctx, s.log, d.svc)
+		if d.svc.cnpg == "" && dragonflyOwned(d.svc.sts) {
+			p.healDragonflyOperator(ctx, s.log, d.svc, s.now)
+			if s.now.Sub(d.since) >= dragonflyReplicaDeadlockMinAge {
+				p.healDragonflyReplicaDeadlock(ctx, s.log, d.svc, s.now)
 			}
 			continue
 		}
-		p.healDragonflyOperator(ctx, s.log, d.svc, s.now)
-		if s.now.Sub(d.since) >= dragonflyReplicaDeadlockMinAge {
-			p.healDragonflyReplicaDeadlock(ctx, s.log, d.svc, s.now)
+		// va-stuck-terminating: a masterless stateful service owned by a known db
+		// operator gets the operator pod bounced to force
+		// re-election — the same re-election nudge as the
+		// dragonfly heal, on its own per-operator 30m cooldown. A
+		// CNPG candidate has no StatefulSet; its pre-aggregated pod
+		// and Service labels go through dbOperatorForLabels so a
+		// cluster carrying app.kubernetes.io/managed-by=cloudnative-pg
+		// bounces cnpg-controller-manager, while an unattributed
+		// cluster falls to the diagnostics-only path.
+		var op string
+		if d.svc.cnpg != "" {
+			op = dbOperatorForLabels(
+				[]map[string]string{d.svc.podLabels, d.svc.svcObj.Labels}, nil)
+		} else {
+			op = dbOperatorFor(d.svc.sts)
+		}
+		if op != "" {
+			p.healDBOperator(ctx, s.log, d.svc, op, s.now)
+		} else {
+			p.logStatefulPodRoles(ctx, s.log, d.svc)
 		}
 	}
 }

@@ -237,23 +237,54 @@ var dbQuorumTokens = []string{
 // nothing while the thrash persists.
 const MinEvictRSSBytes = 512 * 1024 * 1024
 
+// statefulOwnerKinds are ownerReference kinds whose pods hold
+// stateful/quorum workloads — a plain StatefulSet plus the database
+// operators that raise pods under their own CRD kinds (CloudNativePG
+// Cluster, Dragonfly, ScyllaCluster/ScyllaDBDatacenter, Percona
+// PGv2/PSMDB/PXC). Losing one replica under memory pressure can cost
+// quorum, so these pods are never the "preferred" eviction tier.
+var statefulOwnerKinds = map[string]bool{
+	"StatefulSet":          true,
+	"Cluster":              true, // CloudNativePG postgresql.cnpg.io
+	"Dragonfly":            true,
+	"ScyllaCluster":        true,
+	"ScyllaDBDatacenter":   true,
+	"PerconaServerMongoDB": true,
+	"PerconaXtraDBCluster": true,
+	"PerconaPGCluster":     true,
+}
+
 // ownedByStatefulSet reports whether any ownerReference is a
-// StatefulSet — the tiering hint for victim preference.
+// stateful/quorum workload owner (statefulOwnerKinds) — the tiering
+// hint for victim preference.
 func ownedByStatefulSet(p *corev1.Pod) bool {
 	for _, ref := range p.OwnerReferences {
-		if ref.Kind == "StatefulSet" {
+		if statefulOwnerKinds[ref.Kind] {
 			return true
 		}
 	}
 	return false
 }
 
+// dbQuorumLabelKeys are label KEYS that mark database/quorum pods
+// regardless of value — CNPG's instanceRole and the CrunchyData
+// postgres-operator role selector carry no dbQuorumTokens substring.
+// Keys are compared lowercased (label keys are case-sensitive but
+// the convention is camelCase suffixes like instanceRole).
+var dbQuorumLabelKeys = map[string]bool{
+	"cnpg.io/instancerole":                   true,
+	"postgres-operator.crunchydata.com/role": true,
+}
+
 // carriesDBQuorumLabel reports whether the pod's labels name a
-// database/quorum workload (dbQuorumTokens, case-insensitive over
-// keys and values).
+// database/quorum workload — dbQuorumLabelKeys exact key matches
+// plus dbQuorumTokens (case-insensitive over keys and values).
 func carriesDBQuorumLabel(p *corev1.Pod) bool {
 	for k, v := range p.Labels {
 		lk, lv := strings.ToLower(k), strings.ToLower(v)
+		if dbQuorumLabelKeys[lk] {
+			return true
+		}
 		for _, tok := range dbQuorumTokens {
 			if strings.Contains(lk, tok) || strings.Contains(lv, tok) {
 				return true
@@ -261,6 +292,20 @@ func carriesDBQuorumLabel(p *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// evictablePodOnNode applies the psi-thrash-victim-selection safety
+// rails that disqualify a pod outright: terminating pods, excluded
+// namespaces, critical priority classes — and, as an INDEPENDENT
+// gate, any pod carrying database/quorum labels. carriesDBQuorumLabel
+// does not depend on the owner kind: a CNPG/Percona pod is never a
+// victim and never "preferred" no matter which CRD owns it, because
+// quorum loss costs far more than the memory an eviction frees.
+func evictablePodOnNode(p *corev1.Pod) bool {
+	return p.DeletionTimestamp == nil &&
+		!psiEvictExcludedNamespaces[p.Namespace] &&
+		!psiEvictCriticalPriorityClasses[p.Spec.PriorityClassName] &&
+		!carriesDBQuorumLabel(p)
 }
 
 // highestRSSPod returns the eviction victim for the
@@ -272,8 +317,10 @@ func carriesDBQuorumLabel(p *corev1.Pod) bool {
 //     eviction at all (victim=nil).
 //   - psiEvictExcludedNamespaces + critical priority classes are
 //     never candidates.
-//   - StatefulSet pods carrying database/quorum labels are never
-//     candidates (quorum loss >> memory freed).
+//   - Pods carrying database/quorum labels are never candidates —
+//     carriesDBQuorumLabel is an independent gate inside
+//     evictablePodOnNode, not tied to the owner kind (quorum loss >>
+//     memory freed).
 //   - Tiered pick: BestEffort/Burstable pods NOT owned by a
 //     StatefulSet are preferred; Guaranteed pods and other
 //     StatefulSet pods are the fallback tier — evicting them is
@@ -290,9 +337,7 @@ func highestRSSPod(d *wdeps.Deps, pods []corev1.Pod, pids []int) (victim *corev1
 	byUID := map[string]*candidate{}
 	for i := range pods {
 		p := &pods[i]
-		if p.DeletionTimestamp != nil || psiEvictExcludedNamespaces[p.Namespace] ||
-			psiEvictCriticalPriorityClasses[p.Spec.PriorityClassName] ||
-			(ownedByStatefulSet(p) && carriesDBQuorumLabel(p)) {
+		if !evictablePodOnNode(p) {
 			continue
 		}
 		byUID[string(p.UID)] = &candidate{

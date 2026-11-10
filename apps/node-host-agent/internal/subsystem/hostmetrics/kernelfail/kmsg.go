@@ -386,8 +386,17 @@ func (r *Runner) notePageAllocFailure(msg string) {
 	if len(detail) > 200 {
 		detail = detail[:200]
 	}
+	// NPD contract: the ACTION entry line feeds
+	// KernelPageAllocFailure (events.go) — ActionEntryRe parses
+	// it. Once per episode: repeat kmsg records only refresh the
+	// latch mtime, so gate the line on the latch being absent.
+	fresh := !r.deps.Store.Exists(latchdefs.LatchPageAllocFailure)
 	r.deps.Store.Enter(latchdefs.LatchPageAllocFailure,
 		"page allocation failure: "+detail)
+	if fresh {
+		r.deps.Store.AppendLog(latchdefs.ActionEntryPrefix(
+			latchdefs.LatchPageAllocFailure) + detail)
+	}
 }
 
 // noteClocksourceUnstable latches state-clocksource-unstable on a

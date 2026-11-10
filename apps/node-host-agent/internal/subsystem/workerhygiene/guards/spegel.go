@@ -82,7 +82,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// socket is inconclusive and skips (pod-mode agents without a
 	// host /run view land here too).
 	if spegelSocketStale(c.d.Cfg.Seams.Host.StatFn,
-		spegelContainerdSock, sp.CreationTimestamp.Time) {
+		spegelSockPath(c.d.Cfg.CtrSocket), sp.CreationTimestamp.Time) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s holds stale containerd.sock inode (socket recreated after pod start)",
 			sp.Namespace, sp.Name))
@@ -153,6 +153,18 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Actions.WithLabelValues(wdeps.CheckSpegel, "pod_delete").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckSpegel, "ok")
+}
+
+// spegelSockPath resolves the HOST-side containerd socket the
+// staleness stat must read: Cfg.CtrSocket is the /host/run view the
+// agent's other containerd probes use (ctr + kubelet share it), and
+// spegelContainerdSock is only the fallback for fixtures/callers
+// that never populated it.
+func spegelSockPath(ctrSocket string) string {
+	if ctrSocket == "" {
+		return spegelContainerdSock
+	}
+	return ctrSocket
 }
 
 // spegelSocketStale reports whether the host's containerd socket was

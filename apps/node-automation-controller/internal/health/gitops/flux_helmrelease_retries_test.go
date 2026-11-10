@@ -4,15 +4,21 @@
 package gitops
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -176,5 +182,35 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt)
 	if token != firstToken {
 		t.Fatal("re-patched inside the 30m cooldown")
+	}
+}
+
+// maybePatchHRRetry's failure half: once the persisted cooldown and
+// the maintenance/budget gates clear, a failed annotation patch is
+// metabolized — IncError'd, ledger unstamped so the next sweep
+// retries instead of cooling down on a write that never landed.
+func TestMaybePatchHRRetryPatchError(t *testing.T) {
+	now := time.Now()
+	hr := shHR("apps", "hr", "False", "UpgradeFailed",
+		"upgrade failed: timed out", now.Add(-20*time.Minute))
+	dyn := probetest.OpDyn(hr)
+	dyn.PrependReactor("patch", "helmreleases",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver down")
+		})
+	p := &fluxHRRetriesCheck{Deps: &probefw.Deps{
+		Name: CheckNameFluxHRRetries,
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  dyn,
+	}}
+	before := testutil.QueueErrorCount(t, CheckNameFluxHRRetries)
+	p.maybePatchHRRetry(ctx, logr.Discard(), hrRetryGVR, hr,
+		"apps/hr", now)
+	if got := testutil.QueueErrorCount(t, CheckNameFluxHRRetries) - before; got != 1 {
+		t.Fatalf("patch failure metered %v errors, want 1", got)
+	}
+	ck := probefw.SelfHealKey(CheckNameFluxHRRetries, "apps/hr")
+	if p.hrRetryHealed.CooledDown(ck, fluxHRHealCooldown, now) {
+		t.Fatal("failed patch stamped the cooldown — next sweep would skip the retry")
 	}
 }

@@ -98,6 +98,18 @@ func TestOwnedByStatefulSet(t *testing.T) {
 	if !ownedByStatefulSet(p) {
 		t.Fatal("StatefulSet owner must be true")
 	}
+	// Database-operator owner kinds count too — CNPG Cluster,
+	// Dragonfly, Scylla, Percona PGv2/PSMDB/PXC pods are never the
+	// preferred eviction tier.
+	for _, kind := range []string{
+		"Cluster", "Dragonfly", "ScyllaCluster", "ScyllaDBDatacenter",
+		"PerconaServerMongoDB", "PerconaXtraDBCluster", "PerconaPGCluster",
+	} {
+		q := &corev1.Pod{OwnerReferences: []metav1.OwnerReference{{Kind: kind}}}
+		if !ownedByStatefulSet(q) {
+			t.Fatalf("owner kind %s must be true", kind)
+		}
+	}
 }
 
 func TestCarriesDBQuorumLabel(t *testing.T) {
@@ -109,6 +121,12 @@ func TestCarriesDBQuorumLabel(t *testing.T) {
 		"value match":      {labels: map[string]string{"app": "rabbitmq-server"}, want: true},
 		"key match":        {labels: map[string]string{"app.kubernetes.io/scylla": "yes"}, want: true},
 		"case-insensitive": {labels: map[string]string{"DB": "PostgreSQL"}, want: true},
+		"cnpg instanceRole": {labels: map[string]string{
+			"cnpg.io/cluster": "pg", "cnpg.io/instanceRole": "primary"}, want: true},
+		"crunchy role": {labels: map[string]string{
+			"postgres-operator.crunchydata.com/role": "master"}, want: true},
+		"cnpg cluster label alone is not quorum": {labels: map[string]string{
+			"cnpg.io/cluster": "pg"}, want: false},
 	} {
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
 		if got := carriesDBQuorumLabel(p); got != tc.want {
@@ -156,7 +174,7 @@ func TestHighestRSSPodTiersAndRails(t *testing.T) {
 	}
 
 	// Excluded namespaces / critical priority classes / terminating
-	// pods / StatefulSet+db-quorum pods are never victims.
+	// pods / db-quorum pods are never victims.
 	d3, _ := gDeps(t)
 	mkRSSProc(t, d3, 31, wdepstest.UIDA, big)
 	sys := psiPod("sys", "kube-system", wdepstest.UIDA, "")
@@ -185,7 +203,40 @@ func TestHighestRSSPodTiersAndRails(t *testing.T) {
 	quorum.Labels = map[string]string{"app": "scylla"}
 	victim, _ = highestRSSPod(d3, []corev1.Pod{quorum}, []int{31})
 	if victim != nil {
-		t.Fatal("StatefulSet+db-quorum pod must never be a victim")
+		t.Fatal("db-quorum pod must never be a victim")
+	}
+
+	// CNPG pod — owner Kind "Cluster" (postgresql.cnpg.io) with the
+	// cnpg.io/instanceRole label — is excluded by the independent
+	// carriesDBQuorumLabel gate even though its namespace is not on
+	// the excluded list.
+	cnpg := psiPod("pg-primary", "database", wdepstest.UIDA,
+		string(corev1.PodQOSBurstable))
+	cnpg.OwnerReferences = []metav1.OwnerReference{{Kind: "Cluster"}}
+	cnpg.Labels = map[string]string{
+		"cnpg.io/cluster": "pg", "cnpg.io/instanceRole": "primary"}
+	if evictablePodOnNode(&cnpg) {
+		t.Fatal("CNPG primary pod must not be evictable")
+	}
+	if ownedByStatefulSet(&cnpg) != true {
+		t.Fatal("CNPG Cluster owner must count as stateful-owned")
+	}
+	victim, _ = highestRSSPod(d3, []corev1.Pod{cnpg}, []int{31})
+	if victim != nil {
+		t.Fatal("CNPG pod must never be a victim")
+	}
+
+	// A db-quorum pod NOT owned by any stateful kind is still
+	// excluded — the label gate is independent of ownerReferences.
+	loose := psiPod("loose-db", "app", wdepstest.UIDA, "")
+	loose.Labels = map[string]string{
+		"postgres-operator.crunchydata.com/role": "replica"}
+	if evictablePodOnNode(&loose) {
+		t.Fatal("crunchy-role pod must not be evictable without owner refs")
+	}
+	victim, _ = highestRSSPod(d3, []corev1.Pod{loose}, []int{31})
+	if victim != nil {
+		t.Fatal("unowned db-quorum pod must never be a victim")
 	}
 
 	// No pids → no victim.
@@ -598,7 +649,7 @@ func TestCheckDeactivating(t *testing.T) {
 	// list-units failure (no SDReply stub → ENOENT): inconclusive —
 	// the streak is kept, not reset, and no count is logged.
 	c.deactStreak = 5
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
 	if c.deactStreak != 5 {
 		t.Fatalf("exec failure deactStreak=%d want kept at 5", c.deactStreak)
 	}
@@ -609,7 +660,7 @@ func TestCheckDeactivating(t *testing.T) {
 
 	// Empty output → streak resets.
 	f.SDReply["state=deactivating"] = "\n"
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
 	if c.deactStreak != 0 {
 		t.Fatalf("empty list deactStreak=%d want 0", c.deactStreak)
 	}
@@ -618,7 +669,7 @@ func TestCheckDeactivating(t *testing.T) {
 	f.SDReply["state=deactivating"] =
 		"some.service loaded active deactivating stopping\n" +
 			"not-a-scope loaded active deactivating\n"
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
 	if c.deactStreak != 0 {
 		t.Fatalf("non-scope lines deactStreak=%d want 0", c.deactStreak)
 	}
@@ -626,18 +677,72 @@ func TestCheckDeactivating(t *testing.T) {
 	// One wedged scope: streak 1 stays silent (alert needs ≥2).
 	f.SDReply["state=deactivating"] =
 		"cri-containerd-abc123.scope loaded active deactivating stopping\n"
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
 	if c.deactStreak != 1 {
 		t.Fatalf("first wedged sweep deactStreak=%d want 1", c.deactStreak)
 	}
 	// Second consecutive sweep → the diagnose-only suspect line.
-	c.checkDeactivating(ctx)
+	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
 	if c.deactStreak != 2 {
 		t.Fatalf("second wedged sweep deactStreak=%d want 2", c.deactStreak)
 	}
 	if log := f.LogLines(t); !strings.Contains(log,
 		"deactivating count=1 streak=2") {
 		t.Fatalf("want deactivating suspect line, log=%q", log)
+	}
+}
+
+// TestReapDeactivatingOrphanedScopes — W21-G3: a cri-containerd
+// scope wedged in `deactivating` across ≥2 sweeps whose container
+// id belongs to NO Running pod is force-stopped (SIGKILL + stop);
+// a scope still owned by a live pod stays diagnose-only.
+func TestReapDeactivatingOrphanedScopes(t *testing.T) {
+	d, f := gDeps(t)
+	c := &ScopesCheck{d: d}
+	ctx := context.Background()
+
+	liveID := "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888"
+	orphanID := "9999deadbeef0000111122223333444455556666777788889999aaaabbbbcccc"
+	liveUnit := "cri-containerd-" + liveID + ".scope"
+	orphanUnit := "cri-containerd-" + orphanID + ".scope"
+	f.SDReply["state=deactivating"] = liveUnit +
+		" loaded active deactivating stopping\n" +
+		orphanUnit + " loaded active deactivating stopping\n"
+	f.SDReply["kill --signal=SIGKILL"] = ""
+	f.SDReply["stop cri-containerd-"] = ""
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "live"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:        "app",
+				ContainerID: "containerd://" + liveID,
+			}},
+		},
+	}
+	ce := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}}
+
+	// Sweep 1 — streak 1, the per-unit ledger is still empty: no reap.
+	c.checkDeactivating(ctx, ce)
+	if f.SDRan("kill --signal=SIGKILL") {
+		t.Fatal("reaped on the first sighting — needs ≥2 sweeps")
+	}
+	// Sweep 2 — streak 2: the orphan is SIGKILLed + stopped, the
+	// live pod's scope is left alone.
+	c.checkDeactivating(ctx, ce)
+	if !f.SDRan("kill --signal=SIGKILL " + orphanUnit) {
+		t.Fatal("orphaned scope not SIGKILLed")
+	}
+	if !f.SDRan("stop " + orphanUnit) {
+		t.Fatal("orphaned scope not stopped")
+	}
+	if f.SDRan("kill --signal=SIGKILL "+liveUnit) ||
+		f.SDRan("stop "+liveUnit) {
+		t.Fatal("live pod's scope was reaped — would be a pod kill")
+	}
+	if log := f.LogLines(t); !strings.Contains(log,
+		"deactivating reap unit="+orphanUnit) {
+		t.Fatalf("want reap ACTION line, log=%q", log)
 	}
 }
 

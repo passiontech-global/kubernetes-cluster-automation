@@ -432,22 +432,21 @@ func TestPSIEvictorStatefulSetDBQuorum(t *testing.T) {
 	}
 }
 
-// TestPSIEvictorDBLabelWithoutStatefulSet: the quorum-label guard
-// requires BOTH a StatefulSet owner AND a db label — a db label on
-// a Deployment-owned pod does not exempt it (deployments reschedule
-// freely; only StatefulSet identity pins the quorum member).
+// TestPSIEvictorDBLabelWithoutStatefulSet: the quorum-label guard is
+// an INDEPENDENT gate (evictablePodOnNode) — a db label exempts the
+// pod even without a StatefulSet/operator owner, because losing a
+// database replica under memory pressure can cost quorum no matter
+// which controller owns it.
 func TestPSIEvictorDBLabelWithoutStatefulSet(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
 	labeled := psiPod("pg-0", "app", wdepstest.UIDA)
-	// carriesDBQuorumLabel WOULD match this — the missing piece is
-	// the StatefulSet owner.
 	labeled.Labels = map[string]string{"app": "postgresql"}
 	pods := []corev1.Pod{*labeled}
 	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
 	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
-	if evs := wdepstest.EvictActions(e.CS); len(evs) != 1 || evs[0] != "pg-0" {
-		t.Fatalf("evictions = %v, want pg-0 (label alone does not exempt)", evs)
+	if evs := wdepstest.EvictActions(e.CS); len(evs) != 0 {
+		t.Fatalf("evictions = %v, want none (db label alone exempts)", evs)
 	}
 }
 

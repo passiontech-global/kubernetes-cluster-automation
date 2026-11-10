@@ -25,6 +25,13 @@ const (
 	// at this rate pins NATed UDP tuples (the A+AAAA DNS race
 	// class) — the remedy is evicting stale UDP entries.
 	conntrackDropSpike = 50
+	// conntrackInsertSpike is the per-cycle insert_failed-only
+	// delta that triggers the surgical UNREPLIED udp flush — a much
+	// smaller bar than the blunt all-UDP flush because refused
+	// inserts are the earliest conntrack-pressure signal and the
+	// unreplied-only delete leaves ASSURED flows (Nebula,
+	// WireGuard, live DNS exchanges) untouched.
+	conntrackInsertSpike = 5
 )
 
 // --- Check: conntrack-guard (H2) ---
@@ -67,6 +74,13 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 			used, max, ratio, conntrackEnterRatio))
 		n.state.Enter(latchdefs.LatchConntrackPressure,
 			fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
+	}
+	// Past the enter ratio the table is refusing headroom — flush
+	// the orphaned UNREPLIED udp entries immediately (surgical:
+	// ASSURED tunnels and established flows survive), budgeted so
+	// sustained pressure can't re-run conntrack -D every cycle.
+	if ratio > conntrackEnterRatio {
+		n.flushUnrepliedUDPConntrack(ctx, checkCT)
 	}
 	n.checkConntrackDropSpike(ctx)
 	n.cycles.WithLabelValues(checkCT, "ok").Inc()
@@ -130,7 +144,25 @@ func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
 		"insert_failed", "drop", "early_drop")
 	if !ok {
 		n.ctStatSeen = false
+		n.ctInsertSeen = false
 		return
+	}
+	// insert_failed alone — the surgical UNREPLIED flush triggers on
+	// a much smaller per-cycle delta (>5) than the blunt all-UDP
+	// flush (>50): refused inserts are the earliest pressure signal,
+	// and the unreplied-only delete spares ASSURED flows.
+	ins, iok := conntrackStatSum(n.cfg.ConntrackStatFile, "insert_failed")
+	if iok {
+		if n.ctInsertSeen && ins > n.ctInsertPrev &&
+			ins-n.ctInsertPrev > conntrackInsertSpike {
+			n.state.SuspectLog(checkCT, fmt.Sprintf(
+				"suspect: conntrack insert_failed +%d in one cycle (> %d) — flushing unreplied udp conntrack entries",
+				ins-n.ctInsertPrev, conntrackInsertSpike), suspectLogCadence)
+			n.flushUnrepliedUDPConntrack(ctx, checkCT)
+		}
+		n.ctInsertPrev, n.ctInsertSeen = ins, true
+	} else {
+		n.ctInsertSeen = false
 	}
 	prev, seen := n.ctStatPrev, n.ctStatSeen
 	n.ctStatPrev, n.ctStatSeen = sum, true
@@ -265,4 +297,45 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 	}
 	n.actions.WithLabelValues(check, "flush").Inc()
 	n.state.AppendLog("ACTION: flushed stale udp/53 conntrack entries")
+}
+
+// flushUnrepliedUDPConntrack drops only UNREPLIED udp conntrack
+// entries — :53 first, then every unreplied UDP flow. UNREPLIED is
+// the kernel's "no reply packet ever seen" state: exactly the orphan
+// DNS/UDP tuples a filling or churning table accumulates, while
+// ASSURED entries (established Nebula/WireGuard tunnels, live DNS
+// exchanges) are a different conntrack state and survive untouched.
+// Same best-effort runMountCmd seam and budget shape as the blunt
+// flushes — a missing binary or denied delete logs and moves on,
+// never fails the cycle. The budget is its own
+// (last-conntrack-unreplied-flush): the surgical flush must not be
+// starved by, or starve, the blunt last-conntrack-flush window.
+func (n *NetHealth) flushUnrepliedUDPConntrack(ctx context.Context, check string) {
+	if !n.state.RateTrySpend("last-conntrack-unreplied-flush", conntrackFlushCooldown) {
+		logger().Debug("conntrack unreplied udp flush skipped — cooldown (last-conntrack-unreplied-flush <" +
+			conntrackFlushCooldown.String() + ")")
+		return
+	}
+	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
+	// joins the host NET namespace, so `conntrack` would resolve
+	// against the container image (which does not ship
+	// conntrack-tools). The host mount ns reaches the host binary;
+	// the host net ns operates on the real conntrack table.
+	flushed := false
+	for _, args := range [][]string{
+		{"conntrack", "-D", "-p", "udp", "--dport", "53", "-u", "UNREPLIED"},
+		{"conntrack", "-D", "-p", "udp", "-u", "UNREPLIED"},
+	} {
+		out, err := n.cfg.runMountCmd(ctx, args)
+		if err != nil {
+			n.state.AppendLog(fmt.Sprintf("conntrack unreplied udp flush skipped: %v (%s)",
+				err, trimRunErr(out)))
+			continue
+		}
+		flushed = true
+		n.actions.WithLabelValues(check, "flush_unreplied").Inc()
+	}
+	if flushed {
+		n.state.AppendLog("ACTION: flushed unreplied udp conntrack entries")
+	}
 }

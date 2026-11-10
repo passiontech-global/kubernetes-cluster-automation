@@ -124,9 +124,20 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.Exit(latchdefs.LatchCiliumEnvoyXDSReject, nil)
 	}
 	if c.xdsFails >= c.d.Cfg.ConsecNeeded {
+		// NPD contract: the ACTION entry line feeds
+		// CiliumEnvoyXDSReject (events.go) — ActionEntryRe parses
+		// it. Once per episode: Enter is idempotent while the
+		// latch holds, so gate the line on the latch being absent.
+		fresh := !c.d.State.Exists(latchdefs.LatchCiliumEnvoyXDSReject)
 		c.d.State.Enter(latchdefs.LatchCiliumEnvoyXDSReject,
 			fmt.Sprintf("update_rejected=%d fails=%d",
 				c.xdsLast, c.xdsFails))
+		if fresh {
+			c.d.State.AppendLog(latchdefs.ActionEntryPrefix(
+				latchdefs.LatchCiliumEnvoyXDSReject) +
+				fmt.Sprintf("update_rejected=%d fails=%d",
+					c.xdsLast, c.xdsFails))
+		}
 		c.killCiliumEnvoy(tasks,
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))

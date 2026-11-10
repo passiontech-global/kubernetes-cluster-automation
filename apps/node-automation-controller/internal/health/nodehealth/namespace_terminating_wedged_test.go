@@ -4,6 +4,8 @@
 package nodehealth
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +15,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -345,5 +353,339 @@ func TestMaybeStripFinalizersProtectedOnly(t *testing.T) {
 func bareDeployment(ns, name string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// nsFinalizerSweep — the discovery-driven dead-owner sweep
+// ---------------------------------------------------------------------------
+
+// sweepDiscovery stubs DiscoveryInterface.ServerPreferredResources —
+// the fake clientset's implementation returns nil unconditionally,
+// so the sweep's resource census needs this seam. Every other method
+// is unreachable from the sweep (embedded nil interface).
+type sweepDiscovery struct {
+	discovery.DiscoveryInterfaces
+	lists []*metav1.APIResourceList
+	err   error
+}
+
+func (d sweepDiscovery) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	return d.lists, d.err
+}
+
+// sweepClientset wraps the fake clientset with a stubbed discovery —
+// kubernetes.Interface is embedded so every typed call still lands
+// on the tracker; only Discovery() is shadowed.
+type sweepClientset struct {
+	kubernetes.Interface
+	disc discovery.DiscoveryInterfaces
+}
+
+func (c sweepClientset) Discovery() discovery.DiscoveryInterfaces { return c.disc }
+
+// nsWedged builds a Namespace Terminating for termAge.
+func nsWedged(name string, termAge time.Duration) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-termAge)},
+		},
+		Status: corev1.NamespaceStatus{Phase: corev1.NamespaceTerminating},
+	}
+}
+
+// fooGVR is the runtime-discovered CR the sweep census reads —
+// deliberately outside DynListKinds' table so each test registers
+// exactly the GVRs it serves.
+var fooGVR = schema.GroupVersionResource{
+	Group: "example.com", Version: "v1", Resource: "foos"}
+
+// bazGVR is advertised by the discovery census but its LIST always
+// fails — the "no permission / absent — not evidence" continue.
+var bazGVR = schema.GroupVersionResource{
+	Group: "example.com", Version: "v1", Resource: "bazs"}
+
+// nsSweepDyn builds the dynamic fake serving the sweep census:
+// FooList for fooGVR plus a BazList whose every LIST errors — the
+// "no permission / absent — not evidence" continue (registered so
+// the fake does not panic on the unlisted GVR, erroring via reactor
+// instead).
+func nsSweepDyn(objs ...runtime.Object) dynamic.Interface {
+	kinds := testutil.DynListKinds()
+	kinds[fooGVR] = "FooList"
+	kinds[bazGVR] = "BazList"
+	dyn := testutil.NewFakeDyn(kinds, objs...)
+	dyn.PrependReactor("list", "bazs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("bazs not served")
+		})
+	return dyn
+}
+
+// sweepFoo builds a terminating Foo CR in ns carrying finalizers
+// and an ownerRef to the named controller kind ("" = no owner).
+func sweepFoo(ns, name string, fins []string,
+	ownerKind, ownerName string) *unstructured.Unstructured {
+
+	md := map[string]any{
+		"namespace":         ns,
+		"name":              name,
+		"resourceVersion":   "100",
+		"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(fins) > 0 {
+		anyFins := make([]any, len(fins))
+		for i, f := range fins {
+			anyFins[i] = f
+		}
+		md["finalizers"] = anyFins
+	}
+	if ownerKind != "" {
+		md["ownerReferences"] = []any{map[string]any{
+			"apiVersion": "apps/v1",
+			"kind":       ownerKind,
+			"name":       ownerName,
+			"controller": true,
+			"uid":        "uid-" + ownerName,
+		}}
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Foo",
+		"metadata":   md,
+	}}
+}
+
+// nsSweepLists builds the discovery census the sweep walks: a nil
+// entry, an unparseable GroupVersion, a namespaced+subresource pair
+// on example.com/v1, a cluster-scoped resource, a list-only resource
+// (no patch verb) and a GVR the dynamic fake does not serve.
+func nsSweepLists() []*metav1.APIResourceList {
+	return []*metav1.APIResourceList{
+		nil,                              // skipped outright
+		{GroupVersion: "bogus-no-slash"}, // ParseGroupVersion fails
+		{
+			GroupVersion: "example.com/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "foos", Namespaced: true, Kind: "Foo",
+					Verbs: metav1.Verbs{"get", "list", "patch", "watch"}},
+				{Name: "foos/status", Namespaced: true, Kind: "Foo",
+					Verbs: metav1.Verbs{"get", "patch"}}, // subresource
+				{Name: "bars", Namespaced: true, Kind: "Bar",
+					Verbs: metav1.Verbs{"get", "list"}}, // no patch verb
+				{Name: "bazs", Namespaced: true, Kind: "Baz",
+					Verbs: metav1.Verbs{"get", "list", "patch"}}, // unserved by dyn
+				{Name: "clusters", Namespaced: false, Kind: "Cluster",
+					Verbs: metav1.Verbs{"get", "list", "patch"}}, // cluster-scoped
+			},
+		},
+	}
+}
+
+// The full sweep through Run: a wedged namespace triggers the
+// discovery census; the dead-Deployment-owned Foo loses its
+// strippable finalizer while protected finalizers stay, and every
+// skip branch (wrong namespace, not terminating, no finalizers,
+// live owner) leaves its object untouched.
+func TestNsFinalizerSweepEndToEnd(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged, nsWedged("live-app", time.Minute),
+		bareDeployment("dead-app", "live-deploy"))
+
+	dead := sweepFoo("dead-app", "foo-dead",
+		[]string{"example.com/finalizer", "kubernetes.io/pvc-protection"},
+		"Deployment", "gone-deploy")
+	otherNS := sweepFoo("live-app", "foo-other",
+		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+	alive := sweepFoo("dead-app", "foo-alive",
+		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+	alive.SetDeletionTimestamp(nil) // not terminating
+	noFin := sweepFoo("dead-app", "foo-nofin", nil, "", "")
+	liveOwner := sweepFoo("dead-app", "foo-live",
+		[]string{"example.com/finalizer"}, "Deployment", "live-deploy")
+
+	dyn := nsSweepDyn(dead, otherNS, alive, noFin, liveOwner)
+
+	scs := sweepClientset{Interface: cs,
+		disc: sweepDiscovery{lists: nsSweepLists()}}
+	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
+
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("wedged namespace must FAIL")
+	}
+	gvr := fooGVR
+	got, err := dyn.Resource(gvr).Namespace("dead-app").
+		Get(ctx, "foo-dead", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fins := got.GetFinalizers()
+	if len(fins) != 1 || fins[0] != "kubernetes.io/pvc-protection" {
+		t.Fatalf("foo-dead finalizers = %v, want only the protected one", fins)
+	}
+	for _, name := range []string{"foo-other", "foo-alive", "foo-nofin", "foo-live"} {
+		var ns string
+		if name == "foo-other" {
+			ns = "live-app"
+		} else {
+			ns = "dead-app"
+		}
+		g, err := dyn.Resource(gvr).Namespace(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 1
+		if name == "foo-nofin" {
+			want = 0
+		}
+		if len(g.GetFinalizers()) != want {
+			t.Fatalf("%s finalizers = %v, want %d", name, g.GetFinalizers(), want)
+		}
+	}
+}
+
+// The 30m per-namespace cooldown throttles the sweep: a stamped
+// finalsweep key leaves every finalizer untouched on the next Run.
+func TestNsFinalizerSweepCooldown(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged)
+	dead := sweepFoo("dead-app", "foo-dead",
+		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+	dyn := nsSweepDyn(dead)
+	scs := sweepClientset{Interface: cs,
+		disc: sweepDiscovery{lists: nsSweepLists()}}
+	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
+	chk := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p)
+	chk.Heals.Stamp(
+		probefw.SelfHealKey(CheckNameNamespaceWedged, "finalsweep/dead-app"),
+		time.Now())
+
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("wedged namespace must FAIL even inside the sweep cooldown")
+	}
+	got, err := dyn.Resource(fooGVR).Namespace("dead-app").
+		Get(ctx, "foo-dead", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.GetFinalizers()) != 1 {
+		t.Fatalf("cooldown must defer the strip, finalizers = %v",
+			got.GetFinalizers())
+	}
+}
+
+// A full discovery failure skips the sweep entirely — detection
+// already FAILed the check, and "cannot enumerate" is not evidence
+// any owner is dead.
+func TestNsFinalizerSweepDiscoveryFails(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged)
+	dead := sweepFoo("dead-app", "foo-dead",
+		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+	dyn := nsSweepDyn(dead)
+	scs := sweepClientset{Interface: cs,
+		disc: sweepDiscovery{err: errors.New("discovery down")}}
+	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
+
+	if res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).
+		Run(ctx); res.Pass {
+		t.Fatal("wedged namespace must FAIL")
+	}
+	got, err := dyn.Resource(fooGVR).Namespace("dead-app").
+		Get(ctx, "foo-dead", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.GetFinalizers()) != 1 {
+		t.Fatalf("discovery failure must skip the sweep, finalizers = %v",
+			got.GetFinalizers())
+	}
+}
+
+// ErrGroupDiscoveryFailed with resolvable groups still sweeps the
+// returned lists — an aggregated APIService outage (often the one
+// living in THIS terminating namespace) must not paralyze the
+// sweep behind an unrelated backend's failure.
+func TestNsFinalizerSweepPartialDiscovery(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged)
+	dead := sweepFoo("dead-app", "foo-dead",
+		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+	dyn := nsSweepDyn(dead)
+	scs := sweepClientset{Interface: cs, disc: sweepDiscovery{
+		lists: nsSweepLists(),
+		err: &discovery.ErrGroupDiscoveryFailed{Groups: map[schema.GroupVersion]error{
+			{Group: "broken.example.com", Version: "v1"}: errors.New("apiservice down"),
+		}},
+	}}
+	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
+
+	if res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).
+		Run(ctx); res.Pass {
+		t.Fatal("wedged namespace must FAIL")
+	}
+	got, err := dyn.Resource(fooGVR).Namespace("dead-app").
+		Get(ctx, "foo-dead", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.GetFinalizers()) != 0 {
+		t.Fatalf("partial discovery must still sweep, finalizers = %v",
+			got.GetFinalizers())
+	}
+}
+
+// The 20-strip cap bounds one sweep's blast radius — the 21st
+// dead-owner CR keeps its finalizers for the next throttled pass.
+func TestNsFinalizerSweepStripCap(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged)
+	var objs []runtime.Object
+	for i := 0; i < nsFinalizerMaxStrips+1; i++ {
+		objs = append(objs, sweepFoo("dead-app",
+			fmt.Sprintf("foo-%02d", i),
+			[]string{"example.com/finalizer"},
+			"Deployment", "gone-deploy"))
+	}
+	dyn := nsSweepDyn(objs...)
+	scs := sweepClientset{Interface: cs,
+		disc: sweepDiscovery{lists: nsSweepLists()}}
+	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
+
+	if res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).
+		Run(ctx); res.Pass {
+		t.Fatal("wedged namespace must FAIL")
+	}
+	list, err := dyn.Resource(fooGVR).Namespace("dead-app").
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped, kept := 0, 0
+	for i := range list.Items {
+		if len(list.Items[i].GetFinalizers()) == 0 {
+			stripped++
+		} else {
+			kept++
+		}
+	}
+	if stripped != nsFinalizerMaxStrips || kept != 1 {
+		t.Fatalf("strip cap: %d stripped, %d kept — want %d/1",
+			stripped, kept, nsFinalizerMaxStrips)
+	}
+}
+
+// A nil dynamic client skips the sweep quietly — the wedged
+// namespace still FAILs detection, but no census runs.
+func TestNsFinalizerSweepNilDyn(t *testing.T) {
+	wedged := nsWedged("dead-app", 25*time.Minute)
+	cs := fake.NewSimpleClientset(wedged)
+	deps := probetest.NewDeps(cs, nil)
+	chk := &namespaceTerminatingWedgedCheck{Deps: deps}
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatal("wedged namespace must FAIL with nil dyn")
 	}
 }

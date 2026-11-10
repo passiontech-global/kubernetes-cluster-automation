@@ -64,7 +64,7 @@ func (w *splitBrainWatch) eval(c masterSvc, key string, nReady int,
 	if nReady > 1 {
 		if w.streak.Hit(key) >= statefulMultiMasterMinStreak {
 			sigRep.Flag(statefulServiceMultipleMastersGauge, key,
-				[]string{c.ns, c.svc, c.sts.Name})
+				[]string{c.ns, c.svc, c.workloadName()})
 			sigRep.Find(key + "(multiple_masters)")
 		}
 	} else {

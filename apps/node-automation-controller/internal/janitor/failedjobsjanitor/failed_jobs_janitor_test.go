@@ -1067,3 +1067,166 @@ func TestCompletedRunKindCappedAtFiveHundred(t *testing.T) {
 		t.Fatalf("%d runs left after the sweep, want exactly 1 (the cap held)", remaining)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// unstickPVCProtection — the fresh-reproof branches around the
+// pvc-protection finalizer strip
+// ---------------------------------------------------------------------------
+
+// unstickPVCs builds a Terminating PVC still carrying
+// pvc-protection — the audit's strip candidate.
+func unstickPVCs() *corev1.PersistentVolumeClaim {
+	termAt := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Namespace:         "apps",
+		Name:              "data",
+		ResourceVersion:   "7",
+		DeletionTimestamp: &termAt,
+		Finalizers:        []string{"kubernetes.io/pvc-protection"},
+	}}
+}
+
+// claimPod builds a Running pod in apps mounting claimName.
+func claimPod(name, claimName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: name},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "v",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claimName}}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+// podListReactor answers "list pods" in apps from a queue of
+// responses — each claimedPVCNames call consumes the next entry so a
+// test can make the audit scan and the fresh re-proof disagree.
+func podListReactor(cs *fake.Clientset, responses ...func() (bool, runtime.Object, error)) {
+	var calls atomic.Int32
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			i := int(calls.Add(1)) - 1
+			if i >= len(responses) {
+				i = len(responses) - 1
+			}
+			return responses[i]()
+		})
+}
+
+func podListOK(items ...corev1.Pod) func() (bool, runtime.Object, error) {
+	return func() (bool, runtime.Object, error) {
+		return true, &corev1.PodList{Items: items}, nil
+	}
+}
+
+func podListErr() func() (bool, runtime.Object, error) {
+	return func() (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver down")
+	}
+}
+
+func pvcFinalizers(t *testing.T, cs *fake.Clientset) []string {
+	t.Helper()
+	got, err := cs.CoreV1().PersistentVolumeClaims("apps").
+		Get(ctx, "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got.Finalizers
+}
+
+// The strip needs the claim unreferenced at BOTH reads: the cached
+// census probe AND a fresh re-query right before the patch. A claim
+// mounted between the two, a failed re-query, or a failed census all
+// keep the finalizer — fail closed, metered once per broken read.
+func TestUnstickPVCProtectionVerdicts(t *testing.T) {
+	now := time.Now()
+
+	// Clean census + clean re-proof → finalizers stripped.
+	pvc := unstickPVCs()
+	cs := fake.NewSimpleClientset(pvc)
+	podListReactor(cs, podListOK())
+	j := &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	if f := pvcFinalizers(t, cs); len(f) != 0 {
+		t.Fatalf("unreferenced claim kept finalizers: %v", f)
+	}
+
+	// A pod still mounting the claim at census time — the
+	// finalizer is doing its job.
+	pvc = unstickPVCs()
+	cs = fake.NewSimpleClientset(pvc, claimPod("user", "data"))
+	podListReactor(cs, podListOK(*claimPod("user", "data")))
+	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	if f := pvcFinalizers(t, cs); len(f) == 0 {
+		t.Fatal("referenced claim lost its finalizer")
+	}
+
+	// Census clean but the FRESH re-query finds the claim mounted
+	// since — the strip is refused.
+	pvc = unstickPVCs()
+	cs = fake.NewSimpleClientset(pvc)
+	podListReactor(cs,
+		podListOK(),                          // census: unclaimed
+		podListOK(*claimPod("late", "data"))) // fresh: mounted
+	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	if f := pvcFinalizers(t, cs); len(f) == 0 {
+		t.Fatal("claim mounted since the audit scan lost its finalizer")
+	}
+
+	// Census clean, fresh re-query fails — keep, metered once.
+	pvc = unstickPVCs()
+	cs = fake.NewSimpleClientset(pvc)
+	podListReactor(cs, podListOK(), podListErr())
+	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	if f := pvcFinalizers(t, cs); len(f) == 0 {
+		t.Fatal("fresh re-query failure lost the finalizer")
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 1 {
+		t.Fatalf("fresh re-query failure metered %v times, want 1", got)
+	}
+
+	// Census list itself fails — the probe error is cached and the
+	// finalizer stays; repeat calls reuse the probe without
+	// re-metering the same broken list.
+	pvc = unstickPVCs()
+	cs = fake.NewSimpleClientset(pvc)
+	podListReactor(cs, podListErr())
+	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	cache := map[string]pvcUseProbe{}
+	before = testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	j.unstickPVCProtection(ctx, pvc, cache)
+	j.unstickPVCProtection(ctx, pvc, cache)
+	if f := pvcFinalizers(t, cs); len(f) == 0 {
+		t.Fatal("census failure lost the finalizer")
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 1 {
+		t.Fatalf("census failure metered %v times across two calls, want 1", got)
+	}
+
+	// Pre-seeded failed probe (another duty already paid the
+	// metering) — kept quietly, zero new IncErrors.
+	pvc = unstickPVCs()
+	cs = fake.NewSimpleClientset(pvc)
+	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
+		now: func() time.Time { return now }}
+	before = testutil.QueueErrorCount(t, "failed-jobs-janitor")
+	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{
+		"apps": {err: errors.New("cached list failure")}})
+	if f := pvcFinalizers(t, cs); len(f) == 0 {
+		t.Fatal("cached probe failure lost the finalizer")
+	}
+	if got := testutil.QueueErrorCount(t, "failed-jobs-janitor") - before; got != 0 {
+		t.Fatalf("cached probe failure re-metered %v times, want 0", got)
+	}
+}

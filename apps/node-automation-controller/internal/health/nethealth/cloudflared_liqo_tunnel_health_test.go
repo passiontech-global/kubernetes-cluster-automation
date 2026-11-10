@@ -304,3 +304,135 @@ func TestCfTunnelLogQUICStorm(t *testing.T) {
 		}
 	})
 }
+
+// liqoObj builds a minimal unstructured liqo object with the given
+// labels and a status.conditions list.
+func liqoObj(name string, labels map[string]string,
+	conds ...map[string]any) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.liqo.io/v1", "kind": "VirtualNode",
+		"metadata": map[string]any{"name": name, "namespace": "liqo"},
+	}}
+	if labels != nil {
+		obj.SetLabels(labels)
+	}
+	if len(conds) > 0 {
+		_ = unstructured.SetNestedSlice(obj.Object, condsToAny(conds),
+			"status", "conditions")
+	}
+	return obj
+}
+
+func condsToAny(conds []map[string]any) []any {
+	out := make([]any, len(conds))
+	for i, c := range conds {
+		out[i] = c
+	}
+	return out
+}
+
+// liqoPeerName resolves the remote cluster's identity across the
+// label spellings and status/spec fields the liqo versions carry —
+// first match wins, the object name is the fallback.
+func TestLiqoPeerName(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want string
+	}{
+		{"remote-cluster-id label",
+			liqoObj("vn", map[string]string{
+				"networking.liqo.io/remote-cluster-id": "edge-1"}), "edge-1"},
+		{"discovery cluster-id label",
+			liqoObj("vn", map[string]string{
+				"discovery.liqo.io/cluster-id": "edge-2"}), "edge-2"},
+		{"liqo.io label",
+			liqoObj("vn", map[string]string{
+				"liqo.io/remote-cluster-id": "edge-3"}), "edge-3"},
+		{"status.remoteClusterID",
+			func() *unstructured.Unstructured {
+				o := liqoObj("vn", nil)
+				_ = unstructured.SetNestedField(o.Object, "edge-4", "status", "remoteClusterID")
+				return o
+			}(), "edge-4"},
+		{"status.clusterID",
+			func() *unstructured.Unstructured {
+				o := liqoObj("vn", nil)
+				_ = unstructured.SetNestedField(o.Object, "edge-5", "status", "clusterID")
+				return o
+			}(), "edge-5"},
+		{"spec.clusterID",
+			func() *unstructured.Unstructured {
+				o := liqoObj("vn", nil)
+				_ = unstructured.SetNestedField(o.Object, "edge-6", "spec", "clusterID")
+				return o
+			}(), "edge-6"},
+		{"first label spelling wins",
+			liqoObj("vn", map[string]string{
+				"networking.liqo.io/remote-cluster-id": "edge-7",
+				"discovery.liqo.io/cluster-id":         "edge-8"}), "edge-7"},
+		{"object name fallback",
+			liqoObj("vn-edge-9", nil), "vn-edge-9"},
+	}
+	for _, tc := range cases {
+		if got := liqoPeerName(tc.obj); got != tc.want {
+			t.Errorf("%s: liqoPeerName=%q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// liqoDisconnectedFor reports the Connected/Established=False age —
+// (duration, true) only while a condition actively reports False;
+// absent conditions and True statuses are not evidence of a dead
+// peer. A zero transition time falls back to the object's creation
+// age, and a fully unverifiable clock reads as the minimum age.
+func TestLiqoDisconnectedFor(t *testing.T) {
+	now := time.Now()
+	transition := now.Add(-15 * time.Minute).UTC().Format(time.RFC3339)
+	mkCond := func(status, ts string) map[string]any {
+		c := map[string]any{"type": "Connected", "status": status}
+		if ts != "" {
+			c["lastTransitionTime"] = ts
+		}
+		return c
+	}
+	cases := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want time.Duration
+		ok   bool
+	}{
+		{"no conditions is not evidence",
+			liqoObj("vn", nil), 0, false},
+		{"connected true is healthy",
+			liqoObj("vn", nil, mkCond("True", transition)), 0, false},
+		{"connected false with transition time",
+			liqoObj("vn", nil, mkCond("False", transition)), 15 * time.Minute, true},
+		{"established false counts too",
+			liqoObj("vn", nil, map[string]any{
+				"type": "Established", "status": "False",
+				"lastTransitionTime": transition}), 15 * time.Minute, true},
+		{"connected true wins over a later established false",
+			liqoObj("vn", nil,
+				mkCond("True", transition),
+				map[string]any{"type": "Established", "status": "False",
+					"lastTransitionTime": transition}), 0, false},
+		{"zero transition falls back to creation age",
+			func() *unstructured.Unstructured {
+				o := liqoObj("vn", nil, mkCond("False", ""))
+				o.SetCreationTimestamp(metav1.NewTime(now.Add(-20 * time.Minute)))
+				return o
+			}(), 20 * time.Minute, true},
+		{"fully unverifiable clock reads as minimum age",
+			liqoObj("vn", nil, mkCond("False", "")), liqoPeerDisconnectMinAge, true},
+	}
+	for _, tc := range cases {
+		got, ok := liqoDisconnectedFor(tc.obj, now)
+		// Creation/transition times are second-granular — allow a
+		// small skew around the exact minute.
+		if ok != tc.ok || (ok && (got < tc.want-time.Second || got > tc.want+time.Second)) {
+			t.Errorf("%s: liqoDisconnectedFor=(%v,%v), want ~(%v,%v)",
+				tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+}

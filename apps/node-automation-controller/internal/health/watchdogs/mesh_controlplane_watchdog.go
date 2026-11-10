@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -49,6 +50,12 @@ const (
 	linkerdHealCooldown   = 30 * time.Minute
 	ciliumOperatorNS      = "kube-system"
 	ciliumOperatorPrefix  = "cilium-operator-"
+	// ciliumOperatorLease is the leader-election Lease the cilium
+	// operator holds in kube-system — its spec.holderIdentity names
+	// the pod owning the IPAM bookkeeping, so the heal deletes the
+	// wedged LEADER instead of an arbitrary replica.
+	ciliumOperatorLease        = "cilium-operator-resource-lock"
+	ciliumIPAMCondHeartbeatMax = 10 * time.Minute
 	// The linkerd control-plane identifiers (namespace + the two
 	// Deployment names the heal bounces) live in probefw — the
 	// nethealth endpoint-sync check matches the same pods.
@@ -86,9 +93,14 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	var ipamNodes []string
 	for i := range nodes {
 		c := kube.NodeCondition(&nodes[i], "CiliumIPAMExhausted")
+		// The heartbeat must be fresh: a frozen lastHeartbeatTime
+		// means the reporter that owns the condition is dead — the
+		// True is a zombie the node-condition-sweeper clears, not
+		// live IPAM exhaustion evidence.
 		if c != nil && c.Status == corev1.ConditionTrue &&
 			!c.LastTransitionTime.IsZero() &&
-			now.Sub(c.LastTransitionTime.Time) >= ciliumIPAMMinAge {
+			now.Sub(c.LastTransitionTime.Time) >= ciliumIPAMMinAge &&
+			kube.CondHeartbeatLive(c, ciliumIPAMCondHeartbeatMax, now) {
 			ipamNodes = append(ipamNodes, nodes[i].Name)
 		}
 	}
@@ -195,11 +207,15 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 		return
 	}
 	var target *corev1.Pod
-	for i := range pods {
-		pod := pods[i]
-		if strings.HasPrefix(pod.Name, prefix) && pod.DeletionTimestamp == nil {
-			target = pod
-			break
+	if prefix == ciliumOperatorPrefix {
+		target = p.ciliumOperatorLeaderPod(ctx, log, pods)
+	} else {
+		for i := range pods {
+			pod := pods[i]
+			if strings.HasPrefix(pod.Name, prefix) && pod.DeletionTimestamp == nil {
+				target = pod
+				break
+			}
 		}
 	}
 	if target == nil {
@@ -207,6 +223,61 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 	}
 	p.healNamedPod(ctx, log, component, target.Namespace+"/"+target.Name,
 		target, cooldown, now)
+}
+
+// ciliumOperatorLeaderPod resolves which cilium-operator replica the
+// IPAM heal should delete: the leader-election Lease
+// kube-system/cilium-operator-resource-lock's spec.holderIdentity
+// names the elected holder — deleting a standby just churns a
+// healthy replica while the wedged leader keeps the broken IPAM
+// bookkeeping. holderIdentity is "<pod>_<uuid>" on client-go leader
+// election, so the prefix-stripped name is tried before the verbatim
+// identity. When the Lease is unreadable/absent or its holder does
+// not match a live pod, the fallback is the first Running
+// cilium-operator-* pod — still better than an arbitrary pick since
+// only Running pods are re-rollable targets.
+func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
+	log logr.Logger, pods []*corev1.Pod) *corev1.Pod {
+	var fallback *corev1.Pod
+	for i := range pods {
+		pod := pods[i]
+		if !strings.HasPrefix(pod.Name, ciliumOperatorPrefix) ||
+			pod.DeletionTimestamp != nil ||
+			pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if fallback == nil {
+			fallback = pod
+		}
+	}
+	lease, err := p.CS.CoordinationV1().Leases(ciliumOperatorNS).
+		Get(ctx, ciliumOperatorLease, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			metrics.IncError(p.Name)
+			log.Info("WARN: get cilium-operator leader lease failed — first Running pod fallback",
+				"lease", ciliumOperatorNS+"/"+ciliumOperatorLease, "error", err)
+		}
+		return fallback
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return fallback
+	}
+	holder := *lease.Spec.HolderIdentity
+	candidates := []string{holder}
+	if i := strings.LastIndex(holder, "_"); i > 0 {
+		candidates = append([]string{holder[:i]}, candidates...)
+	}
+	for _, name := range candidates {
+		for i := range pods {
+			pod := pods[i]
+			if pod.Name == name && pod.DeletionTimestamp == nil &&
+				pod.Status.Phase == corev1.PodRunning {
+				return pod
+			}
+		}
+	}
+	return fallback
 }
 
 // healNamedPod is the SOLE heal gate for this check — every pod

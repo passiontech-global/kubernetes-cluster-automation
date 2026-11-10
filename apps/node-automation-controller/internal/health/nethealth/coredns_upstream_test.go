@@ -132,3 +132,34 @@ func TestCoreDNSUpstreamDuplicateNamesAcrossNamespaces(t *testing.T) {
 		}
 	}
 }
+
+// isDNSPod is the census predicate deciding which pods the
+// upstream-failure and readiness-fallback paths consider — by name
+// prefix first, then the label spellings the upstream charts stamp.
+// A pod matching none of them is invisible to the check.
+func TestIsDNSPod(t *testing.T) {
+	pod := func(name string, labels map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Labels: labels}}
+	}
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"coredns name prefix", pod("coredns-abc12", nil), true},
+		{"node-local-dns name prefix", pod("node-local-dns-x1", nil), true},
+		{"k8s-app kube-dns", pod("dns-1", map[string]string{"k8s-app": "kube-dns"}), true},
+		{"k8s-app node-local-dns", pod("dns-2", map[string]string{"k8s-app": "node-local-dns"}), true},
+		{"app name coredns", pod("dns-3", map[string]string{"app.kubernetes.io/name": "coredns"}), true},
+		{"app name node-local-dns", pod("dns-4", map[string]string{"app.kubernetes.io/name": "node-local-dns"}), true},
+		{"bare coredns name is not a prefix match", pod("coredns", nil), false},
+		{"unrelated pod", pod("web-1", map[string]string{"app": "web"}), false},
+		{"nil labels", pod("web-2", nil), false},
+	}
+	for _, tc := range cases {
+		if got := isDNSPod(tc.pod); got != tc.want {
+			t.Errorf("%s: isDNSPod=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

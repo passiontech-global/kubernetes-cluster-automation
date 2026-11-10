@@ -239,3 +239,77 @@ func TestSplitCSV(t *testing.T) {
 		t.Fatalf("empty split=%#v want empty non-nil", got)
 	}
 }
+
+// TestCmdEndToEndFlags: Cmd's flag wiring — provided --config /
+// --unit-file / --expected-keys / --removed-flags reach the scan,
+// and the report's exit code is the process contract (0 clean,
+// 1 drift). Output goes to os.Stdout by design; only the code is
+// asserted.
+func TestCmdEndToEndFlags(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "k0scontroller.service")
+	config := filepath.Join(dir, "k0s.yaml")
+	write(t, unit, "[Unit]\n")
+	write(t, config, cleanK0sYAML())
+
+	// Clean: the pinned expected set + default removed flag → 0.
+	code := Cmd(context.Background(), []string{
+		"--config", config,
+		"--unit-file", unit,
+		"--expected-keys", strings.Join(pinnedKCMArgs, ","),
+		"--removed-flags", "concurrent-service-syncs",
+	})
+	if code != 0 {
+		t.Fatalf("clean run exit=%d want 0", code)
+	}
+
+	// Drift: an extra key the provided expected set doesn't know → 1.
+	write(t, config, cleanK0sYAML("bogus-extra-flag"))
+	code = Cmd(context.Background(), []string{
+		"--config", config,
+		"--unit-file", unit,
+		"--expected-keys", strings.Join(pinnedKCMArgs, ","),
+		"--removed-flags", "concurrent-service-syncs",
+	})
+	if code != 1 {
+		t.Fatalf("drift run exit=%d want 1", code)
+	}
+}
+
+// TestCmdProvidedEmptyFlags: --expected-keys= (explicit empty) is
+// NOT the same as absent — provided-vs-absent decides whether the
+// repo-pinned default applies. An explicitly empty expected set
+// turns every pinned key into an extra-key finding → drift.
+func TestCmdProvidedEmptyFlags(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "k0scontroller.service")
+	config := filepath.Join(dir, "k0s.yaml")
+	write(t, unit, "[Unit]\n")
+	write(t, config, cleanK0sYAML())
+
+	code := Cmd(context.Background(), []string{
+		"--config", config,
+		"--unit-file", unit,
+		"--expected-keys=",
+		"--removed-flags=",
+	})
+	if code != 1 {
+		t.Fatalf("explicit-empty expected set exit=%d want 1 (drift)", code)
+	}
+}
+
+// TestRunCheckCanceledCtx: a cancelled context short-circuits before
+// the scan — the ops runtime-error exit, not a drift verdict.
+func TestRunCheckCanceledCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out bytes.Buffer
+	code := runCheck(ctx, hostmetrics.K0sDriftConfig{
+		ConfigFile:   "/nonexistent/k0s.yaml",
+		UnitFile:     "/nonexistent/k0scontroller.service",
+		ExpectedKeys: pinnedKCMArgs,
+	}, &out)
+	if code != 1 {
+		t.Fatalf("canceled ctx exit=%d want 1", code)
+	}
+}

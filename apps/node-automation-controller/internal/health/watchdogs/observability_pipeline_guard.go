@@ -6,6 +6,8 @@
 // always-firing Watchdog alert must be present (its absence means
 // alerting or rule evaluation is wedged) — plus the error counters
 // of every pipeline stage: alertmanager_notifications_failed_total,
+// prometheus_notifications_dropped_total,
+// prometheus_notifications_alertmanagers_discovered == 0,
 // prometheus_tsdb_wal_corruptions_total,
 // prometheus_target_scrapes_exceeded_sample_limit_total, and
 // fluentbit_output_dropped_records_total/_retries_failed_total.
@@ -78,6 +80,12 @@ var obsPipelineCounters = []struct {
 	{"alertmanager_notifications",
 		`sum(increase(alertmanager_notifications_failed_total[10m])) > 0`,
 		"alert notifications failing to deliver"},
+	{"prometheus_notifications_dropped",
+		`sum(increase(prometheus_notifications_dropped_total[10m])) > 0`,
+		"prometheus dropping alert notifications before delivery"},
+	{"prometheus_alertmanagers_discovered",
+		`max(prometheus_notifications_alertmanagers_discovered) == 0`,
+		"prometheus discovered zero alertmanagers — notifications have nowhere to go"},
 	{"prometheus_tsdb_wal",
 		`sum(increase(prometheus_tsdb_wal_corruptions_total[10m])) > 0`,
 		"prometheus WAL corrupting (hard-reset replay damage)"},
