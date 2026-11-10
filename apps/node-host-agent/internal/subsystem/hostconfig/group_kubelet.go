@@ -67,22 +67,24 @@ func t7AppendExtraArgs(u, extra string) (string, bool) {
 	return out, ok
 }
 
-// kubeletCfgPath ports the T7 discovery: --config of the running
-// kubelet (via /proc cmdline), else the first existing candidate.
-// The candidate STAT comes first — pure filesystem reads, paid every
-// cycle — and the pgrep/tr/awk shell-out runs only when NO candidate
-// unit path exists on disk.
+// kubeletCfgPath ports the T7 discovery: --config of the RUNNING
+// kubelet first (via /proc cmdline — the only source that follows a
+// non-listed --config), the on-disk candidates only as fallback when
+// the daemon isn't running or exposes no --config. Candidate-first
+// would silently patch a stale unit file (e.g. a /run/k0s leftover
+// beside the live /var/lib/k0s path) that the running kubelet never
+// reads — the write would succeed and the heal silently not happen.
 func (c *cyc) kubeletCfgPath() string {
-	for _, p := range t7KubeletCfgCandidates {
-		if c.r.fileExists(p) {
-			return p
-		}
-	}
 	if out, err := c.r.run(c.ctx, "sh", "-c",
 		`pid=$(pgrep -x kubelet | head -1); `+
 			`if [ -n "$pid" ]; then tr '\0' '\n' < "/proc/$pid/cmdline" `+
 			`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; fi`); err == nil {
 		if p := strings.TrimSpace(out); p != "" {
+			return p
+		}
+	}
+	for _, p := range t7KubeletCfgCandidates {
+		if c.r.fileExists(p) {
 			return p
 		}
 	}

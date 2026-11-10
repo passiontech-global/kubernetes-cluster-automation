@@ -159,7 +159,13 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
 		nld.Namespace, nld.Name, c.Fails))
 	if err := c.d.Cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
-		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+		metav1.DeleteOptions{
+			GracePeriodSeconds: ptr.To[int64](0),
+			// Same precondition the calico/spegel remedies carry: the
+			// listing→delete window can outlive this pod, and a
+			// same-named DS recycle is not ours to grace-0 kill.
+			Preconditions: &metav1.Preconditions{UID: &nld.UID},
+		}); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns delete %s/%s failed: %v",
 			nld.Namespace, nld.Name, err))

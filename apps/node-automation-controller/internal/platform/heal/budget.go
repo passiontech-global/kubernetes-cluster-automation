@@ -262,6 +262,16 @@ func (b *TargetBreaker) SetOpenHook(fn func(module, target, reason string)) {
 // breaker still tracks instead of the process lifetime (platform is
 // a depguard leaf — no metrics access here). Passing nil clears it.
 // Boot-time wiring only — callers do not swap hooks mid-sweep.
+//
+// Ordering: open and forget hooks fire OUTSIDE the mutex with no
+// cross-key sequencing, so a forget observed by its sink before a
+// concurrent open's emit lands can leave that one series alive until
+// the target's next episode. Reaching that needs the same
+// (module,target) touched from two goroutines AND the open-firing
+// goroutine stalled a full breaker window between its critical
+// section and its hook — accepted as metric-hygiene-only residual
+// (never heal correctness); serializing via the lock would pin hook
+// sinks (including network-emitting ones) to breaker latency.
 func (b *TargetBreaker) SetForgetHook(fn func(module, target string)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

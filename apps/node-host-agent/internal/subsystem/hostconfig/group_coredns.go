@@ -73,6 +73,15 @@ func (c *cyc) groupCoreDNS() {
 	// workers legitimately carry no marker and don't reference it.
 	if isHub {
 		marker = cgate("marker", marker)
+		// Hub resolv.conf's fallback nameserver line interpolates one
+		// DNSResolvers element — the join gate covers every element
+		// (workers gate the same join for their resolv.conf branch).
+		if len(t.DNSResolvers) > 0 {
+			if !c.cfgScalar("coredns: interdc_dns_resolvers",
+				strings.Join(t.DNSResolvers, " ")) {
+				cfgOK = false
+			}
+		}
 	}
 	if !isHub && len(t.DNSResolvers) == 0 {
 		return // T9 gates entirely on interdc_dns_resolvers | length > 0

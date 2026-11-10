@@ -116,13 +116,17 @@ func CfgScalar(s string) bool {
 // assignment (the node-watchdog conf's KEY="..." lines are sourced by
 // the watchdog scripts wholesale): a '"' closes the quoting and
 // everything after it becomes shell code, while '$' and backtick
-// expand or execute even inside quotes. printableASCII already bans
-// newlines/tabs/control bytes, the splice hazard. Unlike CfgScalar it
-// keeps ':' — legitimate in this conf (host:port stats listeners,
-// ip:6443 fallback-map entries and peers) — and accepts the empty
-// string (optional keys legitimately render empty).
+// expand or execute even inside quotes. '\' is banned too — inside
+// double quotes a trailing backslash escapes the render's OWN closing
+// quote, the string then swallows following conf lines and the next
+// line's value parses OUTSIDE quotes where ';' '|' '&' execute.
+// printableASCII already bans newlines/tabs/control bytes, the splice
+// hazard. Unlike CfgScalar it keeps ':' — legitimate in this conf
+// (host:port stats listeners, ip:6443 fallback-map entries and
+// peers) — and accepts the empty string (optional keys legitimately
+// render empty).
 func CfgShellVal(s string) bool {
-	return (s == "" || printableASCII(s)) && !strings.ContainsAny(s, `"$`+"`")
+	return (s == "" || printableASCII(s)) && !strings.ContainsAny(s, `"$`+"`"+`\`)
 }
 
 // CfgSysctlKey validates a sysctl key for the /etc/sysctl.d render.

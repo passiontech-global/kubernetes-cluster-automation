@@ -89,7 +89,7 @@ var CronJobTooManyMissedStarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 // (node gone, or out-of-service with zero non-DaemonSet pods) — va-stuck-terminating.
 var VolumeAttachmentFinalizersRemovedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_volumeattachment_finalizers_removed_total",
-	Help: "Stuck VolumeAttachment finalizers stripped to free the volume, by node.",
+	Help: "Stuck VolumeAttachment finalizers stripped to free the volume, by node. A series is deleted once its node leaves the sweep census — the counter restarts from 0 if the node returns.",
 }, []string{"node"})
 
 // ---------------------------------------------------------------------------
@@ -125,9 +125,15 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 // window without converging; further remediation defers until the
 // window expires or the target reports healthy. A sustained rate is
 // a node stuck in a remediation loop — look at the module+node pair.
+//
+// Series hygiene: a target's series is DELETED when the breaker drops
+// the target's history (window expiry or RecordTargetHealthy) — the
+// counter restarts from 0 on the target's next episode. rate()/
+// increase() see the reset natively; presence-based or absolute
+// threshold alerts must not assume process-lifetime monotonicity.
 var HealTargetCircuitBrokenTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_heal_target_circuit_broken_total",
-	Help: "Per-target heal circuit-breaker open transitions (non-convergent remediation), by module and target.",
+	Help: "Per-target heal circuit-breaker open transitions (non-convergent remediation), by module and target. A series is deleted when the breaker drops the target's history (window expiry or recovery) — the counter restarts from 0 on the next episode.",
 }, []string{"module", "target"})
 
 // ---------------------------------------------------------------------------

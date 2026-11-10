@@ -255,7 +255,7 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 	// evaluation, and the fleet-wide budget grant is spent on a
 	// DELIVERED eviction only — a PDB refusal refunds it instead of
 	// silently starving every other heal-gated module.
-	deleted := u.deleteBackingPods(ctx, g, targets, now)
+	deleted := u.deleteBackingPods(ctx, g, svc.GetName(), targets, now)
 	// Stamp the cooldown, count the heal and log ACTION only on a
 	// DELIVERED heal — a pass that deleted nothing (NotFound
 	// races) must not open the suppression window or log an
@@ -432,7 +432,8 @@ func (u *unblockHealer) backingPodTargets(ctx context.Context,
 // mutex check fails the pass closed: IncError once, stop — the memo
 // makes the first target hit it anyway.
 func (u *unblockHealer) deleteBackingPods(ctx context.Context,
-	g *apiServiceGuard, targets []corev1.Pod, now time.Time) int {
+	g *apiServiceGuard, apiService string, targets []corev1.Pod,
+	now time.Time) int {
 	log := logf.FromContext(ctx)
 	deleted := 0
 	for i := range targets {
@@ -440,9 +441,13 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 			break
 		}
 		p := &targets[i]
+		// heals is nil (the cooldown is healCandidate's stamp-on-
+		// delivered below) so key rides only the preamble's defer
+		// logs — without it a refused/unverifiable target logs
+		// "target=" with no APIService attribution.
 		proceed, unverifiable, evicted, refused, err :=
 			heal.EvictPodV(ctx, log, &g.verdict, g.cs, g.dyn,
-				nil, "", 0, p, now)
+				nil, apiService, 0, p, now)
 		switch {
 		case unverifiable:
 			metrics.IncError(g.queue)
