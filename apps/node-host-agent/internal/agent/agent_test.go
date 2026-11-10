@@ -564,3 +564,54 @@ func TestSubsystemEarlyReturnCancelDuringBackoff(t *testing.T) {
 		t.Fatal("Run did not return after cancel during backoff")
 	}
 }
+
+// TestMetricsEndpointExposesGoRuntimeAndPprof pins the triage
+// contract on the agent side: /metrics must carry the Go runtime +
+// process collectors (heap vs retained-span attribution for the
+// GOMEMLIMIT sizing) and the metrics mux must serve the pprof
+// endpoints — same contract as node-automation-controller.
+func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
+	a := New(Config{NodeName: "node-a"})
+	srv := httptest.NewServer(a.metricsMux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics: got %d, want 200", resp.StatusCode)
+	}
+	for _, want := range []string{
+		"go_memstats_alloc_bytes", "go_goroutines",
+		"process_resident_memory_bytes",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("/metrics missing runtime metric %q", want)
+		}
+	}
+
+	resp, err = http.Get(srv.URL + "/debug/pprof/heap?debug=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("heap profile: got %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "heap profile:") {
+		t.Fatalf("heap profile body missing header, got:\n%.200s", body)
+	}
+
+	resp, err = http.Get(srv.URL + "/debug/pprof/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cmdline: got %d, want 200", resp.StatusCode)
+	}
+}
