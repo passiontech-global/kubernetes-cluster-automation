@@ -215,20 +215,17 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		}
 	}
 
-	vas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(c.cs))
-	if err != nil {
-		return fmt.Errorf("list volumeattachments: %w", err)
-	}
-
 	// Sweep phase (va_sweep.go): the cycle's probe caches + sighting
-	// ledgers, the sighting pre-pass + target classification, and the
-	// cap-bounded reap.Sweep whose Confirm re-proves every
-	// destructive verdict on the live apiserver.
+	// ledgers, the VA list + sighting pre-pass + target
+	// classification, and the cap-bounded reap.Sweep whose Confirm
+	// re-proves every destructive verdict on the live apiserver.
+	// The paged VA list lives inside buildTargets so it is released
+	// before the sweep runs.
 	cyc := newVaCycle()
-	targets := c.buildTargets(ctx, vas, nodeByName, cyc, now, log)
-	vas = nil // release the paged list before the sweep runs
+	targets, err := c.buildTargets(ctx, nodeByName, cyc, now, log)
+	if err != nil {
+		return err
+	}
 	deleted, failed, capped := c.sweep(ctx, log, nodeByName, targets, cyc, now)
 
 	// Re-arm the grace window for every VA that stopped looking
