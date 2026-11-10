@@ -150,7 +150,7 @@ linters:
         #   - internal/testutil stays generic: fakes must not pull a
         #     domain module in.
         # Deliberately allowed: intra-domain imports (health/datastore
-        # → health/probefw, system/corednspatcher →
+        # → probefw [a top-level leaf], system/corednspatcher →
         # system/pinnedworkload), testutil use in _test.go (excluded
         # from lint anyway), and cmd/manager importing anything.
         nac-platform-is-leaf:
@@ -202,6 +202,36 @@ linters:
               desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
               desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+        # probefw (internal/probefw) is a top-level leaf like
+        # metrics/promq — the health-check framework the shared
+        # contract layer names in CheckReg.New's type. It may use
+        # platform/metrics/promq but never shared, the registry,
+        # test fakes, or a domain module — shared must stay
+        # importable BY probefw's consumers, never the reverse
+        # (probefw → shared was the import cycle that forced
+        # CheckReg.New to be `any`).
+        nac-probefw-leaf:
+          files:
+            - "**/node-automation-controller/internal/probefw/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+              desc: "internal/probefw is a leaf; the module contract must not be imported from it (that was the cycle forcing CheckReg.New to be any)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "internal/probefw is a leaf; the registry must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+              desc: "internal/probefw is a leaf; test fakes must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
         nac-shared-no-domain:
           files:
             - "**/node-automation-controller/internal/shared/**"

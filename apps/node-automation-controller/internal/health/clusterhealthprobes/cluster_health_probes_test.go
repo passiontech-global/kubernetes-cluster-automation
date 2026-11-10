@@ -19,8 +19,16 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/nats"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/olm"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/percona"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/postgres"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/pvc"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/scylla"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/gateway"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
@@ -78,18 +86,18 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: datastore.CheckNameStatefulMasterless, New: datastore.NewStatefulMasterlessCheck},
 		{Name: datastore.CheckNameRabbitMQSuspended, New: datastore.NewRabbitMQSuspendedCheck},
 		{Name: nodehealth.CheckNameLocalPVStranded, New: nodehealth.NewLocalPVStrandedCheck},
-		{Name: datastore.CheckNameOLMHealth, New: datastore.NewOlmHealthCheck},
+		{Name: olm.CheckNameOLMHealth, New: olm.NewOlmHealthCheck},
 		{Name: watchdogs.CheckNameSchedulerWatchdog, New: watchdogs.NewSchedulerWatchdogCheck},
 		{Name: watchdogs.CheckNameMeshWatchdog, New: watchdogs.NewMeshControlPlaneCheck},
 		{Name: nodehealth.CheckNameNodeHang, New: nodehealth.NewNodeHangCheck},
 		{Name: linkerd.CheckNameLinkerdEndpointSync, New: linkerd.NewLinkerdEndpointSyncCheck},
-		{Name: datastore.CheckNameScyllaHealth, New: datastore.NewScyllaHealthCheck},
+		{Name: scylla.CheckNameScyllaHealth, New: scylla.NewScyllaHealthCheck},
 		{Name: gitops.CheckNameFluxHRRetries, New: gitops.NewFluxHRRetriesCheck},
-		{Name: datastore.CheckNamePerconaQuorum, New: datastore.NewPerconaQuorumCheck},
-		{Name: nethealth.CheckNameCiliumBPFMapPressure, New: nethealth.NewCiliumBPFMapPressureCheck},
+		{Name: percona.CheckNamePerconaQuorum, New: percona.NewPerconaQuorumCheck},
+		{Name: cilium.CheckNameCiliumBPFMapPressure, New: cilium.NewCiliumBPFMapPressureCheck},
 		{Name: linkerd.CheckNameLinkerdOpaqueStall, New: linkerd.NewLinkerdProtocolDetectionStallCheck},
 		{Name: nethealth.CheckNameCoreDNSUpstream, New: nethealth.NewCoreDNSUpstreamCheck},
-		{Name: nethealth.CheckNameCiliumNodeIPAM, New: nethealth.NewCiliumNodeIPAMExhaustionCheck},
+		{Name: cilium.CheckNameCiliumNodeIPAM, New: cilium.NewCiliumNodeIPAMExhaustionCheck},
 		{Name: nodehealth.CheckNameNamespaceWedged, New: nodehealth.NewNamespaceTerminatingWedgedCheck},
 		{Name: gitops.CheckNameArgoCDAppStuck, New: gitops.NewArgoCDAppStuckCheck},
 		{Name: gitops.CheckNameKargoPromotionHealth, New: gitops.NewKargoPromotionHealthCheck},
@@ -98,24 +106,24 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: nodehealth.CheckNameImagePullStorm, New: nodehealth.NewImagePullStormCheck},
 		{Name: nodehealth.CheckNameAPIObjectSprawlReportGC, New: nodehealth.NewAPIObjectSprawlReportGCCheck},
 		{Name: nodehealth.CheckNameCPUStealTaintSync, New: nodehealth.NewCPUStealTaintSyncCheck},
-		{Name: nethealth.CheckNameCiliumMissingEndpoints, New: nethealth.NewCiliumMissingEndpointsCheck},
+		{Name: cilium.CheckNameCiliumMissingEndpoints, New: cilium.NewCiliumMissingEndpointsCheck},
 		{Name: linkerd.CheckNameLinkerdH2StreamGuard, New: linkerd.NewLinkerdH2StreamGuardCheck},
 		{Name: nethealth.CheckNameCloudflaredTunnelHealth, New: nethealth.NewCloudflaredTunnelHealthCheck},
 		{Name: nethealth.CheckNameLiqoTunnelHealth, New: nethealth.NewLiqoTunnelHealthCheck},
 		{Name: nethealth.CheckNameKonnectivityTunnelHealth, New: nethealth.NewKonnectivityTunnelHealthCheck},
-		{Name: datastore.CheckNamePostgresWALArchiveGuard, New: datastore.NewPostgresWALArchiveGuardCheck},
-		{Name: datastore.CheckNameScyllaCompactionSchemaGuard, New: datastore.NewScyllaCompactionSchemaGuardCheck},
-		{Name: datastore.CheckNameNatsJetstreamHealth, New: datastore.NewNatsJetstreamHealthCheck},
+		{Name: postgres.CheckNamePostgresWALArchiveGuard, New: postgres.NewPostgresWALArchiveGuardCheck},
+		{Name: scylla.CheckNameScyllaCompactionSchemaGuard, New: scylla.NewScyllaCompactionSchemaGuardCheck},
+		{Name: nats.CheckNameNatsJetstreamHealth, New: nats.NewNatsJetstreamHealthCheck},
 		{Name: nodehealth.CheckNameKedaScaledObjectGuard, New: nodehealth.NewKedaScaledObjectGuardCheck},
-		{Name: nethealth.CheckNameGatewayRouteHealth, New: nethealth.NewGatewayRouteHealthCheck},
+		{Name: gateway.CheckNameGatewayRouteHealth, New: gateway.NewGatewayRouteHealthCheck},
 		{Name: nodehealth.CheckNameControllerLeaseGuard, New: nodehealth.NewControllerLeaseGuardCheck},
-		{Name: datastore.CheckNamePVCResizeStallGuard, New: datastore.NewPVCResizeStallGuardCheck},
+		{Name: pvc.CheckNamePVCResizeStallGuard, New: pvc.NewPVCResizeStallGuardCheck},
 		{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck},
 		{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck},
 		{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck},
 		{Name: watchdogs.CheckNameOnePasswordConnectSync, New: watchdogs.NewOnePasswordConnectSyncCheck},
 		{Name: nethealth.CheckNameLinkerdSidecarOOMGuard, New: nethealth.NewLinkerdSidecarOOMGuardCheck},
-		{Name: nethealth.CheckNameCiliumDatapathMapGuard, New: nethealth.NewCiliumDatapathMapGuardCheck},
+		{Name: cilium.CheckNameCiliumDatapathMapGuard, New: cilium.NewCiliumDatapathMapGuardCheck},
 		{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck},
 		// The three gated gitops rows close out the roster —
 		// the sweep-order contract keeps them after the always-on

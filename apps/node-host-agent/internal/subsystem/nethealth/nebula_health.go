@@ -15,6 +15,7 @@ import (
 	yaml3 "go.yaml.in/yaml/v3"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -208,21 +209,29 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	if dpFail {
 		fails = &n.nebulaDpFail
 	}
-	*fails++
-	if *fails >= n.cfg.ConsecNeeded &&
-		n.state.RateOK("last-nebula-restart", n.cfg.MinRestart) {
+	suspect := func(msg string) {
+		// Key on the reason's leading token so a persisting cause
+		// throttles to the cadence while a NEW cause still logs at
+		// once.
+		n.state.SuspectLog(strings.SplitN(reason, " ", 2)[0],
+			msg, suspectLogCadence)
+	}
+	if checkkit.Pending(n.cfg.ConsecNeeded, fails,
+		"suspect: "+reason, suspect) {
+		n.cycles.WithLabelValues(checkNebula, "ok").Inc()
+		return
+	}
+	if n.state.RateOK("last-nebula-restart", n.cfg.MinRestart) {
 		n.state.AppendLog(fmt.Sprintf(latchdefs.ActionNebulaRestart+
 			"%s - %s (persisted %dx)", net, reason, *fails))
 		n.state.RateSpend("last-nebula-restart")
 		n.nebulaFails, n.nebulaDpFail = 0, 0
 		n.nebulaRestart(ctx)
 	} else {
-		// Key on the reason's leading token so a persisting cause
-		// throttles to the cadence while a NEW cause still logs at
-		// once.
-		n.state.SuspectLog(strings.SplitN(reason, " ", 2)[0], fmt.Sprintf(
-			"suspect: %s (check %d/%d)",
-			reason, *fails, n.cfg.ConsecNeeded), suspectLogCadence)
+		// Confirmed streak but the restart budget is spent — the
+		// suspect line still re-reminds at cadence.
+		suspect("suspect: " + reason +
+			checkkit.Progress(*fails, n.cfg.ConsecNeeded))
 	}
 	n.cycles.WithLabelValues(checkNebula, "ok").Inc()
 }
@@ -482,9 +491,9 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 	if err != nil {
 		n.pmtuFails++
 		n.state.SuspectLog(latchdefs.LatchNebulaPMTUBlackhole, fmt.Sprintf(
-			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200 (check %d/%d): %v (%s)",
-			target, n.pmtuFails, n.cfg.ConsecNeeded, err,
-			trimRunErr(out)), suspectLogCadence)
+			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200%s: %v (%s)",
+			target, checkkit.Progress(n.pmtuFails, n.cfg.ConsecNeeded),
+			err, trimRunErr(out)), suspectLogCadence)
 		if n.pmtuFails >= n.cfg.ConsecNeeded {
 			n.state.Enter(latchdefs.LatchNebulaPMTUBlackhole,
 				fmt.Sprintf("target=%s df_size=1200", target))

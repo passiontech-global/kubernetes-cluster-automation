@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -187,8 +188,9 @@ func (c *HubCheck) Run(ctx context.Context) {
 	// bit-identical rv_cache cannot).
 	if !frozen && gn < c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles) {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: apiserver cache %s — wedge evidence (check %d/%d)",
-			wreason, gn, c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles)))
+			"suspect: apiserver cache %s — wedge evidence%s",
+			wreason,
+			checkkit.Progress(gn, c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles))))
 		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
 		return
 	}

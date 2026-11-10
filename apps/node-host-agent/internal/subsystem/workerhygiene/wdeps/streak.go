@@ -7,9 +7,17 @@
 // counters themselves stay plain ints ON the check structs (some
 // are exported test surface — CiliumWGCheck.Fails etc.), so the
 // helpers take *int and no check state moves.
+//
+// The streak advance + progress suffix themselves live in
+// platform/checkkit — nethealth and the hand-rolled workerhygiene
+// sites share the same contract; this method is the wdeps spelling
+// (ConsecNeeded off Cfg, AppendLog off State) kept so the ~16
+// domain files' call sites stay untouched.
 package wdeps
 
-import "fmt"
+import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
+)
 
 // Gated applies the WD_REQUIRES: k0sworker head gate. When the
 // worker is intentionally down it has already bumped the
@@ -32,23 +40,20 @@ func (d *Deps) CycleResult(check, result string) {
 	d.Cycles.WithLabelValues(check, result).Inc()
 }
 
-// StreakPending advances the consecutive-fail streak one cycle.
-// While the streak is still below ConsecNeeded it appends the
-// suspect line suffixed with the shared " (check %d/%d)" progress
-// marker and reports true — the caller bumps its cycle result and
-// returns (streak not yet confirmed, latch untouched). Once the
-// streak reaches ConsecNeeded it reports false and the caller
-// proceeds to its latch/remedy tail. The line is everything before
-// the suffix — callers keep their per-check suspect wording, this
-// seam only owns the counter and the marker. The healthy tails
+// StreakPending advances the consecutive-fail streak one cycle —
+// checkkit.Pending with this subsystem's ConsecNeeded and the
+// state store's AppendLog. While the streak is still below
+// ConsecNeeded it appends the suspect line suffixed with the
+// shared " (check %d/%d)" progress marker and reports true — the
+// caller bumps its cycle result and returns (streak not yet
+// confirmed, latch untouched). Once the streak reaches
+// ConsecNeeded it reports false and the caller proceeds to its
+// latch/remedy tail. The line is everything before the suffix —
+// callers keep their per-check suspect wording. The healthy tails
 // stay inline: checks clear their counter and latch (Exit vs
 // ExitFrom, which of several latches, the counter bump order)
 // differently enough that a StreakClear would obscure, not dedupe.
 func (d *Deps) StreakPending(fails *int, line string) bool {
-	*fails++
-	if *fails < d.Cfg.ConsecNeeded {
-		d.State.AppendLog(fmt.Sprintf("%s (check %d/%d)", line, *fails, d.Cfg.ConsecNeeded))
-		return true
-	}
-	return false
+	return checkkit.Pending(d.Cfg.ConsecNeeded, fails, line,
+		d.State.AppendLog)
 }

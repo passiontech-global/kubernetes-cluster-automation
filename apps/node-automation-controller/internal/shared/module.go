@@ -7,6 +7,10 @@
 // module's Setup.
 package shared
 
+import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+)
+
 // Module is one operator module's registration row.
 //
 //   - Name is the ops/queue name — it labels the run-error counters
@@ -73,13 +77,12 @@ type Module struct {
 //     contract like Module.Name: alerts key on it, so it must stay
 //     byte-stable forever.
 //   - New is the check constructor — statically
-//     `func(*probefw.Deps) probefw.Check`. It is stored as `any`
-//     because shared may not name internal/health/probefw (probefw
-//     imports shared — naming it back would be an import cycle AND
-//     a depguard violation). The consumer type-asserts at prober
-//     build and fails boot on a wrong type — a mistyped
-//     registration must be loud, never a silently missing check.
+//     `func(*probefw.Deps) probefw.Check`, typed at compile time:
+//     probefw is a top-level leaf (internal/probefw, not under the
+//     health domain tree) precisely so the contract layer can name
+//     this type — a mistyped registration is a build error, not a
+//     boot-time assert.
 type CheckReg struct {
 	Name string
-	New  any
+	New  func(*probefw.Deps) probefw.Check
 }

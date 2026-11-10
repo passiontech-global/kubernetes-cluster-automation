@@ -13,8 +13,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 var ctx = context.Background()
@@ -24,19 +24,13 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewCoreDNSUpstreamCheck,
 	linkerd.NewLinkerdEndpointSyncCheck,
 	linkerd.NewLinkerdProtocolDetectionStallCheck,
-	NewCiliumBPFMapPressureCheck,
-	NewCiliumNodeIPAMExhaustionCheck,
-	NewCiliumMissingEndpointsCheck,
 	linkerd.NewLinkerdH2StreamGuardCheck,
 	NewCloudflaredTunnelHealthCheck,
 	NewLiqoTunnelHealthCheck,
 	NewKonnectivityTunnelHealthCheck,
-	NewGatewayRouteHealthCheck,
 	NewEndpointSliceZoneStarvationCheck,
 	NewLinkerdOutlierGuardCheck,
 	NewLinkerdSidecarOOMGuardCheck,
-	NewCiliumDatapathMapGuardCheck,
-	NewCiliumL2LeaseGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

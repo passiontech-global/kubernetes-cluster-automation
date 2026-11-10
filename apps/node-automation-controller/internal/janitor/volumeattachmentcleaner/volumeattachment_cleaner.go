@@ -63,18 +63,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -227,213 +222,22 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
 
-	// orphanNow tracks which VAs still look missing-node orphaned
-	// this cycle — a VA whose node reappeared, or that was deleted,
-	// must re-arm the two-sighting rule.
-	orphanNow := map[string]bool{}
-	// livePods caches the per-node non-terminal pod verdict for the
-	// cycle — several VAs typically share a node, and the List is
-	// the expensive part of the out-of-service gate. Errors are
-	// cached too (nil pods + err): without it every VA on one
-	// fenced node would re-issue the same failing List and each
-	// bump IncError.
-	livePods := map[string]podListProbe{}
-	// nodePods caches the full per-node pod LIST for the Ready-node
-	// unused-volume gate (a pod's volumes — not just its count —
-	// must be inspected). pvcPVs/pvNames memoize the per-cycle PVC
-	// bound-volume and PV unique-name resolutions the gate's lookups
-	// make; every cache carries its error (fail closed) and meters
-	// it at most once.
-	nodePods := map[string]podListProbe{}
-	pvcPVs := map[string]pvcProbe{}
-	pvNames := map[string]pvProbe{}
+	// Sweep phase (va_sweep.go): the cycle's probe caches + sighting
+	// ledgers, the sighting pre-pass + target classification, and the
+	// cap-bounded reap.Sweep whose Confirm re-proves every
+	// destructive verdict on the live apiserver.
+	cyc := newVaCycle()
+	targets := c.buildTargets(ctx, vas, nodeByName, cyc, now, log)
+	vas = nil // release the paged list before the sweep runs
+	deleted, failed, capped := c.sweep(ctx, log, nodeByName, targets, cyc, now)
 
-	// seenPrior records which of this cycle's missing-node sightings
-	// were already tracked BEFORE the pre-pass stamped them —
-	// "seen in >= 2 consecutive cycles" must compare against the
-	// previous cycle, not the stamp the pre-pass just wrote
-	// (Observe's 'seen' return is exactly that distinction).
-	seenPrior := map[string]bool{}
-
-	// stuckReadyNow/stuckReadyPrior mirror orphanNow/seenPrior for
-	// the Ready-node unused-volume gate: the sightings must be
-	// recorded BEFORE the sweep runs so a VA past the delete cap
-	// keeps its two-cycle window instead of re-arming every capped
-	// cycle.
-	stuckReadyNow := map[string]bool{}
-	stuckReadyPrior := map[string]bool{}
-
-	// Pre-pass: record this cycle's missing-node sightings for EVERY
-	// listed VA before any delete runs — a VA past the delete cap
-	// keeps its firstSeen ledger instead of re-arming the
-	// two-sighting window every capped cycle.
-	c.sightMissingNodeOrphans(vas, nodeByName, orphanNow, seenPrior, now, log)
-
-	// vaTarget is one listed VA carried into the sweep — strip tags
-	// the va-stuck-terminating finalizer-strip action, reason the metric label of the
-	// plain delete (decided inside Confirm, so a capped-out VA costs
-	// no gate evaluation at all). Items are pointers so Confirm's
-	// reason reaches LogTarget/Delete.
-	type vaTarget struct {
-		va     *storagev1.VolumeAttachment
-		strip  bool
-		reason string
-	}
-	var targets []*vaTarget
-	for i := range vas {
-		va := &vas[i]
-		if va.DeletionTimestamp != nil {
-			// va-stuck-terminating: already terminating past the stuck age on a node
-			// that is gone (or fenced with zero non-DaemonSet pods)
-			// — the attacher finalizer can never drain, so the
-			// finalizers are stripped to free the volume. Inside
-			// the grace window it stays the stuck-terminating
-			// audit's surface (C3b), untouched here.
-			if now.Sub(va.DeletionTimestamp.Time) >= vaStuckTerminatingAge {
-				targets = append(targets, &vaTarget{va: va, strip: true})
-				// Ready-node unused-volume sighting — recorded for
-				// every stuck VA (including capped ones) so the
-				// two-cycle window measures consecutive CYCLES, not
-				// consecutive confirmations.
-				c.sightStuckReadyUnused(ctx, va, nodeByName, nodePods,
-					pvcPVs, pvNames, stuckReadyNow, stuckReadyPrior, now, log)
-			}
-			continue
-		}
-		targets = append(targets, &vaTarget{va: va})
-	}
-	vas = nil
-
-	deleted, failed, capped := reap.Sweep(ctx, log, targets, reap.Options[*vaTarget]{
-		// The cap bounds delete ATTEMPTS — a wrong verdict must
-		// never detach more than a handful of volumes at once, and
-		// a rejected write churns the apiserver the same way.
-		Cap: vaDeleteCap,
-		// Deterministic victims — the cap must always pick the same
-		// names, not whichever ordering the apiserver returned.
-		Less: func(a, b *vaTarget) bool { return a.va.Name < b.va.Name },
-		Confirm: func(ctx context.Context, t *vaTarget) (bool, error) {
-			// Census verdict off the informer-backed node map —
-			// cheap and cached; the direct confirm below runs only
-			// when this verdict is destructive.
-			censusVerdict := ""
-			if t.strip {
-				// The va-stuck-terminating wedged-detach gate — fails closed inside
-				// (a pod-list failure keeps the finalizers).
-				if c.stuckTerminatingNodeDead(ctx, t.va, nodeByName,
-					livePods, stuckReadyPrior, now) {
-					censusVerdict = "stuck_terminating"
-				}
-			} else if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
-				// missing_node — the node object is gone; the
-				// age + prior-sighting proof is the gate's.
-				censusVerdict = c.missingNodeReason(t.va, seenPrior, now)
-			} else if c.nodeFencedDead(ctx, node, livePods, now) {
-				censusVerdict = "out_of_service_node"
-			}
-			if censusVerdict == "" {
-				return false, nil
-			}
-			if !t.strip {
-				t.reason = censusVerdict
-			}
-			// The destructive verdict came off the informer cache,
-			// which can lag the apiserver — confirm the node on the
-			// DIRECT clientset before any write (the doc promise).
-			// Fail closed: an unverifiable confirm never detaches a
-			// volume.
-			live, gone, err := c.confirmLiveNode(ctx, t.va.Spec.NodeName)
-			if err != nil {
-				metrics.IncError(c.queue)
-				log.Error(err, "live node confirm failed — keeping VA (fail closed)",
-					"va", t.va.Name, "node", t.va.Spec.NodeName)
-				return false, nil
-			}
-			if gone {
-				// The apiserver itself answers NotFound — the
-				// strongest shape of every destructive verdict; the
-				// census verdict stands.
-				return true, nil
-			}
-			// The live Get found the node — the census snapshot may
-			// have been stale. The LIVE node wins: re-run the
-			// destructive branch against it.
-			if t.strip {
-				liveNodes := map[string]*corev1.Node{t.va.Spec.NodeName: live}
-				return c.stuckTerminatingNodeDead(ctx, t.va, liveNodes,
-					livePods, stuckReadyPrior, now), nil
-			}
-			if t.reason == "missing_node" {
-				// The node object exists on the live apiserver —
-				// the orphan sighting came off a stale snapshot.
-				// Clear it so the two-sighting window re-arms (same
-				// convention as the orphanendpointslicecleaner's
-				// stale-snapshot reset).
-				c.orphanFirstSeen.Forget(t.va.Name)
-				log.Info("KEEP: live node confirm found the node — census snapshot stale",
-					"va", t.va.Name, "node", t.va.Spec.NodeName)
-				return false, nil
-			}
-			// out_of_service_node — re-run the gate on the LIVE
-			// node: Ready again or the taint dropped keeps the VA;
-			// still fenced-and-dead holds the verdict (the pod
-			// census re-reads the cycle's cache).
-			return c.nodeFencedDead(ctx, live, livePods, now), nil
-		},
-		LogTarget: func(log logr.Logger, t *vaTarget) {
-			if t.strip {
-				return // stripFinalizers emits its own PATCH-FINALIZERS line
-			}
-			log.Info("DELETE volumeattachment",
-				"va", t.va.Name, "reason", t.reason, "node", t.va.Spec.NodeName,
-				"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
-		},
-		Delete: func(ctx context.Context, t *vaTarget) error {
-			if t.strip {
-				return c.stripFinalizers(ctx, t.va)
-			}
-			// UID precondition: VA names are deterministic csi-hash
-			// names — a volume re-attachment between list and delete
-			// recreates the SAME name, so only the object we vetted may
-			// be removed.
-			if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, t.va.Name,
-				kube.UIDDeleteOptions(t.va.UID, "")); err != nil {
-				return err
-			}
-			metrics.VolumeAttachmentsCleanedTotal.WithLabelValues(t.reason).Inc()
-			c.orphanFirstSeen.Forget(t.va.Name)
-			return nil
-		},
-		OnError: func(log logr.Logger, t *vaTarget, err error) {
-			if t.strip {
-				return // stripFinalizers already metered + logged the failure
-			}
-			switch {
-			case apierrors.IsNotFound(err):
-				// The VA was deleted under us — raced with an
-				// external cleanup; nothing failed.
-				log.Info("SKIP: volumeattachment already gone — raced with an external delete",
-					"va", t.va.Name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — the VA was recreated
-				// (same csi-hash name, new volume) since the list.
-				log.Info("SKIP: volumeattachment recreated since the list — UID precondition fired",
-					"va", t.va.Name, "node", t.va.Spec.NodeName)
-			default:
-				metrics.IncError(c.queue)
-				log.Error(err, "volumeattachment delete failed",
-					"va", t.va.Name, "node", t.va.Spec.NodeName,
-					"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
-			}
-		},
-	})
 	// Re-arm the grace window for every VA that stopped looking
 	// orphaned (node reappeared, or the VA vanished between cycles).
-	c.forgetReattachedOrphans(orphanNow, log)
+	c.forgetReattachedOrphans(cyc.orphanNow, log)
 	// Same re-arm for the Ready-node window — the gate stopped
 	// holding (pod rebound, volume re-attached, node unReady or the
 	// VA resolved) resets the two-cycle count.
-	c.forgetSettledStuckReady(stuckReadyNow)
+	c.forgetSettledStuckReady(cyc.stuckReadyNow)
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", vaDeleteCap)
 	}

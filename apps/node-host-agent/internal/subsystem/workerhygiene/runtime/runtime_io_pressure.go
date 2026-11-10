@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -307,8 +308,9 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		latched = true
 	} else if slowCond {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: disk-slow-io max_await=%.1fms psi_avg60=%.1f (check %d/%d)",
-			maxAwait, avg60, c.diskSlowFails, diskSlowIOConsecNeeded))
+			"suspect: disk-slow-io max_await=%.1fms psi_avg60=%.1f%s",
+			maxAwait, avg60,
+			checkkit.Progress(c.diskSlowFails, diskSlowIOConsecNeeded)))
 	}
 	if c.inflightFreezeFails >= diskSlowIOConsecNeeded {
 		c.d.State.Enter(latchdefs.LatchDiskSlowIO, fmt.Sprintf(
@@ -317,8 +319,9 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		latched = true
 	} else if freezeCond {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: disk-inflight-freeze frozen_disks=%d inflight=%d ios_delta=0 (check %d/%d)",
-			freezeDisks, freezeInflight, c.inflightFreezeFails, diskSlowIOConsecNeeded))
+			"suspect: disk-inflight-freeze frozen_disks=%d inflight=%d ios_delta=0%s",
+			freezeDisks, freezeInflight,
+			checkkit.Progress(c.inflightFreezeFails, diskSlowIOConsecNeeded)))
 	}
 	// The latch clears only when BOTH detectors' streaks have reset —
 	// a freeze must not be masked by the slow-IO path going quiet.

@@ -50,6 +50,10 @@ FROM alpine:3.24
 RUN apk add --no-cache util-linux iproute2 iputils bash tini
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532
-# tini as PID 1 reaps orphaned grandchildren (nsenter/psql/ip/ethtool
-# exec'd under hostPID) that would otherwise pile up as zombies.
-ENTRYPOINT ["/sbin/tini", "--", "/node-host-agent"]
+# tini -s: the DaemonSet runs hostPID:true, so tini shares the HOST pid
+# namespace and is never PID 1 (host systemd is) — plain tini only reaps
+# its direct child and warns at startup. -s registers it as a child
+# subreaper instead: orphaned grandchildren (nsenter/psql/ip/ethtool
+# exec'd under hostPID) reparent to tini and get reaped rather than
+# falling through to host PID 1.
+ENTRYPOINT ["/sbin/tini", "-s", "--", "/node-host-agent"]

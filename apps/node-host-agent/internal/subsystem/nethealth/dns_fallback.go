@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -253,9 +254,9 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		n.dnsfails[e.Name]++
 		fails := n.dnsfails[e.Name]
 		if fails < n.cfg.ConsecNeeded && curIP == "" {
-			n.state.AppendLog(fmt.Sprintf(
-				"suspect: dns-resolve %s fail via resolv.conf (check %d/%d)",
-				e.Name, fails, n.cfg.ConsecNeeded))
+			n.state.AppendLog("suspect: dns-resolve " + e.Name +
+				" fail via resolv.conf" +
+				checkkit.Progress(fails, n.cfg.ConsecNeeded))
 			continue
 		}
 		// Over threshold or already pinned: keep a live pin, probe a

@@ -39,14 +39,20 @@ byte-stable with the shell-operator alerts).
   collect-cap-confirm-UID-delete sweep skeleton),
   `testhelp` (leaf-level k8s fakes — importable by platform tests,
   which `internal/testutil` cannot reach).
-- `internal/metrics`, `internal/promq` — leaf packages: the metric
-  vectors (ops-contract and multi-consumer series live here forever;
-  a single-check series colocates as a private var + `init()`
-  registration inside the check file that consumes it) and the
-  Prometheus instant-query client.
+- `internal/metrics`, `internal/promq`, `internal/probefw` — leaf
+  packages: the metric vectors (ops-contract and multi-consumer
+  series live here forever; a single-check series colocates as a
+  private var + `init()` registration inside the check file that
+  consumes it), the Prometheus instant-query client, and the
+  health-check framework (Deps/Config/Check/Result + the sweep
+  snapshot/heal/persisted helpers). probefw is a top-level leaf —
+  not under `health/` — because `shared.CheckReg.New` is typed
+  `func(*probefw.Deps) probefw.Check`: the contract layer must be
+  able to name the type (it may use platform/metrics/promq but
+  never shared/registry/testutil or a domain module).
 - `internal/{apiserver,health,integration,janitor,node,system}/*` —
   the modules, one package per module grouped by domain. Health
-  checks live under `health/<sub>/` on top of `health/probefw`;
+  checks live under `health/<sub>/` on top of `internal/probefw`;
   every check is a `CheckReg` row in the registry's health section
   whose collection order into `Deps.CheckRegs` IS the sweep order
   (ops contract — the check rows' relative order must not change).
@@ -54,7 +60,15 @@ byte-stable with the shell-operator alerts).
   `circuitbreaker`, `criticalns`, `guardstate`, `orphansweep`,
   `unmeshed` are leaf duties the facade's single `Setup`/sweep
   orchestrates (one registry row, `errors.Join` of the duty
-  errors); `health/nethealth/linkerd` is the analogous check-side
+  errors). Check-side, domain packages split per product once a
+  family's checks are self-contained: `health/datastore/{nats,
+  scylla, percona, postgres, olm, pvc}` and
+  `health/nethealth/{cilium,gateway}` hold their checks + a mini
+  `harness_test.go` (own `harnessChecks` roster) behind the
+  registry rows, while the parent package keeps the shared helpers
+  (downscaler/site-skew/db-operator/masterless in datastore;
+  config + tunnel/linkerd-guard/coredns/zone-starvation checks in
+  nethealth); `health/nethealth/linkerd` is the oldest such
   subpackage (the three linkerd checks + their shared markers
   behind one facade with three `NewX` constructors — registry rows
   point there, duty logic stays out of the nethealth root).

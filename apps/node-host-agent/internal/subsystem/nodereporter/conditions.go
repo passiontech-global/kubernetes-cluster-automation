@@ -1,11 +1,13 @@
 // Condition evaluation + node status patching.
 //
-// The mapping table is a 1:1 port of the removed NPD
-// watchdog-state-monitor.json (custom plugin): Type, default
-// Reason/Message, permanent-rule problem Reason and the state-<key>
-// latch file the check script probed. WatchdogStale is the special
-// one — check-watchdog-fresh.sh gated on the `installed` marker and
-// compared `last-run` age to 1200s.
+// The latch→condition mapping lives in latchdefs.CondDefs (the SSOT
+// ported 1:1 from the removed NPD watchdog-state-monitor.json:
+// Type, default Reason/Message, permanent-rule problem Reason and
+// the state-<key> latch file the check script probed); this file
+// only fixes the rendered order (conditionOrder) and projects the
+// defs. WatchdogStale is the special one — check-watchdog-fresh.sh
+// gated on the `installed` marker and compared `last-run` age to
+// 1200s — so it stays a local def with no latch.
 package nodereporter
 
 import (
@@ -43,527 +45,105 @@ type conditionDef struct {
 	altStateKeys []string
 }
 
-// conditionDefs is the watchdog-condition table ported from the NPD
-// JSON — order preserved so rendered status.conditions stays stable —
-// plus agent-added entries at the tail (JournaldUnreadable, the infra and leak-pressure
-// latch→condition surfaces and the workerhygiene cilium MTU/WG
-// latches). Every typ is a nodecond constant — single source of
-// truth for the condition names.
-var conditionDefs = []conditionDef{
-	{
-		typ:            nodecond.NodeOverloaded,
-		defaultReason:  "NodeLoadNormal",
-		defaultMessage: "node not overloaded (load15 <= 4xCPU)",
-		problemReason:  "NodeOverloadedDetected",
-		stateKey:       latchdefs.LatchNodeOverloaded,
-	},
-	{
-		typ:            nodecond.WatchdogStale,
-		defaultReason:  "WatchdogFresh",
-		defaultMessage: "node-watchdog ran recently (last-run < 20 min)",
-		problemReason:  "WatchdogStaleDetected",
-		// no stateKey — evaluated by watchdogStale() from installed/last-run
-	},
-	{
-		typ:            nodecond.CiliumAgentDown,
-		defaultReason:  "CiliumAgentUp",
-		defaultMessage: "cilium-agent healthz OK",
-		problemReason:  "CiliumAgentDownDetected",
-		stateKey:       latchdefs.LatchCiliumAgentDown,
-	},
-	{
-		typ:            nodecond.CiliumInitStuck,
-		defaultReason:  "CiliumEndpointsReady",
-		defaultMessage: "no cilium endpoint stuck in init (informer healthy)",
-		problemReason:  "CiliumInitStuckDetected",
-		stateKey:       latchdefs.LatchCiliumInitStuck,
-	},
-	{
-		typ:            nodecond.KubeletRuntimeStall,
-		defaultReason:  "KubeletRuntimeOk",
-		defaultMessage: "no phantom-pods wedge (ctr alive, tasks > 0)",
-		problemReason:  "KubeletRuntimeStallDetected",
-		stateKey:       latchdefs.LatchKubeletRuntimeStall,
-		// BUG-H4: the PLEG/syncloop freeze and the hung containerd
-		// socket are runtime stalls too — every latch must light
-		// the condition. kubelet-watch-wedge adds the kubelet watch-stream wedge
-		// and the containerd meta.db corruption latch (restart can't
-		// recover a corrupt store — same remediation class).
-		altStateKeys: []string{
-			latchdefs.LatchKubeletHealthzDown,
-			latchdefs.LatchKubeletSyncloopDown,
-			latchdefs.LatchContainerdSockDown,
-			latchdefs.LatchKubeletWatchWedge,
-			latchdefs.LatchContainerdCorrupt,
-		},
-	},
-	{
-		typ:            nodecond.DNSFallbackActive,
-		defaultReason:  "DnsDirectOk",
-		defaultMessage: "DNS via resolv.conf healthy, no /etc/hosts pin",
-		problemReason:  "DnsFallbackEngaged",
-		stateKey:       latchdefs.LatchDNSFallback,
-	},
-	{
-		typ:            nodecond.DNSResolvStale,
-		defaultReason:  "DnsResolvFresh",
-		defaultMessage: "DNS pods (nld/coredns) resolv.conf matches host",
-		problemReason:  "DnsResolvStaleDetected",
-		stateKey:       latchdefs.LatchDNSResolvStale,
-	},
-	{
-		typ:            nodecond.PodTeardownWedged,
-		defaultReason:  "PodTeardownOk",
-		defaultMessage: "no long-Terminating pod with leftover task",
-		problemReason:  "PodTeardownWedgedDetected",
-		stateKey:       latchdefs.LatchPodTeardownWedged,
-	},
-	{
-		typ:            nodecond.KubeletWatchWedge,
-		defaultReason:  "KubeletWatchOk",
-		defaultMessage: "kubelet receives pod assignment normally (no unseen pod)",
-		problemReason:  "KubeletWatchWedgeDetected",
-		stateKey:       latchdefs.LatchKubeletWatchWedge,
-	},
-	{
-		// Agent-added (not in the NPD JSON): the journalwatch
-		// tracker's blindness latch — journald installed but every
-		// journal read produces nothing, so all journal-grep checks
-		// and this reporter's own journal monitors are blind.
-		typ:            nodecond.JournaldUnreadable,
-		defaultReason:  "JournaldReadable",
-		defaultMessage: "journald journal reads return entries",
-		problemReason:  "JournaldUnreadableDetected",
-		stateKey:       latchdefs.LatchJournalUnreadable,
-	},
-	{
-		// Agent-added (filesystem-readonly): hostmetrics' statfs probes found a
-		// mount reporting ST_RDONLY — the fs remounted read-only
-		// (kernel error path) and every write on it silently fails.
-		// updateFSReadonlyEvidence/checkKernelDmesg: the same condition also trips on the
-		// state-fs-readonly evidence latch — a PVC backing mount
-		// found ro in /proc/1/mounts or a fresh kernel fs-error
-		// record, before statfs ever sees ST_RDONLY.
-		typ:            nodecond.FilesystemReadOnly,
-		defaultReason:  "FilesystemReadWrite",
-		defaultMessage: "all probed filesystems are read-write",
-		problemReason:  "FilesystemReadOnlyDetected",
-		stateKey:       latchdefs.LatchFilesystemReadonly,
-		altStateKeys:   []string{latchdefs.LatchFSReadonly},
-	},
-	{
-		// Agent-added (d-state-storm): workerhygiene's D-state storm
-		// detector — >=5 tasks (or >=2 runtime-critical) stuck in
-		// uninterruptible sleep means a hung kernel IO path no
-		// service restart can clear; NHC→SNR owns the remedy.
-		typ:            nodecond.KernelHungTasks,
-		defaultReason:  "KernelTasksRunOk",
-		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
-		problemReason:  "KernelHungTasksDetected",
-		stateKey:       latchdefs.LatchDStateStorm,
-		// kernel-softlockup-monitor (npd subpackage): a kmsg
-		// soft-lockup/RCU-stall signature is the same hang class —
-		// the kernel monitor Enters one evidence latch per
-		// signature so a CPU wedged inside the kernel raises
-		// KernelHungTasks even when no D-state storm is counted.
-		altStateKeys: []string{
-			latchdefs.LatchKernelSoftLockup, latchdefs.LatchKernelRCUStall,
-		},
-	},
-	// --- infra latch→condition surface ---
-	// Agent-added conditions for the latches the hygiene subsystems
-	// already wrote (or the infra guards add): every state-<key> below maps
-	// 1:1 to a permanent NodeCondition so the NHC→SNR chain and the
-	// problem_gauge series cover the full latch set.
-	{
-		typ:            nodecond.NebulaIsolated,
-		defaultReason:  "NebulaMeshHealthy",
-		defaultMessage: "all nebula peers handshake normally",
-		problemReason:  "NebulaIsolatedDetected",
-		stateKey:       latchdefs.LatchNebulaIsolated,
-	},
-	{
-		typ:            nodecond.NebulaDegraded,
-		defaultReason:  "NebulaDataplaneOk",
-		defaultMessage: "nebula dataplane healthy (no relay/latency degradation)",
-		problemReason:  "NebulaDegradedDetected",
-		stateKey:       latchdefs.LatchNebulaDegraded,
-	},
-	{
-		typ:            nodecond.CiliumEnvoyDown,
-		defaultReason:  "CiliumEnvoyReady",
-		defaultMessage: "cilium-envoy admin /ready OK",
-		problemReason:  "CiliumEnvoyDownDetected",
-		stateKey:       latchdefs.LatchCiliumEnvoyDown,
-	},
-	{
-		typ:            nodecond.CiliumIPAMExhausted,
-		defaultReason:  "CiliumIPAMOk",
-		defaultMessage: "cilium IPAM pool has headroom (no address leak)",
-		problemReason:  "CiliumIPAMExhaustedDetected",
-		stateKey:       latchdefs.LatchCiliumIPAMExhausted,
-	},
-	{
-		typ:            nodecond.CiliumBPFMapPressure,
-		defaultReason:  "CiliumBPFMapsOk",
-		defaultMessage: "critical cilium BPF maps below 90% capacity",
-		problemReason:  "CiliumBPFMapPressureDetected",
-		stateKey:       latchdefs.LatchCiliumBPFMapPressure,
-	},
-	{
-		typ:            nodecond.SpegelMirrorDegraded,
-		defaultReason:  "SpegelMirrorReady",
-		defaultMessage: "spegel P2P mirror pod Ready",
-		problemReason:  "SpegelMirrorDegradedDetected",
-		stateKey:       latchdefs.LatchSpegelMirrorDegraded,
-	},
-	{
-		typ:            nodecond.CalicoVethLeak,
-		defaultReason:  "CalicoVethCountOk",
-		defaultMessage: "cali* veth count matches pod count (no CNI DEL leak)",
-		problemReason:  "CalicoVethLeakDetected",
-		stateKey:       latchdefs.LatchCalicoVethLeak,
-	},
-	{
-		typ:            nodecond.CalicoFelixDown,
-		defaultReason:  "CalicoFelixReady",
-		defaultMessage: "calico felix :9099 readiness OK",
-		problemReason:  "CalicoFelixDownDetected",
-		stateKey:       latchdefs.LatchCalicoFelixDown,
-	},
-	{
-		typ:            nodecond.Fail2banDown,
-		defaultReason:  "Fail2banActive",
-		defaultMessage: "fail2ban service installed and active",
-		problemReason:  "Fail2banDownDetected",
-		stateKey:       latchdefs.LatchFail2banDown,
-	},
-	{
-		typ:            nodecond.ConntrackPressure,
-		defaultReason:  "ConntrackNormal",
-		defaultMessage: "nf_conntrack table below pressure threshold",
-		problemReason:  "ConntrackPressureDetected",
-		stateKey:       latchdefs.LatchConntrackPressure,
-	},
-	{
-		typ:            nodecond.KernelKeysPressure,
-		defaultReason:  "KernelKeysNormal",
-		defaultMessage: "kernel keyring quota below pressure threshold",
-		problemReason:  "KernelKeysPressureDetected",
-		stateKey:       latchdefs.LatchKernelKeysPressure,
-	},
-	{
-		typ:            nodecond.ControlPlaneCertReloadStale,
-		defaultReason:  "ControlPlaneCertReloadFresh",
-		defaultMessage: "control-plane cert reload markers fresh",
-		problemReason:  "ControlPlaneCertReloadStaleDetected",
-		stateKey:       latchdefs.LatchCPCertReloadStale,
-	},
-	{
-		typ:            nodecond.MemoryPSIThrashing,
-		defaultReason:  "MemoryPSINormal",
-		defaultMessage: "memory PSI full avg60 <= 25% or free memory >= 8%",
-		problemReason:  "MemoryPSIThrashingDetected",
-		stateKey:       latchdefs.LatchPSIMemoryThrash,
-	},
-	// --- leak-pressure latch→condition surface ---
-	// Agent-added conditions for the latches the leak-pressure guards add (or the
-	// H1 clock check already wrote): every state-<key> below maps
-	// 1:1 to a permanent NodeCondition.
-	{
-		// nethealth's H1 clock-discipline latch — adjtimex reports
-		// STA_UNSYNC or esterror > 500ms for ConsecNeeded cycles.
-		typ:            nodecond.ClockUnsynchronized,
-		defaultReason:  "ClockSynchronized",
-		defaultMessage: "kernel clock disciplined (adjtimex synced, esterror <= 500ms)",
-		problemReason:  "ClockUnsynchronizedDetected",
-		stateKey:       latchdefs.LatchClockUnsync,
-	},
-	{
-		// workerhygiene's kernel-slab-leak slab-leak guard — SUnreclaim above
-		// 35% of MemTotal means kernel memory is leaking into
-		// unreclaimable slab (dentries/inodes/slab caches that
-		// drop_caches cannot fully reclaim).
-		typ:            nodecond.KernelSlabLeak,
-		defaultReason:  "KernelSlabNormal",
-		defaultMessage: "unreclaimable kernel slab below pressure threshold",
-		problemReason:  "KernelSlabLeakDetected",
-		stateKey:       latchdefs.LatchKernelSlabLeak,
-	},
-	{
-		// nethealth's overlay-mtu-guard DF PMTU probe — small-packet overlay
-		// pings pass but a 1200-byte DF probe blackholes: the
-		// double-encap path MTU sits below the overlay MTU.
-		typ:            nodecond.NebulaPMTUBlackhole,
-		defaultReason:  "NebulaPMTUOk",
-		defaultMessage: "nebula overlay passes DF probes at probe size",
-		problemReason:  "NebulaPMTUBlackholeDetected",
-		stateKey:       latchdefs.LatchNebulaPMTUBlackhole,
-	},
-	// --- deep-failure latch→condition surface ---
-	{
-		// hostmetrics' pid-fd-pressure kernel resource exhaustion guard —
-		// threads/pid or fd utilization above 0.90 for 3 consecutive
-		// scrapes. PID/FD exhaustion precedes fork() failures and the
-		// classic "can't start new process" node outage.
-		typ:            nodecond.KernelResourceExhaustion,
-		defaultReason:  "KernelResourcesNormal",
-		defaultMessage: "kernel threads/pids and fd table below exhaustion threshold",
-		problemReason:  "KernelResourceExhaustionDetected",
-		stateKey:       latchdefs.LatchPIDFDPressure,
-	},
-	{
-		// nethealth's clock-skew clock-skew guard — chronyc/adjtimex
-		// offset above 2.0s for 5 consecutive cycles. Distinct from
-		// ClockUnsynchronized: the clock HAS a sync source but sits
-		// far enough off to break cert validity/raft leases.
-		typ:            nodecond.ClockSkewDetected,
-		defaultReason:  "ClockSkewOk",
-		defaultMessage: "clock offset within 2.0s of NTP source",
-		problemReason:  "ClockSkewDetected",
-		stateKey:       latchdefs.LatchClockSkew,
-	},
-	// --- latch→condition surface: kernel/host deep-failure + hygiene ---
-	// The remaining registered latches each map 1:1 to a permanent
-	// NodeCondition — kubeconfig-cert-expiring from
-	// controllerhygiene's cert-expiry probe, cpu-steal-pressure from
-	// hostmetrics' hypervisor steal guard, cgroup-dying-leak and
-	// systemd-session-bloat from workerhygiene's reclaim/session
-	// hygiene checks.
-	{
-		// controllerhygiene's kubeconfig cert-expiry guard — an
-		// embedded client cert in one of the node-daemons'
-		// kubeconfigs approaching notAfter. Renewal belongs to the
-		// certs pipeline, not the agent — the condition is the
-		// signal channel.
-		typ:            nodecond.KubeconfigCertExpiring,
-		defaultReason:  "KubeconfigCertValid",
-		defaultMessage: "kubeconfig client certificates valid beyond the expiry horizon",
-		problemReason:  "KubeconfigCertExpiringDetected",
-		stateKey:       latchdefs.LatchKubeconfigCertExpiring,
-	},
-	{
-		// hostmetrics' cpu-steal guard — hypervisor steal time above
-		// the pressure threshold for consecutive scrapes: a noisy
-		// neighbour or overcommitted host starves every pod on the
-		// node (token caches and leases start timing out first).
-		typ:            nodecond.CPUStealPressure,
-		defaultReason:  "CPUStealNormal",
-		defaultMessage: "hypervisor CPU steal below pressure threshold",
-		problemReason:  "CPUStealPressureDetected",
-		stateKey:       latchdefs.LatchCPUStealPressure,
-	},
-	{
-		// workerhygiene's cgroup-dying-reclaim — cgroup v2
-		// nr_dying_descendants above threshold: deleted containers
-		// pin page cache and slow every cgroup-tree walk (the
-		// PLEG-not-healthy class).
-		typ:            nodecond.CgroupDyingLeak,
-		defaultReason:  "CgroupDyingNormal",
-		defaultMessage: "cgroup dying descendants below pressure threshold",
-		problemReason:  "CgroupDyingLeakDetected",
-		stateKey:       latchdefs.LatchCgroupDyingLeak,
-	},
-	{
-		// workerhygiene's systemd-session-hygiene — abandoned logind
-		// session scopes accumulating (or D-Bus latency climbing)
-		// degrades every systemctl call on the node.
-		typ:            nodecond.SystemdSessionBloat,
-		defaultReason:  "SystemdSessionsNormal",
-		defaultMessage: "logind session count and D-Bus latency healthy",
-		problemReason:  "SystemdSessionBloatDetected",
-		stateKey:       latchdefs.LatchSystemdSessionBloat,
-	},
-	{
-		// workerhygiene's kubelet-syncloop PLEG metrics guard —
-		// relist latency (avg/quantile >5s) or last-seen lag >30s
-		// for ConsecNeeded cycles. Early warning: PLEG is starving
-		// before /healthz/syncloop ever answers 500, so NHC/SNR and
-		// the runbooks see the degrade while the sync loop still
-		// replies.
-		typ:            nodecond.KubeletPLEGUnhealthy,
-		defaultReason:  "KubeletPLEGHealthy",
-		defaultMessage: "kubelet PLEG relist latency and last-seen lag healthy",
-		problemReason:  "KubeletPLEGUnhealthyDetected",
-		stateKey:       latchdefs.LatchKubeletPLEGUnhealthy,
-	},
-	// --- gray-failure latch→condition surface ---
-	{
-		// workerhygiene's disk-slow-io disk-slow-io gray-failure guard —
-		// a whole disk whose write await stays >200ms while io PSI
-		// full avg60 sits >= 25% for >=5 consecutive cycles: the
-		// backing device/SAN is degrading but nothing has
-		// D-stormed or remounted ro yet. Consumed cluster-side by
-		// node-hang-precordon and descheduler-storm-gate to keep
-		// new stateful pods off the node — deliberately NOT in any
-		// SNR reboot path (a shared-storage slowdown must not
-		// mass-reboot the fleet).
-		typ:            nodecond.DiskSlowIO,
-		defaultReason:  "DiskIONormal",
-		defaultMessage: "disk write await and io PSI within normal bounds",
-		problemReason:  "DiskSlowIODetected",
-		stateKey:       latchdefs.LatchDiskSlowIO,
-	},
-	{
-		// workerhygiene's kernel-net-shim-hygiene guard — sustained
-		// kernel socket/softnet drop growth or a containerd-shim RSS
-		// breach (individual >=200MiB or total >=1.5GiB).
-		typ:            nodecond.KernelNetShimDegraded,
-		defaultReason:  "KernelNetShimNormal",
-		defaultMessage: "kernel socket/softnet drop rates and containerd-shim RSS within normal bounds",
-		problemReason:  "KernelNetShimDegradedDetected",
-		stateKey:       latchdefs.LatchKernelNetShim,
-	},
-	// --- Clocksource latch→condition surface ---
-	{
-		// hostmetrics' clocksource guard — the kernel marked
-		// its clocksource unstable (kmsg evidence latch) or the
-		// collector found the current clocksource drifted off
-		// tsc/kvm-clock. A demoted clocksource degrades every vDSO
-		// clock_gettime and produces clock-skew false positives.
-		typ:            nodecond.ClocksourceUnstable,
-		defaultReason:  "ClocksourceStable",
-		defaultMessage: "kernel clocksource stable (tsc/kvm-clock, no instability records)",
-		problemReason:  "ClocksourceUnstableDetected",
-		stateKey:       latchdefs.LatchClocksourceUnstable,
-	},
-	// --- workerhygiene cilium latch→condition surface ---
-	{
-		// workerhygiene's B4 MTU-drift guard — the cilium datapath,
-		// the double-encap cilium_wg0 (overlay MTU minus the ~60B WG
-		// header) or a stale pod lxc* veth running an MTU above the
-		// nebula overlay: oversized pod packets die with FRAG_NEEDED
-		// after SYN-ACK (the silent blackhole). The latch carries the
-		// offending pair (e.g. "cilium_net=1500 nebula=1300") and
-		// exits when the MTUs align or the overlay iface is gone.
-		typ:            nodecond.CiliumMTUDrift,
-		defaultReason:  "CiliumMTUAligned",
-		defaultMessage: "cilium datapath MTU matches nebula overlay (no drift)",
-		problemReason:  "CiliumMTUDriftDetected",
-		stateKey:       latchdefs.LatchCiliumMTUDrift,
-	},
-	{
-		// workerhygiene's cilium-wg-peer-gc WireGuard peer-gc healer — cilium_wg0
-		// carries fewer live allowed-ip peers than cilium's
-		// encryption-peer count (zombie peers excluded from the
-		// count), so the stale WG peer state was wiped and
-		// cilium-agent restarted; the latch content is
-		// "allowed_ips=N expected=M" and exits once the counts match.
-		typ:            nodecond.CiliumWGStale,
-		defaultReason:  "CiliumWGPeersOk",
-		defaultMessage: "cilium_wg0 live peers match expected encryption peers (no stale state)",
-		problemReason:  "CiliumWGStaleDetected",
-		stateKey:       latchdefs.LatchCiliumWGPeerWipe,
-	},
-	// --- inode-pressure inode-pressure latch→condition surface ---
-	{
-		// hostmetrics' inode-pressure inode-usage hysteresis guard — a
-		// monitored mount at >=95% inode usage latches
-		// state-inode-pressure; a full inode table fails new
-		// file/tmpfs writes before DiskPressure ever fires. The
-		// kubelet-native InodePressure spelling is reused so the
-		// controller's pre-cordon and storm-gate consumers see the
-		// agent-detected episodes under the same name.
-		typ:            nodecond.InodePressure,
-		defaultReason:  "FilesystemInodesHealthy",
-		defaultMessage: "all monitored filesystems below inode-pressure thresholds",
-		problemReason:  "FilesystemInodesExhausted",
-		stateKey:       latchdefs.LatchInodePressure,
-	},
-	// --- W21 latch→condition surface ---
-	// The last registered latches without a condition: workerhygiene's
-	// konnectivity stale-identifier guard, cilium-envoy xDS-NACK
-	// streak and disk-bloat runaway detector; nethealth's nebula
-	// MTU-blackhole/slowpath/site-edge degradations; hostmetrics'
-	// kernel page-allocation fragmentation evidence latch.
-	{
-		// workerhygiene's pod-teardown konnectivity guard — the
-		// apiserver-backend identifier the konnectivity-agent
-		// sandbox holds drifted from the node IP (stale after a
-		// node IP change); pods then stall on the stale route.
-		typ:            nodecond.KonnectivityIPMismatch,
-		defaultReason:  "KonnectivityIPOk",
-		defaultMessage: "konnectivity-agent identifiers match node IPs",
-		problemReason:  "KonnectivityIPMismatchDetected",
-		stateKey:       latchdefs.LatchKonnectivityIPMismatch,
-	},
-	{
-		// workerhygiene's cilium-envoy xDS guard — cds/lds/rds
-		// update_rejected deltas climbing across consecutive
-		// cycles: envoy keeps NACKing config pushes, so Gateway
-		// routes 404/503 while their API objects report Accepted.
-		typ:            nodecond.CiliumEnvoyXDSReject,
-		defaultReason:  "CiliumEnvoyXDSOk",
-		defaultMessage: "cilium-envoy xDS updates accepted (no update_rejected deltas)",
-		problemReason:  "CiliumEnvoyXDSRejectDetected",
-		stateKey:       latchdefs.LatchCiliumEnvoyXDSReject,
-	},
-	{
-		// workerhygiene's disk-bloat runaway detector — a target
-		// (PVC backing path or pod writable layer) above the
-		// bloat watermark while the filesystem sits past the
-		// critical band.
-		typ:            nodecond.DiskBloatRunaway,
-		defaultReason:  "DiskBloatNormal",
-		defaultMessage: "no target above the disk-bloat watermark",
-		problemReason:  "DiskBloatRunawayDetected",
-		stateKey:       latchdefs.LatchDiskBloat,
-	},
-	{
-		// nethealth's routeguard NM4 DF-probe guard — small-packet
-		// nebula pings pass but a full-size DF probe blackholes:
-		// the path MTU sits below the overlay MTU (or an
-		// intermediate hop drops fragments).
-		typ:            nodecond.NebulaMTUBlackhole,
-		defaultReason:  "NebulaMTUOk",
-		defaultMessage: "nebula overlay passes DF probes at full size",
-		problemReason:  "NebulaMTUBlackholeDetected",
-		stateKey:       latchdefs.LatchNebulaMTUBlackhole,
-	},
-	{
-		// nethealth's dataplane slowpath guard — nebula relay
-		// selection degraded to slow paths or latency climbed
-		// past the dataplane bound.
-		typ:            nodecond.NebulaSlowpath,
-		defaultReason:  "NebulaFastpathOk",
-		defaultMessage: "nebula dataplane on fast paths within latency bounds",
-		problemReason:  "NebulaSlowpathDetected",
-		stateKey:       latchdefs.LatchNebulaSlowpath,
-	},
-	{
-		// nethealth's site-edge guard — peers at the site edge
-		// (cross-DC relays) unreachable or degraded while the
-		// local mesh stays healthy.
-		typ:            nodecond.NebulaSiteedge,
-		defaultReason:  "NebulaSiteedgeOk",
-		defaultMessage: "nebula site-edge peers reachable",
-		problemReason:  "NebulaSiteedgeDetected",
-		stateKey:       latchdefs.LatchNebulaSiteedge,
-	},
-	{
-		// hostmetrics' kmsg page-alloc evidence latch — the kernel
-		// logged "page allocation failure: order:N": the buddy
-		// allocator cannot serve a contiguous block, fragmentation
-		// is winning (workerhygiene compacts memory off it).
-		typ:            nodecond.KernelPageAllocFailure,
-		defaultReason:  "KernelPageAllocOk",
-		defaultMessage: "no kernel page-allocation failure records",
-		problemReason:  "KernelPageAllocFailureDetected",
-		stateKey:       latchdefs.LatchPageAllocFailure,
-	},
-	{
-		// controllerhygiene's sig13 watch-cache wedge guard — the
-		// apiserver's watch-cache stopped tracking etcd's revision
-		// (rv_now - rv_cache gap). Surfaced so cluster-side heals
-		// (coredns-stale-watchdog) defer pod churn while the
-		// apiserver itself serves stale reads; only controller
-		// nodes carry the latch, workers report False.
-		typ:            nodecond.ApiserverWatchCacheWedged,
-		defaultReason:  "APIServerWatchCacheOk",
-		defaultMessage: "apiserver watch-cache tracks etcd revision",
-		problemReason:  "APIServerWatchCacheWedged",
-		stateKey:       latchdefs.LatchAPIServerCacheWedged,
-	},
+// conditionOrder is the rendered node.status.conditions order for the
+// latch-backed watchdog conditions — the historical NPD
+// watchdog-state-monitor.json order with agent-added surfaces
+// appended at the tail. The "" entry is WatchdogStale, the one
+// condition whose evidence is a heartbeat-freshness probe rather
+// than a state-* latch (see staleConditionDef). Order is
+// load-bearing: node_status.conditions is an ordered list and
+// consumers/tests compare index-stable output.
+var conditionOrder = []string{
+	latchdefs.LatchNodeOverloaded,
+	"",
+	latchdefs.LatchCiliumAgentDown,
+	latchdefs.LatchCiliumInitStuck,
+	latchdefs.LatchKubeletRuntimeStall,
+	latchdefs.LatchDNSFallback,
+	latchdefs.LatchDNSResolvStale,
+	latchdefs.LatchPodTeardownWedged,
+	latchdefs.LatchKubeletWatchWedge,
+	latchdefs.LatchJournalUnreadable,
+	latchdefs.LatchFilesystemReadonly,
+	latchdefs.LatchDStateStorm,
+	latchdefs.LatchNebulaIsolated,
+	latchdefs.LatchNebulaDegraded,
+	latchdefs.LatchCiliumEnvoyDown,
+	latchdefs.LatchCiliumIPAMExhausted,
+	latchdefs.LatchCiliumBPFMapPressure,
+	latchdefs.LatchSpegelMirrorDegraded,
+	latchdefs.LatchCalicoVethLeak,
+	latchdefs.LatchCalicoFelixDown,
+	latchdefs.LatchFail2banDown,
+	latchdefs.LatchConntrackPressure,
+	latchdefs.LatchKernelKeysPressure,
+	latchdefs.LatchCPCertReloadStale,
+	latchdefs.LatchPSIMemoryThrash,
+	latchdefs.LatchClockUnsync,
+	latchdefs.LatchKernelSlabLeak,
+	latchdefs.LatchNebulaPMTUBlackhole,
+	latchdefs.LatchPIDFDPressure,
+	latchdefs.LatchClockSkew,
+	latchdefs.LatchKubeconfigCertExpiring,
+	latchdefs.LatchCPUStealPressure,
+	latchdefs.LatchCgroupDyingLeak,
+	latchdefs.LatchSystemdSessionBloat,
+	latchdefs.LatchKubeletPLEGUnhealthy,
+	latchdefs.LatchDiskSlowIO,
+	latchdefs.LatchKernelNetShim,
+	latchdefs.LatchClocksourceUnstable,
+	latchdefs.LatchCiliumMTUDrift,
+	latchdefs.LatchCiliumWGPeerWipe,
+	latchdefs.LatchInodePressure,
+	latchdefs.LatchKonnectivityIPMismatch,
+	latchdefs.LatchCiliumEnvoyXDSReject,
+	latchdefs.LatchDiskBloat,
+	latchdefs.LatchNebulaMTUBlackhole,
+	latchdefs.LatchNebulaSlowpath,
+	latchdefs.LatchNebulaSiteedge,
+	latchdefs.LatchPageAllocFailure,
+	latchdefs.LatchAPIServerCacheWedged,
+}
+
+// staleConditionDef is WatchdogStale's def — the one condition whose
+// evidence is a freshness probe over the watchdog heartbeat files,
+// not a state-* latch, so it has no latchdefs entry by design.
+var staleConditionDef = conditionDef{
+	typ:            nodecond.WatchdogStale,
+	defaultReason:  "WatchdogFresh",
+	defaultMessage: "node-watchdog ran recently (last-run < 20 min)",
+	problemReason:  "WatchdogStaleDetected",
+}
+
+// conditionDefs is the projected latch→condition table: latchdefs.
+// CondDefs carries the per-latch metadata (type, reason/message,
+// problem reason, alt latches) and conditionOrder fixes the render
+// order. Latches without a CondDefs entry have no condition surface
+// by design.
+var conditionDefs = buildConditionDefs()
+
+// buildConditionDefs projects latchdefs.CondDefs onto conditionOrder.
+func buildConditionDefs() []conditionDef {
+	defs := make([]conditionDef, 0, len(conditionOrder))
+	for _, latch := range conditionOrder {
+		if latch == "" {
+			defs = append(defs, staleConditionDef)
+			continue
+		}
+		cd, ok := latchdefs.CondDefs[latch]
+		if !ok {
+			continue
+		}
+		defs = append(defs, conditionDef{
+			typ:            corev1.NodeConditionType(cd.Type),
+			defaultReason:  cd.DefaultReason,
+			defaultMessage: cd.DefaultMessage,
+			problemReason:  cd.ProblemReason,
+			stateKey:       latch,
+			altStateKeys:   cd.Alts,
+		})
+	}
+	return defs
 }
 
 // condEval is the evaluated state of one condition this cycle.

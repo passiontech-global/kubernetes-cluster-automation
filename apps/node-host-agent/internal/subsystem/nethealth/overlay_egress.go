@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -288,8 +289,8 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				n.flushPeerNebulaConntrack(ctx, checkEgress, r)
 			} else {
 				n.state.SuspectLog("egress-probe-"+r, fmt.Sprintf(
-					"suspect: egress %s probe=%s cur=%s (check %d/%d)", r, probe, comm, ctr, need),
-					suspectLogCadence)
+					"suspect: egress %s probe=%s cur=%s%s", r, probe, comm,
+					checkkit.Progress(ctr, need)), suspectLogCadence)
 			}
 		}
 		// Serving via relay while the tunnel itself is unreachable →

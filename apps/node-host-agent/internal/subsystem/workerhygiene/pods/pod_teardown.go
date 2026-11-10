@@ -14,6 +14,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -297,8 +298,9 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// same KonnectivityStaleId pattern while accumulating.
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: "+latchdefs.ReasonKonnectivityStaleID+
-				" host=%s != node-ip=%s (check %d/%d)",
-			agentHost, nodeIP, c.Fails, c.d.Cfg.ConsecNeeded))
+				" host=%s != node-ip=%s%s",
+			agentHost, nodeIP,
+			checkkit.Progress(c.Fails, c.d.Cfg.ConsecNeeded)))
 	}
 	c.d.CycleResult(wdeps.CheckKonn, "ok")
 }
@@ -458,8 +460,8 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		}
 		c.fails = 0
 	default:
-		c.d.State.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s (check %d/%d)",
-			staleStr, c.fails, c.d.Cfg.ConsecNeeded))
+		c.d.State.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s%s",
+			staleStr, checkkit.Progress(c.fails, c.d.Cfg.ConsecNeeded)))
 	}
 	c.d.CycleResult(wdeps.CheckDNS, "ok")
 }

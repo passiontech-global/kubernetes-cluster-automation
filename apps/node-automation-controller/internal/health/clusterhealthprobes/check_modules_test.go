@@ -1,21 +1,19 @@
 // check_modules_test.go — the CheckReg merge contract: collected
 // check registrations BECOME the prober roster via Deps.CheckRegs
-// (in collection order), dedupe by name, and a wrong-typed New
-// fails prober construction loudly (a silent skip would boot a
-// roster missing a check ops believes is registered). The
-// gated-off-collection half is covered at registry level
-// (TestSetupModulesCheckRegGate).
+// (in collection order), dedupe by name. (The old wrong-typed-New
+// half moved to compile time — CheckReg.New is the typed
+// constructor field.) The gated-off-collection half is covered at
+// registry level (TestSetupModulesCheckRegGate).
 package clusterhealthprobes
 
 import (
-	"strings"
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -61,9 +59,9 @@ func TestCheckRegJoinsRoster(t *testing.T) {
 }
 
 // Setup forwards Deps.CheckRegs into prober construction: a valid
-// reg registers the sweep runnable, a mistyped New fails Setup with
-// an error naming the check instead of booting a roster that
-// silently lacks it.
+// reg registers the sweep runnable. (The old mistyped-New half of
+// this contract is now compile-time — CheckReg.New is the typed
+// constructor field, so a wrong shape cannot be built.)
 func TestSetupConsumesCheckRegs(t *testing.T) {
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
@@ -78,22 +76,6 @@ func TestSetupConsumesCheckRegs(t *testing.T) {
 	}
 	if len(m.Added) != 1 {
 		t.Fatalf("registered %d runnables, want 1", len(m.Added))
-	}
-
-	bad := testutil.NewStubManager()
-	err := Setup(shared.Deps{
-		Name: "cluster-health-probes",
-		Mgr:  bad, CS: fake.NewSimpleClientset(), Dyn: testutil.NewDynamicClient(),
-		CheckRegs: []shared.CheckReg{{
-			Name: "not-a-check",
-			New:  "not-a-constructor",
-		}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "not-a-check") {
-		t.Fatalf("mistyped CheckReg.New must fail Setup naming the check, got %v", err)
-	}
-	if len(bad.Added) != 0 {
-		t.Fatalf("failed prober build registered %d runnables, want 0", len(bad.Added))
 	}
 }
 

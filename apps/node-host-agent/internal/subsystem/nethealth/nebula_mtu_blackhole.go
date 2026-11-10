@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -231,9 +232,9 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		fails := st.mtuFails
 		st.mu.Unlock()
 		n.state.SuspectLog(latchdefs.LatchNebulaMTUBlackhole, fmt.Sprintf(
-			"suspect: nebula-mtu-blackhole df_probe_failed peer=%s size=%s (check %d/%d): %v (%s)",
-			peer, mtuDFSize, fails, mtuBlackholeNeeded, err,
-			trimRunErr(out)), suspectLogCadence)
+			"suspect: nebula-mtu-blackhole df_probe_failed peer=%s size=%s%s: %v (%s)",
+			peer, mtuDFSize, checkkit.Progress(fails, mtuBlackholeNeeded),
+			err, trimRunErr(out)), suspectLogCadence)
 		if fails >= mtuBlackholeNeeded {
 			// NPD contract: the ACTION entry line feeds
 			// NebulaMTUBlackhole (events.go) — ActionEntryRe
