@@ -68,6 +68,12 @@ var reconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 // integration.go / operations.go), so this list no longer has to be
 // edited when a domain adds a series.
 func init() {
+	// NOTE: no Go runtime / process collector here — controller-runtime
+	// v0.25's internal controller metrics init() already registers
+	// collectors.NewProcessCollector + collectors.NewGoCollector(MetricsAll)
+	// on this shared registry (TestGoAndProcessRuntimeMetricsRegistered
+	// pins that contract; a second registration here would panic at
+	// boot on the duplicate).
 	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors)
 }
 

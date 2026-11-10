@@ -24,6 +24,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -510,5 +511,75 @@ func TestWireTargetBreakerLedger(t *testing.T) {
 	if metrics.HealTargetCircuitBrokenTotal.
 		DeleteLabelValues("kubelet-liveness-reaper", "n1") {
 		t.Fatal("expiry GC left the emitted series alive — forget must prune it")
+	}
+}
+
+// TestPprofHandlers pins the memory-triage contract: the metrics
+// server must carry the net/http/pprof endpoints as ExtraHandlers
+// (heap/goroutine profiles on :9115) and must never claim /metrics —
+// controller-runtime rejects that mapping in Options validation, so
+// a key that collides would fail Start, not shadow silently.
+func TestPprofHandlers(t *testing.T) {
+	handlers := pprofHandlers()
+	for _, path := range []string{
+		"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/profile",
+		"/debug/pprof/symbol", "/debug/pprof/trace",
+	} {
+		if handlers[path] == nil {
+			t.Fatalf("pprofHandlers missing %s", path)
+		}
+	}
+	if handlers["/metrics"] != nil {
+		t.Fatal("/metrics must stay controller-runtime's own route")
+	}
+
+	// pprof.Index dispatches the named profiles — the heap profile is
+	// the exact artifact the memory investigation needs, so a broken
+	// dispatch (404/redirect) must fail here, not during the next
+	// working-set incident.
+	rec := httptest.NewRecorder()
+	handlers["/debug/pprof/"].ServeHTTP(rec,
+		httptest.NewRequest(http.MethodGet, "/debug/pprof/heap?debug=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heap profile: got %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "heap profile:") {
+		t.Fatalf("heap profile body missing header, got:\n%.200s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	handlers["/debug/pprof/cmdline"].ServeHTTP(rec,
+		httptest.NewRequest(http.MethodGet, "/debug/pprof/cmdline", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cmdline: got %d, want 200", rec.Code)
+	}
+}
+
+// TestGoAndProcessRuntimeMetricsRegistered pins the memory-triage
+// contract: the shared controller-runtime registry must expose the Go
+// runtime and process collectors so the single :9115 ServiceMonitor
+// scrape can attribute a working-set spike to live heap
+// (go_memstats_alloc_bytes, heap_inuse) vs retained-but-freed spans
+// (heap_sys - heap_released, RSS) — the evidence the GOMEMLIMIT
+// sizing depends on. Lives in this package because the collectors are
+// registered by controller-runtime's internal metrics init(), which
+// only runs when the manager (this package's dependency tree) is
+// linked in.
+func TestGoAndProcessRuntimeMetricsRegistered(t *testing.T) {
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("registry gather: %v", err)
+	}
+	names := make(map[string]bool, len(families))
+	for _, mf := range families {
+		names[mf.GetName()] = true
+	}
+	for _, want := range []string{
+		"go_memstats_alloc_bytes", "go_memstats_heap_inuse_bytes",
+		"go_goroutines", "process_resident_memory_bytes", "process_open_fds",
+	} {
+		if !names[want] {
+			t.Fatalf("registry missing runtime metric %q", want)
+		}
 	}
 }
