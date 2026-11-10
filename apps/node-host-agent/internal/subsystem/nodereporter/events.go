@@ -136,7 +136,9 @@ var logRules = []logRule{
 	{"CiliumWireGuardPeerDrift", regexp.MustCompile(regexp.QuoteMeta(latchdefs.ActionCiliumWGKill))},
 	// disk-bloat: disk-bloat runaway detector —
 	// "ACTION disk-bloat: target=... bytes=... used_pct=...".
-	{"DiskBloatRunaway", latchdefs.ActionEntryRe(latchdefs.LatchDiskBloat)},
+	// (nodecond constant — DiskBloatRunaway is now a condition name;
+	// the reason string is unchanged.)
+	{nodecond.DiskBloatRunaway, latchdefs.ActionEntryRe(latchdefs.LatchDiskBloat)},
 	// journalwatch blindness latch — STATE-ENTER only (one event per
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).
@@ -204,6 +206,21 @@ var logRules = []logRule{
 	// hostmetrics' clock-warp detector line —
 	// "ACTION clock-warp: delta=... tick=... (events=N)".
 	{"NodeClockWarpDetected", latchdefs.ActionEntryRe(latchdefs.ActionClockWarp)},
+	// --- W21 latch→event surface ---
+	// The three latches whose producers emit the ACTION-entry line
+	// once per episode (the disk-bloat NPD contract shape —
+	// ActionEntryPrefix at the Enter site, gated on the latch
+	// being absent): cilium-envoy-xds-reject (workerhygiene envoy
+	// xDS-NACK streak), nebula-mtu-blackhole (nethealth routeguard
+	// NM4 DF-probe blackhole) and page-alloc-failure (hostmetrics
+	// kmsg buddy-allocator fragmentation evidence).
+	{nodecond.CiliumEnvoyXDSReject, latchdefs.ActionEntryRe(latchdefs.LatchCiliumEnvoyXDSReject)},
+	{nodecond.NebulaMTUBlackhole, latchdefs.ActionEntryRe(latchdefs.LatchNebulaMTUBlackhole)},
+	{nodecond.KernelPageAllocFailure, latchdefs.ActionEntryRe(latchdefs.LatchPageAllocFailure)},
+	// controllerhygiene's sig13 watch-cache wedge latch — one Event
+	// per STATE-ENTER (the apiserver serving stale watch-cache data
+	// is exactly when cluster-side heals must defer pod churn).
+	{nodecond.ApiserverWatchCacheWedged, latchdefs.StateEnterRe(latchdefs.LatchAPIServerCacheWedged)},
 }
 
 // exitLogRules — STATE-EXIT lines that earn an informational (Normal)

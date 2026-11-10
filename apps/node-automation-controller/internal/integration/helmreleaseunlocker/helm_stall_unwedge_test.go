@@ -630,3 +630,63 @@ func TestHelmStallAttemptsPrunedWhenHRVanishes(t *testing.T) {
 		t.Fatalf("listed HR lost its stallAttempt entry: %+v", att)
 	}
 }
+
+// hrStalledRollout is the HR-layer gate deciding which releases get
+// deadlock-analyzed: a suspended HR is parked (never analyzed), a
+// terminal Stalled=True parks the release, and Ready=False carrying
+// helm's stalled-rollout waiter fragments ("stalled resources",
+// "failed early") is the live-wedge signature. Everything else —
+// Ready=True, unrelated failure messages, absent conditions — is
+// not this check's business.
+func TestHRStalledRollout(t *testing.T) {
+	withConds := func(conds ...map[string]any) *unstructured.Unstructured {
+		hr := hrObj("flux-system", "rel", "v2")
+		list := make([]any, len(conds))
+		for i, c := range conds {
+			list[i] = c
+		}
+		hr.Object["status"] = map[string]any{"conditions": list}
+		return hr
+	}
+	cond := func(tpe, status, msg string) map[string]any {
+		return map[string]any{
+			"type": tpe, "status": status, "message": msg,
+			"lastTransitionTime": time.Now().UTC().Format(time.RFC3339)}
+	}
+	suspend := func(hr *unstructured.Unstructured) *unstructured.Unstructured {
+		hr.Object["spec"] = map[string]any{"suspend": true}
+		return hr
+	}
+	cases := []struct {
+		name string
+		hr   *unstructured.Unstructured
+		want bool
+	}{
+		{"suspended parks even a stalled HR",
+			suspend(stalledHR("flux-system", "rel", "app", "x")), false},
+		{"stalled true is terminal",
+			withConds(cond("Stalled", "True", "RetriesExceeded")), true},
+		{"ready false on stalled resources",
+			withConds(cond("Ready", "False",
+				"upgrade failed: stalled resources")), true},
+		{"ready false on failed early",
+			withConds(cond("Ready", "False",
+				"Helm upgrade failed: failed early due to stalled resources")), true},
+		{"message match is case-insensitive",
+			withConds(cond("Ready", "False", "STALLED RESOURCES")), true},
+		{"ready false on unrelated message",
+			withConds(cond("Ready", "False", "chart pull failed")), false},
+		{"ready true is healthy",
+			withConds(cond("Ready", "True", "")), false},
+		{"stalled false does not trigger",
+			withConds(cond("Stalled", "False", ""),
+				cond("Ready", "False", "other")), false},
+		{"no conditions",
+			hrObj("flux-system", "rel", "v2"), false},
+	}
+	for _, tc := range cases {
+		if got := hrStalledRollout(tc.hr); got != tc.want {
+			t.Errorf("%s: hrStalledRollout=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

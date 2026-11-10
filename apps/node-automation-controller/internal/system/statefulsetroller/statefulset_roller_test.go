@@ -701,3 +701,248 @@ func TestStatefulSetRollerDefersOnImagePullStall(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// rollOne residual branches — direct run()-level coverage
+// ---------------------------------------------------------------------------
+
+// podOrdinal parses "<sts>-<N>" strictly: a name that does not carry
+// the sts prefix, or a non-numeric suffix, is not an ordinal member.
+func TestPodOrdinal(t *testing.T) {
+	for _, tc := range []struct {
+		pod  string
+		want int
+		ok   bool
+	}{
+		{"db-3", 3, true},
+		{"db-0", 0, true},
+		{"db-x", 0, false},    // non-numeric suffix
+		{"other-3", 0, false}, // missing the sts prefix entirely
+	} {
+		got, ok := podOrdinal("db", tc.pod)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("podOrdinal(db, %q) = %d,%v want %d,%v",
+				tc.pod, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// An opted-in drifting StatefulSet owning no pods has nothing to
+// roll — the empty census is a skip, not an error.
+func TestStatefulSetRollerNoOwnedPods(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 0)
+	objs := srNodes(1)
+	objs = append(objs, sts)
+	cs := fake.NewSimpleClientset(objs...)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Every owned pod already on the update revision means status lags —
+// there is no stale ordinal to evict.
+func TestStatefulSetRollerAllPodsOnNewRevision(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-new", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod evicted although every member is already on the new revision")
+	}
+}
+
+// A Ready=True pod whose transition timestamp sits in the FUTURE is
+// clock-skewed, not settled — the stability gate refuses it.
+func TestStatefulSetRollerFutureReadyTimestampSkips(t *testing.T) {
+	t0 := time.Now()
+	future := srPod("db", 0, "rev-old", 30*time.Minute)
+	future.Status.Conditions[0].LastTransitionTime =
+		metav1.NewTime(t0.Add(time.Hour))
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, future)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod evicted on a future-dated Ready transition")
+	}
+}
+
+// spec.replicas unset makes the membership gate inconclusive — no
+// roll on an unverifiable desired count.
+func TestStatefulSetRollerNilReplicasSkips(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	sts.Spec.Replicas = nil
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod evicted with spec.replicas unset")
+	}
+}
+
+// The owned-pods list failing is a tolerated per-STS failure: the
+// sweep IncErrors and continues rather than aborting the run.
+func TestStatefulSetRollerPodsListError(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := srRoller(cs, t0)
+	r.queue = "statefulset-ondelete-roller"
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	before := natestutil.QueueErrorCount(t, r.queue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("pods list failure must not fail the sweep: %v", err)
+	}
+	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
+		t.Fatalf("IncError delta = %v, want 1", d)
+	}
+}
+
+// The PDB census failing is likewise a tolerated per-STS error.
+func TestStatefulSetRollerPDBListError(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("list", "poddisruptionbudgets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.queue = "statefulset-ondelete-roller"
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	before := natestutil.QueueErrorCount(t, r.queue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("PDB list failure must not fail the sweep: %v", err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod evicted although the PDB census was unreadable")
+	}
+	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
+		t.Fatalf("IncError delta = %v, want 1", d)
+	}
+}
+
+// A PDB whose selector matches nothing in the namespace is not a
+// gate — the roll proceeds past it.
+func TestStatefulSetRollerNonMatchingPDBAllowsRoll(t *testing.T) {
+	t0 := time.Now()
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "other-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "other"}}},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
+	}
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute), pdb)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("non-matching PDB blocked the roll")
+	}
+}
+
+// An unparseable PDB selector fails CLOSED as labels.Everything() —
+// a disruptionsAllowed=0 PDB with a bogus selector still vetoes.
+func TestStatefulSetRollerUnparseablePDBSelectorFailsClosed(t *testing.T) {
+	t0 := time.Now()
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "bad-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{{
+					Key: "app", Operator: "BogusOperator"}}}},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
+	}
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute), pdb)
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("unparseable-selector PDB did not fail closed")
+	}
+}
+
+// A refused eviction is a tolerated per-STS failure: IncError, the
+// pod stays, the sweep continues.
+func TestStatefulSetRollerEvictError(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, errors.New("eviction refused")
+		})
+	r := srRoller(cs, t0)
+	r.queue = "statefulset-ondelete-roller"
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	before := natestutil.QueueErrorCount(t, r.queue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("evict failure must not fail the sweep: %v", err)
+	}
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod deleted although the eviction was refused")
+	}
+	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
+		t.Fatalf("IncError delta = %v, want 1", d)
+	}
+}

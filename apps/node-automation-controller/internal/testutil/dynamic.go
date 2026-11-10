@@ -19,6 +19,10 @@ var (
 	// NewDynamicClient returns a dynamic fake that can List every CRD
 	// GVK the modules read (see testhelp for the GVK table).
 	NewDynamicClient = testhelp.NewDynamicClient
+	// NewDynamicClientWithCRDs is NewDynamicClient plus the
+	// apiextensions CustomResourceDefinition kinds — for fakes whose
+	// checks List CRDs every sweep.
+	NewDynamicClientWithCRDs = testhelp.NewDynamicClientWithCRDs
 	// DynScheme returns a fresh scheme with built-ins + every known CRD.
 	DynScheme = testhelp.DynScheme
 	// DynListKinds is the GVR->ListKind map NewDynamicClient knows —

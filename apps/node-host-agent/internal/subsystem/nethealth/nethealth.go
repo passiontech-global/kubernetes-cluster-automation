@@ -365,9 +365,13 @@ type NetHealth struct {
 	// insert_failed+drop+early_drop columns; ctStatSeen separates
 	// "first read" (baseline only) from a real delta — the spike
 	// detector must not flush on a counter jump across an agent
-	// restart vs an unset baseline.
-	ctStatPrev uint64
-	ctStatSeen bool
+	// restart vs an unset baseline. ctInsertPrev/ctInsertSeen are
+	// the insert_failed-ONLY twin feeding the surgical UNREPLIED
+	// udp flush (conntrackInsertSpike).
+	ctStatPrev   uint64
+	ctStatSeen   bool
+	ctInsertPrev uint64
+	ctInsertSeen bool
 
 	// mtuProbe is the nebula-mtu-blackhole prober state (see
 	// nebula_mtu_blackhole.go) — per-instance, so its lifetime is

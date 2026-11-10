@@ -958,3 +958,72 @@ func TestVeleroAuditorRepoListError(t *testing.T) {
 		t.Fatal("expected error when the backuprepositories list fails")
 	}
 }
+
+// reinitStaleRepo's actuation branches: a held cooldown defers
+// before any delete; a NotFound delete is a quiet no-op; any other
+// delete failure is metered; only a delivered delete stamps the
+// cooldown and counts the re-init.
+func TestReinitStaleRepoBranches(t *testing.T) {
+	now := time.Now()
+	key := "backuprepository/velero/repo-x"
+
+	// Cooldown already stamped — the heal defers, the CR survives.
+	repo := veleroRepo("velero", "repo-x", "NotReady", time.Time{})
+	dyn := newDynFake(repo)
+	a := newVeleroAuditor(dyn, now)
+	a.queue = "velero-backup-auditor"
+	a.repoHealed.Stamp(key, now)
+	a.reinitStaleRepo(ctx, repo, "velero", "repo-x")
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-x", metav1.GetOptions{}); err != nil {
+		t.Fatalf("cooled-down repo deleted anyway: %v", err)
+	}
+
+	// Delete lands on an already-gone object — NotFound is a quiet
+	// no-op, never an IncError.
+	a = newVeleroAuditor(newDynFake(), now)
+	a.queue = "velero-backup-auditor"
+	before := testutil.QueueErrorCount(t, "velero-backup-auditor")
+	a.reinitStaleRepo(ctx, repo, "velero", "repo-ghost")
+	if got := testutil.QueueErrorCount(t, "velero-backup-auditor") - before; got != 0 {
+		t.Fatalf("NotFound delete metered %v errors, want 0", got)
+	}
+	if a.repoHealed.CooledDown(key, veleroRepoHealedCooldown, now) {
+		t.Fatal("NotFound delete stamped the cooldown — nothing was healed")
+	}
+
+	// A real delete failure — metered, cooldown unstamped.
+	repo = veleroRepo("velero", "repo-y", "NotReady", time.Time{})
+	dyn = newDynFake(repo)
+	dyn.PrependReactor("delete", "backuprepositories",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver down")
+		})
+	a = newVeleroAuditor(dyn, now)
+	a.queue = "velero-backup-auditor"
+	before = testutil.QueueErrorCount(t, "velero-backup-auditor")
+	a.reinitStaleRepo(ctx, repo, "velero", "repo-y")
+	if got := testutil.QueueErrorCount(t, "velero-backup-auditor") - before; got != 1 {
+		t.Fatalf("delete failure metered %v errors, want 1", got)
+	}
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-y", metav1.GetOptions{}); err != nil {
+		t.Fatalf("failed delete removed the repo anyway: %v", err)
+	}
+
+	// Delivered delete — CR gone, cooldown stamped for the next
+	// window.
+	repo = veleroRepo("velero", "repo-z", "NotReady", time.Time{})
+	dyn = newDynFake(repo)
+	a = newVeleroAuditor(dyn, now)
+	a.queue = "velero-backup-auditor"
+	a.reinitStaleRepo(ctx, repo, "velero", "repo-z")
+	if _, err := dyn.Resource(veleroRepoGVR).Namespace("velero").
+		Get(ctx, "repo-z", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("delivered delete left the repo: %v", err)
+	}
+	if !a.repoHealed.CooledDown("backuprepository/velero/repo-z",
+		veleroRepoHealedCooldown, now.Add(time.Minute)) {
+		t.Fatal("delivered delete did not stamp the cooldown")
+	}
+}

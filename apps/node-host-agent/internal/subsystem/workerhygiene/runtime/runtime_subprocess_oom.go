@@ -10,6 +10,14 @@
 // still there after a 60s confirm window, the kill hit a
 // subprocess → ContainerSubprocessOOMKilled Warning event on the
 // Pod + the node_agent_container_subprocess_oom_total counter.
+//
+// The sibling counter memory.events:oom_group_kill counts the
+// OTHER kill shape — the kernel nuking EVERY task in the container
+// cgroup at once (cgroup-v2 group kill: memory.max breached with
+// no single reclaimable victim, or oom.group_kill=1 policy). There
+// is no "subprocess survived" ambiguity to confirm, so every
+// observed increase emits a ContainerCgroupOOMGroupKilled Warning
+// event on the Pod with the memory.stat breakdown.
 package runtime
 
 import (
@@ -33,14 +41,15 @@ import (
 const subprocOOMConfirm = 60 * time.Second
 
 // oomScope is the per-container-cgroup observation state: the last
-// oom_kill count read, the init pid seen when it last advanced and
-// when, plus the oom_kill generation already reported (one event
-// per kill burst, not per cycle).
+// oom_kill / oom_group_kill counts read, the init pid seen when
+// oom_kill last advanced and when, plus the oom_kill generation
+// already reported (one event per kill burst, not per cycle).
 type oomScope struct {
-	oomKill   int64
-	pid1      int
-	pendingAt time.Time // zero = no pending living-dead verdict
-	reported  int64     // oom_kill value the event already covers
+	oomKill      int64
+	oomGroupKill int64
+	pid1         int
+	pendingAt    time.Time // zero = no pending living-dead verdict
+	reported     int64     // oom_kill value the event already covers
 }
 
 // SubprocOOMCheck is the subproc-oom living-dead OOM detector as a
@@ -150,12 +159,28 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			if !ok {
 				continue
 			}
+			// oom_group_kill rides the same file — a missing key
+			// (pre-5.x kernels, partial cgroupfs) just yields 0 and
+			// the group-kill half stays silent.
+			groupKill, _ := cgroupEventsValue(
+				filepath.Join(scope, "memory.events"), "oom_group_kill")
 			pid1, pidOK := cgroupInitPID(scope)
 			st := c.scopes[scope]
 			if st == nil {
-				st = &oomScope{oomKill: kill, pid1: pid1}
+				st = &oomScope{oomKill: kill, oomGroupKill: groupKill,
+					pid1: pid1}
 				c.scopes[scope] = st
 				continue // first sighting — no delta to judge
+			}
+			// Group-kill half — independent of the living-dead
+			// verdict below: every observed oom_group_kill
+			// increase is a real whole-cgroup kill worth an event
+			// (no confirm window — the kill already happened).
+			if groupKill > st.oomGroupKill {
+				delta := groupKill - st.oomGroupKill
+				st.oomGroupKill = groupKill
+				c.reportGroupKill(ctx, uid, podByUID[uid], scope,
+					groupKill, delta, oomMemStatMiB(scope))
 			}
 			switch {
 			case kill > st.oomKill:
@@ -251,4 +276,51 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 		"ACTION: ContainerSubprocessOOMKilled — pod %s/%s scope=%s oom_kill=%d pid1=%d%s unchanged after %s",
 		pod.Namespace, pod.Name, base, kill, pid1, memStat, subprocOOMConfirm))
 	c.d.Actions.WithLabelValues(wdeps.CheckSubprocOOM, "event").Inc()
+}
+
+// reportGroupKill emits the ContainerCgroupOOMGroupKilled Warning
+// event on the owning Pod — the whole-cgroup kill counterpart of
+// the subproc-oom living-dead event: memory.events oom_group_kill
+// counts kills where the kernel terminated EVERY task in the
+// container cgroup (memory.max breached with no single reclaimable
+// victim, or an oom.group_kill policy). memStat carries the same
+// "anon=XMiB shmem=YMiB file=ZMiB" memory.stat breakdown as the
+// sibling report — appended to the note and the ACTION line when
+// non-empty.
+func (c *SubprocOOMCheck) reportGroupKill(ctx context.Context, uid string,
+	pod *corev1.Pod, scope string, groupKill, delta int64, memStat string) {
+	base := filepath.Base(scope)
+	if memStat != "" {
+		memStat = " mem_stat=" + memStat
+	}
+	if pod == nil || c.d.Cfg.Client == nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: container-oom-group-kill scope=%s pod uid=%s oom_group_kill=%d (+%d)%s — pod unresolvable, event skipped",
+			base, uid, groupKill, delta, memStat))
+		return
+	}
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
+		Reason:    "ContainerCgroupOOMGroupKilled",
+		Note: fmt.Sprintf(
+			"container %s hit memcg oom_group_kill (+%d, %d total) — kernel killed the entire container cgroup; pod will restart%s",
+			base, delta, groupKill, memStat),
+		When: now,
+		Regarding: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Namespace:  pod.Namespace,
+			Name:       pod.Name,
+			UID:        pod.UID,
+		},
+		Owner: pod.Namespace + "/" + pod.Name,
+	}); err != nil {
+		return
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: ContainerCgroupOOMGroupKilled — pod %s/%s scope=%s oom_group_kill=%d (+%d)%s",
+		pod.Namespace, pod.Name, base, groupKill, delta, memStat))
+	c.d.Actions.WithLabelValues(wdeps.CheckSubprocOOM, "group_oom").Inc()
 }

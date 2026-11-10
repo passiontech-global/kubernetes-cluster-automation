@@ -13,6 +13,11 @@ import (
 
 func fixture(t *testing.T, rules []testutil.ExecRule) (*Probe, *testutil.FakeExec, string) {
 	t.Helper()
+	// largeKeysCache is package-level — reset it so one test's
+	// census cannot leak into the next.
+	largeKeysCache.Lock()
+	largeKeysCache.rows, largeKeysCache.seen = nil, false
+	largeKeysCache.Unlock()
 	cfg, fr, dir := kdepstest.Config(t, rules)
 	return New(kdepstest.Deps(t, cfg)), fr, dir
 }

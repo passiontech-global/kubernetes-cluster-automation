@@ -374,6 +374,14 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		if resolutionFailed(plan.Object) {
 			continue
 		}
+		// A Failed phase is terminal for this plan revision —
+		// approving it again just re-asserts spec.approved every
+		// sweep while the operator waits for a human (or a new
+		// Subscription revision) to resolve the failure.
+		if phase, _, _ := unstructured.NestedString(
+			plan.Object, "status", "phase"); phase == "Failed" {
+			continue
+		}
 		key := plan.GetNamespace() + "/" + plan.GetName()
 		proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 			&p.plansApproved, plan, olmInstallPlanApproveAnno, key,

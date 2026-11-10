@@ -2,8 +2,10 @@
 // (infrastructure/base/scaling/coredns/coredns-topology-spread.yaml in
 // passiontech-fluxcd, plus the cicd override single-zone-topology-patch.yaml).
 //
-// Keeps deployment kube-system/coredns at the pinned probe timeouts,
-// resources and topologySpreadConstraints. The Deployment is owned by
+// Keeps deployment kube-system/coredns at the pinned probe timeouts
+// (incl. livenessProbe.failureThreshold=5), rollingUpdate
+// maxUnavailable=1, resources and topologySpreadConstraints. The
+// Deployment is owned by
 // the k0s stack applier, which reverts it on every apply — its stock
 // manifest carries a required hostname podAntiAffinity (max 1 pod
 // kube-dns per node) so a surge pod can never schedule, and the 1s
@@ -51,6 +53,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -214,11 +217,12 @@ func corednsMinDomainsWanted(zoneWhen string, minDomains int) bool {
 }
 
 // corednsNeedsPatch reports whether the Deployment lacks any pinned
-// field — probe timeouts, requests/limits, cleared affinity, the two
-// wanted spread constraints, or (when proportional scaling is on,
-// wantReplicas>0) a drifted .spec.replicas. A missing coredns
-// container counts as drifted (same as the shell's empty jsonpath
-// probe).
+// field — probe timeouts + liveness failure threshold, requests/
+// limits, cleared affinity, the two wanted spread constraints, the
+// rollingUpdate.maxUnavailable=1 strategy pin, or (when proportional
+// scaling is on, wantReplicas>0) a drifted .spec.replicas. A missing
+// coredns container counts as drifted (same as the shell's empty
+// jsonpath probe).
 func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wantReplicas int32) bool {
 	// Replica drift only counts when the pin is enabled — a nil
 	// .spec.replicas defaults to 1 at the API but still means "we
@@ -233,7 +237,9 @@ func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wa
 			continue
 		}
 		if pinnedworkload.ProbeTimeoutsDrifted(c) ||
-			pinnedworkload.ResourcesDrifted(c, corednsWantReq, corednsWantLim) {
+			corednsLivenessThresholdDrifted(c) ||
+			pinnedworkload.ResourcesDrifted(c, corednsWantReq, corednsWantLim) ||
+			corednsStrategyDrifted(d) {
 			return true
 		}
 		if pinnedworkload.AffinitySet(ps) {
@@ -242,6 +248,33 @@ func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wa
 		return !corednsTopologyOK(ps.TopologySpreadConstraints, zoneWhen, minDomains)
 	}
 	return true
+}
+
+// corednsLivenessThresholdDrifted requires the pinned
+// livenessProbe.failureThreshold=5 — at the default 10s period a
+// single slow /ready sync while the apiserver is loaded must not
+// restart the pod (5 misses ≈ 50s of tolerance before kubelet acts).
+// The readiness probe keeps its default threshold: unready is the
+// correct signal there, only liveness needs the wider fuse.
+func corednsLivenessThresholdDrifted(c *corev1.Container) bool {
+	return c.LivenessProbe == nil || c.LivenessProbe.FailureThreshold != 5
+}
+
+// corednsStrategyDrifted requires the pinned
+// strategy.rollingUpdate.maxUnavailable=1 — the k8s default 25%
+// can take a quarter of a small fleet down in one rollout while the
+// apiserver is already degraded (the W21-G4 post-mortem class).
+// maxSurge stays unpinned: surge pods are what keep DNS answers
+// flowing mid-rollout. A Recreate strategy is drift too — the pin
+// only exists under RollingUpdate.
+func corednsStrategyDrifted(d *appsv1.Deployment) bool {
+	st := d.Spec.Strategy
+	if st.Type == appsv1.RecreateDeploymentStrategyType {
+		return true
+	}
+	ru := st.RollingUpdate
+	return ru == nil || ru.MaxUnavailable == nil ||
+		ru.MaxUnavailable.Type != intstr.Int || ru.MaxUnavailable.IntValue() != 1
 }
 
 // corednsTopologyOK requires both wanted constraints: zone per the
@@ -309,12 +342,21 @@ func corednsPatchBody(zoneWhen string, minDomains int, wantReplicas int32) ([]by
 		zone["minDomains"] = nil // explicit null — deletes a stale value
 	}
 	spec := map[string]any{
+		// The strategy pin merges field-wise: maxUnavailable=1 lands
+		// while an existing maxSurge survives; "type" is pinned so a
+		// Recreate drift cannot survive the patch (the drift check
+		// treats it as drift, so leaving it would re-patch forever).
+		"strategy": map[string]any{
+			"type":          "RollingUpdate",
+			"rollingUpdate": map[string]any{"maxUnavailable": 1},
+		},
 		"template": map[string]any{
 			"spec": map[string]any{
 				"affinity": nil,
 				"containers": []any{map[string]any{
-					"name":           "coredns",
-					"livenessProbe":  map[string]any{"timeoutSeconds": 5},
+					"name": "coredns",
+					"livenessProbe": map[string]any{
+						"timeoutSeconds": 5, "failureThreshold": 5},
 					"readinessProbe": map[string]any{"timeoutSeconds": 5},
 					"resources": map[string]any{
 						"requests": map[string]any{"cpu": "25m", "memory": "64Mi"},

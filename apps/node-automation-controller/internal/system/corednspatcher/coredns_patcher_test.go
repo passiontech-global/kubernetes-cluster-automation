@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -45,11 +46,18 @@ func corednsDeploy(zoneWhen string, minDomains int) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "coredns", Namespace: "kube-system"},
 		Spec: appsv1.DeploymentSpec{
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				},
+			},
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:           "coredns",
-						LivenessProbe:  &corev1.Probe{TimeoutSeconds: 5},
+						Name: "coredns",
+						LivenessProbe: &corev1.Probe{
+							TimeoutSeconds: 5, FailureThreshold: 5},
 						ReadinessProbe: &corev1.Probe{TimeoutSeconds: 5},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -96,6 +104,8 @@ func corednsDeployBare() *appsv1.Deployment {
 	d.Spec.Template.Spec.Containers[0].LivenessProbe = &corev1.Probe{TimeoutSeconds: 1}
 	d.Spec.Template.Spec.Containers[0].ReadinessProbe = &corev1.Probe{TimeoutSeconds: 1}
 	d.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
+	// k0s stock declares no strategy — the RollingUpdate pin is ours.
+	d.Spec.Strategy = appsv1.DeploymentStrategy{}
 	return d
 }
 
@@ -150,6 +160,23 @@ func TestCorednsNeedsPatch(t *testing.T) {
 		}), "DoNotSchedule", 2, 0, true},
 		{"probe timeout drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].ReadinessProbe.TimeoutSeconds = 1
+		}), "DoNotSchedule", 2, 0, true},
+		{"liveness failureThreshold drifted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Template.Spec.Containers[0].LivenessProbe.FailureThreshold = 3
+		}), "DoNotSchedule", 2, 0, true},
+		{"rollingUpdate nil", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Strategy.RollingUpdate = nil
+		}), "DoNotSchedule", 2, 0, true},
+		{"maxUnavailable percent drifted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Strategy.RollingUpdate.MaxUnavailable =
+				ptr.To(intstr.FromString("25%"))
+		}), "DoNotSchedule", 2, 0, true},
+		{"maxUnavailable int 2 drifted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Strategy.RollingUpdate.MaxUnavailable =
+				ptr.To(intstr.FromInt(2))
+		}), "DoNotSchedule", 2, 0, true},
+		{"recreate strategy drifted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Strategy.Type = appsv1.RecreateDeploymentStrategyType
 		}), "DoNotSchedule", 2, 0, true},
 		{"request cpu drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] =
@@ -239,6 +266,12 @@ func TestCoreDNSPatcherAppliesPatch(t *testing.T) {
 	}
 	if !strings.Contains(string(got), `"minDomains":2`) {
 		t.Fatalf("zone constraint missing minDomains: %s", got)
+	}
+	if !strings.Contains(string(got), `"failureThreshold":5`) {
+		t.Fatalf("patch missing liveness failureThreshold pin: %s", got)
+	}
+	if !strings.Contains(string(got), `"maxUnavailable":1`) {
+		t.Fatalf("patch missing rollingUpdate maxUnavailable pin: %s", got)
 	}
 	if strings.Contains(string(got), `"replicas"`) {
 		t.Fatalf("disabled scaling must not send replicas: %s", got)

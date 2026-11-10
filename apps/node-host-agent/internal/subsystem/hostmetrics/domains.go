@@ -293,6 +293,8 @@ var domainTable = []domainEntry{
 				"memory.events high of the unit — direct-reclaim throttling."},
 			{descCgMemOOMKill, "node_host_agent_cgroup_memory_oom_kill_events_total",
 				"memory.events oom_kill of the unit."},
+			{descCgMemOOMGroupKill, "node_host_agent_cgroup_memory_oom_group_kill_events_total",
+				"memory.events oom_group_kill of the unit — whole-cgroup OOM kills."},
 		}},
 	{name: "kernel-keys",
 		emit: (*Collector).collectKernelKeys,

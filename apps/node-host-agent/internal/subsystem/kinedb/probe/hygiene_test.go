@@ -507,6 +507,7 @@ postgres|postgres|4|50|3|7|0|0|0|0|0|transaction
 	for _, absent := range []string{
 		"ROLLBACK PREPARED", "pg_drop_replication_slot", "pg_terminate_backend",
 		"split_part(name", // churn watermark must not be sampled
+		"OCTET_LENGTH",    // the large-keys census detoast must not run
 	} {
 		if strings.Contains(j, absent) {
 			t.Fatalf("read-only probe ran mutating/forbidden %q:\n%s", absent, j)
@@ -598,6 +599,10 @@ func TestHygieneItemQueryFailures(t *testing.T) {
 			func(p *Probe, h *hygieneResult, n func(string)) {
 				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
 			}},
+		{"large-keys", "OCTET_LENGTH", "large-keys-fail",
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				p.hygieneLargeKeys(ctx, "pg", "postgres", "secret", h, n)
+			}},
 	}
 	for _, tc := range cases {
 		k, fr, _ := fixture(t, hygieneRules)
@@ -676,11 +681,183 @@ func TestEmitXactTextfileHeadersWithoutSamples(t *testing.T) {
 	for _, name := range []string{
 		"kine_db_multixact_age_transactions",
 		"kine_db_orphan_prepared_xacts",
+		"kine_db_large_object_bytes",
 	} {
 		for _, line := range strings.Split(content, "\n") {
 			if strings.HasPrefix(line, name+" ") {
 				t.Fatalf("sample %q emitted without aSeen flag:\n%s", line, content)
 			}
 		}
+	}
+}
+
+// Item 8: the large-key census queries the top-5 live keys over
+// 512KiB and exports them as kine_db_large_object_bytes{key=...}.
+// The first probe spends the 15m budget and runs the DISTINCT ON
+// scan; a second probe inside the window re-emits the cached rows
+// without re-querying.
+func TestProbeLargeKeysCensusEmitsAndCoolsDown(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	fr.On("OCTET_LENGTH(value)",
+		"1048576|/registry/secrets/default/db-tls\n"+
+			"786432|/registry/configmaps/kube-system/coredns-custom\n")
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if !res.hyg.largeSeen || len(res.hyg.largeKeys) != 2 {
+		t.Fatalf("largeKeys=%+v", res.hyg.largeKeys)
+	}
+	if res.hyg.largeKeys[0].key != "/registry/secrets/default/db-tls" ||
+		res.hyg.largeKeys[0].bytes != 1048576 {
+		t.Fatalf("top row=%+v", res.hyg.largeKeys[0])
+	}
+	if !strings.Contains(fr.Joined(), "DISTINCT ON (name)") ||
+		!strings.Contains(fr.Joined(), "OCTET_LENGTH(value) > 524288") ||
+		!strings.Contains(fr.Joined(), "LIMIT 5") {
+		t.Fatalf("census query missing DISTINCT ON/OCTET_LENGTH/LIMIT:\n%s", fr.Joined())
+	}
+	if _, err := os.Stat(filepath.Join(k.d.Cfg.GuardStateDir, largeKeysFile)); err != nil {
+		t.Fatalf("large-keys budget file missing: %v", err)
+	}
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	for _, want := range []string{
+		`kine_db_large_object_bytes{key="/registry/secrets/default/db-tls"} 1048576`,
+		`kine_db_large_object_bytes{key="/registry/configmaps/kube-system/coredns-custom"} 786432`,
+		"# TYPE kine_db_large_object_bytes gauge",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+
+	// Second probe inside the 15m budget: the query must NOT run
+	// again, but the cached census still emits.
+	fr.ClearLog()
+	fr.Clear("OCTET_LENGTH(value)")
+	res = k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("second probe failed: %v", res.notes)
+	}
+	if strings.Contains(fr.Joined(), "DISTINCT ON") {
+		t.Fatalf("census re-ran inside the 15m budget:\n%s", fr.Joined())
+	}
+	if !res.hyg.largeSeen || len(res.hyg.largeKeys) != 2 {
+		t.Fatalf("cached census lost: %+v", res.hyg.largeKeys)
+	}
+	content = kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, `key="/registry/secrets/default/db-tls"} 1048576`) {
+		t.Fatalf("cached census not re-emitted:\n%s", content)
+	}
+}
+
+// A failed census keeps the previous cache (none on first run →
+// header-only family, no fabricated samples).
+func TestProbeLargeKeysQueryFailure(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "OCTET_LENGTH(value)", Err: errors.New("connection reset")}))
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.largeSeen {
+		t.Fatal("failed census marked seen")
+	}
+	joined := strings.Join(res.notes, "\n")
+	if !strings.Contains(joined, "large-keys-fail") {
+		t.Fatalf("notes missing large-keys-fail:\n%s", joined)
+	}
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, "# HELP kine_db_large_object_bytes") {
+		t.Fatalf("header-only family missing:\n%s", content)
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "kine_db_large_object_bytes{") {
+			t.Fatalf("fabricated sample on census failure:\n%s", content)
+		}
+	}
+}
+
+// Key names containing label-hostile characters are escaped; a
+// successful empty census still emits the family header.
+func TestProbeLargeKeysEmptyAndEscaped(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	fr.On("OCTET_LENGTH(value)", "600000|/registry/configmaps/ns/a\"b\\c\n")
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, `key="/registry/configmaps/ns/a\"b\\c"} 600000`) {
+		t.Fatalf("escaped label missing:\n%s", content)
+	}
+
+	// Fresh fixture: census succeeds with zero rows → headers only.
+	k2, fr2, dir2 := fixture(t, hygieneRules)
+	fr2.On("OCTET_LENGTH(value)", "")
+	res = k2.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if !res.hyg.largeSeen || len(res.hyg.largeKeys) != 0 {
+		t.Fatalf("empty census=%+v", res.hyg.largeKeys)
+	}
+	content = kdepstest.ReadText(t, dir2, xactPromFile)
+	if !strings.Contains(content, "# HELP kine_db_large_object_bytes") {
+		t.Fatalf("empty census dropped the family header:\n%s", content)
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "kine_db_large_object_bytes{") {
+			t.Fatalf("phantom sample on empty census:\n%s", content)
+		}
+	}
+}
+
+// ReadOnly never spends the census budget nor runs the DISTINCT ON
+// scan — and never writes the textfile.
+func TestProbeLargeKeysReadOnly(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	k.d.Cfg.ReadOnly = true
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if strings.Contains(fr.Joined(), "DISTINCT ON") {
+		t.Fatalf("read-only probe ran the census scan:\n%s", fr.Joined())
+	}
+	if _, err := os.Stat(filepath.Join(k.d.Cfg.GuardStateDir, largeKeysFile)); !os.IsNotExist(err) {
+		t.Fatal("read-only probe spent the census budget")
+	}
+}
+
+// Malformed census lines are skipped, never fatal; the `bytes|name`
+// field order keeps a key containing '|' parseable (Cut takes the
+// first separator — the name lands last by design).
+func TestProbeLargeKeysParseSkipsGarbage(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "OCTET_LENGTH(value)", Out: strings.Join([]string{
+			"notanum|/bad-int",
+			"no-separator",
+			"700000|/registry/with|pipe",
+			"",
+			"  ",
+			"600000|/ok",
+		}, "\n") + "\n"},
+	))
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	h := res.hyg
+	if !h.largeSeen || len(h.largeKeys) != 2 {
+		t.Fatalf("largeKeys=%+v", h.largeKeys)
+	}
+	if h.largeKeys[0].key != "/registry/with|pipe" || h.largeKeys[0].bytes != 700000 ||
+		h.largeKeys[1].key != "/ok" || h.largeKeys[1].bytes != 600000 {
+		t.Fatalf("largeKeys=%+v", h.largeKeys)
+	}
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, `kine_db_large_object_bytes{key="/registry/with|pipe"} 700000`) {
+		t.Fatalf("pipe-key label wrong:\n%s", content)
 	}
 }

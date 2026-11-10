@@ -412,3 +412,112 @@ func TestExecCombinedBoundedFoldsStderr(t *testing.T) {
 		t.Fatalf("budget deadline=%v want (0, 45s]", deadline)
 	}
 }
+
+// TestEnabledStateWordsAndProbeFailure: the disabled/masked
+// vocabulary is a definitive "off" (nil error), while garbage
+// output with a clean exit and an error carrying no state word are
+// both probe failures — Enabled reports them, IsEnabled folds.
+func TestEnabledStateWordsAndProbeFailure(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
+	ctx := context.Background()
+
+	for _, word := range []string{"disabled", "masked", "masked-runtime", "bad"} {
+		f.On("is-enabled u.service", word+"\n")
+		enabled, err := c.Enabled(ctx, "u.service")
+		if err != nil || enabled {
+			t.Fatalf("is-enabled %q = %v,%v want false,nil", word, enabled, err)
+		}
+	}
+
+	// Garbage stdout + nil error → unexpected-output probe failure.
+	f.On("is-enabled weird.service", "??\n")
+	if _, err := c.Enabled(ctx, "weird.service"); err == nil {
+		t.Fatal("unparseable is-enabled output want Enabled error")
+	}
+	// Error + state word on stdout is still a real answer — covered
+	// by the disabled words above; error + empty output is the
+	// probe-failure path IsEnabledAcceptsEnabledVocabulary folds.
+}
+
+// TestActionCommandErrors: every systemd action wraps its failure
+// with the command + unit in the message — the shell's stderr
+// evidence for the journal.
+func TestActionCommandErrors(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		argv string
+		run  func() error
+		want string
+	}{
+		{"restart", "restart u.service", func() error {
+			return c.Restart(ctx, "u.service")
+		}, "systemctl restart u.service"},
+		{"reload-or-restart", "reload-or-restart u.service", func() error {
+			return c.ReloadOrRestart(ctx, "u.service")
+		}, "systemctl reload-or-restart u.service"},
+		{"signal", "kill -s SIGTERM u.service", func() error {
+			return c.Signal(ctx, "u.service", "SIGTERM")
+		}, "systemctl kill -s SIGTERM u.service"},
+		{"daemon-reload", "daemon-reload", func() error {
+			return c.DaemonReload(ctx)
+		}, "systemctl daemon-reload"},
+	}
+	for _, tc := range cases {
+		f.FailOn(tc.argv, errors.New("exit 1"))
+		err := tc.run()
+		if err == nil {
+			t.Fatalf("%s: want error", tc.name)
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s err=%v want it to name %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// TestActiveAgeProbeAndClockErrors: ActiveAge surfaces a failed
+// systemctl probe, and procUptimeSeconds rejects an unparseable
+// uptime file — both mean "not settled" to the caller.
+func TestActiveAgeProbeAndClockErrors(t *testing.T) {
+	f := newFake()
+	uptime := filepath.Join(t.TempDir(), "uptime")
+	if err := os.WriteFile(uptime, []byte("10000.25 8000.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := New(Config{HostRoot: "/", RunCmd: f.Run}, WithProcUptimeFile(uptime))
+	ctx := context.Background()
+
+	// systemctl probe failure propagates.
+	f.FailOn("show -p ActiveEnterTimestampMonotonic --value u.service",
+		errors.New("exit 3"))
+	if _, err := c.ActiveAge(ctx, "u.service"); err == nil {
+		t.Fatal("broken systemctl want ActiveAge error")
+	}
+
+	// Unparseable /proc/uptime → error (never settle blind).
+	bad := filepath.Join(t.TempDir(), "uptime")
+	if err := os.WriteFile(bad, []byte("not-a-float 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c2 := New(Config{HostRoot: "/", RunCmd: f.Run}, WithProcUptimeFile(bad))
+	f.On("show -p ActiveEnterTimestampMonotonic --value v.service", "5000000000\n")
+	if _, err := c2.ActiveAge(ctx, "v.service"); err == nil {
+		t.Fatal("garbage uptime file want ActiveAge error")
+	}
+
+	// procUptimeSeconds directly: empty file and missing file.
+	empty := filepath.Join(t.TempDir(), "uptime")
+	if err := os.WriteFile(empty, []byte("  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := procUptimeSeconds(empty); err == nil {
+		t.Fatal("empty uptime file want error")
+	}
+	if _, err := procUptimeSeconds(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing uptime file want error")
+	}
+}

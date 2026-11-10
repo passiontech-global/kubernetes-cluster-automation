@@ -222,6 +222,31 @@ func buildDynScheme() *runtime.Scheme {
 // one instance is safe for every NewDynamicClient call.
 var dynSchemeOnce = sync.OnceValue(buildDynScheme)
 
+// dynCRDListGVKs are the apiextensions kinds the CRD-inclusive fake
+// registers ON TOP of dynCRDGVKs — deliberately kept out of the
+// shared table (see CRDGVR: baking them in would widen the default
+// fake for every test that must NOT see CRDs and silence the
+// panic-on-unregistered-List guard those tests rely on).
+var dynCRDListGVKs = []schema.GroupVersionKind{
+	{Group: "apiextensions.k8s.io", Version: "v1",
+		Kind: "CustomResourceDefinition"},
+}
+
+// dynSchemeWithCRDsOnce caches the CRD-inclusive scheme — the same
+// table plus the apiextensions kinds, for fakes whose checks
+// genuinely List CRDs every sweep (api-object-sprawl-report-gc's
+// kine large-object census reads them via AllUnstructured).
+var dynSchemeWithCRDsOnce = sync.OnceValue(func() *runtime.Scheme {
+	s := buildDynScheme()
+	for _, gvk := range dynCRDListGVKs {
+		s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		s.AddKnownTypeWithName(
+			gvk.GroupVersion().WithKind(gvk.Kind+"List"),
+			&unstructured.UnstructuredList{})
+	}
+	return s
+})
+
 // DynScheme returns a FRESH scheme carrying the client-go built-ins
 // plus every CRD GVK in dynCRDGVKs (object and <Kind>List kinds, all
 // as unstructured). Use it when a test needs the same type coverage
@@ -251,7 +276,21 @@ var dynListKindOverrides = map[schema.GroupVersionResource]string{
 // outside the dynCRDGVKs table (runtime-discovered resources), keep
 // using NewFakeDyn, optionally merged with DynListKinds().
 func NewDynamicClient(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	scheme := dynSchemeOnce()
+	return newDynamicClient(dynSchemeOnce(), objs...)
+}
+
+// NewDynamicClientWithCRDs is NewDynamicClient plus the apiextensions
+// CustomResourceDefinition kinds — the fake the full health sweep
+// needs now that api-object-sprawl-report-gc's kine large-object
+// census Lists CRDs every cycle. Tests asserting CRD-absence keep
+// using NewDynamicClient/NewFakeDyn: the unregistered-List panic
+// stays their guard.
+func NewDynamicClientWithCRDs(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	return newDynamicClient(dynSchemeWithCRDsOnce(), objs...)
+}
+
+func newDynamicClient(scheme *runtime.Scheme,
+	objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 
 	// The body mirrors dynamicfake.NewSimpleDynamicClient — the
 	// all-unstructured scheme copy and the typed-seed conversion —

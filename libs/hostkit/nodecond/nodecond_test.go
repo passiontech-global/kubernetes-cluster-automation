@@ -8,9 +8,9 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 40 latch-backed + 7 monitor/kubelet-owned = 47.
+// 48 latch-backed + 7 monitor/kubelet-owned = 55.
 var allConditionNames = []string{
-	// Latch-backed (40).
+	// Latch-backed (48).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -28,6 +28,9 @@ var allConditionNames = []string{
 	CgroupDyingLeak, SystemdSessionBloat,
 	KubeletPLEGUnhealthy, DiskSlowIO, KernelNetShimDegraded,
 	ClocksourceUnstable,
+	KonnectivityIPMismatch, CiliumEnvoyXDSReject, DiskBloatRunaway,
+	NebulaMTUBlackhole, NebulaSlowpath, NebulaSiteedge,
+	KernelPageAllocFailure, ApiserverWatchCacheWedged,
 	// Monitor- and kubelet-owned (7).
 	KernelDeadlock, ReadonlyFilesystem, InodePressure,
 	HostNetworkProblems, ClusterNetworkProblems,
@@ -59,8 +62,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 47 {
-		t.Fatalf("allConditionNames = %d entries, want 47 (40 latch-backed + 7 monitor/kubelet)",
+	if len(allConditionNames) != 55 {
+		t.Fatalf("allConditionNames = %d entries, want 55 (48 latch-backed + 7 monitor/kubelet)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -76,10 +79,10 @@ func TestConstantsNonEmptyAndUnique(t *testing.T) {
 }
 
 func TestListLengths(t *testing.T) {
-	// HeartbeatSweptNames: 41 latch-backed (incl. InodePressure,
+	// HeartbeatSweptNames: 49 latch-backed (incl. InodePressure,
 	// agent-latched since inode-pressure) + ReadonlyFilesystem; KernelDeadlock
 	// (permanent) excluded.
-	if got, want := len(HeartbeatSweptNames), 42; got != want {
+	if got, want := len(HeartbeatSweptNames), 50; got != want {
 		t.Errorf("len(HeartbeatSweptNames) = %d, want %d", got, want)
 	}
 	if got, want := len(HangPreCordonNames), 19; got != want {
@@ -163,7 +166,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[InodePressure] {
 		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
-	// Every remaining constant — exactly the 41 latch-backed — in.
+	// Every remaining constant — exactly the 49 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {
@@ -184,8 +187,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 41 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 41", latchBacked)
+	if latchBacked != 49 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 49", latchBacked)
 	}
 }
 

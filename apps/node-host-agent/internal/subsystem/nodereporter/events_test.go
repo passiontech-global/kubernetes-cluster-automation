@@ -375,6 +375,12 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"STATE-ENTER: cgroup-dying-leak nr_dying_descendants=6200", "CgroupDyingLeak"},
 		{"STATE-ENTER: systemd-session-bloat abandoned=24 dbus_latency=3.2s", "SystemdSessionBloat"},
 		{"STATE-ENTER: kernel-net-shim-degraded shim-rss-high pid=777 rss=250MiB", "KernelNetShimDegraded"},
+		// W21 latch→event surface — the three ACTION-entry rules.
+		{"ACTION cilium-envoy-xds-reject: update_rejected=12 fails=3", "CiliumEnvoyXDSReject"},
+		{"ACTION nebula-mtu-blackhole: peer=10.8.0.9 df_size=1200", "NebulaMTUBlackhole"},
+		{"ACTION page-alloc-failure: page allocation failure: order:3", "KernelPageAllocFailure"},
+		// sig13 watch-cache wedge latch — STATE-ENTER per episode.
+		{"STATE-ENTER: apiserver-cache-wedged", "ApiserverWatchCacheWedged"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

@@ -11,13 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -263,5 +266,83 @@ func TestCorev1EndpointsVacant(t *testing.T) {
 				t.Fatalf("corev1EndpointsVacant = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// patroniLeaderVacant is the Patroni failover-lock predicate: BOTH
+// DCS surfaces (the <cr>-leader Lease and Endpoints) must exist-or-
+// default-vacant with at least one actually seen, and both vacant —
+// a held holder or a routing endpoints object is a live primary. A
+// declared pgbouncer proxy adds the pooler path: empty pooler
+// Endpoints means clients have no route even if a primary exists.
+func TestPatroniLeaderVacant(t *testing.T) {
+	lease := func(holder *string) *coordinationv1.Lease {
+		return &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "pg-main-leader"},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: holder},
+		}
+	}
+	ep := func(name string, addrs ...string) *corev1.Endpoints {
+		e := &corev1.Endpoints{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: name}}
+		if len(addrs) > 0 {
+			sub := corev1.EndpointSubset{}
+			for _, a := range addrs {
+				sub.Addresses = append(sub.Addresses,
+					corev1.EndpointAddress{IP: a})
+			}
+			e.Subsets = []corev1.EndpointSubset{sub}
+		}
+		return e
+	}
+	cr := func(pgBouncer bool) *unstructured.Unstructured {
+		c := pgCluster("db", "pg-main")
+		if pgBouncer {
+			_ = unstructured.SetNestedField(c.Object, true,
+				"spec", "proxy", "pgBouncer", "expose")
+		}
+		return c
+	}
+	check := func(objs ...runtime.Object) *perconaQuorumCheck {
+		return &perconaQuorumCheck{Deps: &probefw.Deps{
+			CS: fake.NewSimpleClientset(objs...)}}
+	}
+	cases := []struct {
+		name string
+		objs []runtime.Object
+		cr   *unstructured.Unstructured
+		want bool
+	}{
+		{"held lease is a live primary",
+			[]runtime.Object{lease(ptr.To("pg-main-0")), ep("pg-main-leader")},
+			cr(false), false},
+		{"vacant lease + vacant endpoints",
+			[]runtime.Object{lease(ptr.To("")), ep("pg-main-leader")},
+			cr(false), true},
+		{"lease absent, endpoints vacant",
+			[]runtime.Object{ep("pg-main-leader")},
+			cr(false), true},
+		{"both surfaces absent is not evidence",
+			nil, cr(false), false},
+		{"vacant lease but endpoints route an address",
+			[]runtime.Object{lease(ptr.To("")),
+				ep("pg-main-leader", "10.0.0.1")},
+			cr(false), false},
+		{"pgbouncer declared, pooler endpoints vacant",
+			[]runtime.Object{ep("pg-main-pgbouncer")},
+			cr(true), true},
+		{"pgbouncer declared, pooler endpoints absent",
+			nil, cr(true), true},
+		{"pgbouncer declared, pooler routes an address",
+			[]runtime.Object{ep("pg-main-pgbouncer", "10.0.0.9")},
+			cr(true), false},
+		{"no pgbouncer — pooler never consulted",
+			[]runtime.Object{ep("pg-main-pgbouncer", "10.0.0.9")},
+			cr(false), false},
+	}
+	for _, tc := range cases {
+		if got := check(tc.objs...).patroniLeaderVacant(ctx, logr.Discard(), tc.cr); got != tc.want {
+			t.Errorf("%s: patroniLeaderVacant=%v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

@@ -5,7 +5,9 @@
 package nodehealth
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -614,5 +616,194 @@ func TestNodeHangPatchInvalidatesNodesOnly(t *testing.T) {
 	}
 	if !got["w-hang"].Spec.Unschedulable {
 		t.Fatal("post-patch census misses the fresh cordon")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Remaining Run branches — control-plane skip, clock-skew heartbeat
+// gate, latch-active clock fuse, patch failures, already-cordoned skip
+// ---------------------------------------------------------------------------
+
+// Control-plane nodes are excluded from BOTH the worker count and the
+// latch scan — a cp node carrying a sustained latch is never a
+// precordon candidate (it runs no kubelet workload anyway).
+func TestCheckNodeHangControlPlaneSkipped(t *testing.T) {
+	cp := probetest.ReadyWorkerNode("w-cp", "KernelHungTasks", 5*time.Minute, false)
+	cp.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+	cs := fake.NewSimpleClientset(cp,
+		probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("hung worker did not fail the check")
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-cp", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Unschedulable {
+		t.Fatal("control-plane node cordoned — it is not a worker")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("control-plane node stamped")
+	}
+}
+
+// A fused clock-skew latch with a frozen heartbeat is the same zombie
+// shape as the hang latches — warn, don't cordon. This exercises the
+// clock-skew half of nodeHangLatch's stale reporting.
+func TestCheckNodeHangClockSkewStaleHeartbeat(t *testing.T) {
+	skew := probetest.ReadyWorkerNode("w-cpskew", "ClockUnsynchronized", 15*time.Minute, false)
+	skew.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(skew, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("stale-heartbeat clock latch must not fail the check: %+v", res)
+	}
+	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-cpskew", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("zombie clock latch cordoned the node")
+	}
+}
+
+// nodeHangLatchActive's clock-skew half: a stamped cordon stays while
+// ANY clock latch is True — here ClockSkewDetected is the only active
+// condition and it is still inside its 10m fuse (not cordon evidence,
+// but it IS uncordon evidence).
+func TestCheckNodeHangClockLatchHoldsPreCordon(t *testing.T) {
+	n := precordonedWorkerNode("w-clockheld", true)
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               "ClockSkewDetected",
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-30 * time.Second)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
+	})
+	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("fresh clock latch must not fail the check: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-clockheld", metav1.GetOptions{})
+	if !got.Spec.Unschedulable {
+		t.Fatal("uncordoned while a clock latch is still True")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
+		t.Fatal("pre-cordon stamp removed while clock latch active")
+	}
+}
+
+// A failed node List is an Infra result — the check cannot tell
+// "no hang" from "never looked".
+func TestCheckNodeHangInfraError(t *testing.T) {
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx)
+	if res.Infra == nil {
+		t.Fatalf("node list failure must surface as Infra, got %+v", res)
+	}
+}
+
+// Patch failures are tolerated per-node: the uncordon patch error
+// leaves the node cordoned+stamped and IncErrors once — the next
+// sweep retries.
+func TestCheckNodeHangUncordonPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		precordonedWorkerNode("w-held", true),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	before := testutil.QueueErrorCount(t, "cluster-health-probes")
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("a failed uncordon must not fabricate a finding: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-held", metav1.GetOptions{})
+	if !got.Spec.Unschedulable {
+		t.Fatal("uncordon reported delivered on a rejected patch")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
+		t.Fatal("stamp removed although the uncordon patch failed")
+	}
+	if d := testutil.QueueErrorCount(t, "cluster-health-probes") - before; d != 1 {
+		t.Fatalf("uncordon patch failure IncError delta = %v, want 1", d)
+	}
+}
+
+// Same tolerance on the stale-stamp clear: the patch error keeps the
+// stamp (a later sweep retries the cleanup) and IncErrors once.
+func TestCheckNodeHangStaleStampPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		precordonedWorkerNode("w-stale", false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	before := testutil.QueueErrorCount(t, "cluster-health-probes")
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("a failed stamp clear must not fabricate a finding: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-stale", metav1.GetOptions{})
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
+		t.Fatal("stale stamp removed although the patch failed")
+	}
+	if d := testutil.QueueErrorCount(t, "cluster-health-probes") - before; d != 1 {
+		t.Fatalf("stale-stamp patch failure IncError delta = %v, want 1", d)
+	}
+}
+
+// The cordon patch itself failing leaves the node schedulable — the
+// finding still reports (the latch IS live) and the error is metered.
+func TestCheckNodeHangCordonPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	before := testutil.QueueErrorCount(t, "cluster-health-probes")
+	res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("live latch must still fail the check on a patch error")
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-hang", metav1.GetOptions{})
+	if got.Spec.Unschedulable {
+		t.Fatal("node cordoned although the patch was rejected")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("pre-cordon stamp written although the patch was rejected")
+	}
+	if d := testutil.QueueErrorCount(t, "cluster-health-probes") - before; d != 1 {
+		t.Fatalf("cordon patch failure IncError delta = %v, want 1", d)
+	}
+}
+
+// A manually cordoned node carrying a live latch emits the finding
+// but is NOT re-patched — spec.unschedulable is already true, so the
+// sweep must not stack our stamp onto somebody else's cordon.
+func TestCheckNodeHangSkipsAlreadyCordoned(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-manual-hang", "KernelHungTasks", 5*time.Minute, true),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("live latch on a cordoned node must still fail the check")
+	}
+	if !strings.Contains(res.Why, "w-manual-hang") {
+		t.Fatalf("why missing the latched node: %q", res.Why)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-manual-hang", metav1.GetOptions{})
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("pre-cordon stamp stacked onto a foreign cordon")
 	}
 }

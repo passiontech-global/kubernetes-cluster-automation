@@ -16,7 +16,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -158,13 +157,13 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 	}
 	if zones[statefulStandbySiteZone] {
 		// Trigger A: the master lives in the standby zone
-		// while the STS still serves Ready replicas in the
+		// while the workload still serves Ready replicas in the
 		// main zone — reads/writes pay the inter-DC RTT.
-		if stsReadyInZone(c.sts, s.podItems, s.podNode, s.nodeZone,
+		if workloadReadyInZone(c, s.podItems, s.podNode, s.nodeZone,
 			statefulMainSiteZone) {
 			s.rep.Flag(statefulMasterSiteSkewGauge,
 				key+"/"+statefulStandbySiteZone,
-				[]string{c.ns, c.svc, c.sts.Name,
+				[]string{c.ns, c.svc, c.workloadName(),
 					statefulStandbySiteZone})
 			rep.Find(key + "(site_skew " + statefulStandbySiteZone +
 				" while datahub replicas ready)")
@@ -176,7 +175,7 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 	// disprove the pin).
 	if resolved > 0 && zones[statefulStandbySiteZone] &&
 		!zones[statefulMainSiteZone] {
-		s.lanitPinned[key] = []string{c.ns, c.svc, c.sts.Name,
+		s.lanitPinned[key] = []string{c.ns, c.svc, c.workloadName(),
 			statefulStandbySiteZone}
 	}
 }
@@ -225,19 +224,27 @@ func endpointZone(e kube.ReadyEndpoint, podNode, nodeZone map[string]string) str
 	return ""
 }
 
-// stsReadyInZone reports whether the StatefulSet has at least one
-// Ready pod on a node labeled with the given topology zone — the
-// "the STS still serves the main site" half of trigger A.
-func stsReadyInZone(sts *appsv1.StatefulSet,
+// workloadReadyInZone reports whether the candidate's workload has
+// at least one Ready pod on a node labeled with the given topology
+// zone — the "the workload still serves the main site" half of
+// trigger A. A StatefulSet matches through its selector; a CNPG
+// Cluster (no StatefulSet) matches on its cnpg.io/cluster label.
+func workloadReadyInZone(c masterSvc,
 	pods []corev1.Pod, podNode, nodeZone map[string]string, zone string) bool {
 
-	sel, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
-	if err != nil {
-		return false
+	var sel labels.Selector
+	if c.sts != nil {
+		s, err := metav1.LabelSelectorAsSelector(c.sts.Spec.Selector)
+		if err != nil {
+			return false
+		}
+		sel = s
+	} else {
+		sel = labels.SelectorFromSet(labels.Set{cnpgClusterLabel: c.cnpg})
 	}
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Namespace != sts.Namespace ||
+		if pod.Namespace != c.ns ||
 			!sel.Matches(labels.Set(pod.Labels)) ||
 			pod.DeletionTimestamp != nil ||
 			!kube.PodReadyCond(pod) {

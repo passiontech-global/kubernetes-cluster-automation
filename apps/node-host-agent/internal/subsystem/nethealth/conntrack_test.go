@@ -465,3 +465,111 @@ func TestPeerConntrackFlushDefaultsAndDedup(t *testing.T) {
 		t.Fatal("peer flush must not use the :53 tuple")
 	}
 }
+
+// --- W21-G7: surgical UNREPLIED udp flush ---
+
+// unrepliedFlushCmds is the exact argv pair flushUnrepliedUDPConntrack
+// must exec — :53 scoped first, then every unreplied UDP flow; the
+// -u UNREPLIED state filter is what spares ASSURED entries
+// (Nebula/WireGuard tunnels, live DNS exchanges).
+var unrepliedFlushCmds = []string{
+	"conntrack -D -p udp --dport 53 -u UNREPLIED",
+	"conntrack -D -p udp -u UNREPLIED",
+}
+
+func ranAllExactCmds(e *env, cmds []string) bool {
+	ran := map[string]bool{}
+	for _, c := range e.host.Cmds() {
+		ran[strings.Join(c, " ")] = true
+	}
+	for _, want := range cmds {
+		if !ran[want] {
+			return false
+		}
+	}
+	return true
+}
+
+// insert_failed alone jumping >5 in one cycle fires the surgical
+// UNREPLIED flush even though the combined spike stays under the
+// blunt all-UDP threshold — refused inserts are the earliest
+// pressure signal.
+func TestConntrackInsertSpikeFlushesUnreplied(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("0000000a", "00000000", "00000000"))
+	e.n.Cycle(context.Background()) // baseline read — never flushes
+	if ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatal("unreplied flush fired on the baseline read")
+	}
+	// insert_failed +7 (>5) while drop/early_drop stay flat — the
+	// combined delta is also 7, far under the 50 blunt threshold.
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("00000011", "00000000", "00000000"))
+	e.n.Cycle(context.Background())
+	if !ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatalf("unreplied flush did not fire on a +7 insert_failed spike, cmds=%v",
+			e.host.Cmds())
+	}
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("blunt all-UDP flush fired under its own threshold")
+	}
+	// A second spike inside the 15m budget must not re-exec.
+	e.host.ClearLog()
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("00000030", "00000000", "00000000"))
+	e.n.Cycle(context.Background())
+	if ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatal("unreplied flush refired inside the cooldown")
+	}
+}
+
+// An insert_failed delta at or under 5 is normal churn — no flush.
+func TestConntrackInsertSpikeUnderThreshold(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("0000000a", "00000000", "00000000"))
+	e.n.Cycle(context.Background())
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("0000000f", "00000000", "00000000")) // +5 — not >5
+	e.n.Cycle(context.Background())
+	if ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatal("unreplied flush fired at exactly the +5 threshold")
+	}
+}
+
+// Table usage past the 90% enter ratio flushes unreplied UDP entries
+// immediately — before any insert_failed evidence accumulates.
+func TestConntrackRatioFlushesUnreplied(t *testing.T) {
+	e := fixture(t, nil)
+	testutil.WriteFile(t, e.ctmax, "1000\n")
+	testutil.WriteFile(t, e.ctcount, "950\n") // 0.95 > 0.90
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "conntrack-pressure") {
+		t.Fatal("pressure latch missing above enter ratio")
+	}
+	if !ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatalf("unreplied flush did not fire past the enter ratio, cmds=%v",
+			e.host.Cmds())
+	}
+	// Sustained pressure inside the cooldown must not re-exec.
+	e.host.ClearLog()
+	e.n.Cycle(context.Background())
+	if ranAllExactCmds(e, unrepliedFlushCmds) {
+		t.Fatal("unreplied flush refired inside the cooldown")
+	}
+}
+
+// The surgical flush is best-effort like its blunt siblings: a
+// missing conntrack binary logs and moves on, and each of the two
+// deletes is independent (a :53 failure must not skip the wildcard).
+func TestFlushUnrepliedUDPConntrackBestEffort(t *testing.T) {
+	e := fixture(t, nil)
+	e.host.FailOn("conntrack", errCmdFail)
+	e.n.flushUnrepliedUDPConntrack(context.Background(), checkCT)
+	if !strings.Contains(logLines(t, e), "unreplied udp flush skipped") {
+		t.Fatalf("missing flush-skip log:\n%s", logLines(t, e))
+	}
+}

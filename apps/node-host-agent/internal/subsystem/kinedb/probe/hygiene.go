@@ -52,6 +52,15 @@
 //     sequential scan (stale pg_statistic or a poisoned index), so
 //     an ANALYZE runs immediately under the 30m last-kine-analyze
 //     budget instead of waiting for the daily maint window.
+//  8. Large-key census — the top-5 LIVE kine keys whose value
+//     exceeds 512KiB (DISTINCT ON name ... ORDER BY name, id DESC
+//     = kine's latest-revision read; deleted=0 keeps live keys).
+//     The detoast of every live row's bytea is too heavy for every
+//     probe round, so the scan rides a persisted 15m
+//     last-kine-large-keys budget and the in-process cache
+//     re-emits until the next window; exported as
+//     kine_db_large_object_bytes{key="..."} — the per-key bloat
+//     census behind the controller-side kine_large_objects audit.
 //
 // Items 5–6 export through their own textfile (kine-db-xact.prom)
 // rather than emitProbe's kine-db.prom — the prometheus collector
@@ -67,6 +76,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -114,6 +124,19 @@ const (
 	// last-dead-tuple-vacuum.
 	kineAnalyzeBudget = 30 * time.Minute
 	kineAnalyzeFile   = "last-kine-analyze"
+
+	// Item 8 (kine-large-keys census): the top-5 live keys whose
+	// value exceeds 512KiB — the per-key bloat census behind the
+	// controller-side kine_large_objects audit. The DISTINCT ON
+	// scan detoasts every live row's bytea, far too heavy for every
+	// 2-minute probe round, so it rides a persisted 15m budget
+	// (last-kine-large-keys, same spend-on-attempt contract as the
+	// other last-* files) and the last census re-emits until the
+	// next window — storelocal's maxObjBytes contract.
+	largeKeysBudget  = 15 * time.Minute
+	largeKeysFile    = "last-kine-large-keys"
+	largeKeyMinBytes = 524288
+	largeKeysTopN    = 5
 )
 
 // inactiveSlot is one pg_replication_slots row with active=false.
@@ -156,7 +179,29 @@ type hygieneResult struct {
 	seqTupRead   int64
 	seqSeen      bool
 	analyzeFired bool // the seq-scan ANALYZE ran this round
+	// Item 8 (kine-large-keys census — refreshed at most every
+	// largeKeysBudget, re-emitted every round from the cache).
+	largeKeys []largeKeyRow
+	largeSeen bool
 }
+
+// largeKeyRow is one census hit: the kine key path (name column —
+// the full /registry/... key) and its live value's byte size.
+type largeKeyRow struct {
+	key   string
+	bytes int64
+}
+
+// largeKeysCache is the last successful top-5 census — in-process
+// like preparedXactRolledBackTotal; the persisted last-kine-large-keys
+// budget decides when it refreshes, so a restart re-censuses only
+// after the window (the series goes absent for the remainder —
+// same contract as storelocal's maxObjBytes).
+var largeKeysCache = struct {
+	sync.Mutex
+	rows []largeKeyRow
+	seen bool
+}{}
 
 // preparedXactRolledBackTotal is the lifetime count behind
 // kine_db_orphan_prepared_xacts_rolled_back_total — in-process
@@ -192,6 +237,7 @@ func (p *Probe) pgHygiene(ctx context.Context, pg, user, pass string,
 	p.hygienePreparedXacts(ctx, pg, user, pass, h, note)
 	p.hygieneInvalidIndexes(ctx, pg, user, pass, h, note)
 	p.hygieneSeqScan(ctx, pg, user, pass, h, note)
+	p.hygieneLargeKeys(ctx, pg, user, pass, h, note)
 	p.emitXactTextfile(h)
 }
 
@@ -351,6 +397,65 @@ func (p *Probe) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 		"table", p.d.Cfg.Table, "seq_tup_read_delta", delta)
 }
 
+// hygieneLargeKeys — item 8: the top-5 LIVE kine keys whose value
+// exceeds 512KiB. DISTINCT ON (name) ... ORDER BY name, id DESC
+// mirrors kine's own latest-revision read, so deleted=0 on that row
+// means the key is live; OCTET_LENGTH counts the bytea payload the
+// controller-side kine_large_objects audit sizes via the API. The
+// scan detoasts every live row's value — far too heavy for every
+// 2-minute probe round — so it rides the persisted 15m
+// last-kine-large-keys budget (spend-on-attempt, same contract as
+// last-kine-analyze) and the in-process cache re-emits the last
+// census until the next window. ReadOnly skips the query entirely:
+// the textfile writer already refuses to emit there.
+func (p *Probe) hygieneLargeKeys(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, note func(string)) {
+	largeKeysCache.Lock()
+	h.largeKeys, h.largeSeen = largeKeysCache.rows, largeKeysCache.seen
+	largeKeysCache.Unlock()
+	if p.d.Cfg.ReadOnly {
+		return
+	}
+	// MkdirAll before the spend — Store.WriteEpochFile does not
+	// create the state dir itself (same note as hygieneSeqScan).
+	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
+	if !p.d.State.RateTrySpend(largeKeysFile, largeKeysBudget) {
+		return // inside the 15m window — cached rows still emit
+	}
+	// `bytes|name` field order: name lands LAST so a key containing
+	// '|' still parses (Cut takes the first separator only).
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT OCTET_LENGTH(value), name FROM ("+
+			"SELECT DISTINCT ON (name) name, value, deleted "+
+			"FROM %s ORDER BY name, id DESC) latest "+
+			"WHERE deleted = 0 AND OCTET_LENGTH(value) > %d "+
+			"ORDER BY 1 DESC LIMIT %d",
+		kdeps.SQLIdent(p.d.Cfg.Table), largeKeyMinBytes, largeKeysTopN))
+	if err != nil {
+		note(fmt.Sprintf("large-keys-fail: %v", err))
+		return
+	}
+	var rows []largeKeyRow
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		sz, name, ok := strings.Cut(line, "|")
+		if !ok {
+			continue
+		}
+		b, perr := strconv.ParseInt(strings.TrimSpace(sz), 10, 64)
+		if perr != nil {
+			continue
+		}
+		rows = append(rows, largeKeyRow{key: name, bytes: b})
+	}
+	largeKeysCache.Lock()
+	largeKeysCache.rows, largeKeysCache.seen = rows, true
+	largeKeysCache.Unlock()
+	h.largeKeys, h.largeSeen = rows, true
+}
+
 // emitXactTextfile renders kine-db-xact.prom for items 5–6 — header
 // always, sample only behind its *Seen flag (a failed read goes
 // absent rather than fabricating a zero), and the lifetime rollback
@@ -384,6 +489,22 @@ func (p *Probe) emitXactTextfile(h *hygieneResult) {
 			"(ROLLBACK PREPARED) to release the xmin horizon.", "counter")
 	b.Line(fmt.Sprintf("kine_db_orphan_prepared_xacts_rolled_back_total %d",
 		preparedXactRolledBackTotal.Load()))
+	// Item 8 — the large-key census: one labelled sample per top-5
+	// key, header-only before the first successful census so the
+	// family goes absent rather than pinning a stale reading.
+	largeKeysHelp := "Live (deleted=0, latest revision) kine keys " +
+		"whose value exceeds 512 KiB — the per-key bloat census " +
+		"behind the controller-side kine_large_objects audit."
+	if h.largeSeen && len(h.largeKeys) > 0 {
+		for _, r := range h.largeKeys {
+			b.GaugeLabels("kine_db_large_object_bytes", largeKeysHelp,
+				fmt.Sprintf("key=\"%s\"",
+					promfile.EscapeLabelValue(r.key)),
+				float64(r.bytes))
+		}
+	} else {
+		b.Header("kine_db_large_object_bytes", largeKeysHelp)
+	}
 	p.d.EmitTextfile(xactPromFile, &b)
 }
 

@@ -14,6 +14,12 @@
 //     memory.events:high counter while the node-wide thrash latch
 //     is OFF (a node event already owns that signal — counting
 //     pods on top would double-report).
+//   - PodMemoryHighThrottled Warning events on the owning Pod —
+//     the stall is invisible in pod status (Running, probes
+//     green), so the event is the operator-facing surface; deduped
+//     per pod slice and re-armed on a conclusive non-throttle
+//     cycle (an unreadable pressure/events file holds the marker,
+//     same inconclusive posture as observability-pipeline-guard).
 //   - node_cgroup_pids_utilization_max_ratio (gauge): the worst
 //     pids.current / pids.max across pod cgroups — a ratio near 1
 //     means the next clone() EAGAINs ("fork: resource temporarily
@@ -28,6 +34,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -50,6 +58,11 @@ type CgroupThrottleCheck struct {
 	d              *wdeps.Deps
 	prevHigh       map[string]int64
 	prevPidsDenial map[string]int64
+	// evented dedupes the PodMemoryHighThrottled Warning per pod
+	// slice dir — re-armed by a conclusive non-throttle cycle or
+	// the dir's disappearance (a recycled slice name must not
+	// inherit the old pod's marker).
+	evented map[string]bool
 }
 
 // Name returns the check label / WD_SIG key.
@@ -167,7 +180,7 @@ func podSliceDirs(kubepods string) []string {
 }
 
 // Run executes one cgroup-pod-throttle round.
-func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
+func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckCgroupThrottle) {
 		return
 	}
@@ -189,6 +202,13 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.prevPidsDenial == nil {
 		c.prevPidsDenial = map[string]int64{}
 	}
+	if c.evented == nil {
+		c.evented = map[string]bool{}
+	}
+	podByUID := map[string]*corev1.Pod{}
+	for i := range e.Pods {
+		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
+	}
 	dirs := podSliceDirs(kubepods)
 	seen := map[string]bool{}
 	var maxRatio float64
@@ -207,9 +227,20 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		if psiOK && highOK && highDelta > 0 &&
 			avg60 > podCgroupPSIFullHigh && !nodeThrashing {
 			c.d.PodCgroupMemoryThrottled++
+			uid := podUIDFromSlice(dir)
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cgroup-pod-throttle pod uid=%s memory.pressure full avg60=%.1f high_delta=+%d — memory.high throttle stall without node PSI pressure (cgroup-pod-throttle)",
-				podUIDFromSlice(dir), avg60, highDelta))
+				uid, avg60, highDelta))
+			if !c.evented[dir] && c.throttledEvent(ctx, uid,
+				avg60, highDelta, podByUID[uid]) {
+				c.evented[dir] = true
+			}
+		} else if psiOK && highOK {
+			// Conclusive non-throttle cycle — re-arm the episode
+			// marker so a LATER throttle burst emits a fresh event.
+			// An unreadable pressure/events file is inconclusive
+			// and holds the marker (a flap must not re-page).
+			delete(c.evented, dir)
 		}
 		// --- pids.max utilization half ---
 		cur, curOK := readCgroupInt(filepath.Join(dir, "pids.current"))
@@ -242,6 +273,53 @@ func (c *CgroupThrottleCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			delete(c.prevPidsDenial, dir)
 		}
 	}
+	for dir := range c.evented {
+		if !seen[dir] {
+			delete(c.evented, dir)
+		}
+	}
 	c.d.PodCgroupPIDsMaxUtilRatio = maxRatio
 	c.d.CycleResult(wdeps.CheckCgroupThrottle, "ok")
+}
+
+// throttledEvent creates the PodMemoryHighThrottled Warning Event on
+// the owning Pod — the pod-level counterpart of the suspect line:
+// the cgroup throttle stall is invisible in pod status (Running,
+// probes green), so the event is the operator-facing surface.
+// Returns true when the episode counts as handled — the event was
+// created, the pod is unresolvable (a dead pod's cgroup can't take
+// an event anyway), or no events client exists (standalone/test
+// posture). A create failure returns false so the caller's dedup
+// marker does not advance and the next cycle retries.
+func (c *CgroupThrottleCheck) throttledEvent(ctx context.Context,
+	uid string, avg60 float64, highDelta int64, pod *corev1.Pod) bool {
+
+	if pod == nil || c.d.Cfg.Client == nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cgroup-pod-throttle pod uid=%s memory.high throttle — pod unresolvable, event skipped",
+			uid))
+		return true
+	}
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
+		Reason:    "PodMemoryHighThrottled",
+		Note: fmt.Sprintf(
+			"pod cgroup under kubepods.slice throttled on memory.high: memory.pressure full avg60=%.1f%%, memory.events high +%d this cycle — pod stalls in direct reclaim while node PSI stays flat (memory.request mis-sized)",
+			avg60, highDelta),
+		When: now,
+		Regarding: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Namespace:  pod.Namespace,
+			Name:       pod.Name,
+			UID:        pod.UID,
+		},
+		Owner: pod.Namespace + "/" + pod.Name,
+	}); err != nil {
+		return false
+	}
+	c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "event").Inc()
+	return true
 }

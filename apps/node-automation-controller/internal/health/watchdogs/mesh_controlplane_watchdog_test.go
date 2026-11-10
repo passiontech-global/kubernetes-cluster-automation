@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -273,6 +274,116 @@ func TestMeshHealComponentPodRespectsCooldown(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the heal cooldown — gate refused too late")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// issuer-serial-watch — CiliumIPAMExhausted heartbeat freshness (W21-R7)
+// ---------------------------------------------------------------------------
+
+// ciliumOpPod builds a Running cilium-operator replica with a
+// Deployment ownerRef — the re-rollable shape healNamedPod requires.
+func ciliumOpPod(name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: name,
+			UID:               types.UID("u-" + name),
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "Deployment",
+				Name: "cilium-operator", UID: types.UID("dep-cilium-op"),
+				Controller: &ctrue,
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+// ipamNode builds a Ready node carrying CiliumIPAMExhausted=True
+// transitioned `age` ago; heartbeat is fresh by default (the
+// ReadyWorkerNode stamp), staleHeartbeat freezes it past the
+// 10m freshness window.
+func ipamNode(name string, age time.Duration, staleHeartbeat bool) *corev1.Node {
+	n := probetest.ReadyWorkerNode(name, "CiliumIPAMExhausted", age, false)
+	if staleHeartbeat {
+		for i := range n.Status.Conditions {
+			if n.Status.Conditions[i].Type == "CiliumIPAMExhausted" {
+				n.Status.Conditions[i].LastHeartbeatTime =
+					metav1.NewTime(time.Now().Add(-ciliumIPAMCondHeartbeatMax - time.Minute))
+			}
+		}
+	}
+	return n
+}
+
+// A CiliumIPAMExhausted=True whose heartbeat froze is a zombie — the
+// owning reporter is dead (the node-condition-sweeper owns clearing
+// it). The watchdog must not heal on stale evidence: no finding, no
+// pod delete.
+func TestMeshIPAMExhaustedStaleHeartbeatSkipped(t *testing.T) {
+	pod := ciliumOpPod(ciliumOperatorPrefix + "6f9d8-abcde")
+	cs := fake.NewSimpleClientset(
+		ipamNode("w1", 20*time.Minute, true), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("stale-heartbeat zombie must not produce a finding: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("stale-heartbeat evidence must not delete the operator pod")
+	}
+}
+
+// A fresh CiliumIPAMExhausted=True deletes the pod the leader Lease
+// names — holderIdentity "<pod>_<uuid>" resolves the elected leader,
+// so the standby listed first survives.
+func TestMeshIPAMExhaustedHealsLeaseHolder(t *testing.T) {
+	standby := ciliumOpPod(ciliumOperatorPrefix + "standby-111")
+	leader := ciliumOpPod(ciliumOperatorPrefix + "leader-222")
+	holder := leader.Name + "_9f8e7d6c"
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: ciliumOperatorLease},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
+	cs := fake.NewSimpleClientset(
+		ipamNode("w1", 20*time.Minute, false), standby, leader, lease)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("fresh CiliumIPAMExhausted must FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+		Get(ctx, leader.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("lease-holder leader pod not deleted")
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+		Get(ctx, standby.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("standby pod deleted — the heal must target the lease holder only")
+	}
+}
+
+// With no leader Lease at all, the heal falls back to the first
+// Running cilium-operator-* pod — still a re-rollable target.
+func TestMeshIPAMExhaustedNoLeaseFallsBack(t *testing.T) {
+	first := ciliumOpPod(ciliumOperatorPrefix + "first-111")
+	second := ciliumOpPod(ciliumOperatorPrefix + "second-222")
+	cs := fake.NewSimpleClientset(
+		ipamNode("w1", 20*time.Minute, false), first, second)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("fresh CiliumIPAMExhausted must FAIL the check")
+	}
+	deleted := 0
+	for _, name := range []string{first.Name, second.Name} {
+		if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			deleted++
+		}
+	}
+	if deleted != 1 {
+		t.Fatalf("no-lease fallback deleted %d pods, want exactly 1", deleted)
 	}
 }
 

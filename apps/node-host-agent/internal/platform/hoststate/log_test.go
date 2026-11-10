@@ -9,6 +9,7 @@ package hoststate
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -119,4 +120,16 @@ func TestAppendLogConcurrentRotationLosesNoGeneration(t *testing.T) {
 	if missing > 0 {
 		t.Fatalf("%d appended lines lost to the rotation race", missing)
 	}
+}
+
+// An unwritable LogFile (a path under a regular file) warns and drops
+// the line — AppendLog/AppendLogWarn never fail a check over a log.
+func TestAppendLogUnwritableFile(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New(t.TempDir(), filepath.Join(blocker, "watchdog.log"), nil, nil)
+	s.AppendLog("lost-line")     // must not panic
+	s.AppendLogWarn("lost-warn") // must not panic
 }

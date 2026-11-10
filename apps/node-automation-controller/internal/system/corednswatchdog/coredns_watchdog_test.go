@@ -20,6 +20,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // ---------------------------------------------------------------------------
@@ -530,6 +531,100 @@ func TestCoreDNSRecover(t *testing.T) {
 		w := newCDNSWatchdog(fake.NewSimpleClientset())
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
 			t.Fatal("expected error when deploy/coredns is absent")
+		}
+	})
+}
+
+// W21-G4: a fresh ApiserverWatchCacheWedged=True on any node defers
+// the WHOLE recovery — surgical pod deletes and the whole-fleet
+// rollout restart alike — while the apiserver serves stale
+// watch-cache reads. A frozen heartbeat is a dead reporter's zombie
+// (the node-condition-sweeper owns clearing it) and must NOT gate.
+func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
+	wedgedNode := func(hb time.Time) *corev1.Node {
+		n := testutil.Node("cp1", corev1.ConditionTrue, nil)
+		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+			Type:               nodecond.ApiserverWatchCacheWedged,
+			Status:             corev1.ConditionTrue,
+			LastHeartbeatTime:  metav1.NewTime(hb),
+			LastTransitionTime: metav1.NewTime(hb),
+		})
+		return n
+	}
+
+	t.Run("fresh wedge gates pod deletes and rollout restart", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			wedgedNode(time.Now()),
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		// Whole-fleet stale — the path that would rollout-restart.
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{"cdns-a", "cdns-b"} {
+			if !cdnsPodExists(t, cs, p) {
+				t.Fatalf("pod %s churned while apiserver watch-cache wedged", p)
+			}
+		}
+		d := getCDNSDeployment(t, cs)
+		if a := d.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]; a != "" {
+			t.Fatal("rollout restarted while apiserver watch-cache wedged")
+		}
+		if d.Annotations[corednsTSAnno] != "" {
+			t.Fatal("cooldown stamped while gated — next run must still act")
+		}
+	})
+
+	t.Run("subset stale also gated", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			wedgedNode(time.Now()),
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+		if !cdnsPodExists(t, cs, "cdns-a") {
+			t.Fatal("suspect pod deleted while apiserver watch-cache wedged")
+		}
+	})
+
+	t.Run("stale heartbeat zombie does not gate", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			wedgedNode(time.Now().Add(-watchCacheWedgedHeartbeatMax-time.Minute)),
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+		if cdnsPodExists(t, cs, "cdns-a") {
+			t.Fatal("zombie wedge condition suppressed a needed recovery")
+		}
+		if !cdnsPodExists(t, cs, "cdns-b") {
+			t.Fatal("healthy pod deleted")
+		}
+	})
+
+	t.Run("condition False does not gate", func(t *testing.T) {
+		n := testutil.Node("cp1", corev1.ConditionTrue, nil)
+		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+			Type:               nodecond.ApiserverWatchCacheWedged,
+			Status:             corev1.ConditionFalse,
+			LastHeartbeatTime:  metav1.NewTime(time.Now()),
+			LastTransitionTime: metav1.NewTime(time.Now()),
+		})
+		cs := fake.NewSimpleClientset(
+			n,
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+		if cdnsPodExists(t, cs, "cdns-a") {
+			t.Fatal("False wedge condition suppressed a needed recovery")
 		}
 	})
 }

@@ -171,7 +171,11 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		var patch vwcPatch
 		for j := range cfg.Webhooks {
 			w := &cfg.Webhooks[j]
-			if w.FailurePolicy == nil || *w.FailurePolicy == admissionv1.Ignore {
+			// failurePolicy nil is the API default Fail — a
+			// boot-path entry that never declared a policy is
+			// exactly the fail-closed case this duty exists to
+			// soften, so only an explicit Ignore skips the patch.
+			if w.FailurePolicy != nil && *w.FailurePolicy == admissionv1.Ignore {
 				continue
 			}
 			if !bootWebhook(*w) {

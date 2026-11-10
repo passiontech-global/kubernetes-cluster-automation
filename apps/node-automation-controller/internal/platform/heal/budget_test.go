@@ -458,6 +458,81 @@ func TestTargetBreakerForgetHookFiresPerDrop(t *testing.T) {
 	}
 }
 
+// The bulk prune past the 64-entry soft cap: once the target map
+// grows past the cap, the next consult drops every entry whose
+// grant history has fully expired and fires the forget hook once
+// per dropped key — while an entry holding even one in-window
+// stamp keeps its history and stays silent. Without this the map
+// would accumulate one entry per healed pod for the process
+// lifetime.
+func TestTargetBreakerBulkPruneDropsExpiredEntries(t *testing.T) {
+	b := NewTargetBreaker(100, 10*time.Minute)
+	var forgot []string
+	b.SetForgetHook(func(module, target string) {
+		forgot = append(forgot, module+"/"+target)
+	})
+	now := time.Now()
+	// 70 distinct targets — past the 64-entry cap so every later
+	// consult runs pruneLocked. All granted inside the window.
+	for i := range 70 {
+		if ok, _ := b.TryAcquireTarget("m", fmt.Sprintf("t%02d", i), now); !ok {
+			t.Fatalf("grant %d denied inside the cap", i)
+		}
+	}
+	// t00 earns two more grants deep inside the window — at the
+	// final consult its [now, now+8m, now+9m] history straddles the
+	// cut (the `now` stamp expired, the fresh ones did not), which
+	// is the keep-branch pruneLocked must not drop.
+	for _, at := range []time.Time{now.Add(8 * time.Minute), now.Add(9 * time.Minute)} {
+		if ok, _ := b.TryAcquireTarget("m", "t00", at); !ok {
+			t.Fatal("t00 re-grant denied inside the cap")
+		}
+	}
+	if len(forgot) != 0 {
+		t.Fatalf("prune fired forgets with nothing expired: %v", forgot)
+	}
+	// A consult for a NEW target at now+11m: the cut (now+1m) leaves
+	// every single-stamp entry fully expired — 69 bulk drops — while
+	// t00's mixed history survives untouched.
+	if ok, _ := b.TryAcquireTarget("m", "new", now.Add(11*time.Minute)); !ok {
+		t.Fatal("new target denied after the prune")
+	}
+	if len(forgot) != 69 {
+		t.Fatalf("forget fired %d times, want 69 (one per expired entry): %v",
+			len(forgot), forgot)
+	}
+	seen := map[string]bool{}
+	for _, f := range forgot {
+		if f == "m/t00" || f == "m/new" {
+			t.Fatalf("live entry %q was forgotten", f)
+		}
+		if seen[f] {
+			t.Fatalf("forget re-fired for %q", f)
+		}
+		seen[f] = true
+	}
+	// The kept entry still holds all three stamps — pruneLocked
+	// drops whole entries, it never trims a survivor's history.
+	keep := b.targets[breakerTarget{module: "m", target: "t00"}]
+	if keep == nil || len(keep.stamps) != 3 {
+		t.Fatalf("t00 history = %+v, want 3 surviving stamps", keep)
+	}
+	if b.targets[breakerTarget{module: "m", target: "t01"}] != nil {
+		t.Fatal("expired entry t01 survived the bulk prune")
+	}
+	if b.targets[breakerTarget{module: "m", target: "new"}] == nil {
+		t.Fatal("new target missing after its grant")
+	}
+	// The map is back under the cap — the next consult pays no
+	// prune and fires no further forgets.
+	if ok, _ := b.TryAcquireTarget("m", "another", now.Add(12*time.Minute)); !ok {
+		t.Fatal("post-prune grant denied")
+	}
+	if len(forgot) != 69 {
+		t.Fatalf("forget re-fired after the map dropped under the cap: %v", forgot)
+	}
+}
+
 // The package-global forget wiring mirrors the open hook: wired on
 // the configured breaker, dropped with the instance on reconfigure.
 func TestTargetBreakerGlobalForgetHook(t *testing.T) {

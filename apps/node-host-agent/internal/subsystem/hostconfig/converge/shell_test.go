@@ -214,6 +214,54 @@ func TestCfgScalar(t *testing.T) {
 	}
 }
 
+func TestCfgShellVal(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		// Empty IS allowed — optional keys legitimately render empty
+		// (unlike CfgScalar, which requires a non-empty scalar).
+		{"", true},
+		// Plain scalars, inner spaces, and ':' — legitimate in this
+		// conf's host:port stats listeners, ip:6443 fallback-map
+		// entries and peers lists (CfgScalar bans ':'; this gate
+		// keeps it).
+		{"value", true},
+		{"a b c", true},
+		{"host:6443", true},
+		{"10.0.0.1:6443", true},
+		{"#comment", true},
+		{"a#b", true},
+		{"it's", true}, // a single quote is literal inside "..."
+		// '"' closes the KEY="..." quoting — everything after it
+		// becomes shell code when the conf is sourced.
+		{`a"b`, false},
+		{`"`, false},
+		// '$' and backtick expand/execute even inside double quotes.
+		{"$HOME", false},
+		{"$(id)", false},
+		{"`id`", false},
+		// '\' escapes the render's OWN closing quote: the string
+		// swallows following conf lines and the next line's value
+		// parses outside quotes where ';' '|' '&' execute.
+		{`a\b`, false},
+		{`\`, false},
+		{`trail\`, false},
+		// Control bytes — first of all '\n' — splice extra conf lines.
+		{"a\nb", false},
+		{"a\tb", false},
+		{"a\x00b", false},
+		{"a\rb", false},
+		// Non-ASCII bytes are outside the printable range.
+		{"café", false},
+		{"✓", false},
+	} {
+		if got := CfgShellVal(tc.in); got != tc.want {
+			t.Errorf("CfgShellVal(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestCfgSysctlKey(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

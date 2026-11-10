@@ -172,6 +172,10 @@ var (
 		"node_host_agent_cgroup_memory_oom_kill_events_total",
 		"memory.events `oom_kill` of the unit — actual OOM kills counted by the cgroup.",
 		[]string{"node", "unit"}, nil)
+	descCgMemOOMGroupKill = prometheus.NewDesc(
+		"node_host_agent_cgroup_memory_oom_group_kill_events_total",
+		"memory.events `oom_group_kill` of the unit — whole-cgroup OOM kills (every task terminated at once).",
+		[]string{"node", "unit"}, nil)
 )
 
 // collectSystemdScopes counts cri-containerd-*.scope dirs under the
@@ -206,12 +210,16 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 // system.slice units (memory-events-reclaim): a climbing `high` count is
 // direct-reclaim throttling evidence — the unit freezes without an
 // OOMKill, the classic healthcheck-timeout-with-no-logs gray
-// failure; `oom_kill` counts the kills that do happen. Each series
-// emits only when its own field parses.
+// failure; `oom_kill` counts the kills that do happen and
+// `oom_group_kill` the whole-cgroup ones. Each series emits only
+// when its own field parses. W21-G2 adds the whole pod-workload
+// slice alongside the k0s daemons — pod-level high/oom_kill/
+// oom_group_kill counts were invisible while only system.slice
+// units were watched; the unit label spells it "kubepods.slice".
 func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
-	for _, unit := range c.cfg.CgroupMemUnits {
-		ev := vmstatCounters(filepath.Join(c.cfg.CgroupRoot,
-			"system.slice", unit, "memory.events"), "high", "oom_kill")
+	emit := func(unit, dir string) {
+		ev := vmstatCounters(filepath.Join(c.cfg.CgroupRoot, dir,
+			"memory.events"), "high", "oom_kill", "oom_group_kill")
 		if v, ok := ev["high"]; ok {
 			ch <- prometheus.MustNewConstMetric(descCgMemHigh,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
@@ -220,5 +228,13 @@ func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(descCgMemOOMKill,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
 		}
+		if v, ok := ev["oom_group_kill"]; ok {
+			ch <- prometheus.MustNewConstMetric(descCgMemOOMGroupKill,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
+		}
 	}
+	for _, unit := range c.cfg.CgroupMemUnits {
+		emit(unit, filepath.Join("system.slice", unit))
+	}
+	emit("kubepods.slice", "kubepods.slice")
 }

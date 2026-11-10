@@ -175,3 +175,54 @@ func TestClearAllSuspects(t *testing.T) {
 		t.Fatal("non-suspect state files must survive the clear")
 	}
 }
+
+// TestClearSuspectRemoveFailureIsDebugOnly: a budget path that
+// refuses removal (here: a non-empty directory squatting on the
+// last-suspect-<key> name) must not fail the clear — the failure is
+// Debug-surfaced and the caller carries on.
+func TestClearSuspectRemoveFailureIsDebugOnly(t *testing.T) {
+	s, _, _ := newTestStore(t)
+
+	// Squat on the budget path with a non-empty dir — os.Remove
+	// fails ENOTEMPTY, which is NOT IsNotExist and must take the
+	// Debug-log branch.
+	squatter := filepath.Join(s.Dir, SuspectBudgetPrefix+"stuck")
+	if err := os.MkdirAll(filepath.Join(squatter, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s.ClearSuspect("stuck") // must not panic or propagate
+
+	// Same failure inside the family-wide clear.
+	s.ClearAllSuspects()
+}
+
+// TestClearAllSuspectsRemoveFailureIsDebugOnly: one unw removable
+// member must not stop the sweep of the rest.
+func TestClearAllSuspectsRemoveFailureIsDebugOnly(t *testing.T) {
+	s, _, _ := newTestStore(t)
+
+	// A removable budget beside an unremovable one (non-empty dir).
+	s.RateSpend(SuspectBudgetPrefix + "good")
+	squatter := filepath.Join(s.Dir, SuspectBudgetPrefix+"stuck")
+	if err := os.MkdirAll(filepath.Join(squatter, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s.ClearAllSuspects()
+
+	if _, err := os.Stat(suspectBudgetPath(s, "good")); !os.IsNotExist(err) {
+		t.Fatal("removable suspect budget survived the sweep")
+	}
+	if _, err := os.Stat(squatter); err != nil {
+		t.Fatal("the squatter itself must be left alone")
+	}
+}
+
+// A Dir whose name breaks the glob pattern (unclosed '[') makes
+// filepath.Glob return ErrBadPattern — ClearAllSuspects fails open:
+// Debug-surfaced, no panic, no partial sweep.
+func TestClearAllSuspectsBadPattern(t *testing.T) {
+	s := New("/nonexistent-[", "", nil, nil)
+	s.ClearAllSuspects() // must not panic
+}

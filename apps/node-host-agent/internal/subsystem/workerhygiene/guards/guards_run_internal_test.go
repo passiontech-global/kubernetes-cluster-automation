@@ -395,7 +395,7 @@ func TestSpegelRunStaleSockDeleteUID(t *testing.T) {
 	}
 	gotUID := deleteUIDPrecondition(f)
 
-	// Point the seam's const-path stat at a temp socket recreated
+	// Point the seam's resolved-path stat at a temp socket recreated
 	// after podCreated + spegelSockStaleMargin — the stale inode.
 	sock := filepath.Join(t.TempDir(), "containerd.sock")
 	if err := os.WriteFile(sock, []byte("x"), 0o644); err != nil {
@@ -405,7 +405,7 @@ func TestSpegelRunStaleSockDeleteUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Cfg.Seams.Host.StatFn = func(path string) (os.FileInfo, error) {
-		if path == spegelContainerdSock {
+		if path == spegelSockPath(d.Cfg.CtrSocket) {
 			return os.Stat(sock)
 		}
 		return os.Stat(path)
@@ -425,7 +425,7 @@ func TestSpegelRunStaleSockDeleteUID(t *testing.T) {
 
 	// The inconclusive leg: a stat MISS is never a delete — the same
 	// fixture without the seam override stats the real (absent)
-	// /run/k0s/containerd.sock and must take the healthy exit.
+	// Cfg.CtrSocket path and must take the healthy exit.
 	d2, f2 := gDeps(t)
 	f2.Now = f2.Now.Add(time.Hour)
 	c2 := &SpegelCheck{d: d2, Fails: 1}
@@ -436,6 +436,57 @@ func TestSpegelRunStaleSockDeleteUID(t *testing.T) {
 	}
 	if c2.Fails != 0 {
 		t.Fatalf("healthy exit must clear the streak, fails=%d", c2.Fails)
+	}
+}
+
+// TestSpegelRunStaleSockUsesCfgCtrSocket confirms Run resolves the
+// staleness stat path from Cfg.CtrSocket (the /host/run view every
+// other containerd probe shares), not the pod-side const — and that
+// an empty Cfg.CtrSocket falls back to spegelContainerdSock.
+func TestSpegelRunStaleSockUsesCfgCtrSocket(t *testing.T) {
+	ctx := context.Background()
+
+	var statPath string
+	d, f := gDeps(t)
+	f.Now = f.Now.Add(time.Hour)
+	custom := "/custom/host/run/k0s/containerd.sock"
+	d.Cfg.CtrSocket = custom
+	sock := filepath.Join(t.TempDir(), "containerd.sock")
+	if err := os.WriteFile(sock, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(sock, f.Now, f.Now); err != nil {
+		t.Fatal(err)
+	}
+	d.Cfg.Seams.Host.StatFn = func(path string) (os.FileInfo, error) {
+		statPath = path
+		if path == custom {
+			return os.Stat(sock)
+		}
+		return os.Stat(path)
+	}
+	sp := spegelPod(f, true)
+	sp.UID = types.UID("uid-spegel-custom")
+	if _, err := f.CS.CoreV1().Pods("spegel").Create(
+		ctx, &sp, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c := &SpegelCheck{d: d}
+	c.Run(ctx, runEnv(sp))
+	if statPath != custom {
+		t.Fatalf("StatFn saw path %q want Cfg.CtrSocket %q", statPath, custom)
+	}
+	if got := wdepstest.DeleteActions(f.CS); len(got) != 1 {
+		t.Fatalf("stale socket on custom path must delete, actions=%v", got)
+	}
+
+	// Empty Cfg.CtrSocket → spegelSockPath falls back to the pod-side
+	// const; a stale stat there still drives the delete.
+	if got := spegelSockPath(""); got != spegelContainerdSock {
+		t.Fatalf("spegelSockPath(\"\")=%q want %q", got, spegelContainerdSock)
+	}
+	if got := spegelSockPath(custom); got != custom {
+		t.Fatalf("spegelSockPath(custom)=%q want %q", got, custom)
 	}
 }
 

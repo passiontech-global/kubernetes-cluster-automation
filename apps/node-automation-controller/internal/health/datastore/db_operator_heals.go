@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
@@ -30,7 +31,7 @@ var dbOperatorNames = []string{
 	"mariadb-operator", "pxc-operator", "psmdb-operator",
 	"pg-operator", "scylla-operator",
 	"percona-xtradb-cluster-operator", "percona-server-mongodb-operator",
-	"percona-postgresql-operator",
+	"percona-postgresql-operator", "cloudnative-pg",
 }
 
 // dbOperatorDeploymentAliases groups the Deployment/pod-name spellings
@@ -43,6 +44,7 @@ var dbOperatorDeploymentAliases = map[string][]string{
 	"percona-xtradb-cluster-operator": {"percona-xtradb-cluster-operator", "pxc-operator"},
 	"percona-server-mongodb-operator": {"percona-server-mongodb-operator", "psmdb-operator"},
 	"percona-postgresql-operator":     {"percona-postgresql-operator", "pg-operator"},
+	"cloudnative-pg":                  {"cloudnative-pg", "cnpg-controller-manager"},
 }
 
 // dbOperatorPodPrefixes returns every pod-name prefix the logical
@@ -63,21 +65,37 @@ func dbOperatorPodPrefixes(operator string) []string {
 	return []string{operator}
 }
 
+// dbOperatorLabelKeys are the label keys operators actually stamp
+// their identity on (app.kubernetes.io/managed-by,
+// app.kubernetes.io/part-of and app.kubernetes.io/name).
+var dbOperatorLabelKeys = []string{
+	"app.kubernetes.io/managed-by",
+	"app.kubernetes.io/part-of",
+	"app.kubernetes.io/name",
+}
+
 // dbOperatorFor returns the db operator name owning this StatefulSet,
 // or "" — matching ONLY the label keys operators actually stamp their
-// identity on (app.kubernetes.io/managed-by, app.kubernetes.io/part-of
-// and app.kubernetes.io/name) plus controller ownerReference names.
-// Matching every label VALUE was wrong: an image tag or chart name
-// containing e.g. "pg-operator" would attribute an unrelated STS to
-// that operator and let the check bounce its pods.
+// identity on (dbOperatorLabelKeys) plus controller ownerReference
+// names. Matching every label VALUE was wrong: an image tag or chart
+// name containing e.g. "pg-operator" would attribute an unrelated STS
+// to that operator and let the check bounce its pods.
 func dbOperatorFor(sts *appsv1.StatefulSet) string {
-	operatorLabelKeys := []string{
-		"app.kubernetes.io/managed-by",
-		"app.kubernetes.io/part-of",
-		"app.kubernetes.io/name",
-	}
-	for _, lbls := range []map[string]string{sts.Labels, sts.Spec.Template.Labels} {
-		for _, key := range operatorLabelKeys {
+	return dbOperatorForLabels(
+		[]map[string]string{sts.Labels, sts.Spec.Template.Labels},
+		sts.OwnerReferences)
+}
+
+// dbOperatorForLabels is the label-set form of dbOperatorFor for
+// workloads with no StatefulSet to read — a CNPG Cluster's pod labels
+// arrive pre-aggregated. The same restricted-key rule applies: only
+// dbOperatorLabelKeys values and ownerReference names are matched, so
+// an arbitrary workload label can never attribute a heal target.
+func dbOperatorForLabels(labelSets []map[string]string,
+	ownerRefs []metav1.OwnerReference) string {
+
+	for _, lbls := range labelSets {
+		for _, key := range dbOperatorLabelKeys {
 			v := lbls[key]
 			for _, op := range dbOperatorNames {
 				if strings.Contains(v, op) {
@@ -86,7 +104,7 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 			}
 		}
 	}
-	for _, ref := range sts.OwnerReferences {
+	for _, ref := range ownerRefs {
 		for _, op := range dbOperatorNames {
 			if strings.Contains(ref.Name, op) {
 				return op
@@ -129,5 +147,5 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 	}
 	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
 		"operator", operator, "service", sig.ns+"/"+sig.svc,
-		"statefulset", sig.sts.Name)
+		"workload", sig.workloadName())
 }

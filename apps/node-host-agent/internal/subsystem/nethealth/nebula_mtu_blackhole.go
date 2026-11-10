@@ -235,8 +235,18 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 			peer, mtuDFSize, fails, mtuBlackholeNeeded, err,
 			trimRunErr(out)), suspectLogCadence)
 		if fails >= mtuBlackholeNeeded {
+			// NPD contract: the ACTION entry line feeds
+			// NebulaMTUBlackhole (events.go) — ActionEntryRe
+			// parses it. Once per episode, gated on the latch
+			// being absent (Enter is idempotent while held).
+			fresh := !n.state.Exists(latchdefs.LatchNebulaMTUBlackhole)
 			n.state.Enter(latchdefs.LatchNebulaMTUBlackhole,
 				fmt.Sprintf("peer=%s df_size=%s", peer, mtuDFSize))
+			if fresh {
+				n.state.AppendLog(latchdefs.ActionEntryPrefix(
+					latchdefs.LatchNebulaMTUBlackhole) +
+					fmt.Sprintf("peer=%s df_size=%s", peer, mtuDFSize))
+			}
 			n.maybeClampNebulaMSS(ctx, wd, st)
 		}
 		return

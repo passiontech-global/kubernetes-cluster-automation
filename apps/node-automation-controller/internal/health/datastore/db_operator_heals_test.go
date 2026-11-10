@@ -160,3 +160,45 @@ func TestDBOperatorHealNoRunningPodDefers(t *testing.T) {
 		}
 	}
 }
+
+// dbOperatorForLabels — the label-set form dbOperatorFor delegates
+// to (and the CNPG candidate path calls with the synthetic
+// cnpg.io/cluster map): only the restricted operator identity keys
+// and ownerReference names match. An arbitrary label VALUE carrying
+// an operator substring must NOT attribute — that is the loose-match
+// bug dbOperatorFor's restricted keys exist to prevent, and a CNPG
+// cluster literally named "pg-operator-x" proves it.
+func TestDBOperatorForLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		labelSets []map[string]string
+		owners    []metav1.OwnerReference
+		want      string
+	}{
+		{"managed-by on a label set",
+			[]map[string]string{{"app.kubernetes.io/managed-by": "pxc-operator"}},
+			nil, "pxc-operator"},
+		{"part-of wins across multiple sets",
+			[]map[string]string{
+				{"app": "x"},
+				{"app.kubernetes.io/part-of": "mariadb-operator"},
+			}, nil, "mariadb-operator"},
+		{"ownerReference name",
+			nil,
+			[]metav1.OwnerReference{{Name: "percona-postgresql-operator-0"}},
+			"percona-postgresql-operator"},
+		{"cnpg cluster label is not an identity key",
+			[]map[string]string{{cnpgClusterLabel: "pg-operator-x"}},
+			nil, ""},
+		{"arbitrary label value never matches",
+			[]map[string]string{{"app": "pg-operator"}},
+			nil, ""},
+		{"empty inputs", nil, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dbOperatorForLabels(tc.labelSets, tc.owners); got != tc.want {
+				t.Fatalf("dbOperatorForLabels = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

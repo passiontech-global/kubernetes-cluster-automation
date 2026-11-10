@@ -389,7 +389,7 @@ func TestNatsJetstreamStreamLeaderlessEmitsThenHeals(t *testing.T) {
 	base := time.Now()
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		switch {
-		case strings.Contains(query, "sum by"):
+		case strings.Contains(query, "min by"):
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
 		case strings.Contains(query, "stream_leader"):
@@ -444,7 +444,7 @@ func TestNatsJetstreamStreamLeaderlessQuorumGuard(t *testing.T) {
 	base := time.Now()
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		switch {
-		case strings.Contains(query, "sum by"):
+		case strings.Contains(query, "min by"):
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
 		case strings.Contains(query, "stream_leader"):
@@ -477,7 +477,7 @@ func TestNatsJetstreamStreamLeaderlessQuorumGuard(t *testing.T) {
 func TestNatsJetstreamStreamLeaderlessNamespaceScope(t *testing.T) {
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		switch {
-		case strings.Contains(query, "sum by"):
+		case strings.Contains(query, "min by"):
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
 		case strings.Contains(query, "stream_leader"):
@@ -503,6 +503,91 @@ func TestNatsJetstreamStreamLeaderlessNamespaceScope(t *testing.T) {
 		if _, err := cs.CoreV1().Pods("mq").
 			Get(ctx, name, metav1.GetOptions{}); err != nil {
 			t.Fatalf("namespace-scope verdict must not bounce pods: %v", err)
+		}
+	}
+}
+
+// Multi-stream partial leader loss: namespace "mq" runs two streams —
+// events keeps its leader (series value 1) while orders lost hers
+// (0). `sum by` would read 1 and miss the loss entirely; `min by`
+// reads 0 and flags the namespace. The stub answers `sum by` with 1
+// so a regression back to sum fails this test loudly.
+func TestNatsJetstreamStreamLeaderlessPartialLoss(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "min by"):
+			// min(events=1, orders=0) = 0 — the leaderless stream wins.
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		case strings.Contains(query, "sum by"):
+			// Only reachable if the check regresses to `sum by` —
+			// the summed value stays positive and the check passes.
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 1}}
+		case strings.Contains(query, "stream_leader"):
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "nats-0",
+					"stream_name": "events"}, Value: 1},
+				{Labels: map[string]string{"namespace": "mq", "pod": "nats-0",
+					"stream_name": "orders"}, Value: 0},
+			}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset(natsFixture()...)
+	p := natsProber(cs, srv)
+
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("partial stream leader loss must FAIL the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_nats_jetstream_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "nats-0",
+			"reason": "stream_leaderless"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("stream_leaderless gauge must emit on partial leader loss")
+	}
+}
+
+// natsSTSKey resolves the StatefulSet owning a member pod — the
+// per-cluster quorum-census grouping key. The controller owner ref
+// wins; the "<sts>-<ordinal>" name shape is the fallback for a pod
+// whose owner ref was stripped, and a dash-less name groups under
+// itself so two clusters can never pool members.
+func TestNatsSTSKey(t *testing.T) {
+	stsOwned := func() *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mq", Name: "nats-1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "StatefulSet", Name: "nats-cluster-a",
+				Controller: ptr.To(true)}}}}
+	}
+	if got := natsSTSKey(stsOwned()); got != "mq/nats-cluster-a" {
+		t.Fatalf("owner-ref key = %q, want mq/nats-cluster-a", got)
+	}
+	// A non-StatefulSet controller (or a non-controller ref) falls
+	// through to the name shape.
+	rsOwned := stsOwned()
+	rsOwned.OwnerReferences[0].Kind = "ReplicaSet"
+	if got := natsSTSKey(rsOwned); got != "mq/nats" {
+		t.Fatalf("replicaset-owned key = %q, want mq/nats", got)
+	}
+	bare := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "mq", Name: "nats-2"}}
+	if got := natsSTSKey(bare); got != "mq/nats" {
+		t.Fatalf("name-shape key = %q, want mq/nats", got)
+	}
+	// Dash-less and trailing-dash names still resolve to a stable
+	// group key — never an empty or truncated one.
+	for name, want := range map[string]string{
+		"nats":    "mq/nats",
+		"nats-":   "mq/nats",
+		"a-b-c-0": "mq/a-b-c",
+	} {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mq", Name: name}}
+		if got := natsSTSKey(p); got != want {
+			t.Errorf("natsSTSKey(%q)=%q, want %q", name, got, want)
 		}
 	}
 }

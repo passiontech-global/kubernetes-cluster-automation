@@ -373,7 +373,7 @@ var operatorTargets = []operatorTarget{
 		name:        "self-node-remediation-operator",
 		leaseNS:     "operators",
 		leaseNames:  []string{"547f6cb6.medik8s.io"},
-		podSelector: "control-plane=controller-manager,self-node-remediation-operator",
+		podSelector: "app.kubernetes.io/name=self-node-remediation-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
 			gvr:    kube.GVRSelfNodeRemediation,
@@ -452,7 +452,7 @@ var operatorTargets = []operatorTarget{
 		name:          "shipwright-operator",
 		leaseNS:       "operators",
 		leaseNames:    []string{"01a9b2d1.shipwright.io"},
-		podSelector:   "app=shipwright-operator,control-plane=controller-manager",
+		podSelector:   "name=shipwright-operator",
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -539,12 +539,15 @@ var operatorTargets = []operatorTarget{
 	{
 		// fence-agents-remediation (W20): the FAR operator in
 		// operators — medik8s election ids are per-operator hashes
-		// (e1f13584/547f6cb6.medik8s.io for NHC/SNR) and FAR's is not
-		// pinned here, so the leaseOptional Running-pod fallback is
-		// the liveness proof; the CR signature is the same sparse-
-		// status medik8s variant noStatusAtAll covers.
+		// (e1f13584/547f6cb6.medik8s.io for NHC/SNR, c21c06a5 for
+		// FAR); the pinned lease restores the stale-Lease check and
+		// cooldown-annotation heal the pod fallback cannot provide,
+		// while leaseOptional still covers a future id rotation.
+		// The CR signature is the same sparse-status medik8s variant
+		// noStatusAtAll covers.
 		name:          "fence-agents-remediation-operator",
 		leaseNS:       "operators",
+		leaseNames:    []string{"c21c06a5.medik8s.io"},
 		podSelector:   "app.kubernetes.io/name=fence-agents-remediation-operator",
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,

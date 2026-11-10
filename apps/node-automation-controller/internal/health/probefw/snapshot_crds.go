@@ -19,10 +19,7 @@ import (
 // gvrCustomResourceDefinitions is the apiextensions/v1 CRD GVR —
 // cluster-scoped, read through the dynamic client (no typed client
 // for apiextensions in this module's imports).
-var gvrCustomResourceDefinitions = schema.GroupVersionResource{
-	Group: "apiextensions.k8s.io", Version: "v1",
-	Resource: "customresourcedefinitions",
-}
+var gvrCustomResourceDefinitions = kube.GVRCustomResourceDefinition
 
 // AllCRDs is the CRD twin — the shared definition census that tells
 // which operator CRDs exist before a check walks their instances

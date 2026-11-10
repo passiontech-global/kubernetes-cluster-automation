@@ -24,9 +24,9 @@ import (
 // False — the 2026-11-07 zombie left by a wedged reporter.
 func TestNodeCondSweeperClearsZombie(t *testing.T) {
 	n := probetest.ReadyWorkerNode("w-zombie", "KubeletPLEGUnhealthy",
-		nodeHangCondHeartbeatMaxAge+time.Minute, false)
+		nodeCondSweepHeartbeatMaxAge+time.Minute, false)
 	n.Status.Conditions[1].LastHeartbeatTime =
-		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
 	cs := fake.NewSimpleClientset(n,
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
@@ -82,7 +82,7 @@ func TestNodeCondSweeperKeepsFreshNoHeartbeat(t *testing.T) {
 // Non-managed condition types (kubelet-owned, foreign writers) are
 // never patched even with a frozen heartbeat.
 func TestNodeCondSweeperIgnoresForeignConditions(t *testing.T) {
-	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
+	old := metav1.NewTime(time.Now().Add(-2 * nodeCondSweepHeartbeatMaxAge))
 	n := probetest.ReadyWorkerNode("w-foreign", "", 0, false)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               "ForeignCondition",
@@ -108,7 +108,7 @@ func TestNodeCondSweeperIgnoresForeignConditions(t *testing.T) {
 // run on 2026-11-07.
 func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 	n := precordonedWorkerNode("w-held", true)
-	old := metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	old := metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               "KubeletPLEGUnhealthy",
 		Status:             corev1.ConditionTrue,
@@ -138,7 +138,7 @@ func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 // member. The remaining split (KernelDeadlock permanent, kubelet
 // condition types untouched) is pinned by nodecond.
 func TestNodeCondSweeperSweepsFrozenInodePressure(t *testing.T) {
-	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
+	old := metav1.NewTime(time.Now().Add(-2 * nodeCondSweepHeartbeatMaxAge))
 	n := probetest.ReadyWorkerNode("w-inode", "", 0, false)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
 		Type:               "InodePressure",
@@ -177,9 +177,9 @@ func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
 		t.Fatal("WatchdogStale missing from the sweeper allowlist")
 	}
 	n := probetest.ReadyWorkerNode("w-watchdog", "WatchdogStale",
-		nodeHangCondHeartbeatMaxAge+time.Minute, false)
+		nodeCondSweepHeartbeatMaxAge+time.Minute, false)
 	n.Status.Conditions[1].LastHeartbeatTime =
-		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
 	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
@@ -213,10 +213,10 @@ func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
 // CONSUMER side: a name in HeartbeatSweptNames that the sweeper
 // skipped would be a zombie the reporter can never reconcile.
 func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
-	old := metav1.NewTime(time.Now().Add(-2 * nodeHangCondHeartbeatMaxAge))
+	old := metav1.NewTime(time.Now().Add(-2 * nodeCondSweepHeartbeatMaxAge))
 	for _, name := range nodecond.HeartbeatSweptNames {
 		n := probetest.ReadyWorkerNode("w-sweep-"+name, corev1.NodeConditionType(name),
-			nodeHangCondHeartbeatMaxAge+time.Minute, false)
+			nodeCondSweepHeartbeatMaxAge+time.Minute, false)
 		n.Status.Conditions[1].LastHeartbeatTime = old
 		cs := fake.NewSimpleClientset(n)
 		p := testProberDyn(cs, probetest.OpDyn())
@@ -252,9 +252,9 @@ func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
 // census for nothing.
 func TestNodeCondSweeperPatchInvalidatesNodesOnly(t *testing.T) {
 	n := probetest.ReadyWorkerNode("w-zombie", "KubeletPLEGUnhealthy",
-		nodeHangCondHeartbeatMaxAge+time.Minute, false)
+		nodeCondSweepHeartbeatMaxAge+time.Minute, false)
 	n.Status.Conditions[1].LastHeartbeatTime =
-		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
 	cs := fake.NewSimpleClientset(n,
 		probetest.ReadyWorkerNode("w-ok", "", 0, false),
 		probetest.PendingUnscheduledPod("apps", "witness", time.Minute, true))
@@ -309,5 +309,61 @@ func TestNodeCondSweeperPatchInvalidatesNodesOnly(t *testing.T) {
 		if c := kube.NodeCondition(&fresh[i], "KubeletPLEGUnhealthy"); c == nil || c.Status != corev1.ConditionFalse {
 			t.Fatalf("post-patch census carries the stale pre-patch copy: %+v", c)
 		}
+	}
+}
+
+// A NotReady node is mid-rescue — NHC/SNR/FAR own its conditions
+// now, so the sweeper must not erase the evidence the remediation
+// path reads. The zombie True survives untouched and the check
+// stays quiet.
+func TestNodeCondSweeperSkipsNotReadyNode(t *testing.T) {
+	n := probetest.ReadyWorkerNode("w-notready", "KubeletPLEGUnhealthy",
+		nodeCondSweepHeartbeatMaxAge+time.Minute, false)
+	// Flip Ready to False — kubelet is down, the rescue path owns
+	// this node's conditions now.
+	for i := range n.Status.Conditions {
+		if n.Status.Conditions[i].Type == corev1.NodeReady {
+			n.Status.Conditions[i].Status = corev1.ConditionFalse
+		}
+	}
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(n,
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("NotReady node's zombie must be left for the rescue path: %+v", res)
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-notready", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := kube.NodeCondition(got, "KubeletPLEGUnhealthy")
+	if c == nil || c.Status != corev1.ConditionTrue {
+		t.Fatalf("NotReady zombie condition = %+v, want Status=True untouched", c)
+	}
+}
+
+// The zombie TTL is 25m — a condition whose heartbeat froze 20m ago
+// is still inside the NHC remediation window (WatchdogStale allows
+// 1200s) and must NOT be swept yet; only past 25m does the sweeper
+// call the writer dead.
+func TestNodeCondSweeperTTLBoundary(t *testing.T) {
+	// 20m-frozen heartbeat: inside the window → untouched.
+	n := probetest.ReadyWorkerNode("w-mid", "KubeletPLEGUnhealthy",
+		nodeCondSweepHeartbeatMaxAge, false)
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-20 * time.Minute))
+	n.Status.Conditions[1].LastTransitionTime =
+		metav1.NewTime(time.Now().Add(-20 * time.Minute))
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("20m-frozen condition must survive inside the TTL: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-mid", metav1.GetOptions{})
+	if c := kube.NodeCondition(got, "KubeletPLEGUnhealthy"); c == nil ||
+		c.Status != corev1.ConditionTrue {
+		t.Fatalf("20m zombie = %+v, want Status=True untouched", c)
 	}
 }

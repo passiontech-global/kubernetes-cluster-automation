@@ -11,6 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -78,6 +83,67 @@ func TestCgroupThrottleDetectsMemoryHigh(t *testing.T) {
 	if h.PodCgroupMemoryThrottled != 1 {
 		t.Fatalf("throttled=%d want 1 (flat high = episode over)",
 			h.PodCgroupMemoryThrottled)
+	}
+}
+
+// TestCgroupThrottlePodMemoryHighThrottledEvent — W21-G2: the
+// throttle verdict also lands a PodMemoryHighThrottled Warning on
+// the owning Pod, deduped per pod slice and re-armed by a
+// conclusive non-throttle cycle.
+func TestCgroupThrottlePodMemoryHighThrottledEvent(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "throttled", Namespace: "default",
+			UID: types.UID(wdepstest.UIDA)},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	h := e.H
+	ctx := context.Background()
+	cg := t.TempDir()
+	h.Cfg.Runtime.CgroupRoot = cg
+	slice := filepath.Join("kubepods.slice",
+		"kubepods-pod"+strings.ReplaceAll(wdepstest.UIDA, "-", "_")+".slice")
+	mkPodSlice(t, cg, slice, "55.00", "10", "20", "500", "0")
+	env := &wdeps.CycleEnv{WorkerActive: true, Pods: []corev1.Pod{*pod}}
+	run := func() {
+		wdepstest.Check[*runtime.CgroupThrottleCheck](h,
+			wdeps.CheckCgroupThrottle).Run(ctx, env)
+	}
+
+	run() // baseline — first sighting, no delta yet
+	mkPodSlice(t, cg, slice, "55.00", "14", "20", "500", "0")
+	run() // throttle verdict → first event
+	evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 1 || evs.Items[0].Reason != "PodMemoryHighThrottled" {
+		t.Fatalf("events=%+v want one PodMemoryHighThrottled", evs.Items)
+	}
+	if evs.Items[0].Regarding.Name != "throttled" {
+		t.Fatalf("event regarding=%q want pod throttled",
+			evs.Items[0].Regarding.Name)
+	}
+	// Same episode, high keeps growing — the dedupe marker holds.
+	mkPodSlice(t, cg, slice, "55.00", "20", "20", "500", "0")
+	run()
+	evs, _ = e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if len(evs.Items) != 1 {
+		t.Fatalf("dedupe failed: %d events in one episode", len(evs.Items))
+	}
+	// Conclusive non-throttle cycle (avg60 cool, high flat) re-arms.
+	mkPodSlice(t, cg, slice, "10.00", "20", "20", "500", "0")
+	run()
+	// A NEW throttle burst emits a fresh event — advance the clock
+	// so the events.v1 name (<pod>.<nanos>) doesn't collide with
+	// the first episode's on the frozen fixture clock.
+	e.Now = e.Now.Add(time.Second)
+	mkPodSlice(t, cg, slice, "60.00", "25", "20", "500", "0")
+	run()
+	evs, _ = e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if len(evs.Items) != 2 {
+		t.Fatalf("re-armed episode emitted %d events, want 2", len(evs.Items))
 	}
 }
 
