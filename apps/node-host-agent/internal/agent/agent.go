@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -70,6 +72,16 @@ func New(cfg Config) *Agent {
 	}
 	a := &Agent{cfg: cfg, reg: reg}
 
+	// Go runtime + process metrics (go_memstats_*, process_rss, fds,
+	// network) on the shared registry — the memory-triage evidence for
+	// the per-node scan bursts (GOMEMLIMIT sizing, DaemonSet limit).
+	// Same registration as the controller's metrics package so both
+	// endpoints answer the same triage queries.
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
 	a.info = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_host_agent_info",
 		Help: "Static agent identity.",
@@ -117,6 +129,17 @@ func (a *Agent) metricsMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(a.reg,
 		promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}))
+	// pprof on the metrics listener — same contract as
+	// node-automation-controller (heap/goroutine profiles for memory
+	// triage). NOTE: the DaemonSet exposes 9115 as a hostPort, so this
+	// is reachable from the node network, not just in-cluster; the
+	// host-internal-ports nft guard (hostconfig group_nld) already
+	// fences inbound traffic to these listener ports.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	return mux
 }
 
