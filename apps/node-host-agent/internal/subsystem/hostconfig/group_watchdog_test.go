@@ -232,6 +232,10 @@ func TestWatchdogConfInjectionFailsClosed(t *testing.T) {
 		"newline":  "interdc_slowpath_rtt_ms: |-\n  100\n  200",
 		"expand":   `interdc_slowpath_rtt_ms: '$(id)'`,
 		"backtick": "interdc_slowpath_rtt_ms: '`id`'",
+		// A trailing backslash escapes the render's own closing
+		// quote: the string swallows the following conf lines and the
+		// next line's value parses OUTSIDE quotes where ; | & execute.
+		"backslash": `interdc_slowpath_rtt_ms: 'neb1\'`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			vars := writeVarsDir(t, "")

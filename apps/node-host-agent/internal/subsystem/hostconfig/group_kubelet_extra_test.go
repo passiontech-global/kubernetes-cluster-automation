@@ -31,6 +31,16 @@ func TestKubeletCfgPathDiscovery(t *testing.T) {
 		t.Fatalf("kubeletCfgPath = %q, want the probed path", got)
 	}
 
+	// The probe WINS over an existing stale candidate: a kubelet
+	// running with a non-listed --config beside a stale listed file
+	// must get its live config patched, not the leftover.
+	sr.ClearLog()
+	sr.On("pgrep -x kubelet", "/etc/kubelet/custom.yaml")
+	hostWrite(t, r, "/var/lib/k0s/kubelet/config.yaml", "apiVersion: kubelet.config.k8s.io/v1beta1\n")
+	if got := c.kubeletCfgPath(); got != "/etc/kubelet/custom.yaml" {
+		t.Fatalf("kubeletCfgPath = %q, want the probed path over the stale candidate", got)
+	}
+
 	// Probe silent → first existing candidate.
 	sr.ClearLog()
 	sr.On("pgrep -x kubelet", "")
