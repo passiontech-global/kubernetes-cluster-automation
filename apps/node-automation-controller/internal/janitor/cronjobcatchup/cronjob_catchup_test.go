@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -871,5 +872,56 @@ func TestCronJobCatchupImpossibleScheduleNotStale(t *testing.T) {
 	}
 	if n := ccJobCount(t, cs, "ops"); n != 0 {
 		t.Fatalf("catch-up spawned for a schedule that can never fire (%d jobs)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// unfreezeDeadline — the >100-missed cap repair patch
+// ---------------------------------------------------------------------------
+
+// The repair lands the provenance annotation AND
+// spec.startingDeadlineSeconds=3600 in one merge patch — merge
+// preserves every spec key not named, so a concurrent writer's
+// edits cannot be clobbered. Reports true so the caller skips its
+// own catch-up spawn this cycle (KCM's recovery Job is the catch-up).
+func TestUnfreezeDeadlineStamps(t *testing.T) {
+	cj := ccCronJob("batch", "nightly", "0 0 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if !c.unfreezeDeadline(ctx, logr.Discard(), cj, time.Now()) {
+		t.Fatal("unfreezeDeadline reported failure on a clean patch")
+	}
+	got, err := cs.BatchV1().CronJobs("batch").Get(ctx, "nightly", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.StartingDeadlineSeconds == nil ||
+		*got.Spec.StartingDeadlineSeconds != deadlinePatchSeconds {
+		t.Fatalf("startingDeadlineSeconds = %v, want %d",
+			got.Spec.StartingDeadlineSeconds, deadlinePatchSeconds)
+	}
+	if _, ok := got.Annotations[deadlinePatchedAnno]; !ok {
+		t.Fatal("provenance annotation not stamped — the repair is invisible to audit")
+	}
+}
+
+// A patch failure is counted and returns false — absorbed (the
+// sweep retries next cycle) but metered, and the caller still spawns
+// its own catch-up this cycle since the deadline repair never landed.
+func TestUnfreezeDeadlinePatchErrorCounted(t *testing.T) {
+	cj := ccCronJob("batch", "nightly", "0 0 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	cs.PrependReactor("patch", "cronjobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	c := newCatchup(cs)
+	c.queue = "cronjob-catchup"
+	before := testutil.QueueErrorCount(t, "cronjob-catchup")
+	if c.unfreezeDeadline(ctx, logr.Discard(), cj, time.Now()) {
+		t.Fatal("unfreezeDeadline reported success on a failed patch")
+	}
+	if got := testutil.QueueErrorCount(t, "cronjob-catchup") - before; got != 1 {
+		t.Fatalf("queue errors delta = %v, want 1", got)
 	}
 }

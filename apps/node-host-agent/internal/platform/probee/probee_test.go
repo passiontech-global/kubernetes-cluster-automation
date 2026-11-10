@@ -2,6 +2,7 @@ package probee
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -398,3 +399,44 @@ func TestProbesHonorDeadline(t *testing.T) {
 // Silence the unused-import-style lint for the package logger — it
 // exists so future probe additions can log without a new file.
 var _ = logger
+
+// clientOrDefault: the variadic *http.Client seam — an injected
+// client wins, nil/absent falls back to the probe's package default.
+func TestClientOrDefault(t *testing.T) {
+	injected := &http.Client{}
+	if got := clientOrDefault([]*http.Client{injected}, insecureClient); got != injected {
+		t.Fatal("injected client not preferred")
+	}
+	if got := clientOrDefault([]*http.Client{nil}, insecureClient); got != insecureClient {
+		t.Fatal("nil injected client must fall back to the default")
+	}
+	if got := clientOrDefault(nil, plainClient); got != plainClient {
+		t.Fatal("absent client must fall back to the default")
+	}
+}
+
+// failReadBody is a response body that fails every Read — the
+// HTTPBodyInsecure verdict propagates it instead of returning "".
+type failReadBody struct{}
+
+func (failReadBody) Read([]byte) (int, error) { return 0, errors.New("read boom") }
+func (failReadBody) Close() error             { return nil }
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestHTTPBodyInsecureReadError(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(
+		func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       failReadBody{},
+				Request:    r,
+			}, nil
+		})}
+	if _, err := HTTPBodyInsecure(context.Background(),
+		"http://probe.invalid/", 5*time.Second, client); err == nil {
+		t.Fatal("body read error must propagate")
+	}
+}

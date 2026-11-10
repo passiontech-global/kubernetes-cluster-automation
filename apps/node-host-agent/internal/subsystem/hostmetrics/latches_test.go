@@ -225,3 +225,49 @@ func TestSnapStaleLatchPathsEmptyDir(t *testing.T) {
 		t.Fatalf("bad-pattern glob = %v, want nil", got)
 	}
 }
+
+// refreshLatches' signal-driven updaters — the PSI read, an
+// ST_RDONLY statfs flag and a parseable key-users file each drive
+// their latch (the earlier tests only exercised the mtime-refresh
+// half with inconclusive inputs).
+func TestRefreshLatchesSignalPaths(t *testing.T) {
+	cfg, _ := fixture(t)
+	logFile := filepath.Join(t.TempDir(), "watchdog.log")
+	cfg.WatchdogLogFile = logFile
+
+	// PSI over the enter threshold → state-node-overloaded.
+	psi := filepath.Join(t.TempDir(), "cpu-pressure")
+	testutil.WriteFile(t, psi, "some avg10=1.00 avg60=95.00 avg300=0.00 total=1\n")
+	cfg.PSIFile = psi
+
+	// One mount flagged ST_RDONLY (flag bit 1) → state-filesystem-readonly.
+	cfg.FilesystemTargets = []string{"/fake/etc", "/fake/k0s"}
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		st.Files = 1000
+		st.Ffree = 999
+		if path == "/fake/etc" {
+			st.Flags = 1 // ST_RDONLY
+		}
+		return nil
+	}
+
+	// key-users at 96% of maxkeys → state-kernel-keys-pressure.
+	ku := filepath.Join(t.TempDir(), "key-users")
+	testutil.WriteFile(t, ku, "  1000: 42 96000 95000 100000 2500000\n")
+	cfg.KeyUsersFile = ku
+
+	c := New(cfg)
+	c.Latches().refreshLatches()
+
+	for _, name := range []string{
+		latchdefs.LatchNodeOverloaded,
+		latchdefs.LatchFilesystemReadonly,
+		latchdefs.LatchKernelKeysPressure,
+	} {
+		p := filepath.Join(cfg.WatchdogStateDir,
+			latchdefs.LatchFilePrefix+name)
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("state-%s missing after refresh: %v", name, err)
+		}
+	}
+}

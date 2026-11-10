@@ -403,3 +403,78 @@ func TestDownloadFileArtifactCap(t *testing.T) {
 		t.Fatalf("content = %d bytes, want the full capped artifact", len(got))
 	}
 }
+
+// DownloadFile's remaining failure paths: unbuildable request, a
+// parent component that is not a dir, a squatter at the .dl staging
+// name, and a rename target that is a directory.
+func TestDownloadFileFailures(t *testing.T) {
+	ctx := context.Background()
+	payload := "x"
+
+	t.Run("bad URL", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "f")
+		if err := DownloadFile(ctx, "http://bad url", dst, "", 5*time.Second); err == nil {
+			t.Fatal("expected request-build error")
+		}
+	})
+
+	t.Run("mkdir under a file fails", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(payload))
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		testutil.WriteFile(t, filepath.Join(dir, "blocker"), "x")
+		if err := DownloadFile(ctx, srv.URL, filepath.Join(dir, "blocker", "f"), "", 5*time.Second); err == nil {
+			t.Fatal("expected mkdir error")
+		}
+	})
+
+	t.Run(".dl squatter fails the stage", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(payload))
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "f")
+		if err := os.Mkdir(dst+".dl", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := DownloadFile(ctx, srv.URL, dst, "", 5*time.Second); err == nil {
+			t.Fatal("expected stage-create error")
+		}
+	})
+
+	t.Run("rename over a dir fails", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(payload))
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "f")
+		if err := os.Mkdir(dst, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := DownloadFile(ctx, srv.URL, dst, "", 5*time.Second); err == nil {
+			t.Fatal("expected rename error onto a directory")
+		}
+		if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {
+			t.Fatal("staged .dl not swept after rename failure")
+		}
+	})
+}
+
+// installMember's rename refuses a directory dst the same way —
+// surfaced through UntarInstall.
+func TestUntarInstallDstIsDir(t *testing.T) {
+	dir := t.TempDir()
+	tgz := filepath.Join(dir, "bundle.tar.gz")
+	writeTarGz(t, tgz, map[string]string{"bin/tool": "tool-bytes"})
+	dst := filepath.Join(dir, "tool")
+	if err := os.Mkdir(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := UntarInstall(tgz, "tool", dst, 0o755); err == nil {
+		t.Fatal("expected rename error onto a directory")
+	}
+}

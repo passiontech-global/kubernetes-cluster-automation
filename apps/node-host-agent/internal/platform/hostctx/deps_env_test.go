@@ -170,3 +170,19 @@ func TestDepsFromEnvOverrides(t *testing.T) {
 		t.Fatalf("NodeName=%q want env-node (env wins)", d.NodeName)
 	}
 }
+
+// TestDepsFromEnvConfParseFailure: a conf path that exists but
+// cannot be read (a directory) fails the Load — the error is not
+// fatal: the agent runs on the empty-conf defaults exactly like the
+// shell modules did without a sourced node-watchdog.conf.
+func TestDepsFromEnvConfParseFailure(t *testing.T) {
+	t.Setenv(envnames.EnvWatchdogConf, t.TempDir()) // Load fails: it's a dir
+
+	d := DepsFromEnv(testParams("/host", "node-a"))
+	if d.Watchdog == nil || d.Watchdog.NebulaNet != "interdc" {
+		t.Fatalf("Watchdog=%+v want defaults after parse failure", d.Watchdog)
+	}
+	if d.WatchdogSrc == nil {
+		t.Fatal("WatchdogSrc is nil")
+	}
+}

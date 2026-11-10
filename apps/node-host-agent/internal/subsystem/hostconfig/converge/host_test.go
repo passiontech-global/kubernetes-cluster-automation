@@ -254,3 +254,66 @@ func TestFileExists(t *testing.T) {
 		t.Error("missing path must not exist")
 	}
 }
+
+// WriteManaged failure paths surface through fail() — an unwritable
+// staging dir or a parent component that is not a dir both report
+// (false, err), never a swallowed half-write.
+func TestWriteManagedFailures(t *testing.T) {
+	t.Run("mkdir under a file fails", func(t *testing.T) {
+		h := Host{Root: t.TempDir()}
+		testutil.WriteFile(t, h.Join("/blocker"), "x")
+		changed, err := h.WriteManaged("/blocker/f", []byte("y"), 0o644)
+		if err == nil {
+			t.Fatal("expected MkdirAll-under-file error")
+		}
+		if changed {
+			t.Fatal("failed write must not report changed")
+		}
+	})
+	t.Run("unwritable stage dir fails", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("permission checks are not enforced for root")
+		}
+		h := Host{Root: t.TempDir()}
+		if err := os.MkdirAll(h.Join("/ro"), 0o555); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := h.WriteManaged("/ro/f", []byte("y"), 0o644)
+		if err == nil {
+			t.Fatal("expected staging error in a read-only dir")
+		}
+		if changed {
+			t.Fatal("failed write must not report changed")
+		}
+	})
+}
+
+// RemoveManaged edge verdicts: a stat failure that is NOT "missing"
+// (permission denied) reports (false, nil) — treating the file as
+// absent is safer than erroring a whole cycle — while a file that
+// exists but cannot be unlinked surfaces the remove error.
+func TestRemoveManagedFailures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are not enforced for root")
+	}
+	h := Host{Root: t.TempDir()}
+	testutil.WriteFile(t, h.Join("/nosee/f"), "x")
+	if err := os.Chmod(h.Join("/nosee"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.Join("/nosee"), 0o755) })
+	removed, err := h.RemoveManaged("/nosee/f")
+	if err != nil || removed {
+		t.Fatalf("unreadable path = %v,%v want false,nil", removed, err)
+	}
+
+	testutil.WriteFile(t, h.Join("/nodel/f"), "x")
+	if err := os.Chmod(h.Join("/nodel"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.Join("/nodel"), 0o755) })
+	removed, err = h.RemoveManaged("/nodel/f")
+	if err == nil || removed {
+		t.Fatalf("undeletable file = %v,%v want false,err", removed, err)
+	}
+}

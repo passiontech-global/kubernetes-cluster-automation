@@ -8,6 +8,7 @@ package hostconfig
 import (
 	"context"
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"strings"
 	"testing"
 )
@@ -225,5 +226,31 @@ func TestCoreDNSInstallBadTarball(t *testing.T) {
 	}
 	if c.errs == 0 {
 		t.Fatal("failed coredns extraction did not count a cycle error")
+	}
+}
+
+// jsonPlain flattens OMap/List into plain Go maps/slices for the
+// zone-serial hash — a bare []any input (e.g. a decoded YAML list
+// that never went through the jinja boxing) hits the same recursion.
+func TestJSONPlainFlattens(t *testing.T) {
+	inner := jinja.NewOMap()
+	inner.Set("z", 1)
+	om := jinja.NewOMap()
+	om.Set("b", inner)
+	om.Set("a", &jinja.List{V: []any{3, "x"}})
+
+	got := jsonPlain(om).(map[string]any)
+	if got["b"].(map[string]any)["z"] != 1 {
+		t.Fatalf("nested OMap not flattened: %v", got)
+	}
+	if l := got["a"].([]any); l[0] != 3 || l[1] != "x" {
+		t.Fatalf("List not flattened: %v", l)
+	}
+
+	// Plain []any — the untested branch: elements are still
+	// recursively flattened.
+	out := jsonPlain([]any{inner, "s"}).([]any)
+	if out[0].(map[string]any)["z"] != 1 || out[1] != "s" {
+		t.Fatalf("[]any input not flattened: %v", out)
 	}
 }

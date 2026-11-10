@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -408,4 +409,216 @@ func entryNames(entries []os.DirEntry) []string {
 		out = append(out, e.Name())
 	}
 	return out
+}
+
+// applyDefaults on a bare Config fills every knob with the script
+// defaults — the zero value IS the production config — and the owner
+// knobs default INDEPENDENTLY (uid -1 alone must not leave gid 0).
+func TestApplyDefaults(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	if c.WorkDir != DefaultWorkDir || c.RuncDir != DefaultRuncDir ||
+		c.RuncSource != DefaultRuncSource {
+		t.Fatalf("path defaults = %q %q %q", c.WorkDir, c.RuncDir, c.RuncSource)
+	}
+	if c.OwnerUID != cacheOwner || c.OwnerGID != cacheOwner {
+		t.Fatalf("owner defaults = %d:%d want %d", c.OwnerUID, c.OwnerGID, cacheOwner)
+	}
+	if c.Mode != cachePerm {
+		t.Fatalf("mode default = %o want %o", c.Mode, cachePerm)
+	}
+	if c.listSubvols == nil || c.deleteSubvol == nil || c.chown == nil {
+		t.Fatal("seams not defaulted")
+	}
+	c = Config{OwnerUID: -1}
+	c.applyDefaults()
+	if c.OwnerUID != -1 || c.OwnerGID != cacheOwner {
+		t.Fatalf("partial owner = %d:%d want -1:%d", c.OwnerUID, c.OwnerGID, cacheOwner)
+	}
+}
+
+// The wipe refuses "/" and relative work dirs outright — a
+// misconfigured WorkDir is catastrophic, not a no-op.
+func TestWorkerInitUnsafeWorkDir(t *testing.T) {
+	for _, wd := range []string{"/", "relative/dir"} {
+		cfg := testConfig(t, func(c *Config) { c.WorkDir = wd })
+		if err := WorkerInit(context.Background(), cfg); err == nil {
+			t.Fatalf("WorkDir %q accepted", wd)
+		}
+	}
+}
+
+// A cancelled ctx aborts the subvolume-delete loop itself — before
+// any wipe or scaffold work runs.
+func TestWorkerInitBtrfsLoopCtxCancel(t *testing.T) {
+	cfg := testConfig(t, func(c *Config) {
+		c.listSubvols = func(context.Context, string) ([]string, error) {
+			return []string{"v1", "v2"}, nil
+		}
+	})
+	seedWorkDir(t, cfg.WorkDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := WorkerInit(ctx, cfg); err == nil {
+		t.Fatal("expected ctx error from the subvolume loop")
+	}
+}
+
+// A shared-cache that exists as a FILE is not the missing-dir no-op:
+// ReadDir fails ENOTDIR and the init reports it (fail-closed).
+func TestWorkerInitSharedCacheIsFile(t *testing.T) {
+	cfg := testConfig(t, nil)
+	mustDir(t, cfg.WorkDir)
+	mustFile(t, filepath.Join(cfg.WorkDir, sharedCacheName), "x")
+	if err := WorkerInit(context.Background(), cfg); err == nil {
+		t.Fatal("expected error for shared-cache-as-file")
+	}
+}
+
+// A scaffold dir name squatting as a FILE inside shared-cache fails
+// the mkdir — the keep-list entry survives the wipe, then MkdirAll
+// cannot make a dir over it.
+func TestWorkerInitScaffoldMkdirFails(t *testing.T) {
+	cfg := testConfig(t, nil)
+	sc := filepath.Join(cfg.WorkDir, sharedCacheName)
+	mustFile(t, filepath.Join(sc, PersistentCacheDirs[0]), "not a dir")
+	if err := WorkerInit(context.Background(), cfg); err == nil {
+		t.Fatal("expected mkdir failure for file-squatting scaffold dir")
+	}
+}
+
+// A symlink named like a keep-list dir survives the wipe (the name
+// match keeps it) but the chown/chmod pass skips it via Lstat —
+// dereferencing would chmod whatever host path it points at.
+func TestWorkerInitSkipsPersistentSymlink(t *testing.T) {
+	var chowned []string
+	cfg := testConfig(t, func(c *Config) {
+		c.OwnerUID, c.OwnerGID = cacheOwner, cacheOwner
+		c.chown = func(name string, _, _ int) error {
+			chowned = append(chowned, name)
+			return nil
+		}
+	})
+	sc := filepath.Join(cfg.WorkDir, sharedCacheName)
+	outside := t.TempDir()
+	mustDir(t, sc)
+	if err := os.Symlink(outside, filepath.Join(sc, "go-mod")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WorkerInit(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(chowned, filepath.Join(sc, "go-mod")) {
+		t.Fatal("symlinked keep-list dir was chowned")
+	}
+	fi, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() == 0o777 {
+		t.Fatal("chmod dereferenced the symlink onto the target")
+	}
+}
+
+// A missing wrapper source fails the SECOND install — the runc.real
+// copy already landed (set -e order).
+func TestWorkerInitWrapperInstallFails(t *testing.T) {
+	cfg := testConfig(t, func(c *Config) {
+		c.WrapperSource = filepath.Join(t.TempDir(), "gone")
+	})
+	seedWorkDir(t, cfg.WorkDir)
+	err := WorkerInit(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "install runc wrapper") {
+		t.Fatalf("err=%v want the wrapper install failure", err)
+	}
+	assertPresent(t, filepath.Join(cfg.RuncDir, "runc.real"))
+	assertMissing(t, filepath.Join(cfg.RuncDir, "runc"))
+}
+
+// WrapperSource "" resolves the running binary via os.Executable —
+// the self-copy default.
+func TestWorkerInitWrapperSourceExecutable(t *testing.T) {
+	cfg := testConfig(t, func(c *Config) { c.WrapperSource = "" })
+	seedWorkDir(t, cfg.WorkDir)
+	if err := WorkerInit(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	assertPresent(t, filepath.Join(cfg.RuncDir, "runc"))
+}
+
+// btrfs subvolume show && delete --recursive: the show guard gates
+// the delete — a failed show means delete never runs (the list entry
+// is already gone); a passing show execs the delete.
+func TestBtrfsDeleteSubvolExecsDelete(t *testing.T) {
+	bin := t.TempDir()
+	log := filepath.Join(bin, "calls")
+	fake := filepath.Join(bin, "btrfs")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + log + "\n" +
+		"if [ \"$2\" = \"show\" ] && [ \"$3\" = \"/dead\" ]; then exit 1; fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := btrfsDeleteSubvol(context.Background(), "/dead"); err == nil {
+		t.Fatal("show failure must propagate — delete skipped")
+	}
+	if err := btrfsDeleteSubvol(context.Background(), "/live"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "subvolume show /dead") {
+		t.Fatalf("missing show call:\n%s", got)
+	}
+	if strings.Contains(got, "delete --recursive /dead") {
+		t.Fatalf("delete ran after a failed show:\n%s", got)
+	}
+	if !strings.Contains(got, "subvolume delete --recursive /live") {
+		t.Fatalf("missing delete call:\n%s", got)
+	}
+}
+
+// copyFileAtomic's failure paths: every one sweeps the .tmp stage.
+func TestCopyFileAtomicFailures(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, []byte("blob"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("missing source", func(t *testing.T) {
+		dst := filepath.Join(dir, "d0")
+		if err := copyFileAtomic(filepath.Join(dir, "gone"), dst, 0o755); err == nil {
+			t.Fatal("expected open error")
+		}
+		assertMissing(t, dst+".tmp")
+	})
+	t.Run("tmp create fails", func(t *testing.T) {
+		dst := filepath.Join(dir, "no-dir", "d1")
+		if err := copyFileAtomic(src, dst, 0o755); err == nil {
+			t.Fatal("expected tmp-create error")
+		}
+	})
+	t.Run("copy failure sweeps tmp", func(t *testing.T) {
+		// A directory source: Open succeeds, the io.Copy read fails.
+		dst := filepath.Join(dir, "d2")
+		if err := copyFileAtomic(dir, dst, 0o755); err == nil {
+			t.Fatal("expected copy error for a directory source")
+		}
+		assertMissing(t, dst+".tmp")
+	})
+	t.Run("rename over dir fails", func(t *testing.T) {
+		dst := filepath.Join(dir, "d3")
+		mustDir(t, dst)
+		if err := copyFileAtomic(src, dst, 0o755); err == nil {
+			t.Fatal("expected rename error onto a directory")
+		}
+		assertMissing(t, dst+".tmp")
+	})
 }

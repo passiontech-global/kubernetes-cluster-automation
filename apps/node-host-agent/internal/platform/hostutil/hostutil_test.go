@@ -408,3 +408,37 @@ func TestWriteAtomicRenameFailureSweepsStage(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteAtomicChmodFailureSweepsStage: a staging file whose
+// forced Chmod fails is closed AND removed — the same sweep contract
+// every post-stage failure path carries.
+func TestWriteAtomicChmodFailureSweepsStage(t *testing.T) {
+	dir := t.TempDir()
+	var stagePath string
+	err := WriteAtomic(filepath.Join(dir, "f"), []byte("x"), AtomicOpts{
+		Stage: func(d string) (*os.File, error) {
+			p := filepath.Join(d, "stage-closed")
+			stagePath = p
+			f, err := os.Create(p)
+			if err != nil {
+				return nil, err
+			}
+			// A closed *os.File fails Chmod (EBADF) — the first
+			// fallible step after staging.
+			if err := f.Close(); err != nil {
+				return nil, err
+			}
+			return f, nil
+		},
+		Mode: 0o644,
+	})
+	if err == nil {
+		t.Fatal("chmod on a closed stage must fail")
+	}
+	if _, serr := os.Stat(stagePath); !os.IsNotExist(serr) {
+		t.Fatal("staging file leaked after chmod failure")
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "f")); !os.IsNotExist(serr) {
+		t.Fatal("target installed despite chmod failure")
+	}
+}

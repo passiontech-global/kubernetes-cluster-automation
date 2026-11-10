@@ -247,3 +247,56 @@ func TestEndpointGuardStartCancelled(t *testing.T) {
 		t.Fatal("Start did not return on a cancelled context")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// fetchJWKSKIDs — /openid/v1/jwks key-id census per backend.
+// ---------------------------------------------------------------------------
+
+// Identical kid sets compare equal as strings — the census sorts and
+// space-joins so sa.pub/sa.key rotation skew reads as a diff. Empty
+// kid entries are dropped (a JWKS row without a kid signs nothing).
+func TestFetchJWKSKIDs(t *testing.T) {
+	t.Run("sorted join, empty kids dropped", func(t *testing.T) {
+		var gotURL string
+		rt := &testutil.StubTransport{Fn: func(r *http.Request) (*http.Response, error) {
+			gotURL = r.URL.String()
+			return testutil.ProbeResponse(200,
+				`{"keys":[{"kid":"b-2"},{"kid":""},{"kid":"a-1"}]}`), nil
+		}}
+		got, err := fetchJWKSKIDs(ctx, &http.Client{Transport: rt}, "10.0.0.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "a-1 b-2" {
+			t.Fatalf("kids = %q, want %q", got, "a-1 b-2")
+		}
+		if want := "https://10.0.0.1:6443/openid/v1/jwks"; gotURL != want {
+			t.Fatalf("request URL = %q, want %q", gotURL, want)
+		}
+	})
+
+	t.Run("non-2xx is a wedge signal", func(t *testing.T) {
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return testutil.ProbeResponse(http.StatusInternalServerError, "boom"), nil
+		}}
+		if _, err := fetchJWKSKIDs(ctx, &http.Client{Transport: rt}, "10.0.0.1"); err == nil {
+			t.Fatal("expected HTTP error to propagate")
+		}
+	})
+}
+
+// transport reuses the cached in-cluster RoundTripper once built —
+// the SA token + CA wiring happens exactly once per guard.
+func TestTransportReturnsCachedRT(t *testing.T) {
+	cached := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+		return testutil.ProbeResponse(200, "{}"), nil
+	}}
+	g := &apiServerEndpointGuard{rt: cached}
+	rt, err := g.transport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt != cached {
+		t.Fatal("transport() rebuilt the RoundTripper instead of returning the cached one")
+	}
+}

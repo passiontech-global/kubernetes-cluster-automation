@@ -364,3 +364,84 @@ func TestCreateBundleParsing(t *testing.T) {
 		})
 	}
 }
+
+// syncFile's open failure is the only error it can produce in the
+// normal world (fsync on a just-written file is near-infallible).
+func TestSyncFileMissing(t *testing.T) {
+	if err := syncFile(filepath.Join(t.TempDir(), "gone")); err == nil {
+		t.Fatal("expected open error")
+	}
+}
+
+// A "mounts" field that is not an array fails its own unmarshal —
+// passthrough, config untouched, exec still runs.
+func TestWrapperCreateBadMountsShape(t *testing.T) {
+	bundle := writeSpec(t, `{
+	  "mounts": {"destination": "/scratch"},
+	  "linux": {"uidMappings": [{"containerID":0,"hostID":4294967294,"size":1}]}
+	}`)
+	configPath := filepath.Join(bundle, "config.json")
+	before, _ := os.ReadFile(configPath)
+
+	var calls []execCall
+	code := runRuncWrapper(
+		[]string{"runc", "--bundle", bundle, "create", "id"},
+		nil, "/runc.real", recordingExec(&calls, nil))
+	if code != 0 || len(calls) != 1 {
+		t.Fatalf("code=%d calls=%v — exec must still happen", code, calls)
+	}
+	after, _ := os.ReadFile(configPath)
+	if !slices.Equal(before, after) {
+		t.Fatal("bad-mounts config was modified")
+	}
+	assertMissing(t, configPath+".tmp")
+}
+
+// An unparseable mount ENTRY is skipped, not fatal — the /scratch
+// anchor is still found and the injection lands.
+func TestWrapperCreateSkipsBadMountEntry(t *testing.T) {
+	bundle := writeSpec(t, `{
+	  "mounts": [42, {"destination": "/scratch", "type": "bind", "source": "/s", "options": ["bind","rw"]}],
+	  "linux": {"uidMappings": [{"containerID":0,"hostID":4294967294,"size":1}]}
+	}`)
+	injectSharedCacheMount(filepath.Join(bundle, "config.json"), sharedCacheSource)
+
+	// The bad entry is preserved verbatim — decode loosely: mounts
+	// is [42, injected, /scratch].
+	data, err := os.ReadFile(filepath.Join(bundle, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Mounts []any `json:"mounts"`
+	}
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 3 {
+		t.Fatalf("mounts=%v want 3 entries", spec.Mounts)
+	}
+	inj, ok := spec.Mounts[1].(map[string]any)
+	if !ok || inj["destination"] != "/shared-cache" {
+		t.Fatalf("mounts=%v want injection before /scratch", spec.Mounts)
+	}
+}
+
+// The atomic swap's first step: when <config>.tmp cannot be created
+// (a directory squats at the staging path) the rewrite bails with the
+// config untouched — fail-open, no litter.
+func TestWrapperCreateTmpWriteFails(t *testing.T) {
+	bundle := writeSpec(t, qualifyingSpec)
+	configPath := filepath.Join(bundle, "config.json")
+	before, _ := os.ReadFile(configPath)
+	if err := os.Mkdir(configPath+".tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	injectSharedCacheMount(configPath, sharedCacheSource)
+
+	after, _ := os.ReadFile(configPath)
+	if !slices.Equal(before, after) {
+		t.Fatal("config modified despite tmp-write failure")
+	}
+}
