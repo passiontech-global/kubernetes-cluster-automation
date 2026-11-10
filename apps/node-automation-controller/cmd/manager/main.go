@@ -50,6 +50,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"strings"
 	"sync"
@@ -261,6 +263,22 @@ func buildCacheOptions() cache.Options {
 	}
 }
 
+// pprofHandlers returns the net/http/pprof endpoint table wired as
+// ExtraHandlers on the metrics server — one mux, one port, no extra
+// listener or Service change. "/debug/pprof/" (pprof.Index) dispatches
+// the named profiles (heap, goroutine, block, mutex, allocs,
+// threadcreate); cmdline/profile/symbol/trace need their dedicated
+// handlers.
+func pprofHandlers() map[string]http.Handler {
+	return map[string]http.Handler{
+		"/debug/pprof/":        http.HandlerFunc(pprof.Index),
+		"/debug/pprof/cmdline": http.HandlerFunc(pprof.Cmdline),
+		"/debug/pprof/profile": http.HandlerFunc(pprof.Profile),
+		"/debug/pprof/symbol":  http.HandlerFunc(pprof.Symbol),
+		"/debug/pprof/trace":   http.HandlerFunc(pprof.Trace),
+	}
+}
+
 // buildMgrOptions assembles ctrl.Options from the parsed flag values.
 // leaseDuration/renewDeadline/retryPeriod carry the flag values where
 // 0 means "operator did not set it": the matching Options fields are
@@ -269,8 +287,17 @@ func buildCacheOptions() cache.Options {
 func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration) ctrl.Options {
 	mgrOptions := ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Scheme: scheme,
+		// pprof rides the metrics listener (:9115 — ClusterIP/headless
+		// Service, no ingress): heap/goroutine/block profiles are the
+		// memory-triage evidence for the leader working-set plateau
+		// that OOMKilled the pod at the 256Mi limit (2026-11-09).
+		// Same convention as kubelet/kube-scheduler, which ship pprof
+		// on their debug endpoints by default.
+		Metrics: metricsserver.Options{
+			BindAddress:   metricsAddr,
+			ExtraHandlers: pprofHandlers(),
+		},
 		HealthProbeBindAddress: probeAddr,
 		// Active/passive HA (--leader-elect): every runnable is
 		// lease-gated (plain Runnables default NeedLeaderElection()=true,
