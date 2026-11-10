@@ -4,13 +4,16 @@
 package datastore
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -208,6 +211,51 @@ func TestCNPGFencedInstanceAutoUnfence(t *testing.T) {
 	}
 	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-2" {
 		t.Fatalf("annotation = %q, want pg-f-2 only", got)
+	}
+}
+
+// The unfence merge patch pins the List snapshot's resourceVersion:
+// a fence the CNPG operator writes between List and Patch turns the
+// patch into a conflict (skipped this cycle — the operator's
+// protective write survives) instead of being silently dropped by
+// the merge.
+func TestCNPGUnfencePatchPinsResourceVersion(t *testing.T) {
+	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
+		"db", "pg-f", "fenced_instances")
+	now := time.Now()
+	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1")
+	cr.SetResourceVersion("4217")
+	node := testutil.Node("w1", corev1.ConditionTrue, nil)
+	pod := fencedPod("db", "pg-f", "pg-f-1", "w1")
+	cs := fake.NewSimpleClientset(node, pod)
+	dyn := probetest.OpDyn(cr)
+	var body string
+	dyn.PrependReactor("patch", "clusters",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			body = string(action.(ktesting.PatchAction).GetPatch())
+			return false, nil, nil // fall through to the fake's write
+		})
+	p := testProberDyn(cs, dyn)
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+	probetest.FreezeNow(p.Deps, now)
+	_ = chk.Run(ctx)
+	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
+	chk.Run(ctx)
+	if body == "" {
+		t.Fatal("stale fence with a verified-healthy pod must unfence")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("patch body %q: %v", body, err)
+	}
+	meta, _ := doc["metadata"].(map[string]any)
+	if rv, _ := meta["resourceVersion"].(string); rv != "4217" {
+		t.Fatalf("unfence patch must pin the List snapshot's resourceVersion, got %v", doc)
+	}
+	annos, _ := meta["annotations"].(map[string]any)
+	if got, ok := annos[cnpgFencedInstancesAnno]; !ok || got != nil {
+		t.Fatalf("single-instance unfence must delete the annotation key, got %v", annos)
 	}
 }
 

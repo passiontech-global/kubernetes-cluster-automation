@@ -61,6 +61,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 const (
@@ -113,6 +114,13 @@ var veleroStuckPhases = map[string]string{
 }
 
 const veleroStuckMaxAge = 6 * time.Hour
+
+// veleroInstallNSDefault is where the velero server and its
+// node-agent DaemonSet are installed — the namespace the in-flight
+// audit resolves the agent pod in (PVBs/PVRs themselves live in the
+// WORKLOAD namespaces). Override with VELERO_NAMESPACE for installs
+// in a non-default namespace.
+const veleroInstallNSDefault = "velero"
 
 // veleroRepoMaintenanceMaxAge is the backup-health repo-maintenance bound:
 // velero runs restic/kopia repository maintenance (prune + repack)
@@ -197,7 +205,12 @@ func pausedLedgerKey(uid, namespace, schedule string) string {
 type veleroBackupAuditor struct {
 	cs  kubernetes.Interface // reserved for future typed reads
 	dyn dynamic.Interface
-	now shared.Clock // clock seam — same pattern as certDriftAuditor
+	// veleroNS is the namespace velero itself is installed in —
+	// where the node-agent DaemonSet runs, resolved from
+	// VELERO_NAMESPACE at Setup (zero value = the default, so the
+	// literally-built tests read "velero" too).
+	veleroNS string
+	now      shared.Clock // clock seam — same pattern as certDriftAuditor
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -257,6 +270,16 @@ type veleroBackupAuditor struct {
 	verdict kube.Verdict
 }
 
+// veleroInstallNS is the namespace the velero node-agent DaemonSet
+// runs in — the pod list behind pvbAgentPod must land there, never in
+// the PVB's (workload) namespace.
+func (a *veleroBackupAuditor) veleroInstallNS() string {
+	if a.veleroNS == "" {
+		return veleroInstallNSDefault
+	}
+	return a.veleroNS
+}
+
 // Setup registers the 15m sweep — or nothing when
 // the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED=false, resolved
 // by setupModules into Deps.Disabled): same disabled-flag pattern as
@@ -265,10 +288,11 @@ func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
 	return shared.SetupNoConfig(d, func() error {
 		a := &veleroBackupAuditor{
-			cs:    cs,
-			dyn:   dyn,
-			now:   shared.SystemClock,
-			queue: d.Name,
+			cs:       cs,
+			dyn:      dyn,
+			veleroNS: envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault),
+			now:      shared.SystemClock,
+			queue:    d.Name,
 		}
 		return shared.AddPeriodic(mgr, a.queue, veleroAuditInterval, a.run)
 	})

@@ -63,6 +63,40 @@ func sq(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// vmPath re-spells the staged candidate for a docker -v mount:
+// stagedPath is the HostRoot view the agent wrote through; the
+// mount consumes the host-namespace spelling — the live file's dir
+// plus the staged file's base name (the same join the
+// inspect-derived mount sources use).
+func vmPath(livePath, stagedPath string) string {
+	return filepath.Join(filepath.Dir(livePath), filepath.Base(stagedPath))
+}
+
+// stageCfgCandidate writes candidate bytes next to the live file
+// (same dir, so the throwaway container mounts exactly the candidate
+// a later same-fs promotion would land) and returns the staged path
+// under the HostRoot view. The caller removes it after validation.
+func stageCfgCandidate(livePath string, content []byte) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(livePath), ".haproxy.cfg-*")
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
+}
+
 func (c *cyc) groupAPILBVM() {
 	r, ctx := c.r, c.ctx
 	e := c.apiLBVMEntry()
@@ -113,7 +147,18 @@ SystemMaxUse=500M
 
 	c.apiLBHaproxy(container, sockDir, socket)
 
-	// guard conf (lbg_* host-var parity).
+	// guard conf (lbg_* host-var parity). The conf is a SOURCED shell
+	// file — every vars-derived value gets the charset gate matching
+	// its slot before render: unquoted KEY=value slots take shToken
+	// (a space/metachar splices a second command), double-quoted
+	// KEY="..." slots take cfgShellVal (a '"'/backtick/$ breaks out
+	// of the quoting). A refused value skips the write — a stale
+	// conf is safer than a hostile one.
+	confOK := c.shToken("mode", mode) &&
+		c.shToken("haproxy_backend", backend) &&
+		c.cfgShellVal("api_backends", apiBackends) &&
+		c.cfgShellVal("haproxy_backends", backends) &&
+		c.shToken("haproxy_socket", socket)
 	conf := fmt.Sprintf(`# /etc/api-backend-guard.conf — managed by node-host-agent hostconfig
 # (port of hub_converge.yaml api_lb_guard scope). Do NOT edit by hand —
 # converge overwrites. Edit the api_lb_guard_vms vars in vars/cluster.yaml.
@@ -148,7 +193,9 @@ CA_FILE=/etc/api-backend-guard/ca.crt
 		c.err("api-lb-vm: chmod 0700 credential dir failed — guard token left readable",
 			"error", err)
 	}
-	_, _ = r.writeManaged("/etc/api-backend-guard.conf", []byte(conf), 0o644)
+	if confOK {
+		_, _ = r.writeManaged("/etc/api-backend-guard.conf", []byte(conf), 0o644)
+	}
 
 	// the shell guard is retired — prune covers it globally too, but
 	// sweep it here so this group is self-contained.
@@ -227,6 +274,28 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 			"    stats timeout 30s\n" +
 			"# END api-lb-guard: admin socket for guard backend drain\n" +
 			string(b)
+		// Candidate-staged validate-then-promote (checkedDeploy
+		// parity): haproxy -c runs on a staged copy mounted into the
+		// throwaway container — a bad candidate (a cfg that already
+		// carries a global section would render a duplicate) never
+		// lands at the live path the container loads on
+		// restart/reboot. runLong: docker run may pull the image
+		// first, which outlives the interactive budget on slow
+		// egress.
+		staged, err := stageCfgCandidate(r.hp(cfgPath), []byte(nb))
+		if err != nil {
+			c.err("api-lb-vm: staging candidate haproxy.cfg failed — live cfg untouched",
+				"cfg", cfgPath, "error", err)
+			return
+		}
+		defer func() { _ = os.Remove(staged) }()
+		if out, err := r.runLong(ctx, "docker", "run", "--rm",
+			"-v", vmPath(cfgPath, staged)+":/tmp/haproxy.cfg:ro",
+			image, "haproxy", "-c", "-f", "/tmp/haproxy.cfg"); err != nil {
+			c.err("api-lb-vm: haproxy -c failed on the staged candidate — live cfg untouched",
+				"cfg", cfgPath, "out", out, "error", err)
+			return
+		}
 		cfgChanged, _ = r.writeManaged(cfgPath, []byte(nb), 0o644)
 	}
 
@@ -245,10 +314,12 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		}
 	}
 
-	// validate before touching the live container — a bad cfg never
-	// reaches the VIP. runLong: docker run may pull the image first,
-	// which outlives the interactive budget on slow egress.
-	if cfgChanged || composeChanged {
+	// A compose-only change still validates the live cfg before
+	// touching the container — the cfgChanged arm above already
+	// validated its candidate on the staged copy before promoting
+	// it. runLong: docker run may pull the image first, which
+	// outlives the interactive budget on slow egress.
+	if composeChanged && !cfgChanged {
 		if out, err := r.runLong(ctx, "docker", "run", "--rm",
 			"-v", cfgPath+":/tmp/haproxy.cfg:ro",
 			image, "haproxy", "-c", "-f", "/tmp/haproxy.cfg"); err != nil {

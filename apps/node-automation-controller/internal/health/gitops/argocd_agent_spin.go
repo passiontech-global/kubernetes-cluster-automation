@@ -95,6 +95,9 @@ var argocdAgentSpinErrMarkers = []string{
 // any such line AFTER the last stream error proves the agent already
 // recovered from the errors in the tail — no live loop.
 var argocdAgentReconnectMarkers = []string{
+	// "connected" is a substring of "(dis)connected" — the scan
+	// excludes lines also containing "disconnect" so a teardown
+	// line never reads as a successful reconnect.
 	"connected",
 	"connection established",
 	"stream established",
@@ -126,7 +129,10 @@ const argocdAgentCPUQuery = `sum by (pod) (rate(container_cpu_usage_seconds_tota
 // delete fires; detection alone emits the gauge every sweep. A
 // missing/unresolvable Prometheus endpoint or a failed log read
 // downgrades THAT channel to unavailable, not clean — the other
-// channel still decides.
+// channel still decides; with BOTH channels unavailable the sweep is
+// inconclusive and the pod's first-seen entry carries through the
+// keep-set (the Prune contract: never wipe a clock the sweep could
+// not re-evaluate).
 func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -139,6 +145,7 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 	// inside the pod loop would stamp N identical PromQL evaluations
 	// for the same series set.
 	series, cpuErr := p.PromQuery(ctx, argocdAgentCPUQuery)
+	cpuOK := cpuErr == nil
 	if cpuErr != nil {
 		log.Info("WARN: argocd-agent spin — cpu channel unavailable",
 			"error", cpuErr)
@@ -154,16 +161,38 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 		if now.Sub(pod.CreationTimestamp.Time) < argocdAgentMinAge {
 			continue // a fresh pod has no spin history worth reading
 		}
+		key := pod.Namespace + "/" + pod.Name
 		reason := ""
+		logOK := true
 		if p.cpuSpin(series, pod) {
 			reason = "cpu"
-		} else if p.logSpin(ctx, log, pod) {
+		} else if spin, lerr := p.logSpin(ctx, log, pod); lerr != nil {
+			logOK = false // fetch failed — inconclusive, not clean
+		} else if spin {
 			reason = "logs"
+		}
+		if !cpuOK && !logOK {
+			// Both channels unevaluable this sweep — inconclusive,
+			// not clean. Carry the key through the keep-set so the
+			// Prune below cannot wipe the first-seen clock the sweep
+			// could not re-evaluate (a flaky-evidence spin would
+			// otherwise never reach argocdAgentWindow), and carry the
+			// pod's held gauge series so the sweep-end reconcile does
+			// not read "can't tell" as "resolved" (same contract the
+			// ksm-wedge scan runs).
+			log.Info("WARN: argocd-agent spin — cpu + log channels both unavailable, spin unverifiable",
+				"pod", key)
+			live[key] = true
+			for k, lv := range p.emitted.Last() {
+				if strings.HasPrefix(k, key+"/") {
+					rep.Carry(k, lv)
+				}
+			}
+			continue
 		}
 		if reason == "" {
 			continue
 		}
-		key := pod.Namespace + "/" + pod.Name
 		live[key] = true
 		first, seenBefore := p.seen.Observe(key, now)
 		// The emitted series key carries the reason so a channel flap
@@ -204,13 +233,14 @@ func (p *argoCDAgentSpinCheck) cpuSpin(
 // logSpin is channel (b): the last argocdAgentTail log lines scanned
 // for the repeated stream-error signature with no successful
 // reconnect after the LAST error — errors the agent already
-// recovered from are history, not a live loop. A failed log read is
-// inconclusive (false, WARN) per the shared PodLogTail posture; the
-// spin needs its OWN scan because the verdict is count- and
+// recovered from are history, not a live loop. A failed log read
+// returns the error — inconclusive, never clean (the caller keeps
+// the pod's first-seen entry through sweeps it could not evaluate);
+// the spin needs its OWN scan because the verdict is count- and
 // order-sensitive, which the first-match PodLogTail helper cannot
 // express.
 func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
-	log logr.Logger, pod *corev1.Pod) bool {
+	log logr.Logger, pod *corev1.Pod) (bool, error) {
 
 	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -223,15 +253,15 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	if err != nil {
 		log.Info("WARN: argocd-agent spin — log channel unavailable",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
-		return false
+		return false, err
 	}
 	defer func() { _ = stream.Close() }()
 	errs, recovered := scanAgentSpinLines(
 		io.LimitReader(stream, argocdAgentLogCap))
 	if errs >= argocdAgentMinErrs && !recovered {
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // scanAgentSpinLines counts stream-error lines and reports whether a
@@ -255,7 +285,14 @@ func scanAgentSpinLines(lines io.Reader) (errs int, recoveredAfter bool) {
 			}
 		}
 		for _, m := range argocdAgentReconnectMarkers {
-			if strings.Contains(line, m) {
+			// "connected" also matches "(dis)connected" — a
+			// teardown/disconnect line is never a reconnect. The
+			// plain "disconnect" substring check cannot see the
+			// parenthesized spelling (the ')' breaks it), so
+			// exclude that shape explicitly.
+			if strings.Contains(line, m) &&
+				!strings.Contains(line, "disconnect") &&
+				!strings.Contains(line, "(dis)connected") {
 				lastOK = i
 				break
 			}

@@ -31,12 +31,6 @@ func (n *NetHealth) overlayUp(ctx context.Context) bool {
 		n.unitEnabledActive(ctx, "tinc@"+wd.TincNet)
 }
 
-// ruleHasTarget reports whether `ip rule list pref 1500` output
-// carries a "to <ip>" rule — shell `grep -q "to $r "`.
-func ruleHasTarget(rules, ip string) bool {
-	return strings.Contains(rules, "to "+ip+" ")
-}
-
 // ruleTablesFor returns every lookup table referenced by rules for ip.
 func ruleTablesFor(rules, ip string) []int {
 	var out []int
@@ -120,19 +114,25 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		if comm != "relay" {
 			comm = "direct"
 		}
+		// live reads the rule state AS THE PRUNE LEAVES IT: only a
+		// rule pointing at the CURRENT table survives the stale-table
+		// prune below. Deriving live from the pre-prune snapshot made
+		// a stale-table-only rule read as a live relay rule — for a
+		// committed=direct relay the drift heal then del'd a rule the
+		// prune had just removed (suspect heal-fail, converging only
+		// next cycle).
 		live := "direct"
-		if ruleHasTarget(rules1500, r) {
-			live = "relay"
-		}
 		// Prune rules pointing at tables other than the active one —
 		// an overlay flip (tinc↔nebula) leaves stale-table rules that
 		// would still push traffic into the dead table.
 		for _, t := range ruleTablesFor(rules1500, r) {
-			if t != table {
-				n.ipRuleDel1500(ctx, r, []int{t})
-				n.state.AppendLog(fmt.Sprintf(
-					"cleanup: egress %s rule lookup %d stale (current table %d)", r, t, table))
+			if t == table {
+				live = "relay"
+				continue
 			}
+			n.ipRuleDel1500(ctx, r, []int{t})
+			n.state.AppendLog(fmt.Sprintf(
+				"cleanup: egress %s rule lookup %d stale (current table %d)", r, t, table))
 		}
 		// Drift heal: live rule must match committed state (up/down
 		// scripts can delete rules behind our back).
@@ -302,7 +302,10 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 			}
 		}
 	}
-	// Cleanup state/rules for relays removed from the list.
+	// Cleanup state/rules for relays removed from the list. One
+	// relay can own 3 state files — the deletes are idempotent but
+	// the log line is once per RELAY, not per file.
+	pruned := map[string]bool{}
 	for _, f := range append(append(n.egressFiles("egress-state-"),
 		n.egressFiles("egress-ctr-")...),
 		n.egressFiles("egress-icmpblk-")...) {
@@ -315,8 +318,11 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		n.ipRuleDel1500(ctx, ip, allTables)
 		_ = os.Remove(f)
 		delete(n.egressCtr, ip)
-		n.state.AppendLog(fmt.Sprintf(
-			"cleanup: egress state/rule for %s (no longer in OVERLAY_EGRESS_RELAYS)", ip))
+		if !pruned[ip] {
+			pruned[ip] = true
+			n.state.AppendLog(fmt.Sprintf(
+				"cleanup: egress state/rule for %s (no longer in OVERLAY_EGRESS_RELAYS)", ip))
+		}
 	}
 	n.cycles.WithLabelValues(checkEgress, "ok").Inc()
 }

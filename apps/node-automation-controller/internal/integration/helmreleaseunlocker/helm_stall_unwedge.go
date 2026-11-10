@@ -207,6 +207,24 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		if att.count > 0 && now.Sub(att.last) < stallAttemptCooldown {
 			continue // inside the 6h attempt gap — let the last unwedge land
 		}
+		// Fail-closed maintenance mutex — the scale-down below
+		// removes live pods' ReplicaSet replicas: during a
+		// cordon/drain/upgrade the unwedge would compound the
+		// deliberate disruption. Gate AFTER the cooldown/attempt
+		// checks so a deferral burns neither the persisted
+		// cooldown nor one of the per-revision attempts.
+		proceed, unverifiable := heal.Gate(ctx, log, &u.verdict,
+			u.cs, u.dyn, key, now)
+		switch {
+		case unverifiable:
+			// Tolerated per-HR failure — absorbed like the
+			// unwedge error path below; IncError keeps it on
+			// the alert path.
+			metrics.IncError(u.queue)
+			continue
+		case !proceed:
+			continue
+		}
 		acted, refuse, err := u.unwedge(ctx, gvr, hr)
 		if err == nil {
 			// Every non-error outcome burns one of the
@@ -306,7 +324,7 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 	// hook while its Job object still exists, so the retry would
 	// wedge identically. Reap it BEFORE the requestedAt cycle; the
 	// sweep is best-effort and cannot undo the window we just opened.
-	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr))
+	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
 
 	// Then poke the HR: requestedAt is the reconcile-now hint,
 	// resetAt (same token — required pairing) zeroes the failure

@@ -117,7 +117,10 @@ func TestAPILBHaproxyPreconditions(t *testing.T) {
 }
 
 // TestAPILBHaproxyValidationFailure — haproxy -c in the throwaway
-// container failing must abort before recreate/restart, error counted.
+// container failing must abort before recreate/restart, error counted,
+// and the live cfg must keep the last good bytes (a cfg that already
+// carries a global section would render a duplicate — that candidate
+// must never persist at the live path).
 func TestAPILBHaproxyValidationFailure(t *testing.T) {
 	r, sr, c := vmFixture(t, goodInspect, false)
 	hostWrite(t, r, "/opt/haproxy/docker-compose.yml", "services:\n  haproxy: {}\n")
@@ -129,6 +132,20 @@ func TestAPILBHaproxyValidationFailure(t *testing.T) {
 	}
 	if len(sr.CallsMatching("docker compose")) > 0 || len(sr.CallsMatching("docker restart")) > 0 {
 		t.Fatal("live container touched despite failed validation")
+	}
+	if got := hostRead(t, r, "/opt/haproxy/haproxy.cfg"); got != "global\n    maxconn 100\n" {
+		t.Fatalf("live cfg modified despite failed validation:\n%s", got)
+	}
+	entries, err := os.ReadDir(filepath.Join(r.cfg.HostRoot, "opt/haproxy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 { // compose + live cfg — staged candidate cleaned up
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("staged candidate leaked: %v", names)
 	}
 }
 

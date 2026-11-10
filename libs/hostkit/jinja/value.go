@@ -327,14 +327,15 @@ func getIndex(v any, k any) (any, error) {
 		if !ok {
 			return Undefined{"index"}, nil
 		}
-		// Same negative-index semantics as the []any branch.
+		// Same negative-index semantics as the []any branch, in runes.
+		runes := []rune(t)
 		if i < 0 {
-			i += int64(len(t))
+			i += int64(len(runes))
 		}
-		if i < 0 || i >= int64(len(t)) {
+		if i < 0 || i >= int64(len(runes)) {
 			return Undefined{"index"}, nil
 		}
-		return string(t[i]), nil
+		return string(runes[i]), nil
 	}
 	return Undefined{"index"}, nil
 }
@@ -821,6 +822,13 @@ func binOp(op string, l, r any) (any, error) {
 			_, ok := rt.Get(Stringify(l))
 			return ok, nil
 		}
+		// Plain Go maps get the same membership test *OMap has —
+		// "k" in map[string]any was a silent false while deepEq
+		// already treats all three mapping shapes equivalently.
+		if mv, ok := asMapping(r); ok {
+			_, found := mv.get(Stringify(l))
+			return found, nil
+		}
 		return false, nil
 	}
 	return nil, fmt.Errorf("unsupported op %q", op)
@@ -983,7 +991,10 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			}
 			i := int64(len(l.V)) - 1
 			if len(args) > 0 {
-				j, _ := ToInt(args[0])
+				j, ok := ToInt(args[0])
+				if !ok {
+					return nil, errors.New("pop: index must be an integer")
+				}
 				i = j
 				// python list.pop accepts negative indices.
 				if i < 0 {

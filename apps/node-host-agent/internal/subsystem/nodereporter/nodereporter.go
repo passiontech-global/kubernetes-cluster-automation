@@ -37,6 +37,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -233,10 +234,14 @@ type Reporter struct {
 
 	// Log tail bookkeeping: byte offset into WatchdogLogFile plus a
 	// carry buffer for a line split across two reads. logScanned marks
-	// whether the lookback-replay pass has completed.
+	// whether the lookback-replay pass has completed. logFi is the
+	// last successful scan's stat — os.SameFile against it detects a
+	// rename rotation even when the fresh file already grew past the
+	// old offset (a size shrink would never be seen).
 	logOffset   int64
 	logPending  []byte
 	logScanned  bool
+	logFi       os.FileInfo
 	evSeq       atomic.Uint64            // event-name uniqueness suffix
 	emittedEvts map[string]*emittedEvent // dedup key → created/aggregated Event
 

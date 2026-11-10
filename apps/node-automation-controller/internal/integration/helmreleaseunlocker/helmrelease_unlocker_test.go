@@ -577,8 +577,8 @@ func TestHelmReleaseUnlockerTargetNamespaceSemantics(t *testing.T) {
 		helmRelSecret("ops", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"),
 		helmRelSecret("target-ns", "sh.helm.release.v1.r.v2", "target-ns-myapp", 2, "pending-upgrade"),
 		// Hook Jobs live in the RELEASE namespace.
-		hookJob("target-ns", "myapp-pre-upgrade", true),
-		hookJob("ops", "misplaced-hook", true), // storage ns — not where hooks run
+		hookJob("target-ns", "myapp-pre-upgrade", "target-ns-myapp", true),
+		hookJob("ops", "misplaced-hook", "target-ns-myapp", true), // storage ns — not where hooks run
 	)
 	u := newUnlocker(cs, dyn, time.Hour, "ops/myapp")
 
@@ -721,14 +721,17 @@ func TestHelmReleaseUnlockerNoPendingSecret(t *testing.T) {
 // C3a — failed helm-hook Job reaper
 // ---------------------------------------------------------------------------
 
-// hookJob builds a Job carrying the helm.sh/hook annotation; failed
-// controls whether it reports JobFailed=True.
-func hookJob(ns, name string, failed bool) *batchv1.Job {
+// hookJob builds a Job carrying the helm.sh/hook annotation and the
+// meta.helm.sh/release-name label helm stamps on every rendered
+// resource, hooks included; failed controls whether it reports
+// JobFailed=True.
+func hookJob(ns, name, release string, failed bool) *batchv1.Job {
 	j := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   ns,
 			Name:        name,
 			Annotations: map[string]string{"helm.sh/hook": "pre-upgrade"},
+			Labels:      map[string]string{helmReleaseNameLabel: release},
 		},
 	}
 	if failed {
@@ -743,7 +746,7 @@ func hookJob(ns, name string, failed bool) *batchv1.Job {
 // plainFailedJob: JobFailed=True but NO helm.sh/hook annotation — the
 // reaper must never touch non-hook Jobs (failed-jobs-janitor's turf).
 func plainFailedJob(ns, name string) *batchv1.Job {
-	j := hookJob(ns, name, true)
+	j := hookJob(ns, name, "myapp", true)
 	j.Annotations = nil
 	return j
 }
@@ -762,15 +765,21 @@ func jobExists(t *testing.T, cs *kfake.Clientset, ns, name string) bool {
 
 // On a real unlock, a FAILED helm-hook Job in the HR's target namespace
 // is reaped (it would block the retried release's hooks), while a
-// still-running hook Job, a non-hook failed Job, and hook Jobs in
-// other namespaces are all left alone.
+// still-running hook Job, a non-hook failed Job, a hook Job of
+// ANOTHER release (wrong or missing meta.helm.sh/release-name), and
+// hook Jobs in other namespaces are all left alone.
 func TestHelmReleaseUnlockerReapsFailedHookJobs(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
+	foreign := hookJob("apps", "foreign-release-hook", "other-release", true)
+	unattributed := hookJob("apps", "unattributed-hook", "myapp", true)
+	unattributed.Labels = nil // helm.sh/hook without release attribution
 	cs := kfake.NewSimpleClientset(append(secrets,
-		hookJob("apps", "myapp-pre-upgrade", true),   // reaped
-		hookJob("apps", "myapp-post-upgrade", false), // still running — kept
-		plainFailedJob("apps", "unrelated-batch"),    // no hook anno — kept
-		hookJob("other-ns", "other-hook", true),      // wrong ns — kept
+		hookJob("apps", "myapp-pre-upgrade", "myapp", true),   // reaped
+		hookJob("apps", "myapp-post-upgrade", "myapp", false), // still running — kept
+		plainFailedJob("apps", "unrelated-batch"),             // no hook anno — kept
+		foreign,      // another release's hook — kept
+		unattributed, // no release label — kept
+		hookJob("other-ns", "other-hook", "myapp", true), // wrong ns — kept
 	)...)
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
@@ -782,9 +791,10 @@ func TestHelmReleaseUnlockerReapsFailedHookJobs(t *testing.T) {
 	if jobExists(t, cs, "apps", "myapp-pre-upgrade") {
 		t.Fatal("failed helm-hook Job not reaped on unlock")
 	}
-	for _, n := range []string{"myapp-post-upgrade", "unrelated-batch"} {
+	for _, n := range []string{"myapp-post-upgrade", "unrelated-batch",
+		"foreign-release-hook", "unattributed-hook"} {
 		if !jobExists(t, cs, "apps", n) {
-			t.Fatalf("job %s reaped — only FAILED helm-hook Jobs may go", n)
+			t.Fatalf("job %s reaped — only FAILED Jobs attributed to THIS release may go", n)
 		}
 	}
 	if !jobExists(t, cs, "other-ns", "other-hook") {
@@ -837,7 +847,7 @@ func TestHelmReleaseUnlockerRefusedUnlockSkipsHookSweep(t *testing.T) {
 	dyn := newDynFake(hr)
 	cs := kfake.NewSimpleClientset(
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "pending-install"),
-		hookJob("apps", "myapp-pre-install", true))
+		hookJob("apps", "myapp-pre-install", "myapp", true))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
 	if err := u.run(ctx); err != nil {
@@ -855,8 +865,8 @@ func TestHelmReleaseUnlockerRefusedUnlockSkipsHookSweep(t *testing.T) {
 // hookJobStarted builds a hook Job with NO terminal condition created
 // createdAgo ago; pods sets Status.Active (a genuinely running Job has
 // active pods; a wedged or not-yet-scheduled one has none).
-func hookJobStarted(ns, name string, createdAgo time.Duration, pods int32) *batchv1.Job {
-	j := hookJob(ns, name, false)
+func hookJobStarted(ns, name, release string, createdAgo time.Duration, pods int32) *batchv1.Job {
+	j := hookJob(ns, name, release, false)
 	j.CreationTimestamp = metav1.NewTime(time.Now().Add(-createdAgo))
 	j.Status.Active = pods
 	return j
@@ -869,7 +879,7 @@ func hookJobStarted(ns, name string, createdAgo time.Duration, pods int32) *batc
 func TestHelmReleaseUnlockerSkipsRunningHookJob(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	cs := kfake.NewSimpleClientset(append(secrets,
-		hookJobStarted("apps", "myapp-pre-upgrade", time.Hour, 1), // Running — upgrade alive
+		hookJobStarted("apps", "myapp-pre-upgrade", "myapp", time.Hour, 1), // Running — upgrade alive
 	)...)
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
@@ -897,7 +907,7 @@ func TestHelmReleaseUnlockerSkipsRunningHookJob(t *testing.T) {
 func TestHelmReleaseUnlockerSkipsFreshHookJob(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	cs := kfake.NewSimpleClientset(append(secrets,
-		hookJobStarted("apps", "myapp-pre-upgrade", time.Minute, 0), // just created, pods pending
+		hookJobStarted("apps", "myapp-pre-upgrade", "myapp", time.Minute, 0), // just created, pods pending
 	)...)
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
@@ -919,8 +929,8 @@ func TestHelmReleaseUnlockerSkipsFreshHookJob(t *testing.T) {
 func TestHelmReleaseUnlockerTerminalHookResidueStillUnlocks(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	cs := kfake.NewSimpleClientset(append(secrets,
-		hookJob("apps", "myapp-pre-upgrade", true),               // Failed — residue
-		hookJobStarted("apps", "myapp-old-hook", 2*time.Hour, 0), // stale, no pods — residue
+		hookJob("apps", "myapp-pre-upgrade", "myapp", true),               // Failed — residue
+		hookJobStarted("apps", "myapp-old-hook", "myapp", 2*time.Hour, 0), // stale, no pods — residue
 	)...)
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
@@ -968,7 +978,7 @@ func TestHelmReleaseUnlockerPendingSecretDeleteNotFound(t *testing.T) {
 func TestHelmReleaseUnlockerHookJobDeleteNotFoundIsBenign(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	cs := kfake.NewSimpleClientset(append(secrets,
-		hookJob("apps", "myapp-pre-upgrade", true))...)
+		hookJob("apps", "myapp-pre-upgrade", "myapp", true))...)
 	cs.PrependReactor("delete", "jobs",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewNotFound(

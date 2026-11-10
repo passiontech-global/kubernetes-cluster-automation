@@ -90,8 +90,9 @@ func (r *certManagerReaper) listOrdersForCert(ctx context.Context,
 func (r *certManagerReaper) buildOrderIndex(ctx context.Context,
 	ns string) *orderIndex {
 	idx := &orderIndex{byCert: map[string][]unstructured.Unstructured{}}
-	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
-		List(ctx, metav1.ListOptions{})
+	orders, err := kube.ListAllUnstructured(ctx,
+		r.dyn.Resource(orderGVR).Namespace(ns),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
 		metrics.IncError(r.queue)
 		idx.err = err
@@ -166,6 +167,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	// cert is already refused. A restart empties r.resets, so the
 	// first sight of a cert hydrates the budget back from its
 	// persisted annotation — the 3-per-cycle cap survives restarts.
+	r.armResets()
 	st := r.resets[key]
 	if st == nil {
 		st = certResetFromAnnotation(cert)
@@ -188,8 +190,9 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		return false
 	}
 
-	chals, err := r.dyn.Resource(challengeGVR).Namespace(ns).
-		List(ctx, metav1.ListOptions{})
+	chals, err := kube.ListAllUnstructured(ctx,
+		r.dyn.Resource(challengeGVR).Namespace(ns),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
 		metrics.IncError(r.queue)
 		log.Error(err, "challenge list failed", "cert", key)

@@ -4,6 +4,7 @@
 package gitops
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +117,50 @@ func TestArgoCDAgentSpinDeletesAfterWindow(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, young.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("young pod deleted before the age gate: %v", err)
+	}
+}
+
+// agentLogFailReactor answers pod log reads with err — the log
+// channel unavailable, inconclusive never clean.
+func agentLogFailReactor(err error) ktesting.ReactionFunc {
+	return func(a ktesting.Action) (bool, runtime.Object, error) {
+		if a.GetSubresource() != "log" {
+			return false, nil, nil
+		}
+		return true, nil, err
+	}
+}
+
+// Inconclusive sweeps (cpu + log channels both unavailable) must
+// carry the pod's first-seen entry through the keep-set — Prune may
+// not wipe a clock the sweep could not re-evaluate, or a
+// flaky-evidence spin never reaches argocdAgentWindow and never
+// heals.
+func TestArgoCDAgentSpinInconclusiveSweepKeepsSeen(t *testing.T) {
+	base := time.Now()
+	pod := agentPod("argocd-agent-agent-flaky", base.Add(-time.Hour))
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", agentLogReactor(spinLogBody(20, false)))
+	p := probetest.NewCheckProber(cs, testutil.NewDynamicClient(),
+		NewArgoCDAgentSpinCheck)
+	probetest.FreezeNow(p.Deps, base)
+	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
+
+	if res := chk.Run(ctx); res.Pass {
+		t.Fatalf("first spin sighting must FAIL: %+v", res)
+	}
+	// The log channel dies for one sweep (the cpu channel is already
+	// dead — no prometheus endpoint wired): inconclusive, not clean.
+	cs.PrependReactor("get", "pods",
+		agentLogFailReactor(errors.New("kubelet log read boom")))
+	_ = chk.Run(ctx)
+	// The log channel revives past the window: the sustained spin
+	// deletes the pod on the preserved clock.
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	cs.PrependReactor("get", "pods", agentLogReactor(spinLogBody(20, false)))
+	chk.Run(ctx)
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("flaky-evidence spin pod was not deleted — the inconclusive sweep wiped the first-seen clock")
 	}
 }
 

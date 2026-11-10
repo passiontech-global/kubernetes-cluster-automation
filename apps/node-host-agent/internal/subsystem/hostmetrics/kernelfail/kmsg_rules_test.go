@@ -4,6 +4,7 @@
 package kernelfail
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,7 +44,7 @@ func TestKmsgPageAllocLatch(t *testing.T) {
 		"order:0 allocation noise is routine — must not latch",
 		"page allocation failure: order:2, mode:0x40")
 	latch := filepath.Join(f.deps.StateDir, "state-page-alloc-failure")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatal("state-page-alloc-failure latch missing")
 	}
@@ -56,7 +57,7 @@ func TestKmsgClocksourceUnstableLatch(t *testing.T) {
 		"clocksource: timekeeping watchdog on CPU0: Marking clocksource 'tsc' as unstable",
 		"clocksource: Switched to clocksource hpet")
 	latch := filepath.Join(f.deps.StateDir, "state-clocksource-unstable")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatal("state-clocksource-unstable latch missing")
 	}

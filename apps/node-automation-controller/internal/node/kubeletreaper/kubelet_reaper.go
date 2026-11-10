@@ -15,11 +15,18 @@
 //
 // The probe also fails when the node's konnectivity-agent is dead or
 // the inter-DC mesh flaps while kubelet still renews its lease — so
-// tainting is gated on the Ready condition's lastHeartbeatTime: a
-// fresh heartbeat means a broken proxy path (skip/untaint), a stale
-// or missing heartbeat means the kubelet is really dead (taint).
-// Without that gate a mesh flap mass-taints and the descheduler
-// evicts hundreds of pods (has happened).
+// tainting is gated on the kube-node-lease/<node> Lease's
+// spec.renewTime: a live kubelet renews it every ~10s over its own
+// kubelet->apiserver connection, which does not traverse the broken
+// proxy path, so a fresh renewal means a broken proxy path
+// (skip/untaint) and a stale or missing one means the kubelet is
+// really dead (taint). The Ready condition's lastHeartbeatTime is
+// NOT usable as this gate — an upstream kubelet refreshes it only
+// when it actually patches its Node status (nodeStatusHasChanged
+// deliberately ignores the stamp; cadence nodeStatusReportFrequency,
+// 5m default plus up to 50% jitter), so a healthy kubelet routinely
+// reads minutes stale. Without the gate a mesh flap mass-taints and
+// the descheduler evicts hundreds of pods (has happened).
 package kubeletreaper
 
 import (
@@ -30,6 +37,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -45,7 +53,18 @@ const (
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
 	// per-probe apiserver timeout (8s) lives in kube.KubeletHealthz
-	kubeletReaperHBStaleS = 120 // Ready heartbeat older -> dead kubelet
+	// kubeletLeaseNamespace holds the per-node heartbeat Leases — one
+	// Lease named exactly like the Node (upstream node-heartbeat
+	// contract; every kubelet heartbeat is an update of that Lease's
+	// spec.renewTime).
+	kubeletLeaseNamespace = "kube-node-lease"
+	// kubeletReaperLeaseStale is the renewal age past which the
+	// kubelet reads as dead: a live kubelet renews every ~10s
+	// (renewInterval = leaseDuration/4, 40s default), so its stamp is
+	// <15s old even with clock skew — 60s gives several missed
+	// renewals of headroom without letting a dead kubelet wait more
+	// than the next 2m cycle for its taint.
+	kubeletReaperLeaseStale = 60 * time.Second
 )
 
 type kubeletReaper struct {
@@ -204,7 +223,7 @@ func truncateLog(s string, max int) string {
 // sweep applies the taint decision for one node. listed is the object
 // from this run's node list — already fresh enough to see our taint.
 // The per-node Get (the bash's `kubectl get node`) now only happens
-// when the probe FAILED: the heartbeat gate below needs a fresh read,
+// when the probe FAILED: the liveness gate below needs a fresh read,
 // while a healthy probe with no listed taint has literally nothing to
 // decide — one fewer apiserver read per worker per cycle.
 func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool) error {
@@ -242,25 +261,25 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	has := kube.HasTaint(node.Spec.Taints, kubeletReaperTaint)
 	name := listed.Name
 
-	// Probe failed — heartbeat gate: fresh Ready heartbeat = broken
-	// proxy path, not a dead kubelet. A MISSING Ready condition or a
-	// zero LastHeartbeatTime means the kubelet never posted status —
-	// stale (taint). A heartbeat dated in the FUTURE (age <= 0, clock
-	// skew between the kubelet's host and this pod) is still proof of
-	// life — fresh (no taint); conflating skew with staleness would
-	// mass-taint on an NTP flap.
-	age := -1 // sentinel: no usable timestamp -> stale
-	if c := kube.NodeCondition(node, corev1.NodeReady); c != nil &&
-		!c.LastHeartbeatTime.IsZero() {
-		age = int(r.now.Now().Sub(c.LastHeartbeatTime.Time) / time.Second)
-		if age < 0 {
-			// A heartbeat 1-2s in the future computes -1 and would
-			// collide with the sentinel — clamp so skew reads as
-			// the proof of life it is, never as staleness.
-			age = 0
-		}
+	// Probe failed — liveness gate: a fresh Lease renewal = broken
+	// proxy path, not a dead kubelet. The signal is the
+	// kube-node-lease/<node> Lease's spec.renewTime, NOT the Ready
+	// condition's lastHeartbeatTime: an upstream kubelet refreshes
+	// that stamp only when it actually patches its Node status
+	// (nodeStatusHasChanged deliberately ignores it) at
+	// nodeStatusReportFrequency — 5m default plus up to 50% jitter —
+	// so a HEALTHY kubelet routinely reads minutes stale on the old
+	// 120s heartbeat gate and got tainted exactly during the
+	// konnectivity/proxy outage this gate exists to ride out.
+	alive, err := r.kubeletAlive(ctx, name)
+	if err != nil {
+		// Fail closed: an unreadable lease is not evidence of death
+		// — tainting on our own read failure would punish live
+		// kubelets during an apiserver flap. The per-node error
+		// path meters it; the next 2m cycle retries.
+		return fmt.Errorf("get lease %s/%s: %w", kubeletLeaseNamespace, name, err)
 	}
-	if age == -1 || age > kubeletReaperHBStaleS {
+	if !alive {
 		if !has {
 			// Per-target non-convergent circuit breaker — the 4th
 			// taint of the same node inside the breaker window
@@ -283,10 +302,10 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 				return fmt.Errorf("taint %s on node %s: %w",
 					kubeletReaperTaint, name, err)
 			}
-			log.Info("TAINT: kubelet :10250 down + heartbeat stale/missing -> NoSchedule",
-				"node", name, "probes", kubeletReaperProbes, "heartbeatAgeS", age)
+			log.Info("TAINT: kubelet :10250 down + lease stale/missing -> NoSchedule",
+				"node", name, "probes", kubeletReaperProbes)
 		} else {
-			log.Info("KEEP-TAINT: heartbeat stale/missing", "node", name, "heartbeatAgeS", age)
+			log.Info("KEEP-TAINT: lease stale/missing", "node", name)
 		}
 		return nil
 	}
@@ -295,9 +314,40 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 			return fmt.Errorf("remove taint %s on node %s: %w",
 				kubeletReaperTaint, name, err)
 		}
-		log.Info("UNTAINT: heartbeat fresh -> taint removed", "node", name, "heartbeatAgeS", age)
+		log.Info("UNTAINT: kubelet alive (lease fresh) -> taint removed", "node", name)
 	} else {
-		log.Info("SKIP-TAINT: probe fail but heartbeat fresh", "node", name, "heartbeatAgeS", age)
+		log.Info("SKIP-TAINT: probe fail but kubelet alive (lease fresh)", "node", name)
 	}
 	return nil
+}
+
+// kubeletAlive reports whether the kube-node-lease/<node> Lease's
+// renewal stamp proves the kubelet is alive. A live kubelet renews
+// every ~10s, so anything past kubeletReaperLeaseStale reads as dead
+// — well above the renewal cadence, and a dead kubelet's stamp
+// crosses it within a minute. A MISSING Lease or a zero renewTime
+// means the kubelet never posted a heartbeat — dead (the same
+// missing-evidence-is-stale convention the Ready gate used). A
+// renewal dated in the FUTURE (clock skew between the kubelet's host
+// and this pod) is still proof of life — fresh; conflating skew with
+// staleness would mass-taint on an NTP flap.
+func (r *kubeletReaper) kubeletAlive(ctx context.Context, node string) (bool, error) {
+	lease, err := r.cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Get(ctx, node, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		// No heartbeat ever posted — dead.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if lease.Spec.RenewTime.IsZero() {
+		return false, nil
+	}
+	if age := r.now.Now().Sub(lease.Spec.RenewTime.Time); age < 0 {
+		// A renewal 1-2s in the future is skew, not staleness.
+		return true, nil
+	} else {
+		return age <= kubeletReaperLeaseStale, nil
+	}
 }

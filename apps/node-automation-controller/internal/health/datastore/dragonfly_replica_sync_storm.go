@@ -109,10 +109,15 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	linkSeries, errL := p.PromQuery(ctx,
 		`(dragonfly_master_link_status == 0) or (redis_master_link_status == 0)`)
 	if errL != nil {
+		// The master-link series is the check's PRIMARY signal —
+		// without it the sweep saw nothing, and a Pass here would
+		// read a sustained Prometheus outage as a healthy fleet
+		// (the sibling checks' posture: primary-signal failure is
+		// Infra, not a pass).
 		log.Info("WARN: dragonfly master-link query failed — check inconclusive",
 			"error", errL)
 		res := emptySweepClose()
-		res.Pass = true
+		res.Infra = fmt.Errorf("dragonfly master-link query: %w", errL)
 		return res
 	}
 	stormSeries, errS := p.PromQuery(ctx,

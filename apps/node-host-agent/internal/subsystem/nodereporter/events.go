@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
@@ -408,11 +409,21 @@ func (r *Reporter) readLogWindow() (*logWindow, error) {
 	}
 	var tail []byte // unread bytes of the rotated .1 generation
 	win := &logWindow{}
-	if fi.Size() < r.logOffset {
+	// A rename rotation swaps the file under the same path. Size
+	// alone misses it when the fresh file grows past the old offset
+	// before the next scan — the seek would then land mid-file in
+	// the NEW generation and the unread .1 tail would never drain
+	// (Events + problem_counter silently lost for that window).
+	// Identity (dev/ino via os.SameFile) detects the generation
+	// change regardless of size; the size check stays for the
+	// same-inode shrink (in-place truncate/rewrite).
+	generationChanged := r.logFi != nil && !os.SameFile(r.logFi, fi)
+	if generationChanged || fi.Size() < r.logOffset {
 		win.rotated = true
 		logger().Debug("nodereporter: watchdog log rotated — draining "+
 			"the .1 tail, offset reset", "file", r.cfg.WatchdogLogFile,
-			"oldOffset", r.logOffset, "size", fi.Size())
+			"oldOffset", r.logOffset, "size", fi.Size(),
+			"generationChanged", generationChanged)
 		// The .1 tail continues r.logPending (the partial line the
 		// old generation never terminated) — read it BEFORE clearing
 		// anything. The carry survives only when the tail actually
@@ -475,6 +486,9 @@ func (r *Reporter) readLogWindow() (*logWindow, error) {
 	// replay scan even if it yielded no complete lines yet.
 	r.logScanned = true
 	r.logOffset += rawLen
+	// Remember the generation read — the next scan's os.SameFile
+	// check compares against THIS stat.
+	r.logFi = fi
 	return win, nil
 }
 
@@ -569,9 +583,17 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string, eventType
 	// Truncate BEFORE keying: two >1KiB notes sharing the first
 	// maxEventNote bytes store an identical Note, so they must share
 	// one dedup entry — keying on the untruncated note would create
-	// distinct Events with identical content.
+	// distinct Events with identical content. The cut snaps back to
+	// a rune boundary and ToValidUTF8 strips any remaining invalid
+	// bytes: the apiserver stores Note as a UTF-8 string and rejects
+	// invalid input, so a garbage log line must not wedge its Event
+	// create permanently.
 	if len(note) > maxEventNote {
-		note = note[:maxEventNote]
+		i := maxEventNote
+		for i > 0 && !utf8.RuneStart(note[i]) {
+			i--
+		}
+		note = strings.ToValidUTF8(note[:i], "")
 	}
 	key := reason + "\x1f" + note
 

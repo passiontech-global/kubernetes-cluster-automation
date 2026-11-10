@@ -72,7 +72,7 @@ func TestDrainDmesgT(t *testing.T) {
 		return out, nil
 	}
 
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	b, err := os.ReadFile(f.r.statePath(kmsgCursorFile))
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +88,7 @@ func TestDrainDmesgT(t *testing.T) {
 
 	// Tick two: same history plus a fresh fs-error line.
 	out = out + "\n" + dmesgLine(t2, "EXT4-fs error (dev sda1) in x")
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	if _, err := os.Stat(
 		f.r.statePath(kmsgFsErrorFile)); err != nil {
 		t.Fatalf("fresh fs error not recorded: %v", err)
@@ -115,7 +115,7 @@ func TestDrainDmesgRaw(t *testing.T) {
 		return strings.Join(base, "\n"), nil
 	}
 
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	b, err := os.ReadFile(f.r.statePath(kmsgCursorFile))
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestDrainDmesgRaw(t *testing.T) {
 	// Anchor still present + one appended line → only the new line
 	// classifies.
 	base = append(base, "EXT4-fs error (dev sdb)")
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	if _, err := os.Stat(
 		f.r.statePath(kmsgFsErrorFile)); err != nil {
 		t.Fatalf("fresh fs error not recorded: %v", err)
@@ -137,7 +137,7 @@ func TestDrainDmesgRaw(t *testing.T) {
 	// Anchor evicted (ring wrapped past it) → re-anchor, classify
 	// nothing.
 	base = []string{"wrapped a", "wrapped b", "wrapped c"}
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	b, err = os.ReadFile(f.r.statePath(kmsgCursorFile))
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestDrainDmesgRaw(t *testing.T) {
 // no cursor, no markers, no error.
 func TestDrainDmesgNoAccess(t *testing.T) {
 	f := kfixture(t)
-	f.r.drainDmesg(&f.r.kscan)
+	f.r.drainDmesg(context.Background(), &f.r.kscan)
 	if _, err := os.Stat(
 		f.r.statePath(kmsgCursorFile)); !os.IsNotExist(err) {
 		t.Fatalf("cursor written despite no access (err=%v)", err)
@@ -175,8 +175,8 @@ func TestCloseKMSSession(t *testing.T) {
 func TestRunnerRefreshClose(t *testing.T) {
 	f := kfixture(t)
 	kmsgFixture(t, f.deps, "6,1,1000,0;routine")
-	f.r.Refresh()
-	f.r.Refresh() // second pass over an open session
+	f.r.Refresh(context.Background())
+	f.r.Refresh(context.Background()) // second pass over an open session
 	if f.r.kscan.sess == nil {
 		t.Fatal("kmsg session not opened by Refresh")
 	}

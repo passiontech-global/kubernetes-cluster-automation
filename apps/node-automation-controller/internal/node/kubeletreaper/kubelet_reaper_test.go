@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,13 +26,28 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
-// krStaleNode builds a worker whose Ready heartbeat is far older than
-// kubeletReaperHBStaleS — the taint decision's precondition.
+// krStaleNode builds a dead-kubelet worker: its Ready heartbeat is
+// minutes old AND it posts no kube-node-lease Lease — no renewal
+// evidence, the taint decision's precondition.
 func krStaleNode(name string) *corev1.Node {
 	n := testutil.Node(name, corev1.ConditionTrue, nil)
 	n.Status.Conditions[0].LastHeartbeatTime =
 		metav1.NewTime(time.Now().Add(-10 * time.Minute))
 	return n
+}
+
+// krLease stamps the kube-node-lease heartbeat Lease for node with a
+// renewal `age` old (negative = dated in the future — clock skew).
+func krLease(node string, age time.Duration) *coordinationv1.Lease {
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kubeletLeaseNamespace,
+			Name:      node,
+		},
+		Spec: coordinationv1.LeaseSpec{
+			RenewTime: &metav1.MicroTime{Time: time.Now().Add(-age)},
+		},
+	}
 }
 
 // krReaper builds the sweep fixture: direct clientset, pinned clock,
@@ -173,7 +189,7 @@ func TestKubeletReaperRunAbortsWhenNoProbeSucceeds(t *testing.T) {
 }
 
 // The healthy/dead split: a serving kubelet clears its marks, a dead
-// one with a stale heartbeat gets the NoSchedule taint — and the
+// one with no lease renewal gets the NoSchedule taint — and the
 // control-plane node is never probed nor swept.
 func TestKubeletReaperRunTaintsOnlyTheDeadWorker(t *testing.T) {
 	cp := testutil.Node("cp1", corev1.ConditionTrue,
@@ -182,23 +198,31 @@ func TestKubeletReaperRunTaintsOnlyTheDeadWorker(t *testing.T) {
 	wDead := krStaleNode("w-dead")
 	wDead.Spec.Taints = []corev1.Taint{{
 		Key: kubeletReaperTaint, Effect: corev1.TaintEffectNoSchedule}}
-	wFresh := krStaleNode("w-fresh") // probe fails but heartbeat is fresh -> skip
-	wFresh.Status.Conditions[0].LastHeartbeatTime =
-		metav1.NewTime(time.Now())
-	cs := fake.NewSimpleClientset(cp, wOK, wDead, wFresh)
+	// w-alive: probe fails (broken proxy path) but the kubelet renews
+	// its heartbeat Lease — proof of life, no taint.
+	wAlive := krStaleNode("w-alive") // stale heartbeat does NOT mean dead
+	cs := fake.NewSimpleClientset(cp, wOK, wDead, wAlive)
+	for _, lease := range []*coordinationv1.Lease{
+		krLease("w-ok", 5*time.Second), krLease("w-alive", 5*time.Second),
+	} {
+		if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Create(ctx, lease, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	now := time.Now()
 	r := krRunReaper(cs, now,
 		func(_ context.Context, node string) bool { return node == "w-ok" })
 	if err := r.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	// w-dead already carried the taint -> kept (heartbeat stale).
+	// w-dead already carried the taint -> kept (no lease renewal).
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w-dead").Spec.Taints, kubeletReaperTaint) {
-		t.Fatal("stale-heartbeat dead worker lost its taint")
+		t.Fatal("dead worker (stale lease) lost its taint")
 	}
-	// w-fresh: probe failed but the heartbeat proves life -> no taint.
-	if kube.HasTaint(testutil.GetNode(t, cs, "w-fresh").Spec.Taints, kubeletReaperTaint) {
-		t.Fatal("fresh-heartbeat worker tainted — broken proxy path punished")
+	// w-alive: probe failed but the lease proves life -> no taint.
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-alive").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("lease-renewing worker tainted — broken proxy path punished")
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w-ok").Spec.Taints, kubeletReaperTaint) {
 		t.Fatal("healthy worker tainted")
@@ -242,6 +266,99 @@ func TestKubeletReaperRunAbsorbsSweepErrors(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w-bad").Spec.Taints, kubeletReaperTaint) {
 		t.Fatal("w-bad tainted despite its get failing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sweep() — the liveness gate: the kube-node-lease Lease renewal
+// stamp is the proof of life, not the Ready heartbeat.
+// ---------------------------------------------------------------------------
+
+// THE REGRESSION: a kubelet refreshes Ready's lastHeartbeatTime only
+// when it patches its Node status (5m cadence + jitter, skipped when
+// nothing changed), so a HEALTHY kubelet routinely reads minutes
+// stale. A probe failure on a broken proxy path must not taint it
+// while its Lease renewal (every ~10s) proves life.
+func TestKubeletReaperFreshLeaseSkipsTaintDespiteStaleHeartbeat(t *testing.T) {
+	n := krStaleNode("w1") // heartbeat 10m old — "stale" under the old gate
+	cs := fake.NewSimpleClientset(n)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	r := krReaper(cs, now)
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("lease-renewing kubelet tainted on a stale heartbeat stamp")
+	}
+}
+
+// The mirror direction pins the swap: a fresh heartbeat does NOT mask
+// a dead kubelet. The stamp is a leftover from the last status patch
+// before the kubelet died; the untouched Lease renewal is the verdict.
+func TestKubeletReaperStaleLeaseTaintsDespiteFreshHeartbeat(t *testing.T) {
+	n := testutil.Node("w1", corev1.ConditionTrue, nil)
+	// Fresh Ready heartbeat — the exact signal the pre-lease gate
+	// trusted. The stale lease below must still taint.
+	n.Status.Conditions[0].LastHeartbeatTime = metav1.NewTime(time.Now())
+	cs := fake.NewSimpleClientset(n)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Minute), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	r := krReaper(cs, now)
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("kubelet with a dead lease renewal not tainted")
+	}
+}
+
+// A renewal dated in the FUTURE is clock skew, not staleness — proof
+// of life (the same clamp the Ready gate carried).
+func TestKubeletReaperFutureLeaseRenewalSkipsTaint(t *testing.T) {
+	n := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(n)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", -30*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	r := krReaper(cs, now)
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("future-dated renewal (clock skew) read as staleness")
+	}
+}
+
+// An unreadable Lease is not evidence of death — the sweep fails
+// closed (returns an error, taints nothing) instead of tainting on
+// its own read failure.
+func TestKubeletReaperLeaseGetErrorFailsClosed(t *testing.T) {
+	n := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(n)
+	cs.PrependReactor("get", "leases",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("lease get boom")
+		})
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	r := krReaper(cs, now)
+	if err := r.sweep(ctx, n, false); err == nil {
+		t.Fatal("lease read failure must fail the node's sweep, not taint")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("node tainted while its lease was unreadable")
 	}
 }
 

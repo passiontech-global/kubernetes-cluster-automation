@@ -1,6 +1,7 @@
 package hostmetrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,17 +26,25 @@ func TestKernelKeysUsedRatio(t *testing.T) {
 		t.Fatal("missing key-users reported as ok")
 	}
 	testutil.WriteFile(t, f,
-		"     0: 1234 5678 100 1000000 25000000\n"+
-			"  1000: 42 82000 81000 100000 2500000\n")
+		// Real /proc/key-users rows (this host): "uid: usage
+		// nkeys/nikeys qnkeys/maxkeys qnbytes/maxbytes".
+		"    0:    70 69/69 55/1000000 1326/25000000\n"+
+			"  1000:     9 9/9 18/20 79/20000\n"+
+			// Edge rows: a UID with zero keys parses to ratio 0, a
+			// zero quota row is skipped (no division), malformed
+			// lines never kill the parse.
+			"  101:     1 0/0 0/200 0/20000\n"+
+			"  102:     1 1/1 5/0 9/20000\n"+
+			"junk\n")
 	got, ok := c.kernelKeysUsedRatio()
 	if !ok {
 		t.Fatal("key-users not parsed")
 	}
-	// worst ratio = 81000/100000 = 0.81
-	if got < 0.80 || got > 0.82 {
-		t.Fatalf("ratio=%v want ~0.81", got)
+	// worst ratio = 18/20 = 0.9 (root row: 55/1000000 ≈ 0.000055)
+	if got < 0.89 || got > 0.91 {
+		t.Fatalf("ratio=%v want ~0.9", got)
 	}
-	// 0.81 > 0.80 → latch sets.
+	// 0.9 > 0.80 → latch sets.
 	c.Latches().updateKernelKeysLatch(got)
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
 		"state-kernel-keys-pressure")); err != nil {
@@ -46,7 +55,7 @@ func TestKernelKeysUsedRatio(t *testing.T) {
 func TestRefreshLatchesWritesFiles(t *testing.T) {
 	cfg, _ := fixture(t)
 	c := New(cfg)
-	c.Latches().refreshLatches()
+	c.Latches().refreshLatches(context.Background())
 	// A healthy fixture clears/latches nothing fatal — the point is
 	// the loop runs every contract file without panic.
 }
@@ -81,7 +90,7 @@ func TestRefreshLatchesTouchesHeldLatches(t *testing.T) {
 		}
 	}
 
-	c.Latches().refreshLatches()
+	c.Latches().refreshLatches(context.Background())
 
 	for name := range old {
 		p := filepath.Join(cfg.WatchdogStateDir, name)
@@ -136,7 +145,7 @@ func TestInodePressureHysteresis(t *testing.T) {
 	l := c.Latches()
 
 	// 96% on /fake/etc → enter, detail names the mount + ratio.
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if !latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch not set at 0.96")
 	}
@@ -153,7 +162,7 @@ func TestInodePressureHysteresis(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/fake/etc": {920, 1000}, "/fake/k0s": {500, 1000},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if !latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch cleared inside the hysteresis band")
 	}
@@ -162,7 +171,7 @@ func TestInodePressureHysteresis(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/fake/etc": {900, 1000}, "/fake/k0s": {500, 1000},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch not cleared at 0.90")
 	}
@@ -173,7 +182,7 @@ func TestInodePressureHysteresis(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/fake/etc": {0, 0}, "/fake/k0s": {500, 1000},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch set from inconclusive evidence")
 	}
@@ -182,7 +191,7 @@ func TestInodePressureHysteresis(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/fake/etc": {10, 1000}, "/fake/k0s": {500, 1000},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch appeared on a healthy pass")
 	}
@@ -195,7 +204,7 @@ func TestKernelKeysGaugeEmitAndExit(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.KeyUsersFile = filepath.Join(t.TempDir(), "key-users")
 	testutil.WriteFile(t, cfg.KeyUsersFile,
-		"  1000: 42 82000 90000 100000 2500000\n")
+		"  1000: 42 90/90 180/200 1800/20000\n") // qnkeys/maxkeys = 0.9
 	c := New(cfg)
 	if v, ok := metricValue(t, c, "node_host_agent_kernel_keys_used_ratio",
 		map[string]string{"node": "node-a"}); !ok || v != 0.9 {
@@ -251,13 +260,13 @@ func TestRefreshLatchesSignalPaths(t *testing.T) {
 		return nil
 	}
 
-	// key-users at 96% of maxkeys → state-kernel-keys-pressure.
+	// key-users at 96% of the key quota → state-kernel-keys-pressure.
 	ku := filepath.Join(t.TempDir(), "key-users")
-	testutil.WriteFile(t, ku, "  1000: 42 96000 95000 100000 2500000\n")
+	testutil.WriteFile(t, ku, "  1000: 42 96/96 192/200 1920/20000\n")
 	cfg.KeyUsersFile = ku
 
 	c := New(cfg)
-	c.Latches().refreshLatches()
+	c.Latches().refreshLatches(context.Background())
 
 	for _, name := range []string{
 		latchdefs.LatchNodeOverloaded,

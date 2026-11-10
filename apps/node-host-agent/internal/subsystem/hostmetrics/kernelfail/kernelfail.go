@@ -161,6 +161,12 @@ func New(d Deps) *Runner {
 	if d.TickInterval <= 0 {
 		d.TickInterval = defaultTickInterval
 	}
+	if d.Clock == nil {
+		d.Clock = timex.NewCell(nil)
+	}
+	if d.Store == nil && d.StateDir != "" {
+		d.Store = hoststate.New(d.StateDir, "", nil, nil)
+	}
 	return &Runner{deps: d}
 }
 
@@ -170,12 +176,13 @@ func New(d Deps) *Runner {
 // page-alloc evidence the later steps consume — workerhygiene's
 // SystemOOMVictim and vm.compact_memory triggers included), then
 // the pid/fd pressure, steal/entropy, clock-skew and
-// fs-readonly-evidence updaters.
-func (r *Runner) Refresh() {
-	r.checkKernelDmesg()
+// fs-readonly-evidence updaters. ctx cancels the in-flight host
+// commands (dmesg fallback, chronyc) when the ticker's ctx dies.
+func (r *Runner) Refresh(ctx context.Context) {
+	r.checkKernelDmesg(ctx)
 	r.updatePidFDPressure()
 	r.updateStealEntropy()
-	r.checkClockSkew()
+	r.checkClockSkew(ctx)
 	r.checkClockWarp()
 	r.updateFSReadonlyEvidence()
 }

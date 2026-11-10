@@ -145,13 +145,13 @@ func routeGuardDebounceLoop(ctx context.Context, events <-chan struct{},
 			if timer == nil {
 				timer = time.NewTimer(debounce)
 			} else {
-				timer.Reset(debounce)
+				rearmTimer(timer, debounce)
 			}
 			fire = timer.C
 		case <-fire:
 			fire = nil // disarm until the next event/re-arm
 			if wait := minRestore - time.Since(lastRestore); wait > 0 {
-				timer.Reset(wait)
+				rearmTimer(timer, wait)
 				fire = timer.C
 				continue
 			}
@@ -159,4 +159,20 @@ func routeGuardDebounceLoop(ctx context.Context, events <-chan struct{},
 			reconcile(ctx)
 		}
 	}
+}
+
+// rearmTimer re-arms an already-running timer: a tick may still be
+// queued in timer.C (an event won the select against an already
+// fired timer) — a bare Reset does not drain it and the next
+// iteration would consume the stale tick instantly, collapsing the
+// debounce to zero. Stop + drain, then Reset — the documented
+// Timer.Reset pattern.
+func rearmTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }

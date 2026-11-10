@@ -20,6 +20,12 @@ const (
 	defaultOpenEBSLocalDir  = "/var/openebs/local"
 	defaultLocalPVScanEvery = 15 * time.Minute
 	localPVMaxWalkEntries   = 20000
+	// localPVMaxStaleWalks — how many consecutive failed walks the
+	// last good snapshot still serves. Past it the series stop
+	// until a walk succeeds: volumes deleted while the root is
+	// unreadable must not emit forever (a stale per-PVC byte count
+	// misreports disk pressure).
+	localPVMaxStaleWalks = 3
 )
 
 // --- OpenEBS LocalPV per-PVC dir bytes ---
@@ -33,22 +39,50 @@ type localpvCache struct {
 	mu    sync.Mutex
 	at    time.Time
 	bytes map[string]int64
+	fails int // consecutive failed walks over the cached snapshot
 }
 
-// snapshot returns the cached per-PVC bytes and whether they're
-// still fresh — non-nil and younger than interval.
-func (s *localpvCache) snapshot(now time.Time,
-	interval time.Duration) (map[string]int64, bool) {
+// get returns the per-PVC bytes, walking at most once under the
+// lock: a stale check and the walk that follows are ONE critical
+// section, so two concurrent scrapes cannot both run the bounded du
+// (the second queues and reuses the first's store) and a store can
+// never land between the stale check and the failed-walk bump
+// (which would miscount the streak against fresh data). The walk is
+// deliberately inside the lock — bounded by localPVMaxWalkEntries,
+// so the queueing second scrape pays a wait, not a second walk.
+func (s *localpvCache) get(now time.Time, interval time.Duration,
+	walk func() map[string]int64) (bytes map[string]int64, stopped bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.bytes, s.bytes != nil && now.Sub(s.at) < interval
+	if s.bytes != nil && now.Sub(s.at) < interval {
+		return s.bytes, false
+	}
+	if walked := walk(); walked != nil {
+		s.at, s.bytes, s.fails = now, walked, 0
+		return walked, false
+	}
+	return s.noteWalkFailedLocked()
 }
 
-// store replaces the cache with a fresh walk result stamped at now.
-func (s *localpvCache) store(now time.Time, bytes map[string]int64) {
-	s.mu.Lock()
-	s.at, s.bytes = now, bytes
-	s.mu.Unlock()
+// noteWalkFailedLocked records one failed du walk and returns the
+// cached snapshot while it is still servable: the first
+// localPVMaxStaleWalks failures keep serving the last good bytes,
+// past them the cache is dropped (nil) until a successful walk
+// stores again. stopped reports the just-crossed transition into
+// the emit-nothing state so the caller logs it once; with nothing
+// cached there is nothing to go stale and no transition ever fires.
+// Callers must hold s.mu (get).
+func (s *localpvCache) noteWalkFailedLocked() (bytes map[string]int64, stopped bool) {
+	if s.bytes == nil {
+		s.fails = 0
+		return nil, false
+	}
+	s.fails++
+	if s.fails <= localPVMaxStaleWalks {
+		return s.bytes, false
+	}
+	s.bytes = nil
+	return nil, s.fails == localPVMaxStaleWalks+1
 }
 
 var descLocalPVDirBytes = prometheus.NewDesc(
@@ -62,17 +96,18 @@ var descLocalPVDirBytes = prometheus.NewDesc(
 // otherwise pay a full filesystem walk per PVC per scrape. A
 // missing/unreadable root emits nothing (absent, not 0 — "no
 // local-path volumes here" must stay distinguishable from "zero
-// bytes").
+// bytes"). A root that turns unreadable keeps serving the last
+// good snapshot for localPVMaxStaleWalks failed walks, then stops
+// emitting until a walk succeeds — a deleted PVC's stale byte
+// count must not misreport disk pressure forever.
 func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
-	cached, fresh := c.lpv.snapshot(c.cfg.Clock.Now(), c.cfg.LocalPVScanInterval)
-	bytes := cached
-	if !fresh {
-		if walked := c.walkLocalPVDirs(); walked != nil {
-			c.lpv.store(c.cfg.Clock.Now(), walked)
-			bytes = walked
-		}
-		// A failed walk (root unreadable) keeps serving the last
-		// good snapshot rather than blanking every series.
+	bytes, stopped := c.lpv.get(c.cfg.Clock.Now(),
+		c.cfg.LocalPVScanInterval, c.walkLocalPVDirs)
+	if stopped {
+		logger().Warn("hostmetrics: openebs local dir unreadable — "+
+			"localpv metrics stopped until the root is readable again",
+			"dir", c.cfg.OpenEBSLocalDir,
+			"walks", localPVMaxStaleWalks+1)
 	}
 	for pvc, b := range bytes {
 		ch <- prometheus.MustNewConstMetric(descLocalPVDirBytes,
@@ -82,10 +117,11 @@ func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
 
 // walkLocalPVDirs sums the bytes under every pvc-* dir in
 // OpenEBSLocalDir. Returns nil when the root can't be listed —
-// callers keep the previous cache. Each volume's walk is bounded
-// at localPVMaxWalkEntries entries: a runaway PVC with millions of
-// files must not stall the scrape; the emitted count is then a
-// partial sum (documented on the metric).
+// callers serve the previous cache for localPVMaxStaleWalks failed
+// walks, then emit nothing until a walk succeeds. Each volume's
+// walk is bounded at localPVMaxWalkEntries entries: a runaway PVC
+// with millions of files must not stall the scrape; the emitted
+// count is then a partial sum (documented on the metric).
 func (c *Collector) walkLocalPVDirs() map[string]int64 {
 	entries, err := os.ReadDir(c.cfg.OpenEBSLocalDir)
 	if err != nil {

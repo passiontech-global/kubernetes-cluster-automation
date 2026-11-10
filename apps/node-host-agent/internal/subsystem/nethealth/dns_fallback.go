@@ -52,15 +52,18 @@ func (n *NetHealth) pinFiles() []string {
 
 // renderHostsBlock rewrites the managed block in HostsFile from the
 // pin files. block=="" (no pins) removes the block. Returns whether
-// the file changed.
-func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
-	data, err := os.ReadFile(n.cfg.HostsFile)
-	if err != nil {
+// the file changed, and the error when the block could not be
+// applied (hosts file unreadable or the atomic write failed) — the
+// caller must not treat "unchanged" as "applied" for latch/condition
+// purposes.
+func (n *NetHealth) renderHostsBlock(block string) (changed bool, err error) {
+	data, rerr := os.ReadFile(n.cfg.HostsFile)
+	if rerr != nil {
 		logger().Warn("nethealth: hosts file unreadable — dns-fallback "+
 			"block left untouched",
 			"path", n.cfg.HostsFile,
-			"error", err)
-		return false
+			"error", rerr)
+		return false, rerr
 	}
 	cur := string(data)
 	var kept []string
@@ -122,19 +125,19 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 		next = body + "\n" + hostsBlockBegin + "\n" + block + hostsBlockEnd + "\n"
 	}
 	if !hadBlock && block == "" {
-		return false
+		return false, nil
 	}
 	if next == cur {
-		return false
+		return false, nil
 	}
-	if err := hostutil.WriteFileAtomic(n.cfg.HostsFile, next); err != nil {
+	if werr := hostutil.WriteFileAtomic(n.cfg.HostsFile, next); werr != nil {
 		logger().Warn("nethealth: hosts file write failed — dns-fallback "+
 			"block not applied",
 			"path", n.cfg.HostsFile,
-			"error", err)
-		return false
+			"error", werr)
+		return false, werr
 	}
-	return true
+	return true, nil
 }
 
 // managedPinLine reports whether a hosts-file line pins one of the
@@ -166,14 +169,21 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		// Map empty → clean up block + files like the shell's else
 		// (`rm -f dnsfb-*`: pin/last-good/counter files all go —
 		// shell leftovers included).
-		if n.renderHostsBlock("") {
-			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (map empty)")
+		// A failed render leaves the block in the hosts file —
+		// exiting the latch then would claim disengagement while
+		// kubelet still resolves against the pins. The exit waits
+		// for a cycle where the write lands.
+		if changed, rerr := n.renderHostsBlock(""); rerr == nil {
+			if changed {
+				n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (map empty)")
+			}
+			n.stateExit(latchdefs.LatchDNSFallback)
 		}
 		for _, f := range n.egressFiles("dnsfb-") {
 			_ = os.Remove(f)
 		}
 		n.dnsfails = map[string]int{}
-		n.stateExit(latchdefs.LatchDNSFallback)
+		n.dnsok = map[string]int{}
 		n.cycles.WithLabelValues(checkDNSFB, "ok").Inc()
 		return
 	}
@@ -185,6 +195,10 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 	for _, e := range wd.DNSFallback {
 		lg := filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-lg-"+e.Name)
 		pinf := filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-pin-"+e.Name)
+		curIP := ""
+		if pin := strings.Fields(hostutil.ReadTrimmed(pinf)); len(pin) >= 1 {
+			curIP = pin[0]
+		}
 		resolved := ""
 		for _, server := range ns {
 			ip, err := n.cfg.dnsProbe(ctx, server, e.Name)
@@ -210,15 +224,34 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 				}
 			}
 			delete(n.dnsfails, e.Name)
+			if curIP == "" {
+				// Nothing pinned — nothing to unpin. Drop any
+				// leftover streak too: a pin removed out-of-band
+				// must not let the NEXT pin unpin after a single
+				// success off the stale count.
+				delete(n.dnsok, e.Name)
+				continue
+			}
+			// Symmetric hysteresis: the pin survives a successful
+			// probe. Unpinning on the FIRST success let one lucky
+			// resolution tear the managed block out of /etc/hosts
+			// and put it back on the next failure — on flapping DNS
+			// the block toggled every other cycle and each toggle
+			// fired a conntrack flush. The pin drops only after
+			// ConsecNeeded CONSECUTIVE successes, mirroring the
+			// pin-on streak.
+			n.dnsok[e.Name]++
+			if n.dnsok[e.Name] < n.cfg.ConsecNeeded {
+				continue
+			}
+			delete(n.dnsok, e.Name)
 			_ = os.Remove(pinf)
 			continue
 		}
+		// Failed probe: the success streak is broken.
+		delete(n.dnsok, e.Name)
 		n.dnsfails[e.Name]++
 		fails := n.dnsfails[e.Name]
-		curIP := ""
-		if pin := strings.Fields(hostutil.ReadTrimmed(pinf)); len(pin) >= 1 {
-			curIP = pin[0]
-		}
 		if fails < n.cfg.ConsecNeeded && curIP == "" {
 			n.state.AppendLog(fmt.Sprintf(
 				"suspect: dns-resolve %s fail via resolv.conf (check %d/%d)",
@@ -278,6 +311,11 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			delete(n.dnsfails, name)
 		}
 	}
+	for name := range n.dnsok {
+		if !inMap[name] {
+			delete(n.dnsok, name)
+		}
+	}
 	// Render the managed block from the pins.
 	var block strings.Builder
 	for _, f := range n.pinFiles() {
@@ -286,22 +324,42 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		}
 	}
 	if block.Len() != 0 {
-		if n.renderHostsBlock(block.String()) {
-			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block updated")
-			// Newly written pins mean DNS was dead — conntrack
-			// entries learned on the broken path blackhole lookups
-			// until expiry unless flushed now.
-			n.flushStaleUDPConntrack(ctx, checkDNSFB)
+		changed, rerr := n.renderHostsBlock(block.String())
+		if rerr != nil {
+			// The block did not land — kubelet still resolves against
+			// the dead resolver. Entering the latch here would claim
+			// dns-fallback remediation is engaged while it is not.
+			n.state.SuspectLog("dnsfb-hosts-write", fmt.Sprintf(
+				"suspect: dns-fallback hosts block not applied (%v) — condition not claimed",
+				rerr), suspectLogCadence)
+		} else {
+			if changed {
+				n.state.AppendLog("ACTION: /etc/hosts dns-fallback block updated")
+				// Newly written pins mean DNS was dead — conntrack
+				// entries learned on the broken path blackhole lookups
+				// until expiry unless flushed now.
+				n.flushStaleUDPConntrack(ctx, checkDNSFB)
+			}
+			n.state.Enter(latchdefs.LatchDNSFallback, "")
 		}
-		n.state.Enter(latchdefs.LatchDNSFallback, "")
 	} else {
-		if n.renderHostsBlock("") {
-			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
-			// Unpin is a DNS-path transition too — replies for the
-			// restored resolver may sit in stale udp/53 entries.
-			n.flushStaleUDPConntrack(ctx, checkDNSFB)
+		changed, rerr := n.renderHostsBlock("")
+		if rerr != nil {
+			// Symmetric honesty: the block may still be in the file —
+			// exiting the latch would claim the remediation ended
+			// while the pins are still live.
+			n.state.SuspectLog("dnsfb-hosts-write", fmt.Sprintf(
+				"suspect: dns-fallback hosts block removal failed (%v) — condition kept",
+				rerr), suspectLogCadence)
+		} else {
+			if changed {
+				n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
+				// Unpin is a DNS-path transition too — replies for the
+				// restored resolver may sit in stale udp/53 entries.
+				n.flushStaleUDPConntrack(ctx, checkDNSFB)
+			}
+			n.stateExit(latchdefs.LatchDNSFallback)
 		}
-		n.stateExit(latchdefs.LatchDNSFallback)
 	}
 	n.cycles.WithLabelValues(checkDNSFB, "ok").Inc()
 }

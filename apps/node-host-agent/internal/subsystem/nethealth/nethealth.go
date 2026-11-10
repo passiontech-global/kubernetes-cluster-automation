@@ -276,9 +276,14 @@ func (c *Config) applyDefaults() {
 			defer cancel()
 			r := &net.Resolver{
 				PreferGo: true,
-				Dial: func(dctx context.Context, _, _ string) (net.Conn, error) {
+				// Pass the resolver's network through — the stub
+				// retries TCP when a UDP answer comes back
+				// truncated (TC bit); pinning UDP would downgrade
+				// that retry to a second truncating query and
+				// misread a healthy resolver as dead.
+				Dial: func(dctx context.Context, network, _ string) (net.Conn, error) {
 					d := net.Dialer{Timeout: 2 * time.Second}
-					return d.DialContext(dctx, "udp", net.JoinHostPort(nameserver, "53"))
+					return d.DialContext(dctx, network, net.JoinHostPort(nameserver, "53"))
 				},
 			}
 			ips, err := r.LookupIP(dctx, "ip4", name)
@@ -349,7 +354,12 @@ type NetHealth struct {
 	// goes through it (the single lib.sh-parity implementation).
 	state *hoststate.Store
 
-	dnsfails     map[string]int // per DNS_FALLBACK_MAP name
+	dnsfails map[string]int // per DNS_FALLBACK_MAP name
+	// dnsok counts consecutive successful DNS probes per name — the
+	// unpin streak. The pin drops only after ConsecNeeded
+	// consecutive successes (symmetric with dnsfails' pin-on gate);
+	// a single lucky resolution must not tear the managed block out.
+	dnsok        map[string]int // per DNS_FALLBACK_MAP name
 	nebulaFails  int            // socket/tun/stats fails
 	nebulaDpFail int            // dataplane-dead fails
 	nebulaDeg    int            // dataplane-degraded runs
@@ -409,6 +419,7 @@ func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 	n := &NetHealth{
 		cfg:       cfg,
 		dnsfails:  map[string]int{},
+		dnsok:     map[string]int{},
 		egressCtr: map[string]int{},
 	}
 	// The store binds the shared timex.Cell — a post-New

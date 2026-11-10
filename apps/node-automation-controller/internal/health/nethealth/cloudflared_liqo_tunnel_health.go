@@ -71,11 +71,14 @@ const (
 // cfTunnelQUICMarkers are the log signatures of a cloudflared
 // connector whose QUIC path to the edge is dead — the pod stays
 // Ready (its /ready endpoint answers locally) while every edge
-// dial times out.
+// dial times out. "failed to sufficiently increase receive buffer"
+// is deliberately absent: that cloudflared UDP-buffer warning is
+// benign and ships on virtually every host with stock
+// net.core.rmem_max — consulted on the metrics-unreachable path it
+// turned healthy connectors into repeatedly deleted pods.
 var cfTunnelQUICMarkers = []string{
 	"failed to dial to edge with quic",
 	"timeout: no recent network activity",
-	"failed to sufficiently increase receive buffer",
 }
 
 var (
@@ -184,6 +187,7 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
+		sig := key + "/" + string(pod.UID)
 		bad := false
 		if ha, ok := p.cfTunnelHAConnections(ctx, pod); ok {
 			bad = ha == 0
@@ -191,15 +195,19 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			bad = storm
 		} else {
 			// Both evidence paths failed — inconclusive, not clean.
+			// Carry the key through the keep-set so the Prune below
+			// cannot wipe a streak the sweep could not evaluate —
+			// a dead tunnel with flaky evidence would otherwise
+			// never reach cfTunnelMinStreak.
 			log.Info("WARN: cloudflared metrics + logs both unreadable — wedge unverifiable",
 				"pod", key, "error", lerr)
+			streakKeep[sig] = true
 			continue
 		}
 		if !bad {
-			p.streak.Reset(key + "/" + string(pod.UID)) // fresh evidence of health — re-arm
+			p.streak.Reset(sig) // fresh evidence of health — re-arm
 			continue
 		}
-		sig := key + "/" + string(pod.UID)
 		streakKeep[sig] = true
 		if p.streak.Hit(sig) < cfTunnelMinStreak {
 			continue

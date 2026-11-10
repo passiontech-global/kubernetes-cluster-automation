@@ -83,13 +83,18 @@ func (c *cyc) groupBase() {
 	c.conntrackHashsize()
 	// A4 assert: effective == expected (informational fail like
 	// ansible) — best-effort verify; the apply failures above are
-	// what count the group error.
-	out, _ := r.run(ctx, "sysctl", "-n", "net.ipv4.tcp_congestion_control", "net.core.default_qdisc")
-	lines := strings.Fields(out)
-	want := []string{c.sysctlVal("bbr_sysctls", 0), c.sysctlVal("bbr_sysctls", 1)}
-	if len(lines) < 2 || lines[0] != want[0] || lines[1] != want[1] {
-		logger().Warn("BBR/fq not effective — kernel values differ from rendered sysctls",
-			"got", out, "want", strings.Join(want, " "))
+	// what count the group error. Skipped entirely when
+	// bbr_sysctls converges nothing — an absent var is not an
+	// error above, and asserting "" against the live values would
+	// warn forever on nodes that simply don't set it.
+	if pairs := c.sysctlPairs("bbr_sysctls"); len(pairs) > 0 {
+		out, _ := r.run(ctx, "sysctl", "-n", "net.ipv4.tcp_congestion_control", "net.core.default_qdisc")
+		lines := strings.Fields(out)
+		want := []string{c.sysctlVal("bbr_sysctls", 0), c.sysctlVal("bbr_sysctls", 1)}
+		if len(lines) < 2 || lines[0] != want[0] || lines[1] != want[1] {
+			logger().Warn("BBR/fq not effective — kernel values differ from rendered sysctls",
+				"got", out, "want", strings.Join(want, " "))
+		}
 	}
 
 	// Coredump guard: disable host coredump storage — a crashing daemon
@@ -125,8 +130,10 @@ ProcessSizeMax=0
 		// newline/metachar var would inject a SECOND directive
 		// systemd applies; an unparsable one is dropped at
 		// daemon-reload and the unit silently keeps stock fd limits.
-		// Refuse both: skip the write, count the error.
-		if nofile := c.v("k0sworker_limit_nofile"); c.cfgLimitNOFILE("k0sworker_limit_nofile", nofile) {
+		// Refuse both: skip the write, count the error. An empty
+		// var is absent, not refused — gating it here (like the
+		// sysctl pairs above) keeps it from erroring every cycle.
+		if nofile := c.v("k0sworker_limit_nofile"); nofile != "" && c.cfgLimitNOFILE("k0sworker_limit_nofile", nofile) {
 			if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/10-limits.conf",
 				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s worker
 [Service]
@@ -145,7 +152,7 @@ TasksMax=infinity
 	if c.controller() {
 		_ = c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
 		// Same verbatim-assignment gate as the worker drop-in above.
-		if nofile := c.v("k0scontroller_limit_nofile"); c.cfgLimitNOFILE("k0scontroller_limit_nofile", nofile) {
+		if nofile := c.v("k0scontroller_limit_nofile"); nofile != "" && c.cfgLimitNOFILE("k0scontroller_limit_nofile", nofile) {
 			if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
 				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
 [Service]

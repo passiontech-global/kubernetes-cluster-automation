@@ -9,6 +9,8 @@
 package agent
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,5 +45,83 @@ func TestSuperviseHealthyRun(t *testing.T) {
 					tc.elapsed, tc.backof, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRestartTimerDrainsStaleTick: a bare timer.Reset on a timer
+// whose tick is still queued in timer.C — the case every Run that
+// outlives the armed backoff produces (the timer fires 5s into the
+// run) — hands the STALE tick to the select: the restart happens
+// with ZERO wait and the whole 5s→5m ladder is skipped. restartTimer
+// must stop+drain before Reset, so the re-armed fire lands no
+// earlier than the new delay.
+func TestRestartTimerDrainsStaleTick(t *testing.T) {
+	t.Parallel()
+	timer := time.NewTimer(5 * time.Millisecond)
+	time.Sleep(15 * time.Millisecond) // tick fired, NOT consumed
+	restartTimer(timer, 200*time.Millisecond)
+	select {
+	case <-timer.C:
+		t.Fatal("stale tick consumed — restart skipped the backoff")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The re-armed fire still lands after the full new delay.
+	select {
+	case <-timer.C:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-armed timer never fired")
+	}
+}
+
+// ladderSubsystem: the first Run outlives the armed 5s backoff timer
+// (fires mid-run), the second blocks until ctx is cancelled.
+type ladderSubsystem struct {
+	calls     atomic.Int32
+	firstDone chan struct{}
+}
+
+func (s *ladderSubsystem) Name() string { return "ladder" }
+
+func (s *ladderSubsystem) Run(ctx context.Context) {
+	if s.calls.Add(1) == 1 {
+		time.Sleep(superviseBackoffInitial + 300*time.Millisecond)
+		close(s.firstDone)
+		return
+	}
+	<-ctx.Done()
+}
+
+// TestSuperviseWaitsFullBackoffAfterRunOutlivingBackoff: the armed
+// timer fires INSIDE any Run that outlives the current backoff —
+// the normal healthy case. The queued stale tick must not skip the
+// wait: the restart after such a run still waits the full jittered
+// backoff (≥ backoff − 15%).
+func TestSuperviseWaitsFullBackoffAfterRunOutlivingBackoff(t *testing.T) {
+	a := New(Config{})
+	sub := &ladderSubsystem{firstDone: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.superviseSubsystem(ctx, sub)
+
+	<-sub.firstDone // the first Run outlived the armed timer
+	ended := time.Now()
+
+	// The second Run must start — but no earlier than the shortest
+	// jittered wait (backoff ±15% → ≥ backoff*17/20). The 20ms poll
+	// granularity is noise against a 4.25s floor.
+	var restartedAt time.Time
+	for deadline := ended.Add(10 * time.Second); time.Now().Before(deadline); {
+		if sub.calls.Load() >= 2 {
+			restartedAt = time.Now()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if restartedAt.IsZero() {
+		t.Fatal("supervisor never restarted the subsystem")
+	}
+	if gap := restartedAt.Sub(ended); gap < superviseBackoffInitial*17/20 {
+		t.Fatalf("second Run started %v after the first ended — the stale "+
+			"timer tick skipped the %v backoff", gap, superviseBackoffInitial)
 	}
 }

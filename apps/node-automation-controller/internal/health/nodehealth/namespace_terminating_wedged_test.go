@@ -75,8 +75,10 @@ func TestNsStuckDiagnostic(t *testing.T) {
 
 // protectedFinalizer — the never-strip list: the foreground-deletion
 // marker, every kubernetes.io/ finalizer, the external-attacher/
-// family; anything else (including the bare "kubernetes.io" prefix
-// without the slash) is strippable.
+// family, and the known third-party families (snapshot controller,
+// fluxcd tooling, argo controllers, velero); anything else
+// (including the bare "kubernetes.io" prefix without the slash) is
+// a candidate for the attribution check.
 func TestProtectedFinalizer(t *testing.T) {
 	cases := []struct {
 		f    string
@@ -86,8 +88,19 @@ func TestProtectedFinalizer(t *testing.T) {
 		{"kubernetes.io/pvc-protection", true},
 		{"kubernetes.io/pv-protection", true},
 		{"external-attacher/csi-driver", true},
+		{"snapshot.storage.kubernetes.io/finalizer", true},
+		{"velero.io/pod-backup", true},
+		{"kustomize.toolkit.fluxcd.io/finalizer", true},
+		{"helm.toolkit.fluxcd.io/finalizer", true},
+		{"source.toolkit.fluxcd.io/finalizer", true},
+		{"image.toolkit.fluxcd.io/finalizer", true},
+		{"notifications.toolkit.fluxcd.io/finalizer", true},
+		{"fluxcd.io/x", true},
+		{"argoproj.io/cleanup", true},
+		{"notifications.argoproj.io/finalizer", true},
 		{"example.com/x", false},
-		{"kubernetes.io", false}, // HasPrefix("kubernetes.io/") — bare prefix, no slash, not protected
+		{"notfluxcd.io/x", false}, // suffix must match the real domains, not a substring
+		{"kubernetes.io", false},  // HasPrefix("kubernetes.io/") — bare prefix, no slash, not protected
 		{"", false},
 	}
 	for _, tc := range cases {
@@ -145,7 +158,9 @@ func TestNamespaceTerminatingWedged(t *testing.T) {
 
 // maybeStripFinalizers exercises the finalizer sweep's strip path
 // directly: a terminating CR owned by a Deployment that no longer
-// exists gets its non-protected finalizer removed while
+// exists gets its finalizer removed — the value is positively
+// attributable to the dead owner ("gone-deploy.example.com" — the
+// domain's leading label is the controller's name) — while
 // kubernetes.io/* finalizers stay.
 func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "foos"}
@@ -156,7 +171,7 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 			"namespace":         "dead-ns",
 			"name":              "foo-1",
 			"resourceVersion":   "100",
-			"finalizers":        []any{"example.com/finalizer", "kubernetes.io/pvc-protection"},
+			"finalizers":        []any{"gone-deploy.example.com/finalizer", "kubernetes.io/pvc-protection"},
 			"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
 			"ownerReferences": []any{map[string]any{
 				"apiVersion": "apps/v1",
@@ -207,7 +222,7 @@ func TestMaybeStripFinalizersDeadRolloutOwner(t *testing.T) {
 			"namespace":         "dead-ns",
 			"name":              "foo-ro",
 			"resourceVersion":   "100",
-			"finalizers":        []any{"example.com/finalizer"},
+			"finalizers":        []any{"foo-rs.example.com/finalizer"},
 			"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
 			"ownerReferences": []any{map[string]any{
 				"apiVersion": "apps/v1",
@@ -321,6 +336,49 @@ func TestMaybeStripFinalizersLiveOwnerSkipped(t *testing.T) {
 	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-2", metav1.GetOptions{})
 	if len(got.GetFinalizers()) != 1 {
 		t.Fatalf("finalizers = %v, want untouched", got.GetFinalizers())
+	}
+}
+
+// A dead-owner CR whose finalizer is NOT attributable to the dead
+// owner keeps it: the writer is usually a different, still-alive
+// controller (a snapshot operator, a flux kustomization) whose
+// external cleanup a strip would silently orphan — when in doubt,
+// do NOT strip.
+func TestMaybeStripFinalizersUnattributableKept(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "foos"}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Foo",
+		"metadata": map[string]any{
+			"namespace":         "dead-ns",
+			"name":              "foo-4",
+			"resourceVersion":   "100",
+			"finalizers":        []any{"snapshot.storage.example.com/volumesnapshot", "unrelated-controller.example.com/cleanup"},
+			"deletionTimestamp": time.Now().UTC().Format(time.RFC3339),
+			"ownerReferences": []any{map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"name":       "gone-deploy",
+				"controller": true,
+				"uid":        "uid-gone",
+			}},
+		},
+	}}
+	cs := fake.NewSimpleClientset() // owner Deployment absent
+	kinds := testutil.DynListKinds()
+	kinds[gvr] = "FooList"
+	dyn := testutil.NewFakeDyn(kinds, obj)
+	p := testProberDyn(cs, dyn)
+
+	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+		t.Fatal("unattributable finalizers must not be stripped")
+	}
+	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-4", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.GetFinalizers()) != 2 {
+		t.Fatalf("finalizers = %v, want both kept (in doubt — do not strip)", got.GetFinalizers())
 	}
 }
 
@@ -494,16 +552,16 @@ func TestNsFinalizerSweepEndToEnd(t *testing.T) {
 		bareDeployment("dead-app", "live-deploy"))
 
 	dead := sweepFoo("dead-app", "foo-dead",
-		[]string{"example.com/finalizer", "kubernetes.io/pvc-protection"},
+		[]string{"gone-deploy.example.com/finalizer", "kubernetes.io/pvc-protection"},
 		"Deployment", "gone-deploy")
 	otherNS := sweepFoo("live-app", "foo-other",
-		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+		[]string{"gone-deploy.example.com/finalizer"}, "Deployment", "gone-deploy")
 	alive := sweepFoo("dead-app", "foo-alive",
-		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+		[]string{"gone-deploy.example.com/finalizer"}, "Deployment", "gone-deploy")
 	alive.SetDeletionTimestamp(nil) // not terminating
 	noFin := sweepFoo("dead-app", "foo-nofin", nil, "", "")
 	liveOwner := sweepFoo("dead-app", "foo-live",
-		[]string{"example.com/finalizer"}, "Deployment", "live-deploy")
+		[]string{"gone-deploy.example.com/finalizer"}, "Deployment", "live-deploy")
 
 	dyn := nsSweepDyn(dead, otherNS, alive, noFin, liveOwner)
 
@@ -613,7 +671,7 @@ func TestNsFinalizerSweepPartialDiscovery(t *testing.T) {
 	wedged := nsWedged("dead-app", 25*time.Minute)
 	cs := fake.NewSimpleClientset(wedged)
 	dead := sweepFoo("dead-app", "foo-dead",
-		[]string{"example.com/finalizer"}, "Deployment", "gone-deploy")
+		[]string{"gone-deploy.example.com/finalizer"}, "Deployment", "gone-deploy")
 	dyn := nsSweepDyn(dead)
 	scs := sweepClientset{Interface: cs, disc: sweepDiscovery{
 		lists: nsSweepLists(),
@@ -647,7 +705,7 @@ func TestNsFinalizerSweepStripCap(t *testing.T) {
 	for i := 0; i < nsFinalizerMaxStrips+1; i++ {
 		objs = append(objs, sweepFoo("dead-app",
 			fmt.Sprintf("foo-%02d", i),
-			[]string{"example.com/finalizer"},
+			[]string{"gone-deploy.example.com/finalizer"},
 			"Deployment", "gone-deploy"))
 	}
 	dyn := nsSweepDyn(objs...)

@@ -255,6 +255,41 @@ func TestCronJobCatchupLabelDedupeSkips(t *testing.T) {
 	}
 }
 
+// The dedupe index keeps the NEWEST labeled Job per CronJob. An old
+// catch-up (past the window) lingering beside a fresh one must not
+// mask the fresh one — the typed List is name-ascending and unix
+// suffixes sort by age, so indexing the FIRST hit indexes the OLDEST
+// and the window check passes, spawning a duplicate catch-up (the
+// double-fire this fail-closed dedupe exists to prevent).
+func TestCronJobCatchupDedupeKeepsNewestLabeledJob(t *testing.T) {
+	now := time.Now()
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+	stale := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "ops",
+			Name:              "nightly-catchup-100",
+			Labels:            map[string]string{catchupLabel: "nightly"},
+			CreationTimestamp: metav1.NewTime(now.Add(-48 * time.Hour)), // past the window
+		},
+	}
+	fresh := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "ops",
+			Name:              "nightly-catchup-200",
+			Labels:            map[string]string{catchupLabel: "nightly"},
+			CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Hour)), // inside the window
+		},
+	}
+	cs := fake.NewSimpleClientset(cj, stale, fresh)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 2 {
+		t.Fatalf("fresh labeled Job masked by stale sibling: %d jobs, want 2 (no duplicate catch-up)", n)
+	}
+}
+
 // The in-memory daily cap holds even when the created catch-up Job is
 // gone — the label dedupe alone could not cover a deleted Job.
 func TestCronJobCatchupDailyCap(t *testing.T) {

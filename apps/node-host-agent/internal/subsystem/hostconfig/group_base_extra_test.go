@@ -67,6 +67,25 @@ func TestBaseModprobeAndSysctlFailures(t *testing.T) {
 	}
 }
 
+// TestBaseAbsentLimitVarsNoError — worker/controller nodes whose vars
+// lack k0sworker/k0scontroller_limit_nofile converge clean: an absent
+// var is skipped like the sysctl pairs, not refused (refusing the
+// empty value would count an error every cycle and fail converge-once
+// on healthy nodes).
+func TestBaseAbsentLimitVarsNoError(t *testing.T) {
+	r, _, c := baseFixture(t, "")
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service", "[Service]\n")
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service", "[Service]\n")
+	c.groupBase()
+	if c.errs != 0 {
+		t.Fatalf("healthy node without limit vars counted %d errors", c.errs)
+	}
+	if hostExists(r, "/etc/systemd/system/k0sworker.service.d/10-limits.conf") ||
+		hostExists(r, "/etc/systemd/system/k0scontroller.service.d/10-limits.conf") {
+		t.Fatal("limits drop-in written from an absent var")
+	}
+}
+
 // TestBaseControllerLimitsDropin — the controller fd-limits drop-in
 // converges both ways: rendered on a valid var, refused+skipped on an
 // unsafe one, daemon-reload only when it actually landed.
