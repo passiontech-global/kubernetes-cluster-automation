@@ -15,6 +15,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -160,6 +161,45 @@ func TestCertManagerReaperDeletesStuckOrder(t *testing.T) {
 	st := r.resets["app/tls-a"]
 	if st == nil || st.total != 1 {
 		t.Fatalf("expected reset total=1 for app/tls-a, got %+v", st)
+	}
+}
+
+// Every Order/CertificateRequest/Challenge list rides the shared
+// page bound — a namespace with a large ACME history must not pay an
+// unbounded single-shot List per sweep (a timed-out list there used
+// to fail the whole sweep closed). Scoped to the namespaced lists:
+// the dynamic fake's ROOT list action drops ListOptions.Limit
+// (client-go drops everything but the selectors when recording the
+// cluster-wide certificates list), so only namespaced actions can
+// assert the page bound.
+func TestCertManagerReaperListsArePaged(t *testing.T) {
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
+	seen := map[string]bool{}
+	var limits []int64
+	dyn.PrependReactor("list", "*",
+		func(a clienttesting.Action) (bool, runtime.Object, error) {
+			li, ok := a.(clienttesting.ListActionImpl)
+			if !ok || li.GetNamespace() == "" {
+				return false, nil, nil // fall through; root actions drop opts
+			}
+			seen[li.GetResource().Resource] = true
+			limits = append(limits, li.ListOptions.Limit)
+			return false, nil, nil // fall through to the fake
+		})
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range []string{"orders", "certificaterequests", "challenges"} {
+		if !seen[res] {
+			t.Fatalf("sweep never listed %s", res)
+		}
+	}
+	for _, l := range limits {
+		if l != kube.DefaultListPageSize {
+			t.Fatalf("unpaged list observed: Limit=%d, want %d", l, kube.DefaultListPageSize)
+		}
 	}
 }
 

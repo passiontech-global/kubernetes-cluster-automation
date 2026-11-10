@@ -214,6 +214,42 @@ func TestEgressStaleTableRulePruned(t *testing.T) {
 	}
 }
 
+// TestEgressStaleTableOnlyRuleNotHealFailed: a committed=direct
+// relay whose ONLY rule points at a stale table reads as live=direct
+// once the prune removes that rule — the drift heal must NOT `ip
+// rule del … lookup <current table>` against a rule the prune just
+// deleted (that flagged a bogus heal-fail that converged only next
+// cycle). Conversely a committed=relay relay in the same spot IS
+// healed back in: its current-table rule is genuinely missing.
+func TestEgressStaleTableOnlyRuleNotHealFailed(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.host.On("rule list pref 1500",
+		"1500:\tfrom all to 8.8.8.8 lookup 102\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "direct\n")
+	e.pingOK["8.8.8.8|true"] = true
+	e.n.checkOverlayEgress(context.Background())
+	if !e.host.Ran("rule del pref 1500 to 8.8.8.8/32 lookup 102") {
+		t.Fatalf("stale-table rule not pruned: %v", e.host.Cmds())
+	}
+	if e.host.Ran("rule del pref 1500 to 8.8.8.8/32 lookup 100") {
+		t.Fatalf("heal del'd the current-table rule the prune just removed: %v",
+			e.host.Cmds())
+	}
+	if strings.Contains(logLines(t, e), "heal egress") {
+		t.Fatalf("bogus heal attempted on an already-direct relay:\n%s",
+			logLines(t, e))
+	}
+
+	// Same live rule state, committed relay → the missing
+	// current-table rule is real drift and gets healed in.
+	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
+	e.n.checkOverlayEgress(context.Background())
+	if !e.host.Ran("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
+		t.Fatalf("committed relay without a current-table rule not healed: %v",
+			e.host.Cmds())
+	}
+}
+
 // A failed icmp-blocked marker write degrades to a warn — the
 // direct verdict itself still stands.
 func TestEgressICMPMarkerWriteFailureDegrades(t *testing.T) {

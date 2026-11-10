@@ -675,16 +675,25 @@ func TestVeleroAuditorStuckBackupGauge(t *testing.T) {
 
 // The full ST6 cleanup: a PVB InProgress >6h whose node-agent
 // container restarted AFTER the PVB started is deleted, and the
-// agent pod is bounced so the next backup starts clean.
+// agent pod is bounced so the next backup starts clean. The PVB
+// lives in the WORKLOAD namespace ("app") while the node-agent pod
+// lives in velero's install namespace ("velero") — the lookup must
+// land there, and a same-named impostor in the PVB's namespace must
+// never be consulted or bounced.
 func TestVeleroAuditorWedgedPVBCleaned(t *testing.T) {
 	now := time.Now()
-	pvb := veleroPVB("velero", "pvb-1", "InProgress", 7*time.Hour,
+	pvb := veleroPVB("app", "pvb-1", "InProgress", 7*time.Hour,
 		"node-agent-aaa", "node-1")
 	// Agent pod itself is old (started before the PVB) but its
 	// container restarted 6h ago — after the PVB began 7h ago.
 	agent := nodeAgentPod("velero", "node-agent-aaa", "node-1",
 		now.Add(-24*time.Hour), now.Add(-6*time.Hour))
-	cs := kfake.NewSimpleClientset(agent)
+	// A workload-namespace pod with "node-agent" in its name on the
+	// same node is NOT the agent — finding it must not stop the
+	// cleanup, and it must never be bounced.
+	impostor := nodeAgentPod("app", "node-agent-pretender", "node-1",
+		now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+	cs := kfake.NewSimpleClientset(agent, impostor)
 	dyn := newDynFake(
 		veleroSchedule("velero", "daily", false, time.Hour),
 		pvb)
@@ -693,14 +702,18 @@ func TestVeleroAuditorWedgedPVBCleaned(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if pvbExists(t, dyn, "velero", "pvb-1") {
+	if pvbExists(t, dyn, "app", "pvb-1") {
 		t.Fatal("wedged PVB not deleted")
 	}
 	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-aaa",
 		metav1.GetOptions{}); err == nil {
 		t.Fatal("node-agent pod not bounced")
 	}
-	if v, ok := wedgedSeries(t, "velero", "pvb-1"); !ok || v != 1 {
+	if _, err := cs.CoreV1().Pods("app").Get(ctx, "node-agent-pretender",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("workload-namespace impostor pod bounced — agent lookup left velero's namespace")
+	}
+	if v, ok := wedgedSeries(t, "app", "pvb-1"); !ok || v != 1 {
 		t.Fatalf("pvb-1 wedged series = %v,%v want 1,true", v, ok)
 	}
 }
@@ -710,7 +723,7 @@ func TestVeleroAuditorWedgedPVBCleaned(t *testing.T) {
 // agent still owns the Kopia thread.
 func TestVeleroAuditorWedgedPVBHealthyAgentKept(t *testing.T) {
 	now := time.Now()
-	pvb := veleroPVB("velero", "pvb-ok", "InProgress", 7*time.Hour,
+	pvb := veleroPVB("app", "pvb-ok", "InProgress", 7*time.Hour,
 		"node-agent-bbb", "node-2")
 	agent := nodeAgentPod("velero", "node-agent-bbb", "node-2",
 		now.Add(-24*time.Hour), now.Add(-24*time.Hour))
@@ -723,7 +736,7 @@ func TestVeleroAuditorWedgedPVBHealthyAgentKept(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !pvbExists(t, dyn, "velero", "pvb-ok") {
+	if !pvbExists(t, dyn, "app", "pvb-ok") {
 		t.Fatal("PVB deleted although its node-agent is healthy")
 	}
 	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-bbb",
@@ -732,8 +745,79 @@ func TestVeleroAuditorWedgedPVBHealthyAgentKept(t *testing.T) {
 	}
 	// Still old enough to mark — the gauge reports the wedge age
 	// even when the agent looks alive.
-	if v, ok := wedgedSeries(t, "velero", "pvb-ok"); !ok || v != 1 {
+	if v, ok := wedgedSeries(t, "app", "pvb-ok"); !ok || v != 1 {
 		t.Fatalf("pvb-ok wedged series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// A failed agent-pod lookup is never wedge evidence: the cleanup
+// skips (fail closed), the PVB survives, the agent pod is untouched,
+// and the failure is metered.
+func TestVeleroAuditorAgentLookupFailureKeepsPVB(t *testing.T) {
+	now := time.Now()
+	pvb := veleroPVB("app", "pvb-1", "InProgress", 7*time.Hour,
+		"node-agent-aaa", "node-1")
+	agent := nodeAgentPod("velero", "node-agent-aaa", "node-1",
+		now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+	cs := kfake.NewSimpleClientset(agent)
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("pod list boom")
+		})
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		pvb)
+	a := newVeleroAuditor(dyn, now)
+	a.cs = cs
+	a.queue = "velero-backup-auditor"
+	before := testutil.QueueErrorCount(t, "velero-backup-auditor")
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !pvbExists(t, dyn, "app", "pvb-1") {
+		t.Fatal("PVB deleted although the agent lookup failed — a lookup failure is never wedge evidence")
+	}
+	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-aaa",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("agent pod bounced although the lookup failed")
+	}
+	if got := testutil.QueueErrorCount(t, "velero-backup-auditor") - before; got < 1 {
+		t.Fatalf("agent lookup failure not metered (%v)", got)
+	}
+}
+
+// A live-confirmed absence of the agent pod in velero's install
+// namespace IS wedge evidence: the PVB is deleted, no pod is bounced
+// (there is nothing to bounce), and unrelated velero-server pods on
+// the node stay out of the way.
+func TestVeleroAuditorAgentGoneInVeleroNSIsWedge(t *testing.T) {
+	now := time.Now()
+	pvb := veleroPVB("app", "pvb-gone", "InProgress", 7*time.Hour,
+		"workload-1", "node-4")
+	// The velero server Deployment pod shares the install namespace
+	// and even the node — it is not a node-agent and must never be
+	// treated as one.
+	server := nodeAgentPod("velero", "velero-7f9b", "node-4",
+		now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+	server.Labels = map[string]string{"name": "velero"}
+	cs := kfake.NewSimpleClientset(server)
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		pvb)
+	a := newVeleroAuditor(dyn, now)
+	a.cs = cs
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pvbExists(t, dyn, "app", "pvb-gone") {
+		t.Fatal("wedged PVB kept although no node-agent pod exists in velero's namespace")
+	}
+	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "velero-7f9b",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("velero server pod bounced as a node-agent")
+	}
+	if v, ok := wedgedSeries(t, "app", "pvb-gone"); !ok || v != 1 {
+		t.Fatalf("pvb-gone wedged series = %v,%v want 1,true", v, ok)
 	}
 }
 

@@ -5,6 +5,7 @@
 package datastore
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -49,6 +50,32 @@ func TestDragonflySyncStormResumeRestarts(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("dragonfly").
 		Get(ctx, "dragonfly-master-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("master must never be restarted")
+	}
+}
+
+// A failed PRIMARY-signal query is Infra, never a pass — a sustained
+// Prometheus outage must not read as a healthy dragonfly fleet (the
+// sibling checks' posture for primary-signal failures).
+func TestDragonflyPrimaryQueryFailureIsInfra(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "prometheus down", http.StatusInternalServerError)
+		}))
+	t.Cleanup(srv.Close)
+	cs := fake.NewSimpleClientset(
+		dragonflyMemberPod("dragonfly", "dragonfly-replica-1", "replica"),
+		dragonflyMemberPod("dragonfly", "dragonfly-master-0", "master"))
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	if res.Infra == nil {
+		t.Fatalf("primary master-link query failure must be Infra: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("dragonfly").
+		Get(ctx, "dragonfly-replica-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("inconclusive evidence must never restart a pod: %v", err)
 	}
 }
 

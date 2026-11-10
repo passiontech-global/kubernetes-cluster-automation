@@ -227,6 +227,36 @@ func TestKedaRescueStatefulSetTarget(t *testing.T) {
 	}
 }
 
+// spec.scaleTargetRef.kind is honored: a ScaledObject targeting a
+// StatefulSet whose name collides with a same-namespace Deployment
+// patches the StatefulSet, never the namesake.
+func TestKedaRescueHonorsScaleTargetRefKind(t *testing.T) {
+	so := kedaObj("apps", "sts-scaler", "worker", 1, "False", "")
+	_ = unstructured.SetNestedField(so.Object, "StatefulSet",
+		"spec", "scaleTargetRef", "kind")
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "worker"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To[int32](0)},
+	}
+	dep := zeroDeploy("apps", "worker", nil) // the namesake Deployment
+	cs := fake.NewSimpleClientset(sts, dep)
+	p := testProberDyn(cs, probetest.OpDyn(so))
+	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
+
+	chk.rescueZeroTarget(ctx, logr.Discard(), so, time.Now())
+	gotSts, err := cs.AppsV1().StatefulSets("apps").Get(ctx, "worker", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSts.Spec.Replicas == nil || *gotSts.Spec.Replicas != 1 {
+		t.Fatalf("declared StatefulSet target not rescued: replicas = %v", gotSts.Spec.Replicas)
+	}
+	gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "worker", metav1.GetOptions{})
+	if gotDep.Spec.Replicas == nil || *gotDep.Spec.Replicas != 0 {
+		t.Fatal("the same-name Deployment was patched for a StatefulSet target")
+	}
+}
+
 // minReplicaCount absent/zero clamps the rescue floor to 1 — a
 // Deployment target proves the typed patch carries the computed value.
 func TestKedaRescueMinReplicaFloor(t *testing.T) {

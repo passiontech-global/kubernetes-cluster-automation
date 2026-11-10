@@ -253,9 +253,11 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// list this pods-outage fake never hit), so it meters the same
 	// failure — twenty-five total. The CNPG masterless candidate
 	// census in stateful-masterless-services lists the same pods —
-	// twenty-six total.
-	if got := errCount() - before; got != 26 {
-		t.Fatalf("run errors delta = %v, want 26", got)
+	// twenty-six total. dragonfly-replica-sync-storm's PRIMARY
+	// master-link query dies on the health-text stub and now reports
+	// Infra instead of passing silently — twenty-seven total.
+	if got := errCount() - before; got != 27 {
+		t.Fatalf("run errors delta = %v, want 27", got)
 	}
 }
 

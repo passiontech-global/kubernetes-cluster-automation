@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -44,8 +45,8 @@ const (
 // read-only adjtimex: Timex.Offset (µs) is the kernel's offset
 // estimate and STA_UNSYNC the sync verdict — enough to makestep and
 // (when the estimate exceeds 2s) to latch.
-func (r *Runner) clockSkewProbe() (float64, bool, bool) {
-	out, err := r.deps.RunHostCmd(context.Background(), "chronyc", "tracking")
+func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
+	out, err := r.deps.RunHostCmd(ctx, "chronyc", "tracking")
 	if err == nil {
 		if off, synced, ok := parseChronycTracking(out); ok {
 			return off, synced, true
@@ -94,14 +95,14 @@ func parseChronycTracking(out string) (float64, bool, bool) {
 // consecutive ticks. A >0.5s offset OR an unsynchronised clock earns
 // a `chronyc makestep` — rate-limited to one per 10m. Inconclusive
 // probes (no chronyc, adjtimex failure) leave count+latch alone.
-func (r *Runner) checkClockSkew() {
-	off, synced, ok := r.clockSkewProbe()
+func (r *Runner) checkClockSkew(ctx context.Context) {
+	off, synced, ok := r.clockSkewProbe(ctx)
 	if !ok {
 		return
 	}
 	if (!synced || math.Abs(off) > clockSkewStepOffset) &&
 		r.deps.Store.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
-		out, err := r.deps.RunHostCmd(context.Background(), "chronyc", "makestep")
+		out, err := r.deps.RunHostCmd(ctx, "chronyc", "makestep")
 		if err != nil {
 			logger().Warn("hostmetrics: chronyc makestep failed",
 				"error", err, "out", strings.TrimSpace(out))
@@ -129,8 +130,8 @@ func (r *Runner) checkClockSkew() {
 				n = v + 1
 			}
 		}
-		if err := os.WriteFile(countPath,
-			[]byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
+		if err := hostutil.WriteFileAtomicBytes(countPath,
+			[]byte(strconv.FormatInt(n, 10)+"\n")); err != nil {
 			logger().Debug("hostmetrics: clock-skew count write failed",
 				"path", countPath, "error", err)
 		}

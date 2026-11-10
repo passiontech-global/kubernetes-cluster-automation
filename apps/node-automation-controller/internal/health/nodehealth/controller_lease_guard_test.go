@@ -119,7 +119,10 @@ func TestControllerRunningPodsAttribution(t *testing.T) {
 	pods := []corev1.Pod{holder, sibling, otherController, mirror,
 		pending, terminating, unrelatedFallback}
 
-	got := controllerRunningPods(lease, pods)
+	got, ambiguous := controllerRunningPods(lease, pods)
+	if ambiguous {
+		t.Fatalf("positively-attributed set reported ambiguous: %v", got)
+	}
 	names := map[string]bool{}
 	for _, p := range got {
 		names[p.Name] = true
@@ -140,24 +143,126 @@ func TestControllerRunningPodsAttribution(t *testing.T) {
 	// "orphan" rides it even while the holder pod still resolves.
 
 	// Holder pod gone: pods named "<lease name>-*" are still the
-	// wedged controller's targets.
-	gone := controllerRunningPods(lease, []corev1.Pod{unrelatedFallback, mirror})
+	// wedged controller's targets — a single-owner fallback set is
+	// not ambiguous even though the only member has no owner ref.
+	gone, fallbackAmbiguous := controllerRunningPods(lease,
+		[]corev1.Pod{unrelatedFallback, mirror})
 	if len(gone) != 1 || gone[0].Name != "kube-controller-manager-orphan" {
 		t.Fatalf("holder-gone fallback = %v, want only the <lease>-* pod", gone)
+	}
+	if fallbackAmbiguous {
+		t.Fatal("single-owner fallback set reported ambiguous")
 	}
 
 	// Verbatim holder identity without the "_<uuid>" suffix matches.
 	verbatimLease := cpLease("kube-system", "l", "pod_abc-123", 0, 0, time.Now())
 	plainPod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod_abc-123", UID: "u"}}
 	plainPod.Status.Phase = corev1.PodRunning
-	if got := controllerRunningPods(verbatimLease, []corev1.Pod{plainPod}); len(got) != 1 {
+	if got, amb := controllerRunningPods(verbatimLease, []corev1.Pod{plainPod}); amb || len(got) != 1 {
 		t.Fatalf("verbatim holder identity not matched: %v", got)
 	}
 
 	// Empty/nil holder identity and no "<lease>-*" pods → nothing.
 	emptyLease := cpLease("kube-system", "empty", "", 0, 0, time.Now())
-	if got := controllerRunningPods(emptyLease, pods); len(got) != 0 {
+	if got, amb := controllerRunningPods(emptyLease, pods); amb || len(got) != 0 {
 		t.Fatalf("empty holder identity attributed pods: %v", got)
+	}
+}
+
+// The "<lease>-*" fallback matching pods from MORE than one
+// controller owner is ambiguous: an expired cert-manager lease also
+// name-matches cert-manager-cainjector / cert-manager-webhook
+// replicas, and deleting the oldest would kill a healthy component.
+func TestControllerRunningPodsAmbiguousFallback(t *testing.T) {
+	lease := cpLease("cert-manager", "cert-manager", "", 0, 0, time.Now())
+	controller := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "cert-manager-controller-abc", UID: "u1",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: "cert-manager-controller", UID: "dep-1", Controller: ptr.To(true),
+		}},
+	}}
+	cainjector := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "cert-manager-cainjector-xyz", UID: "u2",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: "cert-manager-cainjector", UID: "dep-2", Controller: ptr.To(true),
+		}},
+	}}
+	webhook := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "cert-manager-webhook-www", UID: "u3",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: "cert-manager-webhook", UID: "dep-3", Controller: ptr.To(true),
+		}},
+	}}
+	for _, p := range []*corev1.Pod{&controller, &cainjector, &webhook} {
+		p.Status.Phase = corev1.PodRunning
+	}
+	got, ambiguous := controllerRunningPods(lease,
+		[]corev1.Pod{controller, cainjector, webhook})
+	if !ambiguous {
+		t.Fatalf("multi-controller fallback set not flagged ambiguous: %v", got)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ambiguous fallback pods = %v, want all three matches", got)
+	}
+
+	// A single-controller fallback set (one Deployment owning both
+	// replicas) is positively attributable — not ambiguous.
+	replica1 := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "cert-manager-a", UID: "r1",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: "cert-manager", UID: "dep-0", Controller: ptr.To(true),
+		}},
+	}}
+	replica2 := replica1
+	replica2.Name = "cert-manager-b"
+	replica2.UID = "r2"
+	replica2.Status.Phase = corev1.PodRunning
+	replica1.Status.Phase = corev1.PodRunning
+	got, ambiguous = controllerRunningPods(lease,
+		[]corev1.Pod{replica1, replica2})
+	if ambiguous || len(got) != 2 {
+		t.Fatalf("single-owner fallback = %v ambiguous=%v, want both pods, not ambiguous", got, ambiguous)
+	}
+}
+
+// An expired lease whose holder pod is gone and whose "<lease>-*"
+// fallback matches pods from MULTIPLE controllers heals nothing: the
+// name-prefix guess is ambiguous (an expired cert-manager lease also
+// matches cainjector/webhook replicas), so the oldest healthy
+// component must survive while the lease still reports.
+func TestLeaseGuardAmbiguousFallbackSkipsHeal(t *testing.T) {
+	lease := cpLease("cert-manager", "cert-manager", "",
+		20*time.Minute, 1, time.Now())
+	cainjector := probetest.ReadyPodWithIP("cert-manager",
+		"cert-manager-cainjector-abc", "10.0.0.21", nil)
+	cainjector.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "Deployment", Name: "cert-manager-cainjector",
+		UID: "dep-cainj", Controller: ptr.To(true)}}
+	webhook := probetest.ReadyPodWithIP("cert-manager",
+		"cert-manager-webhook-def", "10.0.0.22", nil)
+	webhook.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "Deployment", Name: "cert-manager-webhook",
+		UID: "dep-hook", Controller: ptr.To(true)}}
+	cs := fake.NewSimpleClientset(lease, cainjector, webhook)
+	_, ch := leaseGuardProber(cs)
+
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("expired lease with running pods must fail")
+	}
+	for _, name := range []string{"cert-manager-cainjector-abc", "cert-manager-webhook-def"} {
+		if _, err := cs.CoreV1().Pods("cert-manager").Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("ambiguous fallback must heal nothing — %s died: %v", name, err)
+		}
+	}
+	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
+		map[string]string{"namespace": "cert-manager",
+			"lease": "cert-manager", "reason": "expired_with_running_pods"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("lease must still report expired_with_running_pods: %v", m)
 	}
 }
 

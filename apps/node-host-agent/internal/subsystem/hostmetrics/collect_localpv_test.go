@@ -133,3 +133,68 @@ func TestLocalPVDirBytesFailedWalkKeepsSnapshot(t *testing.T) {
 		t.Fatalf("after failed walk bytes=%v ok=%v want 100 (kept snapshot)", got, ok)
 	}
 }
+
+// TestLocalPVDirBytesStaleSnapshotBound: the kept snapshot is a
+// BOUNDED grace — after localPVMaxStaleWalks consecutive failed
+// walks the series stop (a deleted PVC must not emit stale bytes
+// forever), and a successful walk brings them back.
+func TestLocalPVDirBytesStaleSnapshotBound(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	cfg.OpenEBSLocalDir = root
+	now := time.Now()
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	vol := filepath.Join(root, "pvc-doomed")
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
+
+	c := New(cfg)
+	got, _ := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-doomed"})
+	if got != 100 {
+		t.Fatalf("initial bytes=%v want 100", got)
+	}
+	// Root vanishes + cache expires → the snapshot survives the
+	// grace window (3 consecutive failed walks).
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	for i := range localPVMaxStaleWalks {
+		now = now.Add(16 * time.Minute)
+		got, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+			map[string]string{"node": "node-a", "pvc_volume": "pvc-doomed"})
+		if !ok || got != 100 {
+			t.Fatalf("failed walk %d: bytes=%v ok=%v want 100 (kept snapshot)", i+1, got, ok)
+		}
+	}
+	// Past the grace window the series stop.
+	now = now.Add(16 * time.Minute)
+	if _, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-doomed"}); ok {
+		t.Fatal("stale snapshot served past the failed-walk bound")
+	}
+	// Still stopped on subsequent failed walks — not a per-cycle flake.
+	now = now.Add(16 * time.Minute)
+	if _, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-doomed"}); ok {
+		t.Fatal("stale series reappeared while the root stayed unreadable")
+	}
+	// A successful walk is the only way back.
+	vol = filepath.Join(root, "pvc-new")
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(vol, "b.bin"), strings.Repeat("z", 500))
+	now = now.Add(16 * time.Minute)
+	got, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-new"})
+	if !ok || got != 500 {
+		t.Fatalf("recovered bytes=%v ok=%v want 500 (fresh walk)", got, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-doomed"}); ok {
+		t.Fatal("deleted PVC series resurrected after recovery")
+	}
+}

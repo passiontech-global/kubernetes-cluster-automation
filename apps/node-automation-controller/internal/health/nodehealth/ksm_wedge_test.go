@@ -113,9 +113,11 @@ func TestKSMWedgeBareUnauthorizedReadsClean(t *testing.T) {
 }
 
 // A clean tail falls through to the Prometheus counter half: an
-// error-counter increase still wedges the pod (the spamming
-// reflector can rotate the 401 storm out of the last tail lines),
-// while a missing series reads clean.
+// error-counter increase at/above the ksmReflectorErrorMinIncrease
+// floor still wedges the pod (the spamming reflector can rotate the
+// 401 storm out of the last tail lines), while a sub-floor increase —
+// one routine reflector retry per 10m window, self-healing noise —
+// and a missing series read clean.
 func TestKSMWedgeReflectorErrorCounterHalf(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -125,6 +127,12 @@ func TestKSMWedgeReflectorErrorCounterHalf(t *testing.T) {
 		{"error increase wedges", []probetest.PromTestSample{{
 			Labels: map[string]string{"pod": "kube-state-metrics-m"},
 			Value:  42}}, leaseReasonKSMReflectorErrors},
+		{"increase at the floor wedges", []probetest.PromTestSample{{
+			Labels: map[string]string{"pod": "kube-state-metrics-m"},
+			Value:  float64(ksmReflectorErrorMinIncrease)}}, leaseReasonKSMReflectorErrors},
+		{"sub-floor increase is noise, not a wedge", []probetest.PromTestSample{{
+			Labels: map[string]string{"pod": "kube-state-metrics-m"},
+			Value:  float64(ksmReflectorErrorMinIncrease - 1)}}, ""},
 		{"missing series is clean", nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

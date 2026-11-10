@@ -125,14 +125,21 @@ func Setup(d shared.Deps) error {
 	})
 }
 
+// armResets lazily initializes the resets ledger — unit tests drive
+// the reap helpers directly on a literal-constructed reaper, so the
+// arm cannot live only in run().
+func (r *certManagerReaper) armResets() {
+	if r.resets == nil {
+		r.resets = map[string]*certReset{}
+	}
+}
+
 func (r *certManagerReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
 	// reaper literally without the Setup path. crReaped is a
 	// CooldownSet — zero-value ready, no arm.
-	if r.resets == nil {
-		r.resets = map[string]*certReset{}
-	}
+	r.armResets()
 	r.crCache = map[string]crListResult{}
 	r.orderCache = map[string]*orderIndex{}
 	now := r.now.Now()

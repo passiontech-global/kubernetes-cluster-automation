@@ -10,8 +10,9 @@ import (
 )
 
 // TestSecurityFail2BanInstallFailureCounts — a missing fail2ban whose
-// apt install fails counts; the jail still renders (declarative
-// state first).
+// apt install fails counts and aborts the group (api-lb parity): no
+// jail file at the live path and no service/probe churn against a
+// missing daemon (the half-applied state would error every cycle).
 func TestSecurityFail2BanInstallFailureCounts(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(map[string]string{
@@ -28,8 +29,14 @@ func TestSecurityFail2BanInstallFailureCounts(t *testing.T) {
 	if c.errs != 1 {
 		t.Fatalf("errs = %d, want exactly the install failure", c.errs)
 	}
-	if !hostExists(r, "/etc/fail2ban/jail.d/90-cluster-sshd.conf") {
-		t.Fatal("jail not rendered despite the install failure")
+	if hostExists(r, "/etc/fail2ban/jail.d/90-cluster-sshd.conf") {
+		t.Fatal("jail written although the package never installed")
+	}
+	if len(sr.CallsMatching("fail2ban.service")) > 0 {
+		t.Fatal("fail2ban.service touched although the package never installed")
+	}
+	if len(sr.CallsMatching("fail2ban-client status sshd")) > 0 {
+		t.Fatal("fail2ban-client probed against a missing package")
 	}
 }
 

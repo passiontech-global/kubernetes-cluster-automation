@@ -98,9 +98,15 @@ const (
 	helmStuckThreshold = 30 * time.Minute // first-seen window before acting
 	helmUnlockCooldown = 24 * time.Hour   // max 1 unlock/HR inside this window
 	helmSecretType     = "helm.sh/release.v1"
-	helmControllerNS   = "flux-system"
-	helmControllerSel  = "app.kubernetes.io/name=helm-controller"
-	fluxReconcileAnno  = kube.AnnoFluxRequestedAt
+	// helmReleaseNameLabel is the label helm 3 stamps on EVERY
+	// rendered resource — hook Jobs included — naming the release
+	// that owns it. Hook Jobs without it carry no release
+	// attribution and are never reaped (they may be another
+	// release's residue an operator is keeping for debugging).
+	helmReleaseNameLabel = "meta.helm.sh/release-name"
+	helmControllerNS     = "flux-system"
+	helmControllerSel    = "app.kubernetes.io/name=helm-controller"
+	fluxReconcileAnno    = kube.AnnoFluxRequestedAt
 )
 
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
@@ -119,6 +125,10 @@ type helmReleaseUnlocker struct {
 	// windows and the 24h cooldowns are deterministic. nil →
 	// time.Now.
 	now shared.Clock
+	// verdict is the shared maintenance-mutex memo the unwedge
+	// pass folds into heal.Gate — one evaluation serves every
+	// due HR in the sweep instead of one API-read bundle each.
+	verdict kube.Verdict
 
 	// One sub-struct per healer duty so run() prunes/resets each
 	// duty's ledgers as one block. Every ledger type is zero-value
@@ -428,12 +438,19 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 }
 
 // cleanFailedHookJobs deletes batchv1 Jobs in ns that carry the
-// helm.sh/hook annotation and report JobFailed=True, with background
-// propagation so their pods go with them. Only FAILED hook Jobs are
-// targets — a Running one is a live workload, never reaped. Each
-// deletion bumps metrics.HelmHookJobsCleanedTotal{namespace}. Errors
-// are logged and skipped — hook cleanup never fails the caller.
-func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
+// helm.sh/hook annotation AND this release's attribution — the
+// meta.helm.sh/release-name label helm stamps on every rendered
+// resource, hooks included — and report JobFailed=True, with
+// background propagation so their pods go with them. A hook Job
+// without the label (or naming another release) is not provably
+// this release's: unlocking one HelmRelease must never delete
+// another release's failed hook residue an operator may be keeping
+// for debugging, so unattributed Jobs are logged and skipped. Only
+// FAILED hook Jobs are targets — a Running one is a live workload,
+// never reaped. Each deletion bumps
+// metrics.HelmHookJobsCleanedTotal{namespace}. Errors are logged and
+// skipped — hook cleanup never fails the caller.
+func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, release string) {
 	log := logf.FromContext(ctx)
 	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
@@ -447,6 +464,12 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		j := &jobs[i]
 		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
 			continue // not a helm hook — never ours to reap
+		}
+		if j.Labels[helmReleaseNameLabel] != release {
+			log.Info("SKIP: helm-hook Job carries no attribution for this release — left alone",
+				"ns", ns, "job", j.Name,
+				"labeledRelease", j.Labels[helmReleaseNameLabel], "release", release)
+			continue
 		}
 		if !jobFailed(j) {
 			continue // still running or succeeded — leave it

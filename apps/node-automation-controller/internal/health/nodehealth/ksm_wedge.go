@@ -32,6 +32,12 @@ const (
 	// counts as wedged — a single retry burst is self-healing.
 	ksmWedgeMinAge     = 10 * time.Minute
 	ksmPodHealCooldown = 30 * time.Minute
+	// The metrics half of the wedge OR holds to the same
+	// sustained-failure bar: ANY increase >0 fires on one routine
+	// reflector retry per 10m window and bounces the pod every
+	// cooldown — a wedged stream instead climbs past this floor
+	// within the window.
+	ksmReflectorErrorMinIncrease = 5
 	// Log-tail bounds reuse the shared probefw tail defaults (200
 	// lines / 256 KiB / 8s) — same shape as every pod-log probe.
 	ksmLogTailLines = probefw.DefaultTailLines
@@ -213,7 +219,7 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 		}
 		return "", fmt.Errorf("prometheus: %w", err)
 	}
-	if errs > 0 {
+	if errs >= ksmReflectorErrorMinIncrease {
 		return leaseReasonKSMReflectorErrors, nil
 	}
 	if logErr != nil {
@@ -250,7 +256,9 @@ func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
 
 // ksmReflectorErrorIncrease is the metrics half of the wedge OR: KSM
 // exports per-resource list/watch counters labelled result="error" —
-// a wedged stream shows a continuous increase. A missing series is
+// a wedged stream shows a continuous increase. The caller applies
+// ksmReflectorErrorMinIncrease as the wedge floor: an increase below
+// it is routine retry noise, not wedge evidence. A missing series is
 // clean; a query failure is inconclusive.
 func (p *controllerLeaseGuardCheck) ksmReflectorErrorIncrease(
 	ctx context.Context, pod *corev1.Pod) (float64, error) {

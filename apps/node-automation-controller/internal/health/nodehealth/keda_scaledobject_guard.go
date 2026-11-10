@@ -169,7 +169,11 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 // max(minReplicaCount, 1). Deployment/StatefulSet targets resolve
 // through the typed censuses; argoproj.io Rollout targets ride the
 // unstructured census + dynamic patch (argo-rollout-gates) — the apiext kinds
-// KEDA can scale beyond those carry no typed handle here. A target
+// KEDA can scale beyond those carry no typed handle here. Resolution
+// honors spec.scaleTargetRef.kind — only the declared kind is
+// consulted, so a StatefulSet whose name collides with a Deployment
+// never patches the namesake; an unknown/missing kind falls back to
+// the census order, logged. A target
 // the downscaler parked (any downscaler/* annotation on a 0-replica
 // spec) is skipped: that zero
 // is intent, and un-parking it fights the downscaler's own schedule.
@@ -187,28 +191,54 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		rescue = 1
 	}
 
-	// The target resolves against the sweep's shared censuses —
-	// Deployment first, StatefulSet as the fallback kind, mirroring
-	// the old Get-then-Get shape (a census read failure is
-	// inconclusive, not "not at zero").
+	// scaleTargetRef.kind names the workload kind KEDA scales — a
+	// ScaledObject targeting a StatefulSet whose name collides with a
+	// same-namespace Deployment must patch the StatefulSet, not the
+	// namesake. Resolve ONLY the declared kind; an unknown or missing
+	// kind keeps the old census order (Deployment → StatefulSet →
+	// Rollout) as a logged fallback — a guess, not an attribution. A
+	// census read failure stays inconclusive, not "not at zero".
+	declared, declaredOK := kube.NestedString(
+		so.Object, "spec", "scaleTargetRef", "kind")
+	want := ""
+	if declaredOK {
+		// EqualFold — a lowercase spelling ("deployment") must not
+		// fall into the census-order fallback and patch the wrong
+		// kind's namesake; canonical casing is kept so the want ==
+		// checks below stay literal.
+		switch {
+		case strings.EqualFold(declared, "Deployment"):
+			want = "Deployment"
+		case strings.EqualFold(declared, "StatefulSet"):
+			want = "StatefulSet"
+		case strings.EqualFold(declared, "Rollout"):
+			want = "Rollout"
+		}
+	}
+	if want == "" {
+		log.Info("WARN: keda zero-rescue — scaleTargetRef.kind unknown/missing, target resolution falls back to census order",
+			"scaledobject", ns+"/"+so.GetName(), "kind", declared)
+	}
 	var annotations map[string]string
 	var replicas *int32
+	var rv string
 	kind := ""
-	deps, err := p.AllDeployments(ctx)
-	switch {
-	case err != nil:
-		return // census unreadable — inconclusive, retry next sweep
-	default:
+	if want == "" || want == "Deployment" {
+		deps, err := p.AllDeployments(ctx)
+		if err != nil {
+			return // census unreadable — inconclusive, retry next sweep
+		}
 		for i := range deps {
 			if deps[i].Namespace == ns && deps[i].Name == target {
 				kind = "Deployment"
 				annotations = deps[i].Annotations
 				replicas = deps[i].Spec.Replicas
+				rv = deps[i].ResourceVersion
 				break
 			}
 		}
 	}
-	if kind == "" {
+	if kind == "" && (want == "" || want == "StatefulSet") {
 		stss, serr := p.AllStatefulSets(ctx)
 		if serr != nil {
 			return // census unreadable — inconclusive
@@ -218,11 +248,12 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 				kind = "StatefulSet"
 				annotations = stss[i].Annotations
 				replicas = stss[i].Spec.Replicas
+				rv = stss[i].ResourceVersion
 				break
 			}
 		}
 	}
-	if kind == "" {
+	if kind == "" && (want == "" || want == "Rollout") {
 		// argo-rollout-gates — argoproj.io Rollout fallback: KEDA scales Rollouts
 		// the same way (scaleTargetRef kind Rollout). Unstructured CR
 		// — spec.replicas comes off the census object; a failed
@@ -236,6 +267,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			if r.GetNamespace() == ns && r.GetName() == target {
 				kind = "Rollout"
 				annotations = r.GetAnnotations()
+				rv = r.GetResourceVersion()
 				if reps, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
 					v := int32(reps)
 					replicas = &v
@@ -264,8 +296,13 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	if !proceed {
 		return
 	}
+	// metadata.resourceVersion pins the write — a legitimate
+	// scale-up (HPA, GitOps, manual) landing between the census
+	// read and this patch becomes a 409 conflict instead of a
+	// silent revert to the rescue floor.
 	payload, err := json.Marshal(map[string]any{
-		"spec": map[string]any{"replicas": rescue},
+		"metadata": map[string]any{"resourceVersion": rv},
+		"spec":     map[string]any{"replicas": rescue},
 	})
 	if err != nil {
 		return

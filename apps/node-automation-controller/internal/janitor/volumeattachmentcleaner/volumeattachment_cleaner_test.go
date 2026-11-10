@@ -68,6 +68,37 @@ func vacPod(ns, name, node string, phase corev1.PodPhase) *corev1.Pod {
 	}
 }
 
+// vacDSPod builds a DaemonSet-owned pod on node; claim names a PVC
+// the pod mounts (empty = no claim-backed volume). claimKind switches
+// the claim shape between a PVC claim and a generic ephemeral volume.
+func vacDSPod(ns, name, node, claim string, ephemeral bool) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "DaemonSet",
+				Name: "agent", Controller: ptr.To(true),
+			}},
+		},
+		Spec:   corev1.PodSpec{NodeName: node},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	if claim != "" {
+		vol := corev1.Volume{Name: "data"}
+		if ephemeral {
+			vol.VolumeSource = corev1.VolumeSource{
+				Ephemeral: &corev1.EphemeralVolumeSource{}}
+		} else {
+			vol.VolumeSource = corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claim,
+				}}
+		}
+		p.Spec.Volumes = []corev1.Volume{vol}
+	}
+	return p
+}
+
 func newVACleaner(cs *fake.Clientset, now shared.Clock) *volumeAttachmentCleaner {
 	return &volumeAttachmentCleaner{
 		cs:    cs,
@@ -287,6 +318,59 @@ func TestVACleanerOutOfServicePodsBlock(t *testing.T) {
 	}
 	if !vaExists(t, cs, "va-fenced") {
 		t.Fatal("VA deleted while a non-terminal pod still sits on the node")
+	}
+}
+
+// A DaemonSet pod mounting a claim on the fenced node keeps the VA:
+// DS agents can hold PVC/generic-ephemeral mounts just like workload
+// pods (the fast-reboot branch's podsUsingVolume already inspects
+// them), so discounting DS pods wholesale would fabricate a live==0
+// and strip a mount that is still in use.
+func TestVACleanerOutOfServiceDaemonSetClaimPodBlocks(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		vacNode("dead", corev1.ConditionFalse, outOfService),
+		vacDSPod("kube-system", "agent-a", "dead", "data-a", false), // PVC claim
+		vacDSPod("kube-system", "agent-b", "dead", "data-b", true),  // generic ephemeral
+		vacAttachment("va-fenced", "dead", now.Add(-time.Hour)),
+	)
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(20 * time.Minute)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !vaExists(t, cs, "va-fenced") {
+		t.Fatal("VA deleted while a DaemonSet pod holds a claim mount on the fenced node")
+	}
+}
+
+// A DaemonSet pod WITHOUT any claim-backed volume stays discounted —
+// the plain infra-agent shape must not keep the gate shut forever.
+func TestVACleanerOutOfServiceDaemonSetPodWithoutClaimKeepsGateOpen(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		vacNode("dead", corev1.ConditionFalse, outOfService),
+		vacDSPod("kube-system", "agent-plain", "dead", "", false),
+		vacAttachment("va-fenced", "dead", now.Add(-time.Hour)),
+	)
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !vaExists(t, cs, "va-fenced") {
+		t.Fatal("VA deleted before the 15m not-Ready window elapsed")
+	}
+	now = now.Add(16 * time.Minute)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if vaExists(t, cs, "va-fenced") {
+		t.Fatal("VA kept past the window — a claimless DaemonSet pod must not block the gate")
 	}
 }
 

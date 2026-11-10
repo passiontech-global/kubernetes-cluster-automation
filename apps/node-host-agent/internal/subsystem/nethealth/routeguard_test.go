@@ -320,6 +320,29 @@ func TestRouteGuardDebounceLoopDoneAborts(t *testing.T) {
 	}
 }
 
+// TestRouteGuardRearmDrainsStaleTick: a bare timer.Reset on a timer
+// whose tick is still queued in timer.C (an event won the select
+// against an already fired timer) hands the STALE tick to the next
+// receive — the trailing-edge debounce collapses to zero. rearmTimer
+// must stop+drain first, so the re-armed fire lands no earlier than
+// the new delay.
+func TestRouteGuardRearmDrainsStaleTick(t *testing.T) {
+	timer := time.NewTimer(5 * time.Millisecond)
+	time.Sleep(15 * time.Millisecond) // tick fired, NOT consumed
+	rearmTimer(timer, 200*time.Millisecond)
+	select {
+	case <-timer.C:
+		t.Fatal("stale tick consumed — debounce collapsed to zero")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The re-armed fire still lands after the full new delay.
+	select {
+	case <-timer.C:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-armed timer never fired")
+	}
+}
+
 // The min-interval cap: a burst inside the window must not exec
 // (exec-storm guard) but is re-armed to the window's end — the
 // trailing edge of a flap still lands exactly one restore.

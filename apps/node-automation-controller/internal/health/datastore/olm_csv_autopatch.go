@@ -133,18 +133,38 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		}
 		// Patch (not Update): the controller's RBAC on
 		// clusterserviceversions is get/list/patch — an Update call
-		// would 403 every sweep. A merge patch carrying the WHOLE
-		// mutated spec is equivalent here because the unstructured
-		// object already holds the complete spec — nothing is
-		// invented or dropped. The cooldown stamp rides the SAME
-		// merge patch (RFC 7386 folds metadata.annotations into the
-		// existing map, sibling keys survive) so one write lands the
-		// heal and its persisted cooldown together.
-		spec, _ := csv.Object["spec"].(map[string]any)
+		// would 403 every sweep. The merge patch carries ONLY the
+		// subtree the autopatch mutates (spec.install.spec.deployments
+		// — the array every mutator above writes back): shipping the
+		// whole listed spec would fold every stale-snapshot key
+		// (scalars, other arrays) back over the live object,
+		// reverting OLM writes that landed in the List→Patch window.
+		// RFC 7386 merges maps recursively and replaces arrays
+		// wholesale, so sibling spec keys survive untouched and the
+		// mutated deployments array lands in full. The cooldown stamp
+		// rides the SAME merge patch (metadata.annotations folds into
+		// the existing map) so one write lands the heal and its
+		// persisted cooldown together.
+		deployments, _, _ := unstructured.NestedSlice(
+			csv.Object, "spec", "install", "spec", "deployments")
+		// metadata.resourceVersion pins the write — the listed
+		// snapshot's deployments array goes back wholesale, so an
+		// OLM write landing in the List→Patch window (mid-upgrade
+		// bundle re-assertion) becomes a 409 conflict, retried
+		// next sweep against a fresh read, instead of a silent
+		// revert of the newer spec.
 		patch, err := json.Marshal(map[string]any{
-			"spec": spec,
-			"metadata": map[string]any{"annotations": map[string]any{
-				olmCSVPatchHealAnno: now.UTC().Format(time.RFC3339)}},
+			"spec": map[string]any{
+				"install": map[string]any{
+					"spec": map[string]any{
+						"deployments": deployments,
+					},
+				},
+			},
+			"metadata": map[string]any{
+				"resourceVersion": csv.GetResourceVersion(),
+				"annotations": map[string]any{
+					olmCSVPatchHealAnno: now.UTC().Format(time.RFC3339)}},
 		})
 		if err != nil {
 			metrics.IncError(p.Name)
@@ -303,11 +323,23 @@ func stripManagerLeaderElect(obj map[string]any) bool {
 			}
 			kept := make([]any, 0, len(args))
 			stripped := false
-			for _, a := range args {
+			for i, a := range args {
 				if s, ok := a.(string); ok &&
 					(s == "--leader-elect" || s == "--leader-elect=true") {
 					stripped = true
 					continue
+				}
+				// Two-arg form: "--leader-elect false" strips the
+				// flag AND its value token — leaving the bare
+				// "false" would hand the manager a stray
+				// positional arg. Only a literal true/false is
+				// consumed; a following real flag is kept.
+				if stripped && i > 0 {
+					if prev, _ := args[i-1].(string); prev == "--leader-elect" {
+						if s, ok := a.(string); ok && (s == "true" || s == "false") {
+							continue
+						}
+					}
 				}
 				kept = append(kept, a)
 			}

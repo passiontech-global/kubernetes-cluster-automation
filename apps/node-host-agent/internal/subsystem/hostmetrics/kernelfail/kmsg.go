@@ -174,7 +174,7 @@ func (r *Runner) writeKmsgCursor(cur *kmsgCursor) {
 // `dmesg -T` (timestamps) then plain `dmesg` (line-count cursor) when
 // the device can't be opened. An unreadable kernel log is
 // inconclusive — no markers, no latch movement.
-func (r *Runner) checkKernelDmesg() {
+func (r *Runner) checkKernelDmesg(ctx context.Context) {
 	st := &r.kscan
 	if st.sess == nil {
 		st.sess = r.newKmsgSession()
@@ -185,7 +185,7 @@ func (r *Runner) checkKernelDmesg() {
 	// Read/open failure — drop the session; the dmesg fallback
 	// covers this tick and kmsg is retried next tick.
 	r.closeKMSSession(st)
-	r.drainDmesg(st)
+	r.drainDmesg(ctx, st)
 }
 
 // newKmsgSession builds the tail session — the Tailer opens the
@@ -430,7 +430,13 @@ func (r *Runner) noteConntrackFull() {
 // the sysctl path directly; containerized agents without a writable
 // /proc/sys get a Warn and move on.
 func (r *Runner) maybeBumpConntrackMax() {
-	if !r.deps.Store.RateOK(conntrackBumpBudgetFile, conntrackBumpEvery) {
+	// RateTrySpend not RateOK+RateSpend: check-and-spend must be one
+	// atomic budget decision — two callers racing the window could
+	// otherwise both pass RateOK and double-bump inside 30m. A
+	// failed sysctl write spends the window too: retrying a
+	// permanently read-only /proc every tick is not better than
+	// waiting out the budget.
+	if !r.deps.Store.RateTrySpend(conntrackBumpBudgetFile, conntrackBumpEvery) {
 		return
 	}
 	cur, ok := hostutil.ReadUintFile(r.deps.ConntrackMaxFile)
@@ -447,7 +453,6 @@ func (r *Runner) maybeBumpConntrackMax() {
 			"path", r.deps.ConntrackMaxFile, "error", err)
 		return
 	}
-	r.deps.Store.RateSpend(conntrackBumpBudgetFile)
 	logger().Warn("hostmetrics: nf_conntrack table full — bumped "+
 		"nf_conntrack_max",
 		"from", cur, "to", next)
@@ -462,11 +467,11 @@ func (r *Runner) maybeBumpConntrackMax() {
 // a count cursor would go permanently blind; a lost anchor skips
 // the tick and re-anchors at the tail rather than reprocessing the
 // whole retained ring).
-func (r *Runner) drainDmesg(st *kernelScanState) {
-	out, err := r.deps.RunHostCmd(context.Background(), "dmesg", "-T")
+func (r *Runner) drainDmesg(ctx context.Context, st *kernelScanState) {
+	out, err := r.deps.RunHostCmd(ctx, "dmesg", "-T")
 	mode := "dmesgT"
 	if err != nil {
-		out, err = r.deps.RunHostCmd(context.Background(), "dmesg")
+		out, err = r.deps.RunHostCmd(ctx, "dmesg")
 		mode = "dmesgRaw"
 	}
 	if err != nil {

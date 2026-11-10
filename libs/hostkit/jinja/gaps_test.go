@@ -254,3 +254,39 @@ func TestSplitHelpers(t *testing.T) {
 		}
 	}
 }
+
+// union is a set union: unique elements across all operands (Jinja2/Ansible).
+func TestUnionDedupes(t *testing.T) {
+	tpl := `{{ [1, 2] | union([2, 3]) }}|{{ [true, 'x'] | union([true]) }}|{{ [1, 1, 2] | union([3]) }}`
+	got, err := Render(tpl, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[1, 2, 3]|[True, x]|[1, 2, 3]"; got != want {
+		t.Fatalf("union = %q want %q", got, want)
+	}
+}
+
+// unique dedupes by value equality, not stringified form.
+func TestUniqueDeepEq(t *testing.T) {
+	tpl := `{{ [true, 'True'] | unique | length }}|{{ [[1], [1]] | unique | length }}|{{ [1, 1.0] | unique | length }}|{{ ['a', 'a', 'b'] | unique | length }}`
+	got, err := Render(tpl, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "2|1|1|2"; got != want {
+		t.Fatalf("unique = %q want %q", got, want)
+	}
+}
+
+// String indexing counts runes, matching iteration and Python semantics.
+func TestStringIndexRune(t *testing.T) {
+	tpl := `{{ s[1] }}|{{ s[-4] }}`
+	got, err := Render(tpl, map[string]any{"s": "héllo"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "é|é"; got != want {
+		t.Fatalf("index = %q want %q", got, want)
+	}
+}

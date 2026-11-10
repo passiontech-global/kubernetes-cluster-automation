@@ -549,6 +549,73 @@ func TestNatsJetstreamStreamLeaderlessPartialLoss(t *testing.T) {
 	}
 }
 
+// Per-pod attribution: a namespace whose min series is 0 because ONE
+// member lost a stream leader must not stamp the members whose own
+// series are all positive — those still hold their leadership, and
+// bouncing the leadership holder cascades leader loss (one bounce
+// per 30m loop). Only the member whose OWN per-stream minimum is 0
+// joins the healable pod-local path.
+func TestNatsJetstreamStreamLeaderlessSparesLeadershipHolder(t *testing.T) {
+	base := time.Now()
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "min by"):
+			// The namespace minimum reads 0 — nats-0 lost the orders
+			// stream leader — but the OTHER members' series are all
+			// positive: they still hold their streams.
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq"}, Value: 0}}
+		case strings.Contains(query, "stream_leader"):
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "nats-0",
+					"stream_name": "orders"}, Value: 0},
+				{Labels: map[string]string{"namespace": "mq", "pod": "nats-1",
+					"stream_name": "events"}, Value: 1},
+				{Labels: map[string]string{"namespace": "mq", "pod": "nats-2",
+					"stream_name": "events"}, Value: 1},
+			}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset(natsFixture()...)
+	p := natsProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
+	res := check.Run(ctx)
+	if res.Pass {
+		t.Fatal("stream_leaderless member must FAIL the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_nats_jetstream_unhealthy",
+		map[string]string{"namespace": "mq", "pod": "nats-0",
+			"reason": "stream_leaderless"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("the per-pod culprit member must stamp")
+	}
+	for _, holder := range []string{"nats-1", "nats-2"} {
+		if m := probetest.FindMetric(t, "node_automation_nats_jetstream_unhealthy",
+			map[string]string{"namespace": "mq", "pod": holder,
+				"reason": "stream_leaderless"}); m != nil {
+			t.Fatalf("leadership holder %s must not stamp — bouncing it would cascade leader loss", holder)
+		}
+	}
+
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	if res := check.Run(ctx); res.Pass {
+		t.Fatal("persisted stream_leaderless must still FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "nats-0", metav1.GetOptions{}); err == nil {
+		t.Fatal("the culprit member must bounce past the window")
+	}
+	for _, holder := range []string{"nats-1", "nats-2"} {
+		if _, err := cs.CoreV1().Pods("mq").
+			Get(ctx, holder, metav1.GetOptions{}); err != nil {
+			t.Fatalf("leadership holder %s must survive the sweep", holder)
+		}
+	}
+}
+
 // natsSTSKey resolves the StatefulSet owning a member pod — the
 // per-cluster quorum-census grouping key. The controller owner ref
 // wins; the "<sts>-<ordinal>" name shape is the fallback for a pod

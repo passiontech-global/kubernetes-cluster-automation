@@ -455,6 +455,76 @@ func TestAutoApproveStuckInstallPlanCooldownGate(t *testing.T) {
 	}
 }
 
+// The CSV merge patch ships ONLY the subtree the autopatch mutates
+// (spec.install.spec.deployments) — never the whole listed spec. A
+// whole-spec merge patch would fold the stale List snapshot's other
+// keys (scalars, sibling arrays) back over the live object, reverting
+// OLM writes that landed in the List→Patch window.
+func TestAutoPatchOperatorCSVsPatchSubtreeOnly(t *testing.T) {
+	csv := argocdOperatorCSV("argocd-operator.v2.7.1")
+	// A sibling spec key OLM may have written between our List and
+	// Patch (bundle image bump, env injection). The whole-spec patch
+	// the fix replaced folded this back over the live value from the
+	// stale snapshot; the subtree patch must omit it.
+	csv.Object["spec"].(map[string]any)["provider"] =
+		map[string]any{"name": "olm-live-write"}
+	dyn := probetest.OpDyn(csv)
+	var body string
+	dyn.PrependReactor("patch", "clusterserviceversions",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			body = string(action.(ktesting.PatchAction).GetPatch())
+			return false, nil, nil
+		})
+	chk := probetest.MustCheck[*olmHealthCheck](t,
+		testProberDyn(fake.NewSimpleClientset(), dyn))
+
+	chk.autoPatchOperatorCSVs(ctx, logr.Discard(), time.Now())
+	if body == "" {
+		t.Fatal("unpatched argocd-operator CSV must be patched")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("patch body %q: %v", body, err)
+	}
+	spec, ok := doc["spec"].(map[string]any)
+	if !ok || len(spec) != 1 {
+		t.Fatalf("patch must carry exactly one spec key: %v", doc)
+	}
+	if _, leaked := spec["provider"]; leaked {
+		t.Fatalf("patch folded stale sibling spec key back in: %v", doc)
+	}
+	install, ok := spec["install"].(map[string]any)
+	if !ok || len(install) != 1 {
+		t.Fatalf("patch spec.install must carry exactly one key: %v", doc)
+	}
+	ispec, ok := install["spec"].(map[string]any)
+	if !ok || len(ispec) != 1 {
+		t.Fatalf("patch spec.install.spec must carry exactly one key: %v", doc)
+	}
+	deploys, ok := ispec["deployments"].([]any)
+	if !ok || len(deploys) == 0 {
+		t.Fatalf("patch must carry spec.install.spec.deployments: %v", doc)
+	}
+	dep, _ := deploys[0].(map[string]any)
+	containers, foundC, _ := unstructured.NestedSlice(
+		dep, "spec", "template", "spec", "containers")
+	if !foundC {
+		t.Fatalf("patched deployment lost its pod template: %v", dep)
+	}
+	found := false
+	for _, c := range containers {
+		cm, _ := c.(map[string]any)
+		if cm != nil && cm["name"] == "manager" {
+			if _, ok := cm["startupProbe"]; ok {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("patch must ship the mutated deployments array (startupProbe clone)")
+	}
+}
+
 // argocdOperatorCSV builds an unpatched argocd-operator CSV (manager
 // container without the startupProbe — the drift shape the sweep
 // heals).

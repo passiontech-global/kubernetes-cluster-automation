@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	eventsv1 "k8s.io/api/events/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -623,6 +624,72 @@ func TestRotationFreshLinesAreNotReplay(t *testing.T) {
 	}
 }
 
+// TestRenameRotationDetectedWhenFreshFileGrows: the watchdog rotates
+// by rename; if the fresh file grows PAST the old offset before the
+// next scan (sustained watchdog-log writes), a size-shrink
+// comparison never sees a rotation — the reader would seek mid-file
+// into the NEW generation and the unread .1 tail would never drain
+// (Events + problem_counter silently lost for that window). The
+// dev/ino identity check detects the generation change regardless of
+// size.
+func TestRenameRotationDetectedWhenFreshFileGrows(t *testing.T) {
+	e := fixture(t)
+	e.appendLog(t, "ACTION: restarting k0sworker - pre-rotation")
+	e.cycle()
+	base := e.counter("K0sworkerRestarted")
+	if base != 1 {
+		t.Fatalf("pre-rotation counter = %v, want 1", base)
+	}
+
+	// Rotate exactly like the store, append the old generation's
+	// unseen tail line to .1, then grow the FRESH file well past the
+	// old offset before the next scan.
+	if err := os.Rename(e.log, e.log+".1"); err != nil {
+		t.Fatal(err)
+	}
+	e.appendRawTo(t, e.log+".1",
+		e.now.Format(time.RFC3339)+" ACTION: restarting k0sworker - tail-of-old-generation\n")
+	for range 200 {
+		e.appendLog(t, "unmatched fresh filler padding padding padding")
+	}
+	if fi, err := os.Stat(e.log); err != nil {
+		t.Fatal(err)
+	} else if fi.Size() <= e.r.logOffset {
+		t.Fatalf("fresh file %d not past old offset %d — test setup broken",
+			fi.Size(), e.r.logOffset)
+	}
+
+	e.cycle()
+
+	if got := e.counter("K0sworkerRestarted"); got != base+1 {
+		t.Fatalf("counter = %v, want %v (the .1 tail must drain even "+
+			"without a size shrink)", got, base+1)
+	}
+	found := false
+	for _, ev := range eventsByReason(t, e, "K0sworkerRestarted") {
+		if strings.Contains(ev.Note, "tail-of-old-generation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unread .1 tail skipped — rename rotation missed")
+	}
+	fi, err := os.Stat(e.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.r.logOffset != fi.Size() {
+		t.Fatalf("logOffset = %d, want the fresh file size %d",
+			e.r.logOffset, fi.Size())
+	}
+	// The next cycle must not re-deliver anything.
+	e.cycle()
+	if got := e.counter("K0sworkerRestarted"); got != base+1 {
+		t.Fatalf("counter after re-cycle = %v, want %v (no re-delivery)",
+			got, base+1)
+	}
+}
+
 // TestInodePressureEvents: the inode-pressure inode-pressure latch's
 // STATE-ENTER line emits a Warning Event (reason InodePressure, note
 // carries the offending mount + ratio) and its STATE-EXIT line emits
@@ -750,6 +817,45 @@ func TestEventNoteTruncated(t *testing.T) {
 	}
 	if len(evs[0].Note) != maxEventNote {
 		t.Fatalf("note len = %d, want %d", len(evs[0].Note), maxEventNote)
+	}
+}
+
+// TestEventNoteTruncationStaysValidUTF8: the maxEventNote cut snaps
+// back to a rune boundary and ToValidUTF8 drops any invalid bytes —
+// the apiserver stores Note as a UTF-8 string and rejects invalid
+// input, so a garbage log line must not wedge its Event create
+// permanently.
+func TestEventNoteTruncationStaysValidUTF8(t *testing.T) {
+	e := fixture(t)
+	// The 1024-byte cut lands MID-RUNE: 1022 ASCII bytes plus a
+	// 3-byte rune straddling the boundary.
+	note := strings.Repeat("a", 1022) + "日" + strings.Repeat("b", 64)
+	if err := e.r.emitEvent(context.Background(), "X", note, "Warning"); err != nil {
+		t.Fatalf("emit failed: %v", err)
+	}
+	evs := eventsByReason(t, e, "X")
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if !utf8.ValidString(evs[0].Note) {
+		t.Fatalf("Note is not valid UTF-8: %q", evs[0].Note)
+	}
+	if len(evs[0].Note) != 1022 {
+		t.Fatalf("note len = %d, want 1022 (cut snapped to the rune boundary)",
+			len(evs[0].Note))
+	}
+
+	// Raw invalid bytes inside the cap are dropped, not stored.
+	if err := e.r.emitEvent(context.Background(), "Y",
+		strings.Repeat("c", 1020)+"\xff\xfe"+"tail", "Warning"); err != nil {
+		t.Fatalf("emit failed: %v", err)
+	}
+	evs = eventsByReason(t, e, "Y")
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if !utf8.ValidString(evs[0].Note) {
+		t.Fatalf("Note is not valid UTF-8: %q", evs[0].Note)
 	}
 }
 

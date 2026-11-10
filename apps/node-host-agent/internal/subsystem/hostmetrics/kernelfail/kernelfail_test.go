@@ -33,7 +33,7 @@ func TestKmsgFSAndConntrack(t *testing.T) {
 		"random unrelated kernel line")
 	// Conntrack max file for the sysctl-bump path.
 	testutil.WriteFile(t, f.deps.ConntrackMaxFile, "262144\n")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(filepath.Join(f.deps.StateDir,
 		kmsgFsErrorFile)); err != nil {
 		t.Fatal("kmsg-fs-error marker missing")
@@ -44,7 +44,7 @@ func TestKmsgFSAndConntrack(t *testing.T) {
 		t.Fatalf("conntrack drops=%q want 2", got)
 	}
 	// Second drain must not double-count — the fd sits at EOF.
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	got = strings.TrimSpace(testutil.ReadFile(t,
 		filepath.Join(f.deps.StateDir, kmsgConntrackDropsFile)))
 	if got != "2" {
@@ -71,7 +71,7 @@ func TestKmsgOOMClassification(t *testing.T) {
 			"oom_memcg=/system.slice,task_memcg=/system.slice,"+
 			"task=kubelet,pid=88",
 		"Memory cgroup out of memory: Killed process 88 (kubelet) total-vm:5kB")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	victim := strings.TrimSpace(testutil.ReadFile(t, filepath.Join(
 		f.deps.StateDir, kmsgOOMVictimFile)))
 	if !strings.Contains(victim, "kubelet") {
@@ -94,7 +94,7 @@ func TestKmsgFirstOpenPrimesBacklog(t *testing.T) {
 	_ = os.MkdirAll(devDir, 0o755)
 	testutil.WriteFile(t, f.deps.KmsgDevicePaths(f.deps.HostRoot)[0],
 		"6,1,1000,0;EXT4-fs error old history\n")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(filepath.Join(f.deps.StateDir,
 		kmsgFsErrorFile)); !os.IsNotExist(err) {
 		t.Fatal("backlog record classified on first open")
@@ -216,7 +216,7 @@ func TestClockSkew(t *testing.T) {
 			"Leap status     : Not synchronised\n", nil
 	}
 	for i := 0; i < clockSkewLatchNeeded; i++ {
-		f.r.checkClockSkew()
+		f.r.checkClockSkew(context.Background())
 	}
 	if !stepped {
 		t.Fatal("chronyc makestep not attempted")
@@ -429,7 +429,7 @@ func TestKmsgEmptyFirstOpenWritesNoCursor(t *testing.T) {
 	_ = os.MkdirAll(filepath.Dir(dev), 0o755)
 	// Ring holds only an UNPARSEABLE line — no cursor-eligible seq.
 	testutil.WriteFile(t, dev, "not-a-kmsg-record\n")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(filepath.Join(f.deps.StateDir,
 		kmsgCursorFile)); !os.IsNotExist(err) {
 		t.Fatal("cursor written despite no parsed record on first open")
@@ -438,7 +438,7 @@ func TestKmsgEmptyFirstOpenWritesNoCursor(t *testing.T) {
 	// record arriving after the empty first open IS news.
 	testutil.WriteFile(t, dev, "not-a-kmsg-record\n6,7,2000,0;"+
 		"Out of memory: Killed process 7 (kubelet) total-vm:2kB\n")
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	b, err := os.ReadFile(filepath.Join(f.deps.StateDir, kmsgCursorFile))
 	if err != nil {
 		t.Fatalf("cursor never anchored after parsed record: %v", err)
@@ -463,7 +463,7 @@ func TestCheckKernelDmesgFallsBackToDmesg(t *testing.T) {
 	}
 	f.r.deps.RunHostCmd = f.deps.RunHostCmd
 
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	// Tick 1 only PRIMES the dmesg cursor (the retained ring is
 	// history, not news) and drops the failed kmsg session.
 	if f.r.kscan.sess != nil {
@@ -488,7 +488,7 @@ func TestCheckKernelDmesgFallsBackToDmesg(t *testing.T) {
 		}
 		return "", errors.New("plain dmesg unexpected")
 	}
-	f.r.checkKernelDmesg()
+	f.r.checkKernelDmesg(context.Background())
 	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); err != nil {
 		t.Fatalf("fs-error marker missing after the dmesg fallback: %v", err)
 	}
@@ -721,7 +721,7 @@ func TestClockSkewAdjtimexFallback(t *testing.T) {
 	}
 	f.r.deps.Adjtimex = f.deps.Adjtimex
 
-	f.r.checkClockSkew()
+	f.r.checkClockSkew(context.Background())
 	if _, err := os.Stat(f.r.statePath(clockSteppedMarkerFile)); !os.IsNotExist(err) {
 		t.Fatal("clock-stepped marker written for a failed makestep")
 	}
@@ -734,7 +734,7 @@ func TestClockSkewAdjtimexFallback(t *testing.T) {
 	}
 	// Inconclusive probes (adjtimex failing too) leave everything.
 	f.r.deps.Adjtimex = func(*unix.Timex) (int, error) { return 0, unix.ENOSYS }
-	f.r.checkClockSkew()
+	f.r.checkClockSkew(context.Background())
 	b, _ = os.ReadFile(f.r.statePath(clockSkewCountFile))
 	if strings.TrimSpace(string(b)) != "1" {
 		t.Fatalf("inconclusive probe moved the count: %q", b)
@@ -812,7 +812,7 @@ func TestUnwritableStateDirKeepsDraining(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(f.deps.StateDir, 0o755) })
 
-	f.r.checkKernelDmesg() // classify runs; cursor + marker writes fail
+	f.r.checkKernelDmesg(context.Background()) // classify runs; cursor + marker writes fail
 
 	if _, err := os.Stat(f.r.statePath(kmsgFsErrorFile)); !os.IsNotExist(err) {
 		t.Fatalf("marker materialized through a read-only state dir: %v", err)

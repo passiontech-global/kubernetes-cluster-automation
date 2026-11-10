@@ -3,6 +3,7 @@ package deadnodesweeper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -421,6 +423,87 @@ func TestDeadNodeSweeperUntaintsRecoveredNode(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("recovered node still carries out-of-service taint")
+	}
+}
+
+// staleNodeCacheReader stands in for a lagging informer cache: it
+// answers List with the snapshot it was built with, never consulting
+// the live clientset (same shape as the evictor's peStaleCacheReader).
+type staleNodeCacheReader struct{ snapshot []runtime.Object }
+
+func (r staleNodeCacheReader) List(_ context.Context, l client.ObjectList,
+	_ ...client.ListOption) error {
+	nl, ok := l.(*corev1.NodeList)
+	if !ok {
+		return fmt.Errorf("staleNodeCacheReader: unexpected list type %T", l)
+	}
+	nl.Items = nil
+	for _, o := range r.snapshot {
+		nl.Items = append(nl.Items, *o.(*corev1.Node).DeepCopy())
+	}
+	return nil
+}
+
+// THE REGRESSION for the recovery untaint: the cached census still
+// reads the node Ready, but it flipped Ready→Unknown inside the
+// informer's lag window. The fence must be live-confirmed — stripping
+// it on the cache's word would let new pods schedule onto the dead
+// node for a whole lag window.
+func TestDeadNodeSweeperKeepsFenceWhenLiveNotReady(t *testing.T) {
+	stale := testutil.Node("w1", corev1.ConditionTrue, nil, outOfServiceTaint)
+	live := testutil.Node("w1", corev1.ConditionUnknown, nil, outOfServiceTaint)
+	cs := fake.NewSimpleClientset(live)
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	s.nodeReader = staleNodeCacheReader{snapshot: []runtime.Object{stale}}
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("out-of-service fence stripped on stale-cache Ready evidence")
+	}
+}
+
+// A failed live Get during the recovery confirm is fail-closed: the
+// fence stays up this cycle (error metered, run still nil) — the next
+// cycle retries.
+func TestDeadNodeSweeperUntaintConfirmErrorKeepsFence(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("w1", corev1.ConditionTrue, nil, outOfServiceTaint))
+	// The recovery-confirm Get fails — but only the FIRST one, so the
+	// test's own verification Get below still reads the node back.
+	badGets := 0
+	cs.PrependReactor("get", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			badGets++
+			if badGets == 1 {
+				return true, nil, errors.New("live get boom")
+			}
+			return false, nil, nil
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatalf("one unconfirmable node must not fail the run: %v", err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("out-of-service fence stripped while the node was unverifiable")
+	}
+}
+
+// A node that vanished between the cached census and the recovery
+// confirm has nothing left to lift — skipped without error.
+func TestDeadNodeSweeperUntaintConfirmNotFoundSkips(t *testing.T) {
+	stale := testutil.Node("w1", corev1.ConditionTrue, nil, outOfServiceTaint)
+	cs := fake.NewSimpleClientset()
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	s.nodeReader = staleNodeCacheReader{snapshot: []runtime.Object{stale}}
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("gone node must stay gone, got %v", err)
 	}
 }
 

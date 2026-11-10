@@ -44,8 +44,14 @@ func TestDNSFallbackPinAndRecover(t *testing.T) {
 	if !stateExists(e, latch) {
 		t.Fatal("dns-fallback latch missing")
 	}
-	// DNS recovers → block + pin + latch removed.
+	// DNS recovers → the pin survives the FIRST success (unpin is
+	// hysteretic like the pin-on streak) and the second consecutive
+	// success removes block + pin + latch.
 	e.dnsOK["10.1.1.1|api.test.internal"] = "10.0.0.1"
+	e.n.Cycle(context.Background())
+	if !strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatalf("a single success tore the pin out:\n%s", testutil.ReadFile(t, e.hosts))
+	}
 	e.n.Cycle(context.Background())
 	hosts = testutil.ReadFile(t, e.hosts)
 	if strings.Contains(hosts, "node-watchdog-dns") {
@@ -94,7 +100,7 @@ func TestRenderHostsBlockUnterminatedBegin(t *testing.T) {
 	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n"+
 		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
 
-	if !e.n.renderHostsBlock("10.0.0.2 api.y\n") {
+	if _, err := e.n.renderHostsBlock("10.0.0.2 api.y\n"); err != nil {
 		t.Fatal("unterminated block not rewritten")
 	}
 	hosts := testutil.ReadFile(t, e.hosts)
@@ -106,14 +112,14 @@ func TestRenderHostsBlockUnterminatedBegin(t *testing.T) {
 		t.Fatalf("new block not written well-formed:\n%s", hosts)
 	}
 	// The rewrite is convergent: the next render sees a clean file.
-	if e.n.renderHostsBlock("10.0.0.2 api.y\n") {
+	if changed, _ := e.n.renderHostsBlock("10.0.0.2 api.y\n"); changed {
 		t.Fatalf("rewrite not idempotent:\n%s", testutil.ReadFile(t, e.hosts))
 	}
 
 	// Removing the block keeps the tail too.
 	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n"+
 		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
-	if !e.n.renderHostsBlock("") {
+	if _, err := e.n.renderHostsBlock(""); err != nil {
 		t.Fatal("unterminated block removal not rewritten")
 	}
 	hosts = testutil.ReadFile(t, e.hosts)
@@ -141,7 +147,7 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 		"10.0.0.9 api.test.internal\n"+ // stale pin on a managed name
 		"10.0.0.7 stranded.example\n") // foreign entry — rescued
 
-	if !e.n.renderHostsBlock("10.0.0.2 api.test.internal\n") {
+	if _, err := e.n.renderHostsBlock("10.0.0.2 api.test.internal\n"); err != nil {
 		t.Fatal("unterminated block not rewritten")
 	}
 	hosts := testutil.ReadFile(t, e.hosts)
@@ -274,18 +280,19 @@ func TestNameserversParsing(t *testing.T) {
 }
 
 // An unreadable hosts file must not be rewritten — renderHostsBlock
-// refuses and reports no change.
+// refuses and reports no change AND an error (the caller must be
+// able to tell "unchanged" from "not applied").
 func TestRenderHostsBlockUnreadableFile(t *testing.T) {
 	e := fixture(t, nil)
 	e.n.cfg.HostsFile = filepath.Join(t.TempDir(), "absent-hosts")
-	if e.n.renderHostsBlock("10.0.0.1 api\n") {
-		t.Fatal("rendered a block into an unreadable hosts file")
+	if changed, err := e.n.renderHostsBlock("10.0.0.1 api\n"); changed || err == nil {
+		t.Fatalf("changed=%v err=%v — rendered into an unreadable hosts file", changed, err)
 	}
 }
 
 // A hosts file that cannot be atomically rewritten (read-only
 // directory — the read-only /etc bind mount case) reports no change
-// instead of crashing the cycle.
+// AND an error instead of crashing the cycle.
 func TestRenderHostsBlockWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	hosts := filepath.Join(dir, "hosts")
@@ -296,8 +303,8 @@ func TestRenderHostsBlockWriteFailure(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 	e := fixture(t, nil)
 	e.n.cfg.HostsFile = hosts
-	if e.n.renderHostsBlock("10.0.0.1 api\n") {
-		t.Fatal("renderHostsBlock claimed success on a failed write")
+	if changed, err := e.n.renderHostsBlock("10.0.0.1 api\n"); changed || err == nil {
+		t.Fatalf("changed=%v err=%v — claimed success on a failed write", changed, err)
 	}
 	if got := testutil.ReadFile(t, hosts); got != "127.0.0.1 localhost\n" {
 		t.Fatalf("hosts mutated despite write failure: %q", got)
@@ -369,5 +376,118 @@ func TestDNSFallbackPruneRemovesCtrFile(t *testing.T) {
 		if _, err := os.Stat(f); !os.IsNotExist(err) {
 			t.Fatalf("prune kept %s", f)
 		}
+	}
+}
+
+// TestDNSFallbackUnpinNeedsConsecSuccesses: the unpin is hysteretic
+// like the pin — one successful probe must NOT tear the pin (and the
+// managed block) out, and a failure between successes resets the
+// streak. The pin drops only after ConsecNeeded CONSECUTIVE
+// successes; on flapping DNS a single lucky resolution must not
+// toggle the block (and its conntrack flush) every other cycle.
+func TestDNSFallbackUnpinNeedsConsecSuccesses(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.2"}},
+		},
+	})
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.2:6443"] = true
+
+	// Two failing cycles → pin 10.0.0.2.
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatalf("no pin written:\n%s", testutil.ReadFile(t, e.hosts))
+	}
+
+	// One successful resolution → pin kept.
+	e.dnsOK["10.1.1.1|api.test.internal"] = "10.0.0.1"
+	e.n.Cycle(context.Background())
+	if !strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatal("a single success tore the pin out")
+	}
+
+	// A failed probe between successes resets the streak.
+	delete(e.dnsOK, "10.1.1.1|api.test.internal")
+	e.n.Cycle(context.Background())
+	e.dnsOK["10.1.1.1|api.test.internal"] = "10.0.0.1"
+	e.n.Cycle(context.Background())
+	if !strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatal("pin dropped although a failure interrupted the success streak")
+	}
+
+	// Second consecutive success → unpin: block + pin + latch gone.
+	e.n.Cycle(context.Background())
+	if strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatalf("pin kept after ConsecNeeded consecutive successes:\n%s",
+			testutil.ReadFile(t, e.hosts))
+	}
+	if stateExists(e, "dns-fallback") {
+		t.Fatal("latch kept after unpin")
+	}
+}
+
+// A failed hosts render must not lie to the condition: with a pin to
+// apply but an unwritable hosts file, the dns-fallback latch stays
+// UNENTERED — the block never landed, kubelet still resolves against
+// dead DNS, and claiming engagement would misreport the node
+// condition. The failure is logged distinctly.
+func TestDNSFallbackWriteFailureDoesNotEnterLatch(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.1"}},
+		},
+	})
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.1:6443"] = true
+	ro := t.TempDir()
+	hosts := filepath.Join(ro, "hosts")
+	testutil.WriteFile(t, hosts, "127.0.0.1 localhost\n")
+	if err := os.Chmod(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+	e.n.cfg.HostsFile = hosts
+
+	for range 2 { // ConsecNeeded cycles → pin file written
+		e.n.Cycle(context.Background())
+	}
+	if pins := e.n.pinFiles(); len(pins) == 0 {
+		t.Fatal("pin file not written — test setup broken")
+	}
+	if stateExists(e, "dns-fallback") {
+		t.Fatal("dns-fallback latch entered although the hosts block never landed")
+	}
+	if !strings.Contains(logLines(t, e), "block not applied") {
+		t.Fatalf("render failure not logged distinctly:\n%s", logLines(t, e))
+	}
+}
+
+// Symmetric honesty on the exit side: a map-empty cleanup whose
+// hosts render fails must KEEP the latch — the block may still sit
+// in the hosts file, so exiting would claim the remediation ended
+// while the pins are still live.
+func TestDNSFallbackEmptyMapWriteFailureKeepsLatch(t *testing.T) {
+	e := fixture(t, nil) // empty map → the cleanup path
+	ro := t.TempDir()
+	hosts := filepath.Join(ro, "hosts")
+	testutil.WriteFile(t, hosts, "127.0.0.1 localhost\n"+
+		"# BEGIN node-watchdog-dns\n10.0.0.1 api.x\n# END node-watchdog-dns\n")
+	if err := os.Chmod(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+	e.n.cfg.HostsFile = hosts
+	testutil.WriteFile(t, filepath.Join(e.state, "state-dns-fallback"), "1\n")
+
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "dns-fallback") {
+		t.Fatal("latch exited although the hosts render failed and the block is still live")
+	}
+	if got := testutil.ReadFile(t, hosts); !strings.Contains(got, "10.0.0.1 api.x") {
+		t.Fatalf("hosts mutated despite write failure: %q", got)
 	}
 }

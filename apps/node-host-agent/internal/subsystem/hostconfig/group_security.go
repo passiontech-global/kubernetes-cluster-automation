@@ -17,11 +17,15 @@ func (c *cyc) groupSecurity() {
 	if c.vb("fail2ban_enabled") {
 		if out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${db:Status-Status}", "fail2ban"); out != "installed" {
 			// runLong: apt install on slow egress outlives the
-			// interactive budget.
+			// interactive budget. A failed install aborts the group
+			// (api-lb parity): writing the jail and probing services
+			// against a missing package would error every cycle with
+			// a half-applied state.
 			if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 				"apt-get", "install", "-y", "fail2ban"); err != nil {
 				c.err("security: fail2ban install failed — jail will not apply",
 					"error", err)
+				return
 			}
 		}
 		b, err := r.render("fail2ban-cluster.conf.j2", c.tplCtx())

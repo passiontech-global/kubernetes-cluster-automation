@@ -421,8 +421,9 @@ type jobDedupeIndex struct {
 	// exactly once per sweep.
 	failed bool
 	// labeled: the catch-up label's VALUE is the CronJob name —
-	// "ns/cronjob" → the labeled Job and its creation time (first in
-	// list order wins; deduped() applies the per-CronJob window).
+	// "ns/cronjob" → the NEWEST labeled Job and its creation time
+	// (deduped() applies the per-CronJob window to this one's age;
+	// an older sibling lingering past the window must not mask it).
 	labeled map[string]labeledJob
 	// activeOwner: "ns/cronjob" → the name of a Job whose controller
 	// ownerRef points at that CronJob and which is still active.
@@ -476,7 +477,7 @@ func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 		j := &jobs[i]
 		if label := j.Labels[catchupLabel]; label != "" {
 			key := j.Namespace + "/" + label
-			if _, ok := idx.labeled[key]; !ok {
+			if lj, ok := idx.labeled[key]; !ok || jobNewerThan(j, lj) {
 				idx.labeled[key] = labeledJob{
 					name:    j.Name,
 					created: j.CreationTimestamp.Time,
@@ -494,6 +495,20 @@ func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 		}
 	}
 	return idx
+}
+
+// jobNewerThan reports whether j is newer than the indexed labeled
+// job — creationTimestamp first, name descending as the tie-break
+// (a same-second spawn keeps the lexicographically newest, i.e. the
+// highest unix suffix). typed List order is name ASCENDING, so with
+// "<cronjob>-catchup-<unix>" names the FIRST labeled job in list
+// order is the OLDEST — indexing it would let an old catch-up past
+// the dedupe window mask a fresh one and double-fire the workload.
+func jobNewerThan(j *batchv1.Job, lj labeledJob) bool {
+	if j.CreationTimestamp.Time.After(lj.created) {
+		return true
+	}
+	return j.CreationTimestamp.Time.Equal(lj.created) && j.Name > lj.name
 }
 
 // capped enforces the in-memory 1-catchup-per-cronjob-per-day limit.

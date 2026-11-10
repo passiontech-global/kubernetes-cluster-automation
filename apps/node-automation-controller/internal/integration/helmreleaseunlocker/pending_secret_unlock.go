@@ -245,7 +245,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// the hook fresh. Best-effort: a list/delete failure here must
 	// NOT undo the unlock that already landed — the pending-secret
 	// delete + reconcile stamp are the fix.
-	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr))
+	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
 	return true, nil
 }
 

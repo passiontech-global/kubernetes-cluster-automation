@@ -380,8 +380,13 @@ func cnpgInstanceOnHealthyNode(pods []corev1.Pod,
 // deletion when empty) is computed from the SAME parse the detection
 // used so a second unfence in one sweep cannot resurrect the first
 // removal, and concurrent annotation drift cannot resurrect a
-// just-cleared instance either. Returns the patch error; the caller
-// stamps the cooldown only on success.
+// just-cleared instance either. The patch pins the List snapshot's
+// resourceVersion (same shape stripFinalizers uses for
+// VolumeAttachments) so a fence the CNPG operator added between List
+// and Patch turns this into a conflict — skipped this cycle, the
+// operator's protective write survives — instead of being silently
+// dropped by the merge. Returns the patch error; the caller stamps
+// the cooldown only on success.
 func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	ctx context.Context, cr *unstructured.Unstructured, inst string,
 	all []string, removed map[string]bool) error {
@@ -395,6 +400,7 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	}
 	patch := map[string]any{
 		"metadata": map[string]any{
+			"resourceVersion": cr.GetResourceVersion(),
 			"annotations": map[string]any{
 				cnpgFencedInstancesAnno: nil,
 			},

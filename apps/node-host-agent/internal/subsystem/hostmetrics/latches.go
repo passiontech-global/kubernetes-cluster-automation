@@ -63,13 +63,15 @@ func (l *Latches) Name() string { return "hostmetrics" }
 func (l *Latches) Run(ctx context.Context) {
 	defer l.c.kf.Close()
 	cycle.Every("hostmetrics", l.c.cfg.LatchInterval,
-		func(context.Context) { l.refreshLatches() }).Run(ctx)
+		func(ctx context.Context) { l.refreshLatches(ctx) }).Run(ctx)
 }
 
 // refreshLatches re-evaluates every file-contract latch once — the
 // same logic Collect runs per scrape, decoupled from scrapes
 // (BUG-H5). Each updater is already idempotent + hysteresis-safe.
-func (l *Latches) refreshLatches() {
+// ctx reaches the kernelfail engine's host commands so a shutdown
+// cancel interrupts an in-flight dmesg/chronyc probe.
+func (l *Latches) refreshLatches(ctx context.Context) {
 	c := l.c
 	if avg60, ok := c.psiAvg60(); ok {
 		c.updateOverloadLatch(avg60)
@@ -106,7 +108,7 @@ func (l *Latches) refreshLatches() {
 	// steal/entropy, clock skew and fs-readonly evidence, in that
 	// fixed order. Lives in the kernelfail subpackage; ticker-only
 	// — a scrape-side drain would steal records from this loop.
-	c.kf.Refresh()
+	c.kf.Refresh(ctx)
 	// BUG-H6: while a latch stays held keep its mtime fresh so the
 	// janitor's LatchMaxAge reap can't retire an active signal.
 	for _, name := range []string{
@@ -176,10 +178,13 @@ func snapStaleLatchPaths(dir string) []string {
 // --- kernel-keys-pressure: /proc/key-users kernel keyring quota ---
 
 // kernelKeysUsedRatio returns the highest fill ratio across the
-// per-UID rows of /proc/key-users ("uid: usage nkeys nikeys maxkeys
-// maxbytes" — nikeys vs maxkeys is the enforced quota). ok=false on
-// a missing/unparseable file (kernel keyring disabled or proc
-// absent) — inconclusive evidence must not move the latch.
+// per-UID rows of /proc/key-users. Real row (proc_key_users_show,
+// security/keys/proc.c): "uid: usage nkeys/nikeys qnkeys/maxkeys
+// qnbytes/maxbytes" — e.g. "    0:    70 69/69 55/1000000
+// 1326/25000000". The enforced key quota is the qnkeys/maxkeys pair
+// (keys currently allocated against quota / the key quota).
+// ok=false on a missing/unparseable file (kernel keyring disabled or
+// proc absent) — inconclusive evidence must not move the latch.
 func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 	data, err := os.ReadFile(c.cfg.KeyUsersFile)
 	if err != nil {
@@ -189,18 +194,17 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 	seen := false
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
+		// uid: usage nkeys/nikeys qnkeys/maxkeys qnbytes/maxbytes —
+		// a real row always carries all five columns.
 		if len(f) < 5 {
 			continue
 		}
-		// Fields after the "uid:" label: usage nkeys nikeys maxkeys
-		// maxbytes — column order of proc_key_users_show.
-		nikeys, errN := strconv.ParseFloat(f[3], 64)
-		maxkeys, errM := strconv.ParseFloat(f[4], 64)
-		if errN != nil || errM != nil || maxkeys <= 0 {
+		used, quota, ok := slashPair(f[3])
+		if !ok || quota <= 0 {
 			continue
 		}
 		seen = true
-		if r := nikeys / maxkeys; r > best {
+		if r := used / quota; r > best {
 			best = r
 		}
 	}
@@ -208,6 +212,21 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 		return 0, false
 	}
 	return best, true
+}
+
+// slashPair parses a kernel "n/m" counter pair ("55/1000000" — the
+// slash-pair shape /proc/key-users, /proc/loadavg-style rows use).
+func slashPair(s string) (num, den float64, ok bool) {
+	n, m, found := strings.Cut(s, "/")
+	if !found {
+		return 0, 0, false
+	}
+	num, errN := strconv.ParseFloat(n, 64)
+	den, errD := strconv.ParseFloat(m, 64)
+	if errN != nil || errD != nil {
+		return 0, 0, false
+	}
+	return num, den, true
 }
 
 // updateKernelKeysLatch drives state-kernel-keys-pressure (kernel-keys-pressure):
@@ -226,7 +245,7 @@ func (l *Latches) updateKernelKeysLatch(ratio float64) {
 
 var descKernelKeys = prometheus.NewDesc(
 	"node_host_agent_kernel_keys_used_ratio",
-	"Highest per-UID keyring fill ratio from /proc/key-users (instantiated/max; >0.80 latches state-kernel-keys-pressure).",
+	"Highest per-UID keyring fill ratio from /proc/key-users (quota used/max; >0.80 latches state-kernel-keys-pressure).",
 	[]string{"node"}, nil)
 
 // collectKernelKeys emits the kernel-keys-pressure used-ratio gauge — absent when

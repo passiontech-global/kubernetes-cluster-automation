@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -29,8 +30,14 @@ const (
 // reconcileRecoveredNodes builds the sweep's node census and untaints
 // every node that came back Ready=True while still carrying the
 // out-of-service taint — it must not keep the taint or it stays
-// unschedulable. An untaint failure is tolerated (log + IncError +
-// skip that node): the next cycle retries.
+// unschedulable. The cached census decides WHO looks recovered, but
+// the untaint confirms on the LIVE API first — the same discipline as
+// the evictor's untaintRecovered: within informer lag a node that
+// flipped Ready→Unknown still reads Ready here, and stripping its
+// fence then would let new pods schedule onto a dead node for a whole
+// lag window. A node that vanished, is not Ready live, or fails to
+// confirm keeps its fence this cycle. An untaint failure is tolerated
+// (log + IncError + skip that node): the next cycle retries.
 func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 	nodes []corev1.Node) (nodeByName map[string]*corev1.Node,
 	nodeNames map[string]bool, hasNotReady bool, untainted int) {
@@ -48,18 +55,38 @@ func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 
 		// Recovery first: a node back to Ready=True must not keep
 		// the out-of-service taint or it stays unschedulable.
-		if kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) && kube.NodeReady(n) {
-			if err := kube.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
-				log.Error(err, "untaint failed", "node", n.Name)
-				metrics.IncError(s.queue)
-				continue
-			}
-			untainted++
-			// A recovered node's stale skip flag reads as
-			// an unfenced dead node forever; clear it with the taint.
-			metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(n.Name)
-			log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
+		if !kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) || !kube.NodeReady(n) {
+			continue
 		}
+		live, err := s.cs.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			// Node deleted since the census — its fence died
+			// with it; nothing to lift.
+			continue
+		}
+		if err != nil {
+			// Fail closed: unconfirmable means the fence stays up
+			// this cycle — the next cycle retries.
+			log.Error(err, "live node get failed — untaint skipped this cycle", "node", n.Name)
+			metrics.IncError(s.queue)
+			continue
+		}
+		if !kube.NodeReady(live) {
+			// Live truth overrides the cache: the Ready flip is
+			// stale — the node is dead again. Keep the fence.
+			log.Info("node not Ready live — untaint skipped", "node", n.Name)
+			continue
+		}
+		if err := kube.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
+			log.Error(err, "untaint failed", "node", n.Name)
+			metrics.IncError(s.queue)
+			continue
+		}
+		untainted++
+		// A recovered node's stale skip flag reads as
+		// an unfenced dead node forever; clear it with the taint.
+		metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(n.Name)
+		log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 	}
 	return nodeByName, nodeNames, hasNotReady, untainted
 }

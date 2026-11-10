@@ -100,11 +100,16 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 // livePodCount returns how many WORKLOAD pods on node are
 // non-terminal (not Succeeded/Failed) — the "is anyone still
 // potentially writing" check. DaemonSet and static mirror pods don't
-// count: they run on every node, hold no PVC mounts, and on a fenced
-// node are force-deleted + recreated as Pending by the controller —
-// counting them would keep this gate permanently closed and the
-// feature dead. Terminating workload pods count as live: a pod
-// wedged in Terminating on a fenced node is the node controller's
+// count as workload by default: they run on every node and on a
+// fenced node are force-deleted + recreated as Pending by the
+// controller — counting them wholesale would keep this gate
+// permanently closed and the feature dead. But a DaemonSet pod CAN
+// mount claims (PVCs, generic ephemeral volumes — the shapes
+// podsUsingVolume verifies in the fast-reboot branch), and a fenced
+// node hosting a DS writer must keep its VAs — so a DS pod holding a
+// claim-based volume counts live, while one with none stays
+// discounted. Terminating workload pods count as live: a pod wedged
+// in Terminating on a fenced node is the node controller's
 // force-delete problem, and until it finishes the mount may still
 // exist. The underlying list is cached per cycle via nodePodList —
 // the fenced gate's count and the stuck-Terminating gate's
@@ -139,9 +144,27 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 			}
 		}
 		if ds {
-			continue // infra agent — never holds a workload mount
+			// Infra agent — counts as a writer only when it mounts
+			// a claim-backed volume the way any workload pod would.
+			if podHoldsClaim(p) {
+				live++
+			}
+			continue
 		}
 		live++
 	}
 	return live, nil
+}
+
+// podHoldsClaim reports whether the pod mounts a claim-based volume —
+// a PVC claim or a generic ephemeral volume's generated claim (named
+// <pod>-<volume>, owned by the pod). Direct inline CSI volumes carry
+// no claim to resolve here.
+func podHoldsClaim(p *corev1.Pod) bool {
+	for _, v := range p.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil || v.Ephemeral != nil {
+			return true
+		}
+	}
+	return false
 }

@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +105,7 @@ func TestInodePressureFilesZeroClearsLatch(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/mnt/data": {960, 1000}, "/mnt/btrfs": {0, 0},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if !latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch not set at 0.96")
 	}
@@ -115,7 +116,7 @@ func TestInodePressureFilesZeroClearsLatch(t *testing.T) {
 	c.cfg.statfsFn = inodeStatfs(map[string][2]uint64{
 		"/mnt/data": {500, 1000}, "/mnt/btrfs": {0, 0},
 	})
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch held despite a Files==0 healthy pass")
 	}
@@ -134,7 +135,7 @@ func TestInodePressureFilesZeroClearsLatch(t *testing.T) {
 		st.Files, st.Ffree = 0, 0
 		return nil
 	}
-	l.refreshLatches()
+	l.refreshLatches(context.Background())
 	if latchExists(t, cfg) {
 		t.Fatal("inode-pressure latch set from an all-Files==0 pass")
 	}

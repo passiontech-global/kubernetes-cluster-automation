@@ -142,7 +142,13 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 	// windowed/healable pod-local path (bounce only under the
 	// >=2-Ready-siblings quorum guard); series whose pod cannot be
 	// resolved emit at namespace scope — a namespace-scope Raft
-	// verdict has no single culprit pod.
+	// verdict has no single culprit pod. The pod-local stamp needs
+	// PER-POD evidence — a member whose OWN per-stream minimum is 0,
+	// i.e. some stream leader it reports is gone. A member whose
+	// series are all positive still holds its leadership and must
+	// never stamp: bounceWedged would delete the very member the
+	// raft groups rally around, cascading leader loss (one bounce
+	// per 30m loop).
 	streamCounts, errSC := s.p.PromQuery(ctx,
 		`nats_jetstream_stream_leader`)
 	streamMins, errSM := s.p.PromQuery(ctx,
@@ -156,6 +162,11 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 			minByNS[series.Label("namespace")] = series.Value
 		}
 		podsByNS := map[string][]string{}
+		// minByPod carries each member's OWN per-stream minimum — the
+		// per-pod evidence the healable stamp requires (the
+		// namespace-scope min by (namespace) above only proves SOME
+		// member in the namespace lost a stream leader).
+		minByPod := map[string]float64{} // "ns/pod" -> minimum
 		for _, series := range streamCounts {
 			ns := series.Label("namespace")
 			if ns == "" {
@@ -166,6 +177,10 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 			}
 			if pod := series.Label("pod", "pod_name"); pod != "" {
 				podsByNS[ns] = append(podsByNS[ns], pod)
+				key := ns + "/" + pod
+				if prev, seen := minByPod[key]; !seen || series.Value < prev {
+					minByPod[key] = series.Value
+				}
 			}
 		}
 		for ns, podNames := range podsByNS {
@@ -174,6 +189,9 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 			}
 			resolved := false
 			for _, podName := range podNames {
+				if minByPod[ns+"/"+podName] != 0 {
+					continue // its own streams are all led — a leadership holder, never a bounce target
+				}
 				pod := s.census.resolvePod(ns, podName)
 				if pod == nil || pod.DeletionTimestamp != nil {
 					continue // stale series or a non-member — not ours

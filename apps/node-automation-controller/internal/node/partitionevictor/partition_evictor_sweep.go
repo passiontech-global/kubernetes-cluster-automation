@@ -32,7 +32,6 @@ type partitionSweep struct {
 	log     logr.Logger
 	now     time.Time
 	nodes   []corev1.Node
-	byName  map[string]*corev1.Node
 	flagged map[string]bool
 	total   int
 	action  map[string]bool
@@ -58,10 +57,8 @@ func (s *partitionSweep) census(ctx context.Context) error {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 	s.nodes = nodes
-	s.byName = make(map[string]*corev1.Node, len(nodes))
 	s.flagged = map[string]bool{}
 	for i := range nodes {
-		s.byName[nodes[i].Name] = &nodes[i]
 		if kube.IsControlPlane(&nodes[i]) {
 			continue
 		}
@@ -205,10 +202,30 @@ func (s *partitionSweep) taintFlagged(ctx context.Context) {
 	s.taintedNode = map[string]bool{}
 	s.breakerCharged = map[string]bool{}
 	for _, name := range s.sortedAction() {
-		node := s.byName[name]
-		if kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
-			// Already fenced — evictions may proceed without a new
-			// grant (the fence predates this sweep).
+		// Live-confirm the fence before trusting it: the census's
+		// cached spec is stale by the same seconds-to-minutes lag
+		// confirmLive exists for — a fence removed live while the
+		// cache still shows it must not let evictions fire onto an
+		// unfenced node (deleted pods would reschedule straight
+		// back onto the blackholed host).
+		live, err := s.e.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			// Node vanished inside the recovery window — nothing to
+			// fence or evict; benign skip, not an error (same
+			// treatment confirmLive and untaintRecovered give it).
+			s.log.Info("SKIP: node gone at live confirm", "node", name)
+			continue
+		}
+		if err != nil {
+			// Fail closed: no live fence confirmation, no eviction
+			// this sweep — the next run retries.
+			metrics.IncError(s.e.queue)
+			s.log.Error(err, "live node get failed — evictions skipped this sweep", "node", name)
+			continue
+		}
+		if kube.HasTaint(live.Spec.Taints, partitionTaintKey) {
+			// Already fenced live — evictions may proceed without a
+			// new grant (the fence predates this sweep).
 			s.taintedNode[name] = true
 			continue
 		}

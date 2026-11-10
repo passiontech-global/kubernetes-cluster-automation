@@ -1090,6 +1090,80 @@ func TestPartitionEvictorLiveGetFailClosedSkipsNode(t *testing.T) {
 	}
 }
 
+// THE REGRESSION for the eviction gate's fence check: the cached
+// census still showed the previous run's fence, but the LIVE node has
+// lost it (removed by another operator while the cache lagged). The
+// fence must be live-confirmed and re-applied before any eviction —
+// evicting on the cache's word would reschedule pods straight back
+// onto the unfenced blackholed host.
+func TestPartitionEvictorRefencesWhenLiveFenceMissing(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	// Census snapshot: partitioned AND fenced.
+	stale := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint)
+	// Live truth: still partitioned, fence gone.
+	live := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute)
+	objs := append([]runtime.Object{live, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+	e := &partitionEvictor{
+		cs:         cs,
+		nodeReader: peStaleCacheReader{snapshot: append([]runtime.Object{stale}, peHealthyNodes("h", 2)...)},
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("live-unfenced partitioned node evicted without a re-applied fence")
+	}
+	if pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod not evicted although the fence landed first")
+	}
+}
+
+// A failed live Get inside the fence confirmation is fail-closed:
+// without proof the fence is up, the node's evictions are skipped for
+// this sweep (error metered, run still nil) — never fired on trust.
+func TestPartitionEvictorFenceConfirmGetErrorSkipsEviction(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	flagged := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute)
+	objs := append([]runtime.Object{flagged, pePod("flux-system", "p1", "victim")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	// Get #1 (confirmLive) must succeed so the node reaches the taint
+	// pass; Get #2 (the fence confirmation there) fails.
+	gets := 0
+	cs.PrependReactor("get", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			gets++
+			if gets == 2 {
+				return true, nil, errors.New("live get boom")
+			}
+			return false, nil, nil
+		})
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("one unverifiable fence must not fail the sweep: %v", err)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "nodes" && a.GetVerb() == "patch" {
+			t.Fatal("node patched though the fence was never live-confirmed")
+		}
+		if ca, ok := a.(ktesting.CreateAction); ok &&
+			a.GetResource().Resource == "pods" && ca.GetSubresource() == "eviction" {
+			t.Fatal("pod evicted on an unconfirmed fence")
+		}
+	}
+	if !pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod evicted while the fence confirmation had failed")
+	}
+}
+
 // A node whose breaker already opened defers BOTH of this module's
 // actions: the fencing taint is skipped and the pods survive the
 // sweep — the run absorbs the defer without an error. (A fresh

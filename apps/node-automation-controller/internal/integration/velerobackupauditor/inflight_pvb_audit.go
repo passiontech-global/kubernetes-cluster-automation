@@ -319,9 +319,11 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 	// Bounce the node-agent pod so its next scheduled backup starts
 	// clean — the DaemonSet recreates it. A missing agent pod needs
 	// no bounce (it is already gone). A FAILED bounce reports
-	// not-healed: the caller skips the cooldown stamp, so the next
-	// sweep retries the half-done heal (the PVB delete tolerates
-	// NotFound on retry) instead of parking it for 30m wedged.
+	// not-healed and skips the cooldown stamp: the wedged transfer
+	// object itself is already gone, so the skip leaves only the
+	// agent restart undelivered — visible in the error log and the
+	// IncError, but there is nothing left to re-drive the retry
+	// against (the census will not list the deleted PVB/PVR again).
 	if agent != nil {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
@@ -341,14 +343,20 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 }
 
 // pvbAgentPod resolves the node-agent pod that owns the PVB's Kopia
-// thread. PodVolumeBackupSpec carries spec.node (the node the
-// snapshot runs on) and spec.pod (the WORKLOAD pod — not the
-// agent); status has no pod/node fields. The velero node-agent
-// DaemonSet runs one pod per node, so spec.node identifies it.
-// nil,nil means "no agent pod found" which IS wedge evidence.
+// thread. PodVolumeBackups are created in the WORKLOAD pod's
+// namespace, but the velero node-agent DaemonSet runs in velero's
+// install namespace (VELERO_NAMESPACE, default "velero") — the
+// lookup lands THERE, never in the PVB's namespace (a PVB namespace
+// never hosts the agent, so that list always came back empty and
+// every absence was misread as a wedge). PodVolumeBackupSpec carries
+// spec.pod (the WORKLOAD pod — not the agent); status has no
+// pod/node fields. The DaemonSet runs one pod per node, so
+// spec.node identifies it. An error return means the lookup itself
+// failed (namespace absent / API down) — the caller skips the
+// cleanup, it is never wedge evidence. nil,nil means "no agent pod
+// found" which IS wedge evidence.
 func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	pvb *unstructured.Unstructured) (*corev1.Pod, error) {
-	ns := pvb.GetNamespace()
 	node := pvbNode(pvb)
 	if node == "" {
 		return nil, nil
@@ -356,20 +364,25 @@ func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
 		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(a.cs, ns))
+	}, kube.Pods(a.cs, a.veleroInstallNS()))
 	if err != nil {
 		return nil, err
 	}
 	// Only an actual node-agent pod counts — the DaemonSet names
-	// them "node-agent-*". The spec.nodeName check runs in code too
-	// (fake clientsets ignore field selectors), and there is NO
-	// fallback to "any pod on the node": velero's namespace also
-	// hosts the velero server Deployment, and the old pods[0]
-	// fallback could hand that server pod to cleanWedgedPVB's
-	// bounce — deleting it would abort every backup in flight.
+	// them "node-agent-*" and stamps its pod template with the
+	// name=node-agent label (its own selector). The spec.nodeName
+	// check runs in code too (fake clientsets ignore field
+	// selectors), and there is NO fallback to "any pod on the
+	// node": velero's namespace also hosts the velero server
+	// Deployment, and the old pods[0] fallback could hand that
+	// server pod to cleanWedgedTransfer's bounce — deleting it
+	// would abort every backup in flight.
 	for i := range pods {
-		if strings.Contains(pods[i].Name, "node-agent") &&
-			pods[i].Spec.NodeName == node {
+		if pods[i].Spec.NodeName != node {
+			continue
+		}
+		if pods[i].Labels["name"] == "node-agent" ||
+			strings.Contains(pods[i].Name, "node-agent") {
 			return &pods[i], nil
 		}
 	}

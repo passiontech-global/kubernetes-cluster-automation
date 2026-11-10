@@ -122,12 +122,16 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		})
 		return &List{l}, nil
 	case "unique":
-		seen := map[string]bool{}
 		var out []any
 		for _, it := range ToIter(v) {
-			k := Stringify(it)
-			if !seen[k] {
-				seen[k] = true
+			dup := false
+			for _, e := range out {
+				if deepEq(it, e) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
 				out = append(out, it)
 			}
 		}
@@ -152,10 +156,35 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return &List{out}, nil
 	case "union":
+		// Ansible set union: unique elements across ALL operands —
+		// the seed operand's own duplicates collapse too, keeping the
+		// first occurrence of each value.
 		var out []any
-		out = append(out, ToIter(v)...)
+		for _, it := range ToIter(v) {
+			dup := false
+			for _, e := range out {
+				if deepEq(it, e) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				out = append(out, it)
+			}
+		}
 		for _, a := range args {
-			out = append(out, ToIter(a)...)
+			for _, it := range ToIter(a) {
+				dup := false
+				for _, e := range out {
+					if deepEq(it, e) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					out = append(out, it)
+				}
+			}
 		}
 		return &List{out}, nil
 	case "dict2items":
@@ -191,9 +220,13 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "bool":
 		return Truthy(v), nil
 	case "int":
-		def := int64(0)
+		// Python parity: the default is returned VERBATIM when
+		// conversion fails — x|int(default="abc") yields "abc",
+		// not ToInt("abc")==0. Keep it untyped so a non-numeric
+		// default survives to the return.
+		var def any = int64(0)
 		if len(args) > 0 {
-			def, _ = ToInt(args[0])
+			def = args[0]
 		}
 		base := int64(10)
 		if len(args) > 1 {

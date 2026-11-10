@@ -253,7 +253,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 				}
 				continue
 			}
-			targets := controllerRunningPods(lease, pods)
+			targets, ambiguous := controllerRunningPods(lease, pods)
 			if len(targets) == 0 {
 				// Holder gone AND no sibling under the same
 				// controller — a dead operator, not a wedged
@@ -263,6 +263,16 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			p.emitUnhealthy(&rep, ns, lease.Name,
 				leaseReasonExpiredRunningPods)
 			rep.Find(key + "(" + leaseReasonExpiredRunningPods + ")")
+			if ambiguous {
+				// The "<lease>-*" fallback matched pods from more
+				// than one controller — the oldest pod is not
+				// provably the wedged elector's, so no heal this
+				// cycle (a healthy component must not die on a
+				// name-prefix guess).
+				log.Info("skip controller lease heal: fallback pod match spans multiple controllers",
+					"lease", key)
+				continue
+			}
 			p.healStaleLeaseController(ctx, log, lease, targets, now)
 		}
 	}
@@ -325,6 +335,9 @@ func (p *controllerLeaseGuardCheck) leaseFlapping(key string,
 // prove a jump — first sightings read clean.
 func (p *controllerLeaseGuardCheck) leaseThrashing(key string, now time.Time) bool {
 	samples := p.transitions[key]
+	if len(samples) == 0 {
+		return false // leaseFlapping normally appends first — never index blind
+	}
 	cutoff := now.Add(-leaseThrashWindow)
 	var first *leaseTransitionSample
 	for i := range samples {
@@ -371,8 +384,14 @@ func leaseStaleWindow(lease *coordinationv1.Lease, now time.Time) bool {
 // names directly (client-go's "<pod>_<uuid>", kept verbatim too for
 // electors that don't suffix), pods sharing the controller owner UID
 // of a resolved holder pod, and — the fallback for a holder pod
-// already gone — pods named "<lease name>-*".
-func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) []corev1.Pod {
+// already gone — pods named "<lease name>-*". The second return
+// reports the fallback match set spanning more than one distinct
+// controller owner (ownerReferences kind/name groups): the name-shape
+// guess then has no positive target — an expired cert-manager lease
+// also matches cert-manager-cainjector-*/cert-manager-webhook-*
+// replicas — and the caller must skip the heal this cycle.
+func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) (
+	targets []corev1.Pod, fallbackAmbiguous bool) {
 	holderNames := map[string]bool{}
 	if h := lease.Spec.HolderIdentity; h != nil && *h != "" {
 		holderNames[*h] = true
@@ -390,6 +409,7 @@ func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) []cor
 		}
 	}
 	var out []corev1.Pod
+	fallbackOwners := map[string]bool{}
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Status.Phase != corev1.PodRunning ||
@@ -404,17 +424,26 @@ func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) []cor
 			// is a no-op heal that would repeat every cooldown.
 			continue
 		}
+		ref := metav1.GetControllerOf(pod)
 		if holderNames[pod.Name] ||
-			strings.HasPrefix(pod.Name, lease.Name+"-") {
+			(ref != nil && ownerUIDs[ref.UID]) {
 			out = append(out, *pod)
 			continue
 		}
-		if ref := metav1.GetControllerOf(pod); ref != nil &&
-			ownerUIDs[ref.UID] {
-			out = append(out, *pod)
+		if !strings.HasPrefix(pod.Name, lease.Name+"-") {
+			continue
+		}
+		// The "<lease>-*" name-shape fallback is a guess, not an
+		// attribution: group its matches by controller owner so a
+		// set spanning several controllers reads as ambiguous.
+		out = append(out, *pod)
+		if ref != nil {
+			fallbackOwners[ref.Kind+"/"+ref.Name] = true
+		} else {
+			fallbackOwners[pod.Name] = true // unattributable — its own group
 		}
 	}
-	return out
+	return out, len(fallbackOwners) > 1
 }
 
 // healStaleLeaseController bounces the oldest Running pod of the

@@ -161,14 +161,14 @@ func TestClockSteppedMarker(t *testing.T) {
 	// budget was still spent (rate_spend parity), so the retry
 	// needs the gap to elapse.
 	markStep(true)
-	f.r.checkClockSkew()
+	f.r.checkClockSkew(context.Background())
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatal("clock-stepped-at written on failed makestep")
 	}
 
 	now = now.Add(11 * time.Minute)
 	markStep(false)
-	f.r.checkClockSkew()
+	f.r.checkClockSkew(context.Background())
 	got := strings.TrimSpace(testutil.ReadFile(t, marker))
 	if _, err := strconv.ParseInt(got, 10, 64); err != nil {
 		t.Fatalf("clock-stepped-at content %q not an epoch", got)

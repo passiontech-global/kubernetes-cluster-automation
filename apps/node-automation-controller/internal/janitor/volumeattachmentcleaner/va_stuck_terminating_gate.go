@@ -3,9 +3,10 @@
 // DeletionTimestamp past vaStuckTerminatingAge whose attacher-side
 // cleanup is dead can never drain its own finalizer, so the cleaner
 // strips it to free the PV. Two proof shapes survive the plain-delete
-// gates: the node gone outright, or fenced with zero non-DaemonSet
-// pods (stuckTerminatingNodeDead); and the fast-reboot leak — the
-// node came back Ready before the fencing taint ever landed, the
+// gates: the node gone outright, or fenced with zero live pods (a
+// DaemonSet pod holding a claim mount counts as live — see
+// livePodCount — stuckTerminatingNodeDead); and the fast-reboot leak —
+// the node came back Ready before the fencing taint ever landed, the
 // volume is provably unused, and the sighting held for >= 2
 // consecutive cycles (stuckReadyUnused and the Ready-node
 // unused-volume gate below). Split out of volumeattachment_cleaner.go
@@ -16,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -33,10 +35,11 @@ import (
 
 // stuckTerminatingNodeDead is the va-stuck-terminating wedged-detach gate: the VA's
 // node is gone outright, or carries the out-of-service taint while a
-// live pod List proves zero non-DaemonSet pods remain — in both
-// shapes the external-attacher has no live node to report the detach
-// to, so the finalizer can never drain. Any pod-list failure fails
-// closed (the mount may still be real).
+// live pod List proves zero live pods remain (a DaemonSet pod holding
+// a claim mount counts — the same census the out-of-service gate
+// runs) — in both shapes the external-attacher has no live node to
+// report the detach to, so the finalizer can never drain. Any
+// pod-list failure fails closed (the mount may still be real).
 func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
 	livePods map[string]podListProbe, stuckReadyPrior map[string]bool,
@@ -90,23 +93,32 @@ func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	return live == 0
 }
 
-// stripFinalizers merge-patches metadata.finalizers away on a wedged
+// stripFinalizers merge-patches metadata.finalizers on a wedged
 // VolumeAttachment — the last resort that frees the PV when the
-// attacher-side cleanup is dead. The patch pins resourceVersion so a
-// concurrent attacher write makes this a conflict (retried next
-// sweep) rather than a blind overwrite.
+// attacher-side cleanup is dead. Only external-attacher finalizers
+// are stripped: a third-party finalizer somebody parked on the
+// object survives — the gate's proofs establish the attacher is
+// dead, not that every holder may go. The patch pins
+// resourceVersion so a concurrent attacher write makes this a
+// conflict (retried next sweep) rather than a blind overwrite.
 func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	va *storagev1.VolumeAttachment) error {
 	log := logf.FromContext(ctx)
-	log.Info("PATCH-FINALIZERS: stuck VolumeAttachment on a dead node — stripping finalizers to free the volume",
+	kept := make([]string, 0, len(va.Finalizers))
+	for _, f := range va.Finalizers {
+		if !strings.HasPrefix(f, "external-attacher/") {
+			kept = append(kept, f)
+		}
+	}
+	log.Info("PATCH-FINALIZERS: stuck VolumeAttachment on a dead node — stripping attacher finalizers to free the volume",
 		"va", va.Name, "node", va.Spec.NodeName,
 		"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"),
 		"terminatingFor", c.now.Now().Sub(va.DeletionTimestamp.Time).Truncate(time.Minute),
-		"finalizers", va.Finalizers)
+		"finalizers", va.Finalizers, "keeping", kept)
 	payload, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"resourceVersion": va.ResourceVersion,
-			"finalizers":      nil,
+			"finalizers":      kept,
 		},
 	})
 	if err != nil {

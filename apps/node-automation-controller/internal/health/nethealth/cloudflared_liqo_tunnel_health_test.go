@@ -305,6 +305,67 @@ func TestCfTunnelLogQUICStorm(t *testing.T) {
 	})
 }
 
+// The benign UDP-buffer warning ("failed to sufficiently increase
+// receive buffer" — present on virtually every host with stock
+// net.core.rmem_max) is NOT a dead-tunnel signature: on the
+// metrics-unreachable path it must never degrade the connector, let
+// alone delete it.
+func TestCfTunnelBufferWarningIsNotADeadTunnel(t *testing.T) {
+	pod := cfPod("cf", "cf-1", "10.0.0.1", types.UID("rs-cf"))
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"2026-11-10T00:00:00Z WRN failed to sufficiently increase "+
+			"receive buffer size (expected: 7168, got: 2129)\n", nil))
+	p := testProber(cs)
+	// Metrics unreachable — the transport 500s every scrape, forcing
+	// the log-tail fallback.
+	p.HTTPClient = &http.Client{Transport: cfMetricsTransport(nil)}
+	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
+
+	for i := 0; i <= cfTunnelMinStreak; i++ {
+		if res := chk.Run(ctx); !res.Pass {
+			t.Fatalf("benign buffer warning must not degrade the connector (sweep %d): %+v", i, res)
+		}
+	}
+	if _, err := cs.CoreV1().Pods("cf").Get(ctx, "cf-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy connector must never be deleted on a benign warning: %v", err)
+	}
+}
+
+// Inconclusive sweeps (metrics + logs both unreadable) must carry the
+// pod's streak through the keep-set — Prune may not wipe a streak the
+// sweep could not evaluate, or a dead tunnel with flaky evidence
+// never reaches cfTunnelMinStreak and never heals.
+func TestCfTunnelInconclusiveSweepKeepsStreak(t *testing.T) {
+	owner := types.UID("rs-cf")
+	bad := cfPod("cf", "cf-1", "10.0.0.1", owner)
+	good := cfPod("cf", "cf-2", "10.0.0.2", owner)
+	cs := fake.NewSimpleClientset(bad, good)
+	// Metrics channel: sweep 1 reads ha=0 for cf-1; then the channel
+	// dies for one sweep and revives.
+	metrics := map[string]string{"10.0.0.1": "cloudflared_tunnel_ha_connections 0\n"}
+	p := testProber(cs)
+	p.HTTPClient = &http.Client{Transport: cfMetricsTransport(metrics)}
+	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
+
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("first degraded sighting inside streak must pass: %+v", res)
+	}
+	// Both channels die: the transport drops the body and the kubelet
+	// log read errors — inconclusive, not clean.
+	delete(metrics, "10.0.0.1")
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"", errors.New("kubelet log read boom")))
+	_ = chk.Run(ctx)
+	// Metrics revive: the second degraded sighting rides the
+	// preserved streak straight to cfTunnelMinStreak.
+	metrics["10.0.0.1"] = "cloudflared_tunnel_ha_connections 0\n"
+	chk.Run(ctx)
+	if _, err := cs.CoreV1().Pods("cf").Get(ctx, "cf-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("flaky-evidence dead tunnel must still reach the streak threshold, err=%v", err)
+	}
+}
+
 // liqoObj builds a minimal unstructured liqo object with the given
 // labels and a status.conditions list.
 func liqoObj(name string, labels map[string]string,

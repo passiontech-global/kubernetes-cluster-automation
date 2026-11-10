@@ -122,14 +122,73 @@ func nsStuckDiagnostic(ns *corev1.Namespace, now time.Time) string {
 // sweep must NEVER strip: the foreground-deletion propagation
 // marker, every in-tree kubernetes.io/* finalizer (pvc-protection,
 // pv-protection, service-protection, ... — each has its own
-// controller contract), and the CSI external-attacher finalizer
-// family the volumeattachment-cleaner owns.
+// controller contract), the CSI external-attacher finalizer
+// family the volumeattachment-cleaner owns, and the known
+// third-party finalizer families (snapshot controller, fluxcd
+// tooling, argo controllers, velero) whose writers are usually
+// still alive even when THIS object's workload controller is
+// gone — stripping one silently orphans its external cleanup,
+// and a wedged namespace is recoverable while orphaned cleanup
+// is not.
 func protectedFinalizer(f string) bool {
 	if f == "foregroundDeletion" {
 		return true
 	}
-	return strings.HasPrefix(f, "kubernetes.io/") ||
-		strings.HasPrefix(f, "external-attacher/")
+	for _, fam := range []string{
+		"kubernetes.io/",
+		"external-attacher/",
+		"snapshot.storage.kubernetes.io/",
+		"velero.io/",
+	} {
+		if strings.HasPrefix(f, fam) {
+			return true
+		}
+	}
+	// Subdomain families — *.fluxcd.io/* and *.argoproj.io/* cover
+	// every kustomize/helm/source/notification toolkit and argo
+	// controller finalizer; match the domain suffix instead of
+	// enumerating subdomains.
+	if d, ok := finalizerDomain(f); ok {
+		return strings.HasSuffix(d, ".fluxcd.io") || d == "fluxcd.io" ||
+			strings.HasSuffix(d, ".argoproj.io") || d == "argoproj.io"
+	}
+	return false
+}
+
+// finalizerDomain splits the domain half off a finalizer value —
+// "kustomize.toolkit.fluxcd.io" of
+// "kustomize.toolkit.fluxcd.io/finalizer". A value with no "/"
+// has no domain half.
+func finalizerDomain(f string) (string, bool) {
+	i := strings.Index(f, "/")
+	if i <= 0 {
+		return "", false
+	}
+	return f[:i], true
+}
+
+// finalizerAttributedToOwner reports whether a non-protected
+// finalizer value can be positively pinned on the object's controller
+// owner — the conventional "<controller-name>.<domain>/cleanup"
+// shape, where the domain's leading label is the controller's name
+// ("node-maintenance-operator.medik8s.io/finalizer" written by the
+// node-maintenance-operator Deployment). A finalizer that cannot be
+// pinned that way stays: only the dead owner's own cleanup marker is
+// provably safe to strip, everything else may belong to a different,
+// still-alive controller.
+func finalizerAttributedToOwner(f string,
+	obj *unstructured.Unstructured) bool {
+
+	ref := metav1.GetControllerOf(obj)
+	if ref == nil || ref.Name == "" {
+		return false
+	}
+	d, ok := finalizerDomain(f)
+	if !ok {
+		return false
+	}
+	name := strings.ToLower(ref.Name)
+	return d == name || strings.HasPrefix(d, name+".")
 }
 
 // nsFinalizerSweep enumerates namespaced resources in a wedged
@@ -226,7 +285,11 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 
 // maybeStripFinalizers removes strippable finalizers from one
 // terminating object — only when its controller ownerRef resolves to
-// a workload that provably no longer exists. Returns true when a
+// a workload that provably no longer exists, and only finalizers
+// positively attributable to that dead owner: protected families and
+// finalizers whose writer cannot be pinned on the dead owner are
+// kept (their writers are usually different, still-alive controllers
+// whose external cleanup must not be orphaned). Returns true when a
 // patch was applied.
 func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Context,
 	log logr.Logger, gvr schema.GroupVersionResource,
@@ -235,10 +298,15 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 	var keep []string
 	var strip []string
 	for _, f := range obj.GetFinalizers() {
-		if protectedFinalizer(f) {
+		switch {
+		case protectedFinalizer(f):
 			keep = append(keep, f)
-		} else {
+		case finalizerAttributedToOwner(f, obj):
 			strip = append(strip, f)
+		default:
+			// Neither protected nor positively attributable to the
+			// proven-dead owner — keep. When in doubt, do NOT strip.
+			keep = append(keep, f)
 		}
 	}
 	if len(strip) == 0 {

@@ -96,6 +96,7 @@ knobs (always-on, no gates).
 | `CILIUM_IDENTITY_GC_ENABLED` | cilium-identity-auditor | on unless `"false"` | Sub-feature gate — enables identity GC (deletion); off = audit-only. |
 | `CERT_DRIFT_AUDITOR_ENABLED` | cert-drift-auditor | on unless `"false"` | Registration gate — audits cert/secret drift. |
 | `VELERO_BACKUP_AUDITOR_ENABLED` | velero-backup-auditor | on unless `"false"` | Registration gate — audits Velero backup health. |
+| `VELERO_NAMESPACE` | velero-backup-auditor | `velero` | Namespace Velero is installed in — where the in-flight PVB/PVR wedge audit looks up the node-agent pod that owns the transfer's Kopia thread (PodVolumeBackups themselves live in the workload namespaces). |
 | `HELM_STALL_UNWEDGE_ENABLED` | helmrelease-unlocker | off unless `"true"` | Sub-feature gate — gates ONLY the stalled-rollout unwedge pass; pending-secret unlock and artifact-source healing always run. |
 | `EXTERNALSECRET_NUDGE_ENABLED` | externalsecret-nudge | off unless `"true"` | Registration gate — nudges stuck ExternalSecrets; off = module registers nothing (for clusters without ESO). |
 

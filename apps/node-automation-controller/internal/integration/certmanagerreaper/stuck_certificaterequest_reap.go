@@ -34,8 +34,9 @@ func (r *certManagerReaper) listCRs(ctx context.Context, ns string) (*unstructur
 	if res, ok := r.crCache[ns]; ok {
 		return res.list, res.err
 	}
-	list, err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
-		List(ctx, metav1.ListOptions{})
+	list, err := kube.ListAllUnstructured(ctx,
+		r.dyn.Resource(certificateRequestGVR).Namespace(ns),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
 		metrics.IncError(r.queue)
 	}
@@ -120,8 +121,9 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		}
 	}
 	if liveOrder != nil {
-		chals, cerr := r.dyn.Resource(challengeGVR).Namespace(ns).
-			List(ctx, metav1.ListOptions{})
+		chals, cerr := kube.ListAllUnstructured(ctx,
+			r.dyn.Resource(challengeGVR).Namespace(ns),
+			metav1.ListOptions{Limit: kube.DefaultListPageSize})
 		if cerr != nil {
 			metrics.IncError(r.queue)
 			log.Error(cerr, "challenge list failed", "cert", key)
@@ -137,6 +139,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	}
 	// Same budget as an Order reset — a deleted CR re-issues the
 	// request and draws the same ACME rate limit.
+	r.armResets()
 	st := r.resets[key]
 	if st == nil {
 		st = certResetFromAnnotation(cert)

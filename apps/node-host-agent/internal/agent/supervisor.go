@@ -36,6 +36,21 @@ func superviseHealthyRun(elapsed, backoff time.Duration) bool {
 	return elapsed >= backoff*2 || elapsed >= superviseBackoffMax
 }
 
+// restartTimer re-arms the reusable backoff timer for the next wait.
+// A run that outlived the previous backoff leaves its fired tick
+// queued in timer.C — Reset does not drain it, so the select would
+// consume the stale tick immediately and restart with zero wait.
+// Stop + drain before Reset — the documented Timer.Reset pattern.
+func restartTimer(timer *time.Timer, wait time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(wait)
+}
+
 // supervise launches the supervisor goroutine for every configured
 // subsystem and returns immediately. Run calls it before binding
 // the listeners so subsystem startup never blocks serving — and a
@@ -73,9 +88,15 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	// with 5.1s runs reset the ladder every round and stay pinned
 	// at a 5s restart cadence forever.
 	backoff := superviseBackoffInitial
-	// Reusable backoff timer: Reset(wait) re-arms from end-of-work
-	// before each wait (time.After parity), so a run that outlives
-	// the current backoff can't let a stale tick skip the next one.
+	// Reusable backoff timer. A Run that outlives the armed wait —
+	// the normal healthy case: the timer fires 5s into every run
+	// longer than the backoff — leaves the fired tick QUEUED in
+	// timer.C. Reset does not drain it (the old "time.After parity"
+	// claim below was wrong for Reset: it holds for a fresh
+	// time.After channel, not for Timer.Reset), so a bare Reset let
+	// the select consume the stale tick instantly and restart with
+	// ZERO wait — the whole 5s→5m ladder silently skipped. Every
+	// re-arm goes through restartTimer, which stops and drains first.
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	for {
@@ -105,11 +126,15 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		// restart cadence — without it every crash-looping
 		// subsystem restarts in lockstep at 5s and again at
 		// the same multiple up the exponential ladder, piling
-		// all the restart log lines and work into one burst.
-		wait := backoff + time.Duration(rand.Float64()*2-1)*(backoff*3/20)
+		// all the restart log lines and work into one burst. The
+		// jitter is computed in float BEFORE the Duration
+		// conversion — time.Duration(rand.Float64()*2-1)
+		// truncates [-1,1) to 0, which would null the jitter
+		// term entirely.
+		wait := backoff + time.Duration((rand.Float64()*2-1)*float64(backoff*3/20))
 		logger().Error("subsystem exited unexpectedly — restarting",
 			"subsystem", name, "backoff", backoff, "wait", wait)
-		timer.Reset(wait)
+		restartTimer(timer, wait)
 		select {
 		case <-ctx.Done():
 			return
