@@ -35,12 +35,17 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   evaluator + ordered-map/YAML values behind vars-file resolution).
 - `internal/latchdefs` — pure-data leaf owning the `state-<name>`
   latch REGISTRY: every `Latch*` name const, the `LatchDefs` table
-  (owner subsystem + declared multi-owner ids), and the
-  `KnownLatchName`/`SharedOwners` lookups. Stdlib-only; both the
-  platform leaf (`hoststate` imports it for shared-owner
-  validation) and every producing subsystem import it.
+  (owner subsystem + declared multi-owner ids), the
+  `KnownLatchName`/`SharedOwners` lookups, and `CondDefs` — the
+  latch→NodeCondition surface registry (type name, OK/problem
+  reason+message, alt latches) that nodereporter projects into its
+  rendered-condition order. Stdlib-only; both the platform leaf
+  (`hoststate` imports it for shared-owner validation) and every
+  producing subsystem import it.
 - `internal/platform/*` — leaf libraries: cycle (period loop),
-  checks (check-group dispatch),
+  checks (check-group dispatch), checkkit (shared streak/progress
+  bookkeeping — the ` (check n/m)` suspect suffix and the RAM
+  pending-streak advance every check used to hand-roll),
   hoststate (`state-*`/`last-*` latch files; the latch NAMES'
   registry lives in `internal/latchdefs`), hostexec, hostutil,
   systemd, watchdogconf, probee, procfs, journalwatch, promfile,
@@ -121,7 +126,13 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   k0scontroller.service exists).
 - Check dispatch goes through `platform/checks.Group` — declared
   check order and group order are LOAD-BEARING (state latch
-  producers/consumers assume it).
+  producers/consumers assume it). Consecutive-failure streak
+  bookkeeping goes through `platform/checkkit` (`Pending` for the
+  RAM-counter shape, `Progress` for the ` (check n/m)` suffix) —
+  never hand-type the suffix; file-backed `consecutive-*` counters
+  stay on `hoststate.Store.Incr/ResetCounter` (apiprober's `apibe-*`
+  per-backend freeze files are a deliberate exception: they track
+  budget freezes, not streaks).
 - Watchdog files contract: `state-<name>` latches and `last-*`
   rate-limit budgets live in one dir behind `hoststate.Store`
   (ports lib.sh state_enter/state_exit semantics).

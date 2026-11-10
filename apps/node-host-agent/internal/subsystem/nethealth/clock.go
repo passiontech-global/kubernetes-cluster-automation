@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 )
 
 const (
@@ -57,10 +58,8 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
-	n.clockFails++
-	if n.clockFails < n.cfg.ConsecNeeded {
-		n.state.AppendLog(fmt.Sprintf("suspect: clock-unsync %s (check %d/%d)",
-			bad, n.clockFails, n.cfg.ConsecNeeded))
+	if checkkit.Pending(n.cfg.ConsecNeeded, &n.clockFails,
+		"suspect: clock-unsync "+bad, n.state.AppendLog) {
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}

@@ -35,6 +35,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -122,8 +123,9 @@ func (c *PoolCheck) Run(ctx context.Context) {
 	n := c.d.State.Incr(cdeps.FileCtrPool)
 	if n < c.d.Cfg.KinePool.Cycles {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kine conns-to-db=%d > %d — pool spiral? (check %d/%d)",
-			conns, c.d.Cfg.KinePool.MaxConns, n, c.d.Cfg.KinePool.Cycles))
+			"suspect: kine conns-to-db=%d > %d — pool spiral?%s",
+			conns, c.d.Cfg.KinePool.MaxConns,
+			checkkit.Progress(n, c.d.Cfg.KinePool.Cycles)))
 		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "ok").Inc()
 		return
 	}

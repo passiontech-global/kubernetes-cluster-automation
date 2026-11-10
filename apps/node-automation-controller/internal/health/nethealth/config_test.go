@@ -6,7 +6,7 @@ package nethealth
 import (
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 func TestCiliumConfigFromEnv(t *testing.T) {

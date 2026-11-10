@@ -5,7 +5,7 @@
 package linkerd
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 // NewLinkerdEndpointSyncCheck builds the netns-endpoint-sync endpoint-sync check —

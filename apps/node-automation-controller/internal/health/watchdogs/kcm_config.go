@@ -11,7 +11,7 @@ package watchdogs
 import (
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 

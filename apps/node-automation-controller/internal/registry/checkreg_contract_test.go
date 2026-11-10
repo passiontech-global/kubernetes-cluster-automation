@@ -2,18 +2,16 @@
 // against the live Modules table rather than a hand-maintained list:
 // every row carries exactly one of Setup/CheckReg, every CheckReg has
 // a non-empty Name (it becomes the kuberhealthy_check label value —
-// ops contract) and a New that type-asserts to the sweep's
-// constructor shape. shared stores New as `any` because it cannot
-// name internal/health/probefw (import cycle + depguard) — this test
-// is the compile-time-shape stand-in, so a mistyped registration
-// fails HERE, at test time, instead of at some later boot.
+// ops contract) and a non-nil New (the constructor type itself is
+// enforced at compile time — CheckReg.New is the typed
+// func(*probefw.Deps) probefw.Check field, not `any`).
 package registry
 
 import (
 	"slices"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -46,9 +44,11 @@ func TestCheckRegContract(t *testing.T) {
 				t.Fatalf("module name %q != CheckReg.Name %q — check rows are named after the check",
 					m.Name, m.CheckReg.Name)
 			}
-			if _, ok := m.CheckReg.New.(func(*probefw.Deps) probefw.Check); !ok {
-				t.Fatalf("CheckReg.New is %T, want func(*probefw.Deps) probefw.Check",
-					m.CheckReg.New)
+			// CheckReg.New's func type is enforced at compile time
+			// now — a nil constructor is the only shape left that
+			// could fail a sweep, so the contract pins non-nil.
+			if m.CheckReg.New == nil {
+				t.Fatal("CheckReg.New is nil — the row contributes nothing to the roster")
 			}
 		})
 	}

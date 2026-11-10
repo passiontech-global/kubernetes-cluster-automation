@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -94,9 +95,9 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				c.fails))
 		}
 	default:
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail (check %d/%d)",
-			c.fails, c.d.Cfg.ConsecNeeded))
+		c.d.State.AppendLog(
+			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail" +
+				checkkit.Progress(c.fails, c.d.Cfg.ConsecNeeded))
 	}
 	c.d.CycleResult(wdeps.CheckCilium, "ok")
 }

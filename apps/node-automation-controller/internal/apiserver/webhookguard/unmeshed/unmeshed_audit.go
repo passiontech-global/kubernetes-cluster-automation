@@ -7,27 +7,21 @@
 // provably healthy again — evicts a bounded number of them so their
 // owner controller recreates them meshed. Its state (the
 // emitted-series ledgers) lives on Auditor; shared deps are reached
-// through snap.G.
+// through snap.G. The duty splits by phase: the census half lives in
+// unmeshed_census.go (namespace directives + the paged pod scan +
+// the mesh-signature helpers), the destructive remediation half in
+// unmeshed_evict.go (gates + the bounded EvictV1 loop); this file
+// keeps the kill-switch, the Auditor state and the orchestration.
 package unmeshed
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"slices"
-	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -86,75 +80,17 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	g := snap.G
 	log := logf.FromContext(ctx)
 
-	// The namespace census carries the ns-level inject=enabled
-	// opt-in. An empty list is an API flap — a pod whose namespace
-	// cannot be checked must never be classified, so abort the
-	// audit before anything is emitted or deleted.
-	if snap.NSErr != nil {
-		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.NSErr)
-	}
-	if len(snap.NS.Items) == 0 {
-		return errors.New("empty namespace list (API flap) — unmeshed audit skipped")
-	}
-	nsInject := make(map[string]string, len(snap.NS.Items))
-	for _, ns := range snap.NS.Items {
-		nsInject[ns.Name] = injectDirective(ns.Labels, ns.Annotations)
-	}
-
-	// Server-side phase filter (the informer cache is list/watch-
-	// locked to kube-system cilium pods, so this goes through CS like
-	// every other module); the in-code phase check stays because
-	// fake clientsets ignore field selectors. The list is PAGED —
-	// all Running pods cluster-wide is an unbounded read, and each
-	// page is processed then dropped instead of pinning the whole
-	// list for the sweep.
-	now := g.Now.Now()
-	unmeshed := 0 // UnmeshedPods tuples re-asserted this sweep
-	var candidates []corev1.Pod
-	listOpts := metav1.ListOptions{
-		FieldSelector: "status.phase=Running",
-		Limit:         guardstate.ListPageSize,
-	}
-	err := kube.ListEach(ctx, listOpts,
-		kube.Pods(g.CS, metav1.NamespaceAll),
-		func(items []corev1.Pod) error {
-			for i := range items {
-				p := &items[i]
-				if p.Status.Phase != corev1.PodRunning {
-					continue // mirrors the FieldSelector for fake clients
-				}
-				if !podWantsMesh(p, nsInject[p.Namespace]) {
-					continue
-				}
-				if podHasSidecar(p) {
-					continue
-				}
-				a.unmeshedEmitted.Set(metrics.UnmeshedPods, 1,
-					p.Namespace+"/"+p.Name, p.Namespace, p.Name)
-				unmeshed++
-				log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
-					"pod", p.Namespace+"/"+p.Name)
-				// Deletion requires a CONTROLLER owner (a bare
-				// ownerReference proves nothing is recreating the pod)
-				// that is not a Node — mirror pods only reflect a
-				// static manifest, deleting one changes nothing — and
-				// the pod must not already be terminating: its
-				// replacement gets the sidecar at admission, so a
-				// second delete buys nothing. The candidate is COPIED
-				// out of the page — holding pointers would keep the
-				// whole pods.Items backing array reachable until the
-				// deletes finish.
-				if owner := metav1.GetControllerOf(p); owner != nil &&
-					owner.Kind != "Node" &&
-					p.DeletionTimestamp.IsZero() &&
-					now.Sub(p.CreationTimestamp.Time) >= unmeshedMinPodAge {
-					candidates = append(candidates, *p)
-				}
-			}
-			return nil
-		})
+	// Census phase (unmeshed_census.go) — the namespace inject map
+	// first: a pod whose namespace cannot be checked must never be
+	// classified.
+	nsInject, err := nsInjectDirectives(snap)
 	if err != nil {
-		return fmt.Errorf("list pods — unmeshed audit skipped: %w", err)
+		return err
+	}
+	now := g.Now.Now()
+	unmeshed, candidates, err := a.censusUnmeshed(ctx, snap, nsInject, now, log)
+	if err != nil {
+		return err
 	}
 
 	// Prune series for pods that vanished or gained the sidecar —
@@ -164,159 +100,8 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	if len(candidates) == 0 {
 		return nil
 	}
-	if !RemediationEnabled() {
-		log.Info("unmeshed remediation disabled (UNMESHED_POD_REMEDIATION_ENABLED=false)",
-			"candidates", len(candidates))
-		return nil
-	}
-
-	// Remediation only runs when the injector is provably back: the
-	// webhook not circuit-broken, its declared Fail policy intact,
-	// and >= 1 Ready endpoint behind its Service. An unverifiable
-	// answer fails closed — a wrong "healthy" verdict deletes pods
-	// that would only be recreated unmeshed again.
-	healthy, err := guardstate.InjectorHealthy(snap)
-	if err != nil {
-		metrics.IncError(g.Queue)
-		log.Info("WARN: injector health unverifiable — remediation skipped (fail closed)",
-			"error", err, "candidates", len(candidates))
-		return nil
-	}
-	if !healthy {
-		log.Info("injector webhook not healthy — remediation deferred",
-			"candidates", len(candidates))
-		return nil
-	}
-
-	// unmeshed-pod-auditor — the shared heal preamble gates the evictions
-	// (heal.Gate = the maintenance mutex + the fleet-wide heal
-	// budget, both fail closed): killing pods mid-drain/upgrade is
-	// exactly what the mutex exists to prevent, and the budget caps
-	// how many pods this sweep may unlock per window. The mutex
-	// evaluation is memoized through the Guard verdict, sharing one
-	// check with the breaker's bounce passes.
-	proceed, unverifiable := heal.Gate(ctx, log, &g.Verdict, g.CS, g.Dyn,
-		"unmeshed-pod-evict", now)
-	if unverifiable {
-		metrics.IncError(g.Queue)
-		log.Info("WARN: maintenance check unverifiable — "+
-			"DEFER: unmeshed remediation skipped (fail closed)",
-			"candidates", len(candidates))
-		return nil
-	}
-	if !proceed {
-		log.Info("DEFER: maintenance active or heal budget spent — unmeshed remediation skipped",
-			"candidates", len(candidates))
-		return nil
-	}
-
-	// Deterministic order so the cap picks the same pods.
-	slices.SortFunc(candidates, func(a, b corev1.Pod) int {
-		return strings.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
-	})
-	deleted, attempts := 0, 0
-	for i := range candidates {
-		p := &candidates[i]
-		if deleted >= unmeshedDeleteCap || attempts >= unmeshedDeleteAttempts {
-			break
-		}
-		attempts++
-		log.Info("EVICT: unmeshed pod — owner controller recreates it meshed",
-			"pod", p.Namespace+"/"+p.Name,
-			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
-		// The kill goes through the policy/v1 Eviction API, NOT a raw
-		// Delete (unmeshed-pod-auditor): the apiserver enforces PodDisruptionBudgets
-		// and consumes a disruption slot atomically, so an already
-		// degraded workload cannot lose its last replica to a
-		// cosmetic fix. The UID precondition closes the TOCTOU
-		// window between the audit snapshot and the evict — a
-		// same-named pod recreated in between was admitted after
-		// the injector recovered and is not ours to reap.
-		uid := p.UID
-		deleteOpts := kube.UIDDeleteOptions(uid, "")
-		eviction := &policyv1.Eviction{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      p.Name,
-				Namespace: p.Namespace,
-			},
-			DeleteOptions: &deleteOpts,
-		}
-		if err := g.CS.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
-			if apierrors.IsTooManyRequests(err) {
-				// HTTP 429 — a PDB with disruptionsAllowed==0
-				// refused the eviction. That is a deferral, not a
-				// failure: the workload is already at its replica
-				// floor and killing this pod would finish the
-				// outage. Keep it, count no error, move on.
-				log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
-					"pod", p.Namespace+"/"+p.Name)
-				continue
-			}
-			log.Error(err, "unmeshed pod eviction failed", "pod", p.Namespace+"/"+p.Name)
-			metrics.IncError(g.Queue)
-			continue
-		}
-		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
-		deleted++
-	}
-	log.Info("unmeshed audit done", "unmeshed", unmeshed,
-		"candidates", len(candidates), "deleted", deleted)
+	// Remediation phase (unmeshed_evict.go) — the three fail-closed
+	// gates then the bounded EvictV1 pass.
+	a.remediate(ctx, snap, candidates, unmeshed, now, log)
 	return nil
-}
-
-// podWantsMesh reports whether the pod opted into linkerd injection:
-// the pod's own linkerd.io/inject directive decides first (disabled
-// opts out even inside an enabled namespace, enabled opts in even
-// inside a disabled one); when the pod says nothing the namespace
-// directive applies.
-func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
-	if p.Spec.HostNetwork {
-		return false // hostNetwork pods are never injected
-	}
-	for _, ref := range p.OwnerReferences {
-		if ref.Kind == "Job" || ref.Kind == "CronJob" {
-			return false // batch pods are never injected
-		}
-	}
-	switch d := injectDirective(p.Labels, p.Annotations); d {
-	case "disabled":
-		return false
-	case "enabled":
-		return true
-	default:
-		return nsDirective == "enabled"
-	}
-}
-
-// podHasSidecar reports whether the pod carries a linkerd-proxy
-// container or initContainer — the injection signature.
-func podHasSidecar(p *corev1.Pod) bool {
-	for _, c := range p.Spec.Containers {
-		if c.Name == kube.LinkerdProxyContainer {
-			return true
-		}
-	}
-	for _, c := range p.Spec.InitContainers {
-		if c.Name == kube.LinkerdProxyContainer {
-			return true
-		}
-	}
-	return false
-}
-
-// injectDirective reads linkerd.io/inject from an object's labels and
-// annotations — annotations are checked BEFORE labels and the first
-// recognized directive wins (linkerd's own precedence); an absent or
-// unrecognized annotation value falls through to the label check, and
-// no directive anywhere returns "".
-func injectDirective(labels, annotations map[string]string) string {
-	for _, m := range []map[string]string{annotations, labels} {
-		switch m[kube.LinkerdInjectKey] {
-		case "disabled":
-			return "disabled"
-		case "enabled":
-			return "enabled"
-		}
-	}
-	return ""
 }

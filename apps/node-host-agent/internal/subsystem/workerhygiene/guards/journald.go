@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -114,8 +115,8 @@ func newJournaldIntegrity(d *wdeps.Deps) *journalwatch.Integrity {
 		Sink: journalwatch.IntegritySink{
 			StreakPending: func(v journalwatch.Verdict, n, needed int) {
 				d.State.AppendLog(fmt.Sprintf(
-					"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
-					v.Corrupt, v.Empty, v.Err, n, needed))
+					"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active%s",
+					v.Corrupt, v.Empty, v.Err, checkkit.Progress(n, needed)))
 			},
 			BudgetSkipped: func() {
 				d.State.AppendLog("suspect: journald-integrity confirmed but vacuum " +

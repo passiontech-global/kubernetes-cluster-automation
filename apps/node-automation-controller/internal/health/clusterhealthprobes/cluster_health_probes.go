@@ -69,9 +69,10 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -167,8 +168,15 @@ type clusterHealthProber struct {
 // here instead of silently dropping the check (see
 // check_modules.go).
 func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthProber, error) {
+	// NodeReader is the manager's cached client; a nil Mgr (the
+	// literally-constructed test Deps shape shared.Deps documents)
+	// leaves it nil — the documented fall-back-to-ListNodes posture.
+	var nodeReader kube.CachedNodeReader
+	if d.Mgr != nil {
+		nodeReader = d.Mgr.GetClient()
+	}
 	p := &clusterHealthProber{
-		Deps:     probefw.NewDeps(d, cfg),
+		Deps:     probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg),
 		boot:     time.Now(),
 		lastPass: map[string]time.Time{},
 	}

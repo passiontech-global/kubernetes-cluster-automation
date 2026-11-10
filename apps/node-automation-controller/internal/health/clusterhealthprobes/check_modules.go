@@ -29,9 +29,6 @@
 package clusterhealthprobes
 
 import (
-	"fmt"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -39,11 +36,9 @@ import (
 // registrations into the prober roster, deduped by name — a repeat
 // registration (SetupModules driven twice in one test binary, or
 // two rows naming the same check) cannot double-register,
-// preserving the old registerCheck idempotence. r.New is `any`
-// because shared cannot name probefw (import cycle + depguard); a
-// registration that isn't the standard
-// `func(*probefw.Deps) probefw.Check` shape is a boot-time error
-// naming the check, never a silent skip.
+// preserving the old registerCheck idempotence. r.New carries the
+// typed check constructor — a mistyped registration fails the
+// build, never reaches boot.
 func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) error {
 	seen := make(map[string]bool, len(p.checks)+len(regs))
 	for _, c := range p.checks {
@@ -53,12 +48,7 @@ func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) error {
 		if seen[r.Name] {
 			continue
 		}
-		newCheck, ok := r.New.(func(*probefw.Deps) probefw.Check)
-		if !ok {
-			return fmt.Errorf("check %q: CheckReg.New is %T, want func(*probefw.Deps) probefw.Check",
-				r.Name, r.New)
-		}
-		p.checks = append(p.checks, checkEntry{name: r.Name, check: newCheck(p.Deps)})
+		p.checks = append(p.checks, checkEntry{name: r.Name, check: r.New(p.Deps)})
 		seen[r.Name] = true
 	}
 	return nil

@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -147,8 +148,8 @@ func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			storm = true // latched storm continues — no repeated ACTION line
 		default:
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: zombie-storm ppid=%d zombies=%d (check %d/%d)",
-				ppid, n, streak, c.d.Cfg.ConsecNeeded))
+				"suspect: zombie-storm ppid=%d zombies=%d%s",
+				ppid, n, checkkit.Progress(streak, c.d.Cfg.ConsecNeeded)))
 		}
 	}
 	if storm {
