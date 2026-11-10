@@ -10,12 +10,14 @@ package volumeattachmentcleaner
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -90,18 +92,26 @@ type vaTarget struct {
 	reason string
 }
 
-// buildTargets runs the sighting pre-pass and classifies every
-// listed VA into a sweep target. The missing-node sightings are
-// recorded for EVERY VA before any delete runs — a VA past the
-// delete cap keeps its firstSeen ledger instead of re-arming the
-// two-sighting window every capped cycle. A Terminating VA past the
-// stuck age becomes a strip target and gets its Ready-node
-// unused-volume sighting stamped (recorded for every stuck VA
-// including capped ones — the window measures consecutive CYCLES,
-// not consecutive confirmations).
+// buildTargets lists the cluster's VolumeAttachments and runs the
+// sighting pre-pass, classifying every listed VA into a sweep
+// target. The missing-node sightings are recorded for EVERY VA
+// before any delete runs — a VA past the delete cap keeps its
+// firstSeen ledger instead of re-arming the two-sighting window
+// every capped cycle. A Terminating VA past the stuck age becomes a
+// strip target and gets its Ready-node unused-volume sighting
+// stamped (recorded for every stuck VA including capped ones — the
+// window measures consecutive CYCLES, not consecutive
+// confirmations). The paged list is local to this function so it is
+// released before the sweep runs.
 func (c *volumeAttachmentCleaner) buildTargets(ctx context.Context,
-	vas []storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
-	cyc *vaCycle, now time.Time, log logr.Logger) []*vaTarget {
+	nodeByName map[string]*corev1.Node, cyc *vaCycle,
+	now time.Time, log logr.Logger) ([]*vaTarget, error) {
+	vas, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.VolumeAttachments(c.cs))
+	if err != nil {
+		return nil, fmt.Errorf("list volumeattachments: %w", err)
+	}
 	c.sightMissingNodeOrphans(vas, nodeByName, cyc.orphanNow, cyc.seenPrior, now, log)
 	var targets []*vaTarget
 	for i := range vas {
@@ -126,7 +136,7 @@ func (c *volumeAttachmentCleaner) buildTargets(ctx context.Context,
 		}
 		targets = append(targets, &vaTarget{va: va})
 	}
-	return targets
+	return targets, nil
 }
 
 // sweep runs the targets through reap.Sweep — cap-bounded,
