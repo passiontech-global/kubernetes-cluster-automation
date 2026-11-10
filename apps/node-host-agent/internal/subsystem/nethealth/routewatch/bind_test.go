@@ -4,6 +4,8 @@
 package routewatch
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -19,5 +21,17 @@ func TestBindRouteSocket(t *testing.T) {
 	}
 	if err := unix.Close(fd); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// An unopenable netns path (no such file) fails BindInNetns before
+// any thread is locked — the error names the path.
+func TestBindInNetnsUnopenableNetns(t *testing.T) {
+	_, err := BindInNetns(filepath.Join(t.TempDir(), "no-such-ns"))
+	if err == nil {
+		t.Fatal("BindInNetns succeeded on a missing netns path")
+	}
+	if !strings.Contains(err.Error(), "no such file") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

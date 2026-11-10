@@ -112,8 +112,13 @@ const (
 	// LogKeyDeadFallbk keys the dead-fallback hold lines —
 	// suspectLog dedupe budget keys are dropped by stateExit when
 	// they match a latch name; the dead-fallback lines have no
-	// dedicated latch so they get their own key.
-	LogKeyDeadFallbk = "dead-fallback"
+	// dedicated latch so they get their own key. The streak-gate
+	// and cooldown lines get their own keys: SuspectLog budgets
+	// per KEY, so sharing LogKeyDeadFallbk let the every-cycle
+	// "unmeasurable" line starve them inside one cadence window.
+	LogKeyDeadFallbk       = "dead-fallback"
+	LogKeyDeadFallbkStreak = "dead-fallback-streak"
+	LogKeyDeadFallbkCool   = "dead-fallback-cooldown"
 	// ClkTck is getconf CLK_TCK on x86_64 Linux — the /proc stat
 	// starttime unit the pid-age math needs.
 	ClkTck = 100.0

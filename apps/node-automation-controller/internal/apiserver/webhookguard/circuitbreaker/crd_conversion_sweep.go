@@ -18,7 +18,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
 
 // crdConversionSweep carries one SweepCRDConversionBackends run's
@@ -198,9 +197,12 @@ func (s *crdConversionSweep) carryCRD(crdName string) {
 // Service: confirm a live bounce target BEFORE the heal preamble (a
 // stale census ref must not spend a budget grant — or open the
 // per-service cooldown — on a pod that no longer exists), then the
-// shared heal.AllowedV preamble (BounceCooldown + maintenance
-// mutex, fail closed, &g.Verdict memoized across services) and the
-// UID-preconditioned pod delete.
+// UID-preconditioned pod delete. The shared preamble (BounceCooldown
+// + maintenance mutex, fail closed, &g.Verdict memoized across
+// services and shared with the admission bounce + unmeshed paths)
+// rides inside deleteBouncePod's heal.EvictPodV call, so a PDB
+// refusal refunds the grant it consumed instead of burning one fleet
+// grant per sweep.
 func (s *crdConversionSweep) bounceHung(ctx context.Context) {
 	for _, svcKey := range s.hung {
 		target := s.b.oldestLiveBackingPod(ctx, s.snap, svcKey,
@@ -208,20 +210,6 @@ func (s *crdConversionSweep) bounceHung(ctx context.Context) {
 		if target == nil {
 			s.log.Info("conversion bounce: no live Ready backing pod found — endpoint refs are stale",
 				"service", svcKey)
-			continue
-		}
-		// heal.AllowedV folds the BounceCooldown per-service cooldown AND the
-		// maintenance mutex into one fail-closed preamble; &g.Verdict
-		// memoizes the mutex across services (and shares it with the
-		// admission bounce + unmeshed paths) instead of paying three
-		// API reads per service.
-		proceed, unverifiable := heal.AllowedV(ctx, s.log, &s.g.Verdict,
-			s.g.CS, s.g.Dyn, &s.b.bounceAt, svcKey, BounceCooldown, s.now)
-		if unverifiable {
-			metrics.IncError(s.g.Queue)
-			continue
-		}
-		if !proceed {
 			continue
 		}
 		s.b.deleteBouncePod(ctx, s.snap, svcKey, target, s.now)

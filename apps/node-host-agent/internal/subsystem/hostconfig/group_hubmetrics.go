@@ -105,16 +105,18 @@ func (c *cyc) hubMetricsNodeExporter() {
 			c.err("hub-metrics-fw: node_exporter deb download failed",
 				"url", url, "error", err)
 		},
-		install: func(c *cyc, _ string) {
+		install: func(c *cyc, _ string) error {
 			// ansible apt deb: => apt-get on the deb path (dep resolution
 			// included); the runner sees host paths, not HostRoot-joined.
 			// runLong: dep resolution on a slow-egress VM outlives the
 			// interactive budget.
-			if _, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-				"apt-get", "install", "-y", "/tmp/"+file); err != nil {
-				c.err("hub-metrics-fw: node_exporter deb install failed",
-					"deb", "/tmp/"+file, "error", err)
-			}
+			_, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+				"apt-get", "install", "-y", "/tmp/"+file)
+			return err
+		},
+		installErr: func(c *cyc, _ string, err error) {
+			c.err("hub-metrics-fw: node_exporter deb install failed",
+				"deb", "/tmp/"+file, "error", err)
 		},
 	}); !ok {
 		return

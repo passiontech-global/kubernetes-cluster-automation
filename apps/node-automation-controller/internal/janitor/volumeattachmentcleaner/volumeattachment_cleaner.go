@@ -138,6 +138,16 @@ type volumeAttachmentCleaner struct {
 	// taint ever landed). Two consecutive sightings are required to
 	// strip — same conservative convention as orphanFirstSeen.
 	stuckReadyFirstSeen state.FirstSeenLedger
+	// finalizersRemovedEmitted is the carry-forward ledger for the
+	// VolumeAttachmentFinalizersRemovedTotal counter (key node):
+	// stripFinalizers Emits the tuple it Inc'd, each sweep re-emits
+	// the tuples whose node this census still lists, and the
+	// sweep's Prune retires the series once the node is gone — a
+	// counter Inc is never undone by its own code path, so without
+	// this the vec grows monotonically on node-pool rotation (the
+	// same shape as deadnodesweeper's fencedWithoutSNREmitted).
+	// Zero value ready.
+	finalizersRemovedEmitted state.GaugeLedger[string]
 }
 
 // Setup registers the 5-minute sweep. The
@@ -160,6 +170,10 @@ func Setup(d shared.Deps) error {
 func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := c.now.Now()
+
+	// Drop any aborted sweep's leftover emissions so this sweep's
+	// ledger state reflects only what THIS run measured.
+	c.finalizersRemovedEmitted.Begin()
 
 	// Gate 1: the node list is the single source of truth for
 	// "should this attachment exist". Abort on error — a partial or
@@ -192,6 +206,19 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// not-Ready clock was measuring a node that no longer exists.
 	c.pruneVanishedNodes(nodeByName)
 	nodes = nil
+
+	// Carry-forward: a finalizer-strip counter series stays alive
+	// while its node still exists — re-emit every tracked tuple whose
+	// node this census listed so the end-of-sweep Prune keeps it.
+	// "Node absent" is the only resolve signal a strip counter has,
+	// and only a sweep that actually listed the cluster may claim it
+	// (the error and empty-list returns above leave the ledger
+	// untouched). Fresh strips below re-emit their own tuples.
+	for key, lv := range c.finalizersRemovedEmitted.Last() {
+		if nodeByName[lv[0]] != nil {
+			c.finalizersRemovedEmitted.Emit(key, lv...)
+		}
+	}
 
 	vas, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
@@ -410,6 +437,12 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", vaDeleteCap)
 	}
+	// Retire strip-counter series whose node the census no longer
+	// lists — node-pool rotation must not grow the vec for the
+	// process lifetime (carry-forward above kept every tuple whose
+	// node survived; only this complete-sweep path may claim a
+	// resolve, mirroring the deadnodesweeper's end-of-sweep prunes).
+	c.finalizersRemovedEmitted.Prune(metrics.VolumeAttachmentFinalizersRemovedTotal.DeleteLabelValues)
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
 }

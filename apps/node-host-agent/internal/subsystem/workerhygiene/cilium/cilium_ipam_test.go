@@ -241,3 +241,72 @@ func TestParseCiliumIPAMShapes(t *testing.T) {
 		})
 	}
 }
+
+// --- Run gates, inconclusive rounds, and gauge clamping ---
+
+// TestCiliumIPAMRunGatesKeepCounter: an API flake, an unreadable
+// socket and an unparseable healthz body are all inconclusive — the
+// exhausted streak is kept, never reset by missing evidence.
+func TestCiliumIPAMRunGatesKeepCounter(t *testing.T) {
+	cycle := func(e *env, apiok bool) *wdeps.CycleEnv {
+		return &wdeps.CycleEnv{APIOK: apiok, WorkerActive: true}
+	}
+	// API unreachable → abort before the socket read.
+	e := fixture(t)
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":0}}}`)
+	c := wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM)
+	c.Fails = 1
+	c.Run(context.Background(), cycle(e, false))
+	if c.Fails != 1 {
+		t.Fatalf("Fails=%d want 1 after the API abort", c.Fails)
+	}
+
+	// Socket unreadable → abort, counter kept.
+	e = fixture(t)
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":0}}}`)
+	e.UnixErr = errors.New("socket gone")
+	c = wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM)
+	c.Fails = 1
+	c.Run(context.Background(), cycle(e, true))
+	if c.Fails != 1 {
+		t.Fatalf("Fails=%d want 1 after the socket abort", c.Fails)
+	}
+
+	// No parseable ipam section → suspect line + abort, counter kept.
+	e = fixture(t)
+	e.UnixBody = []byte(`{"router":{"h":1}}`)
+	c = wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM)
+	c.Fails = 1
+	c.Run(context.Background(), cycle(e, true))
+	if c.Fails != 1 {
+		t.Fatalf("Fails=%d want 1 after the unparseable body", c.Fails)
+	}
+	if !strings.Contains(e.LogLines(t), "no parseable ipam.ipv4 data") {
+		t.Fatalf("missing inconclusive line:\n%s", e.LogLines(t))
+	}
+}
+
+// TestCiliumIPAMRunLeakedClampsToZero: more pods holding addresses
+// than the agent reports allocated → leaked clamps at 0 (never a
+// negative gauge), and the allocated gauge still publishes.
+func TestCiliumIPAMRunLeakedClampsToZero(t *testing.T) {
+	inUse := func(ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "p" + ip, Namespace: "default"},
+			Spec:       corev1.PodSpec{NodeName: "node-a"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
+		}
+	}
+	e := fixture(t, inUse("10.244.0.11"), inUse("10.244.0.12"))
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":2,"available":10}}}`)
+	e.H.Cycle(context.Background())
+	if got := testutil.ToFloat64(e.H.CiliumLeaked); got != 0 {
+		t.Fatalf("leaked gauge=%v want 0 (clamped)", got)
+	}
+	if got := testutil.ToFloat64(e.H.CiliumAllocated); got != 2 {
+		t.Fatalf("allocated gauge=%v want 2", got)
+	}
+	if wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails != 0 {
+		t.Fatal("a clamped round must not arm the exhaustion streak")
+	}
+}

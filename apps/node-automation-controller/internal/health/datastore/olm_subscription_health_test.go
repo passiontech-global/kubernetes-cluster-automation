@@ -6,6 +6,7 @@ package datastore
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ---------------------------------------------------------------------------
@@ -436,5 +438,88 @@ func TestOLMOperatorHealOnePodPerCycle(t *testing.T) {
 			Get(ctx, keep, metav1.GetOptions{}); err != nil {
 			t.Fatalf("%s must survive one heal cycle: %v", keep, err)
 		}
+	}
+}
+
+// clearOLMResolvedStamps: a stamp whose key left the live signature
+// set is dropped from the CSV annotation AND the in-RAM ledger; a
+// failed patch is warn-only (the in-RAM half still forgets) — never
+// an error.
+func TestOLMClearResolvedStamps(t *testing.T) {
+	key := olmKindCSV + "/operators/rabbitmq.v1.2.3/" + olmReasonCSVStuck
+	mkCSV := func() *unstructured.Unstructured {
+		csv := testutil.Unstructured(
+			olmCSVGVR.GroupVersion().WithKind("ClusterServiceVersion"),
+			"operators", "rabbitmq.v1.2.3", nil)
+		csv.SetAnnotations(map[string]string{
+			kube.AnnoFirstSeenOLMUnhealthy: `{"` + key + `":"2026-01-02T03:04:05Z"}`})
+		return csv
+	}
+	base := time.Now()
+
+	t.Run("resolved key cleared from anno and ledger", func(t *testing.T) {
+		csv := mkCSV()
+		p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(csv))
+		chk := probetest.MustCheck[*olmHealthCheck](t, p)
+		chk.olmFirstSeen.Observe(key, base)
+
+		scan := &olmScan{live: map[string][]string{},
+			objByKey: map[string]*unstructured.Unstructured{},
+			audited:  map[*unstructured.Unstructured]schema.GroupVersionResource{csv: olmCSVGVR}}
+		chk.clearOLMResolvedStamps(ctx, logf.FromContext(ctx), scan)
+
+		stamped, _, _ := unstructured.NestedString(csv.Object,
+			"metadata", "annotations", kube.AnnoFirstSeenOLMUnhealthy)
+		if strings.Contains(stamped, key) {
+			t.Fatalf("resolved stamp survived on the object: %q", stamped)
+		}
+		for _, k := range probetest.LedgerKeys(&chk.olmFirstSeen) {
+			if k == key {
+				t.Fatal("resolved stamp survived in the in-RAM ledger")
+			}
+		}
+	})
+
+	t.Run("patch failure is warn-only — ledger still forgets", func(t *testing.T) {
+		csv := mkCSV()
+		dyn := probetest.OpDyn(csv)
+		dyn.PrependReactor("patch", "clusterserviceversions",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("conflict")
+			})
+		p := testProberDyn(fake.NewSimpleClientset(), dyn)
+		chk := probetest.MustCheck[*olmHealthCheck](t, p)
+		chk.olmFirstSeen.Observe(key, base)
+
+		scan := &olmScan{live: map[string][]string{},
+			objByKey: map[string]*unstructured.Unstructured{},
+			audited:  map[*unstructured.Unstructured]schema.GroupVersionResource{csv: olmCSVGVR}}
+		chk.clearOLMResolvedStamps(ctx, logf.FromContext(ctx), scan) // must not panic/error
+
+		for _, k := range probetest.LedgerKeys(&chk.olmFirstSeen) {
+			if k == key {
+				t.Fatal("in-RAM ledger not forgotten on a failed annotation patch")
+			}
+		}
+	})
+}
+
+// collectOLMSignatures: a generic (non-NotFound) list failure on the
+// CSV stream is an Infra verdict — the audit must not read a partial
+// picture as healthy.
+func TestOLMCollectSignaturesListErrorIsInfra(t *testing.T) {
+	dyn := probetest.OpDyn()
+	dyn.PrependReactor("list", "clusterserviceversions",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*olmHealthCheck](t, p)
+	if _, err := chk.collectOLMSignatures(ctx, time.Now()); err == nil {
+		t.Fatal("CSV list failure must surface an error")
+	}
+	res := chk.Run(ctx)
+	if res.Infra == nil {
+		t.Fatalf("CSV list failure must be an Infra verdict: %+v", res)
 	}
 }

@@ -136,6 +136,12 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	// observes the new clock (hoststate.New doc).
 	d.State = subframe.StoreAt(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
 		cfg.Seams.Host.Clock, logger)
+	// Declare every EnterFrom/ExitFrom producer id this subsystem can
+	// emit — the journal owner plus the two pod-teardown latch
+	// holders — so a post-restart ExitFrom seeds only live owners.
+	d.State.RegisterActiveOwner(journalwatch.OwnerWorkerHygiene)
+	d.State.RegisterActiveOwner(wdeps.CheckTeardown)
+	d.State.RegisterActiveOwner(wdeps.CheckCtrTasks)
 	// Streak contract lives in journalwatch.NewUnreadableTrackerForOwner:
 	// each hygiene persists its OWN consecutive-journal-unreadable-<owner>
 	// streak file and holds the shared state-journal-unreadable latch

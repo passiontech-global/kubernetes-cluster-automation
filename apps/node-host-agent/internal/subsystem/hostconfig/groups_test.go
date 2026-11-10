@@ -554,8 +554,8 @@ func TestCfgGatesRefuseUnsafe(t *testing.T) {
 		},
 		"cfgScalar": {
 			gate: func(c *cyc, s string) bool { return c.cfgScalar("x", s) },
-			in:   []string{"100", "60s", "a:b", "a#b", "line\nbreak", ""},
-			want: []bool{true, true, false, false, false, false},
+			in:   []string{"100", "60s", "a:b", "a#b", "line\nbreak", "", `q"uote`, "sq'x"},
+			want: []bool{true, true, false, false, false, false, false, false},
 		},
 		"cfgLimitNOFILE": {
 			gate: func(c *cyc, s string) bool { return c.cfgLimitNOFILE("x", s) },

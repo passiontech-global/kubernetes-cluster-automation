@@ -19,6 +19,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -965,5 +966,203 @@ func TestWatchdogSyncErrorGaugeHealthyNoRaise(t *testing.T) {
 	}
 	if got := syncErrGaugeVal(t); got != 0 {
 		t.Fatalf("gauge = %v with a healthy tail, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// deleteConnectorPod — UID-preconditioned delete outcomes
+// ---------------------------------------------------------------------------
+
+// wedgeDeletedCount reads the delivered-deletes counter for the test
+// namespace and reason.
+func wedgeDeletedCount(t *testing.T, reason string) float64 {
+	t.Helper()
+	return ptestutil.ToFloat64(metrics.CFTunnelWedgePodsDeletedTotal.
+		WithLabelValues(cfWatchdogTestNS, reason))
+}
+
+// deleteConnectorPod verifies before it deletes — the listed pod
+// could already have been replaced by a same-named fresh pod, and
+// killing the replacement would undo the heal. The fake API server
+// ignores delete preconditions, so the conflict branch is simulated
+// by a reactor that replays exactly what the real API answers when
+// the precondition UID no longer matches: a Conflict error.
+func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
+	now := time.Now()
+	pod := staleUnreadyProxyPod("proxy-wedged",
+		now.Add(-time.Hour), now.Add(-10*time.Minute))
+
+	t.Run("uid conflict — error, no counter", func(t *testing.T) {
+		testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+			cfWatchdogTestNS, "fatal_logs")
+		repl := pod.DeepCopy()
+		repl.UID = pod.UID + "-fresh"
+		cs := fake.NewSimpleClientset(repl)
+		cs.PrependReactor("delete", "pods",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				da := a.(ktesting.DeleteAction)
+				uid := da.GetDeleteOptions().Preconditions.UID
+				if uid != nil && string(*uid) != string(repl.UID) {
+					return true, nil, apierrors.NewConflict(
+						corev1.Resource("pods"), repl.Name,
+						errors.New("the object has been modified"))
+				}
+				return false, nil, nil
+			})
+		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+			now: shared.Clock(func() time.Time { return now })}
+		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err == nil {
+			t.Fatal("precondition miss must propagate the Conflict error")
+		}
+		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
+			t.Fatalf("failed delete counted %v heals", got)
+		}
+	})
+
+	t.Run("notfound — nil, no counter", func(t *testing.T) {
+		testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+			cfWatchdogTestNS, "fatal_logs")
+		cs := fake.NewSimpleClientset()
+		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+			now: shared.Clock(func() time.Time { return now })}
+		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err != nil {
+			t.Fatalf("already-gone pod must be nil: %v", err)
+		}
+		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
+			t.Fatalf("a delete we did not deliver counted %v heals", got)
+		}
+	})
+
+	t.Run("api error — error propagates, no counter", func(t *testing.T) {
+		testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+			cfWatchdogTestNS, "fatal_logs")
+		cs := fake.NewSimpleClientset(pod)
+		cs.PrependReactor("delete", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("etcd unavailable")
+			})
+		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+			now: shared.Clock(func() time.Time { return now })}
+		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err == nil {
+			t.Fatal("api failure must propagate")
+		}
+		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
+			t.Fatalf("failed API delete counted %v heals", got)
+		}
+	})
+
+	t.Run("delivered delete counts", func(t *testing.T) {
+		testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+			cfWatchdogTestNS, "fatal_logs")
+		cs := fake.NewSimpleClientset(pod)
+		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+			now: shared.Clock(func() time.Time { return now })}
+		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err != nil {
+			t.Fatalf("clean delete failed: %v", err)
+		}
+		if got := wedgeDeletedCount(t, "fatal_logs"); got != 1 {
+			t.Fatalf("delivered delete counter = %v, want 1", got)
+		}
+	})
+}
+
+// The per-target cfTunnelMaxHealsPerTarget bound: a mass wedge
+// deletes at most cap pods per sweep, and once the fatal-log path
+// fills the cap the all-unready slot stays suppressed — one sweep can
+// never exceed cfTunnelMaxHealsPerTarget deletes.
+func TestWatchdogHealCapPerTarget(t *testing.T) {
+	now := time.Now()
+	testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+		cfWatchdogTestNS, "fatal_logs")
+	testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
+		cfWatchdogTestNS, "all_unready_oldest")
+	cs := fake.NewSimpleClientset(
+		staleUnreadyProxyPod("proxy-w1", now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		staleUnreadyProxyPod("proxy-w2", now.Add(-time.Hour), now.Add(-9*time.Minute)),
+		staleUnreadyProxyPod("proxy-w3", now.Add(-time.Hour), now.Add(-8*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR Couldn't start tunnel: config file error\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
+		now: shared.Clock(func() time.Time { return now })}
+	deleted, err := w.healCloudflaredWedges(context.Background())
+	if err != nil {
+		t.Fatalf("heal sweep: %v", err)
+	}
+	if deleted != cfTunnelMaxHealsPerTarget {
+		t.Fatalf("deleted %d pods, want the cap %d", deleted, cfTunnelMaxHealsPerTarget)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-w3") == cfPodExists(t, cs, cfWatchdogTestNS, "proxy-w1") {
+		t.Fatal("expected exactly the cap-front pods deleted and the rest kept")
+	}
+	if got := wedgeDeletedCount(t, "fatal_logs"); got != float64(cfTunnelMaxHealsPerTarget) {
+		t.Fatalf("fatal_logs counter = %v, want %d", got, cfTunnelMaxHealsPerTarget)
+	}
+	if got := wedgeDeletedCount(t, "all_unready_oldest"); got != 0 {
+		t.Fatalf("cap-full sweep issued %v all-unready deletes — slot must be suppressed", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// cf-gateway-sync-error — inconclusive-tail branches
+// ---------------------------------------------------------------------------
+
+// An EMPTY log tail (fresh controller pod, quiet window) is
+// inconclusive: with the errored stamp already past the clear window
+// the gauge must stay 1 and the stamp must hold — no clean evidence,
+// no clear.
+func TestWatchdogSyncErrorEmptyTailNeverClears(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(gatewayCtrlPod("cf-gw-ctrl-0"))
+	cs.PrependReactor("get", "pods", cfLogReactor(""))
+	testutil.CleanupMetric(t, cftunnelGatewaySyncErrorGauge, cfWatchdogTestNS)
+	cftunnelGatewaySyncErrorGauge.WithLabelValues(cfWatchdogTestNS).Set(1)
+	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
+		namespace: cfWatchdogTestNS,
+		now:       shared.Clock(func() time.Time { return now })}
+	w.syncErrLast = map[string]time.Time{cfWatchdogTestNS: now.Add(-6 * time.Minute)}
+	w.auditControllerSyncErrors(context.Background())
+	if got := syncErrGaugeVal(t); got != 1 {
+		t.Fatalf("gauge = %v after an empty tail, want 1", got)
+	}
+	if _, ok := w.syncErrLast[cfWatchdogTestNS]; !ok {
+		t.Fatal("inconclusive sweep cleared the errored stamp")
+	}
+}
+
+// With 2 replicas, one unreadable tail + one clean tail is still
+// inconclusive (the crash-loop shape is exactly when one tail is
+// unreadable) — the gauge must stay 1.
+func TestWatchdogSyncErrorPartialReplicaReadKeepsGauge(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		gatewayCtrlPod("cf-gw-ctrl-0"), gatewayCtrlPod("cf-gw-ctrl-1"))
+	calls := 0
+	cs.PrependReactor("get", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "log" {
+				return false, nil, nil
+			}
+			calls++
+			if calls == 1 {
+				return true, nil, errors.New("log stream dead")
+			}
+			return true, &runtime.Unknown{Raw: []byte("all quiet\n")}, nil
+		})
+	testutil.CleanupMetric(t, cftunnelGatewaySyncErrorGauge, cfWatchdogTestNS)
+	cftunnelGatewaySyncErrorGauge.WithLabelValues(cfWatchdogTestNS).Set(1)
+	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
+		namespace: cfWatchdogTestNS,
+		now:       shared.Clock(func() time.Time { return now })}
+	w.syncErrLast = map[string]time.Time{cfWatchdogTestNS: now.Add(-6 * time.Minute)}
+	w.auditControllerSyncErrors(context.Background())
+	if calls != 2 {
+		t.Fatalf("read %d log tails, want both replicas", calls)
+	}
+	if got := syncErrGaugeVal(t); got != 1 {
+		t.Fatalf("gauge = %v after a partial read, want 1", got)
+	}
+	if _, ok := w.syncErrLast[cfWatchdogTestNS]; !ok {
+		t.Fatal("partial-read sweep cleared the errored stamp")
 	}
 }

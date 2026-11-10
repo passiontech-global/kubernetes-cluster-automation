@@ -2,6 +2,7 @@ package orphanendpointslicecleaner
 
 import (
 	"errors"
+	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -300,5 +302,135 @@ func TestOrphanEndpointSliceIgnoresUnlabeled(t *testing.T) {
 	}
 	if !oescSliceExists(t, cs, "apps", "manual") {
 		t.Fatal("unlabeled slice reaped")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Delete cap, streak bookkeeping, fail-closed confirm
+// ---------------------------------------------------------------------------
+
+// oescTrackedCount reports how many keys the absentStreak ledger
+// holds — the ledger exposes no Len, so a keep-all Prune counts it.
+func oescTrackedCount(l *state.StreakLedger) int {
+	n := 0
+	l.Prune(func(string) bool { return true })
+	return n
+}
+
+// The delete cap bounds churn at orphanEndpointSliceDeleteCap per
+// sweep even with more streak-qualified orphans: exactly the cap
+// number of slices go (deterministically the ns/name-sorted head),
+// the survivors keep their full streak (NOT re-armed to 1), and reap
+// on the very next cycle.
+func TestOrphanEndpointSliceDeleteCap(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.OrphanEndpointSlicesCleanedTotal, "apps")
+	objs := []runtime.Object{oescService("default", "kubernetes")}
+	var slices []*discoveryv1.EndpointSlice
+	for i := 0; i < orphanEndpointSliceDeleteCap+2; i++ {
+		s := oescSlice("apps", fmt.Sprintf("cap-%02d-xyz", i), "gone", 30*time.Minute)
+		slices = append(slices, s)
+		objs = append(objs, s)
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	c := oescCleaner(cs)
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	} // streak 1 for all
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remaining := 0
+	for _, s := range slices {
+		if oescSliceExists(t, cs, "apps", s.Name) {
+			remaining++
+			// Survivors must carry their FULL streak into the next
+			// cycle — a re-armed streak would add another 2-cycle
+			// delay on top of the cap.
+			if got := c.absentStreak.Count(oescStreakKey(s)); got != 2 {
+				t.Fatalf("survivor %s streak = %d, want 2", s.Name, got)
+			}
+		}
+	}
+	if remaining != 2 {
+		t.Fatalf("survivors after cap = %d, want 2", remaining)
+	}
+	// The deterministic ns/name ordering means the sorted head went:
+	// cap-50/cap-51 (names cap-00..cap-51) survive.
+	for _, name := range []string{"cap-50-xyz", "cap-51-xyz"} {
+		if !oescSliceExists(t, cs, "apps", name) {
+			t.Fatalf("slice %s deleted despite sorting after the cap boundary", name)
+		}
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues("apps")); got != orphanEndpointSliceDeleteCap {
+		t.Fatalf("cleaned counter = %v, want %d", got, orphanEndpointSliceDeleteCap)
+	}
+	// Cycle 3: the two survivors reap immediately.
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if oescSliceExists(t, cs, "apps", "cap-50-xyz") || oescSliceExists(t, cs, "apps", "cap-51-xyz") {
+		t.Fatal("capped survivors not reaped on the following cycle")
+	}
+}
+
+// A slice deleted externally between cycles must not leave a stale
+// streak entry behind — the per-sweep prune drops ledger keys that
+// no longer appear in the orphan census.
+func TestOrphanEndpointSliceStreakPrunedWhenSliceVanishes(t *testing.T) {
+	slice := oescSlice("apps", "vanish-xyz", "gone", 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		oescService("default", "kubernetes"), slice)
+	c := oescCleaner(cs)
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.absentStreak.Count(oescStreakKey(slice)) != 1 {
+		t.Fatal("first sighting not recorded")
+	}
+	// External cleanup removes the slice between cycles.
+	if err := cs.DiscoveryV1().EndpointSlices("apps").
+		Delete(ctx, slice.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := oescTrackedCount(&c.absentStreak); got != 0 {
+		t.Fatalf("streak ledger holds %d entries after the slice vanished, want 0", got)
+	}
+}
+
+// A non-NotFound Service Get failure at the live re-confirm keeps the
+// slice (fail closed), meters the error, and retains the streak —
+// the next cycle retries the delete instead of re-arming 2 cycles.
+func TestOrphanEndpointSliceConfirmErrorFailsClosed(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.OrphanEndpointSlicesCleanedTotal, "apps")
+	slice := oescSlice("apps", "confirm-xyz", "gone", 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		oescService("default", "kubernetes"), slice)
+	c := oescCleaner(cs)
+	c.queue = "orphan-endpointslice-cleaner"
+	c.absentStreak.Set(oescStreakKey(slice), orphanEndpointSliceStreak-1)
+
+	cs.PrependReactor("get", "services",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	before := testutil.QueueErrorCount(t, "orphan-endpointslice-cleaner")
+	if err := c.run(ctx); err != nil {
+		t.Fatalf("confirm failure must not error the run: %v", err)
+	}
+	if !oescSliceExists(t, cs, "apps", slice.Name) {
+		t.Fatal("slice deleted when the Service confirm failed")
+	}
+	if got := testutil.QueueErrorCount(t, "orphan-endpointslice-cleaner") - before; got != 1 {
+		t.Fatalf("confirm failure not metered: error delta = %v, want 1", got)
+	}
+	if got := c.absentStreak.Count(oescStreakKey(slice)); got != orphanEndpointSliceStreak {
+		t.Fatalf("streak not retained after failed confirm: %d, want %d",
+			got, orphanEndpointSliceStreak)
 	}
 }

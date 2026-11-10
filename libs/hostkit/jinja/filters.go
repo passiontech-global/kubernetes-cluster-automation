@@ -84,6 +84,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			return int64(len(t.V)), nil
 		case *OMap:
 			return int64(t.Len()), nil
+		case map[string]any:
+			return int64(len(t)), nil
+		case map[string]string:
+			return int64(len(t)), nil
 		}
 		return int64(0), nil
 	case "first":
@@ -102,9 +106,12 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		l := append([]any{}, ToIter(v)...)
 		sort.SliceStable(l, func(i, j int) bool {
 			if isNum(l[i]) && isNum(l[j]) {
-				fi, _ := toFloat(l[i])
-				fj, _ := toFloat(l[j])
-				return fi < fj
+				// numCmp keeps the ok flag — a NaN/±Inf operand used
+				// to compare as 0.0 — and compares int64 pairs
+				// exactly past 2^53.
+				if c, ok := numCmp(l[i], l[j]); ok {
+					return c < 0
+				}
 			}
 			if lp, ok := l[i].(*List); ok {
 				if rp, ok := l[j].(*List); ok && len(lp.V) > 0 && len(rp.V) > 0 {
@@ -152,8 +159,13 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return &List{out}, nil
 	case "dict2items":
-		if om, ok := v.(*OMap); ok {
-			return &List{om.Items()}, nil
+		switch t := v.(type) {
+		case *OMap:
+			return &List{t.Items()}, nil
+		case map[string]any:
+			return &List{omFromStringMap(t).Items()}, nil
+		case map[string]string:
+			return &List{omFromStringMap(t).Items()}, nil
 		}
 		return &List{}, nil
 	case "items2dict":
@@ -211,6 +223,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 				if i, ok := floatToInt64(f); ok {
 					return i, nil
 				}
+			}
+		default:
+			// Every other Go integer type (int, int32, uint, ...).
+			if i, ok := asInt64(v); ok {
+				return i, nil
 			}
 		}
 		return def, nil

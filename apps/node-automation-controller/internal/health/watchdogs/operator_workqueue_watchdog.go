@@ -126,6 +126,9 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	// opHealed keys on operator pod controllers that can be
+	// recreated under fresh names — prune expired stamps each sweep.
+	p.opHealed.PruneExpired(now, operatorHealCooldown)
 
 	var rep probefw.SweepReport
 	for _, op := range operatorTargets {

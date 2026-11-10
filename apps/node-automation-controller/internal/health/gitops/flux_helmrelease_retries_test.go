@@ -106,6 +106,48 @@ func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
 	}
 }
 
+// The persisted half of the gate, restart-resume shape: a FRESH check
+// process (empty in-RAM ledger) reads the requestedAt stamp a previous
+// patch — ours or `flux reconcile`'s — left on the HR and holds off
+// inside the 30m window. Detection still FAILs; only remediation is
+// suppressed (the HealAllowedPersisted preamble the kustomization
+// sibling runs).
+func TestCheckFluxHelmReleaseRetriesPersistedGate(t *testing.T) {
+	base := time.Now()
+	hr := shHR("apps", "hr", "False", "UpgradeFailed",
+		"upgrade failed", base.Add(-time.Hour))
+	hr.SetAnnotations(map[string]string{
+		kube.AnnoFluxRequestedAt: base.Add(-10 * time.Minute).
+			UTC().Format(time.RFC3339)})
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("still-stuck HR must keep FAILING")
+	}
+	got, err := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
+		Get(ctx, "hr", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// requestedAt is the PRE-EXISTING stamp — the patch would show as
+	// forceAt/resetAt (only the triple patch writes those) and a
+	// rewritten requestedAt token.
+	for _, anno := range []string{kube.AnnoFluxForceAt, kube.AnnoFluxResetAt} {
+		if _, found, _ := unstructured.NestedString(
+			got.Object, "metadata", "annotations", anno); found {
+			t.Fatalf("reconcile annotation %s patched through the persisted gate", anno)
+		}
+	}
+	token, _, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt)
+	if want := base.Add(-10 * time.Minute).UTC().Format(time.RFC3339); token != want {
+		t.Fatalf("requestedAt rewritten %q inside the persisted gate, want %q",
+			token, want)
+	}
+}
+
 // The 30m cooldown: a second sweep inside the window must not re-patch
 // — the requestedAt stamp we left is the durable half.
 func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {

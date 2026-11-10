@@ -89,6 +89,50 @@ func TestCPUStealZombieHeartbeatDoesNotTaint(t *testing.T) {
 	}
 }
 
+// stealHealthyWorkers — the headroom counter on a zero-value check —
+// counts only Ready+schedulable+steal-untainted workers outside the
+// exclude set and the control plane; a live CPUStealPressure is not
+// headroom but a frozen-heartbeat zombie is, and a node already
+// bearing the steal taint never counts (its taint was earned).
+func TestStealHealthyWorkersCountsHeadroom(t *testing.T) {
+	now := time.Now()
+
+	live := stealNode("live", corev1.ConditionTrue, 10*time.Minute) // pressured, live heartbeat → excluded
+	// Same pressure but a frozen heartbeat — zombie, counts as headroom.
+	zombie := stealNode("zombie", corev1.ConditionTrue, 10*time.Minute)
+	for i, c := range zombie.Status.Conditions {
+		if c.Type == cpuStealCond {
+			zombie.Status.Conditions[i].LastHeartbeatTime =
+				metav1.NewTime(now.Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+		}
+	}
+	// A false-pressure condition also counts.
+	falseCond := stealNode("falsecond", corev1.ConditionFalse, time.Minute)
+
+	alreadyTainted := testutil.Node("tainted", corev1.ConditionTrue, nil,
+		corev1.Taint{Key: kube.TaintCPUSteal, Effect: corev1.TaintEffectNoSchedule})
+	unschedulable := testutil.Node("cordoned", corev1.ConditionTrue, nil)
+	unschedulable.Spec.Unschedulable = true
+	notReady := testutil.Node("notready", corev1.ConditionFalse, nil)
+	cp := testutil.Node("cp", corev1.ConditionTrue,
+		map[string]string{"node-role.kubernetes.io/control-plane": ""})
+
+	nodes := []corev1.Node{*live, *zombie, *falseCond, *alreadyTainted,
+		*unschedulable, *notReady, *cp}
+
+	// Zero-value receiver: only pure helpers, no Deps needed.
+	p := &cpuStealTaintSyncCheck{}
+	if got := p.stealHealthyWorkers(nodes, "", now); got != 2 {
+		t.Fatalf("stealHealthyWorkers = %d, want 2 (zombie+falsecond)", got)
+	}
+	if got := p.stealHealthyWorkers(nodes, "zombie", now); got != 1 {
+		t.Fatalf("exclude=zombie: got %d, want 1", got)
+	}
+	if got := p.stealHealthyWorkers(nodes, "falsecond", now); got != 1 {
+		t.Fatalf("exclude=falsecond: got %d, want 1", got)
+	}
+}
+
 func TestCPUStealSkipsTaintWithoutHeadroom(t *testing.T) {
 	w1 := stealNode("w1", corev1.ConditionTrue, 10*time.Minute)
 	w2 := stealNode("w2", corev1.ConditionTrue, 20*time.Minute)

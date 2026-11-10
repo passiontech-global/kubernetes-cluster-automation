@@ -74,13 +74,23 @@ type PoolCheck struct {
 // Name returns the check label / log context.
 func (c *PoolCheck) Name() string { return cdeps.CheckKinePool }
 
-// Run executes one pool-guard cycle.
-func (c *PoolCheck) Run(_ context.Context) {
+// Run executes one pool-guard cycle. ctx is honored at the two
+// points where aborting is cheap and safe: between the kine
+// discovery scan and the fd/net-table scan, and before the kill —
+// a SIGTERM delivered on a cancelled context races the supervisor's
+// own shutdown stop.
+func (c *PoolCheck) Run(ctx context.Context) {
 	kpid := c.d.Proc.FindByComm("kine")
 	if kpid == 0 {
 		// No kine process: etcd controller or k0s not initialised —
 		// the probe is a silent no-op (the shell exited the same way).
 		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "no_kine").Inc()
+		return
+	}
+	// Shutdown between the discovery scan and the fd/net-table scan:
+	// an aborted cycle must not publish half-read gauges.
+	if err := ctx.Err(); err != nil {
+		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "aborted").Inc()
 		return
 	}
 	dbPort := c.kineDBPort(kpid)
@@ -128,6 +138,16 @@ func (c *PoolCheck) Run(_ context.Context) {
 			conns, n, int(c.d.Cfg.KinePool.MinRestart.Minutes())),
 			c.d.Cfg.SuspectLogCadence)
 		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "ok").Inc()
+		return
+	}
+
+	// The kill gate: cancellation is checked AFTER the evidence is
+	// persisted (the latch + spiral counter files survive the abort
+	// and re-arm the next cycle) but BEFORE any budget spend or
+	// signal — an aborted cycle must not spend the kill budget on a
+	// SIGTERM it never delivers.
+	if err := ctx.Err(); err != nil {
+		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "aborted").Inc()
 		return
 	}
 

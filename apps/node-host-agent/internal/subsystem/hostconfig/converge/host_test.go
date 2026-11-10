@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -22,6 +23,63 @@ func TestHostJoin(t *testing.T) {
 	rooted := Host{Root: t.TempDir()}
 	if got := rooted.Join("/f"); !strings.HasPrefix(got, rooted.Root) {
 		t.Fatalf("Join must root under Root, got %q", got)
+	}
+}
+
+func TestWriteManagedConcurrentNoTear(t *testing.T) {
+	// Two overlapping WriteManaged calls on one path (the crash-
+	// restart race: an old process between open and rename while a
+	// new one starts) must not tear each other — each writer stages
+	// under a UNIQUE "<base>.converge.tmp-<rand>" draw, so a rename
+	// can only publish bytes that writer wrote itself. Both land or
+	// last-wins cleanly; no stage lingers afterward.
+	h := Host{Root: t.TempDir()}
+	if _, err := h.WriteManaged("/f.conf", []byte("seed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const n = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			content := []byte(strings.Repeat(string(rune('a'+i)), 4096))
+			if _, err := h.WriteManaged("/f.conf", content, 0o644); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatalf("concurrent write failed: %v", err)
+	default:
+	}
+	b, err := os.ReadFile(h.Join("/f.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The file must be exactly ONE writer's bytes — no interleaving.
+	lastWins := false
+	for i := range n {
+		if string(b) == strings.Repeat(string(rune('a'+i)), 4096) {
+			lastWins = true
+		}
+	}
+	if !lastWins {
+		t.Fatalf("torn concurrent write: %q...", string(b[:20]))
+	}
+	// Sweep: every stage was renamed or removed on its own failure
+	// path — none linger in the target dir.
+	entries, err := os.ReadDir(h.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".converge.tmp") {
+			t.Fatalf("stale staging file left behind: %s", e.Name())
+		}
 	}
 }
 
@@ -46,13 +104,15 @@ func TestWriteManaged(t *testing.T) {
 		if st.Mode().Perm() != 0o640 {
 			t.Fatalf("mode = %o, want 640", st.Mode().Perm())
 		}
-		// The tmp+rename contract: no staging file may linger.
+		// The tmp+rename contract: no staging file may linger. The
+		// stage name is unique per write ("<base>.converge.tmp-<rand>")
+		// — the sweep matches the ".converge.tmp" infix.
 		entries, err := os.ReadDir(filepath.Dir(dst))
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".converge.tmp") {
+			if strings.Contains(e.Name(), ".converge.tmp") {
 				t.Fatalf("staging file left behind: %s", e.Name())
 			}
 		}

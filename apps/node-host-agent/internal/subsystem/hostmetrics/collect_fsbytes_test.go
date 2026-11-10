@@ -45,6 +45,23 @@ func TestCollectFSBytesRatio(t *testing.T) {
 	}
 }
 
+// TestCollectFSBytesPseudoFsGuard: a statfs where Bavail > Blocks is
+// pseudo-filesystem nonsense — never emitted as a negative ratio.
+func TestCollectFSBytesPseudoFsGuard(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.FSBytesTargets = []string{"/host/run"}
+	cfg.statfsFn = func(_ string, st *unix.Statfs_t) error {
+		st.Blocks, st.Bavail = 100, 500 // Bavail > Blocks
+		return nil
+	}
+	c := New(cfg)
+	if _, ok := metricValue(t, c,
+		"node_host_agent_filesystem_bytes_used_ratio",
+		map[string]string{"node": "node-a", "mount": "/host/run"}); ok {
+		t.Fatal("pseudo-fs nonsense emitted a series")
+	}
+}
+
 func TestFSBytesTargetsDefault(t *testing.T) {
 	// applyDefaults joins run/k0s under HostRoot — pod mode shape.
 	c := New(Config{HostRoot: "/host"})

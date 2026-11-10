@@ -391,3 +391,132 @@ func TestCollectAIO(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectAIOBump: past 75% of the table with headroom left, the
+// runtime bump doubles aio-max-nr in place (capped at the target) —
+// and the maximum gauge shows the POST-bump ceiling, not the stale
+// one. A failed sysctl write is silent: the gauges keep the truth.
+func TestCollectAIOBump(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	nrFile := filepath.Join(root, "aio-nr")
+	maxFile := filepath.Join(root, "aio-max-nr")
+	oldNr, oldMax := aioNrFile, aioMaxFile
+	aioNrFile, aioMaxFile = nrFile, maxFile
+	t.Cleanup(func() { aioNrFile, aioMaxFile = oldNr, oldMax })
+	labels := map[string]string{"node": "node-a"}
+
+	// 100/100 → ratio 1.0 > 0.75 → doubled to 200 (far under the cap).
+	testutil.WriteFile(t, nrFile, "100\n")
+	testutil.WriteFile(t, maxFile, "100\n")
+	c := New(cfg)
+	if got, ok := metricValue(t, c, "node_host_agent_aio_maximum", labels); !ok || got != 200 {
+		t.Fatalf("aio_maximum after bump=%v ok=%v want 200", got, ok)
+	}
+	if got, ok := metricValue(t, c, "node_host_agent_aio_used_ratio", labels); !ok || got != 0.5 {
+		t.Fatalf("aio_used_ratio after bump=%v ok=%v want 0.5", got, ok)
+	}
+
+	// Near the target the bump caps at aioMaxTarget instead of
+	// overshooting it.
+	testutil.WriteFile(t, nrFile, "3000000\n")
+	testutil.WriteFile(t, maxFile, "3000000\n")
+	c2 := New(cfg)
+	if got, ok := metricValue(t, c2, "node_host_agent_aio_maximum", labels); !ok || got != float64(aioMaxTarget) {
+		t.Fatalf("aio_maximum capped=%v ok=%v want %d", got, ok, uint64(aioMaxTarget))
+	}
+	want := float64(3000000) / float64(aioMaxTarget)
+	if got, ok := metricValue(t, c2, "node_host_agent_aio_used_ratio", labels); !ok || got != want {
+		t.Fatalf("aio_used_ratio capped=%v ok=%v want %v", got, ok, want)
+	}
+
+	// An unwritable sysctl (read-only file — WriteFileDirect opens
+	// the existing node in place, so a read-only parent dir alone
+	// does not stop it) fails the bump silently — the gauges still
+	// report the on-disk truth.
+	roDir := filepath.Join(root, "ro")
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(roDir, "aio-nr"), "3000000\n")
+	testutil.WriteFile(t, filepath.Join(roDir, "aio-max-nr"), "3000000\n")
+	aioNrFile, aioMaxFile = filepath.Join(roDir, "aio-nr"), filepath.Join(roDir, "aio-max-nr")
+	if err := os.Chmod(aioMaxFile, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(aioMaxFile, 0o644) })
+	c3 := New(cfg)
+	if got, ok := metricValue(t, c3, "node_host_agent_aio_maximum", labels); !ok || got != 3000000 {
+		t.Fatalf("aio_maximum through a failed bump=%v ok=%v want the read truth 3000000", got, ok)
+	}
+}
+
+// TestCollectUserNSGauge: the userns ceiling gauge emits only while
+// /proc/sys/user/max_user_namespaces parses.
+func TestCollectUserNSGauge(t *testing.T) {
+	cfg, _ := fixture(t)
+	f := filepath.Join(t.TempDir(), "max_user_namespaces")
+	old := maxUserNSFile
+	maxUserNSFile = f
+	t.Cleanup(func() { maxUserNSFile = old })
+
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_max_user_namespaces",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("userns ceiling emitted without the sysctl file")
+	}
+	testutil.WriteFile(t, f, "65536\n")
+	if got, ok := metricValue(t, c, "node_host_agent_max_user_namespaces",
+		map[string]string{"node": "node-a"}); !ok || got != 65536 {
+		t.Fatalf("max_user_namespaces=%v ok=%v want 65536", got, ok)
+	}
+}
+
+// TestEphemeralPortWidthDefaults pins the sysctl fallbacks: missing,
+// short, malformed and inverted ranges all yield the kernel's stock
+// span, a valid range yields its width.
+func TestEphemeralPortWidthDefaults(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ip_local_port_range")
+	if got := ephemeralPortWidth(filepath.Join(dir, "missing")); got != defaultEphemeralPortWidth {
+		t.Fatalf("missing range width=%v want %v", got, defaultEphemeralPortWidth)
+	}
+	testutil.WriteFile(t, p, "10240\n")
+	if got := ephemeralPortWidth(p); got != defaultEphemeralPortWidth {
+		t.Fatalf("single-field range width=%v want %v", got, defaultEphemeralPortWidth)
+	}
+	testutil.WriteFile(t, p, "abc def\n")
+	if got := ephemeralPortWidth(p); got != defaultEphemeralPortWidth {
+		t.Fatalf("malformed range width=%v want %v", got, defaultEphemeralPortWidth)
+	}
+	testutil.WriteFile(t, p, "65535 1024\n")
+	if got := ephemeralPortWidth(p); got != defaultEphemeralPortWidth {
+		t.Fatalf("inverted range width=%v want %v", got, defaultEphemeralPortWidth)
+	}
+	testutil.WriteFile(t, p, "10240 65535\n")
+	if got := ephemeralPortWidth(p); got != 55296 {
+		t.Fatalf("10240-65535 width=%v want 55296", got)
+	}
+}
+
+// TestSockstatCloseWaitAliasAndMalformed: kernels reporting "cw"
+// instead of "close_wait" still feed the close-wait gauge; short
+// even-field lines and non-numeric values are skipped, not emitted
+// as junk.
+func TestSockstatCloseWaitAliasAndMalformed(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.SockstatFile,
+		"TCP: inuse 25 orphan 2 tw 4 cw 9\n"+
+			"sockets: used\n"+ // even field count → skipped
+			"X: bad notanumber\n"+ // non-numeric value → skipped
+			"TCP: inuse 1 2\n") // even field count → skipped
+	c := New(cfg)
+	if got, ok := metricValue(t, c, "node_host_agent_sockstat_tcp_close_wait",
+		map[string]string{"node": "node-a"}); !ok || got != 9 {
+		t.Fatalf("tcp_close_wait via cw alias=%v ok=%v want 9", got, ok)
+	}
+	if got, ok := metricValue(t, c, "node_host_agent_sockstat_tcp_tw",
+		map[string]string{"node": "node-a"}); !ok || got != 4 {
+		t.Fatalf("tcp_tw=%v ok=%v want 4", got, ok)
+	}
+}

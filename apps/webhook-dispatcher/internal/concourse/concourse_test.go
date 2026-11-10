@@ -881,33 +881,99 @@ func TestResourcesColdStartWaitRespectsContext(t *testing.T) {
 	}
 }
 
-func TestRefreshConcurrentCallerThrottledMidFetch(t *testing.T) {
+func TestRefreshConcurrentCallerJoinsInFlightFetch(t *testing.T) {
 	release := make(chan struct{})
-	defer close(release) // never leave the slow ATC blocking cleanup
-	srv, inFlight, _ := slowATC(t, release, 1)
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease()
+	srv, inFlight, pipelinesHits := slowATC(t, release, 1)
 	c := &Client{BaseURL: srv.URL, Team: "main"}
 
+	first := make(chan error, 1)
 	go func() {
-		_, _ = c.Refresh(context.Background())
+		_, err := c.Refresh(context.Background())
+		first <- err
 	}()
 	waitInFlight(t, inFlight)
 
-	// Throttled by the in-flight attempt stamp — returns immediately
-	// without its own fetch.
-	concErr := make(chan error, 1)
+	// A second Refresh while the first is in flight JOINS it — single
+	// flight: it must not return early with a stale/empty index, must
+	// not fire a duplicate ATC fetch, and only settles once the
+	// in-flight fetch does.
+	second := make(chan error, 1)
 	go func() {
 		_, err := c.Refresh(context.Background())
-		concErr <- err
+		second <- err
 	}()
 	select {
-	case err := <-concErr:
-		if err != nil {
-			t.Fatalf("throttled Refresh err=%v want nil", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Refresh blocked behind in-flight fetch (throttle missed)")
+	case err := <-second:
+		t.Fatalf("joined Refresh returned early err=%v — want it to wait for the in-flight fetch", err)
+	case <-time.After(200 * time.Millisecond):
 	}
 
+	closeRelease()
+	if err := <-first; err != nil {
+		t.Fatalf("first Refresh err=%v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("joined Refresh err=%v want nil", err)
+	}
+	if got := pipelinesHits.Load(); got != 1 {
+		t.Fatalf("pipelines fetches=%d want 1 (singleflight)", got)
+	}
+}
+
+func TestRefreshManyConcurrentCallersSingleFetch(t *testing.T) {
+	release := make(chan struct{})
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease()
+	srv, inFlight, pipelinesHits := slowATC(t, release, 1)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	const callers = 4
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			_, err := c.Refresh(context.Background())
+			errs <- err
+		}()
+	}
+	waitInFlight(t, inFlight)
+	closeRelease()
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Fatalf("Refresh err=%v want nil", err)
+		}
+	}
+	if got := pipelinesHits.Load(); got != 1 {
+		t.Fatalf("pipelines fetches=%d want 1 (singleflight)", got)
+	}
+}
+
+func TestFetchIndexPipeline404DropsGhosts(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
+	// Seed the index so prevByPipeline carries p2's last-known
+	// resources into the next fetch.
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// p2 is deleted between the pipeline listing and its resource
+	// fetch: the listing still returns it, but its resources endpoint
+	// 404s. The refreshed index must drop p2's ghost resources
+	// entirely — not carry them over, and not fail the fetch.
+	stub.fail("/api/v1/teams/main/pipelines/p2/resources", http.StatusNotFound)
+	index, err := c.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh err=%v want nil (404 is not a fetch failure)", err)
+	}
+	for _, r := range index {
+		if r.Pipeline == "p2" {
+			t.Fatalf("index keeps ghost resource %+v from deleted pipeline", r)
+		}
+	}
+	if len(index) != 3 {
+		t.Fatalf("index=%d resources want 3 (p1 only)", len(index))
+	}
 }
 
 // waitInFlight blocks until a request is inside the slow ATC handler.

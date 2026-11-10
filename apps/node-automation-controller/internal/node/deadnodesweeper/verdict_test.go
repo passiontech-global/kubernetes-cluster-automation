@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -395,4 +396,70 @@ func TestConfirmedDeadProbeErrorClassification(t *testing.T) {
 			t.Fatal("RBAC error must not fence the node")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// healthyCanaryName — the sweep's Ready-node pick.
+// ---------------------------------------------------------------------------
+
+// The canary is the FIRST Ready=True node in census order; a census
+// with no Ready node yields "" — the global-outage shape the canary
+// check must veto on.
+func TestHealthyCanaryName(t *testing.T) {
+	notReady := func(name string) corev1.Node {
+		return *testutil.Node(name, corev1.ConditionFalse, nil)
+	}
+	ready := func(name string) corev1.Node {
+		return *testutil.Node(name, corev1.ConditionTrue, nil)
+	}
+
+	t.Run("first Ready node in census order", func(t *testing.T) {
+		nodes := []corev1.Node{notReady("n0"), ready("n1"), ready("n2")}
+		if got := healthyCanaryName(nodes); got != "n1" {
+			t.Fatalf("healthyCanaryName = %q, want n1 (first Ready in order)", got)
+		}
+	})
+
+	t.Run("Ready only later in the census still picked", func(t *testing.T) {
+		nodes := []corev1.Node{notReady("n0"), notReady("n1"), ready("n2")}
+		if got := healthyCanaryName(nodes); got != "n2" {
+			t.Fatalf("healthyCanaryName = %q, want n2", got)
+		}
+	})
+
+	t.Run("no Ready node yields the empty canary", func(t *testing.T) {
+		nodes := []corev1.Node{notReady("n0"), notReady("n1"),
+			*testutil.Node("n2", corev1.ConditionUnknown, nil)}
+		if got := healthyCanaryName(nodes); got != "" {
+			t.Fatalf("healthyCanaryName = %q, want empty (nothing certifies the path)", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// remediationItems — the nil-dynamic-client wiring guard.
+// ---------------------------------------------------------------------------
+
+// A nil dynamic client is a wiring bug, not "no fencing evidence":
+// remediationItems must fail closed with a distinct error (and must
+// not cache the failure as fetched), unlike the missing-CRD skip.
+func TestRemediationItemsNilDynFailsClosed(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("w1", corev1.ConditionUnknown, nil))
+	s := &deadNodeSweeper{cs: cs, probeFn: healthyProbe} // dyn deliberately nil
+
+	rem := &remediationCache{}
+	items, err := s.remediationItems(ctx, rem)
+	if err == nil {
+		t.Fatal("nil dynamic client must fail closed with an error")
+	}
+	if items != nil {
+		t.Fatalf("nil dynamic client returned items %v, want none", items)
+	}
+	if !strings.Contains(err.Error(), "no dynamic client") {
+		t.Fatalf("error %q is not the distinct nil-dyn wiring error", err)
+	}
+	if rem.fetched {
+		t.Fatal("wiring error must not latch the cache as fetched")
+	}
 }

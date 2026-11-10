@@ -171,7 +171,14 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		}
 		if !scheduled {
 			pending++
-			rep.Find(pod.Namespace + "/" + pod.Name)
+			// Only record the finding while a schedulable worker
+			// exists — with every worker cordoned/NotReady the
+			// pending pods are explained by capacity, not a frozen
+			// scheduler, and Verdict must read Pass to match the
+			// schedulerFrozenGauge=0 below.
+			if schedulable {
+				rep.Find(pod.Namespace + "/" + pod.Name)
+			}
 		}
 	}
 	// Nowhere to schedule (or nothing stuck pending) — the freeze

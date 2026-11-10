@@ -295,13 +295,13 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 	deadFirst := c.d.Cfg.Hub.SelfAPI != "" &&
 		(c.d.Cfg.Hub.PeerAPI == "" || c.d.Cfg.Hub.SelfAPI < c.d.Cfg.Hub.PeerAPI)
 	if dn < c.d.StreakCycles(c.d.Cfg.Sig13.SoloCycles) || !deadFirst {
-		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbk, fmt.Sprintf(
+		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkStreak, fmt.Sprintf(
 			"suspect: apiserver dead, kine db ok — dead-fallback needs %d cycles + first-hub (dn=%d first=%v)",
 			c.d.StreakCycles(c.d.Cfg.Sig13.SoloCycles), dn, deadFirst), c.d.Cfg.SuspectLogCadence)
 		return
 	}
 	if !c.d.State.RateOK(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {
-		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbk, fmt.Sprintf(
+		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool, fmt.Sprintf(
 			"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
 			int(c.d.Cfg.Sig13.MinRestart.Minutes())), c.d.Cfg.SuspectLogCadence)
 		return
@@ -321,6 +321,11 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 	case cdeps.ModeDryRun:
 		c.d.State.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would restart k0scontroller - apiserver dead, kine db ok (dead-fallback %dx)", dn))
+		// Spend the same budget enforce would — a dry-run that
+		// ignores the restart cooldown logs an action every cycle
+		// and misrepresents what enforce would actually do.
+		c.d.State.RateSpend(cdeps.FileRateRestart)
+		c.d.State.ResetCounter(cdeps.FileCtrDead)
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "dryrun_restart").Inc()
 	}
 }

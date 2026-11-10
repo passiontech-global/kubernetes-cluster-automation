@@ -84,7 +84,11 @@ func Cmd(ctx context.Context, args []string) int {
 		cutStr = fs.Arg(0)
 	}
 	if cutStr == "" {
-		cutStr = "1970-01-01T00:00:00Z"
+		// "default deletes everything" — the purge predicate keeps
+		// events with CreationTimestamp BEFORE the cutoff, so the
+		// far-future bound is what makes an unset --before delete
+		// all of them (1970 would delete nothing).
+		cutStr = "9999-12-31T23:59:59Z"
 	}
 	cutoff, err := time.Parse(time.RFC3339, cutStr)
 	if err != nil {

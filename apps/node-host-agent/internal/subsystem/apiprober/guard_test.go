@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -299,5 +300,63 @@ func TestWriteGapFileSkipsIdentical(t *testing.T) {
 	got, err := os.ReadFile(f)
 	if err != nil || string(got) != "43\n" {
 		t.Fatalf("gap file = %q err=%v want 43", got, err)
+	}
+}
+
+// parseStaticBackend: the bare "ip:port" spelling self-names
+// (watchdogconf parity), "name=addr" splits, and every malformed
+// shape is rejected rather than guessed.
+func TestParseStaticBackendEntries(t *testing.T) {
+	if sb, ok := parseStaticBackend("ctl1=10.0.0.1:6443"); !ok ||
+		sb.Name != "ctl1" || sb.Addr != "10.0.0.1:6443" {
+		t.Fatalf("named entry = %+v, %v", sb, ok)
+	}
+	if sb, ok := parseStaticBackend("  10.0.0.1:6443  "); !ok ||
+		sb.Name != "10.0.0.1:6443" || sb.Addr != "10.0.0.1:6443" {
+		t.Fatalf("bare entry = %+v, %v (want self-named)", sb, ok)
+	}
+	for _, bad := range []string{"", "   ", "=", "ctl1=", "=10.0.0.1:6443"} {
+		if sb, ok := parseStaticBackend(bad); ok {
+			t.Fatalf("parseStaticBackend(%q) = %+v, true — want rejected", bad, sb)
+		}
+	}
+}
+
+// Env-set APIPROBER_COMPANION_BACKENDS must survive the conf overlay —
+// the conf's HAPROXY_BACKENDS is a fallback layer only (env > conf >
+// default), same as the other envSet-guarded knobs.
+func TestEnvSetCompanionsWinOverGuardConf(t *testing.T) {
+	confPath := filepath.Join(t.TempDir(), "guard.conf")
+	testutil.WriteFile(t, confPath, "HAPROXY_BACKENDS=\"conf_comp other\"\n")
+	t.Setenv(envnames.EnvAPIGuardConf, confPath)
+	t.Setenv(envnames.EnvApiproberCompanionBackends, "env_comp")
+	cfg := ConfigFromEnv(EnvDeps{})
+	if cfg.GuardSrc != nil {
+		t.Fatal("ConfigFromEnv must leave GuardSrc nil for New to auto-wire")
+	}
+	if len(cfg.CompanionBackends) != 1 || cfg.CompanionBackends[0] != "env_comp" {
+		t.Fatalf("env companions = %v", cfg.CompanionBackends)
+	}
+	cfg.HTTPClient = &http.Client{} // skip the CA client build
+	cfg.GuardSrc = NewGuardReloader(confPath, GuardDefaults{})
+	p, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.eff.companions) != 1 || p.eff.companions[0] != "env_comp" {
+		t.Fatalf("eff companions = %v — env set shadowed by conf", p.eff.companions)
+	}
+	// Without env, the conf set (primary stripped) applies.
+	t.Setenv(envnames.EnvApiproberCompanionBackends, "")
+	cfg2 := ConfigFromEnv(EnvDeps{})
+	cfg2.HTTPClient = &http.Client{}
+	cfg2.GuardSrc = NewGuardReloader(confPath, GuardDefaults{})
+	p2, err := New(cfg2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.eff.companions) != 2 ||
+		p2.eff.companions[0] != "conf_comp" || p2.eff.companions[1] != "other" {
+		t.Fatalf("conf companions = %v — conf layer missing", p2.eff.companions)
 	}
 }

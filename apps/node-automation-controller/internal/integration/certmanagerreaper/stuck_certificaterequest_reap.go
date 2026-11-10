@@ -91,6 +91,50 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	if stuck == nil {
 		return false
 	}
+	// A CR that looks stuck may still own a pending Order whose
+	// Challenge is progressing normally — deleting the CR
+	// cascade-deletes that Order and undoes the keep decision
+	// reapCert just made for it. Only reap when every owned pending
+	// Order is itself wedged (or none exists).
+	orders, oerr := r.listOrdersForCert(ctx, ns, name)
+	if oerr != nil {
+		log.Error(oerr, "order attribution failed", "cert", key)
+		return false
+	}
+	var liveOrder *unstructured.Unstructured
+	for i := range orders {
+		o := &orders[i]
+		owned := false
+		for _, or := range o.GetOwnerReferences() {
+			if or.Kind == "CertificateRequest" && or.Name == stuck.GetName() {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			continue
+		}
+		if st, _ := kube.NestedString(o.Object, "status", "state"); st == "pending" {
+			liveOrder = o
+			break
+		}
+	}
+	if liveOrder != nil {
+		chals, cerr := r.dyn.Resource(challengeGVR).Namespace(ns).
+			List(ctx, metav1.ListOptions{})
+		if cerr != nil {
+			metrics.IncError(r.queue)
+			log.Error(cerr, "challenge list failed", "cert", key)
+			return false
+		}
+		if !stuckChallengeForOrder(liveOrder, chals.Items, now) {
+			log.Info("KEEP: stuck CertificateRequest owns a pending Order "+
+				"whose challenge is still progressing — not reaping",
+				"cert", key, "certificaterequest", stuck.GetName(),
+				"order", liveOrder.GetName())
+			return false
+		}
+	}
 	// Same budget as an Order reset — a deleted CR re-issues the
 	// request and draws the same ACME rate limit.
 	st := r.resets[key]

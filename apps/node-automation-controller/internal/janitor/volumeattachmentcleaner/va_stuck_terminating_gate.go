@@ -121,6 +121,11 @@ func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	}
 	metrics.VolumeAttachmentFinalizersRemovedTotal.
 		WithLabelValues(va.Spec.NodeName).Inc()
+	// The counter is never decremented by its own code path — the
+	// ledger tracks the tuple so the sweep's end-of-sweep Prune can
+	// retire the series once the node is gone (each sweep re-arms it
+	// via the carry-forward while the census still lists the node).
+	c.finalizersRemovedEmitted.Emit(va.Spec.NodeName, va.Spec.NodeName)
 	return nil
 }
 

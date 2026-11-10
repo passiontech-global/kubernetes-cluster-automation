@@ -24,6 +24,20 @@ func (c *cyc) groupWatchdog() {
 		return
 	}
 	// conf — worker variant (hub adds SIG13 block when hub:true).
+	// Every vars-derived/topology scalar below lands inside a
+	// KEY="..." line the watchdog scripts source wholesale — a quote
+	// or newline in a value would inject arbitrary conf/shell
+	// directives. Each value passes cfgShellVal; ONE refusal fails
+	// the whole render closed (conf skipped, no write — the refusals
+	// are already counted per value).
+	confOK := true
+	wval := func(what, v string) string {
+		if !c.cfgShellVal(what, v) {
+			confOK = false
+			return ""
+		}
+		return v
+	}
 	var b strings.Builder
 	b.WriteString(`# Managed by node-config-agent - node-watchdog sig5 probe
 # targets: public IP remote (table 100) + tunnel marker IP
@@ -32,20 +46,20 @@ func (c *cyc) groupWatchdog() {
 # this node consumes — watchdog toggles ip rule based on the
 # direct-underlay probe.
 `)
-	fmt.Fprintf(&b, "OVERLAY_PROBE_TARGETS=\"%s\"\n", strings.Join(t.ProbeTargets, " "))
-	fmt.Fprintf(&b, "OVERLAY_PROBE_MARKERS=\"%s\"\n", strings.Join(t.ProbeMarkers, " "))
-	fmt.Fprintf(&b, "OVERLAY_SLOWPATH_MARKERS=\"%s\"\n", strings.Join(t.SlowpathMkrs, " "))
-	fmt.Fprintf(&b, "OVERLAY_SLOWPATH_RTT_MS=\"%s\"\n", defStr(c.v("interdc_slowpath_rtt_ms"), "100"))
-	fmt.Fprintf(&b, "OVERLAY_SITE_MARKERS=\"%s\"\n", strings.Join(t.SiteMarkers, " "))
-	fmt.Fprintf(&b, "OVERLAY_SITEEDGE_RTT_MS=\"%s\"\n", defStr(c.v("interdc_siteedge_rtt_ms"), "50"))
-	fmt.Fprintf(&b, "OVERLAY_EGRESS_TCP=\"%s\"\n", strings.Join(t.EgressProbes, " "))
-	fmt.Fprintf(&b, "OVERLAY_EGRESS_RELAYS=\"%s\"\n", strings.Join(t.EgressRelays, " "))
-	fmt.Fprintf(&b, "NEBULA_NET=\"%s\"\n", defStr(c.v("interdc_nebula_net"), "interdc"))
-	fmt.Fprintf(&b, "NEBULA_PORT=\"%s\"\n", defStr(c.v("interdc_nebula_port"), "45670"))
-	fmt.Fprintf(&b, "NEBULA_DEV=\"%s\"\n", defStr(c.v("interdc_nebula_dev"), "neb1"))
-	fmt.Fprintf(&b, "NEBULA_STATS_URL=\"http://%s/metrics\"\n", defStr(c.v("interdc_nebula_stats_listen"), "127.0.0.1:9800"))
-	fmt.Fprintf(&b, "OVERLAY_ACTIVE=\"%s\"\n", t.Overlay)
-	fmt.Fprintf(&b, "OVERLAY_EGRESS_TABLE=\"%s\"\n", defStr(c.v("interdc_nebula_table_pub"), "100"))
+	fmt.Fprintf(&b, "OVERLAY_PROBE_TARGETS=\"%s\"\n", wval("overlay_probe_targets", strings.Join(t.ProbeTargets, " ")))
+	fmt.Fprintf(&b, "OVERLAY_PROBE_MARKERS=\"%s\"\n", wval("overlay_probe_markers", strings.Join(t.ProbeMarkers, " ")))
+	fmt.Fprintf(&b, "OVERLAY_SLOWPATH_MARKERS=\"%s\"\n", wval("overlay_slowpath_markers", strings.Join(t.SlowpathMkrs, " ")))
+	fmt.Fprintf(&b, "OVERLAY_SLOWPATH_RTT_MS=\"%s\"\n", wval("interdc_slowpath_rtt_ms", defStr(c.v("interdc_slowpath_rtt_ms"), "100")))
+	fmt.Fprintf(&b, "OVERLAY_SITE_MARKERS=\"%s\"\n", wval("overlay_site_markers", strings.Join(t.SiteMarkers, " ")))
+	fmt.Fprintf(&b, "OVERLAY_SITEEDGE_RTT_MS=\"%s\"\n", wval("interdc_siteedge_rtt_ms", defStr(c.v("interdc_siteedge_rtt_ms"), "50")))
+	fmt.Fprintf(&b, "OVERLAY_EGRESS_TCP=\"%s\"\n", wval("overlay_egress_tcp", strings.Join(t.EgressProbes, " ")))
+	fmt.Fprintf(&b, "OVERLAY_EGRESS_RELAYS=\"%s\"\n", wval("overlay_egress_relays", strings.Join(t.EgressRelays, " ")))
+	fmt.Fprintf(&b, "NEBULA_NET=\"%s\"\n", wval("interdc_nebula_net", defStr(c.v("interdc_nebula_net"), "interdc")))
+	fmt.Fprintf(&b, "NEBULA_PORT=\"%s\"\n", wval("interdc_nebula_port", defStr(c.v("interdc_nebula_port"), "45670")))
+	fmt.Fprintf(&b, "NEBULA_DEV=\"%s\"\n", wval("interdc_nebula_dev", defStr(c.v("interdc_nebula_dev"), "neb1")))
+	fmt.Fprintf(&b, "NEBULA_STATS_URL=\"http://%s/metrics\"\n", wval("interdc_nebula_stats_listen", defStr(c.v("interdc_nebula_stats_listen"), "127.0.0.1:9800")))
+	fmt.Fprintf(&b, "OVERLAY_ACTIVE=\"%s\"\n", wval("overlay_active", t.Overlay))
+	fmt.Fprintf(&b, "OVERLAY_EGRESS_TABLE=\"%s\"\n", wval("interdc_nebula_table_pub", defStr(c.v("interdc_nebula_table_pub"), "100")))
 	fb := t.DNSFallbackMap
 	// T12-part1: strip cp_endpoint entry when api-local-lb is enabled.
 	if c.vb("api_lb_enabled") && c.worker() {
@@ -58,21 +72,21 @@ func (c *cyc) groupWatchdog() {
 		}
 		fb = strings.Join(keep, " ")
 	}
-	fmt.Fprintf(&b, "DNS_FALLBACK_MAP=\"%s\"\n", fb)
+	fmt.Fprintf(&b, "DNS_FALLBACK_MAP=\"%s\"\n", wval("dns_fallback_map", fb))
 	// defaults.yaml defines these as jinja over api_lb_backends —
 	// resolve the same semantics in Go so an eval failure can never
 	// leak Undefined/raw text into the conf.
 	pb, lbSrv, lbVip := c.apilbWatchdogVars()
-	fmt.Fprintf(&b, "API_BACKENDS=\"%s\"\n", strings.Join(pb, " "))
-	fmt.Fprintf(&b, "APISERVER_GAP_MIN=\"%s\"\n", defStr(c.v("apiserver_wedge_gap_min"), "10000"))
-	fmt.Fprintf(&b, "APISERVER_GAP_CYCLES=\"%s\"\n", defStr(c.v("apiserver_wedge_gap_cycles"), "2"))
-	fmt.Fprintf(&b, "APISERVER_FROZEN_CYCLES=\"%s\"\n", defStr(c.v("apiserver_wedge_frozen_cycles"), "2"))
-	fmt.Fprintf(&b, "API_LB_SERVERS=\"%s\"\n", lbSrv)
-	fmt.Fprintf(&b, "API_LB_VIP=\"%s\"\n", lbVip)
+	fmt.Fprintf(&b, "API_BACKENDS=\"%s\"\n", wval("apiserver_probe_backends", strings.Join(pb, " ")))
+	fmt.Fprintf(&b, "APISERVER_GAP_MIN=\"%s\"\n", wval("apiserver_wedge_gap_min", defStr(c.v("apiserver_wedge_gap_min"), "10000")))
+	fmt.Fprintf(&b, "APISERVER_GAP_CYCLES=\"%s\"\n", wval("apiserver_wedge_gap_cycles", defStr(c.v("apiserver_wedge_gap_cycles"), "2")))
+	fmt.Fprintf(&b, "APISERVER_FROZEN_CYCLES=\"%s\"\n", wval("apiserver_wedge_frozen_cycles", defStr(c.v("apiserver_wedge_frozen_cycles"), "2")))
+	fmt.Fprintf(&b, "API_LB_SERVERS=\"%s\"\n", wval("apiserver_lb_servers", lbSrv))
+	fmt.Fprintf(&b, "API_LB_VIP=\"%s\"\n", wval("apiserver_lb_vip", lbVip))
 	b.WriteString("API_LB_SOCKET=\"/run/api-local-lb-admin.sock\"\n")
 	b.WriteString("API_LB_BACKEND=\"api_local_back\"\n")
-	fmt.Fprintf(&b, "SIG14_LB_MODE=\"%s\"\n", defStr(c.v("apiserver_lb_guard_mode"), "off"))
-	fmt.Fprintf(&b, "APISERVER_RECOVER_CYCLES=\"%s\"\n", defStr(c.v("apiserver_lb_recover_cycles"), "3"))
+	fmt.Fprintf(&b, "SIG14_LB_MODE=\"%s\"\n", wval("apiserver_lb_guard_mode", defStr(c.v("apiserver_lb_guard_mode"), "off")))
+	fmt.Fprintf(&b, "APISERVER_RECOVER_CYCLES=\"%s\"\n", wval("apiserver_lb_recover_cycles", defStr(c.v("apiserver_lb_recover_cycles"), "3")))
 	if t.AmLighthouse {
 		var peers []string
 		for _, l := range t.Lighthouses {
@@ -84,28 +98,36 @@ func (c *cyc) groupWatchdog() {
 		if len(peers) > 0 {
 			peer = peers[0] + ":6443"
 		}
-		fmt.Fprintf(&b, "SIG13_AUTOFIX=\"%s\"\n", defStr(c.v("sig13_autofix"), "off"))
-		fmt.Fprintf(&b, "SIG13_MIN_RESTART_S=\"%s\"\n", defStr(c.v("sig13_min_restart_s"), "7200"))
-		fmt.Fprintf(&b, "APISERVER_SOLO_CYCLES=\"%s\"\n", defStr(c.v("apiserver_wedge_solo_cycles"), "8"))
-		fmt.Fprintf(&b, "APISERVER_FAST_PROBE_CYCLES=\"%s\"\n", defStr(c.v("apiserver_fast_probe_cycles"), "3"))
-		fmt.Fprintf(&b, "APISERVER_FAST_SOLO_CYCLES=\"%s\"\n", defStr(c.v("apiserver_fast_solo_cycles"), "5"))
-		fmt.Fprintf(&b, "APISERVER_STALE_MIN_ERRS=\"%s\"\n", defStr(c.v("apiserver_stale_min_errs"), "15"))
-		fmt.Fprintf(&b, "API_SELF=\"%s:6443\"\n", nodeIPStr(t.Node, "ip"))
-		fmt.Fprintf(&b, "API_PEER=\"%s\"\n", peer)
-		fmt.Fprintf(&b, "KINE_DB_PROBE=\"%s\"\n", c.v("kine_db_probe"))
-		fmt.Fprintf(&b, "KINE_POOL_AUTOFIX=\"%s\"\n", defStr(c.v("kine_pool_autofix"), "off"))
-		fmt.Fprintf(&b, "KINE_POOL_MAX_CONNS=\"%s\"\n", defStr(c.v("kine_pool_max_conns"), "72"))
-		fmt.Fprintf(&b, "KINE_POOL_CYCLES=\"%s\"\n", defStr(c.v("kine_pool_cycles"), "3"))
-		fmt.Fprintf(&b, "KINE_POOL_MIN_RESTART_S=\"%s\"\n", defStr(c.v("kine_pool_min_restart_s"), "1200"))
-		fmt.Fprintf(&b, "KINE_TTL_AUTOFIX=\"%s\"\n", defStr(c.v("kine_ttl_autofix"), "off"))
-		fmt.Fprintf(&b, "KINE_TTL_MIN_RESTART_S=\"%s\"\n", defStr(c.v("kine_ttl_min_restart_s"), "1800"))
-		fmt.Fprintf(&b, "KINE_TTL_REWEDGE_CYCLES=\"%s\"\n", defStr(c.v("kine_ttl_rewedge_cycles"), "2"))
-		fmt.Fprintf(&b, "KINE_TTL_CTL_RESTART_S=\"%s\"\n", defStr(c.v("kine_ttl_ctl_restart_s"), "7200"))
-		fmt.Fprintf(&b, "K0S_OOMLOOP_AUTOFIX=\"%s\"\n", defStr(c.v("k0s_oomloop_autofix"), "off"))
-		fmt.Fprintf(&b, "K0S_OOMLOOP_MIN_KILLS=\"%s\"\n", defStr(c.v("k0s_oomloop_min_kills"), "3"))
-		fmt.Fprintf(&b, "K0S_OOMLOOP_WINDOW_S=\"%s\"\n", defStr(c.v("k0s_oomloop_window_s"), "3600"))
+		fmt.Fprintf(&b, "SIG13_AUTOFIX=\"%s\"\n", wval("sig13_autofix", defStr(c.v("sig13_autofix"), "off")))
+		fmt.Fprintf(&b, "SIG13_MIN_RESTART_S=\"%s\"\n", wval("sig13_min_restart_s", defStr(c.v("sig13_min_restart_s"), "7200")))
+		fmt.Fprintf(&b, "APISERVER_SOLO_CYCLES=\"%s\"\n", wval("apiserver_wedge_solo_cycles", defStr(c.v("apiserver_wedge_solo_cycles"), "8")))
+		fmt.Fprintf(&b, "APISERVER_FAST_PROBE_CYCLES=\"%s\"\n", wval("apiserver_fast_probe_cycles", defStr(c.v("apiserver_fast_probe_cycles"), "3")))
+		fmt.Fprintf(&b, "APISERVER_FAST_SOLO_CYCLES=\"%s\"\n", wval("apiserver_fast_solo_cycles", defStr(c.v("apiserver_fast_solo_cycles"), "5")))
+		fmt.Fprintf(&b, "APISERVER_STALE_MIN_ERRS=\"%s\"\n", wval("apiserver_stale_min_errs", defStr(c.v("apiserver_stale_min_errs"), "15")))
+		fmt.Fprintf(&b, "API_SELF=\"%s:6443\"\n", wval("node_ip", nodeIPStr(t.Node, "ip")))
+		fmt.Fprintf(&b, "API_PEER=\"%s\"\n", wval("apiserver_peer", peer))
+		fmt.Fprintf(&b, "KINE_DB_PROBE=\"%s\"\n", wval("kine_db_probe", c.v("kine_db_probe")))
+		fmt.Fprintf(&b, "KINE_POOL_AUTOFIX=\"%s\"\n", wval("kine_pool_autofix", defStr(c.v("kine_pool_autofix"), "off")))
+		fmt.Fprintf(&b, "KINE_POOL_MAX_CONNS=\"%s\"\n", wval("kine_pool_max_conns", defStr(c.v("kine_pool_max_conns"), "72")))
+		fmt.Fprintf(&b, "KINE_POOL_CYCLES=\"%s\"\n", wval("kine_pool_cycles", defStr(c.v("kine_pool_cycles"), "3")))
+		fmt.Fprintf(&b, "KINE_POOL_MIN_RESTART_S=\"%s\"\n", wval("kine_pool_min_restart_s", defStr(c.v("kine_pool_min_restart_s"), "1200")))
+		fmt.Fprintf(&b, "KINE_TTL_AUTOFIX=\"%s\"\n", wval("kine_ttl_autofix", defStr(c.v("kine_ttl_autofix"), "off")))
+		fmt.Fprintf(&b, "KINE_TTL_MIN_RESTART_S=\"%s\"\n", wval("kine_ttl_min_restart_s", defStr(c.v("kine_ttl_min_restart_s"), "1800")))
+		fmt.Fprintf(&b, "KINE_TTL_REWEDGE_CYCLES=\"%s\"\n", wval("kine_ttl_rewedge_cycles", defStr(c.v("kine_ttl_rewedge_cycles"), "2")))
+		fmt.Fprintf(&b, "KINE_TTL_CTL_RESTART_S=\"%s\"\n", wval("kine_ttl_ctl_restart_s", defStr(c.v("kine_ttl_ctl_restart_s"), "7200")))
+		fmt.Fprintf(&b, "K0S_OOMLOOP_AUTOFIX=\"%s\"\n", wval("k0s_oomloop_autofix", defStr(c.v("k0s_oomloop_autofix"), "off")))
+		fmt.Fprintf(&b, "K0S_OOMLOOP_MIN_KILLS=\"%s\"\n", wval("k0s_oomloop_min_kills", defStr(c.v("k0s_oomloop_min_kills"), "3")))
+		fmt.Fprintf(&b, "K0S_OOMLOOP_WINDOW_S=\"%s\"\n", wval("k0s_oomloop_window_s", defStr(c.v("k0s_oomloop_window_s"), "3600")))
 	}
-	_, _ = r.writeManaged("/etc/node-watchdog.conf", []byte(b.String()), 0o644)
+	// Fail closed: a refused value means arbitrary conf/shell
+	// injection, so the WHOLE conf is skipped — the previous on-disk
+	// file keeps serving until the var is fixed (the refusal and its
+	// value are already counted+logged by cfgShellVal).
+	if confOK {
+		_, _ = r.writeManaged("/etc/node-watchdog.conf", []byte(b.String()), 0o644)
+	} else {
+		logger().Warn("watchdog: node-watchdog.conf render skipped — unsafe value refused, keeping previous conf")
+	}
 
 	// log file + textfile dir + state dir + installed marker — still
 	// converged: nethealth latches state-*/egress-state-* files in the

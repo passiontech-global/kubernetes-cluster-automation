@@ -35,6 +35,11 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	// — the recreated pod carries a fresh suffix, so a "<ns>/<pod>"
 	// key lets the same workload's re-heal fire every sweep.
 	ck := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, kube.PodControllerKey(pod))
+	// Free in-RAM cooldown first — a stamped controller key defers
+	// without touching the mutex verdict or the global heal budget.
+	if p.Heals.CooledDown(ck, linkerdOpaqueHealCool, now) {
+		return
+	}
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, ck, linkerdOpaqueHealCool, now)
 	if unverifiable {

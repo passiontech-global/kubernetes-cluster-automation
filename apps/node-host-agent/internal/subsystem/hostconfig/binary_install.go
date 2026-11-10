@@ -86,8 +86,11 @@ type managedBinarySpec struct {
 
 	// install is the external-installer hook (the deb groups'
 	// apt-get install of the verified staged deb). It replaces the
-	// untar path; its failures report/log inside.
-	install func(c *cyc, local string)
+	// untar path; a returned error is reported via installErr (the
+	// per-site counted line) and fails the flow (ok=false) — callers
+	// gating daemon restarts on ok must never proceed past a failed
+	// apt install onto a stale daemon.
+	install func(c *cyc, local string) error
 
 	// companion installs a second, best-effort member from the same
 	// tarball (nebula-cert): its failure only warns, never counts —
@@ -149,7 +152,18 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 	}
 	switch {
 	case sp.install != nil:
-		sp.install(c, local)
+		if err := sp.install(c, local); err != nil {
+			// Same contract as the untar path's installErr: the
+			// per-site counted line reports the failure — and the
+			// flow fails (ok=false) so restart gating never treats
+			// a stale daemon as freshly installed.
+			if sp.installErr != nil {
+				sp.installErr(c, local, err)
+			} else {
+				c.err(sp.name+": "+sp.artifact+" install failed", "file", local, "error", err)
+			}
+			return changed, false
+		}
 	case sp.member != "":
 		mainErr := untarInstall(local, sp.member, c.r.hp(sp.dest), sp.mode)
 		if mainErr != nil {

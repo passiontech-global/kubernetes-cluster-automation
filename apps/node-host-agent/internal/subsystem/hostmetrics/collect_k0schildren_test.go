@@ -75,3 +75,61 @@ func TestCollectK0sChildrenNoSlice(t *testing.T) {
 		t.Fatal("children RSS emitted without the controller slice")
 	}
 }
+
+// TestK0sChildLabelFallbacks: a proc with no cmdline (or one
+// without a NUL-terminated argv0) falls back to comm; neither file
+// resolving yields no label.
+func TestK0sChildLabelFallbacks(t *testing.T) {
+	dir := t.TempDir()
+	commOnly := filepath.Join(dir, "comm-only")
+	if err := os.MkdirAll(commOnly, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(commOnly, "comm"), "etcd\n")
+	if got := k0sChildLabel(commOnly); got != "etcd" {
+		t.Fatalf("comm-only label=%q want etcd", got)
+	}
+
+	// A cmdline without a single NUL byte (kernel-clamped or raced
+	// read) cannot yield an argv0 — comm still answers.
+	testutil.WriteFile(t, filepath.Join(commOnly, "cmdline"), "/usr/bin/kine-no-nul")
+	if got := k0sChildLabel(commOnly); got != "etcd" {
+		t.Fatalf("no-NUL cmdline label=%q want the comm fallback etcd", got)
+	}
+
+	// Neither file readable → no label, the pid is skipped.
+	empty := filepath.Join(dir, "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := k0sChildLabel(empty); got != "" {
+		t.Fatalf("unresolvable label=%q want empty", got)
+	}
+}
+
+// TestProcVMRSSMalformed: a status without a VmRSS line, a bare
+// "VmRSS:" header and a non-numeric size are all unparseable —
+// never a silent 0.
+func TestProcVMRSSMalformed(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "status")
+	testutil.WriteFile(t, p, "Name:\tx\nState:\tS (sleeping)\n")
+	if _, ok := procVMRSS(p); ok {
+		t.Fatal("status without a VmRSS line parsed")
+	}
+	testutil.WriteFile(t, p, "VmRSS:\n")
+	if _, ok := procVMRSS(p); ok {
+		t.Fatal("bare VmRSS header parsed")
+	}
+	testutil.WriteFile(t, p, "VmRSS:\tnotanumber kB\n")
+	if _, ok := procVMRSS(p); ok {
+		t.Fatal("non-numeric VmRSS parsed")
+	}
+	if _, ok := procVMRSS(filepath.Join(dir, "missing")); ok {
+		t.Fatal("missing status file parsed")
+	}
+	testutil.WriteFile(t, p, "VmRSS:\t12 kB\n")
+	if v, ok := procVMRSS(p); !ok || v != 12<<10 {
+		t.Fatalf("VmRSS=%v ok=%v want %v bytes", v, ok, 12<<10)
+	}
+}

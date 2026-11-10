@@ -7,9 +7,11 @@ package kubeletreaper
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -240,5 +242,48 @@ func TestKubeletReaperRunAbsorbsSweepErrors(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w-bad").Spec.Taints, kubeletReaperTaint) {
 		t.Fatal("w-bad tainted despite its get failing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// truncateLog — the log-value cap for arbitrary proxy response bodies.
+// ---------------------------------------------------------------------------
+
+func TestTruncateLog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"short body unchanged", "ok", 200, "ok"},
+		{"empty body stays empty", "", 200, ""},
+		{"surrounding whitespace trimmed", "  ok\n\t", 200, "ok"},
+		{"exactly max is unchanged", strings.Repeat("a", 200), 200, strings.Repeat("a", 200)},
+		{"longer body truncated to max plus ellipsis",
+			strings.Repeat("a", 201), 200, strings.Repeat("a", 200) + "…"},
+		{"trim happens before the cap",
+			"  " + strings.Repeat("a", 201) + "  ", 200, strings.Repeat("a", 200) + "…"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := truncateLog(tc.in, tc.max); got != tc.want {
+				t.Fatalf("truncateLog(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+		})
+	}
+
+	// The cap counts BYTES after the trim, and the ellipsis is
+	// multibyte: the result of a long multibyte body is exactly max
+	// bytes of the trimmed input followed by "…". Slicing mid-rune
+	// must never produce invalid UTF-8.
+	long := strings.Repeat("é", 300)
+	got := truncateLog(long, 200)
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("multibyte body missing ellipsis suffix: %q", got[len(got)-4:])
+	}
+	body := strings.TrimSuffix(got, "…")
+	if body != strings.Repeat("é", 100) || !utf8.ValidString(got) {
+		t.Fatalf("multibyte body truncated to %d bytes, want the first 200 bytes", len(body))
 	}
 }

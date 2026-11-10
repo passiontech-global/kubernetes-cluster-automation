@@ -76,8 +76,13 @@ type Watcher interface {
 	Poll(ctx context.Context) // internal loop updating state
 }
 
-// DirWatcher polls a sha256 over (name,size,mtime,content-hash) of
-// every file under the watched dirs every period.
+// DirWatcher polls a fingerprint over (name, size, mtime, content
+// hash) of every file under the watched dirs every period. The per-
+// file content read+hash runs only when a file's (size, mtime) stat
+// differs from the previous scan — an unchanged stat reuses the
+// cached hash, so a quiet dir costs stats only. Residual risk,
+// accepted: a rewrite that keeps BOTH size and mtime identical is
+// trusted as unchanged (mtime granularity) and will not fire an edge.
 type DirWatcher struct {
 	Dirs   []string
 	Period time.Duration
@@ -86,7 +91,24 @@ type DirWatcher struct {
 	last   string
 	dirty  bool // Poll-latched change edge, consumed by Changed
 	polled bool // Poll has observed the dir at least once
+
+	// stats caches the last scan's per-file (size, mtime, hash);
+	// fingerprint reads+writes it under fpMu — Changed runs a
+	// fingerprint OUTSIDE w.mu by design, so scans may overlap.
+	fpMu  sync.Mutex
+	stats map[string]dirWatchFile
 }
+
+// dirWatchFile is one file's cached fingerprint inputs.
+type dirWatchFile struct {
+	size    int64
+	mtimeNS int64
+	sum     []byte
+}
+
+// readFile is the content-read seam — tests count reads to prove the
+// stat-unchanged fast path skips hashing.
+var readFile = os.ReadFile
 
 func (w *DirWatcher) fingerprint() string {
 	h := sha256.New()
@@ -105,16 +127,36 @@ func (w *DirWatcher) fingerprint() string {
 		})
 	}
 	sort.Strings(files)
+	w.fpMu.Lock()
+	defer w.fpMu.Unlock()
+	next := make(map[string]dirWatchFile, len(files))
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		var sum []byte
+		st, err := os.Stat(f)
 		if err != nil {
-			logger().Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
+			logger().Debug("hostconfig: watcher cannot stat file — excluded from fingerprint",
 				"file", f, "error", err)
 			continue
 		}
+		if c, ok := w.stats[f]; ok && c.size == st.Size() && c.mtimeNS == st.ModTime().UnixNano() {
+			// Stat unchanged → trust the cached content hash; the
+			// file's bytes are not re-read this scan.
+			sum = c.sum
+		} else {
+			b, err := readFile(f)
+			if err != nil {
+				logger().Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
+					"file", f, "error", err)
+				continue
+			}
+			s := sha256.Sum256(b)
+			sum = s[:]
+		}
+		next[f] = dirWatchFile{size: st.Size(), mtimeNS: st.ModTime().UnixNano(), sum: sum}
 		h.Write([]byte(f))
-		h.Write(b)
+		h.Write(sum)
 	}
+	w.stats = next
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -605,6 +647,22 @@ func (c *cyc) cfgScalar(what, s string) bool {
 		return true
 	}
 	c.err("hostconfig: unsafe value refused for config render",
+		"what", what, "value", s)
+	return false
+}
+
+// cfgShellVal is the shell-sourced-conf sibling of cfgScalar: it
+// gates a vars-derived/topology scalar rendered into a double-quoted
+// KEY="..." line of /etc/node-watchdog.conf (see converge.CfgShellVal
+// for why ':' stays legal here while '"', '$' and backtick do not).
+// A refused value counts a cycle error and fails the whole render
+// closed — the conf is sourced as one unit, so a partially-rendered
+// file would silently disable probes.
+func (c *cyc) cfgShellVal(what, s string) bool {
+	if converge.CfgShellVal(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe value refused for watchdog conf render",
 		"what", what, "value", s)
 	return false
 }

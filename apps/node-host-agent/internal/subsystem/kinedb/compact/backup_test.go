@@ -6,6 +6,7 @@ package compact
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,5 +190,208 @@ func TestNewestDumpAndMagic(t *testing.T) {
 	}
 	if dumpValidMagic(filepath.Join(dir, "missing")) {
 		t.Fatal("missing file reported valid")
+	}
+}
+
+// --- backupVerify failure paths ---
+
+// A stale dump with no filesystem headroom (or a failed free-space
+// probe) is not refreshed — a full disk must not be made worse.
+func TestBackupVerifyLowFreeSkips(t *testing.T) {
+	for _, free := range []float64{0.1, -1} { // -1 = statfs error
+		k, fr, dir := fixture(t, []testutil.ExecRule{
+			{Substr: "pg_dump", Err: errors.New("must not run")},
+		})
+		bdir := filepath.Join(dir, "backups")
+		k.d.Cfg.BackupDir = bdir
+		k.d.Cfg.StatFSFn = func(string) (float64, error) {
+			if free < 0 {
+				return 0, errors.New("statfs failed")
+			}
+			return free, nil
+		}
+		var notes []string
+		k.backupVerify(context.Background(), "pg", "postgres", "secret",
+			&Result{}, func(s string) { notes = append(notes, s) })
+		if len(notes) != 1 || notes[0] != "backup-skipped-low-free" {
+			t.Fatalf("free=%v notes=%v", free, notes)
+		}
+		if fr.Joined() != "" {
+			t.Fatalf("free=%v ran the dump pipeline:\n%s", free, fr.Joined())
+		}
+	}
+}
+
+// A pg_dump failure inside the container notes, cleans the partial
+// /tmp file, and publishes nothing.
+func TestBackupVerifyDumpFails(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_dump -Fc", Err: errors.New("out of memory")},
+	})
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	var notes []string
+	res := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res,
+		func(s string) { notes = append(notes, s) })
+	if res.backupSeen {
+		t.Fatal("failed dump must not read seen")
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "pg_dump-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+	// The partial container-side file is rm'd, and no pg_restore
+	// validation or cp followed.
+	j := fr.Joined()
+	if !fr.Ran("rm -f /tmp/kine-backup.dump") {
+		t.Fatalf("partial dump not cleaned:\n%s", j)
+	}
+	if strings.Contains(j, "pg_restore") || strings.Contains(j, "cp pg:") {
+		t.Fatalf("pipeline continued past the dump failure:\n%s", j)
+	}
+}
+
+// A failed pg_restore -l listing rejects the dump — no host copy.
+func TestBackupVerifyValidateFails(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_dump -Fc", Out: "dumped\n"},
+		{Substr: "pg_restore -l", Err: errors.New("invalid header")},
+	})
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	var notes []string
+	res := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res,
+		func(s string) { notes = append(notes, s) })
+	if res.backupSeen || res.backupValid {
+		t.Fatalf("res=%+v must stay unseen/invalid", res)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "pg_restore-validate-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+	if !fr.Ran("rm -f /tmp/kine-backup.dump") {
+		t.Fatalf("container dump not cleaned:\n%s", fr.Joined())
+	}
+	if strings.Contains(fr.Joined(), "cp pg:") {
+		t.Fatal("invalid dump was copied to the host")
+	}
+}
+
+// A failed host cp removes the .tmp staging file and publishes
+// nothing — the next cycle re-runs the whole pipeline.
+func TestBackupVerifyCpFails(t *testing.T) {
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_dump -Fc", Out: "dumped\n"},
+		{Substr: "pg_restore -l", Out: "ok\n"},
+		{Substr: "cp pg:", Err: errors.New("disk full")},
+	})
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	if err := os.MkdirAll(bdir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var notes []string
+	res := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res,
+		func(s string) { notes = append(notes, s) })
+	if res.backupSeen {
+		t.Fatal("failed cp must not read seen")
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "backup-cp-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+	ents, err := os.ReadDir(bdir)
+	if err != nil || len(ents) != 0 {
+		t.Fatalf("backup dir not clean after cp failure: %v %v", ents, err)
+	}
+}
+
+// pruneDumps keeps the newest backupKeepDumps *.dump files (mtime
+// order), sweeps *.tmp partials, and leaves a small dir untouched.
+func TestPruneDumpsRetention(t *testing.T) {
+	dir := t.TempDir()
+	// Six dumps, oldest first — the two oldest must go.
+	names := []string{"kine-1.dump", "kine-2.dump", "kine-3.dump",
+		"kine-4.dump", "kine-5.dump", "kine-6.dump"}
+	base := time.Now()
+	for i, n := range names {
+		p := filepath.Join(dir, n)
+		if err := os.WriteFile(p, []byte("PGDMP"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mt := base.Add(time.Duration(i) * time.Hour)
+		_ = os.Chtimes(p, mt, mt)
+	}
+	tmp := filepath.Join(dir, "kine-9.dump.tmp")
+	if err := os.WriteFile(tmp, []byte("PGD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pruneDumps(dir)
+	for _, n := range []string{"kine-1.dump", "kine-2.dump", tmp} {
+		if _, err := os.Stat(filepath.Join(dir, n)); !os.IsNotExist(err) {
+			t.Fatalf("%s survived the prune", n)
+		}
+	}
+	for _, n := range []string{"kine-3.dump", "kine-4.dump", "kine-5.dump", "kine-6.dump"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Fatalf("newest dump %s pruned: %v", n, err)
+		}
+	}
+
+	// A dir at the retention bound is left alone.
+	small := t.TempDir()
+	for _, n := range names[:backupKeepDumps] {
+		if err := os.WriteFile(filepath.Join(small, n), []byte("PGDMP"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneDumps(small)
+	ents, _ := os.ReadDir(small)
+	if len(ents) != backupKeepDumps {
+		t.Fatalf("prune touched the retention bound: %d entries", len(ents))
+	}
+}
+
+// A dump entry that vanished between the glob and the stat (a
+// dangling symlink) drops out of the aged list — if that leaves the
+// retention bound unmet, nothing is pruned.
+func TestPruneDumpsSkipsUnstattable(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Now()
+	for i, n := range []string{"a.dump", "b.dump", "c.dump", "d.dump"} {
+		p := filepath.Join(dir, n)
+		if err := os.WriteFile(p, []byte("PGDMP"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mt := base.Add(time.Duration(i) * time.Hour)
+		_ = os.Chtimes(p, mt, mt)
+	}
+	// Two dangling *.dump symlinks inflate the glob past the bound
+	// but stat-fail out of the aged list.
+	for _, n := range []string{"ghost1.dump", "ghost2.dump"} {
+		if err := os.Symlink(filepath.Join(dir, "nowhere"), filepath.Join(dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneDumps(dir)
+	for _, n := range []string{"a.dump", "b.dump", "c.dump", "d.dump"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Fatalf("kept dump %s pruned: %v", n, err)
+		}
+	}
+}
+
+// A truncated dump (< the 5-byte magic) fails the header sniff.
+func TestDumpValidMagicShortFile(t *testing.T) {
+	dir := t.TempDir()
+	short := filepath.Join(dir, "short.dump")
+	if err := os.WriteFile(short, []byte("PG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if dumpValidMagic(short) {
+		t.Fatal("two-byte file reported valid")
 	}
 }

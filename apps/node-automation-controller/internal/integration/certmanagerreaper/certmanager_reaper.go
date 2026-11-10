@@ -162,7 +162,8 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		// the annotation.
 		_, tracked := r.resets[key]
 		hasAnno := cert.GetAnnotations()[acmeResetsAnno] != ""
-		if !needsReap && certReady(cert) && (tracked || hasAnno) {
+		if !needsReap && !certExpiringSoon(cert, now) && certReady(cert) &&
+			(tracked || hasAnno) {
 			delete(r.resets, key)
 			if hasAnno {
 				if err := r.patchResetsAnnotation(ctx, cert, nil); err != nil {

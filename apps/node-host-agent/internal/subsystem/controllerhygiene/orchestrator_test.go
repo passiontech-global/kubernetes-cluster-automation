@@ -98,6 +98,42 @@ func TestRunFeedsAndCyclesUntilCancel(t *testing.T) {
 	}
 }
 
+// A panic inside the feeder goroutine must be contained: Run's spawned
+// closure recovers it, logs it to the watchdog tail (WATCHDOG=1 stops
+// — the operator-visible failure), re-panics into Spawn's recover so
+// the agent stays alive, and Run's own cycle loop keeps running until
+// ctx is cancelled.
+func TestRunFeederPanicContained(t *testing.T) {
+	e := fixture(t)
+	e.Props["k0scontroller.service:MainPID"] = "123"
+	e.H.Cfg.Feeder.Enabled = true
+	e.H.Cfg.NotifyFn = func(string) error { panic("watchdog boom") }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.H.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.CountLogLines("feeder: PANIC") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if e.CountLogLines("feeder: PANIC") == 0 {
+		t.Fatalf("feeder panic not logged to the watchdog tail:\n%s", e.LogLines())
+	}
+
+	// The dispatcher loop itself must survive the feeder's death.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
 func TestConfigFromEnvForwarding(t *testing.T) {
 	cfg := ConfigFromEnv(EnvDeps{})
 	if cfg.Interval != 60*time.Second {

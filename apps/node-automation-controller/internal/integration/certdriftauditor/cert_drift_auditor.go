@@ -232,6 +232,10 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	// run and their errors join (nil+nil+nil → nil). The periodic
 	// wrapper owns run-level IncError, so this run() must not count
 	// the error it returns (double-count).
+	// linkerdIssuerHeals keys on the single linkerd-identity name —
+	// prune before the audits so an early-returning sweep still
+	// bounds the ledger.
+	a.linkerdIssuerHeals.PruneExpired(a.now.Now(), linkerdIssuerCooldown)
 	webhookErr := a.auditWebhookCABundles(ctx)
 	tlsErr := a.auditTLSSecrets(ctx)
 	trustErr := a.auditTrustBundles(ctx)

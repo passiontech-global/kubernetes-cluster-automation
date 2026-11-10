@@ -696,3 +696,118 @@ func TestZombieSidecarShutdownCapPerCycle(t *testing.T) {
 		t.Fatalf("second-cycle shutdown calls = %d, want 2 (deferred only)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// jobAllowsReap — Job-object verdicts
+// ---------------------------------------------------------------------------
+
+// A pod whose parent Job object is GONE has no controller to
+// recreate it — the reap is allowed without any completion evidence.
+func TestJobAllowsReapJobObjectGone(t *testing.T) {
+	cs := fake.NewSimpleClientset() // no Job object at all
+	r := zsrReaper(cs, &zsrShutdownProbe{})
+	p := zsrPod("jobs", "orphaned-xyz", 10*time.Minute, 0)
+	if !r.jobAllowsReap(ctx, p, false) {
+		t.Fatal("reap vetoed while the parent Job object no longer exists")
+	}
+}
+
+// A Job lookup that fails with anything OTHER than NotFound is
+// "cannot verify" — fail closed (keep the pod) and meter once.
+func TestJobAllowsReapGetErrorFailsClosed(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("get", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := zsrReaper(cs, &zsrShutdownProbe{})
+	r.queue = "zombie-sidecar-reaper"
+	p := zsrPod("jobs", "unverified-xyz", 10*time.Minute, 0)
+
+	before := testutil.QueueErrorCount(t, "zombie-sidecar-reaper")
+	if r.jobAllowsReap(ctx, p, false) {
+		t.Fatal("reap allowed despite an unverifiable Job lookup — fail closed violated")
+	}
+	if got := testutil.QueueErrorCount(t, "zombie-sidecar-reaper") - before; got != 1 {
+		t.Fatalf("job lookup failure not metered: error delta = %v, want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// zombiePod — pure vetoes
+// ---------------------------------------------------------------------------
+
+// A non-zero app exit is only final under restartPolicy Never; under
+// Always the kubelet restarts the container, so the pod is vetoed.
+// An otherwise-qualifying zombie already carrying a DeletionTimestamp
+// is vetoed too — a delete is in flight, don't pile on.
+func TestZombiePodVetoes(t *testing.T) {
+	r := zsrReaper(fake.NewSimpleClientset(), &zsrShutdownProbe{})
+	now := time.Now()
+
+	alwaysExit := zsrPod("jobs", "always-exit", 10*time.Minute, 1)
+	alwaysExit.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	if got := r.zombiePod(alwaysExit, now); got != "" {
+		t.Fatalf("non-zero exit + restartPolicy Always = sidecar %q, want \"\"", got)
+	}
+
+	terminating := zsrPod("jobs", "terminating-xyz", 10*time.Minute, 0)
+	termAt := metav1.NewTime(now)
+	terminating.DeletionTimestamp = &termAt
+	if got := r.zombiePod(terminating, now); got != "" {
+		t.Fatalf("terminating zombie = sidecar %q, want \"\"", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-sidecar endpoint fallback + zero-value lazy arm
+// ---------------------------------------------------------------------------
+
+// An unknown sidecar name falls back to the linkerd target — the
+// proxy request still goes to :4191/shutdown, not some invented path.
+func TestProxyShutdownUnknownSidecarFallsBackToLinkerd(t *testing.T) {
+	var gotPath string
+	cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	})
+	r := &zombieSidecarReaper{cs: cs}
+	p := zsrPod("jobs", "odd-mesh-xyz", time.Minute, 0)
+	if err := r.proxyShutdown(ctx, p, "envoy-wherever"); err != nil {
+		t.Fatalf("proxyShutdown: %v", err)
+	}
+	want := "/api/v1/namespaces/jobs/pods/odd-mesh-xyz:4191/proxy/shutdown"
+	if gotPath != want {
+		t.Fatalf("unknown-sidecar proxy request = %s, want %s", gotPath, want)
+	}
+}
+
+// A zero-value-ish reaper literal without the poked/tried maps and
+// without shutdownFn runs one full cycle without a nil dereference:
+// the lazy-arm in run() seeds the ledgers, the unreachable shutdown
+// paths fail, and the qualifying zombie is reaped on the spot.
+func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
+
+	// Non-zero exit + no podIP: the direct admin call is skipped, the
+	// proxy fallback degrades to "unreachable" on the fake clientset,
+	// and the graceful path fails → immediate reap is allowed (exit 1).
+	p := zsrPod("jobs", "lazy-xyz", 10*time.Minute, 1)
+	p.Status.PodIP = ""
+	cs := fake.NewSimpleClientset(p)
+	r := &zombieSidecarReaper{cs: cs, now: time.Now} // no maps, no shutdownFn
+
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("zero-value reaper run: %v", err)
+	}
+	if zsrPodExists(t, cs, "jobs", "lazy-xyz") {
+		t.Fatal("zombie survived the single lazy-armed cycle")
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.ZombieSidecarPodsReapedTotal.WithLabelValues("jobs")); got != 1 {
+		t.Fatalf("reaped counter = %v, want 1", got)
+	}
+	if r.poked == nil || r.tried == nil {
+		t.Fatal("lazy-arm did not seed the poked/tried ledgers")
+	}
+}

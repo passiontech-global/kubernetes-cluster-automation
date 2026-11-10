@@ -18,6 +18,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -67,12 +68,16 @@ func (r *deschedulerStormGate) applyVerdict(ctx context.Context,
 	}
 	r.holdWarned.Forget(stormHoldLedgerKey)
 
-	cur := int32(-1)
-	curStr := ""
+	// The apiserver defaults spec.replicas to 1 when unset — mirror
+	// that default here instead of leaking a sentinel: the old
+	// cur=-1 read a nil-replicas deployment as "wrong" on every
+	// clear reconcile, forcing a redundant scale patch, and its ""
+	// evidence rendered `cur=` in the decision annotation.
+	cur := int32(1)
 	if deploy.Spec.Replicas != nil {
 		cur = *deploy.Spec.Replicas
-		curStr = strconv.Itoa(int(cur))
 	}
+	curStr := strconv.Itoa(int(cur))
 	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s] imagepull=[%s]",
 		r.now.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
 		strings.Join(ev.notReady, "\n"), strings.Join(ev.bad, "\n"),
@@ -93,11 +98,22 @@ func (r *deschedulerStormGate) applyVerdict(ctx context.Context,
 		// Merge-patch only (never a full-object Update): a cached
 		// Get races any concurrent spec edit (HPA, gitops) and
 		// would clobber it or fail on resourceVersion.
+		// metadata.resourceVersion inside the merge patch is the
+		// apiserver's test-and-set: everything this verdict read —
+		// hold annotation, replicas, the evidence — was observed at
+		// that RV, and three cluster-wide scans run between the Get
+		// and this patch. An operator setting the hold mid-sweep
+		// (or any other concurrent edit) bumps the RV, the apiserver
+		// rejects with 409, and the patch can never silently
+		// overwrite the hold.
 		patch, err := json.Marshal(map[string]any{
 			"spec": map[string]any{"replicas": want},
-			"metadata": map[string]any{"annotations": map[string]string{
-				stormGateDecisionAnno: decision,
-			}},
+			"metadata": map[string]any{
+				"resourceVersion": deploy.ResourceVersion,
+				"annotations": map[string]string{
+					stormGateDecisionAnno: decision,
+				},
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("marshal replicas patch: %w", err)
@@ -105,6 +121,16 @@ func (r *deschedulerStormGate) applyVerdict(ctx context.Context,
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
 			Patch(ctx, "descheduler", types.MergePatchType, patch,
 				metav1.PatchOptions{}); err != nil {
+			if apierrors.IsConflict(err) {
+				// The deployment changed since the Get — a hold set
+				// mid-sweep is exactly the dangerous case. Defer the
+				// whole verdict: no scale, no annotation, the regular
+				// cadence re-reads everything next sweep. A conflict
+				// is a lost race, not an actuation failure.
+				log.Info("DEFER: descheduler deployment changed mid-sweep — re-reading next sweep",
+					"observedResourceVersion", deploy.ResourceVersion)
+				return nil
+			}
 			return fmt.Errorf(
 				"scale deployment kube-system/descheduler to %d replicas: %w",
 				want, err)

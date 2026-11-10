@@ -92,13 +92,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Connection pool tuned for the fan-out shape: 16 check-webhook
+	// workers + 8 index workers all share this client, so idle conns
+	// must cover the burst or every POST re-dials the ATC.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 64
+	transport.MaxIdleConnsPerHost = 32
+	transport.MaxConnsPerHost = 32
+	transport.IdleConnTimeout = 90 * time.Second
+
 	client := &concourse.Client{
 		BaseURL:      envx.String("CONCOURSE_URL", "http://concourse-web:8080"),
 		Team:         envx.String("CONCOURSE_TEAM", "main"),
 		User:         user,
 		Password:     password,
 		WebhookToken: os.Getenv("CI_WEBHOOK_TOKEN"),
-		HTTP:         &http.Client{Timeout: 15 * time.Second},
+		HTTP:         &http.Client{Timeout: 15 * time.Second, Transport: transport},
 		IndexTTL:     time.Minute,
 	}
 

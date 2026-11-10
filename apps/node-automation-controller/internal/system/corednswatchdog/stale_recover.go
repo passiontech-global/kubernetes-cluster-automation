@@ -60,6 +60,17 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 			"pods", suspects, "notReady", notReady)
 		return nil
 	}
+	// Fleet not fully ready = a rollout is already recreating pods —
+	// check BEFORE the maintenance mutex/budget so a mid-rollout
+	// sweep never spends a heal token on a skip it already knows.
+	if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
+		// Legitimate skip — recovery would stack on the in-flight
+		// rollout it is waiting for.
+		log.Info("SKIP recovery: coredns not fully ready",
+			"pods", suspects,
+			"ready", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
+		return nil
+	}
 	// Maintenance mutex — a SECOND, different storm signal alongside
 	// the NotReady gate above: cordon/kured/autopilot mean a drain
 	// or k0s upgrade is in flight and pod deletes must not race it.
@@ -76,15 +87,6 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		return nil
 	}
 	if !proceed {
-		return nil
-	}
-	// Fleet not fully ready = a rollout is already recreating pods.
-	if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
-		// Legitimate skip — recovery would stack on the in-flight
-		// rollout it is waiting for.
-		log.Info("SKIP recovery: coredns not fully ready",
-			"pods", suspects,
-			"ready", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
 		return nil
 	}
 

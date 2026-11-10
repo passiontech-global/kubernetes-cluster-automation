@@ -32,6 +32,24 @@ func cliConfig(t *testing.T, rules []testutil.ExecRule) (Config, *testutil.FakeE
 	}, fr
 }
 
+// A Config New rejects (non-identifier table) prints the init
+// failure line and exits 1 — before any probe check runs.
+func TestRunCheckCLIInitFailure(t *testing.T) {
+	cfg, _ := cliConfig(t, nil)
+	cfg.Table = "kine; DROP TABLE kine"
+	var out bytes.Buffer
+	if code := RunCheckCLI(context.Background(), cfg, &out); code != 1 {
+		t.Fatalf("exit=%d want 1:\n%s", code, out.String())
+	}
+	got := out.String()
+	if !strings.HasPrefix(got, "check-kine-db: init:") {
+		t.Fatalf("output=%q want init-failure prefix", got)
+	}
+	if strings.Contains(got, "== kine DB probe on") {
+		t.Fatalf("probe ran despite the init failure:\n%s", got)
+	}
+}
+
 func TestRunCheckCLIAllOK(t *testing.T) {
 	cfg, _ := cliConfig(t, kdepstest.ProbeOKRules)
 	var out bytes.Buffer

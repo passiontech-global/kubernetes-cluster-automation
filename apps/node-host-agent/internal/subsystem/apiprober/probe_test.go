@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -479,6 +480,101 @@ func TestListRVTLSErrorClass(t *testing.T) {
 			strings.TrimPrefix(srv.URL, "http://"), "/x")
 		if fc != failTLS || rv != 0 {
 			t.Fatalf("listRV(plain http) = %d, %v want 0, failTLS", rv, fc)
+		}
+	})
+}
+
+// failDetail renders the (class, error) structured-log field — "" on
+// any success shape, "<class>: <err>" otherwise.
+func TestFailDetail(t *testing.T) {
+	for _, tc := range []struct {
+		c    failClass
+		err  error
+		want string
+	}{
+		{failNone, errors.New("boom"), ""},
+		{failAuth, nil, ""},
+		{failNone, nil, ""},
+		{failAuth, errors.New("HTTP 401 from apiserver"),
+			"auth: HTTP 401 from apiserver"},
+	} {
+		if got := failDetail(tc.c, tc.err); got != tc.want {
+			t.Fatalf("failDetail(%q, %v)=%q want %q", tc.c, tc.err, got, tc.want)
+		}
+	}
+}
+
+// decodeListRV token-walks just deep enough for metadata — every
+// branch decides whether listRV classifies a fault as failParse
+// (errBadPayload / syntax / EOF) or failBody (anything else in the
+// walk), i.e. apiserver-side evidence vs a stream fault.
+func TestDecodeListRVTokenWalk(t *testing.T) {
+	t.Run("stops at metadata past nested values", func(t *testing.T) {
+		// Nested objects and arrays before metadata force the depth
+		// tracking (delim open/close + continue) to actually run; the
+		// trailing items must stay unread.
+		var rv string
+		dec := json.NewDecoder(strings.NewReader(
+			`{"apiVersion":"v1","spec":{"nested":{"deep":1}},"arr":[1,2],` +
+				`"metadata":{"resourceVersion":"42"},"items":[]}`))
+		if err := decodeListRV(dec, &rv); err != nil {
+			t.Fatalf("decodeListRV: %v", err)
+		}
+		if rv != "42" {
+			t.Fatalf("rv=%q want 42", rv)
+		}
+	})
+	t.Run("unexpected start", func(t *testing.T) {
+		err := decodeListRV(json.NewDecoder(strings.NewReader(`[1,2]`)),
+			new(string))
+		if !errors.Is(err, errBadPayload) ||
+			!strings.Contains(err.Error(), "unexpected JSON start") {
+			t.Fatalf("decodeListRV(array)=%v want errBadPayload start", err)
+		}
+	})
+	t.Run("empty payload", func(t *testing.T) {
+		if err := decodeListRV(json.NewDecoder(strings.NewReader(``)),
+			new(string)); !errors.Is(err, io.EOF) {
+			t.Fatalf("decodeListRV(empty)=%v want EOF", err)
+		}
+	})
+	t.Run("truncated mid-walk", func(t *testing.T) {
+		// EOF before metadata lands — a stream fault. Mid-object the
+		// decoder surfaces io.ErrUnexpectedEOF (plain io.EOF only for
+		// a fully empty body); listRV classes everything but
+		// syntax/errBadPayload as failBody, so this is a body fault.
+		err := decodeListRV(
+			json.NewDecoder(strings.NewReader(`{"metadata"`)), new(string))
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("decodeListRV(truncated)=%v want ErrUnexpectedEOF", err)
+		}
+	})
+	t.Run("truncated before metadata key completes", func(t *testing.T) {
+		// Dies inside the walk's own Token() — metadata never seen.
+		// (Top-of-value exhaustion surfaces plain io.EOF, mid-object
+		// io.ErrUnexpectedEOF; listRV classes both as failParse.)
+		err := decodeListRV(
+			json.NewDecoder(strings.NewReader(`{"a"`)), new(string))
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("decodeListRV(truncated key)=%v want EOF", err)
+		}
+	})
+	t.Run("metadata not an object", func(t *testing.T) {
+		// A decode fault inside the walk is neither syntax nor
+		// errBadPayload — listRV must NOT class it as failParse.
+		err := decodeListRV(json.NewDecoder(strings.NewReader(`{"metadata":5}`)),
+			new(string))
+		if err == nil || errors.Is(err, errBadPayload) || errors.Is(err, io.EOF) {
+			t.Fatalf("decodeListRV(metadata=5)=%v want body-read class", err)
+		}
+	})
+	t.Run("empty resourceVersion", func(t *testing.T) {
+		err := decodeListRV(
+			json.NewDecoder(strings.NewReader(`{"metadata":{"resourceVersion":""}}`)),
+			new(string))
+		if !errors.Is(err, errBadPayload) ||
+			!strings.Contains(err.Error(), "empty metadata.resourceVersion") {
+			t.Fatalf("decodeListRV(empty rv)=%v want errBadPayload", err)
 		}
 	})
 }

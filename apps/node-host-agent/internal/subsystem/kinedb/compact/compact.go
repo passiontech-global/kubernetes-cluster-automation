@@ -291,7 +291,16 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 	// except when the marker is already ahead (then to head).
 	target := head - g.d.Cfg.Tail
 	if target <= crev {
-		target = head
+		// Fewer than Tail new revisions since the last compact —
+		// pushing compact_revision to head would erase the watch
+		// tail buffer and storm the apiserver with 410 Gone. Hold
+		// at crev instead so the DELETE only sweeps history; a
+		// never-compacted DB (crev==0) still falls back to head.
+		if crev > 0 {
+			target = crev
+		} else {
+			target = head
+		}
 	}
 	// compact-step-cap: never step the whole window in one cycle.
 	target = g.clampStepTarget(crev, target)

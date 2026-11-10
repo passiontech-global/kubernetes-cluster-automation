@@ -4,11 +4,16 @@
 package heal
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // resetBudget restores the inert (unconfigured) gate after a test —
@@ -89,6 +94,164 @@ func TestAllowedVNoBudgetIsInert(t *testing.T) {
 			t.Fatalf("call %d = (%v,%v) with no budget, want (true,false)",
 				i, proceed, unverifiable)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Refund — the refused-eviction counterpart of the grant gate.
+// ---------------------------------------------------------------------------
+
+// Refund returns exactly the grant Allow consumed: the window's
+// remaining grant count is restored to its pre-Allow value, a refund
+// for an instant that consumed no grant removes nothing (it can
+// never eat a sibling grant), and the cap still holds after a
+// refund-and-refill.
+func TestBudgetRefundRestoresWindowExactly(t *testing.T) {
+	b := NewBudget(2, time.Minute)
+	now := time.Now()
+	if !b.Allow(now) || !b.Allow(now) {
+		t.Fatal("grants denied under the cap")
+	}
+	if b.Allow(now.Add(time.Second)) {
+		t.Fatal("third grant allowed past the cap")
+	}
+	// Refunding one consumed stamp re-opens exactly one slot.
+	b.Refund(now)
+	if !b.Allow(now.Add(time.Second)) {
+		t.Fatal("grant denied after a refund — window not restored")
+	}
+	if b.Allow(now.Add(2 * time.Second)) {
+		t.Fatal("more grants allowed than the cap after refund")
+	}
+	// A refund for an instant that never consumed a grant must not
+	// eat the OTHER stamp: the window stays full, the cap holds.
+	b.Refund(now.Add(time.Hour))
+	if b.Allow(now.Add(2 * time.Second)) {
+		t.Fatal("over-refund freed a slot no refund earned")
+	}
+}
+
+// A double refund is a no-op — the second finds no stamp Equal(now)
+// and cannot push the count below the grants actually consumed — and
+// a refund for a stamp that already expired out of the window is
+// equally inert.
+func TestBudgetRefundDoubleAndExpiredInert(t *testing.T) {
+	b := NewBudget(1, time.Minute)
+	now := time.Now()
+	if !b.Allow(now) {
+		t.Fatal("first grant denied under the cap")
+	}
+	if b.Allow(now) {
+		t.Fatal("second grant allowed past the cap")
+	}
+	b.Refund(now)
+	b.Refund(now) // double refund — nothing left to remove
+	if !b.Allow(now) {
+		t.Fatal("grant denied after a double refund")
+	}
+	if b.Allow(now) {
+		t.Fatal("cap lost after double refund — count went negative")
+	}
+	// Past the window the stamp expires out; refunding that instant
+	// must not conjure room by removing a LIVE stamp (none Equal(now)
+	// exists — the newest grant at now+61s must survive).
+	b2 := NewBudget(1, time.Minute)
+	t0 := time.Now()
+	if !b2.Allow(t0) {
+		t.Fatal("grant denied under the cap")
+	}
+	b2.Refund(t0.Add(-2 * time.Minute)) // never granted
+	b2.Refund(t0.Add(2 * time.Minute))  // a stamp that exists but at the wrong instant
+	if !b2.Allow(t0.Add(61 * time.Second)) {
+		t.Fatal("expired stamp's instant refunded a live sibling grant")
+	}
+}
+
+// A PDB-refused EvictPodV hands its budget grant back: consecutive
+// refused sweeps never drain the window — the pre-fix split shape
+// (AllowedV at the caller, EvictPod at the delete) burned one grant
+// per sweep on a PDB-hung target and starved every other heal-gated
+// module. refused stays a deferral: (proceed, !unverifiable, false,
+// refused=true, nil) both times.
+func TestEvictPodVRefusalRefundsGrant(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
+	cs := fake.NewSimpleClientset(p)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewTooManyRequests(
+				"pdb allows no disruptions", 0)
+		})
+	now := time.Now()
+	for i := range 2 {
+		proceed, unverifiable, evicted, refused, err := EvictPodV(ctx,
+			logr.Discard(), nil, cs, planAwareDyn(), nil,
+			fmt.Sprintf("k%d", i), 0, p, now)
+		if !proceed || unverifiable || evicted || !refused || err != nil {
+			t.Fatalf("refused sweep %d = (%v,%v,%v,%v,%v), want (true,false,false,true,nil)",
+				i+1, proceed, unverifiable, evicted, refused, err)
+		}
+	}
+	// Both grants were refunded: exactly ONE slot is free again — the
+	// window is restored, not over-credited.
+	b := defaultBudget.Load()
+	if b == nil {
+		t.Fatal("budget not configured")
+	}
+	if !b.Allow(now.Add(time.Second)) {
+		t.Fatal("window not restored after two refused evictions")
+	}
+	if b.Allow(now.Add(2 * time.Second)) {
+		t.Fatal("refund over-credited the window")
+	}
+}
+
+// Refusal then delivery: the refusal's grant is returned and the
+// DELIVERED eviction consumes and KEEPS its own — one grant per
+// delivered heal stays the accounting (the contract the linkerd
+// endpoint-sync sweep pins at its call site), so a third key defers
+// once the window's single grant is spent for real.
+func TestEvictPodVRefusalThenDeliveryAccounting(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	now := time.Now()
+	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, now)
+	refusing := fake.NewSimpleClientset(p)
+	refusing.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewTooManyRequests(
+				"pdb allows no disruptions", 0)
+		})
+	proceed, unverifiable, evicted, refused, err := EvictPodV(ctx, logr.Discard(),
+		nil, refusing, planAwareDyn(), nil, "k", 0, p, now)
+	if !proceed || unverifiable || evicted || !refused || err != nil {
+		t.Fatalf("refusal = (%v,%v,%v,%v,%v), want (true,false,false,true,nil)",
+			proceed, unverifiable, evicted, refused, err)
+	}
+	// The delivered bounce rides a PDB-free clientset one minute later.
+	delivering := fake.NewSimpleClientset(p)
+	proceed, unverifiable, evicted, refused, err = EvictPodV(ctx, logr.Discard(),
+		nil, delivering, planAwareDyn(), nil, "k2", 0, p, now.Add(time.Minute))
+	if !proceed || unverifiable || !evicted || refused || err != nil {
+		t.Fatalf("delivery = (%v,%v,%v,%v,%v), want (true,false,true,false,nil)",
+			proceed, unverifiable, evicted, refused, err)
+	}
+	// The delivered grant stays spent — a third key defers (fail
+	// closed, no error owed).
+	proceed, unverifiable = AllowedV(ctx, logr.Discard(), nil,
+		delivering, planAwareDyn(), nil, "k3", 0, now.Add(2*time.Minute))
+	if proceed || unverifiable {
+		t.Fatalf("post-delivery grant = (%v,%v), want (false,false) — delivered heal must keep its grant",
+			proceed, unverifiable)
 	}
 }
 
@@ -247,4 +410,71 @@ func TestTryAcquireTargetGlobalOpenFiresHook(t *testing.T) {
 	if ok, _ := TryAcquireTarget("m", "n", now.Add(time.Minute)); !ok {
 		t.Fatal("grant denied after global healthy reset")
 	}
+}
+
+// The forget hook fires once per history drop — the healthy reset,
+// the inline expiry GC inside the next consult, and the bulk prune —
+// and stays silent for a healthy call with no history to drop. This
+// is the series-prune bridge's contract: a target the breaker no
+// longer tracks must be reported exactly once per forget.
+func TestTargetBreakerForgetHookFiresPerDrop(t *testing.T) {
+	b := NewTargetBreaker(TargetBreakerLimit, TargetBreakerWindow)
+	var forgot []string
+	b.SetForgetHook(func(module, target string) {
+		forgot = append(forgot, module+"/"+target)
+	})
+	now := time.Now()
+	// Healthy reset with NO history: silent.
+	b.RecordTargetHealthy("m", "n0")
+	if len(forgot) != 0 {
+		t.Fatalf("healthy clear without history fired the forget hook: %v", forgot)
+	}
+	// Open an episode, then converge: exactly one forget.
+	for range TargetBreakerLimit {
+		b.TryAcquireTarget("m", "n1", now)
+	}
+	b.RecordTargetHealthy("m", "n1")
+	if len(forgot) != 1 || forgot[0] != "m/n1" {
+		t.Fatalf("healthy reset forgets = %v, want [m/n1]", forgot)
+	}
+	// Expiry GC: grants fully expire, the next consult GCs the entry
+	// and fires the hook once — while still GRANTING (fresh history).
+	for range TargetBreakerLimit {
+		b.TryAcquireTarget("m", "n2", now)
+	}
+	if ok, _ := b.TryAcquireTarget("m", "n2", now.Add(TargetBreakerWindow+time.Second)); !ok {
+		t.Fatal("grant denied after expiry GC")
+	}
+	if len(forgot) != 2 || forgot[1] != "m/n2" {
+		t.Fatalf("expiry GC forgets = %v, want append m/n2", forgot)
+	}
+	// The consult after the GC starts a fresh history — no second
+	// forget for the same drop.
+	if _, r := b.TryAcquireTarget("m", "n2", now.Add(TargetBreakerWindow+2*time.Second)); r != "" {
+		t.Fatalf("fresh history rejected: %q", r)
+	}
+	if len(forgot) != 2 {
+		t.Fatalf("forget re-fired for a live history: %v", forgot)
+	}
+}
+
+// The package-global forget wiring mirrors the open hook: wired on
+// the configured breaker, dropped with the instance on reconfigure.
+func TestTargetBreakerGlobalForgetHook(t *testing.T) {
+	resetTargetBreaker(t)
+	fired := 0
+	ConfigureTargetBreaker(TargetBreakerLimit, TargetBreakerWindow)
+	SetTargetCircuitForgetHook(func(module, target string) { fired++ })
+	now := time.Now()
+	for range TargetBreakerLimit {
+		TryAcquireTarget("m", "n", now)
+	}
+	RecordTargetHealthy("m", "n")
+	if fired != 1 {
+		t.Fatalf("global forget hook fired %d times, want 1", fired)
+	}
+	// Unset before a breaker exists: the package-level setter is a
+	// no-op, not a panic.
+	ConfigureTargetBreaker(0, 0)
+	SetTargetCircuitForgetHook(func(module, target string) { fired++ })
 }

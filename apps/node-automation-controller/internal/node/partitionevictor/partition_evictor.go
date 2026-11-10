@@ -202,6 +202,25 @@ func nodePartitioned(n *corev1.Node, now time.Time) bool {
 	return false
 }
 
+// livePartitionTrue reports whether the LIVE node still reports any
+// partition condition True — by status alone, deliberately without
+// nodePartitioned's age and heartbeat gates. This is the untaint
+// direction of the same signal: eviction needs PROOF a partition is
+// real (aged past partitionMinAge, live-heartbeat vouch) before it
+// acts, but an untaint needs PROOF the partition is gone before the
+// fence comes down. So every True counts against recovery: a fresh
+// latch still inside partitionMinAge, and a zombie one the wedged
+// reporter can no longer vouch for, both keep the fence up this
+// sweep even though nodePartitioned would flag neither.
+func livePartitionTrue(n *corev1.Node) bool {
+	for _, t := range partitionCondTypes {
+		if c := kube.NodeCondition(n, t); c != nil && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
 // partitionEvictNamespaces parses PARTITION_EVICT_NAMESPACES into the
 // namespace set the sweep evicts from: comma-separated, entries
 // trimmed, blanks dropped (so "a, ,b" and trailing commas produce no

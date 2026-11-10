@@ -6,8 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // nebulaWD is a minimal nebula-active watchdog config for the MTU
@@ -259,5 +263,269 @@ func TestCiliumWGMTUInvariantCompliantNoClamp(t *testing.T) {
 	n.checkNebulaMTUBlackhole(ctx, st)
 	if e.host.Ran("-o cilium_wg0") {
 		t.Fatal("clamp fired although cilium_wg0 satisfies the MTU invariant")
+	}
+}
+
+// --- prober loop ---
+
+// The prober loop ticks on the nethealth Interval, probes every 5th
+// invocation, and writes the gauge EVERY invocation; an unset
+// Interval falls back to the module default instead of a zero
+// ticker.
+func TestMTUProbeLoopTicksAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	textfileDirOverride = dir
+	defer func() { textfileDirOverride = "" }()
+	e := mtuEnv(t)
+	n := e.n
+	st := n.mtuState()
+	n.cfg.Interval = 5 * time.Millisecond // fast ticks
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.mtuProbeLoop(ctx, st)
+	}()
+	waitForCond(t, 2*time.Second, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.cycle >= 6
+	})
+	cancel()
+	<-done
+	st.mu.Lock()
+	probed := st.cycle >= 5 // cycle 5 is the first %5==0 tick
+	st.mu.Unlock()
+	if !probed {
+		t.Fatalf("no probe tick reached within %d cycles", st.cycle)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "node-agent-nebula-mtu.prom")); err != nil {
+		t.Fatalf("gauge not written on off-invocations: %v", err)
+	}
+
+	// Zero Interval → the module default keeps the ticker sane; the
+	// up-front invocation still counts as cycle #1 and writes the
+	// gauge.
+	e2 := mtuEnv(t)
+	e2.n.cfg.Interval = 0
+	st2 := e2.n.mtuState()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		e2.n.mtuProbeLoop(ctx2, st2)
+	}()
+	// The up-front invocation is cycle #1 even on the 2m default.
+	waitForCond(t, 2*time.Second, func() bool {
+		st2.mu.Lock()
+		defer st2.mu.Unlock()
+		return st2.cycle >= 1
+	})
+	cancel2()
+	<-done2
+	st2.mu.Lock()
+	defer st2.mu.Unlock()
+	if st2.cycle != 1 {
+		t.Fatalf("up-front invocation not counted: cycle=%d", st2.cycle)
+	}
+}
+
+// The MSS clamp rate limit: the first latch spends the 30m budget,
+// immediate re-invocations are no-ops (no extra iptables forks), and
+// the clamp falls back to the neb1 default dev name when the conf
+// carries none. A FAILED -A must NOT spend the budget — the next
+// tick retries immediately while flows still blackhole.
+func TestMaybeClampNebulaMSSRateLimitAndFailure(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	// Rule absent (-C fails) and -A failing: clamp fails, budget not
+	// spent.
+	e.host.FailOn("-C POSTROUTING", errCmdFail)
+	e.host.FailOn("-A POSTROUTING", errCmdFail)
+	n.maybeClampNebulaMSS(ctx, n.cfg.Watchdog, st)
+	if !strings.Contains(logLines(t, e), "MSS clamp failed on neb1") {
+		t.Fatalf("missing clamp-failure log:\n%s", logLines(t, e))
+	}
+	st.mu.Lock()
+	spent := !st.lastClamp.IsZero()
+	st.mu.Unlock()
+	if spent {
+		t.Fatal("clamp budget spent on a failed iptables run")
+	}
+	// Now let the -A succeed: budget spent, both devs clamped
+	// (NebulaDev=neb1 here; the empty-dev default is covered below).
+	e.host.Clear("-A POSTROUTING")
+	n.maybeClampNebulaMSS(ctx, n.cfg.Watchdog, st)
+	st.mu.Lock()
+	spent = !st.lastClamp.IsZero()
+	st.mu.Unlock()
+	if !spent {
+		t.Fatal("clamp budget not spent on a delivered clamp")
+	}
+	e.host.ClearLog()
+	n.maybeClampNebulaMSS(ctx, n.cfg.Watchdog, st) // inside 30m window
+	if e.host.Ran("iptables") {
+		t.Fatalf("clamp re-forked inside the 30m rate limit: %v", e.host.Cmds())
+	}
+}
+
+// An empty NebulaDev falls back to the neb1 script constant —
+// neither an empty iptables -o nor a panic.
+func TestMaybeClampNebulaMSSEmptyDev(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	wd := &watchdogconf.Config{} // no NebulaDev
+	n.maybeClampNebulaMSS(ctx, wd, n.mtuState())
+	if !e.host.Ran("-o neb1") {
+		t.Fatalf("clamp did not target the neb1 default dev: %v", e.host.Cmds())
+	}
+}
+
+// unclampMSSOn: a rule the -C probe cannot confirm is a silent
+// no-op; a confirmed rule whose -D fails is logged and leaves the
+// mss_unclamp metric alone.
+func TestUnclampMSSPaths(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	// Rule absent/uncheckable → no-op (fixture fake answers -C with
+	// success by default; force failure).
+	e.host.FailOn("-C POSTROUTING -o neb1", errCmdFail)
+	e.host.ClearLog()
+	n.unclampMSSOn(ctx, "neb1")
+	if e.host.Ran("-D POSTROUTING") {
+		t.Fatal("unclamp -D ran without a confirmed rule")
+	}
+	// Rule present, delete fails → logged, no metric.
+	e.host.On("-C POSTROUTING -o neb1", "ok\n")
+	e.host.FailOn("-D POSTROUTING -o neb1", errCmdFail)
+	n.unclampMSSOn(ctx, "neb1")
+	if !strings.Contains(logLines(t, e), "MSS unclamp failed on neb1") {
+		t.Fatalf("missing unclamp-failure log:\n%s", logLines(t, e))
+	}
+	if got := promtest.ToFloat64(n.actions.WithLabelValues(
+		mtuCheckName, "mss_unclamp")); got != 0 {
+		t.Fatalf("mss_unclamp metric=%v want 0 on failed delete", got)
+	}
+	// Successful delete → metric + ACTION line.
+	e.host.On("-D POSTROUTING -o neb1", "")
+	e.host.ClearLog()
+	n.unclampMSSOn(ctx, "neb1")
+	if got := promtest.ToFloat64(n.actions.WithLabelValues(
+		mtuCheckName, "mss_unclamp")); got != 1 {
+		t.Fatalf("mss_unclamp metric=%v want 1", got)
+	}
+	if !strings.Contains(logLines(t, e),
+		"removed the TCP MSS clamp on neb1") {
+		t.Fatalf("missing unclamp ACTION line:\n%s", logLines(t, e))
+	}
+}
+
+// sysfsMTU parses the interface MTU; junk content is an error, not
+// a zero MTU that would satisfy the invariant.
+func TestSysfsMTUParsing(t *testing.T) {
+	e := mtuEnv(t)
+	root := t.TempDir()
+	e.n.cfg.HostRoot = root
+	if _, err := e.n.sysfsMTU("absent0"); err == nil {
+		t.Fatal("missing dev MTU read succeeded")
+	}
+	path := filepath.Join(root, "sys", "class", "net", "junk0", "mtu")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("not-a-number\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.n.sysfsMTU("junk0"); err == nil {
+		t.Fatal("garbage MTU parsed without error")
+	}
+}
+
+// The invariant needs BOTH MTUs: a cilium_wg0 with a readable MTU
+// but an unreadable nebula dev MTU must not clamp on a half-read
+// comparison.
+func TestCiliumWGMTUInvariantMissingNebMTU(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	n.cfg.HostRoot = ciliumSysfsMTU(t, map[string]string{
+		"cilium_wg0": "1420", // violating — but neb1 MTU unreadable
+	})
+	n.checkCiliumWGMTUInvariant(ctx, "neb1", st)
+	if e.host.Ran("-o cilium_wg0") {
+		t.Fatal("clamp decided on a half-read invariant")
+	}
+	st.mu.Lock()
+	known := st.wgClampKnown
+	st.mu.Unlock()
+	if known {
+		t.Fatal("wgClampKnown set without a complete invariant check")
+	}
+}
+
+// A violating cilium_wg0 whose clamp exec fails warns and keeps
+// wgClampKnown unset — the next probe cycle retries the clamp.
+func TestCiliumWGMTUInvariantClampFailureRetries(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	ctx := context.Background()
+	st := n.mtuState()
+	n.cfg.HostRoot = ciliumSysfsMTU(t, map[string]string{
+		"neb1":       "1300",
+		"cilium_wg0": "1420",
+	})
+	e.host.FailOn("-C POSTROUTING -o cilium_wg0", errCmdFail)
+	e.host.FailOn("-A POSTROUTING -o cilium_wg0", errCmdFail)
+	n.checkCiliumWGMTUInvariant(ctx, "neb1", st)
+	if !strings.Contains(logLines(t, e), "cilium_wg0 MSS clamp failed") {
+		t.Fatalf("missing invariant clamp-failure warn:\n%s", logLines(t, e))
+	}
+	st.mu.Lock()
+	known := st.wgClampKnown
+	st.mu.Unlock()
+	if known {
+		t.Fatal("wgClampKnown set although the clamp never landed")
+	}
+	// And the healthy DF ping still passes below (overlay unaffected).
+	e.pingOK["10.128.0.2|false"] = true
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if _, err := os.Stat(filepath.Join(e.state,
+		"state-nebula-mtu-blackhole")); !os.IsNotExist(err) {
+		t.Fatal("blackhole latched without a DF failure")
+	}
+}
+
+// The textfile gauge degrades silently when the directory cannot be
+// created or the write fails — the probe loop must survive a broken
+// node-exporter mount.
+func TestMTUMetricWriteFailuresDegrade(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	st := n.mtuState()
+	// A FILE squatting the textfile dir path → MkdirAll fails.
+	blocker := filepath.Join(t.TempDir(), "textfile")
+	testutil.WriteFile(t, blocker, "not a dir\n")
+	textfileDirOverride = blocker
+	defer func() { textfileDirOverride = "" }()
+	n.writeMTUBHMetric(st) // mkdir fails → debug log, return
+
+	// A read-only dir → promfile.Write fails after mkdir succeeds.
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	st.mu.Lock()
+	st.lastGauge = "" // force the write attempt
+	st.mu.Unlock()
+	textfileDirOverride = dir
+	n.writeMTUBHMetric(st)
+	if _, err := os.Stat(filepath.Join(dir, "node-agent-nebula-mtu.prom")); !os.IsNotExist(err) {
+		t.Fatal("metric file appeared despite a failed write")
 	}
 }

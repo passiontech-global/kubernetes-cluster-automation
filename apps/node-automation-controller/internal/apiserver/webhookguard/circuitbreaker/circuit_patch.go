@@ -138,14 +138,21 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 // evalHook runs one sub-webhook through the four verdict branches —
 // recover-defer / recover-confirmed, still-broken re-assert, and the
 // dead-backend trip candidate. Anything else (healthy entry, blind
-// probe source) needs no write.
+// probe source) needs no write. An unmeasurable ref (svcEffective ==
+// svcRaw == -1: a URL webhook, or a Service ref with an empty
+// namespace/name) can neither trip nor recover — a broken entry with
+// one NEVER advances the recover streak; it freezes in evalStillBroken
+// until the ref points at a measurable Service again, because
+// flipping the policy back to Fail on zero evidence a backend was
+// ever probed would un-fail-close a live outage.
 func (e *circuitEval) evalHook(h hookView) {
 	e.present[h.name] = true
 	key := e.kind + "/" + e.cfgName + "/" + h.name
 	isBroken := e.broken[h.name]
 	// svcEffective < 0 marks "not Service-backed" — URL webhooks
 	// and malformed refs are unmeasurable, the breaker never
-	// trips them. Effective excludes Ready endpoints sitting on
+	// trips them and never recovers them (the -1 freeze keeps the
+	// entry in evalStillBroken). Effective excludes Ready endpoints sitting on
 	// partitioned/unresponsive nodes (endpoint-census); Raw keeps them for
 	// the threshold pick.
 	svcEffective, svcRaw := -1, -1
@@ -166,7 +173,13 @@ func (e *circuitEval) evalHook(h hookView) {
 			e.ready.Probed[svc] && !e.ready.Responsive[svc] && !e.blind
 	}
 	switch {
-	case isBroken && svcEffective != 0 && !unresponsive && !e.blind:
+	// Recover only on MEASURABLE, non-zero census evidence — both
+	// counters must have left the -1 sentinel (a URL webhook or
+	// malformed Service ref is unmeasurable and must NEVER advance
+	// the streak) and effective must be positive (0 endpoints is a
+	// backend that is still dead, not a recovered one; effective > 0
+	// implies raw > 0, spelled out for symmetry with the freeze).
+	case isBroken && svcEffective > 0 && svcRaw > 0 && !unresponsive && !e.blind:
 		e.evalRecover(h, key, svc)
 	case isBroken:
 		e.evalStillBroken(h, key)
@@ -214,10 +227,13 @@ func (e *circuitEval) evalRecover(h hookView, key, svc string) {
 
 // evalStillBroken re-asserts Ignore on an annotation-broken entry
 // whose backend is still dead — the annotation is the SSOT, so a
-// policy flipped back externally is corrected. The series
-// re-asserts post-patch via stillBroken: a failed patch leaves the
-// annotation unverifiable, so marking it emitted here would let the
-// prune keep (or drop) the wrong set.
+// policy flipped back externally is corrected. This is also the
+// unmeasurable ref's freeze: a URL-rewritten (or malformed-ref)
+// entry lands here every sweep, and the streak clear below is what
+// keeps a half-advanced healthy streak from surviving the rewrite.
+// The series re-asserts post-patch via stillBroken: a failed patch
+// leaves the annotation unverifiable, so marking it emitted here
+// would let the prune keep (or drop) the wrong set.
 func (e *circuitEval) evalStillBroken(h hookView, key string) {
 	e.b.clearHealthyStreak(key) // the healthy streak must be CONSECUTIVE
 	if h.fp == nil || *h.fp != admissionv1.Ignore {

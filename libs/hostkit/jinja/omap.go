@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 
 	yaml3 "go.yaml.in/yaml/v3"
@@ -57,6 +58,22 @@ func (m *OMap) Del(k string) {
 			return
 		}
 	}
+}
+
+// omFromStringMap boxes a plain Go string map into an *OMap with
+// sorted keys — dict2items needs the OMap item shape, and Go's
+// random map order would make the output nondeterministic.
+func omFromStringMap[V any](m map[string]V) *OMap {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	om := NewOMap()
+	for _, k := range keys {
+		om.Set(k, m[k])
+	}
+	return om
 }
 
 // Items returns ordered [key,value] pairs (jinja dict2items shape).
@@ -105,6 +122,25 @@ func DecodeYAML(data []byte) (any, error) {
 			return nil, err
 		}
 	}
+}
+
+// isDecimalInt reports whether s is an optionally-signed run of
+// ASCII digits — used to re-classify yaml.v3's !!float-tagged
+// leading-zero decimals ("08", "09") as the ints they are.
+func isDecimalInt(s string) bool {
+	i := 0
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	if i == len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // yamlMaxDepth bounds yamlNodeToValue — a recursive anchor
@@ -163,15 +199,35 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 			if i, err := strconv.ParseInt(n.Value, 0, 64); err == nil {
 				return i, nil
 			}
+			// "08"/"09": base-0 reads the leading 0 as octal and
+			// rejects them; YAML ints are decimal, so retry base-10
+			// before degrading to the raw string.
+			if i, err := strconv.ParseInt(n.Value, 10, 64); err == nil {
+				return i, nil
+			}
 			return n.Value, nil
 		case "!!float":
 			if f, err := strconv.ParseFloat(n.Value, 64); err == nil {
+				// yaml.v3 tags leading-zero decimals like "08"/"09"
+				// as !!float (they match no YAML 1.1 int pattern) —
+				// a digits-only scalar is an int in every practical
+				// sense; keep it int64. "1.0"/"1e3" keep float.
+				if isDecimalInt(n.Value) {
+					if i, ierr := strconv.ParseInt(n.Value, 10, 64); ierr == nil {
+						return i, nil
+					}
+				}
 				return f, nil
 			}
 			return n.Value, nil
 		case "!!bool":
 			return n.Value == "true" || n.Value == "True" || n.Value == "TRUE", nil
-		case "!!null", "":
+		case "!!null":
+			// Every YAML null spelling (~, null, Null, NULL, empty)
+			// is nil — returning n.Value leaked the literal "Null"
+			// string into templates.
+			return nil, nil
+		case "":
 			if n.Value == "" || n.Value == "null" || n.Value == "~" {
 				return nil, nil
 			}

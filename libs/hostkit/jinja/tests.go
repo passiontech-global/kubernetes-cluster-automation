@@ -20,11 +20,10 @@ func runTest(name string, v any, args []any) (bool, error) {
 	case "none":
 		return v == nil, nil
 	case "mapping":
-		_, ok := v.(*OMap)
-		return ok, nil
+		return isMappingValue(v), nil
 	case "iterable", "sequence":
 		switch v.(type) {
-		case []any, *List, *OMap, string:
+		case []any, *List, *OMap, map[string]any, map[string]string, string:
 			return true, nil
 		}
 		return false, nil

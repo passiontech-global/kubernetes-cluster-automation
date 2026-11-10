@@ -401,11 +401,18 @@ func mergeTemplateAnnos(obj metav1.Object, anno map[string]string) {
 	case *batchv1.CronJob:
 		set(&w.Spec.JobTemplate.Spec.Template.ObjectMeta)
 	case *unstructured.Unstructured:
-		m := make(map[string]any, len(anno))
-		for k, v := range anno {
-			m[k] = v
+		// Merge onto the annotations the object ALREADY carries —
+		// a blind SetNestedMap would drop keys patched earlier in
+		// the same sweep (skip-inbound-ports / skip-outbound-ports).
+		existing, _, _ := unstructured.NestedStringMap(w.Object,
+			"spec", "template", "metadata", "annotations")
+		if existing == nil {
+			existing = map[string]string{}
 		}
-		_ = unstructured.SetNestedMap(w.Object, m,
+		for k, v := range anno {
+			existing[k] = v
+		}
+		_ = unstructured.SetNestedStringMap(w.Object, existing,
 			"spec", "template", "metadata", "annotations")
 	}
 }

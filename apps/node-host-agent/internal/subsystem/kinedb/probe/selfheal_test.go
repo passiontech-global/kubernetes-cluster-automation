@@ -5,6 +5,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -323,5 +324,235 @@ func TestProbePsqlSessionsCarryAppName(t *testing.T) {
 	}
 	if !seenPG {
 		t.Fatal("probe cycle spawned no psql child (fixture drift)")
+	}
+}
+
+// --- reaper + wedge: read-only diagnostics and failure paths ---
+
+// TestReapStuckSessionsReadOnly: the check-kine-db contract — COUNT
+// what the reaper WOULD kill, run no terminate statement, stay
+// silent on a clean count.
+func TestReapStuckSessionsReadOnly(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Err: errors.New("must not run")},
+	})
+	k.d.Cfg.ReadOnly = true
+	var notes []string
+	note := func(s string) { notes = append(notes, s) }
+
+	fr.On("COUNT(pid)", "3\n")
+	k.reapStuckSessions(context.Background(), "pg", "postgres", "secret", note)
+	if len(notes) != 1 ||
+		!strings.Contains(notes[0], "read-only: 3 stuck kine session(s) would be reaped") {
+		t.Fatalf("notes=%v want one would-reap note", notes)
+	}
+	if fr.Ran("pg_terminate_backend") {
+		t.Fatal("read-only probe ran the terminate statement")
+	}
+
+	// A clean count reports nothing.
+	fr.On("COUNT(pid)", "0\n")
+	notes = nil
+	k.reapStuckSessions(context.Background(), "pg", "postgres", "secret", note)
+	if len(notes) != 0 {
+		t.Fatalf("notes=%v want none for a stuck-free read", notes)
+	}
+}
+
+// A failed read (either mode) notes and moves on — best-effort reaper.
+func TestReapStuckSessionsQueryFail(t *testing.T) {
+	for _, readOnly := range []bool{false, true} {
+		k, _, _ := fixture(t, []testutil.ExecRule{
+			{Substr: "pg_stat_activity", Err: errors.New("connection reset")},
+		})
+		k.d.Cfg.ReadOnly = readOnly
+		var notes []string
+		k.reapStuckSessions(context.Background(), "pg", "postgres", "secret",
+			func(s string) { notes = append(notes, s) })
+		if len(notes) != 1 || !strings.Contains(notes[0], "reap-sessions-fail") {
+			t.Fatalf("readOnly=%v notes=%v", readOnly, notes)
+		}
+	}
+}
+
+// The terminate path counts one 't' per killed backend — including
+// the single-trailing-'t' reply where the text ends without a
+// newline (boolToInt's reason to exist).
+func TestReapStuckSessionsTerminateCounts(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		want int64
+	}{
+		{"t\nt\nt\n", 3},
+		{"t", 1}, // single backend, -tA no trailing newline
+	} {
+		k, fr, _ := fixture(t, []testutil.ExecRule{
+			{Substr: "pg_terminate_backend", Out: tc.out},
+		})
+		var notes []string
+		k.reapStuckSessions(context.Background(), "pg", "postgres", "secret",
+			func(s string) { notes = append(notes, s) })
+		if got := k.d.M.IdleTermTotal; got != tc.want {
+			t.Fatalf("out=%q total=%d want %d", tc.out, got, tc.want)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], "reaped") {
+			t.Fatalf("out=%q notes=%v", tc.out, notes)
+		}
+		_ = fr
+	}
+	if boolToInt(true) != 1 || boolToInt(false) != 0 {
+		t.Fatal("boolToInt broken")
+	}
+}
+
+// activeBackendQueries: the count, and the two inconclusive shapes
+// (query failure, unparseable reply) that reset the starve streak.
+func TestActiveBackendQueriesPaths(t *testing.T) {
+	var notes []string
+	note := func(s string) { notes = append(notes, s) }
+
+	k2, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pid <> pg_backend_pid", Out: "4\n"},
+	})
+	if n, ok := k2.activeBackendQueries(context.Background(),
+		"pg", "postgres", "secret", note); !ok || n != 4 {
+		t.Fatalf("n=%d ok=%v want 4,true", n, ok)
+	}
+
+	k3, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pid <> pg_backend_pid", Err: errors.New("down")},
+	})
+	notes = nil
+	if n, ok := k3.activeBackendQueries(context.Background(),
+		"pg", "postgres", "secret", note); ok || n != 0 ||
+		len(notes) != 1 || !strings.Contains(notes[0], "active-queries-fail") {
+		t.Fatalf("n=%d ok=%v notes=%v", n, ok, notes)
+	}
+
+	k4, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pid <> pg_backend_pid", Out: "not-a-number\n"},
+	})
+	notes = nil
+	if n, ok := k4.activeBackendQueries(context.Background(),
+		"pg", "postgres", "secret", note); ok || n != 0 ||
+		len(notes) != 1 || !strings.Contains(notes[0], "active-queries-unparsed") {
+		t.Fatalf("n=%d ok=%v notes=%v", n, ok, notes)
+	}
+}
+
+// wedgeRes builds the Result half checkPGBWedge consumes — the pool
+// snapshot and the two auth checks drive every fire condition.
+func wedgeRes(e2eAuth, backendEnv int64, pool poolStats, poolSeen bool) *Result {
+	return &Result{
+		Checks: map[string]int64{
+			CheckE2EAuth:    e2eAuth,
+			CheckBackendEnv: backendEnv,
+			CheckWire:       1,
+			CheckContainers: 1,
+		},
+		poolSeen: poolSeen,
+		pool:     pool,
+	}
+}
+
+// The three read-only diagnostics: saturation, server-pool
+// starvation and the auth wedge each note (and only note) their
+// remediation is suppressed.
+func TestCheckPGBWedgeReadOnlyDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	var notes []string
+	note := func(s string) { notes = append(notes, s) }
+
+	// Saturated: cl_waiting far past WaitMax.
+	k, fr, _ := fixture(t, nil)
+	k.d.Cfg.ReadOnly = true
+	fr.On("pid <> pg_backend_pid", "0\n") // halfOpen shape → backend queried
+	res := wedgeRes(1, 1, poolStats{clWaiting: 50, serverConns: 3}, true)
+	k.checkPGBWedge(ctx, "pg", "pgb", "postgres", "secret", res, note)
+	if len(notes) != 1 || !strings.Contains(notes[0],
+		"read-only: pgbouncer saturated cl_waiting=50") {
+		t.Fatalf("saturated notes=%v", notes)
+	}
+
+	// Starved: classic queue shape, backend idle → RECONNECT suppressed.
+	k, fr, _ = fixture(t, nil)
+	k.d.Cfg.ReadOnly = true
+	fr.On("pid <> pg_backend_pid", "1\n")
+	notes = nil
+	res = wedgeRes(1, 1,
+		poolStats{clWaiting: 3, svActive: 0, serverConns: 5}, true)
+	k.checkPGBWedge(ctx, "pg", "pgb", "postgres", "secret", res, note)
+	if len(notes) != 1 || !strings.Contains(notes[0],
+		"server-pool starvation") {
+		t.Fatalf("starved notes=%v", notes)
+	}
+
+	// Auth wedge: e2e failed while the backend login still works.
+	k, _, _ = fixture(t, nil)
+	k.d.Cfg.ReadOnly = true
+	notes = nil
+	res = wedgeRes(0, 1, poolStats{}, false)
+	k.checkPGBWedge(ctx, "pg", "pgb", "postgres", "secret", res, note)
+	if len(notes) != 1 || !strings.Contains(notes[0],
+		"read-only: pgbouncer auth wedge") {
+		t.Fatalf("auth wedge notes=%v", notes)
+	}
+}
+
+// A pooler restart failure is noted and counts the cycle as failed —
+// the rate budget was spent on the attempt.
+func TestCheckPGBWedgeRestartFail(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "restart", Err: errors.New("container locked")},
+		{Substr: "pid <> pg_backend_pid", Out: "0\n"},
+	})
+	var notes []string
+	res := wedgeRes(1, 1, poolStats{clWaiting: 99, serverConns: 3}, true)
+	k.checkPGBWedge(context.Background(), "pg", "kine-pgbouncer",
+		"postgres", "secret", res,
+		func(s string) { notes = append(notes, s) })
+	// Note 1: the wedge itself; note 2: the failed restart.
+	if len(notes) != 2 || !strings.Contains(notes[1], "pgb-restart-fail") {
+		t.Fatalf("notes=%v", notes)
+	}
+	if !fr.Ran("restart kine-pgbouncer") {
+		t.Fatalf("restart did not run:\n%s", fr.Joined())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "guard", pgbRestartFile)); err != nil {
+		t.Fatalf("restart budget not spent: %v", err)
+	}
+}
+
+// The e2e-auth-fail streak persists across probes and resets to 0 on
+// a clean probe — the two-consecutive-probes contract.
+func TestCheckPGBWedgeE2EStreakPersistsAndResets(t *testing.T) {
+	failPath := func(k *Probe) string {
+		return filepath.Join(k.d.Cfg.GuardStateDir, pgbE2EFailFile)
+	}
+	// Stale streak from before a restart: one prior failure.
+	k, fr, dir := fixture(t, nil)
+	if err := os.MkdirAll(k.d.Cfg.GuardStateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kdeps.WriteIntFile(filepath.Join(dir, "guard", pgbE2EFailFile), 1)
+	var notes []string
+	res := wedgeRes(0, 1, poolStats{}, false)
+	k.checkPGBWedge(context.Background(), "pg", "pgb", "postgres", "secret",
+		res, func(s string) { notes = append(notes, s) })
+	if v, err := kdeps.ReadIntFile(failPath(k)); err != nil || v != 2 {
+		t.Fatalf("streak=%d err=%v want 2", v, err)
+	}
+	// fails=2 fires the restart — the auth-wedge reason text.
+	if !strings.Contains(fr.Joined(), "restart pgb") {
+		t.Fatalf("auth wedge streak 2 did not remediate:\n%s", fr.Joined())
+	}
+
+	// A clean probe resets the counter.
+	k2, _, _ := fixture(t, nil)
+	res = wedgeRes(1, 1, poolStats{}, false)
+	k2.checkPGBWedge(context.Background(), "pg", "pgb", "postgres", "secret",
+		res, func(string) {})
+	if v, err := kdeps.ReadIntFile(failPath(k2)); err != nil || v != 0 {
+		t.Fatalf("reset streak=%d err=%v want 0", v, err)
 	}
 }

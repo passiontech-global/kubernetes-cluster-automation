@@ -11,6 +11,7 @@ tasks:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - '/mise.toml'
 
   vet:
     command: 'go vet ./...'
@@ -19,12 +20,14 @@ tasks:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - '/mise.toml'
 
   format:
     script: 'test -z "$(gofmt -l .)"'
     toolchains: 'system'
     inputs:
       - '**/*.go'
+      - '/mise.toml'
 
   # golangci-lint (pinned in mise.toml) — part of the `moon ci` PR gate.
   # GOLANGCI_LINT_CACHE is per-project: `moon run :lint` spawns one
@@ -44,5 +47,6 @@ tasks:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - '/mise.toml'
       # golangci-lint resolves its config by walking up to the repo root.
       - '/.golangci.yml'

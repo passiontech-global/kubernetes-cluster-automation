@@ -292,6 +292,13 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		return
 	}
 
+	// Confirm the delete target exists BEFORE the persisted-cooldown
+	// + mutex + budget preamble — a StatefulSet with no matching pod
+	// must not spend a global heal token on a guaranteed no-op.
+	target := smallestOrdinalPod(pods, sig.sts.Name)
+	if target == nil {
+		return // no STS-named pod found — nothing safe to delete
+	}
 	// Gate 3 — persisted stamp → maintenance mutex in ONE call
 	// (Deps.HealAllowedPersisted folds the 30m wider-of in-RAM+
 	// persisted cooldown with the mutex, on the Deps-wide memoized
@@ -308,10 +315,6 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		return
 	}
 
-	target := smallestOrdinalPod(pods, sig.sts.Name)
-	if target == nil {
-		return // no STS-named pod found — nothing safe to delete
-	}
 	// UID precondition (inside heal.DeletePod) closes the list→delete
 	// TOCTOU: a same-named replacement pod is not ours to reap.
 	if _, err := heal.DeletePod(ctx, p.CS, &p.drPodHealed, stsKey, target, now); err != nil {

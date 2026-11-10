@@ -292,3 +292,147 @@ func TestGuardCycleScriptError(t *testing.T) {
 		t.Fatalf("textfile:\n%s", content)
 	}
 }
+
+// --- Cycle gate paths: creds, container down, stats read ---
+
+// Missing .env creds short-circuit the guard cycle — no query runs,
+// the cycle reads failed.
+func TestGuardCycleCredsMissing(t *testing.T) {
+	k, fr, dir := fixture(t, nil)
+	if err := os.WriteFile(filepath.Join(dir, ".env"),
+		[]byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := k.Cycle(context.Background())
+	if res.ok {
+		t.Fatal("missing creds must read failed")
+	}
+	if !containsGuardNote(res.notes, "missing .env creds") {
+		t.Fatalf("notes=%v", res.notes)
+	}
+	if fr.Ran("psql") {
+		t.Fatalf("guard ran queries without creds:\n%s", fr.Joined())
+	}
+}
+
+// A down postgres container short-circuits the same way.
+func TestGuardCycleContainerDown(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Err: errors.New("no such container")},
+		{Substr: "ps --format", Out: ""},
+	})
+	res := k.Cycle(context.Background())
+	if res.ok {
+		t.Fatal("down container must read failed")
+	}
+	if !containsGuardNote(res.notes, "postgres container kine-postgres down") {
+		t.Fatalf("notes=%v", res.notes)
+	}
+	if fr.Ran("psql") {
+		t.Fatalf("guard queried a down container:\n%s", fr.Joined())
+	}
+}
+
+// A failed stats read fails the cycle without firing; an
+// unparseable one does the same with its own note.
+func TestGuardCycleStatsReadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rule testutil.ExecRule
+		want string
+	}{
+		{"query fail", testutil.ExecRule{Substr: "MAX(id)",
+			Err: errors.New("connection reset")}, "stats query fail"},
+		{"unparsed", testutil.ExecRule{Substr: "MAX(id)",
+			Out: "garbage\n"}, "stats unparsed"},
+	} {
+		k, _, _ := fixture(t, []testutil.ExecRule{
+			{Substr: "inspect", Out: "true"},
+			tc.rule,
+		})
+		res := k.Cycle(context.Background())
+		if res.ok || res.statsOK {
+			t.Fatalf("%s: res=%+v must stay failed+unseen", tc.name, res)
+		}
+		if !containsGuardNote(res.notes, tc.want) {
+			t.Fatalf("%s: notes=%v want %q", tc.name, res.notes, tc.want)
+		}
+	}
+}
+
+// The marker-off-by-one hold: head-Tail at or under compact_rev
+// holds the marker at crev (zero chunk windows — only the vacuum
+// runs), while a never-compacted DB (crev==0) falls back to head.
+func TestGuardCycleTargetHoldAndNeverCompacted(t *testing.T) {
+	cases := []struct {
+		name           string
+		stats          string
+		wantPrevTarget string // "prev_revision = N" in the chunk window
+		wantChunks     int
+	}{
+		// head=1000, crev=900, Tail=1000 → target 0 <= crev → hold at
+		// crev: no DO block, only the vacuum round.
+		{"hold at crev", "1000|900|500000\n", "", 0},
+		// crev=0 (never compacted) → hold branch falls back to head.
+		{"never compacted", "1000|0|500000\n", "prev_revision = 1000", 1},
+	}
+	for _, tc := range cases {
+		k, fr, _ := fixture(t, []testutil.ExecRule{
+			{Substr: "inspect", Out: "true"},
+			{Substr: "ON_ERROR_STOP", Out: "NOTICE:  deleted=7\n"},
+			guardAfterRule,
+			{Substr: "MAX(id)", Out: tc.stats},
+		})
+		res := k.Cycle(context.Background())
+		if !res.fired || !res.ok {
+			t.Fatalf("%s: res=%+v notes=%v", tc.name, res, res.notes)
+		}
+		script := fr.LastStdin()
+		got := strings.Count(script, "DO $$")
+		if got != tc.wantChunks ||
+			(tc.wantPrevTarget != "" && !strings.Contains(script, tc.wantPrevTarget)) {
+			t.Fatalf("%s: chunks=%d want %d, prevTarget %q in:\n%s",
+				tc.name, got, tc.wantChunks, tc.wantPrevTarget, script)
+		}
+	}
+}
+
+// The backup-health series render seen-gated into the guard
+// textfile — valid and invalid dumps both render, an unmeasured
+// cycle fabricates neither.
+func TestEmitGuardBackupSeries(t *testing.T) {
+	k, _, dir := fixture(t, nil)
+
+	k.emitGuard(&Result{backupSeen: true, backupValid: true, backupAge: 42})
+	content := kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
+	for _, want := range []string{
+		"kine_db_backup_age_seconds 42",
+		"kine_db_backup_valid 1",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+
+	k.emitGuard(&Result{backupSeen: true, backupValid: false, backupAge: 42})
+	content = kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
+	if !strings.Contains(content, "kine_db_backup_valid 0") {
+		t.Fatalf("invalid dump must render 0:\n%s", content)
+	}
+
+	k.emitGuard(&Result{})
+	content = kdepstest.ReadText(t, dir, "kine-compact-guard.prom")
+	if strings.Contains(content, "kine_db_backup_age_seconds") ||
+		strings.Contains(content, "kine_db_backup_valid") {
+		t.Fatalf("unseen backup fabricated series:\n%s", content)
+	}
+}
+
+func containsGuardNote(notes []string, substr string) bool {
+	for _, n := range notes {
+		if strings.Contains(n, substr) {
+			return true
+		}
+	}
+	return false
+}

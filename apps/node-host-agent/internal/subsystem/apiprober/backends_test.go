@@ -4,6 +4,7 @@ package apiprober
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -165,5 +166,27 @@ func TestWithDefaultPort(t *testing.T) {
 		if got := withDefaultPort(in); got != want {
 			t.Fatalf("withDefaultPort(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+// mergeStatic drops empty entries silently and char-spray garbage
+// (a jinja scalar string arriving rune-by-rune) with a warn — only
+// plausible name/addr pairs survive, and a valid entry still lands
+// marked UP.
+func TestMergeStaticSkipsEmptyAndMalformed(t *testing.T) {
+	buf := captureSlog(t)
+	got := mergeStatic(nil, []StaticBackend{
+		{},                                     // both fields empty — dropped silently
+		{Name: "hub 1", Addr: "10.0.0.1:6443"}, // space → char-spray guard
+		{Name: "{ctl}", Addr: "10.0.0.2"},      // brace spray → guard
+		{Name: "x", Addr: "10.0.0.3"},          // single-char name → guard
+		{Name: "ctl1", Addr: "10.0.0.4:6443"},  // valid
+	})
+	if len(got) != 1 || got[0].Name != "ctl1" ||
+		got[0].Addr != "10.0.0.4:6443" || got[0].Status != "UP" {
+		t.Fatalf("mergeStatic=%+v want only ctl1", got)
+	}
+	if !strings.Contains(buf.String(), "skipping malformed API_BACKENDS entry") {
+		t.Fatalf("malformed entry not warned:\n%s", buf.String())
 	}
 }

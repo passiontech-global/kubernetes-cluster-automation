@@ -466,3 +466,156 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 		t.Fatal("pod deleted during maintenance")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// pure predicates — master-role service / STS selector / dragonfly ownership
+// ---------------------------------------------------------------------------
+
+// masterRoleService: a master-role label in the Service SELECTOR or
+// on the Service itself qualifies; a replica-role selector does not.
+func TestMasterRoleServicePredicate(t *testing.T) {
+	mk := func(selector, labels map[string]string) *corev1.Service {
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "db", Name: "svc", Labels: labels},
+			Spec: corev1.ServiceSpec{Selector: selector}}
+	}
+	for _, tc := range []struct {
+		name string
+		svc  *corev1.Service
+		want bool
+	}{
+		{"selector role=master", mk(map[string]string{"role": "master"}, nil), true},
+		{"svc label role=master", mk(nil, map[string]string{"role": "master"}), true},
+		{"svc label redis-role=leader", mk(nil, map[string]string{"redis-role": "leader"}), true},
+		{"selector role=replica", mk(map[string]string{"role": "replica"}, nil), false},
+		{"no role anywhere", mk(map[string]string{"app": "x"}, nil), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := masterRoleService(tc.svc); got != tc.want {
+				t.Fatalf("masterRoleService = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// selectorMatchesSTS: the role keys are stripped from the Service
+// selector before matching (pods carry diverging role labels), an
+// empty remainder never matches, and a pod missing the selector key
+// does not match.
+func TestSelectorMatchesSTSPredicate(t *testing.T) {
+	mk := func(selector map[string]string) *corev1.Service {
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "db", Name: "svc"},
+			Spec: corev1.ServiceSpec{Selector: selector}}
+	}
+	for _, tc := range []struct {
+		name      string
+		svc       *corev1.Service
+		podLabels map[string]string
+		want      bool
+	}{
+		{"role key stripped, app matches",
+			mk(map[string]string{"app": "db", "role": "master"}),
+			map[string]string{"app": "db", "role": "replica"}, true},
+		{"app mismatch",
+			mk(map[string]string{"app": "db", "role": "master"}),
+			map[string]string{"app": "other"}, false},
+		{"missing key",
+			mk(map[string]string{"app": "db", "role": "master"}),
+			map[string]string{"role": "master"}, false},
+		{"selector only role keys — empty remainder",
+			mk(map[string]string{"role": "master"}),
+			map[string]string{"role": "master"}, false},
+		{"nil selector", mk(nil),
+			map[string]string{"app": "db"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := selectorMatchesSTS(tc.svc, tc.podLabels); got != tc.want {
+				t.Fatalf("selectorMatchesSTS = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// dragonflyOwned: part-of OR created-by on the StatefulSet or its
+// pod template claims the set for the dragonfly operator.
+func TestDragonflyOwnedPredicate(t *testing.T) {
+	mk := func(labels, tmplLabels map[string]string) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "db", Name: "df", Labels: labels},
+			Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: tmplLabels}}}}
+	}
+	for _, tc := range []struct {
+		name string
+		sts  *appsv1.StatefulSet
+		want bool
+	}{
+		{"part-of on the sts", mk(map[string]string{"app.kubernetes.io/part-of": "dragonfly"}, nil), true},
+		{"created-by on the pod template", mk(nil,
+			map[string]string{"app.kubernetes.io/created-by": "dragonfly-operator"}), true},
+		{"unrelated labels", mk(map[string]string{"app": "x"},
+			map[string]string{"app": "x"}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dragonflyOwned(tc.sts); got != tc.want {
+				t.Fatalf("dragonflyOwned = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// podMasterRole: any of the role keys carrying a master/primary/
+// leader value marks the pod; a replica value or no label at all
+// does not.
+func TestPodMasterRolePredicate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"role=master", map[string]string{"role": "master"}, true},
+		{"redis-role=primary", map[string]string{"redis-role": "primary"}, true},
+		{"app.kubernetes.io/role=leader",
+			map[string]string{"app.kubernetes.io/role": "leader"}, true},
+		{"role=replica", map[string]string{"role": "replica"}, false},
+		{"unlabeled", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "db", Name: "pod-0", Labels: tc.labels}}
+			if got := podMasterRole(pod); got != tc.want {
+				t.Fatalf("podMasterRole = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// smallestOrdinalPod pure pins: the lowest STS ordinal wins, pods
+// outside the <sts>-<n> naming shape are ignored, and an all-foreign
+// or empty pool yields nil (nothing safe to delete).
+func TestSmallestOrdinalPodPredicate(t *testing.T) {
+	mkPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "db", Name: name}}
+	}
+	t.Run("lowest ordinal wins", func(t *testing.T) {
+		got := smallestOrdinalPod([]*corev1.Pod{
+			mkPod("df-1"), mkPod("df-0"), mkPod("df-10"), mkPod("other-0"),
+			mkPod("df-junk")}, "df")
+		if got == nil || got.Name != "df-0" {
+			t.Fatalf("smallestOrdinalPod = %v, want df-0", got)
+		}
+	})
+	t.Run("no STS-named pods", func(t *testing.T) {
+		if got := smallestOrdinalPod([]*corev1.Pod{
+			mkPod("other-0"), mkPod("df-junk")}, "df"); got != nil {
+			t.Fatalf("smallestOrdinalPod = %v, want nil", got)
+		}
+	})
+	t.Run("empty pool", func(t *testing.T) {
+		if got := smallestOrdinalPod(nil, "df"); got != nil {
+			t.Fatalf("smallestOrdinalPod = %v, want nil", got)
+		}
+	})
+}

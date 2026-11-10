@@ -22,7 +22,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -102,6 +101,7 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 		return *r
 	}
 	now := p.Now()
+	p.hrRetryHealed.PruneExpired(now, fluxHRHealCooldown)
 
 	// Find the served HelmRelease version — v2 then v2beta2 through
 	// the sweep-memoized reader: each GVR's LIST is paid at most once
@@ -212,14 +212,26 @@ func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message
 // maybePatchHRRetry stamps the reconcile annotations on a stuck
 // HelmRelease unless the 30m cooldown is still warm — the wider of
 // the in-RAM ledger and the requestedAt stamp a previous patch (ours
-// or `flux reconcile`'s) already left. The write side stays
-// hand-rolled: StampPersisted emits a single-annotation patch and
-// this heal needs requestedAt AND forceAt stamped together.
+// or `flux reconcile`'s) already left. The preamble is the shared
+// persisted-cooldown shape (Deps.HealAllowedPersisted →
+// heal.AllowedVPersisted, the sibling kustomization nudge's gate):
+// only after the cooldown clears do the maintenance mutex + global
+// heal budget evaluate (fail closed) — a reconcile nudge during a
+// drain churns the release exactly like any other heal. The write
+// side stays hand-rolled: StampPersisted emits a single-annotation
+// patch and this heal needs requestedAt AND forceAt stamped together.
 func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Logger,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
 	key string, now time.Time) {
-	if heal.PersistedCooledDown(&p.hrRetryHealed, hr,
-		kube.AnnoFluxRequestedAt, key, fluxHRHealCooldown, now) {
+	ck := probefw.SelfHealKey(CheckNameFluxHRRetries, key)
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.hrRetryHealed, hr, kube.AnnoFluxRequestedAt, ck,
+		fluxHRHealCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 	token := now.UTC().Format(time.RFC3339)
@@ -244,7 +256,7 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 		log.Error(err, "helmrelease retry patch failed", "hr", key)
 		return
 	}
-	p.hrRetryHealed.Stamp(key, now)
+	p.hrRetryHealed.Stamp(ck, now)
 	log.Info("patched helmrelease reconcile annotations",
 		"hr", key, "requestedAt", token)
 }

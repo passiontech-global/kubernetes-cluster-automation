@@ -101,12 +101,28 @@ var (
 )
 
 // CfgScalar reports whether s may be rendered as a plain scalar into
-// a config file (YAML mapping value, toml assignment): printable
-// ASCII only — a control byte, first of all '\n', would splice an
-// extra key/line into the file — and no ':' or '#', the mapping /
-// comment separators that re-open the file's syntax.
+// a config file (YAML mapping value, toml assignment, Corefile
+// token): printable ASCII only — a control byte, first of all '\n',
+// would splice an extra key/line into the file — and no ':' or '#',
+// the mapping / comment separators that re-open the file's syntax,
+// and no quotes, which re-open or close a quoted scalar (a '"'
+// inside a rendered token lets a crafted value terminate the quoting
+// and splice arbitrary directives after it).
 func CfgScalar(s string) bool {
-	return printableASCII(s) && !strings.ContainsAny(s, ":#")
+	return printableASCII(s) && !strings.ContainsAny(s, `:#"'`)
+}
+
+// CfgShellVal gates a scalar rendered inside a double-quoted shell
+// assignment (the node-watchdog conf's KEY="..." lines are sourced by
+// the watchdog scripts wholesale): a '"' closes the quoting and
+// everything after it becomes shell code, while '$' and backtick
+// expand or execute even inside quotes. printableASCII already bans
+// newlines/tabs/control bytes, the splice hazard. Unlike CfgScalar it
+// keeps ':' — legitimate in this conf (host:port stats listeners,
+// ip:6443 fallback-map entries and peers) — and accepts the empty
+// string (optional keys legitimately render empty).
+func CfgShellVal(s string) bool {
+	return (s == "" || printableASCII(s)) && !strings.ContainsAny(s, `"$`+"`")
 }
 
 // CfgSysctlKey validates a sysctl key for the /etc/sysctl.d render.

@@ -4,13 +4,39 @@
 // For resolves slog.With per call so the handler picked up is always the
 // current slog.Default() — a package-level var would bind the pre-main
 // default before slog.SetDefault installs the JSON handler in main().
+// The resolved loggers themselves ARE cached per (slog.Default(), name):
+// hundreds of callsites invoke logger().Info(...) per sweep, and each
+// uncached call allocates a fresh *slog.Logger plus a handler clone.
 package logx
 
-import "log/slog"
+import (
+	"log/slog"
+	"sync"
+)
+
+var (
+	forMu      sync.Mutex
+	forDefault *slog.Logger
+	forCache   = map[string]*slog.Logger{}
+)
 
 // For returns a logger tagged with the given name. The name is emitted as
-// the "logger" attribute on every record. slog.With is resolved per call —
-// never cached in a package-level var — so the handler picked up is always
-// the current slog.Default(), including the JSON handler installed by
-// slog.SetDefault in main().
-func For(name string) *slog.Logger { return slog.With("logger", name) }
+// the "logger" attribute on every record. Loggers are cached keyed on the
+// current slog.Default(): if slog.SetDefault swaps in a new handler the
+// cache is dropped and rebuilt against it, so the JSON handler installed
+// by main() is always the one that emits.
+func For(name string) *slog.Logger {
+	def := slog.Default()
+	forMu.Lock()
+	defer forMu.Unlock()
+	if def != forDefault {
+		forDefault = def
+		forCache = map[string]*slog.Logger{}
+	}
+	if l, ok := forCache[name]; ok {
+		return l
+	}
+	l := def.With("logger", name)
+	forCache[name] = l
+	return l
+}

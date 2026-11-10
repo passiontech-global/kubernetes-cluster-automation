@@ -233,8 +233,8 @@ func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
 	}
 	path := filepath.Join(c.d.State.Dir, cdeps.FileKCMQueueSnap)
 	if err := hostutil.WriteFileAtomicBytes(path, b); err != nil {
-		logger().Warn("controllerhygiene: kcm snapshot write failed",
-			"path", path, "error", err)
+		c.d.State.AppendLogWarn(fmt.Sprintf(
+			"kcm snapshot write failed path=%s error=%v", path, err))
 	}
 }
 

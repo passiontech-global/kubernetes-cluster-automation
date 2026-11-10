@@ -87,7 +87,28 @@ func stampFirstSeen(ctx context.Context, obj metav1.Object,
 	if err != nil {
 		return err
 	}
-	return patch(ctx, data)
+	if err := patch(ctx, data); err != nil {
+		return err
+	}
+	syncFirstSeenAnno(obj, annoKey, firstSeenValue(m))
+	return nil
+}
+
+// syncFirstSeenAnno mirrors a just-persisted first-seen annotation
+// onto the in-memory object — every probe holding the pre-patch
+// snapshot would otherwise keep reading the stale map for the rest
+// of the sweep (and re-stamp or mis-window the next check).
+func syncFirstSeenAnno(obj metav1.Object, annoKey string, v any) {
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	if s, ok := v.(string); ok {
+		ann[annoKey] = s
+	} else {
+		delete(ann, annoKey)
+	}
+	obj.SetAnnotations(ann)
 }
 
 // FirstSeenPersisted is the persisted variant of the first-seen
@@ -210,5 +231,6 @@ func ClearPersistedFirstSeen(ctx context.Context, log logr.Logger,
 			"key", key, "anno", annoKey, "error", err)
 		return err
 	}
+	syncFirstSeenAnno(obj, annoKey, firstSeenValue(m))
 	return nil
 }

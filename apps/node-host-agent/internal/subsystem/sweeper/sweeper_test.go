@@ -332,6 +332,38 @@ func TestMountAppearingMidSweepSkips(t *testing.T) {
 	}
 }
 
+// The pre-rm re-read is the last belt before the destructive rm —
+// a table that was readable at the cycle-start snapshot but
+// unreadable at rm time must fail closed too (skipMountsUnread),
+// never fall through to os.RemoveAll on stale information.
+func TestMountsUnreadableAtRmSkips(t *testing.T) {
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := nhatestutil.FakeKube(other)
+	s, base, mountsFile := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+	// The snapshot read at cycle start succeeds; the mounts file is
+	// gone by the time the orphan's re-GET runs — immediately before
+	// the fresh pre-rm read.
+	cs.PrependReactor("get", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			if err := os.Remove(mountsFile); err != nil {
+				return true, nil, err
+			}
+			return true, nil, apierrors.NewNotFound(
+				corev1.Resource("persistentvolumes"), pvcUUID)
+		})
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite unreadable pre-rm mount table: %v", err)
+	}
+	if got := skipCount(t, s, skipMountsUnread); got != 1 {
+		t.Fatalf("mounts_unreadable skips=%v want 1 (fresh re-read)", got)
+	}
+}
+
 func TestMaxDeleteCap(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")

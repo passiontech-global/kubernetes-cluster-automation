@@ -34,6 +34,10 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 	for i := range heals {
 		h := &heals[i]
 		pvcKey := h.pvc.Namespace + "/" + h.pvc.Name
+		// Free in-RAM cooldown before the mutex/budget preamble.
+		if p.localPVHealed.CooledDown(pvcKey, localPVEphemeralHealCooldown, now) {
+			continue
+		}
 		proceed, unverifiable := p.HealAllowed(ctx, log,
 			&p.localPVHealed, pvcKey,
 			localPVEphemeralHealCooldown, now)
@@ -124,6 +128,31 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 			break
 		}
 	}
+	// Confirm a provisioner pod exists BEFORE the persisted-cooldown
+	// + mutex + budget preamble — an empty/absent pod set must not
+	// spend a global heal token.
+	pods, err := p.PodsIn(ctx, openebsProvisionerNS)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list provisioner pods failed — heal deferred",
+			"error", err)
+		return
+	}
+	hasTarget := false
+	for i := range pods {
+		if strings.HasPrefix(pods[i].Name, openebsProvisionerPrefix) {
+			hasTarget = true
+			break
+		}
+	}
+	if !hasTarget {
+		return
+	}
+	// Free in-RAM cooldown before the persisted/mutex/budget gate.
+	if p.pvcProvHealed.CooledDown(openebsProvisionerName,
+		pvcProvisionerHealCooldown, now) {
+		return
+	}
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 		&p.pvcProvHealed, obj, pvcProvHealAnno, openebsProvisionerName,
 		pvcProvisionerHealCooldown, now)
@@ -132,13 +161,6 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 		return
 	}
 	if !proceed {
-		return
-	}
-	pods, err := p.PodsIn(ctx, openebsProvisionerNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list provisioner pods failed — heal deferred",
-			"error", err)
 		return
 	}
 	deleted := false

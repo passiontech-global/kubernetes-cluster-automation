@@ -257,3 +257,117 @@ func TestDNSFallbackEmptyMapRemovesAllDNSFBFiles(t *testing.T) {
 		}
 	}
 }
+
+// nameservers parses up to max entries and tolerates a missing file
+// (no nameservers → DNS probes idle).
+func TestNameserversParsing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	testutil.WriteFile(t, path,
+		"# comment\nnameserver 10.0.0.1\nsearch x\nnameserver 10.0.0.2\nnameserver 10.0.0.3\nnameserver 10.0.0.4\n")
+	got := nameservers(path, 3)
+	if len(got) != 3 || got[0] != "10.0.0.1" || got[2] != "10.0.0.3" {
+		t.Fatalf("nameservers=%v want first 3", got)
+	}
+	if got := nameservers(filepath.Join(t.TempDir(), "absent"), 3); got != nil {
+		t.Fatalf("missing file nameservers=%v want nil", got)
+	}
+}
+
+// An unreadable hosts file must not be rewritten — renderHostsBlock
+// refuses and reports no change.
+func TestRenderHostsBlockUnreadableFile(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.HostsFile = filepath.Join(t.TempDir(), "absent-hosts")
+	if e.n.renderHostsBlock("10.0.0.1 api\n") {
+		t.Fatal("rendered a block into an unreadable hosts file")
+	}
+}
+
+// A hosts file that cannot be atomically rewritten (read-only
+// directory — the read-only /etc bind mount case) reports no change
+// instead of crashing the cycle.
+func TestRenderHostsBlockWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	hosts := filepath.Join(dir, "hosts")
+	testutil.WriteFile(t, hosts, "127.0.0.1 localhost\n")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	e := fixture(t, nil)
+	e.n.cfg.HostsFile = hosts
+	if e.n.renderHostsBlock("10.0.0.1 api\n") {
+		t.Fatal("renderHostsBlock claimed success on a failed write")
+	}
+	if got := testutil.ReadFile(t, hosts); got != "127.0.0.1 localhost\n" {
+		t.Fatalf("hosts mutated despite write failure: %q", got)
+	}
+}
+
+// A dnsfb-pin-<name> file that cannot be overwritten (a directory
+// squatting the path) must not abort the cycle — the pin action is
+// logged, the write failure logged, the cycle moves on.
+func TestDNSFallbackPinWriteFailureLogged(t *testing.T) {
+	wd := &watchdogconf.Config{DNSFallback: []watchdogconf.DNSEntry{
+		{Name: "api.test.internal", Port: "6443",
+			Candidates: []string{"10.0.0.1"}},
+	}}
+	e := fixture(t, wd)
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.1:6443"] = true
+	if err := os.MkdirAll(filepath.Join(e.state, "dnsfb-pin-api.test.internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !strings.Contains(logLines(t, e), "pin file write failed for api.test.internal") {
+		t.Fatalf("missing pin-write failure log:\n%s", logLines(t, e))
+	}
+}
+
+// An unwritable last-known-good file (directory squatting the path)
+// logs the warning; resolution otherwise proceeds and the fail
+// counter still resets.
+func TestDNSFallbackLastGoodWriteFailureLogged(t *testing.T) {
+	wd := &watchdogconf.Config{DNSFallback: []watchdogconf.DNSEntry{
+		{Name: "api.test.internal", Port: "6443"},
+	}}
+	e := fixture(t, wd)
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.dnsOK["10.1.1.1|api.test.internal"] = "10.0.0.9"
+	if err := os.MkdirAll(filepath.Join(e.state, "dnsfb-lg-api.test.internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.n.Cycle(context.Background())
+	// The warning goes to the structured log (slog), the observable
+	// on-disk contract is: the squatting directory is untouched, the
+	// cycle completed cleanly — DNS answered, so no latch armed and
+	// the stale pin (none) was cleared as usual.
+	if _, err := os.Stat(filepath.Join(e.state, "dnsfb-pin-api.test.internal")); !os.IsNotExist(err) {
+		t.Fatal("pin file resurrected on a DNS-ok cycle")
+	}
+	if stateExists(e, "dns-fallback") {
+		t.Fatal("latch armed while DNS answered")
+	}
+}
+
+// A pin left for a name dropped from the map loses its pin AND its
+// dnsfb-ctr counter file; a counter file for a still-mapped name is
+// not touched by the prune (the counter dir file is legacy shell
+// residue — the Go port keeps the counter in memory).
+func TestDNSFallbackPruneRemovesCtrFile(t *testing.T) {
+	wd := &watchdogconf.Config{DNSFallback: []watchdogconf.DNSEntry{
+		{Name: "api.test.internal", Port: "6443"},
+	}}
+	e := fixture(t, wd)
+	pinGone := filepath.Join(e.state, "dnsfb-pin-old.test.internal")
+	ctrGone := filepath.Join(e.state, "dnsfb-ctr-old.test.internal")
+	testutil.WriteFile(t, pinGone, "10.9.9.9 old.test.internal\n")
+	testutil.WriteFile(t, ctrGone, "3\n")
+	e.n.Cycle(context.Background())
+	for _, f := range []string{pinGone, ctrGone} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("prune kept %s", f)
+		}
+	}
+}

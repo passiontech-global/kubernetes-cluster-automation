@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,5 +257,187 @@ func TestSignalDisabledSkipsCheck(t *testing.T) {
 func TestNameIdentifiesNetHealth(t *testing.T) {
 	if got := fixture(t, nil).n.Name(); got != "nethealth" {
 		t.Fatalf("Name()=%q want nethealth", got)
+	}
+}
+
+// applyDefaults mirrors the shell-module defaults — a zero Config
+// (the "no conf file" node) must land on every documented default
+// without any explicit value.
+func TestApplyDefaultsZeroConfig(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	if c.Interval != defaultInterval ||
+		c.WatchdogStateDir != defaultWatchdogStateDir ||
+		c.WatchdogLogFile != defaultWatchdogLogFile ||
+		c.HostResolvConf != defaultHostResolvConf ||
+		c.HostsFile != defaultHostsFile ||
+		c.ProcNetUDP != defaultProcNetUDP ||
+		c.ProcNetUDP6 != defaultProcNetUDP6 ||
+		c.UptimeFile != defaultUptimeFile ||
+		c.ConntrackCountFile != defaultConntrackCountFile ||
+		c.ConntrackMaxFile != defaultConntrackMaxFile ||
+		c.ConntrackStatFile != defaultConntrackStatFile ||
+		c.HostRoot != defaultHostRoot ||
+		c.ConsecNeeded != defaultConsecNeeded ||
+		c.MinRestart != defaultMinRestart {
+		t.Fatalf("defaults not applied: %+v", c)
+	}
+	if c.Watchdog == nil {
+		t.Fatal("nil Watchdog not replaced with an empty config")
+	}
+	if c.NebulaDirectTCPPorts == nil {
+		t.Fatal("nil port list not defaulted")
+	}
+	if got := c.sysClassNet; got != defaultSysClassNet {
+		t.Fatalf("sysClassNet=%q want %q", got, defaultSysClassNet)
+	}
+	// The transport seams fall back to production defaults, not nil.
+	if c.runHostCmd == nil || c.runMountCmd == nil || c.dnsProbe == nil ||
+		c.tcpProbe == nil || c.ping == nil || c.probeHTTP == nil {
+		t.Fatalf("default transport seam missing: runHostCmd=%v runMountCmd=%v "+
+			"dnsProbe=%v tcpProbe=%v ping=%v probeHTTP=%v",
+			c.runHostCmd != nil, c.runMountCmd != nil, c.dnsProbe != nil,
+			c.tcpProbe != nil, c.ping != nil, c.probeHTTP != nil)
+	}
+	if c.adjtimexFn == nil {
+		t.Fatal("adjtimexFn default missing")
+	}
+	if c.Clock == nil {
+		t.Fatal("Clock default missing")
+	}
+}
+
+// The default host-exec closures go through one hostexec Runner — on
+// HostRoot "/" (agent on the host itself) that is a plain exec of
+// the named binary, with stderr folded into the output
+// (ExecCombined).
+func TestDefaultHostExecSeams(t *testing.T) {
+	c := Config{HostRoot: "/"}
+	c.applyDefaults()
+	ctx := context.Background()
+	if _, err := c.runHostCmd(ctx, []string{"true"}); err != nil {
+		t.Fatalf("default runHostCmd failed: %v", err)
+	}
+	if _, err := c.runMountCmd(ctx, []string{"true"}); err != nil {
+		t.Fatalf("default runMountCmd failed: %v", err)
+	}
+	// A failing binary surfaces its output+error through the same
+	// seam the trimRunErr diagnostics consume.
+	_, err := c.runHostCmd(ctx, []string{"false"})
+	if err == nil {
+		t.Fatal("default runHostCmd swallowed a non-zero exit")
+	}
+}
+
+// The default tcpProbe is a plain dial: refused port errors, an open
+// loopback listener succeeds (and closes).
+func TestDefaultTCPProbe(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	ctx := context.Background()
+	if err := c.tcpProbe(ctx, "127.0.0.1", "1", time.Second); err == nil {
+		t.Fatal("tcpProbe dialled a closed port successfully")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	if err := c.tcpProbe(ctx, "127.0.0.1", port, time.Second); err != nil {
+		t.Fatalf("tcpProbe failed against a live listener: %v", err)
+	}
+}
+
+// The default ping seam composes runHostCmd (captured at
+// applyDefaults time) — the marked variant adds the decimal 8192
+// fwmark (iputils rejects the hex form) and success parses the min
+// RTT out of ping output; no output parses as -1.
+func TestDefaultPingSeam(t *testing.T) {
+	fake := testutil.NewFakeExec()
+	c := Config{}
+	c.runHostCmd = fake.Run
+	c.applyDefaults()
+	ctx := context.Background()
+	// Unmatched command → the fake answers success with no output.
+	ok, rtt := c.ping(ctx, "10.0.0.1", 3, 4, true)
+	if !ok || rtt != -1 {
+		t.Fatalf("ping=%v rtt=%v want true/-1 on empty output", ok, rtt)
+	}
+	joined := fake.Joined()
+	if !strings.Contains(joined, "-m 8192") {
+		t.Fatalf("marked ping missing the 0x2000 mark: %s", joined)
+	}
+	// Failing transport → unreachable, no RTT.
+	fake.ClearLog()
+	fake.FailOn("ping", errCmdFail)
+	ok, rtt = c.ping(ctx, "10.0.0.1", 3, 4, false)
+	if ok || rtt != 0 {
+		t.Fatalf("ping=%v rtt=%v want false/0 on transport failure", ok, rtt)
+	}
+	if strings.Contains(fake.Joined(), "-m 8192") {
+		t.Fatal("unmarked ping carried the fwmark flag")
+	}
+}
+
+// Registering the same metrics twice on one registry fails the
+// second New instead of silently double-counting.
+func TestNewRejectsDuplicateMetricRegistration(t *testing.T) {
+	root := t.TempDir()
+	mk := func() Config {
+		state := filepath.Join(root, "wd")
+		if err := os.MkdirAll(state, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return Config{
+			Interval:         time.Hour,
+			WatchdogStateDir: state,
+			WatchdogLogFile:  filepath.Join(root, "wd.log"),
+			HostRoot:         "/",
+		}
+	}
+	reg := prometheus.NewRegistry()
+	if _, err := New(mk(), reg); err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	if _, err := New(mk(), reg); err == nil {
+		t.Fatal("second New registered duplicate metrics without error")
+	}
+}
+
+// The default dnsProbe is a direct one-nameserver A lookup (dig @ns
+// parity): a loopback resolver that refuses connections surfaces as
+// an error, never a pinned lie. Loopback-only — no external DNS.
+func TestDefaultDNSProbe(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	ip, err := c.dnsProbe(context.Background(), "127.0.0.1", "example.internal")
+	if err == nil {
+		t.Fatalf("dnsProbe succeeded against a dead loopback resolver: ip=%q", ip)
+	}
+	if ip != "" {
+		t.Fatalf("dnsProbe returned ip=%q with an error", ip)
+	}
+}
+
+// The default probeHTTP is the shared insecure-TLS GET: a refused
+// loopback port is an error.
+func TestDefaultProbeHTTP(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	if err := c.probeHTTP(context.Background(),
+		"http://127.0.0.1:1/metrics", time.Second); err == nil {
+		t.Fatal("probeHTTP succeeded against a refused loopback port")
+	}
+}
+
+// unitEnabledActive folds a missing systemd client to false —
+// callers gate remediation on it and a nil client must read as
+// "not up", never panic.
+func TestUnitEnabledActiveNilSystemd(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.Systemd = nil
+	if e.n.unitEnabledActive(context.Background(), "nebula@interdc") {
+		t.Fatal("unitEnabledActive true without a systemd client")
 	}
 }

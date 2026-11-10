@@ -144,7 +144,7 @@ func (n forNode) bind(s *scope, it any) error {
 	// 2-key mapping would "unpack" into its own key names. The
 	// idiom is x.key/x.value on a single loop var, or .items()
 	// which yields real [k,v] pairs.
-	if _, ok := it.(*OMap); ok {
+	if isMappingValue(it) {
 		return fmt.Errorf("for: cannot unpack a mapping into %d names — use .items() or a single loop var", len(n.names))
 	}
 	pair := ToIter(it)
@@ -164,9 +164,14 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	}
 	// Iterating a mapping yields its KEYS as plain strings — a
 	// `for k,v in omap` then char-splits each key (or binds garbage
-	// where python raises "cannot unpack"). Fail loud: the idiom is
-	// `.items()`/`dict2items`, which yields real pairs.
-	if _, ok := v.(*OMap); ok && len(n.names) == 2 {
+	// where python raises "cannot unpack"). Fail loud for ANY unpack
+	// arity > 1: the idiom is `.items()`/`dict2items`, which yields
+	// real pairs. (== 2 used to be the only rejected arity; >= 3
+	// fell through to a confusing per-item unpack error.)
+	if isMappingValue(v) && len(n.names) > 1 {
+		if len(n.names) != 2 {
+			return fmt.Errorf("for: cannot unpack a mapping into %d names — use .items() or a single loop var", len(n.names))
+		}
 		return errors.New("for: cannot unpack mapping keys — use .items() or dict2items")
 	}
 	// Jinja scopes a for body: the loop var(s) and any {% set %}

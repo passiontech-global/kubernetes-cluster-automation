@@ -71,11 +71,28 @@ func TestNewSSHDialer(t *testing.T) {
 
 // --- in-process SSH server ---
 
+// sshServerOpts scripts the harness's failure modes (nil-safe zero
+// value = the plain always-successful server the live test uses):
+// failOn answers a matching command with stderr + exit-status 1,
+// hangOn accepts the exec but never answers (the client must cancel),
+// rejectSession/rejectExec fail the session open / the exec request.
+type sshServerOpts struct {
+	failOn        map[string]string
+	hangOn        []string
+	rejectSession bool
+	rejectExec    bool
+	// closeOnExec tears the session channel down as soon as the exec
+	// request arrives — the client's request fails mid-flight.
+	closeOnExec bool
+}
+
 // testServer is a minimal SSH server: public-key auth always
 // accepted, each exec request served by execFn(cmd, stdin) → output.
 type testServer struct {
-	ln  net.Listener
-	cfg *ssh.ServerConfig
+	ln   net.Listener
+	cfg  *ssh.ServerConfig
+	opts sshServerOpts
+	quit chan struct{}
 
 	mu   sync.Mutex
 	cmds []string
@@ -83,6 +100,12 @@ type testServer struct {
 
 func newTestSSHServer(t *testing.T, clientKeyPath string,
 	execFn func(cmd string, stdin []byte) string) *testServer {
+	return newTestSSHServerOpts(t, clientKeyPath, execFn, sshServerOpts{})
+}
+
+func newTestSSHServerOpts(t *testing.T, clientKeyPath string,
+	execFn func(cmd string, stdin []byte) string,
+	opts sshServerOpts) *testServer {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -96,13 +119,18 @@ func newTestSSHServer(t *testing.T, clientKeyPath string,
 		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 			return &ssh.Permissions{}, nil
 		},
-	}}
+	}, opts: opts, quit: make(chan struct{})}
 	s.cfg.AddHostKey(hostSigner)
 	s.ln, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.ln.Close() })
+	// LIFO: quit closes before the listener, so a hung session
+	// goroutine unblocks before the accept loop tears down.
+	t.Cleanup(func() {
+		close(s.quit)
+		_ = s.ln.Close()
+	})
 	go s.acceptLoop(execFn)
 	return s
 }
@@ -139,6 +167,10 @@ func (s *testServer) acceptLoop(execFn func(string, []byte) string) {
 				_ = ch.Reject(ssh.UnknownChannelType, "no")
 				continue
 			}
+			if s.opts.rejectSession {
+				_ = ch.Reject(ssh.Prohibited, "sessions disabled")
+				continue
+			}
 			srv, inReqs, _ := ch.Accept()
 			go s.serveSession(srv, inReqs, execFn)
 		}
@@ -158,6 +190,16 @@ func (s *testServer) serveSession(srv ssh.Channel,
 			}
 			continue
 		}
+		if s.opts.closeOnExec {
+			_ = srv.Close()
+			return
+		}
+		if s.opts.rejectExec {
+			if req.WantReply {
+				_ = req.Reply(false, nil)
+			}
+			return
+		}
 		// exec payload is a bare length-prefixed string.
 		if len(req.Payload) < 4 {
 			return
@@ -173,6 +215,23 @@ func (s *testServer) serveSession(srv ssh.Channel,
 		s.mu.Lock()
 		s.cmds = append(s.cmds, cmd)
 		s.mu.Unlock()
+		for sub, stderr := range s.opts.failOn {
+			if strings.HasPrefix(cmd, sub) {
+				_, _ = srv.Stderr().Write([]byte(stderr))
+				status := make([]byte, 4)
+				binary.BigEndian.PutUint32(status, 1)
+				_, _ = srv.SendRequest("exit-status", false, status)
+				return
+			}
+		}
+		for _, sub := range s.opts.hangOn {
+			if strings.HasPrefix(cmd, sub) {
+				// Accept the exec, then never answer — only the
+				// client's link-teardown cancel path can unblock.
+				<-s.quit
+				return
+			}
+		}
 		// Write commands (`cat >` / `sudo -n tee`) stream stdin —
 		// drain to EOF before answering.
 		var stdin []byte

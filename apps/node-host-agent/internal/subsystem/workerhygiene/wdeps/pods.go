@@ -65,5 +65,6 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 		metav1.DeleteOptions{
 			GracePeriodSeconds: ptr.To[int64](0),
 			PropagationPolicy:  ptr.To(metav1.DeletePropagationBackground),
+			Preconditions:      &metav1.Preconditions{UID: &p.UID},
 		})
 }

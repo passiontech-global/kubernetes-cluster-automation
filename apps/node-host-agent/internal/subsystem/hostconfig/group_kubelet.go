@@ -69,17 +69,20 @@ func t7AppendExtraArgs(u, extra string) (string, bool) {
 
 // kubeletCfgPath ports the T7 discovery: --config of the running
 // kubelet (via /proc cmdline), else the first existing candidate.
+// The candidate STAT comes first — pure filesystem reads, paid every
+// cycle — and the pgrep/tr/awk shell-out runs only when NO candidate
+// unit path exists on disk.
 func (c *cyc) kubeletCfgPath() string {
+	for _, p := range t7KubeletCfgCandidates {
+		if c.r.fileExists(p) {
+			return p
+		}
+	}
 	if out, err := c.r.run(c.ctx, "sh", "-c",
 		`pid=$(pgrep -x kubelet | head -1); `+
 			`if [ -n "$pid" ]; then tr '\0' '\n' < "/proc/$pid/cmdline" `+
 			`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; fi`); err == nil {
 		if p := strings.TrimSpace(out); p != "" {
-			return p
-		}
-	}
-	for _, p := range t7KubeletCfgCandidates {
-		if c.r.fileExists(p) {
 			return p
 		}
 	}
@@ -305,7 +308,14 @@ func (c *cyc) groupPulls() {
 					strings.TrimSuffix(evictionBlock(want), "\n"),
 					`(?m)^kind: KubeletConfiguration`)
 			}
-			_, _ = r.writeManaged(cfgPath, []byte(s), 0o644)
+			// The write result matters: a failed write must not fall
+			// through silently to the containerd drop-ins with the
+			// summary unable to tell patched from skipped.
+			if ch, err := r.writeManaged(cfgPath, []byte(s), 0o644); err != nil {
+				c.err("T7: kubelet config write failed", "path", cfgPath, "error", err)
+			} else if ch {
+				logger().Info("T7: kubelet config live-patched", "path", cfgPath)
+			}
 		}
 	}
 

@@ -189,14 +189,19 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			errs = append(errs, fmt.Errorf("boot-webhook fail-open: marshal patch %s: %w", cfg.Name, err))
 			continue
 		}
-		if _, err := snap.G.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(
-			ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}, ""); err != nil {
+		patched, err := snap.G.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(
+			ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "")
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				continue // deleted between list and patch — next sweep sees the truth
 			}
 			errs = append(errs, fmt.Errorf("boot-webhook fail-open: patch %s: %w", cfg.Name, err))
 			continue
 		}
+		// Sync the in-memory snapshot so the critical.Sweep reading
+		// snap right after sees the patched FailurePolicy, not the
+		// pre-patch Ignore the list returned.
+		snap.SetVWC(patched)
 		for _, e := range patch.Webhooks {
 			metrics.BootWebhookFailOpenTotal.WithLabelValues(cfg.Name, e.Name).Inc()
 			log.Info("fail-open enforced", "config", cfg.Name, "webhook", e.Name)

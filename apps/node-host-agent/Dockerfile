@@ -47,7 +47,9 @@ FROM alpine:3.24
 # the floating alpine:3.24 tag would break the build whenever upstream
 # bumps a package.
 # hadolint ignore=DL3018
-RUN apk add --no-cache util-linux iproute2 iputils bash
+RUN apk add --no-cache util-linux iproute2 iputils bash tini
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532
-ENTRYPOINT ["/node-host-agent"]
+# tini as PID 1 reaps orphaned grandchildren (nsenter/psql/ip/ethtool
+# exec'd under hostPID) that would otherwise pile up as zombies.
+ENTRYPOINT ["/sbin/tini", "--", "/node-host-agent"]

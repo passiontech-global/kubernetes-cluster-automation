@@ -12,11 +12,13 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -1095,5 +1097,279 @@ func TestStormGateNHCListError(t *testing.T) {
 	r := &deschedulerStormGate{cs: cs, dyn: dyn}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the NHC list fails")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// maintenance-hold-stale — the stamping branches (uncovered half).
+// ---------------------------------------------------------------------------
+
+// A hold with NO first-seen stamp yet (the controller just started
+// tracking it) gets stamped via the deploy merge-patch — and stays
+// silent until the window holds out. The patch must be the annotation
+// merge-patch contract: MergePatchType, carrying the first-seen
+// annotation keyed by the hold's ledger key.
+func TestStormGateHoldWithoutStampStampsAndStaysSilent(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, holdAnnos(0))) // hold "true", no stamp
+	rec := events.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake(), recorder: rec}
+
+	var patchBody []byte
+	var patchType types.PatchType
+	cs.PrependReactor("patch", "deployments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			pa := a.(ktesting.PatchAction)
+			if pa.GetName() != "descheduler" || pa.GetNamespace() != "kube-system" {
+				t.Fatalf("patched %s/%s, want kube-system/descheduler",
+					pa.GetNamespace(), pa.GetName())
+			}
+			patchType = pa.GetPatchType()
+			patchBody = pa.GetPatch()
+			return false, nil, nil // let the fake apply it
+		})
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if patchType != types.MergePatchType {
+		t.Fatalf("first-seen stamp used %s, want merge patch", patchType)
+	}
+	if !strings.Contains(string(patchBody), kube.AnnoFirstSeenStormGateHold) ||
+		!strings.Contains(string(patchBody), stormHoldLedgerKey) {
+		t.Fatalf("patch body missing first-seen annotation for %s: %s",
+			stormHoldLedgerKey, patchBody)
+	}
+	if got := getDescheduler(t, cs).
+		Annotations[kube.AnnoFirstSeenStormGateHold]; got == "" {
+		t.Fatal("fresh hold was not stamped with a first-seen")
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("just-stamped hold warned %d times, want 0", got)
+	}
+
+	// A second reconcile inside the window stays silent too.
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("reconciles after stamping warned %d times, want 0", got)
+	}
+}
+
+// A FRESH NHC pause (no first-seen annotation yet) gets its stamp
+// patched through the dynamic client and warns nothing — the window
+// only opens when the stamp says the pause has aged past 2h.
+func TestStormGateNHCPauseFreshStampsFirstSeen(t *testing.T) {
+	nhc := nhcCR("nhc", []string{"runbook pause"}) // pause, no stamp
+	dyn := stormGateDynFake(nhc)
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	rec := events.NewFakeRecorder(16)
+	r := &deschedulerStormGate{cs: cs, dyn: dyn, recorder: rec}
+
+	for range 2 {
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obj, err := dyn.Resource(kube.GVRNodeHealthCheck).
+		Get(ctx, "nhc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp, ok := obj.GetAnnotations()[kube.AnnoFirstSeenNHCPause]
+	if !ok || stamp == "" {
+		t.Fatalf("fresh pause was not stamped: annotations %v", obj.GetAnnotations())
+	}
+	if !strings.Contains(stamp, "nhc") {
+		t.Fatalf("stamp %q does not carry the NHC ledger key", stamp)
+	}
+	if got := drainMaintenanceHoldStale(rec); got != 0 {
+		t.Fatalf("fresh pause warned %d times, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stormEvidence.storming — the verdict's fold over the signal slices.
+// ---------------------------------------------------------------------------
+
+// Any one non-empty signal slice is storm evidence; all empty is a
+// clear verdict.
+func TestStormEvidenceStorming(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   *stormEvidence
+		want bool
+	}{
+		{"all empty is clear", &stormEvidence{}, false},
+		{"notReady alone storms", &stormEvidence{notReady: []string{"n1"}}, true},
+		{"bad alone storms", &stormEvidence{bad: []string{"n1"}}, true},
+		{"tainted alone storms", &stormEvidence{tainted: []string{"n1"}}, true},
+		{"cordoned alone storms", &stormEvidence{cordoned: []string{"n1"}}, true},
+		{"maintenance alone storms", &stormEvidence{maintenance: []string{"kured"}}, true},
+		{"preempted alone storms", &stormEvidence{preempted: []string{"pod"}}, true},
+		{"imagePull alone storms", &stormEvidence{imagePull: []string{"pod"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.ev.storming(); got != tc.want {
+				t.Fatalf("storming() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hold-TOCTOU guard — the scale patch's resourceVersion precondition.
+// ---------------------------------------------------------------------------
+
+// The hold-annotation TOCTOU: three cluster-wide scans run between
+// the deployment Get and the scale patch, so an operator setting
+// storm-gate-hold=true mid-sweep used to be defeated — the patch
+// carried no precondition and silently scaled anyway. The patch now
+// pins the Get's metadata.resourceVersion; the apiserver rejects with
+// 409 and the reconcile DEFERS: no scale, no decision annotation, no
+// error, the regular cadence re-reads everything next sweep.
+func TestStormGateMidSweepHoldConflictDefers(t *testing.T) {
+	deploy := deschedulerDeploy(2, nil) // clear verdict -> want 1 -> scale patch fires
+	deploy.ResourceVersion = "42"
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deploy)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	deployGVR := appsv1.SchemeGroupVersion.WithResource("deployments")
+	cs.PrependReactor("patch", "deployments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			pa := a.(ktesting.PatchAction)
+			var body struct {
+				Metadata struct {
+					ResourceVersion string `json:"resourceVersion"`
+				} `json:"metadata"`
+			}
+			if err := json.Unmarshal(pa.GetPatch(), &body); err != nil {
+				t.Fatalf("unmarshal patch body: %v", err)
+			}
+			// The operator sets the hold annotation mid-sweep — a
+			// concurrent write the fake tracker does not replay for
+			// us, so the reactor performs it by hand the way the
+			// apiserver would (RV bumped 42 -> 43). All tracker
+			// access here goes through cs.Tracker() directly: the
+			// reactor already runs under Fake.Invokes' exclusive
+			// lock, and a nested clientset call would re-enter it
+			// and deadlock.
+			tracked, err := cs.Tracker().Get(
+				deployGVR, "kube-system", "descheduler", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get deployment inside reactor: %v", err)
+			}
+			live := tracked.(*appsv1.Deployment)
+			if live.Annotations == nil {
+				live.Annotations = map[string]string{}
+			}
+			live.Annotations[stormGateHoldAnno] = "true"
+			live.ResourceVersion = "43"
+			cs.Tracker().Update(deployGVR, live, "kube-system")
+			// The apiserver contract this test stands in for: a merge
+			// patch whose metadata.resourceVersion no longer matches
+			// the live object is rejected with 409 Conflict.
+			if body.Metadata.ResourceVersion != "43" {
+				return true, nil, apierrors.NewConflict(
+					deployGVR.GroupResource(), "descheduler",
+					errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+			}
+			return false, nil, nil
+		})
+	res, err := r.Reconcile(ctx, reconcile.Request{})
+	if err != nil {
+		t.Fatalf("a lost race must defer, not error the reconcile: %v", err)
+	}
+	if res.RequeueAfter != 5*time.Minute {
+		t.Fatalf("deferred sweep lost the regular 5m requeue: %+v", res)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 2 {
+		t.Fatalf("scaled despite the mid-sweep hold — replicas=%d", got)
+	}
+	d := getDescheduler(t, cs)
+	if d.Annotations[stormGateHoldAnno] != "true" {
+		t.Fatalf("mid-sweep hold annotation lost: %v", d.Annotations)
+	}
+	if got := d.Annotations[stormGateDecisionAnno]; got != "" {
+		t.Fatalf("decision annotation written on a conflicted sweep: %q", got)
+	}
+}
+
+// A deployment with spec.replicas unset reads as the API default of
+// 1: a clear verdict scales nothing (the old cur=-1 sentinel forced
+// a redundant scale patch on EVERY clear reconcile against such a
+// deployment) and the decision annotation carries cur=1 evidence,
+// not an empty cur=.
+func TestStormGateNilReplicasDefaultsToOne(t *testing.T) {
+	deploy := deschedulerDeploy(1, nil)
+	deploy.Spec.Replicas = nil
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil), // clear -> want 1
+		deploy)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	var patches [][]byte
+	cs.PrependReactor("patch", "deployments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			patches = append(patches, a.(ktesting.PatchAction).GetPatch())
+			return false, nil, nil
+		})
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range patches {
+		if strings.Contains(string(p), "replicas") {
+			t.Fatalf("nil replicas scaled although the API default is already 1: %s", p)
+		}
+	}
+	decision := getDescheduler(t, cs).Annotations[stormGateDecisionAnno]
+	if !strings.Contains(decision, "want=1") || !strings.Contains(decision, "cur=1") {
+		t.Fatalf("decision annotation missing the cur=1 API default: %q", decision)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// maintenance-mutex memo — one mutex evaluation per verdict TTL.
+// ---------------------------------------------------------------------------
+
+// The maintenance-mutex evidence is memoized on the reconciler (the
+// kube.Verdict pattern): the second reconcile inside the ~1m TTL
+// window performs no dynamic API reads at all — every node
+// storm-signal flip fans a full sweep into this single-key queue,
+// and without the memo each node-event reconcile re-paid the mutex's
+// autopilot Plan + medik8s remediation lists. (The NHC pause probe
+// is deliberately excluded from the count: it is not memoized and
+// runs per sweep.)
+func TestStormGateMaintenanceEvidenceMemoized(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	dyn := stormGateDynFake()
+	mutexLists := 0
+	dyn.PrependReactor("list", "*",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetResource().Resource != kube.GVRNodeHealthCheck.Resource {
+				mutexLists++
+			}
+			return false, nil, nil
+		})
+	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if mutexLists == 0 {
+		t.Fatal("cold reconcile paid no mutex dynamic reads")
+	}
+	first := mutexLists
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mutexLists - first; got != 0 {
+		t.Fatalf("second reconcile inside the TTL made %d dynamic reads — memo not consulted", got)
 	}
 }

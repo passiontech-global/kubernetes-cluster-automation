@@ -262,3 +262,28 @@ func TestDragonflySyncStormPromOutageCleansLedgers(t *testing.T) {
 		t.Fatalf("seen ledger must prune clean on the outage: %v", keys)
 	}
 }
+
+// isDragonflyPod pure pins: each of the three well-known label paths
+// qualifies, a dragonfly substring in any label value qualifies, and
+// unrelated labels do not.
+func TestIsDragonflyPodPredicate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"app.kubernetes.io/name", map[string]string{"app.kubernetes.io/name": "dragonfly"}, true},
+		{"part-of", map[string]string{"app.kubernetes.io/part-of": "dragonfly"}, true},
+		{"created-by", map[string]string{"app.kubernetes.io/created-by": "dragonfly-operator"}, true},
+		{"substring value", map[string]string{"app": "dragonfly-df-0"}, true},
+		{"unrelated", map[string]string{"app": "redis-standalone"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "db", Name: "df-0", Labels: tc.labels}}
+			if got := isDragonflyPod(pod); got != tc.want {
+				t.Fatalf("isDragonflyPod = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

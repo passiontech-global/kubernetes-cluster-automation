@@ -1,14 +1,25 @@
 // olm_csv_autopatch_test.go — coverage for the W20-CP3 durable-patch
 // duties: the argocd-operator probe patch, the node-maintenance
 // --leader-elect strip, the InstallPlan ResolutionFailed read, and
-// the int64/float64 number coercion the dynamic client produces.
+// the int64/float64 number coercion the dynamic client produces —
+// plus the gated write-heal shapes: the spec.approved=true InstallPlan
+// heal (captured patch body) and the persisted-cooldown gate both
+// heals run through.
 package datastore
 
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
 // ---------------------------------------------------------------------------
@@ -308,5 +319,215 @@ func TestResolutionFailed(t *testing.T) {
 				t.Fatalf("resolutionFailed = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// installPlan builds an everest-namespace InstallPlan aged `age`
+// carrying the given spec fields.
+func installPlan(name string, age time.Duration,
+	spec map[string]any) *unstructured.Unstructured {
+	plan := probetest.UnstructuredObj(
+		"operators.coreos.com/v1alpha1", "InstallPlan", "everest", name, 1, 0)
+	plan.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	if spec != nil {
+		plan.Object["spec"] = spec
+	}
+	return plan
+}
+
+// The captured patch body: a stuck everest plan is approved via
+// spec.approved=true — the granted state — never via spec.approval
+// (the Automatic|Manual policy ENUM; writing "Approved" there was the
+// silent no-op this test pins the fix for), and the cooldown stamp
+// rides the same patch.
+func TestAutoApproveStuckInstallPlanPatchesApprovedField(t *testing.T) {
+	base := time.Now()
+	plan := installPlan("install-db-operator",
+		olmInstallPlanApproveMinAge+time.Minute,
+		map[string]any{"approval": "Manual", "approved": false})
+	dyn := probetest.OpDyn(plan)
+	var bodies []string
+	dyn.PrependReactor("patch", "installplans",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			bodies = append(bodies,
+				string(action.(ktesting.PatchAction).GetPatch()))
+			return false, nil, nil // fall through to the fake's write
+		})
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*olmHealthCheck](t, p)
+
+	chk.autoApproveStuckInstallPlans(ctx, logr.Discard(), base)
+	if len(bodies) != 1 {
+		t.Fatalf("patch calls = %d, want 1", len(bodies))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(bodies[0]), &doc); err != nil {
+		t.Fatalf("patch body %q: %v", bodies[0], err)
+	}
+	spec, _ := doc["spec"].(map[string]any)
+	if approved, _ := spec["approved"].(bool); !approved {
+		t.Fatalf("patch body spec = %v, want spec.approved=true", spec)
+	}
+	if _, hit := spec["approval"]; hit {
+		t.Fatalf("patch body still writes the approval ENUM: %v", spec)
+	}
+	meta, _ := doc["metadata"].(map[string]any)
+	annos, _ := meta["annotations"].(map[string]any)
+	if _, ok := annos[olmInstallPlanApproveAnno]; !ok {
+		t.Fatalf("patch body missing the %s cooldown stamp: %v",
+			olmInstallPlanApproveAnno, doc)
+	}
+}
+
+// Quiet paths: a young plan, an already-approved plan, a
+// ResolutionFailed plan and an out-of-scope-namespace plan are all
+// left alone.
+func TestAutoApproveStuckInstallPlanQuietPaths(t *testing.T) {
+	base := time.Now()
+	cases := []struct {
+		name string
+		plan *unstructured.Unstructured
+	}{
+		{"young plan", installPlan("young", time.Minute,
+			map[string]any{"approval": "Manual", "approved": false})},
+		{"already approved", installPlan("approved",
+			olmInstallPlanApproveMinAge+time.Minute,
+			map[string]any{"approval": "Manual", "approved": true})},
+		{"resolution failed", func() *unstructured.Unstructured {
+			plan := installPlan("broken", time.Hour,
+				map[string]any{"approval": "Manual", "approved": false})
+			plan.Object["status"] = map[string]any{"conditions": []any{
+				map[string]any{"type": "ResolutionFailed", "status": "True"}}}
+			return plan
+		}()},
+		{"out-of-namespace", func() *unstructured.Unstructured {
+			plan := installPlan("medik8s", time.Hour,
+				map[string]any{"approval": "Manual", "approved": false})
+			plan.SetNamespace("operators") // the intentional Manual gate
+			return plan
+		}()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dyn := probetest.OpDyn(c.plan)
+			patches := 0
+			dyn.PrependReactor("patch", "installplans",
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					patches++
+					return false, nil, nil
+				})
+			p := testProberDyn(fake.NewSimpleClientset(), dyn)
+			chk := probetest.MustCheck[*olmHealthCheck](t, p)
+			chk.autoApproveStuckInstallPlans(ctx, logr.Discard(), base)
+			if patches != 0 {
+				t.Fatalf("%s: patched %d times, want 0", c.name, patches)
+			}
+		})
+	}
+}
+
+// The persisted half of the 30m approve cooldown: a plan whose
+// approval was REVERTED mid-window (approved=false again) but whose
+// passiontech.dev/last-installplan-approve stamp is fresh draws no
+// patch from a fresh check process — the restart-resume shape an
+// in-RAM-only ledger would re-fire every restart.
+func TestAutoApproveStuckInstallPlanCooldownGate(t *testing.T) {
+	base := time.Now()
+	plan := installPlan("install-db-operator", time.Hour,
+		map[string]any{"approval": "Manual", "approved": false})
+	plan.SetAnnotations(map[string]string{
+		olmInstallPlanApproveAnno: base.Add(-10 * time.Minute).
+			UTC().Format(time.RFC3339)})
+	dyn := probetest.OpDyn(plan)
+	patches := 0
+	dyn.PrependReactor("patch", "installplans",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*olmHealthCheck](t, p)
+
+	chk.autoApproveStuckInstallPlans(ctx, logr.Discard(), base)
+	if patches != 0 {
+		t.Fatalf("patched %d times inside the persisted cooldown, want 0",
+			patches)
+	}
+}
+
+// argocdOperatorCSV builds an unpatched argocd-operator CSV (manager
+// container without the startupProbe — the drift shape the sweep
+// heals).
+func argocdOperatorCSV(name string) *unstructured.Unstructured {
+	csv := probetest.UnstructuredObj("operators.coreos.com/v1alpha1",
+		"ClusterServiceVersion", "operators", name, 1, 0)
+	csv.Object["spec"] = csvDeploymentsObj(managerCtr())["spec"]
+	return csv
+}
+
+// The CSV durable-patch write carries the cooldown stamp in the SAME
+// merge patch, and the persisted stamp suppresses a FRESH check
+// process (empty in-RAM ledger — the restart-resume shape) inside the
+// window even after OLM re-asserts the bundle spec (drift again,
+// annotations untouched) — the patch-vs-revert fight the gate exists
+// to stop.
+func TestAutoPatchOperatorCSVsGateAndStamp(t *testing.T) {
+	base := time.Now()
+	csv := argocdOperatorCSV("argocd-operator.v2.7.1")
+	dyn := probetest.OpDyn(csv)
+	var body string
+	dyn.PrependReactor("patch", "clusterserviceversions",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			body = string(action.(ktesting.PatchAction).GetPatch())
+			return false, nil, nil
+		})
+	chk := probetest.MustCheck[*olmHealthCheck](t,
+		testProberDyn(fake.NewSimpleClientset(), dyn))
+
+	// First sweep: drift healed, stamp landed.
+	chk.autoPatchOperatorCSVs(ctx, logr.Discard(), base)
+	if body == "" {
+		t.Fatal("unpatched argocd-operator CSV must be patched")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("patch body %q: %v", body, err)
+	}
+	meta, _ := doc["metadata"].(map[string]any)
+	annos, _ := meta["annotations"].(map[string]any)
+	if _, ok := annos[olmCSVPatchHealAnno]; !ok {
+		t.Fatalf("patch body missing the %s cooldown stamp: %v",
+			olmCSVPatchHealAnno, doc)
+	}
+
+	// OLM re-asserts the bundle mid-window: the spec drifts back, the
+	// annotations (ours included) survive — an OLM upgrade rewrites
+	// spec/status, not foreign metadata.
+	got, err := dyn.Resource(olmCSVGVR).Namespace("operators").
+		Get(ctx, "argocd-operator.v2.7.1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasserted := argocdOperatorCSV("argocd-operator.v2.7.1")
+	reasserted.SetAnnotations(got.GetAnnotations())
+	if _, err := dyn.Resource(olmCSVGVR).Namespace("operators").
+		Update(ctx, reasserted, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	patches := 0
+	dyn.PrependReactor("patch", "clusterserviceversions",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+	// A FRESH check process — the prober owns its instances, so a new
+	// prober is the restarted operator: empty csvPatched ledger.
+	chk2 := probetest.MustCheck[*olmHealthCheck](t,
+		testProberDyn(fake.NewSimpleClientset(), dyn))
+	chk2.autoPatchOperatorCSVs(ctx, logr.Discard(),
+		base.Add(10*time.Minute))
+	if patches != 0 {
+		t.Fatalf("re-patched %d times inside the persisted cooldown, want 0",
+			patches)
 	}
 }

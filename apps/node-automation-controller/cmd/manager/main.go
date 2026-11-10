@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -149,6 +150,71 @@ func emitCircuitOpenEvent(cs kubernetes.Interface, module, target, reason string
 	}
 	ctrl.Log.Info("EVENT: RemediationCircuitBreakerOpen — remediation deferred",
 		"module", module, "node", target, "reason", reason)
+}
+
+// healTargetLedger is the bounded emitted-tuples ledger behind
+// HealTargetCircuitBrokenTotal{module,target}: the open hook records
+// every tuple it Inc'd and the breaker's forget hook (the expiry GC
+// / healthy reset dropping the target's history — see
+// heal.SetTargetCircuitForgetHook) retires exactly the recorded
+// tuples, so a series lives no longer than the breaker's own state
+// for that target instead of the process lifetime (a counter Inc is
+// never undone by its own code path — the ledger is what lets the
+// forget path find and delete it). Mutex-guarded: the hooks fire from
+// several module sweep goroutines.
+type healTargetLedger struct {
+	mu      sync.Mutex
+	emitted map[[2]string]struct{}
+}
+
+func (l *healTargetLedger) emit(module, target string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.emitted == nil {
+		l.emitted = map[[2]string]struct{}{}
+	}
+	l.emitted[[2]string{module, target}] = struct{}{}
+}
+
+// forget deletes the series for a forgotten target — only when this
+// ledger emitted it: the breaker forgets targets whose circuits never
+// opened too (grants under the limit, then expired), and their series
+// do not exist. Deleting a tuple that was never WithLabelValues'd is
+// harmless, but gating on the ledger keeps `delete` doubling as the
+// exists-probe honest for tests.
+func (l *healTargetLedger) forget(module, target string,
+	del func(labelValues ...string) bool) {
+	l.mu.Lock()
+	key := [2]string{module, target}
+	_, ok := l.emitted[key]
+	delete(l.emitted, key)
+	l.mu.Unlock()
+	if ok {
+		del(module, target)
+	}
+}
+
+// wireTargetBreaker installs the process-global per-target
+// non-convergent breaker and its hook bridges — the boot-time wiring
+// that keeps platform/heal a depguard leaf (the package cannot import
+// internal/metrics or hold a clientset). The open transition
+// increments HealTargetCircuitBrokenTotal, records the tuple in the
+// ledger and stamps the RemediationCircuitBreakerOpen Warning event
+// on the target Node (best-effort — see emitCircuitOpenEvent); the
+// forget transition prunes exactly the recorded tuples, so a target
+// the breaker no longer tracks cannot pin its series forever.
+func wireTargetBreaker(cs kubernetes.Interface) {
+	var ledger healTargetLedger
+	heal.ConfigureTargetBreaker(heal.TargetBreakerLimit, heal.TargetBreakerWindow)
+	heal.SetTargetCircuitOpenHook(func(module, target, reason string) {
+		ledger.emit(module, target)
+		metrics.HealTargetCircuitBrokenTotal.WithLabelValues(module, target).Inc()
+		emitCircuitOpenEvent(cs, module, target, reason)
+	})
+	heal.SetTargetCircuitForgetHook(func(module, target string) {
+		ledger.forget(module, target,
+			metrics.HealTargetCircuitBrokenTotal.DeleteLabelValues)
+	})
 }
 
 // buildCacheOptions assembles the informer cache shape. The cache
@@ -310,6 +376,20 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	tuneClientConfig(cfg)
 
+	// The endpoint-guard warning filter is installed BEFORE anything
+	// is built from this config — ctrl.NewManager first, then the
+	// clients: the manager derives its own cached client and REST
+	// mapper's transports from cfg when it is constructed, and
+	// buildKubeClients clones the same config for the direct clients.
+	// A handler assigned only after NewManager returns would reach
+	// buildKubeClients but not the manager's captured copy of the
+	// config, so the guard's Endpoints write on hosted planes could
+	// still surface as a manager-side warning. Installing it here also
+	// lets Setup reuse THIS dynamic client instead of cloning cfg into
+	// a second one — which would duplicate the http.Transport and its
+	// TLS connection pool just to silence one warning header.
+	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
+
 	mgr, err := ctrl.NewManager(cfg,
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
 			leaseDuration, renewDeadline, retryPeriod))
@@ -318,14 +398,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The endpoint-guard warning filter is attached BEFORE the
-	// clients are built: the guard writes the deprecated Endpoints
-	// object deliberately on hosted planes, and installing the
-	// handler on the shared config lets Setup reuse THIS dynamic
-	// client instead of cloning cfg into a second one — which would
-	// duplicate the http.Transport and its TLS connection pool just
-	// to silence one warning header.
-	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
 	clients, err := buildKubeClients(cfg)
 	if err != nil {
 		log.Error(err, "unable to create kube clients")
@@ -351,16 +423,7 @@ func main() {
 	// inside 3h without the target converging defers further
 	// remediation until the window expires or the target reports
 	// healthy (RecordTargetHealthy from each module's recovery path).
-	// Same hook bridge as the budget (platform cannot import
-	// internal/metrics — depguard leaf rule): the open transition
-	// increments the counter and stamps the
-	// RemediationCircuitBreakerOpen Warning event on the Node
-	// (best-effort — see emitCircuitOpenEvent).
-	heal.ConfigureTargetBreaker(heal.TargetBreakerLimit, heal.TargetBreakerWindow)
-	heal.SetTargetCircuitOpenHook(func(module, target, reason string) {
-		metrics.HealTargetCircuitBrokenTotal.WithLabelValues(module, target).Inc()
-		emitCircuitOpenEvent(cs, module, target, reason)
-	})
+	wireTargetBreaker(cs)
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn,
 		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}

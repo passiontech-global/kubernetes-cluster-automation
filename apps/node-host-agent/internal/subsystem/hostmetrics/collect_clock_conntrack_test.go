@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -371,5 +372,68 @@ func TestConntrackSearchRestartAbsentWithoutColumn(t *testing.T) {
 		if _, ok := metricValue(t, c, name, node); ok {
 			t.Fatalf("%s emitted without its column", name)
 		}
+	}
+}
+
+// TestClocksourceRestoreWriteFailure: a read-only current-clocksource
+// sysctl fails the kvm-clock restore silently — the degraded gauge
+// still reports the truth.
+func TestClocksourceRestoreWriteFailure(t *testing.T) {
+	cfg, _ := fixture(t)
+	dir := t.TempDir()
+	cfg.ClocksourceCurrentFile = filepath.Join(dir, "current_clocksource")
+	cfg.ClocksourceAvailableFile = filepath.Join(dir, "available_clocksource")
+	testutil.WriteFile(t, cfg.ClocksourceCurrentFile, "hpet\n")
+	testutil.WriteFile(t, cfg.ClocksourceAvailableFile, "tsc hpet\n")
+	if err := os.Chmod(cfg.ClocksourceCurrentFile, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfg.ClocksourceCurrentFile, 0o644) })
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_clocksource_non_tsc",
+		map[string]string{"node": "node-a", "clocksource": "hpet"}); !ok || v != 1 {
+		t.Fatalf("degraded=%v ok=%v want 1 despite the failed restore", v, ok)
+	}
+	if got := strings.TrimSpace(testutil.ReadFile(t, cfg.ClocksourceCurrentFile)); got != "hpet" {
+		t.Fatalf("current clocksource rewritten to %q through a failed write", got)
+	}
+}
+
+// TestARPEntriesSkipsBlankLines: blank rows (a trailing newline, a
+// gapped table) never inflate the entry count.
+func TestARPEntriesSkipsBlankLines(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.ARPTableFile = filepath.Join(t.TempDir(), "arp")
+	testutil.WriteFile(t, cfg.ARPTableFile,
+		"IP address  HW type  Flags  IP address  HW type  Flags  Mask  Device\n"+
+			"192.168.1.1 0x1 0x2 00:11:22:33:44:55 * eth0\n"+
+			"\n"+
+			"10.0.0.1 0x1 0x2 00:aa:bb:cc:dd:ee * eth0\n"+
+			"\n")
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_arp_entries",
+		map[string]string{"node": "node-a"}); !ok || v != 2 {
+		t.Fatalf("arp entries=%v ok=%v want 2 (blank lines skipped)", v, ok)
+	}
+}
+
+// TestConntrackStatCountersGuards: a header without any wanted
+// column is inconclusive, and malformed per-CPU rows are skipped
+// rather than summed as junk.
+func TestConntrackStatCountersGuards(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "nf_conntrack")
+	if _, ok := conntrackStatCounters(filepath.Join(dir, "missing"), "found"); ok {
+		t.Fatal("missing file parsed")
+	}
+	testutil.WriteFile(t, p, "entries invalid timeout\n00000002 00000001\n")
+	if _, ok := conntrackStatCounters(p, "found", "create"); ok {
+		t.Fatal("header without a wanted column parsed")
+	}
+	testutil.WriteFile(t, p,
+		"entries found\n00000002 00000004\n00000001 00000006\n0 SHORT\n")
+	out, ok := conntrackStatCounters(p, "found")
+	if !ok || out["found"] != 10 {
+		t.Fatalf("found=%v ok=%v want 10 (malformed row skipped)", out["found"], ok)
 	}
 }

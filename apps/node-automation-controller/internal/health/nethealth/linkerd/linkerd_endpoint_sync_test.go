@@ -980,3 +980,85 @@ func TestLinkerdSockLBNoCiliumNoMesh(t *testing.T) {
 		t.Fatalf("no linkerd namespace must pass: %+v", res)
 	}
 }
+
+// linkerdEndpointSetsDiverge pure pins: divergence is any ready pod
+// IP missing from the slice, or any slice address with no live pod
+// behind it; equal sets (including both empty) converge.
+func TestLinkerdEndpointSetsDiverge(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		readyIPs, liveIPs, esRd map[string]bool
+		want                    bool
+	}{
+		{
+			"ready pod IP missing from the slice",
+			map[string]bool{"10.0.0.1": true}, map[string]bool{"10.0.0.1": true},
+			map[string]bool{}, true,
+		},
+		{
+			"slice address with no live pod",
+			map[string]bool{}, map[string]bool{},
+			map[string]bool{"10.0.0.9": true}, true,
+		},
+		{
+			"equal sets",
+			map[string]bool{"10.0.0.1": true},
+			map[string]bool{"10.0.0.1": true},
+			map[string]bool{"10.0.0.1": true}, false,
+		},
+		{
+			"all empty",
+			map[string]bool{}, map[string]bool{}, map[string]bool{}, false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := linkerdEndpointSetsDiverge(tc.readyIPs, tc.liveIPs, tc.esRd); got != tc.want {
+				t.Fatalf("linkerdEndpointSetsDiverge = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// linkerdAuditedService pure pins: only an injected namespace, a
+// selector-backed, non-ExternalName, ready-addresses service is
+// audited.
+func TestLinkerdAuditedService(t *testing.T) {
+	mk := func(mutate func(*corev1.Service)) *corev1.Service {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "svc"},
+			Spec: corev1.ServiceSpec{
+				ClusterIP: "10.96.0.1",
+				Selector:  map[string]string{"app": "x"},
+			},
+		}
+		mutate(svc)
+		return svc
+	}
+	injectedNS := map[string]bool{"app": true}
+	for _, tc := range []struct {
+		name     string
+		injected map[string]bool
+		svc      *corev1.Service
+		want     bool
+	}{
+		{"clusterip + selector + injected", injectedNS, mk(func(*corev1.Service) {}), true},
+		{"selectorless", injectedNS, mk(func(s *corev1.Service) {
+			s.Spec.Selector = nil
+		}), false},
+		{"externalname", injectedNS, mk(func(s *corev1.Service) {
+			s.Spec.Type = corev1.ServiceTypeExternalName
+			s.Spec.Selector = nil
+		}), false},
+		{"uninjected namespace", map[string]bool{"other": true},
+			mk(func(*corev1.Service) {}), false},
+		{"publishNotReadyAddresses", injectedNS, mk(func(s *corev1.Service) {
+			s.Spec.PublishNotReadyAddresses = true
+		}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := linkerdAuditedService(tc.injected, tc.svc); got != tc.want {
+				t.Fatalf("linkerdAuditedService = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

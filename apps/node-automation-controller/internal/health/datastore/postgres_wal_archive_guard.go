@@ -91,15 +91,46 @@ var postgresClusterLabels = []string{
 
 // postgresCRKinds is the cluster-CR census — each family's status
 // conditions carry archive/backup health the operator already
-// detected (CNPG ContinuousArchiving, Percona pgbackrest repo
-// conditions, Everest backup posture).
+// detected. pgWALConds is the family's real archive/backup condition
+// types (exact-matched by pgWALConditionUnhealthy); pgCondBareFallback
+// marks families whose condition types are NOT a closed documented
+// enum, so unknown archiv/backup/wal-ish types still substring-match
+// there (see pgWALConditionUnhealthy).
 var postgresCRKinds = []struct {
 	kind string
 	gvr  schema.GroupVersionResource
+	// pgWALConds: the condition types this family's operator
+	// publishes for archive/backup health, False = the WAL-runaway
+	// evidence this check exists to surface.
+	pgWALConds []string
+	// pgCondBareFallback: unknown archiv/backup/wal-ish condition
+	// types still count on this family (see pgWALConditionUnhealthy).
+	pgCondBareFallback bool
 }{
-	{"PerconaPGCluster", kube.GVRPerconaPGCluster},
-	{"CNPGCluster", kube.GVRCNPGCluster},
-	{"EverestDatabaseCluster", kube.GVREverestDatabaseCluster},
+	// Percona Operator for PostgreSQL — the documented
+	// status.conditions[].type set. The old bare substring net only
+	// ever caught the two types whose spelling contains "backup"
+	// ("pgbackrest..." does NOT — "backrest" is not "backup"), so the
+	// exact list is exactly that prior coverage: the
+	// restore/replica/TLS/repo-host conditions stay out (False there
+	// is a normal in-flight state, not WAL evidence).
+	{"PerconaPGCluster", kube.GVRPerconaPGCluster, []string{
+		"ReadyForBackup",                   // False: repo host not ready / no replica-create backup
+		"PGBackRestManualBackupSuccessful", // False: latest on-demand backup failed
+	}, false},
+	// CloudNativePG — ConditionContinuousArchiving /
+	// ConditionBackup (= "LastBackupSucceeded") in the operator's
+	// API (api/v1 cluster_types.go).
+	{"CNPGCluster", kube.GVRCNPGCluster, []string{
+		"ContinuousArchiving", // False: WAL archiving failing
+		"LastBackupSucceeded", // False: last backup failed
+	}, false},
+	// Everest — the databaseclusters CRD's condition set is not a
+	// documented closed enum (the operator's own backup posture rides
+	// versioned types that drift), so unknown archiv/backup/wal-ish
+	// types keep the bare substring net here: the check is
+	// detection-only and a missed stall is the expensive failure.
+	{"EverestDatabaseCluster", kube.GVREverestDatabaseCluster, nil, true},
 }
 
 var (
@@ -137,13 +168,19 @@ func init() {
 }
 
 // pgWALConditionUnhealthy reports whether a cluster CR condition is
-// archive/backup evidence: a condition type containing archiv/backup/
-// wal whose status is False past pgArchiveCondMinAge.
-func pgWALConditionUnhealthy(c kube.Condition, now time.Time) bool {
-	t := strings.ToLower(c.Type)
-	if !strings.Contains(t, "archiv") &&
-		!strings.Contains(t, "backup") &&
-		!strings.Contains(t, "wal") {
+// archive/backup evidence. The primary gate is an EXACT match
+// (case-insensitive) against the family's real condition types —
+// operators publish benign custom conditions whose type merely
+// contains "backup"/"wal" ("BackupScheduleConfigured"), and the old
+// bare substring match flagged them. conds carries the scanned
+// family's pgWALConds set; bareFallback keeps the archiv/backup/wal
+// substring list alive ONLY for families whose condition types are
+// not a documented closed enum (Everest — see postgresCRKinds), so
+// an undocumented type spelling still surfaces there. A matched
+// condition flags when its status is False past pgArchiveCondMinAge.
+func pgWALConditionUnhealthy(c kube.Condition, conds []string,
+	bareFallback bool, now time.Time) bool {
+	if !walCondTypeMatch(c.Type, conds, bareFallback) {
 		return false
 	}
 	if c.Status != "False" {
@@ -151,6 +188,26 @@ func pgWALConditionUnhealthy(c kube.Condition, now time.Time) bool {
 	}
 	return !c.LastTransitionTime.IsZero() &&
 		now.Sub(c.LastTransitionTime) >= pgArchiveCondMinAge
+}
+
+// walCondTypeMatch exact-matches the condition type against the
+// family's known archive/backup types (lowercased — operators are
+// consistent about their own enum spellings but tests read either),
+// falling back to the archiv/backup/wal substring list only where
+// the family opted into the bare net.
+func walCondTypeMatch(typ string, conds []string, bareFallback bool) bool {
+	t := strings.ToLower(typ)
+	for _, cond := range conds {
+		if t == strings.ToLower(cond) {
+			return true
+		}
+	}
+	if !bareFallback {
+		return false
+	}
+	return strings.Contains(t, "archiv") ||
+		strings.Contains(t, "backup") ||
+		strings.Contains(t, "wal")
 }
 
 // pgWALLogReason matches the log-line signatures of a WAL runaway —

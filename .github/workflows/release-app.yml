@@ -87,7 +87,7 @@ jobs:
           fi
           if [ -z "$last_tag" ]; then
             last_tag="$APP/v0.0.0"
-            git tag "$last_tag" "$(git rev-list --max-parents=0 HEAD)"
+            git tag "$last_tag" "$(git rev-list --max-parents=0 HEAD | tail -n 1)"
           fi
           last_ver="${last_tag##*/}"
 

@@ -38,6 +38,7 @@ func TestPartitionEvictor(t *testing.T) {
 		objs = append(objs, n)
 	}
 	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs) // fake records evictions without deleting pods
 	e := &partitionEvictor{cs: cs}
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)

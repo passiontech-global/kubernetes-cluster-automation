@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+	"os"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -469,4 +470,43 @@ func TestSetupMetricsServerPatcherNodeWatch(t *testing.T) {
 	if p.Generic(event.GenericEvent{Object: n1}) {
 		t.Fatal("generic event fired")
 	}
+}
+
+// configFromEnv pins: the documented defaults are 3 replicas / 1
+// node per replica; an explicit override wins; MIN_REPLICAS=0 is the
+// documented way to disable the replica pin entirely.
+func TestConfigFromEnv(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		for _, k := range []string{
+			"METRICS_SERVER_MIN_REPLICAS", "METRICS_SERVER_NODES_PER_REPLICA",
+		} {
+			t.Setenv(k, "")
+			if err := os.Unsetenv(k); err != nil {
+				t.Fatalf("unset %s: %v", k, err)
+			}
+		}
+		cfg := configFromEnv()
+		if cfg.minReplicas != 3 || cfg.nodesPerReplica != 1 {
+			t.Fatalf("defaults = %d/%d, want 3/1",
+				cfg.minReplicas, cfg.nodesPerReplica)
+		}
+	})
+
+	t.Run("explicit override", func(t *testing.T) {
+		t.Setenv("METRICS_SERVER_MIN_REPLICAS", "5")
+		t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "2")
+		cfg := configFromEnv()
+		if cfg.minReplicas != 5 || cfg.nodesPerReplica != 2 {
+			t.Fatalf("override = %d/%d, want 5/2",
+				cfg.minReplicas, cfg.nodesPerReplica)
+		}
+	})
+
+	t.Run("min replicas 0 disables the pin", func(t *testing.T) {
+		t.Setenv("METRICS_SERVER_MIN_REPLICAS", "0")
+		t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
+		if cfg := configFromEnv(); cfg.minReplicas != 0 {
+			t.Fatalf("minReplicas = %d, want 0 (pin disabled)", cfg.minReplicas)
+		}
+	})
 }

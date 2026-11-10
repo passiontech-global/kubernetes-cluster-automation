@@ -73,11 +73,16 @@ func (e *env) mkEtcdHost(t *testing.T) string {
 // wireEtcdGuard points cfg.K0sDir at the fabricated host tree and
 // installs the scripted seams. EtcdBackupDir gets a writable tempdir
 // — the pre-maintenance snapshot gate runs before every remediation
-// and would otherwise try /var/backups/etcd on the test host.
+// and would otherwise try /var/backups/etcd on the test host — with
+// the StatFSFn seam pinned to ample headroom: the real statfs makes
+// the 30%-free ratio gate depend on the host's tempdir occupancy and
+// flakes under parallel load (tests that exercise the gate itself
+// override StatFSFn after wiring).
 func (e *env) wireEtcdGuard(t *testing.T, g *etcdGuardFake) {
 	t.Helper()
 	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
 	e.H.Cfg.EtcdBackupDir = filepath.Join(filepath.Dir(e.State), "etcd-backups")
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
 	e.H.Cfg.EtcdctlFn = g.ctl
 	e.H.Cfg.EvpurgeRunFn = func(_ context.Context, _ eventpurge.Config,
 		cutoff time.Time, _ io.Writer) error {
@@ -428,6 +433,9 @@ func TestEtcdGuardPreMaintSnapshot(t *testing.T) {
 	e := fixture(t)
 	snapDir := t.TempDir()
 	e.H.Cfg.EtcdBackupDir = snapDir
+	// Pin the headroom gate — real statfs on the host tempdir makes
+	// the 30%-free ratio host-dependent.
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
 	snapSaved := false
 	var order []string
 	g := &etcdGuardFake{
@@ -486,6 +494,9 @@ func TestEtcdGuardPreMaintSnapshot(t *testing.T) {
 func TestEtcdGuardSnapshotInvalidAbortsRescue(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.EtcdBackupDir = t.TempDir()
+	// Pin the headroom gate so the abort is attributable to the
+	// invalid snapshot, not the host's tempdir occupancy.
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
 	g := &etcdGuardFake{
 		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
 	}
@@ -730,5 +741,307 @@ func TestVerifySnapshots(t *testing.T) {
 	c.VerifySnapshots()
 	if got := promtest.ToFloat64(e.H.Deps.EtcdSnapAge); got < 7100 {
 		t.Fatalf("etcdSnapAge=%v after empty snapshot", got)
+	}
+}
+
+// Directory entries under a snapshot dir are not snapshots — the
+// scan must skip them and keep ageing the newest real file.
+func TestVerifySnapshotsSkipsDirectories(t *testing.T) {
+	e := fixture(t)
+	snapDir := t.TempDir()
+	e.H.Cfg.EtcdSnapshotDir = snapDir
+	c := etcd.NewGuard(e.H.Deps)
+
+	// A stray directory plus a 1h-old snapshot file: only the file
+	// may land on the age gauge.
+	if err := os.MkdirAll(filepath.Join(snapDir, "staged-restore"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	snap := filepath.Join(snapDir, "snapshot.db")
+	if err := os.WriteFile(snap, []byte("etcd-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := e.Now.Add(-time.Hour)
+	_ = os.Chtimes(snap, old, old)
+	c.VerifySnapshots()
+	if got := promtest.ToFloat64(e.H.Deps.EtcdSnapAge); got < 3500 || got > 3700 {
+		t.Fatalf("etcdSnapAge=%v want ~3600 — dir entries must not feed the gauge", got)
+	}
+	if n := e.CountLogLines("no etcd snapshot"); n != 0 {
+		t.Fatalf("real snapshot misreported as missing (%d lines)", n)
+	}
+}
+
+// --- probe error paths (alarm list / endpoint status) ---
+
+// A failed alarm read must not hide a real alarm NOR fabricate a
+// clear one: the size signal stays authoritative, the gauge keeps
+// its last value, and the healthy cycle still closes as ok.
+func TestEtcdGuardAlarmListErrorKeepsGaugeAndOk(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{status: etcdStatusJSON(100<<20, 90<<20)} // below limit → probe runs
+	e.wireEtcdGuard(t, g)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return nil, errors.New("alarm boom")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok")); got != 1 {
+		t.Fatalf("cycles{ok}=%v want 1 — a failed alarm read is not a trigger", got)
+	}
+	if got := promtest.ToFloat64(e.H.EtcdNospace); got != 0 {
+		t.Fatalf("nospace gauge=%v want 0 — keep last, never force-clear", got)
+	}
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("alarm-read failure triggered remediation: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if !strings.Contains(e.LogLines(), "alarm list failed") {
+		t.Fatalf("alarm failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// A transport-level endpoint status failure (not just a parse
+// failure) skips the cycle — nothing measurable, status_error.
+func TestEtcdGuardStatusTransportErrorNoop(t *testing.T) {
+	e := fixture(t)
+	e.wireEtcdGuard(t, &etcdGuardFake{})
+	e.H.Cfg.EtcdctlFn = func(context.Context, ...string) ([]byte, error) {
+		return nil, errors.New("etcdctl boom")
+	}
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "status_error")); got != 1 {
+		t.Fatalf("cycles{status_error}=%v want 1", got)
+	}
+	if g := promtest.ToFloat64(e.H.EtcdDBSize); g != 0 {
+		t.Fatalf("db_size gauge=%v want untouched 0", g)
+	}
+	if !strings.Contains(e.LogLines(), "endpoint status failed") {
+		t.Fatalf("status failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// A well-formed but empty endpoint JSON list is a parse-level error
+// too — element[0] does not exist, so the quota check must skip.
+func TestEtcdGuardStatusEmptyEndpointListNoop(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{status: "[]"}
+	e.wireEtcdGuard(t, g)
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "status_error")); got != 1 {
+		t.Fatalf("cycles{status_error}=%v want 1", got)
+	}
+	if len(g.ctlCalls) != 1 {
+		t.Fatalf("empty endpoint list probed again: %v", g.ctlCalls)
+	}
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("empty endpoint list triggered remediation: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+}
+
+// --- pre-maintenance snapshot environment failure paths ---
+
+// EtcdBackupDir impossible to create (its parent is a regular file)
+// aborts before any etcdctl call — no rollback point, no destructive
+// half.
+func TestEtcdGuardSnapshotDirUncreatableAborts(t *testing.T) {
+	e := fixture(t)
+	blocker := filepath.Join(filepath.Dir(e.State), "not-a-dir")
+	testutil.WriteFile(t, blocker, "regular file")
+	e.H.Cfg.EtcdBackupDir = filepath.Join(blocker, "backups")
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cycle(context.Background())
+	if len(g.ctlCalls) != 1 { // endpoint status only
+		t.Fatalf("etcdctl ran past the failed snapshot dir: %v", g.ctlCalls)
+	}
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran without a snapshot dir: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "snapshot dir") {
+		t.Fatalf("dir failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// A failing statfs on the backup fs must abort the snapshot the same
+// way — unknown headroom, no write.
+func TestEtcdGuardSnapshotStatfsFailAborts(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.EtcdBackupDir = t.TempDir()
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) {
+		return 0, 0, errors.New("statfs boom")
+	}
+	e.H.Cycle(context.Background())
+	for _, c := range g.ctlCalls {
+		if strings.Contains(strings.Join(c, " "), "snapshot") {
+			t.Fatalf("snapshot attempted on statfs failure: %v", g.ctlCalls)
+		}
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "statfs") {
+		t.Fatalf("statfs failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// The `snapshot save` call itself failing aborts before evpurge and
+// the rescue — the budget already spent (retry no sooner than the
+// next guard window).
+func TestEtcdGuardSnapshotSaveFailAborts(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.EtcdBackupDir = t.TempDir()
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "snapshot save"):
+			return nil, errors.New("save boom")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran on a failed snapshot save: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "snapshot save failed") {
+		t.Fatalf("save failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// A save that exits 0 but leaves an artifact `snapshot status`
+// cannot parse aborts the destructive half (truncated-stream parity).
+func TestEtcdGuardSnapshotVerifyAfterSaveFailAborts(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.EtcdBackupDir = t.TempDir()
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "snapshot save"):
+			// Non-empty this time — the size check must pass so the
+			// snapshot-status verify is what fails.
+			if err := os.WriteFile(args[len(args)-1], []byte("truncated"), 0o600); err != nil {
+				return nil, err
+			}
+			return []byte("{}"), nil
+		case strings.Contains(j, "snapshot status"):
+			return nil, errors.New("corrupt snapshot")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran on an unverifiable snapshot: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "failed verification") {
+		t.Fatalf("verify failure not logged:\n%s", e.LogLines())
+	}
+}
+
+// Inside the hourly snapshot budget a zero-byte newest premaint
+// snapshot is no rollback point — the destructive half must abort.
+func TestEtcdGuardSnapshotFallbackEmptyNewestAborts(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = dir
+	if err := os.WriteFile(filepath.Join(dir, "premaint-100.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
+	e.H.Cycle(context.Background())
+	for _, c := range g.ctlCalls {
+		if strings.Contains(strings.Join(c, " "), "snapshot status") {
+			t.Fatalf("snapshot status ran against an empty file: %v", g.ctlCalls)
+		}
+	}
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran on an empty fallback: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+}
+
+// Inside the hourly budget a non-empty premaint snapshot that no
+// longer parses aborts too — a truncated artifact proves nothing.
+func TestEtcdGuardSnapshotFallbackVerifyFailAborts(t *testing.T) {
+	e := fixture(t)
+	dir := t.TempDir()
+	e.H.Cfg.EtcdBackupDir = dir
+	if err := os.WriteFile(filepath.Join(dir, "premaint-100.db"),
+		[]byte("snap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "snapshot status"):
+			return nil, errors.New("corrupt snapshot")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("remediation ran on a corrupt fallback: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error")); got != 1 {
+		t.Fatalf("cycles{snapshot_error}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "failed verification") {
+		t.Fatalf("fallback verify failure not logged:\n%s", e.LogLines())
 	}
 }

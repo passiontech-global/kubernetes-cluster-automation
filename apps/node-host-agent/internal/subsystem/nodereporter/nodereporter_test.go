@@ -878,3 +878,88 @@ func TestRunSyncsOnceThenReturnsOnCancelledContext(t *testing.T) {
 		t.Fatal("Run must execute one cycle before honouring cancellation")
 	}
 }
+
+// TestFirstLatchAltKeys: the primary latch wins on the message,
+// empty keys are skipped, and altStateKeys are the fallback order.
+func TestFirstLatchAltKeys(t *testing.T) {
+	e := fixture(t)
+	e.writeFile("state-primary", "1700000001\n")
+	e.writeFile("state-alt-b", "1700000002\n")
+
+	key, since, ok := e.r.firstLatch("primary", []string{"alt-a", "alt-b"})
+	if !ok || key != "primary" || since != "1700000001" {
+		t.Fatalf("firstLatch=%q,%q,%v want primary,1700000001,true", key, since, ok)
+	}
+
+	// Primary gone → the first PRESENT alt wins ("alt-a" absent).
+	if err := os.Remove(filepath.Join(e.dir, "state-primary")); err != nil {
+		t.Fatal(err)
+	}
+	key, since, ok = e.r.firstLatch("primary", []string{"alt-a", "alt-b"})
+	if !ok || key != "alt-b" || since != "1700000002" {
+		t.Fatalf("alt fallback=%q,%q,%v want alt-b,1700000002,true", key, since, ok)
+	}
+
+	// Nothing present → not ok.
+	if err := os.Remove(filepath.Join(e.dir, "state-alt-b")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := e.r.firstLatch("primary", []string{"alt-a", "alt-b"}); ok {
+		t.Fatal("firstLatch reported a latch with no state files")
+	}
+
+	// Empty keys never match — a def with an empty primary and empty
+	// alts evaluates false without touching the state dir.
+	if _, _, ok := e.r.firstLatch("", []string{"", ""}); ok {
+		t.Fatal("empty keys matched")
+	}
+}
+
+// TestStateFileSinceContentRules: empty latch content reports the
+// shell-parity "unknown" instead of an empty since.
+func TestStateFileSinceContentRules(t *testing.T) {
+	e := fixture(t)
+	if _, ok := e.r.stateFileSince("nope"); ok {
+		t.Fatal("missing state file reported present")
+	}
+	e.writeFile("state-empty", "\n")
+	since, ok := e.r.stateFileSince("empty")
+	if !ok || since != "unknown" {
+		t.Fatalf("empty content since=%q ok=%v want unknown,true", since, ok)
+	}
+	e.writeFile("state-full", "1700000009\n")
+	since, ok = e.r.stateFileSince("full")
+	if !ok || since != "1700000009" {
+		t.Fatalf("content since=%q ok=%v want 1700000009,true", since, ok)
+	}
+}
+
+// TestCycleSurvivesBrokenSources: heartbeat-init, condition-sync and
+// log-sync failures are logged into the cycle bookkeeping — the
+// cycle completes and never panics; a sick monitor cannot starve the
+// latch→condition critical path.
+func TestCycleSurvivesBrokenSources(t *testing.T) {
+	e := fixture(t)
+	blocker := filepath.Join(e.root, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// State dir AND log file under regular files — heartbeat init and
+	// both syncs fail inside this one cycle.
+	e.r.cfg.WatchdogStateDir = filepath.Join(blocker, "wd")
+	e.r.cfg.WatchdogLogFile = filepath.Join(blocker, "log")
+	e.cycle() // must not panic
+
+	if got := testutil.ToFloat64(e.r.cycles.WithLabelValues("started")); got != 1 {
+		t.Fatalf("started cycles=%v want 1", got)
+	}
+}
+
+// TestReadTailBytesUnreadableFile: an openable-but-unreadable path
+// (a directory) degrades to nil like every other tail failure.
+func TestReadTailBytesUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+	if got := readTailBytes(dir, 0, 1024); got != nil {
+		t.Fatalf("directory tail = %q, want nil", got)
+	}
+}

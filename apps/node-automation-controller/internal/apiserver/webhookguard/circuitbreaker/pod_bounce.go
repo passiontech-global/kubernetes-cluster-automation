@@ -29,10 +29,10 @@ import (
 // controller (Deployment/ReplicaSet) recreates it fresh, which is
 // the rolling bounce a hung webhook process needs. One bounce per
 // service per BounceCooldown; every bounce runs the shared heal
-// preamble (heal.AllowedV) — the per-service cooldown on the shared
+// preamble (heal.EvictPodV — the per-service cooldown on the shared
 // bounceAt ledger, the maintenance mutex (a cordon/drain/kured reboot
 // or an in-flight k0s upgrade defers the kill) and the fleet-wide
-// heal budget — and all three fail closed like every other pod kill
+// heal budget) and all three fail closed like every other pod kill
 // in this module.
 func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	snap *guardstate.Snapshot, ready guardstate.EndpointCensus) {
@@ -79,21 +79,14 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	// runs: a stale census ref must not spend a budget grant or open
 	// the per-service cooldown on nothing. The mutex evaluation is
 	// memoized through the Guard verdict, so the pass pays ONE
-	// maintenance check no matter how many services bounce.
+	// maintenance check no matter how many services bounce — the
+	// preamble itself (cooldown + mutex + budget grant) now rides
+	// inside deleteBouncePod's heal.EvictPodV call.
 	for _, key := range keys {
 		target := b.oldestLiveBackingPod(ctx, snap, key, ready.BackingPods[key], now)
 		if target == nil {
 			log.Info("webhook bounce: no live Ready backing pod found — endpoint refs are stale",
 				"service", key)
-			continue
-		}
-		proceed, unverifiable := heal.AllowedV(ctx, log, &g.Verdict,
-			g.CS, g.Dyn, &b.bounceAt, key, BounceCooldown, now)
-		if unverifiable {
-			metrics.IncError(g.Queue)
-			continue
-		}
-		if !proceed {
 			continue
 		}
 		b.deleteBouncePod(ctx, snap, key, target, now)
@@ -136,24 +129,42 @@ func (b *Breaker) oldestLiveBackingPod(ctx context.Context, snap *guardstate.Sna
 	return oldest
 }
 
-// deleteBouncePod issues the UID-preconditioned eviction of a
-// pre-resolved bounce target through the policy/v1 Eviction API
-// (heal.EvictPod) — never a raw Delete, which would bypass every
-// PodDisruptionBudget and could take the backend's last Ready replica
-// (the contract the unmeshed path already runs on). A PDB refusal
-// (429) is a deferral: the pod stays hung, nothing is metered and
-// bounceAt is not stamped, so the next sweep retries once disruptions
-// free up. EvictPod stamps bounceAt on a DELIVERED bounce only — a
-// failed eviction leaves the pod hung and the next sweep retries.
+// deleteBouncePod runs the whole preamble→actuation pair for a
+// pre-resolved bounce target in ONE call (heal.EvictPodV): the
+// per-service cooldown on the shared bounceAt ledger, the maintenance
+// mutex (memoized through the Guard verdict) and the fleet-wide heal
+// budget grant, then the UID-preconditioned eviction through the
+// policy/v1 Eviction API (heal.EvictPod) — never a raw Delete, which
+// would bypass every PodDisruptionBudget and could take the backend's
+// last Ready replica (the contract the unmeshed path already runs
+// on). The single-call pairing is what refunds the budget grant on a
+// PDB refusal (429): the deferral delivered no heal, so a backend
+// wedged behind a drained disruptionsAllowed must not burn one fleet
+// grant per sweep and starve every other heal-gated module. refused
+// stays a DEFERRAL, never an error: the pod stays hung, nothing is
+// metered and bounceAt is not stamped, so the next sweep retries once
+// disruptions free up. EvictPodV stamps bounceAt on a DELIVERED
+// bounce only — a failed eviction leaves the pod hung and the next
+// sweep retries.
 func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot,
 	svcKey string, target *corev1.Pod, now time.Time) {
 	g := snap.G
 	log := logf.FromContext(ctx)
+	proceed, unverifiable, _, refused, err := heal.EvictPodV(ctx, log,
+		&g.Verdict, g.CS, g.Dyn, &b.bounceAt, svcKey, BounceCooldown,
+		target, now)
+	if !proceed {
+		// Cooldown / held mutex / spent budget — the preamble already
+		// logged the defer reason; unverifiable is fail-closed and
+		// owed this module's error counter.
+		if unverifiable {
+			metrics.IncError(g.Queue)
+		}
+		return
+	}
 	log.Info("BOUNCE: evicting oldest Ready webhook pod — hung TCP+TLS handshake",
 		"service", svcKey, "pod", target.Namespace+"/"+target.Name,
 		"age", now.Sub(target.CreationTimestamp.Time).Truncate(time.Second))
-	_, refused, err := heal.EvictPod(ctx, g.CS, &b.bounceAt, svcKey,
-		target, now)
 	switch {
 	case refused:
 		log.Info("DEFER: PDB refused webhook pod bounce — keeping pod alive",

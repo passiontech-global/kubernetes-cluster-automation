@@ -77,6 +77,31 @@ func (b *Budget) Allow(now time.Time) bool {
 	return true
 }
 
+// Refund returns the grant Allow consumed at now — the refused-eviction
+// counterpart of the gate. The budget is deliberately a grant-time
+// counter (a grant is spent when AllowedV unlocks a heal, before the
+// actuation), but a PDB refusal delivers no heal for the grant it
+// consumed, so the refused path hands the stamp back. Un-consuming is
+// symmetric: exactly ONE stamp Equal(now) is removed — the one Allow
+// appended — restoring the window's remaining grant count to its
+// pre-Allow value and never below the grants actually consumed (a
+// refund for an instant that consumed nothing — never granted,
+// already refunded, or already expired out of the window — finds no
+// stamp and is a no-op, so it can never eat a sibling grant). The
+// removal is by value, not a tail trim, so an interleaved later grant
+// (another module's Allow landing between this Allow and this
+// Refund) keeps the slice's ascending order.
+func (b *Budget) Refund(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := len(b.grants) - 1; i >= 0; i-- {
+		if b.grants[i].Equal(now) {
+			b.grants = append(b.grants[:i], b.grants[i+1:]...)
+			return
+		}
+	}
+}
+
 // defaultBudget is the process-wide limiter AllowedV consults; nil
 // disables the gate. Written once at boot by ConfigureBudget, read
 // per AllowedV call — a plain pointer is fine (no hot reconfigure),
@@ -121,6 +146,18 @@ func budgetGate(now time.Time) bool {
 		(*h)()
 	}
 	return false
+}
+
+// budgetRefund hands one grant back to the process-global budget —
+// the refused-eviction counterpart of budgetGate, called by
+// EvictPodV when the eviction it just attempted is PDB-refused (a
+// deferral delivered no heal, so it must not spend a fleet grant).
+// No budget configured consumed nothing, so it is a no-op; a refund
+// fires no hook — only denials are metered.
+func budgetRefund(now time.Time) {
+	if b := defaultBudget.Load(); b != nil {
+		b.Refund(now)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -185,11 +222,12 @@ type targetHistory struct {
 // serially per module, but the process-global instance is consulted
 // from several module goroutines.
 type TargetBreaker struct {
-	mu       sync.Mutex
-	limit    int
-	window   time.Duration
-	targets  map[breakerTarget]*targetHistory
-	openHook func(module, target, reason string)
+	mu         sync.Mutex
+	limit      int
+	window     time.Duration
+	targets    map[breakerTarget]*targetHistory
+	openHook   func(module, target, reason string)
+	forgetHook func(module, target string)
 }
 
 // NewTargetBreaker returns a breaker granting at most limit grants
@@ -213,6 +251,23 @@ func (b *TargetBreaker) SetOpenHook(fn func(module, target, reason string)) {
 	b.openHook = fn
 }
 
+// SetForgetHook registers fn to run once per FORGET — the breaker
+// dropping a (module,targetKey)'s history outright. Both fire sites
+// mean the breaker no longer holds state for the target, so nothing
+// it announced is live anymore: the expiry GC inside TryAcquireTarget
+// (a fully expired window closes and deletes the entry) and
+// RecordTargetHealthy's convergence clear. The bridge lets
+// cmd/manager prune the HealTargetCircuitBrokenTotal series the open
+// hook emitted, bounding the vec's cardinality to targets the
+// breaker still tracks instead of the process lifetime (platform is
+// a depguard leaf — no metrics access here). Passing nil clears it.
+// Boot-time wiring only — callers do not swap hooks mid-sweep.
+func (b *TargetBreaker) SetForgetHook(fn func(module, target string)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.forgetHook = fn
+}
+
 // TryAcquireTarget records one node-action grant for
 // (module,targetKey) at now and reports whether it was allowed. When
 // limit grants already sit inside the trailing window the request is
@@ -226,6 +281,10 @@ func (b *TargetBreaker) TryAcquireTarget(module, targetKey string, now time.Time
 	cut := now.Add(-b.window)
 	k := breakerTarget{module: module, target: targetKey}
 	h := b.targets[k]
+	// forgotten collects every (module,target) whose history this call
+	// dropped — the inline expiry GC below and the bulk prune — so the
+	// forget hook can fire ONCE per dropped entry outside the mutex.
+	var forgotten []breakerTarget
 	if h != nil {
 		// Same ascending-prefix trim as Budget.Allow: grants append
 		// in time order, so the expired prefix drops with one slice
@@ -241,8 +300,13 @@ func (b *TargetBreaker) TryAcquireTarget(module, targetKey string, now time.Time
 		if len(h.stamps) == 0 {
 			delete(b.targets, k)
 			h = nil
+			forgotten = append(forgotten, k)
 		}
 	}
+	if len(b.targets) > 64 {
+		forgotten = append(forgotten, b.pruneLocked(cut)...)
+	}
+	forgetHook := b.forgetHook
 	var fire func(module, target, reason string)
 	allowed := true
 	reason := ""
@@ -262,20 +326,60 @@ func (b *TargetBreaker) TryAcquireTarget(module, targetKey string, now time.Time
 		h.stamps = append(h.stamps, now)
 	}
 	b.mu.Unlock()
+	if forgetHook != nil {
+		for _, f := range forgotten {
+			forgetHook(f.module, f.target)
+		}
+	}
 	if fire != nil {
 		fire(module, targetKey, reason)
 	}
 	return allowed, reason
 }
 
+// pruneLocked drops target entries whose grant history has fully
+// expired — random pod names would otherwise accumulate one map
+// entry per healed pod forever. Runs only past the 64-entry soft
+// cap so the common case pays nothing; the caller HOLDS b.mu.
+// Returns every dropped (module,target) key so the caller can fire
+// the forget hook for them outside the mutex — a bulk-dropped entry
+// is a forget exactly like the inline expiry GC's.
+func (b *TargetBreaker) pruneLocked(cut time.Time) []breakerTarget {
+	var dropped []breakerTarget
+	for k, h := range b.targets {
+		if len(h.stamps) == 0 {
+			delete(b.targets, k)
+			dropped = append(dropped, k)
+			continue
+		}
+		// stamps are ascending — the first in-window stamp ends
+		// the expired prefix.
+		if i := slices.IndexFunc(h.stamps, func(t time.Time) bool {
+			return t.After(cut)
+		}); i < 0 {
+			delete(b.targets, k)
+			dropped = append(dropped, k)
+		}
+	}
+	return dropped
+}
+
 // RecordTargetHealthy clears (module,targetKey)'s history
 // immediately — the recovery-side call: the target's own evidence of
 // convergence (healthy probe, partition healed, steal cleared) ends
-// the episode now instead of waiting out the window.
+// the episode now instead of waiting out the window. Clearing a
+// history that existed is a forget — the forget hook fires (outside
+// the mutex) so the series the open hook emitted can be pruned; a
+// clear with no history is a no-op and stays silent.
 func (b *TargetBreaker) RecordTargetHealthy(module, targetKey string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	_, had := b.targets[breakerTarget{module: module, target: targetKey}]
 	delete(b.targets, breakerTarget{module: module, target: targetKey})
+	forget := b.forgetHook
+	b.mu.Unlock()
+	if had && forget != nil {
+		forget(module, targetKey)
+	}
 }
 
 // defaultTargetBreaker is the process-wide breaker the module sweeps
@@ -303,6 +407,18 @@ func ConfigureTargetBreaker(limit int, window time.Duration) {
 func SetTargetCircuitOpenHook(fn func(module, target, reason string)) {
 	if b := defaultTargetBreaker.Load(); b != nil {
 		b.SetOpenHook(fn)
+	}
+}
+
+// SetTargetCircuitForgetHook registers fn to run once per breaker
+// forget (see TargetBreaker.SetForgetHook) — the prune bridge
+// cmd/manager wires so HealTargetCircuitBrokenTotal series die with
+// the target's breaker state. No-op while no breaker is configured —
+// boot order is ConfigureTargetBreaker first, and reconfiguring drops
+// any previously wired hook with the old instance.
+func SetTargetCircuitForgetHook(fn func(module, target string)) {
+	if b := defaultTargetBreaker.Load(); b != nil {
+		b.SetForgetHook(fn)
 	}
 }
 

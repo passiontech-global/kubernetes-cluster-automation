@@ -78,7 +78,8 @@ type crdConversionKey struct{ crd, service, reason string }
 // touches the CRD object — and bounces the oldest wedged backend pod
 // so the controller recreates it serving (the same stage-1 heal as
 // the admission path: BounceCooldown, the shared maintenance
-// mutex via heal.AllowedV, UID-preconditioned eviction).
+// mutex + fleet budget via heal.EvictPodV, UID-preconditioned
+// eviction).
 //
 // Series hygiene: a complete sweep emits the current tuple per
 // unhealthy CRD and prunes whatever was not re-seen — a stale

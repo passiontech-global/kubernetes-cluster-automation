@@ -186,6 +186,22 @@ func TestProcLimitsSoftFD(t *testing.T) {
 	if _, ok := procLimitsSoftFD(p); ok {
 		t.Fatal("unlimited parsed as a bound")
 	}
+	// Short line, a zero soft limit and a missing file are no bounds.
+	testutil.WriteFile(t, p, "Max open files            1024\n")
+	if _, ok := procLimitsSoftFD(p); ok {
+		t.Fatal("short limits line parsed as a bound")
+	}
+	testutil.WriteFile(t, p, "Max open files            0                    0                    files\n")
+	if _, ok := procLimitsSoftFD(p); ok {
+		t.Fatal("zero soft limit parsed as a bound")
+	}
+	testutil.WriteFile(t, p, "Max address space         unlimited            unlimited            bytes\n")
+	if _, ok := procLimitsSoftFD(p); ok {
+		t.Fatal("non-fd limits line parsed as a bound")
+	}
+	if _, ok := procLimitsSoftFD(filepath.Join(dir, "missing")); ok {
+		t.Fatal("missing limits file parsed as a bound")
+	}
 }
 
 func TestCollectContainerdMetaDB(t *testing.T) {

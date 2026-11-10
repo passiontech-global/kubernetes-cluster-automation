@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -50,27 +51,90 @@ func init() {
 func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context,
 	objects, kineRep *probefw.SweepReport) error {
 
-	cms, err := kube.ListAll(ctx,
+	// Stream pages instead of materializing the whole census — a
+	// cluster-wide ConfigMap+Secret list is the biggest read this
+	// check makes, and only objects near the size guard ever earn
+	// an exact json.Marshal (approxObjectSize gates it).
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.ConfigMaps(p.CS, metav1.NamespaceAll))
+		kube.ConfigMaps(p.CS, metav1.NamespaceAll),
+		func(items []corev1.ConfigMap) error {
+			for i := range items {
+				cm := &items[i]
+				if approxObjectSize(cm,
+					strMapLen(cm.Data)+bytesMapLen(cm.BinaryData)) < kineMarshalFloor {
+					continue
+				}
+				p.recordKineLargeObject(ctx, objects, kineRep, "configmap",
+					cm.Namespace, cm.Name, cm)
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list configmaps: %w", err)
 	}
-	for i := range cms {
-		p.recordKineLargeObject(ctx, objects, kineRep, "configmap",
-			cms[i].Namespace, cms[i].Name, &cms[i])
-	}
-	secrets, err := kube.ListAll(ctx,
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.Secrets(p.CS, metav1.NamespaceAll))
+		kube.Secrets(p.CS, metav1.NamespaceAll),
+		func(items []corev1.Secret) error {
+			for i := range items {
+				s := &items[i]
+				if approxObjectSize(s, bytesMapLen(s.Data)+
+					strMapLen(s.StringData)) < kineMarshalFloor {
+					continue
+				}
+				p.recordKineLargeObject(ctx, objects, kineRep, "secret",
+					s.Namespace, s.Name, s)
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list secrets: %w", err)
 	}
-	for i := range secrets {
-		p.recordKineLargeObject(ctx, objects, kineRep, "secret",
-			secrets[i].Namespace, secrets[i].Name, &secrets[i])
-	}
 	return nil
+}
+
+// kineMarshalFloor is the approx-size below which an object cannot
+// reach kineLargeObjectThreshold even after JSON framing overhead —
+// only objects at or above it earn an exact json.Marshal, so the
+// census never allocates a full serialized copy of every small
+// ConfigMap/Secret on the cluster.
+const kineMarshalFloor = kineLargeObjectThreshold / 2
+
+func bytesMapLen(m map[string][]byte) int {
+	n := 0
+	for _, v := range m {
+		n += len(v)
+	}
+	return n
+}
+
+func strMapLen(m map[string]string) int {
+	n := 0
+	for k, v := range m {
+		n += len(k) + len(v)
+	}
+	return n
+}
+
+// approxObjectSize estimates an object's serialized footprint from
+// its payload fields — the caller-supplied Data/BinaryData byte
+// total plus annotation and managedFields bulk — without paying a
+// marshal per object. It deliberately over-counts framing (key
+// bytes, per-entry slack) so a false negative is impossible: an
+// object skipped here cannot marshal past the threshold.
+func approxObjectSize(obj metav1.Object, payload int) int {
+	size := payload
+	for k, v := range obj.GetAnnotations() {
+		size += len(k) + len(v)
+	}
+	for _, mf := range obj.GetManagedFields() {
+		// GetRawBytes (not the deprecated .Raw direct access) — may
+		// alias the underlying slice, which is fine: only the length
+		// is read.
+		size += len(mf.FieldsV1.GetRawBytes()) + 160
+	}
+	return size
 }
 
 // recordKineLargeObject measures obj's serialized size — the bytes the

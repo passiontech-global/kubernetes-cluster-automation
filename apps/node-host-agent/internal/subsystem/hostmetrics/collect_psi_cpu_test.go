@@ -57,6 +57,25 @@ func TestPSIUnreadableKeepsLatch(t *testing.T) {
 	}
 }
 
+// TestPSIMalformedValueAbsent: a garbage avg60 value is
+// inconclusive — no gauge, no latch movement, never a fake 0.
+func TestPSIMalformedValueAbsent(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.PSIFile = filepath.Join(t.TempDir(), "cpu")
+	testutil.WriteFile(t, cfg.PSIFile,
+		"some avg10=1.00 avg60=garbage avg300=5.00 total=1\n"+
+			"full avg60=0.00 total=0\n")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_watchdog_psi_cpu_some_avg60",
+		map[string]string{}); ok {
+		t.Fatal("psi gauge emitted with a malformed avg60 value")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
+		"state-node-overloaded")); !os.IsNotExist(err) {
+		t.Fatal("malformed PSI latched node-overloaded")
+	}
+}
+
 // --- cpu-delivered probe ---
 
 func TestCPUDeliveredEmitsAfterMeasure(t *testing.T) {
@@ -97,5 +116,31 @@ func TestCPUDeliveredAbsentBeforeMeasure(t *testing.T) {
 	if _, ok := metricValue(t, c, "node_cpu_delivered_ratio",
 		map[string]string{}); ok {
 		t.Fatal("ratio emitted before first completed measurement")
+	}
+}
+
+// TestMeasureCPURealBusyLoop exercises the un-seamed probe. The
+// value itself is the test host's CPU-delivery measurement, so only
+// structural invariants are asserted — the same property the shell
+// probe had.
+func TestMeasureCPURealBusyLoop(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.cpuMeasure = nil // the real RUSAGE_THREAD busy-loop
+	c := New(cfg)
+	ratio, wall, ok := c.measureCPU()
+	if !ok {
+		t.Fatal("busy-loop probe reported failure")
+	}
+	if wall <= 0 || wall > cpuDeliveredMaxWall.Seconds() {
+		t.Fatalf("wall=%v outside (0, %v]", wall, cpuDeliveredMaxWall)
+	}
+	if ratio <= 0 || ratio > 1 {
+		t.Fatalf("ratio=%v outside (0,1]", ratio)
+	}
+	c.cpu.mu.Lock()
+	sink := c.cpu.sink
+	c.cpu.mu.Unlock()
+	if sink == 0 {
+		t.Fatal("busy-loop checksum sink never parked")
 	}
 }

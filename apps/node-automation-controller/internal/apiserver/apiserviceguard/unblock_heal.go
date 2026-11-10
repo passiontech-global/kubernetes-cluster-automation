@@ -245,23 +245,16 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName)
 		return false
 	}
-	// Wedge proven AND a target exists — the shared preamble gates
-	// the heal: per-APIService cooldown first, then the
-	// maintenance mutex (a cordon/drain/kured reboot or an
-	// in-flight k0s upgrade defers the restart, and "cannot
-	// verify" fails closed AND IncErrors the queue). The
-	// facade's verdict memoizes the mutex so a run of candidates
-	// pays one evaluation.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &g.verdict,
-		g.cs, g.dyn, cooldown, svc.GetName(),
-		cooldownDur, now)
-	switch {
-	case unverifiable:
-		metrics.IncError(g.queue)
-		return false
-	case !proceed:
-		return false
-	}
+	// Wedge proven AND a target exists — the heal is gated per target
+	// inside deleteBackingPods (heal.EvictPodV = AllowedV → EvictPod →
+	// refund-on-refused in one call): per-APIService cooldown is the
+	// caller's stamp below, the maintenance mutex (a cordon/drain/kured
+	// reboot or an in-flight k0s upgrade defers the restart, and
+	// "cannot verify" fails closed AND IncErrors the queue) is memoized
+	// on the facade's verdict so a run of candidates pays one
+	// evaluation, and the fleet-wide budget grant is spent on a
+	// DELIVERED eviction only — a PDB refusal refunds it instead of
+	// silently starving every other heal-gated module.
 	deleted := u.deleteBackingPods(ctx, g, targets, now)
 	// Stamp the cooldown, count the heal and log ACTION only on a
 	// DELIVERED heal — a pass that deleted nothing (NotFound
@@ -421,16 +414,23 @@ func (u *unblockHealer) backingPodTargets(ctx context.Context,
 }
 
 // deleteBackingPods evicts the pre-resolved restart targets, capped
-// per call. The kill rides the policy/v1 Eviction API (heal.EvictPod)
-// — the same PDB-respecting actuation the unmeshed path runs on: a
-// raw Delete would bypass every PodDisruptionBudget and could take
-// the backend's last Ready replica mid-outage. A PDB refusal (429) is
-// a deferral — the pod stays, nothing is metered, and `deleted`
-// staying 0 keeps healCandidate from stamping the cooldown or logging
-// an unblock that did not happen. NotFound races are quiet no-ops;
-// any other eviction failure is metered and logged with the pod's own
-// context. Caller holds the maintenance-mutex verdict: these are LIVE
-// pods.
+// per call. Each kill rides heal.EvictPodV — the gate+act+refund
+// composite: the UID-preconditioned, PDB-respecting Eviction API the
+// unmeshed path runs on (a raw Delete would bypass every
+// PodDisruptionBudget and could take the backend's last Ready replica
+// mid-outage), the memoized maintenance-mutex verdict (nil heals — the
+// per-APIService cooldown is healCandidate's stamp-on-delivered below,
+// NOT a per-target pre-check: a multi-pod fan-out must not have its
+// second target blocked by the first delivery's stamp), and a
+// fleet-wide budget grant spent on DELIVERED evictions only — a 429
+// refusal is refunded, keeping a PDB-hung backend from starving every
+// other heal-gated module. A refusal is a deferral — the pod stays,
+// nothing is metered, and `deleted` staying 0 keeps healCandidate from
+// stamping the cooldown or logging an unblock that did not happen.
+// NotFound races are quiet no-ops; any other eviction failure is
+// metered and logged with the pod's own context. An unverifiable
+// mutex check fails the pass closed: IncError once, stop — the memo
+// makes the first target hit it anyway.
 func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 	g *apiServiceGuard, targets []corev1.Pod, now time.Time) int {
 	log := logf.FromContext(ctx)
@@ -440,14 +440,17 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 			break
 		}
 		p := &targets[i]
-		// heal.EvictPod carries the UID precondition — a same-named
-		// pod recreated between the list and the evict is not ours
-		// to restart — and answers refusals through the PDB-aware
-		// Eviction API instead of a raw Delete. The nil ledger
-		// leaves stamping to the caller: the cooldown key is the
-		// APIService, not the pod.
-		_, refused, err := heal.EvictPod(ctx, g.cs, nil, "", p, now)
+		proceed, unverifiable, evicted, refused, err :=
+			heal.EvictPodV(ctx, log, &g.verdict, g.cs, g.dyn,
+				nil, "", 0, p, now)
 		switch {
+		case unverifiable:
+			metrics.IncError(g.queue)
+			log.Info("heal deferred: maintenance check unverifiable — fail closed",
+				"pod", p.Namespace+"/"+p.Name)
+			return deleted
+		case !proceed:
+			continue // mutex held / budget denied — nothing this pass
 		case refused:
 			log.Info("DEFER: PDB refused backing pod eviction — keeping pod alive",
 				"pod", p.Namespace+"/"+p.Name)
@@ -459,6 +462,8 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 			log.Error(err, "backing pod eviction failed",
 				"pod", p.Namespace+"/"+p.Name)
 			continue
+		case !evicted:
+			continue // proceeded but nothing landed — treat like a race
 		}
 		deleted++
 	}

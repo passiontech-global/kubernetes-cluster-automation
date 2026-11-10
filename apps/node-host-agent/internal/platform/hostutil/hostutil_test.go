@@ -273,59 +273,6 @@ func TestMTUOfIface(t *testing.T) {
 	}
 }
 
-func TestStageFixed(t *testing.T) {
-	dir := t.TempDir()
-	fixed := filepath.Join(dir, "swept-name")
-
-	// Pre-existing content must be truncated — the staging file is
-	// O_TRUNC, not append.
-	testutil.WriteFile(t, fixed, "stale payload")
-
-	f, err := StageFixed("swept-name")(dir)
-	if err != nil {
-		t.Fatalf("StageFixed open: %v", err)
-	}
-	name := f.Name()
-	if name != fixed {
-		t.Fatalf("staged at %q, want fixed path %q", name, fixed)
-	}
-	if _, err := f.WriteString("fresh"); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	got, err := os.ReadFile(fixed)
-	if err != nil || string(got) != "fresh" {
-		t.Fatalf("content = %q (%v), want truncated to %q", got, err, "fresh")
-	}
-	// A FRESH staging name gets the OpenFile perm — group/other must
-	// see nothing regardless of umask (umask can only restrict).
-	fresh, err := StageFixed("fresh-name")(dir)
-	if err != nil {
-		t.Fatalf("fresh stage: %v", err)
-	}
-	_ = fresh.Close()
-	fi, err := os.Stat(filepath.Join(dir, "fresh-name"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := fi.Mode().Perm(); mode&0o077 != 0 {
-		t.Fatalf("mode = %v, want no group/other access", mode)
-	}
-
-	// The fixed name is honored verbatim — no random suffix — so a
-	// second stage reopens the SAME path.
-	f2, err := StageFixed("swept-name")(dir)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	if f2.Name() != fixed {
-		t.Fatalf("second stage at %q, want %q", f2.Name(), fixed)
-	}
-	_ = f2.Close()
-}
-
 func TestShellQuote(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"plain", "'plain'"},

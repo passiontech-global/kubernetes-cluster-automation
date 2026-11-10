@@ -118,3 +118,43 @@ func TestInotifyZeroWatchInstanceCounts(t *testing.T) {
 		t.Fatalf("watches ratio=%v ok=%v want 0.02 (2 watches)", got, ok)
 	}
 }
+
+// TestInotifyTopWarnOnce: crossing the warn ratio edge-logs the top
+// holders once per episode — the second over-threshold scrape is a
+// no-op, and an under-threshold scrape re-arms the edge.
+func TestInotifyTopWarnOnce(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxWatchesFile, "100\n")
+	// 8 inotify fds of 10 → 0.8, exactly the warn ratio; a comm file
+	// names the holder in the report.
+	for fd := 3; fd <= 10; fd++ {
+		mkFdinfo(t, cfg.ProcRoot, 111, fd, fd) // fd n carries n watches
+	}
+	testutil.WriteFile(t, filepath.Join(cfg.ProcRoot, "111", "comm"),
+		"cilium-agent\n")
+	c := New(cfg)
+
+	got, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0.8 {
+		t.Fatalf("instances ratio=%v ok=%v want 0.8", got, ok)
+	}
+	// The first over-threshold scrape consumed the edge.
+	if was := c.ino.noteWarned("instances", true); !was {
+		t.Fatal("over-threshold warn flag was not set by the scrape")
+	}
+	// A second scrape inside the cache interval is served from the
+	// sweep cache — the edge flag stays set.
+	if got, _ := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); got != 0.8 {
+		t.Fatalf("cached scrape=%v want 0.8", got)
+	}
+	if was := c.ino.noteWarned("instances", false); !was {
+		t.Fatal("under-threshold scrape lost the episode flag")
+	}
+	// And it re-arms: the next over-threshold scrape warns again.
+	if was := c.ino.noteWarned("instances", true); was {
+		t.Fatal("edge flag did not re-arm after an under-threshold scrape")
+	}
+}
