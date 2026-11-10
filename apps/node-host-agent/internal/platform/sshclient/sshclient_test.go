@@ -388,3 +388,15 @@ func TestDialWithWrongHostKeyPinRejected(t *testing.T) {
 		t.Fatalf("dial err = %v, want fingerprint mismatch", err)
 	}
 }
+
+// The <=0 fallback keeps a zero Config on the originals' baked-in 22.
+func TestConfigPort(t *testing.T) {
+	for _, tc := range []struct {
+		port int
+		want int
+	}{{0, 22}, {-5, 22}, {2222, 2222}} {
+		if got := (Config{Port: tc.port}).port(); got != tc.want {
+			t.Errorf("Config{Port:%d}.port() = %d want %d", tc.port, got, tc.want)
+		}
+	}
+}

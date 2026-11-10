@@ -84,3 +84,15 @@ func TestCmdCleanConverge(t *testing.T) {
 		t.Fatalf("Cmd(clean converge)=%d want 0", code)
 	}
 }
+
+// No --node-name and no env override → the OS hostname is the final
+// fallback (converge keeps it unlike the daemon's fail-loud path).
+func TestCmdHostnameFallback(t *testing.T) {
+	stubHost(t)
+	t.Setenv("NODE_HOST_AGENT_NODE_NAME", "")
+	t.Setenv("NODE_NAME", "")
+	code := Cmd(context.Background(), []string{"--vars-dir=" + t.TempDir()})
+	if code != 1 {
+		t.Fatalf("Cmd(no node name, missing topology)=%d want 1", code)
+	}
+}

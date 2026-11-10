@@ -448,3 +448,331 @@ func TestHealNamedPodSkipsUnownedPod(t *testing.T) {
 		t.Fatal("unowned pod deleted — nothing would re-roll it")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// linkerdPodWedged — wedge signature truth table
+// ---------------------------------------------------------------------------
+
+// The wedged signature is exactly two shapes: a CrashLoopBackOff
+// container past 2 restarts, or every container started and none
+// ever went Ready (the ranch-style wedge). Everything adjacent —
+// pending pods, terminating pods, too-young pods, missing statuses,
+// a Ready container, an unstarted container, a crashloop still under
+// the restart bar — must read false so the re-roll only fires on the
+// ported signatures.
+func TestLinkerdPodWedgedSignatures(t *testing.T) {
+	started := true
+	notStarted := false
+	old := time.Now().Add(-time.Hour)
+	young := time.Now().Add(-time.Minute)
+	deleting := metav1.NewTime(time.Now())
+
+	mk := func(mut func(*corev1.Pod)) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "linkerd-destination-x",
+				CreationTimestamp: metav1.NewTime(old),
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		mut(p)
+		return p
+	}
+	crashloop := func(restarts int32, ready bool) []corev1.ContainerStatus {
+		return []corev1.ContainerStatus{{
+			Name: "c", Started: &started, Ready: ready,
+			RestartCount: restarts,
+			State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+		}}
+	}
+
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"pending pod is not a wedge", mk(func(p *corev1.Pod) {
+			p.Status.Phase = corev1.PodPending
+		}), false},
+		{"deleting pod is not a wedge", mk(func(p *corev1.Pod) {
+			p.DeletionTimestamp = &deleting
+		}), false},
+		{"too young to judge", mk(func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(young)
+			p.Status.ContainerStatuses = crashloop(5, false)
+		}), false},
+		{"no container statuses yet", mk(func(*corev1.Pod) {}), false},
+		{"crashloop past the restart bar", mk(func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = crashloop(3, false)
+		}), true},
+		{"crashloop under the restart bar on a Ready container", mk(func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = crashloop(2, true)
+		}), false},
+		{"all started, none ever Ready — the ranch wedge", mk(func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{
+				{Name: "a", Started: &started, Ready: false},
+				{Name: "b", Started: &started, Ready: false},
+			}
+		}), true},
+		{"one Ready container clears the wedge", mk(func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{
+				{Name: "a", Started: &started, Ready: false},
+				{Name: "b", Started: &started, Ready: true},
+			}
+		}), false},
+		{"an unstarted container is not the all-started wedge", mk(func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{
+				{Name: "a", Started: &started, Ready: false},
+				{Name: "b", Started: &notStarted, Ready: false},
+			}
+		}), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := linkerdPodWedged(tc.pod, time.Now()); got != tc.want {
+				t.Fatalf("linkerdPodWedged = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// healComponentPod — generic prefix target resolution
+// ---------------------------------------------------------------------------
+
+// A non-cilium prefix takes the generic first-match loop: the first
+// live pod under the prefix is handed to healNamedPod — the
+// ciliumOperatorPrefix lease-resolution branch is skipped entirely.
+func TestMeshHealComponentPodGenericPrefix(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-abc-123",
+		"u-gen", "rs-gen")
+	// A same-prefix pod already deleting must not be picked over the
+	// live one — the loop skips DeletionTimestamp targets.
+	marked := wedgedLinkerdPod(kube.LinkerdDestinationName+"-abc-000",
+		"u-marked", "rs-marked")
+	ts := metav1.NewTime(time.Now())
+	marked.DeletionTimestamp = &ts
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, marked)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	chk.healComponentPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
+		kube.LinkerdNS, kube.LinkerdDestinationName, linkerdHealCooldown, time.Now())
+	if chk.gateEvals != 1 {
+		t.Fatalf("gate evaluations = %d, want exactly 1 — the live prefix match must reach the gate", chk.gateEvals)
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("generic-prefix target pod not deleted")
+	}
+}
+
+// No live pod under the prefix resolves to a nil target — the heal
+// stops before the gate, spending no HealAllowed evaluation.
+func TestMeshHealComponentPodNoTarget(t *testing.T) {
+	pod := wedgedLinkerdPod("linkerd-identity-abc-123", "u-id", "rs-id")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	chk.healComponentPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
+		kube.LinkerdNS, kube.LinkerdDestinationName, linkerdHealCooldown, time.Now())
+	if chk.gateEvals != 0 {
+		t.Fatalf("gate evaluations = %d, want 0 — no target must not reach the gate", chk.gateEvals)
+	}
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("pod deleted although no pod matched the prefix")
+	}
+}
+
+// A pod-list failure defers the whole heal AND counts it — an
+// apiserver flap must not read as a silent clean pass while the
+// target resolution no-ops.
+func TestMeshHealComponentPodListErrorCounted(t *testing.T) {
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false))
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	runErrors := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := runErrors()
+	chk.healComponentPod(ctx, logr.Discard(), "cilium-operator",
+		ciliumOperatorNS, ciliumOperatorPrefix, ciliumOpHealCooldown, time.Now())
+	if got := runErrors() - before; got != 1 {
+		t.Fatalf("run_errors delta = %v, want 1 — the list failure must be counted", got)
+	}
+	if chk.gateEvals != 0 {
+		t.Fatalf("gate evaluations = %d, want 0 — the list error must stop before the gate", chk.gateEvals)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ciliumOperatorLeaderPod — leader-election Lease resolution
+// ---------------------------------------------------------------------------
+
+// ciliumOpRunning builds a Running cilium-operator replica — the only
+// shape the leader resolution will touch (fallback never picks a
+// non-Running or deleting pod).
+func ciliumOpRunning(name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: name,
+			UID: types.UID("u-" + name),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func ciliumOpLease(holder string) *coordinationv1.Lease {
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: ciliumOperatorLease,
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
+}
+
+// The Lease's holderIdentity names the elected replica — the heal
+// must bounce the leader, not a standby, or the wedged IPAM
+// bookkeeping survives the re-roll. client-go leader election
+// appends "_<uuid>" to the pod name, so the suffix-stripped
+// candidate is tried before the verbatim identity.
+func TestCiliumOperatorLeaderPodPrefersLeaseHolder(t *testing.T) {
+	standby := ciliumOpRunning("cilium-operator-aaa")
+	leader := ciliumOpRunning("cilium-operator-bbb")
+	holder := "cilium-operator-bbb_9f2e1c"
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		standby, leader, ciliumOpLease(holder))
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	pods := []*corev1.Pod{standby, leader}
+	if got := chk.ciliumOperatorLeaderPod(ctx, logr.Discard(), pods); got != leader {
+		t.Fatalf("leader pod = %v, want the Lease holder cilium-operator-bbb", got)
+	}
+}
+
+// A holderIdentity naming a pod that no longer exists (or is no
+// longer Running) degrades to the first Running cilium-operator pod
+// — still the right re-roll target over an arbitrary pick.
+func TestCiliumOperatorLeaderPodHolderGoneFallsBack(t *testing.T) {
+	standby := ciliumOpRunning("cilium-operator-aaa")
+	holder := "cilium-operator-gone_deadbeef"
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		standby, ciliumOpLease(holder))
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	if got := chk.ciliumOperatorLeaderPod(ctx, logr.Discard(),
+		[]*corev1.Pod{standby}); got != standby {
+		t.Fatalf("holder-gone pick = %v, want the first Running fallback", got)
+	}
+}
+
+// A Lease read failure is counted and degrades to the fallback —
+// "can't prove the leader" must still surface as an error, not a
+// silent arbitrary pick.
+func TestCiliumOperatorLeaderPodLeaseErrorCounted(t *testing.T) {
+	standby := ciliumOpRunning("cilium-operator-aaa")
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false), standby)
+	cs.PrependReactor("get", "leases",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	runErrors := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := runErrors()
+	if got := chk.ciliumOperatorLeaderPod(ctx, logr.Discard(),
+		[]*corev1.Pod{standby}); got != standby {
+		t.Fatalf("lease-error pick = %v, want the fallback", got)
+	}
+	if got := runErrors() - before; got != 1 {
+		t.Fatalf("run_errors delta = %v, want 1 — the lease read failure must be counted", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// healNamedPod — gate error paths
+// ---------------------------------------------------------------------------
+
+// An unverifiable maintenance check fails the heal CLOSED: the pod
+// stays, the miss is counted, and the one gate evaluation is still
+// spent (the verdict was attempted).
+func TestHealNamedPodUnverifiableFailsClosed(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-ddd-444", "u-dest4", "rs-dest4")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	runErrors := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := runErrors()
+	chk.healNamedPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
+		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("pod deleted while the maintenance check was unverifiable")
+	}
+	if got := runErrors() - before; got != 1 {
+		t.Fatalf("run_errors delta = %v, want 1 — unverifiable is fail-closed, not silent", got)
+	}
+}
+
+// A delivered-gate delete that the apiserver rejects is counted and
+// logged — the pod stays and the cooldown is NOT stamped (the ledger
+// stamps only on a delivered delete, so the next sweep retries).
+func TestHealNamedPodDeleteErrorCounted(t *testing.T) {
+	pod := wedgedLinkerdPod(kube.LinkerdDestinationName+"-eee-555", "u-dest5", "rs-dest5")
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+	runErrors := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := runErrors()
+	chk.healNamedPod(ctx, logr.Discard(), kube.LinkerdDestinationName,
+		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
+	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
+		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatal("pod deleted although the apiserver rejected the delete")
+	}
+	if got := runErrors() - before; got != 1 {
+		t.Fatalf("run_errors delta = %v, want 1 — the failed delete must be counted", got)
+	}
+}

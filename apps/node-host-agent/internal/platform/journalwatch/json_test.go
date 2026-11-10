@@ -180,3 +180,21 @@ func TestFetchErrorKeepsCursor(t *testing.T) {
 		t.Fatalf("retry: got=%+v err=%v", got, err)
 	}
 }
+
+// TestMessageFieldEdges: MESSAGE arrives in shapes the string
+// decode cannot take — absent (len 0), a non-string scalar, or a
+// non-byte array. All reduce to "" and never fail the batch.
+func TestMessageFieldEdges(t *testing.T) {
+	data := `{"__REALTIME_TIMESTAMP":"10","MESSAGE":42}` + "\n" +
+		`{"__REALTIME_TIMESTAMP":"11"}` + "\n" +
+		`{"__REALTIME_TIMESTAMP":"12","MESSAGE":{"nested":1}}`
+	got := ParseJSON(data)
+	if len(got) != 3 {
+		t.Fatalf("got %d entries want 3: %+v", len(got), got)
+	}
+	for i, e := range got {
+		if e.Msg != "" {
+			t.Fatalf("entry %d Msg=%q want \"\"", i, e.Msg)
+		}
+	}
+}

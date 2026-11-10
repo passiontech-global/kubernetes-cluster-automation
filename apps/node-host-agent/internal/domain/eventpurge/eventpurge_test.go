@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -522,5 +523,167 @@ func TestRetryDelayPolicy(t *testing.T) {
 	}
 	if got := retryDelay(map[string][]string{"Retry-After": {"soon"}}, 0); got != 500*time.Millisecond {
 		t.Fatalf("unparseable Retry-After = %v want the exponential fallback", got)
+	}
+}
+
+// applyDefaults fills every knob — a bare Config{} IS the script's
+// production config (CA resolution included).
+func TestApplyDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.applyDefaults()
+	if cfg.API != defaultAPI {
+		t.Fatalf("API=%q want %q", cfg.API, defaultAPI)
+	}
+	if cfg.CAFile != DefaultCA() || cfg.CertFile != defaultCertFile ||
+		cfg.KeyFile != defaultKeyFile {
+		t.Fatalf("pki defaults = %q %q %q", cfg.CAFile, cfg.CertFile, cfg.KeyFile)
+	}
+	if cfg.Workers != defaultWorkers || cfg.Timeout != defaultTimeout ||
+		cfg.MaxDeletes != defaultMaxDeletes {
+		t.Fatalf("knob defaults = %d %v %d", cfg.Workers, cfg.Timeout, cfg.MaxDeletes)
+	}
+}
+
+// A TLS client that cannot be built (unreadable CA) fails Run before
+// any LIST is attempted — fatal, not a tally.
+func TestRunClientSetupFailure(t *testing.T) {
+	var out bytes.Buffer
+	err := Run(context.Background(), Config{
+		API:      "https://127.0.0.1:1",
+		CAFile:   filepath.Join(t.TempDir(), "no-ca.crt"),
+		CertFile: "x", KeyFile: "y",
+	}, time.Now(), &out)
+	if err == nil || !strings.Contains(err.Error(), "read CA") {
+		t.Fatalf("err=%v want the read-CA failure", err)
+	}
+}
+
+// A failed LIST page is fatal — the purge never starts deleting.
+func TestRunListHTTPFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+	defer srv.Close()
+	var out bytes.Buffer
+	err := Run(context.Background(), Config{
+		API: srv.URL, Client: srv.Client(),
+	}, time.Now(), &out)
+	if err == nil || !strings.Contains(err.Error(), "list events: HTTP 500") {
+		t.Fatalf("err=%v want the list HTTP failure", err)
+	}
+}
+
+// A 200 page that is not an EventList is fatal too — a truncated or
+// rewritten response must not drive deletes.
+func TestRunListBadJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("not json"))
+		}))
+	defer srv.Close()
+	var out bytes.Buffer
+	err := Run(context.Background(), Config{
+		API: srv.URL, Client: srv.Client(),
+	}, time.Now(), &out)
+	if err == nil || !strings.Contains(err.Error(), "list events") {
+		t.Fatalf("err=%v want the JSON failure", err)
+	}
+}
+
+// An unbuildable request URL surfaces through listStale — doReq's
+// NewRequest failure branch.
+func TestListStaleBadURL(t *testing.T) {
+	_, err := listStale(context.Background(), http.DefaultClient,
+		"http://bad url", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "list events") {
+		t.Fatalf("err=%v want the request-build failure", err)
+	}
+}
+
+// failBody is a response body that fails every Read — doReq's
+// read-failure branch (distinct from the oversize-cap failure).
+type failBody struct{}
+
+func (failBody) Read([]byte) (int, error) { return 0, errors.New("read boom") }
+func (failBody) Close() error             { return nil }
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestListStaleBodyReadError(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(
+		func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       failBody{},
+				Request:    r,
+			}, nil
+		})}
+	_, err := listStale(context.Background(), client, "http://fake", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "list events") {
+		t.Fatalf("err=%v want the body-read failure", err)
+	}
+}
+
+// A ctx dying mid-backoff aborts the retry instead of burning the
+// budget — the detail names the abort, not a give-up.
+func TestDeleteAbortsRetryOnCancelledCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	saw := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			close(saw)
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+	defer srv.Close()
+	// Cancel shortly after the 429 is served — the response round
+	// trip finishes in ~ms while the backoff sleeps 500ms, so the
+	// ctx dies inside sleepCtx: the aborted-retry branch, not the
+	// transport-error branch a pre-cancelled request would hit.
+	go func() { <-saw; time.Sleep(100 * time.Millisecond); cancel() }()
+	ok, detail := deleteOne(ctx, srv.Client(), srv.URL, "/x")
+	if ok {
+		t.Fatal("cancelled retry reported ok")
+	}
+	if !strings.Contains(detail, "aborted retrying HTTP 429") {
+		t.Fatalf("detail=%q want aborted-retrying", detail)
+	}
+}
+
+// retryDelay clamps everything at the cap: a huge server Retry-After
+// AND a shift-overflowing attempt count both land on 30s.
+func TestRetryDelayCapClamp(t *testing.T) {
+	hdr := http.Header{"Retry-After": []string{"999"}}
+	if got := retryDelay(hdr, 0); got != deleteBackoffCap {
+		t.Fatalf("Retry-After 999 = %v want %v", got, deleteBackoffCap)
+	}
+	if got := retryDelay(nil, 62); got != deleteBackoffCap {
+		t.Fatalf("overflow attempt = %v want %v", got, deleteBackoffCap)
+	}
+}
+
+// sleepCtx: false when ctx dies first, true when the delay elapses.
+func TestSleepCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepCtx(ctx, time.Hour) {
+		t.Fatal("sleepCtx on a dead ctx returned true")
+	}
+	if !sleepCtx(context.Background(), 0) {
+		t.Fatal("elapsed sleep returned false")
+	}
+}
+
+// deleteAll's feed loop stops sending on ctx.Done — with no workers
+// draining jobs the select can only take the cancel branch.
+func TestDeleteAllStopsFeedingOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ok, errs, firstErr := deleteAll(ctx, http.DefaultClient,
+		"http://fake", []string{"/a", "/b"}, 0)
+	if ok != 0 || errs != 0 || firstErr != "" {
+		t.Fatalf("deleteAll = %d,%d,%q want 0,0,\"\"", ok, errs, firstErr)
 	}
 }

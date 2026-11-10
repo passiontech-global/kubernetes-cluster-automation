@@ -164,3 +164,37 @@ func TestCertDriftAuditorTrustAnchorSkew(t *testing.T) {
 		t.Fatalf("skew gauge = %v, want 0 with no issuer", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// emitTrustBundle — only parseable bundles land on the gauge
+// ---------------------------------------------------------------------------
+
+// An empty bundle emits nothing and a bundle with no parseable
+// X.509 PEM emits nothing — "can't parse" is not an expiry signal,
+// so neither may fabricate a days-to-expiry series.
+func TestEmitTrustBundleSkipsNonPEM(t *testing.T) {
+	a := newCertDriftAuditor(fake.NewSimpleClientset(), nil, time.Now())
+	a.emitTrustBundle(ctx, "ns", "empty", nil)
+	a.emitTrustBundle(ctx, "ns", "garbage", []byte("not a pem bundle"))
+	if got := promtestutil.CollectAndCount(
+		metrics.TrustBundleDaysToExpiry, "ns", "empty"); got != 0 {
+		t.Fatalf("empty bundle emitted %d series, want 0", got)
+	}
+	if got := promtestutil.CollectAndCount(
+		metrics.TrustBundleDaysToExpiry, "ns", "garbage"); got != 0 {
+		t.Fatalf("unparseable bundle emitted %d series, want 0", got)
+	}
+}
+
+// A valid bundle lands the earliest cert's days-to-expiry — the
+// series key rides the (namespace, name) tuple the prune reconciles.
+func TestEmitTrustBundleWrites(t *testing.T) {
+	_, _, pem := chainCA(t, "bundle-root", []byte{9, 9, 9})
+	a := newCertDriftAuditor(fake.NewSimpleClientset(), nil, time.Now())
+	a.emitTrustBundle(ctx, "ns", "bundle", pem)
+	got := promtestutil.ToFloat64(
+		metrics.TrustBundleDaysToExpiry.WithLabelValues("ns", "bundle"))
+	if got <= 0 || got > 1 {
+		t.Fatalf("days-to-expiry = %v, want ~1 (the fixture cert lives 24h)", got)
+	}
+}

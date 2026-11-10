@@ -23,6 +23,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -561,5 +562,59 @@ func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
 			"lease": "flux-op", "reason": leaseReasonFlapping})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("flux-system flap series = %v, want 1", m)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// carryNamespace — "not evaluated" must not read as "resolved"
+// ---------------------------------------------------------------------------
+
+// A namespace whose scan never ran this sweep (a list error) carries
+// its HELD state forward: the emitted gauge tuples re-register under
+// the same keys so Prune keeps the series, and the flap-history keys
+// stay live so the persistence window is not re-armed. Only the
+// failed namespace's keys carry — a working namespace's state is
+// never the carry's business.
+func TestCarryNamespaceRestoresHeldState(t *testing.T) {
+	_, ch := leaseGuardProber(fake.NewSimpleClientset())
+
+	// Land the state a completed sweep leaves behind, in TWO
+	// namespaces so the prefix filter is exercised: one unhealthy
+	// tuple + one thrashing tuple + flap history on kube-system,
+	// matching state on flux-system.
+	var rep, thrashRep probefw.SweepReport
+	rep.Flag(controllerLeaseUnhealthyGauge,
+		"kube-system/op-a/"+leaseReasonExpiredRunningPods,
+		[]string{"kube-system", "op-a", leaseReasonExpiredRunningPods})
+	rep.Flag(controllerLeaseUnhealthyGauge,
+		"flux-system/op-b/"+leaseReasonFlapping,
+		[]string{"flux-system", "op-b", leaseReasonFlapping})
+	thrashRep.Flag(controllerLeaseThrashingGauge, "kube-system/op-a",
+		[]string{"kube-system", "op-a"})
+	thrashRep.Flag(controllerLeaseThrashingGauge, "flux-system/op-b",
+		[]string{"flux-system", "op-b"})
+	rep.Close(&ch.emitted, controllerLeaseUnhealthyGauge.DeleteLabelValues)
+	thrashRep.Close(&ch.thrashEmitted,
+		controllerLeaseThrashingGauge.DeleteLabelValues)
+	ch.transitions = map[string][]leaseTransitionSample{
+		"kube-system/op-a": {{at: time.Now(), transitions: 7}},
+		"flux-system/op-b": {{at: time.Now(), transitions: 2}},
+	}
+
+	var carryRep, carryThrash probefw.SweepReport
+	liveLeases := map[string]bool{}
+	ch.carryNamespace(&carryRep, &carryThrash, liveLeases, "kube-system")
+
+	if got := carryRep.Flagged(); got != 1 {
+		t.Fatalf("carried unhealthy tuples = %d, want 1 — kube-system's tuple only", got)
+	}
+	if got := carryThrash.Flagged(); got != 1 {
+		t.Fatalf("carried thrashing tuples = %d, want 1 — kube-system's tuple only", got)
+	}
+	if !liveLeases["kube-system/op-a"] {
+		t.Fatal("kube-system's flap history dropped — the window would re-arm on one API flap")
+	}
+	if liveLeases["flux-system/op-b"] {
+		t.Fatal("flux-system's transitions leaked into kube-system's carry")
 	}
 }

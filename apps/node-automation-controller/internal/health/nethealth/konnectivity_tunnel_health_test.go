@@ -182,3 +182,46 @@ func TestKonnectivityNoPrometheusPasses(t *testing.T) {
 		t.Fatalf("no prometheus endpoint must pass: %+v", res)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// isKonnectivityAgentPod — DaemonSet membership signatures
+// ---------------------------------------------------------------------------
+
+// Membership is the kube-system namespace plus EITHER chart label
+// (k8s-app or app.kubernetes.io/name — the chart has stamped both
+// across versions) or, when labels drift, the konnectivity-agent-
+// pod name shape — the same posture isDNSPod takes for coredns.
+func TestIsKonnectivityAgentPod(t *testing.T) {
+	mk := func(ns, name string, labels map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name, Labels: labels}}
+	}
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"right labels outside kube-system do not count",
+			mk("monitoring", "konnectivity-agent-x", map[string]string{
+				"k8s-app": "konnectivity-agent"}), false},
+		{"k8s-app label member",
+			mk("kube-system", "pod-x", map[string]string{
+				"k8s-app": "konnectivity-agent"}), true},
+		{"app.kubernetes.io/name label member",
+			mk("kube-system", "pod-x", map[string]string{
+				"app.kubernetes.io/name": "konnectivity-agent"}), true},
+		{"name shape is the label-drift fallback",
+			mk("kube-system", "konnectivity-agent-7d4f9-abcde", nil), true},
+		{"unrelated kube-system pod",
+			mk("kube-system", "coredns-abc", nil), false},
+		{"prefix look-alike is not a member",
+			mk("kube-system", "konnectivity-agent", nil), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isKonnectivityAgentPod(tc.pod); got != tc.want {
+				t.Fatalf("isKonnectivityAgentPod = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
