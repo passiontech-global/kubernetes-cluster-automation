@@ -47,6 +47,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
@@ -55,6 +56,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -72,6 +74,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/leaderelect"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -207,6 +210,43 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 	return mgrOptions
 }
 
+// leasePreemptRunnable adapts leaderelect.Preemptor to a
+// controller-runtime Runnable that must run on standbys too —
+// NeedLeaderElection()=false is the whole point: the replica that
+// is NOT the leader is exactly the one that must shorten the Lease
+// when the leader's node dies (W24 fast dead-leader preemption).
+type leasePreemptRunnable struct {
+	preemptor *leaderelect.Preemptor
+	log       logr.Logger
+}
+
+// NeedLeaderElection returns false deliberately — see the type
+// comment: a lease-gated sweep could never run on the standby that
+// needs to act.
+func (r *leasePreemptRunnable) NeedLeaderElection() bool { return false }
+
+func (r *leasePreemptRunnable) Start(ctx context.Context) error {
+	ticker := time.NewTicker(leaderelect.SweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			reason, err := r.preemptor.Sweep(ctx)
+			switch {
+			case err != nil:
+				r.log.Error(err, "leader lease preempt sweep failed")
+			case reason != "":
+				metrics.LeaderLeasePreemptionsTotal.
+					WithLabelValues(reason).Inc()
+				r.log.Info("leader lease preempted — holder proved dead",
+					"reason", reason)
+			}
+		}
+	}
+}
+
 func main() {
 	var metricsAddr, probeAddr, modulesFilter string
 	var showVersion, leaderElect bool
@@ -337,6 +377,22 @@ func main() {
 		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
+	}
+
+	// W24 fast dead-leader lease preemption: without it a leader
+	// whose node dies holds the 180s LeaseDuration while every heal
+	// module on the standby idles. The sweep runs on every replica
+	// and shortens the Lease to 1s only when the holder is provably
+	// dead — gated on -leader-elect because without election there
+	// is no Lease object to preempt.
+	if leaderElect {
+		if err := mgr.Add(&leasePreemptRunnable{
+			preemptor: &leaderelect.Preemptor{CS: cs},
+			log:       ctrl.Log.WithName("leader-lease-preemptor"),
+		}); err != nil {
+			log.Error(err, "unable to add leader lease preemptor")
+			os.Exit(1)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

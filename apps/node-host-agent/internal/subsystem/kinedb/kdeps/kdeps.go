@@ -40,10 +40,15 @@ type Deps struct {
 	// ChurnTop is the kine-churn top-5 churn result computed by the
 	// probe loop (churn window watermark lives in GuardStateDir)
 	// and emitted by the guard cycle into kine-compact-guard.prom.
-	// ChurnMu guards the slice header — probe and compact-guard
+	// ChurnKeys is the W24 per-object twin: the same window sampled
+	// GROUP BY full key (not the /registry/<group>/<resource>
+	// prefix) so an SSA managedFields ping-pong names its exact
+	// victim object on kine_db_top_hotkey_revisions_5m{key}.
+	// ChurnMu guards both slice headers — probe and compact-guard
 	// cycles run on separate goroutines (Run spawns one loop each).
-	ChurnMu  sync.RWMutex
-	ChurnTop []ChurnEntry
+	ChurnMu   sync.RWMutex
+	ChurnTop  []ChurnEntry
+	ChurnKeys []ChurnKeyEntry
 }
 
 // ChurnEntry is one resource prefix's revision count in the last
@@ -51,6 +56,16 @@ type Deps struct {
 type ChurnEntry struct {
 	Resource string
 	Revs     int64
+}
+
+// ChurnKeyEntry is one full Kine object key's revision count in the
+// last churn window (the "/registry/" prefix already stripped) —
+// ordered by count desc, top churnTopN only, and only keys with
+// >= churnKeyMinRevs revisions (the ping-pong floor — below it a
+// hot key is ordinary write volume, not an SSA fight).
+type ChurnKeyEntry struct {
+	Key  string
+	Revs int64
 }
 
 // NewDeps applies the Config defaults, builds the collector mirror

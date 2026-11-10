@@ -9,6 +9,7 @@ package velerobackupauditor
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -67,7 +68,7 @@ func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
 			}
 			continue
 		}
-		a.flagBadBackup(ctx, b, ns, name)
+		a.flagBadBackup(ctx, s, b, ns, name)
 	}
 
 	// Prune series whose condition resolved since the last sweep —
@@ -106,12 +107,14 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 }
 
 // flagBadBackup evaluates the latest Backup's status against the
-// three rot signatures and marks the matching reason series. All
-// three gate on phase=Completed: the signatures mean "a successful
-// backup that protected nothing" — errors/warnings on an in-flight
-// or failed backup are partial counters, not rot.
+// rot signatures and marks the matching reason series. All of them
+// gate on phase=Completed: the signatures mean "a successful backup
+// that protected nothing" — errors/warnings on an in-flight or
+// failed backup are partial counters, not rot. s is the owning
+// Schedule — the stale check needs its cron to exempt weekly and
+// monthly cadences whose >36h-old newest backup is normal, not rot.
 func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
-	b *unstructured.Unstructured, ns, schedule string) {
+	s, b *unstructured.Unstructured, ns, schedule string) {
 	log := logf.FromContext(ctx)
 	phase, _ := kube.NestedString(b.Object, "status", "phase")
 	// velero-bsl-audit — terminal failures and wedged in-flight phases are
@@ -172,4 +175,56 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"warnings", warns)
 	}
+	// W24 Schrödinger's-backup stale check: a Completed backup older
+	// than veleroMissingBackupMaxAge on a daily-or-faster Schedule
+	// means the schedule silently stopped producing fresh restore
+	// points — every other check sees a healthy "Completed" phase.
+	// Weekly/monthly cadences are exempt: their newest backup is
+	// legitimately older than the horizon between runs.
+	if !scheduleRunsWeeklyOrMonthly(s) {
+		if done := veleroBackupDoneAt(b); !done.IsZero() &&
+			a.now.Now().Sub(done) > veleroMissingBackupMaxAge {
+			a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+				backupKey{ns, schedule, "stale"}, ns, schedule, "stale")
+			log.Info("velero schedule's newest completed backup is stale — schedule may have stopped firing",
+				"backup", b.GetNamespace()+"/"+b.GetName(),
+				"schedule", ns+"/"+schedule,
+				"age", a.now.Now().Sub(done).Truncate(time.Hour))
+		}
+	}
+}
+
+// veleroBackupDoneAt is the stale-check age clock: the moment the
+// restorable point landed — status.completionTimestamp, falling
+// back to status.startTimestamp (older Velero without a completion
+// stamp) and finally creationTimestamp. Both status fields are
+// RFC3339 strings on the unstructured Backup; an unparseable value
+// falls through to the next source rather than reading as zero-age.
+func veleroBackupDoneAt(b *unstructured.Unstructured) time.Time {
+	for _, field := range []string{"completionTimestamp", "startTimestamp"} {
+		if t, ok := kube.NestedString(b.Object, "status", field); ok {
+			if tt, err := time.Parse(time.RFC3339, t); err == nil {
+				return tt
+			}
+		}
+	}
+	return b.GetCreationTimestamp().Time
+}
+
+// scheduleRunsWeeklyOrMonthly reports whether the Schedule's cron
+// restricts its runs to specific days — day-of-month (monthly) or
+// day-of-week (weekly) fields other than "*". Such cadences
+// legitimately hold a newest backup older than the 36h stale
+// horizon between runs, so flagBadBackup exempts them. An
+// unparseable or absent cron reads as NOT exempt — a Schedule we
+// cannot prove is infrequent still gets the stale check.
+func scheduleRunsWeeklyOrMonthly(s *unstructured.Unstructured) bool {
+	cron, _ := kube.NestedString(s.Object, "spec", "schedule")
+	f := strings.Fields(cron)
+	if len(f) < 5 {
+		return false
+	}
+	// Standard 5-field cron: min hour dom mon dow — f[2] is
+	// day-of-month, f[4] is day-of-week.
+	return f[2] != "*" || f[4] != "*"
 }

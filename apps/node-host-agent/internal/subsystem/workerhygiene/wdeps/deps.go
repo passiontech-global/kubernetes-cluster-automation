@@ -95,6 +95,16 @@ type Series struct {
 	// bytes — surfaced as node_agent_pagetables_bytes (W19-K4); a
 	// monotonic climb is a mapping/pagetable leak signature.
 	PageTablesBytes int64
+	// DentryUnusedCount is /proc/sys/fs/dentry-state nr_unused —
+	// surfaced as node_agent_dentry_unused_count (W24); the
+	// negative-dentry reclaim gate reads it every meminfo cycle.
+	DentryUnusedCount int64
+	// CtrMetaProbeLatencySec is the wall time of the lightweight
+	// `k0s ctr namespaces ls -q` metadata probe — surfaced as
+	// node_agent_ctr_meta_probe_latency_seconds (W24); a bbolt
+	// freelist-fragmented meta.db shows up here long before it
+	// shows up as task failures.
+	CtrMetaProbeLatencySec float64
 	// The kernel-net-shim-hygiene family: kernel socket/softnet drop
 	// counters from /proc/net/{netstat,softnet_stat} (accumulating
 	// kernel counters, not deltas) plus the containerd-shim RSS

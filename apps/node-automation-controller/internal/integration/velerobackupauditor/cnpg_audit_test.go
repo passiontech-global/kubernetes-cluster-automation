@@ -45,6 +45,10 @@ func cnpgScheduledBackup(ns, name, cluster string, suspend bool,
 // cnpgBackup builds a Backup for cluster `cluster` — phase is
 // status.phase, age backs creationTimestamp, started/stopped are
 // status.startedAt / status.stoppedAt (RFC3339, "" omits them).
+// Completed backups get healthy Barman restore metadata by default
+// (method + backupId + beginWal) so the W24 empty_metadata check
+// stays quiet — tests for that signature strip the fields after
+// building.
 func cnpgBackup(ns, name, cluster, phase string, age time.Duration,
 	started, stopped string) *unstructured.Unstructured {
 	status := map[string]any{"phase": phase}
@@ -53,6 +57,11 @@ func cnpgBackup(ns, name, cluster, phase string, age time.Duration,
 	}
 	if stopped != "" {
 		status["stoppedAt"] = stopped
+	}
+	if phase == "completed" {
+		status["method"] = "barmanObjectStore"
+		status["backupId"] = "20261110T120000"
+		status["beginWal"] = "0000000100000000000000A1"
 	}
 	o := testutil.Unstructured(
 		cnpgBackupGVR.GroupVersion().WithKind("Backup"), ns, name,
@@ -167,6 +176,42 @@ func TestCNPGBackupReasonsMatrix(t *testing.T) {
 			t.Fatalf("empty list must judge nothing, got %v", got)
 		}
 	})
+
+	// W24 empty_metadata — a completed backup with no usable restore
+	// metadata: status.error set, or a Barman backup missing BOTH
+	// backupId and beginWal. volumeSnapshot backups legitimately
+	// carry neither WAL field.
+	stripMeta := func(b *unstructured.Unstructured) *unstructured.Unstructured {
+		st := b.Object["status"].(map[string]any)
+		delete(st, "backupId")
+		delete(st, "beginWal")
+		return b
+	}
+	t.Run("empty_metadata barman no wal", func(t *testing.T) {
+		got := cnpgBackupReasons([]*unstructured.Unstructured{
+			stripMeta(cnpgBackup("data", "b1", "db", "completed", 2*time.Hour,
+				rfc(3*time.Hour), rfc(2*time.Hour))),
+		}, now)
+		if !contains(got, "empty_metadata") {
+			t.Fatalf("barman backup without backupId/beginWal must flag empty_metadata, got %v", got)
+		}
+	})
+	t.Run("empty_metadata status error", func(t *testing.T) {
+		b := cnpgBackup("data", "b1", "db", "completed", 2*time.Hour,
+			rfc(3*time.Hour), rfc(2*time.Hour))
+		b.Object["status"].(map[string]any)["error"] = "wal archiving failed"
+		if got := cnpgBackupReasons([]*unstructured.Unstructured{b}, now); !contains(got, "empty_metadata") {
+			t.Fatalf("completed backup with status.error must flag empty_metadata, got %v", got)
+		}
+	})
+	t.Run("volumeSnapshot exempt from wal check", func(t *testing.T) {
+		b := stripMeta(cnpgBackup("data", "b1", "db", "completed", 2*time.Hour,
+			rfc(3*time.Hour), rfc(2*time.Hour)))
+		b.Object["status"].(map[string]any)["method"] = "volumeSnapshot"
+		if got := cnpgBackupReasons([]*unstructured.Unstructured{b}, now); contains(got, "empty_metadata") {
+			t.Fatalf("volumeSnapshot backup must not flag empty_metadata, got %v", got)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -207,14 +252,17 @@ func TestVeleroAuditorCNPGBackupHealth(t *testing.T) {
 	if err := a.auditCNPGBackups(ctx); err != nil {
 		t.Fatalf("audit: %v", err)
 	}
+	// W24: db-failed and db-stuck hold backup objects but NONE ever
+	// completed — past the 36h schedule age they co-flag stale
+	// (zero-completed-history) beside their primary reason.
 	for cluster, want := range map[string][]string{
-		"db-failed":    {"failed"},
-		"db-stuck":     {"stuck"},
+		"db-failed":    {"failed", "stale"},
+		"db-stuck":     {"stuck", "stale"},
 		"db-stale":     {"stale"},
 		"db-suspended": nil,
 		"db-ok":        nil,
 	} {
-		for _, reason := range []string{"failed", "stuck", "stale", "missing"} {
+		for _, reason := range []string{"failed", "stuck", "stale", "missing", "empty_metadata"} {
 			v, ok := cnpgSeries(t, "data", cluster, reason)
 			shouldBe := contains(want, reason)
 			if ok != shouldBe || (shouldBe && v != 1) {

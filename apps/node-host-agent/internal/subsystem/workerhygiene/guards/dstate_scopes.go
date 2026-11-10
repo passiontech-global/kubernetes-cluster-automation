@@ -321,14 +321,9 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-	n := 0
-	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Fields(line); len(f) > 0 &&
-			strings.HasSuffix(f[0], ".scope") {
-			n++
-		}
-	}
+	n := len(scopeUnitNames(out))
 	c.checkDeactivating(ctx, e)
+	c.checkAbandoned(ctx, e)
 	if n == 0 {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
@@ -368,13 +363,7 @@ func (c *ScopesCheck) checkDeactivating(ctx context.Context, e *wdeps.CycleEnv) 
 			"suspect: systemd-scopes deactivating list-units failed: %v (%s) — streak kept",
 			derr, strings.TrimSpace(dout)))
 	} else {
-		var units []string
-		for _, line := range strings.Split(dout, "\n") {
-			if f := strings.Fields(line); len(f) > 0 &&
-				strings.HasSuffix(f[0], ".scope") {
-				units = append(units, f[0])
-			}
-		}
+		units := scopeUnitNames(dout)
 		if len(units) == 0 {
 			c.deactStreak = 0
 		} else {
@@ -442,6 +431,77 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 			"ACTION: systemd-scopes deactivating reap unit=%s — orphaned cri-containerd scope force-stopped after %d sweeps",
 			unit, c.deactStreak))
 	}
+}
+
+// checkAbandoned is the W24 abandoned-scope reaper: systemd marks a
+// scope `abandoned` when its processes all exited while containerd
+// was mid-restart — the unit is already dead but stays registered
+// in PID 1's unit table, and on high-churn nodes the pile-up slows
+// every D-Bus call kubelet/containerd makes (same failure shape as
+// the failed/deactivating leaks this check already owns). Unlike
+// `deactivating` there is no live teardown to protect: an abandoned
+// scope's cgroup is empty, so `systemctl stop` only unregisters the
+// corpse — safe to run without a persistence streak. Only scopes
+// whose container id is absent from every Running pod's container
+// set are stopped (a scope still owned by a live pod is diagnose-
+// only), capped at 10 units per sweep. Runs even when no failed
+// scopes exist — a node can leak abandoned units alone.
+func (c *ScopesCheck) checkAbandoned(ctx context.Context, e *wdeps.CycleEnv) {
+	aout, aerr := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
+		"--type=scope", "--state=abandoned", "--no-legend", "--plain",
+		"cri-containerd-*.scope")
+	if aerr != nil {
+		// Inconclusive — same contract as the deactivating probe:
+		// a transient D-Bus failure is logged, never fatal.
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: systemd-scopes abandoned list-units failed: %v (%s) — sweep skipped",
+			aerr, strings.TrimSpace(aout)))
+		return
+	}
+	units := scopeUnitNames(aout)
+	if len(units) == 0 {
+		return
+	}
+	live := runningContainerIDs(e)
+	stopped := 0
+	for i, unit := range units {
+		if stopped >= 10 {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes abandoned %d units left — cap 10/sweep reached",
+				len(units)-i))
+			break
+		}
+		if containerIDLive(scopeContainerID(unit), live) {
+			continue // still owned by a Running pod — diagnose only
+		}
+		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
+			"stop", unit); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes abandoned stop %s failed: %v (%s)",
+				unit, err, strings.TrimSpace(out)))
+			continue
+		}
+		stopped++
+		c.d.Actions.WithLabelValues(wdeps.CheckSysScopes, "stop_abandoned").Inc()
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: systemd-scopes abandoned reap unit=%s — orphaned cri-containerd scope unregistered",
+			unit))
+	}
+}
+
+// scopeUnitNames extracts the unit names from a
+// `systemctl list-units --no-legend --plain` reply — the first
+// field of each non-empty line ending in .scope (the LOAD/ACTIVE/
+// SUB/DESCRIPTION columns collapse to fields[0]).
+func scopeUnitNames(out string) []string {
+	var units []string
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 &&
+			strings.HasSuffix(f[0], ".scope") {
+			units = append(units, f[0])
+		}
+	}
+	return units
 }
 
 // scopeContainerID extracts the containerd id out of a

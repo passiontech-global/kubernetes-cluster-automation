@@ -72,6 +72,7 @@ type Metrics struct {
 
 	// kine-churn/backup-health: top-churn + physical-backup verifier series.
 	TopChurn    *prometheus.GaugeVec // resource
+	TopHotkey   *prometheus.GaugeVec // key — W24 per-object SSA ping-pong
 	BackupAge   prometheus.Gauge
 	BackupValid prometheus.Gauge
 
@@ -206,6 +207,10 @@ func NewMetrics() *Metrics {
 			Name: "kine_db_top_churn_revisions_5m",
 			Help: "Top-5 resource prefixes by revision count in the last 5-minute window — mutating-webhook ping-pong detector (kine-churn).",
 		}, []string{"resource"}),
+		TopHotkey: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "kine_db_top_hotkey_revisions_5m",
+			Help: "Top-5 full Kine object keys by revision count in the last 5-minute window (>=50 revs, leases/events excluded) — per-object SSA managedFields ping-pong detector.",
+		}, []string{"key"}),
 		BackupAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kine_db_backup_age_seconds",
 			Help: "Age of the newest physical pg_dump in the backup dir — staleness of the disaster-recovery path (backup-health).",
@@ -248,7 +253,7 @@ func (m *Metrics) Collectors() []prometheus.Collector {
 		m.InactiveSlot,
 		m.PgbClientWaiting, m.PgbMaxWait, m.InvalidIndexes,
 		m.SeqScans, m.SeqTupRead,
-		m.TopChurn, m.BackupAge, m.BackupValid,
+		m.TopChurn, m.TopHotkey, m.BackupAge, m.BackupValid,
 		m.Cycles,
 	}
 }

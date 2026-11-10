@@ -15,10 +15,19 @@ import (
 // --- kernel-message detectors (kernel-dmesg) ---
 
 var (
-	// Filesystem/block error signatures — the plan's literal set.
+	// Filesystem/block error signatures — the plan's literal set,
+	// plus the W24 XFS structural-corruption family: "Metadata I/O
+	// error" alone misses the B+tree/AG corruption verdicts XFS
+	// prints when it force-shuts a filesystem down (the node is
+	// about to go read-only — the latch must arm NOW, not after
+	// the shutdown line). BTRFS: error covers the same verdict on
+	// btrfs nodes.
 	fsErrorRe = regexp.MustCompile(
 		`blk_update_request: I/O error|Buffer I/O error on dev|` +
-			`EXT4-fs error|XFS \([^)]*\): Metadata I/O error|XFS_ERROR`)
+			`EXT4-fs error|XFS \([^)]*\): Metadata I/O error|XFS_ERROR|` +
+			`XFS \([^)]*\): (?:Metadata corruption detected|Internal error|` +
+			`Corruption of in-memory data|Shutting down filesystem)|` +
+			`xfs_force_shutdown|BTRFS: error`)
 	// nf_conntrack table-full — packets are being DROPPED.
 	conntrackFullRe = regexp.MustCompile(`nf_conntrack: table full`)
 	// "Out of memory: Killed process <pid> (<comm>) ..." — global

@@ -184,6 +184,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_keda_scaledobject_unhealthy",
 	"node_automation_kine_large_object_bytes",
 	"node_automation_konnectivity_agent_half_open",
+	"node_automation_leader_lease_preemptions_total",
 	"node_automation_linkerd_endpoint_desync",
 	"node_automation_linkerd_gitops_opaque_drift",
 	"node_automation_linkerd_h2_stream_stalled",

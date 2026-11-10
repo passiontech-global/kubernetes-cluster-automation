@@ -88,7 +88,7 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		evidence += fmt.Sprintf("%d orphan shim(s) ppid=1", orphans)
 	}
-	c.measureMetaDBSize()
+	c.measureMetaDBSize(ctx)
 	if evidence != "" {
 		c.fails++
 		c.d.State.AppendLog(fmt.Sprintf(
@@ -109,15 +109,39 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 const ctrMetaDBRel = "containerd/io.containerd.metadata.v1.bolt/meta.db"
 
 // measureMetaDBSize stats the bbolt store and publishes its size on
-// node_agent_ctr_metadb_bytes (W19-K3). A missing file (fresh node,
-// non-k0s layout) leaves the last value — never a fake 0.
-func (c *CtrMetaCheck) measureMetaDBSize() {
+// node_agent_ctr_metadb_bytes (W19-K3), then times the lightest
+// metadata read containerd serves — `k0s ctr -n k8s.io namespaces
+// ls -q` — onto node_agent_ctr_meta_probe_latency_seconds (W24). A
+// meta.db whose freelist fragmented under churn answers this probe
+// in seconds before it starts failing task operations outright —
+// the latency series is the early-warning the size gauge cannot
+// give. A missing file or a failed probe leaves the last value —
+// never a fake 0.
+func (c *CtrMetaCheck) measureMetaDBSize(ctx context.Context) {
 	fi, err := os.Stat(filepath.Join(
 		c.d.Cfg.K0sDataDir, ctrMetaDBRel))
-	if err != nil {
+	if err == nil {
+		c.d.CtrMetaDBBytes = fi.Size()
+	}
+	c.measureMetaProbeLatency(ctx)
+}
+
+// measureMetaProbeLatency times one `k0s ctr namespaces ls -q`
+// round-trip through the Ctr.ExecOut seam. The command touches only
+// the namespace index — the cheapest possible meta.db read — so its
+// wall time tracks bbolt page-fetch latency, not payload size. An
+// exec error or a nil seam leaves the previous reading in place.
+func (c *CtrMetaCheck) measureMetaProbeLatency(ctx context.Context) {
+	if c.d.Cfg.Seams.Ctr.ExecOut == nil {
 		return
 	}
-	c.d.CtrMetaDBBytes = fi.Size()
+	start := c.d.Cfg.Seams.Host.Clock.Now()
+	if _, err := c.d.Cfg.Seams.Ctr.ExecOut(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "namespaces", "ls", "-q"); err != nil {
+		return
+	}
+	c.d.CtrMetaProbeLatencySec =
+		c.d.Cfg.Seams.Host.Clock.Now().Sub(start).Seconds()
 }
 
 // countMetaOrphanShims counts containerd-shim-runc-v2 processes that

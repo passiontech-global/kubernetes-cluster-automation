@@ -163,6 +163,21 @@ var DeadNodeFencedWithoutSNRTotal = prometheus.NewCounterVec(prometheus.CounterO
 	Help: "Out-of-service fences applied without a medik8s SNR CR, by node and whether it held stateful volumes/pods.",
 }, []string{"node", "has_volumes"})
 
+// LeaderLeasePreemptionsTotal counts fast dead-leader lease
+// preemptions (internal/platform/leaderelect — the
+// NeedLeaderElection=false sweep that shortens the controller's own
+// leader-election LeaseDuration to 1s when the holder pod is
+// deleted/terminating or its node is NotReady/tainted-dead). The
+// reason label carries which dead-holder evidence fired
+// (pod_missing / pod_terminating / node_not_ready /
+// node_unreachable). A sustained rate means the active/passive HA
+// pair is failing over on dead-node evidence repeatedly — check
+// whether the leader's node is flapping rather than truly dead.
+var LeaderLeasePreemptionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_leader_lease_preemptions_total",
+	Help: "Leader-election LeaseDuration shortenings applied after the holder proved dead, by holder-dead evidence.",
+}, []string{"reason"})
+
 // operationsCollectors lists every vector declared in this file, in
 // declaration order; the single init() below registers the table, so
 // registration order stays byte-stable and adding a metric touches
@@ -177,6 +192,7 @@ var operationsCollectors = []prometheus.Collector{
 	CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal,
 	HealTargetCircuitBrokenTotal,
 	DeadNodeUnfencedStatefulSkipped, DeadNodeFencedWithoutSNRTotal,
+	LeaderLeasePreemptionsTotal,
 }
 
 func init() {

@@ -108,6 +108,19 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 				now.Sub(dcCreated.Time) > veleroMissingBackupMaxAge {
 				reasons = append(reasons, "missing")
 			}
+		} else if !everestHasSucceeded(clusterBackups) {
+			// W24 Schrödinger's-backup: backup objects EXIST but
+			// none ever reached state=Succeeded — every attempt
+			// failed (or is wedged in Running) and the in-list
+			// stale check, which keys on the newest SUCCEEDED,
+			// sees nothing. Past the 36h horizon the cluster is
+			// effectively unprotected. Caller-side because the
+			// age clock is the DatabaseCluster's.
+			dcCreated := dc.GetCreationTimestamp()
+			if !dcCreated.IsZero() &&
+				now.Sub(dcCreated.Time) > veleroMissingBackupMaxAge {
+				reasons = append(reasons, "stale")
+			}
 		}
 		for _, reason := range reasons {
 			k := everestKey{ns, name, reason}
@@ -177,4 +190,17 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 		break // newest Succeeded decides — older ones are history
 	}
 	return reasons
+}
+
+// everestHasSucceeded reports whether any backup in the cluster's
+// history reached state=Succeeded — the zero-success-history half
+// of the W24 stale check (caller-side: it needs the cluster's age).
+func everestHasSucceeded(backups []*unstructured.Unstructured) bool {
+	for _, b := range backups {
+		if state, _ := kube.NestedString(
+			b.Object, "status", "state"); state == "Succeeded" {
+			return true
+		}
+	}
+	return false
 }

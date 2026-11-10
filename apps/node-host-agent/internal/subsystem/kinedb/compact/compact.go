@@ -392,6 +392,7 @@ func (g *Guard) emitGuard(res *Result) {
 	// pinning a stale value on /metrics forever.
 	g.d.ChurnMu.RLock()
 	churnTop := append([]kdeps.ChurnEntry(nil), g.d.ChurnTop...)
+	churnKeys := append([]kdeps.ChurnKeyEntry(nil), g.d.ChurnKeys...)
 	g.d.ChurnMu.RUnlock()
 	g.d.M.TopChurn.Reset()
 	for _, e := range churnTop {
@@ -399,6 +400,17 @@ func (g *Guard) emitGuard(res *Result) {
 			"Top-5 resource prefixes by revision count in the last 5-minute window",
 			fmt.Sprintf("resource=%q", e.Resource), float64(e.Revs))
 		g.d.M.TopChurn.WithLabelValues(e.Resource).Set(float64(e.Revs))
+	}
+	// W24 hot-key twin: same window, full Kine keys — the SSA
+	// managedFields ping-pong names its victim object. Same
+	// Reset+repopulate contract: a key falling out of the top-5
+	// loses its series instead of pinning a stale value.
+	g.d.M.TopHotkey.Reset()
+	for _, e := range churnKeys {
+		p.GaugeLabels("kine_db_top_hotkey_revisions_5m",
+			"Top-5 full Kine object keys by revision count in the last 5-minute window (>=50 revs, leases/events excluded)",
+			fmt.Sprintf("key=%q", e.Key), float64(e.Revs))
+		g.d.M.TopHotkey.WithLabelValues(e.Key).Set(float64(e.Revs))
 	}
 	// backup-health: physical-backup verifier series — seen-gated like
 	// the stats series: an unmeasured cycle must not fabricate a
