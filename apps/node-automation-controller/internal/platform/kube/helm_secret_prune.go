@@ -113,6 +113,13 @@ func PruneSupersededHelmSecrets(ctx context.Context, cs kubernetes.Interface,
 		if s.Type != corev1.SecretType(helmReleaseSecretType) {
 			continue
 		}
+		// The decision needs only metadata — each revision embeds
+		// the compressed chart (MBs), and the cluster-wide list can
+		// hold thousands of them. Drop the payload before the
+		// helmTyped copy and the byRelease grouping pin it in RAM
+		// for the whole sweep; deletes and the census count
+		// namespaces/labels only.
+		s.Data = nil
 		helmTyped = append(helmTyped, *s)
 		if release := s.Labels["name"]; release != "" {
 			k := relKey{s.Namespace, release}
@@ -167,7 +174,11 @@ func PruneSupersededHelmSecrets(ctx context.Context, cs kubernetes.Interface,
 				cand.s.Name, UIDDeleteOptions(cand.s.UID, ""))
 			if apierrors.IsNotFound(err) {
 				// Already gone — another actor won the race; the
-				// prune goal is met, not an error.
+				// prune goal for this slot is met, so it still
+				// counts toward toDelete. Skipping the decrement
+				// would delete one secret too many — a newer
+				// revision than the cap requires.
+				toDelete--
 				continue
 			}
 			if err != nil {

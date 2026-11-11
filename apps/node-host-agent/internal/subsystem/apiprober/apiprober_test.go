@@ -47,10 +47,29 @@ type fakeHAProxy struct {
 	failReply map[string]string
 }
 
+// unixSockDir returns a temp dir whose path stays far below the
+// 108-byte sockaddr_un.sun_path limit: t.TempDir() inherits TMPDIR,
+// and a TMPDIR longer than /tmp pushes unix-socket binds past it
+// ("bind: invalid argument"). /tmp is the short base on every unix
+// host this agent targets; the system tempdir is the fallback where
+// /tmp does not exist.
+func unixSockDir(t *testing.T) string {
+	t.Helper()
+	if st, err := os.Stat("/tmp"); err == nil && st.IsDir() {
+		dir, err := os.MkdirTemp("/tmp", "apiprober-test-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		return dir
+	}
+	return t.TempDir()
+}
+
 func newFakeHAProxy(t *testing.T, rows ...[2]string) *fakeHAProxy {
 	t.Helper()
 	f := &fakeHAProxy{
-		sockPath: t.TempDir() + "/haproxy.sock",
+		sockPath: filepath.Join(unixSockDir(t), "haproxy.sock"),
 		servers:  map[string]string{},
 		disabled: map[string]bool{},
 	}

@@ -621,9 +621,18 @@ func boolArg(args []any, kw map[string]any, name string, pos int, def bool) bool
 	return def
 }
 
+// sortTuple is the multi-attribute sort key ("age,name") — a
+// dedicated type so sortKeyLess can tell a tuple key apart from a
+// plain []any element (a YAML-decoded sequence sorts on its first
+// item, it is NOT a tuple). Without the distinct type the two
+// shared []any: tuple comparison recursed element-wise into real
+// sequences (unbounded on cyclic values) and the sequence branch
+// was dead code.
+type sortTuple []any
+
 // sortKeyOf resolves ONE element's sort key: the element itself, or
 // the attribute path(s) the jinja2 `attribute` kwarg names. Multi-key
-// paths ("age,name") resolve to a []any tuple compared element-wise;
+// paths ("age,name") resolve to a sortTuple compared element-wise;
 // digit segments index sequences (sort(attribute='0') on pairs).
 // String keys are case-folded HERE (jinja2's ignore_case
 // postprocess) so the comparator never re-folds per comparison —
@@ -665,7 +674,7 @@ func sortKeyOf(el any, attribute string, caseSensitive bool) (any, error) {
 	if len(keys) == 1 {
 		return keys[0], nil
 	}
-	return keys, nil
+	return sortTuple(keys), nil
 }
 
 // allDigits reports whether s is a bare ASCII digit run — python's
@@ -688,11 +697,13 @@ func allDigits(s string) bool {
 // NaN-aware), strings on the already-folded byte order, sequence
 // elements on their first item, everything else on the stringified
 // form (the Stringify walker is step-budgeted, so cyclic sequences
-// terminate). Tuple keys (multi-attribute) compare element-wise with
-// deepEq for the equal-skip, exactly like python tuple ordering.
+// terminate). Tuple keys (multi-attribute sortTuple) compare
+// element-wise with deepEq for the equal-skip, exactly like python
+// tuple ordering — the dedicated type keeps a plain []any element on
+// the sequence path instead of recursing here without bound.
 func sortKeyLess(a, b any) bool {
-	if at, ok := a.([]any); ok {
-		if bt, ok2 := b.([]any); ok2 {
+	if at, ok := a.(sortTuple); ok {
+		if bt, ok2 := b.(sortTuple); ok2 {
 			for i := range min(len(at), len(bt)) {
 				if deepEq(at[i], bt[i]) {
 					continue

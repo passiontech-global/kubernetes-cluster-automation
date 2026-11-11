@@ -258,7 +258,10 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		// Stamp the attempt before starting the fetch: concurrent callers
 		// hitting the checks above while this fetch is in flight must see
 		// a fresh lastAttemptAt and be served the existing index instead
-		// of starting their own fetch behind this one.
+		// of starting their own fetch behind this one. The pre-stamp
+		// value is kept so a caller-cancelled fetch can restore it —
+		// an aborted attempt must not throttle the next caller.
+		prevAttemptAt := c.lastAttemptAt
 		c.lastAttemptAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
@@ -288,8 +291,14 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		// indexFetchErrorsTotal. Publish and record nothing; the
 		// defer still clears the flight and closes done, so
 		// cold-start waiters wake and re-decide on their own
-		// (possibly still-live) contexts.
+		// (possibly still-live) contexts. The attempt stamp is
+		// restored for the same reason — nothing was learned about
+		// the ATC, so the next caller must not be throttled by an
+		// attempt that only this caller's unwind aborted.
 		if err != nil && ctx.Err() != nil {
+			c.mu.Lock()
+			c.lastAttemptAt = prevAttemptAt
+			c.mu.Unlock()
 			return nil, ctx.Err()
 		}
 
@@ -381,8 +390,14 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		// fetched, and a Refresh that joined an in-flight fetch must
 		// not fire a second rebuild on wake). fetchedAt can't see
 		// failed attempts — lastForceRefreshAt covers those.
-		if time.Since(c.fetchedAt) < c.minRefreshInterval() ||
-			time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
+		// The throttle only applies when there IS an index to serve:
+		// on a cold start (index == nil) a second Refresh inside the
+		// window would otherwise clone the nil index and return
+		// (nil, nil) — a silent empty success instead of the fetch
+		// error the caller asked a forced refresh to surface.
+		if c.index != nil &&
+			(time.Since(c.fetchedAt) < c.minRefreshInterval() ||
+				time.Since(c.lastForceRefreshAt) < c.minRefreshInterval()) {
 			index := slices.Clone(c.index)
 			c.mu.Unlock()
 			return index, nil
@@ -391,7 +406,9 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		// throttle branch instead of queueing a second doomed fetch behind
 		// this one; a failure keeps that stamp so the next forced refresh
 		// inside the throttle window still serves the cached index instead
-		// of immediately re-fetching a just-failed ATC.
+		// of immediately re-fetching a just-failed ATC. The pre-stamp
+		// value is kept so a caller-cancelled fetch can restore it.
+		prevForceRefreshAt := c.lastForceRefreshAt
 		c.lastForceRefreshAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
@@ -409,10 +426,15 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		index, err := c.fetchIndex(ctx, prev)
 		if err != nil && ctx.Err() != nil {
 			// Caller shutdown, not an ATC failure — same rule as
-			// Resources: no negative-cache write, no counter. The
-			// flight's done closes via the defer with err unset, so
-			// joiners loop back and re-decide instead of reading a
-			// shutdown as an ATC outage.
+			// Resources: no negative-cache write, no counter, and the
+			// throttle stamp rolls back so the next forced refresh is
+			// not suppressed by an attempt this caller's unwind
+			// aborted. The flight's done closes via the defer with
+			// err unset, so joiners loop back and re-decide instead
+			// of reading a shutdown as an ATC outage.
+			c.mu.Lock()
+			c.lastForceRefreshAt = prevForceRefreshAt
+			c.mu.Unlock()
 			return nil, ctx.Err()
 		}
 		if err != nil {

@@ -330,7 +330,7 @@ func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
 	// resumes on the same cycle.
 	buf := captureSlog(t)
 	stub := newAPIStub(t)
-	sockPath := filepath.Join(t.TempDir(), "haproxy.sock")
+	sockPath := filepath.Join(unixSockDir(t), "haproxy.sock")
 	p, err := New(Config{
 		SocketPath:  sockPath,
 		BackendName: "kube_apiserver",

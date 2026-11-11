@@ -88,8 +88,14 @@ jobs:
           version_in="$VERSION_INPUT"
 
           # Space-separated globs -> repeated --include-path args for git-cliff.
+          # noglob is load-bearing: the entries ARE globs for git-cliff —
+          # bash must not expand them against the checkout first
+          # (libs/hostkit/envx/** would collapse to first-level dirs and
+          # lose the /** tail, silently dropping every nested commit).
           lib_path_args=()
+          set -f
           for g in $LIB_PATHS; do lib_path_args+=(--include-path "$g"); done
+          set +f
 
           # Latest release tag for this app. Tag scheme: "<app>/vX.Y.Z";
           # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z"

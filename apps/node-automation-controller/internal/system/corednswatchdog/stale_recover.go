@@ -203,10 +203,12 @@ const watchCacheWedgedHeartbeatMax = 10 * time.Minute
 // that owned the True is dead (a zombie the node-condition-sweeper
 // clears), so it does not count.
 func (w *coreDNSWatchdog) watchCacheWedgedNode(ctx context.Context) (string, error) {
-	// The informer-cache read (nil nodeReader falls back to the
-	// clientset in tests) — this runs every sweep and the node
-	// census is already watched for the storm gate.
-	nodes, err := kube.ListNodesCached(ctx, w.nodeReader, w.cs)
+	// Direct apiserver read, NOT the informer cache: this gate only
+	// runs when CoreDNS is already proven stale, which is exactly
+	// when an ApiserverWatchCacheWedged=True condition is live — and
+	// a wedged watch cache freezes the informer cache too, so the
+	// cached read would never see the condition it exists to check.
+	nodes, err := kube.ListNodes(ctx, w.cs)
 	if err != nil {
 		return "", err
 	}

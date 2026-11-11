@@ -234,6 +234,11 @@ func (p *linkerdSidecarOOMCheck) scanInitDeadlock(
 		if !arm && offender.Name != "" {
 			matched, err := kube.ReadPodLogTail(ctx, p.CS, pod,
 				kube.PodLogOpts{
+					// offender is an INIT container status — without
+					// Container the read resolves to a regular
+					// container (PodInitializing 400 on a Pending
+					// pod), never seeing the dial-refused line.
+					Container: offender.Name,
 					TailLines: probefw.DefaultTailLines,
 					MaxBytes:  probefw.LogMaxBytes,
 					Timeout:   probefw.LogTimeout,

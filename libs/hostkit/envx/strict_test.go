@@ -359,32 +359,40 @@ func TestSetWarnfRaceAgainstGetterTraffic(t *testing.T) {
 	SetWarnf(func(string, ...any) { warns.Add(1) })
 	t.Cleanup(func() { SetWarnf(nil) })
 
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
+	// Deterministic overlap: readers run a fixed iteration count and
+	// the writer hammers SetWarnf until they ALL finish, so every
+	// getter call provably runs while a counting hook is installed.
+	// The previous shape (writer finishes 20k swaps then closes stop)
+	// let a CPU-starved reader miss its first scheduling slot
+	// entirely — warns stayed 0 and the test flaked under load.
+	var readers sync.WaitGroup
+	readers.Add(4)
 	for range 4 {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					GetenvInt("ENVX_TEST_WARNF_RACE", 1)
-				}
+			defer readers.Done()
+			for range 2000 {
+				GetenvInt("ENVX_TEST_WARNF_RACE", 1)
 			}
 		}()
 	}
-	wg.Add(1)
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
 	go func() {
-		defer wg.Done()
-		for range 20000 {
-			SetWarnf(func(string, ...any) { warns.Add(1) })
+		defer writer.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				SetWarnf(func(string, ...any) { warns.Add(1) })
+			}
 		}
-		SetWarnf(nil)
-		close(stop)
 	}()
-	wg.Wait()
+	readers.Wait()
+	close(stop)
+	writer.Wait()
+	SetWarnf(nil)
 
 	if warns.Load() == 0 {
 		t.Fatal("sink never invoked during the hammer")
