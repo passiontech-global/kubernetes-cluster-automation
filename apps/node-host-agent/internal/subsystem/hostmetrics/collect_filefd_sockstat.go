@@ -501,16 +501,6 @@ func tcpTableScan(paths ...string) (stateCounts map[byte]int,
 	return stateCounts, perTuple, ok
 }
 
-// tcpStateCount scans the /proc/net/tcp{,6} socket tables and
-// counts entries whose `st` column (field 3, hex TCP state) equals
-// state. ok=false when NO table read at all — a single readable
-// family still counts (an IPv6-less host legitimately lacks tcp6).
-// Streamed line-by-line (see tcpTableScan).
-func tcpStateCount(state byte, paths ...string) (float64, bool) {
-	counts, _, ok := tcpTableScan(paths...)
-	return float64(counts[state]), ok
-}
-
 // emitPerTupleHotspot publishes the per-endpoint socket counts:
 // the max-tuple gauge every readable scrape, plus a labelled gauge
 // per endpoint past hotTupleSockets only (the 40k roadmap

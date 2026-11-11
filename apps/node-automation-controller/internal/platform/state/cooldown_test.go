@@ -237,7 +237,7 @@ func TestCooldownSetConcurrentAccess(t *testing.T) {
 		go func() { defer wg.Done(); c.Stamp(key, now) }()
 		go func() { defer wg.Done(); c.CooledDown(key, time.Minute, now) }()
 		go func() { defer wg.Done(); _ = c.Entries() }()
-		go func() { defer wg.Done(); c.PruneExpired(now.Add(time.Hour), time.Minute) }()
+		go func() { defer wg.Done(); c.PruneExpired(now, time.Minute) }()
 	}
 	wg.Wait()
 	if got := len(c.Entries()); got == 0 {
