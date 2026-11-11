@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -40,19 +41,19 @@ const conntrackStatBody = "  entries  searched found insert insert_failed drop e
 	"00000ed4  00000000 00000000 00000000 0000000a 00000004 00000000\n" +
 	"00000ed5  00000000 00000000 00000000 00000014 00000002 00000000\n"
 
-func TestConntrackStatCounters(t *testing.T) {
+func TestConntrackStatParse(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "nf_conntrack")
 	testutil.WriteFile(t, f, conntrackStatBody)
-	got, ok := conntrackStatCounters(f, "insert_failed", "drop")
+	st, ok := procfs.ReadConntrackStat(f)
 	if !ok {
-		t.Fatal("conntrackStatCounters reported unparsed")
+		t.Fatal("ReadConntrackStat reported unparsed")
 	}
 	// hex sums: 0xa+0x14=30 insert_failed, 0x4+0x2=6 drop.
-	if got["insert_failed"] != 30 || got["drop"] != 6 {
-		t.Fatalf("conntrackStatCounters = %v, want insert_failed=30 drop=6", got)
+	if st.InsertFailed != 30 || st.Drop != 6 {
+		t.Fatalf("conntrack stat = %+v, want insert_failed=30 drop=6", st)
 	}
-	if _, ok := conntrackStatCounters(filepath.Join(dir, "missing"), "drop"); ok {
+	if _, ok := procfs.ReadConntrackStat(filepath.Join(dir, "missing")); ok {
 		t.Fatal("missing file must report unparsed")
 	}
 }

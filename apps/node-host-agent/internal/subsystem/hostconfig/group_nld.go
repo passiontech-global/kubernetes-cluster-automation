@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T4 nodelocaldns guard ----------
@@ -70,18 +70,43 @@ DNSStubListener=no
 	// guard allow list = private + node IPs + extra, sorted —
 	// shared with the host-internal-ports guard (host-internal-ports).
 	allow := c.guardAllowSources()
+	allowV4, allowV6 := splitAddrFamilies(allow)
+	var saddrRules strings.Builder
+	// Family-scoped accepts, each gated on :53 (roadmap 1.2): a
+	// blanket saddr accept here does not shield packets from the
+	// LATER host-internal-ports chain (nft accept in one base chain
+	// still hands the packet to the next priority), but an
+	// allowlisted source must beat the dport 53 drops below — and
+	// the families must be split because an inet table's ip6 packets
+	// never match `ip saddr`. An empty family set is invalid nft —
+	// skip its rules entirely (IPv6-less allowlist → v6 :53 falls to
+	// the drop: the whole point of the inet upgrade).
+	if len(allowV4) > 0 {
+		fmt.Fprintf(&saddrRules, "        ip saddr { %s } tcp dport 53 accept\n",
+			strings.Join(allowV4, ", "))
+		fmt.Fprintf(&saddrRules, "        ip saddr { %s } udp dport 53 accept\n",
+			strings.Join(allowV4, ", "))
+	}
+	if len(allowV6) > 0 {
+		fmt.Fprintf(&saddrRules, "        ip6 saddr { %s } tcp dport 53 accept\n",
+			strings.Join(allowV6, ", "))
+		fmt.Fprintf(&saddrRules, "        ip6 saddr { %s } udp dport 53 accept\n",
+			strings.Join(allowV6, ", "))
+	}
+	// inet table (roadmap 1.2): the old `table ip` guard never saw
+	// IPv6 — a dual-stack listener (:53 wildcard bind) let every v6
+	// source through the v4-only firewall.
 	nft := fmt.Sprintf(`# Managed by node-config-agent - block DNS from non-cluster sources
-destroy table ip nodelocaldns_guard
-table ip nodelocaldns_guard {
+destroy table inet nodelocaldns_guard
+table inet nodelocaldns_guard {
     chain input {
         type filter hook input priority filter - 10; policy accept;
         iifname "lo" accept
-        ip saddr { %s } accept
-        tcp dport 53 drop
+%s        tcp dport 53 drop
         udp dport 53 drop
     }
 }
-`, strings.Join(allow, ", "))
+`, saddrRules.String())
 	c.applyNftUnit("nodelocaldns-guard", "/etc/nodelocaldns-guard.nft",
 		[]byte(nft), "nodelocal-dns :53 guard (block non-cluster sources)")
 	// sweep the buggy nftables.d path this port originally wrote
@@ -92,42 +117,119 @@ table ip nodelocaldns_guard {
 	c.convergeHostPortsGuard()
 }
 
-// guardAllowSources returns the sorted allow CIDR/IP set shared by
-// the nft guards: nodelocaldns_guard_allow_private + every node's
-// registry ip + nodelocaldns_guard_allow_extra.
+// guardAllowSources returns the sorted allow CIDR/IP set the
+// nodelocaldns guard uses: nodelocaldns_guard_allow_private +
+// every node's registry ip + nodelocaldns_guard_allow_extra. The
+// PRIVATE ranges belong to THIS guard only — pods must resolve
+// node-local-dns — the ports guard deliberately does not inherit
+// them (roadmap 1.2: blanket 10.0.0.0/8 on the admin ports is the
+// hole, not the DNS path).
 func (c *cyc) guardAllowSources() []string {
 	allow := append(c.vs("nodelocaldns_guard_allow_private"),
 		c.vs("nodelocaldns_guard_allow_extra")...)
+	allow = append(allow, c.registryNodeIPs()...)
+	sort.Strings(allow)
+	return allow
+}
+
+// registryNodeIPs collects every node's registry addresses — the
+// `ip` v4 entry plus the `ip6` v6 entry when the registry carries
+// one. Non-mapping registry entries are skipped, not a panic (the
+// TestNLDAllowSourcesScalarNode contract).
+func (c *cyc) registryNodeIPs() []string {
+	var ips []string
 	for _, k := range c.t.Nodes.Keys() {
 		nv, _ := c.t.Nodes.Get(k)
 		om, _ := nv.(*jinja.OMap)
 		if om == nil {
 			continue
 		}
-		if ip, ok := om.Get("ip"); ok {
-			if s, ok := ip.(string); ok && s != "" {
-				allow = append(allow, s)
+		for _, key := range []string{"ip", "ip6"} {
+			if ip, ok := om.Get(key); ok {
+				if s, ok := ip.(string); ok && s != "" {
+					ips = append(ips, s)
+				}
 			}
 		}
 	}
+	return ips
+}
+
+// portsGuardAllowSources returns the sorted allow CIDR/IP set for
+// the host-internal-ports guard: every node's registry IP +
+// host_internal_ports_guard_allow_extra — the operator-declared
+// Prometheus/monitoring sources. Deliberately NOT
+// nodelocaldns_guard_allow_private (roadmap 1.2: RFC1918-wide
+// access to kubelet/node-exporter/the agent's metrics+pprof ports
+// is the vulnerability; pods and VLAN neighbours must not match
+// these rules), and NOT the interface wildcard accepts (removed —
+// see convergeHostPortsGuard).
+func (c *cyc) portsGuardAllowSources() []string {
+	allow := append([]string{}, c.vs("host_internal_ports_guard_allow_extra")...)
+	allow = append(allow, c.registryNodeIPs()...)
 	sort.Strings(allow)
 	return allow
+}
+
+// splitAddrFamilies partitions an allow list into nft-usable
+// literal sets — `ip saddr {…}` vs `ip6 saddr {…}` — because an
+// inet table needs the explicit family match and a v6 literal in a
+// v4 set is a parse error. The family test is the IPv6 literal's
+// colon (covers bare addrs and prefix forms); everything else stays
+// in the v4 half verbatim (config-trust parity with the old
+// single-set join — whatever form the operator wrote is passed
+// through, nft -c validates it).
+func splitAddrFamilies(addrs []string) (v4, v6 []string) {
+	for _, a := range addrs {
+		if strings.Contains(a, ":") {
+			v6 = append(v6, a)
+			continue
+		}
+		v4 = append(v4, a)
+	}
+	return v4, v6
 }
 
 // hostPortsGuardPorts are the node-internal TCP listeners (host-internal-ports)
 // that must never answer a non-cluster source over the underlay:
 // kubelet healthz/ro-port/read-only, node-exporter, blackbox
-// exporter, coredns metrics, node-problem-detector and the
-// node-host-agent metrics port.
-var hostPortsGuardPorts = []int{10248, 10250, 10256, 9100, 9115, 9253, 20256, 30020}
+// exporter, coredns metrics, node-problem-detector, the
+// node-host-agent metrics port — and, per roadmap 1.2, the
+// previously missing node-internal listeners: :39901 (node-host-agent
+// probe/SNR), the Cilium hostNetwork agents (:4240 health,
+// :4244 cilium-envoy health, :9962-9964 agent/hubble metrics) and
+// the whole Kubernetes NodePort range (hostPortsGuardNodePortRange
+// — the old list carried a lone 30020, which the range subsumes).
+var hostPortsGuardPorts = []int{
+	4240, 4244, 9100, 9115, 9253, 9962, 9963, 9964,
+	10248, 10250, 10256, 20256, 39901,
+}
+
+// hostPortsGuardNodePortRange is the Kubernetes default Service
+// nodePort span, dropped for non-cluster sources with the same
+// reasoning as the singleton 30020 it replaces: NodePort consumers
+// in this stack are in-cluster (ingress/tunnel datapath) or
+// cluster sources — a WAN scanner reaching a NodePort on the
+// underlay is never legitimate.
+const hostPortsGuardNodePortRange = "30000-32767"
 
 // convergeHostPortsGuard deploys the host-internal-ports nft guard
-// + its boot oneshot (host-internal-ports): inbound TCP to the internal listeners
-// is dropped unless it arrives via loopback, a cluster datapath
-// interface (neb1, cilium/lxc/cali — pod traffic paths), an
-// established/related flow, or an allowlisted source. Enabled by
-// default; `host_internal_ports_guard_enabled: false` tears the
-// unit and the live table down.
+// + its boot oneshot (host-internal-ports): inbound TCP to the internal
+// listeners is dropped unless it arrives via loopback, the nebula
+// cluster trunk (neb1), an established/related flow, or an
+// allowlisted source (registry node IPs +
+// host_internal_ports_guard_allow_extra — the operator-declared
+// Prometheus/monitoring set). Roadmap 1.2 tightening: the old
+// `iifname "cilium*"|"lxc*"|"cali*"` accepts and the blanket
+// RFC1918 allow list are GONE — those were the pod/VLAN-neighbour
+// path to /debug/pprof, kubelet and the exporters (the
+// nodelocaldns guard's RFC1918 accept keeps :53 serviceable for
+// pods; its accepts do not shield anything from this chain — nft
+// accept in one base chain still hands the packet to the next
+// priority). The table is inet (dual-stack): the old `table ip`
+// never filtered a v6 wildcard bind. Enabled by default;
+// `host_internal_ports_guard_enabled: false` tears the unit and
+// the live table down.
 func (c *cyc) convergeHostPortsGuard() {
 	r, ctx := c.r, c.ctx
 	// An UNDEFINED var means default-ON — the guard exists because
@@ -147,7 +249,7 @@ func (c *cyc) convergeHostPortsGuard() {
 		// Drop the LIVE table too — disabling must actually reopen
 		// the ports, not only stop the oneshot.
 		_, _ = r.run(ctx, "sh", "-c",
-			"nft delete table ip host_internal_ports_guard 2>/dev/null; true")
+			"nft delete table inet host_internal_ports_guard 2>/dev/null; true")
 		return
 	}
 	var ports strings.Builder
@@ -157,29 +259,36 @@ func (c *cyc) convergeHostPortsGuard() {
 		}
 		fmt.Fprintf(&ports, "%d", p)
 	}
-	allow := c.guardAllowSources()
-	saddr := ""
-	if len(allow) > 0 {
-		// An empty saddr set literal is invalid nft — skip the rule
-		// when no allowlist resolved at all.
-		saddr = fmt.Sprintf("        ip saddr { %s } accept\n",
-			strings.Join(allow, ", "))
+	fmt.Fprintf(&ports, ", %s", hostPortsGuardNodePortRange)
+	allow := c.portsGuardAllowSources()
+	allowV4, allowV6 := splitAddrFamilies(allow)
+	var saddr strings.Builder
+	// Family-scoped accepts — an inet table's ip6 packets never
+	// match `ip saddr`, and an empty set literal is invalid nft, so
+	// each family only renders when its half of the allow list
+	// resolved at all (an empty allowlist drops the accept rules but
+	// NOT the drops: loopback + neb1 + established + node IPs remain
+	// the cluster path).
+	if len(allowV4) > 0 {
+		fmt.Fprintf(&saddr, "        ip saddr { %s } accept\n",
+			strings.Join(allowV4, ", "))
+	}
+	if len(allowV6) > 0 {
+		fmt.Fprintf(&saddr, "        ip6 saddr { %s } accept\n",
+			strings.Join(allowV6, ", "))
 	}
 	nft := fmt.Sprintf(`# Managed by node-config-agent - drop non-cluster traffic to node-internal ports
-destroy table ip host_internal_ports_guard
-table ip host_internal_ports_guard {
+destroy table inet host_internal_ports_guard
+table inet host_internal_ports_guard {
     chain input {
         type filter hook input priority filter - 5; policy accept;
         iifname "lo" accept
         iifname "neb1" accept
-        iifname "cilium*" accept
-        iifname "lxc*" accept
-        iifname "cali*" accept
         ct state { established, related } accept
 %s        tcp dport { %s } drop
     }
 }
-`, saddr, ports.String())
+`, saddr.String(), ports.String())
 	c.applyNftUnit("host-internal-ports-guard", "/etc/host-internal-ports-guard.nft",
 		[]byte(nft), "host internal ports guard (drop non-cluster sources to node-internal listeners)")
 }

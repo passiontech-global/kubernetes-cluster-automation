@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // TestKubeletCfgPathDiscovery — the running-kubelet probe wins over

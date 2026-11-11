@@ -108,10 +108,13 @@ func pkiCertFiles(path string) []string {
 	return files
 }
 
-// pemDaysLeft returns days until the EARLIEST notAfter of any cert
-// block in the PEM data — a bundle file exports its worst member.
-// ok=false when no block parses.
-func pemDaysLeft(data []byte, now int64) (float64, bool) {
+// pemMinNotAfter returns the EARLIEST notAfter (unix seconds) of any
+// cert block in the PEM data — a bundle file exports its worst
+// member. ok=false when no block parses. Split out so the stat-key
+// cache can memoize the expensive x509 walk and leave only the cheap
+// day math (now-min)/86400 per scrape; the day-math floor semantics
+// are pinned by the test-side pemDaysLeft helper.
+func pemMinNotAfter(data []byte) (int64, bool) {
 	var min time.Time
 	ok := false
 	for rest := data; ; {
@@ -131,10 +134,7 @@ func pemDaysLeft(data []byte, now int64) (float64, bool) {
 	if !ok {
 		return 0, false
 	}
-	// math.Floor, not truncation: -1.9d must read -2, not -1 — an
-	// already-expired cert rounds AWAY from zero like the positive
-	// side does toward it.
-	return math.Floor(float64(min.Unix()-now) / 86400), true
+	return min.Unix(), true
 }
 
 // collectPKICerts emits days-left per cert file — absent when no
@@ -145,14 +145,17 @@ func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
 	now := c.cfg.Clock.Now().Unix()
 	for _, src := range c.cfg.PKICertPaths {
 		for _, f := range pkiCertFiles(src) {
-			data, err := os.ReadFile(f)
-			if err != nil {
-				continue
-			}
-			days, ok := pemDaysLeft(data, now)
+			// Stat-key cache: the PEM+x509 walk only re-runs when the
+			// file's dev/ino/size/mtime fingerprint moves — certs are
+			// rewritten ~yearly, scrapes land every 15s.
+			min, ok := c.certs.get(f, pemMinNotAfter)
 			if !ok {
 				continue
 			}
+			// math.Floor, not truncation: -1.9d must read -2, not -1 —
+			// an already-expired cert rounds AWAY from zero like the
+			// positive side does toward it.
+			days := math.Floor(float64(min-now) / 86400)
 			// Keep the leading slash: HostRoot="/" strips it while
 			// HostRoot="/host" leaves it — the label must read
 			// identically on pods and standalone hosts.

@@ -4,9 +4,11 @@
 // apiprober.GuardReloader (/etc/api-backend-guard.conf). Both files
 // are hostconfig-managed rewrites that land mid-run, so consumers
 // must not pin a startup parse — the runner re-sourced its confs
-// every run. The files are a few KB at most; a plain re-read per Get
-// is the simplest correct semantics, with no mtime/size window where
-// a same-second rewrite is missed.
+// every run. The files are a few KB at most; Get stats the file and
+// skips the read+parse entirely while the (dev,ino,size,mtime)
+// fingerprint is unchanged — safe because every writer stages via
+// atomic rename, which always lands a new inode, so there is no
+// window where a rewrite keeps the old fingerprint.
 //
 // Semantics (shell `source` parity — "read fresh each run, defaults
 // on absent"):
@@ -31,6 +33,8 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // Parse turns raw conf bytes into a T. A nil/empty slice means the
@@ -82,7 +86,21 @@ type Reloader[T any] struct {
 	mu      sync.Mutex
 	cur     T
 	loadErr bool // edge-latch for the unreadable-conf Warn
+	// okKey is the hostutil.FileStatKey of the file whose parse
+	// produced cur (missingKey when the file was absent). Get stats
+	// before reading: an unchanged fingerprint proves the bytes
+	// can't have moved — every writer here stages via atomic rename,
+	// which always lands a new inode — so the read+parse is skipped
+	// entirely. FAILED parses never populate okKey: a persistent
+	// corrupt conf must keep retrying so WarnEveryGet stays loud.
+	okKey string
 }
+
+// missingKey is the okKey sentinel for "file absent" — a missing
+// file parses as empty content (the all-defaults value), and caching
+// that result under a sentinel lets repeated Gets skip the open too.
+// A later-created file stats with a real key and parses for real.
+const missingKey = "\x00absent"
 
 // New seeds the reloader with initial and points it at path — the
 // first Get re-reads regardless, so a zero initial is fine.
@@ -108,6 +126,24 @@ func (r *Reloader[T]) Get() T {
 	if r.opts.BlankPathHolds && r.Path == "" {
 		return r.cur
 	}
+	// Stat-gate the read+parse: FileStatKey fingerprints
+	// (dev,ino,size,mtime) — hostconfig's atomic-rename writes
+	// always land a new inode, so an unchanged key proves cur is
+	// still the freshest parse. Only SUCCESSFUL loads populate
+	// okKey. The !r.loadErr term keeps the gate honest after a
+	// failed load: an in-place corruption inside the stat
+	// fingerprint (same dev/ino/size/mtime — coarse mtimes make
+	// that reachable) would otherwise early-return the stale cur
+	// forever, swallowing the retry Load owes every Get.
+	key := missingKey
+	if sk, err := hostutil.FileStatKey(r.Path); err == nil {
+		key = sk
+	} else if !os.IsNotExist(err) {
+		key = "" // non-ENOENT stat failure — don't cache, let Load report it
+	}
+	if key != "" && key == r.okKey && !r.loadErr {
+		return r.cur
+	}
 	if v, err := Load(r.Path, r.parse); err == nil {
 		if r.loadErr {
 			r.loadErr = false
@@ -116,6 +152,7 @@ func (r *Reloader[T]) Get() T {
 			}
 		}
 		r.cur = v
+		r.okKey = key
 	} else if r.opts.WarnEveryGet || !r.loadErr {
 		r.loadErr = true
 		r.opts.Log.Warn(r.opts.WarnMsg, "path", r.Path, "error", err)

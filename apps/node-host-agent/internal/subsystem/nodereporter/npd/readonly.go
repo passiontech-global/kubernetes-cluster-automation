@@ -49,7 +49,7 @@ func readonlyTargets(mounts map[string]procfs.Mount, targets, fstypes []string) 
 		if !ok || !fs[e.FSType] {
 			continue
 		}
-		if e.Opts["ro"] {
+		if e.HasOpt("ro") {
 			ro = append(ro, fmt.Sprintf("%s (%s)", t, e.FSType))
 		}
 	}

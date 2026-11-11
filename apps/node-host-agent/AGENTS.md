@@ -28,11 +28,12 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   subsystem domain, `envnames_<subsystem>.go`; shared/core knobs
   and the `ENABLE_*` gates live in `envnames.go`). Leaf package —
   call sites reference `envnames.EnvX`, never the literal.
-- `libs/hostkit` (repo root, separate Go module wired via replace +
-  go.work) — shared leaf libraries that used to live here:
-  `envx` (env knobs/Mode/Knob tables), `logx` (named slog loggers),
-  `timex` (settable clock seam), and `jinja` (the mini-Jinja2
-  evaluator + ordered-map/YAML values behind vars-file resolution).
+- `libs/hostkit` + `libs/jinja` (repo root, separate Go modules
+  wired via replace + go.work) — shared leaf libraries that used to
+  live here: `envx` (env knobs/Mode/Knob tables), `logx` (named slog
+  loggers), `timex` (settable clock seam) in hostkit, and `jinja`
+  (the mini-Jinja2 evaluator + ordered-map/YAML values behind
+  vars-file resolution) in its own module.
 - `internal/latchdefs` — pure-data leaf owning the `state-<name>`
   latch REGISTRY: every `Latch*` name const, the `LatchDefs` table
   (owner subsystem + declared multi-owner ids), the
@@ -70,7 +71,7 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   periodic subsystem also drives (topology is the inter-DC
   vars-files → derived-topology pass consumed by hostconfig,
   hubsync, workerhygiene, and ops/nebulasign — those consumers
-  use libs/hostkit/jinja directly for the ordered-map/render
+  use libs/jinja directly for the ordered-map/render
   surface). Domain pkgs sit
   above platform (they may use hostexec/hostkit) and below
   subsystem/ops — they must not import either.
@@ -99,7 +100,7 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
 - `internal/platform` is a leaf: it must NEVER import
   `internal/domain`, `internal/subsystem`, `internal/agent`, or
   `internal/ops` (prefix-denied, so subpackages count).
-- `internal/domain` may import platform + libs/hostkit only — it
+- `internal/domain` may import platform + libs/hostkit + libs/jinja only — it
   must not import `internal/subsystem`, `internal/ops`,
   `internal/agent`, or `cmd`.
 - `internal/agent` must not import `internal/domain`,

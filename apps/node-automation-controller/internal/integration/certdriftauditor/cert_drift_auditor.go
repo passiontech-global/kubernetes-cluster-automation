@@ -60,7 +60,6 @@ import (
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
@@ -115,12 +114,10 @@ const (
 // cert-manager type this module reads.
 var certificateGVR = kube.GVRCertificate
 
-// customResourceDefinitionGVR is where Check A reads the CRD
-// spec.conversion webhook surface — the typed clientset has no
+// Check A reads the CRD spec.conversion webhook surface through
+// kube.GVRCustomResourceDefinition — the typed clientset has no
 // apiextensions surface, so CRDs reach through dyn like the
 // cert-manager CRDs.
-var customResourceDefinitionGVR = schema.GroupVersionResource{
-	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
 
 // webhookMetricKey / secretMetricKey are the exact label tuples of the
 // two exported gauge vecs — keeping them as map keys makes the

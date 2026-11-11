@@ -1,16 +1,13 @@
 // collect_ebpf.go — ebpf-inventory eBPF program/map inventory: unique
 // prog_id/map_id across /proc/<pid>/fdinfo/* plus pinned objects
 // under the bpffs mount — zero forks, the leak-audit counters a
-// cilium/eBPF map leak grows against.
+// cilium/eBPF map leak grows against. The fd walk itself lives in
+// collect_fdlinks.go, shared singleflighted with the inotify census.
 package hostmetrics
 
 import (
-	"io/fs"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,17 +19,6 @@ const (
 	defaultEBPFScanInterval = 60 * time.Second
 	defaultBpffsDir         = "/sys/fs/bpf"
 )
-
-// ebpfCache is the sweep's scrape-side cache — the same shape as
-// inotifyCache: a private mutex over the stamped result, refreshed
-// at most once per EBPFScanInterval.
-type ebpfCache struct {
-	mu      sync.Mutex
-	at      time.Time
-	progs   int
-	maps    int
-	scanned bool
-}
 
 var (
 	descEBPFProgs = prometheus.NewDesc(
@@ -72,80 +58,17 @@ func scanBPFIDLines(data []byte, progs, maps map[uint64]bool) {
 // opening every fdinfo file on the host (inotify sweep parity).
 const ebpfFDTarget = "anon_inode:bpf-"
 
-// sweepEBPF counts unique eBPF prog/map ids: every prog_id:/map_id:
-// line in the fdinfo of fds whose /proc/<pid>/fd link target names
-// a bpf object, plus the pinned objects under BpffsDir. The bpffs
-// half is a WALK, not an open: bpffs rejects readmode open(2) for
-// whole object classes (map pins need O_RDWR by kernel policy,
-// programs are not readable at all), so an open-based id harvest
-// silently produced NOTHING for the very pins the leak audit cares
-// about. Every walked non-dir entry IS a pinned object — it counts
-// even unopened. scanned=false when neither source read.
-func (c *Collector) sweepEBPF() (progs, maps map[uint64]bool, pins int, scanned bool) {
-	progs, maps = map[uint64]bool{}, map[uint64]bool{}
-	if pids, err := os.ReadDir(c.cfg.ProcRoot); err == nil {
-		scanned = true
-		for _, p := range pids {
-			if !p.IsDir() || !pidDirRe.MatchString(p.Name()) {
-				continue
-			}
-			fds, err := os.ReadDir(filepath.Join(c.cfg.ProcRoot,
-				p.Name(), "fd"))
-			if err != nil {
-				continue
-			}
-			for _, fd := range fds {
-				// Readlink is one cheap syscall per fd — only
-				// bpf-object fds earn the fdinfo open+read.
-				target, err := os.Readlink(filepath.Join(
-					c.cfg.ProcRoot, p.Name(), "fd", fd.Name()))
-				if err != nil || !strings.Contains(target, ebpfFDTarget) {
-					continue
-				}
-				data, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot,
-					p.Name(), "fdinfo", fd.Name()))
-				if err != nil {
-					continue
-				}
-				scanBPFIDLines(data, progs, maps)
-			}
-		}
-	}
-	if _, err := os.Stat(c.cfg.BpffsDir); err == nil {
-		scanned = true
-		_ = filepath.WalkDir(c.cfg.BpffsDir,
-			func(path string, d fs.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
-					return nil //nolint:nilerr // unreadable entries are skipped, never fatal
-				}
-				pins++
-				return nil
-			})
-	}
-	return progs, maps, pins, scanned
-}
-
-// ebpfSnapshot returns the cached sweep, re-walking at most once per
+// ebpfSnapshot returns the eBPF half of the shared fd-link sweep
+// (collect_fdlinks.go), re-walking at most once per
 // EBPFScanInterval. Unresolved pins fold into the maps count — the
 // leak-audit headline (a cilium map-pin leak grows that series even
-// when bpffs refuses the opens an id harvest would need).
+// when bpffs refuses the opens an id harvest would need). scanned
+// mirrors the old sweep's verdict: the proc root OR the bpffs dir
+// listed.
 func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
-	c.ebpf.mu.Lock()
-	if c.cfg.Clock.Now().Sub(c.ebpf.at) < c.cfg.EBPFScanInterval && c.ebpf.scanned {
-		p, m, s := c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned
-		c.ebpf.mu.Unlock()
-		return p, m, s
-	}
-	c.ebpf.mu.Unlock()
-
-	// Sweep unlocked — two scrapes may walk in parallel; the later
-	// store wins, harmless for a cache (inotifySnapshot parity).
-	ps, ms, pins, ok := c.sweepEBPF()
-	c.ebpf.mu.Lock()
-	c.ebpf.at = c.cfg.Clock.Now()
-	c.ebpf.progs, c.ebpf.maps, c.ebpf.scanned = len(ps), len(ms)+pins, ok
-	c.ebpf.mu.Unlock()
-	return len(ps), len(ms) + pins, ok
+	res := c.fdLinkSnapshot(c.cfg.EBPFScanInterval)
+	return len(res.progs), len(res.maps) + res.pins,
+		res.procOK || res.bpffsOK
 }
 
 // collectEBPF emits the unique-id counts — 0 is real data (a node

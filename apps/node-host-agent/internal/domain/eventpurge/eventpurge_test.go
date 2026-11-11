@@ -294,6 +294,14 @@ func TestRunAbortsOnCancelledContext(t *testing.T) {
 			// the in-flight DELETE fails on cancellation instead of
 			// racing its response through the cancel.
 			<-r.Context().Done()
+			// The client's cancellation usually aborts the DELETE
+			// client-side — but the response headers can also win
+			// that race (the transport's ctx watch and the response
+			// read race; under load the 200 used to land first and
+			// the tally read deleted=2 errors=0). An error status
+			// makes the racing branch an error too, so the tally
+			// reads deleted=1 errors=1 either way.
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)

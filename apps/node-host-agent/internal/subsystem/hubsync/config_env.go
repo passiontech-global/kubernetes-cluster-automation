@@ -1,3 +1,5 @@
+// config_env.go — the NODE_HOST_AGENT_* env contract for hubsync:
+// ConfigFromEnv resolves the knobs into a Config ready for New.
 package hubsync
 
 import (

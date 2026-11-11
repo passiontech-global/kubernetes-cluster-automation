@@ -59,6 +59,12 @@ const (
 	// (precedence: NODE_HOST_AGENT_NODE_NAME > NODE_NAME >
 	// --node-name).
 	EnvNodeName = "NODE_HOST_AGENT_NODE_NAME"
+	// EnvPprofBindAddress is the loopback-only /debug/pprof listen
+	// address — the default flag value for --pprof-bind-address
+	// (roadmap 1.2: profiles off the 0.0.0.0:9115 hostPort; the env
+	// supplies the DaemonSet/systemd-side override since those
+	// launch units cannot pass flags).
+	EnvPprofBindAddress = "NODE_HOST_AGENT_PPROF_BIND_ADDRESS"
 	// EnvRequestTimeout is the kube-API request budget — shared by
 	// cmd/agent and the sweeper.
 	EnvRequestTimeout = "NODE_HOST_AGENT_REQUEST_TIMEOUT"

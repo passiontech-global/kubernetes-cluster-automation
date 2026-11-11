@@ -52,6 +52,11 @@ const (
 	kubeletReaperTaint    = kube.TaintKubeletUnresponsive
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
+	// kubeletProbeWorkers bounds the parallel probe pool — each
+	// probe is up to 4 sequential apiserver-proxied kubelet calls,
+	// so the cap keeps a large cluster's sweep inside the apiserver
+	// budget while still finishing wedged nodes within one period.
+	kubeletProbeWorkers = 16
 	// per-probe apiserver timeout (8s) lives in kube.KubeletHealthz
 	// kubeletLeaseNamespace holds the per-node heartbeat Leases — one
 	// Lease named exactly like the Node (upstream node-heartbeat
@@ -99,14 +104,31 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 
-	// Probe all workers in parallel so >=2 wedged nodes still finish
-	// inside one ~62s run.
+	// Probe all workers on a FIXED pool so >=2 wedged nodes still
+	// finish inside one ~62s run without spawning a goroutine per
+	// node — each probe is up to 4 sequential apiserver-proxied
+	// kubelet calls, so unbounded fan-out was the cluster's biggest
+	// concurrent-request burst.
 	type result struct {
 		node string
 		ok   bool
 	}
+	workers := kubeletProbeWorkers
+	if workers > len(nodes) {
+		workers = len(nodes)
+	}
 	results := make(chan result, len(nodes))
+	jobs := make(chan string)
 	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for name := range jobs {
+				results <- result{name, r.probeFn(ctx, name)}
+			}
+		}()
+	}
 	for i := range nodes {
 		n := &nodes[i]
 		if kube.IsControlPlane(n) {
@@ -115,12 +137,9 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 			log.Info("SKIP-CP", "node", n.Name)
 			continue
 		}
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
-			results <- result{name, r.probeFn(ctx, name)}
-		}(n.Name)
+		jobs <- n.Name
 	}
+	close(jobs)
 	wg.Wait()
 	close(results)
 

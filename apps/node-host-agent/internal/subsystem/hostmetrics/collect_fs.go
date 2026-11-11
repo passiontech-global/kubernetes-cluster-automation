@@ -189,6 +189,42 @@ var (
 		[]string{"node", "mount"}, nil)
 )
 
+// fsProbe is one mount's scrape-scoped statfs answer — the verdict
+// Collect computes once per mount and both fs domains read.
+type fsProbe struct {
+	st      unix.Statfs_t
+	stalled bool
+	ok      bool
+}
+
+// scrapeFSProbes probes every FilesystemTargets + FSBytesTargets
+// mount ONCE per scrape (config order, deduped) — the k0s data dir
+// and the OpenEBS local root sit in BOTH target lists, and two
+// statfs calls per mount per scrape doubled the hung-mount window
+// for no extra information. The answers ride scrapeCtx (per-scrape,
+// like psi/cert) instead of a Collector field that would race under
+// concurrent Collect. The deadline/singleflight machinery stays in
+// probeFS — the latch ticker (refreshLatches) still probes on its
+// own cadence.
+func (c *Collector) scrapeFSProbes() map[string]fsProbe {
+	mounts := make([]string, 0, len(c.cfg.FilesystemTargets)+len(c.cfg.FSBytesTargets))
+	seen := make(map[string]bool, cap(mounts))
+	for _, list := range [][]string{c.cfg.FilesystemTargets, c.cfg.FSBytesTargets} {
+		for _, m := range list {
+			if !seen[m] {
+				seen[m] = true
+				mounts = append(mounts, m)
+			}
+		}
+	}
+	out := make(map[string]fsProbe, len(mounts))
+	for _, m := range mounts {
+		st, stalled, ok := c.probeFS(m)
+		out[m] = fsProbe{st: st, stalled: stalled, ok: ok}
+	}
+	return out
+}
+
 // collectFilesystem emits per-mount inode gauges plus the
 // probe_stalled signal for EVERY configured target — a 0 means the
 // probe answered in time (even with an error), so "reachable but
@@ -197,12 +233,13 @@ var (
 // fake numbers. A successful probe also exports the ST_RDONLY flag
 // (filesystem-readonly): one read-only mount latches state-filesystem-readonly for
 // nodereporter's FilesystemReadOnly condition.
-func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
+func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric, sc scrapeCtx) {
 	anyRO := false
 	probed := false        // at least one statfs answered — the latch's evidence base
 	var ie fsInodeEvidence // inode-pressure inode-pressure verdict for this pass
 	for _, mount := range c.cfg.FilesystemTargets {
-		st, stalled, ok := c.probeFS(mount)
+		pr := sc.fs[mount]
+		st, stalled, ok := pr.st, pr.stalled, pr.ok
 		v := 0.0
 		if stalled {
 			v = 1

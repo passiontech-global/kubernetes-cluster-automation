@@ -144,12 +144,15 @@ type cfTunnelProxyWatchdog struct {
 	verdict kube.Verdict
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
-	// syncErrLast is namespace -> sweep time of the last log tail
+	// syncErrLast is the namespace -> sweep time of the last log tail
 	// that carried a sync-error signature (cf-gateway-sync-error). The gauge stays
 	// 1 until a sweep reads a clean tail at least
 	// cfTunnelSyncErrClearAfter after the last errored one — a single
 	// clean sweep between error sweeps would flap the series.
-	syncErrLast map[string]time.Time
+	// state.CooldownSet is the shared last-stamp ledger — the
+	// hand-rolled map it replaced did exactly its Stamp/CooledDown/
+	// Forget job.
+	syncErrLast state.CooldownSet
 }
 
 // Setup registers the periodic sweep — only on

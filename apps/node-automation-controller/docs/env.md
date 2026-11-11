@@ -35,6 +35,8 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 |---|---|---|---|
 | `NODE_AUTOMATION_HEAL_BUDGET_MAX` | manager (platform/heal) | `10` | Max heal grants (AllowedV "proceed" verdicts) per window across ALL heal-gated modules — the aggregate blast-radius cap. `0` disables the budget. Denials count on `node_automation_heal_budget_exhausted_total`. |
 | `NODE_AUTOMATION_HEAL_BUDGET_WINDOW` | manager (platform/heal) | `5m` | Sliding window the heal-budget grant count is measured over. |
+| `NODE_AUTOMATION_HEAL_FLUX_CONFLICT_LOOP_MAX` | manager (platform/heal) | `3` | Repeats per object inside the window before a desired-state heal patch SKIPS as a Flux Heal-Revert Loop (SSA ping-pong — the object's managedFields carry a helm-controller/kustomize-controller manager). `0` disables the gate. Skips count on `node_automation_heal_gitops_conflict_total` (alert GitOpsAutoHealConflict) — fix the drift in Git. |
+| `NODE_AUTOMATION_HEAL_FLUX_CONFLICT_WINDOW` | manager (platform/heal) | `30m` | Sliding window the per-object Heal-Revert-Loop repeat count is measured over; draining it re-arms one probe patch. |
 
 ## System patchers / watchdogs
 

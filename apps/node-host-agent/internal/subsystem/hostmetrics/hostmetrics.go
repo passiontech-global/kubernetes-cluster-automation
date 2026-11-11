@@ -176,14 +176,16 @@ type Collector struct {
 	// mutex (the domains are independent, so the old single mu
 	// split into one lock per domain). Field docs live on the
 	// domain types.
-	seen latchSeenBook     // collect_watchdog.go — emit-0 bookkeeping
-	k0s  k0sDriftCache     // collect_k0sdrift.go — mtime+size config cache
-	cpu  cpuDeliveredProbe // collect_psi_cpu.go — busy-loop probe
-	fs   fsProbeState      // collect_fs.go — hung-mount probes
-	ino  inotifyCache      // collect_inotify.go — fdinfo sweep cache
-	lpv  localpvCache      // collect_localpv.go — du walk cache
-	ebpf ebpfCache         // collect_ebpf.go — prog/map id sweep cache
-	proc procScanCache     // collect_procs_scan.go — shared /proc walk (daemon-fd + zombies)
+	seen   latchSeenBook     // collect_watchdog.go — emit-0 bookkeeping
+	k0s    k0sDriftCache     // collect_k0sdrift.go — mtime+size config cache
+	cpu    cpuDeliveredProbe // collect_psi_cpu.go — busy-loop probe
+	fs     fsProbeState      // collect_fs.go — hung-mount probes
+	ino    inotifyCache      // collect_inotify.go — >80% warn edge flags
+	lpv    localpvCache      // collect_localpv.go — du walk cache
+	fdscan fdLinkCache       // collect_fdlinks.go — shared inotify+ebpf /proc fd sweep (singleflight)
+	proc   procScanCache     // collect_procs_scan.go — shared /proc walk (daemon-fd + zombies)
+	scopes scopesCache       // collect_procs_cgroup.go — systemd scope-count TTL cache
+	certs  certNotAfterCache // certcache.go — stat-key memoized X.509 notAfter (pki + nebula)
 	// kf is the kernel deep-failure engine (kernelfail
 	// subpackage) — the kmsg tail session + the steal jiffie
 	// baseline live inside it. Owned by the Collector directly:
@@ -251,7 +253,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// Side-effect probes run BEFORE the state-dir scan so a latch
 	// they transition shows up in this scrape's watchdog_state.
 	// The shared probe results ride scrapeCtx into the domains that
-	// fold them in (watchdog, nebula-cert, psi).
+	// fold them in (watchdog, nebula-cert, psi, filesystem, fs-bytes).
 	var sc scrapeCtx
 	sc.avg60, sc.psiOK = c.psiAvg60()
 	if sc.psiOK {
@@ -262,6 +264,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// watchdog-state latch bookkeeping and the days-left gauge.
 	sc.certDays, sc.certOK = c.nebulaCertDaysLeft()
 	c.updateCertLatch(sc.certDays, sc.certOK)
+	// One statfs per mount per scrape: the filesystem and fs-bytes
+	// domains share overlapping targets (the k0s data dir, the
+	// OpenEBS local root), and each used to probe them separately.
+	// The answers ride scrapeCtx into both; probeFS's singleflight
+	// still bounds in-flight goroutines at one per mount.
+	sc.fs = c.scrapeFSProbes()
 	for _, d := range domainTable {
 		d.run(c, ch, sc)
 	}

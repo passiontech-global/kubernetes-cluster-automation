@@ -7,57 +7,65 @@ package hubsync
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // TestOmBoolCoercions: ansible-truthy string spellings coerce, bare
 // bools pass through, ints read non-zero-true, and unrecognized
-// values fall back to def.
+// values fall back to def — the omBool shims' table, now pinned
+// against *jinja.OMap.BoolDef, the getter the target aggregation
+// delegates to.
 func TestOmBoolCoercions(t *testing.T) {
-	om := func(kv ...any) *jinja.OMap {
+	newOM := func(kv ...any) *jinja.OMap {
 		m := jinja.NewOMap()
 		for i := 0; i < len(kv); i += 2 {
 			m.Set(kv[i].(string), kv[i+1])
 		}
 		return m
 	}
-	truthy := []any{true, "true", "True", " yes ", "1", "on", int64(5)}
+	truthy := []any{true, "true", "True", " yes ", "1", "on", int64(5), 1.5}
 	for _, v := range truthy {
-		if !omBool(om("k", v), "k", false) {
-			t.Fatalf("omBool(%v) want true", v)
+		if !newOM("k", v).BoolDef("k", false) {
+			t.Fatalf("BoolDef(%v) want true", v)
 		}
 	}
-	falsy := []any{false, "false", "No", "0", "off", int64(0)}
+	falsy := []any{false, "false", "No", "0", "off", int64(0), 0.0}
 	for _, v := range falsy {
-		if omBool(om("k", v), "k", true) {
-			t.Fatalf("omBool(%v) want false", v)
+		if newOM("k", v).BoolDef("k", true) {
+			t.Fatalf("BoolDef(%v) want false", v)
 		}
 	}
 	// Unrecognized scalar → def; missing key → def.
-	if omBool(om("k", "garbage"), "k", true) != true {
+	if !newOM("k", "garbage").BoolDef("k", true) {
 		t.Fatal("unrecognized value must fall back to def")
 	}
-	if omBool(om("k", 1.5), "k", false) {
-		t.Fatal("float must fall back to def")
-	}
-	if !omBool(om("other", true), "k", true) {
+	if !newOM().BoolDef("k", true) {
 		t.Fatal("missing key must fall back to def")
 	}
 }
 
 // TestStrOfTypes: strings pass through, int64/float64 format, and
-// everything else (bools, nil) is dropped — hubsync's omStr must not
-// stringify bools (the nebulasign shims differ on purpose).
+// nil/containers are dropped — the omStr/strOf table, now pinned
+// against *jinja.OMap.Str. bools differ from the old shim on
+// purpose: the lib getter renders true → "true" (the YAML/registry
+// spelling) where hubsync's copy dropped them.
 func TestStrOfTypes(t *testing.T) {
-	for _, tc := range []struct {
+	om := jinja.NewOMap()
+	for i, tc := range []struct {
 		v    any
 		want string
 	}{{"s", "s"}, {int64(42), "42"}, {float64(2.5), "2.5"},
-		{true, ""}, {nil, ""}, {struct{}{}, ""}} {
-		if got := strOf(tc.v); got != tc.want {
-			t.Fatalf("strOf(%v)=%q want %q", tc.v, got, tc.want)
+		{true, "true"}, {false, ""}, {nil, ""},
+		// An unknown non-container struct renders via fmt — the
+		// getter's documented fallback (the old shim returned "").
+		{struct{}{}, "{}"}} {
+		k := "k" + strconv.Itoa(i)
+		om.Set(k, tc.v)
+		if got := om.Str(k); got != tc.want {
+			t.Fatalf("Str(%v)=%q want %q", tc.v, got, tc.want)
 		}
 	}
 }

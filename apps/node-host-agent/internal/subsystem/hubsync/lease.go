@@ -1,3 +1,6 @@
+// lease.go — the coordination.k8s.io Lease holder gate: the acquire/
+// renew loop type and the renew bookkeeping Cycle re-checks before
+// every target.
 package hubsync
 
 import (

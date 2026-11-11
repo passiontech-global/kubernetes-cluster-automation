@@ -141,21 +141,14 @@ func (r *Runner) updatePidFDPressure() {
 			worst, what = v.v, v.name
 		}
 	}
-	countPath := r.statePath(pidFDCountFile)
 	latchPath := r.deps.Store.Path(latchdefs.LatchPIDFDPressure)
 	if worst > kernelProcPressureRatio {
-		n := int64(1)
-		if b, err := os.ReadFile(countPath); err == nil {
-			if v, perr := strconv.ParseInt(
-				strings.TrimSpace(string(b)), 10, 64); perr == nil {
-				n = v + 1
-			}
-		}
-		if err := os.WriteFile(countPath,
-			[]byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
-			logger().Debug("hostmetrics: pid-fd count write failed",
-				"path", countPath, "error", err)
-		}
+		// Store.Incr — the shared consecutive-counter core (steal/
+		// entropy parity): locked read+increment+write on the same
+		// <state dir>/pid-fd-pressure-count file the hand-rolled
+		// read/write managed; a failed write loses the streak (never
+		// invents one) and the Store logs the failure.
+		n := r.deps.Store.Incr(pidFDCountFile)
 		if n >= kernelProcPressureNeeded {
 			r.ensureStateLatch(latchPath, latchdefs.LatchFilePrefix+latchdefs.LatchPIDFDPressure,
 				fmt.Sprintf("%s ratio=%.3f", what, worst))
@@ -170,7 +163,7 @@ func (r *Runner) updatePidFDPressure() {
 	}
 	// Below threshold — reset the streak and release the latch
 	// (Exit logs STATE-EXIT, the filelog's transition contract).
-	_ = os.Remove(countPath)
+	r.deps.Store.ResetCounter(pidFDCountFile)
 	r.deps.Store.Exit(latchdefs.LatchPIDFDPressure, nil)
 }
 

@@ -4,13 +4,13 @@ package cilium_test
 
 import (
 	"context"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- B4: MTU drift ---

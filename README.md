@@ -22,8 +22,11 @@ one app in this workspace, alongside the per-node host agent.
 .moon/                       moon workspace config + shared tasks
 apps/
   node-automation-controller/  moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
-  node-host-agent/             moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+  node-host-agent/             moon project (own go.mod, cliff.toml, Dockerfile)
   webhook-dispatcher/          moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+libs/
+  hostkit/                   shared leaf module: envx, logx, httpx, timex, nodecond, fsx
+  jinja/                     shared leaf module: mini-jinja2 evaluator (node-host-agent)
 .github/workflows/
   ci.yml                         PR gate — moon ci on affected projects
   release-app.yml                reusable release pipeline
@@ -52,7 +55,8 @@ Common tasks (`test`, `vet`, `format`) are defined once in
 apps tagged `docker`; `build`/`image` live in each app's `moon.yml`. All
 binaries come from mise — moon tasks run on the `system` toolchain.
 
-A committed `go.work` covers all three modules, so `go` and gopls work
+A committed `go.work` covers all five modules (the three apps plus
+`libs/hostkit` and `libs/jinja`), so `go` and gopls work
 from the repo root. CI sets `GOWORK=off`, keeping release builds on
 per-module dependency resolution.
 

@@ -11,23 +11,33 @@
 //     recurrence re-arms the window.
 //
 // Like GaugeLedger the zero value is ready to use (lazy arm on first
-// write) and neither type locks — sweeps are single-goroutine or the
-// caller already serializes under its own per-module mutex. The maps
-// are deliberately unbounded: keys live only as long as the
-// condition they track, and Prune/Forget is the caller's hygiene
-// hook for resolved ones.
+// write). CooldownSet locks: Deps.Heals is one ledger shared by every
+// check in the sweep, and the cluster-health-probes run loop drives
+// checks through a bounded worker pool, so two checks may stamp the
+// same ledger concurrently. FirstSeenLedger (and the streak/gauge
+// ledgers) stay lock-free — they are per-check instance state, one
+// goroutine touches a given check per sweep. The maps are
+// deliberately unbounded: keys live only as long as the condition
+// they track, and Prune/Forget is the caller's hygiene hook for
+// resolved ones.
 package state
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // CooldownSet tracks the last action stamp per key.
 type CooldownSet struct {
+	mu   sync.Mutex
 	last map[string]time.Time
 }
 
 // CooledDown reports whether key was stamped inside cooldown of now.
 // An unstamped key is never cooled down.
 func (c *CooldownSet) CooledDown(key string, cooldown time.Duration, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	last, ok := c.last[key]
 	return ok && now.Sub(last) < cooldown
 }
@@ -37,6 +47,8 @@ func (c *CooldownSet) CooledDown(key string, cooldown time.Duration, now time.Ti
 // not start the cooldown or one transient error would suppress the
 // remediation for the whole window.
 func (c *CooldownSet) Stamp(key string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.last == nil {
 		c.last = map[string]time.Time{}
 	}
@@ -47,6 +59,8 @@ func (c *CooldownSet) Stamp(key string, now time.Time) {
 // Use when the healed condition is verified resolved so a brand-new
 // failure on the same key is not suppressed by the old stamp.
 func (c *CooldownSet) Forget(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	delete(c.last, key)
 }
 
@@ -57,6 +71,8 @@ func (c *CooldownSet) Forget(key string) {
 // key AND its last-action stamp so age-based retention ("drop
 // stamps older than the longest cooldown") needs no second lookup.
 func (c *CooldownSet) Prune(keep func(key string, last time.Time) bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	pruned := 0
 	for k, last := range c.last {
 		if !keep(k, last) {
@@ -73,6 +89,8 @@ func (c *CooldownSet) Prune(keep func(key string, last time.Time) bool) int {
 // Mutating the returned map does not affect the ledger; write
 // through Stamp/Forget.
 func (c *CooldownSet) Entries() map[string]time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	out := make(map[string]time.Time, len(c.last))
 	for k, last := range c.last {
 		out[k] = last
@@ -91,6 +109,8 @@ func (c *CooldownSet) Entries() map[string]time.Time {
 // this needs no complete-sweep precondition: expiry is computed per
 // entry, not voted by a keep set.
 func (c *CooldownSet) PruneExpired(now time.Time, maxAge time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	pruned := 0
 	for k, last := range c.last {
 		if now.Sub(last) > maxAge {
@@ -105,6 +125,8 @@ func (c *CooldownSet) PruneExpired(now time.Time, maxAge time.Duration) int {
 // the single-key read for "when did this one fire" diagnostics;
 // Entries() is for bulk inspection only (it copies the whole map).
 func (c *CooldownSet) Last(key string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	t, ok := c.last[key]
 	return t, ok
 }

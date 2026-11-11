@@ -1,6 +1,6 @@
 // harness_test.go — the test wiring the linkerd check tests share:
 // the ctx shorthand and the testProber/testProberDyn wrappers binding
-// the package's three check constructors to the shared probetest
+// the package's five check constructors to the shared probetest
 // prober (MustCheck, LedgerKeys live in probetest).
 package linkerd
 
@@ -21,6 +21,8 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewLinkerdEndpointSyncCheck,
 	NewLinkerdProtocolDetectionStallCheck,
 	NewLinkerdH2StreamGuardCheck,
+	NewLinkerdOutlierGuardCheck,
+	NewLinkerdSidecarOOMGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

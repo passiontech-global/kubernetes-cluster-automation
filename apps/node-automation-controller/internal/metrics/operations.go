@@ -117,6 +117,32 @@ var HealBudgetExhaustedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Heal grants denied by the global heal budget (aggregate blast-radius cap).",
 })
 
+// HealGitOpsConflictTotal counts desired-state heal patches SKIPPED
+// by the SSA ping-pong defense (internal/platform/heal
+// FluxPatchGate): the same object re-patched past the loop threshold
+// inside the window while a Flux GitOps manager (helm-controller /
+// kustomize-controller) owns fields on it — the Heal-Revert Loop
+// shape, where the heal and Flux keep overwriting each other through
+// Kine. manager is the Flux manager recorded on the object. A
+// sustained rate is a drift the heal path keeps fighting — fix the
+// source in Git (alert GitOpsAutoHealConflict keys on this counter).
+var HealGitOpsConflictTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_heal_gitops_conflict_total",
+	Help: "Heal patches skipped as Flux Heal-Revert-Loop conflicts (SSA ping-pong), by Flux manager.",
+}, []string{"manager"})
+
+// StatefulSetOnDeleteDragonflyUnsyncedSkipped counts OnDelete rolls
+// deferred by the statefulset-ondelete-roller's dragonfly cold-start
+// gate: a member pod reads master_link_status == 0 (mid-FULL-SYNC —
+// Ready=True only proves the port answers), so the next member is
+// NOT taken down. A sustained rate is a Dragonfly set stuck syncing
+// (or a replica wedged mid-full-sync) — rolling would stampede the
+// master behind it.
+var StatefulSetOnDeleteDragonflyUnsyncedSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_statefulset_ondelete_dragonfly_unsynced_skipped_total",
+	Help: "OnDelete rolls deferred for a dragonfly replica with master_link_status down, by namespace and statefulset.",
+}, []string{"namespace", "statefulset"})
+
 // HealTargetCircuitBrokenTotal counts per-target heal circuit-breaker
 // open transitions (internal/platform/heal — consulted by the node
 // cordon/taint patch actions of kubelet-liveness-reaper,
@@ -190,7 +216,8 @@ var operationsCollectors = []prometheus.Collector{
 	CronJobTooManyMissedStarts,
 	VolumeAttachmentFinalizersRemovedTotal,
 	CFTunnelWedgePodsDeletedTotal, HealBudgetExhaustedTotal,
-	HealTargetCircuitBrokenTotal,
+	HealGitOpsConflictTotal, HealTargetCircuitBrokenTotal,
+	StatefulSetOnDeleteDragonflyUnsyncedSkipped,
 	DeadNodeUnfencedStatefulSkipped, DeadNodeFencedWithoutSNRTotal,
 	LeaderLeasePreemptionsTotal,
 }

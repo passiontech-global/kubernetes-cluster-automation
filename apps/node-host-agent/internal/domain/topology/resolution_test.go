@@ -6,7 +6,7 @@ package topology
 import (
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 func testVars(t *testing.T) *Vars {

@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/localpv"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
@@ -18,15 +19,16 @@ var ctx = context.Background()
 
 // harnessChecks is this package's check roster in sweep order — both
 // wrappers below pass the same slice through probetest.NewCheckProber.
+// The sprawl-gc, controller-lease-guard and localpv-stranded-pods
+// constructors live in the sprawl/, leases/ and localpv/ subpackages
+// (each with its own harness).
 var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewNodeHangCheck,
 	NewImagePullStormCheck,
-	NewLocalPVStrandedCheck,
+	localpv.NewLocalPVStrandedCheck,
 	NewNamespaceTerminatingWedgedCheck,
-	NewAPIObjectSprawlReportGCCheck,
 	NewCPUStealTaintSyncCheck,
 	NewKedaScaledObjectGuardCheck,
-	NewControllerLeaseGuardCheck,
 	NewNodeConditionSweeperCheck,
 	NewAPIServerRelistStormCheck,
 }

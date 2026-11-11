@@ -173,13 +173,16 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 		}
 		pods = cached.Items
 	} else {
-		listed, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
-			LabelSelector: "k8s-app=cilium",
-		})
+		listed, err := kube.ListAll(ctx,
+			metav1.ListOptions{
+				Limit:         kube.DefaultListPageSize,
+				LabelSelector: "k8s-app=cilium",
+			},
+			kube.Pods(r.cs, "kube-system"))
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("list cilium pods: %w", err)
 		}
-		pods = listed.Items
+		pods = listed
 	}
 	// The old sweep issued a kube-system List per tainted node (an N+1
 	// on the apiserver); indexing spec.nodeName in-code reproduces the

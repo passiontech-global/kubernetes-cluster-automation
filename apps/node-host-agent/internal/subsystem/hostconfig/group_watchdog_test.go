@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // ---------- legacy watchdog prune ----------
@@ -25,7 +27,7 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
 		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
 	// Seed every legacy artifact the prune must sweep.
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		hostWrite(t, r, "/etc/systemd/system/"+u, "[Unit]\n")
 	}
 	for _, p := range legacyWatchdogDropins {
@@ -49,13 +51,13 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 		t.Fatalf("systemctl disable calls=%d want 1: %v",
 			len(disableCalls), disableCalls)
 	}
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		if !strings.Contains(disableCalls[0], u) {
 			t.Fatalf("batched disable missing unit %q: %q", u, disableCalls[0])
 		}
 	}
 	// every unit file / drop-in / script / lib dir gone
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		if hostExists(r, "/etc/systemd/system/"+u) {
 			t.Fatalf("unit file still present: %s", u)
 		}
@@ -85,7 +87,7 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 	// idempotent second cycle — no resurrected files, no errors
 	sr.ClearLog()
 	c.groupWatchdog()
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		if hostExists(r, "/etc/systemd/system/"+u) {
 			t.Fatalf("unit file resurrected: %s", u)
 		}

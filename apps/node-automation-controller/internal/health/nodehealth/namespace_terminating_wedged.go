@@ -59,6 +59,13 @@ const (
 	nsFinalizerMaxStrips     = 20
 )
 
+// errSweepCapped stops a paged ListEach walk once the sweep hits
+// its strip cap — the visit error halts page fetching so the cap
+// lands before the next GVR's list, mirroring the pre-pagination
+// early return. Never surfaced: the capped flag distinguishes it
+// from a real fetch error.
+var errSweepCapped = errors.New("finalizer strip cap reached")
+
 var (
 	// namespace-terminating-wedged — namespace stuck Terminating.
 	namespaceTerminatingWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -247,34 +254,45 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 			}
 			gvr := schema.GroupVersionResource{
 				Group: gv.Group, Version: gv.Version, Resource: r.Name}
-			// Namespace-scoped LIST, not the sweep snapshot's
+			// Namespace-scoped PAGED LIST, not the sweep snapshot's
 			// cluster-wide AllUnstructured: the snapshot memoizes per
 			// GVR but the LIST itself still hauls EVERY namespace's
 			// objects of ~100-200 GVRs into memory just to filter one
 			// namespace client-side — the heap spike behind the
 			// 256Mi OOM incident. A namespaced list returns only this
 			// namespace's objects (usually a handful) and stays cheap
-			// even repeated per wedged namespace per cooldown.
-			list, err := kube.ListAllUnstructured(ctx,
-				p.Dyn.Resource(gvr).Namespace(nsName), metav1.ListOptions{})
+			// even repeated per wedged namespace per cooldown; pages
+			// stream so even a single GVR gone wild cannot spike the
+			// heap the way an unpaginated LIST would.
+			capped := false
+			err := kube.ListEach(ctx,
+				metav1.ListOptions{Limit: kube.DefaultListPageSize},
+				kube.DynamicPage(p.Dyn.Resource(gvr).Namespace(nsName)),
+				func(items []unstructured.Unstructured) error {
+					for i := range items {
+						obj := &items[i]
+						if obj.GetDeletionTimestamp() == nil ||
+							len(obj.GetFinalizers()) == 0 {
+							continue
+						}
+						if p.maybeStripFinalizers(ctx, log, gvr, obj) {
+							stripped++
+							if stripped >= nsFinalizerMaxStrips {
+								capped = true
+								return errSweepCapped
+							}
+						}
+					}
+					return nil
+				})
+			if capped {
+				p.Heals.Stamp(ck, now)
+				log.Info("namespace finalizer sweep — strip cap reached",
+					"namespace", nsName, "stripped", stripped)
+				return
+			}
 			if err != nil {
 				continue // no permission / absent — not evidence
-			}
-			for i := range list.Items {
-				obj := &list.Items[i]
-				if obj.GetDeletionTimestamp() == nil ||
-					len(obj.GetFinalizers()) == 0 {
-					continue
-				}
-				if p.maybeStripFinalizers(ctx, log, gvr, obj) {
-					stripped++
-					if stripped >= nsFinalizerMaxStrips {
-						p.Heals.Stamp(ck, now)
-						log.Info("namespace finalizer sweep — strip cap reached",
-							"namespace", nsName, "stripped", stripped)
-						return
-					}
-				}
 			}
 		}
 	}

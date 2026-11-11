@@ -3,6 +3,8 @@ package kube
 import (
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestNestedScalars(t *testing.T) {
@@ -247,4 +249,61 @@ func TestNestedStringSlice(t *testing.T) {
 	if _, ok := NestedStringSlice(map[string]any{}, "names"); ok {
 		t.Fatal("absent path reported found")
 	}
+}
+
+// StripCRDSchemaVersions must mutate the CRD IN PLACE: the old
+// implementation navigated via NestedSlice, which deep-copies — the
+// delete hit the copy and the object kept every schema (the exact
+// heap-pinning this strip exists to prevent). The test proves the
+// ORIGINAL object loses spec.versions[*].schema.
+func TestStripCRDSchemaVersions(t *testing.T) {
+	crd := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"spec": map[string]any{
+			"group":      "example.com",
+			"conversion": map[string]any{"strategy": "None"},
+			"versions": []any{
+				map[string]any{
+					"name": "v1",
+					"schema": map[string]any{
+						"openAPIV3Schema": map[string]any{"type": "object"},
+					},
+				},
+				map[string]any{
+					"name":   "v2",
+					"served": true,
+					"schema": map[string]any{
+						"openAPIV3Schema": map[string]any{"type": "object"},
+					},
+				},
+				"not-a-map", // non-map entries are skipped, not panics
+			},
+		},
+	}}
+	StripCRDSchemaVersions(crd)
+	versions, ok := crd.Object["spec"].(map[string]any)["versions"].([]any)
+	if !ok {
+		t.Fatalf("spec.versions unreadable after strip: %#v", crd.Object["spec"])
+	}
+	for i, v := range versions[:2] {
+		vm := v.(map[string]any)
+		if _, has := vm["schema"]; has {
+			t.Errorf("versions[%d] still carries schema after strip", i)
+		}
+		if vm["name"] == nil {
+			t.Errorf("versions[%d] lost its name — strip must be surgical", i)
+		}
+	}
+	// Conversion (what the audits read) survives.
+	if conv, ok := crd.Object["spec"].(map[string]any)["conversion"].(map[string]any); !ok || conv["strategy"] != "None" {
+		t.Fatalf("spec.conversion must survive the strip")
+	}
+	// Degenerate shapes are no-ops, not panics.
+	StripCRDSchemaVersions(nil)
+	StripCRDSchemaVersions(&unstructured.Unstructured{})
+	StripCRDSchemaVersions(&unstructured.Unstructured{Object: map[string]any{
+		"spec": "scalar"}})
+	StripCRDSchemaVersions(&unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"versions": "not-a-list"}}})
 }

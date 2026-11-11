@@ -36,6 +36,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -131,6 +133,16 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		if !proceed {
 			continue
 		}
+		// SSA ping-pong defense: a Git-applied CSV (a kustomize-
+		// controller manager on the object) re-asserts the Git spec
+		// every reconcile — the deployments restore past the loop
+		// threshold is the Heal-Revert Loop. Skip + report; the
+		// spec belongs in Git.
+		if !heal.FluxPatchGate("csv", csv, key, now) {
+			log.Info("skip heal: Flux Heal-Revert Loop detected — olm csv spec patch deferred",
+				"csv", key)
+			continue
+		}
 		// Patch (not Update): the controller's RBAC on
 		// clusterserviceversions is get/list/patch — an Update call
 		// would 403 every sweep. The merge patch carries ONLY the
@@ -145,7 +157,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		// rides the SAME merge patch (metadata.annotations folds into
 		// the existing map) so one write lands the heal and its
 		// persisted cooldown together.
-		deployments, _, _ := unstructured.NestedSlice(
+		deployments, _ := kube.NestedSlice(
 			csv.Object, "spec", "install", "spec", "deployments")
 		// metadata.resourceVersion pins the write — the listed
 		// snapshot's deployments array goes back wholesale, so an
@@ -192,7 +204,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 // the object was mutated. A manager with NO livenessProbe gets no
 // invented probe — there is no safe handler to clone.
 func ensureArgocdOperatorProbes(obj map[string]any) bool {
-	deployments, found, _ := unstructured.NestedSlice(
+	deployments, found := kube.NestedSlice(
 		obj, "spec", "install", "spec", "deployments")
 	if !found {
 		return false
@@ -203,7 +215,7 @@ func ensureArgocdOperatorProbes(obj map[string]any) bool {
 		if !ok {
 			continue
 		}
-		containers, found, _ := unstructured.NestedSlice(
+		containers, found := kube.NestedSlice(
 			dep, "spec", "template", "spec", "containers")
 		if !found {
 			continue
@@ -296,7 +308,7 @@ func unstructuredNumber(v any) (float64, bool) {
 // exit instead of crashing into re-election, so the flag must not
 // survive a CSV upgrade. Returns true when args were mutated.
 func stripManagerLeaderElect(obj map[string]any) bool {
-	deployments, found, _ := unstructured.NestedSlice(
+	deployments, found := kube.NestedSlice(
 		obj, "spec", "install", "spec", "deployments")
 	if !found {
 		return false
@@ -307,7 +319,7 @@ func stripManagerLeaderElect(obj map[string]any) bool {
 		if !ok {
 			continue
 		}
-		containers, found, _ := unstructured.NestedSlice(
+		containers, found := kube.NestedSlice(
 			dep, "spec", "template", "spec", "containers")
 		if !found {
 			continue
@@ -395,7 +407,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		if plan.GetNamespace() != "everest" {
 			continue
 		}
-		if approved, _, _ := unstructured.NestedBool(
+		if approved, _ := kube.NestedBool(
 			plan.Object, "spec", "approved"); approved {
 			continue // already approved — nothing to heal
 		}
@@ -410,7 +422,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		// approving it again just re-asserts spec.approved every
 		// sweep while the operator waits for a human (or a new
 		// Subscription revision) to resolve the failure.
-		if phase, _, _ := unstructured.NestedString(
+		if phase, _ := kube.NestedString(
 			plan.Object, "status", "phase"); phase == "Failed" {
 			continue
 		}
@@ -456,7 +468,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 // conditions carry ResolutionFailed=True — approving a plan whose
 // resolution already failed changes nothing but the label.
 func resolutionFailed(obj map[string]any) bool {
-	conds, found, _ := unstructured.NestedSlice(obj,
+	conds, found := kube.NestedSlice(obj,
 		"status", "conditions")
 	if !found {
 		return false
@@ -466,8 +478,8 @@ func resolutionFailed(obj map[string]any) bool {
 		if !ok {
 			continue
 		}
-		typ, _, _ := unstructured.NestedString(m, "type")
-		status, _, _ := unstructured.NestedString(m, "status")
+		typ, _ := kube.NestedString(m, "type")
+		status, _ := kube.NestedString(m, "status")
 		if typ == "ResolutionFailed" && status == "True" {
 			return true
 		}

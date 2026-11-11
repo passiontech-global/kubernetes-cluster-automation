@@ -137,6 +137,12 @@ func TestHTTPClient(t *testing.T) {
 	if tr.MaxIdleConnsPerHost != 3 {
 		t.Fatalf("MaxIdleConnsPerHost=%d want 3", tr.MaxIdleConnsPerHost)
 	}
+	// The transport is a DefaultTransport clone, not a from-scratch
+	// struct — ForceAttemptHTTP2 survives, so the custom TLS config
+	// does not silently downgrade the pool to HTTP/1.1.
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 lost — custom TLS config disables HTTP/2")
+	}
 	tlsCfg := tr.TLSClientConfig
 	if tlsCfg == nil || tlsCfg.MinVersion != tls.VersionTLS12 {
 		t.Fatalf("TLSClientConfig=%+v want TLS1.2 floor", tlsCfg)

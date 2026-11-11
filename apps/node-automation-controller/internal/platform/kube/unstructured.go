@@ -175,3 +175,35 @@ func FindCondition(conds []Condition, condType string) (Condition, bool) {
 func ConditionOf(obj map[string]any, condType string) (Condition, bool) {
 	return FindCondition(Conditions(obj, "status", "conditions"), condType)
 }
+
+// StripCRDSchemaVersions drops spec.versions[*].schema — the
+// OpenAPI validation schemas that dominate a CRD object's serialized
+// size (tens of MB across a cluster census) — from an unstructured
+// CRD in place. Audits that only read spec.conversion / status call
+// this right after listing so the schema bulk never pins heap for
+// the rest of the sweep; the apiserver does not need it back (these
+// objects are read-only census payloads, never re-applied).
+//
+// The navigation must be direct map type-asserts down crd.Object:
+// NestedSlice/NestedMap hand back DEEP COPIES, so deleting from
+// their result would silently strip nothing from the object itself.
+func StripCRDSchemaVersions(crd *unstructured.Unstructured) {
+	if crd == nil || crd.Object == nil {
+		return
+	}
+	spec, ok := crd.Object["spec"].(map[string]any)
+	if !ok {
+		return
+	}
+	versions, ok := spec["versions"].([]any)
+	if !ok {
+		return
+	}
+	for _, v := range versions {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		delete(vm, "schema")
+	}
+}

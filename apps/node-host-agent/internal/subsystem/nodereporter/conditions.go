@@ -277,6 +277,13 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 // evalConditions reads the latch files once and computes the wanted
 // state of all watchdog conditions.
 func (r *Reporter) evalConditions() []condEval {
+	// One ReadDir of the state dir answers "which latches exist" for
+	// every conditionDef at once — the per-key os.ReadFile probes
+	// used to cost ~2 syscalls per absent latch (54+ defs × alts)
+	// every cycle. Present latches still get their content read;
+	// a latch created mid-cycle is picked up next cycle (the
+	// reporter's patch cadence already quantizes condition flips).
+	present := r.latchIndex()
 	out := make([]condEval, 0, len(conditionDefs))
 	for _, d := range conditionDefs {
 		res := condEval{def: d, status: corev1.ConditionFalse,
@@ -290,7 +297,7 @@ func (r *Reporter) evalConditions() []condEval {
 				res.message = fmt.Sprintf(
 					"node-watchdog missed heartbeat %ds (timer dead or run failed)", age)
 			}
-		} else if key, since, ok := r.firstLatch(d.stateKey, d.altStateKeys); ok {
+		} else if key, since, ok := r.firstLatchIdx(present, d.stateKey, d.altStateKeys); ok {
 			res.status = corev1.ConditionTrue
 			res.reason = d.problemReason
 			// check-watchdog-state.sh echo verbatim.
@@ -301,12 +308,43 @@ func (r *Reporter) evalConditions() []condEval {
 	return out
 }
 
-// firstLatch probes the given latch keys in order and reports the
+// latchIndex snapshots which state-<key> latch files exist — one
+// os.ReadDir per evalConditions pass. Keys are the bare latch names
+// (the "state-" prefix stripped); "installed"/"last-run" and every
+// non-latch file are excluded.
+func (r *Reporter) latchIndex() map[string]bool {
+	out := make(map[string]bool)
+	entries, err := os.ReadDir(r.cfg.WatchdogStateDir)
+	if err != nil {
+		// nil, not the empty map: an unreadable state dir is "no
+		// snapshot", not "nothing active" — firstLatchIdx falls back
+		// to per-key probes, so a transient ReadDir failure cannot
+		// clear an active NodeCondition.
+		return nil
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasPrefix(n, latchdefs.LatchFilePrefix) {
+			out[strings.TrimPrefix(n, latchdefs.LatchFilePrefix)] = true
+		}
+	}
+	return out
+}
+
+// firstLatchIdx probes the given latch keys in order and reports the
 // first present one's key + content — multi-latch conditions name
 // their fallback keys in altStateKeys (primary wins on the message).
-func (r *Reporter) firstLatch(primary string, alts []string) (key, since string, ok bool) {
+// A non-nil snapshot answers absent keys with a map lookup instead
+// of an os.ReadFile; nil (no ReadDir answer) probes every key, the
+// pre-batch behavior the unit tests exercise.
+func (r *Reporter) firstLatchIdx(present map[string]bool,
+	primary string, alts []string) (key, since string, ok bool) {
+
 	for _, k := range append([]string{primary}, alts...) {
 		if k == "" {
+			continue
+		}
+		if present != nil && !present[k] {
 			continue
 		}
 		if s, found := r.stateFileSince(k); found {

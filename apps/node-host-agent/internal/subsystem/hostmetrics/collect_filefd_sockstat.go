@@ -5,6 +5,9 @@ package hostmetrics
 
 import (
 	"bufio"
+	"encoding/hex"
+	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -146,6 +149,28 @@ var (
 		"node_host_agent_netstat_tcp_timeouts_total",
 		"TcpExt TCPTimeouts — connections that timed out in any state.",
 		[]string{"node"}, nil)
+	// descNetstatTWOverflow — roadmap A6: TCPTimeWaitOverflow, the
+	// TIME_WAIT bucket > per-protocol tw reuse limit (tcp_max_tw_buckets)
+	// overflowing — each hit is a dropped TIME_WAIT socket being
+	// force-recycled, the leading edge of EADDRNOTAVAIL storms.
+	descNetstatTWOverflow = prometheus.NewDesc(
+		"node_host_agent_netstat_tcp_tw_overflow_total",
+		"TcpExt TCPTimeWaitOverflow — TIME_WAIT sockets dropped past tcp_max_tw_buckets (ephemeral-port exhaustion leading edge).",
+		[]string{"node"}, nil)
+	// Per-tuple ephemeral hot-spot (roadmap A6): the node-wide
+	// saturation ratio stays flat while ONE (dstIP, dstPort)
+	// exhausts the 4-tuple space — max socks against that single
+	// endpoint, plus a per-endpoint gauge emitted ONLY past the
+	// 40k threshold (bounded cardinality: a hot endpoint is rare
+	// and is exactly the one worth labeling).
+	descTCPPerTupleMax = prometheus.NewDesc(
+		"node_host_agent_tcp_per_tuple_max_sockets",
+		"Max sockets to a single (dstIP,dstPort) across /proc/1/net/tcp{,6} — a 4-tuple space exhaustion hot-spot invisible in node-wide socket counts.",
+		[]string{"node"}, nil)
+	descTCPPerTupleHot = prometheus.NewDesc(
+		"node_host_agent_tcp_per_tuple_sockets",
+		"Sockets to one hot (dstIP,dstPort) endpoint — emitted only past the 40k tuple threshold (bounded series).",
+		[]string{"node", "dst"}, nil)
 	descSNMPReasmFails = prometheus.NewDesc(
 		"node_host_agent_snmp_ip_reasm_fails_total",
 		"Ip ReasmFails — IP fragment reassembly failures.",
@@ -290,11 +315,14 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 	// tables, NOT sockstat — it must emit even when the sockstat
 	// file itself is absent, so it runs before the early return.
 	// ok=false only when NO family table read (a node with neither
-	// file is inconclusive, not empty).
-	if cw, ok := tcpStateCount(0x08,
+	// file is inconclusive, not empty). The same single pass feeds
+	// the roadmap A6 per-tuple hot-spot gauges (a whole-table second
+	// scan on a busy node is 100k+ lines of IO for nothing).
+	if stateCounts, perTuple, ok := tcpTableScan(
 		c.cfg.ProcNetTCP, c.cfg.ProcNetTCP6); ok {
 		ch <- prometheus.MustNewConstMetric(descTCPCloseWaitSocks,
-			prometheus.GaugeValue, cw, c.cfg.NodeName)
+			prometheus.GaugeValue, float64(stateCounts[0x08]), c.cfg.NodeName)
+		c.emitPerTupleHotspot(ch, perTuple)
 	}
 	f, err := os.Open(c.cfg.SockstatFile)
 	if err != nil {
@@ -401,18 +429,49 @@ func ephemeralPortWidth(path string) float64 {
 	return float64(hi - lo + 1)
 }
 
-// tcpStateCount scans the /proc/net/tcp{,6} socket tables and
-// counts entries whose `st` column (field 3, hex TCP state) equals
-// state. ok=false when NO table read at all — a single readable
-// family still counts (an IPv6-less host legitimately lacks
-// tcp6). Streamed line-by-line: os.ReadFile + strings.Split over
-// the whole socket table allocated ~15-25MiB of garbage per
-// scrape on busy nodes.
-func tcpStateCount(state byte, paths ...string) (float64, bool) {
-	want := string([]byte{
-		"0123456789ABCDEF"[state>>4], "0123456789ABCDEF"[state&0x0f]})
-	var n float64
-	var ok bool
+// hotTupleSockets is the roadmap A6 threshold: one (dstIP, dstPort)
+// endpoint holding more than this many sockets has exhausted its
+// 4-tuple space on any realistic ephemeral range (55k ports) —
+// clients toward it EADDRNOTAVAIL while every node-wide socket
+// gauge looks healthy.
+const hotTupleSockets = 40000
+
+// hexSockAddr decodes a /proc/net/tcp address column — 8 or 32 hex
+// chars (IPv4/IPv6, little-endian per u32 word) + ":port" — into
+// host order "a.b.c.d:port" / "[v6]:port". An unparseable column
+// yields the raw string (never a metric value fabricated from a
+// guess).
+func hexSockAddr(s string) string {
+	host, port, found := strings.Cut(s, ":")
+	if !found {
+		return s
+	}
+	raw, err := hex.DecodeString(host)
+	if err != nil || (len(raw) != 4 && len(raw) != 16) {
+		return s
+	}
+	pn, err := strconv.ParseUint(port, 16, 16)
+	if err != nil {
+		return s
+	}
+	if len(raw) == 4 {
+		return fmt.Sprintf("%d.%d.%d.%d:%d", raw[3], raw[2], raw[1], raw[0], pn)
+	}
+	// tcp6 renders the 16 in6_addr bytes contiguously in network
+	// order (the per-u32 little-endian shuffle is the v4-only
+	// artifact) — net.IP formats it straight.
+	return fmt.Sprintf("[%s]:%d", net.IP(raw).String(), pn)
+}
+
+// tcpTableScan is one streaming pass over the /proc/net/tcp{,6}
+// socket tables: per-state totals (the CLOSE_WAIT count) and the
+// per-remote-endpoint counts (the roadmap A6 tuple hot-spot).
+// ok=false when NO table read at all — a single readable family
+// still counts (an IPv6-less host legitimately lacks tcp6).
+func tcpTableScan(paths ...string) (stateCounts map[byte]int,
+	perTuple map[string]int, ok bool) {
+	stateCounts = map[byte]int{}
+	perTuple = map[string]int{}
 	for _, p := range paths {
 		f, err := os.Open(p)
 		if err != nil {
@@ -426,13 +485,51 @@ func tcpStateCount(state byte, paths ...string) (float64, bool) {
 				first = false
 				continue // column header
 			}
-			if fields := strings.Fields(sc.Text()); len(fields) > 3 && fields[3] == want {
-				n++
+			fields := strings.Fields(sc.Text())
+			if len(fields) < 4 {
+				continue
 			}
+			st, err := strconv.ParseUint(fields[3], 16, 8)
+			if err != nil {
+				continue // malformed line — never emit junk
+			}
+			stateCounts[byte(st)]++
+			perTuple[hexSockAddr(fields[2])]++
 		}
 		_ = f.Close()
 	}
-	return n, ok
+	return stateCounts, perTuple, ok
+}
+
+// tcpStateCount scans the /proc/net/tcp{,6} socket tables and
+// counts entries whose `st` column (field 3, hex TCP state) equals
+// state. ok=false when NO table read at all — a single readable
+// family still counts (an IPv6-less host legitimately lacks tcp6).
+// Streamed line-by-line (see tcpTableScan).
+func tcpStateCount(state byte, paths ...string) (float64, bool) {
+	counts, _, ok := tcpTableScan(paths...)
+	return float64(counts[state]), ok
+}
+
+// emitPerTupleHotspot publishes the per-endpoint socket counts:
+// the max-tuple gauge every readable scrape, plus a labelled gauge
+// per endpoint past hotTupleSockets only (the 40k roadmap
+// threshold — bounded series, and an un-hot node keeps its
+// exposition flat).
+func (c *Collector) emitPerTupleHotspot(ch chan<- prometheus.Metric,
+	perTuple map[string]int) {
+	max := 0
+	for dst, n := range perTuple {
+		if n > max {
+			max = n
+		}
+		if n > hotTupleSockets {
+			ch <- prometheus.MustNewConstMetric(descTCPPerTupleHot,
+				prometheus.GaugeValue, float64(n), c.cfg.NodeName, dst)
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(descTCPPerTupleMax,
+		prometheus.GaugeValue, float64(max), c.cfg.NodeName)
 }
 
 // --- netstat/snmp kernel TCP/IP counters ---
@@ -490,6 +587,11 @@ func (c *Collector) collectNetstatSNMP(ch chan<- prometheus.Metric) {
 		emit(descNetstatListenDrops, "ListenDrops")
 		emit(descNetstatSynRetrans, "TCPSynRetrans")
 		emit(descNetstatTCPTimeouts, "TCPTimeouts")
+		// Roadmap A6 — the TIME_WAIT bucket overflowing
+		// tcp_max_tw_buckets: each hit is a force-recycled TIME_WAIT
+		// socket, the leading edge of EADDRNOTAVAIL toward a hot
+		// endpoint.
+		emit(descNetstatTWOverflow, "TCPTimeWaitOverflow")
 	}
 	if data, err := os.ReadFile(c.cfg.SNMPFile); err == nil {
 		kv := parseNetstatPairs(string(data))

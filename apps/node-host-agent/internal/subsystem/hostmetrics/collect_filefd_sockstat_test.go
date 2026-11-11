@@ -3,9 +3,11 @@
 package hostmetrics
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -518,5 +520,100 @@ func TestSockstatCloseWaitAliasAndMalformed(t *testing.T) {
 	if got, ok := metricValue(t, c, "node_host_agent_sockstat_tcp_tw",
 		map[string]string{"node": "node-a"}); !ok || got != 4 {
 		t.Fatalf("tcp_tw=%v ok=%v want 4", got, ok)
+	}
+}
+
+// --- A6: per-tuple ephemeral hot-spot + TCPTimeWaitOverflow ---
+
+// TestPerTupleHotSpotThreshold: the per-endpoint counts come out of
+// the same single table scan as the CLOSE_WAIT count; the max-tuple
+// gauge always emits when a table reads, the per-endpoint gauge only
+// past the 40k threshold, and the dst label carries the decoded
+// host-order address.
+func TestPerTupleHotSpotThreshold(t *testing.T) {
+	cfg, _ := fixture(t)
+	dir := t.TempDir()
+	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
+	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	// 0100007F:1F90 = 127.0.0.1:8080 (LE word 7F000001) — one socket
+	// below the threshold; AC1E90AF:8C3A = 175.144.30.172:35898 with
+	// 40001 sockets (one over the 40k threshold, written once here
+	// and counted by the repeated-row logic in the scan).
+	var b strings.Builder
+	b.WriteString("  sl  local_address rem_address   st\n")
+	b.WriteString("   0: 0100007F:0050 0100007F:1F90 01\n")
+	for i := 0; i < 40001; i++ {
+		fmt.Fprintf(&b, "%4d: 0100007F:0050 AC1E90AF:8C3A 01\n", i+1)
+	}
+	testutil.WriteFile(t, cfg.ProcNetTCP, b.String())
+	testutil.WriteFile(t, cfg.ProcNetTCP6,
+		"  sl  local_address                         rem_address                        st\n"+
+			"   0: 0000000000000000000000000100007F:0050 0000000000000000000000000100007F:1F90 08\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_max_sockets",
+		node); !ok || v != 40001 {
+		t.Fatalf("per-tuple max=%v ok=%v want 40001", v, ok)
+	}
+	dst := map[string]string{"node": "node-a", "dst": "175.144.30.172:35898"}
+	if v, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_sockets",
+		dst); !ok || v != 40001 {
+		t.Fatalf("hot tuple gauge=%v ok=%v want 40001", v, ok)
+	}
+	// A below-threshold endpoint carries no labelled series.
+	if _, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_sockets",
+		map[string]string{"node": "node-a", "dst": "127.0.0.1:8080"}); ok {
+		t.Fatal("below-threshold endpoint emitted a labelled series")
+	}
+	// The close-wait count still rides the same scan (1 v6 row).
+	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
+		node); !ok || v != 1 {
+		t.Fatalf("close_wait=%v ok=%v want 1 (same-pass scan)", v, ok)
+	}
+}
+
+func TestPerTupleMaxAbsentWithoutTables(t *testing.T) {
+	cfg, _ := fixture(t)
+	dir := t.TempDir()
+	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
+	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_max_sockets",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("per-tuple max emitted with no socket tables")
+	}
+}
+
+func TestTCPTimeWaitOverflowCounter(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.NetstatFile,
+		"TcpExt: RcvPruned ListenOverflows ListenDrops TCPSynRetrans TCPTimeouts TCPTimeWaitOverflow\n"+
+			"TcpExt: 0 12 3 45 67 89\n")
+	testutil.WriteFile(t, cfg.SNMPFile,
+		"Ip: Forwarding DefaultTTL InReceives ReasmFails\n"+
+			"Ip: 1 64 100 4\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_netstat_tcp_tw_overflow_total",
+		node); !ok || v != 89 {
+		t.Fatalf("tw overflow=%v ok=%v want 89", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_netstat_tcp_tw_overflow_total",
+		node); !ok {
+		t.Fatal("tw overflow vanished on second read")
+	}
+}
+
+func TestHexSockAddrDecode(t *testing.T) {
+	for raw, want := range map[string]string{
+		"0100007F:1F90":                         "127.0.0.1:8080",
+		"AC1E90AF:8C3A":                         "175.144.30.172:35898",
+		"00000000000000000000000000000001:0016": "[::1]:22",
+		"junk":                                  "junk",
+		"0100007F":                              "0100007F",
+	} {
+		if got := hexSockAddr(raw); got != want {
+			t.Fatalf("hexSockAddr(%q)=%q want %q", raw, got, want)
+		}
 	}
 }

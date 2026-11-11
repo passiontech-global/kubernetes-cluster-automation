@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -178,16 +180,46 @@ var (
 		[]string{"node", "unit"}, nil)
 )
 
-// collectSystemdScopes counts cri-containerd-*.scope dirs under the
-// kubepods cgroup slice (systemd-scopes): a leaking abandoned-scope
-// footprint is what slows every PID 1 D-Bus call down before
-// systemctl-level symptoms appear. Counted directly in the cgroup
-// fs — no systemctl fork per scrape. Emits only when the slice
-// root exists.
-func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
-	root := filepath.Join(c.cfg.CgroupRoot, "kubepods.slice")
+// defaultScopesScanInterval caches the kubepods scope walk — the
+// footprint moves on process-lifecycle timescales, not scrape
+// timescales, and the walk is heaviest exactly in the leak condition
+// it measures (proc/inotify/ebpf scan-cache parity).
+const defaultScopesScanInterval = 60 * time.Second
+
+// scopesCache holds the last systemd-scope count — the Collector's
+// scrape-side cache slice (domains.go contract: the cache lives next
+// to the collect_*.go file that owns it). The mutex is private.
+type scopesCache struct {
+	mu    sync.Mutex
+	at    time.Time
+	count float64
+	seen  bool
+}
+
+// get returns the cached scope count, re-walking at most once per
+// defaultScopesScanInterval. On read failure past the window the
+// cache serves nothing — a vanished slice root falls back to the
+// absent series (pre-cache parity), while a fresh entry keeps
+// serving until its TTL is up.
+func (s *scopesCache) get(now time.Time, root string) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen && now.Sub(s.at) < defaultScopesScanInterval {
+		return s.count, true
+	}
+	n, ok := walkSystemdScopes(root)
+	if !ok {
+		return 0, false
+	}
+	s.count, s.at, s.seen = n, now, true
+	return n, true
+}
+
+// walkSystemdScopes counts cri-containerd-*.scope dirs under the
+// kubepods slice root — ok=false when the root doesn't stat.
+func walkSystemdScopes(root string) (float64, bool) {
 	if _, err := os.Stat(root); err != nil {
-		return
+		return 0, false
 	}
 	var n float64
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -202,6 +234,23 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 		}
 		return nil
 	})
+	return n, true
+}
+
+// collectSystemdScopes counts cri-containerd-*.scope dirs under the
+// kubepods cgroup slice (systemd-scopes): a leaking abandoned-scope
+// footprint is what slows every PID 1 D-Bus call down before
+// systemctl-level symptoms appear. Counted directly in the cgroup
+// fs — no systemctl fork per scrape. Emits only when the slice
+// root exists; the walk is TTL-cached (scopesCache) so a leak
+// doesn't pay a full dir walk every 15s scrape. Per-pid cgroup
+// reads stay live — only the scope LIST is cached.
+func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
+	root := filepath.Join(c.cfg.CgroupRoot, "kubepods.slice")
+	n, ok := c.scopes.get(c.cfg.Clock.Now(), root)
+	if !ok {
+		return
+	}
 	ch <- prometheus.MustNewConstMetric(descSystemdScopes,
 		prometheus.GaugeValue, n, c.cfg.NodeName)
 }

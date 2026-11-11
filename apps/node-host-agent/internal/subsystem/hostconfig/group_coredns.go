@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T9 coredns stub + hub ----------

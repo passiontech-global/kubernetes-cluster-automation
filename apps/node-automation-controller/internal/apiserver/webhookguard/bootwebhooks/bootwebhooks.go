@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -57,6 +58,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -185,6 +187,18 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			patch.Webhooks = append(patch.Webhooks, webhookPatchEntry{Name: w.Name, FailurePolicy: &policy})
 		}
 		if len(patch.Webhooks) == 0 {
+			continue
+		}
+
+		// SSA ping-pong defense: the fail-open flip fights Flux when
+		// the config is Git-owned — past the Heal-Revert-Loop
+		// threshold the patch skips (the webhook stays fail-closed
+		// against Git's wish) and the conflict counter fires so the
+		// failurePolicy is fixed at the Git source.
+		if !heal.FluxPatchGate(guardstate.KindValidating, cfg,
+			guardstate.KindValidating+"/"+cfg.Name, time.Now()) {
+			log.Info("skip heal: Flux Heal-Revert Loop detected — boot-webhook fail-open patch deferred",
+				"config", cfg.Name)
 			continue
 		}
 

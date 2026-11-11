@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/fileconf"
 )
 
 func TestConfigFromEnv(t *testing.T) {
@@ -36,7 +37,7 @@ func TestConfigFromEnv(t *testing.T) {
 	if _, ok := cfg.Runner.(NsenterRunner); !ok {
 		t.Fatalf("Runner=%T — /host root must nsenter", cfg.Runner)
 	}
-	w, ok := cfg.Watcher.(*DirWatcher)
+	w, ok := cfg.Watcher.(*fileconf.DirWatcher)
 	if !ok {
 		t.Fatalf("Watcher=%T", cfg.Watcher)
 	}

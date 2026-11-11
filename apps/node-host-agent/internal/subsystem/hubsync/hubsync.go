@@ -58,8 +58,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/fileconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/logx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -89,9 +90,9 @@ const (
 	defaultSecretName      = "api-backend-guard-token"
 )
 
-// Watcher is the change-edge contract hostconfig.DirWatcher
-// implements — Changed reports whether the watched dirs' content
-// fingerprint moved since the last call.
+// Watcher is the change-edge contract fileconf.DirWatcher implements —
+// Changed reports whether the watched dirs' content fingerprint moved
+// since the last call.
 type Watcher interface {
 	Changed() bool
 }
@@ -113,7 +114,7 @@ type Config struct {
 	SyncInterval  time.Duration // full converge cadence (default 10m)
 	WatchInterval time.Duration // how often the dir fingerprint is polled
 	// Watcher edges trigger an early cycle on vars/nebula-certs
-	// content drift. Nil → a hostconfig.DirWatcher over VarsDir +
+	// content drift. Nil → a fileconf.DirWatcher over VarsDir +
 	// NebulaCertsDir.
 	Watcher Watcher
 
@@ -217,8 +218,12 @@ func (c *Config) applyDefaults() {
 		c.Log = logger()
 	}
 	if c.Watcher == nil {
-		c.Watcher = &hostconfig.DirWatcher{
+		// The watcher's debug texts stay hostconfig-prefixed (grep
+		// contract from the shared implementation's original home),
+		// so it keeps logging under the hostconfig identity.
+		c.Watcher = &fileconf.DirWatcher{
 			Dirs: []string{c.VarsDir, c.NebulaCertsDir},
+			Log:  logx.For("hostconfig"),
 		}
 	}
 	if c.SpawnFn == nil {

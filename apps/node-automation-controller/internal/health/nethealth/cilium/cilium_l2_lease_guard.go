@@ -54,16 +54,17 @@ type ciliumL2LeaseGuardCheck struct {
 	// reason fires at >= 2 — one not-Ready sweep is an agent restart
 	// blip, two in a row is the agent down. A Ready sweep resets the
 	// streak (not-consecutive cycles are restarts, not an outage), so
-	// a later flap re-arms it.
-	agentNotReadyStreak map[string]int
+	// a later flap re-arms it. The shared state.StreakLedger shape:
+	// Hit on a not-Ready sweep, Reset on a Ready sweep, Prune against
+	// the live node census.
+	agentNotReadyStreak state.StreakLedger
 }
 
 // NewCiliumL2LeaseGuardCheck builds the cilium-l2-lease-guard check — the gauge
-// ledger and the streak map are zero-value ready; heal cooldowns
+// ledger and the streak ledger are zero-value ready; heal cooldowns
 // ride the shared Deps.Heals set.
 func NewCiliumL2LeaseGuardCheck(d *probefw.Deps) probefw.Check {
-	return &ciliumL2LeaseGuardCheck{Deps: d,
-		agentNotReadyStreak: map[string]int{}}
+	return &ciliumL2LeaseGuardCheck{Deps: d}
 }
 
 const (
@@ -155,7 +156,7 @@ func (p *ciliumL2LeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		holder := derefString(lease.Spec.HolderIdentity)
 		reasons := ciliumL2StaleHolderReasons(lease, byName[holder],
-			agentNotReady[holder] >= ciliumAgentNotReadyStreak)
+			agentNotReady.Count(holder) >= ciliumAgentNotReadyStreak)
 		if len(reasons) == 0 {
 			continue
 		}
@@ -231,19 +232,19 @@ func nodeReady(node *corev1.Node) bool {
 }
 
 // ciliumAgentStreak updates and returns the per-node cilium-agent
-// not-Ready streak: one pod's not-Ready sweep increments, a Ready
-// sweep resets. A pod-list failure leaves the streak untouched —
-// "can't tell" must not count as a not-Ready cycle. A node whose
-// agent pod has vanished (pod deleted, node fine) does NOT
+// not-Ready streak: one pod's not-Ready sweep increments (Hit), a
+// Ready sweep resets (Reset). A pod-list failure leaves the streak
+// untouched — "can't tell" must not count as a not-Ready cycle. A
+// node whose agent pod has vanished (pod deleted, node fine) does NOT
 // accumulate — Cilium not scheduling an agent is the operator's
 // problem, not a stale lease, and the node-level reasons already
 // cover a gone node.
 func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
-	ctx context.Context, nodes []corev1.Node) map[string]int {
+	ctx context.Context, nodes []corev1.Node) *state.StreakLedger {
 
 	pods, err := p.AllPods(ctx)
 	if err != nil {
-		return p.agentNotReadyStreak
+		return &p.agentNotReadyStreak
 	}
 	onNode := map[string]bool{}
 	for i := range nodes {
@@ -268,22 +269,18 @@ func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
 			continue
 		}
 		if podReadyStatus(pod) {
-			delete(p.agentNotReadyStreak, pod.Spec.NodeName)
+			p.agentNotReadyStreak.Reset(pod.Spec.NodeName)
 			continue
 		}
-		p.agentNotReadyStreak[pod.Spec.NodeName]++
+		p.agentNotReadyStreak.Hit(pod.Spec.NodeName)
 	}
 	// A node that vanished while not-Ready is never revisited — its
 	// agent pod is gone with it, so the loop above can neither reset
 	// nor delete the key. Prune against the live node census (the
 	// same caller-prune contract every state ledger carries) so the
-	// map stays bounded by cluster size.
-	for node := range p.agentNotReadyStreak {
-		if !onNode[node] {
-			delete(p.agentNotReadyStreak, node)
-		}
-	}
-	return p.agentNotReadyStreak
+	// ledger stays bounded by cluster size.
+	p.agentNotReadyStreak.Prune(func(key string) bool { return onNode[key] })
+	return &p.agentNotReadyStreak
 }
 
 // deleteStaleLease deletes one stale Lease through the shared heal
@@ -314,11 +311,13 @@ func (p *ciliumL2LeaseGuardCheck) deleteStaleLease(
 		// Another actor (the Cilium agent itself) beat us to it —
 		// the stale holder is gone either way.
 		p.Heals.Stamp(key, now)
+		p.InvalidateLeases(ctx) // lease gone — drop the census + index
 	case err != nil:
 		log.Info("WARN: stale cilium L2 announce lease delete failed",
 			"lease", lease.Name, "error", err)
 	default:
 		p.Heals.Stamp(key, now)
+		p.InvalidateLeases(ctx) // lease gone — drop the census + index
 		log.Info("HEAL: deleted stale cilium L2 announce lease — re-elect a healthy holder",
 			"lease", lease.Name,
 			"holder", derefString(lease.Spec.HolderIdentity))

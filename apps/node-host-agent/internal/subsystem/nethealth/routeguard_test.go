@@ -813,16 +813,16 @@ func TestSpawnRouteGuardSetnsDeadGate(t *testing.T) {
 	// stop it so cleanup races nothing.
 	waitForCond(t, 2*time.Second, func() bool {
 		st := e.n.mtuState()
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return st.cycle >= 1
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return st.Cycle >= 1
 	})
 	cancel()
 	waitForCond(t, 2*time.Second, func() bool {
 		st := e.n.mtuState()
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return !st.running
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
 	})
 }
 
@@ -861,9 +861,9 @@ func TestRouteGuardSetnsDeadExits(t *testing.T) {
 	cancel()
 	waitForCond(t, 2*time.Second, func() bool {
 		st := e.n.mtuState()
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return !st.running
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
 	})
 	wg.Wait()
 }

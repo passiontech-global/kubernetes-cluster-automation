@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -29,7 +29,7 @@ var ctx = context.Background()
 // unregistered.
 func wgDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	kinds := testutil.DynListKinds()
-	kinds[guardstate.CustomResourceDefinitionGVR] = "CustomResourceDefinitionList"
+	kinds[kube.GVRCustomResourceDefinition] = "CustomResourceDefinitionList"
 	return testutil.NewFakeDyn(kinds, objs...)
 }
 

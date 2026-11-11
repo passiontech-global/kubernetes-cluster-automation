@@ -109,6 +109,10 @@ var (
 	// ---------------------------------------------------------------
 	GVVeleroSchedule = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "schedules"}
+	// GVVeleroBackup is the velero.io/v1 Backup — velero-backup-auditor's
+	// census subject and the operator watchdog's never-reconciled
+	// signature (W20). (The operator watchdog's row used to carry its
+	// own duplicate GVRVeleroBackup declaration of the same GVR.)
 	GVVeleroBackup = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backups"}
 	GVVeleroBackupStorageLocation = schema.GroupVersionResource{
@@ -235,10 +239,6 @@ var (
 		Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
 	GVRVeleroDataDownload = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
-	// GVRVeleroBackup is the velero.io/v1 Backup the operator
-	// watchdog watches for the never-reconciled signature (W20).
-	GVRVeleroBackup = schema.GroupVersionResource{
-		Group: "velero.io", Version: "v1", Resource: "backups"}
 
 	// ---------------------------------------------------------------
 	// Shipwright (failed-jobs-janitor BuildRuns; cluster-health-probes

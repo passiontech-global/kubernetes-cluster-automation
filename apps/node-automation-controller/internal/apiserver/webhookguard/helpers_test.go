@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -56,7 +56,7 @@ func wgDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 // ns/name — the conversion-backend fixture.
 func wgCRDConversion(crdName, svcNS, svcName string) *unstructured.Unstructured {
 	crd := testutil.Unstructured(
-		guardstate.CustomResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		kube.GVRCustomResourceDefinition.GroupVersion().WithKind("CustomResourceDefinition"),
 		"", crdName, nil)
 	_ = unstructured.SetNestedField(crd.Object, "Webhook",
 		"spec", "conversion", "strategy")

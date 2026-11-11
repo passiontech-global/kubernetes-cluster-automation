@@ -24,7 +24,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
@@ -113,7 +112,7 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 	}
 	var ev []string
 	for i := range plans.Items {
-		state, _, _ := unstructured.NestedString(
+		state, _ := NestedString(
 			plans.Items[i].Object, "status", "state")
 		if state != "Schedulable" && state != "Completed" {
 			ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
@@ -156,7 +155,7 @@ func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]s
 			// record awaiting deletion — the cordon+drain already
 			// finished, so it is not live evidence.
 			if gvr == GVRNodeMaintenance {
-				if phase, _, _ := unstructured.NestedString(
+				if phase, _ := NestedString(
 					obj.Object, "status", "phase"); phase == "Succeeded" {
 					continue
 				}

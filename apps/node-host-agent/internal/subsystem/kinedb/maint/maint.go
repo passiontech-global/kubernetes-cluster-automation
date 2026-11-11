@@ -125,7 +125,12 @@ type Result struct {
 	// invalid-index-reaper invalid-index reaper tallies.
 	invalidDropped int
 	invalidKept    int // non-ccnew/ccold invalids left for an operator
-	notes          []string
+	// urgent-reindex (bloat.go) — the post-storm out-of-band gate:
+	// off|cooldown|skipped-lock-busy|done|fail (only fail flips
+	// okUrgent; skips count as ok like the repack gates).
+	urgentState string
+	okUrgent    bool
+	notes       []string
 }
 
 // Maint runs the daily maintenance job — the kine-db-maint.sh port.
@@ -141,7 +146,8 @@ func New(d *kdeps.Deps) *Maint { return &Maint{d: d} }
 // Cycle runs one maintenance round and emits metrics + textfile —
 // was maintCycle. Returns the result for tests.
 func (m *Maint) Cycle(ctx context.Context) *Result {
-	res := &Result{okRepack: true, okFreeze: true, repackState: "skipped"}
+	res := &Result{okRepack: true, okFreeze: true, okUrgent: true,
+		repackState: "skipped"}
 	note := func(s string) { res.notes = append(res.notes, s) }
 
 	user, pass, credOK := m.d.Creds()
@@ -155,12 +161,13 @@ func (m *Maint) Cycle(ctx context.Context) *Result {
 		m.maintRun(ctx, pg, user, pass, res, note, !m.maintEpochFresh())
 	}
 	m.emitMaint(res)
-	sum := fmt.Sprintf("reindex=%v repack=%s freeze=%s heap=%dB idx=%dB "+
+	sum := fmt.Sprintf("reindex=%v repack=%s freeze=%s urgent=%s heap=%dB idx=%dB "+
 		"dead=%d%% xid=%s",
 		res.okReindex, res.repackState, kdeps.ReasonOrDash(res.freezeState),
+		kdeps.ReasonOrDash(res.urgentState),
 		res.heapBytes, res.indexBytes, res.deadPct,
 		kdeps.IntOrNA(res.xidSeen, res.xidAge))
-	if res.okReindex && res.okRepack && res.okFreeze {
+	if res.okReindex && res.okRepack && res.okFreeze && res.okUrgent {
 		logger().Info("kine-db-maint OK: " + sum)
 		m.d.M.Cycles.WithLabelValues("maint", "ok").Inc()
 	} else {
@@ -242,6 +249,11 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 			"skip window")
 		logger().Info("kinedb: maint heavy block skipped — epoch inside the skip window")
 		m.readSizes(ctx, pg, user, pass, res, note)
+		// urgent-reindex (bloat.go): the sizes read above is exactly
+		// the gate input — a post-storm bloat discovered mid-interval
+		// reindexes TODAY under the advisory lock, epoch window or
+		// not.
+		m.urgentReindex(ctx, pg, user, pass, res, note)
 		return
 	}
 
@@ -300,6 +312,10 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		res.repackState = "assess-fail"
 		return
 	}
+	// urgent-reindex rides the heavy path too: the reindex above may
+	// have failed or lock-skipped and left the bloat standing — the
+	// gate (with its cooldown) decides, not the epoch.
+	m.urgentReindex(ctx, pg, user, pass, res, note)
 
 	// (d) pg_repack ONLY when the heap is genuinely bloated —
 	// autovacuum keeps it roughly compact, so this fires rarely.
@@ -483,6 +499,25 @@ func (m *Maint) emitMaint(res *Result) {
 	p.Gauge("kine_db_maint_last_run_timestamp_seconds",
 		"Last maintenance run", ts)
 	m.d.M.MaintLastRun.Set(ts)
+	// urgent-reindex (bloat.go): the maint_ok check renders only once
+	// the gate has actually been evaluated (a cycle without live
+	// postgres never reaches the gate — no fabricated pass), and the
+	// timestamp lands only on a completed out-of-band reindex.
+	if res.urgentState != "" {
+		urgent := 1.0
+		if res.urgentState == "fail" {
+			urgent = 0
+		}
+		p.GaugeLabels("kine_db_maint_ok",
+			"Maintenance job result on the kine DB (1 = ok/skip, 0 = fail)",
+			`check="urgent_reindex"`, urgent)
+		m.d.M.MaintOK.WithLabelValues("urgent_reindex").Set(urgent)
+	}
+	if res.urgentState == "done" {
+		p.Gauge("kine_db_urgent_reindex_last_run_timestamp_seconds",
+			"Last post-storm out-of-band REINDEX TABLE CONCURRENTLY.", ts)
+		m.d.M.UrgentReindexLastRun.Set(ts)
+	}
 	// relation_bytes comes out of the stats read — emitGuard's
 	// statsOK gating applied here too: on assess-fail a fabricated
 	// 0 overwriting a meaningful size is worse than a stale gauge.

@@ -25,12 +25,12 @@ package systemd
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // Config is hostexec.Config — a type alias, not a field-for-field
@@ -296,7 +296,7 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic %q (not active)",
 			unit, ts)
 	}
-	up, err := procUptimeSeconds(c.procUptimeFile)
+	up, err := hostutil.UptimeSeconds(c.procUptimeFile)
 	if err != nil {
 		return 0, fmt.Errorf("%s: read %s: %w", unit, c.procUptimeFile, err)
 	}
@@ -309,20 +309,9 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 	return 0, nil
 }
 
-// procUptimeSeconds parses the first field of /proc/uptime — seconds
-// since boot on the boot-relative timeline the kernel and systemd's
-// *Monotonic properties share.
-func procUptimeSeconds(path string) (float64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	f := strings.Fields(string(data))
-	if len(f) == 0 {
-		return 0, fmt.Errorf("empty uptime %s", path)
-	}
-	return strconv.ParseFloat(f[0], 64)
-}
+// (ActiveAge reads /proc/uptime through hostutil.UptimeSeconds — the
+// shared parser; the systemd-local copy it replaced drifted only in
+// an error string.)
 
 // Restart mirrors `systemctl restart <unit>`.
 func (c *Client) Restart(ctx context.Context, unit string) error {

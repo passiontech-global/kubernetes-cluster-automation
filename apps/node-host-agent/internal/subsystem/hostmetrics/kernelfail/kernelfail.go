@@ -80,6 +80,19 @@ type Deps struct {
 	// provisioner roots the ro-mount evidence scans.
 	OpenEBSLocalDir string
 
+	// Ext4ErrorsGlob globs the per-filesystem ext4 error counters
+	// (roadmap A5) — /sys/fs/ext4/<dev>/errors_count, the
+	// superblock-resident count that survives agent restarts AND
+	// remounts; > 0 means the kernel logged metadata errors on that
+	// filesystem at some point. Empty → defaultExt4ErrorsGlob.
+	Ext4ErrorsGlob string
+	// NVMeSmartGlob globs the NVMe controller SMART sysfs pages —
+	// /sys/class/nvme/nvme*/smart_log, the packed nvme_smart_log
+	// struct where mainline kernels ship it (vendor kernels do; the
+	// missing-attribute case falls back to `nvme smart-log` via
+	// RunHostCmd). Empty → defaultNVMeSmartGlob.
+	NVMeSmartGlob string
+
 	// TickInterval is the latch ticker's expected cadence — carried
 	// into the warp ACTION line's "tick=" evidence text. <=0 →
 	// defaultTickInterval.
@@ -161,6 +174,12 @@ func New(d Deps) *Runner {
 	if d.TickInterval <= 0 {
 		d.TickInterval = defaultTickInterval
 	}
+	if d.Ext4ErrorsGlob == "" {
+		d.Ext4ErrorsGlob = defaultExt4ErrorsGlob
+	}
+	if d.NVMeSmartGlob == "" {
+		d.NVMeSmartGlob = defaultNVMeSmartGlob
+	}
 	if d.Clock == nil {
 		d.Clock = timex.NewCell(nil)
 	}
@@ -185,6 +204,10 @@ func (r *Runner) Refresh(ctx context.Context) {
 	r.checkClockSkew(ctx)
 	r.checkClockWarp()
 	r.updateFSReadonlyEvidence()
+	// disk-pre-fail (A5) — ext4 errors_count + NVMe SMART early
+	// indicators: the death-bed warning BEFORE the filesystem
+	// aborts read-only, while the LocalPV data is still evacuable.
+	r.updateDiskPreFailEvidence()
 }
 
 // Close releases the /dev/kmsg fd the session holds — the

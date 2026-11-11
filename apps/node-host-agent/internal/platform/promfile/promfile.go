@@ -110,10 +110,14 @@ func EscapeLabelValue(v string) string {
 func stagingPattern(name string) string { return "." + name + ".*" }
 
 // Write atomically installs content as <dir>/<name>: MkdirAll, then
-// hostutil.WriteAtomic (CreateTemp staging, payload fsync, rename,
-// dir fsync) — the textfile collector rejects partially-written
-// files, and without the fsyncs a crash can leave a
-// renamed-but-empty file behind (or lose the rename itself). The
+// hostutil.WriteAtomic (CreateTemp staging, rename) — the textfile
+// collector rejects partially-written files. The fsyncs are skipped
+// (AtomicOpts.NoSync): a .prom file is ephemeral — node_exporter
+// re-reads it every scrape and the next cycle rewrites it, so a
+// crash losing the newest render costs one scrape interval of
+// metrics, not correctness. The read-compare gate skips the whole
+// staging+rename when the rendered content is unchanged (the
+// apibe-gap pattern) — most ticks render identical output. The
 // staging shape stays promfile's own: see stagingPattern — sharing
 // hostutil's ".tmp-" convention here would put scrapeable
 // ".*.prom" names in the collector's glob.
@@ -121,10 +125,15 @@ func Write(dir, name string, content []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return hostutil.WriteAtomic(filepath.Join(dir, name), content, hostutil.AtomicOpts{
-		Stage:   hostutil.StageTempPattern(stagingPattern(name)),
-		Mode:    0o644,
-		DirSync: true,
+	path := filepath.Join(dir, name)
+	if cur, err := os.ReadFile(path); err == nil &&
+		string(cur) == string(content) {
+		return nil
+	}
+	return hostutil.WriteAtomic(path, content, hostutil.AtomicOpts{
+		Stage:  hostutil.StageTempPattern(stagingPattern(name)),
+		Mode:   0o644,
+		NoSync: true,
 	})
 }
 

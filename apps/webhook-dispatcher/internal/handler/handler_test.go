@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,9 +49,15 @@ type fakeBackend struct {
 	mu        sync.Mutex
 	refreshed int
 	checks    []concourse.Resource
+	// cur mirrors what the real client's Match reads: the index the
+	// last fetch (Resources or Refresh) published.
+	cur []concourse.Resource
 }
 
 func (f *fakeBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cur = f.resources
 	return f.resources, f.indexErr
 }
 
@@ -57,7 +65,14 @@ func (f *fakeBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshed++
+	f.cur = f.refreshRes
 	return f.refreshRes, f.refreshErr
+}
+
+func (f *fakeBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return linearMatch(f.cur, wantType, repos)
 }
 
 func (f *fakeBackend) CheckWebhook(_ context.Context, r concourse.Resource) (int, error) {
@@ -80,6 +95,25 @@ func (f *fakeBackend) refreshCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.refreshed
+}
+
+// linearMatch is the reference matcher the test backends answer Match
+// with — a plain scan. The real concourse.Client answers from its
+// (type, repo) lookup map; the two must stay equivalent (the O(1)
+// index test in the concourse package pins that directly).
+func linearMatch(resources []concourse.Resource, wantType string,
+	repos map[string]struct{}) []concourse.Resource {
+	var out []concourse.Resource
+	for _, r := range resources {
+		if r.Type != wantType {
+			continue
+		}
+		if _, ok := repos[r.Repo]; !ok {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 var pushBody = `{"repository":{
@@ -470,14 +504,23 @@ type sequencingBackend struct {
 	statuses  []int
 	mu        sync.Mutex
 	n         int
+	// cur is touched only on the request goroutine (Resources → Match
+	// → Refresh → Match all run inside ServeHTTP).
+	cur []concourse.Resource
 }
 
 func (s *sequencingBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
+	s.cur = s.resources
 	return s.resources, nil
 }
 
 func (s *sequencingBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+	s.cur = s.resources
 	return s.resources, nil
+}
+
+func (s *sequencingBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+	return linearMatch(s.cur, wantType, repos)
 }
 
 func (s *sequencingBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
@@ -598,6 +641,10 @@ func (b *throttledBackend) Resources(_ context.Context) ([]concourse.Resource, e
 
 func (b *throttledBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
 	return b.resources, nil
+}
+
+func (b *throttledBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+	return linearMatch(b.resources, wantType, repos)
 }
 
 func (b *throttledBackend) CheckWebhook(ctx context.Context, _ concourse.Resource) (int, error) {
@@ -730,7 +777,7 @@ func TestWaitDrainsInFlightFanout(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	h.Wait() // exported drain path — same as main's shutdown
+	h.Wait(context.Background()) // exported drain path — same as main's shutdown
 	if got := b.calls(); got != 2 {
 		t.Fatalf("check calls=%d want 2 after Wait", got)
 	}
@@ -757,6 +804,10 @@ func (g *gateBackend) Resources(context.Context) ([]concourse.Resource, error) {
 
 func (g *gateBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
 	return g.resources, nil
+}
+
+func (g *gateBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+	return linearMatch(g.resources, wantType, repos)
 }
 
 func (g *gateBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
@@ -801,7 +852,7 @@ func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
 
 		waitDone := make(chan struct{})
 		go func() {
-			h.Wait()
+			h.Wait(context.Background())
 			close(waitDone)
 		}()
 		// The fan-out is already registered (Add ran before the
@@ -855,7 +906,7 @@ func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		h.Wait()
+		h.Wait(context.Background())
 		close(done)
 	}()
 	select {
@@ -865,6 +916,107 @@ func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
 	}
 	if got := len(b.checkList()); got != 0 {
 		t.Fatalf("check calls=%d want 0 (budget-expired targets must not POST)", got)
+	}
+}
+
+// blockingBackend parks every CheckWebhook on release — fan-outs that
+// cannot finish, exactly the shutdown-budget scenario.
+type blockingBackend struct {
+	release   chan struct{}
+	resources []concourse.Resource
+}
+
+func (b *blockingBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
+	return b.resources, nil
+}
+
+func (b *blockingBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+	return b.resources, nil
+}
+
+func (b *blockingBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+	return linearMatch(b.resources, wantType, repos)
+}
+
+func (b *blockingBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
+	<-b.release
+	return http.StatusCreated, nil
+}
+
+// TestWaitBudgetExpiresWithInFlightFanout: the shutdown contract —
+// Wait must RETURN when its budget expires even with a fan-out stuck
+// mid-flight, so Shutdown(10s)+Wait(15s) beats the pod's 30s SIGKILL.
+// The abandoned fan-out is counted and logged (dropped return value);
+// once the stuck POSTs finish, an unconstrained drain sees 0 left.
+func TestWaitBudgetExpiresWithInFlightFanout(t *testing.T) {
+	b := &blockingBackend{release: make(chan struct{})}
+	for i := range 2 {
+		b.resources = append(b.resources, concourse.Resource{
+			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
+			Type: "git", Repo: "org/repo",
+		})
+	}
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+
+	// Both check POSTs are parked inside the backend — the delivery's
+	// fan-out is genuinely in flight and cannot finish.
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	dropped := h.Wait(ctx)
+	cancel()
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("Wait returned after %v — the budget was not honored", elapsed)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped=%d want 1 (the delivery's in-flight fan-out)", dropped)
+	}
+
+	close(b.release) // the parked POSTs land
+	if got := h.Wait(context.Background()); got != 0 {
+		t.Fatalf("dropped=%d want 0 once the stuck checks finish", got)
+	}
+}
+
+// TestPreVerificationLogsHideRawHeaderValues: header values are
+// attacker-controlled until the HMAC check passes — pre-verification
+// logs must not echo them verbatim. The delivery GUID is filtered to
+// a safe alphabet (quotes, semicolons, control bytes dropped) and the
+// event collapses onto the fixed metric label set.
+func TestPreVerificationLogsHideRawHeaderValues(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := New(testSecret, &fakeBackend{})
+	req := signedRequest(t, "push", pushBody)
+	req.Header.Set("X-GitHub-Delivery",
+		`evil"value;flood`+"\x01"+`-tail-1234`)
+	req.Header.Set("X-GitHub-Event", "push\x00forged")
+	// Invalid signature — every log line this delivery produces is
+	// written before verification.
+	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	logs := buf.String()
+	for _, raw := range []string{`evil"value`, "flood\x01", "push\x00forged"} {
+		if strings.Contains(logs, raw) {
+			t.Fatalf("raw header value %q leaked into logs:\n%s", raw, logs)
+		}
+	}
+	// The event is the fixed label value, not the raw header.
+	if !strings.Contains(logs, "event=other") {
+		t.Fatalf("pre-verification event not normalized to the fixed label set:\n%s", logs)
+	}
+	// The harmless remainder of the delivery GUID survives for
+	// correlation.
+	if !strings.Contains(logs, "delivery=evilvalueflood-tail-1234") {
+		t.Fatalf("sanitized delivery id missing from logs:\n%s", logs)
 	}
 }
 

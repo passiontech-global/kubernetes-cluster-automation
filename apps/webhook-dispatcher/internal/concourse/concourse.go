@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,8 +47,24 @@ type Client struct {
 	// the whole index on every push. Zero -> 30 seconds.
 	MinRefreshInterval time.Duration
 
-	mu        sync.Mutex
+	// NegCacheTTL is the cold-start negative-cache window: when a
+	// fetch fails with NO index to serve, Resources callers used to
+	// each stamp a fresh attempt and start their own fetch — N
+	// concurrent first deliveries serialized N doomed index
+	// rebuilds at a flapping ATC. The shared error is returned
+	// instead for this window. Zero -> 3 seconds.
+	NegCacheTTL time.Duration
+
+	mu sync.Mutex
+
+	// index is the last successfully fetched index; lookup is its
+	// (type, repo) -> resources map, built once per fetch publish so
+	// the per-delivery match is a map hit (Client.Match) instead of a
+	// linear scan of every resource in the team. Both are replaced
+	// wholesale on publish — never mutated in place — so serving a
+	// snapshot is race-free and Match returns value copies.
 	index     []Resource
+	lookup    map[indexKey][]Resource
 	fetchedAt time.Time
 	// lastAttemptAt stamps the start of the most recent fetch attempt
 	// made by Resources — success or failure — so a failed fetch backs
@@ -72,6 +90,12 @@ type Client struct {
 	// sharing the in-flight fetch's result instead of stampeding the
 	// ATC with duplicate full-index fetches.
 	flight *fetchFlight
+	// lastErr/lastErrAt are the cold-start negative cache — see
+	// NegCacheTTL. Written under c.mu on any fetch failure EXCEPT a
+	// caller-cancelled context (not an ATC failure), cleared on
+	// success; consulted only while c.index == nil.
+	lastErr   error
+	lastErrAt time.Time
 }
 
 // fetchFlight tracks one in-flight index fetch. done is closed by the
@@ -102,6 +126,42 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("GET %s: unexpected status %d", e.path, e.status)
 }
 
+// indexKey keys the lookup map: one entry per (resource type, repo)
+// pair. A delivery's match is then a handful of map hits instead of a
+// linear scan of every resource in the team on every webhook.
+type indexKey struct {
+	typ  string
+	repo string
+}
+
+// newLookup builds the (type, repo) -> resources map for a freshly
+// fetched index. Called once per publish, not once per delivery.
+func newLookup(index []Resource) map[indexKey][]Resource {
+	lookup := make(map[indexKey][]Resource, len(index))
+	for _, r := range index {
+		k := indexKey{r.Type, r.Repo}
+		lookup[k] = append(lookup[k], r)
+	}
+	return lookup
+}
+
+// Match returns the current index's resources of wantType whose repo
+// is one of repos — the O(1) lookup the handler's per-delivery match
+// runs on, over the map newLookup built at the last fetch publish.
+// Returned Resource values are copies: callers cannot reach the
+// client's snapshot. Repos are visited in sorted order so the result
+// order is deterministic (equal inputs, equal output — helps logs and
+// tests; the fan-out itself is order-insensitive).
+func (c *Client) Match(wantType string, repos map[string]struct{}) []Resource {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var matched []Resource
+	for _, repo := range slices.Sorted(maps.Keys(repos)) {
+		matched = append(matched, c.lookup[indexKey{wantType, repo}]...)
+	}
+	return matched
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -121,6 +181,13 @@ func (c *Client) minRefreshInterval() time.Duration {
 		return c.MinRefreshInterval
 	}
 	return 30 * time.Second
+}
+
+func (c *Client) negCacheTTL() time.Duration {
+	if c.NegCacheTTL > 0 {
+		return c.NegCacheTTL
+	}
+	return 3 * time.Second
 }
 
 // Resources returns the repo -> resource index, served from a ~60s
@@ -144,7 +211,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 	for {
 		c.mu.Lock()
 		if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
-			index := c.index
+			index := slices.Clone(c.index)
 			c.mu.Unlock()
 			return index, nil
 		}
@@ -152,9 +219,22 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		// stale index without re-fetching. Without this backoff every
 		// request re-takes the mutex and blocks on a doomed fetch.
 		if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
-			index := c.index
+			index := slices.Clone(c.index)
 			c.mu.Unlock()
 			return index, nil
+		}
+		// Cold-start negative cache: the last fetch failed with
+		// nothing to serve — hand back the SHARED error instead of
+		// letting this caller (and every waiter that just woke on
+		// the failed flight's done channel) stamp a fresh attempt
+		// and start the next doomed rebuild. Gated on index==nil:
+		// with a stale index to serve the backoff checks above
+		// already own the retry decision.
+		if c.index == nil && c.lastErr != nil &&
+			time.Since(c.lastErrAt) < c.negCacheTTL() {
+			err := c.lastErr
+			c.mu.Unlock()
+			return nil, err
 		}
 		// A fetch is already in flight — never start a second one on
 		// top of it. With an index to serve (even a stale one) this
@@ -166,7 +246,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 			index := c.index
 			c.mu.Unlock()
 			if index != nil {
-				return index, nil
+				return slices.Clone(index), nil
 			}
 			select {
 			case <-done:
@@ -182,7 +262,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		c.lastAttemptAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
-		prev := append([]Resource(nil), c.index...)
+		prev := slices.Clone(c.index)
 		c.mu.Unlock()
 		// The flight's done channel is closed exactly once, when this
 		// fetch settles (even if fetchIndex panics) — cold-start waiters
@@ -199,21 +279,50 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 
 		index, err := c.fetchIndex(ctx, prev)
 
+		// A caller-cancelled context (request shutdown, handler
+		// deadline) is not an ATC failure: the fetch died because
+		// THIS caller went away. Recording it would negative-cache
+		// the caller's own unwind for NegCacheTTL — every later
+		// cold-start caller shares a shutdown error that says
+		// nothing about the ATC — and count healthy unwinds in
+		// indexFetchErrorsTotal. Publish and record nothing; the
+		// defer still clears the flight and closes done, so
+		// cold-start waiters wake and re-decide on their own
+		// (possibly still-live) contexts.
+		if err != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		c.mu.Lock()
 		if err != nil {
 			flight.err = err
+			// Negative-cache the failure (NegCacheTTL) — cold-start
+			// waiters waking on done re-loop into this check and
+			// share the error rather than serializing fetches.
+			c.lastErr, c.lastErrAt = err, time.Now()
+			indexFetchErrorsTotal.Inc()
 			if c.index != nil {
 				logger().Warn("resource index refresh failed — serving stale",
 					"concourse_url", c.BaseURL, "team", c.Team,
 					"error", err)
-				stale := c.index
+				stale := slices.Clone(c.index)
 				c.mu.Unlock()
 				return stale, nil
 			}
 			c.mu.Unlock()
 			return nil, err
 		}
-		c.index, c.fetchedAt = index, time.Now()
+		// The client keeps its OWN copy of the fetched index — the
+		// caller's slice must not alias the cache, or a caller mutating
+		// its return value would corrupt what every later delivery
+		// matches against. Serve paths below clone out too.
+		c.index = slices.Clone(index)
+		c.fetchedAt = time.Now()
+		c.lookup = newLookup(c.index)
+		c.lastErr = nil
+		// Freshness signal: this gauge moves only here and in Refresh's
+		// success path — a stalled value is the stale-index alarm.
+		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
 		c.mu.Unlock()
 		return index, nil
 	}
@@ -274,7 +383,7 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		// failed attempts — lastForceRefreshAt covers those.
 		if time.Since(c.fetchedAt) < c.minRefreshInterval() ||
 			time.Since(c.lastForceRefreshAt) < c.minRefreshInterval() {
-			index := c.index
+			index := slices.Clone(c.index)
 			c.mu.Unlock()
 			return index, nil
 		}
@@ -286,7 +395,7 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		c.lastForceRefreshAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
-		prev := append([]Resource(nil), c.index...)
+		prev := slices.Clone(c.index)
 		c.mu.Unlock()
 		defer func() {
 			c.mu.Lock()
@@ -298,12 +407,33 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 		}()
 
 		index, err := c.fetchIndex(ctx, prev)
+		if err != nil && ctx.Err() != nil {
+			// Caller shutdown, not an ATC failure — same rule as
+			// Resources: no negative-cache write, no counter. The
+			// flight's done closes via the defer with err unset, so
+			// joiners loop back and re-decide instead of reading a
+			// shutdown as an ATC outage.
+			return nil, ctx.Err()
+		}
 		if err != nil {
 			flight.err = err // before the deferred close(done) — joiners read it
+			// Same cold-start negative cache as Resources — a
+			// Resources caller that joined THIS flight re-loops
+			// into the lastErr check on a cold index.
+			c.mu.Lock()
+			c.lastErr, c.lastErrAt = err, time.Now()
+			c.mu.Unlock()
+			indexFetchErrorsTotal.Inc()
 			return nil, err
 		}
 		c.mu.Lock()
-		c.index, c.fetchedAt = index, time.Now()
+		// Same own-copy rule as Resources' publish — the caller's
+		// slice must not alias the cache.
+		c.index = slices.Clone(index)
+		c.fetchedAt = time.Now()
+		c.lookup = newLookup(c.index)
+		c.lastErr = nil
+		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
 		c.mu.Unlock()
 		return index, nil
 	}
@@ -364,9 +494,9 @@ func (c *Client) fetchIndex(ctx context.Context,
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			var resources []struct {
-				Name   string         `json:"name"`
-				Type   string         `json:"type"`
-				Source map[string]any `json:"source"`
+				Name   string `json:"name"`
+				Type   string `json:"type"`
+				Source source `json:"source"`
 			}
 			path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
 			if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
@@ -544,15 +674,27 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	return err
 }
 
-// sourceRepo pulls the repo identity out of a resource's source:
-// git-type resources carry "uri", github-pr resources "repository".
-func sourceRepo(source map[string]any) string {
-	for _, k := range []string{"uri", "repository"} {
-		if v, ok := source[k].(string); ok && v != "" {
-			return v
-		}
+// source is the slice of a resource's source config the index needs:
+// git-type resources carry the repo in "uri", github-pr resources in
+// "repository". A struct rather than map[string]any: the decode keeps
+// encoding/json's tolerance for every other key a resource type
+// carries (interval, check_every, ...) and skips the per-resource map
+// allocation — a whole-team index decode used to build a map per
+// resource only to fish out one string.
+type source struct {
+	URI        string `json:"uri"`
+	Repository string `json:"repository"`
+}
+
+// sourceRepo pulls the repo identity out of a resource's source;
+// "uri" wins when both keys are present (a github-pr resource with a
+// git uri checks out via the uri), the same precedence the map-based
+// decode had.
+func sourceRepo(s source) string {
+	if s.URI != "" {
+		return s.URI
 	}
-	return ""
+	return s.Repository
 }
 
 // NormalizeRepo reduces a GitHub repo identifier — scp-like SSH

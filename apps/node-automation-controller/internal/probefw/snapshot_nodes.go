@@ -17,22 +17,18 @@ import (
 // re-read bypasses the informer cache and reads d.CS directly (a
 // node patched milliseconds ago must not be served from a lagging
 // cache); that read memoizes, and the rest of the sweep consumes it.
+// The forceCS flag arrives consumed-inside-the-lock from memo.get —
+// the armed/loaded decision can never split across racing readers.
 func (d *Deps) AllNodes(ctx context.Context) ([]corev1.Node, error) {
 	s := sweepSnap(ctx)
-	s.muNodes.Lock()
-	defer s.muNodes.Unlock()
-	if !s.nodesSet {
-		s.nodesSet = true
+	return s.nodes.get(func(forceCS bool) ([]corev1.Node, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		if s.nodesForceCS {
-			s.nodesForceCS = false
-			s.nodes, s.nodesErr = kube.ListNodes(lctx, d.CS)
-		} else {
-			s.nodes, s.nodesErr = kube.ListNodesCached(lctx, d.NodeReader, d.CS)
+		if forceCS {
+			return kube.ListNodes(lctx, d.CS)
 		}
-	}
-	return s.nodes, s.nodesErr
+		return kube.ListNodesCached(lctx, d.NodeReader, d.CS)
+	})
 }
 
 // NodeZones is the memoized node → topology-zone join the
@@ -47,19 +43,15 @@ func (d *Deps) AllNodes(ctx context.Context) ([]corev1.Node, error) {
 // the serial sweep shares it across checks.
 func (d *Deps) NodeZones(ctx context.Context) (map[string]string, error) {
 	s := sweepSnap(ctx)
-	s.muNodeZones.Lock()
-	defer s.muNodeZones.Unlock()
-	if !s.nodeZonesSet {
-		s.nodeZonesSet = true
-		var nodes []corev1.Node
-		nodes, s.nodeZonesErr = d.AllNodes(ctx)
-		if s.nodeZonesErr == nil {
-			s.nodeZones = make(map[string]string, len(nodes))
-			for i := range nodes {
-				s.nodeZones[nodes[i].Name] =
-					nodes[i].Labels[corev1.LabelTopologyZone]
-			}
+	return s.nodeZones.get(func(bool) (map[string]string, error) {
+		nodes, err := d.AllNodes(ctx)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return s.nodeZones, s.nodeZonesErr
+		m := make(map[string]string, len(nodes))
+		for i := range nodes {
+			m[nodes[i].Name] = nodes[i].Labels[corev1.LabelTopologyZone]
+		}
+		return m, nil
+	})
 }

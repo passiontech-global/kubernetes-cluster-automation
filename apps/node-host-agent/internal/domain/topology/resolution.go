@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // Vars is a lazily-resolved view over the merged vars maps.

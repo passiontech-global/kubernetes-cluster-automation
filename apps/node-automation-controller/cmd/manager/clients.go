@@ -6,12 +6,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"time"
 
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/flowcontrol"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -32,10 +37,86 @@ import (
 // same 50/100 bucket. Left nil, each of the three constructors builds
 // its own limiter and the fleet's real ceiling silently triples to
 // 150 QPS / 300 burst.
-func tuneClientConfig(cfg *rest.Config) {
+//
+// ONE transport by construction: tuneClientConfig runs before
+// ctrl.NewManager and buildKubeClients, so installing the shared
+// base *http.Transport on cfg.Transport here covers every kube
+// client this binary builds — the manager's cached clients and
+// RESTMapper, the direct typed+dynamic pair and the probe pair. The
+// previous posture relied on client-go's tlsTransportCache keying
+// identical TLS options to one shared transport; the typed configs
+// differ from the dynamic ones in ContentType and the cache's
+// weak-pointer/GC behavior (client-go v0.37 made cache entries
+// weakly held) made the single-transport guarantee implicit rather
+// than structural. Baking the resolved TLS options into one
+// *http.Transport and pointing every config at it makes the sharing
+// hold by construction: one CA pool, one TLS session cache, one
+// HTTP/2 conn pool to the apiserver, regardless of how many configs
+// are derived. The TLS fields are cleared off cfg after the bake —
+// transport.New rejects a custom Transport combined with TLS client
+// options, and the options live in the base's tls.Config anyway.
+// Auth is NOT baked in: every constructor still wraps the base with
+// its own bearer-token/impersonation round-tripper via
+// HTTPWrappersForConfig, so SA-token rotation posture is unchanged.
+// File-reload rotation (ReloadCAFiles/ReloadTLSFiles) applies to
+// kubeconfig-cert deployments; this controller runs in-cluster with
+// an immutable projected CA and no TLS client certs, where those
+// reloaders never fire. Mirrors transport/cache.go newTransport
+// field-for-field so connection behavior (handshake timeout,
+// per-host idle pool, HTTP/2 tuning, proxy + CIDR handling) is
+// unchanged.
+func tuneClientConfig(cfg *rest.Config) error {
 	cfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50, 1))
 	cfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100, 1)
 	cfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(cfg.QPS, cfg.Burst)
+
+	tr, err := sharedBaseTransport(cfg)
+	if err != nil {
+		return err
+	}
+	cfg.Transport = tr
+	cfg.TLSClientConfig = rest.TLSClientConfig{}
+	return nil
+}
+
+// sharedBaseTransport builds the base *http.Transport shared by every
+// kube client, resolving cfg the same way each client constructor
+// would: TLS options through rest.TransportConfig + transport.
+// TLSConfigFor (CA pool, client-cert callback, server name), proxy
+// from cfg.Proxy when set with http.ProxyFromEnvironment as the
+// fallback (utilnet's CIDR-aware variant via SetTransportDefaults),
+// and the standard 30s/30s dialer. See tuneClientConfig for why the
+// sharing is explicit.
+func sharedBaseTransport(cfg *rest.Config) (http.RoundTripper, error) {
+	tc, err := cfg.TransportConfig()
+	if err != nil {
+		return nil, fmt.Errorf("resolve kube transport config: %w", err)
+	}
+	tlsCfg, err := transport.TLSConfigFor(tc)
+	if err != nil {
+		return nil, fmt.Errorf("build kube tls config: %w", err)
+	}
+	var dial func(ctx context.Context, network, address string) (net.Conn, error)
+	if tc.DialHolder != nil {
+		dial = tc.DialHolder.Dial
+	} else {
+		dial = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
+	proxy := http.ProxyFromEnvironment
+	if tc.Proxy != nil {
+		proxy = tc.Proxy
+	}
+	return utilnet.SetTransportDefaults(&http.Transport{
+		Proxy:               proxy,
+		TLSHandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:     tlsCfg,
+		MaxIdleConnsPerHost: 25, // transport/cache.go idleConnsPerHost
+		DialContext:         dial,
+		DisableCompression:  tc.DisableCompression,
+	}), nil
 }
 
 // kubeClients bundles the four API clients module Setup receives:

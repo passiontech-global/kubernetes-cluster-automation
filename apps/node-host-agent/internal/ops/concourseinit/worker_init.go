@@ -20,6 +20,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // btrfsCmdTimeout bounds each btrfs invocation — a wedged btrfs
@@ -333,32 +336,21 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	if err := os.Chmod(tmp, perm); err != nil {
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
 		_ = os.Remove(tmp)
 		return err
 	}
-	// fsync before the rename — a crash after mv must never expose
-	// zeroed/partial bytes at the install path (DownloadFile parity).
-	if err := syncFile(tmp); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	// fsx.Promote carries the durability contract the bespoke tail
+	// used to hand-roll: mode pinned before the rename, payload
+	// fsynced so a crash after the mv never exposes zeroed/partial
+	// bytes at the install path (DownloadFile parity), the staged
+	// binary's pages dropped after Sync (its cache charge belongs to
+	// whoever execs it), and the dir fsync after the rename makes
+	// the directory entry itself durable.
+	return fsx.Promote(out, dst, fsx.Opts{
+		Mode:      perm,
+		DirSync:   true,
+		AfterSync: pagecache.Drop,
+	})
 }
-
-// syncFile lives in runc_wrapper.go — shared by both files in this
-// package.

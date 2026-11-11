@@ -436,3 +436,42 @@ func NewReloader(path string, initial *Config) *Reloader {
 // across callers and retained by the reloader — consumers must not
 // mutate it.
 func (r *Reloader) Get() *Config { return r.Reloader.Get() }
+
+// LegacyUnits — the retired shell-watchdog systemd units, the single
+// shared list for their two consumers: hostconfig's prune stops,
+// disables and deletes the unit FILES, and the janitor's ghost-unit
+// sweep resets the systemd RUNTIME records (Loaded: not-found
+// entries) systemd keeps after the files are gone. One list, not two
+// hand-copied mirrors: a unit added to one side's copy but not the
+// other left either live unit files or un-reset ghosts behind.
+// Includes the first Go port's *-restart OnFailure units and both
+// node-watchdog-failed spellings (ansible-installed plain name,
+// spec's @-template name). Lives in this leaf package because
+// subsystem trees cannot import each other (depguard
+// nha-subsystem-no-cross) and both consumers already depend on the
+// watchdog contract here.
+var LegacyUnits = []string{
+	"node-watchdog.timer",
+	"node-watchdog.service",
+	"node-watchdog-failed.service",
+	"node-watchdog-failed@.service",
+	"k0sworker-watchdog.service",
+	"k0sworker-watchdog-restart.service",
+	"k0scontroller-watchdog.service",
+	"k0scontroller-watchdog-restart.service",
+	"k0s-apiserver-wedge-probe.timer",
+	"k0s-apiserver-wedge-probe.service",
+	"k0s-kine-pool-probe.timer",
+	"k0s-kine-pool-probe.service",
+	"k0s-oomloop-probe.timer",
+	"k0s-oomloop-probe.service",
+	"nebula-route-guard.service",
+	"api-backend-guard.timer",
+	"api-backend-guard.service",
+	"kine-db-probe.timer",
+	"kine-db-probe.service",
+	"kine-compact-guard.timer",
+	"kine-compact-guard.service",
+	"kine-db-maint.timer",
+	"kine-db-maint.service",
+}

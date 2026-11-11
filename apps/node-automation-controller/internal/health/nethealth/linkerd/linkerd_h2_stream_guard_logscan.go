@@ -58,24 +58,27 @@ var linkerdIdentityStallMarkers = []string{
 func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 	pod *corev1.Pod) (storm, identity bool, err error) {
 
-	_, err = probefw.PodLogTail(ctx, p.CS, pod, kube.LinkerdProxyContainer,
-		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-		func(line string) bool {
-			l := strings.ToLower(line)
-			for _, marker := range linkerdH2StormMarkers {
-				if strings.Contains(l, marker) {
-					storm = true
-					break
-				}
+	_, err = kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
+		Container: kube.LinkerdProxyContainer,
+		TailLines: probefw.DefaultTailLines,
+		MaxBytes:  probefw.LogMaxBytes,
+		Timeout:   probefw.LogTimeout,
+	}, func(line string) bool {
+		l := strings.ToLower(line)
+		for _, marker := range linkerdH2StormMarkers {
+			if strings.Contains(l, marker) {
+				storm = true
+				break
 			}
-			for _, marker := range linkerdIdentityStallMarkers {
-				if strings.Contains(l, marker) {
-					identity = true
-					break
-				}
+		}
+		for _, marker := range linkerdIdentityStallMarkers {
+			if strings.Contains(l, marker) {
+				identity = true
+				break
 			}
-			return storm && identity
-		})
+		}
+		return storm && identity
+	})
 	return storm, identity, err
 }
 

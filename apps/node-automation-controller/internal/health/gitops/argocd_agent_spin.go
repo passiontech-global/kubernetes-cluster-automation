@@ -242,22 +242,17 @@ func (p *argoCDAgentSpinCheck) cpuSpin(
 func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod) (bool, error) {
 
-	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	tail := int64(argocdAgentTail)
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{
-			Container: probefw.ResolveDefaultContainer(pod, ""),
-			TailLines: &tail,
-		}).Stream(lctx)
+	text, err := kube.ReadPodLogText(ctx, p.CS, pod, kube.PodLogOpts{
+		TailLines: argocdAgentTail,
+		MaxBytes:  argocdAgentLogCap,
+		Timeout:   30 * time.Second,
+	})
 	if err != nil {
 		log.Info("WARN: argocd-agent spin — log channel unavailable",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 		return false, err
 	}
-	defer func() { _ = stream.Close() }()
-	errs, recovered := scanAgentSpinLines(
-		io.LimitReader(stream, argocdAgentLogCap))
+	errs, recovered := scanAgentSpinLines(strings.NewReader(text))
 	if errs >= argocdAgentMinErrs && !recovered {
 		return true, nil
 	}

@@ -17,8 +17,20 @@
 // A single resource failure never fails the delivery — GitHub
 // redelivery would re-trigger every resource, not just the failed one.
 //
-// GET /metrics exposes the Prometheus counters/histogram; GET /healthz
-// is the liveness probe.
+// Two listeners, deliberately split: the public one (:8080, LISTEN_ADDR)
+// serves only what GitHub needs — POST /webhook, GET /healthz (the
+// liveness probe, manifest-compatible), GET /readyz (readiness). The
+// internal one (:9115, METRICS_ADDR) serves GET /metrics (from a
+// dedicated Prometheus registry) and net/http/pprof under
+// /debug/pprof/ — operational endpoints that must never be reachable
+// from GitHub's side. Both listeners are BOUND before the process
+// waits on signals, so a port collision or typo'd address aborts boot
+// instead of surfacing asynchronously.
+//
+// Shutdown contract: on SIGINT/SIGTERM the public listener drains for
+// at most 10s, then the in-flight fan-out wait gets at most 15s
+// (Handler.Wait logs abandoned fan-outs) — ~25s worst case, under the
+// pod's 30s SIGKILL grace period.
 //
 // Env contract:
 //
@@ -28,25 +40,34 @@
 //	CONCOURSE_URL          (default http://concourse-web:8080)
 //	CONCOURSE_TEAM         (default main)
 //	LISTEN_ADDR            (default :8080)
+//	METRICS_ADDR           (default :9115)
+//
+// See docs/env.md for the full catalog.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/pprof" // handlers wired explicitly below (Index, Profile, ...) — never on DefaultServeMux
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/handler"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 var version = "dev"
@@ -113,21 +134,62 @@ func main() {
 
 	wh := handler.New(os.Getenv("GITHUB_WEBHOOK_SECRET"), client)
 
-	mux := http.NewServeMux()
-	mux.Handle("POST /webhook", wh)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// All Prometheus metrics register on this dedicated registry,
+	// served by the internal listener only — the public listener faces
+	// GitHub and must not expose index/fan-out internals.
+	reg := prometheus.NewRegistry()
+	handler.RegisterMetrics(reg)
+	concourse.RegisterMetrics(reg)
+
+	// Internal listener: metrics scrape + pprof. Trusted-network
+	// surface — keep everything operational off LISTEN_ADDR.
+	internalMux := http.NewServeMux()
+	internalMux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	internalMux.HandleFunc("/debug/pprof/", pprof.Index)
+	internalMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	internalMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	internalMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	internalMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	publicMux := http.NewServeMux()
+	publicMux.Handle("POST /webhook", wh)
+	publicMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("GET /metrics", promhttp.Handler())
+	// Readiness mirrors liveness for the split-listener contract: both
+	// listeners are bound (and serving) before this flag is set, so a
+	// request here implies the process is serving — the flag still
+	// gates it honestly across the bind→serve window.
+	var ready atomic.Bool
+	publicMux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	listenAddr := envx.String("LISTEN_ADDR", ":8080")
+	metricsAddr := envx.String("METRICS_ADDR", ":9115")
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv := &http.Server{
-		Addr:    envx.String("LISTEN_ADDR", ":8080"),
-		Handler: mux,
+	// Bind BEFORE entering the wait-on-signal loop: a port collision
+	// or typo'd address must abort boot (log + exit), not surface
+	// asynchronously from a goroutine after readiness. httpx.New does
+	// the same bind-then-serve for the internal server.
+	publicLn, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger().Error("binding public listener", "addr", listenAddr, "error", err)
+		os.Exit(1)
+	}
+	publicSrv := &http.Server{
+		Addr:    listenAddr,
+		Handler: publicMux,
 		// ReadTimeout covers the whole request incl. the body (bounded
 		// by MaxBytesReader at 8 MiB) — without it a slow-drip client
 		// outlives ReadHeaderTimeout and holds the conn forever.
@@ -137,41 +199,68 @@ func main() {
 		// (fan-out itself is async — the response is a fast 202).
 		WriteTimeout: 45 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		// GitHub sends a handful of modest headers; the tight cap keeps
+		// a hostile peer from parking large header buffers per conn.
+		MaxHeaderBytes: 64 << 10,
 	}
-	// shutdownDone closes when BOTH the HTTP drain and the fan-out
-	// wait have finished — main must block on it after ListenAndServe
-	// returns or it would exit while detached check POSTs are still
-	// in flight.
-	shutdownDone := make(chan struct{})
-	go func() {
-		defer close(shutdownDone)
-		<-ctx.Done()
-		logger().Info("shutdown signal received — draining connections")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger().Warn("graceful shutdown failed — connections dropped",
-				"error", err)
-		}
-		// srv.Shutdown only drains listeners and request handlers —
-		// the detached fan-out goroutines outlive the requests that
-		// spawned them. Wait for the last check POST to land (each is
-		// bounded by the per-target fan-out timeout) before exiting.
-		logger().Info("connections drained — waiting for in-flight fan-outs")
-		wh.Wait()
-		// Fan-outs are done — drop the keep-alive connections the ATC
-		// client pooled during dispatch so the process exits without
-		// lingering sockets.
-		client.HTTP.CloseIdleConnections()
-	}()
-
-	logger().Info("starting webhook-dispatcher",
-		"version", version, "addr", srv.Addr,
-		"routes", "POST /webhook, GET /healthz, GET /metrics",
-		"concourse_url", client.BaseURL, "concourse_team", client.Team)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger().Error("server exited", "error", err)
+	internalSrv, err := httpx.New(metricsAddr, internalMux, httpx.Opts{})
+	if err != nil {
+		logger().Error("binding metrics listener", "addr", metricsAddr, "error", err)
 		os.Exit(1)
 	}
-	<-shutdownDone
+
+	// Serve both. A serve-loop failure (accept error) is fatal — same
+	// as the old single ListenAndServe: log and exit non-zero.
+	publicErr := make(chan error, 1)
+	go func() {
+		if err := publicSrv.Serve(publicLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			publicErr <- err
+		}
+	}()
+	internalErr := internalSrv.Serve() // <-chan error; ErrServerClosed folded
+	ready.Store(true)
+
+	logger().Info("starting webhook-dispatcher",
+		"version", version, "addr", listenAddr,
+		"routes", "POST /webhook, GET /healthz, GET /readyz",
+		"metrics_addr", metricsAddr,
+		"internal_routes", "GET /metrics, /debug/pprof/*",
+		"concourse_url", client.BaseURL, "concourse_team", client.Team)
+
+	select {
+	case err := <-publicErr:
+		logger().Error("server exited", "error", err)
+		os.Exit(1)
+	case err := <-internalErr:
+		logger().Error("metrics server exited", "error", err)
+		os.Exit(1)
+	case <-ctx.Done():
+	}
+
+	// Shutdown: drain both listeners (10s), then the fan-out wait
+	// (Handler.waitBudget, 15s). Total ~25s worst case — under the
+	// pod's 30s SIGKILL grace period, so the process exits on its own
+	// terms instead of being killed with check POSTs half-written.
+	logger().Info("shutdown signal received — draining connections")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := publicSrv.Shutdown(shutdownCtx); err != nil {
+		logger().Warn("graceful shutdown failed — connections dropped",
+			"error", err)
+	}
+	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
+		logger().Warn("metrics server shutdown failed", "error", err)
+	}
+	cancel()
+	// srv.Shutdown only drains listeners and request handlers — the
+	// detached fan-out goroutines outlive the requests that spawned
+	// them. Wait (budgeted) for the last check POST to land before
+	// exiting; Wait logs any fan-outs abandoned at budget expiry.
+	logger().Info("connections drained — waiting for in-flight fan-outs")
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), handler.WaitBudget)
+	wh.Wait(waitCtx)
+	waitCancel()
+	// Fan-outs are done (or abandoned) — drop the keep-alive
+	// connections the ATC client pooled during dispatch so the process
+	// exits without lingering sockets.
+	client.HTTP.CloseIdleConnections()
 }

@@ -54,6 +54,31 @@ func TestEmit(t *testing.T) {
 			subsystem: "hubsync",
 			want:      "| — | hubsync | — |\n",
 		},
+		"default onOff flip (both faces)": {
+			envFlag:   "NODE_HOST_AGENT_ENABLE_SWEEPER",
+			subsystem: "sweeper", def: "onOff(w.defKube)",
+			want: "| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `on` (pod) / `off` (standalone) |\n",
+		},
+		"default ModeOn": {
+			envFlag:   "NODE_HOST_AGENT_ENABLE_APIPROBER",
+			subsystem: "apiprober", def: "envx.ModeOn",
+			want: "| `NODE_HOST_AGENT_ENABLE_APIPROBER` | apiprober | `on` |\n",
+		},
+		"default ModeOff": {
+			envFlag:   "NODE_HOST_AGENT_ENABLE_X",
+			subsystem: "x", def: "envx.ModeOff",
+			want: "| `NODE_HOST_AGENT_ENABLE_X` | x | `off` |\n",
+		},
+		"default ModeAuto": {
+			envFlag:   "NODE_HOST_AGENT_ENABLE_KINEDB",
+			subsystem: "kinedb", def: "envx.ModeAuto",
+			want: "| `NODE_HOST_AGENT_ENABLE_KINEDB` | kinedb | `auto` |\n",
+		},
+		"unrecognized default falls back verbatim": {
+			envFlag:   "NODE_HOST_AGENT_ENABLE_Y",
+			subsystem: "y", def: "someOther(w)",
+			want: "| `NODE_HOST_AGENT_ENABLE_Y` | y | `someOther(w)` |\n",
+		},
 	} {
 		got := captureStdout(t, func() {
 			emit(tc.envFlag, tc.subsystem, tc.def)
@@ -105,15 +130,16 @@ func runMainInHelper(t *testing.T, env string, root string) (stdout, stderr stri
 
 // TestMainRendersGatesTable runs main() end-to-end against the real
 // module tree: the emitted table must carry the wired descriptor rows
-// (source order, raw Default expressions) plus the declared-but-
-// unwired ENABLE_FEEDER gate appended at the end.
+// (source order, Default expressions rendered as their resolved
+// tri-state value) plus the declared-but-unwired ENABLE_FEEDER gate
+// appended at the end.
 func TestMainRendersGatesTable(t *testing.T) {
 	out, stderr, code := runMainInHelper(t, "GO_HELPER_GENENVDOC", moduleRoot)
 	if code != 0 {
 		t.Fatalf("genenvdoc exit=%d stderr=%q", code, stderr)
 	}
 	for _, want := range []string{
-		"| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `onOff(w.defKube)` |",
+		"| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `on` (pod) / `off` (standalone) |",
 		"| — | hubsync | — |",
 		"| `NODE_HOST_AGENT_ENABLE_FEEDER` | — | — |",
 	} {

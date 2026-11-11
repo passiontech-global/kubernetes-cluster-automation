@@ -3,9 +3,10 @@
 // the parent/listener/Accepted-condition staleness predicates for
 // the GatewayClass, Gateway and route kinds (their status has no
 // top-level observedGeneration), the cached GatewayClass →
-// controllerName resolution, and the ciliumOwns* filters that keep
+// controllerName resolution, and the ciliumOwns*/cftOwns* filters that keep
 // gateway-API resources shared by several controllers attributed to
-// the right operator. Split out of operator_watchdog_targets.go —
+// the right operator (cilium-operator and the cloudflare-tunnel
+// gateway controller). Split out of operator_watchdog_targets.go —
 // see that file for the watched-operator table.
 package watchdogs
 
@@ -266,6 +267,95 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 	// gateway controller will ever write status.parents. Keeping it
 	// in every operator's stuck set gets each leader pod killed on
 	// every cooldown for a route nobody owns.
+	if sawGatewayRef && !gatewayFound {
+		return false
+	}
+	return !resolved
+}
+
+// cftGatewayClassName is the GatewayClass the cloudflare-tunnel
+// gateway-controller serves — infrastructure/base/gateway-api/
+// gateways/cloudflare-tunnel pins it in Git. Ownership keys on the
+// class NAME, not the controller's spec.controllerName string: that
+// string is chart-version dependent, the class name is not.
+const cftGatewayClassName = "cloudflare-tunnel"
+
+// cftOwnsGatewayObject keeps a Gateway in the cloudflare-tunnel
+// stuck set when its spec.gatewayClassName names the cloudflare-tunnel
+// class. Unresolvable/absent class names KEEP the object — an
+// unattributable stuck Gateway is still a gateway-API-plane problem
+// (the same fail-open posture ciliumOwnsGatewayObject documents);
+// only a PROVEN foreign class drops it. One exception: a successful
+// class census that lacks the name PROVES the GatewayClass is gone —
+// the Gateway is orphaned and no controller will ever own it, so it
+// must not hold this operator's heal budget (bug #11's shape one
+// level up: name-match alone cannot see a deleted class).
+func cftOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	class, _ := kube.NestedString(o.Object, "spec", "gatewayClassName")
+	if class == "" {
+		return true
+	}
+	if p != nil {
+		if m, listed := p.gatewayClassCensus(ctx); listed {
+			if _, known := m[class]; !known {
+				return false
+			}
+		}
+	}
+	return class == cftGatewayClassName
+}
+
+// cftOwnsRouteParent keeps a route in the stuck set when any
+// spec.parentRefs[] Gateway resolves to the cloudflare-tunnel class —
+// the ciliumOwnsRouteParent shape with the class-name key. Routes
+// with no Gateway parents or unresolvable parents stay in the set;
+// a route provably riding another controller's Gateway is that
+// controller's problem.
+func cftOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	refs, found := kube.NestedSlice(o.Object, "spec", "parentRefs")
+	if !found || len(refs) == 0 {
+		return true
+	}
+	resolved := false
+	sawGatewayRef := false
+	gatewayFound := false
+	for _, ref := range refs {
+		m, ok := ref.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _ := kube.NestedString(m, "kind"); k != "" && k != "Gateway" {
+			continue
+		}
+		if g, _ := kube.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
+			continue
+		}
+		name, _ := kube.NestedString(m, "name")
+		if name == "" {
+			continue
+		}
+		ns, _ := kube.NestedString(m, "namespace")
+		if ns == "" {
+			ns = o.GetNamespace()
+		}
+		sawGatewayRef = true
+		gw, ok := lookupGateway(ctx, p, ns, name)
+		if !ok {
+			continue
+		}
+		gatewayFound = true
+		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")
+		resolved = true
+		if class == cftGatewayClassName {
+			return true
+		}
+	}
+	// A route whose every Gateway parent fails to resolve is an
+	// orphan — no gateway controller will ever write status.parents,
+	// so it must not sit in this operator's stuck set (same rule as
+	// ciliumOwnsRouteParent).
 	if sawGatewayRef && !gatewayFound {
 		return false
 	}

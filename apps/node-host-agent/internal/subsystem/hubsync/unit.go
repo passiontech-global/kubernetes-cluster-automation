@@ -1,3 +1,5 @@
+// unit.go — the remote node-host-agent.service rendering (systemdUnit)
+// and its unit-name helper.
 package hubsync
 
 import (

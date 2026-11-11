@@ -53,7 +53,9 @@ rg -oN --no-heading '[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*"NODE_HOST_AGENT_[A-Z
 		cmd internal || true
 } >"$refs"
 
-# --- knob rows: "pkg-dir<TAB>VAR<TAB>file:line" ---------------------
+# --- knob rows: "pkg-dir<TAB>VAR<TAB>file:line[, file:line...]" -----
+# Same var read several times in one package: sources are comma-
+# joined (file:line sorted, duplicates within a file collapsed).
 awk -F: -v mapfile="$constmap" '
 	BEGIN {
 		while ((getline l < mapfile) > 0) {
@@ -84,7 +86,23 @@ awk -F: -v mapfile="$constmap" '
 			split(k, p, SUBSEP)
 			printf "%s\t%s\t%s:%d\n", p[1], p[2], p[3], min[k]
 		}
-	}' "$refs" | sort -t '	' -k1,1 -k2,2 >"$rows"
+	}' "$refs" | sort -t '	' -k1,1 -k2,2 -k3,3 \
+	| awk -F'	' '
+		{
+			k = $1 SUBSEP $2
+			if (k in srcs) srcs[k] = srcs[k] ", " $3
+			else {
+				# keep insertion order of the sorted stream
+				order[++n] = k; dir[k] = $1; var[k] = $2
+				srcs[k] = $3
+			}
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				k = order[i]
+				printf "%s\t%s\t%s\n", dir[k], var[k], srcs[k]
+			}
+		}' >"$rows"
 
 nvars=$(cut -f2 "$rows" | sort -u | wc -l | tr -d ' ')
 npkgs=$(cut -f1 "$rows" | sort -u | wc -l | tr -d ' ')
@@ -102,9 +120,9 @@ declared once as an \`envnames.Env*\` const in
 contract); call sites — \`envx.*\`/\`envx.*Knob\` declarations,
 bespoke \`{Name: ...}\` knob rows and \`os.Getenv\`/\`getenv\`
 calls in non-test \`*.go\` files — reference the const. The tables
-below group knobs by the package(s) referencing them with the
-source location of the first reference ($nvars knobs referenced
-across $npkgs packages). The
+below group knobs by the package(s) referencing them, listing the
+source location of every reference in that package ($nvars knobs
+referenced across $npkgs packages). The
 \`NODE_HOST_AGENT_ENABLE_*\` tri-state gates live in their own table:
 they come from the \`Descriptor\` registry, not a \`config_env.go\`.
 
@@ -159,4 +177,7 @@ CONTRACT
 } >"$final"
 
 mv "$final" "$out"
+# mktemp stages 0600 and mv preserves the mode — the doc is
+# operator-facing, not a secret: publish it world-readable.
+chmod 0644 "$out"
 printf 'gen-envdoc: wrote %s (%s knobs, %s packages)\n' "$out" "$nvars" "$npkgs"

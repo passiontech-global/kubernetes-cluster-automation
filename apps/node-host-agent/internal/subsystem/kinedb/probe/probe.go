@@ -23,6 +23,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
@@ -55,11 +57,28 @@ var (
 const pgWireTimeout = 8 * time.Second
 
 // Probe runs the 2-minute check round — the kine-db-probe.sh port
-// plus the probe-cadence remediations. It keeps no state of its
-// own: config, metrics, the state store, the exec plumbing and the
-// churn hand-off all live on the shared *kdeps.Deps.
+// plus the probe-cadence remediations. Config, metrics, the state
+// store, the exec plumbing and the churn hand-off live on the
+// shared *kdeps.Deps; the two fields below are the process-lifetime
+// state hygiene.go keeps in-process.
 type Probe struct {
 	d *kdeps.Deps
+
+	// largeKeys is the last successful top-5 census — the persisted
+	// last-kine-large-keys budget decides when it refreshes, so a
+	// restart re-censuses only after the window (the series goes
+	// absent for the remainder — same contract as storelocal's
+	// maxObjBytes).
+	largeKeysMu   sync.Mutex
+	largeKeysRows []largeKeyRow
+	largeKeysSeen bool
+
+	// preparedXactRolledBack is the lifetime count behind
+	// kine_db_orphan_prepared_xacts_rolled_back_total — cumulative
+	// like Metrics.IdleTermTotal (a prometheus Counter resets on
+	// restart anyway; the textfile emits the running total every
+	// round the block runs).
+	preparedXactRolledBack atomic.Int64
 }
 
 // New returns the probe loop over d, filling the wire-probe seam

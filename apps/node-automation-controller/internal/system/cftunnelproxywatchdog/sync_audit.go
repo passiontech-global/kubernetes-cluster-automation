@@ -8,9 +8,7 @@ package cftunnelproxywatchdog
 
 import (
 	"context"
-	"io"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -88,19 +86,16 @@ func (w *cfTunnelProxyWatchdog) auditControllerSyncErrors(ctx context.Context) {
 		}
 	}
 	if errSeen {
-		if w.syncErrLast == nil {
-			w.syncErrLast = map[string]time.Time{}
-		}
-		w.syncErrLast[w.namespace] = now
+		w.syncErrLast.Stamp(w.namespace, now)
 		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(1)
 		log.Info("gateway controller sync error detected",
 			"namespace", w.namespace, "pods", len(pods))
 		return
 	}
-	stamp, ok := w.syncErrLast[w.namespace]
-	if ok && readOK && !readFailed && now.Sub(stamp) >= cfTunnelSyncErrClearAfter {
+	if _, stamped := w.syncErrLast.Last(w.namespace); stamped && readOK && !readFailed &&
+		!w.syncErrLast.CooledDown(w.namespace, cfTunnelSyncErrClearAfter, now) {
 		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(0)
-		delete(w.syncErrLast, w.namespace)
+		w.syncErrLast.Forget(w.namespace)
 		log.Info("gateway controller sync error cleared",
 			"namespace", w.namespace)
 	}
@@ -110,24 +105,12 @@ func (w *cfTunnelProxyWatchdog) auditControllerSyncErrors(ctx context.Context) {
 // pod: SinceSeconds=300, TailLines=200, byte-capped.
 func (w *cfTunnelProxyWatchdog) controllerLogTail(ctx context.Context,
 	p *corev1.Pod) (string, error) {
-	lctx, cancel := context.WithTimeout(ctx, cfTunnelSyncErrLogTimeout)
-	defer cancel()
-	since := cfTunnelSyncErrSinceSeconds
-	tail := cfTunnelSyncErrTailLines
-	stream, err := w.cs.CoreV1().Pods(p.Namespace).GetLogs(p.Name,
-		&corev1.PodLogOptions{
-			SinceSeconds: &since,
-			TailLines:    &tail,
-		}).Stream(lctx)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, cfTunnelSyncErrLogMaxBytes))
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return kube.ReadPodLogText(ctx, w.cs, p, kube.PodLogOpts{
+		TailLines:    cfTunnelSyncErrTailLines,
+		SinceSeconds: cfTunnelSyncErrSinceSeconds,
+		MaxBytes:     cfTunnelSyncErrLogMaxBytes,
+		Timeout:      cfTunnelSyncErrLogTimeout,
+	})
 }
 
 // controllerSyncErrors matches the observed Cloudflare API sync

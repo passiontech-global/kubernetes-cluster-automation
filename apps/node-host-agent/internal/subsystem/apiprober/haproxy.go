@@ -87,6 +87,14 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 		if header == nil {
 			return nil, errors.New("show stat: data row before header")
 		}
+		// pxname is column 0 — a row for OUR backend starts with
+		// "<backend>,". `show stat` emits the whole proxy table
+		// (hundreds of rows on a busy LB); filtering on the prefix
+		// before Split skips the CSV parse + map lookups for every
+		// unrelated proxy's row.
+		if !strings.HasPrefix(line, p.eff.backend+",") {
+			continue
+		}
 		fields := strings.Split(line, ",")
 		get := func(col string) string {
 			i, ok := header[col]

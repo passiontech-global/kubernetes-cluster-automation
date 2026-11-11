@@ -22,6 +22,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -82,7 +83,7 @@ func TestCarryBrokenForward(t *testing.T) {
 // backend/conv-svc:9443.
 func cbConversionCRD() *unstructured.Unstructured {
 	crd := testutil.Unstructured(
-		guardstate.CustomResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		kube.GVRCustomResourceDefinition.GroupVersion().WithKind("CustomResourceDefinition"),
 		"", "widgets.example.com", nil)
 	_ = unstructured.SetNestedField(crd.Object, "Webhook",
 		"spec", "conversion", "strategy")
@@ -211,7 +212,7 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		// backend proves the controller can reach webhook pods,
 		// licensing the unresponsive verdict on the other.
 		okCRD := testutil.Unstructured(
-			guardstate.CustomResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+			kube.GVRCustomResourceDefinition.GroupVersion().WithKind("CustomResourceDefinition"),
 			"", "gadgets.example.com", nil)
 		_ = unstructured.SetNestedField(okCRD.Object, "Webhook",
 			"spec", "conversion", "strategy")

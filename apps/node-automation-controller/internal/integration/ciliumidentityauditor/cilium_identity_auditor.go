@@ -52,23 +52,26 @@
 // label keys by distinct-value cardinality: each unique label SET
 // mints an identity, so the high-cardinality key is the workload
 // attribute inflating the eBPF identity table.
+//
+// File layout: this file holds the module contract, the auditor struct,
+// Setup and the run sweep pipeline; cilium_identity_gc.go the v2 GC
+// delete path, cilium_identity_usage.go the CEP/CES usage extraction
+// and reserved-range exemption, cilium_identity_labels.go the
+// security-label cardinality profiling.
 package ciliumidentityauditor
 
 import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -77,7 +80,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -352,213 +354,4 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		return nil
 	}
 	return a.gcOrphans(ctx, orphans, idCreated, idUIDs, now)
-}
-
-// gcOrphans is the v2 delete path: only orphans that satisfy BOTH the
-// grace-period (orphaned across ≥2 sweeps) and min-age (object itself
-// old enough to have had a fair chance at an endpoint) gates are
-// eligible, and even then deletion only proceeds while every node is
-// Ready — capped at ciliumGCMaxDelete per sweep.
-func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
-	orphans []string, idCreated map[string]time.Time,
-	idUIDs map[string]types.UID, now time.Time) error {
-	log := logf.FromContext(ctx)
-
-	var eligible []string
-	for _, name := range orphans {
-		orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
-		if orphanedFor < ciliumOrphanGracePeriod {
-			continue // first seen this sweep or still inside grace
-		}
-		if created, ok := idCreated[name]; !ok || now.Sub(created) < ciliumOrphanMinAge {
-			continue // too young — endpoint may not exist yet
-		}
-		eligible = append(eligible, name)
-	}
-	if len(eligible) == 0 {
-		log.Info("GC: no orphans past grace+age gates yet",
-			"orphans", len(orphans))
-		return nil
-	}
-
-	// Storm gate: a NotReady (or absent) node can still be running
-	// pods whose CiliumEndpoints are unsynced — deleting "orphans"
-	// underneath them strips live workloads of network policy. No
-	// nodes at all means the cluster is too broken to judge, so an
-	// empty list aborts too rather than vacuously passing "all
-	// Ready".
-	nodes, err := kube.ListNodesCached(ctx, a.nodeReader, a.cs)
-	if err != nil {
-		return fmt.Errorf("list nodes: %w", err) // propagates to run()'s return — wrapper IncErrors
-	}
-	if len(nodes) == 0 {
-		log.Info("GC SKIP: no nodes listed — cannot verify cluster health",
-			"eligible", len(eligible))
-		return nil
-	}
-	for i := range nodes {
-		if !kube.NodeReady(&nodes[i]) {
-			log.Info("GC SKIP: node not Ready — identities may still be live on it",
-				"node", nodes[i].Name, "eligible", len(eligible))
-			return nil
-		}
-	}
-
-	// The cap bounds delete ATTEMPTS (failed deletes churn the
-	// apiserver the same way) — leftover identities drain next sweep.
-	deleted, failed, capped := reap.Sweep(ctx, log, eligible,
-		reap.Options[string]{
-			Cap: ciliumGCMaxDelete,
-			LogTarget: func(log logr.Logger, name string) {
-				orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
-				log.Info("ACTION: GC orphaned CiliumIdentity",
-					"identity", name,
-					"orphanedFor", orphanedFor.Truncate(time.Minute))
-			},
-			Delete: func(ctx context.Context, name string) error {
-				// UID precondition closes the list→delete TOCTOU: a
-				// same-named identity recreated between the List above
-				// and this Delete is not the orphan this sweep vetted
-				// — the apiserver rejects it with a Conflict, reported
-				// through OnError like the NotFound race below.
-				uid := idUIDs[name]
-				if err := a.dyn.Resource(ciliumIdentityGVR).
-					Delete(ctx, name, kube.UIDDeleteOptions(uid, "")); err != nil {
-					return err
-				}
-				metrics.CiliumIdentitiesCollectedTotal.Inc()
-				return nil
-			},
-			OnError: func(log logr.Logger, name string, err error) {
-				switch {
-				case apierrors.IsNotFound(err):
-					log.Info("SKIP: identity already gone — raced with cilium's own GC",
-						"identity", name)
-				case apierrors.IsConflict(err):
-					log.Info("SKIP: identity recreated since the list — UID precondition fired",
-						"identity", name)
-				default:
-					metrics.IncError(a.queue)
-					log.Error(err, "identity delete failed", "identity", name)
-				}
-			},
-		})
-	if capped {
-		log.Info("GC capped — remaining orphans drain next sweep",
-			"cap", ciliumGCMaxDelete,
-			"remaining", len(eligible)-deleted-failed)
-	}
-	log.Info("GC done", "eligible", len(eligible), "deleted", deleted)
-	return nil
-}
-
-// endpointIdentityID extracts .status.identity.id — numeric in real
-// objects (int64) but float64 in hand-built fixtures.
-func endpointIdentityID(ep *unstructured.Unstructured) string {
-	if id, ok := kube.NestedInt64(
-		ep.Object, "status", "identity", "id"); ok {
-		return strconv.FormatInt(id, 10)
-	}
-	if f, ok := kube.NestedFloat64(
-		ep.Object, "status", "identity", "id"); ok {
-		return strconv.FormatInt(int64(f), 10)
-	}
-	return ""
-}
-
-// sliceIdentityIDs extracts every endpoint's identity id from a
-// CiliumEndpointSlice's .spec.endpoints[].identity.id — the CES
-// replacement for the CEP's .status.identity.id. Non-numeric entries
-// are skipped like the CEP path does.
-func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
-	endpoints, _ := kube.NestedSlice(
-		ces.Object, "spec", "endpoints")
-	out := make([]string, 0, len(endpoints))
-	for _, e := range endpoints {
-		m, ok := e.(map[string]any)
-		if !ok {
-			continue
-		}
-		if id, ok := kube.NestedInt64(
-			m, "identity", "id"); ok {
-			out = append(out, strconv.FormatInt(id, 10))
-			continue
-		}
-		if f, ok := kube.NestedFloat64(
-			m, "identity", "id"); ok {
-			out = append(out, strconv.FormatInt(int64(f), 10))
-		}
-	}
-	return out
-}
-
-// reservedIdentity exempts Cilium's reserved identity range from
-// orphan accounting: a numeric name <= ciliumReservedIDMax (upstream
-// GC never reaps 1–255) or a security label carrying the `reserved:`
-// prefix (reserved:host, reserved:world, ... — checked in both
-// metadata.labels, where Cilium actually stores identity labels, and
-// .spec.security-labels for shape tolerance).
-func reservedIdentity(id *unstructured.Unstructured) bool {
-	if n, err := strconv.ParseInt(id.GetName(), 10, 64); err == nil &&
-		n <= ciliumReservedIDMax {
-		return true
-	}
-	for k := range id.GetLabels() {
-		if strings.HasPrefix(k, "reserved:") {
-			return true
-		}
-	}
-	secLabels, _ := kube.NestedStringMap(
-		id.Object, "spec", "security-labels")
-	for k := range secLabels {
-		if strings.HasPrefix(k, "reserved:") {
-			return true
-		}
-	}
-	return false
-}
-
-// topSecurityLabelKeys profiles .spec.security-labels across the
-// identity list and returns the n keys carrying the most distinct
-// values, rendered "key(count)" for one structured log field.
-// Cilium mints one identity per distinct security-label SET, so an
-// identity-table blow-up is always a high-cardinality key — a
-// per-pod label, a churning version tag — and the cardinality of
-// its VALUES is what names it (a key seen on every identity with
-// one fixed value mints nothing). Sort is count-desc then key-asc
-// so the report is deterministic.
-func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
-	values := map[string]map[string]struct{}{}
-	for i := range ids {
-		sec, _ := kube.NestedStringMap(
-			ids[i].Object, "spec", "security-labels")
-		for k, v := range sec {
-			if values[k] == nil {
-				values[k] = map[string]struct{}{}
-			}
-			values[k][v] = struct{}{}
-		}
-	}
-	type kv struct {
-		key string
-		n   int
-	}
-	keys := make([]kv, 0, len(values))
-	for k, set := range values {
-		keys = append(keys, kv{k, len(set)})
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].n != keys[j].n {
-			return keys[i].n > keys[j].n
-		}
-		return keys[i].key < keys[j].key
-	})
-	if len(keys) > n {
-		keys = keys[:n]
-	}
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, fmt.Sprintf("%s(%d)", k.key, k.n))
-	}
-	return out
 }

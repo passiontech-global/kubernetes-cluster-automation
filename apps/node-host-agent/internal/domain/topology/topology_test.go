@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 func writeVars(t *testing.T) string {
@@ -309,7 +309,7 @@ node-b:
 	if topo.Markers["b"] != "172.29.0.20" {
 		t.Fatalf("marker b=%q errors=%v — registry jinja unresolved", topo.Markers["b"], topo.Errors)
 	}
-	if ip := mapStr(topo.Node, "ip"); ip != "10.0.2.20" {
+	if ip := topo.Node.Str("ip"); ip != "10.0.2.20" {
 		t.Fatalf("node ip=%q — registry jinja unresolved", ip)
 	}
 }

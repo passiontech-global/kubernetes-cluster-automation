@@ -69,6 +69,30 @@ func main() {
 	}
 }
 
+// defaultCell renders the Default expression as the VALUE it
+// resolves to — the raw wiring.go selector text (`envx.ModeOn`,
+// `onOff(w.defKube)`) is plumbing, not an operator fact. The three
+// envx mode spellings map to their tri-state word; the defKube flip
+// (pod mode on, standalone off) renders both faces. Anything else
+// falls back to the verbatim expression so an unrecognized shape
+// still lands in the doc.
+func defaultCell(def string) string {
+	switch def {
+	case "envx.ModeOn":
+		return "`on`"
+	case "envx.ModeOff":
+		return "`off`"
+	case "envx.ModeAuto":
+		return "`auto`"
+	case "onOff(w.defKube)":
+		return "`on` (pod) / `off` (standalone)"
+	case "":
+		return "—"
+	default:
+		return "`" + def + "`"
+	}
+}
+
 // emit prints one markdown table row; an empty env var, subsystem or
 // default renders as "—" (hubsync has no env gate, some descriptors
 // no default), matching the doc's existing convention.
@@ -81,12 +105,7 @@ func emit(envFlag, subsystem, def string) {
 	if subsystem == "" {
 		subsystem = "—"
 	}
-	if def == "" {
-		def = "—"
-	} else {
-		def = "`" + def + "`"
-	}
-	fmt.Printf("| %s | %s | %s |\n", envFlag, subsystem, def)
+	fmt.Printf("| %s | %s | %s |\n", envFlag, subsystem, defaultCell(def))
 }
 
 // fatal reports a scanner failure on stderr and exits nonzero — the

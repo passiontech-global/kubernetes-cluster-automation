@@ -1,6 +1,6 @@
 // snapshot_kinds_test.go — the extended snapshot censuses: every
 // per-resource-kind read (Events/PVCs/StatefulSets/Deployments/
-// DaemonSets/CRDs/unstructured-per-GVR) memoizes ONCE per sweep and
+// DaemonSets/unstructured-per-GVR) memoizes ONCE per sweep and
 // shares its error with every later caller; InvalidateNodes drops the
 // node census AND forces the next AllNodes past the informer cache;
 // InvalidateEndpointSlices drops only the slice census. The
@@ -300,9 +300,9 @@ func TestInvalidateEndpointSlices(t *testing.T) {
 	}
 }
 
-// AllCRDs and AllUnstructured memoize per sweep (CRDs cluster-wide)
-// and per (sweep, GVR) — two GVRs list independently, the same GVR
-// twice does not re-LIST, and a nil Dyn surfaces as a memoized error.
+// AllUnstructured memoizes per (sweep, GVR) — two GVRs list
+// independently, the same GVR twice does not re-LIST, and a nil Dyn
+// surfaces as a memoized error.
 func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 	crdGVR := testhelp.CRDGVR
 	scyllaGVR := schema.GroupVersionResource{
@@ -326,12 +326,12 @@ func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 	d := &Deps{CS: fake.NewSimpleClientset(), Dyn: dyn}
 	ctx := WithSweepSnapshot(context.Background())
 
-	crdList, err := d.AllCRDs(ctx)
+	crdList, err := d.AllUnstructured(ctx, crdGVR)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(crdList) != 1 || crdList[0].GetName() != "scyllaclusters.scylla.scylladb.com" {
-		t.Fatalf("AllCRDs = %v", crdList)
+		t.Fatalf("AllUnstructured(crd) = %v", crdList)
 	}
 	s1, err := d.AllUnstructured(ctx, scyllaGVR)
 	if err != nil {
@@ -341,8 +341,8 @@ func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Second calls — same GVR and the CRD census — must be memoized.
-	if _, err := d.AllCRDs(ctx); err != nil {
+	// Second calls — same GVR — must be memoized.
+	if _, err := d.AllUnstructured(ctx, crdGVR); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := d.AllUnstructured(ctx, scyllaGVR)
@@ -366,9 +366,6 @@ func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 func TestSnapshotNilDynErrors(t *testing.T) {
 	d := &Deps{CS: fake.NewSimpleClientset()}
 	ctx := WithSweepSnapshot(context.Background())
-	if _, err := d.AllCRDs(ctx); err == nil {
-		t.Fatal("AllCRDs with nil Dyn must error")
-	}
 	if _, err := d.AllUnstructured(ctx, schema.GroupVersionResource{Resource: "plans"}); err == nil {
 		t.Fatal("AllUnstructured with nil Dyn must error")
 	}

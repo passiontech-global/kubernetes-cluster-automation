@@ -19,8 +19,15 @@ import (
 // runs inside module Setup (invoked from main() well after
 // ctrl.SetLogger); no envx getter executes in a package-var
 // initializer.
+//
+// The rebind goes through envx.SetWarnf, the atomic-hook path: the
+// rebind is still this init()-time, before-the-first-getter ordering
+// as before, but the swap no longer races getter traffic (a plain
+// `envx.Warnf = f` assignment is a racy var write — and it orphans
+// the hook, so SetWarnf would silently stop routing until the var is
+// reassigned again).
 func init() {
-	envx.Warnf = func(msg string, kv ...any) {
+	envx.SetWarnf(func(msg string, kv ...any) {
 		logf.Log.WithName("env").Info(msg, kv...)
-	}
+	})
 }

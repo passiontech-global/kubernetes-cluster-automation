@@ -14,7 +14,6 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -242,10 +241,8 @@ const pgWALLogSinceWindow = 30 * time.Minute
 // pgWALLogHit fetches the postgres container's log tail (bounded by
 // TailLines AND SinceSeconds) and returns the first matching WAL
 // signature — a fetch failure is inconclusive, not healthy. The
-// matched reason rides out through the match closure. This mirrors
-// probefw.PodLogTail with the extra SinceSeconds option the shared
-// helper does not carry (its other consumers scan whole-lifetime
-// signatures by design).
+// matched reason rides out through the match closure, over the shared
+// kube.ReadPodLogTail fetch path.
 func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	pod *corev1.Pod) (string, error) {
 
@@ -257,39 +254,31 @@ func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	} else {
 		return "", nil // no unambiguous postgres container — skip
 	}
-	opts := pgWALLogOptions(container)
-	lctx, cancel := context.WithTimeout(ctx, probefw.LogTimeout)
-	defer cancel()
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		opts).Stream(lctx)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, probefw.LogMaxBytes))
-	if err != nil {
-		return "", err
-	}
 	var reason string
-	for _, line := range strings.Split(string(data), "\n") {
-		if r := pgWALLogReason(line); r != "" {
-			reason = r
-			break
-		}
+	_, err := kube.ReadPodLogTail(ctx, p.CS, pod, pgWALLogOpts(container),
+		func(line string) bool {
+			if r := pgWALLogReason(line); r != "" {
+				reason = r
+				return true
+			}
+			return false
+		})
+	if err != nil {
+		return "", err
 	}
 	return reason, nil
 }
 
-// pgWALLogOptions builds the bounded pod-log read: the tail bound
-// AND the SinceSeconds bound (separate for tests — the fake
-// clientset reactor cannot surface the options).
-func pgWALLogOptions(container string) *corev1.PodLogOptions {
-	tail := probefw.DefaultTailLines
-	since := int64(pgWALLogSinceWindow.Seconds())
-	return &corev1.PodLogOptions{
+// pgWALLogOpts builds the bounded pod-log read: the tail bound AND
+// the SinceSeconds bound (separate for tests — the fake clientset
+// reactor cannot surface the options).
+func pgWALLogOpts(container string) kube.PodLogOpts {
+	return kube.PodLogOpts{
 		Container:    container,
-		TailLines:    &tail,
-		SinceSeconds: &since,
+		TailLines:    probefw.DefaultTailLines,
+		SinceSeconds: int64(pgWALLogSinceWindow.Seconds()),
+		MaxBytes:     probefw.LogMaxBytes,
+		Timeout:      probefw.LogTimeout,
 	}
 }
 

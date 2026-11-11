@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -193,6 +194,20 @@ func TestSAPubFingerprintAbsentWhenFileMissing(t *testing.T) {
 	if !metricFamilyAbsent(t, c, "node_k0s_sa_pub_fingerprint_hash") {
 		t.Fatal("fingerprint emitted for a missing sa.pub")
 	}
+}
+
+// pemDaysLeft is the day math on pemMinNotAfter — production stopped
+// carrying it as a helper (collectPKICerts folds (now-min)/86400
+// inline after the cache lookup), so the floor semantics live here:
+// math.Floor, not truncation — -1.9d must read -2, not -1, an
+// already-expired cert rounding AWAY from zero like the positive
+// side does toward it.
+func pemDaysLeft(data []byte, now int64) (float64, bool) {
+	min, ok := pemMinNotAfter(data)
+	if !ok {
+		return 0, false
+	}
+	return math.Floor(float64(min-now) / 86400), true
 }
 
 // TestPemDaysLeftNonCertBlockSurvives: a PEM bundle carrying a

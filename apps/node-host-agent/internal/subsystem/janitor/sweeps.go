@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // The registry of currently-producible state-<name> latch names
@@ -24,35 +25,20 @@ import (
 // reaped latch is classified rule=max-age for a registered name and
 // rule=unknown for anything else.
 
-// legacyUnitNames — the retired shell-watchdog units, mirroring
-// hostconfig's legacyWatchdogUnits list (hostconfig owns the unit
-// FILES; the janitor owns the systemd RUNTIME records — kept as a
-// separate list so neither side's edit is coupled).
-var legacyUnitNames = map[string]bool{
-	"node-watchdog.timer":                    true,
-	"node-watchdog.service":                  true,
-	"node-watchdog-failed.service":           true,
-	"node-watchdog-failed@.service":          true,
-	"k0sworker-watchdog.service":             true,
-	"k0sworker-watchdog-restart.service":     true,
-	"k0scontroller-watchdog.service":         true,
-	"k0scontroller-watchdog-restart.service": true,
-	"k0s-apiserver-wedge-probe.timer":        true,
-	"k0s-apiserver-wedge-probe.service":      true,
-	"k0s-kine-pool-probe.timer":              true,
-	"k0s-kine-pool-probe.service":            true,
-	"k0s-oomloop-probe.timer":                true,
-	"k0s-oomloop-probe.service":              true,
-	"nebula-route-guard.service":             true,
-	"api-backend-guard.timer":                true,
-	"api-backend-guard.service":              true,
-	"kine-db-probe.timer":                    true,
-	"kine-db-probe.service":                  true,
-	"kine-compact-guard.timer":               true,
-	"kine-compact-guard.service":             true,
-	"kine-db-maint.timer":                    true,
-	"kine-db-maint.service":                  true,
-}
+// legacyUnitNames indexes watchdogconf.LegacyUnits for isLegacyUnit —
+// the same single list hostconfig's unit-file prune consumes
+// (hostconfig owns the FILES; the janitor owns the systemd RUNTIME
+// records). It used to be a hand-copied mirror of hostconfig's
+// private list; the mirror risk (one side edited, the other not —
+// leaving either live files or un-reset ghosts) is why the list now
+// lives once, in platform/watchdogconf.
+var legacyUnitNames = func() map[string]bool {
+	m := make(map[string]bool, len(watchdogconf.LegacyUnits))
+	for _, u := range watchdogconf.LegacyUnits {
+		m[u] = true
+	}
+	return m
+}()
 
 // legacyUnitPrefixes — legacy families listed by pattern: instantiated
 // templates and the retired ansible-era node-config-agent units.

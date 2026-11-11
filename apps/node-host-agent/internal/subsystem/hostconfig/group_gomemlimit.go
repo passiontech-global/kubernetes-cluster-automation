@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- gomemlimit-sum: k0scontroller GOMEMLIMIT sum guard ----------
@@ -48,10 +50,10 @@ const goMemlimitGuardDropIn = "/etc/systemd/system/k0scontroller.service.d/52-go
 //     clamp against (fail-open: the per-host maps are the intent).
 func (c *cyc) k0scontrollerGoMemlimitSumGuard() {
 	r := c.r
-	memMax, maxOK := parseByteSize(strOf(
-		c.t.Vars.Get("k0scontroller_memory_max_by_host"), r.cfg.NodeName))
-	limit, limOK := parseByteSize(strOf(
-		c.t.Vars.Get("k0scontroller_go_memlimit_by_host"), r.cfg.NodeName))
+	memMaxOm, _ := c.t.Vars.Get("k0scontroller_memory_max_by_host").(*jinja.OMap)
+	limitOm, _ := c.t.Vars.Get("k0scontroller_go_memlimit_by_host").(*jinja.OMap)
+	memMax, maxOK := parseByteSize(memMaxOm.Str(r.cfg.NodeName))
+	limit, limOK := parseByteSize(limitOm.Str(r.cfg.NodeName))
 	capBytes := memMax - goMemlimitSiblingReserve
 	if !maxOK || !limOK || capBytes <= 0 || limit <= capBytes {
 		if ch, _ := r.removeManaged(goMemlimitGuardDropIn); ch {
@@ -63,10 +65,8 @@ func (c *cyc) k0scontrollerGoMemlimitSumGuard() {
 	logger().Warn("base: k0scontroller GOMEMLIMIT exceeds MemoryMax-"+
 		"2GiB sibling reserve — clamping (a single child's soft cap "+
 		"must leave room for the other unit children)",
-		"configured", strOf(c.t.Vars.Get(
-			"k0scontroller_go_memlimit_by_host"), r.cfg.NodeName),
-		"memory_max", strOf(c.t.Vars.Get(
-			"k0scontroller_memory_max_by_host"), r.cfg.NodeName),
+		"configured", limitOm.Str(r.cfg.NodeName),
+		"memory_max", memMaxOm.Str(r.cfg.NodeName),
 		"clamped_mib", clamped)
 	if ch, _ := r.writeManaged(goMemlimitGuardDropIn,
 		[]byte(fmt.Sprintf(`# Managed by node-config-agent - gomemlimit-sum GOMEMLIMIT sum guard

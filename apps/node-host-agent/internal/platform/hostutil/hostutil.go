@@ -9,20 +9,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // RenameFile is the rename(2) seam — tests stub it to force the
-// EBUSY/EXDEV bind-mount fallback without a real mount.
+// EBUSY/EXDEV bind-mount fallback without a real mount. The write
+// core (and with it the rename call) is delegated to fsx; the init
+// trampoline below points fsx.RenameFile at THIS var, so RenameFile
+// stays the one live seam for every WriteAtomic consumer and the
+// existing stubs (hostutil_test.go, nethealth's dns_fallback EBUSY
+// test) keep working unchanged.
 var RenameFile = os.Rename
+
+// The delegation hands the rename to fsx.WriteFile, whose seam is
+// fsx.RenameFile — route it back through this package's var so a
+// stub of RenameFile reaches the delegated core too. Init runs
+// after both packages' vars are initialized, so this reliably wins
+// over fsx's own os.Rename default.
+func init() {
+	fsx.RenameFile = func(from, to string) error { return RenameFile(from, to) }
+}
 
 // renameFallbackLogged remembers which paths already warned about the
 // direct-write fallback — one line per path per process (a
@@ -36,6 +53,10 @@ var renameFallbackLogged sync.Map
 // consumers are the staging name shape and the page-cache hook; the
 // durability contract (payload fsync before rename, dir fsync after)
 // is uniform — see DirSync for the one alignment this unify forced.
+// The fields map 1:1 onto fsx.Opts: the core they tune lives in
+// libs/hostkit/fsx (the verbatim port of the former in-package
+// implementation), hostutil keeps the API + the EBUSY/EXDEV
+// bind-mount fallback above it.
 type AtomicOpts struct {
 	// Stage opens the staging file the rename will promote to path.
 	// It must create the file in the dir it is handed (the target's
@@ -73,74 +94,42 @@ type AtomicOpts struct {
 	// cache charge does not outlive the write (post-Sync the pages
 	// are clean, so DONTNEED drops them outright).
 	AfterSync func(f *os.File)
+	// NoSync skips BOTH fsyncs (payload and DirSync) — the
+	// CreateTemp+Chmod+Rename atomicity contract is unchanged, so
+	// readers still never see a torn file; only crash durability is
+	// dropped. Reserved for ephemeral files a crash may lose
+	// harmlessly because the next cycle rewrites them anyway:
+	// node-exporter .prom textfiles, apibe-gap-*, last-run. Config
+	// files under /etc and latch/state files keep the durable
+	// path — a lost latch reads as "condition cleared".
+	NoSync bool
 }
 
 // StageTempPattern returns a Stage that CreateTemps a uniquely
 // named staging file in dir — pattern keeps the "*" placeholder
 // (CreateTemp replaces it with a random suffix).
 func StageTempPattern(pattern string) func(string) (*os.File, error) {
-	return func(dir string) (*os.File, error) { return os.CreateTemp(dir, pattern) }
+	return fsx.StageTempPattern(pattern)
 }
 
 // WriteAtomic installs content at path via a same-dir staging file
 // + rename — the one atomic-write implementation for the agent
 // (promfile and converge route through it with their own
-// AtomicOpts). The payload fsync BEFORE the rename closes the crash
-// window where the rename lands but the bytes were never flushed; a
-// positive DirSync makes the rename itself durable. Every failure
-// path sweeps the staging file; a short write is a failed write.
+// AtomicOpts). The staging→chmod→write→fsync→rename→dirsync core is
+// delegated to libs/hostkit/fsx (fsx.WriteFile — ported verbatim
+// from this file, zero behavior drift); the payload fsync BEFORE
+// the rename closes the crash window where the rename lands but the
+// bytes were never flushed, a positive DirSync makes the rename
+// itself durable, every failure path sweeps the staging file and a
+// short write is a failed write — see fsx.WriteFile.
 func WriteAtomic(path string, content []byte, opts AtomicOpts) error {
-	dir := filepath.Dir(path)
-	tmp, err := opts.Stage(dir)
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// From here on every failure path must remove the staging file;
-	// a leaked staging file would sit in the state dir forever.
-	fail := func(err error) error {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	// Force the final mode before sync+rename (see AtomicOpts.Mode).
-	if err := tmp.Chmod(opts.Mode); err != nil {
-		return fail(err)
-	}
-	// A short write is a failed write — n < len(content) means a
-	// truncated file would be promoted by the rename below.
-	if n, werr := tmp.Write(content); werr != nil || n < len(content) {
-		if werr == nil {
-			werr = io.ErrShortWrite
-		}
-		return fail(werr)
-	}
-	// fsync the payload before the rename — without it a crash can
-	// leave a renamed-but-empty file behind.
-	if err := tmp.Sync(); err != nil {
-		return fail(err)
-	}
-	if opts.AfterSync != nil {
-		opts.AfterSync(tmp)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := RenameFile(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if opts.DirSync {
-		if d, err := os.Open(dir); err == nil {
-			err = d.Sync()
-			_ = d.Close()
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return fsx.WriteFile(path, content, fsx.Opts{
+		Stage:     opts.Stage,
+		Mode:      opts.Mode,
+		DirSync:   opts.DirSync,
+		AfterSync: opts.AfterSync,
+		NoSync:    opts.NoSync,
+	})
 }
 
 // WriteFileAtomic writes content via a tmp file in the same dir +
@@ -207,6 +196,31 @@ func WriteFileDirect(path, content string) error {
 // WriteFileAtomicBytes is WriteFileAtomic for callers holding []byte.
 func WriteFileAtomicBytes(path string, data []byte) error {
 	return WriteFileAtomic(path, string(data))
+}
+
+// WriteFileAtomicNoSync is WriteFileAtomic minus the durability
+// fsyncs — same tmp+rename atomicity (AtomicOpts.NoSync), for the
+// ephemeral files the next cycle rewrites anyway: .prom textfiles,
+// apibe-gap-*, last-run. A crash can lose the newest content; the
+// file is never torn.
+func WriteFileAtomicNoSync(path, content string) error {
+	err := WriteAtomic(path, []byte(content), AtomicOpts{
+		Stage:  StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
+		Mode:   0o644,
+		NoSync: true,
+	})
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.EXDEV) {
+		return err
+	}
+	if _, logged := renameFallbackLogged.LoadOrStore(path, true); !logged {
+		logger().Warn("atomic rename refused (bind-mounted "+
+			"target?) — falling back to direct fsync'd write",
+			"path", path, "error", err)
+	}
+	return WriteFileDirect(path, content)
 }
 
 // UptimeSeconds parses the first field of a /proc/uptime-format file
@@ -319,4 +333,47 @@ func RuntimeConfigMTU(path string) (int64, bool) {
 		return 0, false
 	}
 	return slices.Max(vals), true
+}
+
+// TouchIfDue refreshes path's atime/mtime to now via Chtimes ONLY
+// when the file's current mtime is at least minAge old — the
+// callers already hold the os.Stat result, so a fresh latch costs
+// zero extra syscalls (the comparison is pure arithmetic on
+// fi.ModTime). Held latches used to Chtimes on every check cycle;
+// with the janitor reaping at 24h a 15min cadence (latchdefs.
+// LatchTouchMinInterval) is already generous. Returns the Chtimes
+// error, nil when skipped or touched.
+func TouchIfDue(path string, fi os.FileInfo, now time.Time, minAge time.Duration) error {
+	age := now.Sub(fi.ModTime())
+	// Skip only on a genuinely fresh mtime. A NEGATIVE age means the
+	// file's mtime sits ahead of this clock (fake test clocks, an
+	// NTP step-back) — that is exactly the case a touch must fix,
+	// not skip.
+	if age >= 0 && age < minAge {
+		return nil
+	}
+	return os.Chtimes(path, now, now)
+}
+
+// FileStatKey fingerprints a file's identity+generation WITHOUT
+// reading it: dev, inode, size and mtime. Every writer in this
+// tree stages via atomic rename (WriteAtomic family), which always
+// lands a NEW inode — so an unchanged key proves the bytes cannot
+// have changed and callers may skip re-reading/re-parsing the file
+// (CA bundles, X.509 certs, rendered confs all re-stat per cycle).
+// A missing file returns the os.Stat error verbatim.
+func FileStatKey(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	// os.Stat results expose *syscall.Stat_t on Linux — the x/sys
+	// unix.Stat_t is a distinct type and the assertion would always
+	// fail (run_tmpfs.go:147 hit the same trap).
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("stat %s: unexpected FileInfo.Sys type %T", path, fi.Sys())
+	}
+	return fmt.Sprintf("%d:%d:%d:%d",
+		st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano()), nil
 }

@@ -114,6 +114,14 @@ type Series struct {
 	KernelSoftnetTimeSqueeze    int64 // softnet_stat time_squeeze, all CPUs
 	ContainerdShimMaxRSSBytes   int64 // worst containerd-shim-runc-v2 RSS
 	ContainerdShimTotalRSSBytes int64 // sum across all shims
+	// PipeBlockedProcs counts the pod processes past the pipe-write
+	// persist window this cycle (pipe-write-freeze): the main
+	// process of a container wedged in TASK_INTERRUPTIBLE
+	// pipe_write — the stdout/stderr 64KB pipe deadlock, the
+	// "ghost pod" whose tcpSocket probes keep answering SYN-ACK
+	// while the app is frozen. Surfaced as
+	// node_agent_container_pipe_blocked.
+	PipeBlockedProcs int64
 }
 
 // Deps is the shared state every Check consumes — the split's

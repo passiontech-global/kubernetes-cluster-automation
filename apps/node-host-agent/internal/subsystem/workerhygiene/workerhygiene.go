@@ -403,6 +403,22 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		walkCache[root] = walkResult{total: total, truncated: truncated}
 		return total, truncated
 	}
+	// The per-pid /proc stat parse is shared too — zombie-storm and
+	// d-state-storm each swept every pid's stat file back-to-back;
+	// one memoized map serves both (and any later stat consumer).
+	stats := map[int]procfs.Stat{}
+	statsSet := false
+	statsOnce := func() map[int]procfs.Stat {
+		if !statsSet {
+			statsSet = true
+			for _, pid := range pidsOnce() {
+				if st, ok := h.Proc.Stat(pid); ok {
+					stats[pid] = st
+				}
+			}
+		}
+		return stats
+	}
 	*h.envCell = wdeps.CycleEnv{
 		Pods:         pods,
 		APIOK:        apiOK,
@@ -410,6 +426,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		TasksOnce:    tasksOnce,
 		PidsOnce:     pidsOnce,
 		JournalOnce:  journalOnce,
+		StatsOnce:    statsOnce,
 		WalkOnce:     walkOnce,
 	}
 	checks.Dispatch(ctx, sigOn, h.Cycles, h.groups)
@@ -430,8 +447,13 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 // the LIST failed — checks treat it as "apiserver unreachable"
 // (inconclusive: keep counters/latches, never act).
 func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
+	// ResourceVersion "0": serve the LIST from the apiserver's
+	// watch cache — a possibly-stale read is fine (each cycle
+	// re-lists; guards act only on latched multi-cycle evidence)
+	// and it skips the quorum read + etcd fan-out every cycle.
 	list, err := h.Cfg.Client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + h.Cfg.NodeName,
+		FieldSelector:   "spec.nodeName=" + h.Cfg.NodeName,
+		ResourceVersion: "0",
 	})
 	if err != nil {
 		h.State.AppendLog(fmt.Sprintf(

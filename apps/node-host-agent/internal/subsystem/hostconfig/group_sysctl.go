@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T1/T2/A4/T16 + hostname hosts pin ----------
@@ -24,7 +26,8 @@ func sysctlFile(pairs [][2]string, header string) []byte {
 func (c *cyc) sysctlPairs(varName string) [][2]string {
 	var out [][2]string
 	for _, it := range c.vl(varName) {
-		k, v := strOf(it, "name"), strOf(it, "value")
+		m, _ := it.(*jinja.OMap) // nil-safe: Str answers "" for a nil map
+		k, v := m.Str("name"), m.Str("value")
 		if k == "" || v == "" {
 			// Unset/degenerate var entry — render nothing rather than
 			// a valueless `key = ` line sysctl --system would choke

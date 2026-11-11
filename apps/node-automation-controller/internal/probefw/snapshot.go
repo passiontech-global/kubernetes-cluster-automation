@@ -33,19 +33,22 @@
 // re-list instead of acting on the pre-mutation view (a stale pod
 // would otherwise be evaluated — and possibly re-healed — as if
 // still alive; UID-preconditioned deletes make that harmless but
-// noisy). InvalidatePods/InvalidateNodes/InvalidateEndpointSlices
-// each drop exactly the kind the mutation touched — Nodes additionally
-// force the next AllNodes to bypass the just-patched informer cache —
-// and InvalidateSweep remains the blanket for Service/Namespace-level
-// mutations. The snapshot is read-only: callers must not mutate
-// returned objects in place (several checks sort/filter — sort a
-// copy).
+// noisy). InvalidatePods/InvalidateNodes/InvalidateEndpointSlices/
+// InvalidateLeases each drop exactly the kind the mutation touched —
+// Nodes additionally force the next AllNodes to bypass the
+// just-patched informer cache — InvalidateSweep remains the blanket
+// for Service/Namespace-level mutations, and its reset list is
+// registered once at construction so a NEW census kind cannot be
+// forgotten the way the Lease census was (a mid-sweep Lease
+// delete/patch used to stay visible to every later check). The
+// snapshot is read-only: callers must not mutate returned objects
+// in place (several checks sort/filter — sort a copy).
 //
 // The per-kind readers live in sibling files grouped by census
 // family — snapshot_pods.go, snapshot_nodes.go,
 // snapshot_workloads.go, snapshot_cluster.go, snapshot_crds.go —
-// this file keeps the shared memoizer struct, its ctx plumbing, and
-// the Invalidate* write-side API.
+// this file keeps the shared memo[T] primitive, its ctx plumbing,
+// and the Invalidate* write-side API.
 package probefw
 
 import (
@@ -59,6 +62,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // snapshotListTimeout bounds one memoized LIST below the sweep ctx —
@@ -75,122 +79,126 @@ const snapshotListTimeout = 2 * time.Minute
 // and Deps methods resolve it, so no other package can inject one.
 type sweepCtxKey struct{}
 
-// sweepSnapshot memoizes one sweep's cluster-wide reads. Each field
-// triples as (items, err, loaded): the FIRST caller pays the LIST —
-// including its error, which is memoized with it (a transient
-// apiserver failure must read identically to every check in the
-// cycle rather than costing a retry storm) — and every later caller
-// reads the copy.
+// memo is the generic (value, err, loaded) triple every census kind
+// carries, replacing the hand-rolled (mu, items, err, set) quads
+// that made InvalidateSweep a hand-maintained list of kinds — the
+// leases census was missing from it, so a mid-sweep Lease mutation
+// stayed visible to every later check. T is the WHOLE memoized
+// value: a slice for censuses ([]corev1.Pod), a map for the derived
+// joins (map[string]string).
 //
 // Locking: the sweep drives its checks serially inside one
 // shared.Periodic goroutine, but check BODIES increasingly fan out
 // into bounded worker pools (per-pod probes), so any two goroutines
-// can now reach the same memoized read at once. Every kind therefore
-// carries its own sync.Mutex guarding its triple: same-kind readers
-// serialize on the first LIST (the second waits for the memo instead
-// of double-LISTing or racing the write), different kinds never
-// contend. Locks are only ever taken one at a time per goroutine
-// (the derived joins take their own lock, then the census's), so
-// there is no ordering cycle to deadlock on.
+// can now reach the same memoized read at once. The mutex guards
+// all fields: same-kind readers serialize on the first load (the
+// second waits for the memo instead of double-LISTing or racing the
+// write), different kinds never contend. Locks are only ever taken
+// one at a time per goroutine (the derived joins take their own
+// lock, then the census's), so there is no ordering cycle to
+// deadlock on.
 //
-// ctx is the snapshot's LIST context: captured at WithSweepSnapshot
-// (the sweep ctx) or the caller's ctx in the direct-Run path. It
-// must outlive any single check's PerCheck deadline — see the file
-// header for the poisoning bug that motivates it.
+// The FIRST caller pays the load — including its error, which is
+// memoized with it (a transient apiserver failure must read
+// identically to every check in the cycle rather than costing a
+// retry storm) — and every later caller reads the copy.
+type memo[T any] struct {
+	mu    sync.Mutex
+	items T
+	err   error
+	set   bool
+	// forceCS is the nodes-only one-shot: InvalidateNodes arms it so
+	// the NEXT load reads d.CS directly instead of the informer
+	// cache (which lags a just-patched node by the sync delay). It
+	// is consumed INSIDE the first-load critical section — a reader
+	// can never observe "armed" without also performing the forced
+	// load, and two racing readers cannot split the decision.
+	forceCS bool
+}
+
+// get returns the memoized (items, err), running load on the first
+// call. load receives the consumed forceCS flag — only the nodes
+// census branches on it; every other kind ignores the parameter.
+func (m *memo[T]) get(load func(forceCS bool) (T, error)) (T, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.set {
+		m.set = true
+		force := m.forceCS
+		m.forceCS = false
+		m.items, m.err = load(force)
+	}
+	return m.items, m.err
+}
+
+// reset returns the memo to its never-loaded state — items, err,
+// loaded flag AND any armed forceCS (InvalidateNodes re-arms after
+// via resetForced).
+func (m *memo[T]) reset() {
+	m.mu.Lock()
+	var zero T
+	m.items, m.err, m.set, m.forceCS = zero, nil, false, false
+	m.mu.Unlock()
+}
+
+// resetForced is reset + arm in ONE critical section — the
+// post-invalidate nodes read must bypass the informer cache, and a
+// reader slipping between two separate reset/arm calls could pay a
+// cached load and leave the arm dangling.
+func (m *memo[T]) resetForced() {
+	m.mu.Lock()
+	var zero T
+	m.items, m.err, m.set = zero, nil, false
+	m.forceCS = true
+	m.mu.Unlock()
+}
+
+// sweepSnapshot carries one sweep's memoized reads. Every census is
+// a memo[T]; the derived placement/key joins (NodeZones, PodNodes,
+// LeaseIndex, ServiceIndex) are memos of their own so they invalidate
+// alongside their census. unstructReads stays a map — the dynamic
+// reads are unbounded in kind (gateway-api routes, scylla clusters,
+// flux releases, ...), so the same (items, err) pair hangs off a map
+// keyed by the comparable GVR struct under one family mutex.
+//
+// resets is the blanket-invalidation list, bound ONCE at
+// construction: InvalidateSweep iterates it so a newly added census
+// kind joins the reset set by being declared — it cannot be forgotten
+// the way the Lease census was.
 type sweepSnapshot struct {
 	ctx context.Context
 
-	muPods  sync.Mutex
-	pods    []corev1.Pod
-	podsErr error
-	podsSet bool
+	pods         memo[[]corev1.Pod]
+	nodes        memo[[]corev1.Node]
+	slices       memo[[]discoveryv1.EndpointSlice]
+	services     memo[[]corev1.Service]
+	namespaces   memo[[]corev1.Namespace]
+	events       memo[[]corev1.Event]
+	pvcs         memo[[]corev1.PersistentVolumeClaim]
+	statefulSets memo[[]appsv1.StatefulSet]
+	deployments  memo[[]appsv1.Deployment]
+	daemonSets   memo[[]appsv1.DaemonSet]
+	leases       memo[[]coordinationv1.Lease]
 
-	muNodes sync.Mutex
-	// nodesForceCS is InvalidateNodes' one-shot "the next AllNodes
-	// must bypass the informer cache" flag: a check that just
-	// patched a node cannot trust the cache read (it lags the
-	// apiserver by the informer sync delay), so the re-read goes
-	// straight to d.CS. Consumed by that next AllNodes; the
-	// memoized result then serves the rest of the sweep.
-	nodesForceCS bool
-	nodes        []corev1.Node
-	nodesErr     error
-	nodesSet     bool
+	// Derived joins — memoized like the censuses: the derived error
+	// is the census's own, and each drops WITH its census (a join
+	// built from the pre-mutation view is the same stale read in
+	// map form).
+	nodeZones    memo[map[string]string]
+	podNodes     memo[map[string]string]
+	leaseIndex   memo[map[types.NamespacedName]*coordinationv1.Lease]
+	serviceIndex memo[map[types.NamespacedName]*corev1.Service]
 
-	muSlices  sync.Mutex
-	slices    []discoveryv1.EndpointSlice
-	slicesErr error
-	slicesSet bool
-
-	muServices  sync.Mutex
-	services    []corev1.Service
-	servicesErr error
-	servicesSet bool
-
-	muNamespaces  sync.Mutex
-	namespaces    []corev1.Namespace
-	namespacesErr error
-	namespacesSet bool
-
-	muEvents  sync.Mutex
-	events    []corev1.Event
-	eventsErr error
-	eventsSet bool
-
-	muPVCs  sync.Mutex
-	pvcs    []corev1.PersistentVolumeClaim
-	pvcsErr error
-	pvcsSet bool
-
-	muStatefulSets  sync.Mutex
-	statefulSets    []appsv1.StatefulSet
-	statefulSetsErr error
-	statefulSetsSet bool
-
-	muDeployments  sync.Mutex
-	deployments    []appsv1.Deployment
-	deploymentsErr error
-	deploymentsSet bool
-
-	muDaemonSets  sync.Mutex
-	daemonSets    []appsv1.DaemonSet
-	daemonSetsErr error
-	daemonSetsSet bool
-
-	muLeases  sync.Mutex
-	leases    []coordinationv1.Lease
-	leasesErr error
-	leasesSet bool
-
-	muCRDs  sync.Mutex
-	crds    []unstructured.Unstructured
-	crdsErr error
-	crdsSet bool
-
-	// AllUnstructured memoizes per GVR instead of per field — the
-	// dynamic reads are unbounded in kind (gateway-api routes,
-	// scylla clusters, flux releases, ...), so the same
-	// (items, err) pair hangs off a map keyed by the
-	// comparable GVR struct, guarded by one mutex for the whole
-	// family. Lazy-built: both the WithSweepSnapshot path and the
-	// fallback snapshot start nil.
+	// AllUnstructured memoizes per GVR instead of per field — see
+	// the type comment above. Lazy-built: both the
+	// WithSweepSnapshot path and the fallback snapshot start nil.
 	muUnstructs   sync.Mutex
 	unstructReads map[schema.GroupVersionResource]*unstructRead
 
-	// nodeZones/podNodes are the memoized placement JOINS derived
-	// from the pods/nodes censuses — several checks need the maps,
-	// not the raw lists, and rebuilding them per check meant each
-	// consumer re-walked the same census. They memoize like the
-	// censuses: the derived error is the census's own.
-	muNodeZones  sync.Mutex
-	nodeZones    map[string]string
-	nodeZonesErr error
-	nodeZonesSet bool
-
-	muPodNodes  sync.Mutex
-	podNodes    map[string]string
-	podNodesErr error
-	podNodesSet bool
+	// resets is every memo's reset, bound at construction — see the
+	// type comment. InvalidateSweep runs it wholesale, then re-arms
+	// the nodes forceCS read via resetForced.
+	resets []func()
 }
 
 // unstructRead is the per-GVR memoized dynamic read behind
@@ -201,6 +209,23 @@ type unstructRead struct {
 	err   error
 }
 
+// newSweepSnapshot builds an empty snapshot and binds its blanket
+// reset list — every memo declared on the struct joins the list at
+// construction, so InvalidateSweep can never drift behind the field
+// set the way the hand-maintained drop list did.
+func newSweepSnapshot(ctx context.Context) *sweepSnapshot {
+	s := &sweepSnapshot{ctx: ctx}
+	s.resets = []func(){
+		s.pods.reset, s.nodes.reset, s.slices.reset,
+		s.services.reset, s.namespaces.reset, s.events.reset,
+		s.pvcs.reset, s.statefulSets.reset, s.deployments.reset,
+		s.daemonSets.reset, s.leases.reset,
+		s.nodeZones.reset, s.podNodes.reset,
+		s.leaseIndex.reset, s.serviceIndex.reset,
+	}
+	return s
+}
+
 // WithSweepSnapshot installs a fresh, empty snapshot on ctx — the
 // sweep-root calls it once per run() so the whole check roster
 // shares the cycle's cluster reads. The snapshot captures ctx as its
@@ -209,8 +234,7 @@ type unstructRead struct {
 // shared census. Safe to call on a ctx that already carries one (the
 // old snapshot is simply replaced).
 func WithSweepSnapshot(ctx context.Context) context.Context {
-	return context.WithValue(ctx, sweepCtxKey{},
-		&sweepSnapshot{ctx: ctx})
+	return context.WithValue(ctx, sweepCtxKey{}, newSweepSnapshot(ctx))
 }
 
 // snap returns the ctx-carried snapshot, or a fresh one when ctx
@@ -221,7 +245,7 @@ func sweepSnap(ctx context.Context) *sweepSnapshot {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		return s
 	}
-	return &sweepSnapshot{ctx: ctx}
+	return newSweepSnapshot(ctx)
 }
 
 // listCtx returns the ctx one memoized LIST runs under: the
@@ -247,12 +271,8 @@ func (s *sweepSnapshot) listCtx(caller context.Context) (context.Context, contex
 // for every later check. A no-op outside a sweep.
 func (d *Deps) InvalidatePods(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
-		s.muPods.Lock()
-		s.pods, s.podsErr, s.podsSet = nil, nil, false
-		s.muPods.Unlock()
-		s.muPodNodes.Lock()
-		s.podNodes, s.podNodesErr, s.podNodesSet = nil, nil, false
-		s.muPodNodes.Unlock()
+		s.pods.reset()
+		s.podNodes.reset()
 	}
 }
 
@@ -272,13 +292,8 @@ func (d *Deps) InvalidatePods(ctx context.Context) {
 // A no-op outside a sweep.
 func (d *Deps) InvalidateNodes(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
-		s.muNodes.Lock()
-		s.nodes, s.nodesErr, s.nodesSet = nil, nil, false
-		s.nodesForceCS = true
-		s.muNodes.Unlock()
-		s.muNodeZones.Lock()
-		s.nodeZones, s.nodeZonesErr, s.nodeZonesSet = nil, nil, false
-		s.muNodeZones.Unlock()
+		s.nodes.resetForced()
+		s.nodeZones.reset()
 	}
 }
 
@@ -290,9 +305,19 @@ func (d *Deps) InvalidateNodes(ctx context.Context) {
 // outside a sweep.
 func (d *Deps) InvalidateEndpointSlices(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
-		s.muSlices.Lock()
-		s.slices, s.slicesErr, s.slicesSet = nil, nil, false
-		s.muSlices.Unlock()
+		s.slices.reset()
+	}
+}
+
+// InvalidateLeases drops the Lease census AND its ns/name index —
+// the lease twin of InvalidatePods for a check that deleted or
+// patched a Lease mid-sweep (the cilium L2 announce-lease guard's
+// stale-holder delete, the operator-leader heal's stamp patch). A
+// no-op outside a sweep.
+func (d *Deps) InvalidateLeases(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.leases.reset()
+		s.leaseIndex.reset()
 	}
 }
 
@@ -300,63 +325,24 @@ func (d *Deps) InvalidateEndpointSlices(ctx context.Context) {
 // snapshot — call it after a check mutates cluster state beyond pod
 // deletes (node taint/cordon, EndpointSlice delete, Service or
 // Namespace mutation) so later checks re-list fresh data instead of
-// acting on the pre-mutation view. Each kind resets under its own
-// lock (no struct copy: the snapshot carries mutexes now, and
-// copying one under a concurrent reader would race the lock values).
-// A no-op outside a sweep (each call already sees fresh data).
+// acting on the pre-mutation view. The reset list was bound at
+// construction, so every declared census — including the Lease
+// census the hand-maintained list used to forget — drops here. The
+// nodes forced re-read is re-armed afterwards: the blanket reset
+// cleared it, and a sweep-wide mutation is exactly the case the
+// direct clientset read exists for. A no-op outside a sweep (each
+// call already sees fresh data).
 func (d *Deps) InvalidateSweep(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
-		d.InvalidatePods(ctx)
-		d.InvalidateNodes(ctx)
-		d.InvalidateEndpointSlices(ctx)
-		for _, drop := range []func(){
-			func() {
-				s.muServices.Lock()
-				s.services, s.servicesErr, s.servicesSet = nil, nil, false
-				s.muServices.Unlock()
-			},
-			func() {
-				s.muNamespaces.Lock()
-				s.namespaces, s.namespacesErr, s.namespacesSet = nil, nil, false
-				s.muNamespaces.Unlock()
-			},
-			func() {
-				s.muEvents.Lock()
-				s.events, s.eventsErr, s.eventsSet = nil, nil, false
-				s.muEvents.Unlock()
-			},
-			func() {
-				s.muPVCs.Lock()
-				s.pvcs, s.pvcsErr, s.pvcsSet = nil, nil, false
-				s.muPVCs.Unlock()
-			},
-			func() {
-				s.muStatefulSets.Lock()
-				s.statefulSets, s.statefulSetsErr, s.statefulSetsSet = nil, nil, false
-				s.muStatefulSets.Unlock()
-			},
-			func() {
-				s.muDeployments.Lock()
-				s.deployments, s.deploymentsErr, s.deploymentsSet = nil, nil, false
-				s.muDeployments.Unlock()
-			},
-			func() {
-				s.muDaemonSets.Lock()
-				s.daemonSets, s.daemonSetsErr, s.daemonSetsSet = nil, nil, false
-				s.muDaemonSets.Unlock()
-			},
-			func() {
-				s.muCRDs.Lock()
-				s.crds, s.crdsErr, s.crdsSet = nil, nil, false
-				s.muCRDs.Unlock()
-			},
-			func() {
-				s.muUnstructs.Lock()
-				s.unstructReads = nil
-				s.muUnstructs.Unlock()
-			},
-		} {
-			drop()
+		for _, reset := range s.resets {
+			reset()
 		}
+		s.muUnstructs.Lock()
+		s.unstructReads = nil
+		s.muUnstructs.Unlock()
+		// The wholesale reset cleared the nodes forceCS arm — re-arm
+		// it atomically (resetForced is idempotent on an already-
+		// reset memo: it only re-asserts set=false + forceCS=true).
+		s.nodes.resetForced()
 	}
 }

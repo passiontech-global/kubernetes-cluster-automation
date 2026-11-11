@@ -157,7 +157,7 @@ func TestNLDHostPortsGuardDisabledSweep(t *testing.T) {
 	c.groupNLD()
 	for _, call := range []string{
 		"systemctl disable --now host-internal-ports-guard.service",
-		"nft delete table ip host_internal_ports_guard",
+		"nft delete table inet host_internal_ports_guard",
 	} {
 		if len(sr.CallsMatching(call)) == 0 {
 			t.Fatalf("disable sweep missing %q: %v", call, sr.Calls())
@@ -177,7 +177,7 @@ func TestNLDHostPortsGuardDisabledSweep(t *testing.T) {
 	if len(sr.CallsMatching("systemctl daemon-reload")) != 0 {
 		t.Fatal("daemon-reload fired on an already-swept guard")
 	}
-	if !strings.Contains(strings.Join(sr.Calls(), "\n"), "nft delete table ip host_internal_ports_guard") {
+	if !strings.Contains(strings.Join(sr.Calls(), "\n"), "nft delete table inet host_internal_ports_guard") {
 		t.Fatal("live-table delete missing on the idempotent pass (disabling must reopen the ports)")
 	}
 }

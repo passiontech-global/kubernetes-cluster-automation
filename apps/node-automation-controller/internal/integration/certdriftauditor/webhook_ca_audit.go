@@ -39,24 +39,26 @@ import (
 func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	a.seenWebhookExpiry.Begin() // drop any aborted sweep's leftover emissions
 	a.seenWebhooks.Begin()      // drop any aborted sweep's leftover emissions
-	mutating, err := a.cs.AdmissionregistrationV1().
-		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	mutating, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.MutatingWebhookConfigurations(a.cs))
 	if err != nil {
 		return fmt.Errorf("list mutatingwebhookconfigurations: %w", err)
 	}
-	validating, err := a.cs.AdmissionregistrationV1().
-		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	validating, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.ValidatingWebhookConfigurations(a.cs))
 	if err != nil {
 		return fmt.Errorf("list validatingwebhookconfigurations: %w", err)
 	}
 
-	for i := range mutating.Items {
-		m := &mutating.Items[i]
+	for i := range mutating {
+		m := &mutating[i]
 		a.auditOneWebhookConfig(ctx, "MutatingWebhookConfiguration",
 			m.Name, m.Annotations, mutatingEntries(m.Webhooks))
 	}
-	for i := range validating.Items {
-		v := &validating.Items[i]
+	for i := range validating {
+		v := &validating[i]
 		a.auditOneWebhookConfig(ctx, "ValidatingWebhookConfiguration",
 			v.Name, v.Annotations, validatingEntries(v.Webhooks))
 	}
@@ -74,12 +76,16 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	}
 	crds, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(a.dyn.Resource(customResourceDefinitionGVR)))
+		kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)))
 	if err != nil {
 		return fmt.Errorf("list customresourcedefinitions: %w", err)
 	}
 	for i := range crds {
 		crd := &crds[i]
+		// Only spec.conversion is read below — strip the OpenAPI
+		// schemas (the bulk of a CRD object's heap) before the
+		// audit walks the census.
+		kube.StripCRDSchemaVersions(crd)
 		entry, ok := crdConversionEntry(crd)
 		if !ok {
 			continue

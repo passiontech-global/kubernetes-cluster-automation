@@ -319,7 +319,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 // cnpgFencedInstanceList parses the fencedInstances annotation into
 // instance names — empty list when absent or blank.
 func cnpgFencedInstanceList(cr *unstructured.Unstructured) []string {
-	raw, _, _ := unstructured.NestedString(
+	raw, _ := kube.NestedString(
 		cr.Object, "metadata", "annotations", cnpgFencedInstancesAnno)
 	var out []string
 	for _, s := range strings.Split(raw, ",") {

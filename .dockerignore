@@ -1,18 +1,27 @@
 # Repo-root .dockerignore — apps' Dockerfiles are built with the repo
 # ROOT as context (`docker build -f apps/<app>/Dockerfile .`) so the
-# libs/hostkit go.mod replace target resolves inside the context.
-# Each Dockerfile COPYs only the dirs it needs (libs/hostkit + its own
-# app dir); this list just keeps the context small and reproducible.
+# libs/* go.mod replace targets resolve inside the context.
+# Each Dockerfile COPYs only the dirs it needs (libs/hostkit, libs/jinja
+# for node-host-agent, + its own app dir); this list just keeps the
+# context small and reproducible.
 .git/
 .github/
 .moon/
 **/bin/
 **/dist/
 **/node_modules/
-**/notes.md
-**/changelog.md
 **/*.test
 **/coverage.out
+# Source-tree files no Dockerfile consumes: go build ignores _test.go
+# and testdata/ (and none of these images run tests), *.md ships in the
+# build stage only via whole-dir COPYs, go.work must stay OUT so builds
+# run in plain module mode like CI, and mise/.golangci are dev-only.
+**/*_test.go
+**/testdata/
+**/*.md
+go.work*
+mise.toml
+.golangci.yml
 # Gitignored build outputs that must not leak into the build context
 # (a stale apps/node-host-agent/agent is ~47MB). These sit beside the
 # **/bin/ dirs already excluded above.

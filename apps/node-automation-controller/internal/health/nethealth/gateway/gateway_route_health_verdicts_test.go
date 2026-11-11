@@ -122,3 +122,39 @@ func TestGatewayLoadGrantsMemoizesPerCensus(t *testing.T) {
 		t.Fatalf("referencegrants listed %d times, want %d — once per served version", lists, len(referenceGrantGVRs))
 	}
 }
+
+// An EndpointSlice LIST failure counts ONE run_error per sweep: the
+// census attempts once (esTried) and every later backendRef in the
+// sweep short-circuits on esErr instead of re-listing — and
+// re-IncError'ing — per ref. Mirrors the grants census contract.
+func TestGatewayEndpointCensusListErrorCountedOncePerCensus(t *testing.T) {
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false))
+	lists := 0
+	cs.PrependReactor("list", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			lists++
+			return true, nil, errors.New("api down")
+		})
+	p := testProber(cs)
+	chk := p.Checks[0].(*gatewayRouteHealthCheck)
+
+	before := testutil.QueueErrorCount(t, p.Name)
+	c := newGatewayRouteCensus()
+	if err := chk.loadEndpointCensus(ctx, c); err == nil || errors.Is(err, errEndpointCensusInconclusive) {
+		t.Fatalf("first load err=%v want the real list failure", err)
+	}
+	if !c.esErr {
+		t.Fatal("list error did not mark the endpoint census inconclusive")
+	}
+	// A second backendRef's load in the same sweep: sentinel, no
+	// re-list, no second error count.
+	if err := chk.loadEndpointCensus(ctx, c); !errors.Is(err, errEndpointCensusInconclusive) {
+		t.Fatalf("retry err=%v want errEndpointCensusInconclusive", err)
+	}
+	if lists != 1 {
+		t.Fatalf("endpointslices listed %d times, want 1 — esTried must memoize the failure", lists)
+	}
+	if got := testutil.QueueErrorCount(t, p.Name) - before; got != 1 {
+		t.Fatalf("run_errors delta = %v, want 1 — one failed LIST is one incident", got)
+	}
+}

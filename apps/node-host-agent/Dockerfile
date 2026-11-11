@@ -17,6 +17,7 @@ WORKDIR /src
 # not on every source edit. libs/hostkit is go.mod-replaced, so `go mod
 # download` only needs its go.mod, not its sources.
 COPY libs/hostkit/go.* libs/hostkit/
+COPY libs/jinja/go.* libs/jinja/
 COPY apps/node-host-agent/go.mod apps/node-host-agent/go.sum apps/node-host-agent/
 WORKDIR /src/apps/node-host-agent
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -27,6 +28,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Destinations are absolute: WORKDIR is already /src/apps/node-host-agent
 # here, so a relative dest would nest under it instead of landing at /src.
 COPY libs/hostkit/ /src/libs/hostkit/
+COPY libs/jinja/ /src/libs/jinja/
 COPY apps/node-host-agent/ /src/apps/node-host-agent/
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \

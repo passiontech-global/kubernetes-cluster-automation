@@ -112,11 +112,27 @@ type Snapshot struct {
 // (fail-closed source) or merely skips a check.
 func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	s := &Snapshot{G: g, Ctx: ctx}
-	s.NS, s.NSErr = g.CS.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	s.MWC, s.MWCErr = g.CS.AdmissionregistrationV1().
-		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	s.VWC, s.VWCErr = g.CS.AdmissionregistrationV1().
-		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	// Paged censuses — the bare List calls below used to rely on the
+	// apiserver's default page size; on a cluster past it the webhook
+	// duties silently audited a truncated census.
+	opts := metav1.ListOptions{Limit: ListPageSize}
+	if items, err := kube.ListAll(ctx, opts, kube.Namespaces(g.CS)); err != nil {
+		s.NSErr = err
+	} else {
+		s.NS = &corev1.NamespaceList{Items: items}
+	}
+	if items, err := kube.ListAll(ctx, opts,
+		kube.MutatingWebhookConfigurations(g.CS)); err != nil {
+		s.MWCErr = err
+	} else {
+		s.MWC = &admissionv1.MutatingWebhookConfigurationList{Items: items}
+	}
+	if items, err := kube.ListAll(ctx, opts,
+		kube.ValidatingWebhookConfigurations(g.CS)); err != nil {
+		s.VWCErr = err
+	} else {
+		s.VWC = &admissionv1.ValidatingWebhookConfigurationList{Items: items}
+	}
 	// endpoint-census — the node census feeds the effective-ready math: a
 	// "Ready" webhook pod on a partitioned node cannot be called by
 	// the apiserver, so it must not count toward backend health.
@@ -139,7 +155,15 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	} else {
 		s.CRDs, s.CRDErr = kube.ListAll(ctx,
 			metav1.ListOptions{Limit: ListPageSize},
-			kube.DynamicPage(g.Dyn.Resource(CustomResourceDefinitionGVR)))
+			kube.DynamicPage(g.Dyn.Resource(kube.GVRCustomResourceDefinition)))
+		if s.CRDErr == nil {
+			// The duties only read spec.conversion.* — drop the
+			// OpenAPI schemas (the bulk of a CRD census's heap) so
+			// they don't pin 80–150 MiB for the rest of the run.
+			for i := range s.CRDs {
+				kube.StripCRDSchemaVersions(&s.CRDs[i])
+			}
+		}
 	}
 	// Services — paged cluster census shared by the probe-port
 	// resolver (was one Get per webhook backend) and any duty that

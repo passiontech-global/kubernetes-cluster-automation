@@ -43,7 +43,10 @@ type workloadScaleFlappingCheck struct {
 	// excluded for one full window past the rollout's end. In-RAM
 	// like emitted: a controller restart re-arms the gate (the safe
 	// direction is a delayed flap alert, never a false one).
-	stsRolloutSeen map[string]time.Time
+	// state.CooldownSet is the shared last-stamp ledger — the
+	// hand-rolled map it replaced did exactly its Stamp/CooledDown/
+	// PruneExpired job.
+	stsRolloutSeen state.CooldownSet
 }
 
 // NewWorkloadScaleFlappingCheck builds the scale-flap check — the
@@ -157,19 +160,12 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		key := sts.Namespace + "/" + sts.Name
 		if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
 			stsMidRollout[key] = true
-			if p.stsRolloutSeen == nil {
-				p.stsRolloutSeen = map[string]time.Time{}
-			}
-			p.stsRolloutSeen[key] = now
+			p.stsRolloutSeen.Stamp(key, now)
 		}
 	}
 	// Forget rollouts whose last observed mismatch has aged out of
 	// the event window — their churn can no longer be in the census.
-	for key, seen := range p.stsRolloutSeen {
-		if now.Sub(seen) >= scaleFlapWindow {
-			delete(p.stsRolloutSeen, key)
-		}
-	}
+	p.stsRolloutSeen.PruneExpired(now, scaleFlapWindow)
 
 	perWorkload := map[flapKey][]scaleFlapEvent{}
 	for i := range census {
@@ -248,7 +244,7 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		if (e.Reason == stsFlapCreateReason ||
 			e.Reason == stsFlapDeleteReason) &&
 			(stsMidRollout[stsKey] ||
-				now.Sub(p.stsRolloutSeen[stsKey]) < scaleFlapWindow) {
+				p.stsRolloutSeen.CooledDown(stsKey, scaleFlapWindow, now)) {
 			continue
 		}
 		k := flapKey{ns: ns, kind: io.Kind, name: io.Name}

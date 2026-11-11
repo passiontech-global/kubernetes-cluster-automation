@@ -816,7 +816,7 @@ func TestReplicatedDriftMissingSourceQuiet(t *testing.T) {
 func cdaCRD(name string, annos map[string]string, caBundle []byte,
 	svcNS, svcName string) *unstructured.Unstructured {
 	crd := testutil.Unstructured(
-		customResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		kube.GVRCustomResourceDefinition.GroupVersion().WithKind("CustomResourceDefinition"),
 		"", name, nil)
 	crd.SetAnnotations(annos)
 	_ = unstructured.SetNestedField(crd.Object, "Webhook",
@@ -922,7 +922,7 @@ func TestCertDriftAuditorCRDConversionBundleExpiry(t *testing.T) {
 // URL-targeted conversion stay silent.
 func TestCertDriftAuditorCRDConversionEmptyBundle(t *testing.T) {
 	plain := testutil.Unstructured(
-		customResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		kube.GVRCustomResourceDefinition.GroupVersion().WithKind("CustomResourceDefinition"),
 		"", "no-conversion.example.com", nil)
 	cs := fake.NewSimpleClientset()
 	dyn := cdaDyn(
@@ -961,7 +961,7 @@ func TestCertDriftAuditorCRDConversionPrunesDeletedCRD(t *testing.T) {
 	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 1 {
 		t.Fatalf("precondition: mismatch=%v, want 1", got)
 	}
-	if err := dyn.Resource(customResourceDefinitionGVR).
+	if err := dyn.Resource(kube.GVRCustomResourceDefinition).
 		Delete(ctx, "widgets.example.com", metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("delete crd: %v", err)
 	}

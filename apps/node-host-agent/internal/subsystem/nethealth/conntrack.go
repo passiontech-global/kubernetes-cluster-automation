@@ -3,14 +3,13 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 const (
@@ -88,47 +87,6 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 
 // --- conntrack-port-pressure: conntrack insert_failed/drop spike → stale-UDP flush ---
 
-// conntrackStatSum parses /proc/net/stat/nf_conntrack — a header of
-// column names then one HEX row per CPU — and returns the sum of the
-// named columns across all CPUs. ok=false when the file is
-// unreadable or carries none of the wanted columns (module absent →
-// detector idles; hostmetrics' conntrackStatCounters twin).
-func conntrackStatSum(path string, keys ...string) (uint64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 2 {
-		return 0, false
-	}
-	header := strings.Fields(lines[0])
-	idx := map[string]int{}
-	for _, k := range keys {
-		for i, name := range header {
-			if name == k {
-				idx[k] = i
-			}
-		}
-	}
-	if len(idx) == 0 {
-		return 0, false
-	}
-	var sum uint64
-	for _, line := range lines[1:] {
-		f := strings.Fields(line)
-		if len(f) != len(header) {
-			continue // malformed CPU row — skip, never count junk
-		}
-		for _, i := range idx {
-			if v, err := strconv.ParseUint(f[i], 16, 64); err == nil {
-				sum += v
-			}
-		}
-	}
-	return sum, true
-}
-
 // checkConntrackDropSpike — conntrack-port-pressure: the fill-ratio gauge above only
 // sees a nearly-FULL table; insert_failed/drop climb while the table
 // still has headroom when stale UDP tuples collide with new
@@ -138,11 +96,13 @@ func conntrackStatSum(path string, keys ...string) (uint64, bool) {
 // best-effort contract as the :53 flush (a missing binary or denied
 // delete logs and moves on, the cycle verdict is unaffected). The
 // first read only seeds the baseline so an agent restart can't
-// mistake the cumulative counters for a fresh spike.
+// mistake the cumulative counters for a fresh spike. ONE file read
+// per cycle: the combined sum and the insert_failed delta come off
+// the same procfs.ReadConntrackStat parse (the twin conntrackStatSum
+// calls used to read the file twice).
 func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
-	sum, ok := conntrackStatSum(n.cfg.ConntrackStatFile,
-		"insert_failed", "drop", "early_drop")
-	if !ok {
+	st, ok := procfs.ReadConntrackStat(n.cfg.ConntrackStatFile)
+	if !ok || !(st.HasInsertFailed || st.HasDrop || st.HasEarlyDrop) {
 		n.ctStatSeen = false
 		n.ctInsertSeen = false
 		return
@@ -151,8 +111,8 @@ func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
 	// a much smaller per-cycle delta (>5) than the blunt all-UDP
 	// flush (>50): refused inserts are the earliest pressure signal,
 	// and the unreplied-only delete spares ASSURED flows.
-	ins, iok := conntrackStatSum(n.cfg.ConntrackStatFile, "insert_failed")
-	if iok {
+	if st.HasInsertFailed {
+		ins := st.InsertFailed
 		if n.ctInsertSeen && ins > n.ctInsertPrev &&
 			ins-n.ctInsertPrev > conntrackInsertSpike {
 			n.state.SuspectLog(checkCT, fmt.Sprintf(
@@ -164,6 +124,10 @@ func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
 	} else {
 		n.ctInsertSeen = false
 	}
+	// The pressure columns the header carried sum into the combined
+	// delta (missing columns contribute nothing — same as the
+	// per-key sum it replaced).
+	sum := st.InsertFailed + st.Drop + st.EarlyDrop
 	prev, seen := n.ctStatPrev, n.ctStatSeen
 	n.ctStatPrev, n.ctStatSeen = sum, true
 	if !seen || sum <= prev || sum-prev <= conntrackDropSpike {
@@ -257,16 +221,6 @@ func (n *NetHealth) flushPeerNebulaConntrack(ctx context.Context, check string, 
 		n.state.AppendLog(fmt.Sprintf(
 			"ACTION: flushed stale udp/%d conntrack entries for peer %s", port, p))
 	}
-}
-
-// nebulaPeerUnderlayIPs returns the peer underlay IPs the watchdog
-// conf knows about — OVERLAY_PROBE_TARGETS (remote public IPs probed
-// through the tunnel) plus OVERLAY_EGRESS_RELAYS (relay peers). These
-// are the -d destinations conntrack records for udp/<nebula-port>
-// flows; marker IPs are overlay addresses conntrack never sees.
-func nebulaPeerUnderlayIPs(wd *watchdogconf.Config) []string {
-	out := append([]string{}, wd.OverlayProbeTargets...)
-	return append(out, wd.OverlayEgressRelays...)
 }
 
 // flushStaleUDPConntrack drops stale udp/53 conntrack entries after

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
@@ -281,15 +282,17 @@ func (s *natsSweep) logScan(ctx context.Context) {
 		pod := s.census.memberByName[key]
 		g.Go(func() error {
 			reason := ""
-			hit, lerr := probefw.PodLogTail(ctx, s.p.CS, pod, "",
-				probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-				func(line string) bool {
-					if r := natsLogReason(line); r != "" {
-						reason = r // the first marker wins
-						return true
-					}
-					return false
-				})
+			hit, lerr := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{
+				TailLines: probefw.DefaultTailLines,
+				MaxBytes:  probefw.LogMaxBytes,
+				Timeout:   probefw.LogTimeout,
+			}, func(line string) bool {
+				if r := natsLogReason(line); r != "" {
+					reason = r // the first marker wins
+					return true
+				}
+				return false
+			})
 			if lerr == nil && !hit {
 				reason = "" // clean tail — no marker
 			}

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -31,6 +33,10 @@ type webhookPatch struct {
 	mutating bool
 	name     string
 	payload  []byte
+	// cfgObj is the config the patch targets — the SSA ping-pong
+	// gate reads its managedFields (the snapshot lists direct from
+	// the clientset, so the fields are intact).
+	cfgObj metav1.Object
 }
 
 // Sweep removes orphan admission-webhook entries — see doc.go. It is
@@ -85,7 +91,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// re-serializing the whole array from our List snapshot. A
 	// concurrent writer's entry — cainjector rotating caBundle, GitOps
 	// adding a webhook — is merged around, never silently reverted.
-	collect := func(mutating bool, cfgName string, removed []string) {
+	collect := func(mutating bool, cfgName string, cfgObj metav1.Object, removed []string) {
 		if len(removed) == 0 {
 			return
 		}
@@ -102,7 +108,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 				"config", cfgName, "mutating", mutating)
 			return
 		}
-		patches = append(patches, webhookPatch{mutating: mutating, name: cfgName, payload: payload})
+		patches = append(patches, webhookPatch{mutating: mutating, name: cfgName, payload: payload, cfgObj: cfgObj})
 	}
 
 	for _, cfg := range mwc.Items {
@@ -112,7 +118,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 				removed = append(removed, w.Name)
 			}
 		}
-		collect(true, cfg.Name, removed)
+		collect(true, cfg.Name, &cfg, removed)
 	}
 	for _, cfg := range vwc.Items {
 		var removed []string
@@ -121,7 +127,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 				removed = append(removed, w.Name)
 			}
 		}
-		collect(false, cfg.Name, removed)
+		collect(false, cfg.Name, &cfg, removed)
 	}
 
 	// CRD conversion webhooks get the same warn-only treatment: a
@@ -160,6 +166,15 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		kind := guardstate.KindValidating
 		if p.mutating {
 			kind = guardstate.KindMutating
+		}
+		// SSA ping-pong defense: a Git-owned config re-asserts its
+		// webhook list every reconcile — dropping entries past the
+		// Heal-Revert-Loop threshold fights Flux (the orphans are
+		// IN Git). Skip + report; fix the source in Git.
+		if !heal.FluxPatchGate(kind, p.cfgObj, kind+"/"+p.name, time.Now()) {
+			log.Info("skip heal: Flux Heal-Revert Loop detected — orphan-entry patch deferred",
+				"kind", kind, "config", p.name)
+			continue
 		}
 		log.Info("PATCH: drop orphan entries by merge key",
 			"kind", kind, "config", p.name)

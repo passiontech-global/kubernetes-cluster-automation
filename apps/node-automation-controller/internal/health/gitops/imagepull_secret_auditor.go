@@ -103,24 +103,50 @@ func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
+	// One paginated census of the pull-secret type replaces the
+	// per-reference Get storm — the refs set reaches ~150 entries
+	// (every pod, ServiceAccount and workload template), and each Get
+	// was a separate apiserver round trip. The type field selector
+	// keeps the payload to just the secrets this audit reads;
+	// references to any OTHER type (missing, kubernetes.io/dockercfg,
+	// unexpected_type) fall through to a single Get that resolves
+	// which.
+	secs, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			Limit:         probefw.HealthListPageSize,
+			FieldSelector: "type=" + string(corev1.SecretTypeDockerConfigJson),
+		},
+		kube.Secrets(p.CS, metav1.NamespaceAll))
+	if err != nil {
+		return probefw.Result{Infra: fmt.Errorf("list pull secrets: %w", err)}
+	}
+	byRef := make(map[pullSecretRef]*corev1.Secret, len(secs))
+	for i := range secs {
+		byRef[pullSecretRef{ns: secs[i].Namespace, name: secs[i].Name}] = &secs[i]
+	}
+
 	var rep probefw.SweepReport
 	for ref := range refs {
-		sec, err := p.CS.CoreV1().Secrets(ref.ns).
-			Get(ctx, ref.name, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(err):
-			rep.Emit(imagePullSecretUnhealthyGauge,
-				ref.ns+"/"+ref.name+"/missing",
-				[]string{ref.ns, ref.name, "missing"},
-				fmt.Sprintf("%s/%s(missing)", ref.ns, ref.name))
-			continue
-		case err != nil:
-			// A single unreadable Secret is a tolerated
-			// sub-failure: the audit continues on the rest and the
-			// sweep still reports the Infra so the error counts.
-			rep.InfraErr(fmt.Errorf("get secret %s/%s: %w",
-				ref.ns, ref.name, err))
-			continue
+		sec, ok := byRef[ref]
+		if !ok {
+			var err error
+			sec, err = p.CS.CoreV1().Secrets(ref.ns).
+				Get(ctx, ref.name, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(err):
+				rep.Emit(imagePullSecretUnhealthyGauge,
+					ref.ns+"/"+ref.name+"/missing",
+					[]string{ref.ns, ref.name, "missing"},
+					fmt.Sprintf("%s/%s(missing)", ref.ns, ref.name))
+				continue
+			case err != nil:
+				// A single unreadable Secret is a tolerated
+				// sub-failure: the audit continues on the rest and the
+				// sweep still reports the Infra so the error counts.
+				rep.InfraErr(fmt.Errorf("get secret %s/%s: %w",
+					ref.ns, ref.name, err))
+				continue
+			}
 		}
 		reasons := auditPullSecret(sec, now)
 		if len(reasons) == 0 {
@@ -164,13 +190,7 @@ func (p *imagePullSecretAuditorCheck) collectPullSecretRefs(ctx context.Context)
 
 	sas, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		func(ctx context.Context, o metav1.ListOptions) ([]corev1.ServiceAccount, string, error) {
-			page, err := p.CS.CoreV1().ServiceAccounts(metav1.NamespaceAll).List(ctx, o)
-			if err != nil {
-				return nil, "", err
-			}
-			return page.Items, page.Continue, nil
-		})
+		kube.ServiceAccounts(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return nil, fmt.Errorf("list serviceaccounts: %w", err)
 	}

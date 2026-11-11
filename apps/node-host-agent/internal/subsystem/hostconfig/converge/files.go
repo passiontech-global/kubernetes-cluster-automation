@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // maxArtifactBytes bounds the bytes ONE DownloadFile download (and
@@ -127,51 +128,32 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		err = fmt.Errorf("download %s: artifact exceeds the %d MiB cap",
 			url, maxArtifactBytes>>20)
 	}
-	if err == nil {
-		// fsync before rename — the staged artifact must be durable;
-		// Close's error counts too (NFS/delayed-write failures only
-		// surface there). Drop the just-written pages after Sync —
-		// archives are staged for UntarInstall/Sha256FileOK, not for
-		// serving, and their cache would pin the pod's cgroup charge.
-		if err = f.Sync(); err == nil {
-			pagecache.Drop(f)
-		}
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if err == nil && wantSHA256 != "" &&
+		!strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
+		err = fmt.Errorf("download %s: sha256 mismatch", url)
 	}
 	if err != nil {
+		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
 	}
-	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("download %s: sha256 mismatch", url)
-	}
-	// Pin the archive mode before the rename: os.Create's 0666 rides
-	// the umask, so a 077-umask host would stage the shared artifact
-	// tree at 0600 and break the non-root consumers.
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	// Dir fsync after the rename (hostutil.WriteAtomic DirSync
-	// parity): the directory entry itself must be durable, or a
-	// crash between rename and sync can lose the installed file.
-	// Open failure (ENOENT — dir vanished) is tolerated; a Sync
-	// failure is reported.
-	if d, derr := os.Open(filepath.Dir(dst)); derr == nil {
-		if serr := d.Sync(); serr != nil {
-			_ = d.Close()
-			return serr
-		}
-		_ = d.Close()
-	}
-	return nil
+	// fsx.Promote carries the durability contract the bespoke tail
+	// used to hand-roll: fsync before rename — the staged artifact
+	// must be durable; Close's error counts too (NFS/delayed-write
+	// failures only surface there); the just-written pages are
+	// dropped after Sync — archives are staged for
+	// UntarInstall/Sha256FileOK, not for serving, and their cache
+	// would pin the pod's cgroup charge; the archive mode is pinned
+	// before the rename (os.Create's 0666 rides the umask, so a
+	// 077-umask host would stage the shared artifact tree at 0600
+	// and break the non-root consumers); and the dir fsync after the
+	// rename makes the directory entry itself durable (a crash
+	// between rename and sync can lose the installed file).
+	return fsx.Promote(f, dst, fsx.Opts{
+		Mode:      0o644,
+		DirSync:   true,
+		AfterSync: pagecache.Drop,
+	})
 }
 
 // UntarInstall extracts member name from a .tar.gz and atomically
@@ -209,60 +191,35 @@ func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 // collide with the next attempt's), payload fsync + rename + dir
 // fsync, the stage swept on EVERY failure path. The member stream is
 // capped at maxArtifactBytes.
-func installMember(r io.Reader, dst string, mode os.FileMode) (err error) {
+func installMember(r io.Reader, dst string, mode os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	staged := tmp.Name()
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = os.Remove(staged)
-		}
-	}()
 	// One byte past the cap: n > max means the member is over the
-	// budget.
-	n, err := io.Copy(tmp, io.LimitReader(r, maxArtifactBytes+1))
-	if err == nil && n > maxArtifactBytes {
-		err = fmt.Errorf("%s: member exceeds the %d MiB extract cap",
+	// budget. Copy failure (and the cap) sweep the stage before
+	// fsx.Promote takes over its failure paths.
+	if n, cerr := io.Copy(tmp, io.LimitReader(r, maxArtifactBytes+1)); cerr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return cerr
+	} else if n > maxArtifactBytes {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("%s: member exceeds the %d MiB extract cap",
 			dst, maxArtifactBytes>>20)
 	}
-	if err == nil {
-		// fsync before rename (WriteManaged parity) — a crash after
-		// rename must never expose a zeroed binary at the install
-		// path. Then drop the staged pages: a freshly installed
-		// binary's cache charge belongs to whoever execs it, not to
-		// this pod's working set.
-		if err = tmp.Sync(); err == nil {
-			pagecache.Drop(tmp)
-		}
-	}
-	// Close's error counts too — delayed-write failures only
-	// surface there.
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return err // defer sweeps the partial stage
-	}
-	// CreateTemp stages 0600 — force the caller's mode onto the
-	// stage before the rename (hostutil AtomicOpts.Mode parity).
-	if err = os.Chmod(staged, mode); err != nil {
-		return err
-	}
-	if err = os.Rename(staged, dst); err != nil {
-		return err
-	}
-	renamed = true // the stage is gone; nothing left to sweep
-	// Dir fsync after the rename (hostutil.WriteAtomic DirSync
-	// parity). Open failure tolerated, Sync failure reported.
-	if d, derr := os.Open(filepath.Dir(dst)); derr == nil {
-		if serr := d.Sync(); serr != nil {
-			_ = d.Close()
-			return serr
-		}
-		_ = d.Close()
-	}
-	return nil
+	// fsx.Promote carries the durability contract the bespoke tail
+	// used to hand-roll: fsync before rename (WriteManaged parity) —
+	// a crash after rename must never expose a zeroed binary at the
+	// install path; the staged pages are dropped after Sync (a
+	// freshly installed binary's cache charge belongs to whoever
+	// execs it, not to this pod's working set); CreateTemp's 0600 is
+	// overridden with the caller's mode before the rename; and the
+	// dir fsync after the rename makes the directory entry durable.
+	return fsx.Promote(tmp, dst, fsx.Opts{
+		Mode:      mode,
+		DirSync:   true,
+		AfterSync: pagecache.Drop,
+	})
 }

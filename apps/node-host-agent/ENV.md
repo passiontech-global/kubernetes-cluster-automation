@@ -9,9 +9,9 @@ declared once as an `envnames.Env*` const in
 contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
-below group knobs by the package(s) referencing them with the
-source location of the first reference (136 knobs referenced
-across 16 packages). The
+below group knobs by the package(s) referencing them, listing the
+source location of every reference in that package (137 knobs
+referenced across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
 
@@ -25,33 +25,34 @@ subsystem has no env gate.
 
 | Env var | Subsystem | Default |
 | --- | --- | --- |
-| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `onOff(w.defKube)` |
-| `NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE` | concourse-cache | `onOff(w.defKube)` |
-| `NODE_HOST_AGENT_ENABLE_APIPROBER` | apiprober | `envx.ModeOn` |
-| `NODE_HOST_AGENT_ENABLE_HOSTMETRICS` | hostmetrics | `envx.ModeOn` |
-| `NODE_HOST_AGENT_ENABLE_HYGIENE` | workerhygiene | `onOff(w.defKube)` |
-| `NODE_HOST_AGENT_ENABLE_NETHEALTH` | nethealth | `envx.ModeOn` |
-| `NODE_HOST_AGENT_ENABLE_JANITOR` | janitor | `envx.ModeOn` |
-| `NODE_HOST_AGENT_ENABLE_REPORTER` | nodereporter | `onOff(w.defKube)` |
-| `NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE` | controllerhygiene | `envx.ModeAuto` |
-| `NODE_HOST_AGENT_ENABLE_HOSTCONFIG` | hostconfig | `envx.ModeAuto` |
+| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `on` (pod) / `off` (standalone) |
+| `NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE` | concourse-cache | `on` (pod) / `off` (standalone) |
+| `NODE_HOST_AGENT_ENABLE_APIPROBER` | apiprober | `on` |
+| `NODE_HOST_AGENT_ENABLE_HOSTMETRICS` | hostmetrics | `on` |
+| `NODE_HOST_AGENT_ENABLE_HYGIENE` | workerhygiene | `on` (pod) / `off` (standalone) |
+| `NODE_HOST_AGENT_ENABLE_NETHEALTH` | nethealth | `on` |
+| `NODE_HOST_AGENT_ENABLE_JANITOR` | janitor | `on` |
+| `NODE_HOST_AGENT_ENABLE_REPORTER` | nodereporter | `on` (pod) / `off` (standalone) |
+| `NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE` | controllerhygiene | `auto` |
+| `NODE_HOST_AGENT_ENABLE_HOSTCONFIG` | hostconfig | `auto` |
 | — | hubsync | — |
-| `NODE_HOST_AGENT_ENABLE_KINEDB` | kinedb | `envx.ModeAuto` |
+| `NODE_HOST_AGENT_ENABLE_KINEDB` | kinedb | `auto` |
 | `NODE_HOST_AGENT_ENABLE_FEEDER` | — | — |
 
 ## Knobs by package
 
 ### `cmd/agent`
 
-- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:131`
+- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:152`
 - `NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY` — `localbin.go:26`
-- `NODE_HOST_AGENT_REQUEST_TIMEOUT` — `main.go:83`
-- `NODE_HOST_AGENT_STANDALONE` — `main.go:122`
+- `NODE_HOST_AGENT_PPROF_BIND_ADDRESS` — `main.go:272`
+- `NODE_HOST_AGENT_REQUEST_TIMEOUT` — `main.go:87`
+- `NODE_HOST_AGENT_STANDALONE` — `main.go:143`
 - `NODE_HOST_AGENT_TEXTFILE_INTERVAL` — `wiring.go:236`
 
 ### `internal/ops/nebulasign`
 
-- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:64`
+- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `nebulasign.go:65`
 
 ### `internal/ops/opsx`
 
@@ -63,8 +64,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR` — `deps_env.go:115`
 - `NODE_HOST_AGENT_JOURNAL_DIRS` — `deps_env.go:91`
 - `NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED` — `deps_env.go:109`
-- `NODE_HOST_AGENT_NODE_NAME` — `deps_env.go:119`
-- `NODE_HOST_AGENT_NODE_NAME` — `hostctx.go:30`
+- `NODE_HOST_AGENT_NODE_NAME` — `deps_env.go:119, hostctx.go:30`
 - `NODE_HOST_AGENT_TEXTFILE_DIR` — `deps_env.go:117`
 - `NODE_HOST_AGENT_WATCHDOG_CONF` — `deps_env.go:71`
 - `NODE_HOST_AGENT_WATCHDOG_LOG` — `deps_env.go:102`
@@ -86,7 +86,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES` — `config_env.go:116`
 - `NODE_HOST_AGENT_APIPROBER_SOCKET` — `config_env.go:57`
 - `NODE_HOST_AGENT_APIPROBER_TOKEN_FILE` — `config_env.go:71`
-- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober.go:544`
+- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober.go:574`
 
 ### `internal/subsystem/concoursecache`
 
@@ -127,9 +127,9 @@ subsystem has no env gate.
 
 ### `internal/subsystem/hostconfig`
 
-- `NODE_HOST_AGENT_HOSTCONFIG_INTERVAL` — `config_env.go:51`
-- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:47`
-- `NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR` — `config_env.go:49`
+- `NODE_HOST_AGENT_HOSTCONFIG_INTERVAL` — `config_env.go:52`
+- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:48`
+- `NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR` — `config_env.go:50`
 
 ### `internal/subsystem/hostmetrics`
 
@@ -154,8 +154,8 @@ subsystem has no env gate.
 
 ### `internal/subsystem/hubsync`
 
-- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `config_env.go:43`
-- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:42`
+- `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `config_env.go:45`
+- `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:44`
 
 ### `internal/subsystem/janitor`
 
@@ -168,8 +168,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `env.go:44`
 - `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `env.go:46`
 - `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `env.go:36`
-- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `config.go:337`
-- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `env.go:51`
+- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `config.go:337, env.go:51`
 - `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `env.go:38`
 - `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `env.go:42`
 
@@ -224,8 +223,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:230`
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `env.go:97`
+- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:97`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
 - `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:133`

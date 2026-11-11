@@ -76,6 +76,119 @@ func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error
 	return fields[0], nil
 }
 
+// sha256sumCmdChunk bounds one sha256sum invocation's command line —
+// 32KiB keeps every target's ARG_MAX (Linux ~2MiB) and any
+// shell/sudo argv length limit comfortably clear even for the
+// largest mirrors.
+const sha256sumCmdChunk = 32 * 1024
+
+// remoteSHA256All hashes many remote files in ONE SSH session per
+// chunk — a single `sha256sum p1 p2 …` invocation (paths quoted,
+// command line chunked at sha256sumCmdChunk) instead of one session
+// per file, which over WAN round-trips dominated the sync. The
+// per-file semantics remoteSHA256 documents are preserved exactly:
+// an absent file produces no hash line (the coreutils "No such file
+// or directory" note rides stderr through the combined output) and
+// maps to "" — drift; a DIRECTORY is surfaced as an error naming
+// the path (sha256sum reports "Is a directory" and exits 1 exactly
+// like a missing file, and the follow-up `mv tmp path` would
+// silently NEST the staging file inside the directory); any other
+// non-zero exit (126/127 missing tool or denied exec, sudo/shell
+// failures) and transport errors propagate — treating them as
+// "absent" would re-upload on every cycle. Exit 1 from a chunk
+// (absent and/or directory paths) still parses the hash lines the
+// invocation did produce, so one stale path never blanks its
+// siblings' results.
+func remoteSHA256All(ctx context.Context, c Conn,
+	paths []string) (map[string]string, error) {
+	sums := make(map[string]string, len(paths))
+	for _, chunk := range sha256sumChunks(paths) {
+		out, err := c.Run(ctx, "sha256sum "+chunk)
+		if err != nil {
+			var ee ExitError
+			if errors.As(err, &ee) && ee.ExitStatus() == 1 {
+				if dir, isDir := directoryReport(out); isDir {
+					return nil, fmt.Errorf("%s is a directory", dir)
+				}
+				parseSHA256Lines(out, sums)
+				continue
+			}
+			return nil, err
+		}
+		parseSHA256Lines(out, sums)
+	}
+	return sums, nil
+}
+
+// sha256sumChunks splits the quoted-path command tail so no single
+// invocation exceeds sha256sumCmdChunk; one oversized path gets its
+// own chunk rather than being dropped.
+func sha256sumChunks(paths []string) []string {
+	var chunks []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			chunks = append(chunks, b.String())
+			b.Reset()
+		}
+	}
+	for _, p := range paths {
+		q := hostutil.ShellQuote(p)
+		if b.Len() > 0 && b.Len()+1+len(q) > sha256sumCmdChunk {
+			flush()
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(q)
+	}
+	flush()
+	return chunks
+}
+
+// parseSHA256Lines reads coreutils `sha256sum` output lines —
+// `<64 hex>  <path>` in text mode, `<64 hex> *<path>` in binary
+// mode — into sums. Anything else in the combined output (the
+// per-file error notes for absent paths, warnings) carries no hash
+// shape and is skipped.
+func parseSHA256Lines(out string, sums map[string]string) {
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if len(ln) < 66 || ln[64] != ' ' || !isHexHash(ln[:64]) {
+			continue
+		}
+		p := strings.TrimLeft(ln[65:], " *")
+		if p != "" {
+			sums[p] = ln[:64]
+		}
+	}
+}
+
+// isHexHash checks the 64-char sha256 hex prefix.
+func isHexHash(s string) bool {
+	for i := range len(s) {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// directoryReport scans sha256sum's combined output for its per-file
+// "Is a directory" note and returns the offending path.
+func directoryReport(out string) (string, bool) {
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if rest, ok := strings.CutPrefix(ln, "sha256sum: "); ok {
+			if p, ok := strings.CutSuffix(rest, ": Is a directory"); ok && p != "" {
+				return p, true
+			}
+		}
+	}
+	return "", false
+}
+
 // putAtomic streams r into <path>'s staging file, chmods it and
 // atomically renames it over the destination — the order ansible's
 // copy module + mv produced, and the ordering the tests assert.
@@ -163,13 +276,6 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 // lanit→ubuntu) wraps every command in `sudo -n` and streams writes
 // through `sudo -n tee`.
 func needsSudo(user string) bool { return user != "" && user != "root" }
-
-// splitUserHost parses "user@host[:port]" / "host" from
-// ssh_proxyjump — the spec asserted by sync_test.go; the parse
-// itself is sshclient.SplitUserHost (identical shape).
-func splitUserHost(j string) (user, host, port string) {
-	return sshclient.SplitUserHost(j)
-}
 
 // sshConn is hubsync's Conn over an established sshclient.Link —
 // the sudo wrap, streaming Write and per-op conn bound are the

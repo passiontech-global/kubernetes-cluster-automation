@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T7 + T17 ----------

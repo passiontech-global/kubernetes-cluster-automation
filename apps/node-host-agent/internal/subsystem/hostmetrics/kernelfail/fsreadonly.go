@@ -73,7 +73,7 @@ func (r *Runner) roPVCMounts() []string {
 	roots := r.pvcMountRoots()
 	var out []string
 	for _, m := range procfs.ParseMounts(data) {
-		if !m.Opts["ro"] || !pvcMountFSTypes[m.FSType] {
+		if !m.HasOpt("ro") || !pvcMountFSTypes[m.FSType] {
 			continue
 		}
 		under := false

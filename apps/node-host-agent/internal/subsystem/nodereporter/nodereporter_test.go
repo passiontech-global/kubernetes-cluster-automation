@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -899,16 +900,16 @@ func TestFirstLatchAltKeys(t *testing.T) {
 	e.writeFile("state-primary", "1700000001\n")
 	e.writeFile("state-alt-b", "1700000002\n")
 
-	key, since, ok := e.r.firstLatch("primary", []string{"alt-a", "alt-b"})
+	key, since, ok := e.r.firstLatchIdx(nil, "primary", []string{"alt-a", "alt-b"})
 	if !ok || key != "primary" || since != "1700000001" {
-		t.Fatalf("firstLatch=%q,%q,%v want primary,1700000001,true", key, since, ok)
+		t.Fatalf("firstLatchIdx=%q,%q,%v want primary,1700000001,true", key, since, ok)
 	}
 
 	// Primary gone → the first PRESENT alt wins ("alt-a" absent).
 	if err := os.Remove(filepath.Join(e.dir, "state-primary")); err != nil {
 		t.Fatal(err)
 	}
-	key, since, ok = e.r.firstLatch("primary", []string{"alt-a", "alt-b"})
+	key, since, ok = e.r.firstLatchIdx(nil, "primary", []string{"alt-a", "alt-b"})
 	if !ok || key != "alt-b" || since != "1700000002" {
 		t.Fatalf("alt fallback=%q,%q,%v want alt-b,1700000002,true", key, since, ok)
 	}
@@ -917,14 +918,42 @@ func TestFirstLatchAltKeys(t *testing.T) {
 	if err := os.Remove(filepath.Join(e.dir, "state-alt-b")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := e.r.firstLatch("primary", []string{"alt-a", "alt-b"}); ok {
-		t.Fatal("firstLatch reported a latch with no state files")
+	if _, _, ok := e.r.firstLatchIdx(nil, "primary", []string{"alt-a", "alt-b"}); ok {
+		t.Fatal("firstLatchIdx reported a latch with no state files")
 	}
 
 	// Empty keys never match — a def with an empty primary and empty
 	// alts evaluates false without touching the state dir.
-	if _, _, ok := e.r.firstLatch("", []string{"", ""}); ok {
+	if _, _, ok := e.r.firstLatchIdx(nil, "", []string{"", ""}); ok {
 		t.Fatal("empty keys matched")
+	}
+}
+
+// TestReadDirFailureKeepsActiveCondition: a transient ReadDir
+// failure is "no snapshot", not "nothing active" — latchIndex
+// returns nil and firstLatchIdx falls back to per-key probes, so an
+// ACTIVE latch keeps its condition True (the empty-map bug cleared
+// live NodeConditions for a cycle). An x-only state dir fails
+// os.ReadDir while per-file reads still traverse.
+func TestReadDirFailureKeepsActiveCondition(t *testing.T) {
+	e := fixture(t)
+	e.writeFile("state-"+latchdefs.LatchNodeOverloaded, "1700000001\n")
+	if err := os.Chmod(e.dir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.dir, 0o755) })
+	found := false
+	for _, ce := range e.r.evalConditions() {
+		if ce.def.stateKey == latchdefs.LatchNodeOverloaded {
+			found = true
+			if ce.status != corev1.ConditionTrue {
+				t.Fatalf("%s status=%v want True — ReadDir failure cleared an active condition",
+					ce.def.typ, ce.status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no condition def probes " + latchdefs.LatchNodeOverloaded)
 	}
 }
 

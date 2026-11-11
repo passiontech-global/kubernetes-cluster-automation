@@ -54,14 +54,16 @@ func (u *helmReleaseUnlocker) stalledDeployment(ctx context.Context,
 	// No explicit workload: scan the release namespace for the one
 	// Deployment stuck in ProgressDeadlineExceeded — the condition
 	// helm's waiter read when it aborted.
-	deps, err := u.cs.AppsV1().Deployments(releaseNS).List(ctx, metav1.ListOptions{})
+	deps, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Deployments(u.cs, releaseNS))
 	if err != nil {
 		return nil, "", fmt.Errorf("list deployments in %s: %w", releaseNS, err)
 	}
 	var candidates []string
 	var found *appsv1.Deployment
-	for i := range deps.Items {
-		d := &deps.Items[i]
+	for i := range deps {
+		d := &deps[i]
 		if deploymentProgressDeadlineExceeded(d) {
 			candidates = append(candidates, d.Name)
 			found = d

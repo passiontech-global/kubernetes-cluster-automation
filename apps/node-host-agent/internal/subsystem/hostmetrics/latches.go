@@ -35,6 +35,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // Latches is the agent.Subsystem half of hostmetrics — the
@@ -140,9 +141,10 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 		latchdefs.LatchCiliumMTUDrift,
 	} {
 		p := c.state.Path(name)
-		if _, err := os.Stat(p); err == nil {
+		if fi, err := os.Stat(p); err == nil {
 			now := c.cfg.Clock.Now()
-			if cerr := os.Chtimes(p, now, now); cerr != nil {
+			if cerr := hostutil.TouchIfDue(p, fi, now,
+				latchdefs.LatchTouchMinInterval); cerr != nil {
 				logger().Debug("hostmetrics: latch touch failed",
 					"path", p, "error", cerr)
 			}
@@ -152,10 +154,13 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 	// (state-apiserver-backend-stale-<ip-dashed>) — glob the family
 	// instead of naming members.
 	for _, p := range snapStaleLatchPaths(c.state.Dir) {
-		now := c.cfg.Clock.Now()
-		if cerr := os.Chtimes(p, now, now); cerr != nil {
-			logger().Debug("hostmetrics: latch touch failed",
-				"path", p, "error", cerr)
+		if fi, err := os.Stat(p); err == nil {
+			now := c.cfg.Clock.Now()
+			if cerr := hostutil.TouchIfDue(p, fi, now,
+				latchdefs.LatchTouchMinInterval); cerr != nil {
+				logger().Debug("hostmetrics: latch touch failed",
+					"path", p, "error", cerr)
+			}
 		}
 	}
 }

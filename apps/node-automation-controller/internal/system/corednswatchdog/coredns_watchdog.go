@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -239,7 +240,7 @@ func Setup(d shared.Deps) error {
 		w := &coreDNSWatchdog{
 			cs:    d.CS,
 			dyn:   d.Dyn,
-			http:  &http.Client{Timeout: 5 * time.Second},
+			http:  &http.Client{Timeout: 5 * time.Second, Transport: httpx.Transport()},
 			queue: d.Name,
 			now:   shared.SystemClock,
 		}

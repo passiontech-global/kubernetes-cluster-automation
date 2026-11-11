@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -138,17 +140,18 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 // forEachConfig walks the snapshot's mutating then validating configs
 // in order, projecting each config's webhooks through hookView — one
 // shared pass so a kind-specific edit cannot land on only one twin.
-func forEachConfig(snap *guardstate.Snapshot, visit func(kind, cfgName string, hooks []hookView)) {
+func forEachConfig(snap *guardstate.Snapshot,
+	visit func(kind, cfgName string, cfgObj metav1.Object, hooks []hookView)) {
 	if snap.MWC != nil {
 		for i := range snap.MWC.Items {
 			visit(guardstate.KindMutating, snap.MWC.Items[i].Name,
-				mutHookViews(snap.MWC.Items[i].Webhooks))
+				&snap.MWC.Items[i], mutHookViews(snap.MWC.Items[i].Webhooks))
 		}
 	}
 	if snap.VWC != nil {
 		for i := range snap.VWC.Items {
 			visit(guardstate.KindValidating, snap.VWC.Items[i].Name,
-				valHookViews(snap.VWC.Items[i].Webhooks))
+				&snap.VWC.Items[i], valHookViews(snap.VWC.Items[i].Webhooks))
 		}
 	}
 }
@@ -284,8 +287,21 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	// webhooks list, snapshot kept current for the later duties). The
 	// mutating flag only selects the typed clientset call — the only
 	// true MWC/VWC difference.
-	patchExclusion := func(kind string, mutating bool, cfgName string, merges []map[string]any, onFail func()) {
+	patchExclusion := func(kind string, mutating bool, cfgName string,
+		cfgObj metav1.Object, merges []map[string]any, onFail func()) {
 		if len(merges) == 0 {
+			return
+		}
+		// SSA ping-pong defense: the exclusion write fights Flux when
+		// the config is Git-owned (a HelmRelease-applied webhook with
+		// driftDetection re-asserts the Git selector every reconcile).
+		// Past the Heal-Revert-Loop threshold the patch SKIPS — the
+		// missing-exclusion series stays live (onFail) and the
+		// conflict counter fires, so the drift gets fixed in Git.
+		if !heal.FluxPatchGate(kind, cfgObj, kind+"/"+cfgName, time.Now()) {
+			log.Info("skip heal: Flux Heal-Revert Loop detected — exclusion patch deferred",
+				"kind", kind, "config", cfgName)
+			onFail()
 			return
 		}
 		payload, err := json.Marshal(map[string]any{"webhooks": merges})
@@ -332,7 +348,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		}
 	}
 
-	forEachConfig(snap, func(kind, cfgName string, hooks []hookView) {
+	forEachConfig(snap, func(kind, cfgName string, cfgObj metav1.Object, hooks []hookView) {
 		var merges []map[string]any
 		var queued []hookView // webhooks whose exclusion the patch carries
 		for _, w := range hooks {
@@ -354,7 +370,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		// An auto-enforced webhook emits the series only when its
 		// patch FAILED — a landed patch means the exclusion exists
 		// and the ledger re-verifies (and re-emits) next sweep.
-		patchExclusion(kind, kind == guardstate.KindMutating, cfgName, merges, func() {
+		patchExclusion(kind, kind == guardstate.KindMutating, cfgName, cfgObj, merges, func() {
 			for _, w := range queued {
 				s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
 					kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
@@ -437,7 +453,7 @@ func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 			}
 		}
 	}
-	forEachConfig(snap, func(kind, cfgName string, hooks []hookView) {
+	forEachConfig(snap, func(kind, cfgName string, _ metav1.Object, hooks []hookView) {
 		for _, w := range hooks {
 			if !guardstate.FailClosed(w.fp) {
 				continue

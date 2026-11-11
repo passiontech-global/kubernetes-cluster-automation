@@ -140,7 +140,10 @@ func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	if cur, err := os.ReadFile(f); err == nil && string(cur) == content {
 		return
 	}
-	if err := hostutil.WriteFileAtomicBytes(f, []byte(content)); err != nil {
+	// NoSync: the gap file is rewritten every cycle and re-read by
+	// prom_emit — durability buys nothing a crash couldn't recover
+	// next cycle, while the fsync pair fired every 30s per backend.
+	if err := hostutil.WriteFileAtomicNoSync(f, content); err != nil {
 		logger().Warn("watchdog gap file write failed",
 			"file", f, "backend", b.Name, "error", err,
 		)
@@ -166,9 +169,12 @@ func (p *Prober) staleLatched(dir string, b backend) bool {
 func (p *Prober) latchStale(dir string, b backend) {
 	f := dir + "/" + latchdefs.LatchFilePrefix +
 		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
-	if _, err := os.Stat(f); err == nil {
+	if fi, err := os.Stat(f); err == nil {
 		now := time.Now()
-		if cerr := os.Chtimes(f, now, now); cerr != nil {
+		// Touch only once the mtime ages past LatchTouchMinInterval —
+		// the janitor reaps at 24h; per-cycle utimensat was needless.
+		if cerr := hostutil.TouchIfDue(f, fi, now,
+			latchdefs.LatchTouchMinInterval); cerr != nil {
 			logger().Debug("watchdog stale latch touch failed",
 				"file", f, "backend", b.Name, "error", cerr)
 		}

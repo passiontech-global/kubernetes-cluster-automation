@@ -320,10 +320,10 @@ func TestParseMounts(t *testing.T) {
 	if ms[1].Source != "/dev/vda1" || ms[1].MountPoint != "/" || ms[1].FSType != "ext4" {
 		t.Fatalf("mount[1] = %+v", ms[1])
 	}
-	if ms[0].Opts["ro"] || !ms[2].Opts["ro"] || !ms[3].Opts["ro"] {
+	if ms[0].HasOpt("ro") || !ms[2].HasOpt("ro") || !ms[3].HasOpt("ro") {
 		t.Fatal("ro opt lookup wrong")
 	}
-	if !ms[0].Opts["nosuid"] || !ms[1].Opts["relatime"] {
+	if !ms[0].HasOpt("nosuid") || !ms[1].HasOpt("relatime") {
 		t.Fatal("non-ro opts missing")
 	}
 }
@@ -338,10 +338,10 @@ func TestLastByMountPoint(t *testing.T) {
 	if len(by) != 2 {
 		t.Fatalf("got %d mountpoints, want 2", len(by))
 	}
-	if m := by["/var"]; !m.Opts["ro"] || m.Source != "/dev/vdb1" {
+	if m := by["/var"]; !m.HasOpt("ro") || m.Source != "/dev/vdb1" {
 		t.Fatalf("/var = %+v, want the LAST (ro) row", m)
 	}
-	if m := by["/other"]; m.FSType != "xfs" || m.Opts["ro"] {
+	if m := by["/other"]; m.FSType != "xfs" || m.HasOpt("ro") {
 		t.Fatalf("/other = %+v", m)
 	}
 }

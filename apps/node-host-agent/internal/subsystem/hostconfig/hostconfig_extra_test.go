@@ -1,15 +1,13 @@
 // hostconfig_extra_test.go — Reconciler plumbing coverage beyond the
-// core suite: DirWatcher stat-cache corners (walk/read errors, default
-// period, cache-reuse stability), Config.applyDefaults defaults,
-// render failure paths, the systemd verb wrappers' error attribution
-// (ensure/enable/start/restart/stop), the shPort gate, and Run's
-// vars-change watch edge driving a follow-up converge.
+// core suite: Config.applyDefaults defaults, render failure paths, the
+// systemd verb wrappers' error attribution (ensure/enable/start/
+// restart/stop), the shPort gate, and Run's vars-change watch edge
+// driving a follow-up converge. (DirWatcher coverage moved with the
+// type to internal/platform/fileconf/dirwatcher_test.go.)
 package hostconfig
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,74 +17,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
-
-// ---------- DirWatcher corners ----------
-
-// TestDirWatcherMissingDirStable — a watched dir that does not exist
-// (yet — the vars CM may mount late) is skipped by the fingerprint
-// walk; Changed stays false and no error escapes.
-func TestDirWatcherMissingDirStable(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "not-mounted-yet")
-	live := t.TempDir()
-	w := &DirWatcher{Dirs: []string{missing, live}}
-	// First Changed seeds the baseline (pre-Poll fallback); a second
-	// call over the same content must stay quiet.
-	_ = w.Changed()
-	if w.Changed() {
-		t.Fatal("Changed fired twice over a missing dir + empty live dir")
-	}
-	if err := os.WriteFile(filepath.Join(live, "f"), []byte("1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !w.Changed() {
-		t.Fatal("Changed missed a new file in the live dir")
-	}
-}
-
-// TestDirWatcherUnreadableFileExcluded — a file the agent cannot read
-// is excluded from the fingerprint (excluded, not fatal): fingerprint
-// equals the one computed without the file.
-func TestDirWatcherUnreadableFileExcluded(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "ok"), []byte("1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	w := &DirWatcher{Dirs: []string{dir}}
-	sumBefore := w.fingerprint()
-	locked := filepath.Join(dir, "locked")
-	if err := os.WriteFile(locked, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(locked, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
-	if w.fingerprint() != sumBefore {
-		t.Fatal("unreadable file not excluded from the fingerprint")
-	}
-	// Stable across calls: exclusion must not flap the fingerprint.
-	if w.fingerprint() != sumBefore {
-		t.Fatal("fingerprint unstable across calls with an unreadable file")
-	}
-}
-
-// TestDirWatcherDefaultPeriod — Period unset falls back to the
-// package default instead of a zero-ticker panic.
-func TestDirWatcherDefaultPeriod(t *testing.T) {
-	dir := t.TempDir()
-	w := &DirWatcher{Dirs: []string{dir}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { defer close(done); w.Poll(ctx) }()
-	select {
-	case <-done:
-		t.Fatal("Poll returned before ctx cancellation")
-	case <-time.After(150 * time.Millisecond):
-		// Poll latched the baseline and is ticking on the default
-		// period — the zero-period branch did not panic.
-	}
-}
 
 // ---------- Config.applyDefaults ----------
 
@@ -293,24 +223,6 @@ func TestRunBudgetTimeoutRecorded(t *testing.T) {
 	}
 	if d, ok := sr.DeadlineFor("slow probe"); !ok || d <= 0 || d > 30*time.Millisecond {
 		t.Fatalf("deadline = %v ok=%v, want ~the configured CmdTimeout", d, ok)
-	}
-}
-
-// TestDirWatcherDanglingSymlinkSkipped — a dangling symlink is listed
-// by the walk (not a dir) but cannot be stat'd/read: excluded from
-// the fingerprint without failing it.
-func TestDirWatcherDanglingSymlinkSkipped(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "ok"), []byte("1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	w := &DirWatcher{Dirs: []string{dir}}
-	sumBefore := w.fingerprint()
-	if err := os.Symlink(filepath.Join(dir, "gone"), filepath.Join(dir, "dangling")); err != nil {
-		t.Fatal(err)
-	}
-	if w.fingerprint() != sumBefore {
-		t.Fatal("dangling symlink not excluded from the fingerprint")
 	}
 }
 

@@ -227,7 +227,10 @@ func TestProbeArchiveStaleEmitsOne(t *testing.T) {
 
 func TestProbeHygieneMultiXactEmits(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
-		testutil.ExecRule{Substr: "datminmxid", Out: "250000\n"},
+		// The catalog exec answers all three censuses in one
+		// multi-statement output: mxid line, invalid-index line,
+		// seq_scan|seq_tup_read line.
+		testutil.ExecRule{Substr: "datminmxid", Out: "250000\n1\n7|40000\n"},
 	))
 	res := k.Cycle(context.Background())
 	if !res.succeeded {
@@ -242,8 +245,9 @@ func TestProbeHygieneMultiXactEmits(t *testing.T) {
 	}
 }
 
-// A failed mxid read gates only its own series — headers-only in
-// the xact textfile, probe still succeeds.
+// A failed catalog exec gates every census it carries — the mxid
+// series goes headers-only in the xact textfile, probe still
+// succeeds.
 func TestProbeHygieneMultiXactQueryFailure(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "datminmxid", Err: errors.New("connection reset")},
@@ -274,7 +278,7 @@ func TestOrphanPreparedXactsRolledBack(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	fr.On("pg_prepared_xacts", "gid-orphan-1\ngid'quo\n")
 	fr.On("ROLLBACK PREPARED", "ROLLBACK PREPARED\n")
-	before := preparedXactRolledBackTotal.Load()
+	before := k.preparedXactRolledBack.Load()
 	res := k.Cycle(context.Background())
 	h := res.hyg
 	if !h.preparedSeen || h.preparedXacts != 2 || h.preparedRolled != 2 {
@@ -289,7 +293,7 @@ func TestOrphanPreparedXactsRolledBack(t *testing.T) {
 	if !strings.Contains(j, "ROLLBACK PREPARED 'gid''quo'") {
 		t.Fatalf("gid quoting wrong:\n%s", j)
 	}
-	if got := preparedXactRolledBackTotal.Load() - before; got != 2 {
+	if got := k.preparedXactRolledBack.Load() - before; got != 2 {
 		t.Fatalf("rolled-back total delta=%d want 2", got)
 	}
 	content := kdepstest.ReadText(t, dir, xactPromFile)
@@ -348,7 +352,9 @@ func TestNoOrphanPreparedXacts(t *testing.T) {
 
 func TestProbeInvalidIndexCensusEmits(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
-		testutil.ExecRule{Substr: "indisvalid", Out: "2\n"}))
+		// The catalog exec answers all three censuses in one
+		// multi-statement output: mxid line, invalid-index line.
+		testutil.ExecRule{Substr: "indisvalid", Out: "9\n2\n"}))
 	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
@@ -367,7 +373,9 @@ func TestProbeInvalidIndexCensusEmits(t *testing.T) {
 // further spike inside the budget is eaten by the cooldown.
 func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
-	fr.On("seq_tup_read", "120|100000\n")
+	// The catalog exec's three-statement output: mxid, invalid
+	// indexes, seq_scan|seq_tup_read.
+	fr.On("seq_tup_read", "9\n0\n120|100000\n")
 	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
@@ -392,7 +400,7 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 
 	// Second probe: +600K tuples read via seq scan → the planner
 	// regressed; ANALYZE runs immediately, budgeted.
-	fr.On("seq_tup_read", "180|700000\n")
+	fr.On("seq_tup_read", "9\n0\n180|700000\n")
 	res = k.Cycle(context.Background())
 	if !res.hyg.analyzeFired {
 		t.Fatalf("ANALYZE did not fire on a 600K delta: %v", res.notes)
@@ -406,7 +414,7 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 
 	// Third probe still spikes but inside the 30m budget → cooldown.
 	fr.ClearLog()
-	fr.On("seq_tup_read", "200|1400000\n")
+	fr.On("seq_tup_read", "9\n0\n200|1400000\n")
 	res = k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatal("ANALYZE re-fired inside the 30m budget")
@@ -419,12 +427,12 @@ func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
 // A delta at or under 500K is normal kine churn — no ANALYZE.
 func TestProbeSeqScanBelowDeltaNoAnalyze(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
-	fr.On("seq_tup_read", "50|400000\n")
+	fr.On("seq_tup_read", "9\n0\n50|400000\n")
 	res := k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatal("ANALYZE fired on the baseline read")
 	}
-	fr.On("seq_tup_read", "55|890000\n") // +490K — under the trip line
+	fr.On("seq_tup_read", "9\n0\n55|890000\n") // +490K — under the trip line
 	res = k.Cycle(context.Background())
 	if res.hyg.analyzeFired {
 		t.Fatalf("ANALYZE fired under the delta gate: %v", res.notes)
@@ -434,22 +442,23 @@ func TestProbeSeqScanBelowDeltaNoAnalyze(t *testing.T) {
 	}
 }
 
-// Failed item-7 reads gate only their own series — the probe still
-// succeeds and no fabricated counters land in the textfile.
+// A failed catalog exec gates all three censuses it carries — the
+// probe still succeeds and no fabricated counters land in the
+// textfile.
 func TestProbeSeqScanDegradesOnQueryFailure(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
-		testutil.ExecRule{Substr: "seq_tup_read", Err: errors.New("connection reset")},
-		testutil.ExecRule{Substr: "indisvalid", Err: errors.New("connection reset")}))
+		testutil.ExecRule{Substr: "seq_tup_read", Err: errors.New("connection reset")}))
 	res := k.Cycle(context.Background())
 	if !res.succeeded {
 		t.Fatalf("probe failed: %v", res.notes)
 	}
-	if res.hyg.seqSeen || res.hyg.invalidSeen {
+	if res.hyg.seqSeen || res.hyg.invalidSeen || res.hyg.mxidSeen {
 		t.Fatalf("failed reads must stay unseen: %+v", res.hyg)
 	}
 	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	for _, absent := range []string{
 		"kine_db_invalid_indexes",
+		"kine_db_multixact_age_transactions ",
 		"kine_db_seq_scans_total",
 		"kine_db_seq_tuples_read_total",
 	} {
@@ -523,7 +532,7 @@ postgres|postgres|4|50|3|7|0|0|0|0|0|transaction
 func TestProbeSeqScanReadOnlyKeepsBaseline(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	k.d.Cfg.ReadOnly = true
-	fr.On("seq_tup_read", "120|100000\n")
+	fr.On("seq_tup_read", "9\n0\n120|100000\n")
 	res := k.Cycle(context.Background())
 	if !res.hyg.seqSeen || res.hyg.seqTupRead != 100000 {
 		t.Fatalf("seq=%+v", res.hyg)
@@ -540,9 +549,9 @@ func TestProbeSeqScanReadOnlyKeepsBaseline(t *testing.T) {
 // next probe retries (the budget was spent on the attempt).
 func TestProbeSeqScanAnalyzeFailure(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
-	fr.On("seq_tup_read", "120|100000\n")
+	fr.On("seq_tup_read", "9\n0\n120|100000\n")
 	k.Cycle(context.Background()) // baseline
-	fr.On("seq_tup_read", "180|700000\n")
+	fr.On("seq_tup_read", "9\n0\n180|700000\n")
 	fr.FailOn(`ANALYZE "kine"`, errors.New("statement timeout"))
 	res := k.Cycle(context.Background())
 	if res.hyg.analyzeFired {

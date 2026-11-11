@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -417,23 +418,24 @@ func TestARPEntriesSkipsBlankLines(t *testing.T) {
 	}
 }
 
-// TestConntrackStatCountersGuards: a header without any wanted
+// TestConntrackStatParseGuards: a header without any tracked
 // column is inconclusive, and malformed per-CPU rows are skipped
 // rather than summed as junk.
-func TestConntrackStatCountersGuards(t *testing.T) {
+func TestConntrackStatParseGuards(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "nf_conntrack")
-	if _, ok := conntrackStatCounters(filepath.Join(dir, "missing"), "found"); ok {
+	if _, ok := procfs.ReadConntrackStat(filepath.Join(dir, "missing")); ok {
 		t.Fatal("missing file parsed")
 	}
-	testutil.WriteFile(t, p, "entries invalid timeout\n00000002 00000001\n")
-	if _, ok := conntrackStatCounters(p, "found", "create"); ok {
-		t.Fatal("header without a wanted column parsed")
+	testutil.WriteFile(t, p, "entries timeout found\n00000002 00000001\n")
+	if _, ok := procfs.ReadConntrackStat(p); ok {
+		t.Fatal("header without a tracked column parsed")
 	}
 	testutil.WriteFile(t, p,
-		"entries found\n00000002 00000004\n00000001 00000006\n0 SHORT\n")
-	out, ok := conntrackStatCounters(p, "found")
-	if !ok || out["found"] != 10 {
-		t.Fatalf("found=%v ok=%v want 10 (malformed row skipped)", out["found"], ok)
+		"entries insert_failed\n00000002 00000004\n00000001 00000006\n0 SHORT\n")
+	st, ok := procfs.ReadConntrackStat(p)
+	if !ok || st.InsertFailed != 10 {
+		t.Fatalf("insert_failed=%d ok=%v want 10 (malformed cell skipped)",
+			st.InsertFailed, ok)
 	}
 }

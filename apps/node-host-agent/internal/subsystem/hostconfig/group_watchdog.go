@@ -8,7 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T6 watchdog (+ T15 systemd watchdog) ----------
@@ -172,7 +173,7 @@ func (c *cyc) apilbWatchdogVars() (probeBackends []string, lbServers, lbVIP stri
 		if m == nil {
 			continue
 		}
-		name, addr := strOf(m, "name"), strOf(m, "addr")
+		name, addr := m.Str("name"), m.Str("addr")
 		if name == "" || addr == "" {
 			continue
 		}
@@ -226,36 +227,6 @@ func strListVar(c *cyc, name string) []string {
 		func(r rune) bool { return r == ' ' || r == ',' || r == '\'' || r == '"' || r == '[' || r == ']' })
 }
 
-// legacyWatchdogUnits — retired shell-watchdog units, stopped+disabled
-// before their unit FILES are removed. Includes the first Go port's
-// *-restart OnFailure units and both node-watchdog-failed spellings
-// (ansible-installed plain name, spec's @-template name).
-var legacyWatchdogUnits = []string{
-	"node-watchdog.timer",
-	"node-watchdog.service",
-	"node-watchdog-failed.service",
-	"node-watchdog-failed@.service",
-	"k0sworker-watchdog.service",
-	"k0sworker-watchdog-restart.service",
-	"k0scontroller-watchdog.service",
-	"k0scontroller-watchdog-restart.service",
-	"k0s-apiserver-wedge-probe.timer",
-	"k0s-apiserver-wedge-probe.service",
-	"k0s-kine-pool-probe.timer",
-	"k0s-kine-pool-probe.service",
-	"k0s-oomloop-probe.timer",
-	"k0s-oomloop-probe.service",
-	"nebula-route-guard.service",
-	"api-backend-guard.timer",
-	"api-backend-guard.service",
-	"kine-db-probe.timer",
-	"kine-db-probe.service",
-	"kine-compact-guard.timer",
-	"kine-compact-guard.service",
-	"kine-db-maint.timer",
-	"kine-db-maint.service",
-}
-
 // legacyWatchdogDropins — k0s drop-ins of the dead WatchdogSec design
 // (10-watchdog.conf is the ansible-era name, 40-watchdog.conf the
 // restart-loop variant this port already purged).
@@ -304,7 +275,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 	// pass costs only filesystem reads, and the survivors share
 	// ONE disable call (systemctl accepts a unit list).
 	var live []string
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		if r.fileExists("/etc/systemd/system/" + u) {
 			live = append(live, u)
 		}
@@ -314,7 +285,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 			append([]string{"disable", "--now"}, live...)...)
 	}
 	removed := false
-	for _, u := range legacyWatchdogUnits {
+	for _, u := range watchdogconf.LegacyUnits {
 		if ch, _ := r.removeManaged("/etc/systemd/system/" + u); ch {
 			removed = true
 		}

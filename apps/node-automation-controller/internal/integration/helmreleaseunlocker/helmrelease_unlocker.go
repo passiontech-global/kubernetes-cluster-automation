@@ -65,6 +65,17 @@
 //     deleting secrets cannot converge without a working controller;
 //   - an HR stuck again inside the 24h cooldown means the previous
 //     unlock did NOT fix it → IncError (alert) instead of churn.
+//
+// File layout: this file holds the module contract, the
+// unlocker/stall/ledger types and the sweep pipeline (run + Setup);
+// helmrelease_list.go the HR list/paging helpers and the
+// helm-controller health gate, helm_hook_jobs.go the failed helm-hook
+// Job cleanup, helmrelease_identity.go the release-name/namespace
+// resolvers; pending_secret_unlock.go the pending-secret unlock
+// operation, superseded_secret_prune.go the superseded-secret prune,
+// stall_plan.go + helm_stall_unwedge.go + stalled_deployment.go the
+// stalled-rollout unwedge, flux_source_nudge.go the C1 source
+// healer, immutable_job_healer.go the immutable-Job healer.
 package helmreleaseunlocker
 
 import (
@@ -74,20 +85,13 @@ import (
 	"sort"
 	"time"
 
-	"github.com/go-logr/logr"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -386,172 +390,4 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked,
 		"stalled", len(stalled), "stallDue", len(stallDue), "unwedged", unwedged)
 	return errors.Join(pruneErr, ctlErr, ksErr)
-}
-
-// listHelmReleases returns the HR list and the GVR that answered — v2
-// first, v2beta2 when the v2 CRDs are absent. The fallback loop and
-// its benign/real error split are kube.ListFirstGVR's; HRs are
-// unbounded cluster-wide and each item embeds values/crds hooks — a
-// single shot List of a large fleet is a heap spike, so the shared
-// helper pages at kube.DefaultListPageSize.
-func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
-	list, gvr, err := kube.ListFirstUnstructured(ctx, u.dyn, helmReleaseGVRs,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
-	if err != nil {
-		return nil, schema.GroupVersionResource{},
-			fmt.Errorf("list helmreleases (all known GVRs failed): %w", err)
-	}
-	return list, gvr, nil
-}
-
-// listAllPages walks ListOptions.Continue until the apiserver stops
-// paging — every cluster-wide dynamic List in this module goes through
-// it so no single response hauls the whole resource across the wire.
-func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
-	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
-	return kube.ListAllUnstructured(ctx, ri,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
-}
-
-// helmControllerDown reports whether any helm-controller pod is
-// CrashLoopBackOff. A list error is a real error for the caller.
-func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, error) {
-	pods, err := u.cs.CoreV1().Pods(helmControllerNS).List(ctx,
-		metav1.ListOptions{LabelSelector: helmControllerSel})
-	if err != nil {
-		return false, fmt.Errorf("list helm-controller pods: %w", err)
-	}
-	for i := range pods.Items {
-		statuses := append([]corev1.ContainerStatus{},
-			pods.Items[i].Status.InitContainerStatuses...)
-		statuses = append(statuses, pods.Items[i].Status.ContainerStatuses...)
-		for _, s := range statuses {
-			if s.State.Waiting != nil && s.State.Waiting.Reason == "CrashLoopBackOff" {
-				logf.FromContext(ctx).Info("helm-controller pod CrashLoopBackOff",
-					"pod", helmControllerNS+"/"+pods.Items[i].Name,
-					"container", s.Name)
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-// cleanFailedHookJobs deletes batchv1 Jobs in ns that carry the
-// helm.sh/hook annotation AND this release's attribution — the
-// meta.helm.sh/release-name label helm stamps on every rendered
-// resource, hooks included — and report JobFailed=True, with
-// background propagation so their pods go with them. A hook Job
-// without the label (or naming another release) is not provably
-// this release's: unlocking one HelmRelease must never delete
-// another release's failed hook residue an operator may be keeping
-// for debugging, so unattributed Jobs are logged and skipped. Only
-// FAILED hook Jobs are targets — a Running one is a live workload,
-// never reaped. Each deletion bumps
-// metrics.HelmHookJobsCleanedTotal{namespace}. Errors are logged and
-// skipped — hook cleanup never fails the caller.
-func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, release string) {
-	log := logf.FromContext(ctx)
-	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Jobs(u.cs, ns))
-	if err != nil {
-		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
-		return
-	}
-	var targets []*batchv1.Job
-	for i := range jobs {
-		j := &jobs[i]
-		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
-			continue // not a helm hook — never ours to reap
-		}
-		if j.Labels[helmReleaseNameLabel] != release {
-			log.Info("SKIP: helm-hook Job carries no attribution for this release — left alone",
-				"ns", ns, "job", j.Name,
-				"labeledRelease", j.Labels[helmReleaseNameLabel], "release", release)
-			continue
-		}
-		if !jobFailed(j) {
-			continue // still running or succeeded — leave it
-		}
-		targets = append(targets, j)
-	}
-	reap.Sweep(ctx, log, targets, reap.Options[*batchv1.Job]{
-		LogTarget: func(log logr.Logger, j *batchv1.Job) {
-			log.Info("ACTION: delete failed helm-hook Job",
-				"ns", ns, "job", j.Name)
-		},
-		Delete: func(ctx context.Context, j *batchv1.Job) error {
-			if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
-				kube.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
-				return err
-			}
-			metrics.HelmHookJobsCleanedTotal.WithLabelValues(ns).Inc()
-			return nil
-		},
-		// Delete failures are logged and skipped, never IncError'd —
-		// the sweep is best-effort residue cleanup riding a heal,
-		// and the periodic wrapper already counts the run error.
-		OnError: func(log logr.Logger, j *batchv1.Job, err error) {
-			if apierrors.IsNotFound(err) {
-				// Raced with the Job's own cleanup — nothing left to
-				// reap, nothing went wrong (cilium-identity janitor
-				// parity: a benign race is a skip, not an error).
-				log.Info("SKIP: helm-hook Job already gone — raced with its own cleanup",
-					"ns", ns, "job", j.Name)
-				return
-			}
-			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
-		},
-	})
-}
-
-// jobFailed reports whether the Job carries a JobFailed=True condition.
-func jobFailed(j *batchv1.Job) bool {
-	for _, c := range j.Status.Conditions {
-		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-// hrReleaseName mirrors upstream flux's GetReleaseName():
-// spec.releaseName wins, then "<targetNamespace>-<name>" when a
-// targetNamespace is set (flux prefixes the release name to keep
-// same-named HRs in different target namespaces distinct), then the
-// bare object name. It is the `name=` label helm puts on its release
-// secrets.
-func hrReleaseName(hr *unstructured.Unstructured) string {
-	if n, _ := kube.NestedString(hr.Object, "spec", "releaseName"); n != "" {
-		return n
-	}
-	if ns, _ := kube.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
-		return ns + "-" + hr.GetName()
-	}
-	return hr.GetName()
-}
-
-// hrReleaseNS resolves where the release is INSTALLED —
-// spec.targetNamespace || HR namespace (upstream flux's
-// GetReleaseNamespace used to locate hook Jobs, pods, and every
-// workload the chart renders). Hook Jobs live here, not in the
-// storage namespace.
-func hrReleaseNS(hr *unstructured.Unstructured) string {
-	if ns, _ := kube.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
-		return ns
-	}
-	return hr.GetNamespace()
-}
-
-// hrStorageNS mirrors upstream flux's GetStorageNamespace():
-// spec.storageNamespace || HR namespace. This is where helm-controller
-// writes the sh.helm.release.v1 secrets — spec.targetNamespace is NOT
-// part of the chain (it only locates the installed release, not its
-// bookkeeping).
-func hrStorageNS(hr *unstructured.Unstructured) string {
-	if ns, _ := kube.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
-		return ns
-	}
-	return hr.GetNamespace()
 }

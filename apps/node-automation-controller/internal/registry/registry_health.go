@@ -8,18 +8,25 @@ package registry
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/clusterhealthprobes"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/dragonfly"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/nats"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/olm"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/percona"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/postgres"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/pvc"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/rabbitmq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/scylla"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cloudflared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/gateway"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/liqo"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/leases"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/localpv"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/sprawl"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -53,8 +60,8 @@ var healthRows = []shared.Module{
 	{Name: "kcm-workqueue-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameKCMWorkqueue, New: watchdogs.NewKcmWorkqueueCheck}},
 	{Name: "operator-workqueue-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameOperatorWorkqueue, New: watchdogs.NewOperatorWorkqueueCheck}},
 	{Name: "stateful-masterless-services", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameStatefulMasterless, New: datastore.NewStatefulMasterlessCheck}},
-	{Name: "rabbitmq-suspended-listener", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameRabbitMQSuspended, New: datastore.NewRabbitMQSuspendedCheck}},
-	{Name: "localpv-stranded-pods", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameLocalPVStranded, New: nodehealth.NewLocalPVStrandedCheck}},
+	{Name: "rabbitmq-suspended-listener", Group: groupHealth, CheckReg: &shared.CheckReg{Name: rabbitmq.CheckNameRabbitMQSuspended, New: rabbitmq.NewRabbitMQSuspendedCheck}},
+	{Name: "localpv-stranded-pods", Group: groupHealth, CheckReg: &shared.CheckReg{Name: localpv.CheckNameLocalPVStranded, New: localpv.NewLocalPVStrandedCheck}},
 	{Name: "olm-subscription-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: olm.CheckNameOLMHealth, New: olm.NewOlmHealthCheck}},
 	{Name: "scheduler-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameSchedulerWatchdog, New: watchdogs.NewSchedulerWatchdogCheck}},
 	{Name: "mesh-controlplane-watchdog", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameMeshWatchdog, New: watchdogs.NewMeshControlPlaneCheck}},
@@ -70,28 +77,28 @@ var healthRows = []shared.Module{
 	{Name: "namespace-terminating-wedged", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNamespaceWedged, New: nodehealth.NewNamespaceTerminatingWedgedCheck}},
 	{Name: "argocd-app-stuck", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameArgoCDAppStuck, New: gitops.NewArgoCDAppStuckCheck}},
 	{Name: "kargo-promotion-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameKargoPromotionHealth, New: gitops.NewKargoPromotionHealthCheck}},
-	{Name: "rabbitmq-quorum-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameRabbitMQQuorum, New: datastore.NewRabbitMQQuorumHealthCheck}},
-	{Name: "dragonfly-replica-sync-storm", Group: groupHealth, CheckReg: &shared.CheckReg{Name: datastore.CheckNameDragonflySyncStorm, New: datastore.NewDragonflyReplicaSyncStormCheck}},
+	{Name: "rabbitmq-quorum-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: rabbitmq.CheckNameRabbitMQQuorum, New: rabbitmq.NewRabbitMQQuorumHealthCheck}},
+	{Name: "dragonfly-replica-sync-storm", Group: groupHealth, CheckReg: &shared.CheckReg{Name: dragonfly.CheckNameDragonflySyncStorm, New: dragonfly.NewDragonflyReplicaSyncStormCheck}},
 	{Name: "image-pull-storm", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameImagePullStorm, New: nodehealth.NewImagePullStormCheck}},
-	{Name: "api-object-sprawl-report-gc", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameAPIObjectSprawlReportGC, New: nodehealth.NewAPIObjectSprawlReportGCCheck}},
+	{Name: "api-object-sprawl-report-gc", Group: groupHealth, CheckReg: &shared.CheckReg{Name: sprawl.CheckNameAPIObjectSprawlReportGC, New: sprawl.NewAPIObjectSprawlReportGCCheck}},
 	{Name: "cpu-steal-taint-sync", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameCPUStealTaintSync, New: nodehealth.NewCPUStealTaintSyncCheck}},
 	{Name: "cilium-missing-endpoint", Group: groupHealth, CheckReg: &shared.CheckReg{Name: cilium.CheckNameCiliumMissingEndpoints, New: cilium.NewCiliumMissingEndpointsCheck}},
 	{Name: "linkerd-h2-stream-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdH2StreamGuard, New: linkerd.NewLinkerdH2StreamGuardCheck}},
-	{Name: "cloudflared-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCloudflaredTunnelHealth, New: nethealth.NewCloudflaredTunnelHealthCheck}},
-	{Name: "liqo-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLiqoTunnelHealth, New: nethealth.NewLiqoTunnelHealthCheck}},
+	{Name: "cloudflared-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: cloudflared.CheckNameCloudflaredTunnelHealth, New: cloudflared.NewCloudflaredTunnelHealthCheck}},
+	{Name: "liqo-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: liqo.CheckNameLiqoTunnelHealth, New: liqo.NewLiqoTunnelHealthCheck}},
 	{Name: "konnectivity-tunnel-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameKonnectivityTunnelHealth, New: nethealth.NewKonnectivityTunnelHealthCheck}},
 	{Name: "postgres-wal-archive-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: postgres.CheckNamePostgresWALArchiveGuard, New: postgres.NewPostgresWALArchiveGuardCheck}},
 	{Name: "scylla-compaction-schema-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: scylla.CheckNameScyllaCompactionSchemaGuard, New: scylla.NewScyllaCompactionSchemaGuardCheck}},
 	{Name: "nats-jetstream-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nats.CheckNameNatsJetstreamHealth, New: nats.NewNatsJetstreamHealthCheck}},
 	{Name: "keda-scaledobject-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameKedaScaledObjectGuard, New: nodehealth.NewKedaScaledObjectGuardCheck}},
 	{Name: "gateway-route-health", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gateway.CheckNameGatewayRouteHealth, New: gateway.NewGatewayRouteHealthCheck}},
-	{Name: "controller-lease-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameControllerLeaseGuard, New: nodehealth.NewControllerLeaseGuardCheck}},
+	{Name: "controller-lease-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: leases.CheckNameControllerLeaseGuard, New: leases.NewControllerLeaseGuardCheck}},
 	{Name: "pvc-resize-stall-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: pvc.CheckNamePVCResizeStallGuard, New: pvc.NewPVCResizeStallGuardCheck}},
 	{Name: "endpointslice-zone-starvation", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameEndpointSliceZoneStarvation, New: nethealth.NewEndpointSliceZoneStarvationCheck}},
-	{Name: "linkerd-outlier-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdOutlierGuard, New: nethealth.NewLinkerdOutlierGuardCheck}},
+	{Name: "linkerd-outlier-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdOutlierGuard, New: linkerd.NewLinkerdOutlierGuardCheck}},
 	{Name: "node-condition-sweeper", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameNodeCondSweeper, New: nodehealth.NewNodeConditionSweeperCheck}},
 	{Name: "onepassword-connect-sync-probe", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameOnePasswordConnectSync, New: watchdogs.NewOnePasswordConnectSyncCheck}},
-	{Name: "linkerd-sidecar-oom-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameLinkerdSidecarOOMGuard, New: nethealth.NewLinkerdSidecarOOMGuardCheck}},
+	{Name: "linkerd-sidecar-oom-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: linkerd.CheckNameLinkerdSidecarOOMGuard, New: linkerd.NewLinkerdSidecarOOMGuardCheck}},
 	{Name: "cilium-datapath-map-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: cilium.CheckNameCiliumDatapathMapGuard, New: cilium.NewCiliumDatapathMapGuardCheck}},
 	{Name: "cilium-l2-lease-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: cilium.CheckNameCiliumL2LeaseGuard, New: cilium.NewCiliumL2LeaseGuardCheck}},
 	{Name: "observability-pipeline-guard", Group: groupHealth, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck}},

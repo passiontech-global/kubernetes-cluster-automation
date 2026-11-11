@@ -4,12 +4,7 @@
 package hostmetrics
 
 import (
-	"cmp"
 	"fmt"
-	"os"
-	"path/filepath"
-	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,39 +36,13 @@ type inotifyConsumer struct {
 	watches   uint64
 }
 
-// inotifyCache is the fdinfo-sweep domain — one slice of what used
-// to be the Collector's shared mu-guarded fields: the cached
-// /proc/*/fdinfo walk result (refreshed at most once per
-// InotifyScanInterval — a full walk per scrape is too heavy) plus
-// the edge-triggered >80% top-3-holder Warn flags. The mutex is
-// private — the sweep shares no state with the other domains.
+// inotifyCache now holds ONLY the edge-triggered >80% top-3-holder
+// Warn flags — the sweep payload itself lives in the shared
+// fdLinkCache (collect_fdlinks.go) that also feeds the eBPF census.
 type inotifyCache struct {
 	mu          sync.Mutex
-	at          time.Time
-	instances   uint64
-	watches     uint64
-	top         []inotifyConsumer
 	warnedInst  bool // edge-triggered >80% Warn per episode
 	warnedWatch bool
-}
-
-// get returns the cached sweep while it is younger than interval.
-func (s *inotifyCache) get(now time.Time, interval time.Duration) (
-	inst, watch uint64, top []inotifyConsumer, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if now.Sub(s.at) >= interval {
-		return 0, 0, nil, false
-	}
-	return s.instances, s.watches, s.top, true
-}
-
-// put stores a fresh sweep result stamped at now.
-func (s *inotifyCache) put(now time.Time, inst, watch uint64,
-	top []inotifyConsumer) {
-	s.mu.Lock()
-	s.at, s.instances, s.watches, s.top = now, inst, watch, top
-	s.mu.Unlock()
 }
 
 // noteWarned edge-updates the per-kind warn flag (over replaces the
@@ -91,98 +60,52 @@ func (s *inotifyCache) noteWarned(kind string, over bool) (was bool) {
 	return was
 }
 
-// --- A1: inotify instances/watches pressure ---
-var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
-
 // inotifyFDTarget is the /proc/<pid>/fd/<fd> symlink target the
 // kernel gives an inotify group fd — the same source
 // node_exporter/procfs uses to count instances.
 const inotifyFDTarget = "anon_inode:inotify"
 
-// sweepInotify walks every /proc/<pid>/fd/* counting inotify
-// INSTANCES by fd symlink target and WATCHES by `inotify wd:` lines
-// in the matching fdinfo file. The symlink read is mandatory: an
-// inotify group holding ZERO watches emits no identifying line in
-// fdinfo — the classic inotify_init() fd leak (exactly what the
-// instances-used ratio exists to catch) is invisible to any
-// fdinfo-only count while the host races max_user_instances.
-func (c *Collector) sweepInotify() (inst, watch uint64, top []inotifyConsumer) {
-	pids, err := os.ReadDir(c.cfg.ProcRoot)
-	if err != nil {
-		return 0, 0, nil
+// inotifyTopN is the holder count the warn report prints.
+const inotifyTopN = 3
+
+// inotifyTopLess ranks a before b — watches-desc, pid-asc (the
+// top-3 holder report's order).
+func inotifyTopLess(a, b inotifyConsumer) bool {
+	if a.watches != b.watches {
+		return a.watches > b.watches
 	}
-	cons := map[int]*inotifyConsumer{}
-	for _, p := range pids {
-		if !p.IsDir() || !pidDirRe.MatchString(p.Name()) {
-			continue
-		}
-		pid, _ := strconv.Atoi(p.Name())
-		fds, err := os.ReadDir(filepath.Join(c.cfg.ProcRoot, p.Name(), "fd"))
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			target, err := os.Readlink(filepath.Join(
-				c.cfg.ProcRoot, p.Name(), "fd", fd.Name()))
-			if err != nil || target != inotifyFDTarget {
-				continue
-			}
-			// fdinfo may be absent or unreadable for a raced fd —
-			// the instance still counts, with zero watches.
-			var w uint64
-			if data, rerr := os.ReadFile(filepath.Join(
-				c.cfg.ProcRoot, p.Name(), "fdinfo", fd.Name())); rerr == nil {
-				w = uint64(strings.Count(string(data), "inotify wd:"))
-			}
-			inst++
-			watch += w
-			cc := cons[pid]
-			if cc == nil {
-				cc = &inotifyConsumer{pid: pid}
-				cons[pid] = cc
-			}
-			cc.instances++
-			cc.watches += w
-		}
-	}
-	for _, cc := range cons {
-		data, err := os.ReadFile(filepath.Join(
-			c.cfg.ProcRoot, strconv.Itoa(cc.pid), "comm"))
-		if err == nil {
-			cc.name = strings.TrimSpace(string(data))
-		}
-	}
-	all := make([]inotifyConsumer, 0, len(cons))
-	for _, cc := range cons {
-		all = append(all, *cc)
-	}
-	slices.SortFunc(all, func(a, b inotifyConsumer) int {
-		if a.watches != b.watches {
-			return cmp.Compare(b.watches, a.watches)
-		}
-		return cmp.Compare(a.pid, b.pid)
-	})
-	if len(all) > 3 {
-		all = all[:3]
-	}
-	return inst, watch, all
+	return a.pid < b.pid
 }
 
-// inotifySnapshot returns the cached sweep, re-walking the procfs
-// at most once per InotifyScanInterval.
-func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
-	if inst, watch, top, ok := c.ino.get(c.cfg.Clock.Now(),
-		c.cfg.InotifyScanInterval); ok {
-		return inst, watch, top
+// inotifyTopInsert keeps top at the bounded top-3 holders the warn
+// report prints, watches-desc/pid-asc — the bounded-insert form of
+// the old sort-every-consumer-then-truncate, which the sort's
+// by-value slice param silently turned into a no-op (SA4006): the
+// full holder set was retained per sweep just to throw all but
+// three away. Worse-than-tail entries return unchanged.
+func inotifyTopInsert(top []inotifyConsumer, cc inotifyConsumer) []inotifyConsumer {
+	pos := len(top)
+	for pos > 0 && inotifyTopLess(cc, top[pos-1]) {
+		pos--
 	}
+	if pos == inotifyTopN {
+		return top
+	}
+	if len(top) < inotifyTopN {
+		top = append(top, inotifyConsumer{})
+	}
+	copy(top[pos+1:], top[pos:])
+	top[pos] = cc
+	return top
+}
 
-	// The /proc/*/fdinfo sweep can take seconds on a busy node —
-	// run it WITHOUT the cache lock so concurrent scrapes aren't
-	// blocked for the whole walk. Two scrapes may then sweep in
-	// parallel; the later store wins, harmless for a cache.
-	inst, watch, top := c.sweepInotify()
-	c.ino.put(c.cfg.Clock.Now(), inst, watch, top)
-	return inst, watch, top
+// inotifySnapshot returns the inotify half of the shared fd-link
+// sweep (collect_fdlinks.go), re-walking the procfs at most once
+// per InotifyScanInterval — the sweep itself is singleflighted
+// with the eBPF consumer.
+func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
+	res := c.fdLinkSnapshot(c.cfg.InotifyScanInterval)
+	return res.inst, res.watch, res.top
 }
 
 // warnInotifyTop edge-logs the top-3 holder report once per

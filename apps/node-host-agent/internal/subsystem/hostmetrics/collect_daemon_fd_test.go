@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +23,12 @@ func procFdFixture(t *testing.T, cfg Config, pid, comm, cmdline string,
 		t.Fatal(err)
 	}
 	testutil.WriteFile(t, filepath.Join(dir, "comm"), comm+"\n")
+	// The shared sweep reads comm+state from stat (the comm file
+	// read is gone) — seed a minimal stat line carrying the comm.
+	pidN, _ := strconv.Atoi(pid)
+	testutil.WriteFile(t, filepath.Join(dir, "stat"),
+		fmt.Sprintf("%d (%s) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+			pidN, comm))
 	if cmdline != "" {
 		testutil.WriteFile(t, filepath.Join(dir, "cmdline"), cmdline)
 	}

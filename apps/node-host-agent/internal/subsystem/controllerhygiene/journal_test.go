@@ -5,9 +5,10 @@ package controllerhygiene
 import (
 	"context"
 	"errors"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"path/filepath"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
 // --- journal-unreadable blindness latch (journalwatch tracker) ---

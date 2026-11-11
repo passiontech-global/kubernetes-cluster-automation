@@ -74,6 +74,7 @@ func (h *Hygiene) initChecks() {
 	add(guards.NewZombieStorm(d))    // wdeps.CheckZombieStorm
 	add(guards.NewJournald(d))       // wdeps.CheckJournald
 	add(guards.NewDstate(d))         // wdeps.CheckDState
+	add(guards.NewPipeWrite(d))      // wdeps.CheckPipeWrite (A1 — state-S pipe_write deadlock)
 	add(guards.NewScopes(d))         // wdeps.CheckSysScopes
 	add(cilium.NewCiliumLRP(d))      // wdeps.CheckCiliumLRP
 	add(guards.NewSpegel(d))         // wdeps.CheckSpegel

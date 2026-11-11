@@ -5,4 +5,5 @@ use (
 	./apps/node-host-agent
 	./apps/webhook-dispatcher
 	./libs/hostkit
+	./libs/jinja
 )

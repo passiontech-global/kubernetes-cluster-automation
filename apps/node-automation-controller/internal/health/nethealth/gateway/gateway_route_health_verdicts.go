@@ -7,12 +7,12 @@ package gateway
 
 import (
 	"context"
+	"errors"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -43,38 +43,32 @@ func (p *gatewayRouteHealthCheck) serviceBackendUnresolved(ctx context.Context,
 	log logr.Logger, c *gatewayRouteCensus, b routeBackendRef) (unresolved, found bool) {
 
 	key := b.ns + "/" + b.name
-	svc, ok := c.services[key]
-	if !ok && !c.svcMiss[key] && !c.svcErr[key] {
-		// The sweep-memoized Services census replaces the per-backend
-		// GET — one paged LIST per sweep serves every route verdict.
+	if !c.svcTried {
+		// The sweep-memoized Services census loads ONCE per sweep —
+		// the first backend miss builds the ns/name index every later
+		// ref shares, replacing the per-miss linear scan over
+		// p.AllServices (and the per-ref IncError a failed list used
+		// to multiply across backend refs).
+		c.svcTried = true
 		svcs, err := p.AllServices(ctx)
-		switch {
-		case err != nil:
-			c.svcErr[key] = true
+		if err != nil {
+			c.svcErr = true
 			metrics.IncError(p.Name)
 			log.Info("WARN: gateway route backend service list failed — verdict inconclusive",
-				"service", key, "error", err)
-		default:
+				"error", err)
+		} else {
+			c.services = make(map[string]*corev1.Service, len(svcs))
 			for i := range svcs {
-				if svcs[i].Namespace == b.ns && svcs[i].Name == b.name {
-					svc = &svcs[i]
-					c.services[key] = svc
-					break
-				}
-			}
-			if svc == nil {
-				c.svcMiss[key] = true
+				c.services[svcs[i].Namespace+"/"+svcs[i].Name] = &svcs[i]
 			}
 		}
 	}
-	switch {
-	case c.svcMiss[key]:
-		return true, true
-	case c.svcErr[key]:
+	if c.svcErr {
 		return false, false
 	}
+	svc := c.services[key]
 	if svc == nil {
-		return false, false // paranoia — cache said neither hit nor miss
+		return true, true // absent from a healthy census = the Service is gone
 	}
 	if !b.hasPort {
 		return false, true // no pinned port — the Service existing is resolution enough
@@ -150,14 +144,25 @@ func (p *gatewayRouteHealthCheck) backendRefGranted(ctx context.Context,
 // nil-Ready-counts-as-ready like the endpoint-sync census. Only
 // slices bound to a Service via kubernetes.io/service-name
 // contribute.
+//
+// Like svcTried/svcErr, the census attempts ONCE per sweep: the
+// first failure counts ONE run_error and leaves esErr set, and every
+// later backend ref in the sweep short-circuits on esTried with the
+// sentinel — one bad LIST is one incident, not one per backendRef.
 func (p *gatewayRouteHealthCheck) loadEndpointCensus(ctx context.Context,
 	c *gatewayRouteCensus) error {
 
 	if c.esLoaded {
 		return nil
 	}
+	if c.esTried {
+		return errEndpointCensusInconclusive
+	}
+	c.esTried = true
 	slices, err := p.AllEndpointSlices(ctx)
 	if err != nil {
+		c.esErr = true
+		metrics.IncError(p.Name)
 		return err
 	}
 	for key, eps := range kube.ReadyEndpointsByService(slices) {
@@ -175,6 +180,11 @@ func (p *gatewayRouteHealthCheck) loadEndpointCensus(ctx context.Context,
 	c.esLoaded = true
 	return nil
 }
+
+// errEndpointCensusInconclusive is what retry callers of
+// loadEndpointCensus see after the census already failed this sweep —
+// the real error was counted and logged on the first attempt.
+var errEndpointCensusInconclusive = errors.New("endpointslice census failed earlier this sweep")
 
 // loadNamespaceWorkloads caches the ns's Deployments/StatefulSets as
 // downscaler verdict inputs. A list failure is a tolerated
@@ -243,10 +253,10 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		if r.GetNamespace() != ns {
 			continue
 		}
-		tl, _, _ := unstructured.NestedStringMap(r.Object,
+		tl, _ := kube.NestedStringMap(r.Object,
 			"spec", "template", "metadata", "labels")
 		var replicas *int32
-		if reps, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
+		if reps, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
 			v := int32(reps)
 			replicas = &v
 		}

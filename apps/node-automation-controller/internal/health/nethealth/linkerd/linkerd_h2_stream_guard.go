@@ -165,23 +165,30 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		cands = append(cands, pod)
 	}
 
-	// Phase 2 — parallel log tails bounded at linkerdH2LogWorkers:
-	// each fetch is a kubelet round-trip (the sweep's slowest
-	// read), and a serial tail over every meshed pod could eat the
-	// whole per-check budget on a large cluster.
+	// Phase 2 — parallel log tails on a FIXED worker pool bounded at
+	// linkerdH2LogWorkers: each fetch is a kubelet round-trip (the
+	// sweep's slowest read), and a serial tail over every meshed pod
+	// could eat the whole per-check budget on a large cluster. The
+	// pool spawns only N goroutines regardless of len(cands) — the
+	// old spawn-all + semaphore shape allocated a goroutine stack
+	// per candidate just to park on the semaphore.
 	sigs := make([]logSignals, len(cands))
-	sem := make(chan struct{}, linkerdH2LogWorkers)
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for i := range cands {
+	for w := 0; w < linkerdH2LogWorkers && w < len(cands); w++ {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			storm, identity, lerr := p.linkerdH2LogSignals(ctx, cands[i])
-			sigs[i] = logSignals{storm: storm, identity: identity, err: lerr}
-		}(i)
+			for i := range jobs {
+				storm, identity, lerr := p.linkerdH2LogSignals(ctx, cands[i])
+				sigs[i] = logSignals{storm: storm, identity: identity, err: lerr}
+			}
+		}()
 	}
+	for i := range cands {
+		jobs <- i
+	}
+	close(jobs)
 	wg.Wait()
 
 	// Phase 3 — the serial verdict + heal pass over the fetched

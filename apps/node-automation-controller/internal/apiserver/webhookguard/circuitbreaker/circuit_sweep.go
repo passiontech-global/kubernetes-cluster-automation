@@ -20,6 +20,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
 
 // circuitJob is one webhook configuration's per-sweep work: the
@@ -30,7 +31,11 @@ type circuitJob struct {
 	name  string
 	anno  string
 	views []hookView
-	patch func(context.Context, []byte) error
+	// cfgObj is the config the patch targets — the SSA ping-pong
+	// gate reads its managedFields (typed configs are listed direct
+	// from the clientset, so the fields are intact).
+	cfgObj metav1.Object
+	patch  func(context.Context, []byte) error
 }
 
 // circuitSweep carries one Breaker.sweep's working state — the armed
@@ -109,6 +114,7 @@ func (s *circuitSweep) buildJobs() {
 			kind: guardstate.KindMutating, name: cfg.Name,
 			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
 			views: mutHookViews(cfg.Webhooks), patch: patchMutating(cfg),
+			cfgObj: cfg,
 		})
 	}
 	for i := range vwcs.Items {
@@ -117,6 +123,7 @@ func (s *circuitSweep) buildJobs() {
 			kind: guardstate.KindValidating, name: cfg.Name,
 			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
 			views: valHookViews(cfg.Webhooks), patch: patchValidating(cfg),
+			cfgObj: cfg,
 		})
 	}
 }
@@ -135,6 +142,20 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 			s.allowTrips)
 		if payload == nil {
 			circuitMetrics(&s.b.brokenEmitted, job.kind, job.name, nil, nil, stillBroken)
+			continue
+		}
+		// SSA ping-pong defense: a Git-owned config (a HelmRelease-
+		// applied webhook with driftDetection) re-asserts the Git
+		// failurePolicy every reconcile — re-flipping it past the
+		// loop threshold is the Heal-Revert Loop. Skip + report; the
+		// window drains before one probe patch re-arms. The series
+		// state carries forward untouched (the annotation, the SSOT,
+		// still lists whatever it listed).
+		if !heal.FluxPatchGate(job.kind, job.cfgObj,
+			job.kind+"/"+job.name, s.now) {
+			s.b.carryBrokenForward(job.kind, job.name, job.views)
+			s.log.Info("skip heal: Flux Heal-Revert Loop detected — circuit patch deferred",
+				"kind", job.kind, "config", job.name)
 			continue
 		}
 		if err := job.patch(ctx, payload); err != nil {

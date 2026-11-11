@@ -40,17 +40,26 @@ type routeWorkload struct {
 }
 
 // gatewayRouteCensus is the lazily-built cluster view the backend
-// checks share: Services fetched on demand and cached by "ns/name"
-// (nil + miss flag for 404s, err flag for inconclusive lookups), the
+// checks share: the Services census loads ONCE on the first backend
+// miss and indexes every service by "ns/name" (svcTried marks the
+// attempt, svcErr a census-level inconclusive so one failed LIST does
+// not re-list — and re-IncError — per backend ref), the
 // Ready-endpoint census loaded on the first valid backend, and the
 // per-namespace workload list loaded on the first zero-endpoint
 // candidate — a cluster with no flagged routes pays nothing.
 type gatewayRouteCensus struct {
-	services  map[string]*corev1.Service
-	svcMiss   map[string]bool
-	svcErr    map[string]bool
-	esReady   map[string]map[string]bool
-	esLoaded  bool
+	services map[string]*corev1.Service
+	svcTried bool
+	svcErr   bool
+	esReady  map[string]map[string]bool
+	esLoaded bool
+	// esTried/esErr mirror svcTried/svcErr for the Ready-endpoint
+	// census: the LIST attempts ONCE per sweep — a failure is a
+	// census-level inconclusive, so later backend refs in the same
+	// sweep share it instead of re-listing (and re-IncError'ing)
+	// per ref.
+	esTried   bool
+	esErr     bool
 	workloads map[string][]routeWorkload
 	wlLoaded  map[string]bool
 	// grants/grantsTried/grantsErr lazily load the ReferenceGrant
@@ -66,8 +75,6 @@ type gatewayRouteCensus struct {
 func newGatewayRouteCensus() *gatewayRouteCensus {
 	return &gatewayRouteCensus{
 		services:  map[string]*corev1.Service{},
-		svcMiss:   map[string]bool{},
-		svcErr:    map[string]bool{},
 		esReady:   map[string]map[string]bool{},
 		workloads: map[string][]routeWorkload{},
 		wlLoaded:  map[string]bool{},

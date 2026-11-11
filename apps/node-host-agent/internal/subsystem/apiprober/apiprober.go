@@ -72,6 +72,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 )
 
@@ -252,7 +253,20 @@ type Prober struct {
 	cfg    Config
 	client *http.Client
 	caKey  string // cache key of the CA bundle p.client was built with
-	states map[string]*backendState
+	// caStat is the hostutil.FileStatKey of the CA file p.client was
+	// built with — refreshClient stats before paying caClient's
+	// read+PEM-parse+sha256, which used to run every cycle even when
+	// the bundle never moved.
+	caStat string
+	// cycleToken/cycleTokenErr/cycleTokenLoaded carry the SA bearer
+	// token read ONCE per Cycle — the projected token only rotates
+	// on pod restart, so listRV's per-query os.ReadFile multiplied a
+	// syscall by 2×backends×cycles for nothing. Outside Cycle
+	// (tests calling listRV directly) bearerToken reads fresh.
+	cycleToken       string
+	cycleTokenErr    error
+	cycleTokenLoaded bool
+	states           map[string]*backendState
 	// eff is the per-cycle effective view of the knobs the guard
 	// conf may carry — refreshGuard() re-derives it from GuardSrc
 	// every Cycle (and once in New so unit-test entry points that
@@ -500,12 +514,28 @@ func (p *Prober) refreshClient() {
 	if p.cfg.HTTPClient != nil || p.cfg.InsecureTLS {
 		return
 	}
+	var statKey string
+	if p.eff.caFile != "" {
+		// Stat-gate before caClient's read+PEM-parse+sha256: an
+		// unchanged (dev,ino,size,mtime) fingerprint proves the
+		// bundle can't have rotated — hostconfig writes CAs by
+		// atomic rename, which always lands a new inode. A stat
+		// error falls through to caClient, which reports it and
+		// keeps the last-good client (unchanged contract).
+		if sk, err := hostutil.FileStatKey(p.eff.caFile); err == nil {
+			statKey = sk
+			if sk == p.caStat {
+				return
+			}
+		}
+	}
 	cl, key, err := caClient(p.eff.caFile)
 	if err != nil {
 		logger().Error("apiprober: CA load failed — keeping previous TLS client",
 			"ca", p.eff.caFile, "error", err)
 		return
 	}
+	p.caStat = statKey
 	if key != p.caKey {
 		p.client.CloseIdleConnections() // drop the rotated client's pool
 		p.client, p.caKey = cl, key

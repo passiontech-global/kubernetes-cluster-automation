@@ -182,23 +182,26 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 // match" as "healthy".
 func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.Pod) (string, error) {
 	var reason string
-	hit, err := probefw.PodLogTail(ctx, p.CS, pod, scyllaContainerName,
-		probefw.DefaultTailLines, probefw.LogMaxBytes, probefw.LogTimeout,
-		func(line string) bool {
-			for _, re := range scyllaGossipPatterns {
-				if re.MatchString(line) {
-					reason = scyllaReasonGossipStall
-					return true
-				}
+	hit, err := kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
+		Container: scyllaContainerName,
+		TailLines: probefw.DefaultTailLines,
+		MaxBytes:  probefw.LogMaxBytes,
+		Timeout:   probefw.LogTimeout,
+	}, func(line string) bool {
+		for _, re := range scyllaGossipPatterns {
+			if re.MatchString(line) {
+				reason = scyllaReasonGossipStall
+				return true
 			}
-			for _, re := range scyllaTombstonePatterns {
-				if re.MatchString(line) {
-					reason = scyllaReasonTombstoneStall
-					return true
-				}
+		}
+		for _, re := range scyllaTombstonePatterns {
+			if re.MatchString(line) {
+				reason = scyllaReasonTombstoneStall
+				return true
 			}
-			return false
-		})
+		}
+		return false
+	})
 	if err != nil || !hit {
 		return "", err
 	}

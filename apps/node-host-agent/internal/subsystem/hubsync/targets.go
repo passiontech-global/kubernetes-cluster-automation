@@ -1,11 +1,8 @@
 package hubsync
 
 import (
-	"strconv"
-	"strings"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // Target is one SSH-converge destination. Source flags are OR-merged
@@ -65,17 +62,22 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 	if defUser == "" {
 		defUser = "root"
 	}
-	bySite := strMap(t.Vars.Get("interdc_ssh_user_by_site"))
+	bySite := map[string]string{}
+	if som, _ := t.Vars.Get("interdc_ssh_user_by_site").(*jinja.OMap); som != nil {
+		for _, k := range som.Keys() {
+			bySite[k] = som.Str(k)
+		}
+	}
 
 	// ssh_user resolution, 1:1 with hub_converge's add_host chains:
 	//   interdc/api-lb: ssh_user → by_site[site] → default_user
 	//   extra_hosts:    ssh_user → default_user   (no site lookup)
 	userOf := func(om *jinja.OMap, siteMap bool) string {
-		if u := omStr(om, "ssh_user"); u != "" {
+		if u := om.Str("ssh_user"); u != "" {
 			return u
 		}
 		if siteMap {
-			if u := bySite[omStr(om, "site")]; u != "" {
+			if u := bySite[om.Str("site")]; u != "" {
 				return u
 			}
 		}
@@ -124,17 +126,17 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 	for _, k := range t.Nodes.Keys() {
 		nv, _ := t.Nodes.Get(k)
 		om, _ := nv.(*jinja.OMap)
-		if om == nil || omBool(om, "agent", true) {
+		if om == nil || om.BoolDef("agent", true) {
 			continue
 		}
 		name := k // registry key = OS hostname = --node-name
 		add(Target{
 			Name:      name,
-			IP:        omStr(om, "ip"),
+			IP:        om.Str("ip"),
 			SSHUser:   userOf(om, true),
-			ProxyJump: omStr(om, "ssh_proxyjump"),
+			ProxyJump: om.Str("ssh_proxyjump"),
 			InterDC:   true,
-			Hub:       omBool(om, "hub", false),
+			Hub:       om.BoolDef("hub", false),
 		})
 	}
 
@@ -145,10 +147,10 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 			continue
 		}
 		add(Target{
-			Name:    omStr(om, "name"),
-			IP:      omStr(om, "ip"),
+			Name:    om.Str("name"),
+			IP:      om.Str("ip"),
 			SSHUser: userOf(om, false),
-			KineDB:  omBool(om, "kine_db", false),
+			KineDB:  om.BoolDef("kine_db", false),
 		})
 	}
 
@@ -159,8 +161,8 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 			continue
 		}
 		add(Target{
-			Name:    omStr(om, "name"),
-			IP:      omStr(om, "ip"),
+			Name:    om.Str("name"),
+			IP:      om.Str("ip"),
 			SSHUser: userOf(om, true),
 			APILB:   true,
 		})
@@ -174,60 +176,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 }
 
 // --- jinja value helpers (topology keeps its coercions unexported) ---
-
-func omStr(m *jinja.OMap, key string) string {
-	v, ok := m.Get(key)
-	if !ok {
-		return ""
-	}
-	return strOf(v)
-}
-
-func omBool(m *jinja.OMap, key string, def bool) bool {
-	v, ok := m.Get(key)
-	if !ok {
-		return def
-	}
-	switch t := v.(type) {
-	case bool:
-		return t
-	case string:
-		// YAML "True"/"Yes"/"1"-style scalars decode as strings —
-		// coerce the ansible truthy/falsy spellings (kineDBHost
-		// parity) and fall back to def on anything unrecognized.
-		switch strings.ToLower(strings.TrimSpace(t)) {
-		case "true", "yes", "1", "on":
-			return true
-		case "false", "no", "0", "off":
-			return false
-		}
-	case int64:
-		return t != 0
-	}
-	return def
-}
-
-func strOf(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case int64:
-		return strconv.FormatInt(t, 10)
-	case float64:
-		return strconv.FormatFloat(t, 'f', -1, 64)
-	}
-	return ""
-}
-
-// strMap flattens a resolved *jinja.OMap var into a plain
-// string map (interdc_ssh_user_by_site).
-func strMap(v any) map[string]string {
-	out := map[string]string{}
-	if om, ok := v.(*jinja.OMap); ok && om != nil {
-		for _, k := range om.Keys() {
-			vv, _ := om.Get(k)
-			out[k] = strOf(vv)
-		}
-	}
-	return out
-}
+//
+// The strOf/strMap/omStr/omBool shims this package used to carry are
+// gone: the typed getters on *jinja.OMap (Str/StrMap/BoolDef) are
+// that family's single home now.

@@ -22,6 +22,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -265,7 +266,7 @@ func TestSweepValidatingPatchFailureReturnsError(t *testing.T) {
 // Service ns/name — the warn-only fixture.
 func osConversionCRD(name, svcNS, svcName string) unstructured.Unstructured {
 	crd := testutil.Unstructured(
-		guardstate.CustomResourceDefinitionGVR.GroupVersion().
+		kube.GVRCustomResourceDefinition.GroupVersion().
 			WithKind("CustomResourceDefinition"), "", name, nil)
 	_ = unstructured.SetNestedField(crd.Object, "Webhook",
 		"spec", "conversion", "strategy")

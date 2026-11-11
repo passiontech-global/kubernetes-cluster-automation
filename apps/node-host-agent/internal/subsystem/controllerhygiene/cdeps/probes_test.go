@@ -3,11 +3,11 @@
 package cdeps_test
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
-
 	"context"
 	"net"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
 func TestPGWire(t *testing.T) {

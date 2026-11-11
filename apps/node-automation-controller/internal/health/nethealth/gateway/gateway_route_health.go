@@ -33,7 +33,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -240,7 +239,9 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 			continue
 		}
 		if err := p.loadEndpointCensus(ctx, census); err != nil {
-			metrics.IncError(p.Name)
+			// The census load counts ONE run_error per sweep (its
+			// first LIST failure); this per-ref branch only logs and
+			// carries the verdict forward.
 			log.Info("WARN: gateway route health — endpointslice list failed, zero-endpoint verdict skipped",
 				"error", err)
 			// Carry-forward: the census is unverifiable this sweep

@@ -1,0 +1,9 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'go'
+layer: 'library'
+stack: 'backend'
+
+project:
+  title: 'jinja'
+  description: 'Mini-Jinja2 template evaluator + ordered-map/YAML values (OMap, filters, tests) behind vars-file resolution. Depends only on go.yaml.in/yaml/v3.'

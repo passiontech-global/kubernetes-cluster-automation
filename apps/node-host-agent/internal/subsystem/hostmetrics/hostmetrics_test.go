@@ -232,8 +232,10 @@ func TestDescribe(t *testing.T) {
 	//   filefd domain) + 1 max_user_namespaces desc (kernel-resource-table-tuning).
 	// + 1 cgroup oom_group_kill desc (pod-cgroup-oomkill-metrics — kubepods.slice joins the
 	//   memory.events unit set).
-	if got := len(ch); got != 77 {
-		t.Fatalf("Describe emitted %d descs want 77", got)
+	// + 3 A6 descs (per-tuple max + per-tuple hot endpoint +
+	//   TCPTimeWaitOverflow — the sockstat/netstat rows).
+	if got := len(ch); got != 80 {
+		t.Fatalf("Describe emitted %d descs want 80", got)
 	}
 }
 

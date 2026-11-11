@@ -17,6 +17,16 @@ func NewZombieStorm(d *wdeps.Deps) *ZombieStormCheck {
 // NewDstate returns the d-state-storm D-state storm detector.
 func NewDstate(d *wdeps.Deps) *DstateCheck { return &DstateCheck{d: d} }
 
+// NewPipeWrite returns the pipe-write-freeze stdout pipe deadlock
+// detector (A1 — the state-S pipe_write class DstateCheck misses).
+func NewPipeWrite(d *wdeps.Deps) *PipeWriteCheck {
+	return &PipeWriteCheck{
+		d:       d,
+		streak:  map[pipeWriteKey]int{},
+		evented: map[string]bool{},
+	}
+}
+
 // NewScopes returns the systemd-scopes abandoned cri-containerd-*.scope sweep.
 func NewScopes(d *wdeps.Deps) *ScopesCheck { return &ScopesCheck{d: d} }
 

@@ -268,7 +268,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 				kind = "Rollout"
 				annotations = r.GetAnnotations()
 				rv = r.GetResourceVersion()
-				if reps, found, _ := unstructured.NestedInt64(r.Object, "spec", "replicas"); found {
+				if reps, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
 					v := int32(reps)
 					replicas = &v
 				}

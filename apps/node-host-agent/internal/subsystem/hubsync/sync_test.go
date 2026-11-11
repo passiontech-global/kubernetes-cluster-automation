@@ -2,6 +2,8 @@ package hubsync
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path"
 	"sort"
@@ -19,6 +21,8 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -823,19 +827,19 @@ func TestRunWaitsForKey(t *testing.T) {
 }
 
 // TestSplitUserHostPort: proxyjump "user@host:port" keeps its port —
-// same spec as cli.go's splitJump.
+// same spec as cli.go's splitJump, via the shared sshclient.SplitUserHost.
 func TestSplitUserHostPort(t *testing.T) {
-	user, host, port := splitUserHost("admin@10.0.0.1:2222")
+	user, host, port := sshclient.SplitUserHost("admin@10.0.0.1:2222")
 	if user != "admin" || host != "10.0.0.1" || port != "2222" {
-		t.Fatalf("splitUserHost(admin@10.0.0.1:2222)=%q,%q,%q", user, host, port)
+		t.Fatalf("SplitUserHost(admin@10.0.0.1:2222)=%q,%q,%q", user, host, port)
 	}
-	user, host, port = splitUserHost("10.0.0.1")
+	user, host, port = sshclient.SplitUserHost("10.0.0.1")
 	if user != "root" || host != "10.0.0.1" || port != "" {
-		t.Fatalf("splitUserHost(10.0.0.1)=%q,%q,%q", user, host, port)
+		t.Fatalf("SplitUserHost(10.0.0.1)=%q,%q,%q", user, host, port)
 	}
-	user, host, port = splitUserHost("ops@bastion")
+	user, host, port = sshclient.SplitUserHost("ops@bastion")
 	if user != "ops" || host != "bastion" || port != "" {
-		t.Fatalf("splitUserHost(ops@bastion)=%q,%q,%q", user, host, port)
+		t.Fatalf("SplitUserHost(ops@bastion)=%q,%q,%q", user, host, port)
 	}
 }
 
@@ -1015,6 +1019,146 @@ func TestRemoteSHA256Directory(t *testing.T) {
 	}
 	if got, err := remoteSHA256(context.Background(), c, "/etc/missing"); err != nil || got != "" {
 		t.Fatalf("missing path=%q err=%v, want absent", got, err)
+	}
+}
+
+// TestRemoteSHA256AllBatch: ONE sha256sum session over all paths —
+// absent files map to "" (drift), a DIRECTORY surfaces as an error
+// naming the path, and a mixed batch still yields the siblings'
+// hashes. Count the hash sessions to pin the batching itself.
+func TestRemoteSHA256AllBatch(t *testing.T) {
+	c := newFakeConn()
+	c.seedFile("/a/bin", []byte("bin-data"))
+	c.seedFile("/etc/f", []byte("f-data"))
+	sums, err := remoteSHA256All(context.Background(), c,
+		[]string{"/a/bin", "/etc/missing", "/etc/f"})
+	if err != nil {
+		t.Fatalf("remoteSHA256All: %v", err)
+	}
+	if got := sums["/a/bin"]; got == "" {
+		t.Fatalf("/a/bin sum=%q, want hashed", got)
+	}
+	if got := sums["/etc/f"]; got == "" {
+		t.Fatalf("/etc/f sum=%q, want hashed", got)
+	}
+	if got, ok := sums["/etc/missing"]; ok && got != "" {
+		t.Fatalf("/etc/missing = %q, want absent", got)
+	}
+	hashRuns := 0
+	for _, op := range c.opsLog() {
+		if strings.HasPrefix(op, "run:sha256sum ") &&
+			!strings.Contains(op, "test -d") {
+			hashRuns++
+		}
+	}
+	if hashRuns != 1 {
+		t.Fatalf("%d sha256sum sessions, want 1 batched session:\n%v",
+			hashRuns, c.opsLog())
+	}
+
+	// A directory in the batch hard-errors naming the path.
+	c.seedDir("/etc/dir")
+	if _, err := remoteSHA256All(context.Background(), c,
+		[]string{"/a/bin", "/etc/dir"}); err == nil ||
+		!strings.Contains(err.Error(), "/etc/dir is a directory") {
+		t.Fatalf("dir in batch err=%v, want is-a-directory error", err)
+	}
+}
+
+// TestRemoteSHA256AllTransportFailure: a session/transport failure is
+// the DISTINCT error path — it propagates and yields no hashes, never
+// silently-empty drift. The runHook simulates a dead transport with a
+// plain error (not an ExitError, so it can't be mistaken for
+// sha256sum's per-file exit 1), and a non-1 exit (127: missing tool)
+// must propagate too — treating either as "absent" would re-upload
+// on every cycle.
+func TestRemoteSHA256AllTransportFailure(t *testing.T) {
+	c := newFakeConn()
+	c.seedFile("/a/bin", []byte("bin-data"))
+	c.runHook = func(string) (string, error) {
+		return "", errors.New("boom:transport")
+	}
+	sums, err := remoteSHA256All(context.Background(), c, []string{"/a/bin"})
+	if err == nil || !strings.Contains(err.Error(), "boom:transport") {
+		t.Fatalf("err=%v, want transport error propagated", err)
+	}
+	if sums != nil {
+		t.Fatalf("sums=%v, want nil on transport failure", sums)
+	}
+
+	// Exit 127 (sha256sum missing / exec denied) is NOT the
+	// absent-file status — same propagation, not drift.
+	c2 := newFakeConn()
+	c2.runHook = func(string) (string, error) {
+		return "bash: sha256sum: command not found", exitErr{127}
+	}
+	if _, err := remoteSHA256All(context.Background(), c2,
+		[]string{"/a/bin"}); err == nil ||
+		!strings.Contains(err.Error(), "exit status 127") {
+		t.Fatalf("err=%v, want exit-127 propagated", err)
+	}
+}
+
+// TestSHA256sumChunks: the quoted-path command tail never exceeds
+// sha256sumCmdChunk per invocation — an over-budget batch splits into
+// several sha256sum sessions (still far fewer than one per file) and
+// every path is hashed exactly once; a single oversized path gets its
+// own chunk rather than being dropped.
+func TestSHA256sumChunks(t *testing.T) {
+	var paths []string
+	for i := range 40 {
+		paths = append(paths, fmt.Sprintf("/d/file-%03d-%s", i, strings.Repeat("x", 1000)))
+	}
+	chunks := sha256sumChunks(paths)
+	if len(chunks) < 2 {
+		t.Fatalf("%d chunks, want the ~40KiB batch split", len(chunks))
+	}
+	seen := map[string]int{}
+	for i, ch := range chunks {
+		if len(ch) > sha256sumCmdChunk {
+			t.Fatalf("chunk %d is %d bytes, budget %d", i, len(ch), sha256sumCmdChunk)
+		}
+		for _, q := range strings.Split(ch, " ") {
+			seen[unshq(q)]++
+		}
+	}
+	if len(seen) != len(paths) {
+		t.Fatalf("%d unique paths across chunks, want %d", len(seen), len(paths))
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Fatalf("path %s hashed %d times, want exactly 1", p, n)
+		}
+	}
+
+	// The batch API runs one session per chunk — and no more.
+	c := newFakeConn()
+	for _, p := range paths {
+		c.seedFile(p, []byte("x"))
+	}
+	sums, err := remoteSHA256All(context.Background(), c, paths)
+	if err != nil {
+		t.Fatalf("remoteSHA256All: %v", err)
+	}
+	if len(sums) != len(paths) {
+		t.Fatalf("%d sums, want %d", len(sums), len(paths))
+	}
+	hashRuns := 0
+	for _, op := range c.opsLog() {
+		if strings.HasPrefix(op, "run:sha256sum ") {
+			hashRuns++
+		}
+	}
+	if hashRuns != len(chunks) {
+		t.Fatalf("%d sha256sum sessions, want %d (one per chunk):\n%v",
+			hashRuns, len(chunks), c.opsLog())
+	}
+
+	// One oversized path is never dropped — its own chunk.
+	big := "/d/" + strings.Repeat("b", sha256sumCmdChunk)
+	got := sha256sumChunks([]string{big})
+	if len(got) != 1 || got[0] != hostutil.ShellQuote(big) {
+		t.Fatalf("oversized path chunks=%q, want the single quoted path", got)
 	}
 }
 

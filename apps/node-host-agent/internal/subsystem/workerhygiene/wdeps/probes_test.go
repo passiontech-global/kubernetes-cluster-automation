@@ -20,9 +20,9 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
-	"time"
 )
 
 // TestDeletedFDStatRegularFile — a live regular file stats with its

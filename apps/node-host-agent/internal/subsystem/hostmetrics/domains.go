@@ -24,16 +24,21 @@ import "github.com/prometheus/client_golang/prometheus"
 
 // scrapeCtx carries the probe results Collect computes once per
 // scrape and shares across domains — psiAvg60 (the same value the
-// node-overloaded latch hysteresis just acted on) and the parsed
-// nebula cert days (folded into BOTH the watchdog-state latch
-// bookkeeping and the days-left gauge). Passing them through the
-// entry point keeps the values per-scrape — a Collector field would
-// race under concurrent Collect.
+// node-overloaded latch hysteresis just acted on), the parsed nebula
+// cert days (folded into BOTH the watchdog-state latch bookkeeping
+// and the days-left gauge) and the per-mount statfs answers the
+// filesystem + fs-bytes domains read (scrapeFSProbes — one statfs
+// per mount per scrape across their overlapping target lists).
+// Passing them through the entry point keeps the values per-scrape —
+// a Collector field would race under concurrent Collect.
 type scrapeCtx struct {
 	avg60    float64
 	psiOK    bool
 	certDays int64
 	certOK   bool
+	// fs holds one answer per probed mount — the keys are the mount
+	// paths of FilesystemTargets ∪ FSBytesTargets.
+	fs map[string]fsProbe
 }
 
 // descMeta carries one exported series family — the desc Describe()
@@ -51,8 +56,9 @@ type descMeta struct {
 // emit, in Describe order.
 //
 // emit is the common shape (the domain reads its sources and pushes
-// metrics). emitCtx is for the three domains that fold in the shared
-// per-scrape probe results — exactly one of the two is set.
+// metrics). emitCtx is for the domains that fold in the shared
+// per-scrape probe results (watchdog, nebula-cert, psi, filesystem,
+// fs-bytes) — exactly one of the two is set.
 type domainEntry struct {
 	name     string
 	emit     func(*Collector, chan<- prometheus.Metric)
@@ -171,7 +177,7 @@ var domainTable = []domainEntry{
 				"invalid column sum over all CPU rows of nf_conntrack stats."},
 		}},
 	{name: "filesystem",
-		emit: (*Collector).collectFilesystem,
+		emitCtx: (*Collector).collectFilesystem,
 		families: []descMeta{
 			{descFSInodesTotal, "node_host_agent_filesystem_inodes_total",
 				"Total inodes on the probed mount (statfs Files)."},
@@ -221,6 +227,10 @@ var domainTable = []domainEntry{
 				"sockstat TCP inuse+tw over the ip_local_port_range width."},
 			{descTCPCloseWaitSocks, "node_tcp_close_wait_sockets",
 				"Sockets in TCP_CLOSE_WAIT across /proc/1/net/tcp{,6}."},
+			{descTCPPerTupleMax, "node_host_agent_tcp_per_tuple_max_sockets",
+				"Max sockets to one (dstIP,dstPort) — tuple hot-spot."},
+			{descTCPPerTupleHot, "node_host_agent_tcp_per_tuple_sockets",
+				"Sockets per hot (dstIP,dstPort) endpoint past the 40k threshold (bounded series)."},
 		}},
 	{name: "pki-certs",
 		emit: (*Collector).collectPKICerts,
@@ -319,6 +329,8 @@ var domainTable = []domainEntry{
 				"TcpExt TCPSynRetrans — retransmitted SYNs."},
 			{descNetstatTCPTimeouts, "node_host_agent_netstat_tcp_timeouts_total",
 				"TcpExt TCPTimeouts — connections that timed out."},
+			{descNetstatTWOverflow, "node_host_agent_netstat_tcp_tw_overflow_total",
+				"TcpExt TCPTimeWaitOverflow — TIME_WAIT dropped past tcp_max_tw_buckets."},
 			{descSNMPReasmFails, "node_host_agent_snmp_ip_reasm_fails_total",
 				"Ip ReasmFails — IP fragment reassembly failures."},
 			{descSNMPRcvbufErrors, "node_host_agent_snmp_udp_rcvbuf_errors_total",
@@ -343,7 +355,7 @@ var domainTable = []domainEntry{
 				"RSS bytes per child process of k0scontroller.service."},
 		}},
 	{name: "fs-bytes",
-		emit: (*Collector).collectFSBytes,
+		emitCtx: (*Collector).collectFSBytes,
 		families: []descMeta{
 			{descFSBytesRatio, "node_host_agent_filesystem_bytes_used_ratio",
 				"Used-block share of the probed mount (1 - Bavail/Blocks via statfs)."},

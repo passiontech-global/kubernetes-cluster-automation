@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- api-lb-vm (api_lb_guard.yaml) ----------
@@ -36,7 +36,7 @@ func (c *cyc) apiLBVMEntry() *jinja.OMap {
 		if m == nil {
 			continue
 		}
-		if strOf(m, "name") == c.r.cfg.NodeName {
+		if m.Str("name") == c.r.cfg.NodeName {
 			return m
 		}
 	}
@@ -103,13 +103,13 @@ func (c *cyc) groupAPILBVM() {
 	if e == nil {
 		return
 	}
-	sockDir := defStr(strOf(e, "haproxy_sock_dir"), "/run/haproxy-admin")
-	socket := defStr(strOf(e, "haproxy_socket"), "/run/haproxy-admin/admin.sock")
-	container := defStr(strOf(e, "haproxy_container"), "haproxy")
-	backend := defStr(strOf(e, "haproxy_backend"), "kubeAPI_backend")
-	backends := defStr(strOf(e, "haproxy_backends"), backend)
-	apiBackends := strOf(e, "api_backends")
-	mode := defStr(strOf(e, "mode"), "enforce")
+	sockDir := defStr(e.Str("haproxy_sock_dir"), "/run/haproxy-admin")
+	socket := defStr(e.Str("haproxy_socket"), "/run/haproxy-admin/admin.sock")
+	container := defStr(e.Str("haproxy_container"), "haproxy")
+	backend := defStr(e.Str("haproxy_backend"), "kubeAPI_backend")
+	backends := defStr(e.Str("haproxy_backends"), backend)
+	apiBackends := e.Str("api_backends")
+	mode := defStr(e.Str("mode"), "enforce")
 
 	// prereqs — best-effort like ansible failed_when: false. runLong:
 	// apt on a slow-egress infra VM outlives the interactive budget.

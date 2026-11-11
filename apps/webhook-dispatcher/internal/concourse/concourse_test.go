@@ -3,17 +3,22 @@ package concourse
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestNormalizeRepo(t *testing.T) {
@@ -463,9 +468,19 @@ func TestFetchIndexColdStartListingFailureErrors(t *testing.T) {
 	if c.index != nil {
 		t.Fatalf("c.index=%v want nil (incomplete index must not cache)", c.index)
 	}
-	// With the ATC recovered the next call retries (there is no
-	// stale index to back off behind) and builds the real index.
+	// Cold-start negative cache: an immediate retry — even with the
+	// ATC recovered — shares the just-failed fetch's error inside
+	// NegCacheTTL instead of stampeding a fresh rebuild (the
+	// concurrent-first-delivery retry storm this cache exists for).
 	stub.unfail("/api/v1/teams/main/pipelines/p1/resources")
+	if _, err := c.Resources(context.Background()); err == nil {
+		t.Fatal("retry inside NegCacheTTL want shared error, got nil")
+	}
+	// Past the window the next call retries for real and builds the
+	// index — there is no stale index to back off behind.
+	c.mu.Lock()
+	c.lastErrAt = time.Now().Add(-time.Hour)
+	c.mu.Unlock()
 	index, err := c.Resources(context.Background())
 	if err != nil {
 		t.Fatalf("retry after recovery: err=%v want nil", err)
@@ -711,17 +726,29 @@ func TestGetJSONDecodes2xxBody(t *testing.T) {
 }
 
 func TestSourceRepo(t *testing.T) {
-	if got := sourceRepo(map[string]any{"uri": "u", "repository": "r"}); got != "u" {
+	// "uri" wins when both keys are present — the same precedence the
+	// map-based decode had.
+	if got := sourceRepo(source{URI: "u", Repository: "r"}); got != "u" {
 		t.Fatalf("uri precedence=%q want u", got)
 	}
-	if got := sourceRepo(map[string]any{"repository": "r"}); got != "r" {
+	if got := sourceRepo(source{Repository: "r"}); got != "r" {
 		t.Fatalf("repository=%q want r", got)
 	}
-	if got := sourceRepo(map[string]any{"uri": 42}); got != "" {
-		t.Fatalf("non-string=%q want empty", got)
+	if got := sourceRepo(source{}); got != "" {
+		t.Fatalf("empty source=%q want empty", got)
 	}
-	if got := sourceRepo(nil); got != "" {
-		t.Fatalf("nil=%q want empty", got)
+	// Struct decode tolerance: every other field a resource type
+	// carries (interval, check_every, nested version, ...) must be
+	// ignored without failing the decode.
+	var s source
+	body := `{"uri":"git@github.com:org/repo.git","repository":"org/repo",` +
+		`"interval":"1h","check_every":"0","insecure":true,"depth":1,` +
+		`"version":{"ref":"main"},"tags":["v1"]}`
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("decode with unknown fields: %v", err)
+	}
+	if s.URI != "git@github.com:org/repo.git" || s.Repository != "org/repo" {
+		t.Fatalf("decoded=%+v want the uri/repository strings", s)
 	}
 }
 
@@ -1069,5 +1096,322 @@ func TestGetJSONDrainsBodyForKeepAliveReuse(t *testing.T) {
 	}
 	if got := conns.Load(); got != 1 {
 		t.Fatalf("TCP connections=%d want 1 (keep-alive reuse requires the body drained)", got)
+	}
+}
+
+func TestSourceDecodeToleratesUnknownFields(t *testing.T) {
+	// fetchIndex decodes Source into the two-key source struct, not
+	// map[string]any: every other field a resource type carries must
+	// be ignored (no decode failure), and "uri" must win over
+	// "repository" when both are present — the map decode's precedence.
+	stub := newATCStub(t, map[string]string{
+		"/api/v1/teams/main/pipelines": `[{"name":"p1"}]`,
+		"/api/v1/teams/main/pipelines/p1/resources": `[
+			{"name":"both","type":"git","source":{
+				"uri":"git@github.com:org/repo.git",
+				"repository":"org/other",
+				"check_every":"15m","insecure":true,
+				"version":{"ref":"main"}}},
+			{"name":"repo-only","type":"github-pr","source":{
+				"repository":"org/repo","team":"org",
+				"api_key":"secret-value"}},
+			{"name":"norepo","type":"time","source":{
+				"interval":"1h","days":["sunday"]}}
+		]`,
+	})
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[Resource]bool{
+		// "both": the git uri wins over the repository key → org/repo.
+		{Pipeline: "p1", Name: "both", Type: "git", Repo: "org/repo"}:            true,
+		{Pipeline: "p1", Name: "repo-only", Type: "github-pr", Repo: "org/repo"}: true,
+	}
+	if len(index) != len(want) {
+		t.Fatalf("index=%+v want %d resources", index, len(want))
+	}
+	for _, r := range index {
+		if !want[r] {
+			t.Fatalf("unexpected resource in index: %+v", r)
+		}
+	}
+}
+
+// linearScan is the reference implementation the O(1) lookup is
+// checked against — the per-delivery scan Match replaced.
+func linearScan(resources []Resource, wantType string,
+	repos map[string]struct{}) []Resource {
+	var out []Resource
+	for _, r := range resources {
+		if r.Type != wantType {
+			continue
+		}
+		if _, ok := repos[r.Repo]; !ok {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// sameResources compares resource slices as multisets — Match visits
+// repos in sorted order, the scan in index order, so order differs by
+// design while content must not.
+func sameResources(got, want []Resource) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := map[Resource]int{}
+	for _, r := range want {
+		counts[r]++
+	}
+	for _, r := range got {
+		counts[r]--
+		if counts[r] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestMatchMatchesLinearScan(t *testing.T) {
+	// Client.Match must return exactly what a linear scan of the
+	// fetched index returns — the (type, repo) lookup map built once
+	// per fetch publish is an optimization over the old per-delivery
+	// scan, not a behavior change.
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repos := map[string]struct{}{
+		"org/repo": {}, "org/other": {}, "org/none": {},
+	}
+	for _, wantType := range []string{"git", "github-pr", "time", "docker"} {
+		got := c.Match(wantType, repos)
+		if want := linearScan(index, wantType, repos); !sameResources(got, want) {
+			t.Fatalf("Match(%s)=%+v want %+v", wantType, got, want)
+		}
+		// Deterministic: same inputs, same output order.
+		if again := c.Match(wantType, repos); !slices.Equal(again, got) {
+			t.Fatalf("Match(%s) order unstable: %+v vs %+v", wantType, again, got)
+		}
+	}
+	// Edge cases: no repos and unknown repos match nothing.
+	if got := c.Match("git", nil); len(got) != 0 {
+		t.Fatalf("Match(git, nil)=%+v want empty", got)
+	}
+	if got := c.Match("git", map[string]struct{}{"org/absent": {}}); len(got) != 0 {
+		t.Fatalf("Match(git, absent)=%+v want empty", got)
+	}
+}
+
+func TestReturnedIndexAndMatchesAreCopies(t *testing.T) {
+	// Resources/Refresh return clone copies and Match value copies —
+	// a caller mutating what it got back must not be able to corrupt
+	// the client's shared snapshot (other deliveries match against
+	// it under load).
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	index[0].Repo = "mutated/caller"
+
+	fresh, err := c.Resources(context.Background()) // cache hit → clone
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range fresh {
+		if r.Repo == "mutated/caller" {
+			t.Fatalf("caller mutation reached the cached index: %+v", r)
+		}
+	}
+
+	matched := c.Match("git", map[string]struct{}{"org/repo": {}})
+	if len(matched) == 0 {
+		t.Fatal("Match returned nothing — index build broken")
+	}
+	matched[0].Repo = "mutated/caller"
+	if again := c.Match("git", map[string]struct{}{"org/repo": {}}); slices.ContainsFunc(again,
+		func(r Resource) bool { return r.Repo == "mutated/caller" }) {
+		t.Fatal("caller mutation reached the lookup map")
+	}
+}
+
+func TestIndexFreshnessMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	RegisterMetrics(reg)
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	errBefore := testutil.ToFloat64(indexFetchErrorsTotal)
+
+	// A successful fetch emits the freshness gauge at ~now.
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ts := testutil.ToFloat64(indexLastRefreshSeconds)
+	if age := time.Since(time.Unix(int64(ts), 0)); age < 0 || age > 5*time.Second {
+		t.Fatalf("refresh timestamp age=%v want ~now", age)
+	}
+
+	// A failed fetch whose stale index is served still counts the
+	// error — deliveries keep flowing while it climbs.
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.lastAttemptAt = c.fetchedAt
+	c.mu.Unlock()
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatalf("stale fallback err=%v want nil", err)
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore+1 {
+		t.Fatalf("fetch errors=%v want %v", got, errBefore+1)
+	}
+
+	// A failed forced Refresh counts too.
+	stub.unfail("/api/v1/teams/main/pipelines")
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.mu.Unlock()
+	stub.fail("/api/v1/teams/main/pipelines", 503)
+	if _, err := c.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh(503) want error")
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore+2 {
+		t.Fatalf("fetch errors=%v want %v", got, errBefore+2)
+	}
+
+	// Recovery: the gauge moves again, the error counter holds.
+	stub.unfail("/api/v1/teams/main/pipelines")
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.lastAttemptAt = c.fetchedAt
+	c.mu.Unlock()
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if age := time.Since(time.Unix(int64(
+		testutil.ToFloat64(indexLastRefreshSeconds)), 0)); age < 0 || age > 5*time.Second {
+		t.Fatalf("post-recovery refresh timestamp age=%v want ~now", age)
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore+2 {
+		t.Fatalf("fetch errors=%v want %v (recovery must not count)", got, errBefore+2)
+	}
+}
+
+// A caller-cancelled context (request shutdown, handler deadline)
+// must not be recorded as an ATC failure: no negative-cache write
+// (which would hand the caller's own unwind to every later cold-start
+// caller) and no indexFetchErrorsTotal increment. The next caller
+// with a live context fetches normally.
+func TestResourcesCallerCancelNotAnATCFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond) // outlive the caller's patience
+		body := pipelinesBody
+		if strings.HasSuffix(r.URL.Path, "/pipelines/p1/resources") {
+			body = p1Body
+		} else if strings.HasSuffix(r.URL.Path, "/pipelines/p2/resources") {
+			body = p2Body
+		}
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	errBefore := testutil.ToFloat64(indexFetchErrorsTotal)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	if _, err := c.Resources(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Resources err=%v want context.Canceled", err)
+	}
+	c.mu.Lock()
+	lastErr := c.lastErr
+	c.mu.Unlock()
+	if lastErr != nil {
+		t.Fatalf("cancelled fetch wrote lastErr=%v — caller unwind must not negative-cache", lastErr)
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore {
+		t.Fatalf("fetch errors=%v want %v (cancellation must not count)", got, errBefore)
+	}
+	// And the next caller with a live context fetches normally — the
+	// cancellation left no negative cache or doomed backoff behind.
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatalf("post-cancel Resources err=%v want nil", err)
+	}
+	if len(index) != 4 {
+		t.Fatalf("index=%d resources want 4", len(index))
+	}
+	// Refresh applies the same rule: no counter, no lastErr. Rewind
+	// the throttle clocks so the cancelled Refresh really fetches.
+	c.mu.Lock()
+	c.fetchedAt = time.Time{}
+	c.lastForceRefreshAt = time.Time{}
+	c.mu.Unlock()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel2)
+	if _, err := c.Refresh(ctx2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Refresh err=%v want context.Canceled", err)
+	}
+	c.mu.Lock()
+	lastErr = c.lastErr
+	c.mu.Unlock()
+	if lastErr != nil {
+		t.Fatalf("cancelled Refresh wrote lastErr=%v", lastErr)
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore {
+		t.Fatalf("fetch errors after cancelled Refresh=%v want %v", got, errBefore)
+	}
+}
+
+// Cold-start waiters surface the flight's error: the first caller
+// starts the only fetch, a second caller arriving mid-flight waits on
+// done and re-loops into the negative cache — it must come back with
+// the SAME failure instead of stamping a duplicate attempt at the
+// ATC.
+func TestColdStartWaiterSurfacesFlightError(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(150 * time.Millisecond) // hold the flight open for the joiner
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, Team: "main", NegCacheTTL: 5 * time.Second}
+
+	errBefore := testutil.ToFloat64(indexFetchErrorsTotal)
+	errs := make(chan error, 2)
+	go func() {
+		_, err := c.Resources(context.Background())
+		errs <- err
+	}()
+	time.Sleep(30 * time.Millisecond) // let the flight install
+	go func() {
+		_, err := c.Resources(context.Background())
+		errs <- err
+	}()
+	e1, e2 := <-errs, <-errs
+	if e1 == nil || e2 == nil {
+		t.Fatalf("cold-start errors %v/%v want both failed", e1, e2)
+	}
+	if e1.Error() != e2.Error() {
+		t.Fatalf("waiter err %v != flight err %v — flight failure must surface", e2, e1)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("pipeline-list hits=%d want 1 (waiter must join the flight)", got)
+	}
+	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore+1 {
+		t.Fatalf("fetch errors=%v want %v (one fetch, two callers)", got, errBefore+1)
 	}
 }

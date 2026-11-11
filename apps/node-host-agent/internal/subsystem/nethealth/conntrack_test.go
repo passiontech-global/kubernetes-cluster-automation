@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -373,35 +374,37 @@ func TestConntrackUnparseableValuesAbort(t *testing.T) {
 	}
 }
 
-// conntrackStatSum unit contract: unreadable file and header
-// without the wanted columns both read as "detector idles"; a
-// malformed CPU row is skipped without poisoning the sum.
-func TestConntrackStatSumParsing(t *testing.T) {
-	if _, ok := conntrackStatSum(filepath.Join(t.TempDir(), "absent"),
-		"insert_failed"); ok {
+// procfs.ReadConntrackStat unit contract: unreadable file and header
+// without the tracked columns both read as "detector idles"; a
+// malformed CPU row is skipped without poisoning the sums.
+func TestConntrackStatParsing(t *testing.T) {
+	if _, ok := procfs.ReadConntrackStat(filepath.Join(t.TempDir(), "absent")); ok {
 		t.Fatal("missing file must not parse")
 	}
 	dir := t.TempDir()
 	noCols := filepath.Join(dir, "nocols")
 	testutil.WriteFile(t, noCols, "entries searched found\n1 2 3\n")
-	if _, ok := conntrackStatSum(noCols, "insert_failed"); ok {
-		t.Fatal("header without wanted columns must not parse")
+	if _, ok := procfs.ReadConntrackStat(noCols); ok {
+		t.Fatal("header without tracked columns must not parse")
 	}
 	// Header-only file: not enough lines for a per-CPU table.
 	testutil.WriteFile(t, noCols, "entries insert_failed\n")
-	if _, ok := conntrackStatSum(noCols, "insert_failed"); ok {
+	if _, ok := procfs.ReadConntrackStat(noCols); ok {
 		t.Fatal("header-only file must not parse")
 	}
-	// Row 2 has the wrong field count → skipped; row 3 counts.
+	// Row 2 has the wrong field count → skipped; rows 3+4 count.
 	mixed := filepath.Join(dir, "mixed")
 	testutil.WriteFile(t, mixed,
 		"entries insert_failed drop\n"+
 			"aa 00000010\n"+ // malformed — dropped
 			"aa 00000010 00000005\n"+ // 16 + 5
 			"aa 00000004 00000000\n") // + 4 = 25
-	sum, ok := conntrackStatSum(mixed, "insert_failed", "drop")
-	if !ok || sum != 25 {
-		t.Fatalf("sum=%d ok=%v want 25 true", sum, ok)
+	st, ok := procfs.ReadConntrackStat(mixed)
+	if !ok || st.InsertFailed+st.Drop != 25 {
+		t.Fatalf("sum=%d ok=%v want 25 true", st.InsertFailed+st.Drop, ok)
+	}
+	if !st.HasInsertFailed || !st.HasDrop {
+		t.Fatalf("presence flags = %v/%v want true/true", st.HasInsertFailed, st.HasDrop)
 	}
 }
 

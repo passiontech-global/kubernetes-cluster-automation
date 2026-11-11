@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- security (fail2ban + sshd hardening) ----------

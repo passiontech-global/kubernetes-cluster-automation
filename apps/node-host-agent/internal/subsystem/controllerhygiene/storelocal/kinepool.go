@@ -27,12 +27,12 @@ package storelocal
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
@@ -48,22 +48,12 @@ var (
 	sockInodeRe = regexp.MustCompile(`^socket:\[([0-9]+)\]$`)
 )
 
-// tcpStateListen is the st column of /proc/net/tcp(6) rows in LISTEN.
-const tcpStateListen = "0A"
-
-// kine-orphaned-conn-watch stuck-connection states on the same st column:
-// FIN_WAIT2 (05) — we closed, the peer never ACKed our FIN;
-// CLOSE_WAIT (08) — the peer closed, the local app never did.
-// Either held open against the DB port is an orphaned connection
-// the pool count alone cannot distinguish from a live one.
-const (
-	tcpStateFinWait2  = "05"
-	tcpStateCloseWait = "08"
-	// kineRetransmitStuck is the retrnsmt column floor that reads
-	// as "retransmitting abnormally" — occasional loss retries sit
-	// at 1-2; a socket past 3 has stopped making progress.
-	kineRetransmitStuck = 3
-)
+// kineRetransmitStuck is the retrnsmt column floor that reads
+// as "retransmitting abnormally" — occasional loss retries sit
+// at 1-2; a socket past 3 has stopped making progress.
+// (The LISTEN "0A" / FIN_WAIT2 "05" / CLOSE_WAIT "08" st spellings
+// are byte-compared below; the tests carry them as consts.)
+const kineRetransmitStuck = 3
 
 // PoolCheck is the kine->DB connection-spiral backstop as a
 // Check — it keeps no in-memory state: the spiral streak lives in
@@ -206,7 +196,10 @@ func (c *PoolCheck) kineDBConnStats(pid, dbPort int) (conns, stuck int) {
 		}
 		// Stream line-by-line — os.ReadFile + string() would pull the
 		// WHOLE host TCP table (kine shares the host netns; 15-25 MiB
-		// on busy nodes) into heap twice, every 60s cycle.
+		// on busy nodes) into heap twice, every 60s cycle. sc.Bytes +
+		// the []byte classifier keep the per-row cost at zero allocs
+		// (~200k fewer heap allocs/min on a busy controller than the
+		// old sc.Text + strings.Fields shape).
 		sc := bufio.NewScanner(fp)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		header := true
@@ -215,7 +208,7 @@ func (c *PoolCheck) kineDBConnStats(pid, dbPort int) (conns, stuck int) {
 				header = false
 				continue // header row
 			}
-			isConn, isStuck := classifyConnLine(sc.Text(), dbPort, inodes)
+			isConn, isStuck := classifyConnLine(sc.Bytes(), dbPort, inodes)
 			if isConn {
 				conns++
 			}
@@ -230,19 +223,21 @@ func (c *PoolCheck) kineDBConnStats(pid, dbPort int) (conns, stuck int) {
 
 // socketInodes returns the socket inode set of a process — the fd
 // symlinks of the form socket:[<inode>].
-func (c *PoolCheck) socketInodes(pid int) map[string]bool {
+func (c *PoolCheck) socketInodes(pid int) map[uint64]bool {
 	entries, err := os.ReadDir(c.d.Proc.File(pid, "fd"))
 	if err != nil {
 		return nil
 	}
-	set := make(map[string]bool, len(entries))
+	set := make(map[uint64]bool, len(entries))
 	for _, e := range entries {
 		link, err := os.Readlink(c.d.Proc.File(pid, "fd", e.Name()))
 		if err != nil {
 			continue
 		}
 		if m := sockInodeRe.FindStringSubmatch(link); m != nil {
-			set[m[1]] = true
+			if ino, err := strconv.ParseUint(m[1], 10, 64); err == nil {
+				set[ino] = true
+			}
 		}
 	}
 	return set
@@ -255,46 +250,156 @@ func (c *PoolCheck) socketInodes(pid int) map[string]bool {
 // signature — FIN_WAIT2/CLOSE_WAIT state or a retrnsmt counter
 // past the stuck floor. stuck ⊆ conn by construction.
 //
+// The row arrives as a []byte subslice of the scanner buffer and is
+// parsed field-by-field with NO allocation — strings.Fields used to
+// allocate a []string plus a header per row over a 15-25 MiB table.
+//
 // Table columns (0-indexed; tx_queue:rx_queue and tr:tm->when are
 // each ONE colon-joined field):
 //
 //	sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ...
 //	0  1     2   3  4     5     6        7   8       9
-func classifyConnLine(line string, dbPort int,
-	inodes map[string]bool) (isConn, isStuck bool) {
+func classifyConnLine(line []byte, dbPort int,
+	inodes map[uint64]bool) (isConn, isStuck bool) {
 
-	f := strings.Fields(line)
-	if len(f) < 10 {
+	remAddr, state, retr, inode, ok := connFields(line)
+	if !ok {
 		return false, false
 	}
-	if f[3] == tcpStateListen {
+	// st is two uppercase hex digits — byte compares replace the
+	// string consts (tcpStateListen "0A", FIN_WAIT2 "05",
+	// CLOSE_WAIT "08").
+	if len(state) == 2 && state[0] == '0' && state[1] == 'A' {
 		return false, false
 	}
-	port, ok := tcpRemotePort(f)
-	if !ok || port != dbPort || !inodes[f[9]] {
+	port, ok := tcpRemotePort(remAddr)
+	if !ok || port != dbPort {
 		return false, false
 	}
-	if f[3] == tcpStateFinWait2 || f[3] == tcpStateCloseWait {
+	ino, ok := decUint(inode)
+	if !ok || !inodes[ino] {
+		return false, false
+	}
+	if len(state) == 2 && state[0] == '0' &&
+		(state[1] == '5' || state[1] == '8') {
 		return true, true
 	}
 	// retrnsmt is %08X — HEX, not decimal (tcp_ipv4.c seq_printf).
 	// Atoi would fail on "0000000A" (10 retries) and misread
 	// "00000010" as ten instead of sixteen.
-	retr, err := strconv.ParseUint(f[6], 16, 32)
-	return true, err == nil && retr > kineRetransmitStuck
+	retrV, ok := hexUint(retr, 8)
+	return true, ok && retrV > kineRetransmitStuck
+}
+
+// connFields extracts the /proc/net/tcp(6) columns the classifier
+// reads — rem_address(2), st(3), retrnsmt(6), inode(9) — as subslices
+// of line, allocation-free. ok=false when the row carries fewer
+// than the 10 leading columns.
+func connFields(line []byte) (remAddr, state, retr, inode []byte, ok bool) {
+	n, i := 0, 0
+	for n <= 9 {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		start := i
+		for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
+		if start == i {
+			break
+		}
+		switch n {
+		case 2:
+			remAddr = line[start:i]
+		case 3:
+			state = line[start:i]
+		case 6:
+			retr = line[start:i]
+		case 9:
+			inode = line[start:i]
+		}
+		n++
+	}
+	if n < 10 {
+		return nil, nil, nil, nil, false
+	}
+	return remAddr, state, retr, inode, true
 }
 
 // tcpRemotePort parses the remote port out of a /proc/net/tcp(6)
-// row's fields — rem_address is hex "0100007F:1538".
-func tcpRemotePort(f []string) (int, bool) {
-	rem := f[2]
-	j := strings.LastIndexByte(rem, ':')
+// row's rem_address — hex "0100007F:1538". The port field is %04X
+// (up to 4 significant hex digits after leading zeros); anything
+// else is not a parseable address:port.
+func tcpRemotePort(rem []byte) (int, bool) {
+	j := bytes.LastIndexByte(rem, ':')
 	if j < 0 {
 		return 0, false
 	}
-	port, err := strconv.ParseUint(rem[j+1:], 16, 16)
-	if err != nil {
+	return hexPort(rem[j+1:])
+}
+
+// hexPort parses 1-4 hex digits (leading zeros allowed, value must
+// fit 16 bits — strconv.ParseUint(s,16,16) parity) without a string
+// allocation.
+func hexPort(s []byte) (int, bool) {
+	if len(s) == 0 {
+		return 0, false // ParseUint("") errors — an empty port field is not 0
+	}
+	s = bytes.TrimLeft(s, "0")
+	if len(s) == 0 {
+		return 0, true // all zeros — ParseUint yields 0, no error
+	}
+	if len(s) > 4 {
 		return 0, false
 	}
-	return int(port), true
+	v, ok := hexUint(s, 4)
+	return int(v), ok
+}
+
+// hexUint parses up to maxDigits hex digits — the retrnsmt column is
+// %08X fixed-width but leading-zero trims keep short forms legal.
+// ok=false on a non-hex byte or overflow past maxDigits.
+func hexUint(s []byte, maxDigits int) (uint64, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	s = bytes.TrimLeft(s, "0")
+	if len(s) == 0 {
+		return 0, true
+	}
+	if len(s) > maxDigits {
+		return 0, false
+	}
+	var v uint64
+	for _, c := range s {
+		var d uint64
+		switch {
+		case c >= '0' && c <= '9':
+			d = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = uint64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, true
+}
+
+// decUint parses a decimal field (the inode column) without a string
+// allocation.
+func decUint(s []byte) (uint64, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	var v uint64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + uint64(c-'0')
+	}
+	return v, true
 }

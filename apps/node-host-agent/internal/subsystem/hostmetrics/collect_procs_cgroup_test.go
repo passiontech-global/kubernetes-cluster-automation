@@ -8,10 +8,63 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
+
+// TestSystemdScopesCache: the kubepods scope walk is TTL-cached —
+// scrapes inside defaultScopesScanInterval reuse the snapshot; past
+// it a fresh walk runs; a slice root that vanishes keeps serving the
+// last good count until the TTL expires, then the series goes absent
+// (pre-cache parity for a persistent absence).
+func TestSystemdScopesCache(t *testing.T) {
+	cfg, _ := fixture(t)
+	now := time.Now()
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	slice := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
+	if err := os.MkdirAll(filepath.Join(slice, "cri-containerd-dead.scope"),
+		0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"}); !ok || v != 1 {
+		t.Fatalf("scopes=%v ok=%v want 1", v, ok)
+	}
+	// A scope added after the snapshot must not show inside the TTL.
+	if err := os.MkdirAll(filepath.Join(slice, "cri-containerd-new.scope"),
+		0o755); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"}); v != 1 {
+		t.Fatalf("cached scopes=%v want 1 (stale snapshot expected)", v)
+	}
+	// Past the TTL a fresh walk picks the new scope up.
+	now = now.Add(2 * defaultScopesScanInterval)
+	if v, ok := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"}); !ok || v != 2 {
+		t.Fatalf("post-TTL scopes=%v ok=%v want 2", v, ok)
+	}
+	// Root vanishes → the fresh-window cache still serves last good.
+	if err := os.RemoveAll(slice); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if v, ok := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"}); !ok || v != 2 {
+		t.Fatalf("stale scopes=%v ok=%v want 2 (fresh window serves last good)", v, ok)
+	}
+	// Past TTL expiry on the vanished root the series goes absent.
+	now = now.Add(2 * defaultScopesScanInterval)
+	if _, ok := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("series kept after TTL expiry on a vanished slice root")
+	}
+}
 
 func TestZombieCount(t *testing.T) {
 	cfg, _ := fixture(t)

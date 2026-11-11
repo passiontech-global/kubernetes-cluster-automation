@@ -11,7 +11,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- T12 api-local-lb ----------
@@ -204,7 +204,7 @@ func (c *cyc) apiLBExtraLanes() [][2]string {
 		if m == nil {
 			continue
 		}
-		n, p := strOf(m, "name"), strOf(m, "port")
+		n, p := m.Str("name"), m.Str("port")
 		if n == "" || p == "" {
 			continue
 		}

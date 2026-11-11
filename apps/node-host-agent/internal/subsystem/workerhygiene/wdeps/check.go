@@ -10,6 +10,8 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // Check names — prometheus `check` label + log context + WD_SIG key.
@@ -42,6 +44,7 @@ const (
 	CheckCoredumpGC    = "coredump-gc"
 	CheckWritableLayer = "writable-layer-scan"
 	CheckDState        = "d-state-storm"
+	CheckPipeWrite     = "pipe-write-freeze" // container stdout 64KB pipe deadlock detector (A1)
 	CheckSysScopes     = "systemd-scopes"
 	CheckCiliumLRP     = "cilium-lrp-dns" // envoy-xds-lrp
 	CheckSpegel        = "spegel-mirror"
@@ -84,6 +87,13 @@ type CycleEnv struct {
 	TasksOnce    func() (map[string][]CtrTask, bool)
 	PidsOnce     func() []int
 	JournalOnce  func() string
+	// StatsOnce memoizes the per-pid /proc/<pid>/stat parse for the
+	// whole cycle — ZombieStormCheck and DstateCheck each used to
+	// read+parse every pid's stat back-to-back. The map holds only
+	// successfully parsed stats; a missing pid reads as the same
+	// ok=false the direct Stat call gave. Nil in hand-built envs →
+	// checks fall back to per-pid d.Proc.Stat.
+	StatsOnce func() map[int]procfs.Stat
 	// WalkOnce memoizes WalkBytes per cycle — the disk-bloat scan
 	// and the writable-layer scan walk the same snapshot/pod-volume
 	// dirs in one cycle; the cache makes the IO-bounded walk run at

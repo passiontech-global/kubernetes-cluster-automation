@@ -11,7 +11,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- swap (node_tuning_swap.yaml) ----------
@@ -72,9 +72,14 @@ func (c *cyc) kineDBHost() bool {
 		if m == nil {
 			continue
 		}
-		if strOf(m, "name") != c.r.cfg.NodeName {
+		if m.Str("name") != c.r.cfg.NodeName {
 			continue
 		}
+		// item.kine_db | default(false). Deliberately NOT
+		// om.BoolDef/om.Bool: neither getter is 1:1 — the pinned
+		// contract (group_swap_extra_test.go) wants the four truthy
+		// string spellings AND any non-nil non-scalar (a mapping
+		// value) read as true, which no single getter reproduces.
 		if v, ok := m.Get("kine_db"); ok {
 			switch t := v.(type) {
 			case bool:
@@ -86,7 +91,7 @@ func (c *cyc) kineDBHost() bool {
 			}
 			return v != nil
 		}
-		return false // kine_db unset -> item.kine_db | default(false)
+		return false
 	}
 	return false
 }

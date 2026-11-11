@@ -22,7 +22,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -35,12 +34,9 @@ import (
 // unpaged: they are tiny by definition.
 const ListPageSize = kube.DefaultListPageSize
 
-// CustomResourceDefinitionGVR is where the conversion-webhook checks
-// read CRDs — the typed clientset has no apiextensions surface, so
-// the objects reach through dyn like every other CRD this controller
-// consumes.
-var CustomResourceDefinitionGVR = schema.GroupVersionResource{
-	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+// CRDs are read through kube.GVRCustomResourceDefinition — the typed
+// clientset has no apiextensions surface, so the objects reach
+// through dyn like every other CRD this controller consumes.
 
 const (
 	// circuit-breaker-bounce — Admission Webhook gray-failure TCP/TLS brownout

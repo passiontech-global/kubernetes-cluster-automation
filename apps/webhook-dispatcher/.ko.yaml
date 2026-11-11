@@ -11,4 +11,8 @@ builds:
     ldflags:
       - "-s"
       - "-w"
-      - "-X main.version={{ .Env.VERSION }}"
+      # main.version falls back to dev when VERSION is unset — plain
+      # text/template if/else so it works on any ko build. Without this
+      # a local `ko build` (or `moon run :image` outside a release)
+      # embedded an empty -X value and the binary reported no version.
+      - "-X main.version={{ if .Env.VERSION }}{{ .Env.VERSION }}{{ else }}dev{{ end }}"

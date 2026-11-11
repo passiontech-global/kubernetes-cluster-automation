@@ -404,7 +404,7 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 	// Pooler path: when the CR deploys pgbouncer, an empty pooler
 	// Endpoints leaves clients with no route to whatever primary
 	// Patroni believes exists.
-	if _, ok, _ := unstructured.NestedFieldNoCopy(cr.Object,
+	if _, ok := kube.NestedMap(cr.Object,
 		"spec", "proxy", "pgBouncer"); !ok {
 		return false
 	}

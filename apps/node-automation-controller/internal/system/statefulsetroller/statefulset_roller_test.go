@@ -1,8 +1,12 @@
 package statefulsetroller
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	natestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -980,5 +985,166 @@ func TestStatefulSetRollerPDB429RefundsBudget(t *testing.T) {
 	if !proceed || unverifiable {
 		t.Fatalf("PDB-429 Evict did not refund budget grant: Gate = (%v,%v)",
 			proceed, unverifiable)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D16 dragonfly cold-start gate (dragonfly_sync_gate.go)
+// ---------------------------------------------------------------------------
+
+// srDragonflySTS builds a opted-in, OnDelete, Dragonfly-labeled
+// 2-replica StatefulSet whose both members are Ready and stale.
+func srDragonflySTS(t *testing.T) *appsv1.StatefulSet {
+	t.Helper()
+	sts := srSTS("apps", "cache", true)
+	sts.Spec.Template.Labels["app.kubernetes.io/name"] = "dragonfly"
+	srSetMembership(sts, 2)
+	return sts
+}
+
+// srPromStub serves one instant-query response: series maps
+// "<ns>/<pod>" → link status value (an empty map = empty vector).
+func srPromStub(t *testing.T, status int, series map[string]float64) *httptest.Server {
+	t.Helper()
+	type envelope struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				Metric map[string]string `json:"metric"`
+				Value  []json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		var env envelope
+		env.Status = "success"
+		for k, v := range series {
+			bar := strings.IndexByte(k, '/')
+			env.Data.Result = append(env.Data.Result, struct {
+				Metric map[string]string `json:"metric"`
+				Value  []json.RawMessage `json:"value"`
+			}{
+				Metric: map[string]string{
+					"namespace": k[:bar], "pod": k[bar+1:],
+				},
+				Value: []json.RawMessage{json.RawMessage("1770000000"),
+					// Prometheus ships sample values as JSON STRINGS.
+					json.RawMessage(strconv.Quote(strconv.FormatFloat(v, 'f', -1, 64)))},
+			})
+		}
+		_ = json.NewEncoder(w).Encode(env)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// srRollerWithProm wires the roller's dragonfly gate seam to the stub.
+func srRollerWithProm(cs *fake.Clientset, now time.Time, srv *httptest.Server) *statefulSetOnDeleteRoller {
+	r := srRoller(cs, now)
+	r.prom = dragonflyPromSeam{
+		endpoint: srv.URL + "/api/v1/query",
+		client:   promq.Client{HTTP: srv.Client(), Timeout: 2 * time.Second},
+		ok:       true,
+	}
+	return r
+}
+
+// A Dragonfly member whose master link is still down (mid-FULL-SYNC —
+// Ready only proves the port answers) defers the OnDelete roll and
+// counts the skip; the same stub over a non-dragonfly set rolls.
+func TestStatefulSetRollerDragonflyUnsyncedGate(t *testing.T) {
+	natestutil.CleanupMetric(t, metrics.StatefulSetOnDeleteDragonflyUnsyncedSkipped, "apps", "cache")
+	srv := srPromStub(t, http.StatusOK, map[string]float64{"apps/cache-1": 0})
+
+	t0 := time.Now()
+	sts := srDragonflySTS(t)
+	objs := srNodes(1)
+	objs = append(objs, sts,
+		srPod("cache", 0, "rev-old", 30*time.Minute),
+		srPod("cache", 1, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRollerWithProm(cs, t0, srv)
+
+	if err := r.run(ctx); err != nil { // seeds driftSince
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return t0.Add(31 * time.Minute) }
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !srPodExists(t, cs, "apps", "cache-1") {
+		t.Fatal("pod rolled while a replica's master link was down (mid-FULL-SYNC)")
+	}
+	if n := ptestutil.ToFloat64(metrics.StatefulSetOnDeleteDragonflyUnsyncedSkipped.
+		WithLabelValues("apps", "cache")); n == 0 {
+		t.Fatal("unsynced skip not counted")
+	}
+
+	// The gate is dragonfly-scoped: the identical signature over a
+	// plain StatefulSet must NOT block the roll.
+	db := srSTS("apps", "db", true)
+	srSetMembership(db, 2)
+	objs = srNodes(1)
+	objs = append(objs, db,
+		srPod("db", 0, "rev-old", 30*time.Minute),
+		srPod("db", 1, "rev-old", 30*time.Minute))
+	cs2 := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs2)
+	r2 := srRollerWithProm(cs2, t0, srv)
+	r2.driftSince.Observe("apps/db@rev-new", t0.Add(-time.Hour))
+	if err := r2.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs2, "apps", "db-1") {
+		t.Fatal("non-dragonfly set blocked by the dragonfly gate")
+	}
+}
+
+// Sync complete (no link-down series) rolls through the gate; a
+// Prometheus outage (non-200) is tolerated — the gate defers to the
+// other gates rather than pinning the roll on a monitoring failure.
+func TestStatefulSetRollerDragonflySyncedRollsAndOutageTolerated(t *testing.T) {
+	t0 := time.Now()
+
+	// Synced: empty vector — the roll lands.
+	srvUp := srPromStub(t, http.StatusOK, nil)
+	sts := srDragonflySTS(t)
+	objs := srNodes(1)
+	objs = append(objs, sts,
+		srPod("cache", 0, "rev-old", 30*time.Minute),
+		srPod("cache", 1, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRollerWithProm(cs, t0, srvUp)
+	r.driftSince.Observe("apps/cache@rev-new", t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs, "apps", "cache-1") {
+		t.Fatal("roll deferred while every replica read master_link_status up")
+	}
+
+	// Outage: non-200 — tolerated, roll still lands.
+	srvDown := srPromStub(t, http.StatusInternalServerError, nil)
+	sts2 := srDragonflySTS(t)
+	objs2 := srNodes(1)
+	objs2 = append(objs2, sts2,
+		srPod("cache", 0, "rev-old", 30*time.Minute),
+		srPod("cache", 1, "rev-old", 30*time.Minute))
+	cs2 := fake.NewSimpleClientset(objs2...)
+	emulateEviction(cs2)
+	r2 := srRollerWithProm(cs2, t0, srvDown)
+	r2.driftSince.Observe("apps/cache@rev-new", t0.Add(-time.Hour))
+	if err := r2.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs2, "apps", "cache-1") {
+		t.Fatal("roll pinned by a Prometheus outage — the gate must tolerate it")
 	}
 }

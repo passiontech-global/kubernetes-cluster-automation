@@ -396,10 +396,6 @@ func TestProbesHonorDeadline(t *testing.T) {
 	}
 }
 
-// Silence the unused-import-style lint for the package logger — it
-// exists so future probe additions can log without a new file.
-var _ = logger
-
 // clientOrDefault: the variadic *http.Client seam — an injected
 // client wins, nil/absent falls back to the probe's package default.
 func TestClientOrDefault(t *testing.T) {

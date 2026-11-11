@@ -6,6 +6,10 @@
 // Interface contract (same as node-automation-controller):
 //   - Prometheus metrics on :9115/metrics.
 //   - Health/readiness probes on :8081/healthz and :8081/readyz.
+//   - /debug/pprof on a LOOPBACK-only listener (default
+//     127.0.0.1:9116, --pprof-bind-address /
+//     NODE_HOST_AGENT_PPROF_BIND_ADDRESS) — never on the metrics
+//     hostPort (roadmap item 1.2).
 //   - Node identity via the downward API: NODE_NAME, POD_NAME,
 //     POD_NAMESPACE.
 //
@@ -83,6 +87,19 @@ var kubeClient = func() (kubernetes.Interface, error) {
 		cfg.Timeout = envx.Duration(envnames.EnvRequestTimeout,
 			30*time.Second)
 	}
+	// Client budget + wire format — the fleet-wide posture the
+	// controller's tuneClientConfig installs (cmd/manager/clients.go)
+	// sized down for one node's traffic: client-go's QPS 5 / Burst 10
+	// defaults throttled the worker Pod LIST every hygiene cycle;
+	// 20/40 gives the node's handful of consumers headroom without a
+	// controller-grade bucket. Protobuf cuts the LIST/watch payload
+	// — worker Pods carry env specs, so JSON serialization is a real
+	// bandwidth cost; JSON stays in AcceptContentTypes so the
+	// apiserver can negotiate it for anything protobuf can't encode.
+	cfg.QPS = 20
+	cfg.Burst = 40
+	cfg.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
+	cfg.ContentType = "application/vnd.kubernetes.protobuf"
 	return kubernetes.NewForConfig(cfg)
 }
 
@@ -91,10 +108,14 @@ var kubeClient = func() (kubernetes.Interface, error) {
 // for apiprober alone. Off lists descriptors whose env flag/auto
 // resolution said no; Skipped lists the ones that resolved ON but a
 // needs-gate or Build failure kept out of Config.Subsystems. Both
-// lists are in descriptor (startup) order.
+// lists are in descriptor (startup) order. Standalone carries the
+// RESOLVED mode (flag OR env) so the startup log reports what
+// actually drove the enable-set inversion, not the raw --standalone
+// switch.
 type wireReport struct {
-	Off     []string
-	Skipped []string
+	Off        []string
+	Skipped    []string
+	Standalone bool
 }
 
 // buildAgentConfig wires the environment into an agent.Config: cfg
@@ -212,7 +233,8 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 		names = append(names, d.Name)
 		w.resolveAndBuild(d)
 	}
-	report := wireReport{Off: []string{}, Skipped: []string{}}
+	report := wireReport{Off: []string{}, Skipped: []string{},
+		Standalone: standalone}
 	for _, name := range names {
 		if !w.resolved[name] {
 			report.Off = append(report.Off, name)
@@ -234,12 +256,23 @@ func main() {
 		os.Exit(code)
 	}
 
-	var metricsAddr, probeAddr, nodeNameFlag string
+	var metricsAddr, probeAddr, pprofAddr, nodeNameFlag string
 	var showVersion, standaloneFlag bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
 		"address the Prometheus metrics endpoint binds to")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
 		"address the health/readiness probe endpoints bind to")
+	// Loopback-only default: /debug/pprof left 0.0.0.0:9115 in
+	// roadmap item 1.2's audit — every tenant pod and VLAN
+	// neighbour could profile the root daemon.
+	// NODE_HOST_AGENT_PPROF_BIND_ADDRESS feeds the default so the
+	// DaemonSet and the standalone units can override without
+	// flags; the flag wins.
+	flag.StringVar(&pprofAddr, "pprof-bind-address",
+		envx.String(envnames.EnvPprofBindAddress, "127.0.0.1:9116"),
+		"LOOPBACK-ONLY address the /debug/pprof endpoints bind to "+
+			"(empty disables the listener; env "+
+			envnames.EnvPprofBindAddress+" feeds the default)")
 	flag.BoolVar(&standaloneFlag, "standalone", false,
 		"standalone systemd mode: host root /, pod-context subsystems default off "+
 			"(NODE_HOST_AGENT_STANDALONE=1 is equivalent)")
@@ -272,6 +305,7 @@ func main() {
 		Version:     version,
 		MetricsAddr: metricsAddr,
 		ProbeAddr:   probeAddr,
+		PprofAddr:   pprofAddr,
 	}, standaloneFlag)
 	a := agent.New(cfg)
 
@@ -287,8 +321,9 @@ func main() {
 	}
 	logger().Info("starting node-host-agent",
 		"version", version, "node", a.NodeName(), "pod", podName,
-		"standalone", standaloneFlag, "metricsAddr", metricsAddr,
-		"probeAddr", probeAddr, "subsystems", subsystems,
+		"standalone", report.Standalone, "metricsAddr", metricsAddr,
+		"probeAddr", probeAddr, "pprofLoopbackAddr", pprofAddr,
+		"subsystems", subsystems,
 		"off", report.Off, "skipped", report.Skipped)
 	if err := a.Run(ctx); err != nil {
 		logger().Error("agent exited", "error", err)

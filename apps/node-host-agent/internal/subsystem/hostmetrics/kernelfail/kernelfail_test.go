@@ -241,7 +241,7 @@ func TestParseProcMounts(t *testing.T) {
 	if len(ms) != 3 {
 		t.Fatalf("parsed %d mounts want 3", len(ms))
 	}
-	if !ms[1].Opts["ro"] || ms[0].Opts["ro"] {
+	if !ms[1].HasOpt("ro") || ms[0].HasOpt("ro") {
 		t.Fatal("ro flag wrong")
 	}
 }

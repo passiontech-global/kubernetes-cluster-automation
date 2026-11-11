@@ -1,12 +1,10 @@
 // snapshot_crds.go — the dynamic-client census readers of the
-// per-sweep snapshot: AllCRDs plus the per-GVR AllUnstructured
-// family (split out of snapshot.go — see its header for the
-// memoizer contract).
+// per-sweep snapshot: the per-GVR AllUnstructured family (split out
+// of snapshot.go — see its header for the memoizer contract).
 package probefw
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,35 +14,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// gvrCustomResourceDefinitions is the apiextensions/v1 CRD GVR —
-// cluster-scoped, read through the dynamic client (no typed client
-// for apiextensions in this module's imports).
-var gvrCustomResourceDefinitions = kube.GVRCustomResourceDefinition
-
-// AllCRDs is the CRD twin — the shared definition census that tells
-// which operator CRDs exist before a check walks their instances
-// (absent CRD = check skips, one census instead of one probe per
-// check). A nil Dyn is a wiring bug surfaced as an error, memoized
-// like a LIST failure — every CRD-reading check in the cycle reads
-// the same failure instead of each re-deriving it.
-func (d *Deps) AllCRDs(ctx context.Context) ([]unstructured.Unstructured, error) {
-	if d.Dyn == nil {
-		return nil, errors.New("no dynamic client — CRD census unverifiable")
-	}
-	s := sweepSnap(ctx)
-	s.muCRDs.Lock()
-	defer s.muCRDs.Unlock()
-	if !s.crdsSet {
-		s.crdsSet = true
-		lctx, cancel := s.listCtx(ctx)
-		defer cancel()
-		s.crds, s.crdsErr = kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
-			kube.DynamicPage(d.Dyn.Resource(gvrCustomResourceDefinitions)))
-	}
-	return s.crds, s.crdsErr
-}
-
 // AllUnstructured is the per-GVR twin for CR instances: one paged
 // dynamic LIST per (sweep, GVR), memoized in a per-GVR map under one
 // family mutex. The raw apiserver error is memoized verbatim — the
@@ -53,6 +22,13 @@ func (d *Deps) AllCRDs(ctx context.Context) ([]unstructured.Unstructured, error)
 // sharing the memo means they also share one failed read instead of
 // each retrying a broken GVR within the cycle. A nil Dyn is a wiring
 // bug surfaced as an error.
+//
+// Callers that only need a SLICE of each object (the kine
+// large-object audit measuring serialized size) must not route the
+// CRD GVR through here: the memo pins every CRD's OpenAPI schema —
+// 80–150 MiB of unstructured content — on the heap for the rest of
+// the sweep. Those callers stream kube.ListEach pages instead and
+// let each page's objects die with the page.
 func (d *Deps) AllUnstructured(ctx context.Context,
 	gvr schema.GroupVersionResource) ([]unstructured.Unstructured, error) {
 	if d.Dyn == nil {

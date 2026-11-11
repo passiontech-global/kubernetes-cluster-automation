@@ -70,14 +70,17 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		if w.now.Now().Sub(svc.created) >= corednsLogSinceS*time.Second {
 			continue
 		}
-		eps, err := w.cs.DiscoveryV1().EndpointSlices(svc.ns).List(ctx,
-			metav1.ListOptions{LabelSelector: "kubernetes.io/service-name=" + svc.name})
+		eps, err := kube.ListAll(ctx,
+			metav1.ListOptions{
+				Limit:         kube.DefaultListPageSize,
+				LabelSelector: "kubernetes.io/service-name=" + svc.name},
+			kube.EndpointSlices(w.cs, svc.ns))
 		if err != nil {
 			log.Info("dns: cannot list endpointslices — skipping probe candidate",
 				"service", svc.ns+"/"+svc.name, "error", err)
 			continue
 		}
-		for _, es := range eps.Items {
+		for _, es := range eps {
 			for _, ep := range es.Endpoints {
 				// bash: conditions.ready == true — nil does NOT count.
 				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
@@ -152,15 +155,17 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 		// spans EVERY slice the Service owns, not just the freshest:
 		// a Ready IP in a second slice is a valid DNS answer the
 		// single-slice want set would wrongly judge stale.
-		eps, err := w.cs.DiscoveryV1().EndpointSlices(ns).List(ctx,
+		eps, err := kube.ListAll(ctx,
 			metav1.ListOptions{
-				LabelSelector: discoveryv1.LabelServiceName + "=" + svcName})
+				Limit:         kube.DefaultListPageSize,
+				LabelSelector: discoveryv1.LabelServiceName + "=" + svcName},
+			kube.EndpointSlices(w.cs, ns))
 		if err != nil {
 			log.Info("dns: cannot list sibling endpointslices — inconclusive",
 				"service", ns+"/"+svcName, "error", err)
 			return "", nil
 		}
-		for _, es := range eps.Items {
+		for _, es := range eps {
 			for _, ep := range es.Endpoints {
 				if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
 					continue

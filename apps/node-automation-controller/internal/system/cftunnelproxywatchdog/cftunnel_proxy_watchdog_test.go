@@ -920,7 +920,7 @@ func TestWatchdogSyncErrorGaugeSetsAndClears(t *testing.T) {
 
 	// Clean tail but only 2 minutes later — inside the clear window.
 	cs.PrependReactor("get", "pods", cfLogReactor("all quiet\n"))
-	w.syncErrLast[cfWatchdogTestNS] = now.Add(-2 * time.Minute)
+	w.syncErrLast.Stamp(cfWatchdogTestNS, now.Add(-2*time.Minute))
 	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run (clean tail, inside window): %v", err)
 	}
@@ -936,7 +936,7 @@ func TestWatchdogSyncErrorGaugeSetsAndClears(t *testing.T) {
 			}
 			return true, nil, errors.New("log stream dead")
 		})
-	w.syncErrLast[cfWatchdogTestNS] = now.Add(-6 * time.Minute)
+	w.syncErrLast.Stamp(cfWatchdogTestNS, now.Add(-6*time.Minute))
 	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run (log read failure): %v", err)
 	}
@@ -1157,12 +1157,12 @@ func TestWatchdogSyncErrorEmptyTailNeverClears(t *testing.T) {
 	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
 		namespace: cfWatchdogTestNS,
 		now:       shared.Clock(func() time.Time { return now })}
-	w.syncErrLast = map[string]time.Time{cfWatchdogTestNS: now.Add(-6 * time.Minute)}
+	w.syncErrLast.Stamp(cfWatchdogTestNS, now.Add(-6*time.Minute))
 	w.auditControllerSyncErrors(context.Background())
 	if got := syncErrGaugeVal(t); got != 1 {
 		t.Fatalf("gauge = %v after an empty tail, want 1", got)
 	}
-	if _, ok := w.syncErrLast[cfWatchdogTestNS]; !ok {
+	if _, ok := w.syncErrLast.Last(cfWatchdogTestNS); !ok {
 		t.Fatal("inconclusive sweep cleared the errored stamp")
 	}
 }
@@ -1191,7 +1191,7 @@ func TestWatchdogSyncErrorPartialReplicaReadKeepsGauge(t *testing.T) {
 	w := &cfTunnelProxyWatchdog{cs: cs, queue: "cf-tunnel-proxy-watchdog",
 		namespace: cfWatchdogTestNS,
 		now:       shared.Clock(func() time.Time { return now })}
-	w.syncErrLast = map[string]time.Time{cfWatchdogTestNS: now.Add(-6 * time.Minute)}
+	w.syncErrLast.Stamp(cfWatchdogTestNS, now.Add(-6*time.Minute))
 	w.auditControllerSyncErrors(context.Background())
 	if calls != 2 {
 		t.Fatalf("read %d log tails, want both replicas", calls)
@@ -1199,7 +1199,7 @@ func TestWatchdogSyncErrorPartialReplicaReadKeepsGauge(t *testing.T) {
 	if got := syncErrGaugeVal(t); got != 1 {
 		t.Fatalf("gauge = %v after a partial read, want 1", got)
 	}
-	if _, ok := w.syncErrLast[cfWatchdogTestNS]; !ok {
+	if _, ok := w.syncErrLast.Last(cfWatchdogTestNS); !ok {
 		t.Fatal("partial-read sweep cleared the errored stamp")
 	}
 }

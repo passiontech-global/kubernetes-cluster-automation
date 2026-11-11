@@ -6,13 +6,14 @@ package corednswatchdog
 
 import (
 	"context"
-	"io"
 	"regexp"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // corednsLogRE is the dead-informer signature — the bash alternation
@@ -28,30 +29,30 @@ var corednsLogRE = regexp.MustCompile(
 // death signature ("" = clean/unreadable). Bounded to 8s / 256KiB.
 // A stream/read failure is inconclusive, not clean — logged so a
 // broken pod-log path (RBAC, API flap) cannot silently disable
-// layer 1 while layers 2/3 keep reporting "fresh".
+// layer 1 while layers 2/3 keep reporting "fresh". The read rides
+// the shared kube.ReadPodLogTail fetch: the caller carries only the
+// pod name, so the stub pod's empty spec resolves the container to
+// "" — the same apiserver-default request the raw GetLogs made.
 func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 	log := logf.FromContext(ctx)
-	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	since := int64(corednsLogSinceS)
-	stream, err := w.cs.CoreV1().Pods(corednsNS).GetLogs(pod,
-		&corev1.PodLogOptions{SinceSeconds: &since}).Stream(lctx)
+	var hit string
+	_, err := kube.ReadPodLogTail(ctx, w.cs,
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: corednsNS, Name: pod}},
+		kube.PodLogOpts{
+			SinceSeconds: corednsLogSinceS,
+			MaxBytes:     corednsMaxLogBytes,
+			Timeout:      8 * time.Second,
+		}, func(line string) bool {
+			if corednsLogRE.MatchString(line) {
+				hit = line
+				return true
+			}
+			return false
+		})
 	if err != nil {
 		log.Info("log: cannot stream pod logs — layer 1 inconclusive", "pod", pod, "error", err)
 		return ""
 	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, corednsMaxLogBytes))
-	if err != nil {
-		log.Info("log: cannot read pod log stream — layer 1 inconclusive", "pod", pod, "error", err)
-		return ""
-	}
-	for rest := string(data); rest != ""; {
-		line, after, _ := strings.Cut(rest, "\n")
-		rest = after
-		if corednsLogRE.MatchString(line) {
-			return line
-		}
-	}
-	return ""
+	return hit
 }

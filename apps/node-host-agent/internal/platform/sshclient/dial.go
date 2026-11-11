@@ -159,22 +159,12 @@ func (c Config) Handshake(ctx context.Context, nc, carrier net.Conn,
 // clears it. For the SESSION BODY that follows a channel-open use
 // BoundOpCtx instead: Session.Close alone cannot unblock a dead
 // transport (it only sends an SSH channel-close), so the body needs
-// its own deadline. A rejected SetDeadline leaves the op unbounded —
-// warn so a silent hang is at least loud in the logs. A nil log
-// falls back to the package logger.
+// its own deadline. Thin wrapper: the two ops shared a 100%
+// identical body (the rejected-SetDeadline warn + nil-log fallback
+// included), so BoundOpCtx owns the implementation.
 func BoundOp(ctx context.Context, log *slog.Logger, nc net.Conn,
 	timeout time.Duration) func() {
-	if log == nil {
-		log = logger()
-	}
-	dl := time.Now().Add(timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
-	}
-	if err := nc.SetDeadline(dl); err != nil {
-		log.Warn("sshclient: conn deadline rejected — op unbounded", "error", err)
-	}
-	return func() { _ = nc.SetDeadline(time.Time{}) }
+	return BoundOpCtx(ctx, log, nc, timeout)
 }
 
 // BoundOpCtx sets a conn deadline covering a whole ctx-scoped op —

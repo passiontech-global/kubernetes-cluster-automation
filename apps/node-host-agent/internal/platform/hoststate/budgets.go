@@ -51,6 +51,18 @@ func writeEpochFile(path string, epoch int64) error {
 		strconv.FormatInt(epoch, 10)+"\n")
 }
 
+// writeEpochFileNoSync is writeEpochFile minus the durability
+// fsyncs — same tmp+rename atomicity. Reserved for the per-cycle
+// liveness stamps (last-run): the watchdog-stalled alert reads the
+// VALUE, and a crash losing the newest stamp just reads as a few
+// seconds staler — the next cycle rewrites it. Latch creation and
+// rate budgets keep the durable writeEpochFile: a lost budget
+// silently re-opens a cooldown, a lost latch clears a live fault.
+func writeEpochFileNoSync(path string, epoch int64) error {
+	return hostutil.WriteFileAtomicNoSync(path,
+		strconv.FormatInt(epoch, 10)+"\n")
+}
+
 // --- rate-limit budgets (last-*) ---
 
 // RateOK reports whether the budget file <dir>/<name> is absent,

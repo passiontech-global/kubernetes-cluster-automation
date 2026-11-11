@@ -89,7 +89,7 @@ func procStatCPUSums(path string) (steal, total uint64, ok bool) {
 		// Only columns [0,cpuTotalThru) matter — a row that
 		// truncates earlier still counts what it has (steal stays
 		// 0); a row with a non-numeric field is skipped whole —
-		// never emit junk (the conntrackStatCounters rule).
+		// never emit junk (the procfs.ReadConntrackStat rule).
 		var rowSteal, rowTotal uint64
 		bad := false
 		for i := 0; i < cpuTotalThru && i < len(f)-1; i++ {

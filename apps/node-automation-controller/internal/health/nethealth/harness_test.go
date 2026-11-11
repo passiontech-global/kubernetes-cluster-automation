@@ -7,12 +7,14 @@ package nethealth
 import (
 	"context"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cloudflared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/liqo"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
@@ -25,12 +27,12 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	linkerd.NewLinkerdEndpointSyncCheck,
 	linkerd.NewLinkerdProtocolDetectionStallCheck,
 	linkerd.NewLinkerdH2StreamGuardCheck,
-	NewCloudflaredTunnelHealthCheck,
-	NewLiqoTunnelHealthCheck,
+	cloudflared.NewCloudflaredTunnelHealthCheck,
+	liqo.NewLiqoTunnelHealthCheck,
 	NewKonnectivityTunnelHealthCheck,
 	NewEndpointSliceZoneStarvationCheck,
-	NewLinkerdOutlierGuardCheck,
-	NewLinkerdSidecarOOMGuardCheck,
+	linkerd.NewLinkerdOutlierGuardCheck,
+	linkerd.NewLinkerdSidecarOOMGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

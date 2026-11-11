@@ -100,13 +100,37 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 		}
 		return "", exitErr{1}
 	case strings.HasPrefix(exec, "sha256sum "):
-		p := unshq(strings.TrimPrefix(exec, "sha256sum "))
-		b, ok := f.files[p]
-		if !ok {
-			return "", exitErr{1}
+		// One or more shq-quoted paths — the batched hash form
+		// remoteSHA256All issues. Coreutils emulation: one
+		// `<hash>  <path>` line per hashed file, a
+		// `sha256sum: <path>: …` note per failure (absent →
+		// "No such file or directory", a seeded dir →
+		// "Is a directory"), exit 1 when any path failed.
+		var b strings.Builder
+		failed := false
+		for _, q := range strings.Split(strings.TrimPrefix(exec, "sha256sum "), " ") {
+			if q == "" {
+				continue
+			}
+			p := unshq(q)
+			if f.isDirLocked(p) {
+				b.WriteString("sha256sum: " + p + ": Is a directory\n")
+				failed = true
+				continue
+			}
+			data, ok := f.files[p]
+			if !ok {
+				b.WriteString("sha256sum: " + p + ": No such file or directory\n")
+				failed = true
+				continue
+			}
+			sum := sha256.Sum256(data)
+			b.WriteString(hex.EncodeToString(sum[:]) + "  " + p + "\n")
 		}
-		sum := sha256.Sum256(b)
-		return hex.EncodeToString(sum[:]) + "  " + p, nil
+		if failed {
+			return b.String(), exitErr{1}
+		}
+		return b.String(), nil
 	case strings.HasPrefix(exec, "mv "):
 		rest := strings.TrimPrefix(exec, "mv ")
 		// two shq-quoted args

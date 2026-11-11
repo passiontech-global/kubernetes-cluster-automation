@@ -1,33 +1,24 @@
-// helpers.go — small accessors over jinja values (mapGet/mapStr/
-// mapBool/mapList/nodeNameOf) plus the string-slice utilities
-// derive() builds its ordered outputs with.
+// helpers.go — the string-slice utilities derive() builds its
+// ordered outputs with, plus nodeNameOf. The mapGet/mapList jinja
+// accessors are gone: *jinja.OMap's Get/Slice typed getters are that
+// family's single home now.
 package topology
 
 import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // --- helpers over jinja values ---
 
-func mapGet(m any, key string) any {
-	if om, ok := m.(*jinja.OMap); ok {
-		if v, ok := om.Get(key); ok {
-			return v
-		}
+func nodeNameOf(v any) string {
+	if om, ok := v.(*jinja.OMap); ok {
+		return om.Str("name")
 	}
-	return jinja.NewUndefined(key)
+	return ""
 }
-
-func mapStr(m any, key string) string { return jinja.Stringify(mapGet(m, key)) }
-
-func mapBool(m any, key string) bool { return jinja.Truthy(mapGet(m, key)) }
-
-func mapList(m any, key string) []any { return jinja.ToIter(mapGet(m, key)) }
-
-func nodeNameOf(v any) string { return mapStr(v, "name") }
 
 // LastOctet returns the trailing dotted quad of an IPv4 address —
 // the default marker_octet a node entry falls back to when the

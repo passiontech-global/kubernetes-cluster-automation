@@ -18,10 +18,9 @@ var ctx = context.Background()
 
 // harnessChecks is this package's check roster in sweep order — both
 // wrappers below pass the same slice through probetest.NewCheckProber.
+// The rabbitmq/dragonfly checks moved to their own subpackages and
+// ride those packages' harnesses.
 var harnessChecks = []func(*probefw.Deps) probefw.Check{
-	NewRabbitMQQuorumHealthCheck,
-	NewRabbitMQSuspendedCheck,
-	NewDragonflyReplicaSyncStormCheck,
 	NewStatefulMasterlessCheck,
 }
 

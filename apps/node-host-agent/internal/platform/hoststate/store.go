@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -208,9 +209,13 @@ func (s *Store) Enter(name, extra string) {
 // false (no STATE-ENTER transition to log).
 func (s *Store) enterLocked(name string) bool {
 	p := s.Path(name)
-	if _, err := os.Stat(p); err == nil {
+	if fi, err := os.Stat(p); err == nil {
 		now := s.Now()
-		if cerr := os.Chtimes(p, now, now); cerr != nil {
+		// Touch only once the mtime ages past LatchTouchMinInterval —
+		// the janitor reaps at 24h, so a per-cycle utimensat was
+		// ~2,800 needless syscalls/day per held latch.
+		if cerr := hostutil.TouchIfDue(p, fi, now,
+			latchdefs.LatchTouchMinInterval); cerr != nil {
 			s.log().Debug("state latch touch failed",
 				"state", name, "path", p, "error", cerr)
 		}

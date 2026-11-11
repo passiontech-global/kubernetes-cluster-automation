@@ -2,8 +2,10 @@ package handler
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// Prometheus metrics — registered on the default registry so main
-// can serve them with promhttp.Handler() unchanged.
+// Prometheus metrics for the delivery path — registered by main on
+// the DEDICATED internal-listener registry (RegisterMetrics below),
+// never on prometheus.DefaultRegisterer: the public listener faces
+// GitHub and must not serve metrics.
 var deliveriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "webhook_dispatcher_deliveries_total",
 	Help: "GitHub webhook deliveries handled, by event (normalized to " +
@@ -44,6 +46,10 @@ var fanoutDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBuckets(0.05, 2, 12), // 50ms .. ~102s
 })
 
-func init() {
-	prometheus.MustRegister(deliveriesTotal, fanoutTotal, fanoutDuration)
+// RegisterMetrics registers the delivery/fan-out metrics on reg —
+// main builds one dedicated registry for the internal listener and
+// hands it to each package's RegisterMetrics. Panics on duplicate
+// registration; called exactly once at boot.
+func RegisterMetrics(reg *prometheus.Registry) {
+	reg.MustRegister(deliveriesTotal, fanoutTotal, fanoutDuration)
 }

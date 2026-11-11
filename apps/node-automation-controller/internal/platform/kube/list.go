@@ -12,6 +12,7 @@ package kube
 import (
 	"context"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	certificatesv1 "k8s.io/api/certificates/v1"
@@ -178,6 +179,16 @@ func Services(cs kubernetes.Interface, namespace string) PageFunc[corev1.Service
 		func(l *corev1.ServiceList) []corev1.Service { return l.Items })
 }
 
+// ServiceAccounts lists core ServiceAccounts in namespace
+// (imagepull-secret-auditor).
+func ServiceAccounts(cs kubernetes.Interface, namespace string) PageFunc[corev1.ServiceAccount] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.ServiceAccountList, error) {
+			return cs.CoreV1().ServiceAccounts(namespace).List(ctx, o)
+		},
+		func(l *corev1.ServiceAccountList) []corev1.ServiceAccount { return l.Items })
+}
+
 // ResourceQuotas lists ResourceQuotas in namespace
 // (resource-quota-check).
 func ResourceQuotas(cs kubernetes.Interface, namespace string) PageFunc[corev1.ResourceQuota] {
@@ -262,6 +273,15 @@ func Deployments(cs kubernetes.Interface, namespace string) PageFunc[appsv1.Depl
 		func(l *appsv1.DeploymentList) []appsv1.Deployment { return l.Items })
 }
 
+// ReplicaSets lists Apps ReplicaSets in namespace.
+func ReplicaSets(cs kubernetes.Interface, namespace string) PageFunc[appsv1.ReplicaSet] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*appsv1.ReplicaSetList, error) {
+			return cs.AppsV1().ReplicaSets(namespace).List(ctx, o)
+		},
+		func(l *appsv1.ReplicaSetList) []appsv1.ReplicaSet { return l.Items })
+}
+
 // DaemonSets lists Apps DaemonSets in namespace.
 func DaemonSets(cs kubernetes.Interface, namespace string) PageFunc[appsv1.DaemonSet] {
 	return typedPage(
@@ -307,6 +327,32 @@ func CertificateSigningRequests(cs kubernetes.Interface) PageFunc[certificatesv1
 			return cs.CertificatesV1().CertificateSigningRequests().List(ctx, o)
 		},
 		func(l *certificatesv1.CertificateSigningRequestList) []certificatesv1.CertificateSigningRequest {
+			return l.Items
+		})
+}
+
+// MutatingWebhookConfigurations lists cluster-scoped
+// MutatingWebhookConfigurations (webhookguard snapshot, CA-drift
+// audit).
+func MutatingWebhookConfigurations(cs kubernetes.Interface) PageFunc[admissionv1.MutatingWebhookConfiguration] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*admissionv1.MutatingWebhookConfigurationList, error) {
+			return cs.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, o)
+		},
+		func(l *admissionv1.MutatingWebhookConfigurationList) []admissionv1.MutatingWebhookConfiguration {
+			return l.Items
+		})
+}
+
+// ValidatingWebhookConfigurations lists cluster-scoped
+// ValidatingWebhookConfigurations (webhookguard snapshot, CA-drift
+// audit).
+func ValidatingWebhookConfigurations(cs kubernetes.Interface) PageFunc[admissionv1.ValidatingWebhookConfiguration] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*admissionv1.ValidatingWebhookConfigurationList, error) {
+			return cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(ctx, o)
+		},
+		func(l *admissionv1.ValidatingWebhookConfigurationList) []admissionv1.ValidatingWebhookConfiguration {
 			return l.Items
 		})
 }

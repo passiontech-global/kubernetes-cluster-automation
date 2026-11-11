@@ -15,12 +15,18 @@ import (
 // StampLastRun refreshes <Dir>/last-run with the current epoch — the
 // per-cycle liveness stamp the watchdog-stalled alert reads (BUG-H1).
 // No MkdirAll: the dir is provisioned by hostconfig/Docker volume —
-// an absent dir means this host runs no watchdog state at all.
+// an absent dir means this host runs no watchdog state at all. The
+// write is NoSync: last-run rewrites every cycle and a crash losing
+// the newest stamp only reads as slightly stale.
 func (s *Store) StampLastRun() {
 	if s.Dir == "" {
 		return
 	}
-	s.WriteEpochFile(filepath.Join(s.Dir, "last-run"), s.Now().Unix())
+	if err := writeEpochFileNoSync(filepath.Join(s.Dir, "last-run"),
+		s.Now().Unix()); err != nil {
+		s.log().Warn("state file write failed",
+			"path", filepath.Join(s.Dir, "last-run"), "error", err)
+	}
 }
 
 // Heartbeat is the workerhygiene variant: MkdirAll + `installed`
@@ -38,7 +44,12 @@ func (s *Store) Heartbeat() {
 	if _, err := os.Stat(installed); os.IsNotExist(err) {
 		s.WriteEpochFile(installed, now)
 	}
-	s.WriteEpochFile(filepath.Join(s.Dir, "last-run"), now)
+	// last-run is the per-cycle stamp — NoSync like StampLastRun.
+	if err := writeEpochFileNoSync(filepath.Join(s.Dir, "last-run"),
+		now); err != nil {
+		s.log().Warn("state file write failed",
+			"path", filepath.Join(s.Dir, "last-run"), "error", err)
+	}
 }
 
 // InitHeartbeatFiles seeds the installed/last-run pair ONCE — only

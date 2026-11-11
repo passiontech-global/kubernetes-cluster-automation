@@ -132,19 +132,23 @@ func (c *Collector) collectNebulaCert(ch chan<- prometheus.Metric, sc scrapeCtx)
 		prometheus.GaugeValue, float64(sc.certDays))
 }
 
-// nebulaCertDaysLeft returns days until notAfter, and ok=false when
-// the cert is absent or unparseable. Integer-day truncation matches
-// the shell's ((exp - now) / 86400).
-func (c *Collector) nebulaCertDaysLeft() (int64, bool) {
-	data, err := os.ReadFile(c.cfg.NebulaCertFile)
-	if err != nil {
-		return 0, false
-	}
+// nebulaNotAfter parses the host cert PEM — first CERTIFICATE block
+// through the protobuf wire reader (nebula certs are not x509).
+// Signature matches certNotAfterCache.get's parse func.
+func nebulaNotAfter(data []byte) (int64, bool) {
 	block, _ := pem.Decode(data)
 	if block == nil {
 		return 0, false
 	}
-	notAfter, ok := nebulaCertNotAfter(block.Bytes)
+	return nebulaCertNotAfter(block.Bytes)
+}
+
+// nebulaCertDaysLeft returns days until notAfter, and ok=false when
+// the cert is absent or unparseable. Integer-day truncation matches
+// the shell's ((exp - now) / 86400). The parse rides the stat-key
+// cert cache — the file is rewritten ~yearly, the scrape is 15s.
+func (c *Collector) nebulaCertDaysLeft() (int64, bool) {
+	notAfter, ok := c.certs.get(c.cfg.NebulaCertFile, nebulaNotAfter)
 	if !ok {
 		return 0, false
 	}

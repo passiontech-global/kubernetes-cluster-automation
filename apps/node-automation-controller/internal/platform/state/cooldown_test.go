@@ -1,6 +1,8 @@
 package state
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -218,5 +220,27 @@ func TestFirstSeenLedgerObserveAndSeenForgetPrune(t *testing.T) {
 	}
 	if _, ok := l.Seen("b", t0); ok {
 		t.Fatal("dropped key retained")
+	}
+}
+
+// TestCooldownSetConcurrentAccess pins the ledger's locking contract:
+// Deps.Heals is shared by the whole check pool (the B9 worker pool),
+// so stamps/reads/prunes from concurrent goroutines must be safe.
+// Run under -race this fails on any unsynchronized map access.
+func TestCooldownSetConcurrentAccess(t *testing.T) {
+	var c CooldownSet
+	now := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("heal/%d", i)
+		wg.Add(4)
+		go func() { defer wg.Done(); c.Stamp(key, now) }()
+		go func() { defer wg.Done(); c.CooledDown(key, time.Minute, now) }()
+		go func() { defer wg.Done(); _ = c.Entries() }()
+		go func() { defer wg.Done(); c.PruneExpired(now.Add(time.Hour), time.Minute) }()
+	}
+	wg.Wait()
+	if got := len(c.Entries()); got == 0 {
+		t.Fatal("concurrent stamps left the ledger empty")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -234,5 +235,57 @@ func TestPlacementJoinsMemoizeAndInvalidate(t *testing.T) {
 	if podLists != 2 || nodeLists != 1 {
 		t.Fatalf("lists pods=%d nodes=%d after InvalidatePods, "+
 			"want pods=2 nodes=1", podLists, nodeLists)
+	}
+}
+
+// InvalidateLeases drops the Lease census AND its ns/name index: a
+// lease visible through the memoized Lease lookup must go stale after
+// the invalidate — the index re-builds from a fresh LIST on the next
+// Get and sees the object gone — while the memoized read BEFORE the
+// invalidate issues no second LIST. This is the regression the
+// snapshot's doc cites: a mid-sweep Lease mutation used to stay
+// visible to every later check.
+func TestInvalidateLeasesDropsMemoAndIndex(t *testing.T) {
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "kube-system", Name: "cilium-l2announce-web-lb"}}
+	cs := fake.NewSimpleClientset(lease)
+	var leaseLists int
+	cs.PrependReactor("list", "leases",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			leaseLists++
+			return false, nil, nil
+		})
+	d := &Deps{CS: cs}
+	sweepCtx := WithSweepSnapshot(context.Background())
+
+	got, err := d.Lease(sweepCtx, "kube-system", "cilium-l2announce-web-lb")
+	if err != nil || got == nil {
+		t.Fatalf("Lease = %v, %v — want the fixture lease", got, err)
+	}
+	// The memoized index serves repeat reads — no fresh LIST.
+	if _, err := d.Lease(sweepCtx, "kube-system", "cilium-l2announce-web-lb"); err != nil {
+		t.Fatal(err)
+	}
+	if leaseLists != 1 {
+		t.Fatalf("lease LISTs=%d after two Gets, want 1 "+
+			"(the index join must ride the memoized census)", leaseLists)
+	}
+
+	// A mid-sweep heal deletes the Lease; InvalidateLeases must drop
+	// both the census and the index so the next Get re-fetches and
+	// sees the object gone.
+	if err := cs.CoordinationV1().Leases("kube-system").Delete(
+		context.Background(), "cilium-l2announce-web-lb",
+		metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	d.InvalidateLeases(sweepCtx)
+	got, err = d.Lease(sweepCtx, "kube-system", "cilium-l2announce-web-lb")
+	if err != nil || got != nil {
+		t.Fatalf("Lease after invalidate = %v, %v — want nil,nil "+
+			"(the stale memo must not serve the deleted lease)", got, err)
+	}
+	if leaseLists != 2 {
+		t.Fatalf("lease LISTs=%d after InvalidateLeases, want 2", leaseLists)
 	}
 }

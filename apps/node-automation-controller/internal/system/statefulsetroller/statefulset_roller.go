@@ -116,6 +116,10 @@ type statefulSetOnDeleteRoller struct {
 	// annotation drops prunes the entry, restarting the 30m window
 	// (same first-seen convention as pdb-deadlock-watchdog).
 	driftSince state.FirstSeenLedger
+	// prom is the D16 dragonfly sync gate's Prometheus wiring —
+	// endpoint + client resolved ONCE at Setup (env inside a run is
+	// a bug); ok=false leaves the gate inert (see dragonfly_sync_gate.go).
+	prom dragonflyPromSeam
 }
 
 // Setup registers the 10-minute sweep.
@@ -124,8 +128,13 @@ type statefulSetOnDeleteRoller struct {
 // entirely — same contract as cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
+		prom := newDragonflyPromSeam()
 		r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
+			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock, prom: prom}
+		// Surface the gate's wiring once at registration — an inert
+		// gate (no endpoint) must be visible to the operator.
+		logf.Log.WithName(d.Name).Info("registered",
+			"dragonflySyncGate", prom.ok, "promEndpoint", prom.endpoint)
 		return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
 	})
 }
@@ -299,6 +308,18 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 				"stableFor", stable, "required", stsOnDeleteStableMin)
 			return false, nil
 		}
+	}
+
+	// Gate 4 (dragonfly cold-start, D16): Ready=True only proves the
+	// port answers — a replica mid-FULL-SYNC (master link still down,
+	// the dataset streaming over) is NOT healthy, and rolling the
+	// next OnDelete member on top of it stacks cold caches and turns
+	// one restart into the sync-storm stampede. Only Dragonfly-
+	// labeled templates run the gate; the evidence posture (query
+	// failure tolerated, series-present 0 blocks) lives in
+	// dragonfly_sync_gate.go.
+	if r.prom.ok && dragonflyReplicaSet(sts) && !r.dragonflyReplicasSynced(ctx, log, sts, pods) {
+		return false, nil
 	}
 
 	// Find the highest-ordinal pod still on the OLD revision — the

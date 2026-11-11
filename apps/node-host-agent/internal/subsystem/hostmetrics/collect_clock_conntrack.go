@@ -5,13 +5,13 @@ package hostmetrics
 
 import (
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 const (
@@ -212,25 +212,26 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 	// conntrack-arp-pressure: the per-CPU stat counters — insert_failed grows on the
 	// UDP source-port tuple collision (A+AAAA race) long before the
 	// table fills; drop counts the packets conntrack refused. Both
-	// are cumulative kernel counters → CounterValue.
-	if st, ok := conntrackStatCounters(c.cfg.ConntrackStatFile,
-		"insert_failed", "drop", "early_drop", "search_restart", "invalid"); ok {
-		if v, found := st["insert_failed"]; found {
+	// are cumulative kernel counters → CounterValue. (The parse is
+	// the shared procfs.ReadConntrackStat — formerly this file's own
+	// conntrackStatCounters twin.)
+	if st, ok := procfs.ReadConntrackStat(c.cfg.ConntrackStatFile); ok {
+		if st.HasInsertFailed {
 			ch <- prometheus.MustNewConstMetric(descCtInsertFail,
-				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+				prometheus.CounterValue, float64(st.InsertFailed), c.cfg.NodeName)
 			ch <- prometheus.MustNewConstMetric(descCtStatInsertFail,
-				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+				prometheus.CounterValue, float64(st.InsertFailed), c.cfg.NodeName)
 		}
 		// The legacy drops series stays strictly drop-column — a
 		// kernel exposing only early_drop must not fabricate a 0
 		// here; the node_exporter-named twin folds both columns.
-		if v, found := st["drop"]; found {
+		if st.HasDrop {
 			ch <- prometheus.MustNewConstMetric(descCtDrops,
-				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+				prometheus.CounterValue, float64(st.Drop), c.cfg.NodeName)
 		}
-		drops, dropOK := st["drop"]
-		if v, found := st["early_drop"]; found {
-			drops, dropOK = drops+v, true
+		drops, dropOK := st.Drop, st.HasDrop
+		if st.HasEarlyDrop {
+			drops, dropOK = drops+st.EarlyDrop, true
 		}
 		if dropOK {
 			ch <- prometheus.MustNewConstMetric(descCtStatDrop,
@@ -239,56 +240,15 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 		// Hash-chain contention and invalid-state counters —
 		// each emitted only when its own column exists (an older
 		// kernel missing the column → absent series, no fake 0).
-		if v, found := st["search_restart"]; found {
+		if st.HasSearchRestart {
 			ch <- prometheus.MustNewConstMetric(descCtSearchRestarts,
-				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+				prometheus.CounterValue, float64(st.SearchRestart), c.cfg.NodeName)
 		}
-		if v, found := st["invalid"]; found {
+		if st.HasInvalid {
 			ch <- prometheus.MustNewConstMetric(descCtInvalid,
-				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+				prometheus.CounterValue, float64(st.Invalid), c.cfg.NodeName)
 		}
 	}
-}
-
-// conntrackStatCounters parses /proc/net/stat/nf_conntrack — a
-// header line of column names followed by one HEX value row per
-// CPU; the named columns are summed across all CPUs. ok=false when
-// the file is unreadable or the header carries none of the wanted
-// columns (conntrack module absent → absent series, no fake 0).
-func conntrackStatCounters(path string, keys ...string) (map[string]uint64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 2 {
-		return nil, false
-	}
-	header := strings.Fields(lines[0])
-	idx := map[string]int{}
-	for _, k := range keys {
-		for i, name := range header {
-			if name == k {
-				idx[k] = i
-			}
-		}
-	}
-	if len(idx) == 0 {
-		return nil, false
-	}
-	out := map[string]uint64{}
-	for _, line := range lines[1:] {
-		f := strings.Fields(line)
-		if len(f) != len(header) {
-			continue // malformed CPU row — never emit junk
-		}
-		for k, i := range idx {
-			if v, err := strconv.ParseUint(f[i], 16, 64); err == nil {
-				out[k] += v
-			}
-		}
-	}
-	return out, true
 }
 
 var descARPEntries = prometheus.NewDesc(

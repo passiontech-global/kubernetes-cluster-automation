@@ -184,6 +184,9 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 		metrics.IncError(p.Name)
 		log.Error(err, "persist heal stamp failed", "operator", op.name)
 	}
+	// The stamp patch mutated the Lease — drop the sweep's lease
+	// census + index so later checks don't read the pre-patch copy.
+	p.InvalidateLeases(ctx)
 }
 
 // leaderPods resolves the operator's leader pod: holderIdentity is

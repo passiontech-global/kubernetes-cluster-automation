@@ -257,10 +257,11 @@ func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
 	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
 
 	chk.Run(ctx)
-	if chk.agentNotReadyStreak["w-gone"] != 1 ||
-		chk.agentNotReadyStreak["w-keep"] != 1 {
-		t.Fatalf("streaks after one not-Ready sweep = %v, want both 1",
-			chk.agentNotReadyStreak)
+	if chk.agentNotReadyStreak.Count("w-gone") != 1 ||
+		chk.agentNotReadyStreak.Count("w-keep") != 1 {
+		t.Fatalf("streaks after one not-Ready sweep = %d/%d, want both 1",
+			chk.agentNotReadyStreak.Count("w-gone"),
+			chk.agentNotReadyStreak.Count("w-keep"))
 	}
 
 	// w-gone leaves the cluster; its streak must not outlive it.
@@ -269,12 +270,10 @@ func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	chk.Run(ctx)
-	if _, tracked := chk.agentNotReadyStreak["w-gone"]; tracked {
-		t.Fatalf("streak for a deleted node must be pruned, got %v",
-			chk.agentNotReadyStreak)
+	if got := chk.agentNotReadyStreak.Count("w-gone"); got != 0 {
+		t.Fatalf("streak for a deleted node must be pruned, got %d", got)
 	}
-	if chk.agentNotReadyStreak["w-keep"] != 2 {
-		t.Fatalf("present node streak must survive and accumulate, got %v",
-			chk.agentNotReadyStreak)
+	if got := chk.agentNotReadyStreak.Count("w-keep"); got != 2 {
+		t.Fatalf("present node streak must survive and accumulate, got %d", got)
 	}
 }

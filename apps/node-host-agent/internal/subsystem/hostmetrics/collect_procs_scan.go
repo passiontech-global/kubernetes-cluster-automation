@@ -12,9 +12,9 @@
 package hostmetrics
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -63,6 +63,14 @@ func (c *Collector) procSnapshot() (map[string]procScan, bool) {
 // sweepProcs walks ProcRoot once collecting every pid's read set —
 // nil when the root doesn't list. Failed per-pid reads degrade that
 // pid's fields (0/""/-1), never the walk.
+//
+// comm AND state both come out of the single /proc/<pid>/stat read —
+// comm is the parenthesized field 2, state the first token after the
+// LAST ')' — so the /proc/<pid>/comm file read and the strings.Fields
+// slice alloc are both gone. The fd-dir ReadDir (the expensive half:
+// ~30 entries per pid × ~1,500 pids) runs ONLY for pids whose comm
+// is a watched daemon — every other pid's fds field stays -1, which
+// collectDaemonFD already treats as "not a candidate".
 func sweepProcs(procRoot string) map[string]procScan {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -76,29 +84,60 @@ func sweepProcs(procRoot string) map[string]procScan {
 		dir := filepath.Join(procRoot, e.Name())
 		ps := procScan{fds: -1}
 		if data, err := os.ReadFile(filepath.Join(dir, "stat")); err == nil {
-			// The state char sits right after the LAST ')' — comm can
-			// contain spaces and parens (zombies scan's trick).
-			s := string(data)
-			if i := strings.LastIndexByte(s, ')'); i >= 0 {
-				if f := strings.Fields(s[i+1:]); len(f) > 0 {
-					ps.state = f[0][0]
-				}
+			ps.state, ps.comm = parseStatHead(data)
+		}
+		if !daemonFDComm(ps.comm) {
+			procs[e.Name()] = ps
+			continue
+		}
+		var cmdline string
+		if ps.comm == "k0s" {
+			// Only the k0s daemons need cmdline (worker vs
+			// controller share comm) — nobody else pays the read.
+			if b, rerr := os.ReadFile(filepath.Join(dir, "cmdline")); rerr == nil {
+				cmdline = string(b)
 			}
 		}
-		if commB, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
-			ps.comm = strings.TrimSpace(string(commB))
-			if ps.comm == "k0s" {
-				// Only the k0s daemons need cmdline (worker vs
-				// controller share comm) — nobody else pays the read.
-				if b, rerr := os.ReadFile(filepath.Join(dir, "cmdline")); rerr == nil {
-					ps.cmdline = string(b)
-				}
-			}
+		if matchDaemon(ps.comm, cmdline) == "" {
+			procs[e.Name()] = ps
+			continue
 		}
+		ps.cmdline = cmdline
 		if fds, err := os.ReadDir(filepath.Join(dir, "fd")); err == nil {
 			ps.fds = len(fds)
 		}
 		procs[e.Name()] = ps
 	}
 	return procs
+}
+
+// daemonFDComm reports whether comm is one of the daemonFDTargets
+// comm values — the cheap gate that keeps the fd ReadDir off the
+// ~1,490 non-daemon pids. "k0s" covers both worker and controller;
+// the argv[1] discriminator runs later in matchDaemon.
+func daemonFDComm(comm string) bool {
+	for _, d := range daemonFDTargets {
+		if comm == d.comm {
+			return true
+		}
+	}
+	return false
+}
+
+// parseStatHead extracts (state, comm) from a raw /proc/<pid>/stat
+// blob with no strings.Fields allocation: comm is the text between
+// the FIRST '(' and the LAST ')' (it can itself contain spaces and
+// parens), state the first byte after the last ')' + space. ok=false
+// halves degrade to zero values — same verdict the Fields parse
+// gave callers.
+func parseStatHead(data []byte) (state byte, comm string) {
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0, ""
+	}
+	state = data[i+2]
+	if open := bytes.IndexByte(data, '('); open >= 0 && open < i {
+		comm = string(data[open+1 : i])
+	}
+	return state, comm
 }

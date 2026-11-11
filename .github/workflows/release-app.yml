@@ -29,6 +29,16 @@ on:
         required: false
         default: false
         type: boolean
+      amd64_alias:
+        description: "Also ship a bare '<app>-linux-amd64' binary + .sha256 (host-level installs)"
+        required: false
+        default: false
+        type: boolean
+      lib_paths:
+        description: "Space-separated repo-relative globs the app's go.mod actually consumes (git-cliff --include-path args)"
+        required: false
+        default: "libs/hostkit/**"
+        type: string
     outputs:
       rel_tag:
         description: "Release tag created (e.g. <app>/v1.2.3)"
@@ -69,12 +79,17 @@ jobs:
           # input through env indirection instead.
           VERSION_INPUT: ${{ inputs.version }}
           LEGACY_V_TAGS: ${{ inputs.legacy_v_tags }}
+          LIB_PATHS: ${{ inputs.lib_paths }}
           # gh release view below needs API auth to catch a release
           # that exists without its git tag locally.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           version_in="$VERSION_INPUT"
+
+          # Space-separated globs -> repeated --include-path args for git-cliff.
+          lib_path_args=()
+          for g in $LIB_PATHS; do lib_path_args+=(--include-path "$g"); done
 
           # Latest release tag for this app. Tag scheme: "<app>/vX.Y.Z";
           # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z"
@@ -121,7 +136,7 @@ jobs:
             bumped=$(git-cliff --bumped-version \
               --config "apps/$APP/cliff.toml" \
               --include-path "apps/$APP/**" \
-              --include-path "libs/hostkit/**" \
+              "${lib_path_args[@]}" \
               "$last_tag..HEAD")
             # --bumped-version prints exactly one version line, but
             # git-cliff >= 2.10 echoes it in the matched tag's shape:
@@ -191,7 +206,7 @@ jobs:
           git-cliff --unreleased --tag "$rel_tag" \
             --config "apps/$APP/cliff.toml" \
             --include-path "apps/$APP/**" \
-            --include-path "libs/hostkit/**" \
+            "${lib_path_args[@]}" \
             "$last_tag..HEAD" > changelog.md
           grep -q '[^[:space:]]' changelog.md || echo "No user-facing changes." > changelog.md
           {
@@ -228,6 +243,21 @@ jobs:
           cp "apps/$APP/bin/$APP" "apps/$APP/dist/$APP-linux-x86_64"
           tar -czf "apps/$APP/dist/$APP-linux-x86_64.tar.gz" -C "apps/$APP/bin" "$APP"
           (cd "apps/$APP/dist" && sha256sum "$APP-linux-x86_64" "$APP-linux-x86_64.tar.gz" > SHA256SUMS.txt)
+          # Host-level installs (k0s controller/hub nodes running the
+          # agent as a systemd unit — no kubelet/container runtime pull
+          # path on hub non-agent hosts) consume a bare
+          # "<app>-linux-amd64" binary + .sha256. Emit them here so
+          # they ride the same atomic `gh release create` as the rest
+          # of dist/ — a follow-up job would race a 404 window after
+          # `gh release create`, and re-uploading a `gh release
+          # download` artifact can never restore the exec bit
+          # (release assets always download 0644; installers chmod
+          # +x after fetch regardless of what was uploaded).
+          if [ "${{ inputs.amd64_alias }}" = "true" ]; then
+            cp "apps/$APP/dist/$APP-linux-x86_64" "apps/$APP/dist/$APP-linux-amd64"
+            chmod +x "apps/$APP/dist/$APP-linux-amd64"
+            (cd "apps/$APP/dist" && sha256sum "$APP-linux-amd64" > "$APP-linux-amd64.sha256")
+          fi
           cat "apps/$APP/dist/SHA256SUMS.txt"
 
       - name: Build and push GHCR image (ko, see apps/<app>/.ko.yaml)
@@ -235,10 +265,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ env.REL_VERSION }}
           # Prereleases get the version tag only — they must not move
-          # the floating :latest pointer onto a non-stable build.
+          # the floating :latest pointer onto a non-stable build. The
+          # '-rc' term guards a manually dispatched prerelease version
+          # (v1.2.3-rc.1) even when the caller left the prerelease
+          # checkbox unticked; it keys on the RESOLVED version so an
+          # auto-bump onto a prerelease is caught the same way.
           # REL_DOCKER_VERSION is REL_VERSION with '+' swapped for '-':
           # docker/ko tags cannot contain '+'.
-          TAGS: "${{ env.REL_DOCKER_VERSION }}${{ inputs.prerelease == true && '' || ',latest' }}"
+          TAGS: "${{ env.REL_DOCKER_VERSION }}${{ (inputs.prerelease == true || contains(env.REL_VERSION, '-rc')) && '' || ',latest' }}"
           KO_DOCKER_REPO: ${{ env.IMAGE }}
         run: |
           set -euo pipefail
@@ -250,7 +284,10 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REL_PRERELEASE: ${{ inputs.prerelease }}
+          # Same effective-prerelease rule as the image TAGS above: a
+          # dispatched -rc version is a prerelease even when the caller
+          # forgot the checkbox.
+          REL_PRERELEASE: ${{ inputs.prerelease == true || contains(env.REL_VERSION, '-rc') }}
         run: |
           set -euo pipefail
           args=(--title "$APP $REL_VERSION" --notes-file notes.md --target "$GITHUB_SHA")

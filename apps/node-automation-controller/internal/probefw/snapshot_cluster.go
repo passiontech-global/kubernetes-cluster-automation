@@ -1,7 +1,8 @@
 // snapshot_cluster.go — the cluster-scoped census readers of the
-// per-sweep snapshot: EndpointSlices, Services, Namespaces and
-// Events (split out of snapshot.go — see its header for the
-// memoizer contract).
+// per-sweep snapshot: EndpointSlices, Services, Namespaces, Events
+// and Leases, plus the ns/name → object index joins behind the
+// Lease/Service single-object lookups (split out of snapshot.go —
+// see its header for the memoizer contract).
 package probefw
 
 import (
@@ -11,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -19,49 +21,37 @@ import (
 // endpoint-desync checks used to each list on their own.
 func (d *Deps) AllEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSlice, error) {
 	s := sweepSnap(ctx)
-	s.muSlices.Lock()
-	defer s.muSlices.Unlock()
-	if !s.slicesSet {
-		s.slicesSet = true
+	return s.slices.get(func(bool) ([]discoveryv1.EndpointSlice, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.slices, s.slicesErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.EndpointSlices(d.CS, metav1.NamespaceAll))
-	}
-	return s.slices, s.slicesErr
+	})
 }
 
 // AllServices is the service twin.
 func (d *Deps) AllServices(ctx context.Context) ([]corev1.Service, error) {
 	s := sweepSnap(ctx)
-	s.muServices.Lock()
-	defer s.muServices.Unlock()
-	if !s.servicesSet {
-		s.servicesSet = true
+	return s.services.get(func(bool) ([]corev1.Service, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.services, s.servicesErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Services(d.CS, metav1.NamespaceAll))
-	}
-	return s.services, s.servicesErr
+	})
 }
 
 // AllNamespaces is the namespace twin.
 func (d *Deps) AllNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
 	s := sweepSnap(ctx)
-	s.muNamespaces.Lock()
-	defer s.muNamespaces.Unlock()
-	if !s.namespacesSet {
-		s.namespacesSet = true
+	return s.namespaces.get(func(bool) ([]corev1.Namespace, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.namespaces, s.namespacesErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Namespaces(d.CS))
-	}
-	return s.namespaces, s.namespacesErr
+	})
 }
 
 // AllEvents is the events twin — the cluster-wide event census the
@@ -71,17 +61,13 @@ func (d *Deps) AllNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
 // safe and the single largest read saving after Pods.
 func (d *Deps) AllEvents(ctx context.Context) ([]corev1.Event, error) {
 	s := sweepSnap(ctx)
-	s.muEvents.Lock()
-	defer s.muEvents.Unlock()
-	if !s.eventsSet {
-		s.eventsSet = true
+	return s.events.get(func(bool) ([]corev1.Event, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.events, s.eventsErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Events(d.CS, metav1.NamespaceAll))
-	}
-	return s.events, s.eventsErr
+	})
 }
 
 // EventsWithReason filters the shared event census to one reason —
@@ -113,33 +99,66 @@ func (d *Deps) EventsWithReason(ctx context.Context, reason string) ([]corev1.Ev
 // all; callers find their Lease by namespace+name in the result.
 func (d *Deps) AllLeases(ctx context.Context) ([]coordinationv1.Lease, error) {
 	s := sweepSnap(ctx)
-	s.muLeases.Lock()
-	defer s.muLeases.Unlock()
-	if !s.leasesSet {
-		s.leasesSet = true
+	return s.leases.get(func(bool) ([]coordinationv1.Lease, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.leases, s.leasesErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Leases(d.CS, metav1.NamespaceAll))
-	}
-	return s.leases, s.leasesErr
+	})
 }
 
 // Lease finds one Lease in the AllLeases census — the snapshot
 // equivalent of `Leases(ns).Get(ctx, name)`: a hit returns the
 // listed object, a miss returns nil (callers treat absent the same
-// as a NotFound GET). List errors propagate so callers keep their
-// fail-open/closed semantics.
+// as a NotFound GET). The lookup rides the memoized ns/name index —
+// the percona quorum check calls it once per cluster CR and a linear
+// census walk per call was ~36 full scans per sweep. List errors
+// propagate so callers keep their fail-open/closed semantics.
 func (d *Deps) Lease(ctx context.Context, ns, name string) (*coordinationv1.Lease, error) {
-	leases, err := d.AllLeases(ctx)
+	s := sweepSnap(ctx)
+	idx, err := s.leaseIndex.get(func(bool) (map[types.NamespacedName]*coordinationv1.Lease, error) {
+		leases, err := d.AllLeases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		m := make(map[types.NamespacedName]*coordinationv1.Lease, len(leases))
+		for i := range leases {
+			m[types.NamespacedName{
+				Namespace: leases[i].Namespace,
+				Name:      leases[i].Name,
+			}] = &leases[i]
+		}
+		return m, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	for i := range leases {
-		if leases[i].Namespace == ns && leases[i].Name == name {
-			return &leases[i], nil
+	return idx[types.NamespacedName{Namespace: ns, Name: name}], nil
+}
+
+// Service is the AllServices twin of Lease — the ns/name → object
+// lookup over the memoized service index for callers that need one
+// Service out of the census (a miss returns nil, list errors
+// propagate).
+func (d *Deps) Service(ctx context.Context, ns, name string) (*corev1.Service, error) {
+	s := sweepSnap(ctx)
+	idx, err := s.serviceIndex.get(func(bool) (map[types.NamespacedName]*corev1.Service, error) {
+		svcs, err := d.AllServices(ctx)
+		if err != nil {
+			return nil, err
 		}
+		m := make(map[types.NamespacedName]*corev1.Service, len(svcs))
+		for i := range svcs {
+			m[types.NamespacedName{
+				Namespace: svcs[i].Namespace,
+				Name:      svcs[i].Name,
+			}] = &svcs[i]
+		}
+		return m, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return idx[types.NamespacedName{Namespace: ns, Name: name}], nil
 }

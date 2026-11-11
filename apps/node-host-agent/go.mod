@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit v0.0.0
+	github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja v0.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	go.yaml.in/yaml/v3 v3.0.6
@@ -66,3 +67,5 @@ require (
 )
 
 replace github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit => ../../libs/hostkit
+
+replace github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja => ../../libs/jinja

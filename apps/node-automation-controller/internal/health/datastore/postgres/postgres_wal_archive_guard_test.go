@@ -375,17 +375,20 @@ func TestCNPGRecoveryPrunesSeries(t *testing.T) {
 // a whole-lifetime tail would re-flag a crash that predates every
 // other signal in the sweep.
 func TestPostgresWALLogOptionsBounded(t *testing.T) {
-	opts := pgWALLogOptions("postgres")
+	opts := pgWALLogOpts("postgres")
 	if opts.Container != "postgres" {
 		t.Fatalf("container = %q, want postgres", opts.Container)
 	}
-	if opts.TailLines == nil || *opts.TailLines != probefw.DefaultTailLines {
+	if opts.TailLines != probefw.DefaultTailLines {
 		t.Fatal("log read missing the tail bound")
 	}
-	if opts.SinceSeconds == nil ||
-		*opts.SinceSeconds != int64(pgWALLogSinceWindow.Seconds()) ||
-		*opts.SinceSeconds <= 0 {
+	if opts.SinceSeconds != int64(pgWALLogSinceWindow.Seconds()) ||
+		opts.SinceSeconds <= 0 {
 		t.Fatalf("log read missing a positive SinceSeconds bound: %v", opts.SinceSeconds)
+	}
+	if opts.MaxBytes <= 0 || opts.Timeout <= 0 {
+		t.Fatalf("log read missing the byte/time bounds: %v/%v",
+			opts.MaxBytes, opts.Timeout)
 	}
 }
 

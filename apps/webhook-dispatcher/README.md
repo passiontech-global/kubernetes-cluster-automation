@@ -11,9 +11,11 @@ the raw body); a single resource failure never fails the delivery.
 
 ## Interface contract
 
-- Endpoints: `POST /webhook`, `GET /healthz` (returns `ok`).
+- Public listener (`LISTEN_ADDR`, default `:8080`): `POST /webhook`, `GET /healthz` (liveness, returns `ok`), `GET /readyz` (readiness, returns `ok` once both listeners are serving).
+- Internal listener (`METRICS_ADDR`, default `:9115`): `GET /metrics` (Prometheus, dedicated registry) and `net/http/pprof` under `/debug/pprof/` — operational endpoints, never exposed to GitHub's side.
+- Shutdown: on SIGTERM/SIGINT both listeners drain (10s), then in-flight fan-out POSTs get a 15s wait budget — ~25s worst case, under the pod's 30s SIGKILL grace.
 - Flags: `--version`.
-- Env:
+- Env (full catalog with rationale: [docs/env.md](docs/env.md)):
 
 | Var                     | Required | Default                     | Purpose                                           |
 | ----------------------- | -------- | --------------------------- | ------------------------------------------------- |
@@ -22,4 +24,5 @@ the raw body); a single resource failure never fails the delivery.
 | `LOCAL_USERS`           | yes      | —                           | Concourse basic auth, `user:password`             |
 | `CONCOURSE_URL`         |          | `http://concourse-web:8080` | ATC base URL                                      |
 | `CONCOURSE_TEAM`        |          | `main`                      | Team to index and fan out to                      |
-| `LISTEN_ADDR`           |          | `:8080`                     | Listen address                                    |
+| `LISTEN_ADDR`           |          | `:8080`                     | Public listen address                             |
+| `METRICS_ADDR`          |          | `:9115`                     | Internal listen address (`/metrics`, `/debug/pprof/*`) |

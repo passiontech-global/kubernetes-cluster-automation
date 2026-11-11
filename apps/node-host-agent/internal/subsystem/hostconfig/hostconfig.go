@@ -16,13 +16,9 @@ package hostconfig
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -33,8 +29,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 const (
@@ -43,8 +39,11 @@ const (
 	defaultVarsDir        = "/config/vars"
 	defaultNebulaCertsDir = "/config/nebula-certs"
 	defaultWatchdogDir    = "/config/watchdog"
-	defaultWatchPoll      = 15 * time.Second
-	defaultCmdTimeout     = 120 * time.Second
+	// defaultWatchPoll is both the DirWatcher rescan cadence (the
+	// same default lives in fileconf, the watcher's new home) and
+	// the hostconfig-watch loop cadence below.
+	defaultWatchPoll  = 15 * time.Second
+	defaultCmdTimeout = 120 * time.Second
 	// CmdTimeoutLong budgets the slow-egress ops (apt-get
 	// install/purge, docker image pulls/compose up, journalctl
 	// --vacuum) routed through runLong — they legitimately run for
@@ -70,158 +69,13 @@ type (
 	DirectRunner = converge.DirectRunner
 )
 
-// Watcher detects input changes (injectable for tests).
+// Watcher detects input changes (injectable for tests). The shared
+// implementation is platform/fileconf.DirWatcher — it moved out of
+// this package so sibling subsystems (hubsync) can use the same
+// watcher without a subsystem-cross import.
 type Watcher interface {
 	Changed() bool            // one-shot edge
 	Poll(ctx context.Context) // internal loop updating state
-}
-
-// DirWatcher polls a fingerprint over (name, size, mtime, content
-// hash) of every file under the watched dirs every period. The per-
-// file content read+hash runs only when a file's (size, mtime) stat
-// differs from the previous scan — an unchanged stat reuses the
-// cached hash, so a quiet dir costs stats only. Residual risk,
-// accepted: a rewrite that keeps BOTH size and mtime identical is
-// trusted as unchanged (mtime granularity) and will not fire an edge.
-type DirWatcher struct {
-	Dirs   []string
-	Period time.Duration
-
-	mu     sync.Mutex // guards last, dirty, polled — Poll writes, Changed reads
-	last   string
-	dirty  bool // Poll-latched change edge, consumed by Changed
-	polled bool // Poll has observed the dir at least once
-
-	// stats caches the last scan's per-file (size, mtime, hash);
-	// fingerprint reads+writes it under fpMu — Changed runs a
-	// fingerprint OUTSIDE w.mu by design, so scans may overlap.
-	fpMu  sync.Mutex
-	stats map[string]dirWatchFile
-}
-
-// dirWatchFile is one file's cached fingerprint inputs.
-type dirWatchFile struct {
-	size    int64
-	mtimeNS int64
-	sum     []byte
-}
-
-// readFile is the content-read seam — tests count reads to prove the
-// stat-unchanged fast path skips hashing.
-var readFile = os.ReadFile
-
-func (w *DirWatcher) fingerprint() string {
-	h := sha256.New()
-	var files []string
-	for _, d := range w.Dirs {
-		_ = filepath.WalkDir(d, func(p string, e fs.DirEntry, err error) error {
-			if err != nil {
-				logger().Debug("hostconfig: watcher walk error — entry skipped",
-					"dir", d, "path", p, "error", err)
-				return nil
-			}
-			if !e.IsDir() {
-				files = append(files, p)
-			}
-			return nil
-		})
-	}
-	sort.Strings(files)
-	w.fpMu.Lock()
-	defer w.fpMu.Unlock()
-	next := make(map[string]dirWatchFile, len(files))
-	for _, f := range files {
-		var sum []byte
-		st, err := os.Stat(f)
-		if err != nil {
-			logger().Debug("hostconfig: watcher cannot stat file — excluded from fingerprint",
-				"file", f, "error", err)
-			continue
-		}
-		if c, ok := w.stats[f]; ok && c.size == st.Size() && c.mtimeNS == st.ModTime().UnixNano() {
-			// Stat unchanged → trust the cached content hash; the
-			// file's bytes are not re-read this scan.
-			sum = c.sum
-		} else {
-			b, err := readFile(f)
-			if err != nil {
-				logger().Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
-					"file", f, "error", err)
-				continue
-			}
-			s := sha256.Sum256(b)
-			sum = s[:]
-		}
-		next[f] = dirWatchFile{size: st.Size(), mtimeNS: st.ModTime().UnixNano(), sum: sum}
-		h.Write([]byte(f))
-		h.Write(sum)
-	}
-	w.stats = next
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func (w *DirWatcher) Poll(ctx context.Context) {
-	p := w.Period
-	if p <= 0 {
-		p = defaultWatchPoll
-	}
-	initFP := w.fingerprint()
-	w.mu.Lock()
-	if w.last == "" {
-		w.last = initFP
-	}
-	w.polled = true
-	w.mu.Unlock()
-
-	t := time.NewTicker(p)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			fp := w.fingerprint()
-			w.mu.Lock()
-			if fp != w.last {
-				w.dirty = true
-				w.last = fp
-			}
-			w.mu.Unlock()
-		}
-	}
-}
-
-// Changed reports a change edge. Once Poll has run it just consumes
-// the edge Poll latched — the main loop does not re-read and re-hash
-// every file a second time, and an edge observed between two Changed
-// calls is never lost. When Poll has never run (unit tests calling
-// Changed directly) it falls back to comparing a fresh fingerprint
-// against the last snapshot.
-func (w *DirWatcher) Changed() bool {
-	w.mu.Lock()
-	if w.polled {
-		d := w.dirty
-		w.dirty = false
-		w.mu.Unlock()
-		return d
-	}
-	w.mu.Unlock()
-
-	// No Poll yet — fingerprint outside the lock (dir walk + file
-	// reads) so a racing first Poll scan is not stalled on disk IO.
-	fp := w.fingerprint()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	// Poll may have started meanwhile — its dirty latch is then the
-	// authoritative edge and the fingerprint is discarded.
-	if w.polled {
-		d := w.dirty
-		w.dirty = false
-		return d
-	}
-	changed := fp != w.last
-	w.last = fp
-	return changed
 }
 
 // Config — all injectable.
@@ -583,141 +437,5 @@ func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 		logger().Warn("hostconfig: reload failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
-}
 
-// --- sh -c interpolation gates ---
-//
-// Several groups build `sh -c`/`bash -c` command strings with
-// vars-derived values (nebula tables/dev, mesh IPs, ports). The
-// charset/shape predicates live in the converge package — these
-// wrappers add the cycle-error attribution: a refused value counts a
-// cycle error AND refuses the shell work.
-
-// shToken reports whether a vars-derived value may be interpolated
-// into a host shell command.
-func (c *cyc) shToken(what, s string) bool {
-	if converge.SHToken(s) {
-		return true
-	}
-	c.err("hostconfig: unsafe value refused for shell interpolation",
-		"what", what, "value", s)
-	return false
-}
-
-// shIPCIDR is shToken for IP/prefix values.
-func (c *cyc) shIPCIDR(what, s string) bool {
-	if converge.SHIPCIDR(s) {
-		return true
-	}
-	c.err("hostconfig: invalid IP/CIDR refused for shell interpolation",
-		"what", what, "value", s)
-	return false
-}
-
-// shMarkerBase validates the marker subnet base (interdc_marker_base,
-// e.g. "172.29.0") — rules use it as <base>.0/24, so <base>.0 must
-// be a valid IPv4 addr (a 3-octet base, NOT a full IP).
-func (c *cyc) shMarkerBase(what, s string) bool {
-	if converge.SHMarkerBase(s) {
-		return true
-	}
-	c.err("hostconfig: invalid marker base refused for shell interpolation",
-		"what", what, "value", s)
-	return false
-}
-
-// shPort is shToken for TCP/UDP ports destined for --dport or
-// /dev/tcp interpolation.
-func (c *cyc) shPort(what, s string) bool {
-	if converge.SHPort(s) {
-		return true
-	}
-	c.err("hostconfig: invalid port refused for shell interpolation",
-		"what", what, "value", s)
-	return false
-}
-
-// cfgScalar is the rendered-config sibling of shToken: it gates a
-// vars-derived value rendered verbatim as a plain scalar into a
-// config file (kubelet KubeletConfiguration YAML, containerd toml).
-// A refused value counts a cycle error and skips its own render —
-// the remaining lines converge untouched.
-func (c *cyc) cfgScalar(what, s string) bool {
-	if converge.CfgScalar(s) {
-		return true
-	}
-	c.err("hostconfig: unsafe value refused for config render",
-		"what", what, "value", s)
-	return false
-}
-
-// cfgShellVal is the shell-sourced-conf sibling of cfgScalar: it
-// gates a vars-derived/topology scalar rendered into a double-quoted
-// KEY="..." line of /etc/node-watchdog.conf (see converge.CfgShellVal
-// for why ':' stays legal here while '"', '$' and backtick do not).
-// A refused value counts a cycle error and fails the whole render
-// closed — the conf is sourced as one unit, so a partially-rendered
-// file would silently disable probes.
-func (c *cyc) cfgShellVal(what, s string) bool {
-	if converge.CfgShellVal(s) {
-		return true
-	}
-	c.err("hostconfig: unsafe value refused for watchdog conf render",
-		"what", what, "value", s)
-	return false
-}
-
-// cfgSysctlKey / cfgSysctlVal gate the /etc/sysctl.d pair renders —
-// a newline-bearing value would splice further `key = value` lines
-// into the drop-in, applied verbatim by `sysctl --system`.
-func (c *cyc) cfgSysctlKey(what, s string) bool {
-	if converge.CfgSysctlKey(s) {
-		return true
-	}
-	c.err("hostconfig: unsafe sysctl key refused", "what", what, "value", s)
-	return false
-}
-
-func (c *cyc) cfgSysctlVal(what, s string) bool {
-	if converge.CfgSysctlVal(s) {
-		return true
-	}
-	c.err("hostconfig: unsafe sysctl value refused", "what", what, "value", s)
-	return false
-}
-
-// cfgLimitNOFILE gates the systemd LimitNOFILE= drop-in assignments —
-// a value systemd cannot parse is dropped at daemon-reload and the
-// unit silently keeps stock fd limits, so a refused value skips the
-// drop-in write entirely.
-func (c *cyc) cfgLimitNOFILE(what, s string) bool {
-	if converge.CfgLimitNOFILE(s) {
-		return true
-	}
-	c.err("hostconfig: invalid LimitNOFILE refused for drop-in render",
-		"what", what, "value", s)
-	return false
-}
-
-// The *Req variants are the same gates for slots where the value is
-// REQUIRED: an empty value there cannot inject, but it still emits a
-// malformed command (`ip route replace default dev neb1 src <blank>`,
-// `--dport <blank>`) that only fails at Debug level inside sh -c.
-// Required slots count an empty value as a cycle error instead.
-func (c *cyc) shIPCIDRReq(what, s string) bool {
-	if s == "" {
-		c.err("hostconfig: required IP/CIDR empty — refusing shell interpolation",
-			"what", what)
-		return false
-	}
-	return c.shIPCIDR(what, s)
-}
-
-func (c *cyc) shPortReq(what, s string) bool {
-	if s == "" {
-		c.err("hostconfig: required port empty — refusing shell interpolation",
-			"what", what)
-		return false
-	}
-	return c.shPort(what, s)
 }

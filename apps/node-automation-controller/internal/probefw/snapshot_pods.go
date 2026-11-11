@@ -20,17 +20,13 @@ import (
 // (the pre-snapshot semantics).
 func (d *Deps) AllPods(ctx context.Context) ([]corev1.Pod, error) {
 	s := sweepSnap(ctx)
-	s.muPods.Lock()
-	defer s.muPods.Unlock()
-	if !s.podsSet {
-		s.podsSet = true
+	return s.pods.get(func(bool) ([]corev1.Pod, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		s.pods, s.podsErr = kube.ListAll(lctx,
+		return kube.ListAll(lctx,
 			metav1.ListOptions{Limit: HealthListPageSize},
 			kube.Pods(d.CS, metav1.NamespaceAll))
-	}
-	return s.pods, s.podsErr
+	})
 }
 
 // PodsIn filters the shared census to one namespace — the client-side
@@ -88,19 +84,15 @@ func (d *Deps) PodsMatching(ctx context.Context, ns, selector string) ([]*corev1
 // alongside the census. Read-only like every snapshot payload.
 func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
 	s := sweepSnap(ctx)
-	s.muPodNodes.Lock()
-	defer s.muPodNodes.Unlock()
-	if !s.podNodesSet {
-		s.podNodesSet = true
-		var pods []corev1.Pod
-		pods, s.podNodesErr = d.AllPods(ctx)
-		if s.podNodesErr == nil {
-			s.podNodes = make(map[string]string, len(pods))
-			for i := range pods {
-				s.podNodes[pods[i].Namespace+"/"+pods[i].Name] =
-					pods[i].Spec.NodeName
-			}
+	return s.podNodes.get(func(bool) (map[string]string, error) {
+		pods, err := d.AllPods(ctx)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return s.podNodes, s.podNodesErr
+		m := make(map[string]string, len(pods))
+		for i := range pods {
+			m[pods[i].Namespace+"/"+pods[i].Name] = pods[i].Spec.NodeName
+		}
+		return m, nil
+	})
 }

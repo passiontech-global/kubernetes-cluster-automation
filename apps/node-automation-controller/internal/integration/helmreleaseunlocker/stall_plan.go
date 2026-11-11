@@ -58,7 +58,9 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 			dep.Namespace, dep.Name, maxUnavailable), nil
 	}
 
-	rss, err := u.cs.AppsV1().ReplicaSets(dep.Namespace).List(ctx, metav1.ListOptions{})
+	rss, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.ReplicaSets(u.cs, dep.Namespace))
 	if err != nil {
 		return nil, "", fmt.Errorf("list replicasets in %s: %w", dep.Namespace, err)
 	}
@@ -71,8 +73,8 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 
 	// ReplicaSets owned by this Deployment, newest revision first.
 	var owned []*appsv1.ReplicaSet
-	for i := range rss.Items {
-		rs := &rss.Items[i]
+	for i := range rss {
+		rs := &rss[i]
 		if ref := metav1.GetControllerOf(rs); ref != nil &&
 			ref.Kind == "Deployment" && ref.Name == dep.Name {
 			owned = append(owned, rs)

@@ -8,9 +8,10 @@ package hostconfig
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // TestCoreDNSZoneNameFallback — no zone: key in interdc_dns_zone.yaml

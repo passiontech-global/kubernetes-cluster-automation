@@ -9,6 +9,7 @@ tags:
 # hostkit change -> this project's tasks are affected (moon ci).
 dependsOn:
   - 'hostkit'
+  - 'jinja'
 
 project:
   title: 'node-host-agent'
@@ -32,6 +33,9 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
       # internal/envdoc's honesty test reads ENV.md — without this input
       # an envdoc-only change never re-runs the test on CI.
       - 'ENV.md'
@@ -43,6 +47,9 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
 
   lint:
@@ -50,6 +57,9 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
       # golangci-lint resolves its config by walking up to the repo root.
       - '/.golangci.yml'
@@ -69,6 +79,9 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
       - '/mise.toml'
     outputs:
@@ -88,6 +101,7 @@ tasks:
       # envx knob declarations and the go.mod-replaced hostkit tree feed
       # `go run ./internal/envdoc/cmd/genenvdoc` — touch them too.
       - '/libs/hostkit/**'
+      - '/libs/jinja/**'
     outputs:
       - 'ENV.md'
     options:
@@ -95,14 +109,16 @@ tasks:
       shell: true
       cache: false
 
-  image:
+  image-build:
     # Plain docker build of ./Dockerfile — NOT `ko build`: the shipped
     # image must contain userspace tools (nsenter, ip/ss, ping, sh) in
     # the container fs (nethealth runs `nsenter -t 1 -n -- <argv>` where
     # argv resolves container-side), and ko's defaultBaseImage cannot
-    # install packages. .ko.yaml is kept as a local-only fallback.
-    # Callers (release-app.yml) export KO_DOCKER_REPO + TAGS + VERSION
-    # and have already `docker login`'d ghcr.io.
+    # install packages. (The local-only .ko.yaml fallback was removed —
+    # the plain docker build is the only image path.)
+    # Builds all release tags locally and pushes nothing — callers
+    # (release-app.yml) export KO_DOCKER_REPO + TAGS + VERSION and
+    # docker-login before image-push runs.
     # Build context is the repo ROOT (moon runs this script from the
     # project dir) so the go.mod `replace ../../libs/hostkit` target is
     # inside the context; .dockerignore resolution likewise moves to
@@ -114,9 +130,6 @@ tasks:
         args="$args -t ${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
       done
       docker build --build-arg "VERSION=${VERSION:-dev}" $args -f "$PWD/Dockerfile" "$PWD/../.."
-      for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
-        docker push "${KO_DOCKER_REPO}:$t"
-      done
     toolchains: 'system'
     inputs:
       - 'cmd/**/*.go'
@@ -128,9 +141,41 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
       - 'internal/subsystem/hostconfig/templates/**'
       - '/mise.toml'
     options:
       # script is a multi-line shell snippet — must run via shell.
       shell: true
+      cache: false
+
+  image-push:
+    # Pushes the tags image-build just loaded into the local daemon.
+    # Login is the caller's job; this task never authenticates itself.
+    deps:
+      - 'image-build'
+    script: |
+      set -eu
+      for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
+        docker push "${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
+      done
+    toolchains: 'system'
+    inputs:
+      - '$TAGS'
+      - '$KO_DOCKER_REPO'
+    options:
+      # script is a multi-line shell snippet — must run via shell.
+      shell: true
+      cache: false
+
+  # Thin composite kept for the release pipeline: release-app.yml runs
+  # `moon run <app>:image` — build everything, then push. cache:false
+  # so a previously cached composite never satisfies the run without
+  # executing its deps.
+  image:
+    deps:
+      - 'image-push'
+    options:
       cache: false

@@ -127,8 +127,11 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// the revision scan below matches on. Storage ns is flux's
 	// GetStorageNamespace() — spec.storageNamespace || HR namespace;
 	// targetNamespace is NOT part of that chain.
-	secrets, err := u.cs.CoreV1().Secrets(hrStorageNS(hr)).List(ctx,
-		metav1.ListOptions{LabelSelector: "owner=helm,name=" + release})
+	secrets, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			Limit:         kube.DefaultListPageSize,
+			LabelSelector: "owner=helm,name=" + release},
+		kube.Secrets(u.cs, hrStorageNS(hr)))
 	if err != nil {
 		return false, fmt.Errorf("list release secrets in %s for %s: %w",
 			hrStorageNS(hr), release, err)
@@ -137,8 +140,8 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	var pending *corev1.Secret
 	pendingRev := -1
 	var safeRevs []int // deployed/superseded revisions = rollback targets
-	for i := range secrets.Items {
-		s := &secrets.Items[i]
+	for i := range secrets {
+		s := &secrets[i]
 		if s.Type != corev1.SecretType(helmSecretType) || s.Labels["name"] != release {
 			continue
 		}

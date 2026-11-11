@@ -16,9 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
-
 	"golang.org/x/crypto/ssh"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // TestEnabled: present file → live, directory → not, empty path → the

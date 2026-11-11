@@ -605,11 +605,11 @@ func TestSubsystemEarlyReturnCancelDuringBackoff(t *testing.T) {
 	}
 }
 
-// TestMetricsEndpointExposesGoRuntimeAndPprof pins the triage
+// TestMetricsEndpointExposesGoRuntime pins the triage
 // contract on the agent side: /metrics must carry the Go runtime +
 // process collectors (heap vs retained-span attribution for the
-// GOMEMLIMIT sizing) and the metrics mux must serve the pprof
-// endpoints — same contract as node-automation-controller.
+// GOMEMLIMIT sizing) — and, post-roadmap-1.2, must NOT serve pprof
+// (the profiles moved to the loopback-only pprofMux).
 func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 	a := New(Config{NodeName: "node-a"})
 	srv := httptest.NewServer(a.metricsMux())
@@ -639,6 +639,27 @@ func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("pprof on the metrics mux: got %d, want 404 (moved to the loopback listener)", resp.StatusCode)
+	}
+}
+
+// TestPprofMuxLoopbackOnly pins the roadmap-1.2 loopback contract:
+// the pprof mux serves heap/cmdline, and it is reached only through
+// the dedicated listener — the Config field is named to keep the
+// bind-loopback discipline at the callsite (main.go default
+// 127.0.0.1:9116).
+func TestPprofMuxLoopbackOnly(t *testing.T) {
+	a := New(Config{NodeName: "node-a"})
+	srv := httptest.NewServer(a.pprofMux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/debug/pprof/heap?debug=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("heap profile: got %d, want 200", resp.StatusCode)
 	}
@@ -653,5 +674,84 @@ func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("cmdline: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRunPprofLoopbackBindOnly pins the 127.0.0.1 discipline: Run
+// binds the configured pprof loopback listener (a wildcard bind
+// would re-expose the profiles to the node network) — a
+// PprofAddr conflict must fail Run with the loopback error.
+func TestRunPprofLoopbackBindOnly(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	a := New(Config{MetricsAddr: "127.0.0.1:0",
+		ProbeAddr: "127.0.0.1:0", PprofAddr: ln.Addr().String()})
+	err = a.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "pprof loopback listener") {
+		t.Fatalf("Run err=%v want 'pprof loopback listener' error", err)
+	}
+}
+
+// TestRunPprofLoopbackServesWithZeroWriteTimeout proves the 1.2
+// contract end-to-end on a live Run: the loopback listener answers
+// a profile request, and the server was built with WriteTimeout 0
+// — profile/trace legitimately outlive 30s only there (the
+// metrics/probe servers carry bounded timeouts).
+func TestRunPprofLoopbackServesWithZeroWriteTimeout(t *testing.T) {
+	// Pre-resolve concrete ports — Run's listeners are not
+	// reachable through a ":0" config value.
+	free := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		return ln.Addr().String()
+	}
+	metricsAddr, probeAddr, pprofAddr := free(), free(), free()
+	a := New(Config{MetricsAddr: metricsAddr,
+		ProbeAddr: probeAddr, PprofAddr: pprofAddr})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	deadline := time.After(5 * time.Second)
+
+	// Poll the readiness the same way sdnotify does — the probe mux
+	// flips ready once all three listeners are bound.
+	probeReady := func() bool {
+		resp, err := http.Get("http://" + probeAddr + "/healthz")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}
+	for !probeReady() {
+		select {
+		case <-deadline:
+			t.Fatal("Run never became ready")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	resp, err := http.Get("http://" + pprofAddr + "/debug/pprof/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pprof loopback cmdline: got %d, want 200", resp.StatusCode)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-deadline:
+		t.Fatal("Run did not return after context cancel")
 	}
 }

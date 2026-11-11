@@ -10,13 +10,12 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"fmt"
 	"os"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 //go:embed all:templates
@@ -163,19 +162,6 @@ func (c *cyc) vi(name string) int64 { return c.t.Vars.Int(name) }
 func (c *cyc) worker() bool { return c.r.fileExists("/etc/systemd/system/k0sworker.service") }
 
 func (c *cyc) controller() bool { return c.r.fileExists("/etc/systemd/system/k0scontroller.service") }
-
-func strOf(m any, key string) string {
-	om, _ := m.(*jinja.OMap)
-	if om == nil {
-		return ""
-	}
-	v, _ := om.Get(key)
-	s, _ := v.(string)
-	if s == "" && v != nil {
-		return fmt.Sprint(v)
-	}
-	return s
-}
 
 func fileExistsNoRoot(p string) bool {
 	_, err := os.Stat(p)

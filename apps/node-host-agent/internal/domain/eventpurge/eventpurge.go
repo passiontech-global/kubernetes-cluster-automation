@@ -112,6 +112,10 @@ func (c *Config) applyDefaults() {
 // keeps HTTP/2 multiplexing across the whole worker pool.
 func (c Config) httpClient() (*http.Client, error) {
 	if c.Client != nil {
+		// Caller-injected client: used verbatim (same *http.Client
+		// the caller built — CA/cert/key files are ignored). The
+		// run's idle-connection teardown lives in Run's
+		// CloseIdleConnections defer, so no cloning is needed here.
 		return c.Client, nil
 	}
 	pem, err := os.ReadFile(c.CAFile)
@@ -127,19 +131,25 @@ func (c Config) httpClient() (*http.Client, error) {
 		return nil, fmt.Errorf("load client cert %s/%s: %w",
 			c.CertFile, c.KeyFile, err)
 	}
+	// Clone http.DefaultTransport rather than build a Transport from
+	// scratch: the clone carries ForceAttemptHTTP2, so the custom
+	// TLS config below does not silently downgrade the worker pool's
+	// shared connections to HTTP/1.1 (a fresh &http.Transport with
+	// TLSClientConfig set would — that contradicted the HTTP/2
+	// multiplexing this comment block always promised).
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// The worker pool runs cfg.Workers parallel DELETEs —
+	// the default MaxIdleConnsPerHost=2 would churn
+	// connections every cycle.
+	tr.MaxIdleConnsPerHost = c.Workers
+	tr.TLSClientConfig = &tls.Config{
+		RootCAs:      pool,
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
 	return &http.Client{
-		Timeout: c.Timeout,
-		Transport: &http.Transport{
-			// The worker pool runs cfg.Workers parallel DELETEs —
-			// the default MaxIdleConnsPerHost=2 would churn
-			// connections every cycle.
-			MaxIdleConnsPerHost: c.Workers,
-			TLSClientConfig: &tls.Config{
-				RootCAs:      pool,
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			},
-		},
+		Timeout:   c.Timeout,
+		Transport: tr,
 	}, nil
 }
 
@@ -171,6 +181,16 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 	client, err := cfg.httpClient()
 	if err != nil {
 		return err
+	}
+	// One-shot run: hand every pooled conn back to the kernel at
+	// exit instead of holding them for the default 90s idle window.
+	// Locally-built clients only — an INJECTED client is the
+	// caller's; closing its idle connections from here would tear
+	// down pools the caller may still be using.
+	if cfg.Client == nil {
+		if t, ok := client.Transport.(*http.Transport); ok {
+			defer t.CloseIdleConnections()
+		}
 	}
 	paths, err := listStale(ctx, client, cfg.API, cutoff)
 	if err != nil {

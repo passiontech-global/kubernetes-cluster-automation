@@ -9,4 +9,4 @@ import (
 )
 
 // logger returns the package logger; see logx.For for why resolution is per call.
-func logger() *slog.Logger { return logx.For("converge") }
+func logger() *slog.Logger { return logx.For("hostconfig") }

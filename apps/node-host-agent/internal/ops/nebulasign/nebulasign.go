@@ -22,7 +22,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // signJob is one cert request, mirroring sign.yaml's nebula_sign_jobs
@@ -156,7 +157,12 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 	if defUser == "" {
 		defUser = "root"
 	}
-	bySite := jstrMap(t.Vars.Get("interdc_ssh_user_by_site"))
+	// bySite is an arbitrary resolved value, not a key read — box it
+	// into a one-key OMap so StrMap's flatten/empty-non-nil semantics
+	// apply unchanged.
+	bySiteBox := jinja.NewOMap()
+	bySiteBox.Set("by_site", t.Vars.Get("interdc_ssh_user_by_site"))
+	bySite := bySiteBox.StrMap("by_site")
 
 	var jobs []signJob
 	var badNodes []string
@@ -169,8 +175,8 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 		if om == nil {
 			continue
 		}
-		ip := omStr(om, "ip")
-		octet := omStr(om, "marker_octet")
+		ip := om.Str("ip")
+		octet := om.Str("marker_octet")
 		if octet == "" {
 			octet = topology.LastOctet(ip)
 		}
@@ -191,10 +197,10 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 			continue
 		}
 		subs := []string{ip + "/32"}
-		for _, r := range omList(om, "relay") {
+		for _, r := range om.Slice("relay") {
 			var rip string
 			if rm, ok := r.(*jinja.OMap); ok {
-				rip = omStr(rm, "ip")
+				rip = rm.Str("ip")
 			} else {
 				rip = jstr(r)
 			}
@@ -202,15 +208,15 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 				subs = append(subs, rip+"/32")
 			}
 		}
-		user := omStr(om, "ssh_user")
+		user := om.Str("ssh_user")
 		if user == "" {
-			if u := bySite[omStr(om, "site")]; u != "" {
+			if u := bySite[om.Str("site")]; u != "" {
 				user = u
 			} else {
 				user = defUser
 			}
 		}
-		name := omStr(om, "name")
+		name := om.Str("name")
 		if name == "" {
 			name = k
 		}
@@ -226,10 +232,10 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 			Name:      name,
 			IPCIDR:    base + "." + octet + "/24",
 			Subnets:   strings.Join(topology.UniqSorted(subs), ","),
-			Pub:       stripPubArmor(omStr(om, "nebula_key")),
+			Pub:       stripPubArmor(om.Str("nebula_key")),
 			IP:        ip,
 			SSHUser:   user,
-			ProxyJump: omStr(om, "ssh_proxyjump"),
+			ProxyJump: om.Str("ssh_proxyjump"),
 		})
 	}
 	if len(badNodes) > 0 {
@@ -285,24 +291,19 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		dst := filepath.Join(cfg.VarsDir, "nebula-"+j.Name+".crt")
-		tmpDst := dst + ".tmp"
-		if err := os.WriteFile(tmpDst, crt, 0o644); err != nil {
-			_ = os.Remove(tmpDst)
-			return fmt.Errorf("%s: %w", j.Hostname, err)
-		}
-		// Chmod (WriteFile's mode rides the umask) + fsync before the
-		// rename — a crash after mv must never expose a truncated or
-		// mis-permissioned cert at the vars path.
-		if err := os.Chmod(tmpDst, 0o644); err != nil {
-			_ = os.Remove(tmpDst)
-			return fmt.Errorf("%s: %w", j.Hostname, err)
-		}
-		if err := syncFile(tmpDst); err != nil {
-			_ = os.Remove(tmpDst)
-			return fmt.Errorf("%s: %w", j.Hostname, err)
-		}
-		if err := os.Rename(tmpDst, dst); err != nil {
-			_ = os.Remove(tmpDst)
+		// fsx.WriteFile: same-dir staging (the historical fixed
+		// <dst>.tmp shape, kept verbatim), mode forced before the
+		// sync+rename, payload fsync before the rename, staging file
+		// swept on every failure — the tmp+chmod+fsync+rename ladder
+		// this block hand-rolled. No DirSync: the original never
+		// fsynced the dir, and raising that here would be a
+		// durability drift, not a dedup.
+		if err := fsx.WriteFile(dst, crt, fsx.Opts{
+			Mode: 0o644,
+			Stage: func(dir string) (*os.File, error) {
+				return os.Create(dst + ".tmp")
+			},
+		}); err != nil {
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		fmt.Fprintf(os.Stderr, "nebula-sign: signed %s (%s) -> %s\n",
@@ -332,11 +333,11 @@ func stripPubArmor(s string) string {
 
 // --- jinja value helpers ---
 //
-// topology keeps its coercions unexported; hubsync carries the same
-// minimal shims (strOf/strMap/omStr/omBool in targets.go). The copies
-// are NOT identical — jstr/jstrMap/omStr here coerce bool → "true"
-// where hubsync's strOf/strMap/omStr drop it — so the shims stay
-// per-package rather than being exported from topology.
+// omStr/omList/jstrMap are gone: the typed getters on *jinja.OMap
+// (Str/Slice/StrMap) are that family's single home now, and this
+// package's call sites read through them directly. jstr stays only
+// for the bare-relay-entry coercion below — a list element (any),
+// not an OMap key read, so no OMap method covers it.
 
 // jstr coerces a resolved template var to its string form. string /
 // int64 / float64 keep their dedicated formatting, bool keeps
@@ -366,48 +367,4 @@ func jstr(v any) string {
 		return ""
 	}
 	return fmt.Sprint(v)
-}
-
-func omStr(m *jinja.OMap, key string) string {
-	v, ok := m.Get(key)
-	if !ok {
-		return ""
-	}
-	return jstr(v)
-}
-
-func omList(m *jinja.OMap, key string) []any {
-	v, ok := m.Get(key)
-	if !ok {
-		return nil
-	}
-	switch t := v.(type) {
-	case []any:
-		return t
-	case *jinja.List:
-		return t.V
-	}
-	return nil
-}
-
-func jstrMap(v any) map[string]string {
-	out := map[string]string{}
-	if om, ok := v.(*jinja.OMap); ok && om != nil {
-		for _, k := range om.Keys() {
-			vv, _ := om.Get(k)
-			out[k] = jstr(vv)
-		}
-	}
-	return out
-}
-
-// syncFile fsyncs an existing file so the rename that publishes it
-// lands durable bytes, not cache promises (DownloadFile parity).
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	return f.Sync()
 }

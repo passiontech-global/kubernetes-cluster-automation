@@ -6,6 +6,15 @@ package storelocal
 
 import "testing"
 
+// The st-column spellings classifyConnLine byte-compares: LISTEN
+// "0A" is excluded from the connection count; FIN_WAIT2 "05" and
+// CLOSE_WAIT "08" are the stuck orphans.
+const (
+	tcpStateListen    = "0A"
+	tcpStateFinWait2  = "05"
+	tcpStateCloseWait = "08"
+)
+
 // kineTCPRow builds one /proc/net/tcp(6) data row:
 //
 //	sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ...
@@ -17,7 +26,7 @@ func kineTCPRow(st, rem, retrnsmt, inode string) string {
 
 func TestClassifyConnLine(t *testing.T) {
 	// rem port 0x1920 = 6432, the default DB port in the rows below.
-	inodes := map[string]bool{"900": true}
+	inodes := map[uint64]bool{900: true}
 	const dbPort = 6432
 
 	tests := []struct {
@@ -78,7 +87,7 @@ func TestClassifyConnLine(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			isConn, isStuck := classifyConnLine(tc.line, dbPort, inodes)
+			isConn, isStuck := classifyConnLine([]byte(tc.line), dbPort, inodes)
 			if isConn != tc.wantConn || isStuck != tc.stuck {
 				t.Fatalf("classifyConnLine(%q) = %v,%v want %v,%v",
 					tc.line, isConn, isStuck, tc.wantConn, tc.stuck)
@@ -88,7 +97,7 @@ func TestClassifyConnLine(t *testing.T) {
 
 	// tcp6 rows go through the same parser.
 	isConn, isStuck := classifyConnLine(
-		kineTCPRow("01", "00645E0A647D:1920", "00000004", "900"), dbPort, inodes)
+		[]byte(kineTCPRow("01", "00645E0A647D:1920", "00000004", "900")), dbPort, inodes)
 	if !isConn || !isStuck {
 		t.Fatalf("tcp6 retransmitting conn = %v,%v want true,true", isConn, isStuck)
 	}
@@ -108,7 +117,7 @@ func TestTCPRemotePort(t *testing.T) {
 		{"0A0000FF:", 0, false},      // empty port
 	}
 	for _, tc := range tests {
-		port, ok := tcpRemotePort([]string{"sl", "0100007F:1234", tc.rem, "01"})
+		port, ok := tcpRemotePort([]byte(tc.rem))
 		if ok != tc.wantOK || port != tc.wantPort {
 			t.Fatalf("tcpRemotePort(%q) = %d,%v want %d,%v",
 				tc.rem, port, ok, tc.wantPort, tc.wantOK)

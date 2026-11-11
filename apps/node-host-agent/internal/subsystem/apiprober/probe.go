@@ -166,16 +166,14 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	// a healthy backend.
 	req.Header.Set("Accept",
 		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
-	// Token re-read per query — see func doc. An injected HTTPClient
-	// (the test seam) issues its own auth.
+	// Token re-read per CYCLE (see Cycle) — see func doc. An injected
+	// HTTPClient (the test seam) issues its own auth.
 	if p.eff.tokenFile != "" && p.cfg.HTTPClient == nil {
-		tok, err := os.ReadFile(p.eff.tokenFile)
+		tok, err := p.bearerToken()
 		if err != nil {
-			return 0, failToken,
-				fmt.Errorf("read token %s: %w", p.eff.tokenFile, err)
+			return 0, failToken, err
 		}
-		req.Header.Set("Authorization",
-			"Bearer "+strings.TrimSpace(string(tok)))
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -269,4 +267,31 @@ func decodeListRV(dec *json.Decoder, rv *string) error {
 			}
 		}
 	}
+}
+
+// readTokenFile loads the effective SA token file once — called by
+// Cycle at the top of every round so the 2×backends listRV queries
+// share a single read (the projected token only rotates on pod
+// restart). An unset tokenFile or injected HTTPClient yields "" —
+// callers treat empty as "no Authorization header needed" only via
+// the tokenFile!="" guard in listRV.
+func (p *Prober) readTokenFile() (string, error) {
+	if p.eff.tokenFile == "" || p.cfg.HTTPClient != nil {
+		return "", nil
+	}
+	tok, err := os.ReadFile(p.eff.tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("read token %s: %w", p.eff.tokenFile, err)
+	}
+	return strings.TrimSpace(string(tok)), nil
+}
+
+// bearerToken resolves the token for one probe request: the
+// cycle-scoped read when Cycle populated it, a fresh read otherwise
+// (unit tests calling listRV directly keep the old per-call contract).
+func (p *Prober) bearerToken() (string, error) {
+	if p.cycleTokenLoaded {
+		return p.cycleToken, p.cycleTokenErr
+	}
+	return p.readTokenFile()
 }

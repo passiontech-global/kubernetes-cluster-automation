@@ -13,6 +13,7 @@ on:
     paths:
       - "apps/node-host-agent/**"
       - "libs/hostkit/**"
+      - "libs/jinja/**"
       - ".moon/**"
       - "mise.toml"
       - ".github/workflows/release-app.yml"
@@ -43,67 +44,11 @@ jobs:
       app: node-host-agent
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
+      # Host-level installs consume the bare
+      # node-host-agent-linux-amd64 binary; release-app.yml emits the
+      # alias + .sha256 inside dist/ so it uploads atomically with the
+      # release (a follow-up job would download a non-executable 0644
+      # asset and race a 404 window after `gh release create`).
+      amd64_alias: true
+      lib_paths: "libs/hostkit/** libs/jinja/**"
     secrets: inherit
-
-  # The shared pipeline (release-app.yml) ships the container image +
-  # linux-x86_64 dist bundle. This job additionally attaches a bare
-  # static binary to the GitHub release just created (tag
-  # node-host-agent/v*) — the artifact host-level installs consume:
-  # k0s controller/hub nodes running node-host-agent as a systemd unit
-  # (no kubelet/container runtime pull path on hub non-agent hosts).
-  binary:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Fetch release binary
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The release job reports the tag it just created via
-          # outputs — re-deriving it could pick a STALE higher tag
-          # (another release racing ahead). The git lookup stays
-          # only as a fallback.
-          tag="${{ needs.release.outputs.rel_tag }}"
-          if [ -z "$tag" ]; then
-            # versionsort.suffix=- keeps v0.1.0 ranked above v0.1.0-rc.*
-            # (default sort would crown the prerelease "latest").
-            tag="$(git -c versionsort.suffix=- tag -l 'node-host-agent/v[0-9]*' --sort=-v:refname | head -1)"
-          fi
-          test -n "$tag"
-          echo "REL_TAG=$tag" >>"$GITHUB_ENV"
-          # release-app.yml's moon build already produced the
-          # identical artifact — same CGO_ENABLED=0 -trimpath flags,
-          # same -X main.version ldflag value — and attached it to the
-          # release as node-host-agent-linux-x86_64 inside the dist
-          # bundle. Downloading it replaces a third full compile on a
-          # fresh runner.
-          mkdir -p apps/node-host-agent/dist
-          gh release download "$tag" \
-            --pattern 'node-host-agent-linux-x86_64' \
-            --pattern 'SHA256SUMS.txt' \
-            --dir apps/node-host-agent/dist --clobber
-          cd apps/node-host-agent/dist
-          file node-host-agent-linux-x86_64
-          ./node-host-agent-linux-x86_64 --version
-          mv node-host-agent-linux-x86_64 node-host-agent-linux-amd64
-          # SHA256SUMS.txt was summed over the dist filenames — emit
-          # the amd64-named checksum the attach step uploads.
-          awk '$2 == "node-host-agent-linux-x86_64" {
-            print $1 "  node-host-agent-linux-amd64"
-          }' SHA256SUMS.txt > node-host-agent-linux-amd64.sha256
-          cat node-host-agent-linux-amd64.sha256
-
-      - name: Attach to GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh release upload "$REL_TAG" --clobber \
-            apps/node-host-agent/node-host-agent-linux-amd64 \
-            apps/node-host-agent/node-host-agent-linux-amd64.sha256

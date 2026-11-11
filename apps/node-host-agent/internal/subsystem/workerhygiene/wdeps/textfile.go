@@ -253,6 +253,13 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	b.Gauge("node_agent_containerd_shim_total_rss_bytes",
 		"Total containerd-shim-runc-v2 VmRSS on the node — kernel-net-shim-hygiene.",
 		float64(d.Series.ContainerdShimTotalRSSBytes))
+	// pipe-write-freeze series — pod processes wedged in
+	// TASK_INTERRUPTIBLE pipe_write (the stdout/stderr 64KB pipe
+	// deadlock whose tcpSocket probes keep answering on a frozen
+	// app).
+	b.Gauge("node_agent_container_pipe_blocked",
+		"Pod processes stuck in pipe_write (state S) past the persist window — container stdout pipe freeze, pipe-write-freeze.",
+		float64(d.Series.PipeBlockedProcs))
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

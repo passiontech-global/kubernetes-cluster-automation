@@ -2,6 +2,9 @@ package envx
 
 import (
 	"fmt"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -286,5 +289,132 @@ func TestWarnfIsInvokedOnRejectedValues(t *testing.T) {
 
 	if len(calls) != 3 {
 		t.Fatalf("Warnf invoked %d times, want 3: %v", len(calls), calls)
+	}
+}
+
+// A gate value that reads as boolean intent but misses the exact
+// "true"/"false" spelling warns exactly once per key per process and
+// keeps the default outcome in both defaultOn modes — the warning must
+// surface the silent pin without changing Gate's contract. (The plain
+// `Warnf = f` assignment in TestWarnfIsInvokedOnRejectedValues above
+// stays as the legacy rebind-path check; this one goes through
+// SetWarnf, the atomic path.)
+func TestGateWarnsOnIntentLikeMisspellings(t *testing.T) {
+	var calls []string
+	SetWarnf(func(msg string, kv ...any) { calls = append(calls, fmt.Sprint(msg, kv)) })
+	t.Cleanup(func() { SetWarnf(nil) })
+
+	const keyPrefix = "ENVX_TEST_GATE_INTENT_"
+	intents := []string{"True", "False", "TRUE", "FALSE", "1", "0", "yes", "no", "on", "off", "Yes", "ON"}
+	for i, v := range intents {
+		key := fmt.Sprintf("%s%d", keyPrefix, i) // fresh key: warn-once is per KEY
+		t.Setenv(key, v)
+		before := len(calls)
+		// Warn path keeps the default: opt-in stays off, default-on stays on.
+		if got := Gate(key, false); got {
+			t.Fatalf("Gate(%q, false)=%v, want false (default kept)", v, got)
+		}
+		if got := Gate(key, true); !got {
+			t.Fatalf("Gate(%q, true)=%v, want true (default kept)", v, got)
+		}
+		if len(calls) != before+1 {
+			t.Fatalf("Gate(%q): want exactly one new warning, got %d (%v)", v, len(calls)-before, calls[before:])
+		}
+	}
+
+	// Once per key per process: the first resolve of a key warns, a
+	// later resolve of the SAME key with another intent-like value is
+	// silent.
+	const key = "ENVX_TEST_GATE_INTENT_ONCE"
+	t.Setenv(key, "0")
+	if !Gate(key, true) {
+		t.Fatal(`Gate("0", true)=false, want true`)
+	}
+	t.Setenv(key, "True")
+	if !Gate(key, true) {
+		t.Fatal(`Gate("True", true)=false, want true`)
+	}
+	if len(calls) != len(intents)+1 {
+		t.Fatalf("warn-once violated: %d calls, want %d", len(calls), len(intents)+1)
+	}
+
+	// Exact spellings and unset stay silent — they are the applied
+	// contract, not dropped intent.
+	for _, v := range []string{"true", "false", ""} {
+		t.Setenv(key, v)
+		Gate(key, true)
+		Gate(key, false)
+	}
+	if len(calls) != len(intents)+1 {
+		t.Fatalf("exact/unset values warned: %d calls, want %d", len(calls), len(intents)+1)
+	}
+}
+
+// SetWarnf must be race-free against concurrent getter traffic — the
+// swap goes through the atomic pointer while warnings keep flowing
+// (this is the -race exercise; the counter only proves the sink ran).
+func TestSetWarnfRaceAgainstGetterTraffic(t *testing.T) {
+	t.Setenv("ENVX_TEST_WARNF_RACE", "bogus")
+	var warns atomic.Int64
+	SetWarnf(func(string, ...any) { warns.Add(1) })
+	t.Cleanup(func() { SetWarnf(nil) })
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					GetenvInt("ENVX_TEST_WARNF_RACE", 1)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 20000 {
+			SetWarnf(func(string, ...any) { warns.Add(1) })
+		}
+		SetWarnf(nil)
+		close(stop)
+	}()
+	wg.Wait()
+
+	if warns.Load() == 0 {
+		t.Fatal("sink never invoked during the hammer")
+	}
+}
+
+// The three rebind shapes and their routing, in one sequence:
+// SetWarnf installs through the atomic hook (the default Warnf var
+// dispatches to it), a second SetWarnf overrides the first, and the
+// legacy direct `Warnf = f` assignment still routes — the var is the
+// sink either way. After a direct assignment the hook is orphaned
+// (documented at Warnf): the test ends there so the restore cleanup
+// re-establishes the dispatcher before anything else routes.
+func TestWarnfRebindShapesRoute(t *testing.T) {
+	orig := Warnf
+	t.Cleanup(func() {
+		Warnf = orig  // re-install the dispatcher FIRST…
+		SetWarnf(nil) // …then clear the hook it dispatches to
+	})
+
+	var which []string
+	SetWarnf(func(string, ...any) { which = append(which, "hook1") })
+	Warnf("a")
+	SetWarnf(func(string, ...any) { which = append(which, "hook2") })
+	Warnf("b")
+	Warnf = func(string, ...any) { which = append(which, "direct") }
+	Warnf("c")
+
+	want := []string{"hook1", "hook2", "direct"}
+	if !slices.Equal(which, want) {
+		t.Fatalf("rebind routing = %v, want %v", which, want)
 	}
 }

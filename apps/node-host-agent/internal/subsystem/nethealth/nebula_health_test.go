@@ -15,6 +15,7 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/nebula"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -544,13 +545,13 @@ func TestSiteedgeRecoveryResetsAndExits(t *testing.T) {
 	})
 	e.pingOK["10.9.0.1|false"] = true
 	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-siteedge"), "1\n")
-	e.n.nebulaSiteedgeRun = 3
+	e.n.neb.SiteedgeRun = 3
 	wd := e.n.cfg.Watchdog
 	_, results := e.n.probeNebulaOverlay(context.Background(), wd)
 	st := aggregateNebulaOverlay(wd, results)
 	e.n.latchNebulaOverlayPaths(wd, st)
-	if e.n.nebulaSiteedgeRun != 0 {
-		t.Fatalf("siteedge run counter=%d want 0 on recovery", e.n.nebulaSiteedgeRun)
+	if e.n.neb.SiteedgeRun != 0 {
+		t.Fatalf("siteedge run counter=%d want 0 on recovery", e.n.neb.SiteedgeRun)
 	}
 	if stateExists(e, "nebula-siteedge") {
 		t.Fatal("siteedge latch kept after markers recovered")
@@ -568,10 +569,10 @@ func TestNebulaDegradedDefaultConsec(t *testing.T) {
 		OverlayProbeTargets: []string{"10.8.0.1", "10.8.0.2", "10.8.0.3"},
 	}
 	e.n.cfg.Watchdog = wd
-	results := map[string]pingResult{
-		"10.8.0.1": {ok: true, rtt: 5},
-		"10.8.0.2": {ok: false},
-		"10.8.0.3": {ok: false},
+	results := map[string]nebula.PingResult{
+		"10.8.0.1": {Ok: true, Rtt: 5},
+		"10.8.0.2": {Ok: false},
+		"10.8.0.3": {Ok: false},
 	}
 	st := aggregateNebulaOverlay(wd, results)
 	// The degraded verdict arms its own latch — it does NOT produce
@@ -629,8 +630,8 @@ func TestUnderlayHostParsing(t *testing.T) {
 		"":                   "",
 		"   ":                "",
 	} {
-		if got := underlayHost(addr); got != want {
-			t.Fatalf("underlayHost(%q)=%q want %q", addr, got, want)
+		if got := nebula.UnderlayHost(addr); got != want {
+			t.Fatalf("nebula.UnderlayHost(%q)=%q want %q", addr, got, want)
 		}
 	}
 }

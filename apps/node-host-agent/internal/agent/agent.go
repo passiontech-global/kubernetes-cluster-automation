@@ -43,6 +43,15 @@ type Config struct {
 	Version     string // release version injected at build time
 	MetricsAddr string // listen address for /metrics
 	ProbeAddr   string // listen address for /healthz + /readyz
+	// PprofAddr is the LOOPBACK-ONLY listen address for
+	// /debug/pprof — the profile endpoints used to share the
+	// 0.0.0.0:9115 metrics port (roadmap item 1.2: every tenant pod
+	// and VLAN neighbour could hit /debug/pprof/trace?seconds=30 of
+	// the root daemon through the hostPort). main.go always resolves
+	// it (default 127.0.0.1:9116, NODE_HOST_AGENT_PPROF_BIND_ADDRESS
+	// override); an empty value skips the listener entirely (hand
+	// construction in tests / legacy standalone units).
+	PprofAddr string
 
 	// Registry is the shared metrics registry; nil → a fresh
 	// prometheus.NewRegistry(). Injected in tests to isolate
@@ -137,14 +146,27 @@ func (a *Agent) NodeName() string { return a.cfg.NodeName }
 
 func (a *Agent) metricsMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(a.reg,
-		promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}))
-	// pprof on the metrics listener — same contract as
-	// node-automation-controller (heap/goroutine profiles for memory
-	// triage). NOTE: the DaemonSet exposes 9115 as a hostPort, so this
-	// is reachable from the node network, not just in-cluster; the
-	// host-internal-ports nft guard (hostconfig group_nld) already
-	// fences inbound traffic to these listener ports.
+	mux.Handle("/metrics", http.TimeoutHandler(
+		promhttp.HandlerFor(a.reg,
+			promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}),
+		metricsHandlerTimeout, "metrics collection timed out"))
+	// /debug/pprof deliberately does NOT live here: it moved to the
+	// loopback-only pprofMux served as "pprof-loopback" —
+	// profile endpoints on the hostPort 9115 exposed the root
+	// daemon's heap/goroutine state to every tenant pod and VLAN
+	// neighbour, and the nft guard cannot fence 127.0.0.1-bound
+	// listeners that never leave loopback in the first place.
+	return mux
+}
+
+// pprofMux is the profile endpoints on their dedicated LOOPBACK
+// listener (a.pprofLn, "pprof-loopback"): heap/goroutine profiles
+// stay available for memory triage, but only to something already
+// inside the node (SSH, the kubelet-side host) — the bind address
+// itself is the auth. Same handler set the metrics mux carried
+// pre-1.2 and the same contract as node-automation-controller.
+func (a *Agent) pprofMux() *http.ServeMux {
+	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -181,19 +203,58 @@ const (
 	// before Run returns — a subsystem wedged mid-check must not
 	// pin the agent's own shutdown forever.
 	subsystemShutdownTimeout = 10 * time.Second
+	// metricsHandlerTimeout bounds ONE /metrics collection — the
+	// handler can block on a hung filesystem, so the scrape gets a
+	// deadline instead of relying on the server WriteTimeout. The
+	// server itself now carries 30s (> this bound, so the timed-out
+	// response flushes); pprof.Profile/Trace no longer constrain it
+	// — they live on the loopback pprof-loopback server, whose
+	// WriteTimeout stays 0 for exactly that reason.
+	metricsHandlerTimeout = 25 * time.Second
 )
 
-// Run starts the configured subsystems, binds both listeners, marks
-// the agent ready, then blocks until ctx is cancelled or a server
-// fails. Shutdown is graceful: the HTTP servers drain under a
-// bounded timeout and Run waits — bounded — for the supervise
-// goroutines to exit so per-subsystem cleanup (deferred state
-// flushes like apiprober's flushStates) actually completes instead
-// of being abandoned mid-flight. The per-subsystem supervision loop
-// (panic recovery, restart backoff, subUp/restarts metrics) lives in
-// supervisor.go.
+// Run binds both listeners, then starts the configured subsystems,
+// marks the agent ready, and blocks until ctx is cancelled or a
+// server fails. Bind-first is deliberate fail-fast: a port conflict
+// must abort startup before any subsystem loop writes state, so the
+// agent never runs without its telemetry/probe endpoints. Shutdown
+// is graceful: the HTTP servers drain under a bounded timeout and
+// Run waits — bounded — for the supervise goroutines to exit so
+// per-subsystem cleanup (deferred state flushes like apiprober's
+// flushStates) actually completes instead of being abandoned
+// mid-flight. The per-subsystem supervision loop (panic recovery,
+// restart backoff, subUp/restarts metrics) lives in supervisor.go.
 func (a *Agent) Run(ctx context.Context) error {
 	a.started.Store(time.Now().UnixNano())
+
+	// Both listeners bind BEFORE the first subsystem Run starts:
+	// a bind failure exits here with no subsystem goroutine having
+	// ever run — telemetry (and the probe mux) cannot silently go
+	// dark under live subsystems. The pprof loopback listener rides
+	// the same fail-fast chain (roadmap 1.2) — configured → bound
+	// here or not at all, never lazily mid-flight.
+	metricsLn, err := net.Listen("tcp", a.cfg.MetricsAddr)
+	if err != nil {
+		return fmt.Errorf("metrics listener: %w", err)
+	}
+	probeLn, err := net.Listen("tcp", a.cfg.ProbeAddr)
+	if err != nil {
+		_ = metricsLn.Close()
+		return fmt.Errorf("probe listener: %w", err)
+	}
+	// PprofAddr empty → the loopback profile listener is off (hand
+	// construction in tests); main.go always resolves the default so
+	// production never silently runs profile-less.
+	var pprofLn net.Listener
+	if a.cfg.PprofAddr != "" {
+		pprofLn, err = net.Listen("tcp", a.cfg.PprofAddr)
+		if err != nil {
+			_ = probeLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("pprof loopback listener: %w", err)
+		}
+	}
+	a.ready.Store(true)
 
 	// sctx scopes the supervise goroutines to Run: on the
 	// listener-error path (parent ctx still live) Run cancels them
@@ -204,18 +265,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	a.supervise(sctx, &wg)
 
-	metricsLn, err := net.Listen("tcp", a.cfg.MetricsAddr)
-	if err != nil {
-		return fmt.Errorf("metrics listener: %w", err)
-	}
-	probeLn, err := net.Listen("tcp", a.cfg.ProbeAddr)
-	if err != nil {
-		_ = metricsLn.Close()
-		return fmt.Errorf("probe listener: %w", err)
-	}
-	a.ready.Store(true)
-
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	// done releases the parked shutdown goroutines when Run returns —
 	// without it they would linger until ctx cancel even on the errCh
 	// path, then Shutdown a server the sibling Close() already tore
@@ -224,15 +274,21 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer close(done)
 	var servers []*http.Server
 	var srvWG sync.WaitGroup
-	serve := func(name string, ln net.Listener, h http.Handler) {
-		// The metrics handler collects at scrape time and can block
-		// on a hung filesystem — bound every phase so one wedged
-		// connection can't pin the server.
+	serve := func(name string, ln net.Listener, h http.Handler,
+		writeTimeout time.Duration) {
+		// The metrics server carries a bounded WriteTimeout again:
+		// with pprof moved off the mux, /metrics is the only handler
+		// left and the TimeoutHandler already bounds ONE collection
+		// at metricsHandlerTimeout — 30s (>25s) gives the timed-out
+		// body room to flush without letting a slow reader pin the
+		// server (roadmap 1.2: WriteTimeout 0 must exist ONLY on the
+		// loopback profile listener, where pprof.Profile/Trace
+		// legitimately outlive their sampling windows).
 		srv := &http.Server{
 			Handler:           h,
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      30 * time.Second,
+			WriteTimeout:      writeTimeout,
 			IdleTimeout:       60 * time.Second,
 		}
 		servers = append(servers, srv)
@@ -248,8 +304,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 		}()
 	}
-	serve("metrics", metricsLn, a.metricsMux())
-	serve("probe", probeLn, a.probeMux())
+	serve("metrics", metricsLn, a.metricsMux(), 30*time.Second)
+	serve("probe", probeLn, a.probeMux(), 30*time.Second)
+	if pprofLn != nil {
+		// Loopback-only profile listener — WriteTimeout 0 lives HERE
+		// and only here (profile/trace outlive their sampling
+		// window; the bind is 127.0.0.1 so no remote can exploit it).
+		serve("pprof-loopback", pprofLn, a.pprofMux(), 0)
+	}
 
 	// sd-watchdog: systemd self-watchdog — READY=1 now that both
 	// listeners are bound and ready flipped, then WATCHDOG=1 every

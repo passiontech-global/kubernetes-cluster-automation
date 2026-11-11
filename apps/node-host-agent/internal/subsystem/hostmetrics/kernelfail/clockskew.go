@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,7 +16,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -120,28 +118,21 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 				r.statePath(clockSteppedMarkerFile), r.deps.Clock.Now().Unix())
 		}
 	}
-	countPath := r.statePath(clockSkewCountFile)
 	latchPath := r.deps.Store.Path(latchdefs.LatchClockSkew)
 	if math.Abs(off) > clockSkewLatchOffset {
-		n := int64(1)
-		if b, err := os.ReadFile(countPath); err == nil {
-			if v, perr := strconv.ParseInt(
-				strings.TrimSpace(string(b)), 10, 64); perr == nil {
-				n = v + 1
-			}
-		}
-		if err := hostutil.WriteFileAtomicBytes(countPath,
-			[]byte(strconv.FormatInt(n, 10)+"\n")); err != nil {
-			logger().Debug("hostmetrics: clock-skew count write failed",
-				"path", countPath, "error", err)
-		}
+		// Store.Incr — the shared consecutive-counter core: locked
+		// read+increment+write on the same <state dir>/clock-skew-count
+		// file; absent/garbage content restarts the count at 1, a
+		// failed write loses the streak (never invents one) and the
+		// Store logs the failure.
+		n := r.deps.Store.Incr(clockSkewCountFile)
 		if n >= clockSkewLatchNeeded {
 			r.ensureStateLatch(latchPath, latchdefs.LatchFilePrefix+latchdefs.LatchClockSkew,
 				fmt.Sprintf("offset=%.3fs synced=%v", off, synced))
 		}
 		return
 	}
-	_ = os.Remove(countPath)
+	r.deps.Store.ResetCounter(clockSkewCountFile)
 	// Exit self-gates on the file existing and logs STATE-EXIT.
 	r.deps.Store.Exit(latchdefs.LatchClockSkew, nil)
 }

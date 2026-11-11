@@ -37,6 +37,10 @@ type Metrics struct {
 	MaintOK       *prometheus.GaugeVec // check=reindex|repack|vacuum_freeze
 	MaintRelBytes *prometheus.GaugeVec // kind=heap|indexes
 	MaintLastRun  prometheus.Gauge
+	// UrgentReindexLastRun mirrors the post-storm out-of-band
+	// REINDEX (maint/bloat.go) — the timestamp half of the
+	// kine_db_urgent_reindex_* contract.
+	UrgentReindexLastRun prometheus.Gauge
 
 	// kine-pg-hygiene + WAL archive guard series (probe/hygiene.go).
 	// IdleTermTotal mirrors the IdleTxTerm counter so the probe
@@ -155,6 +159,10 @@ func NewMetrics() *Metrics {
 			Name: "kine_db_maint_last_run_timestamp_seconds",
 			Help: "Last maintenance run.",
 		}),
+		UrgentReindexLastRun: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_urgent_reindex_last_run_timestamp_seconds",
+			Help: "Last post-storm out-of-band REINDEX TABLE CONCURRENTLY (indexBytes > 3x heap AND > 1GiB) — bloat.go's same-day path.",
+		}),
 		IdleInTx: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kine_db_idle_in_tx_sessions",
 			Help: "Sessions idle in transaction >3min on the postgres/kine databases — autovacuum blockers.",
@@ -247,7 +255,7 @@ func (m *Metrics) Collectors() []prometheus.Collector {
 		m.CompactRevision, m.Retained, m.Rows, m.ProbeLastRun,
 		m.GuardOK, m.GuardFreeze, m.GuardFired, m.GuardLastDeleted,
 		m.GuardLastCompact, m.GuardLastRun, m.GuardRevAfter,
-		m.MaintOK, m.MaintRelBytes, m.MaintLastRun,
+		m.MaintOK, m.MaintRelBytes, m.MaintLastRun, m.UrgentReindexLastRun,
 		m.IdleInTx, m.IdleInTxAlias, m.IdleTxTerm, m.DeadTupleRatio,
 		m.XidAge, m.WalBytes, m.WalDiskRatio, m.WalArchStale,
 		m.InactiveSlot,

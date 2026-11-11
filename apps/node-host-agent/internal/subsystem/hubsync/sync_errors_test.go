@@ -135,8 +135,11 @@ func TestSyncTargetErrorLadder(t *testing.T) {
 			wantErr: "boom:336",
 		},
 		{
-			name:    "binary sha256 transport error",
-			fail:    map[string]string{"sha256sum '" + remoteBin + "'": "boom:341"},
+			name: "binary sha256 transport error",
+			// Path-only key: the binary hashes inside the batched
+			// binary+unit sha256sum session, so the "sha256sum "
+			// prefix may not sit directly before the path.
+			fail:    map[string]string{"'" + remoteBin + "'": "boom:341"},
 			wantErr: "boom:341",
 		},
 		{
@@ -159,14 +162,14 @@ func TestSyncTargetErrorLadder(t *testing.T) {
 		},
 		{
 			name:    "vars mirror upload failure",
-			fail:    map[string]string{"sha256sum '/etc/node-host-agent/vars/cluster.yaml'": "boom:371"},
+			fail:    map[string]string{"'/etc/node-host-agent/vars/cluster.yaml'": "boom:371"},
 			wantErr: "boom:371",
 		},
 		{
 			name:   "certs mirror upload failure",
 			target: Target{InterDC: true},
 			fail: map[string]string{
-				"sha256sum '/etc/node-host-agent/nebula-certs/nebula-ca.crt'": "boom:378",
+				"'/etc/node-host-agent/nebula-certs/nebula-ca.crt'": "boom:378",
 			},
 			wantErr: "boom:378",
 		},
@@ -190,8 +193,11 @@ func TestSyncTargetErrorLadder(t *testing.T) {
 			name:     "unit sha256 transport error",
 			seed:     func(c *failConn) { c.seedFile(remoteBin, []byte("fake-agent-binary-v1")) },
 			localSum: binSum,
-			fail:     map[string]string{"sha256sum '" + unit + "'": "boom:393"},
-			wantErr:  "boom:393",
+			// Path-only key: the unit hashes inside the batched
+			// binary+unit sha256sum session, so the "sha256sum "
+			// prefix may not sit directly before the path.
+			fail:    map[string]string{"'" + unit + "'": "boom:393"},
+			wantErr: "boom:393",
 		},
 		{
 			name:     "unit putAtomic mv failure",
@@ -287,9 +293,11 @@ func TestSyncDirLocalErrors(t *testing.T) {
 		t.Fatal("dangling symlink want error")
 	}
 
-	// A failing sha256sum on the first file aborts the mirror loop.
+	// A failing sha256sum on the mirror's batched hash session
+	// aborts the mirror loop (path-only key — the path may sit
+	// anywhere in the batched command).
 	up := &failConn{fakeConn: newFakeConn(),
-		fail: map[string]string{"sha256sum '/remote/a.txt'": "boom:485"}}
+		fail: map[string]string{"'/remote/a.txt'": "boom:485"}}
 	if err := s.syncDir(ctx, up, hidden, "/remote", "0644", nil); err == nil ||
 		!strings.Contains(err.Error(), "boom:485") {
 		t.Fatalf("upload failure err=%v", err)

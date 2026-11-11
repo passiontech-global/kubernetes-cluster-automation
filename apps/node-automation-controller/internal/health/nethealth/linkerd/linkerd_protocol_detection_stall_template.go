@@ -125,7 +125,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 					"rollout", ns+"/"+dref.Name)
 				return false, false
 			}
-			annos, _, _ := unstructured.NestedStringMap(ro.Object,
+			annos, _ := kube.NestedStringMap(ro.Object,
 				"spec", "template", "metadata", "annotations")
 			return p.patchTemplatePorts(ctx, log, ro, "rollout", ns, ro.GetName(),
 				annos, missing, false, now, rep, driftNow)
@@ -404,7 +404,7 @@ func mergeTemplateAnnos(obj metav1.Object, anno map[string]string) {
 		// Merge onto the annotations the object ALREADY carries —
 		// a blind SetNestedMap would drop keys patched earlier in
 		// the same sweep (skip-inbound-ports / skip-outbound-ports).
-		existing, _, _ := unstructured.NestedStringMap(w.Object,
+		existing, _ := kube.NestedStringMap(w.Object,
 			"spec", "template", "metadata", "annotations")
 		if existing == nil {
 			existing = map[string]string{}

@@ -12,12 +12,28 @@ package logx
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 )
 
+// forSnapshot is one immutable (default → name-cache) binding.
+// Publication is copy-on-write: readers load the pointer once and never
+// lock — a published snapshot is never mutated, so there is no torn-map
+// window; rebuilders copy the current map under forMu and swap in a
+// fresh snapshot by pointer store. This replaced an RWMutex + shared
+// map, where every cache miss promoted to a write lock and briefly
+// stopped all logging in every subsystem.
+type forSnapshot struct {
+	def     *slog.Logger
+	loggers map[string]*slog.Logger
+}
+
 var (
-	forMu      sync.RWMutex
-	forDefault *slog.Logger
-	forCache   = map[string]*slog.Logger{}
+	// forSnap is the currently published snapshot; nil until the first
+	// For builds one.
+	forSnap atomic.Pointer[forSnapshot]
+	// forMu serializes snapshot rebuilds — the miss path only; a
+	// cached hit never takes it.
+	forMu sync.Mutex
 )
 
 // For returns a logger tagged with the given name. The name is emitted as
@@ -25,29 +41,44 @@ var (
 // current slog.Default(): if slog.SetDefault swaps in a new handler the
 // cache is dropped and rebuilt against it, so the JSON handler installed
 // by main() is always the one that emits.
+//
+// Concurrency: the hot path is one atomic load — concurrent For calls
+// share no lock. Rebuilds serialize on forMu and re-check the freshly
+// published snapshot before building, so two goroutines racing the same
+// name's first resolve still get the identical *slog.Logger, and a
+// rebuild copies the latest snapshot so concurrent misses for different
+// names keep each other's entries.
 func For(name string) *slog.Logger {
 	def := slog.Default()
-	// Read-lock fast path: logger() is called on every log line in
-	// every subsystem, so the common case (cached name, unchanged
-	// default) must not serialize all goroutines on one mutex.
-	forMu.RLock()
-	if def == forDefault {
-		if l, ok := forCache[name]; ok {
-			forMu.RUnlock()
+	// Fast path: a single atomic load — logger() runs on every log
+	// line in every subsystem, so the common case (cached name,
+	// unchanged default) must not even share a read lock.
+	if s := forSnap.Load(); s != nil && s.def == def {
+		if l, ok := s.loggers[name]; ok {
 			return l
 		}
 	}
-	forMu.RUnlock()
 	forMu.Lock()
 	defer forMu.Unlock()
-	if def != forDefault {
-		forDefault = def
-		forCache = map[string]*slog.Logger{}
+	// Re-read under the rebuild lock: another goroutine may have
+	// published a snapshot for this exact default while we waited,
+	// or dropped the cache after a SetDefault swap.
+	s := forSnap.Load()
+	if s == nil || s.def != def {
+		s = &forSnapshot{def: def, loggers: map[string]*slog.Logger{}}
 	}
-	if l, ok := forCache[name]; ok {
+	if l, ok := s.loggers[name]; ok {
 		return l
 	}
 	l := def.With("logger", name)
-	forCache[name] = l
+	next := &forSnapshot{
+		def:     def,
+		loggers: make(map[string]*slog.Logger, len(s.loggers)+1),
+	}
+	for k, v := range s.loggers {
+		next.loggers[k] = v
+	}
+	next.loggers[name] = l
+	forSnap.Store(next)
 	return l
 }

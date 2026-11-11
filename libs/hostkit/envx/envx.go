@@ -24,6 +24,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -238,15 +240,44 @@ func IntList(key string) []int {
 
 // Warnf is the sink for the "invalid env value — using default"
 // diagnostics emitted by the getters (Duration, IntList, and the
-// strict Getenv* family below). It defaults to the package slog
-// logger; an app on a different logging pipeline rebinds it once at
-// startup, before env knobs resolve — node-automation-controller
-// points it at controller-runtime's logr (logf.Log.WithName("env").Info)
-// so the warnings land in the same zap stream the retired
-// internal/platform/envx used. It is a plain func var: rebind before
-// the first getter call, not while env resolution may be running.
+// strict Getenv* family below). Its default implementation is a
+// dispatcher: it reads warnfHook first and falls back to the package
+// slog logger when no hook is installed — so SetWarnf rebinds the
+// sink WITHOUT touching this var, and getter traffic keeps routing
+// through the var (one atomic load per call) race-free.
+//
+// Rebinding — two shapes, one rule:
+//   - SetWarnf is the supported path: atomic swap, race-free against
+//     concurrent getter calls, composable (SetWarnf(nil) restores the
+//     slog default). node-automation-controller's startup init() and
+//     every test use it.
+//   - The legacy direct assignment (`envx.Warnf = f`) still works —
+//     the var stays assignable — but it REPLACES the dispatcher, so
+//     the var write is racy against concurrent getter traffic and it
+//     orphans any installed hook (later SetWarnf calls route nowhere
+//     until the var is reassigned). Only legal strictly before the
+//     first getter call, same as the original pre-SetWarnf ordering
+//     contract; whichever path installed the current sink last wins.
+var warnfHook atomic.Pointer[func(msg string, kv ...any)]
+
 var Warnf = func(msg string, kv ...any) {
+	if f := warnfHook.Load(); f != nil {
+		(*f)(msg, kv...)
+		return
+	}
 	logger().Warn(msg, kv...)
+}
+
+// SetWarnf atomically rebinds the diagnostic sink; nil restores the
+// package slog default. Race-free against concurrent Warnf traffic, so
+// tests and late-rebinding apps rebind through here instead of
+// assigning the Warnf var.
+func SetWarnf(f func(msg string, kv ...any)) {
+	if f == nil {
+		warnfHook.Store(nil)
+		return
+	}
+	warnfHook.Store(&f)
 }
 
 // --------------------------------------------------------------------
@@ -272,7 +303,9 @@ var Warnf = func(msg string, kv ...any) {
 //   - Gate is exact-match: defaultOn=true enables unless the value is
 //     exactly "false" (explicit opt-out); defaultOn=false enables only
 //     when the value is exactly "true" (opt-in). Bool's lenient
-//     1/true/yes/on vocabulary does not apply.
+//     1/true/yes/on vocabulary does not apply — but a set value drawn
+//     from it (any casing) warns once per key while keeping the
+//     default, so a casing slip cannot silently pin a gate.
 // --------------------------------------------------------------------
 
 // Getenv reads a string env knob, returning def when unset or empty —
@@ -365,17 +398,55 @@ func GetenvFloatPositive(key string, def float64) float64 {
 	return def
 }
 
+// gateIntentWarned remembers which keys already had their bool-like
+// misspelling warned about — one line per key per process (Gate
+// resolves in every sweep; a stale "True" in a ConfigMap must not
+// spam the log), the same once-per pattern hostutil uses for its
+// rename-fallback warning.
+var gateIntentWarned sync.Map
+
+// looksLikeGateIntent reports whether v reads as boolean intent Gate
+// will silently drop: Bool's lenient vocabulary (1/0, true/false,
+// yes/no, on/off) in any casing. Exact "true"/"false" — the two values
+// Gate actually applies — are handled before this runs and never land
+// here; anything else in the vocabulary is a mis-cased or synonym
+// spelling that quietly fell back to the default.
+func looksLikeGateIntent(v string) bool {
+	switch strings.ToLower(v) {
+	case "1", "0", "true", "false", "yes", "no", "on", "off":
+		return true
+	}
+	return false
+}
+
 // Gate resolves a feature-gate env var. defaultOn=false is the
 // opt-in convention (enabled only when the value is exactly "true" —
 // the destructive/opt-in gates); defaultOn=true is the always-on
 // convention the ported CronJobs/kuberhealthy checks kept (enabled
 // unless the value is exactly "false" — an explicit opt-out via the
 // base-flags ConfigMap).
+//
+// A set value that LOOKS like boolean intent but misses the exact
+// spelling (e.g. "True", "0", "on") warns once per key and keeps the
+// default — the returned behavior is unchanged, but a knob pinned to
+// its default by a casing slip becomes visible from the outside.
 func Gate(key string, defaultOn bool) bool {
-	if defaultOn {
-		return os.Getenv(key) != "false"
+	v := os.Getenv(key)
+	switch v {
+	case "false":
+		return false
+	case "true":
+		return true
 	}
-	return os.Getenv(key) == "true"
+	if looksLikeGateIntent(v) {
+		// LoadOrStore makes the warn-once decision atomic: exactly one
+		// concurrent resolver becomes the warner for this key.
+		if _, dup := gateIntentWarned.LoadOrStore(key, struct{}{}); !dup {
+			Warnf("bool-like gate value not applied — set exactly \"true\" or \"false\", using default",
+				"key", key, "value", v, "default_on", defaultOn)
+		}
+	}
+	return defaultOn
 }
 
 // Knob is one row of a package's declarative env surface: Name is the

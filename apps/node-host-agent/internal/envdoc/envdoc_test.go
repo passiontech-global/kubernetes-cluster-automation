@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envdoc/scan"
@@ -159,4 +160,44 @@ func TestEnvDocCoversContract(t *testing.T) {
 				"exactly once in the contract package", d)
 		}
 	})
+}
+
+// TestEnvDocOneRowPerVar pins the knob-table dedup: a var referenced
+// in several files of one package must render as ONE row listing
+// every source (comma-joined), never one row per reference. Before
+// the join, NODE_HOST_AGENT_NODE_NAME shipped as two rows
+// (deps_env.go:119 and hostctx.go:30).
+func TestEnvDocOneRowPerVar(t *testing.T) {
+	docPath := filepath.Join(moduleRoot, "ENV.md")
+	doc, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", docPath, err)
+	}
+	var want = "- `NODE_HOST_AGENT_NODE_NAME` — `deps_env.go:119, hostctx.go:30`\n"
+	if n := strings.Count(string(doc), "- `NODE_HOST_AGENT_NODE_NAME`"); n != 1 {
+		t.Fatalf("ENV.md has %d knob rows for NODE_HOST_AGENT_NODE_NAME, "+
+			"want exactly 1 (run scripts/gen-envdoc.sh — the per-package "+
+			"rows must dedupe with sources joined)", n)
+	}
+	if !strings.Contains(string(doc), want) {
+		t.Fatalf("ENV.md knob row for NODE_HOST_AGENT_NODE_NAME does not "+
+			"list both sources (want %q); run scripts/gen-envdoc.sh", want)
+	}
+}
+
+// TestEnvDocMode0644 pins the published file mode: gen-envdoc.sh must
+// chmod the generated doc world-readable (mktemp stages 0600 and mv
+// preserves the mode — a dropped chmod silently republishes the doc
+// as a 0600 secret).
+func TestEnvDocMode0644(t *testing.T) {
+	docPath := filepath.Join(moduleRoot, "ENV.md")
+	fi, err := os.Stat(docPath)
+	if err != nil {
+		t.Fatalf("stat %s: %v", docPath, err)
+	}
+	if fi.Mode().Perm() != 0644 {
+		t.Fatalf("%s mode = %o, want 644 — gen-envdoc.sh must chmod "+
+			"0644 after mv (the doc is operator-facing, not a secret)",
+			docPath, fi.Mode().Perm())
+	}
 }

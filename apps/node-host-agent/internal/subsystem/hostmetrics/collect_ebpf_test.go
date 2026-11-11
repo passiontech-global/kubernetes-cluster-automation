@@ -124,7 +124,9 @@ func TestEBPFScanCache(t *testing.T) {
 	if progs != 0 {
 		t.Fatalf("cache missed: progs=%d want 0", progs)
 	}
-	c.ebpf.at = c.cfg.Clock.Now().Add(-2 * defaultEBPFScanInterval)
+	c.fdscan.mu.Lock()
+	c.fdscan.res.at = c.cfg.Clock.Now().Add(-2 * defaultEBPFScanInterval)
+	c.fdscan.mu.Unlock()
 	progs, _, _ = c.ebpfSnapshot()
 	if progs != 1 {
 		t.Fatalf("post-expiry progs=%d want 1", progs)

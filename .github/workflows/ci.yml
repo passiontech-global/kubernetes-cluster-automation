@@ -38,6 +38,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check go.work is in sync
+        # Nothing else guards go.work: every CI go build runs GOWORK=off
+        # (deps resolve per-module), so a stale workspace file never
+        # breaks CI — it breaks the next workspace-aware local build.
+        # sync must run with GOWORK unset (the job-level GOWORK=off
+        # would disable workspace mode and make it a no-op).
+        run: |
+          env -u GOWORK go work sync
+          git diff --exit-code -- go.work go.work.sum
+
       - name: Run affected tasks
         run: moon ci :format :vet :lint :lint-dockerfile :test :build
 
@@ -61,5 +71,33 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check go.work is in sync
+        run: |
+          env -u GOWORK go work sync
+          git diff --exit-code -- go.work go.work.sum
+
       - name: Lint and vet main
         run: moon run :format :vet :lint :lint-dockerfile :test :build
+
+  # Build every app image WITHOUT pushing. The release workflows only
+  # fire on app-path changes, so nothing else exercises the Dockerfiles
+  # (or the root .dockerignore they depend on) before merge. Mirrors the
+  # release path exactly: root build context, buildkit (the runner
+  # default; the RUN --mount=type=cache layers require it), module mode
+  # (go.work is dockerignored). No registry login — nothing is pushed;
+  # main-push coverage comes from the release builds themselves.
+  docker-build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [node-host-agent, node-automation-controller, webhook-dispatcher]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image (no push)
+        env:
+          APP: ${{ matrix.app }}
+        run: docker build -t "kca-$APP:ci" -f "apps/$APP/Dockerfile" .

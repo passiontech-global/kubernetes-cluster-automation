@@ -1,3 +1,5 @@
+// logging.go — the package logger identity: every hubsync log line
+// resolves through logx.For("hubsync").
 package hubsync
 
 import (

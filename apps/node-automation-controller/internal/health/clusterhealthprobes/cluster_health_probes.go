@@ -64,6 +64,7 @@ import (
 	"context"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
@@ -151,7 +152,10 @@ type clusterHealthProber struct {
 	// staleness. run() prunes names the swept roster no longer
 	// carries, so a future dynamic roster cannot strand entries for
 	// retired checks (bounded by construction today — the roster is
-	// built once at boot).
+	// built once at boot). Deliberately NOT a state.CooldownSet/
+	// FirstSeenLedger: this is an informational success clock for
+	// the seconds_since_success gauge, not a suppression window —
+	// there is no cooldown to gate and no streak to mature.
 	lastPass map[string]time.Time
 
 	// checks is the run() roster — built once at construction from
@@ -246,6 +250,31 @@ func setupConfigFromEnv() setupConfig {
 	}
 }
 
+// checkParallelism bounds the sweep's worker pool — the B9
+// head-of-line fix: 53 serial checks meant 3-4 slow Prometheus or
+// cross-DC checks at the head of the roster delayed every
+// fast-breaker check behind them by 6-10 minutes. Six concurrent
+// checks keep one hung census from stretching the cycle while the
+// per-check PerCheck deadline still bounds each member's share.
+// Every shared mutable the pool touches is guarded: Deps.Heals is a
+// locked CooldownSet, the maintenance verdict memoizes under its own
+// mutex, and the sweep snapshot's memos lock per kind — the pool only
+// removes the roster's serialization.
+const checkParallelism = 6
+
+// checkOutcome is one finished check's result, slotted by roster
+// index. Workers write only their own slot; the report loop replays
+// the slots in roster order so metric/log ordering stays the
+// deterministic serial contract regardless of completion order.
+type checkOutcome struct {
+	name     string
+	ran      bool
+	pass     bool
+	why      string
+	infra    error
+	timedOut bool
+}
+
 func (p *clusterHealthProber) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// One fresh cluster-state snapshot per sweep: the ~40 checks
@@ -266,41 +295,80 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	seen := make(map[string]bool, len(p.checks))
 	for _, c := range p.checks {
 		seen[c.name] = true
-		// Bound one check's share of the serial sweep — a hung
-		// apiserver call used to stretch the whole cycle. The child
-		// deadline cancels the in-flight client call; the check's own
-		// error usually surfaces as infra below, so FAIL/reporting
-		// semantics are unchanged — only the wait is bounded.
-		cctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.PerCheck)
-		res := c.check.Run(cctx)
-		cancel()
-		// A cancelled sweep context (SIGTERM during rollout/shutdown)
-		// is not a health signal: emitting FAIL=1 or a run error now
-		// would leave fake series behind on the dying pod. Bail out
-		// silently — the surviving leader's next cycle reports.
-		if err := ctx.Err(); err != nil {
-			log.V(1).Info("sweep context cancelled — bailing without reporting",
-				"check", c.name, "error", err)
-			return nil // cancelled ctx is not a run error — bail silently
+	}
+
+	// Bounded worker pool: each check runs under its own PerCheck
+	// deadline — a hung apiserver call still cancels only that
+	// check's share — and slots its verdict into outcomes[idx].
+	// Workers never fail (a check's error is the product, carried in
+	// the outcome), so the group's error is always nil and g.Wait
+	// just joins the pool.
+	outcomes := make([]checkOutcome, len(p.checks))
+	var g errgroup.Group
+	g.SetLimit(checkParallelism)
+	for i := range p.checks {
+		idx, entry := i, p.checks[i]
+		g.Go(func() error {
+			// A cancelled sweep context (SIGTERM during
+			// rollout/shutdown) is not a health signal: the slot
+			// stays empty so no verdict is invented for a check the
+			// dying pod never ran — the surviving leader's next
+			// cycle reports it.
+			if ctx.Err() == nil {
+				cctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.PerCheck)
+				res := entry.check.Run(cctx)
+				cancel()
+				outcomes[idx] = checkOutcome{
+					name:     entry.name,
+					ran:      true,
+					pass:     res.Pass,
+					why:      res.Why,
+					infra:    res.Infra,
+					timedOut: cctx.Err() == context.DeadlineExceeded,
+				}
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// A cancelled sweep context (SIGTERM during rollout/shutdown) is
+	// not a health signal: emitting FAIL=1 or a run error now would
+	// leave fake series behind on the dying pod. Bail out silently —
+	// the surviving leader's next cycle reports (completed workers'
+	// slots included: half a sweep's series is still half a fake
+	// signal).
+	if err := ctx.Err(); err != nil {
+		log.V(1).Info("sweep context cancelled — bailing without reporting",
+			"error", err)
+		return nil // cancelled ctx is not a run error — bail silently
+	}
+
+	// Report in roster order — the ops contract's deterministic
+	// series/log ordering — regardless of the order the pool
+	// finished the checks in.
+	for _, o := range outcomes {
+		if !o.ran {
+			continue // unreachable post-Wait without cancellation
 		}
-		if cctx.Err() == context.DeadlineExceeded {
+		if o.timedOut {
 			log.Info("health check exceeded per-check timeout",
-				"check", c.name)
+				"check", o.name)
 		}
-		p.report(c.name, res.Pass)
+		p.report(o.name, o.pass)
 		// A check FAIL is the product — it is reported via metrics and
 		// logged, never as a run error. Only apiserver/client failures
 		// count against the queue's run-error counters.
-		if res.Infra != nil {
+		if o.infra != nil {
 			metrics.IncError(p.Name)
-			log.Error(res.Infra, "health check probe errored — marked FAIL",
-				"check", c.name)
-		} else if !res.Pass {
-			log.Info("health check FAIL", "check", c.name, "reason", res.Why)
+			log.Error(o.infra, "health check probe errored — marked FAIL",
+				"check", o.name)
+		} else if !o.pass {
+			log.Info("health check FAIL", "check", o.name, "reason", o.why)
 		}
 	}
 	// Drop lastPass entries for checks the pass did not sweep — a
-	// cancelled sweep bailed above without pruning, so only a full
+	// cancelled sweep bails above without pruning, so only a full
 	// pass shrinks the ledger.
 	for name := range p.lastPass {
 		if !seen[name] {

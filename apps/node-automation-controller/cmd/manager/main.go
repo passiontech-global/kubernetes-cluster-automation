@@ -322,7 +322,10 @@ func main() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	cfg := ctrl.GetConfigOrDie()
-	tuneClientConfig(cfg)
+	if err := tuneClientConfig(cfg); err != nil {
+		log.Error(err, "unable to tune kube client config")
+		os.Exit(1)
+	}
 
 	// The endpoint-guard warning filter is installed BEFORE anything
 	// is built from this config — ctrl.NewManager first, then the
@@ -365,6 +368,26 @@ func main() {
 		envx.GetenvInt("NODE_AUTOMATION_HEAL_BUDGET_MAX", 10),
 		envx.GetenvDuration("NODE_AUTOMATION_HEAL_BUDGET_WINDOW", 5*time.Minute))
 	heal.SetBudgetExhaustedHook(metrics.HealBudgetExhaustedTotal.Inc)
+
+	// The SSA ping-pong defense — a heal re-patching the same object
+	// past the loop threshold inside the window while a Flux GitOps
+	// manager owns fields on it skips the write and reports instead
+	// of fighting the drift (platform/heal consults the gate at the
+	// desired-state patch sites). NODE_AUTOMATION_HEAL_FLUX_CONFLICT_
+	// LOOP_MAX=0 disables the gate; conflicts count on
+	// node_automation_heal_gitops_conflict_total (alert
+	// GitOpsAutoHealConflict) — fix the drift in Git, not in the
+	// live object.
+	heal.ConfigureFluxConflictLoop(
+		envx.GetenvInt("NODE_AUTOMATION_HEAL_FLUX_CONFLICT_LOOP_MAX", 3),
+		envx.GetenvDuration("NODE_AUTOMATION_HEAL_FLUX_CONFLICT_WINDOW", 30*time.Minute))
+	heal.SetFluxConflictHook(func(sig heal.FluxConflictSignal) {
+		metrics.HealGitOpsConflictTotal.WithLabelValues(sig.Manager).Inc()
+		ctrl.Log.WithName("heal").Info("GitOpsAutoHealConflict: heal patch skipped — "+
+			"Flux Heal-Revert Loop (fix the drift in Git)",
+			"kind", sig.Kind, "namespace", sig.Namespace,
+			"name", sig.Name, "manager", sig.Manager, "key", sig.Key)
+	})
 
 	// The per-target non-convergent circuit breaker — the other half
 	// of the budget above: one (module,node) remediated 3 times

@@ -16,7 +16,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,10 +41,20 @@ func New(root string) FS {
 // (the subsystems' killFn seams plug in directly).
 type KillFn func(pid int, sig syscall.Signal) error
 
-// pidDirRe matches the numeric pid directories directly under the
-// proc root — the single copy of the pattern the subsystems used to
-// keep each.
-var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
+// isPIDName reports whether a /proc entry name is a numeric pid —
+// the plain digit scan replaces the old ^[0-9]+$ regex on the hot
+// per-entry path (every dir entry of every /proc sweep).
+func isPIDName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range name {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // File joins <root>/<pid>/<elems...> — /proc/<pid>/stat and friends.
 func (f FS) File(pid int, elems ...string) string {
@@ -65,7 +74,7 @@ func (f FS) PIDs() ([]int, error) {
 	}
 	var pids []int
 	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
+		if !e.IsDir() || !isPIDName(e.Name()) {
 			continue
 		}
 		if pid, err := strconv.Atoi(e.Name()); err == nil {

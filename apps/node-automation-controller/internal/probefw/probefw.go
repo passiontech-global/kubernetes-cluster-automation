@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
@@ -144,7 +145,7 @@ func NewDeps(name string, cs kubernetes.Interface, dyn dynamic.Interface,
 		NodeReader: nodeReader,
 		Cfg:        cfg,
 		LookupHost: (&net.Resolver{}).LookupHost,
-		HTTPClient: &http.Client{},
+		HTTPClient: &http.Client{Transport: httpx.Transport()},
 		Now:        time.Now,
 	}
 	deps.Prom = promq.Client{HTTP: deps.HTTPClient, Timeout: cfg.Timeouts.Check}

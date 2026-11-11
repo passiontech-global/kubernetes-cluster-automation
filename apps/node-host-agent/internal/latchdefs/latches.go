@@ -24,11 +24,21 @@
 // this is a code consolidation, not a contract change.
 package latchdefs
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // LatchFilePrefix is the filename half every latch shares —
 // "state-"+<name>.
 const LatchFilePrefix = "state-"
+
+// LatchTouchMinInterval is the minimum mtime age before a held
+// latch's touch-refresh fires os.Chtimes — the janitor's reap
+// threshold is 24h, so refreshing every cycle (~30s) was ~2,800
+// needless utimensat calls/day per latched check; 15min keeps a
+// live episode miles inside the reap window at ~96 touches/day.
+const LatchTouchMinInterval = 15 * time.Minute
 
 // Latch name constants — the <name> half of state-<name>, one per
 // latch an enabled check can currently produce, grouped by owning
@@ -137,6 +147,16 @@ const (
 	// /proc/sys/vm/compact_memory (cooldown-owned there) and Exits
 	// it after compacting.
 	LatchPageAllocFailure = "page-alloc-failure" // kernel-pressure
+	// LatchDiskPreFail is the kernelfail disk pre-fail latch
+	// (roadmap A5): ext4 errors_count > 0 or an NVMe SMART early
+	// indicator (critical_warning != 0, media_errors > 0,
+	// percentage_used > 90) — the death-bed warning days before
+	// FilesystemReadOnly, while the LocalPV data can still be
+	// evacuated. Deliberately no NodeCondition surface yet
+	// (evidence-only latch, conditions.go precedent): the
+	// STATE-ENTER line + the node_agent_*_prefail textfile gauges
+	// are the consumption surface.
+	LatchDiskPreFail = "disk-pre-fail" // updateDiskPreFailEvidence
 
 	// apiprober — the per-backend stale family; the suffix is the
 	// backend IP with dots dashed (shell ${beh//./-}), minted per
@@ -278,6 +298,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchCPUStealPressure, Owner: "hostmetrics"},
 	{Name: LatchInodePressure, Owner: "hostmetrics"},
 	{Name: LatchPageAllocFailure, Owner: "hostmetrics"},
+	{Name: LatchDiskPreFail, Owner: "hostmetrics"},
 	{Name: LatchClocksourceUnstable, Owner: "hostmetrics"},
 
 	// apiprober

@@ -14,7 +14,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // deriveCtx carries the per-node pass inputs computed once from the
@@ -88,7 +88,7 @@ func (t *Topology) derive() {
 	if od := v.get("interdc_overlay_default"); !jinja.IsNilOrUndef(od) {
 		overlay = jinja.Stringify(od)
 	}
-	if ov := mapGet(node, "overlay"); !jinja.IsNilOrUndef(ov) {
+	if ov, _ := node.Get("overlay"); !jinja.IsNilOrUndef(ov) {
 		overlay = jinja.Stringify(ov)
 	}
 	t.Overlay = overlay
@@ -102,16 +102,16 @@ func (t *Topology) derive() {
 		base = "172.29.0"
 	}
 	c := &deriveCtx{
-		site:     mapStr(node, "site"),
+		site:     node.Str("site"),
 		self:     t.MeshName,
-		hub:      mapBool(node, "hub"),
+		hub:      node.Bool("hub"),
 		farSites: v.StrList("interdc_far_sites"),
 	}
 	c.markerOf = func(nv *jinja.OMap) string {
-		if mo := mapGet(nv, "marker_octet"); !jinja.IsNilOrUndef(mo) {
+		if mo, _ := nv.Get("marker_octet"); !jinja.IsNilOrUndef(mo) {
 			return base + "." + jinja.Stringify(mo)
 		}
-		return base + "." + LastOctet(mapStr(nv, "ip"))
+		return base + "." + LastOctet(nv.Str("ip"))
 	}
 	c.legacyBase = jinja.Stringify(v.get("interdc_marker_base_legacy"))
 
@@ -127,12 +127,12 @@ func stageMarkersRelays(t *Topology, c *deriveCtx) {
 	t.MarkersLegacy = map[string]string{}
 	t.RelayMap = map[string][]RelayEntry{}
 	t.walkNodes(func(_ string, om *jinja.OMap) {
-		name, ip := nodeNameOf(om), mapStr(om, "ip")
+		name, ip := nodeNameOf(om), om.Str("ip")
 		if name != "" && ip != "" {
 			t.Markers[name] = c.markerOf(om)
 			if c.legacyBase != "" {
 				mo := LastOctet(ip)
-				if m := mapGet(om, "marker_octet"); !jinja.IsNilOrUndef(m) {
+				if m, _ := om.Get("marker_octet"); !jinja.IsNilOrUndef(m) {
 					mo = jinja.Stringify(m)
 				}
 				t.MarkersLegacy[name] = c.legacyBase + "." + mo
@@ -148,9 +148,9 @@ func stageMarkersRelays(t *Topology, c *deriveCtx) {
 // node-level relay_sites/relay_mode defaults.
 func parseRelays(om *jinja.OMap) []RelayEntry {
 	var relays []RelayEntry
-	defSites := mapGet(om, "relay_sites")
+	defSites, _ := om.Get("relay_sites")
 	defMode := "always"
-	if dm := mapGet(om, "relay_mode"); !jinja.IsNilOrUndef(dm) {
+	if dm, _ := om.Get("relay_mode"); !jinja.IsNilOrUndef(dm) {
 		defMode = jinja.Stringify(dm)
 	}
 	addSites := func(e *RelayEntry, s any) {
@@ -158,22 +158,22 @@ func parseRelays(om *jinja.OMap) []RelayEntry {
 			e.Sites = append(e.Sites, jinja.Stringify(x))
 		}
 	}
-	for _, r := range mapList(om, "relay") {
+	for _, r := range om.Slice("relay") {
 		e := RelayEntry{Mode: defMode}
 		if rm, ok := r.(*jinja.OMap); ok {
-			e.IP = mapStr(rm, "ip")
-			if s := mapGet(rm, "sites"); !jinja.IsNilOrUndef(s) {
+			e.IP = rm.Str("ip")
+			if s, _ := rm.Get("sites"); !jinja.IsNilOrUndef(s) {
 				addSites(&e, s)
 			} else if !jinja.IsNilOrUndef(defSites) {
 				addSites(&e, defSites)
 			}
-			if m := mapGet(rm, "mode"); !jinja.IsNilOrUndef(m) {
+			if m, _ := rm.Get("mode"); !jinja.IsNilOrUndef(m) {
 				e.Mode = jinja.Stringify(m)
 			}
-			if w := mapGet(rm, "weight"); !jinja.IsNilOrUndef(w) {
+			if w, _ := rm.Get("weight"); !jinja.IsNilOrUndef(w) {
 				e.Weight, _ = jinja.ToInt(w)
 			}
-			if p := mapGet(rm, "probe"); !jinja.IsNilOrUndef(p) {
+			if p, _ := rm.Get("probe"); !jinja.IsNilOrUndef(p) {
 				e.Probe = jinja.Stringify(p)
 			}
 		} else {
@@ -203,7 +203,7 @@ func stageMarkerDup(t *Topology, _ *deriveCtx) {
 func stageSitePeers(t *Topology, c *deriveCtx) {
 	t.walkNodes(func(_ string, om *jinja.OMap) {
 		nm := nodeNameOf(om)
-		if c.site != "" && mapStr(om, "site") == c.site && nm != "" && nm != c.self {
+		if c.site != "" && om.Str("site") == c.site && nm != "" && nm != c.self {
 			t.SitePeers = append(t.SitePeers, nm)
 		}
 	})
@@ -247,9 +247,9 @@ func stageRelayWin(t *Topology, c *deriveCtx) {
 func stageTargetsEgress(t *Topology, c *deriveCtx) {
 	var targets, egress, egressProbes, probeT []string
 	t.walkNodes(func(_ string, om *jinja.OMap) {
-		nsite, nm := mapStr(om, "site"), nodeNameOf(om)
+		nsite, nm := om.Str("site"), nodeNameOf(om)
 		if nsite != c.site {
-			if ip := mapStr(om, "ip"); ip != "" {
+			if ip := om.Str("ip"); ip != "" {
 				targets = append(targets, ip)
 				probeT = append(probeT, ip)
 			}
@@ -279,7 +279,7 @@ func stageTargetsEgress(t *Topology, c *deriveCtx) {
 func stageProbeMarkers(t *Topology, c *deriveCtx) {
 	var probeM, slowM, siteM []string
 	t.walkNodes(func(_ string, om *jinja.OMap) {
-		nsite, nm := mapStr(om, "site"), nodeNameOf(om)
+		nsite, nm := om.Str("site"), nodeNameOf(om)
 		mk, hasMk := t.Markers[nm]
 		if !hasMk {
 			return
@@ -304,11 +304,11 @@ func stageDNS(t *Topology, c *deriveCtx) {
 	var ips, resolvers []string
 	for _, own := range []bool{true, false} {
 		t.walkNodes(func(_ string, om *jinja.OMap) {
-			if !mapBool(om, "hub") || (mapStr(om, "site") == c.site) != own {
+			if !om.Bool("hub") || (om.Str("site") == c.site) != own {
 				return
 			}
 			mk, hasMk := t.Markers[nodeNameOf(om)]
-			if ip := mapStr(om, "ip"); ip != "" {
+			if ip := om.Str("ip"); ip != "" {
 				ips = append(ips, ip, mk)
 			}
 			if hasMk {
@@ -339,9 +339,9 @@ func stageLighthouses(t *Topology, c *deriveCtx) {
 	lhMap := map[string]Lighthouse{}
 	t.walkNodes(func(_ string, om *jinja.OMap) {
 		nm := nodeNameOf(om)
-		if mapBool(om, "hub") && nm != "" {
+		if om.Bool("hub") && nm != "" {
 			if mk, ok := t.Markers[nm]; ok {
-				lhMap[nm] = Lighthouse{Name: nm, Marker: mk, IP: mapStr(om, "ip")}
+				lhMap[nm] = Lighthouse{Name: nm, Marker: mk, IP: om.Str("ip")}
 				lhNames = append(lhNames, nm)
 			}
 		}
@@ -356,12 +356,12 @@ func stageLighthouses(t *Topology, c *deriveCtx) {
 // remote marker.
 func stageUnsafeRoutes(t *Topology, c *deriveCtx) {
 	t.walkNodes(func(k string, om *jinja.OMap) {
-		nsite, nm := mapStr(om, "site"), nodeNameOf(om)
+		nsite, nm := om.Str("site"), nodeNameOf(om)
 		mk, hasMk := t.Markers[nm]
 		if nsite == c.site || nm == "" || nm == c.self || !hasMk {
 			return
 		}
-		if ip := mapStr(om, "ip"); ip != "" {
+		if ip := om.Str("ip"); ip != "" {
 			t.UnsafeRoutes = append(t.UnsafeRoutes, UnsafeRoute{ip + "/32", mk, 100})
 		}
 		for _, r := range t.RelayMap[nm] {
@@ -387,7 +387,7 @@ func stageUnsafeRoutes(t *Topology, c *deriveCtx) {
 // subnet silently baked into a cert).
 func stageCertSubnets(t *Topology, c *deriveCtx) {
 	var subnets []string
-	if selfIP := mapStr(t.Node, "ip"); selfIP != "" {
+	if selfIP := t.Node.Str("ip"); selfIP != "" {
 		subnets = append(subnets, selfIP+"/32")
 	} else {
 		t.Errors = append(t.Errors, fmt.Sprintf(
@@ -412,20 +412,20 @@ func stageBwAudit(t *Topology, c *deriveCtx) {
 	seenAddr := map[string]bool{}
 	t.walkNodes(func(k string, om *jinja.OMap) {
 		nm := nodeNameOf(om)
-		if nm == "" || nm == c.self || mapStr(om, "ip") == "" {
+		if nm == "" || nm == c.self || om.Str("ip") == "" {
 			return
 		}
 		t.BwAuditTargets = append(t.BwAuditTargets,
-			AuditTarget{nm, mapStr(om, "ip")})
+			AuditTarget{nm, om.Str("ip")})
 		mk := t.Markers[nm]
 		if mk == "" {
 			mk = c.markerOf(om)
 		}
 		t.BwAuditTargets = append(t.BwAuditTargets, AuditTarget{nm + "-marker", mk})
-		for _, r := range mapList(om, "relay") {
+		for _, r := range om.Slice("relay") {
 			var rip string
 			if rm, ok := r.(*jinja.OMap); ok {
-				rip = mapStr(rm, "ip")
+				rip = rm.Str("ip")
 			} else {
 				rip = jinja.Stringify(r)
 			}

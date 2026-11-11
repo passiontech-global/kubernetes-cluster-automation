@@ -21,6 +21,8 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,15 +36,18 @@ import (
 // control planes carry generated-name mirror slices, so discovery goes
 // by the service-name label. Slices mid-deletion are ignored.
 func (g *apiServerEndpointGuard) kubernetesSlices(ctx context.Context) ([]*discoveryv1.EndpointSlice, error) {
-	l, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).List(ctx,
-		metav1.ListOptions{LabelSelector: endpointSliceServiceSelector})
+	items, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			Limit:         kube.DefaultListPageSize,
+			LabelSelector: endpointSliceServiceSelector},
+		kube.EndpointSlices(g.cs, endpointGuardNS))
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*discoveryv1.EndpointSlice, 0, len(l.Items))
-	for i := range l.Items {
-		if l.Items[i].DeletionTimestamp == nil {
-			out = append(out, &l.Items[i])
+	out := make([]*discoveryv1.EndpointSlice, 0, len(items))
+	for i := range items {
+		if items[i].DeletionTimestamp == nil {
+			out = append(out, &items[i])
 		}
 	}
 	slices.SortFunc(out, func(a, b *discoveryv1.EndpointSlice) int {
