@@ -87,6 +87,8 @@ type Topology struct {
 
 	Lighthouses    []Lighthouse // ordered by node name
 	AmLighthouse   bool
+	AmRelay        bool     // nebula_am_relay — node forwards relay traffic for peers
+	NebulaRelayIPs []string // VPN IPs (markers) of nebula_relays entries, declaration order
 	UnsafeRoutes   []UnsafeRoute
 	CertSubnets    []string
 	BwAuditTargets []AuditTarget

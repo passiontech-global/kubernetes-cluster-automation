@@ -292,6 +292,8 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_marker_base":          strv("interdc_marker_base", "172.29.0"),
 		"interdc_nebula_lighthouses":   lh,
 		"interdc_nebula_am_lighthouse": t.AmLighthouse,
+		"interdc_nebula_am_relay":      t.AmRelay,
+		"interdc_nebula_relays":        &jinja.List{V: strSliceToAny(t.NebulaRelayIPs)},
 		"interdc_nebula_unsafe_routes": &jinja.List{V: routes},
 		"interdc_relay_map":            relayMap,
 		"interdc_targets":              &jinja.List{V: strSliceToAny(t.Targets)},

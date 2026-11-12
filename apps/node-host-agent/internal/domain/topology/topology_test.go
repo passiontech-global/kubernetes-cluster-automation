@@ -680,3 +680,115 @@ cp_endpoint: api.x
 		t.Fatalf("edge unsafeRoutes=%+v — want default relay weight %v", edge.UnsafeRoutes, wantDefault)
 	}
 }
+
+// Nebula protocol relay (>=1.6): nebula_am_relay flags the node as a
+// relay; nebula_relays lists mesh names resolved to marker VPN IPs.
+// Misconfigurations (self-listing, missing registry entry, target
+// without am_relay, relay node listing relays) land in Errors.
+func TestDeriveNebulaRelays(t *testing.T) {
+	dir := writeVars(t)
+	nodes := `node-a:
+  name: a
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+  nebula_am_relay: true
+node-b:
+  name: b
+  ip: 10.0.2.20
+  site: s2
+  nebula_relays: [a, ghost]
+node-c:
+  name: c
+  ip: 10.0.1.30
+  site: s1
+`
+	_ = os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"), []byte(nodes), 0o644)
+
+	// spoke: resolves a's marker, skips the unknown "ghost" entry.
+	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topo.AmRelay {
+		t.Fatal("spoke node-b flagged AmRelay")
+	}
+	if len(topo.NebulaRelayIPs) != 1 || topo.NebulaRelayIPs[0] != "172.29.0.10" {
+		t.Fatalf("relayIPs=%v", topo.NebulaRelayIPs)
+	}
+	found := false
+	for _, e := range topo.Errors {
+		if strings.Contains(e, `"ghost"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unknown relay entry not recorded: %v", topo.Errors)
+	}
+
+	// relay node: flag set, no relays of its own.
+	relay, err := Load(Config{VarsDir: dir, NodeName: "node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !relay.AmRelay {
+		t.Fatal("hub node-a missing AmRelay")
+	}
+	if len(relay.NebulaRelayIPs) != 0 {
+		t.Fatalf("relay node leaked relayIPs=%v", relay.NebulaRelayIPs)
+	}
+}
+
+// A relay target without nebula_am_relay and an am_relay node that
+// lists relays are both registry errors.
+func TestDeriveNebulaRelaysInvalid(t *testing.T) {
+	dir := writeVars(t)
+	nodes := `node-a:
+  name: a
+  ip: 10.0.1.10
+  site: s1
+  nebula_am_relay: true
+  nebula_relays: [b]
+node-b:
+  name: b
+  ip: 10.0.2.20
+  site: s2
+  nebula_relays: [c]
+node-c:
+  name: c
+  ip: 10.0.1.30
+  site: s1
+`
+	_ = os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"), []byte(nodes), 0o644)
+
+	topo, err := Load(Config{VarsDir: dir, NodeName: "node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range topo.Errors {
+		if strings.Contains(e, "relay-to-relay") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("am_relay+relays conflict not recorded: %v", topo.Errors)
+	}
+
+	spoke, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spoke.NebulaRelayIPs) != 0 {
+		t.Fatalf("non-am_relay target resolved: %v", spoke.NebulaRelayIPs)
+	}
+	found = false
+	for _, e := range spoke.Errors {
+		if strings.Contains(e, "lacks nebula_am_relay") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("non-am_relay target not recorded: %v", spoke.Errors)
+	}
+}

@@ -62,6 +62,7 @@ var deriveStages = []deriveStage{
 	{"probe/slowpath/site markers", stageProbeMarkers},
 	{"dns fallback + resolvers", stageDNS},
 	{"lighthouses", stageLighthouses},
+	{"nebula relays", stageNebulaRelays},
 	{"unsafe routes", stageUnsafeRoutes},
 	{"cert SAN subnets", stageCertSubnets},
 	{"bw audit targets", stageBwAudit},
@@ -356,6 +357,61 @@ func stageLighthouses(t *Topology, c *deriveCtx) {
 	for _, n := range lhNames {
 		t.Lighthouses = append(t.Lighthouses, lhMap[n])
 	}
+}
+
+// stageNebulaRelays — Nebula protocol relay (>=1.6): am_relay marks
+// this node as a relay; nebula_relays lists mesh names of relay
+// nodes, resolved to their VPN marker IPs for the config's
+// relay.relays (advertised to the lighthouse). Nebula forbids a
+// relay node from using relays itself ("cannot relay to a relay"),
+// and a listed node without am_relay would reject relay requests —
+// both are registry errors, not silent skips.
+func stageNebulaRelays(t *Topology, c *deriveCtx) {
+	t.AmRelay = t.Node.Bool("nebula_am_relay")
+	byName := map[string]*jinja.OMap{}
+	t.walkNodes(func(_ string, om *jinja.OMap) {
+		if nm := nodeNameOf(om); nm != "" {
+			byName[nm] = om
+		}
+	})
+	var ips []string
+	seen := map[string]bool{}
+	for _, x := range t.Node.Slice("nebula_relays") {
+		name := jinja.Stringify(x)
+		if name == "" || name == "None" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		bad := func(format string, args ...any) {
+			t.Errors = append(t.Errors, fmt.Sprintf(format, args...))
+		}
+		switch {
+		case t.AmRelay:
+			bad("node %q (mesh %q): am_relay node must not list nebula_relays — nebula forbids relay-to-relay",
+				t.NodeKey, c.self)
+		case name == c.self:
+			bad("node %q (mesh %q): nebula_relays lists itself",
+				t.NodeKey, c.self)
+		default:
+			target, ok := byName[name]
+			switch {
+			case !ok:
+				bad("node %q (mesh %q): nebula_relays entry %q not in registry",
+					t.NodeKey, c.self, name)
+			case !target.Bool("nebula_am_relay"):
+				bad("node %q (mesh %q): nebula_relays entry %q lacks nebula_am_relay — it would reject relay requests",
+					t.NodeKey, c.self, name)
+			default:
+				if mk, hasMk := t.Markers[name]; hasMk && mk != "" {
+					ips = append(ips, mk)
+				} else {
+					bad("node %q (mesh %q): nebula_relays entry %q has no marker IP",
+						t.NodeKey, c.self, name)
+				}
+			}
+		}
+	}
+	t.NebulaRelayIPs = ips
 }
 
 // stageUnsafeRoutes — remote registry ips + relays routed via the

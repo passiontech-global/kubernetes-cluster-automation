@@ -437,3 +437,82 @@ func TestNebulaConfigRendersSharedCtx(t *testing.T) {
 		t.Fatalf("spoke hosts missing the hub marker:\n%s", cfg2)
 	}
 }
+
+// TestNebulaConfigRelayBlock — the relay: section renders from the
+// derived topology: am_relay flag on relay nodes, relay.relays as
+// marker VPN IPs on spokes, empty list otherwise.
+func TestNebulaConfigRelayBlock(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	patchVarsFile(t, vars, "interdc_nodes.yaml", `node-a:
+  name: a
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+node-b:
+  name: b
+  ip: 10.0.2.20
+  site: s2
+  nebula_relays: [c]
+node-c:
+  name: c
+  ip: 10.0.1.30
+  site: s1
+  nebula_am_relay: true
+`)
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	b, err := c.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render node-b: %v", err)
+	}
+	cfg := string(b)
+	if !strings.Contains(cfg, "am_relay: False") {
+		t.Fatalf("spoke must not be am_relay:\n%s", cfg)
+	}
+	// node-c marker = 172.29.0.30 — the quoted list item appears ONLY
+	// in relay.relays (lighthouse hosts list node-a's .10; unsafe
+	// routes emit `via: 172.29.0.30` unquoted).
+	if !strings.Contains(cfg, `- "172.29.0.30"`) {
+		t.Fatalf("spoke relays missing node-c marker:\n%s", cfg)
+	}
+
+	r2, err := New(Config{NodeName: "node-c", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := loadCyc(t, r2, vars, "node-c")
+	b2, err := c2.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render node-c: %v", err)
+	}
+	cfg2 := string(b2)
+	if !strings.Contains(cfg2, "am_relay: True") {
+		t.Fatalf("relay node missing am_relay:\n%s", cfg2)
+	}
+	if !strings.Contains(cfg2, "relays: []") {
+		t.Fatalf("relay node must render empty relays:\n%s", cfg2)
+	}
+
+	// node-a carries no relay fields → no relay: block at all, so
+	// clusters not using the feature see zero config diff (and zero
+	// nebula restarts) when the agent rolls out.
+	r3, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c3 := loadCyc(t, r3, vars, "node-a")
+	b3, err := c3.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render node-a: %v", err)
+	}
+	if strings.Contains(string(b3), "am_relay") {
+		t.Fatalf("plain node must not render a relay block:\n%s", b3)
+	}
+}

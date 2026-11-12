@@ -77,6 +77,29 @@ punchy:
   punch: true
   respond: true
 
+{% if interdc_nebula_am_relay | bool or interdc_nebula_relays | length > 0 %}
+# Nebula protocol relay (>=1.6): peer khong P2P duoc (UDP underlay
+# flap/blocked) thi forward handshake+data qua relay node. am_relay:
+# node nay forward cho nguoi khac. relays: VPN IPs (marker) cua cac
+# relay node — lighthouse gioi thieu chung cho peer muon toi node
+# nay. Relay node KHONG duoc liet ke relay ("cannot relay to a
+# relay") — derive da chan o registry level.
+# Block CHI render khi node co relay config: node khong dung feature
+# giu nguyen config cu -> khong restart nebula (fleet khac khong
+# dinh); node bo field sau khi da co -> block bien mat -> restart ->
+# am_relay tat sach.
+relay:
+  am_relay: {{ interdc_nebula_am_relay | bool }}
+{% if interdc_nebula_relays | length > 0 %}
+  relays:
+{% for _r in interdc_nebula_relays %}
+    - "{{ _r }}"
+{% endfor %}
+{% else %}
+  relays: []
+{% endif %}
+{% endif %}
+
 tun:
   disabled: false
   dev: {{ interdc_nebula_dev }}
