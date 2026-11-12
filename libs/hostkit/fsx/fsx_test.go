@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fsx.WriteFile must leave exactly the target file behind: content
@@ -273,5 +275,187 @@ func TestPromoteStatErrorFails(t *testing.T) {
 	}
 	if _, err := os.Stat(stageName); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staging file leaked after failed Promote: %v", err)
+	}
+}
+
+// Opts.Rename is the per-call rename seam: two parallel writes each
+// inject their own failing rename — neither touches the package-level
+// RenameFile, so t.Parallel is safe (the whole point of the seam).
+func TestWriteFileRenameSeamPerCall(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	boom := errors.New("per-call rename failure")
+	rename := func(string, string) error {
+		calls.Add(1)
+		return boom
+	}
+	for i := 0; i < 4; i++ {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "f")
+		if err := WriteFile(path, []byte("x"), Opts{Rename: rename}); !errors.Is(err, boom) {
+			t.Fatalf("WriteFile = %v, want %v", err, boom)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("failed rename must not install the target")
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("rename seam invoked %d times, want 4", calls.Load())
+	}
+}
+
+// WriteFileDirect is the bind-mount fallback: truncate+write+fsync in
+// place — content lands verbatim where rename is impossible.
+func TestWriteFileDirect(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+	if err := WriteFileDirect(path, "127.0.0.1 localhost\n"); err != nil {
+		t.Fatalf("WriteFileDirect: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "127.0.0.1 localhost\n" {
+		t.Fatalf("content = %q", got)
+	}
+	// Overwrite truncates rather than appending.
+	if err := WriteFileDirect(path, "new\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(path)
+	if string(got) != "new\n" {
+		t.Fatalf("overwrite content = %q", got)
+	}
+}
+
+// WriteFileAtomicNoSync lands content through the same tmp+rename
+// path minus the fsyncs — the ephemeral-file contract.
+func TestWriteFileAtomicNoSyncLands(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "last-run")
+	if err := WriteFileAtomicNoSync(path, "epoch=1\n"); err != nil {
+		t.Fatalf("WriteFileAtomicNoSync: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "epoch=1\n" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestReadTrimmed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	if err := os.WriteFile(path, []byte("  value\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadTrimmed(path); got != "value" {
+		t.Fatalf("ReadTrimmed = %q", got)
+	}
+	if got := ReadTrimmed(filepath.Join(dir, "missing")); got != "" {
+		t.Fatalf("ReadTrimmed(missing) = %q, want empty", got)
+	}
+}
+
+func TestReadUintFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "n")
+	if err := os.WriteFile(path, []byte("  42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := ReadUintFile(path); !ok || v != 42 {
+		t.Fatalf("ReadUintFile = (%d,%v), want (42,true)", v, ok)
+	}
+	if err := os.WriteFile(path, []byte("not-a-number"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadUintFile(path); ok {
+		t.Fatal("unparseable content reported ok")
+	}
+	if _, ok := ReadUintFile(filepath.Join(dir, "missing")); ok {
+		t.Fatal("missing file reported ok")
+	}
+}
+
+func TestTouchIfDue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "latch")
+	now := time.Now()
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh mtime → skipped (no Chtimes).
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := fi.ModTime()
+	if err := TouchIfDue(path, fi, now, time.Hour); err != nil {
+		t.Fatalf("TouchIfDue(fresh): %v", err)
+	}
+	fi2, _ := os.Stat(path)
+	if !fi2.ModTime().Equal(fresh) {
+		t.Fatal("fresh latch was touched")
+	}
+
+	// Stale mtime → touched to now.
+	stale := now.Add(-2 * time.Hour)
+	if err := os.Chtimes(path, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ = os.Stat(path)
+	if err := TouchIfDue(path, fi, now, time.Hour); err != nil {
+		t.Fatalf("TouchIfDue(stale): %v", err)
+	}
+	fi, _ = os.Stat(path)
+	if fi.ModTime().Before(now.Add(-time.Minute)) {
+		t.Fatalf("stale latch mtime = %v, want ~now", fi.ModTime())
+	}
+
+	// Future mtime (clock skew) → touched, not skipped.
+	future := now.Add(time.Hour)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ = os.Stat(path)
+	if err := TouchIfDue(path, fi, now, time.Hour); err != nil {
+		t.Fatalf("TouchIfDue(future): %v", err)
+	}
+	fi, _ = os.Stat(path)
+	if fi.ModTime().After(now.Add(time.Minute)) {
+		t.Fatal("future-mtime latch kept its future stamp")
+	}
+}
+
+func TestHostSidePath(t *testing.T) {
+	cases := map[string]string{
+		"/host":         "/",
+		"/host/etc/mtu": "/etc/mtu",
+		"/hostname/x":   "/hostname/x", // boundary check: not /host/
+		"/hostile/x":    "/hostile/x",
+		"/etc/hosts":    "/etc/hosts",
+	}
+	for in, want := range cases {
+		if got := HostSidePath(in); got != want {
+			t.Errorf("HostSidePath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	cases := map[string]string{
+		"plain":     "'plain'",
+		"a b":       "'a b'",
+		"it's":      `'it'\''s'`,
+		"$(rm -rf)": `'$(rm -rf)'`,
+	}
+	for in, want := range cases {
+		if got := ShellQuote(in); got != want {
+			t.Errorf("ShellQuote(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

@@ -19,6 +19,11 @@
 //	ControlPlaneFrozen → ControlPlaneCertReloadStale
 package nodecond
 
+import (
+	"strconv"
+	"time"
+)
+
 // Latch-backed NodeConditions — each maps 1:1 to a state-<name>
 // latch the node-host-agent writes (internal/latchdefs) and the
 // nodereporter reflects onto Node.Status.Conditions with a fresh
@@ -272,6 +277,66 @@ var heartbeatSweptSet = func() map[string]struct{} {
 	}
 	return set
 }()
+
+// KuredLockAnno is the reboot-drain lock annotation kured holds on
+// the node it is draining (weave.works/kured-node-lock). L1
+// (nodecoord) checks it on the NODE object and L3
+// (node-automation-controller's maintenance mutex) reads the same
+// key off the kured DaemonSet — one spelling, both sides.
+const KuredLockAnno = "weave.works/kured-node-lock"
+
+// CoordVerdict is the decoded Cluster→Node maintenance state both
+// apps derive from the same annotation pair — the L1 nodecoord
+// cache and any L3 re-derivation must agree bit-for-bit.
+type CoordVerdict struct {
+	// Active is the hold signal: a live maintenance stamp
+	// (MaintenanceUntil > now) OR the kured drain lock present.
+	Active bool
+	// MaintenanceUntil is the parsed
+	// AnnoClusterMaintenanceUntil — zero when absent/unparseable.
+	MaintenanceUntil time.Time
+	// KuredLocked reports the kured drain-lock annotation present —
+	// it carries NO timestamp, so consumers needing a freshness
+	// bound apply their own TTL on top of this verdict.
+	KuredLocked bool
+}
+
+// ParseAnnoTime parses an annotation timestamp — RFC3339Nano and
+// RFC3339 first, then a bare unix-seconds integer (the legacy stamp
+// format several annotations still carry and the hand-set escape
+// hatch). ok=false on absent/empty/unparseable input: callers treat
+// a stamp they cannot read as no stamp at all, never as now.
+func ParseAnnoTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, true
+	}
+	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return time.Unix(ts, 0), true
+	}
+	return time.Time{}, false
+}
+
+// EvaluateCoordAnnos folds a node's annotation map into the
+// Cluster→Node maintenance verdict — the single decode both the L1
+// nodecoord cache and L3-side consumers share. KuredLocked is pure
+// presence (the value is a JSON lock document, not a timestamp);
+// Active is KuredLocked OR a MaintenanceUntil still in the future
+// at now.
+func EvaluateCoordAnnos(annos map[string]string, now time.Time) CoordVerdict {
+	var v CoordVerdict
+	if t, ok := ParseAnnoTime(annos[AnnoClusterMaintenanceUntil]); ok {
+		v.MaintenanceUntil = t
+	}
+	v.KuredLocked = annos[KuredLockAnno] != ""
+	v.Active = v.KuredLocked || v.MaintenanceUntil.After(now)
+	return v
+}
 
 // AgentHeartbeatManaged reports whether cond is a nodereporter-
 // owned condition that carries a live LastHeartbeatTime stamp —

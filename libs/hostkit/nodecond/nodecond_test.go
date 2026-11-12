@@ -3,6 +3,7 @@ package nodecond
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // allConditionNames enumerates every exported condition constant BY
@@ -393,5 +394,66 @@ func TestStormGateRenamesApplied(t *testing.T) {
 	}
 	if !gate[CiliumBPFMapPressure] {
 		t.Error("StormGateNames must contain CiliumBPFMapPressure (plan adds it to the storm gate)")
+	}
+}
+
+func TestParseAnnoTime(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	cases := []struct {
+		name string
+		in   string
+		want time.Time
+		ok   bool
+	}{
+		{"empty", "", time.Time{}, false},
+		{"rfc3339", now.Format(time.RFC3339), now, true},
+		{"rfc3339nano", now.Add(123 * time.Millisecond).Format(time.RFC3339Nano),
+			now.Add(123 * time.Millisecond), true},
+		{"unix seconds", "1700000000", time.Unix(1700000000, 0), true},
+		{"garbage", "manual-forever", time.Time{}, false},
+		{"negative unix", "-5", time.Unix(-5, 0), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseAnnoTime(tc.in)
+			if ok != tc.ok {
+				t.Fatalf("ParseAnnoTime(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+			}
+			if ok && !got.Equal(tc.want) {
+				t.Fatalf("ParseAnnoTime(%q)=%v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateCoordAnnos(t *testing.T) {
+	now := time.Now()
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	past := now.Add(-time.Hour).UTC().Format(time.RFC3339)
+
+	// No annotations → inactive verdict.
+	if v := EvaluateCoordAnnos(nil, now); v.Active || v.KuredLocked || !v.MaintenanceUntil.IsZero() {
+		t.Fatalf("empty annos: %+v, want zero verdict", v)
+	}
+	// Live maintenance window → active, stamp carried through.
+	v := EvaluateCoordAnnos(map[string]string{AnnoClusterMaintenanceUntil: future}, now)
+	if !v.Active || v.KuredLocked {
+		t.Fatalf("future maintenance: %+v, want active non-kured", v)
+	}
+	if v.MaintenanceUntil.IsZero() {
+		t.Fatal("MaintenanceUntil not decoded")
+	}
+	// Expired window → inactive.
+	if v := EvaluateCoordAnnos(map[string]string{AnnoClusterMaintenanceUntil: past}, now); v.Active {
+		t.Fatalf("past maintenance: %+v, want inactive", v)
+	}
+	// Kured lock alone → active (no timestamp on the lock).
+	v = EvaluateCoordAnnos(map[string]string{KuredLockAnno: `{"nodeID":"w1"}`}, now)
+	if !v.Active || !v.KuredLocked {
+		t.Fatalf("kured lock: %+v, want active+kured", v)
+	}
+	// Unparseable stamp + no lock → inactive, zero until.
+	if v := EvaluateCoordAnnos(map[string]string{AnnoClusterMaintenanceUntil: "bogus"}, now); v.Active {
+		t.Fatalf("bogus stamp: %+v, want inactive", v)
 	}
 }

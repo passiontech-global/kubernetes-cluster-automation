@@ -276,9 +276,8 @@ func TestGate(t *testing.T) {
 // values alone don't show the diagnostic fired).
 func TestWarnfIsInvokedOnRejectedValues(t *testing.T) {
 	var calls []string
-	orig := Warnf
-	Warnf = func(msg string, kv ...any) { calls = append(calls, fmt.Sprint(msg, kv)) }
-	t.Cleanup(func() { Warnf = orig })
+	SetWarnf(func(msg string, kv ...any) { calls = append(calls, fmt.Sprint(msg, kv)) })
+	t.Cleanup(func() { SetWarnf(nil) })
 
 	t.Setenv("ENVX_TEST_WARNF_INT", "bogus")
 	GetenvInt("ENVX_TEST_WARNF_INT", 1)
@@ -295,10 +294,8 @@ func TestWarnfIsInvokedOnRejectedValues(t *testing.T) {
 // A gate value that reads as boolean intent but misses the exact
 // "true"/"false" spelling warns exactly once per key per process and
 // keeps the default outcome in both defaultOn modes — the warning must
-// surface the silent pin without changing Gate's contract. (The plain
-// `Warnf = f` assignment in TestWarnfIsInvokedOnRejectedValues above
-// stays as the legacy rebind-path check; this one goes through
-// SetWarnf, the atomic path.)
+// surface the silent pin without changing Gate's contract. Both
+// tests rebind through SetWarnf, the atomic path.
 func TestGateWarnsOnIntentLikeMisspellings(t *testing.T) {
 	var calls []string
 	SetWarnf(func(msg string, kv ...any) { calls = append(calls, fmt.Sprint(msg, kv)) })
@@ -399,29 +396,19 @@ func TestSetWarnfRaceAgainstGetterTraffic(t *testing.T) {
 	}
 }
 
-// The three rebind shapes and their routing, in one sequence:
-// SetWarnf installs through the atomic hook (the default Warnf var
-// dispatches to it), a second SetWarnf overrides the first, and the
-// legacy direct `Warnf = f` assignment still routes — the var is the
-// sink either way. After a direct assignment the hook is orphaned
-// (documented at Warnf): the test ends there so the restore cleanup
-// re-establishes the dispatcher before anything else routes.
+// SetWarnf is the only rebind path: each install overrides the
+// previous hook and Warnf always dispatches through it — a second
+// SetWarnf wins, and SetWarnf(nil) restores the slog default.
 func TestWarnfRebindShapesRoute(t *testing.T) {
-	orig := Warnf
-	t.Cleanup(func() {
-		Warnf = orig  // re-install the dispatcher FIRST…
-		SetWarnf(nil) // …then clear the hook it dispatches to
-	})
+	t.Cleanup(func() { SetWarnf(nil) })
 
 	var which []string
 	SetWarnf(func(string, ...any) { which = append(which, "hook1") })
 	Warnf("a")
 	SetWarnf(func(string, ...any) { which = append(which, "hook2") })
 	Warnf("b")
-	Warnf = func(string, ...any) { which = append(which, "direct") }
-	Warnf("c")
 
-	want := []string{"hook1", "hook2", "direct"}
+	want := []string{"hook1", "hook2"}
 	if !slices.Equal(which, want) {
 		t.Fatalf("rebind routing = %v, want %v", which, want)
 	}

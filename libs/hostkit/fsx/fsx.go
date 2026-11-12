@@ -69,6 +69,11 @@ type Opts struct {
 	// under /etc and latch/state files keep the durable path — a
 	// lost latch reads as "condition cleared".
 	NoSync bool
+	// Rename is the rename(2) seam for THIS write — tests inject a
+	// stub per call instead of mutating the package-level
+	// RenameFile (which would race parallel tests). Nil falls back
+	// to RenameFile.
+	Rename func(oldpath, newpath string) error
 }
 
 // StageTempPattern returns a Stage that CreateTemps a uniquely
@@ -171,7 +176,11 @@ func Promote(f *os.File, path string, opts Opts) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if err := RenameFile(tmpName, path); err != nil {
+	rename := opts.Rename
+	if rename == nil {
+		rename = RenameFile
+	}
+	if err := rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}

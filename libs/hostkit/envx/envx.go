@@ -8,10 +8,10 @@
 // user-facing agreements:
 //
 //   - the lenient family (String, Bool, Int, Int64, Duration, List,
-//     … and the *Knob table constructors) — node-host-agent's
-//     shell-knob convention: unrecognised input quietly falls back to
-//     the default;
-//   - the strict family (the Getenv* getters and Gate, marked below)
+//     … and the *Knob table constructors in knobs.go) —
+//     node-host-agent's shell-knob convention: unrecognised input
+//     quietly falls back to the default;
+//   - the strict family (the Getenv* getters and Gate, in strict.go)
 //     — node-automation-controller's ConfigMap-flag convention,
 //     ported verbatim from its retired internal/platform/envx: an
 //     unparseable or out-of-range value warns (through Warnf) and
@@ -24,7 +24,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -37,17 +36,26 @@ func String(key, def string) string {
 	return def
 }
 
+// parseBoolToken classifies v against the lenient boolean vocabulary
+// shared by Bool and ModeEnv: 1/true/yes/on → true, 0/false/no/off →
+// false, anything else → ok=false so the caller applies its default.
+func parseBoolToken(v string) (val, ok bool) {
+	switch v {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	}
+	return false, false
+}
+
 // Bool parses a boolean env var; unset/empty/unrecognised → def.
 // Accepts 1/0, true/false, yes/no, on/off (case-sensitive).
 func Bool(key string, def bool) bool {
-	switch os.Getenv(key) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return def
+	if val, ok := parseBoolToken(os.Getenv(key)); ok {
+		return val
 	}
+	return def
 }
 
 // Mode is the tri-state of the NODE_HOST_AGENT_ENABLE_* knobs: On
@@ -70,30 +78,41 @@ const (
 // → def (which may itself be ModeAuto). The getter is named ModeEnv,
 // not Mode, so it can't collide with the type.
 func ModeEnv(key string, def Mode) Mode {
-	switch os.Getenv(key) {
-	case "1", "true", "yes", "on":
-		return ModeOn
-	case "0", "false", "no", "off":
+	if val, ok := parseBoolToken(os.Getenv(key)); ok {
+		if val {
+			return ModeOn
+		}
 		return ModeOff
-	default:
-		return def
 	}
+	return def
+}
+
+// intValue parses v as an int, falling back to def — the shared tail
+// of Int and IntOr (an unset env never reaches it: IntOr only calls
+// it for a non-empty value, where "" would parse-fail to def anyway).
+func intValue(v string, def int) int {
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return def
 }
 
 // Int parses an int env var; unset/empty/non-numeric → def.
 func Int(key string, def int) int {
-	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
-		return v
+	return intValue(os.Getenv(key), def)
+}
+
+// int64Value is intValue for int64 knobs.
+func int64Value(v string, def int64) int64 {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return n
 	}
 	return def
 }
 
 // Int64 parses an int64 env var; unset/empty/non-numeric → def.
 func Int64(key string, def int64) int64 {
-	if v, err := strconv.ParseInt(os.Getenv(key), 10, 64); err == nil {
-		return v
-	}
-	return def
+	return int64Value(os.Getenv(key), def)
 }
 
 // Or is the env → conf → (caller) chain for string knobs: an unset or
@@ -125,8 +144,8 @@ func IsSet(key string) bool { return os.Getenv(key) != "" }
 // IntOr is env → conf → def for int knobs (conf ints are raw counts;
 // <=0 = unset). A set-but-non-numeric env yields def, not confVal.
 func IntOr(key string, confVal, def int) int {
-	if os.Getenv(key) != "" {
-		return Int(key, def)
+	if v := os.Getenv(key); v != "" {
+		return intValue(v, def)
 	}
 	if confVal > 0 {
 		return confVal
@@ -137,8 +156,8 @@ func IntOr(key string, confVal, def int) int {
 // Int64Or is env → conf → def for int64 knobs. A set-but-non-numeric
 // env yields def, not confVal.
 func Int64Or(key string, confVal, def int64) int64 {
-	if os.Getenv(key) != "" {
-		return Int64(key, def)
+	if v := os.Getenv(key); v != "" {
+		return int64Value(v, def)
 	}
 	if confVal > 0 {
 		return confVal
@@ -146,17 +165,23 @@ func Int64Or(key string, confVal, def int64) int64 {
 	return def
 }
 
+// maxDurationSeconds is the largest whole-second count a
+// time.Duration can hold — the shared overflow bound for the
+// bare-integer seconds path in durationValue and DurOr's
+// conf-seconds path.
+const maxDurationSeconds = math.MaxInt64 / int64(time.Second)
+
 // DurOr is env → conf-seconds → def for duration knobs (conf carries
 // bare seconds like the shell *_S knobs). A set-but-unparseable or
 // non-positive env yields def, not confSeconds.
 func DurOr(key string, confSeconds int, def time.Duration) time.Duration {
-	if os.Getenv(key) != "" {
-		return Duration(key, def)
+	if v := os.Getenv(key); v != "" {
+		return durationValue(key, v, def)
 	}
 	if confSeconds > 0 {
-		// Same overflow guard as Duration: a conf value past the
+		// Same overflow guard as durationValue: a conf value past the
 		// int64-second ceiling would wrap to a bogus interval.
-		if int64(confSeconds) > math.MaxInt64/int64(time.Second) {
+		if int64(confSeconds) > maxDurationSeconds {
 			Warnf("conf duration overflows int64 — using default",
 				"env", key, "conf_seconds", confSeconds, "default", def)
 			return def
@@ -166,13 +191,9 @@ func DurOr(key string, confSeconds int, def time.Duration) time.Duration {
 	return def
 }
 
-// Duration parses a Go duration ("1h", "30s"); a bare integer is
-// treated as seconds for parity with the shell knobs it replaces.
-// Unset/empty → def. Unparseable or non-positive values warn and fall
-// back to def — a ≤0 interval would panic time.NewTicker inside the
-// subsystem and crash-loop the daemon.
-func Duration(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
+// durationValue parses an already-read env value v as a duration —
+// the shared tail of Duration and DurOr so neither re-reads the env.
+func durationValue(key, v string, def time.Duration) time.Duration {
 	if v == "" {
 		return def
 	}
@@ -183,8 +204,8 @@ func Duration(key string, def time.Duration) time.Duration {
 		// The bare-integer seconds path must not wrap: values past
 		// MaxInt64/1e9 seconds overflow int64 nanoseconds and can land
 		// on a bogus positive interval the <=0 check below would miss.
-		if int64(n) > math.MaxInt64/int64(time.Second) ||
-			int64(n) < math.MinInt64/int64(time.Second) {
+		if int64(n) > maxDurationSeconds ||
+			int64(n) < -maxDurationSeconds {
 			Warnf("env duration overflows int64 — using default",
 				"env", key, "value", v, "default", def)
 			return def
@@ -203,6 +224,15 @@ func Duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// Duration parses a Go duration ("1h", "30s"); a bare integer is
+// treated as seconds for parity with the shell knobs it replaces.
+// Unset/empty → def. Unparseable or non-positive values warn and fall
+// back to def — a ≤0 interval would panic time.NewTicker inside the
+// subsystem and crash-loop the daemon.
+func Duration(key string, def time.Duration) time.Duration {
+	return durationValue(key, os.Getenv(key), def)
 }
 
 // List parses a comma-separated env var, trimming spaces and dropping
@@ -238,29 +268,19 @@ func IntList(key string) []int {
 	return out
 }
 
-// Warnf is the sink for the "invalid env value — using default"
-// diagnostics emitted by the getters (Duration, IntList, and the
-// strict Getenv* family below). Its default implementation is a
-// dispatcher: it reads warnfHook first and falls back to the package
-// slog logger when no hook is installed — so SetWarnf rebinds the
-// sink WITHOUT touching this var, and getter traffic keeps routing
-// through the var (one atomic load per call) race-free.
-//
-// Rebinding — two shapes, one rule:
-//   - SetWarnf is the supported path: atomic swap, race-free against
-//     concurrent getter calls, composable (SetWarnf(nil) restores the
-//     slog default). node-automation-controller's startup init() and
-//     every test use it.
-//   - The legacy direct assignment (`envx.Warnf = f`) still works —
-//     the var stays assignable — but it REPLACES the dispatcher, so
-//     the var write is racy against concurrent getter traffic and it
-//     orphans any installed hook (later SetWarnf calls route nowhere
-//     until the var is reassigned). Only legal strictly before the
-//     first getter call, same as the original pre-SetWarnf ordering
-//     contract; whichever path installed the current sink last wins.
+// warnfHook is the atomic diagnostic sink Warnf dispatches to —
+// SetWarnf swaps it without touching Warnf itself, so getter traffic
+// stays race-free (one atomic load per call) and late rebinds cannot
+// tear a func value mid-call.
 var warnfHook atomic.Pointer[func(msg string, kv ...any)]
 
-var Warnf = func(msg string, kv ...any) {
+// Warnf is the sink for the "invalid env value — using default"
+// diagnostics emitted by the getters (Duration, IntList, and the
+// strict Getenv* family in strict.go). It dispatches through
+// warnfHook first and falls back to the package slog logger when no
+// hook is installed — SetWarnf is the only rebind path, so every
+// caller (tests included) shares the same race-free contract.
+func Warnf(msg string, kv ...any) {
 	if f := warnfHook.Load(); f != nil {
 		(*f)(msg, kv...)
 		return
@@ -269,289 +289,11 @@ var Warnf = func(msg string, kv ...any) {
 }
 
 // SetWarnf atomically rebinds the diagnostic sink; nil restores the
-// package slog default. Race-free against concurrent Warnf traffic, so
-// tests and late-rebinding apps rebind through here instead of
-// assigning the Warnf var.
+// package slog default. Race-free against concurrent Warnf traffic.
 func SetWarnf(f func(msg string, kv ...any)) {
 	if f == nil {
 		warnfHook.Store(nil)
 		return
 	}
 	warnfHook.Store(&f)
-}
-
-// --------------------------------------------------------------------
-// Strict family — node-automation-controller's ConfigMap-flag contract.
-//
-// The Getenv* getters and Gate below were ported verbatim from
-// apps/node-automation-controller/internal/platform/envx and keep its
-// semantics exactly, because they are the env contract of the
-// controller's operator-facing flag ConfigMaps (the ported
-// shell-operator CronJobs/kuberhealthy checks):
-//
-//   - an unparseable or out-of-range value warns via Warnf and falls
-//     back to the default rather than being silently accepted — a
-//     typo'd knob pinned to its default must be visible from outside;
-//   - warn records keep that app's kv names ("key"/"value"/"default"/
-//     "min", not this package's "env" convention) so its log pipeline
-//     sees the same record shape it always emitted;
-//   - durations accept ONLY Go duration format with a >=1s floor —
-//     every duration knob is a sweep interval where <=0 would panic
-//     time.NewTicker and a sub-second value would hot-loop the sweep
-//     (Duration above additionally accepts a bare integer as seconds
-//     for shell-knob parity; GetenvDuration does not);
-//   - Gate is exact-match: defaultOn=true enables unless the value is
-//     exactly "false" (explicit opt-out); defaultOn=false enables only
-//     when the value is exactly "true" (opt-in). Bool's lenient
-//     1/true/yes/on vocabulary does not apply — but a set value drawn
-//     from it (any casing) warns once per key while keeping the
-//     default, so a casing slip cannot silently pin a gate.
-// --------------------------------------------------------------------
-
-// Getenv reads a string env knob, returning def when unset or empty —
-// identical semantics to String; the Getenv name is kept so the strict
-// family reads as one contract.
-func Getenv(key, def string) string {
-	return String(key, def)
-}
-
-// GetenvInt reads an integer env knob. An unparseable value warns and
-// falls back to def; the parsed value is kept verbatim — <=0 is a
-// legitimate setting for the replica-pin knobs (minReplicas<=0
-// disables the pin).
-func GetenvInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-		Warnf("unparseable integer env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
-
-// GetenvDuration reads a duration env knob. Unparseable values warn
-// and fall back to def; so do parsed values < 1s — every duration
-// knob is a sweep interval, where <=0 is never meaningful and would
-// panic time.NewTicker downstream in shared.Periodic, and a
-// sub-second interval would hot-loop the sweep.
-func GetenvDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= time.Second {
-			return d
-		}
-		Warnf("invalid duration env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
-
-// GetenvFloat reads a float env knob with the same warn-and-fallback
-// contract as GetenvInt. ParseFloat also accepts "NaN"/"Inf"/"+Inf"/
-// "-Inf" — non-finite values silently corrupt threshold comparisons
-// downstream (NaN != everything, +Inf > everything), so they take the
-// same warn-and-default path as unparseable input.
-func GetenvFloat(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil &&
-			!math.IsNaN(f) && !math.IsInf(f, 0) {
-			return f
-		}
-		Warnf("unparseable float env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
-
-// GetenvIntMin is GetenvInt with a lower bound: parsed values < min
-// warn and fall back to def (e.g. a negative restart-limit knob would
-// flag every object). min applies to the PARSED value only — def is
-// returned verbatim whether or not it satisfies the bound, so callers
-// may express "disabled" defaults outside the valid-input range.
-func GetenvIntMin(key string, def, min int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= min {
-			return n
-		}
-		Warnf("invalid integer env value, using default",
-			"key", key, "value", v, "default", def, "min", min)
-	}
-	return def
-}
-
-// GetenvFloatPositive is GetenvFloat restricted to strictly positive
-// values: unparseable input and f <= 0 warn and fall back to def.
-// Non-finite values take the same warn-and-default path as
-// GetenvFloat — "+Inf" parses and satisfies f > 0, but it silently
-// disables every threshold comparison downstream. Values > 1 are
-// kept — several threshold knobs document ">1 disables the check" as
-// the operator escape hatch.
-func GetenvFloatPositive(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil &&
-			!math.IsNaN(f) && !math.IsInf(f, 0) && f > 0 {
-			return f
-		}
-		Warnf("invalid float env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
-
-// gateIntentWarned remembers which keys already had their bool-like
-// misspelling warned about — one line per key per process (Gate
-// resolves in every sweep; a stale "True" in a ConfigMap must not
-// spam the log), the same once-per pattern hostutil uses for its
-// rename-fallback warning. The table is capped: env keys are
-// compile-time constants in practice, but nothing stops a caller
-// resolving dynamic key names — on overflow the table is cleared so
-// warn-once restarts rather than the map leaking.
-var gateIntentWarned = struct {
-	mu sync.Mutex
-	m  map[string]struct{}
-}{m: map[string]struct{}{}}
-
-// gateIntentWarnCap bounds gateIntentWarned.m.
-const gateIntentWarnCap = 1024
-
-// gateIntentWarnOnce reports whether this is the first warning for
-// key — atomic under the mutex so concurrent Gate resolutions still
-// warn exactly once.
-func gateIntentWarnOnce(key string) bool {
-	gateIntentWarned.mu.Lock()
-	defer gateIntentWarned.mu.Unlock()
-	if _, ok := gateIntentWarned.m[key]; ok {
-		return false
-	}
-	if len(gateIntentWarned.m) >= gateIntentWarnCap {
-		clear(gateIntentWarned.m)
-	}
-	gateIntentWarned.m[key] = struct{}{}
-	return true
-}
-
-// looksLikeGateIntent reports whether v reads as boolean intent Gate
-// will silently drop: Bool's lenient vocabulary (1/0, true/false,
-// yes/no, on/off) in any casing. Exact "true"/"false" — the two values
-// Gate actually applies — are handled before this runs and never land
-// here; anything else in the vocabulary is a mis-cased or synonym
-// spelling that quietly fell back to the default.
-func looksLikeGateIntent(v string) bool {
-	switch strings.ToLower(v) {
-	case "1", "0", "true", "false", "yes", "no", "on", "off":
-		return true
-	}
-	return false
-}
-
-// Gate resolves a feature-gate env var. defaultOn=false is the
-// opt-in convention (enabled only when the value is exactly "true" —
-// the destructive/opt-in gates); defaultOn=true is the always-on
-// convention the ported CronJobs/kuberhealthy checks kept (enabled
-// unless the value is exactly "false" — an explicit opt-out via the
-// base-flags ConfigMap).
-//
-// A set value that LOOKS like boolean intent but misses the exact
-// spelling (e.g. "True", "0", "on") warns once per key and keeps the
-// default — the returned behavior is unchanged, but a knob pinned to
-// its default by a casing slip becomes visible from the outside.
-func Gate(key string, defaultOn bool) bool {
-	v := os.Getenv(key)
-	switch v {
-	case "false":
-		return false
-	case "true":
-		return true
-	}
-	if looksLikeGateIntent(v) {
-		if gateIntentWarnOnce(key) {
-			Warnf("bool-like gate value not applied — set exactly \"true\" or \"false\", using default",
-				"key", key, "value", v, "default_on", defaultOn)
-		}
-	}
-	return defaultOn
-}
-
-// Knob is one row of a package's declarative env surface: Name is the
-// env var and Resolve lands its value — through the helpers above, so
-// the env → conf → compiled-default chains keep their documented
-// precedence — into the Config field the closure captured. The *Knob
-// constructors cover the common single-getter chains; write a bare
-// {Name, Resolve} literal for bespoke resolutions — Resolve receives
-// Name, so the env string still appears exactly once per row. Build
-// the table inside ConfigFromEnv (Resolve closures capture &cfg) and
-// pass it to Apply.
-type Knob struct {
-	Name    string
-	Resolve func(name string)
-}
-
-// Apply resolves each knob in table order — the engine behind a
-// table-driven ConfigFromEnv env surface.
-func Apply(knobs []Knob) {
-	for _, k := range knobs {
-		k.Resolve(k.Name)
-	}
-}
-
-// StringKnob binds env name → *p via String (env → def).
-func StringKnob(name string, p *string, def string) Knob {
-	return Knob{name, func(k string) { *p = String(k, def) }}
-}
-
-// BoolKnob binds env name → *p via Bool (env → def).
-func BoolKnob(name string, p *bool, def bool) Knob {
-	return Knob{name, func(k string) { *p = Bool(k, def) }}
-}
-
-// IntKnob binds env name → *p via Int (env → def).
-func IntKnob(name string, p *int, def int) Knob {
-	return Knob{name, func(k string) { *p = Int(k, def) }}
-}
-
-// Int64Knob binds env name → *p via Int64 (env → def).
-func Int64Knob(name string, p *int64, def int64) Knob {
-	return Knob{name, func(k string) { *p = Int64(k, def) }}
-}
-
-// DurationKnob binds env name → *p via Duration (env → def).
-func DurationKnob(name string, p *time.Duration, def time.Duration) Knob {
-	return Knob{name, func(k string) { *p = Duration(k, def) }}
-}
-
-// OrKnob binds env name → *p via Or (env → conf; an empty conf flows
-// to the consumer's compiled default, exactly as Or documents).
-func OrKnob(name string, p *string, conf string) Knob {
-	return Knob{name, func(k string) { *p = Or(k, conf) }}
-}
-
-// StrOrKnob binds env name → *p via Str(Or(k, conf), def) — the full
-// env → conf → compiled-default string chain in one row.
-func StrOrKnob(name string, p *string, conf, def string) Knob {
-	return Knob{name, func(k string) { *p = Str(Or(k, conf), def) }}
-}
-
-// IntOrKnob binds env name → *p via IntOr (env → conf → def).
-func IntOrKnob(name string, p *int, conf, def int) Knob {
-	return Knob{name, func(k string) { *p = IntOr(k, conf, def) }}
-}
-
-// Int64OrKnob binds env name → *p via Int64Or (env → conf → def).
-func Int64OrKnob(name string, p *int64, conf, def int64) Knob {
-	return Knob{name, func(k string) { *p = Int64Or(k, conf, def) }}
-}
-
-// DurOrKnob binds env name → *p via DurOr (env → conf-seconds → def).
-func DurOrKnob(name string, p *time.Duration, confSeconds int, def time.Duration) Knob {
-	return Knob{name, func(k string) { *p = DurOr(k, confSeconds, def) }}
-}
-
-// ListKnob binds env name → *p via List (unset/empty → nil).
-func ListKnob(name string, p *[]string) Knob {
-	return Knob{name, func(k string) { *p = List(k) }}
-}
-
-// IntListKnob binds env name → *p via IntList (unset/empty → nil).
-func IntListKnob(name string, p *[]int) Knob {
-	return Knob{name, func(k string) { *p = IntList(k) }}
 }

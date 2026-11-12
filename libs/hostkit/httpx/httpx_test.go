@@ -195,13 +195,16 @@ func TestShutdownBeforeServeClosesListener(t *testing.T) {
 		t.Fatal("Addr empty before Serve")
 	}
 
-	done := srv.Serve()
+	// Shutdown BEFORE the first Serve — the bound listener must be
+	// released by teardown itself, and the later Serve must resolve
+	// nil on the already-closed server rather than accepting.
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 	if got := srv.Addr(); got != "" {
 		t.Fatalf("Addr after Shutdown = %q, want empty", got)
 	}
+	done := srv.Serve()
 	select {
 	case err := <-done:
 		if err != nil {

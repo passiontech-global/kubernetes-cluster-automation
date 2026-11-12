@@ -14,6 +14,7 @@ package httpx
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -43,6 +44,12 @@ type Opts struct {
 	// ReadHeaderTimeout caps the time from connection accept to full
 	// request headers (zero → DefaultReadHeaderTimeout).
 	ReadHeaderTimeout time.Duration
+	// ReadTimeout caps the whole request read — headers AND body
+	// (zero → net/http default: unbounded, preserving the metrics/
+	// stream behavior older callers relied on).
+	ReadTimeout time.Duration
+	// WriteTimeout caps the whole response write (zero → unbounded).
+	WriteTimeout time.Duration
 	// IdleTimeout caps keep-alive connections between requests
 	// (zero → DefaultIdleTimeout). See DefaultIdleTimeout for why an
 	// explicit value is required.
@@ -50,6 +57,9 @@ type Opts struct {
 	// ShutdownBudget is the drain window Shutdown applies when the
 	// caller's ctx carries no deadline (zero → DefaultShutdownBudget).
 	ShutdownBudget time.Duration
+	// MaxHeaderBytes caps request header size (zero → the net/http
+	// default of 1 MiB).
+	MaxHeaderBytes int
 }
 
 // Server is a bound, not-yet-serving HTTP server.
@@ -59,12 +69,13 @@ type Server struct {
 	// teardown reports a clean close instead of accepting on a dead
 	// listener, and a Serve accept-loop error caused BY the teardown
 	// (net.ErrClosed on the listener we closed) folds to nil.
-	mu     sync.Mutex
-	ln     net.Listener
-	closed bool
-	srv    *http.Server
-	budget time.Duration
-	done   chan error
+	mu        sync.Mutex
+	ln        net.Listener
+	closed    bool
+	srv       *http.Server
+	budget    time.Duration
+	done      chan error
+	serveOnce sync.Once
 }
 
 // New binds addr synchronously — the bind-then-serve ordering that
@@ -90,7 +101,10 @@ func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
 		srv: &http.Server{
 			Handler:           handler,
 			ReadHeaderTimeout: opts.ReadHeaderTimeout,
+			ReadTimeout:       opts.ReadTimeout,
+			WriteTimeout:      opts.WriteTimeout,
 			IdleTimeout:       opts.IdleTimeout,
+			MaxHeaderBytes:    opts.MaxHeaderBytes,
 		},
 		budget: opts.ShutdownBudget,
 		done:   make(chan error, 1),
@@ -111,32 +125,38 @@ func (s *Server) Addr() string {
 // Serve starts accepting connections in the background. The returned
 // channel yields nil after a graceful Shutdown (http.ErrServerClosed
 // is folded away — shutting down is not a serve failure) or the
-// accept-loop error otherwise. Serve must be called once; calling it
-// after Close/Shutdown fails on the closed listener.
+// accept-loop error otherwise; it is CLOSED after the result so
+// repeated receives keep answering nil. Serve is idempotent — a
+// second call returns the same channel without spawning a second
+// accept loop (serveOnce) — and a call after Close/Shutdown resolves
+// nil on the closed listener.
 func (s *Server) Serve() <-chan error {
-	s.mu.Lock()
-	ln := s.ln
-	s.mu.Unlock()
-	go func() {
-		var err error
-		switch {
-		case ln == nil || s.isClosed():
-			// Torn down before the accept loop started — a clean
-			// close, not a serve failure.
-			err = http.ErrServerClosed
-		default:
-			err = s.srv.Serve(ln)
-		}
-		if errors.Is(err, http.ErrServerClosed) ||
-			(errors.Is(err, net.ErrClosed) && s.isClosed()) {
-			// ErrServerClosed is the graceful path; net.ErrClosed
-			// is the listener WE closed mid-accept (Shutdown/Close
-			// race) — equally not a serve failure, but ONLY when the
-			// closed flag proves the teardown caused it.
-			err = nil
-		}
-		s.done <- err
-	}()
+	s.serveOnce.Do(func() {
+		s.mu.Lock()
+		ln := s.ln
+		s.mu.Unlock()
+		go func() {
+			var err error
+			switch {
+			case ln == nil || s.isClosed():
+				// Torn down before the accept loop started — a clean
+				// close, not a serve failure.
+				err = http.ErrServerClosed
+			default:
+				err = s.srv.Serve(ln)
+			}
+			if errors.Is(err, http.ErrServerClosed) ||
+				(errors.Is(err, net.ErrClosed) && s.isClosed()) {
+				// ErrServerClosed is the graceful path; net.ErrClosed
+				// is the listener WE closed mid-accept (Shutdown/Close
+				// race) — equally not a serve failure, but ONLY when the
+				// closed flag proves the teardown caused it.
+				err = nil
+			}
+			s.done <- err
+			close(s.done)
+		}()
+	})
 	return s.done
 }
 
@@ -205,4 +225,30 @@ func Timeout(h http.Handler, dt time.Duration, msg string) http.Handler {
 		msg = "request timed out"
 	}
 	return http.TimeoutHandler(h, dt, msg)
+}
+
+// PooledTransport returns an *http.Transport cloned from
+// http.DefaultTransport (keeping its dialer, HTTP/2 and 90s
+// IdleConnTimeout defaults) with the per-host idle pool raised to
+// maxIdlePerHost — http.DefaultTransport's MaxIdleConnsPerHost of 2
+// makes every parallel probe sweep churn connections, and callers
+// sharing one transport also share its TLS session cache.
+// tlsCfg, when non-nil, replaces the clone's TLSClientConfig.
+// maxIdlePerHost <= 0 keeps the stdlib default.
+func PooledTransport(maxIdlePerHost int, tlsCfg *tls.Config) *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Defensive: DefaultTransport is *http.Transport by stdlib
+		// contract; if that ever changes, start from a zero transport
+		// rather than panic.
+		base = &http.Transport{}
+	}
+	c := base.Clone()
+	if maxIdlePerHost > 0 {
+		c.MaxIdleConnsPerHost = maxIdlePerHost
+	}
+	if tlsCfg != nil {
+		c.TLSClientConfig = tlsCfg
+	}
+	return c
 }

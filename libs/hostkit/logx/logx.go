@@ -11,6 +11,7 @@ package logx
 
 import (
 	"log/slog"
+	"maps"
 	"sync"
 	"sync/atomic"
 )
@@ -89,9 +90,7 @@ func For(name string) *slog.Logger {
 		def:     def,
 		loggers: make(map[string]*slog.Logger, len(s.loggers)+1),
 	}
-	for k, v := range s.loggers {
-		next.loggers[k] = v
-	}
+	maps.Copy(next.loggers, s.loggers)
 	next.loggers[name] = l
 	forSnap.Store(next)
 	return l
