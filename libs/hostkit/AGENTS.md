@@ -13,7 +13,7 @@ contracts that more than one app (or subsystem) needs. Shared via
 | `logx`   | Named slog loggers: `logx.For(component)` resolves and caches `slog.Default().With("logger", name)` per call. |
 | `timex`  | The `Clock` seam (`nowFn func() time.Time` with nil-safe `Now()`) plus the settable `Cell`, shared by every sweep/subsystem for tests. |
 | `nodecond` | The single source of truth for NodeCondition names written by the agent and consumed by the controller; untyped strings so no k8s import. Also owns the coordination-annotation helpers (`KuredLockAnno`, `ParseAnnoTime`, `EvaluateCoordAnnos`). |
-| `fsx`    | Atomic file writer (`WriteFile`/`Promote`): same-dir staging → fsync → chmod → rename → optional dir fsync, plus the `WriteFileAtomic*` convenience family with the EBUSY/EXDEV bind-mount fallback (`stat_unix.go`/`stat_other.go` split), and the small read/stat helpers (`ReadTrimmed`, `ReadUintFile`, `TouchIfDue`, `HostSidePath`, `ShellQuote`, `FileStatKey`). Ported verbatim from the agent's `hostutil` so hostutil can delegate without behavior drift. |
+| `fsx`    | Atomic file writer (`WriteFile`/`Promote`): same-dir staging → fsync → chmod → rename → optional dir fsync, plus the `WriteFileAtomic*` convenience family with the EBUSY/EXDEV bind-mount fallback (`stat_unix.go`/`stat_other.go` split), and the small read/stat helpers (`ReadTrimmed`, `ReadUintFile`, `TouchIfDue`, `HostSidePath`, `ShellQuote`, `FileStatKey`). |
 | `ledger` | The time/count-keyed bookkeeping ledgers: `CooldownSet` (mutex-guarded last-action stamps), `FirstSeenLedger`, `StreakLedger`, `SeenSet` — ported verbatim from the controller's `platform/state`, which now aliases them. `GaugeLedger` stays app-side (typed on `*prometheus.GaugeVec`). |
 | `httpx`  | Bind-then-serve lifecycle for probe/metrics endpoints (`New` binds synchronously, idempotent `Serve`, `Shutdown` with a drain budget, `Timeout` per-route wrapper, `PooledTransport` for shared client pools). Handler — including any promhttp mux — is injected by the caller; `httpx/pprofx` is the opt-in pprof registration subpackage (kept separate so `net/http/pprof`'s `DefaultServeMux` side effect only lands where wanted). |
 
@@ -22,7 +22,7 @@ contracts that more than one app (or subsystem) needs. Shared via
 This module is the bottom of the import graph: **Go stdlib only** — no
 `apps/*`, no `libs/jinja`, no third-party modules. `go.mod` carries zero
 requires and `go.sum` stays empty; the depguard rule
-`hostkit-is-leaf` in the repo-root `.golangci.yml` enforces the import
+`hostkit-stdlib-only` in the repo-root `.golangci.yml` enforces the import
 ban (nodecond stays string-typed for exactly this reason — it must not
 import `k8s.io/api`).
 

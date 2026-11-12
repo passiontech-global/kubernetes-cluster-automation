@@ -85,15 +85,6 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 // had (the ctx budgets stay caller-side so a stubbed seam still
 // sees the shell's `timeout N` contract).
 
-// HoldLocalAction reports whether cluster maintenance (kured drain /
-// control-plane upgrade) is active or unverifiable — restart paths
-// must not add churn while the cluster holds the maintenance mutex.
-// Nil Coord → false (unconfigured keeps prior behavior); a
-// configured Coord fails closed inside nodecoord.
-func (d *Deps) HoldLocalAction(ctx context.Context) bool {
-	return d.Cfg.Coord != nil && d.Cfg.Coord.HoldLocalAction(ctx)
-}
-
 // HoldEmergencyHeal is the fail-open counterpart for controller
 // self-heal paths (apiserver/etcd/pki restarts): it holds only on
 // positively-known maintenance so an unreachable apiserver can

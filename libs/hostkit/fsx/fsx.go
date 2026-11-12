@@ -1,13 +1,10 @@
 // Package fsx is libs/hostkit's atomic file writer: a same-dir
 // staging file + rename, fsynced so readers never see a torn file and
-// a crash never promotes unflushed bytes. It is ported verbatim from
-// the node-host-agent's hostutil.WriteAtomic (the canonical
-// implementation) so hostutil can delegate here without behavior
-// drift; the knob set (Opts) mirrors hostutil.AtomicOpts 1:1.
+// a crash never promotes unflushed bytes. It is the canonical
+// implementation shared across the monorepo.
 //
 // Like the rest of libs/hostkit this package is stdlib-only
-// (depguard: hostkit-is-leaf) — the EBUSY/EXDEV bind-mount fallback
-// stays above it in hostutil, which detects those errors and retries.
+// (depguard: hostkit-stdlib-only).
 package fsx
 
 import (

@@ -26,14 +26,17 @@
 //	keyword args (jinja2/ansible parity): sort(reverse=, case_sensitive=,
 //	         attribute=), int(default=, base=), float(default=),
 //	         default(default_value=, boolean=), items2dict(key_name=,
-//	         value_name=), indent(blank=)
-//	functions: lookup('file'|'ansible.builtin.file'|'pipe'|...)
+//	         value_name=), indent(blank=), map(attribute=, default=)
+//	functions: lookup('file'|'ansible.builtin.file'|'pipe'|...), range(...)
 //
 // NOT supported (unused by the ported sources): namespace(), macros,
 // imports, raw blocks, slices, **.
 package jinja
 
-import "strings"
+import (
+	"maps"
+	"strings"
+)
 
 // Undefined is the jinja `undefined` — falsy, default()-able.
 type Undefined struct{ name string }
@@ -86,10 +89,11 @@ func Render(text string, ctx map[string]any, env *Env) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	s := &scope{vars: map[string]any{}, env: env}
-	for k, v := range ctx {
-		s.vars[k] = v
+	vars := maps.Clone(ctx)
+	if vars == nil {
+		vars = map[string]any{}
 	}
+	s := &scope{vars: vars, env: env}
 	var b strings.Builder
 	if err := renderNodes(nodes, s, &b); err != nil {
 		return "", err

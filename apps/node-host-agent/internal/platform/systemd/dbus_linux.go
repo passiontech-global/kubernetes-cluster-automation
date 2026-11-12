@@ -432,14 +432,12 @@ func (b *dbusBackend) dbusListUnitsByPatterns(ctx context.Context, patterns []st
 }
 
 // dbusEnabled mirrors `systemctl is-enabled` via
-// Manager.ListUnitFiles — go-systemd v22 wraps no GetUnitFileState,
-// so the raw sysconn issues the call and the (unit,state) rows are
-// matched client-side. The state vocabulary is identical to
-// is-enabled's stdout words (enabled/enabled-runtime/static/
+// Manager.GetUnitFileState — go-systemd v22 wraps no GetUnitFileState,
+// so the raw sysconn issues the call directly. The state vocabulary is
+// identical to is-enabled's stdout words (enabled/enabled-runtime/static/
 // indirect/alias/generated/transient/linked vs disabled/masked/
-// masked-runtime/bad); a unit absent from the table is the
-// not-found case — reported as an error so callers keep the
-// "can't ask = error" distinction cliEnabled documents.
+// masked-runtime/bad); a systemd unit error (e.g. NoSuchUnit) is
+// returned directly while transport failures wrap errDBusUnavailable.
 func (b *dbusBackend) dbusEnabled(ctx context.Context, unit string) (bool, error) {
 	b.mu.Lock()
 	_, err := b.systemConnLocked(ctx)
@@ -449,35 +447,29 @@ func (b *dbusBackend) dbusEnabled(ctx context.Context, unit string) (bool, error
 		return false, err
 	}
 	if raw == nil {
-		return false, fmt.Errorf("%w: no sysconn for ListUnitFiles", errDBusUnavailable)
+		return false, fmt.Errorf("%w: no sysconn for GetUnitFileState", errDBusUnavailable)
 	}
 	unit = normalizeUnit(unit)
-	var rows []struct {
-		UnitFile string
-		State    string
-		Preset   string
-	}
+	var state string
 	call := raw.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1").
-		CallWithContext(ctx, "org.freedesktop.systemd1.Manager.ListUnitFiles", 0)
-	if err := call.Store(&rows); err != nil {
-		return false, fmt.Errorf("dbus ListUnitFiles: %w", err)
-	}
-	for _, r := range rows {
-		if r.UnitFile != unit {
-			continue
+		CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnitFileState", 0, unit)
+	if err := call.Store(&state); err != nil {
+		var derr godbus.Error
+		if errors.As(err, &derr) && strings.HasPrefix(derr.Name, "org.freedesktop.systemd1.") {
+			return false, fmt.Errorf("systemctl is-enabled %s: %w", unit, err)
 		}
-		switch r.State {
-		case "enabled", "enabled-runtime", "static", "indirect",
-			"alias", "generated", "transient", "linked", "linked-runtime":
-			return true, nil
-		case "disabled", "masked", "masked-runtime", "bad":
-			return false, nil
-		default:
-			logger().Warn("systemd: unexpected unit-file state word — "+
-				"treating unit as not enabled this probe",
-				"unit", unit, "state", r.State)
-			return false, nil
-		}
+		return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %v", errDBusUnavailable, unit, err)
 	}
-	return false, fmt.Errorf("systemctl is-enabled %s: unit not found in ListUnitFiles", unit)
+	switch state {
+	case "enabled", "enabled-runtime", "static", "indirect",
+		"alias", "generated", "transient", "linked", "linked-runtime":
+		return true, nil
+	case "disabled", "masked", "masked-runtime", "bad":
+		return false, nil
+	default:
+		logger().Warn("systemd: unexpected unit-file state word — "+
+			"treating unit as not enabled this probe",
+			"unit", unit, "state", state)
+		return false, nil
+	}
 }

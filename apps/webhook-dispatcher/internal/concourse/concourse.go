@@ -148,11 +148,11 @@ func stripURLError(err error) error {
 	return err
 }
 
-// safeBaseURL renders BaseURL with any userinfo stripped — a Concourse
+// SafeBaseURL renders BaseURL with any userinfo stripped — a Concourse
 // URL may carry basic-auth credentials in the authority, and the
-// value is logged on every index refresh/failure. Logs must never
-// see them.
-func (c *Client) safeBaseURL() string {
+// value is logged on startup and every index refresh/failure. Logs
+// must never see them.
+func (c *Client) SafeBaseURL() string {
 	u, err := url.Parse(c.BaseURL)
 	if err != nil || u.User == nil {
 		return c.BaseURL
@@ -160,6 +160,8 @@ func (c *Client) safeBaseURL() string {
 	u.User = nil
 	return u.String()
 }
+
+func (c *Client) safeBaseURL() string { return c.SafeBaseURL() }
 
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {

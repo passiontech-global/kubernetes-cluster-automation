@@ -39,7 +39,8 @@ of guaranteeing 401s/502s at request time.
   contract.
 - **HTTP server timeouts** (public: read 10s / read-header 5s / write 45s /
   idle 60s; internal: read-header 10s, 5s shutdown budget) — likewise constants;
-  the write timeout exists to cover the 30s request-path index-fetch budget.
+  the write timeout safely covers the 7s request-path index-wait budget (and
+  30s detached fetch).
 
 ## CLI flags
 

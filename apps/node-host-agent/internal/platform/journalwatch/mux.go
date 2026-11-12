@@ -161,7 +161,7 @@ func (m *Multiplexer) Poll(ctx context.Context, id string) ([]Entry, error) {
 		m.mu.Unlock()
 		return nil, errors.New("journalwatch: nil Exec")
 	}
-	needFetch := m.cursor == "" || m.pollEvery() == 0 ||
+	needFetch := m.lastFetch.IsZero() || m.pollEvery() == 0 ||
 		m.now().Sub(m.lastFetch) >= m.pollEvery()
 	m.mu.Unlock()
 
@@ -191,7 +191,7 @@ func (m *Multiplexer) maybeFetch(ctx context.Context) error {
 	defer m.fetchMu.Unlock()
 
 	m.mu.Lock()
-	if m.cursor != "" && m.pollEvery() != 0 &&
+	if !m.lastFetch.IsZero() && m.pollEvery() != 0 &&
 		m.now().Sub(m.lastFetch) < m.pollEvery() {
 		m.mu.Unlock()
 		return nil // another fetcher refreshed the window

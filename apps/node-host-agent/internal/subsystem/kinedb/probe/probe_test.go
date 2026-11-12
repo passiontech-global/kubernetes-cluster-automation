@@ -11,12 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestPGStartupMessage(t *testing.T) {
-	pkt := pgStartupMessage("postgres", "postgres")
+	pkt := probee.PGStartupMessage("postgres", "postgres")
 	// Length prefix covers itself + the whole packet.
 	if got := binary.BigEndian.Uint32(pkt[:4]); int(got) != len(pkt) {
 		t.Fatalf("length prefix=%d packet=%d", got, len(pkt))
@@ -33,12 +34,12 @@ func TestPGStartupMessage(t *testing.T) {
 
 func TestPGFirstByteOK(t *testing.T) {
 	for _, b := range []byte{'R', 'S', 'N', 'K'} {
-		if !pgFirstByteOK(b) {
+		if !probee.PGFirstByteOK(b) {
 			t.Fatalf("byte %c should be ok", b)
 		}
 	}
 	for _, b := range []byte{'E', 'F', 0} {
-		if pgFirstByteOK(b) {
+		if probee.PGFirstByteOK(b) {
 			t.Fatalf("byte %c should fail", b)
 		}
 	}
@@ -354,7 +355,7 @@ func TestPGWireProbeReadFail(t *testing.T) {
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		// Drain the exact StartupMessage (41 bytes for
 		// postgres/postgres), then close with no answer.
-		buf := make([]byte, len(pgStartupMessage("postgres", "postgres")))
+		buf := make([]byte, len(probee.PGStartupMessage("postgres", "postgres")))
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			return
 		}

@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
@@ -90,7 +91,8 @@ type Client struct {
 	// dbus is the zero-fork control path — non-nil only when the
 	// caller supplied no exec seams (production) on linux; tests
 	// injecting RunCmd/RunCmdCombined keep the systemctl path.
-	dbus *dbusBackend
+	dbus         *dbusBackend
+	dbusWarnOnce sync.Once
 }
 
 // New returns a Client for cfg.
@@ -175,8 +177,10 @@ func (c *Client) ExecCombinedBounded(ctx context.Context, budget time.Duration, 
 // the unit twice.
 func (c *Client) dbusUnavailable(err error) bool {
 	if errors.Is(err, errDBusUnavailable) {
-		logger().Warn("systemd: dbus unavailable — falling back to systemctl",
-			"error", err)
+		c.dbusWarnOnce.Do(func() {
+			logger().Warn("systemd: dbus unavailable — falling back to systemctl",
+				"error", err)
+		})
 		return true
 	}
 	return false

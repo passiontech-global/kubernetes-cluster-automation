@@ -50,7 +50,13 @@ var kubeletJournalRules = []rule{
 // than PollEvery. Lookback is re-read per poll so a post-New cfg
 // re-point still lands (the Deps late-binding contract).
 func (m *Monitor) pollJournal(ctx context.Context, sub string) ([]journalwatch.Entry, error) {
-	m.journal.Lookback = m.cfg().LogLookback
+	cfg := m.cfg()
+	m.journal.Lookback = cfg.LogLookback
+	if cfg.KubeletJournalUnit != "" {
+		m.journal.Args = []string{"_SYSTEMD_UNIT=" + cfg.KubeletJournalUnit, "+", "_TRANSPORT=kernel"}
+	} else {
+		m.journal.Args = []string{"_TRANSPORT=kernel"}
+	}
 	return m.journal.Poll(ctx, sub)
 }
 

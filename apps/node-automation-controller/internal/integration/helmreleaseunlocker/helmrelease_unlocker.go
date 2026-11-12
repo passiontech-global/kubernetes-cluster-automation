@@ -89,6 +89,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -120,8 +121,9 @@ const (
 var helmReleaseGVRs = kube.HelmReleaseGVRs
 
 type helmReleaseUnlocker struct {
-	cs  kubernetes.Interface
-	dyn dynamic.Interface
+	cs   kubernetes.Interface
+	dyn  dynamic.Interface
+	meta metadata.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -218,6 +220,7 @@ func Setup(d shared.Deps) error {
 				verdict: d.Maintenance,
 				cs:      d.CS,
 				dyn:     d.Dyn,
+				meta:    d.Meta,
 				queue:   d.Name,
 				now:     shared.SystemClock,
 			}

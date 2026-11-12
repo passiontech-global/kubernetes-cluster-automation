@@ -23,10 +23,10 @@ import (
 // and a Cell that was never Set both read as system time — the same
 // "unarmed seam reads as real clock" convention Clock.Now encodes.
 type Cell struct {
-	// v holds the installed Clock (never nil — Set maps nil to
-	// SystemClock). atomic.Value rather than a mutex: Now() is a
-	// single Load on the hot path.
-	v atomic.Value
+	// v holds the installed Clock (never nil after Set — Set maps nil
+	// to SystemClock). atomic.Pointer rather than a mutex or
+	// atomic.Value: Now() is a single typed Load on the hot path.
+	v atomic.Pointer[Clock]
 }
 
 // NewCell returns a Cell armed with cl; nil → SystemClock.
@@ -42,8 +42,8 @@ func (c *Cell) Now() time.Time {
 	if c == nil {
 		return time.Now()
 	}
-	if v := c.v.Load(); v != nil {
-		return v.(Clock).Now()
+	if p := c.v.Load(); p != nil {
+		return (*p).Now()
 	}
 	return time.Now()
 }
@@ -55,5 +55,5 @@ func (c *Cell) Set(cl Clock) {
 	if cl == nil {
 		cl = SystemClock
 	}
-	c.v.Store(cl)
+	c.v.Store(&cl)
 }

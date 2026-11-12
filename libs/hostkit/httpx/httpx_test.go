@@ -291,6 +291,30 @@ func TestIdleTimeoutApplied(t *testing.T) {
 	}
 }
 
+func TestOptsTimeoutsAndPooledTransport(t *testing.T) {
+	srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{
+		ReadTimeout:    3 * time.Second,
+		WriteTimeout:   4 * time.Second,
+		MaxHeaderBytes: 64 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	if srv.srv.ReadTimeout != 3*time.Second || srv.srv.WriteTimeout != 4*time.Second || srv.srv.MaxHeaderBytes != 64<<10 {
+		t.Fatalf("server opts mismatch: read=%v write=%v maxhdr=%d", srv.srv.ReadTimeout, srv.srv.WriteTimeout, srv.srv.MaxHeaderBytes)
+	}
+
+	tr := PooledTransport(16, nil)
+	if tr.MaxIdleConnsPerHost != 16 || tr.MaxIdleConns != 100 {
+		t.Fatalf("PooledTransport idle counts: perHost=%d total=%d", tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
+	}
+	trDefault := PooledTransport(0, nil)
+	if trDefault.MaxIdleConnsPerHost != 0 {
+		t.Fatalf("PooledTransport(0) perHost=%d, want 0", trDefault.MaxIdleConnsPerHost)
+	}
+}
+
 // Close racing Serve must resolve the serve channel cleanly —
 // net/http's "use of closed network connection" is teardown, not a
 // serve failure, and the closed flag must make a LATER Serve call

@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -74,5 +75,32 @@ func TestHasValidSignatureFormat(t *testing.T) {
 				t.Fatalf("HasValidSignatureFormat=%v want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+func TestSignatureReader(t *testing.T) {
+	body := `{"zen":"Keep it simple."}`
+	valid := sign("s3cret", []byte(body))
+
+	ok, err := SignatureReader("s3cret", strings.NewReader(body), valid)
+	if err != nil || !ok {
+		t.Fatalf("SignatureReader valid = (%v, %v), want (true, nil)", ok, err)
+	}
+	ok, err = SignatureReader("s3cret", strings.NewReader(body), sign("other", []byte(body)))
+	if err != nil || ok {
+		t.Fatalf("SignatureReader wrong sig = (%v, %v), want (false, nil)", ok, err)
+	}
+	ok, err = SignatureReader("s3cret", strings.NewReader(body), "bad-header")
+	if err != nil || ok {
+		t.Fatalf("SignatureReader bad header = (%v, %v), want (false, nil)", ok, err)
+	}
+	boom := errors.New("read failed")
+	ok, err = SignatureReader("s3cret", errReader{err: boom}, valid)
+	if !errors.Is(err, boom) || ok {
+		t.Fatalf("SignatureReader errReader = (%v, %v), want (false, %v)", ok, err, boom)
 	}
 }

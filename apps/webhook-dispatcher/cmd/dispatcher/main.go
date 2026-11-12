@@ -124,14 +124,21 @@ func splitLocalUsers(s string) []string {
 }
 
 // usersSeparatorAhead reports whether the comma at s[i] separates
-// two entries: the segment after it (up to the next comma or EOS)
-// must contain a ':' — the user:pass marker.
+// entries: either the next non-empty comma-delimited segment carries
+// the "user:pass" marker ':', or only empty/whitespace segments
+// remain (trailing comma).
 func usersSeparatorAhead(s string, i int) bool {
-	seg := s[i+1:]
-	if j := strings.IndexByte(seg, ','); j >= 0 {
-		seg = seg[:j]
+	rest := s[i+1:]
+	for {
+		seg, after, hasComma := strings.Cut(rest, ",")
+		if strings.TrimSpace(seg) != "" {
+			return strings.Contains(seg, ":")
+		}
+		if !hasComma {
+			return true
+		}
+		rest = after
 	}
-	return strings.Contains(seg, ":")
 }
 
 func main() {
@@ -244,8 +251,9 @@ func main() {
 	//   - ReadTimeout covers the whole request incl. the body (bounded
 	//     by MaxBytesReader at 8 MiB) — without it a slow-drip client
 	//     outlives ReadHeaderTimeout and holds the conn forever.
-	//   - WriteTimeout must cover the handler's 30s index-fetch budget
-	//     (fan-out itself is async — the response is a fast 202).
+	//   - WriteTimeout must cover the handler's 7s request-path
+	//     index-wait budget (and 30s detached fetch; fan-out itself is
+	//     async — the response is a fast 202).
 	//   - GitHub sends a handful of modest headers; the tight cap keeps
 	//     a hostile peer from parking large header buffers per conn.
 	publicSrv, err := httpx.New(listenAddr, publicMux, httpx.Opts{
@@ -280,7 +288,7 @@ func main() {
 		"routes", "POST /webhook, GET /healthz, GET /readyz",
 		"metrics_addr", metricsAddr,
 		"internal_routes", "GET /metrics, /debug/pprof/*",
-		"concourse_url", client.BaseURL, "concourse_team", client.Team)
+		"concourse_url", client.SafeBaseURL(), "concourse_team", client.Team)
 
 	select {
 	case err := <-publicErr:

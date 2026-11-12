@@ -138,6 +138,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	}
 
 	deleted := false
+	apiErr := false
 	for i := range targets {
 		pod := &targets[i]
 		// The UID precondition inside heal.DeletePod closes the
@@ -145,6 +146,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 		// ours to reap.
 		didDelete, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now)
 		if err != nil {
+			apiErr = true
 			metrics.IncError(p.Name)
 			log.Error(err, "stuck operator leader delete failed",
 				"pod", pod.Namespace+"/"+pod.Name, "operator", op.name)
@@ -163,6 +165,9 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 			"reasons", strings.Join(reasons, ","))
 	}
 	if !deleted {
+		if !apiErr {
+			heal.RefundGrant(now)
+		}
 		return
 	}
 	for _, r := range reasons {

@@ -46,9 +46,12 @@ func TestParseLocalUsersEnv(t *testing.T) {
 		// the user:pass shape — a comma inside a password survives.
 		{"comma in password", "admin:pa,ss", "admin", "pa,ss", true},
 		{"comma then user", "admin:pa,ss,ops:pw", "admin", "pa,ss", true},
-		// A comma with no user:pass-shaped segment after it is NOT a
-		// separator — it stays inside the password (",," included).
-		{"trailing comma stays in password", "admin:pw,", "admin", "pw,", true},
+		// A trailing comma or empty/whitespace segment between entries
+		// is a separator and gets dropped rather than corrupting the
+		// password.
+		{"trailing comma dropped", "admin:pw,", "admin", "pw", true},
+		{"trailing comma with space dropped", "admin:pw, , ", "admin", "pw", true},
+		{"empty segment between users", "u:p, ,v:q", "u", "p", true},
 		{"leading comma dropped", ",admin:pw", "admin", "pw", true},
 		{"space-only entries dropped", " , admin:pw", "admin", "pw", true},
 		{"first invalid second valid", "broken,ops:pw", "ops", "pw", true},

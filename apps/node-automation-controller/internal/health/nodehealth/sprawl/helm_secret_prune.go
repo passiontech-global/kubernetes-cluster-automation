@@ -55,7 +55,7 @@ func init() {
 func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
 
-	secrets, err := helmprune.PruneSupersededHelmSecrets(ctx, p.CS,
+	secrets, err := helmprune.PruneSupersededHelmSecretsMeta(ctx, p.Meta, p.CS, p.Dyn,
 		sprawlMaxSuperseded, helmprune.HelmSecretPruneHooks{
 			Excess: func(ns, release string, superseded, cap int) {
 				helmRep.Set(helmSecretsExcessGauge,

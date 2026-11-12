@@ -168,6 +168,7 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 	// argv prefix the exec wrappers used to pay a fork for.
 	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot,
 		ScrubSystemdEnv: true})
+	defer sdClient.Close()
 
 	// One clientset for the whole process: each NewForConfig builds
 	// its own http.Transport + TLS pool, so sweeper, workerhygiene

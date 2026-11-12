@@ -60,6 +60,8 @@ type leaseLossWatchdog struct {
 	// SetupSignalHandler) — every runnable group drains on ctx.Done.
 	cancel context.CancelFunc
 	log    logr.Logger
+	// interval overrides leaseWatchInterval when > 0 (tests).
+	interval time.Duration
 }
 
 // NeedLeaderElection reports true explicitly: this runnable must
@@ -68,7 +70,11 @@ type leaseLossWatchdog struct {
 func (w *leaseLossWatchdog) NeedLeaderElection() bool { return true }
 
 func (w *leaseLossWatchdog) Start(ctx context.Context) error {
-	ticker := time.NewTicker(leaseWatchInterval)
+	iv := w.interval
+	if iv <= 0 {
+		iv = leaseWatchInterval
+	}
+	ticker := time.NewTicker(iv)
 	defer ticker.Stop()
 	for {
 		select {

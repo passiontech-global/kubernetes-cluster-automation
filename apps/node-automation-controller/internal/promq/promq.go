@@ -17,7 +17,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
+
+var defaultHTTPClient = &http.Client{
+	Transport: httpx.PooledTransport(16, nil),
+}
 
 // maxResponseBytes caps one instant-query response. A vector larger
 // than this is a runaway query, not data — and silently truncating
@@ -106,7 +112,7 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = defaultHTTPClient
 	}
 	// POST + form body, not GET ?query=: real PromQL strings run
 	// hundreds of bytes and some checks issue queries with label

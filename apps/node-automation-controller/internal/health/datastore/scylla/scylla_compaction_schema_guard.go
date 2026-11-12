@@ -13,9 +13,9 @@ package scylla
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -198,73 +198,69 @@ const (
 func (p *scyllaCompactionSchemaGuardCheck) scyllaPodMetrics(ctx context.Context,
 	pod *corev1.Pod) (*scyllaScrape, bool) {
 
-	// 16 MiB ceiling: a ScyllaDB node's :9180/metrics carries
-	// per-shard, per-table and per-endpoint series — on a large
-	// cluster the exposition legitimately exceeds the generic 4 MiB
-	// cap, and FetchPodMetrics' maxBytes+1 read turns an over-cap
-	// body into an explicit truncation error instead of a silently
-	// parsed partial vector.
-	body, err := probefw.FetchPodMetrics(ctx, p.HTTPClient,
-		pod.Status.PodIP, scyllaMetricsPort, scyllaMetricsTimeout, 16<<20)
-	if err != nil {
-		return nil, false
-	}
 	sc := &scyllaScrape{
 		versions: map[float64]bool{},
 		shards:   map[string]float64{},
 	}
-	// One pass, six families. Each case re-checks the exact metric
-	// name through ParseMetricValue (CutPrefix + value parse +
-	// NaN/Inf rejection) — the HasPrefix dispatch only saves the
-	// parse call on non-matching lines; acceptance semantics are
-	// byte-identical to the old per-family scans.
+	// One pass, six families, streamed directly from resp.Body
+	// without buffering up to 16 MiB per worker. Each case re-checks
+	// the exact metric name through ParseMetricValue (CutPrefix +
+	// value parse + NaN/Inf rejection) — the HasPrefix dispatch only
+	// saves the parse call on non-matching lines; acceptance semantics
+	// are byte-identical to the old per-family scans.
 	var readTimeouts, queueOverloads, cacheDrops float64
-	scanner := bufio.NewScanner(bytes.NewReader(body))
-	// Exposition lines are small; the 4 MiB ceiling only exists so
-	// a pathological single line degrades to "inconclusive" instead
-	// of bufio's default 64 KiB token error.
-	scanner.Buffer(make([]byte, 64*1024), 4<<20)
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, scyllaMetricBacklog):
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricBacklog); ok &&
-				v > sc.backlog {
-				sc.backlog = v
-			}
-		case strings.HasPrefix(line, scyllaMetricSchemaVer):
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricSchemaVer); ok {
-				sc.versions[v] = true
-			}
-		case strings.HasPrefix(line, scyllaMetricReactorUtil):
-			// scylla-shard-imbalance — same body, per-shard reactor
-			// utilization; the shard label IS the series key.
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricReactorUtil); ok {
-				if lv, lok := scyllaLabelValue(line, "shard"); lok {
-					sc.shards[lv] = v
+	err := probefw.StreamPodMetrics(ctx, p.HTTPClient,
+		pod.Status.PodIP, scyllaMetricsPort, scyllaMetricsTimeout, 16<<20,
+		func(r io.Reader) error {
+			scanner := bufio.NewScanner(r)
+			// Exposition lines are small; the 4 MiB ceiling only
+			// exists so a pathological single line degrades to
+			// "inconclusive" instead of bufio's default 64 KiB
+			// token error.
+			scanner.Buffer(make([]byte, 64*1024), 4<<20)
+			for scanner.Scan() {
+				line := scanner.Text()
+				switch {
+				case strings.HasPrefix(line, scyllaMetricBacklog):
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricBacklog); ok &&
+						v > sc.backlog {
+						sc.backlog = v
+					}
+				case strings.HasPrefix(line, scyllaMetricSchemaVer):
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricSchemaVer); ok {
+						sc.versions[v] = true
+					}
+				case strings.HasPrefix(line, scyllaMetricReactorUtil):
+					// scylla-shard-imbalance — same body, per-shard
+					// reactor utilization; the shard label IS the
+					// series key.
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricReactorUtil); ok {
+						if lv, lok := scyllaLabelValue(line, "shard"); lok {
+							sc.shards[lv] = v
+						}
+					}
+				case strings.HasPrefix(line, scyllaMetricReadTimeouts):
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricReadTimeouts); ok &&
+						v > readTimeouts {
+						readTimeouts = v
+					}
+				case strings.HasPrefix(line, scyllaMetricSSTableQueue):
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricSSTableQueue); ok &&
+						v > queueOverloads {
+						queueOverloads = v
+					}
+				case strings.HasPrefix(line, scyllaMetricQuerierCache):
+					if v, ok := probefw.ParseMetricValue(line, scyllaMetricQuerierCache); ok &&
+						v > cacheDrops {
+						cacheDrops = v
+					}
 				}
 			}
-		case strings.HasPrefix(line, scyllaMetricReadTimeouts):
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricReadTimeouts); ok &&
-				v > readTimeouts {
-				readTimeouts = v
-			}
-		case strings.HasPrefix(line, scyllaMetricSSTableQueue):
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricSSTableQueue); ok &&
-				v > queueOverloads {
-				queueOverloads = v
-			}
-		case strings.HasPrefix(line, scyllaMetricQuerierCache):
-			if v, ok := probefw.ParseMetricValue(line, scyllaMetricQuerierCache); ok &&
-				v > cacheDrops {
-				cacheDrops = v
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		// A scan failure (token over the ceiling, reader error)
-		// yields a partial scrape — inconclusive beats half-parsed
-		// evidence, same contract as a fetch failure.
+			return scanner.Err()
+		})
+	if err != nil {
+		// A fetch or scan failure yields a partial scrape —
+		// inconclusive beats half-parsed evidence.
 		return nil, false
 	}
 	// The counters fan out per shard / scheduling group — the max

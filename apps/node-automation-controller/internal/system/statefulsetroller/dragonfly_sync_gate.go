@@ -32,7 +32,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
+
+var dragonflySyncHTTP = &http.Client{
+	Transport: httpx.PooledTransport(16, nil),
+	Timeout:   dragonflySyncQueryTimeout,
+}
 
 const (
 	// dragonflySyncQueryTimeout bounds the master-link instant query
@@ -75,7 +81,7 @@ func newDragonflyPromSeam() dragonflyPromSeam {
 	return dragonflyPromSeam{
 		endpoint: endpoint,
 		client: promq.Client{
-			HTTP:    &http.Client{Timeout: dragonflySyncQueryTimeout},
+			HTTP:    dragonflySyncHTTP,
 			Timeout: dragonflySyncQueryTimeout,
 		},
 		ok: true,

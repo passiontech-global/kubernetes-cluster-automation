@@ -152,6 +152,7 @@ type Config struct {
 	// wrapper when HostRoot != "/") — nil builds the default via the
 	// systemd package; tests substitute a fake.
 	journalFetch func(ctx context.Context, args ...string) (string, error)
+	ownedSD      *systemd.Client
 }
 
 func (c *Config) applyDefaults() {
@@ -206,6 +207,7 @@ func (c *Config) applyDefaults() {
 	if c.journalFetch == nil {
 		sd := systemd.New(systemd.Config{HostRoot: c.HostRoot,
 			ScrubSystemdEnv: true})
+		c.ownedSD = sd
 		c.journalFetch = func(ctx context.Context, args ...string) (string, error) {
 			return sd.Exec(ctx, "journalctl", args...)
 		}
@@ -359,6 +361,9 @@ func (s npdSink) EnterLatch(name, evidence string) {
 // file the Reporter holds — it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
 	defer r.monitors.Close()
+	if r.cfg.ownedSD != nil {
+		defer r.cfg.ownedSD.Close()
+	}
 	cycle.Every("nodereporter", r.cfg.Interval, r.runCycle).Run(ctx)
 }
 

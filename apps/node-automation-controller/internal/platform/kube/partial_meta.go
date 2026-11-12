@@ -208,13 +208,9 @@ func listPartialViaDynamic(ctx context.Context, dyn dynamic.Interface,
 	// default (CRDs page small — they are the payload-heavy case);
 	// an explicit Limit above the shared page ceiling is capped
 	// (pagination still reaches every item, just in smaller pages).
-	if opts.Limit <= 0 {
-		if gvr.Group != "" {
-			opts.Limit = crdListPageSize
-		} else {
-			opts.Limit = DefaultListPageSize
-		}
-	} else if opts.Limit > DefaultListPageSize {
+	if gvr.Group != "" && (opts.Limit <= 0 || opts.Limit > crdListPageSize) {
+		opts.Limit = crdListPageSize
+	} else if opts.Limit <= 0 || opts.Limit > DefaultListPageSize {
 		opts.Limit = DefaultListPageSize
 	}
 	getter := dyn.Resource(gvr)

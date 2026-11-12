@@ -427,9 +427,21 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	// Deployment is gone: the RS is GC-pending garbage, so its
 	// finalizers are just as dead.
 	ns := obj.GetNamespace()
-	rs, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	if err != nil {
-		return false
+	var rs metav1.Object
+	if list, lerr := p.AllReplicaSets(ctx); lerr == nil {
+		for i := range list {
+			if list[i].Namespace == ns && list[i].Name == ref.Name {
+				rs = &list[i]
+				break
+			}
+		}
+	}
+	if rs == nil {
+		fetched, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		rs = fetched
 	}
 	if dref := metav1.GetControllerOf(rs); dref != nil {
 		switch dref.Kind {

@@ -51,6 +51,7 @@ func newWatchdog(t *testing.T, objs ...runtime.Object) (*leaseLossWatchdog,
 		stolen:    stolen,
 		cancel:    cancel,
 		log:       logr.Discard(),
+		interval:  15 * time.Millisecond,
 	}
 	return w, stolen, cancelled
 }
@@ -63,7 +64,7 @@ func TestWatchdogForeignHolderCancels(t *testing.T) {
 	go func() { done <- w.Start(ctx) }()
 	select {
 	case <-cancelled:
-	case <-time.After(10 * leaseWatchInterval):
+	case <-time.After(10 * w.interval):
 		t.Fatal("watchdog did not cancel on foreign holder")
 	}
 	if !stolen.Load() {
@@ -86,7 +87,7 @@ func TestWatchdogSelfHolderKeepsRunning(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Start(ctx) }()
 	// Let several poll intervals pass — self holder must never trip.
-	time.Sleep(2*leaseWatchInterval + 100*time.Millisecond)
+	time.Sleep(2*w.interval + 15*time.Millisecond)
 	select {
 	case <-cancelled:
 		t.Fatal("watchdog cancelled on own holder")
@@ -113,7 +114,7 @@ func TestWatchdogEmptyAndMissingLeaseSafe(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- w.Start(ctx) }()
-			time.Sleep(leaseWatchInterval + 100*time.Millisecond)
+			time.Sleep(2*w.interval + 15*time.Millisecond)
 			select {
 			case <-cancelled:
 				t.Fatal("watchdog cancelled on non-theft state")
@@ -137,7 +138,7 @@ func TestWatchdogReadErrorIsNotLoss(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- w.Start(ctx) }()
-	time.Sleep(leaseWatchInterval + 100*time.Millisecond)
+	time.Sleep(2*w.interval + 15*time.Millisecond)
 	select {
 	case <-cancelled:
 		t.Fatal("watchdog cancelled on read error")

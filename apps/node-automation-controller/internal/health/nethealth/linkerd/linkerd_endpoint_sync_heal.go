@@ -148,6 +148,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	}
 
 	healed := false
+	apiErr := false
 	for _, sl := range stale {
 		err := p.CS.DiscoveryV1().EndpointSlices(sl.ns).Delete(ctx, sl.name,
 			kube.UIDDeleteOptions(sl.uid, ""))
@@ -161,6 +162,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 			// Already gone — another actor or the controller beat
 			// us to it; nothing to heal.
 		default:
+			apiErr = true
 			metrics.IncError(p.Name)
 			log.Error(err, "stale endpointslice delete failed",
 				"endpointslice", sl.ns+"/"+sl.name, "service", svcKey)
@@ -180,6 +182,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		// though this sweep's stamp landed first.
 		didDelete, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, target, now)
 		if err != nil {
+			apiErr = true
 			metrics.IncError(p.Name)
 			log.Error(err, "linkerd-destination delete failed",
 				"pod", target.Namespace+"/"+target.Name)
@@ -200,6 +203,8 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	}
 	if healed {
 		p.stampLinkerdDestinationHeal(ctx, log, svc, svcKey, now)
+	} else if !apiErr {
+		heal.RefundGrant(now)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,16 +81,17 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, nodeReader kube.CachedNodeReader, now time.Time) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	all, names, complete := maintenanceStampTargets(ctx, cs, dyn, now)
-	if !all && len(names) == 0 && !complete {
-		return // degraded read, nothing to stamp, unstamp unsafe
-	}
 	nodes, err := kube.ListNodesCached(ctx, nodeReader, cs)
 	if err != nil {
 		return
 	}
+	all, names, complete := maintenanceStampTargets(ctx, cs, dyn, nodes, now)
+	if !all && len(names) == 0 && !complete {
+		return // degraded read, nothing to stamp, unstamp unsafe
+	}
 	stamp := now.Add(maintenanceStampTTL).UTC().Format(time.RFC3339)
 	floor := now.Add(maintenanceStampRefreshFloor)
+	var stampPatch, unstampPatch []byte
 	for i := range nodes {
 		n := &nodes[i]
 		if all || names[n.Name] {
@@ -97,14 +99,17 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 				t.After(floor) {
 				continue // stamp fresh enough — skip the write
 			}
-			data, err := kube.MergePatchAnnos(map[string]any{
-				nodecond.AnnoClusterMaintenanceUntil: stamp,
-			})
-			if err != nil {
-				return
+			if stampPatch == nil {
+				var perr error
+				stampPatch, perr = kube.MergePatchAnnos(map[string]any{
+					nodecond.AnnoClusterMaintenanceUntil: stamp,
+				})
+				if perr != nil {
+					return
+				}
 			}
 			_, _ = cs.CoreV1().Nodes().Patch(ctx, n.Name,
-				types.MergePatchType, data, metav1.PatchOptions{})
+				types.MergePatchType, stampPatch, metav1.PatchOptions{})
 			continue
 		}
 		if !complete {
@@ -114,14 +119,17 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 		if !ok || !controllerOwnedStamp(v, now) {
 			continue // absent, or a value this controller did not write
 		}
-		data, err := kube.MergePatchAnnos(map[string]any{
-			nodecond.AnnoClusterMaintenanceUntil: nil,
-		})
-		if err != nil {
-			return
+		if unstampPatch == nil {
+			var perr error
+			unstampPatch, perr = kube.MergePatchAnnos(map[string]any{
+				nodecond.AnnoClusterMaintenanceUntil: nil,
+			})
+			if perr != nil {
+				return
+			}
 		}
 		_, _ = cs.CoreV1().Nodes().Patch(ctx, n.Name,
-			types.MergePatchType, data, metav1.PatchOptions{})
+			types.MergePatchType, unstampPatch, metav1.PatchOptions{})
 	}
 }
 
@@ -154,25 +162,21 @@ func controllerOwnedStamp(value string, now time.Time) bool {
 // so the caller skips the unstamp half: dropping a hold on a signal
 // we could not observe is the unsafe direction.
 func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
-	dyn dynamic.Interface, now time.Time) (all bool, names map[string]bool,
-	complete bool) {
+	dyn dynamic.Interface, nodes []corev1.Node, now time.Time) (all bool,
+	names map[string]bool, complete bool) {
 	names = map[string]bool{}
 	complete = true
 	nodeNames := map[string]bool{}
-	if nodes, err := maintenanceNodeList(ctx, cs); err == nil {
-		for i := range nodes {
-			nodeNames[nodes[i].Name] = true
-			// The stamp horizon is wider than the verdict's 45m:
-			// a node cordoned for up to 2h is still inside its
-			// drain window for stamping purposes — agents holding
-			// local remediation longer than the verdict needs is
-			// cheap, resuming it mid-drain is not.
-			if kube.NodeCordonedFresh(&nodes[i], now, maintenanceStampCordonMaxAge) {
-				names[nodes[i].Name] = true
-			}
+	for i := range nodes {
+		nodeNames[nodes[i].Name] = true
+		// The stamp horizon is wider than the verdict's 45m:
+		// a node cordoned for up to 2h is still inside its
+		// drain window for stamping purposes — agents holding
+		// local remediation longer than the verdict needs is
+		// cheap, resuming it mid-drain is not.
+		if kube.NodeCordonedFresh(&nodes[i], now, maintenanceStampCordonMaxAge) {
+			names[nodes[i].Name] = true
 		}
-	} else {
-		complete = false
 	}
 	if dyn == nil {
 		// The Plan and medik8s signals are unverifiable without a

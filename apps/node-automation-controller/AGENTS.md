@@ -40,8 +40,8 @@ byte-stable with the shell-operator alerts).
   helpers incl. `RestartTemplatePatch`, comma-set parsing, the GVR
   registry, annotation keys + timestamp stamps, maintenance mutex,
   the Flux artifact-stale signature `fluxconditions.go`,
-  `sweep_overlay.go` — the per-sweep write overlay
-  `probefw.WithSweepSnapshot` installs: annotation deltas
+  `sweep_overlay.go` — the per-sweep write overlay (`internal/probefw/snapshot_overlay.go`
+  installs it via `probefw.WithSweepSnapshot`): annotation deltas
   (`EffectiveAnno`/`RecordAnnoPatch`), pod-template annotation
   deltas (`EffectiveTemplateAnnos`/`RecordTemplateAnnos` — the
   spec.template.metadata.annotations path RecordAnnoPatch cannot
@@ -162,7 +162,7 @@ byte-stable with the shell-operator alerts).
   LIVE workloads (pod deletes, restarts, evictions) gates on the
   maintenance mutex via `heal.AllowedV` — fail closed, an
   unverifiable check IncErrors the queue; the verdict memoizes per
-  `kube.Verdict` field. Garbage collection of terminal/orphan
+  `maintenance.Verdict` field. Garbage collection of terminal/orphan
   objects (evicted pods, failed jobs, orphan CRs/EndpointSlices) is
   exempt — the mutex defers heal/restart churn, not cleanup.
 - Sweep loops: janitor-style collect → cap → (Confirm) →

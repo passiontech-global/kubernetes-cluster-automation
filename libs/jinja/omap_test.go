@@ -5,7 +5,9 @@
 package jinja
 
 import (
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -235,5 +237,52 @@ func TestOMapStrMap(t *testing.T) {
 	var nilMap *OMap
 	if got := nilMap.StrMap("x"); got == nil || len(got) != 0 {
 		t.Fatalf("nil receiver StrMap = %v want empty non-nil", got)
+	}
+}
+
+func TestOMapBoolDefNumericAndHardening(t *testing.T) {
+	m := NewOMapCap(8)
+	m.Set("int0", int(0))
+	m.Set("int1", int(-3))
+	m.Set("u0", uint64(0))
+	m.Set("u1", uint64(7))
+	m.Set("nan", math.NaN())
+	m.Set("f0", float64(0))
+	m.Set("f1", float64(1.5))
+
+	if m.BoolDef("int0", true) || !m.BoolDef("int1", false) {
+		t.Fatalf("BoolDef int mismatch")
+	}
+	if m.BoolDef("u0", true) || !m.BoolDef("u1", false) {
+		t.Fatalf("BoolDef uint64 mismatch")
+	}
+	if m.BoolDef("nan", true) || m.BoolDef("f0", true) || !m.BoolDef("f1", false) {
+		t.Fatalf("BoolDef float/NaN mismatch")
+	}
+
+	// from_yaml payload size limit (parseMaxBytes = 4 MiB)
+	bigYAML := "a: " + strings.Repeat("x", parseMaxBytes+1)
+	if _, err := Render("{{ s | from_yaml }}", map[string]any{"s": bigYAML}, nil); err == nil {
+		t.Fatal("from_yaml > parseMaxBytes succeeded, want error")
+	}
+
+	// Negative int64 < -2^53 sort exactness
+	gotSort, err := Render("{{ xs | sort | join(',') }}", map[string]any{
+		"xs": []any{int64(-(1 << 53) - 1), int64(-(1 << 53) - 3), int64(-(1 << 53) - 2)},
+	}, nil)
+	if err != nil {
+		t.Fatalf("negative int64 sort error: %v", err)
+	}
+	if wantSort := "-9007199254740995,-9007199254740994,-9007199254740993"; gotSort != wantSort {
+		t.Fatalf("negative int64 sort = %q, want %q", gotSort, wantSort)
+	}
+
+	// Uppercase 0B binary literal
+	gotBin, err := Render("{{ 0B1010 }}", nil, nil)
+	if err != nil {
+		t.Fatalf("0B1010 render error: %v", err)
+	}
+	if gotBin != "10" {
+		t.Fatalf("0B1010 = %q, want 10", gotBin)
 	}
 }

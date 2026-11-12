@@ -16,10 +16,7 @@ package probe
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
-	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
@@ -91,50 +89,10 @@ func New(d *kdeps.Deps) *Probe {
 	return &Probe{d: d}
 }
 
-// pgStartupMessage builds the protocol-3.0 StartupMessage — the same
-// payload the bash probe sent via python:
-//
-//	\x00\x03\x00\x00 + "user\x00<U>\x00database\x00<D>\x00\x00"
-//
-// wrapped in the length-prefixed packet.
-func pgStartupMessage(user, db string) []byte {
-	params := "user\x00" + user + "\x00database\x00" + db + "\x00\x00"
-	body := append([]byte{0x00, 0x03, 0x00, 0x00}, params...) // 196608 BE
-	pkt := make([]byte, 4, 4+len(body))
-	binary.BigEndian.PutUint32(pkt, uint32(len(body)+4))
-	return append(pkt, body...)
-}
-
-// pgFirstByteOK classifies the first server response byte: 'R' auth
-// request / 'S' param status / 'N' notice / 'K' backend key all mean
-// the pooler is alive; 'E' (ErrorResponse, e.g. server_login_retry),
-// RST or timeout mean broken.
-func pgFirstByteOK(b byte) bool {
-	switch b {
-	case 'R', 'S', 'N', 'K':
-		return true
-	}
-	return false
-}
-
 // pgWireProbe dials addr, sends the StartupMessage and classifies the
-// first response byte — the Go-native port of the python heredoc.
+// first response byte via the shared probee.PGWireProbeWithTimeout helper.
 func pgWireProbe(ctx context.Context, addr string, timeout time.Duration) bool {
-	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if _, err := conn.Write(pgStartupMessage("postgres", "postgres")); err != nil {
-		return false
-	}
-	b := make([]byte, 1)
-	if _, err := io.ReadFull(conn, b); err != nil {
-		return false
-	}
-	return pgFirstByteOK(b[0])
+	return probee.PGWireProbeWithTimeout(ctx, addr, timeout)
 }
 
 // poolStats is one parsed SHOW POOLS row for the kine database.

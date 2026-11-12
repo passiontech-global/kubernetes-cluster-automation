@@ -16,7 +16,7 @@ Each module is its own package under `internal/<domain>/` (one
 package per module, grouped by domain — same convention as
 `node-host-agent`). The module contract (Deps/Module/Periodic) lives
 in `internal/shared`; reusable leaf machinery in
-`internal/platform/{envx,state,kube}`; the module registry in
+`internal/platform/{state,kube,maintenance,heal,reap}` (plus `libs/hostkit/envx`); the module registry in
 `internal/registry`; test
 fakes/builders in `internal/testutil`, shared metric vectors in
 `internal/metrics` (a health check's own private gauge may instead

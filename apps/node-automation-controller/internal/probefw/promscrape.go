@@ -21,6 +21,68 @@ import (
 	"time"
 )
 
+// StreamPodMetrics GETs http://ip:port/metrics through client and streams
+// the response body directly to fn without buffering the full payload in
+// memory, bounded by timeout and maxBytes. A body exceeding maxBytes
+// returns an explicit truncation error.
+func StreamPodMetrics(ctx context.Context, client *http.Client,
+	ip string, port int, timeout time.Duration, maxBytes int64,
+	fn func(io.Reader) error) error {
+
+	if client == nil {
+		return errors.New("no http client for pod metrics fetch")
+	}
+	if ip == "" {
+		return errors.New("pod has no IP — metrics unreachable")
+	}
+	lctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// net.JoinHostPort, not fmt %s:%d — a bare IPv6 pod IP needs
+	// brackets or the URL parses as host "::1" port garbage.
+	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
+		"http://"+net.JoinHostPort(ip, strconv.Itoa(port))+"/metrics", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Drain before Close (bounded): a body bigger than maxBytes
+		// leaves the tail unread, which makes the connection
+		// unreusable and silently kills keep-alive on client.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("pod metrics endpoint returned %s", resp.Status)
+	}
+	cr := &cappedReader{r: io.LimitReader(resp.Body, maxBytes+1), max: maxBytes}
+	if err := fn(cr); err != nil {
+		return err
+	}
+	if cr.n > maxBytes {
+		return fmt.Errorf("pod metrics endpoint body exceeds %d bytes (truncated)", maxBytes)
+	}
+	return nil
+}
+
+type cappedReader struct {
+	r   io.Reader
+	n   int64
+	max int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if c.n > c.max {
+		return n, fmt.Errorf("pod metrics endpoint body exceeds %d bytes (truncated)", c.max)
+	}
+	return n, err
+}
+
 // FetchPodMetrics GETs the prometheus text exposition at
 // http://ip:port/metrics through client, bounded by timeout and
 // maxBytes. Every failure shape — unset client, empty IP, request
@@ -31,46 +93,14 @@ import (
 func FetchPodMetrics(ctx context.Context, client *http.Client,
 	ip string, port int, timeout time.Duration, maxBytes int64) ([]byte, error) {
 
-	if client == nil {
-		return nil, errors.New("no http client for pod metrics fetch")
-	}
-	if ip == "" {
-		return nil, errors.New("pod has no IP — metrics unreachable")
-	}
-	lctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	// net.JoinHostPort, not fmt %s:%d — a bare IPv6 pod IP needs
-	// brackets or the URL parses as host "::1" port garbage.
-	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
-		"http://"+net.JoinHostPort(ip, strconv.Itoa(port))+"/metrics", nil)
+	var body []byte
+	err := StreamPodMetrics(ctx, client, ip, port, timeout, maxBytes, func(r io.Reader) error {
+		var rerr error
+		body, rerr = io.ReadAll(r)
+		return rerr
+	})
 	if err != nil {
 		return nil, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		// Drain before Close (bounded): a body bigger than maxBytes
-		// leaves the tail unread, which makes the connection
-		// unreusable and silently kills keep-alive on client.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
-	// Read maxBytes+1: a body that exactly fills the cap is legal,
-	// but one byte MORE proves truncation — ScyllaDB-class /metrics
-	// payloads exceed 4 MiB and a silent cut parses as a valid EOF,
-	// dropping the tail series and skewing every per-shard ratio
-	// the caller computes (P1: false drift alerts).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(body)) > maxBytes {
-		return nil, fmt.Errorf("pod metrics endpoint body exceeds %d bytes (truncated)", maxBytes)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pod metrics endpoint returned %s", resp.Status)
 	}
 	return body, nil
 }

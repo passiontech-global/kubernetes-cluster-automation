@@ -50,29 +50,18 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand/v2"
-	"net/http"
-	"net/http/pprof"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -85,228 +74,6 @@ import (
 )
 
 var version = "dev"
-
-// stripManagedFields is the shared managedFields stripper — a factory
-// product built once, not re-allocated per transformed object.
-var stripManagedFields = cache.TransformStripManagedFields()
-
-// defaultCacheTransform trims informer memory: managedFields is a
-// large chunk of every cached object and .Status.Images alone is
-// 50-80% of a Node's size — no module reads either field. Wired as
-// DefaultTransform (not a per-type ByObject.Transform) so it covers
-// the default Node informer too: Node has no ByObject entry — the
-// sweep controllers' watches create that informer from the Default*
-// settings.
-func defaultCacheTransform(obj interface{}) (interface{}, error) {
-	if _, err := stripManagedFields(obj); err != nil {
-		return nil, err
-	}
-	if n, ok := obj.(*corev1.Node); ok {
-		n.Status.Images = nil
-	}
-	return obj, nil
-}
-
-// podCacheLabelSelector is the Pod informer's watch selector —
-// k8s-app in (cilium,kube-dns): the two pod sets the manager's
-// cached reads consume (cilium-taint-reaper's own pods, coredns
-// watchdog's probe census). Parsed once at package init; a parse
-// failure degrades to the original cilium-only selector rather than
-// Everything() — an over-broad watch would pin every kube-system
-// pod in memory for no consumer.
-var podCacheLabelSelector = func() labels.Selector {
-	sel, err := labels.Parse("k8s-app in (cilium,kube-dns)")
-	if err != nil {
-		return labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"})
-	}
-	return sel
-}()
-
-// buildCacheOptions assembles the informer cache shape. The cache
-// must mirror RBAC: several types are list/watch-locked to a single
-// object via resourceNames, so informers MUST carry the matching
-// field/label selector or the API returns Forbidden.
-func buildCacheOptions() cache.Options {
-	return cache.Options{
-		DefaultTransform: defaultCacheTransform,
-		ByObject: map[client.Object]cache.ByObject{
-			// kube-system Role: daemonsets resourceNames
-			// [konnectivity-agent].
-			&appsv1.DaemonSet{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "konnectivity-agent"}),
-			},
-			// kube-system Role: deployments get/list/watch (no
-			// resourceNames — the informer must see BOTH coredns and
-			// metrics-server; a single metadata.name field selector
-			// cannot express that, so the name pinning lives in the
-			// reconciler predicates instead).
-			&appsv1.Deployment{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-			},
-			// ClusterRole: secrets resourceNames [passiontech-pipeline]
-			// (all namespaces; lives in fluent-system).
-			&corev1.Secret{}: {
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "passiontech-pipeline"}),
-			},
-			// cilium component Role: pods in kube-system — informer is
-			// only started when a module actually reads Pods through
-			// the manager client (the cilium taint reaper's
-			// reconciler, or the coredns watchdog's cached probe
-			// census), so clusters without pods watch RBAC never open
-			// this watch. The selector covers BOTH consumers: the
-			// cilium pods the reaper owns and the kube-dns pods the
-			// watchdog probes — RBAC cannot filter by label, so the
-			// same kube-system pods Role covers both.
-			&corev1.Pod{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Label:      podCacheLabelSelector,
-			},
-		},
-	}
-}
-
-// pprofHandlers returns the net/http/pprof endpoint table wired as
-// ExtraHandlers on the metrics server — one mux, one port, no extra
-// listener or Service change. "/debug/pprof/" (pprof.Index) dispatches
-// the named profiles (heap, goroutine, block, mutex, allocs,
-// threadcreate); cmdline/profile/symbol/trace need their dedicated
-// handlers.
-func pprofHandlers() map[string]http.Handler {
-	return map[string]http.Handler{
-		"/debug/pprof/":        http.HandlerFunc(pprof.Index),
-		"/debug/pprof/cmdline": http.HandlerFunc(pprof.Cmdline),
-		"/debug/pprof/profile": http.HandlerFunc(pprof.Profile),
-		"/debug/pprof/symbol":  http.HandlerFunc(pprof.Symbol),
-		"/debug/pprof/trace":   http.HandlerFunc(pprof.Trace),
-	}
-}
-
-// resolveLeaderNamespace resolves the namespace the leader-election
-// Lease lives in — read ONCE here (cmd/manager is the only place
-// raw filesystem access is allowed) so controller-runtime's elector
-// and the dead-leader Preemptor can never disagree about it: two
-// different defaults would have the standby preempting a Lease in a
-// namespace the leader never uses. The service-account namespace
-// file is the pod's own namespace; the "node-ops" fallback matches
-// the deployment's pinned namespace for out-of-cluster runs
-// (envtest, local dev).
-func resolveLeaderNamespace() string {
-	const saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-	if b, err := os.ReadFile(saNamespaceFile); err == nil {
-		if ns := strings.TrimSpace(string(b)); ns != "" {
-			return ns
-		}
-	}
-	return leaderelect.DefaultNamespace
-}
-
-// buildMgrOptions assembles ctrl.Options from the parsed flag values.
-// leaseDuration/renewDeadline/retryPeriod carry the flag values where
-// 0 means "operator did not set it": the matching Options fields are
-// *time.Duration and nil means "controller-runtime default", which is
-// exactly what the zero flag value keeps. leaderNS is the resolved
-// election namespace — passed explicitly so it can never drift from
-// the Preemptor's view of the same Lease.
-func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
-	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration,
-	leaderNS string, leaderLock resourcelock.Interface) ctrl.Options {
-	mgrOptions := ctrl.Options{
-		Scheme: scheme,
-		// pprof rides the metrics listener (:9115 — ClusterIP/headless
-		// Service, no ingress): heap/goroutine/block profiles are the
-		// memory-triage evidence for the leader working-set plateau
-		// that OOMKilled the pod at the 256Mi limit (2026-11-09).
-		// Same convention as kubelet/kube-scheduler, which ship pprof
-		// on their debug endpoints by default.
-		Metrics: metricsserver.Options{
-			BindAddress:   metricsAddr,
-			ExtraHandlers: pprofHandlers(),
-		},
-		HealthProbeBindAddress: probeAddr,
-		// Active/passive HA (--leader-elect): every runnable is
-		// lease-gated (plain Runnables default NeedLeaderElection()=true,
-		// so `periodic` sweepers and all reconcilers only run on the
-		// leader) while informers, metrics and probes stay warm on
-		// standbys. ReleaseOnCancel hands the Lease over on graceful
-		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
-		// on crash (15s default; deployments pass 180s).
-		LeaderElection:          leaderElect,
-		LeaderElectionNamespace: leaderNS,
-		// Lease name follows the upstream election-id convention
-		// (<name>.<domain> — cf. e1f13584.medik8s.io); domain is the
-		// same passiontech.dev registry the annotations use.
-		LeaderElectionID:              leaderElectionID,
-		LeaderElectionReleaseOnCancel: true,
-		// Custom lock: releaseGuardedLock refuses a release write
-		// when the Lease's holder is already another replica —
-		// without it a demoted leader's deferred tryRelease wipes
-		// the NEW leader's record after the LeaseLossWatchdog
-		// preemption (see leaderelection.go).
-		LeaderElectionResourceLockInterface: leaderLock,
-		Cache:                               buildCacheOptions(),
-	}
-	if leaseDuration > 0 {
-		mgrOptions.LeaseDuration = &leaseDuration
-	}
-	if renewDeadline > 0 {
-		mgrOptions.RenewDeadline = &renewDeadline
-	}
-	if retryPeriod > 0 {
-		mgrOptions.RetryPeriod = &retryPeriod
-	}
-	return mgrOptions
-}
-
-// leasePreemptRunnable adapts leaderelect.Preemptor to a
-// controller-runtime Runnable that must run on standbys too —
-// NeedLeaderElection()=false is the whole point: the replica that
-// is NOT the leader is exactly the one that must shorten the Lease
-// when the leader's node dies (selfheal-alert-coverage fast dead-leader preemption).
-type leasePreemptRunnable struct {
-	preemptor *leaderelect.Preemptor
-	log       logr.Logger
-}
-
-// NeedLeaderElection returns false deliberately — see the type
-// comment: a lease-gated sweep could never run on the standby that
-// needs to act.
-func (r *leasePreemptRunnable) NeedLeaderElection() bool { return false }
-
-func (r *leasePreemptRunnable) Start(ctx context.Context) error {
-	// Startup jitter: every standby replica wires this runnable at
-	// boot — without a staggered first pass all of them GET the
-	// Lease (and prime their frozen-window clocks) in lockstep.
-	// A random delay inside one sweep interval de-synchronizes the
-	// first observation; the ticker cadence is unchanged after.
-	jitter := time.Duration(rand.Int64N(int64(leaderelect.SweepInterval)))
-	select {
-	case <-ctx.Done():
-		return nil
-	case <-time.After(jitter):
-	}
-	ticker := time.NewTicker(leaderelect.SweepInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			reason, err := r.preemptor.Sweep(ctx)
-			switch {
-			case err != nil:
-				r.log.Error(err, "leader lease preempt sweep failed")
-			case reason != "":
-				metrics.LeaderLeasePreemptionsTotal.
-					WithLabelValues(reason).Inc()
-				r.log.Info("leader lease preempted — holder proved dead",
-					"reason", reason)
-			}
-		}
-	}
-}
 
 func main() {
 	var metricsAddr, probeAddr, modulesFilter string
