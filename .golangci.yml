@@ -1,9 +1,11 @@
 # golangci-lint config (v2 format, golangci-lint 2.x, pinned via mise).
 #
-# Single root config for all three Go modules under apps/*/: each
-# `golangci-lint run ./...` invocation inside an app dir walks up and
-# finds this file. Paths in exclusion rules below are relative to the
-# app dir golangci-lint runs in, so they only match that app's files.
+# Single root config for all Go modules in the workspace: each
+# `golangci-lint run ./...` invocation inside a module dir walks up
+# and finds this file. Paths in rules below are relative to the
+# module dir golangci-lint runs in, so `**/`-prefixed globs cover
+# every path form. App scoping comes from the deny `pkg` prefixes,
+# which carry each app's module path.
 #
 # Linter set: v2 defaults (errcheck, govet, ineffassign, staticcheck,
 # unused) plus a small pragmatic set of low-noise correctness/perf
@@ -37,533 +39,266 @@ linters:
 
   settings:
     depguard:
-      # Enforces apps/node-host-agent's layering. Empirically, the
+      # Enforces the monorepo's import layering. Empirically, the
       # paths depguard matches `files` against are ABSOLUTE under
-      # `golangci-lint run ./...` and `./internal/...`-prefixed under
-      # `run ./internal/...` — so the globs use a leading `**/` to
-      # cover every form. App scoping comes from the deny `pkg`
-      # prefixes, which carry the node-host-agent module path (the
-      # other apps have no internal/platform|internal/domain|
-      # internal/agent layout anyway). The invariants (see
-      # apps/node-host-agent/AGENTS.md):
-      #   - internal/envnames/** is a leaf: the NODE_HOST_AGENT_*
-      #     contract is const declarations only — it must never
-      #     import another package in the module.
-      #   - internal/latchdefs/** is a leaf too: latch state names
-      #     are the same kind of const contract, importable from
-      #     everywhere, importing nothing.
-      #   - internal/platform/** is the leaf layer (hoststate,
-      #     systemd, ...; envx/logx moved out to libs/hostkit,
-      #     jinja to libs/jinja, topology to internal/domain): it must
-      #     never import the layers above it.
-      #   - internal/domain/** holds the importable domain libs
-      #     shared by subsystems and ops (etcdmaint, eventpurge):
-      #     it may use platform + libs/hostkit + libs/jinja but must not import
-      #     subsystem, ops, agent, or cmd.
-      #   - internal/agent/** is the runtime (metrics/probe servers +
-      #     subsystem supervisor): it must not import the domain
-      #     layers either — subsystems get wired in cmd/agent.
-      #   - internal/subsystem/** must not import internal/ops/**:
-      #     ops are one-shot Cmd wrappers; logic shared with a
-      #     subsystem lives in internal/domain or the subsystem
-      #     itself. The reverse direction stays allowed — ops
-      #     wrappers may import domain libs and subsystems (e.g.
-      #     ops/kinecheckdb wraps subsystem/kinedb).
-      #   - internal/subsystem/* trees are mutually isolated: no
-      #     sibling-subsystem imports (hubsync gets its dir-watcher
-      #     from internal/platform/fileconf, not hostconfig).
-      #   - libs/hostkit is the shared leaf module (Go stdlib only);
-      #     libs/jinja is its own leaf module (stdlib +
-      #     go.yaml.in/yaml/v3): neither may import back into an app
-      #     module, and only node-host-agent consumes libs/jinja —
-      #     the controller and webhook dispatcher deny it outright.
-      # Deliberately NOT denied: ops -> domain and ops -> subsystem
-      # imports (the one-directional half of the old subsystem<->ops
-      # convention), and cmd/agent may import anything.
+      # `golangci-lint run ./...` — so the globs use a leading `**/`.
       # deny `pkg` is a string prefix — `.../internal/subsystem`
       # covers every .../internal/subsystem/* package too.
+      #
+      # The 12×11 node-host-agent subsystem matrix uses YAML anchors:
+      # each subsystem's deny item is defined once (first rule that
+      # needs it) and aliased everywhere else — anchors resolve at
+      # parse time, so golangci-lint sees the identical rule set.
+      # The controller's six domain modules do the same via the
+      # &nac-deny-* anchors, reused by every leaf rule below.
+      #
+      # Invariants (see each app's AGENTS.md):
+      #   - libs/hostkit is Go-stdlib-only; libs/jinja is stdlib +
+      #     go.yaml.in/yaml/v3; the leaf modules never import apps.
+      #   - webhook-dispatcher: verify is stdlib-only, concourse is
+      #     an internal-import leaf, env reads happen only in
+      #     cmd/dispatcher/main.go.
+      #   - node-host-agent: envnames/latchdefs leaves; platform <
+      #     domain < subsystem layering; the 12 subsystems are
+      #     mutually isolated; internal/testutil is test scaffolding
+      #     (depstest fixtures exempt).
+      #   - node-automation-controller: platform/metrics/promq/
+      #     probefw/shared are leaf layers; the six domain trees are
+      #     self-contained; env reads go through libs/hostkit/envx.
       rules:
-        nha-envnames-is-leaf:
-          files:
-            - "**/internal/envnames/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent"
-              desc: "internal/envnames is the env-name contract leaf; it must not import any other package in the module"
-        nha-latchdefs-is-leaf:
-          files:
-            - "**/internal/latchdefs/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent"
-              desc: "internal/latchdefs is the latch state-contract leaf; it must not import any other package in the module"
-        nha-platform-is-leaf:
-          files:
-            - "**/internal/platform/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
-              desc: "internal/platform is the leaf layer; subsystem must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain"
-              desc: "internal/platform is the leaf layer; domain must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
-              desc: "internal/platform is the leaf layer; the agent runtime must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
-              desc: "internal/platform is the leaf layer; ops must not be imported from it (push shared logic down into platform)"
-        nha-domain-no-upward:
-          files:
-            - "**/internal/domain/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
-              desc: "internal/domain is below subsystem; shared logic belongs here, not the reverse (domain must not import subsystem)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
-              desc: "internal/domain is below ops; domain libs must not import the Cmd wrappers that consume them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
-              desc: "internal/domain is a library layer; the agent runtime must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/cmd"
-              desc: "internal/domain is a library layer; cmd entrypoints must not be imported from it"
-        nha-agent-no-domain:
-          files:
-            - "**/internal/agent/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
-              desc: "internal/agent is the runtime layer; subsystems are wired in cmd/agent, not imported here"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain"
-              desc: "internal/agent is the runtime layer; domain libs are wired in cmd/agent, not imported here"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
-              desc: "internal/agent is the runtime layer; ops are wired in cmd/agent, not imported here"
-        nha-subsystem-no-ops:
-          files:
-            - "**/internal/subsystem/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
-              desc: "subsystem must not import ops cmd wrappers; shared domain logic lives in internal/domain or the owning subsystem"
-        # Sibling-subsystem isolation: a file under one subsystem
-        # tree must not import another subsystem tree — shared logic
-        # goes down into internal/domain / internal/platform / libs/
-        # hostkit or is wired in cmd/agent. One rule per subsystem
-        # (each scoped to its own tree and denying the other eleven),
-        # because a single all-roots rule would also fire on a
-        # subsystem importing its OWN sub-packages. depguard rules
-        # are additive (every matching rule checks the file), so
-        # these coexist with nha-subsystem-no-ops above.
-        nha-subsystem-no-cross-apiprober:
-          files:
-            - "**/internal/subsystem/apiprober/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-concoursecache:
-          files:
-            - "**/internal/subsystem/concoursecache/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-controllerhygiene:
-          files:
-            - "**/internal/subsystem/controllerhygiene/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-hostconfig:
-          files:
-            - "**/internal/subsystem/hostconfig/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-hostmetrics:
-          files:
-            - "**/internal/subsystem/hostmetrics/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-hubsync:
-          files:
-            - "**/internal/subsystem/hubsync/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-janitor:
-          files:
-            - "**/internal/subsystem/janitor/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-kinedb:
-          files:
-            - "**/internal/subsystem/kinedb/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-nethealth:
-          files:
-            - "**/internal/subsystem/nethealth/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-nodereporter:
-          files:
-            - "**/internal/subsystem/nodereporter/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-sweeper:
-          files:
-            - "**/internal/subsystem/sweeper/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        nha-subsystem-no-cross-workerhygiene:
-          files:
-            - "**/internal/subsystem/workerhygiene/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
-              desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"
-        hostkit-is-leaf:
+        # ===== shared leaf modules (strict allow-lists) =====
+        hostkit-stdlib-only:
           files:
             - "**/libs/hostkit/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps"
-              desc: "libs/hostkit is a shared leaf module; it must not import any app module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
-              desc: "libs/hostkit is a leaf module; it must not import libs/jinja (the leaf modules stay mutually independent)"
-        jinja-is-leaf:
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit
+        jinja-allowed-deps:
           files:
             - "**/libs/jinja/**"
-          deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps"
-              desc: "libs/jinja is a shared leaf module; it must not import any app module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit"
-              desc: "libs/jinja is a leaf module; it must not import libs/hostkit (the leaf modules stay mutually independent)"
-        # Reverse direction of the leaf rules above: jinja is
-        # node-host-agent's template engine — the controller and the
-        # webhook dispatcher never render templates, so importing
-        # jinja there would drag a yaml parser into modules with no
-        # use for it.
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja
+            - go.yaml.in/yaml/v3
+        # jinja is node-host-agent's template engine — the controller
+        # and the webhook dispatcher never render templates.
         nac-no-jinja:
           files:
             - "**/node-automation-controller/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
-              desc: "node-automation-controller must not import libs/jinja (template rendering is a node-host-agent concern)"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja", desc: "node-automation-controller must not import libs/jinja (template rendering is a node-host-agent concern)"}
         whd-no-jinja:
           files:
             - "**/webhook-dispatcher/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
-              desc: "webhook-dispatcher must not import libs/jinja (template rendering is a node-host-agent concern)"
-        # node-automation-controller layering (see
-        # apps/node-automation-controller/AGENTS.md). Same
-        # absolute-path `files` empirics as above; scoping again comes
-        # from the deny `pkg` prefixes carrying the app module path.
-        # The invariants:
-        #   - internal/platform/** is the leaf layer (envx, kube,
-        #     state, heal): it must never import anything above it —
-        #     not metrics/shared/promq, not the registry, not a
-        #     domain module.
-        #   - internal/metrics and internal/promq are leaf packages
-        #     too: the god-metrics package and the Prometheus client
-        #     must never reach upward either.
-        #   - internal/shared is the module-contract layer (Deps,
-        #     Module, Periodic, SetupWithConfig, CountReconcile): it
-        #     may use metrics/platform but never a domain module or
-        #     the registry.
-        #   - the six domain trees (apiserver, health, integration,
-        #     janitor, node, system) are self-contained modules — no
-        #     cross-domain imports, and never the registry that wires
-        #     them.
-        #   - internal/testutil stays generic: fakes must not pull a
-        #     domain module in.
-        # Deliberately allowed: intra-domain imports (health/datastore
-        # → probefw [a top-level leaf], system/corednspatcher →
-        # system/pinnedworkload), testutil use in _test.go (excluded
-        # from lint anyway), and cmd/manager importing anything.
-        nac-platform-is-leaf:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja", desc: "webhook-dispatcher must not import libs/jinja (template rendering is a node-host-agent concern)"}
+        # ===== webhook-dispatcher =====
+        whd-verify-stdlib-only:
+          files:
+            - "**/webhook-dispatcher/internal/verify/**"
+          list-mode: strict
+          allow:
+            - $gostd
+        whd-concourse-leaf:
+          files:
+            - "**/webhook-dispatcher/internal/concourse/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal", desc: "internal/concourse is a leaf; it must not import sibling internal packages (handler wires it, never the reverse)"}
+        # Raw env reads bypass the envx.* helper layer so the envdoc
+        # source scan cannot see them. depguard is package-granular,
+        # so `os` is denied wholesale on internal/** — env reads
+        # legitimately live only in cmd/dispatcher/main.go.
+        whd-no-raw-env:
+          files:
+            - "**/webhook-dispatcher/internal/**"
+            - "!**/webhook-dispatcher/internal/**/*_test.go"
+          deny:
+            - {pkg: "os", desc: "read env vars through libs/hostkit/envx.* (envdoc test enforces docs/env.md coverage); only cmd/dispatcher/main.go reads env"}
+        # ===== node-host-agent leaf layers =====
+        nha-envnames-is-leaf:
+          files:
+            - "**/internal/envnames/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent", desc: "internal/envnames is the env-name contract leaf; it must not import any other package in the module"}
+        nha-latchdefs-is-leaf:
+          files:
+            - "**/internal/latchdefs/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent", desc: "internal/latchdefs is the latch state-contract leaf; it must not import any other package in the module"}
+        nha-platform-is-leaf:
           files:
             - "**/internal/platform/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-              desc: "internal/platform is the leaf layer; metrics must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
-              desc: "internal/platform is the leaf layer; the module contract must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
-              desc: "internal/platform is the leaf layer; promq must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "internal/platform is the leaf layer; the registry must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
-              desc: "internal/platform is the leaf layer; test fakes must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem", desc: "internal/platform is the leaf layer; subsystem must not be imported from it (push shared logic down into platform)"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain", desc: "internal/platform is the leaf layer; domain must not be imported from it (push shared logic down into platform)"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent", desc: "internal/platform is the leaf layer; the agent runtime must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops", desc: "internal/platform is the leaf layer; ops must not be imported from it (push shared logic down into platform)"}
+        nha-domain-no-upward:
+          files:
+            - "**/internal/domain/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem", desc: "internal/domain is below subsystem; shared logic belongs here, not the reverse (domain must not import subsystem)"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops", desc: "internal/domain is below ops; domain libs must not import the Cmd wrappers that consume them"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent", desc: "internal/domain is a library layer; the agent runtime must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/cmd", desc: "internal/domain is a library layer; cmd entrypoints must not be imported from it"}
+        nha-agent-no-domain:
+          files:
+            - "**/internal/agent/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem", desc: "internal/agent is the runtime layer; subsystems are wired in cmd/agent, not imported here"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain", desc: "internal/agent is the runtime layer; domain libs are wired in cmd/agent, not imported here"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops", desc: "internal/agent is the runtime layer; ops are wired in cmd/agent, not imported here"}
+        nha-subsystem-no-ops:
+          files:
+            - "**/internal/subsystem/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops", desc: "subsystem must not import ops cmd wrappers; shared domain logic lives in internal/domain or the owning subsystem"}
+        # internal/testutil is test scaffolding: production code must
+        # not import it. The three depstest fixture packages are the
+        # sanctioned exception — they ARE the exported test harness
+        # domain subpackages' external test files drive.
+        nha-no-testutil:
+          files:
+            - "**/internal/**"
+            - "!**/internal/**/*_test.go"
+            - "!**/wdepstest/**"
+            - "!**/cdepstest/**"
+            - "!**/kdepstest/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil", desc: "internal/testutil is test scaffolding; production code must not import it"}
+        # ===== node-host-agent sibling-subsystem isolation =====
+        # One rule per subsystem (each scoped to its own tree and
+        # denying the other eleven), because a single all-roots rule
+        # would also fire on a subsystem importing its OWN
+        # sub-packages. depguard rules are additive, so these coexist
+        # with nha-subsystem-no-ops above.
+        nha-subsystem-no-cross-apiprober:
+          files: ["**/internal/subsystem/apiprober/**"]
+          deny:
+            - &nha-deny-concoursecache {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-controllerhygiene {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-hostconfig {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-hostmetrics {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-hubsync {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-janitor {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-kinedb {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-nethealth {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-nodereporter {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-sweeper {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - &nha-deny-workerhygiene {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+        nha-subsystem-no-cross-concoursecache:
+          files: ["**/internal/subsystem/concoursecache/**"]
+          deny:
+            - &nha-deny-apiprober {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober", desc: "subsystem trees are mutually isolated; shared logic belongs in internal/domain or internal/platform"}
+            - *nha-deny-controllerhygiene
+            - *nha-deny-hostconfig
+            - *nha-deny-hostmetrics
+            - *nha-deny-hubsync
+            - *nha-deny-janitor
+            - *nha-deny-kinedb
+            - *nha-deny-nethealth
+            - *nha-deny-nodereporter
+            - *nha-deny-sweeper
+            - *nha-deny-workerhygiene
+        nha-subsystem-no-cross-controllerhygiene:
+          files: ["**/internal/subsystem/controllerhygiene/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-hostconfig:
+          files: ["**/internal/subsystem/hostconfig/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-hostmetrics:
+          files: ["**/internal/subsystem/hostmetrics/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-hubsync:
+          files: ["**/internal/subsystem/hubsync/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-janitor:
+          files: ["**/internal/subsystem/janitor/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-kinedb:
+          files: ["**/internal/subsystem/kinedb/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-nethealth:
+          files: ["**/internal/subsystem/nethealth/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nodereporter, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-nodereporter:
+          files: ["**/internal/subsystem/nodereporter/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-sweeper, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-sweeper:
+          files: ["**/internal/subsystem/sweeper/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-workerhygiene]
+        nha-subsystem-no-cross-workerhygiene:
+          files: ["**/internal/subsystem/workerhygiene/**"]
+          deny: [*nha-deny-apiprober, *nha-deny-concoursecache, *nha-deny-controllerhygiene, *nha-deny-hostconfig, *nha-deny-hostmetrics, *nha-deny-hubsync, *nha-deny-janitor, *nha-deny-kinedb, *nha-deny-nethealth, *nha-deny-nodereporter, *nha-deny-sweeper]
+        # ===== node-automation-controller =====
+        # The six domain no-cross rules run first so their &nac-deny-*
+        # anchors are defined before the leaf rules alias them; every
+        # domain-module deny shares the self-containedness desc.
+        nac-domain-no-cross:
+          files: ["**/node-automation-controller/internal/apiserver/**"]
+          deny:
+            - &nac-deny-health {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+            - &nac-deny-integration {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+            - &nac-deny-janitor {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+            - &nac-deny-node {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+            - &nac-deny-system {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+        nac-domain-no-cross-health:
+          files: ["**/node-automation-controller/internal/health/**"]
+          deny:
+            - &nac-deny-apiserver {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver", desc: "domain modules are self-contained; shared logic belongs in platform/shared"}
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
+        nac-domain-no-cross-integration:
+          files: ["**/node-automation-controller/internal/integration/**"]
+          deny: [*nac-deny-apiserver, *nac-deny-health, *nac-deny-janitor, *nac-deny-node, *nac-deny-system]
+        nac-domain-no-cross-janitor:
+          files: ["**/node-automation-controller/internal/janitor/**"]
+          deny: [*nac-deny-apiserver, *nac-deny-health, *nac-deny-integration, *nac-deny-node, *nac-deny-system]
+        nac-domain-no-cross-node:
+          files: ["**/node-automation-controller/internal/node/**"]
+          deny: [*nac-deny-apiserver, *nac-deny-health, *nac-deny-integration, *nac-deny-janitor, *nac-deny-system]
+        nac-domain-no-cross-system:
+          files: ["**/node-automation-controller/internal/system/**"]
+          deny: [*nac-deny-apiserver, *nac-deny-health, *nac-deny-integration, *nac-deny-janitor, *nac-deny-node]
+        # internal/platform is the leaf layer: nothing above it —
+        # metrics/shared/promq/probefw, the registry, test fakes, or
+        # a domain module — may be imported from it.
+        nac-platform-is-leaf:
+          files: ["**/node-automation-controller/internal/platform/**"]
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics", desc: "internal/platform is the leaf layer; metrics must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared", desc: "internal/platform is the leaf layer; the module contract must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq", desc: "internal/platform is the leaf layer; promq must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw", desc: "internal/platform is the leaf layer; probefw must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "internal/platform is the leaf layer; the registry must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil", desc: "internal/platform is the leaf layer; test fakes must not be imported from it"}
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
+        # metrics/promq are leaf packages: the god-metrics package and
+        # the Prometheus client must never reach upward either.
         nac-metrics-promq-leaf:
           files:
             - "**/node-automation-controller/internal/metrics/**"
             - "**/node-automation-controller/internal/promq/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform"
-              desc: "metrics/promq are leaf packages; platform must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
-              desc: "metrics/promq are leaf packages; the module contract must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "metrics/promq are leaf packages; the registry must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform", desc: "metrics/promq are leaf packages; platform must not be imported from them"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared", desc: "metrics/promq are leaf packages; the module contract must not be imported from them"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw", desc: "metrics/promq are leaf packages; probefw must not be imported from them"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "metrics/promq are leaf packages; the registry must not be imported from them"}
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
         # probefw (internal/probefw) is a top-level leaf like
         # metrics/promq — the health-check framework the shared
         # contract layer names in CheckReg.New's type. It may use
@@ -573,47 +308,32 @@ linters:
         # (probefw → shared was the import cycle that forced
         # CheckReg.New to be `any`).
         nac-probefw-leaf:
-          files:
-            - "**/node-automation-controller/internal/probefw/**"
+          files: ["**/node-automation-controller/internal/probefw/**"]
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
-              desc: "internal/probefw is a leaf; the module contract must not be imported from it (that was the cycle forcing CheckReg.New to be any)"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "internal/probefw is a leaf; the registry must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
-              desc: "internal/probefw is a leaf; test fakes must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "internal/probefw is a leaf; domain modules must not be imported from it"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared", desc: "internal/probefw is a leaf; the module contract must not be imported from it (that was the cycle forcing CheckReg.New to be any)"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "internal/probefw is a leaf; the registry must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil", desc: "internal/probefw is a leaf; test fakes must not be imported from it"}
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
+        # internal/shared is the module-contract layer (Deps, Module,
+        # Periodic, SetupWithConfig, CountReconcile): it may use
+        # metrics/platform but never a domain module or the registry.
         nac-shared-no-domain:
-          files:
-            - "**/node-automation-controller/internal/shared/**"
+          files: ["**/node-automation-controller/internal/shared/**"]
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "internal/shared is the module contract layer; the registry must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
-              desc: "internal/shared is the module contract layer; test fakes must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "internal/shared is the module contract layer; the registry must not be imported from it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil", desc: "internal/shared is the module contract layer; test fakes must not be imported from it"}
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
+        # Domain modules never import the registry that wires them.
         nac-domain-isolation:
           files:
             - "**/node-automation-controller/internal/apiserver/**"
@@ -623,8 +343,7 @@ linters:
             - "**/node-automation-controller/internal/node/**"
             - "**/node-automation-controller/internal/system/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "domain modules are wired by the registry; they must never import it back"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "domain modules are wired by the registry; they must never import it back"}
         # testutil in domain non-test files: denied everywhere EXCEPT
         # health/probetest — that package IS shared test scaffolding
         # (non-_test so sibling test files can import it).
@@ -638,97 +357,17 @@ linters:
             - "**/node-automation-controller/internal/node/**"
             - "**/node-automation-controller/internal/system/**"
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
-              desc: "test fakes belong in _test.go imports, not module code"
-        # The six no-cross rules each deny the OTHER five domains, so
-        # every deny item is a YAML anchor defined at first use and
-        # aliased below — anchors resolve at parse time, so the
-        # depguard rules golangci-lint sees are identical to spelling
-        # all 30 items out (same globs, same pkgs, same desc text).
-        nac-domain-no-cross:
-          files:
-            - "**/node-automation-controller/internal/apiserver/**"
-          deny:
-            - &nac-deny-health
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - &nac-deny-integration
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - &nac-deny-janitor
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - &nac-deny-node
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - &nac-deny-system
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-        nac-domain-no-cross-health:
-          files:
-            - "**/node-automation-controller/internal/health/**"
-          deny:
-            - &nac-deny-apiserver
-              pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
-            - *nac-deny-integration
-            - *nac-deny-janitor
-            - *nac-deny-node
-            - *nac-deny-system
-        nac-domain-no-cross-integration:
-          files:
-            - "**/node-automation-controller/internal/integration/**"
-          deny:
-            - *nac-deny-apiserver
-            - *nac-deny-health
-            - *nac-deny-janitor
-            - *nac-deny-node
-            - *nac-deny-system
-        nac-domain-no-cross-janitor:
-          files:
-            - "**/node-automation-controller/internal/janitor/**"
-          deny:
-            - *nac-deny-apiserver
-            - *nac-deny-health
-            - *nac-deny-integration
-            - *nac-deny-node
-            - *nac-deny-system
-        nac-domain-no-cross-node:
-          files:
-            - "**/node-automation-controller/internal/node/**"
-          deny:
-            - *nac-deny-apiserver
-            - *nac-deny-health
-            - *nac-deny-integration
-            - *nac-deny-janitor
-            - *nac-deny-system
-        nac-domain-no-cross-system:
-          files:
-            - "**/node-automation-controller/internal/system/**"
-          deny:
-            - *nac-deny-apiserver
-            - *nac-deny-health
-            - *nac-deny-integration
-            - *nac-deny-janitor
-            - *nac-deny-node
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil", desc: "test fakes belong in _test.go imports, not module code"}
         nac-testutil-no-domain:
-          files:
-            - "**/node-automation-controller/internal/testutil/**"
+          files: ["**/node-automation-controller/internal/testutil/**"]
           deny:
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
-              desc: "internal/testutil stays generic; it must not import the registry"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
-              desc: "internal/testutil stays generic; it must not import a domain module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
-              desc: "internal/testutil stays generic; it must not import a domain module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
-              desc: "internal/testutil stays generic; it must not import a domain module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
-              desc: "internal/testutil stays generic; it must not import a domain module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
-              desc: "internal/testutil stays generic; it must not import a domain module"
-            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
-              desc: "internal/testutil stays generic; it must not import a domain module"
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry", desc: "internal/testutil stays generic; it must not import the registry"}
+            - *nac-deny-apiserver
+            - *nac-deny-health
+            - *nac-deny-integration
+            - *nac-deny-janitor
+            - *nac-deny-node
+            - *nac-deny-system
         # Raw env reads in module code bypass the envx.* helper layer:
         # every knob must resolve through libs/hostkit/envx so the
         # envdoc source scan sees it and docs/env.md stays complete.
@@ -736,16 +375,14 @@ linters:
         # alone), so `os` is denied wholesale — internal/node/
         # nodelabeler is excluded as the one sanctioned os consumer
         # (its config-file ReadFile), and the envdoc test flags raw
-        # env reads even there. _test.go files are lint-exempt anyway;
-        # the explicit negation keeps the intent legible.
+        # env reads even there.
         nac-no-raw-env:
           files:
             - "**/node-automation-controller/internal/**"
             - "!**/node-automation-controller/internal/**/*_test.go"
             - "!**/node-automation-controller/internal/node/nodelabeler/**"
           deny:
-            - pkg: "os"
-              desc: "read env vars through libs/hostkit/envx.* (envdoc test enforces docs/env.md coverage); nodelabeler keeps the one sanctioned os.ReadFile"
+            - {pkg: "os", desc: "read env vars through libs/hostkit/envx.* (envdoc test enforces docs/env.md coverage); nodelabeler keeps the one sanctioned os.ReadFile"}
 
     staticcheck:
       # -QF*: quick-fix style suggestions (De Morgan's law, tagged
@@ -759,12 +396,18 @@ linters:
       checks: ["all", "-QF*", "-ST1000", "-ST1020"]
 
   exclusions:
-    # Test files are exempt from linting entirely — fixture/test
-    # scaffolding is allowed best-effort idioms (_ = f(), unchecked
-    # closes/writes, deprecated-type fixtures) that production code
-    # must not use.
-    paths:
-      - _test\.go$
+    # Test files keep the cheap-fixture exemptions (unchecked errors,
+    # depguard layering — test scaffolding legitimately reaches
+    # sideways) but NO LONGER skip the correctness linters: govet,
+    # nilerr, copyloopvar, ineffassign, misspell and staticcheck all
+    # guard the test suite too. SA1019 stays exempt for the
+    # deliberately-deprecated fake.NewSimpleClientset fixtures.
+    rules:
+      - linters: [errcheck, depguard, perfsprint, unconvert, usestdlibvars, unused]
+        path: _test\.go$
+      - linters: [staticcheck]
+        path: _test\.go$
+        text: "SA1019"
 
 issues:
   # No result caps — surface every issue so the list is complete.
@@ -779,8 +422,8 @@ formatters:
   settings:
     gci:
       # Import block convention repo-wide: stdlib | third-party |
-      # project-internal (this module + libs/hostkit + libs/jinja, which
-      # all carry the
+      # project-internal (this module + libs/hostkit + libs/jinja,
+      # which all carry the
       # github.com/passiontech-global/kubernetes-cluster-automation
       # prefix).
       sections:

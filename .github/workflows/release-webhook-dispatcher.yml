@@ -13,8 +13,9 @@ on:
     paths:
       - "apps/webhook-dispatcher/**"
       # Only the hostkit subpackages this app actually imports
-      # (envx/httpx/logx) — see the controller workflow for why the
-      # blanket libs/hostkit/** glob is avoided.
+      # (envdoc/envx/httpx/logx) — see the controller workflow for
+      # why the blanket libs/hostkit/** glob is avoided.
+      - "libs/hostkit/envdoc/**"
       - "libs/hostkit/envx/**"
       - "libs/hostkit/httpx/**"
       - "libs/hostkit/logx/**"
@@ -48,7 +49,7 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: webhook-dispatcher
-      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/**"
+      lib_paths: "libs/hostkit/envdoc/** libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/**"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
     secrets: inherit

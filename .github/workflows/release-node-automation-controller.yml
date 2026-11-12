@@ -13,10 +13,14 @@ on:
     paths:
       - "apps/node-automation-controller/**"
       # Only the hostkit subpackages this app actually imports
-      # (envx/nodecond/timex + transitive logx) — a blanket
-      # libs/hostkit/** would fire releases on fsx/httpx changes the
-      # controller never consumes, producing empty releases.
+      # (envdoc/envx/httpx/ledger/nodecond/timex + transitive logx)
+      # — a blanket libs/hostkit/** would fire releases on
+      # fsx/jinja-side changes the controller never consumes,
+      # producing empty releases.
+      - "libs/hostkit/envdoc/**"
       - "libs/hostkit/envx/**"
+      - "libs/hostkit/httpx/**"
+      - "libs/hostkit/ledger/**"
       - "libs/hostkit/logx/**"
       - "libs/hostkit/nodecond/**"
       - "libs/hostkit/timex/**"
@@ -50,9 +54,9 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: node-automation-controller
-      # All four hostkit subpackages the controller consumes, direct
-      # or transitive (envx/nodecond/timex each import logx).
-      lib_paths: "libs/hostkit/envx/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/**"
+      # All seven hostkit subpackages the controller consumes, direct
+      # or transitive (envx/nodecond/timex pull logx where they log).
+      lib_paths: "libs/hostkit/envdoc/** libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/**"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
       legacy_v_tags: true

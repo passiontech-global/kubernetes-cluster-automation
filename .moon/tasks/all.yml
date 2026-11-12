@@ -22,12 +22,20 @@ tasks:
       - 'go.sum'
       - '/mise.toml'
 
+  # golangci-lint fmt covers gofmt AND gci import ordering — the two
+  # formatters .golangci.yml enables — so `moon run :format` checks
+  # exactly what `golangci-lint fmt` would rewrite. --diff exits
+  # nonzero when a rewrite is needed; the per-project cache dir
+  # matches the :lint task's (concurrent moon runs must not share a
+  # golangci-lint cache lock).
   format:
-    script: 'test -z "$(gofmt -l .)"'
+    script: 'GOLANGCI_LINT_CACHE=$MOON_WORKSPACE_ROOT/.moon/cache/golangci-lint/$MOON_PROJECT_ID golangci-lint fmt --diff .'
     toolchains: 'system'
     inputs:
       - '**/*.go'
       - '/mise.toml'
+      # fmt resolves its formatter set from the root config.
+      - '/.golangci.yml'
 
   # golangci-lint (pinned in mise.toml) — part of the `moon ci` PR gate.
   # GOLANGCI_LINT_CACHE is per-project: `moon run :lint` spawns one

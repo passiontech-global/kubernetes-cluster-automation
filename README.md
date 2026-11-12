@@ -25,8 +25,10 @@ apps/
   node-host-agent/             moon project (own go.mod, cliff.toml, Dockerfile)
   webhook-dispatcher/          moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
 libs/
-  hostkit/                   shared leaf module: envx, logx, httpx, timex, nodecond, fsx
-  jinja/                     shared leaf module: mini-jinja2 evaluator (node-host-agent)
+  hostkit/                   shared leaf module (stdlib-only): envx, envdoc,
+                             ledger, nodecond, fsx, httpx (+pprofx), logx, timex
+  jinja/                     shared leaf module: mini-jinja2 evaluator +
+                             ordered-map/YAML values (node-host-agent)
 .github/workflows/
   ci.yml                         PR gate — moon ci on affected projects
   release-app.yml                reusable release pipeline
