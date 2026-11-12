@@ -83,11 +83,18 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 	}
 }
 
-// probeSelfURL is the probe mux's loopback /healthz — "" when
-// cfg.ProbeAddr can't be parsed (the health verdict then falls back
-// to the ready flag alone).
+// probeSelfURL is the probe mux's loopback /healthz. Run stores the
+// BOUND listener address on a.probeAddr — the self-probe dials
+// what actually bound (":0" tests, wildcard rewrites), falling back
+// to cfg.ProbeAddr only when Run never reached the bind (hand-built
+// Agents in tests). "" when the address can't be parsed — the
+// health verdict then falls back to the ready flag alone.
 func (a *Agent) probeSelfURL() string {
-	host, port, err := net.SplitHostPort(a.cfg.ProbeAddr)
+	addr, _ := a.probeAddr.Load().(string)
+	if addr == "" {
+		addr = a.cfg.ProbeAddr
+	}
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return ""
 	}

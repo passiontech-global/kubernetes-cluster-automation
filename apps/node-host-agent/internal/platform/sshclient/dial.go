@@ -26,6 +26,11 @@ type Link struct {
 	Net     net.Conn    // transport conn — TCP direct, chanConn via bastion
 	JumpNet net.Conn    // the bastion's TCP conn (nil on a direct dial)
 	Jump    *ssh.Client // bastion client (nil on a direct dial)
+	// JumpShared marks Jump as BORROWED from a caller-owned Bastion
+	// (DialVia): Close then leaves the bastion alive for the next
+	// target. A one-shot Config.Dial clears it — the Link owns the
+	// bastion and Close shuts it like before.
+	JumpShared bool
 }
 
 // DeadlineConn picks the conn a per-op SetDeadline must land on.
@@ -42,13 +47,94 @@ func (l *Link) DeadlineConn() net.Conn {
 
 // Close shuts the client, then the bastion client — the order both
 // originals used (the tunneled client rides the jump's conn, so it
-// goes first).
+// goes first). A borrowed bastion (JumpShared) stays open: the
+// Bastion owner closes it when the last target releases it.
 func (l *Link) Close() error {
 	err := l.Client.Close()
-	if l.Jump != nil {
+	if l.Jump != nil && !l.JumpShared {
 		_ = l.Jump.Close()
 	}
 	return err
+}
+
+// Bastion is a reusable ProxyJump connection: the bastion's TCP
+// conn plus its SSH client, opened once and shared by every target
+// hop through the same jump spec (hubsync converges N targets per
+// cycle through one bastion — per-target jump dials used to pay a
+// full TCP+SSH handshake each). Spec is the ssh_proxyjump spec it
+// was opened for, kept for error parity with Config.Dial.
+type Bastion struct {
+	Spec   string
+	Net    net.Conn
+	Client *ssh.Client
+}
+
+// Close shuts the bastion client (which owns Net) — idempotent via
+// the ssh.Client contract callers already rely on.
+func (b *Bastion) Close() error {
+	if b == nil {
+		return nil
+	}
+	return b.Client.Close()
+}
+
+// OpenBastion dials only the proxyJump hop — the reusable half of
+// Config.Dial's jump path. The SAME signer and host-key policy
+// serve the bastion (HostKeyVerify covers it, jumpClientConfig
+// parity).
+func (c Config) OpenBastion(ctx context.Context, proxyJump string) (*Bastion, error) {
+	juser, jhost, jport := SplitUserHost(proxyJump)
+	if jport == "" {
+		jport = strconv.Itoa(c.port())
+	}
+	signer, err := c.LoadSigner()
+	if err != nil {
+		return nil, err
+	}
+	jnc, jump, err := c.DialTCP(ctx, net.JoinHostPort(jhost, jport),
+		c.jumpClientConfig(juser, signer))
+	if err != nil {
+		return nil, fmt.Errorf("jump %s: %w", proxyJump, err)
+	}
+	return &Bastion{Spec: proxyJump, Net: jnc, Client: jump}, nil
+}
+
+// DialVia is Config.Dial's target half against an already-open
+// Bastion — same channel-open bound, same handshake bound, same
+// Link contract; JumpShared marks the bastion borrowed so Link.Close
+// leaves it for the next target. Callers that serialize their dials
+// (hubsync's per-target loop) get one jump handshake per cycle
+// instead of one per target.
+func (c Config) DialVia(ctx context.Context, user, host string,
+	b *Bastion) (*Link, error) {
+	if user == "" {
+		user = "root"
+	}
+	port := c.port()
+	signer, err := c.LoadSigner()
+	if err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	cfg := c.ClientConfig(user, signer)
+
+	// Channel-open on the jump has no ctx wiring — bound it on
+	// the jump's conn the same way the handshake is bounded.
+	clear := BoundOp(ctx, c.Log, b.Net, c.Timeout)
+	nc, err := b.Client.Dial("tcp", addr)
+	clear()
+	if err != nil {
+		return nil, fmt.Errorf("jump %s → %s: %w", b.Spec, addr, err)
+	}
+	// nc here is a chanConn — SetDeadline always errors on it,
+	// so the handshake is bounded on b.Net (the real TCP conn all
+	// muxed traffic rides).
+	client, err := c.Handshake(ctx, nc, b.Net, addr, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("%s via %s: %w", addr, b.Spec, err)
+	}
+	return &Link{Client: client, Net: nc, JumpNet: b.Net,
+		Jump: b.Client, JumpShared: true}, nil
 }
 
 // Dial connects to host:Port as user (empty → root), through
@@ -62,6 +148,25 @@ func (c Config) Dial(ctx context.Context, user, host, proxyJump string) (*Link, 
 	if user == "" {
 		user = "root"
 	}
+
+	if proxyJump != "" {
+		b, err := c.OpenBastion(ctx, proxyJump)
+		if err != nil {
+			return nil, err
+		}
+		link, err := c.DialVia(ctx, user, host, b)
+		if err != nil {
+			// Channel-open/handshake failures own the bastion's
+			// lifetime now — close it like the original inline path.
+			_ = b.Close()
+			return nil, err
+		}
+		// One-shot dial: the Link owns the bastion — Close shuts it
+		// via Jump like the pre-Bastion code did.
+		link.JumpShared = false
+		return link, nil
+	}
+
 	port := c.port()
 	signer, err := c.LoadSigner()
 	if err != nil {
@@ -69,36 +174,6 @@ func (c Config) Dial(ctx context.Context, user, host, proxyJump string) (*Link, 
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	cfg := c.ClientConfig(user, signer)
-
-	if proxyJump != "" {
-		juser, jhost, jport := SplitUserHost(proxyJump)
-		if jport == "" {
-			jport = strconv.Itoa(port)
-		}
-		jnc, jump, err := c.DialTCP(ctx, net.JoinHostPort(jhost, jport),
-			c.jumpClientConfig(juser, signer))
-		if err != nil {
-			return nil, fmt.Errorf("jump %s: %w", proxyJump, err)
-		}
-		// Channel-open on the jump has no ctx wiring — bound it on
-		// the jump's conn the same way the handshake is bounded.
-		clear := BoundOp(ctx, c.Log, jnc, c.Timeout)
-		nc, err := jump.Dial("tcp", addr)
-		clear()
-		if err != nil {
-			_ = jump.Close()
-			return nil, fmt.Errorf("jump %s → %s: %w", proxyJump, addr, err)
-		}
-		// nc here is a chanConn — SetDeadline always errors on it,
-		// so the handshake is bounded on jnc (the real TCP conn all
-		// muxed traffic rides).
-		client, err := c.Handshake(ctx, nc, jnc, addr, cfg)
-		if err != nil {
-			_ = jump.Close()
-			return nil, fmt.Errorf("%s via %s: %w", addr, proxyJump, err)
-		}
-		return &Link{Client: client, Net: nc, JumpNet: jnc, Jump: jump}, nil
-	}
 
 	nc, client, err := c.DialTCP(ctx, addr, cfg)
 	if err != nil {

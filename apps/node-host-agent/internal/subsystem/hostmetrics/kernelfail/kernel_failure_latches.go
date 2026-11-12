@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- shared kernel-failure helpers ---
@@ -42,7 +42,7 @@ func (r *Runner) ensureStateLatch(path, name, evidence string) {
 		// Touch only once the mtime ages past LatchTouchMinInterval —
 		// the janitor reaps at 24h, so a per-tick utimensat was
 		// ~2,800 needless syscalls/day per held latch.
-		if cerr := hostutil.TouchIfDue(path, fi, r.deps.Clock.Now(),
+		if cerr := fsx.TouchIfDue(path, fi, r.deps.Clock.Now(),
 			latchdefs.LatchTouchMinInterval); cerr != nil {
 			logger().Debug("hostmetrics: latch touch failed",
 				"path", path, "error", cerr)

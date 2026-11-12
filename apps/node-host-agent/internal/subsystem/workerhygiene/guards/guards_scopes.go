@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -55,38 +56,70 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
 	}
-	out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
-		"--type=scope", "--state=failed", "--no-legend", "--plain",
+	// One list-units per sweep feeds all three state filters —
+	// the old code ran three separate `--state=` queries whose
+	// result sets overlap anyway (every cri-containerd scope,
+	// bucketed by state).
+	units, err := c.d.Cfg.Systemd.ListUnitsByPatterns(ctx,
 		"cri-containerd-*.scope")
 	if err != nil {
 		// A transient systemctl/D-Bus failure is inconclusive — the
 		// scan must NOT stamp (a stamped failure defers the retry a
 		// full interval) and zero evidence was gathered.
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: systemd-scopes list-units failed: %v (%s) — scan skipped",
-			err, strings.TrimSpace(out)))
+			"suspect: systemd-scopes list-units failed: %v — scan skipped", err))
 		c.d.CycleResult(wdeps.CheckSysScopes, "abort")
 		return
 	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-	n := len(scopeUnitNames(out))
-	c.checkDeactivating(ctx, e)
-	c.checkAbandoned(ctx, e)
+	failed := scopeNamesInState(units, "failed")
+	n := len(failed)
+	c.checkDeactivating(ctx, e, scopeNamesInState(units, "deactivating"))
+	c.checkAbandoned(ctx, e, scopeNamesInState(units, "abandoned"))
 	if n == 0 {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
 	}
 	// NPD contract line (reset-failed evidence in the watchdog log).
 	c.d.State.AppendLog(fmt.Sprintf("ACTION: systemd-scopes reset-failed count=%d", n))
-	if rout, rerr := c.d.Cfg.Systemd.Exec(ctx,
-		"systemctl", "reset-failed", "cri-containerd-*.scope"); rerr != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: systemd-scopes reset-failed failed: %v (%s)",
-			rerr, strings.TrimSpace(rout)))
-	} else {
+	// The old `reset-failed cri-containerd-*.scope` glob reset every
+	// matching scope; reset-failed on a non-failed unit is a no-op,
+	// so clearing exactly the failed set this sweep found is
+	// equivalent — and it is the only shape D-Bus ResetFailedUnit
+	// (one unit per call) can express.
+	resetErrs := 0
+	for _, unit := range failed {
+		if rerr := c.d.Cfg.Systemd.ResetFailed(ctx, unit); rerr != nil {
+			resetErrs++
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes reset-failed %s failed: %v",
+				unit, rerr))
+		}
+	}
+	if resetErrs == 0 {
 		c.d.Actions.WithLabelValues(wdeps.CheckSysScopes, "reset_failed").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckSysScopes, "ok")
+}
+
+// scopeNamesInState extracts the .scope unit names whose
+// ActiveState or SubState equals state from a
+// ListUnitsByPatterns("cri-containerd-*.scope") result — the
+// client-side half of `systemctl list-units --state=<s>` (which
+// matches either state column; scopes report "deactivating" and
+// "abandoned" in SUB). The .scope suffix re-check keeps hand-fed
+// lists honest — the glob match is server-side/systemctl's.
+func scopeNamesInState(units []systemd.UnitInfo, state string) []string {
+	var names []string
+	for _, u := range units {
+		if !strings.HasSuffix(u.Name, ".scope") {
+			continue
+		}
+		if u.ActiveState == state || u.SubState == state {
+			names = append(names, u.Name)
+		}
+	}
+	return names
 }
 
 // checkDeactivating is the deactivating-unit-detector deactivating wedge detector:
@@ -99,39 +132,32 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // The streak must survive ≥2 sweeps (~1h) before alerting so a
 // normal stop-in-progress transient never pages. Runs even when no
 // failed scopes exist — a node can wedge on deactivating alone.
-func (c *ScopesCheck) checkDeactivating(ctx context.Context, e *wdeps.CycleEnv) {
-	dout, derr := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
-		"--type=scope", "--state=deactivating", "--no-legend", "--plain",
-		"cri-containerd-*.scope")
-	if derr != nil {
-		// Inconclusive — leave the streak AND the per-unit ledger
-		// untouched rather than resetting on a transient D-Bus
-		// failure.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: systemd-scopes deactivating list-units failed: %v (%s) — streak kept",
-			derr, strings.TrimSpace(dout)))
+// units is the sweep's scopeNamesInState(list, "deactivating")
+// slice — the shared list-units already ran in Run, so a transport
+// failure there aborts the whole sweep before this helper sees an
+// empty-vs-unknown distinction.
+func (c *ScopesCheck) checkDeactivating(ctx context.Context,
+	e *wdeps.CycleEnv, units []string) {
+
+	if len(units) == 0 {
+		c.deactStreak = 0
 	} else {
-		units := scopeUnitNames(dout)
-		if len(units) == 0 {
-			c.deactStreak = 0
-		} else {
-			c.deactStreak++
-			if c.deactStreak >= 2 {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: systemd-scopes deactivating count=%d streak=%d",
-					len(units), c.deactStreak))
-			}
+		c.deactStreak++
+		if c.deactStreak >= 2 {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: systemd-scopes deactivating count=%d streak=%d",
+				len(units), c.deactStreak))
 		}
-		c.reapDeactivating(ctx, e, units)
-		// Rebuild the per-unit ledger AFTER the reap read it —
-		// prevDeact must hold LAST sweep's set when judging this
-		// sweep's candidates.
-		next := make(map[string]bool, len(units))
-		for _, u := range units {
-			next[u] = true
-		}
-		c.prevDeact = next
 	}
+	c.reapDeactivating(ctx, e, units)
+	// Rebuild the per-unit ledger AFTER the reap read it —
+	// prevDeact must hold LAST sweep's set when judging this
+	// sweep's candidates.
+	next := make(map[string]bool, len(units))
+	for _, u := range units {
+		next[u] = true
+	}
+	c.prevDeact = next
 	// No CycleResult here — Run owns the per-sweep cycle accounting;
 	// a second "ok" from this helper would double-count every scan.
 }
@@ -164,18 +190,16 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 		if !c.prevDeact[unit] || containerIDLive(scopeContainerID(unit), live) {
 			continue
 		}
-		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
-			"kill", "--signal=SIGKILL", unit); err != nil {
+		if err := c.d.Cfg.Systemd.Signal(ctx, unit, "SIGKILL"); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: systemd-scopes deactivating kill %s failed: %v (%s)",
-				unit, err, strings.TrimSpace(out)))
+				"suspect: systemd-scopes deactivating kill %s failed: %v",
+				unit, err))
 			continue
 		}
-		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
-			"stop", unit); err != nil {
+		if err := c.d.Cfg.Systemd.Stop(ctx, unit); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: systemd-scopes deactivating stop %s failed: %v (%s)",
-				unit, err, strings.TrimSpace(out)))
+				"suspect: systemd-scopes deactivating stop %s failed: %v",
+				unit, err))
 			continue // the SIGKILL landed; stop retries next sweep
 		}
 		killed++
@@ -198,20 +222,11 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 // whose container id is absent from every Running pod's container
 // set are stopped (a scope still owned by a live pod is diagnose-
 // only), capped at 10 units per sweep. Runs even when no failed
-// scopes exist — a node can leak abandoned units alone.
-func (c *ScopesCheck) checkAbandoned(ctx context.Context, e *wdeps.CycleEnv) {
-	aout, aerr := c.d.Cfg.Systemd.Exec(ctx, "systemctl", "list-units",
-		"--type=scope", "--state=abandoned", "--no-legend", "--plain",
-		"cri-containerd-*.scope")
-	if aerr != nil {
-		// Inconclusive — same contract as the deactivating probe:
-		// a transient D-Bus failure is logged, never fatal.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: systemd-scopes abandoned list-units failed: %v (%s) — sweep skipped",
-			aerr, strings.TrimSpace(aout)))
-		return
-	}
-	units := scopeUnitNames(aout)
+// scopes exist — a node can leak abandoned units alone. units is
+// the sweep's scopeNamesInState(list, "abandoned") slice — same
+// shared-fetch contract as checkDeactivating.
+func (c *ScopesCheck) checkAbandoned(ctx context.Context,
+	e *wdeps.CycleEnv, units []string) {
 	if len(units) == 0 {
 		return
 	}
@@ -232,11 +247,10 @@ func (c *ScopesCheck) checkAbandoned(ctx context.Context, e *wdeps.CycleEnv) {
 		if containerIDLive(scopeContainerID(unit), live) {
 			continue // still owned by a Running pod — diagnose only
 		}
-		if out, err := c.d.Cfg.Systemd.Exec(ctx, "systemctl",
-			"stop", unit); err != nil {
+		if err := c.d.Cfg.Systemd.Stop(ctx, unit); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
-				"suspect: systemd-scopes abandoned stop %s failed: %v (%s)",
-				unit, err, strings.TrimSpace(out)))
+				"suspect: systemd-scopes abandoned stop %s failed: %v",
+				unit, err))
 			continue
 		}
 		stopped++
@@ -245,21 +259,6 @@ func (c *ScopesCheck) checkAbandoned(ctx context.Context, e *wdeps.CycleEnv) {
 			"ACTION: systemd-scopes abandoned reap unit=%s — orphaned cri-containerd scope unregistered",
 			unit))
 	}
-}
-
-// scopeUnitNames extracts the unit names from a
-// `systemctl list-units --no-legend --plain` reply — the first
-// field of each non-empty line ending in .scope (the LOAD/ACTIVE/
-// SUB/DESCRIPTION columns collapse to fields[0]).
-func scopeUnitNames(out string) []string {
-	var units []string
-	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Fields(line); len(f) > 0 &&
-			strings.HasSuffix(f[0], ".scope") {
-			units = append(units, f[0])
-		}
-	}
-	return units
 }
 
 // scopeContainerID extracts the containerd id out of a

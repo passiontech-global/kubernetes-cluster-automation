@@ -34,7 +34,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // Parse turns raw conf bytes into a T. A nil/empty slice means the
@@ -86,7 +86,7 @@ type Reloader[T any] struct {
 	mu      sync.Mutex
 	cur     T
 	loadErr bool // edge-latch for the unreadable-conf Warn
-	// okKey is the hostutil.FileStatKey of the file whose parse
+	// okKey is the fsx.FileStatKey of the file whose parse
 	// produced cur (missingKey when the file was absent). Get stats
 	// before reading: an unchanged fingerprint proves the bytes
 	// can't have moved — every writer here stages via atomic rename,
@@ -136,7 +136,7 @@ func (r *Reloader[T]) Get() T {
 	// that reachable) would otherwise early-return the stale cur
 	// forever, swallowing the retry Load owes every Get.
 	key := missingKey
-	if sk, err := hostutil.FileStatKey(r.Path); err == nil {
+	if sk, err := fsx.FileStatKey(r.Path); err == nil {
 		key = sk
 	} else if !os.IsNotExist(err) {
 		key = "" // non-ENOENT stat failure — don't cache, let Load report it

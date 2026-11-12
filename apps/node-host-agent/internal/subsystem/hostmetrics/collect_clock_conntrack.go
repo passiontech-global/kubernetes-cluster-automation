@@ -10,8 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -188,8 +188,8 @@ var (
 // series, not a fake 0) and the ratio only when both parsed and the
 // limit is non-zero.
 func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
-	count, countOK := hostutil.ReadUintFile(c.cfg.ConntrackCountFile)
-	limit, limitOK := hostutil.ReadUintFile(c.cfg.ConntrackMaxFile)
+	count, countOK := fsx.ReadUintFile(c.cfg.ConntrackCountFile)
+	limit, limitOK := fsx.ReadUintFile(c.cfg.ConntrackMaxFile)
 	if countOK {
 		ch <- prometheus.MustNewConstMetric(descCtEntries,
 			prometheus.GaugeValue, float64(count), c.cfg.NodeName)

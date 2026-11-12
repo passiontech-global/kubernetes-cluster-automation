@@ -637,7 +637,7 @@ func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ = io.ReadAll(resp.Body)
+	_, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("pprof on the metrics mux: got %d, want 404 (moved to the loopback listener)", resp.StatusCode)

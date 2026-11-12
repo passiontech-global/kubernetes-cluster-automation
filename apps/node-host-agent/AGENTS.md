@@ -44,14 +44,27 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   rendered-condition order. Stdlib-only; both the platform leaf
   (`hoststate` imports it for shared-owner validation) and every
   producing subsystem import it.
-- `internal/platform/*` — leaf libraries: cycle (period loop),
-  checks (check-group dispatch), checkkit (shared streak/progress
-  bookkeeping — the ` (check n/m)` suspect suffix and the RAM
-  pending-streak advance every check used to hand-roll),
-  hoststate (`state-*`/`last-*` latch files; the latch NAMES'
-  registry lives in `internal/latchdefs`), hostexec, hostutil,
-  systemd, watchdogconf, probee, procfs, journalwatch, promfile,
-  kmsg, pagecache, sshclient, netlinkx, fileconf.
+- `internal/platform/*` — leaf libraries: cycle (period loop +
+  loop liveness registry), subframe (the shared ordered-check
+  dispatcher — declared check/group order is load-bearing),
+  checkkit (shared streak/progress bookkeeping — the
+  ` (check n/m)` suspect suffix and the RAM pending-streak advance
+  every check used to hand-roll), hoststate (`state-*`/`last-*`
+  latch files; the latch NAMES' registry lives in
+  `internal/latchdefs`), hostexec (host command exec with
+  systemd-env scrubbing), procfs (/proc + sysfs readers — the
+  old hostutil's surviving half; fs helpers moved to
+  libs/hostkit/fsx), systemd (D-Bus client + CLI fallback),
+  watchdogconf, probee (http/dns/postgres/unix probes),
+  journalwatch (the shared journalctl Multiplexer +
+  ClassifyRead), promfile (node-exporter textfile writer),
+  kmsg (/dev/kmsg drain), pagecache (page-cache eviction),
+  sshclient (ctx-aware SSH dial/handshake), netlinkx (netlink
+  sock-diag: TCP states, listener destroy, LinkDel), nodecoord
+  (L1↔L3 node coordination: maintenance verdicts, coord
+  annotations, StampLocalRemediation), sdnotify (sd_notify
+  unixgram sender), hostctx (shared host-side env/Deps
+  resolution), fileconf (content-fingerprint dir watcher).
 - `internal/subsystem/*` — the 12 periodic subsystems (sweeper,
   concoursecache, apiprober, hostmetrics, workerhygiene, nethealth,
   janitor, nodereporter, controllerhygiene, hostconfig, hubsync,
@@ -126,7 +139,7 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   `envx.ModeEnv` + `envx.Mode{On,Off,Auto}`; ModeAuto resolves via
   the Descriptor's `Auto` func (e.g. controllerhygiene iff
   k0scontroller.service exists).
-- Check dispatch goes through `platform/checks.Group` — declared
+- Check dispatch goes through `platform/subframe` — declared
   check order and group order are LOAD-BEARING (state latch
   producers/consumers assume it). Consecutive-failure streak
   bookkeeping goes through `platform/checkkit` (`Pending` for the

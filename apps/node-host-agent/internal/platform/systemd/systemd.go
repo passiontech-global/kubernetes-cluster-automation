@@ -8,6 +8,15 @@
 // When the agent runs directly on the host (HostRoot "/") the
 // wrapper is skipped.
 //
+// Two transports serve the verbs: the zero-fork D-Bus backend
+// (dbus_linux.go — /run/systemd/private, production only) and the
+// nsenter systemctl/journalctl CLI fallback (cli.go — always
+// available, and the only path tests see through injected RunCmd
+// seams). Every public verb tries D-Bus first and falls back ONLY
+// on connection-level failures (errDBusUnavailable): a method-level
+// error is returned as-is so a failed restart is never re-issued
+// through a second transport.
+//
 // All commands go through Config.RunCmd — one seam that tests replace
 // with a fake recorder, and that production wires to
 // exec.CommandContext (via hostexec). Shell parity:
@@ -15,10 +24,13 @@
 //	systemctl is-active <u>        -> Active / IsActive
 //	systemctl show -p LoadState <u> -> Exists / UnitExists (WD_REQUIRES unit:<n>)
 //	systemctl show -p ActiveEnterTimestampMonotonic --value -> ActiveAge
+//	systemctl is-enabled <u>       -> Enabled / IsEnabled
 //	systemctl restart <u>          -> Restart
+//	systemctl stop <u>             -> Stop
 //	systemctl reload-or-restart <u> -> ReloadOrRestart
 //	systemctl kill -s <SIG> <u>    -> Signal
 //	systemctl daemon-reload        -> DaemonReload
+//	systemctl list-units [pats]    -> ListUnits / ListUnitsByPatterns
 //	journalctl -u <u> --since <s>  -> Journal (shared k0sworker snapshot)
 package systemd
 
@@ -26,12 +38,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // Config is hostexec.Config — a type alias, not a field-for-field
@@ -115,6 +125,16 @@ func New(cfg Config, opts ...Option) *Client {
 	return c
 }
 
+// Close releases the D-Bus backend's connection, if one was ever
+// established — process teardown and test cleanup call it so the
+// lazy conn doesn't outlive its owner. Idempotent; the CLI path
+// has nothing to release.
+func (c *Client) Close() {
+	if c.dbus != nil {
+		c.dbus.close()
+	}
+}
+
 // Exec runs an arbitrary host command — systemctl and journalctl are
 // wrapped identically (hostexec.NSAll), and other host binaries
 // (fail2ban-client, ip) share the same nsenter path. ctx is
@@ -196,21 +216,7 @@ func (c *Client) Active(ctx context.Context, unit string) (bool, error) {
 			return false, err
 		}
 	}
-	out, err := c.systemctl(ctx, "is-active", unit)
-	switch strings.TrimSpace(out) {
-	case "active":
-		return true, nil
-	case "reloading", "activating", "deactivating", "inactive",
-		"failed", "maintenance", "unknown":
-		// A real ActiveState — the probe answered "not active".
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("systemctl is-active %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
-	}
-	return false, fmt.Errorf("systemctl is-active %s: unexpected output %q",
-		unit, strings.TrimSpace(out))
+	return c.cliActive(ctx, unit)
 }
 
 // IsActive is Active with the error folded to false — legacy callers
@@ -221,7 +227,7 @@ func (c *Client) IsActive(ctx context.Context, unit string) bool {
 	return err == nil && active
 }
 
-// IsEnabled mirrors `systemctl is-enabled <unit> >/dev/null` — the
+// Enabled mirrors `systemctl is-enabled <unit> >/dev/null` — the
 // runner's WD_TINC_ACTIVE/WD_NEBULA_ACTIVE probes tested the EXIT
 // CODE, not the string: rc=0 covers the whole enabled vocabulary
 // (enabled, enabled-runtime, static, indirect, alias, generated,
@@ -237,22 +243,16 @@ func (c *Client) IsActive(ctx context.Context, unit string) bool {
 // surfaces as an error to callers using this variant (the IsEnabled
 // wrapper still folds it to false, matching the old rc!=0 test).
 func (c *Client) Enabled(ctx context.Context, unit string) (bool, error) {
-	out, err := c.systemctl(ctx, "is-enabled", unit)
-	switch strings.TrimSpace(out) {
-	case "enabled", "enabled-runtime", "static", "indirect", "alias",
-		"generated", "transient", "linked", "linked-runtime":
-		// The whole "installed" vocabulary the rc==0 test accepted.
-		return true, nil
-	case "disabled", "masked", "masked-runtime", "bad":
-		// is-enabled answered — the unit file exists but is off.
-		return false, nil
+	if c.dbus != nil {
+		enabled, err := c.dbus.dbusEnabled(ctx, unit)
+		if err == nil {
+			return enabled, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return false, err
+		}
 	}
-	if err != nil {
-		return false, fmt.Errorf("systemctl is-enabled %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
-	}
-	return false, fmt.Errorf("systemctl is-enabled %s: unexpected output %q",
-		unit, strings.TrimSpace(out))
+	return c.cliEnabled(ctx, unit)
 }
 
 // IsEnabled is Enabled with the error folded to false.
@@ -303,22 +303,7 @@ func (c *Client) Exists(ctx context.Context, unit string) (bool, error) {
 			return false, err
 		}
 	}
-	out, err := c.systemctl(ctx, "show", "-p", "LoadState", "--value", unit)
-	if err != nil {
-		return false, fmt.Errorf("systemctl show -p LoadState --value %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
-	}
-	switch state := strings.TrimSpace(out); state {
-	case "loaded", "merged":
-		return true, nil
-	case "stub", "not-found", "bad-setting", "error", "masked", "":
-		return false, nil
-	default:
-		logger().Warn("systemd: unexpected LoadState word — "+
-			"treating unit as absent this probe",
-			"unit", unit, "loadstate", state)
-		return false, nil
-	}
+	return c.cliExists(ctx, unit)
 }
 
 // UnitExists is Exists on a bounded background context with the
@@ -336,12 +321,8 @@ func (c *Client) UnitExists(unit string) bool {
 // gets a settle window before any new restart is spent on it. The
 // age comes from ActiveEnterTimestampMonotonic (µs since boot,
 // numeric and locale-free) compared against /proc/uptime — exactly
-// what the shell did. The formatted ActiveEnterTimestamp ("Sun
-// 2026-01-04 10:11:12 UTC") is NOT usable: its zone abbrev is the
-// host's local zone ("ICT", "MSK", ...), which time.Parse resolves
-// only when it happens to be a name Go knows — a silent misparse
-// under any non-UTC zone. Error when the unit is not active or
-// either clock is unreadable (both mean "not settled" to the caller).
+// what the shell did. Error when the unit is not active or either
+// clock is unreadable (both mean "not settled" to the caller).
 func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, error) {
 	if c.dbus != nil {
 		age, err := c.dbus.dbusActiveAge(ctx, unit, c.procUptimeFile)
@@ -352,35 +333,8 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 			return 0, err
 		}
 	}
-	out, err := c.systemctl(ctx, "show", "-p",
-		"ActiveEnterTimestampMonotonic", "--value", unit)
-	if err != nil {
-		return 0, err
-	}
-	ts := strings.TrimSpace(out)
-	monoUS, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil || monoUS <= 0 {
-		// 0/"n/a"/empty = never activated this boot; unparseable =
-		// unexpected systemctl output — both count as "not active".
-		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic %q (not active)",
-			unit, ts)
-	}
-	up, err := hostutil.UptimeSeconds(c.procUptimeFile)
-	if err != nil {
-		return 0, fmt.Errorf("%s: read %s: %w", unit, c.procUptimeFile, err)
-	}
-	// Same clock family (CLOCK_MONOTONIC vs boot time) — the µs
-	// rounding can push the delta a hair below zero on a unit that
-	// just started.
-	if age := up*1e6 - float64(monoUS); age > 0 {
-		return time.Duration(age) * time.Microsecond, nil
-	}
-	return 0, nil
+	return c.cliActiveAge(ctx, unit)
 }
-
-// (ActiveAge reads /proc/uptime through hostutil.UptimeSeconds — the
-// shared parser; the systemd-local copy it replaced drifted only in
-// an error string.)
 
 // Restart mirrors `systemctl restart <unit>`.
 func (c *Client) Restart(ctx context.Context, unit string) error {
@@ -457,6 +411,27 @@ func (c *Client) Signal(ctx context.Context, unit, sig string) error {
 	return nil
 }
 
+// ResetFailed mirrors `systemctl reset-failed <unit>` for a single
+// named unit — the D-Bus ResetFailedUnit call. Callers holding a
+// glob (`reset-failed cri-*.scope`) resolve the unit set via
+// ListUnitsByPatterns first and call this per name, matching how
+// systemctl itself expands the pattern client-side.
+func (c *Client) ResetFailed(ctx context.Context, unit string) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusResetFailed(ctx, unit); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
+	out, err := c.systemctl(ctx, "reset-failed", unit)
+	if err != nil {
+		return fmt.Errorf("systemctl reset-failed %s: %w (%s)",
+			unit, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // DaemonReload mirrors `systemctl daemon-reload`.
 func (c *Client) DaemonReload(ctx context.Context) error {
 	if c.dbus != nil {
@@ -477,11 +452,20 @@ func (c *Client) DaemonReload(ctx context.Context) error {
 // ListUnits mirrors `systemctl list-units --all --no-legend
 // --plain` — every loaded unit with its state triple. The D-Bus
 // path answers from ListUnits directly; the systemctl path parses
-// the legend-free table (first four columns are the state fields,
-// the rest is the free-text description).
+// the legend-free table (cli.go).
 func (c *Client) ListUnits(ctx context.Context) ([]UnitInfo, error) {
+	return c.ListUnitsByPatterns(ctx)
+}
+
+// ListUnitsByPatterns mirrors `systemctl list-units --all
+// --no-legend --plain <patterns...>` — the D-Bus ListUnitsByPatterns
+// call filters server-side; the CLI path appends the globs to argv
+// and lets systemctl match. Empty patterns = the unfiltered list
+// (ListUnits). guards_scopes.go uses this for its scoped-unit
+// sweep instead of parsing `systemctl list-units` text itself.
+func (c *Client) ListUnitsByPatterns(ctx context.Context, patterns ...string) ([]UnitInfo, error) {
 	if c.dbus != nil {
-		units, err := c.dbus.dbusListUnits(ctx)
+		units, err := c.dbus.dbusListUnitsByPatterns(ctx, patterns)
 		if err == nil {
 			return units, nil
 		}
@@ -489,49 +473,5 @@ func (c *Client) ListUnits(ctx context.Context) ([]UnitInfo, error) {
 			return nil, err
 		}
 	}
-	out, err := c.Exec(ctx, "systemctl", "list-units",
-		"--all", "--no-legend", "--plain")
-	if err != nil {
-		return nil, fmt.Errorf("systemctl list-units: %w (%s)",
-			err, strings.TrimSpace(out))
-	}
-	var units []UnitInfo
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		f := strings.Fields(line)
-		if len(f) < 4 {
-			continue
-		}
-		u := UnitInfo{
-			Name:        f[0],
-			LoadState:   f[1],
-			ActiveState: f[2],
-			SubState:    f[3],
-		}
-		if len(f) > 4 {
-			u.Description = strings.Join(f[4:], " ")
-		}
-		units = append(units, u)
-	}
-	return units, nil
-}
-
-// Journal mirrors `journalctl -u <unit> --since <since> --no-pager` —
-// the shared k0sworker -10min snapshot the runner dumped once per
-// watchdog run for modules 05/06. Stderr is folded in via
-// ExecCombined: journald reports corrupt journal files on STDERR
-// ("File /var/log/journal/... is corrupt") and the A5 integrity
-// check's "corrupt" substring test is dead code without it — the
-// extra diagnostic lines can't false-positive the 05/06 signature
-// greps (they match k0sworker log content, not journalctl notices).
-// A journald error returns the error with whatever partial output
-// came back (empty is fine — callers count grep hits, an empty
-// journal means zero hits, and a fetch failure is logged, never
-// fatal).
-func (c *Client) Journal(ctx context.Context, unit, since string) (string, error) {
-	return c.ExecCombined(ctx, "journalctl",
-		"-u", unit, "--since", since, "--no-pager")
+	return c.cliListUnits(ctx, patterns)
 }

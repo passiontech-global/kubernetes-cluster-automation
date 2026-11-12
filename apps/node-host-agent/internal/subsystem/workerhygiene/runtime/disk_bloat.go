@@ -21,6 +21,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // disk-bloat disk-bloat thresholds: above the warn watermark the
@@ -184,9 +185,9 @@ func snapshotMountIDs(d *wdeps.Deps) map[string]string {
 	if err != nil {
 		return nil
 	}
-	hostTaskRoot := wdeps.HostSidePath(d.Cfg.CtrTaskRoot)
-	hostSandboxRoot := wdeps.HostSidePath(d.Cfg.SandboxCtlRoot)
-	hostSnapRoot := wdeps.HostSidePath(d.Cfg.Disk.WLayerSnapshotsDir) + "/"
+	hostTaskRoot := fsx.HostSidePath(d.Cfg.CtrTaskRoot)
+	hostSandboxRoot := fsx.HostSidePath(d.Cfg.SandboxCtlRoot)
+	hostSnapRoot := fsx.HostSidePath(d.Cfg.Disk.WLayerSnapshotsDir) + "/"
 	out := map[string]string{}
 	for _, ln := range strings.Split(string(data), "\n") {
 		sep := strings.LastIndex(ln, " - ")
@@ -265,103 +266,6 @@ func snapshotPodUID(d *wdeps.Deps, id string, mountIDs map[string]string) string
 	return taskDirPodUID(d, id)
 }
 
-// diskBloatEvictProtectedNamespaces — namespaces the critical-band
-// evictor never touches (psiEvictExcludedNamespaces parity): system
-// daemons, CNI/mesh control planes, storage operators, cert/secrets
-// plumbing, the flux delivery layer, the remediation namespace.
-// At 92% the disk is dying, but evicting the components needed to
-// recover makes the outage unrecoverable.
-var diskBloatEvictProtectedNamespaces = map[string]bool{
-	"kube-system":      true,
-	"node-ops":         true,
-	"medik8s":          true,
-	"cilium":           true,
-	"linkerd":          true,
-	"linkerd-cni":      true,
-	"openebs":          true,
-	"cert-manager":     true,
-	"external-secrets": true,
-	"operators":        true,
-	"everest-system":   true,
-	"scylla":           true,
-	"scylla-manager":   true,
-	"flux-system":      true,
-}
-
-// diskBloatEvictCriticalPriorityClasses — pods the scheduler marked
-// untouchable (psiEvictCriticalPriorityClasses parity).
-var diskBloatEvictCriticalPriorityClasses = map[string]bool{
-	"system-node-critical":    true,
-	"system-cluster-critical": true,
-}
-
-// diskBloatStatefulOwnerKinds are ownerReference kinds whose pods
-// hold stateful/quorum workloads — psi_thrash statefulOwnerKinds
-// parity: a plain StatefulSet plus the database operators that raise
-// pods under their own CRD kinds (CloudNativePG Cluster,
-// Dragonfly, ScyllaCluster/ScyllaDBDatacenter, Percona
-// PGv2/PSMDB/PXC). The critical disk band must not churn them.
-var diskBloatStatefulOwnerKinds = map[string]bool{
-	"StatefulSet":          true,
-	"Cluster":              true, // CloudNativePG postgresql.cnpg.io
-	"Dragonfly":            true,
-	"ScyllaCluster":        true,
-	"ScyllaDBDatacenter":   true,
-	"PerconaServerMongoDB": true,
-	"PerconaXtraDBCluster": true,
-	"PerconaPGCluster":     true,
-}
-
-// diskBloatOwnedByStatefulSet reports whether any ownerReference is
-// a stateful/quorum workload owner — a stateful workload's pod holds
-// identity-bound storage; the critical band must not churn it.
-func diskBloatOwnedByStatefulSet(p *corev1.Pod) bool {
-	for _, ref := range p.OwnerReferences {
-		if diskBloatStatefulOwnerKinds[ref.Kind] {
-			return true
-		}
-	}
-	return false
-}
-
-// diskBloatDBQuorumTokens mark StatefulSet/operator-owned pods
-// carrying database / quorum state — losing one replica while the
-// disk is at 92% can cost quorum, far worse than the space freed.
-// Matched case-insensitively against label keys AND values
-// (psi dbQuorumTokens parity).
-var diskBloatDBQuorumTokens = []string{
-	"scylla", "dragonfly", "rabbitmq", "pxc", "psmdb", "postgresql",
-	"cnpg", "percona",
-}
-
-// diskBloatDBQuorumLabelKeys are label KEYS that mark database /
-// quorum pods regardless of value — CNPG's instanceRole and the
-// CrunchyData postgres-operator role selector carry no token
-// substring (psi dbQuorumLabelKeys parity).
-var diskBloatDBQuorumLabelKeys = map[string]bool{
-	"cnpg.io/instancerole":                   true,
-	"postgres-operator.crunchydata.com/role": true,
-}
-
-// diskBloatCarriesDBQuorumLabel reports whether the pod's labels
-// name a database/quorum workload — an INDEPENDENT gate like psi's
-// carriesDBQuorumLabel: a CNPG/Percona/Scylla/Dragonfly pod is never
-// the eviction victim no matter which CRD owns it.
-func diskBloatCarriesDBQuorumLabel(p *corev1.Pod) bool {
-	for k, v := range p.Labels {
-		lk, lv := strings.ToLower(k), strings.ToLower(v)
-		if diskBloatDBQuorumLabelKeys[lk] {
-			return true
-		}
-		for _, tok := range diskBloatDBQuorumTokens {
-			if strings.Contains(lk, tok) || strings.Contains(lv, tok) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // DiskBloatCheck is the disk-bloat runaway-dir detector as a Check. It
 // owns the scan stamp (ex-Hygiene.lastBloatScan) — the bounded
 // walk costs IO on the very disk that is full, so above the warn
@@ -432,10 +336,8 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		p := podByUID[uid]
 		if total <= c.d.Cfg.Disk.BloatPodThresholdBytes || p == nil ||
 			p.DeletionTimestamp != nil ||
-			diskBloatEvictProtectedNamespaces[p.Namespace] ||
-			diskBloatEvictCriticalPriorityClasses[p.Spec.PriorityClassName] ||
-			diskBloatCarriesDBQuorumLabel(p) ||
-			diskBloatOwnedByStatefulSet(p) {
+			wdeps.EvictProtectedNamespaces[p.Namespace] ||
+			wdeps.IsEvictProtectedPod(p) {
 			continue
 		}
 		if victim == nil || total > victimBytes {

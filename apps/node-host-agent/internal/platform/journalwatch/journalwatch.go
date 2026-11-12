@@ -272,3 +272,38 @@ func (t *Tracker) Latched() bool { return t.latched }
 func FilesGone(out string) bool {
 	return strings.Contains(strings.ToLower(out), "no journal files")
 }
+
+// ReadClass is the shared journal-read verdict every
+// journald-unreadable check folds into — the blindness classes are
+// identical across subsystems, only the follow-up detail differs.
+type ReadClass int
+
+const (
+	// ClassOK — the read produced usable journal data.
+	ClassOK ReadClass = iota
+	// ClassFailed — the journalctl exec itself errored.
+	ClassFailed
+	// ClassFilesGone — output carries the "No journal files"
+	// notice: journald answered but has no storage.
+	ClassFilesGone
+	// ClassEmpty — literally empty output: ambiguous between a
+	// quiet unit and journald-level blindness (callers disambiguate
+	// with an unfiltered probe or the integrity classifier).
+	ClassEmpty
+)
+
+// ClassifyRead reduces one journalctl read (combined output + exec
+// error) to its ReadClass and the human detail string the callers'
+// suspect/log lines already spell — the single classifier behind
+// every "is journald blind" check so the classes cannot drift.
+func ClassifyRead(out string, err error) (ReadClass, string) {
+	switch {
+	case err != nil:
+		return ClassFailed, "read failed: " + err.Error()
+	case FilesGone(out):
+		return ClassFilesGone, "journalctl reports no journal files"
+	case strings.TrimSpace(out) == "":
+		return ClassEmpty, ""
+	}
+	return ClassOK, ""
+}

@@ -39,6 +39,11 @@ var maintBloatRules = []testutil.ExecRule{
 	{Substr: "inspect", Out: "true"},
 	{Substr: "pg_repack -h", Out: "ok"},
 	{Substr: "pg_repack", Out: "/usr/pgsql-16/bin/pg_repack\n"},
+	// repackBinPath's ls probes: /usr lists a pgsql-16 dir, the
+	// Debian root lists nothing, and the candidate probe hits the
+	// pg_repack rule above (longest-match).
+	{Substr: "ls /usr/lib/postgresql", Out: ""},
+	{Substr: "ls /usr", Out: "bin\netc\nlib\npgsql-16\nsbin\nusr\n"},
 	{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 	{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
 	// kinedb-maintenance headroom gate: 0 WAL bytes, 100GiB free — ample for the
@@ -107,10 +112,12 @@ func TestMaintCycleRepackMissingBinary(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
-		// headroom gate passes, then repackGlob finds nothing →
-		// empty reply.
+		// headroom gate passes, then repackBinPath's ls probes find
+		// no pgsql-*/postresql version dirs → "" → no-binary.
 		{Substr: "pg_ls_waldir", Out: "0\n"},
 		{Substr: "df", Out: "Avail\n107374182400\n"},
+		{Substr: "ls /usr/lib/postgresql", Out: ""},
+		{Substr: "ls /usr", Out: "bin\netc\nlib\nsbin\nusr\n"},
 	})
 	res := k.Cycle(context.Background())
 	if res.repackState != "no-binary" {
@@ -154,6 +161,8 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 		{Substr: "inspect", Out: "true"},
 		{Substr: "-t public.kine --no-superuser-check", Err: errors.New("exit 1")},
 		{Substr: "pg_repack", Out: "/usr/pgsql-16/bin/pg_repack\n"},
+		{Substr: "ls /usr/lib/postgresql", Out: ""},
+		{Substr: "ls /usr", Out: "bin\netc\nlib\npgsql-16\nsbin\nusr\n"},
 		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
 		{Substr: "pg_ls_waldir", Out: "0\n"},
@@ -577,8 +586,8 @@ func TestMaintLockBusySkipsRepack(t *testing.T) {
 	}
 }
 
-// A failed repackGlob lookup reads like a missing binary — noted,
-// no-binary state, okRepack stays true.
+// A failed repackBinPath lookup reads like a missing binary —
+// noted, no-binary state, okRepack stays true.
 func TestMaintRepackLookupFail(t *testing.T) {
 	k, fr, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect", Out: "true"},
@@ -588,7 +597,9 @@ func TestMaintRepackLookupFail(t *testing.T) {
 		{Substr: "df", Out: "Avail\n107374182400\n"},
 		{Substr: "datfrozenxid", Out: "1000000\n"},
 	})
-	fr.FailOn("sh -c", errors.New("no such file"))
+	// Both glob-root listings fail → the lookup reports the exec
+	// error (the old sh -c nonzero exit's repack-lookup-fail note).
+	fr.FailOn("ls /usr", errors.New("no such file"))
 	res := k.Cycle(context.Background())
 	if res.repackState != "no-binary" || !res.okRepack {
 		t.Fatalf("res=%+v notes=%v", res, res.notes)

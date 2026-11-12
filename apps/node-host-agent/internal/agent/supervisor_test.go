@@ -48,31 +48,6 @@ func TestSuperviseHealthyRun(t *testing.T) {
 	}
 }
 
-// TestRestartTimerDrainsStaleTick: a bare timer.Reset on a timer
-// whose tick is still queued in timer.C — the case every Run that
-// outlives the armed backoff produces (the timer fires 5s into the
-// run) — hands the STALE tick to the select: the restart happens
-// with ZERO wait and the whole 5s→5m ladder is skipped. restartTimer
-// must stop+drain before Reset, so the re-armed fire lands no
-// earlier than the new delay.
-func TestRestartTimerDrainsStaleTick(t *testing.T) {
-	t.Parallel()
-	timer := time.NewTimer(5 * time.Millisecond)
-	time.Sleep(15 * time.Millisecond) // tick fired, NOT consumed
-	restartTimer(timer, 200*time.Millisecond)
-	select {
-	case <-timer.C:
-		t.Fatal("stale tick consumed — restart skipped the backoff")
-	case <-time.After(100 * time.Millisecond):
-	}
-	// The re-armed fire still lands after the full new delay.
-	select {
-	case <-timer.C:
-	case <-time.After(2 * time.Second):
-		t.Fatal("re-armed timer never fired")
-	}
-}
-
 // ladderSubsystem: the first Run outlives the armed 5s backoff timer
 // (fires mid-run), the second blocks until ctx is cancelled.
 type ladderSubsystem struct {

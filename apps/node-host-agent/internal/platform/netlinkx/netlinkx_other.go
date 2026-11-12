@@ -32,6 +32,12 @@ func Links(int) ([]netlink.Link, error) { return nil, errNotLinux }
 // LinkByName refuses off Linux.
 func LinkByName(int, string) (netlink.Link, error) { return nil, errNotLinux }
 
+// LinkAddrs refuses off Linux.
+func LinkAddrs(int, string) ([]netlink.Addr, error) { return nil, errNotLinux }
+
+// LinkDel refuses off Linux.
+func LinkDel(int, string) error { return errNotLinux }
+
 // Sockstat reads refuse off Linux.
 func Sockstat(int) (SockstatV4, SockstatV6, error) {
 	return SockstatV4{}, SockstatV6{}, errNotLinux
@@ -39,3 +45,6 @@ func Sockstat(int) (SockstatV4, SockstatV6, error) {
 
 // TCPStates refuses off Linux.
 func TCPStates(int) (map[uint8]int, error) { return nil, errNotLinux }
+
+// DestroyListenersOnPort refuses off Linux.
+func DestroyListenersOnPort(int, uint16) (int, error) { return 0, errNotLinux }

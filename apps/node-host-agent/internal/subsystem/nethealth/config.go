@@ -139,6 +139,11 @@ type Config struct {
 	// a handle inside the host netns). Writes (rule add/del) stay
 	// on runHostCmd — netlinkx is read-only by contract.
 	rulesFn func(pid int) ([]netlink.Rule, error)
+	// linkAddrsFn lists the addresses on one link in pid's netns —
+	// the netlinkx read behind the nebula tun-address probe (the
+	// `ip -o addr show dev` fork replacement). Same rulesFn
+	// contract: reads only, pid 1 = host netns.
+	linkAddrsFn func(pid int, name string) ([]netlink.Addr, error)
 	// adjtimexFn reads the kernel clock discipline — a modes==0
 	// (read-only) adjtimex(2) needs no CAP_SYS_TIME. Tests inject.
 	adjtimexFn func(buf *unix.Timex) (int, error)
@@ -292,6 +297,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.rulesFn == nil {
 		c.rulesFn = netlinkx.Rules
+	}
+	if c.linkAddrsFn == nil {
+		c.linkAddrsFn = netlinkx.LinkAddrs
 	}
 	if c.adjtimexFn == nil {
 		c.adjtimexFn = unix.Adjtimex

@@ -163,7 +163,11 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 	// The systemd client drives every host unit action
 	// (nsenter-wrapped in a container, direct on the host) — built
 	// here because HostRoot, not env, is its input.
-	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot})
+	// ScrubSystemdEnv keeps NOTIFY_SOCKET/WATCHDOG_* out of every
+	// spawned child's environ — the Go-native form of the `env -u`
+	// argv prefix the exec wrappers used to pay a fork for.
+	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot,
+		ScrubSystemdEnv: true})
 
 	// One clientset for the whole process: each NewForConfig builds
 	// its own http.Transport + TLS pool, so sweeper, workerhygiene

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // remoteDir is one remote directory a role's preamble prepares:
@@ -84,15 +84,15 @@ func prepareHost(ctx context.Context, c Conn, cfg Config, t Target, p roleProfil
 				"but unavailable: %w", t.SSHUser, err)
 		}
 	}
-	if _, err := c.Run(ctx, "mkdir -p "+hostutil.ShellQuote(cfg.RemoteVarsDir)); err != nil {
+	if _, err := c.Run(ctx, "mkdir -p "+fsx.ShellQuote(cfg.RemoteVarsDir)); err != nil {
 		return err
 	}
 	for _, d := range p.dirs {
-		if _, err := c.Run(ctx, "mkdir -p "+hostutil.ShellQuote(d.path)); err != nil {
+		if _, err := c.Run(ctx, "mkdir -p "+fsx.ShellQuote(d.path)); err != nil {
 			return err
 		}
 		if d.mode != "" {
-			if _, err := c.Run(ctx, "chmod "+d.mode+" "+hostutil.ShellQuote(d.path)); err != nil {
+			if _, err := c.Run(ctx, "chmod "+d.mode+" "+fsx.ShellQuote(d.path)); err != nil {
 				return err
 			}
 		}

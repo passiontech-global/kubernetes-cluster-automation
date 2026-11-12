@@ -62,22 +62,22 @@ const (
 	// the whole episode.
 	LocalRemediationLease = 3 * time.Minute
 	// kuredLockTTL bounds how long a SUCCESSFULLY READ kured drain
-	// lock keeps holding local actions through apiserver errors —
-	// a brief flap must not drop the drain hold, but an
-	// unverifiable lock cannot hold forever (the fail-open
-	// contract). Same freshness quantum as the annotation cache.
+	// lock keeps holding through apiserver errors in the
+	// stale-while-error verdict — a brief flap must not drop the
+	// drain hold, but an unverifiable lock cannot hold forever.
+	// Same freshness quantum as the annotation cache.
 	kuredLockTTL = CacheTTL
+	// kuredHealTTL is the wider kured-lock window
+	// HoldEmergencyHeal trusts through API failure — a kured drain
+	// legitimately runs for minutes, and the fail-open self-heal
+	// gate only ever holds on POSITIVELY KNOWN maintenance, so the
+	// unverifiable hold may live longer than the verdict cache's.
+	kuredHealTTL = 10 * time.Minute
 
 	// conditionReason is the NodeCondition Reason stamped with
 	// LocalRemediationInProgress — stable string the cluster side
 	// matches on.
 	conditionReason = "L1SelfHeal"
-
-	// kuredLockAnno is the reboot-drain lock annotation — the same
-	// key the controller's maintenance mutex reads off the kured
-	// DaemonSet; L1 checks it on the NODE object (kured stamps the
-	// node it holds the lock for on versions that do).
-	kuredLockAnno = "weave.works/kured-node-lock"
 )
 
 // StatusCondition is the nodes/status patch payload for the
@@ -125,6 +125,19 @@ type Coord struct {
 	// never does (fresh evidence always wins over the cache).
 	lastKuredLocked bool
 	lastKuredAt     time.Time
+	// flight is the in-flight annotation fetch — concurrent
+	// Maintenance callers share ONE apiserver GET (singleflight)
+	// instead of stampeding it; the fetch runs outside c.mu so the
+	// mutex never spans network I/O.
+	flight *annoFlight
+}
+
+// annoFlight is one shared annotation fetch: done closes after v/err
+// are published, so every waiter observes the same verdict.
+type annoFlight struct {
+	done chan struct{}
+	v    Verdict
+	err  error
 }
 
 func (c *Coord) now() time.Time {
@@ -158,17 +171,39 @@ type Verdict struct {
 // previously confirmed window is still open).
 func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.cacheGood && c.now().Sub(c.cachedAt) < CacheTTL {
-		return c.verdictLocked(c.cached, c.cachedAt), nil
+		v := c.verdictLocked(c.cached, c.cachedAt)
+		c.mu.Unlock()
+		return v, nil
 	}
 	if c.GetAnnos == nil {
+		c.mu.Unlock()
 		return Verdict{}, errors.New("nodecoord: nil GetAnnos")
 	}
+	// Singleflight: a fetch already in progress is shared — every
+	// concurrent caller waits on the same apiserver GET instead of
+	// stampeding it (the mutex never spans the network call).
+	if f := c.flight; f != nil {
+		c.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.v, f.err
+		case <-ctx.Done():
+			return Verdict{}, ctx.Err()
+		}
+	}
+	f := &annoFlight{done: make(chan struct{})}
+	c.flight = f
+	c.mu.Unlock()
+
 	annos, err := c.GetAnnos(ctx)
+
+	c.mu.Lock()
+	c.flight = nil
+	var v Verdict
 	if err != nil {
 		if c.cacheGood {
-			v := c.verdictLocked(c.cached, c.cachedAt)
+			v = c.verdictLocked(c.cached, c.cachedAt)
 			// Fresh evidence wins over the error — a cached TRUE
 			// verdict keeps holding through the flap, but a cached
 			// FALSE is NOT overwritten: an API error is not
@@ -181,57 +216,84 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 				c.now().Sub(c.lastKuredAt) < kuredLockTTL
 			v.KuredLocked = kured
 			v.Active = kured || v.MaintenanceUntil.After(c.now())
-			return v, err
 		}
-		return Verdict{}, err
+	} else {
+		c.cached = annos
+		c.cachedAt = c.now()
+		c.cacheGood = true
+		v = c.verdictLocked(annos, c.cachedAt)
+		c.lastKuredLocked = v.KuredLocked
+		c.lastKuredAt = c.cachedAt
+		if v.MaintenanceUntil.After(c.now()) &&
+			v.MaintenanceUntil.After(c.lastMaintUntil) {
+			c.lastMaintUntil = v.MaintenanceUntil
+		}
 	}
-	c.cached = annos
-	c.cachedAt = c.now()
-	c.cacheGood = true
-	v := c.verdictLocked(annos, c.cachedAt)
-	c.lastKuredLocked = v.KuredLocked
-	c.lastKuredAt = c.cachedAt
-	if v.MaintenanceUntil.After(c.now()) &&
-		v.MaintenanceUntil.After(c.lastMaintUntil) {
-		c.lastMaintUntil = v.MaintenanceUntil
-	}
-	return v, nil
+	f.v, f.err = v, err
+	close(f.done)
+	c.mu.Unlock()
+	return v, err
 }
 
+// verdictLocked decodes the annotation map through the shared
+// nodecond.EvaluateCoordAnnos — the same fold the cluster side
+// applies, so L1 and L3 can never drift on the maintenance verdict.
 func (c *Coord) verdictLocked(annos map[string]string, at time.Time) Verdict {
-	v := Verdict{FetchedAt: at}
-	if t, ok := parseAnnoTime(annos[nodecond.AnnoClusterMaintenanceUntil]); ok {
-		v.MaintenanceUntil = t
+	cv := nodecond.EvaluateCoordAnnos(annos, c.now())
+	return Verdict{
+		MaintenanceUntil: cv.MaintenanceUntil,
+		KuredLocked:      cv.KuredLocked,
+		Active:           cv.Active,
+		FetchedAt:        at,
 	}
-	v.KuredLocked = annos[kuredLockAnno] != ""
-	v.Active = v.KuredLocked || v.MaintenanceUntil.After(c.now())
-	return v
 }
 
-// HoldLocalAction is the convenience gate heal paths call before a
-// node-local restart or infra-pod delete.
+// HoldLocalAction is the fail-CLOSED gate destructive heal paths
+// call before deleting local state (pvc-* dirs, pods, files) — a
+// wrong verdict here is unrecoverable churn, so the asymmetry is
+// deliberate:
 //
-// Fail-open contract (RBAC reality): the agent's ClusterRole only
-// grants nodes [get,list] — on a standalone controller VM with no
-// kubelet Node object (Get → 404) or while kube-apiserver is down,
-// an unverifiable maintenance state must NOT freeze L1 self-heal
-// (that is exactly when k0scontroller needs its own restart guards).
-// The hold engages only while a PREVIOUSLY CONFIRMED
-// MaintenanceUntil window is still open (now < lastMaintUntil) —
-// a drain verified moments ago keeps holding through an API blip,
-// everything else fails open.
+//   - verdict read OK        → the maintenance signal itself
+//   - Get → 404 NotFound     → fail OPEN: a standalone controller
+//     VM has no Node object, so maintenance is unverifiable and
+//     must never freeze L1 self-heal
+//   - any other API/network error on a node that HAS a Node object
+//     → fail CLOSED: during a drain an apiserver flap must not drop
+//     the hold — that is exactly when pvc-* cleanup or pod eviction
+//     would delete state the drain still needs
 func (c *Coord) HoldLocalAction(ctx context.Context) bool {
+	v, err := c.Maintenance(ctx)
+	if err == nil {
+		return v.Active
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	return true
+}
+
+// HoldEmergencyHeal is the fail-OPEN gate for self-heal paths that
+// must never deadlock on an unreachable apiserver — controller
+// restarts, CNI recovery, kubelet nudges. It holds ONLY on
+// positively-known maintenance:
+//
+//   - a successful verdict read with Active set, or
+//   - a previously CONFIRMED MaintenanceUntil window still open
+//     (now < lastMaintUntil), or
+//   - a kured drain lock read within kuredHealTTL
+//
+// Every API failure with none of those returns false — an
+// unverifiable state is never a reason to freeze the very heals
+// that un-wedge the cluster.
+func (c *Coord) HoldEmergencyHeal(ctx context.Context) bool {
 	v, err := c.Maintenance(ctx)
 	if err == nil {
 		return v.Active
 	}
 	c.mu.Lock()
 	until := c.lastMaintUntil
-	kured := c.lastKuredLocked && c.now().Sub(c.lastKuredAt) < kuredLockTTL
+	kured := c.lastKuredLocked && c.now().Sub(c.lastKuredAt) < kuredHealTTL
 	c.mu.Unlock()
-	// A confirmed kured drain lock holds through a brief apiserver
-	// flap exactly like a confirmed maintenance window does —
-	// kuredLockTTL bounds how long the unverifiable hold lasts.
 	return kured || (!until.IsZero() && c.now().Before(until))
 }
 
@@ -296,21 +358,6 @@ func (c *Coord) stampCondition(ctx context.Context, cond StatusCondition) error 
 		return nil
 	}
 	return err
-}
-
-// parseAnnoTime reads the RFC3339 stamps the controller writes —
-// tolerant of a bare unix-seconds value for hand-set annotations.
-func parseAnnoTime(s string) (time.Time, bool) {
-	if s == "" {
-		return time.Time{}, false
-	}
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t, true
-	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, true
-	}
-	return time.Time{}, false
 }
 
 // NewKube adapts a kubernetes.Interface + node name into a Coord —

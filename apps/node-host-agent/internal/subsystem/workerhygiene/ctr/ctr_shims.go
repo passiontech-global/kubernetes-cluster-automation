@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 var (
@@ -64,13 +65,13 @@ func normalizeCtrAddr(a string) string {
 // root dir, not inside it).
 func ctrShimSockets(d *wdeps.Deps) map[string]bool {
 	out := map[string]bool{}
-	if s := normalizeCtrAddr(wdeps.HostSidePath(d.Cfg.CtrSocket)); s != "" {
+	if s := normalizeCtrAddr(fsx.HostSidePath(d.Cfg.CtrSocket)); s != "" {
 		out[s] = true
 	}
 	derived := filepath.Join(
 		filepath.Dir(filepath.Dir(filepath.Dir(d.Cfg.CtrTaskRoot))),
 		"containerd.sock")
-	if s := normalizeCtrAddr(wdeps.HostSidePath(derived)); s != "" {
+	if s := normalizeCtrAddr(fsx.HostSidePath(derived)); s != "" {
 		out[s] = true
 	}
 	return out

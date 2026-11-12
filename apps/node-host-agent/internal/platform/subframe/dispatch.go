@@ -1,10 +1,10 @@
-// Package checks is the shared ordered-check dispatcher the
-// subsystem Cycles used to hand-roll: workerhygiene's
-// initChecks-driven loop (per-check WD_SIG_<NAME> kill switch,
-// skipped checks counted cycles{check,"disabled"}) and
-// nethealth's/controllerhygiene's inline if-chains (the same kill
-// switch plus a whole-group WD_REQUIRES:uptime gate counted
-// "uptime_gate").
+// dispatch.go — the shared ordered-check dispatcher the subsystem
+// Cycles used to hand-roll (merged in from platform/checks, which
+// this package absorbed): workerhygiene's initChecks-driven loop
+// (per-check WD_SIG_<NAME> kill switch, skipped checks counted
+// cycles{check,"disabled"}) and nethealth's/controllerhygiene's
+// inline if-chains (the same kill switch plus a whole-group
+// WD_REQUIRES:uptime gate counted "uptime_gate").
 //
 // Declared check ORDER inside a Group and group order inside the
 // table are load-bearing — they preserve the shell runner's module
@@ -15,7 +15,7 @@
 // every call site.
 //
 // Platform packages stay leaf: only context + prometheus.
-package checks
+package subframe
 
 import (
 	"context"

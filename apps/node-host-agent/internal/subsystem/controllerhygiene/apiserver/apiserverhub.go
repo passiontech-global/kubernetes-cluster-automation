@@ -233,7 +233,7 @@ func (c *HubCheck) Run(ctx context.Context) {
 		// the drain did not budget for. Checked before the quorum
 		// probe so an unverifiable maintenance state fails closed
 		// without spending an API call.
-		if c.d.HoldLocalAction(ctx) {
+		if c.d.HoldEmergencyHeal(ctx) {
 			c.d.State.SuspectLog(cdeps.StateCacheWedged, fmt.Sprintf(
 				"suspect: apiserver-cache-wedged %s (%dx) but cluster maintenance in progress — holding restart",
 				wreason, gn), c.d.Cfg.SuspectLogCadence)
@@ -328,7 +328,7 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 			c.d.StreakCycles(c.d.Cfg.Sig13.SoloCycles), dn, deadFirst), c.d.Cfg.SuspectLogCadence)
 		return
 	}
-	if c.d.HoldLocalAction(ctx) {
+	if c.d.HoldEmergencyHeal(ctx) {
 		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool,
 			"suspect: apiserver dead + kine db ok but cluster maintenance in progress — holding restart",
 			c.d.Cfg.SuspectLogCadence)

@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,10 +53,10 @@ const (
 	stealEntropyPromName  = "node-agent-steal.prom"
 )
 
-// procStatCPURowRe matches the per-CPU rows of /proc/stat
-// ("cpu0".."cpuN") — the aggregate "cpu" row carries the same sums
-// already and is skipped so it never double-counts.
-var procStatCPURowRe = regexp.MustCompile(`^cpu[0-9]+$`)
+// The aggregate "cpu " row is the kernel's own sum of every cpuN
+// row — reading just it gives identical steal/total jiffies without
+// walking N per-CPU rows on every 30s latch tick (the sum used to
+// cost O(cpus × fields) parses for data the kernel already folded).
 
 // /proc/stat cpu-column order after the label: user nice system
 // idle iowait irq softirq steal guest guest_nice. The guest columns
@@ -71,25 +70,26 @@ const (
 	cpuTotalThru   = 8 // total sums columns [0,8) — guests excluded
 )
 
-// procStatCPUSums aggregates the steal and total jiffies across all
-// cpuN rows of /proc/stat. ok=false when the file is unreadable or
-// carries no usable cpu row — inconclusive evidence must not move
-// the latch (the kernelKeysUsedRatio rule).
+// procStatCPUSums reads the aggregate "cpu " row of /proc/stat —
+// the kernel's own sum across every cpuN row, so the delta math is
+// identical to summing the per-CPU rows it replaces. ok=false when
+// the file is unreadable or carries no usable cpu row —
+// inconclusive evidence must not move the latch (the
+// kernelKeysUsedRatio rule).
 func procStatCPUSums(path string) (steal, total uint64, ok bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, false
 	}
-	seen := false
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
-		if len(f) < 2 || !procStatCPURowRe.MatchString(f[0]) {
+		if len(f) < 2 || f[0] != "cpu" {
 			continue
 		}
-		// Only columns [0,cpuTotalThru) matter — a row that
-		// truncates earlier still counts what it has (steal stays
-		// 0); a row with a non-numeric field is skipped whole —
-		// never emit junk (the procfs.ReadConntrackStat rule).
+		// Only columns [0,cpuTotalThru) matter — the aggregate row
+		// that truncates earlier still counts what it has (steal
+		// stays 0); a non-numeric field is skipped whole — never
+		// emit junk (the procfs.ReadConntrackStat rule).
 		var rowSteal, rowTotal uint64
 		bad := false
 		for i := 0; i < cpuTotalThru && i < len(f)-1; i++ {
@@ -104,13 +104,11 @@ func procStatCPUSums(path string) (steal, total uint64, ok bool) {
 			}
 		}
 		if bad {
-			continue
+			return 0, 0, false
 		}
-		steal += rowSteal
-		total += rowTotal
-		seen = true
+		return rowSteal, rowTotal, true
 	}
-	return steal, total, seen
+	return 0, 0, false
 }
 
 // stealDelta is the cpu-steal jiffie-delta baseline — one slice of

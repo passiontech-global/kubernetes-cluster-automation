@@ -10,8 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // Host is the managed-file seam a converger writes through: every
@@ -71,8 +71,8 @@ func (h Host) WriteManaged(path string, content []byte, mode os.FileMode) (bool,
 	// doc; post-Sync the pages are clean, so DONTNEED drops them
 	// outright). DirSync failure now surfaces as an error (the shared
 	// core reports it; this verb used to swallow it).
-	if err := hostutil.WriteAtomic(dst, content, hostutil.AtomicOpts{
-		Stage:     hostutil.StageTempPattern(filepath.Base(dst) + ".converge.tmp-*"),
+	if err := fsx.WriteFile(dst, content, fsx.Opts{
+		Stage:     fsx.StageTempPattern(filepath.Base(dst) + ".converge.tmp-*"),
 		Mode:      mode,
 		AfterSync: pagecache.Drop,
 		DirSync:   true,

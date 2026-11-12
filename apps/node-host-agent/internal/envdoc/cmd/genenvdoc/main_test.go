@@ -80,10 +80,9 @@ func TestEmit(t *testing.T) {
 			want: "| `NODE_HOST_AGENT_ENABLE_Y` | y | `someOther(w)` |\n",
 		},
 	} {
-		got := captureStdout(t, func() {
-			emit(tc.envFlag, tc.subsystem, tc.def)
-		})
-		if got != tc.want {
+		var b strings.Builder
+		emitRow(&b, tc.envFlag, tc.subsystem, tc.def)
+		if got := b.String(); got != tc.want {
 			t.Fatalf("%s: emit row = %q want %q", name, got, tc.want)
 		}
 	}

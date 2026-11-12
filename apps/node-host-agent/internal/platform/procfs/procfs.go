@@ -21,8 +21,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // FS is a /proc filesystem view bound to one proc root.
@@ -199,9 +197,10 @@ func (f FS) Age(pid int, now time.Time) time.Duration {
 	return now.Sub(fi.ModTime())
 }
 
-// UptimeSeconds parses <root>/uptime — hostutil's shared reader.
+// UptimeSeconds parses <root>/uptime via the package-level reader
+// in sysinfo.go.
 func (f FS) UptimeSeconds() (float64, error) {
-	return hostutil.UptimeSeconds(filepath.Join(f.root, "uptime"))
+	return UptimeSeconds(filepath.Join(f.root, "uptime"))
 }
 
 // PIDAgeSeconds returns the process age in seconds — `ps -o

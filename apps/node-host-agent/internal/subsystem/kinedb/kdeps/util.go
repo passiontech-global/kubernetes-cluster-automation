@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // FirstLine returns the first non-blank trimmed line of psql -tA
@@ -181,7 +181,7 @@ func WriteIntFile(path string, v int64) {
 	// hostutil's random-suffix tmp + fsync + rename — probe and
 	// guard loops can reach the same file from different goroutines,
 	// so a fixed .tmp-<name> staging path could clobber mid-write.
-	if err := hostutil.WriteFileAtomicBytes(path,
+	if err := fsx.WriteFileAtomicBytes(path,
 		[]byte(strconv.FormatInt(v, 10)+"\n")); err != nil {
 		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 	}

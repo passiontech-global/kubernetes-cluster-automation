@@ -31,6 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/feeder"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil/hostfixture"
 )
 
 // RVResult is one scripted LIST answer (endpoint → cached → result).
@@ -39,11 +40,9 @@ type RVResult struct {
 	OK bool
 }
 
-// KillRecord is one stubbed signal delivery.
-type KillRecord struct {
-	PID int
-	Sig syscall.Signal
-}
+// KillRecord is the shared stubbed-signal record — see
+// internal/testutil/hostfixture.
+type KillRecord = hostfixture.KillRecord
 
 // Fixture is the shared test environment: tempdir host trees +
 // stubbed externals + a controllable clock. Tests are fully
@@ -146,7 +145,7 @@ func (f *Fixture) Bind(d *cdeps.Deps) {
 	d.Cfg.Clock.Set(func() time.Time { return f.Now })
 	d.Cfg.SleepFn = func(time.Duration) {}
 	d.Cfg.KillFn = func(pid int, sig syscall.Signal) error {
-		f.Kills = append(f.Kills, KillRecord{pid, sig})
+		f.Kills = append(f.Kills, KillRecord{PID: pid, Sig: sig})
 		return nil
 	}
 	// The rv LIST probe's low-level seam is the injected HTTPClient —

@@ -5,7 +5,7 @@
 package controllerhygiene
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/apiserver"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/etcd"
@@ -29,10 +29,10 @@ func (h *Hygiene) initChecks() {
 	// a frozen KCM/scheduler or a stale PKI reload must not wait
 	// out the module-22 boot grace; both probes are read-only
 	// until their own consecutive-cycle + rate budgets pass.
-	var ungated []checks.Entry
-	add := func(c cdeps.Check, entries *[]checks.Entry) {
+	var ungated []subframe.Entry
+	add := func(c cdeps.Check, entries *[]subframe.Entry) {
 		h.checks = append(h.checks, c)
-		*entries = append(*entries, checks.Entry{Name: c.Name(), Run: c.Run})
+		*entries = append(*entries, subframe.Entry{Name: c.Name(), Run: c.Run})
 	}
 	add(storelocal.NewPool(h.Deps), &ungated)
 	add(oom.NewLoop(h.Deps), &ungated)
@@ -52,13 +52,13 @@ func (h *Hygiene) initChecks() {
 
 	// Group 2 — WD_REQUIRES: uptime unit:k0scontroller — the
 	// 20min post-boot grace before the destructive wedge/TTL
-	// checks. The skip counts ONCE under checkHub — the label
+	// subframe. The skip counts ONCE under checkHub — the label
 	// the gated cycle always reported.
-	var gated []checks.Entry
+	var gated []subframe.Entry
 	add(apiserver.NewHub(h.Deps), &gated)
 	add(storelocal.NewTTL(h.Deps), &gated)
 
-	h.groups = []checks.Group{
+	h.groups = []subframe.Group{
 		{Entries: ungated},
 		{
 			GateOK:    h.uptimeOK,

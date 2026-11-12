@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sdnotify"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
@@ -34,39 +35,13 @@ const defaultRestartBudget = 90 * time.Second
 // journalctl processes cannot sd_notify back to our unit — the
 // `env -u NOTIFY_SOCKET -u WATCHDOG_PID -u WATCHDOG_USEC` fix the
 // feeder applies (systemd>=255 auto-sends EXIT_STATUS otherwise).
-// Used by the container-side exec whose env the argv form cannot
-// reach: kine_storage's sqlite3 passes the scrubbed environ through
-// hostexec.RunCombinedEnv (etcdctl needs no scrub — it goes through
-// hostexec.Run for the separate-stderr capture instead).
-// Commands routed through the shared systemd client get the argv
-// equivalent — scrubArgv.
+// The implementation lives in platform/hostexec (the runners apply
+// it natively via Config.ScrubSystemdEnv — the argv `env -u` prefix
+// it replaced cost a fork per call); kept here as the named entry
+// point the env-form callers (kine_storage's sqlite3 via
+// hostexec.RunCombinedEnv) already spell.
 func ScrubSystemdEnv(env []string) []string {
-	out := env[:0]
-	for _, e := range env {
-		if strings.HasPrefix(e, "NOTIFY_SOCKET=") ||
-			strings.HasPrefix(e, "WATCHDOG_PID=") ||
-			strings.HasPrefix(e, "WATCHDOG_USEC=") {
-			continue
-		}
-		out = append(out, e)
-	}
-	clear(env[len(out):]) // drop refs held by the filtered tail
-	return out
-}
-
-// scrubArgv prefixes name+args with `env -u NOTIFY_SOCKET -u
-// WATCHDOG_PID -u WATCHDOG_USEC --` — the ScrubSystemdEnv fix in argv
-// form, for commands routed through systemd.Client/hostexec (their
-// RunCmd seam carries no env slot). `env` resolves on the HOST inside
-// the nsenter wrap, immediately before the real binary.
-func scrubArgv(name string, args ...string) []string {
-	argv := make([]string, 0, len(args)+9)
-	argv = append(argv, "env",
-		"-u", "NOTIFY_SOCKET",
-		"-u", "WATCHDOG_PID",
-		"-u", "WATCHDOG_USEC",
-		"--", name)
-	return append(argv, args...)
+	return hostexec.ScrubSystemdEnv(env)
 }
 
 // hostExecCtxBounded runs name args... on the host through the
@@ -93,11 +68,15 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 	if sd == nil {
 		return "", errors.New("no systemd client wired")
 	}
-	argv := scrubArgv(name, args...)
+	// No argv-level env scrub here anymore: the production client
+	// is built with ScrubSystemdEnv (the runners strip
+	// NOTIFY_SOCKET/WATCHDOG_* from the child environ natively),
+	// so argv reaches the client verbatim — `env -u ... --` used to
+	// cost one extra fork per call.
 	if combined {
-		return sd.ExecCombinedBounded(ctx, budget, argv[0], argv[1:]...)
+		return sd.ExecCombinedBounded(ctx, budget, name, args...)
 	}
-	return sd.ExecBounded(ctx, budget, argv[0], argv[1:]...)
+	return sd.ExecBounded(ctx, budget, name, args...)
 }
 
 // --- named host commands over the HostExecFn seam ---
@@ -113,6 +92,15 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 // configured Coord fails closed inside nodecoord.
 func (d *Deps) HoldLocalAction(ctx context.Context) bool {
 	return d.Cfg.Coord != nil && d.Cfg.Coord.HoldLocalAction(ctx)
+}
+
+// HoldEmergencyHeal is the fail-open counterpart for controller
+// self-heal paths (apiserver/etcd/pki restarts): it holds only on
+// positively-known maintenance so an unreachable apiserver can
+// never deadlock the very heals that un-wedge the control plane.
+// Nil Coord → false.
+func (d *Deps) HoldEmergencyHeal(ctx context.Context) bool {
+	return d.Cfg.Coord != nil && d.Cfg.Coord.HoldEmergencyHeal(ctx)
 }
 
 // Restart restarts unit on the HOST systemd — `timeout 90
@@ -160,22 +148,15 @@ func (d *Deps) UnitActiveState(ctx context.Context, unit string) string {
 	return strings.TrimSpace(out)
 }
 
-// SSKill runs `ss -K sport = :6443` — kills the apiserver's hung
-// HTTP/2 watch streams in the host network namespace before a wedge
-// restart (cp-component-restart), so the restart (and the post-restart reconnect)
-// starts clean. It goes through the shared client (host ss binary +
-// host netns) rather than relying on an ss binary inside the agent
-// image — the old raw exec only worked because the pod is
-// hostNetwork AND happened to carry ss.
+// SSKill drops the apiserver's hung HTTP/2 watch streams in the
+// host network namespace before a wedge restart
+// (cp-component-restart), so the restart (and the post-restart
+// reconnect) starts clean. It rides the netlinkx SOCK_DESTROY path
+// (platform SockDestroyFn seam) — the in-process `ss -K sport =
+// :6443` replacement that needs no ss binary and no fork.
 func (d *Deps) SSKill(ctx context.Context) error {
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	out, err := d.Cfg.HostExecFn(cctx, true, 0,
-		"ss", "-K", "sport", "=", ":6443")
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
-	}
-	return nil
+	_, err := d.Cfg.SockDestroyFn(6443)
+	return err
 }
 
 // sdNotify sends msg as a datagram to the sd_notify unix socket —

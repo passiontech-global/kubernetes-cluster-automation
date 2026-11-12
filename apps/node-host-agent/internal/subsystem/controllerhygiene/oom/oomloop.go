@@ -30,8 +30,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // oomKillRe matches the `oom_kill <n>` row of cgroup v2
@@ -238,7 +238,7 @@ func (c *LoopCheck) pruneKills(killsPath string, now int64) int {
 	if len(kept) > 0 {
 		content = strings.Join(kept, "\n") + "\n"
 	}
-	if err := hostutil.WriteFileAtomic(killsPath, content); err != nil {
+	if err := fsx.WriteFileAtomic(killsPath, content); err != nil {
 		c.d.State.AppendLogWarn(fmt.Sprintf(
 			"oomloop: kills file %s rewrite failed: %v — stale entries persist",
 			killsPath, err))

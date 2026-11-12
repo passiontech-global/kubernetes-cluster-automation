@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -60,6 +61,12 @@ type Host struct {
 	// dedup key). ok=false when the fd vanished mid-walk or isn't
 	// a regular file. Seam.
 	DeletedFDStatFn func(path string) (dev, ino uint64, size int64, ok bool)
+	// LinkDelFn deletes one host-netns interface by name — the
+	// calico orphan-veth GC's `ip link delete` replacement
+	// (netlinkx.LinkDel on pid 1, the host init — same target the
+	// old systemd Exec ran in). Default the netlink call; tests
+	// record instead of touching real links.
+	LinkDelFn func(name string) error
 }
 
 func (s *Host) applyDefaults(c *Config) {
@@ -108,6 +115,11 @@ func (s *Host) applyDefaults(c *Config) {
 	}
 	if s.DeletedFDStatFn == nil {
 		s.DeletedFDStatFn = deletedFDStat
+	}
+	if s.LinkDelFn == nil {
+		s.LinkDelFn = func(name string) error {
+			return netlinkx.LinkDel(1, name)
+		}
 	}
 }
 

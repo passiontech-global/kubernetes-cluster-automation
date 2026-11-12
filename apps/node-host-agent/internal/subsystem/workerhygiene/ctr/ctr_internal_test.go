@@ -17,6 +17,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // ctrDeps builds a minimal *wdeps.Deps over the shared fixture —
@@ -128,8 +129,8 @@ func TestHostSidePath(t *testing.T) {
 		"/run/k0s/containerd.sock":      "/run/k0s/containerd.sock",
 		"/hostile/path":                 "/hostile/path", // prefix, not the mount root
 	} {
-		if got := wdeps.HostSidePath(in); got != want {
-			t.Fatalf("wdeps.HostSidePath(%q)=%q want %q", in, got, want)
+		if got := fsx.HostSidePath(in); got != want {
+			t.Fatalf("fsx.HostSidePath(%q)=%q want %q", in, got, want)
 		}
 	}
 }

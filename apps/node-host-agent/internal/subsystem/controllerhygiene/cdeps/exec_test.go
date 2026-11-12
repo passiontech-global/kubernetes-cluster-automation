@@ -39,20 +39,6 @@ func TestScrubSystemdEnv(t *testing.T) {
 	}
 }
 
-func TestScrubArgv(t *testing.T) {
-	got := scrubArgv("systemctl", "restart", "u.service")
-	want := []string{
-		"env",
-		"-u", "NOTIFY_SOCKET",
-		"-u", "WATCHDOG_PID",
-		"-u", "WATCHDOG_USEC",
-		"--", "systemctl", "restart", "u.service",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("scrubArgv=%v want %v", got, want)
-	}
-}
-
 // fakeSeams records which hostexec seam ran and with what argv.
 type fakeSeams struct {
 	runArgv  []string
@@ -97,9 +83,9 @@ func TestHostExecCtxBoundedSelectsSeam(t *testing.T) {
 	if fs.combArgv != nil {
 		t.Fatalf("combined=false ran the combined seam: %v", fs.combArgv)
 	}
-	want := scrubArgv("journalctl", "-n", "1")
+	want := []string{"journalctl", "-n", "1"}
 	if !reflect.DeepEqual(fs.runArgv, want) {
-		t.Fatalf("argv=%v want scrub-prefixed %v", fs.runArgv, want)
+		t.Fatalf("argv=%v want %v", fs.runArgv, want)
 	}
 
 	fs.combArgv = nil
@@ -109,7 +95,7 @@ func TestHostExecCtxBoundedSelectsSeam(t *testing.T) {
 		t.Fatalf("combined=true out=%q err=%v", out, err)
 	}
 	if fs.runArgv == nil || !reflect.DeepEqual(fs.combArgv,
-		scrubArgv("journalctl", "-u", "u")) {
+		[]string{"journalctl", "-u", "u"}) {
 		t.Fatalf("combined=true argv=%v", fs.combArgv)
 	}
 }
@@ -199,27 +185,29 @@ func TestDepUnitActiveState(t *testing.T) {
 }
 
 func TestDepSSKill(t *testing.T) {
-	rec := &execRecorder{}
+	var gotPort uint16
+	var calls int
+	wantErr := errors.New("sock_diag destroy: permission denied")
 	d := &Deps{Cfg: Config{}}
-	d.Cfg.HostExecFn = rec.fn
+	d.Cfg.SockDestroyFn = func(port uint16) (int, error) {
+		calls++
+		gotPort = port
+		return 0, wantErr
+	}
 
+	// The seam error surfaces verbatim — SSKill adds no wrapping.
+	if err := d.SSKill(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("SSKill err=%v want %v", err, wantErr)
+	}
+	if calls != 1 || gotPort != 6443 {
+		t.Fatalf("SockDestroyFn calls=%d port=%d, want 1 call on 6443",
+			calls, gotPort)
+	}
+
+	// Success path: the killed count is informational only.
+	d.Cfg.SockDestroyFn = func(uint16) (int, error) { return 3, nil }
 	if err := d.SSKill(context.Background()); err != nil {
 		t.Fatalf("SSKill err=%v", err)
-	}
-	if !rec.combined || rec.budget != 0 || rec.name != "ss" ||
-		!reflect.DeepEqual(rec.args, []string{"-K", "sport", "=", ":6443"}) {
-		t.Fatalf("seam call combined=%v budget=%s name=%s args=%v",
-			rec.combined, rec.budget, rec.name, rec.args)
-	}
-
-	// The error folds the trimmed output in — the killed-stream
-	// evidence lives on stdout.
-	rec.out = "Netlink error: Operation not permitted\n"
-	rec.err = errors.New("exit 1")
-	err := d.SSKill(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "exit 1") ||
-		!strings.Contains(err.Error(), "Operation not permitted") {
-		t.Fatalf("SSKill err=%v want wrapped output", err)
 	}
 }
 
@@ -250,10 +238,11 @@ func TestSdNotify(t *testing.T) {
 	}
 }
 
-// The default HostExecFn routes through hostExecCtxBounded — the
-// scrub prefix must reach the real argv (seams.go fills the closure;
-// here the transport is faked at the hostexec seam).
-func TestDefaultHostExecFnScrubsArgv(t *testing.T) {
+// The default HostExecFn routes through hostExecCtxBounded — argv
+// reaches the systemd client verbatim: the env scrub lives inside
+// the client's runners (Config.ScrubSystemdEnv), which the fake
+// transport stands in for at the exec seam.
+func TestDefaultHostExecFnPassesArgvVerbatim(t *testing.T) {
 	fs := &fakeSeams{runOut: "ok"}
 	c := Config{Base: subframe.Base{Systemd: newFakeSystemd(fs)}}
 	c.ApplyDefaults()
@@ -262,9 +251,8 @@ func TestDefaultHostExecFnScrubsArgv(t *testing.T) {
 	if err != nil || out != "ok" {
 		t.Fatalf("HostExecFn out=%q err=%v", out, err)
 	}
-	if len(fs.runArgv) < 9 || fs.runArgv[0] != "env" ||
-		fs.runArgv[1] != "-u" || fs.runArgv[7] != "--" ||
-		fs.runArgv[8] != "systemctl" {
-		t.Fatalf("argv not scrub-prefixed: %v", fs.runArgv)
+	want := []string{"systemctl", "is-active", "u"}
+	if !reflect.DeepEqual(fs.runArgv, want) {
+		t.Fatalf("argv=%v want %v", fs.runArgv, want)
 	}
 }

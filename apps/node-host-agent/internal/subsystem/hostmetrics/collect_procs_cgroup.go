@@ -14,7 +14,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -90,12 +91,12 @@ var descCgroupPids = prometheus.NewDesc(
 // files simply don't exist and no series emits.
 func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 	for _, slice := range c.cfg.CgroupPidsSlices {
-		cur, ok := hostutil.ReadUintFile(filepath.Join(
+		cur, ok := fsx.ReadUintFile(filepath.Join(
 			c.cfg.CgroupRoot, slice, "pids.current"))
 		if !ok {
 			continue
 		}
-		mx, ok := hostutil.ReadUintFile(filepath.Join(
+		mx, ok := fsx.ReadUintFile(filepath.Join(
 			c.cfg.CgroupRoot, slice, "pids.max"))
 		if !ok || mx == 0 {
 			continue
@@ -110,7 +111,7 @@ func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 //
 // mtuOfIface/jsonFindInts/runtimeConfigMTU live in
 // internal/platform/hostutil now — the same helpers workerhygiene's
-// checkCiliumMTU uses (hostutil.MTUOfIface / JSONFindInts /
+// checkCiliumMTU uses (procfs.MTUOfIface / JSONFindInts /
 // RuntimeConfigMTU).
 
 var descMTUDrift = prometheus.NewDesc(
@@ -135,16 +136,16 @@ const wgEncapOverheadBytes = 60
 // datapath or pod-veth MTU resolves; absent interfaces simply don't
 // vote.
 func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
-	neb, ok := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
+	neb, ok := procfs.MTUOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
 	if !ok {
 		return
 	}
-	cil, cilOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
+	cil, cilOK := procfs.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
 	if !cilOK {
-		cil, cilOK = hostutil.RuntimeConfigMTU(c.cfg.CiliumRuntimeConfig)
+		cil, cilOK = procfs.RuntimeConfigMTU(c.cfg.CiliumRuntimeConfig)
 	}
-	wg, wgOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
-	lxcMax, lxcOK := hostutil.MaxPodLxcMTU(c.cfg.SysClassNet)
+	wg, wgOK := procfs.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
+	lxcMax, lxcOK := procfs.MaxPodLxcMTU(c.cfg.SysClassNet)
 	if !cilOK && !wgOK && !lxcOK {
 		return
 	}

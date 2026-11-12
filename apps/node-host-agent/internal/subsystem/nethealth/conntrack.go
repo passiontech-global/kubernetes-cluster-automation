@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -43,8 +43,8 @@ const (
 // can't flap it. Missing /proc entries mean the module isn't loaded
 // → no table to pressure, drop any stale latch.
 func (n *NetHealth) checkConntrack(ctx context.Context) {
-	usedStr := hostutil.ReadTrimmed(n.cfg.ConntrackCountFile)
-	maxStr := hostutil.ReadTrimmed(n.cfg.ConntrackMaxFile)
+	usedStr := fsx.ReadTrimmed(n.cfg.ConntrackCountFile)
+	maxStr := fsx.ReadTrimmed(n.cfg.ConntrackMaxFile)
 	if usedStr == "" || maxStr == "" {
 		n.stateExit(latchdefs.LatchConntrackPressure)
 		n.cycles.WithLabelValues(checkCT, "gated").Inc()

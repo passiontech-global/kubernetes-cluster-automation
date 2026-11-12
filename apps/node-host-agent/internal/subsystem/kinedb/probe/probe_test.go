@@ -198,7 +198,7 @@ func TestProbeCycleAllOK(t *testing.T) {
 
 func TestProbeCycleFailures(t *testing.T) {
 	k, _, dir := fixture(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "SHOW POOLS", Out: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
 		{Substr: "logs --since", Out: "server_login_retry\npassword authentication failed\n"},
 		{Substr: "MAX(id)", Out: "1000|200|290\n"},
@@ -233,7 +233,7 @@ func TestProbeCycleFailures(t *testing.T) {
 // evaluate while every cred-needing check stays 0.
 func TestProbeCycleLogScanWithoutCreds(t *testing.T) {
 	k, fr, _ := fixture(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "logs --since", Out: "all quiet"},
 	})
 	if err := os.Remove(k.d.Cfg.EnvFile); err != nil {
@@ -273,18 +273,24 @@ func TestProbeCycleContainersDown(t *testing.T) {
 	}
 }
 
-// TestProbeLogScanQuoting: the log scan is the one place a configured
-// name reaches a `sh -c` STRING — the runtime and container words
-// must be single-quoted so a space/metachar cannot split or glob.
-func TestProbeLogScanQuoting(t *testing.T) {
+// TestProbeLogScanArgv: the log scan runs `logs` argv-direct through
+// the combined seam — no sh -c means the configured runtime and
+// container names reach the exec verbatim, metachars and all (the
+// quoting hazard the old shell string carried is gone by
+// construction).
+func TestProbeLogScanArgv(t *testing.T) {
 	k, fr, _ := fixture(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "logs --since", Out: "all quiet"},
 	})
 	k.Cycle(context.Background())
 	if !strings.Contains(fr.Joined(),
-		"'podman' logs --since 301s 'kine-pgbouncer' 2>&1") {
-		t.Fatalf("log scan argv unquoted:\n%s", fr.Joined())
+		"podman logs --since 301s kine-pgbouncer") {
+		t.Fatalf("log scan argv not direct:\n%s", fr.Joined())
+	}
+	if strings.Contains(fr.Joined(), "2>&1") ||
+		strings.Contains(fr.Joined(), "sh -c") {
+		t.Fatalf("log scan still shells out:\n%s", fr.Joined())
 	}
 }
 
@@ -293,7 +299,7 @@ func TestProbeLogScanQuoting(t *testing.T) {
 // the failure is noted — a scan failure must not read as a clean log.
 func TestProbeLogScanFailure(t *testing.T) {
 	k, _, _ := fixture(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "logs --since", Err: errors.New("container gone")},
 	})
 	res := k.Cycle(context.Background())
@@ -391,7 +397,7 @@ func TestPGWireProbeReset(t *testing.T) {
 // zero their checks — the probe reads failed, not clean.
 func TestProbeCyclePoolAndRevisionQueryFail(t *testing.T) {
 	k, _, _ := fixture(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "SHOW POOLS", Err: errors.New("console unreachable")},
 		// The fallback psql (stats_users from pgbouncer.ini) fails too.
 		{Substr: "userlist.txt", Err: errors.New("no such file")},

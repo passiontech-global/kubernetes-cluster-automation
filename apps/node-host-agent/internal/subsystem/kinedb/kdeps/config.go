@@ -187,6 +187,12 @@ type Config struct {
 	// Run is the command seam — see Runner. The domain loops reach
 	// it through the Deps.Exec* helpers, never directly.
 	Run Runner
+	// RunCombined is Run's stderr-folding sibling — the `2>&1` the
+	// pgbouncer log scan needs (pgbouncer logs on its stderr stream,
+	// which Run deliberately keeps out of the returned output). nil
+	// selects the real hostexec.RunCombinedEnv; stdin is unused
+	// (no combined caller feeds a script).
+	RunCombined Runner
 	// WireFn is the pgbouncer wire-probe seam — the probe package
 	// fills the Go-native PG v3 StartupMessage default lazily
 	// (the wire probe is probe-domain logic; keeping the default
@@ -320,6 +326,11 @@ func (c *Config) ApplyDefaults() error {
 					"cmd", argv[0], "stderr", serr)
 			}
 			return out, err
+		}
+	}
+	if c.RunCombined == nil {
+		c.RunCombined = func(ctx context.Context, env, argv []string, _ string) (string, error) {
+			return hostexec.RunCombinedEnv(ctx, env, argv...)
 		}
 	}
 	if c.StatFSFn == nil {

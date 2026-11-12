@@ -36,9 +36,33 @@ type Looper interface {
 func RunAll(ctx context.Context, loops ...Looper) {
 	var wg sync.WaitGroup
 	stops := make([]func(), 0, len(loops))
+	var detaches []func()
+	defer func() {
+		for _, d := range detaches {
+			d()
+		}
+	}()
 	for _, l := range loops {
+		// *Runner loops register their own named beats in whatever
+		// registry the ctx carries — the subsystem's shared one is
+		// correct for them. Every OTHER Looper gets a child
+		// Liveness attached for the RunAll lifetime: its bare
+		// Heartbeat(ctx) calls stamp the child's fallback beat, so
+		// a fast custom loop can never keep the shared fallback
+		// fresh while a slow sibling wedges (and vice versa —
+		// /healthz judges each scope on its own stamps). The
+		// detach defer keeps restarted Runs from leaking dead
+		// registries whose stale beats would false-positive.
+		lctx := ctx
+		if _, isRunner := l.(*Runner); !isRunner {
+			child := NewLiveness()
+			if parent := LivenessFrom(ctx); parent != nil {
+				detaches = append(detaches, parent.Attach(child))
+			}
+			lctx = WithLiveness(ctx, child)
+		}
 		wg.Add(1)
-		stops = append(stops, Spawn(ctx, l.Name(),
+		stops = append(stops, Spawn(lctx, l.Name(),
 			func(cctx context.Context) {
 				defer wg.Done()
 				l.Run(cctx)

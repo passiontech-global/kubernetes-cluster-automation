@@ -18,7 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -106,7 +106,7 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 	}
 	daysContent := strconv.FormatInt(days, 10) + "\n"
 	if cur, err := os.ReadFile(daysPath); err != nil || string(cur) != daysContent {
-		if err := hostutil.WriteFileAtomic(daysPath, daysContent); err != nil {
+		if err := fsx.WriteFileAtomic(daysPath, daysContent); err != nil {
 			logger().Debug("hostmetrics: nebula-cert-days-left write failed",
 				"path", daysPath, "error", err)
 		}

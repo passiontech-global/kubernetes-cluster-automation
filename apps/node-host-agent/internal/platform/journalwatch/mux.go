@@ -80,6 +80,12 @@ type Multiplexer struct {
 	subs       map[string]*muxSub
 	fetchErr   error // last fetch error, surfaced to Poll callers
 	fetchCount int
+	// fetchMu serializes the journalctl exec OUTSIDE m.mu — the
+	// subprocess can run for seconds and must not stall Subscribe,
+	// Cursor or every other subscriber's queue drain. State
+	// (staleness check + commit) stays on m.mu; only the exec
+	// window is lock-free.
+	fetchMu sync.Mutex
 }
 
 type muxSub struct {
@@ -146,40 +152,67 @@ func (m *Multiplexer) Subscribe(id string, match MatchFunc) error {
 // next Poll retries the identical window.
 func (m *Multiplexer) Poll(ctx context.Context, id string) ([]Entry, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	sub, ok := m.subs[id]
 	if !ok {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("journalwatch: unknown subscriber %q", id)
 	}
 	if m.Exec == nil {
+		m.mu.Unlock()
 		return nil, errors.New("journalwatch: nil Exec")
 	}
-	if m.cursor == "" || m.pollEvery() == 0 ||
-		m.now().Sub(m.lastFetch) >= m.pollEvery() {
-		if err := m.fetchLocked(ctx); err != nil {
+	needFetch := m.cursor == "" || m.pollEvery() == 0 ||
+		m.now().Sub(m.lastFetch) >= m.pollEvery()
+	m.mu.Unlock()
+
+	if needFetch {
+		// The journalctl exec runs outside m.mu (fetchMu
+		// serializes concurrent fetchers) so a slow read never
+		// stalls Subscribe/Cursor/other drains.
+		if err := m.maybeFetch(ctx); err != nil {
 			return nil, err
 		}
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	out := sub.pending
 	sub.pending = nil
 	return out, nil
 }
 
-// fetchLocked runs one journalctl read for the whole journal and
-// fans the decoded entries out to every subscriber's pending
-// queue. Caller holds m.mu — the exec is deliberately serialized:
-// journalctl reads are cheap when cursor-bounded, and parallel
-// fetches would race the shared cursor anyway.
-func (m *Multiplexer) fetchLocked(ctx context.Context) error {
+// maybeFetch runs one shared journalctl read when the window is
+// still stale — the staleness re-check inside fetchMu means a
+// Poll that queued behind another fetcher's exec does not
+// double-read. The mutex is held only for the state check and the
+// commit; the subprocess itself runs unlocked.
+func (m *Multiplexer) maybeFetch(ctx context.Context) error {
+	m.fetchMu.Lock()
+	defer m.fetchMu.Unlock()
+
+	m.mu.Lock()
+	if m.cursor != "" && m.pollEvery() != 0 &&
+		m.now().Sub(m.lastFetch) < m.pollEvery() {
+		m.mu.Unlock()
+		return nil // another fetcher refreshed the window
+	}
 	var cursor = m.cursor
-	entries, err := Fetch(ctx, m.Exec, m.now(), m.lookback(), &cursor, m.Args...)
+	now := m.now()
+	m.mu.Unlock()
+
+	entries, err := Fetch(ctx, m.Exec, now, m.lookback(), &cursor, m.Args...)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err != nil {
 		m.fetchErr = err
 		return err
 	}
 	// cursor advanced inside Fetch through the last COMPLETE line;
 	// committing it here (not before) keeps a mid-parse failure
-	// from losing the window.
+	// from losing the window. lastFetch updates on EVERY successful
+	// read — an empty journal window is still a fresh fetch and
+	// must not re-exec journalctl on every Poll.
 	m.cursor = cursor
 	m.lastFetch = m.now()
 	m.fetchCount++

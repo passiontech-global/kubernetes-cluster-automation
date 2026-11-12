@@ -705,15 +705,21 @@ func TestScopesRunSweepAndReset(t *testing.T) {
 		t.Fatalf("failed sweeps must not stamp the scan interval, ran %dx", n)
 	}
 
-	// Successful sweep with failed scopes → reset-failed ACTION.
-	f.SDReply["state=failed"] =
+	// Successful sweep with failed scopes → per-unit reset-failed
+	// ACTIONs (the shared list-units reply feeds all three state
+	// filters; only the failed rows survive scopeNamesInState).
+	f.SDReply["cri-containerd-*.scope"] =
 		"cri-containerd-abc.scope loaded failed failed\n" +
 			"cri-containerd-def.scope loaded failed failed\n" +
 			"noise.service loaded failed failed\n"
 	f.SDReply["reset-failed"] = ""
 	c.Run(ctx, e)
-	if !f.SDRan("reset-failed cri-containerd-*.scope") {
+	if !f.SDRan("reset-failed cri-containerd-abc.scope") ||
+		!f.SDRan("reset-failed cri-containerd-def.scope") {
 		t.Fatal("failed scopes must be reset via systemctl reset-failed")
+	}
+	if f.SDRan("reset-failed noise.service") {
+		t.Fatal("non-.scope unit must not be reset-failed")
 	}
 	if log := f.LogLines(t); !strings.Contains(log,
 		"ACTION: systemd-scopes reset-failed count=2") {
@@ -734,21 +740,24 @@ func TestScopesRunSweepAndReset(t *testing.T) {
 	}
 
 	// reset-failed failing is logged as suspect, never counted.
-	f.SDReply["state=failed"] = "cri-containerd-xyz.scope loaded failed failed\n"
+	f.SDReply["cri-containerd-*.scope"] =
+		"cri-containerd-xyz.scope loaded failed failed\n"
 	delete(f.SDReply, "reset-failed")
 	f.Now = f.Now.Add(time.Hour)
 	c.Run(ctx, e)
 	if log := f.LogLines(t); !strings.Contains(log,
-		"reset-failed failed: ") {
+		"reset-failed cri-containerd-xyz.scope failed: ") {
 		t.Fatalf("want reset-failed failure line, log=%q", log)
 	}
 }
 
-// countSD counts recorded systemd argvs containing sub.
+// countSD counts recorded systemd argvs containing sub — one
+// list-units exec per scopes sweep now feeds all three state
+// filters, so the count is sweeps, not per-state queries.
 func countSD(f *wdepstest.Fixture, sub string) int {
 	n := 0
 	for _, argv := range f.SDCmds {
-		if strings.Contains(strings.Join(argv, " "), "state=failed") {
+		if strings.Contains(strings.Join(argv, " "), sub) {
 			n++
 		}
 	}

@@ -5,6 +5,7 @@
 package probee
 
 import (
+	"context"
 	"io"
 	"net"
 	"strings"
@@ -16,10 +17,11 @@ import (
 // deadline — the node-local-dns :53 datapath probe. Any reply
 // matching the query id with the QR bit set proves the listener is
 // alive: NXDOMAIN/SERVFAIL still mean the server answers; silence
-// means the datapath is wedged.
+// means the datapath is wedged. ctx bounds the dial; timeout still
+// bounds the whole exchange via the conn deadline.
 //
 // Mirrors workerhygiene.probeDNSUDP (cilium.go).
-func DNSQuery(addr, name string, timeout time.Duration) bool {
+func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	id := uint16(time.Now().UnixNano())
 	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
 	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
@@ -31,7 +33,8 @@ func DNSQuery(addr, name string, timeout time.Duration) bool {
 		q = append(q, label...)
 	}
 	q = append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
-	conn, err := net.DialTimeout("udp", addr, timeout)
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "udp", addr)
 	if err != nil {
 		return false
 	}
@@ -55,8 +58,9 @@ func DNSQuery(addr, name string, timeout time.Duration) bool {
 // fallback every large SRV/A response depends on — so a node whose
 // UDP probe passes can still blackhole headless-StatefulSet lookups.
 // The reply check reads the length-prefixed frame and applies the
-// same id/QR-bit contract.
-func DNSQueryTCP(addr, name string, timeout time.Duration) bool {
+// same id/QR-bit contract. ctx bounds the dial; timeout still
+// bounds the whole exchange via the conn deadline.
+func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	id := uint16(time.Now().UnixNano())
 	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
 	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
@@ -71,7 +75,8 @@ func DNSQueryTCP(addr, name string, timeout time.Duration) bool {
 	// TCP framing: 2-byte big-endian length prefix on both directions.
 	frame := []byte{byte(len(q) >> 8), byte(len(q))}
 	frame = append(frame, q...)
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return false
 	}

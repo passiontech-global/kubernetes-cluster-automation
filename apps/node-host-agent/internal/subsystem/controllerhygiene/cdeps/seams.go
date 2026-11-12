@@ -30,6 +30,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/etcdmaint"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -83,7 +84,14 @@ type Host struct {
 	// `env -u NOTIFY_SOCKET -u WATCHDOG_* --` scrub.
 	HostExecFn func(ctx context.Context, combined bool,
 		budget time.Duration, name string, args ...string) (string, error)
-	NotifyFn func(msg string) error
+	// SockDestroyFn kills TCP listeners on a port in the host
+	// netns — the netlinkx SOCK_DESTROY path that replaced the
+	// `ss -K` fork (no ss binary needed in the agent image). nil →
+	// netlinkx.DestroyListenersOnPort(1, port): pid 1 is host init
+	// under hostPID:true in the DaemonSet and plain /proc
+	// standalone.
+	SockDestroyFn func(port uint16) (int, error)
+	NotifyFn      func(msg string) error
 	// StatFSFn returns (free, total) bytes of the filesystem holding
 	// path — the etcdguard pre-maintenance snapshot headroom gate
 	// reads it (the kine backup verifier has the same gate shape over
@@ -154,6 +162,11 @@ func (s *Seams) applyDefaults(c *Config) {
 			budget time.Duration, name string, args ...string) (string, error) {
 			return hostExecCtxBounded(ctx, sd, combined, budget,
 				name, args...)
+		}
+	}
+	if s.SockDestroyFn == nil {
+		s.SockDestroyFn = func(port uint16) (int, error) {
+			return netlinkx.DestroyListenersOnPort(1, port)
 		}
 	}
 	if s.PgWireFn == nil {

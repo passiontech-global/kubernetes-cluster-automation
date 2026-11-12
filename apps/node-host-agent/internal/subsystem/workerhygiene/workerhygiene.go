@@ -45,13 +45,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
@@ -77,7 +75,7 @@ type Hygiene struct {
 	*wdeps.Deps
 
 	// envCell is the per-cycle CycleEnv cell the dispatch entries
-	// read through: initChecks builds the checks.Entry table ONCE
+	// read through: initChecks builds the subframe.Entry table ONCE
 	// (each Run closes over this cell, not a per-cycle env) and
 	// Cycle assigns a fresh CycleEnv into it each round. Dispatch
 	// runs synchronously in the Cycle goroutine and no check
@@ -92,11 +90,11 @@ type Hygiene struct {
 	checks []wdeps.Check
 
 	// groups is the static dispatch table initChecks builds once —
-	// a single UNGATED checks.Group (the unit-file and uptime gates
+	// a single UNGATED subframe.Group (the unit-file and uptime gates
 	// return early in Cycle and workerActive gates inside each
 	// check, so nothing maps onto Group.GateOK). Entry order IS
 	// checks order — load-bearing.
-	groups []checks.Group
+	groups []subframe.Group
 
 	// feeder is the T15 kubelet watchdog feeder — not a Check (it
 	// runs on its own faster ticker Spawned from Run, outside the
@@ -266,14 +264,14 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		h.Cycles.WithLabelValues("all", "uptime_gate").Inc()
 		return
 	}
-	// One LIST feeds teardown + konnectivity-pod-lookup + dns checks.
+	// One LIST feeds teardown + konnectivity-pod-lookup + dns subframe.
 	// The field selector is still sent (production pre-filter) but the
 	// node match is re-checked per pod — the fake clientset ignores
 	// selectors, and a wrong match is a wrong kill.
 	pods, apiOK := h.listNodePods(ctx)
 	// The containerd task map reads EVERY task dir's config.json —
 	// build it lazily, at most once per cycle, shared between the
-	// teardown, stall and dns checks. Most cycles neither needs it (no
+	// teardown, stall and dns subframe. Most cycles neither needs it (no
 	// pod Terminating, no dns-pod running) so it stays unbuilt. The
 	// second return is the root-reachability flag: false = a task
 	// root could not be listed, so "zero live tasks" verdicts are
@@ -324,20 +322,21 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		if !journalSet {
 			journalSet = true
 			j, err := h.Cfg.Seams.Host.JournalFn(ctx)
-			switch {
-			case err != nil:
+			// Shared blindness classes (journalwatch.ClassifyRead);
+			// the detail strings stay this check's own spelling.
+			switch class, _ := journalwatch.ClassifyRead(j, err); class {
+			case journalwatch.ClassFailed:
 				h.State.AppendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
 				h.NoteJournalRead(false,
 					fmt.Sprintf("snapshot failed: %v", err))
-			case journalwatch.FilesGone(j):
+			case journalwatch.ClassFilesGone:
 				h.NoteJournalRead(false,
 					"journalctl reports no journal files")
-			case strings.TrimSpace(j) != "":
+			case journalwatch.ClassOK:
 				h.NoteJournalRead(true, "")
-				// err==nil && empty: a quiet 10m window is
-				// ambiguous (A5's unfiltered probe owns the
-				// disambiguation) — it neither counts the
-				// streak nor clears it.
+				// ClassEmpty: a quiet 10m window is ambiguous
+				// (A5's unfiltered probe owns the disambiguation)
+				// — it neither counts the streak nor clears it.
 			}
 			journal = j
 		}
@@ -375,7 +374,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// flag is reset before any check runs.
 	h.CiliumAgentKilled = false
 	// The dispatch table is static — initChecks built the
-	// checks.Entry slice once and each Run reads the env through
+	// subframe.Entry slice once and each Run reads the env through
 	// h.envCell, so Cycle only refreshes the cell's contents: the
 	// pod LIST, the workerActive gate and the lazy once-per-cycle
 	// snapshots. Each once-closure still captures THIS cycle's
@@ -429,7 +428,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		StatsOnce:    statsOnce,
 		WalkOnce:     walkOnce,
 	}
-	checks.Dispatch(ctx, sigOn, h.Cycles, h.groups)
+	subframe.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// node_agent_* gauges — one textfile per cycle carrying the
 	// OOM/conntrack counters and the orphan-hostpath measurements
 	// the checks above just refreshed.

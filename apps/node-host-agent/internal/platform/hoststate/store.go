@@ -14,7 +14,7 @@ import (
 	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -222,7 +222,7 @@ func (s *Store) enterLocked(name string) bool {
 		// Touch only once the mtime ages past LatchTouchMinInterval —
 		// the janitor reaps at 24h, so a per-cycle utimensat was
 		// ~2,800 needless syscalls/day per held latch.
-		if cerr := hostutil.TouchIfDue(p, fi, now,
+		if cerr := fsx.TouchIfDue(p, fi, now,
 			latchdefs.LatchTouchMinInterval); cerr != nil {
 			s.log().Debug("state latch touch failed",
 				"state", name, "path", p, "error", cerr)
@@ -329,7 +329,7 @@ func (s *Store) seedOwnersLocked(name string) map[string]bool {
 // ctr-tasks entered for an unkillable orphan shim inside the same
 // Cycle. The owner set is process-local: a producer re-registers
 // its hold every cycle, so the dispatch order inside a Cycle
-// (load-bearing, checks.Group) repopulates it before any ExitFrom
+// (load-bearing, subframe.Group) repopulates it before any ExitFrom
 // can observe a stale empty set.
 //
 // Post-restart: when the file already exists but this process has

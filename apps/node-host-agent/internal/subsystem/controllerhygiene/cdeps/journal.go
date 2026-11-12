@@ -77,12 +77,11 @@ func (d *Deps) JournalText(ctx context.Context, since time.Time) string {
 // window was a quiet unit, while an error, a files-gone notice or
 // literally zero bytes is journald-level blindness.
 func (d *Deps) classifyJournalRead(ctx context.Context, out string, err error) (bool, string) {
-	switch {
-	case err != nil:
-		return false, fmt.Sprintf("read failed: %v", err)
-	case journalwatch.FilesGone(out):
-		return false, "journalctl reports no journal files"
-	case strings.TrimSpace(out) == "":
+	class, detail := journalwatch.ClassifyRead(out, err)
+	switch class {
+	case journalwatch.ClassFailed, journalwatch.ClassFilesGone:
+		return false, detail
+	case journalwatch.ClassEmpty:
 		uout, uerr := d.journalAnyRead(ctx)
 		switch {
 		case uerr != nil:

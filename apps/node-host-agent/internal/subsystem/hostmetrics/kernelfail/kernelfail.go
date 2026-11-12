@@ -151,6 +151,12 @@ type Runner struct {
 	kscan kernelScanState // kmsg.go — tail session + OOM pairing
 	steal stealDelta      // steal_entropy.go — jiffie baseline
 	warp  clockWarpState  // clockskew.go — wall-clock jump detector
+	// nvmeCLI is the cached `nvme smart-log` fallback result
+	// (diskprefail.go) — the per-controller fork runs at most once
+	// per nvmeCLITTL instead of every 30s latch tick. Only the
+	// ticker goroutine touches it, like every other Runner field.
+	nvmeCLI   []nvmeSmart
+	nvmeCLIAt time.Time
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector

@@ -38,6 +38,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
@@ -71,6 +72,12 @@ const (
 	// endu_grp_crit_warn_sumry@6, rsvd7[25]@7, 6×16-byte counters
 	// @32.., unsafe_shutdowns@144, media_errors@160).
 	nvmeMediaErrorsOffset = 160
+	// nvmeCLITTL bounds how long the `nvme smart-log` fallback
+	// result stands before the next probe — SMART wear counters
+	// move on a timescale of days, so 10 minutes of staleness is
+	// invisible next to the detection latency the latch already
+	// carries.
+	nvmeCLITTL = 10 * time.Minute
 )
 
 // nvmeCliRe parses the `nvme smart-log` text the fallback gets from
@@ -199,7 +206,18 @@ func (r *Runner) nvmeSmartPages(ctx context.Context) []nvmeSmart {
 	// in the controller-class glob ("/sys/class/nvme/nvme*"), so
 	// globbing IT lists the controllers whose attribute the kernel
 	// never shipped — probe those with nvme-cli.
+	//
+	// The probe forks one `nvme smart-log` per controller; SMART
+	// counters move on the order of days, so the result is cached
+	// for nvmeCLITTL — the 30s latch tick must not pay a fork storm
+	// for a signal that cannot have changed. An empty (but probed)
+	// result caches too: "no nvme-cli installed" is just as stable.
+	if !r.nvmeCLIAt.IsZero() &&
+		time.Since(r.nvmeCLIAt) < nvmeCLITTL {
+		return r.nvmeCLI
+	}
 	ctrlDirs, _ := filepath.Glob(filepath.Dir(r.deps.NVMeSmartGlob))
+	out = out[:0]
 	for _, dir := range ctrlDirs {
 		ctrl := filepath.Base(dir)
 		outBytes, err := r.deps.RunHostCmd(ctx,
@@ -213,6 +231,7 @@ func (r *Runner) nvmeSmartPages(ctx context.Context) []nvmeSmart {
 			out = append(out, s)
 		}
 	}
+	r.nvmeCLI, r.nvmeCLIAt = out, time.Now()
 	return out
 }
 

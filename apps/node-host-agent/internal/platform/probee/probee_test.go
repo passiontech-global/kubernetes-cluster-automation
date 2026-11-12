@@ -257,16 +257,16 @@ func udpDNSFake(t *testing.T, qr bool) (addr string) {
 }
 
 func TestDNSQuery(t *testing.T) {
-	if !DNSQuery(udpDNSFake(t, true), "kubernetes.default.svc.cluster.local",
+	if !DNSQuery(context.Background(), udpDNSFake(t, true), "kubernetes.default.svc.cluster.local",
 		2*time.Second) {
 		t.Fatal("DNSQuery: responding listener reported false")
 	}
 	// A datagram echo without the QR bit is a query, not a response.
-	if DNSQuery(udpDNSFake(t, false), "example.test", 2*time.Second) {
+	if DNSQuery(context.Background(), udpDNSFake(t, false), "example.test", 2*time.Second) {
 		t.Fatal("DNSQuery: QR-less echo reported true")
 	}
 	// Silence (nothing answering) must fail — the wedge verdict.
-	if DNSQuery("127.0.0.1:1", "example.test", 300*time.Millisecond) {
+	if DNSQuery(context.Background(), "127.0.0.1:1", "example.test", 300*time.Millisecond) {
 		t.Fatal("DNSQuery: dead listener reported true")
 	}
 }
@@ -337,33 +337,33 @@ func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 
 func TestDNSQueryTCP(t *testing.T) {
 	name := "kubernetes.default.svc.cluster.local"
-	if !DNSQueryTCP(tcpDNSFake(t, true, ""), name, 2*time.Second) {
+	if !DNSQueryTCP(context.Background(), tcpDNSFake(t, true, ""), name, 2*time.Second) {
 		t.Fatal("DNSQueryTCP: responding listener reported false")
 	}
 	// A length-prefixed echo without the QR bit is a query, not a
 	// response — same contract as the UDP probe.
-	if DNSQueryTCP(tcpDNSFake(t, false, ""), name, 2*time.Second) {
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, false, ""), name, 2*time.Second) {
 		t.Fatal("DNSQueryTCP: QR-less echo reported true")
 	}
 	// An echoed frame with a different id is a stray datagram.
-	if DNSQueryTCP(tcpDNSFake(t, true, "wrongid"), name, 2*time.Second) {
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, true, "wrongid"), name, 2*time.Second) {
 		t.Fatal("DNSQueryTCP: wrong-id reply reported true")
 	}
 	// An out-of-range length prefix is rejected before the body
 	// read — a malformed peer must not wedge the probe.
-	if DNSQueryTCP(tcpDNSFake(t, true, "badlen"), name, 2*time.Second) {
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, true, "badlen"), name, 2*time.Second) {
 		t.Fatal("DNSQueryTCP: oversized length prefix reported true")
 	}
 	// A truncated frame fails the exact-length read.
-	if DNSQueryTCP(tcpDNSFake(t, true, "short"), name, 2*time.Second) {
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, true, "short"), name, 2*time.Second) {
 		t.Fatal("DNSQueryTCP: truncated frame reported true")
 	}
 	// A listener that accepts but never answers hits the deadline.
-	if DNSQueryTCP(tcpDNSFake(t, true, "silent"), name, 300*time.Millisecond) {
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, true, "silent"), name, 300*time.Millisecond) {
 		t.Fatal("DNSQueryTCP: silent listener reported true")
 	}
 	// Nothing listening at all — the wedge verdict.
-	if DNSQueryTCP("127.0.0.1:1", name, 300*time.Millisecond) {
+	if DNSQueryTCP(context.Background(), "127.0.0.1:1", name, 300*time.Millisecond) {
 		t.Fatal("DNSQueryTCP: dead listener reported true")
 	}
 }

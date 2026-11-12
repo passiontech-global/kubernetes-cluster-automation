@@ -19,6 +19,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 var (
@@ -394,7 +395,7 @@ func (c *CtrTasksCheck) lazyUnmountRootfs(ctx context.Context, d, id string) {
 	if _, err := os.Stat(rootfs); err != nil {
 		return // not mounted (or already gone) — nothing to unmount
 	}
-	host := wdeps.HostSidePath(rootfs)
+	host := fsx.HostSidePath(rootfs)
 	if c.d.Cfg.Systemd == nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-tasks rootfs %s of task %.12s still mounted but no systemd client — skip umount",

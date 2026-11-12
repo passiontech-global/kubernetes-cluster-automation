@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -71,8 +72,8 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
 		return
 	}
-	hostTaskRoot := wdeps.HostSidePath(c.d.Cfg.CtrTaskRoot)
-	hostPodsDir := wdeps.HostSidePath(c.d.Cfg.PodsDir)
+	hostTaskRoot := fsx.HostSidePath(c.d.Cfg.CtrTaskRoot)
+	hostPodsDir := fsx.HostSidePath(c.d.Cfg.PodsDir)
 
 	// podByUID only counts when the apiserver answered — an
 	// inconclusive LIST must never rehome a mounted volume

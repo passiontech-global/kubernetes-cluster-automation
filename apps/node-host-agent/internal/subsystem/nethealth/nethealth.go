@@ -54,10 +54,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/nebula"
 )
@@ -117,7 +116,7 @@ type NetHealth struct {
 	// fills it; the order + the uptime-gated first group preserve
 	// the shell runner's module order (20/21 alone carried
 	// WD_REQUIRES:uptime).
-	groups []checks.Group
+	groups []subframe.Group
 
 	// routeGuardRunning keeps the route guard single-flight while
 	// still allowing a respawn: set when the goroutine spawns,
@@ -191,16 +190,16 @@ func (n *NetHealth) Run(ctx context.Context) {
 // like the shell runner. Each entry's Name is the check* constant —
 // the prometheus `check` label AND the WD_SIG_<NAME> key.
 func (n *NetHealth) initChecks() {
-	n.groups = []checks.Group{
+	n.groups = []subframe.Group{
 		{
 			GateOK: n.uptimeOK,
-			Entries: []checks.Entry{
+			Entries: []subframe.Entry{
 				{Name: checkDNSFB, Run: n.checkDNSFallback},
 				{Name: checkCoreDNS, Run: n.checkCoreDNSStub},
 			},
 		},
 		{
-			Entries: []checks.Entry{
+			Entries: []subframe.Entry{
 				{Name: checkEgress, Run: n.checkOverlayEgress},
 				{Name: checkNebula, Run: n.checkNebulaHealth},
 				{Name: checkF2B, Run: n.checkFail2ban},
@@ -216,7 +215,7 @@ func (n *NetHealth) initChecks() {
 // error opens it (the shell's `[ $UP -lt $MIN ]` test on an empty
 // UPTIME failed the same way: the modules ran).
 func (n *NetHealth) uptimeOK() bool {
-	up, err := hostutil.UptimeSeconds(n.cfg.UptimeFile)
+	up, err := procfs.UptimeSeconds(n.cfg.UptimeFile)
 	return err != nil || up >= minUptimeSeconds
 }
 
@@ -236,5 +235,5 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	// routes them through the mutexed reloader instead
 	// (workerhygiene's feederWatchdogConf parity).
 	_, sigOn := n.cfg.BeginCycle()
-	checks.Dispatch(ctx, sigOn, n.cycles, n.groups)
+	subframe.Dispatch(ctx, sigOn, n.cycles, n.groups)
 }

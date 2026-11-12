@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // backendState tracks per-backend consecutive-cycle counters — the
@@ -143,7 +143,7 @@ func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	// NoSync: the gap file is rewritten every cycle and re-read by
 	// prom_emit — durability buys nothing a crash couldn't recover
 	// next cycle, while the fsync pair fired every 30s per backend.
-	if err := hostutil.WriteFileAtomicNoSync(f, content); err != nil {
+	if err := fsx.WriteFileAtomicNoSync(f, content); err != nil {
 		logger().Warn("watchdog gap file write failed",
 			"file", f, "backend", b.Name, "error", err,
 		)
@@ -173,14 +173,14 @@ func (p *Prober) latchStale(dir string, b backend) {
 		now := time.Now()
 		// Touch only once the mtime ages past LatchTouchMinInterval —
 		// the janitor reaps at 24h; per-cycle utimensat was needless.
-		if cerr := hostutil.TouchIfDue(f, fi, now,
+		if cerr := fsx.TouchIfDue(f, fi, now,
 			latchdefs.LatchTouchMinInterval); cerr != nil {
 			logger().Debug("watchdog stale latch touch failed",
 				"file", f, "backend", b.Name, "error", cerr)
 		}
 		return
 	}
-	if err := hostutil.WriteFileAtomicBytes(f,
+	if err := fsx.WriteFileAtomicBytes(f,
 		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
 		logger().Warn("watchdog stale latch write failed",
 			"file", f, "backend", b.Name, "error", err,
@@ -393,7 +393,7 @@ func readStateInt(path string) (int64, bool) {
 // tmp+rename contract — best-effort: a failed write only costs a
 // restart some streak context.
 func (p *Prober) writeStateFile(path, content string) {
-	if err := hostutil.WriteFileAtomicBytes(path,
+	if err := fsx.WriteFileAtomicBytes(path,
 		[]byte(content+"\n")); err != nil {
 		logger().Warn("apiprober state file write failed",
 			"file", path, "error", err,

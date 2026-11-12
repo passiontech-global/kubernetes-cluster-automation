@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const f2bRestartInterval = 30 * time.Minute
@@ -112,7 +112,7 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		}
 	}
 	if len(pairs) > 0 {
-		if err := hostutil.WriteFileAtomic(bannedFile,
+		if err := fsx.WriteFileAtomic(bannedFile,
 			strings.Join(pairs, " ")+"\n"); err != nil {
 			logger().Warn("nethealth: fail2ban banned-count write "+
 				"failed — node_fail2ban_banned_ips stale this cycle",

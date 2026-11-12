@@ -11,8 +11,8 @@ import (
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- fail2ban (50) ---
@@ -39,7 +39,7 @@ func TestFail2banDownAndBans(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.state, "last-fail2ban-restart")); err != nil {
 		t.Fatal("restart budget file missing")
 	}
-	got := hostutil.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
+	got := fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
 	if !strings.Contains(got, "sshd=7") || !strings.Contains(got, "recidive=1") {
 		t.Fatalf("banned file=%q", got)
 	}
@@ -117,7 +117,7 @@ func TestFail2banActiveUnitClearsLatch(t *testing.T) {
 	if e.sd.Ran("restart") {
 		t.Fatal("restart on a healthy unit")
 	}
-	if !strings.Contains(hostutil.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned")), "sshd=4") {
+	if !strings.Contains(fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned")), "sshd=4") {
 		t.Fatal("banned counts not collected on the healthy unit")
 	}
 }
@@ -174,7 +174,7 @@ func TestFail2banPerJailParsing(t *testing.T) {
 	e.host.On("fail2ban-client status dead",
 		"No output matching the regexp\n")
 	e.n.Cycle(context.Background())
-	got := hostutil.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
+	got := fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
 	// "dead" is a jail whose status lacks the banned counter —
 	// reported as 0; "sshd" carries its real count; recidive failed → 0.
 	if got != "sshd=7 dead=0 recidive=0" {

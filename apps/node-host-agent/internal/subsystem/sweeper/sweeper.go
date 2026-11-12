@@ -57,9 +57,9 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -270,7 +270,7 @@ func (s *Sweeper) mountPoints() ([]string, error) {
 // comparing them un-normalized makes the guard silently miss every
 // live mount (and rm straight through its contents).
 func mountedInside(dir string, mounts []string) bool {
-	dir = hostutil.HostSidePath(dir)
+	dir = fsx.HostSidePath(dir)
 	for _, mp := range mounts {
 		if mp == dir || strings.HasPrefix(mp, dir+"/") {
 			return true

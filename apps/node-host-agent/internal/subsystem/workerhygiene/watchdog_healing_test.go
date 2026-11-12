@@ -397,7 +397,8 @@ func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 
 // TestCheckCalicoVethGCDeletesOrphan: while state-calico-veth-leak
 // is set, a cali* host veth that stays DOWN (carrier 0) for the
-// confirm window is reaped via `ip link delete`.
+// confirm window is reaped via the LinkDelFn netlink seam
+// (was `ip link delete` through systemd Exec).
 func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	e := fixture(t)
 	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali99", "carrier"), "0\n")
@@ -418,7 +419,7 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	if !e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch not set")
 	}
-	if e.SDRan("ip link delete cali99") {
+	if e.LinkDelRan("cali99") {
 		t.Fatal("orphan deleted on first sight — needs the down-age confirm")
 	}
 	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); err != nil {
@@ -426,13 +427,12 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	}
 	// 16m later the marker ages out → the delete runs.
 	e.Now = e.Now.Add(16 * time.Minute)
-	e.SDReply["ip link delete"] = ""
 	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	if !e.SDRan("ip link delete cali99") {
+	if !e.LinkDelRan("cali99") {
 		t.Fatal("orphan veth not deleted after the down-age window")
 	}
-	if e.SDRan("ip link delete calilive") {
+	if e.LinkDelRan("calilive") {
 		t.Fatal("a LIVE veth was deleted")
 	}
 	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); !os.IsNotExist(err) {
@@ -455,7 +455,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); !os.IsNotExist(err) {
 		t.Fatal("veth-seen marker stamped without the leak latch")
 	}
-	if e.SDRan("ip link delete cali99") {
+	if e.LinkDelRan("cali99") {
 		t.Fatal("orphan deleted without the leak latch")
 	}
 }

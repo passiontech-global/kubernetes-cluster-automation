@@ -1,7 +1,7 @@
 // certcache.go — stat-key memoization for the X.509 expiry probes.
 // PKI bundle files and the nebula host cert are rewritten ~yearly,
 // yet every 15s scrape used to re-read + pem.Decode +
-// x509.ParseCertificate / protobuf-walk them. hostutil.FileStatKey
+// x509.ParseCertificate / protobuf-walk them. fsx.FileStatKey
 // fingerprints dev+ino+size+mtime_nsec — every writer here lands
 // via atomic rename (new inode), so an unchanged key proves the
 // bytes are unchanged and the parse result can be reused. Only the
@@ -12,7 +12,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // certNotAfterCache memoizes "earliest cert notAfter (unix)" per
@@ -37,7 +37,7 @@ type certNotAfterEntry struct {
 func (c *certNotAfterCache) get(path string,
 	parse func(data []byte) (int64, bool)) (int64, bool) {
 
-	key, err := hostutil.FileStatKey(path)
+	key, err := fsx.FileStatKey(path)
 	if err != nil {
 		return 0, false
 	}

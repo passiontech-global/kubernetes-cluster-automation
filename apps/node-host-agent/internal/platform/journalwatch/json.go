@@ -14,7 +14,6 @@
 package journalwatch
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,24 +50,32 @@ type ExecFunc func(ctx context.Context, args ...string) (string, error)
 // truncated tail is simply re-fetched next read.
 func ParseJSON(data string) []Entry {
 	var out []Entry
-	for _, line := range bytes.Split([]byte(data), []byte{'\n'}) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+	// Zero-copy line walk: strings.Cut slices the input instead of
+	// bytes.Split materializing a [][]byte of every line — journal
+	// tails can run to the 16 MiB capture cap.
+	rest := data
+	for rest != "" {
+		var line string
+		var found bool
+		line, rest, found = strings.Cut(rest, "\n")
+		line = strings.TrimSpace(line)
+		if line != "" {
+			var e struct {
+				Message   json.RawMessage `json:"MESSAGE"`
+				TS        string          `json:"__REALTIME_TIMESTAMP"`
+				Cursor    string          `json:"__CURSOR"`
+				Unit      string          `json:"_SYSTEMD_UNIT"`
+				Transport string          `json:"_TRANSPORT"`
+			}
+			if err := json.Unmarshal([]byte(line), &e); err == nil {
+				ts, _ := strconv.ParseInt(e.TS, 10, 64)
+				out = append(out, Entry{Msg: messageField(e.Message), TSUS: ts,
+					Cursor: e.Cursor, Unit: e.Unit, Transport: e.Transport})
+			}
 		}
-		var e struct {
-			Message   json.RawMessage `json:"MESSAGE"`
-			TS        string          `json:"__REALTIME_TIMESTAMP"`
-			Cursor    string          `json:"__CURSOR"`
-			Unit      string          `json:"_SYSTEMD_UNIT"`
-			Transport string          `json:"_TRANSPORT"`
+		if !found {
+			break // last line had no trailing newline
 		}
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue
-		}
-		ts, _ := strconv.ParseInt(e.TS, 10, 64)
-		out = append(out, Entry{Msg: messageField(e.Message), TSUS: ts,
-			Cursor: e.Cursor, Unit: e.Unit, Transport: e.Transport})
 	}
 	return out
 }

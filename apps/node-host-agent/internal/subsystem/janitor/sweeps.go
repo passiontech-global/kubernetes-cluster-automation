@@ -182,11 +182,10 @@ func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 }
 
 func (j *Janitor) resetFailedUnit(ctx context.Context, unit, load, active string) {
-	if out, err := j.cfg.Systemd.Exec(ctx,
-		"systemctl", "reset-failed", unit); err != nil {
+	if err := j.cfg.Systemd.ResetFailed(ctx, unit); err != nil {
 		j.state.AppendLog(fmt.Sprintf(
-			"suspect: reset-failed %s failed: %v (%s)",
-			unit, err, strings.TrimSpace(out)))
+			"suspect: reset-failed %s failed: %v",
+			unit, err))
 		return
 	}
 	j.state.AppendLog(fmt.Sprintf(

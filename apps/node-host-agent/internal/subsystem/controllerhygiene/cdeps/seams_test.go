@@ -153,7 +153,7 @@ func TestSeamsExecClosureCapturesClient(t *testing.T) {
 	if err != nil || out != "stdout\n" {
 		t.Fatalf("HostExecFn out=%q err=%v", out, err)
 	}
-	want := scrubArgv("systemctl", "is-active", "u")
+	want := []string{"systemctl", "is-active", "u"}
 	if !reflect.DeepEqual(runArgv, want) {
 		t.Fatalf("argv=%v want %v", runArgv, want)
 	}
@@ -161,7 +161,7 @@ func TestSeamsExecClosureCapturesClient(t *testing.T) {
 	if err != nil || out != "combined\n" {
 		t.Fatalf("HostExecFn combined out=%q err=%v", out, err)
 	}
-	if !reflect.DeepEqual(combArgv, scrubArgv("journalctl", "-n", "1")) {
+	if !reflect.DeepEqual(combArgv, []string{"journalctl", "-n", "1"}) {
 		t.Fatalf("combined argv=%v", combArgv)
 	}
 }

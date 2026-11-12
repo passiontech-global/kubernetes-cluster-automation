@@ -2,7 +2,7 @@
 // subpackage boundary: wires the subsystem's Config seams, store and
 // telemetry into nebula.Deps (live closures — post-New re-stubs stay
 // visible), and keeps the NetHealth-method call surface the
-// checks.Group table and the tests use, so check registration order
+// subframe.Group table and the tests use, so check registration order
 // is byte-identical to before the split.
 package nethealth
 
@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/vishvananda/netlink"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -57,7 +59,10 @@ func newNebulaDeps(n *NetHealth) *nebula.Deps {
 		ProbeHTTP: func(ctx context.Context, url string, timeout time.Duration) error {
 			return n.cfg.probeHTTP(ctx, url, timeout)
 		},
-		IP:                       n.ip,
+		IP: n.ip,
+		LinkAddrs: func(pid int, name string) ([]netlink.Addr, error) {
+			return n.cfg.linkAddrsFn(pid, name)
+		},
 		StateExit:                n.stateExit,
 		UnitEnabledActive:        n.unitEnabledActive,
 		NebulaUpExists:           n.nebulaUpExists,

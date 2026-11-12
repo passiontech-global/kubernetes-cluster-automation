@@ -9,6 +9,7 @@ package netlinkx
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -178,6 +179,9 @@ func diagDumpFamily(family uint8, out map[uint8]int) error {
 	buf := make([]byte, 1<<16)
 	for {
 		n, _, err := unix.Recvfrom(fd, buf, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue // signal interruption is not a dump failure
+		}
 		if err != nil {
 			return fmt.Errorf("sock_diag recv %d: %w", family, err)
 		}
@@ -223,11 +227,228 @@ func parseDiagMsgs(buf []byte, out map[uint8]int) (bool, error) {
 			}
 		}
 		// NLMSG_ALIGN(4): headers and payloads are 4-byte aligned.
+		// A short tail batch can round the aligned length past the
+		// buffer — clamp instead of trusting the kernel's padding.
 		advance := (length + 3) &^ 3
-		if advance >= len(buf) {
-			break // aligned length can round past the batch end
+		if advance > len(buf) {
+			advance = len(buf)
 		}
 		buf = buf[advance:]
 	}
 	return false, nil
+}
+
+// --- SOCK_DESTROY: the `ss -K` replacement --------------------
+//
+// inet_diag_req_v2 wire layout (linux/include/uapi/linux/
+// inet_diag.h): sdiag_family/protocol/ext/pad (4) + idiag_states
+// (4) + idiag_sockid (48) = 56, sent inside the 64-byte request
+// buffer the dump path already uses. inet_diag_msg carries the same
+// 48-byte sockid at payload offset 4; idiag_state sits at offset 1
+// and idiag_dport (big-endian) at sockid+2.
+//
+// The kill sequence mirrors iproute2's `ss -K`: dump the table,
+// keep the sockets matching the filter, then send ONE non-dump
+// SOCK_DIAG_BY_FAMILY request per socket with its sockid copied
+// verbatim — the kernel's inet_diag_destroy walks the matching
+// sockets and drops them.
+
+const (
+	tcpStateListen = 10 // TCP_LISTEN in include/net/tcp_states.h
+	sockidLen      = 48 // sizeof(struct inet_diag_sockid)
+)
+
+// sockMatch is one socket the destroy phase will kill: the address
+// family plus the 48-byte idiag_sockid copied out of the dump.
+type sockMatch struct {
+	family uint8
+	id     [sockidLen]byte
+}
+
+// DestroyListenersOnPort kills every TCP LISTEN socket bound to
+// port in pid's netns — the in-process `ss -K sport = :<port>`
+// replacement (no ss binary, no fork). Returns the number of
+// sockets destroyed; a socket that vanished between dump and
+// destroy is not an error (the kernel simply matches nothing).
+func DestroyListenersOnPort(pid int, port uint16) (int, error) {
+	var killed int
+	err := InNetNS(pid, func() error {
+		var err error
+		killed, err = destroyListeners(port)
+		return err
+	})
+	return killed, err
+}
+
+// diagSock opens a bound NETLINK_SOCK_DIAG socket with the same
+// 5s receive budget the dump path uses.
+func diagSock() (int, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_SOCK_DIAG)
+	if err != nil {
+		return -1, fmt.Errorf("sock_diag socket: %w", err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("sock_diag bind: %w", err)
+	}
+	tv := unix.NsecToTimeval(5 * time.Second.Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("sock_diag rcvtimeo: %w", err)
+	}
+	return fd, nil
+}
+
+// diagRequest builds the nlmsghdr+inet_diag_req_v2 dump/destroy
+// payload shared by both phases: 16-byte header + 64-byte request.
+func diagRequest(seq uint32, family uint8, states uint32, id *[sockidLen]byte) []byte {
+	req := make([]byte, 16+diagReqV2)
+	binary.LittleEndian.PutUint32(req[0:], uint32(16+diagReqV2)) // nlmsg_len
+	binary.LittleEndian.PutUint16(req[4:], unix.SOCK_DIAG_BY_FAMILY)
+	binary.LittleEndian.PutUint16(req[6:], unix.NLM_F_REQUEST)
+	binary.LittleEndian.PutUint32(req[8:], seq)
+	req[16] = family
+	req[17] = unix.IPPROTO_TCP
+	binary.LittleEndian.PutUint32(req[20:], states) // idiag_states
+	if id != nil {
+		copy(req[24:24+sockidLen], id[:]) // idiag_sockid
+	}
+	return req
+}
+
+// destroyListeners runs the dump+destroy sequence inside the
+// caller's (already-scoped) netns.
+func destroyListeners(port uint16) (int, error) {
+	fd, err := diagSock()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
+
+	// Phase 1 — dump both families, collecting LISTEN sockets on
+	// the target port.
+	var matches []sockMatch
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		if err := unix.Sendto(fd, diagRequest(1, family, 0xFFF, nil), 0, sa); err != nil {
+			return 0, fmt.Errorf("sock_diag send %d: %w", family, err)
+		}
+		buf := make([]byte, 1<<16)
+		for {
+			n, _, rerr := unix.Recvfrom(fd, buf, 0)
+			if errors.Is(rerr, unix.EINTR) {
+				continue
+			}
+			if rerr != nil {
+				return 0, fmt.Errorf("sock_diag recv %d: %w", family, rerr)
+			}
+			done, merr := collectPortListeners(buf[:n], family, port, &matches)
+			if merr != nil {
+				return 0, merr
+			}
+			if done {
+				break
+			}
+		}
+	}
+
+	// Phase 2 — one destroy request per matched socket id.
+	killed := 0
+	for i, m := range matches {
+		req := diagRequest(uint32(100+i), m.family, 0xFFF, &m.id)
+		// NLM_F_ACK so a hard failure surfaces instead of silently
+		// dropping the request.
+		binary.LittleEndian.PutUint16(req[6:], unix.NLM_F_REQUEST|unix.NLM_F_ACK)
+		if err := unix.Sendto(fd, req, 0, sa); err != nil {
+			return killed, fmt.Errorf("sock_diag destroy send: %w", err)
+		}
+		// Drain the ACK/error reply so the socket buffer cannot
+		// fill across a large listener table.
+		buf := make([]byte, 4096)
+		for {
+			n, _, rerr := unix.Recvfrom(fd, buf, 0)
+			if errors.Is(rerr, unix.EINTR) {
+				continue
+			}
+			if rerr != nil {
+				return killed, fmt.Errorf("sock_diag destroy recv: %w", rerr)
+			}
+			if ackErr := parseDiagAck(buf[:n]); ackErr != nil {
+				return killed, ackErr
+			}
+			break
+		}
+		killed++
+	}
+	return killed, nil
+}
+
+// collectPortListeners folds one recv batch of the dump into
+// matches — LISTEN-state TCP sockets whose idiag_dport equals port.
+// Returns done=true on NLMSG_DONE (same contract as parseDiagMsgs).
+func collectPortListeners(buf []byte, family uint8, port uint16, matches *[]sockMatch) (bool, error) {
+	for len(buf) >= 16 {
+		length := int(binary.LittleEndian.Uint32(buf[0:4]))
+		mtype := binary.LittleEndian.Uint16(buf[4:6])
+		if length < 16 || length > len(buf) {
+			return false, fmt.Errorf("sock_diag: bad nlmsg len %d", length)
+		}
+		switch mtype {
+		case nlmsgDone:
+			return true, nil
+		case nlmsgError:
+			if length >= 20 {
+				errno := int32(binary.LittleEndian.Uint32(buf[16:20]))
+				if errno < 0 {
+					return false, fmt.Errorf("sock_diag: %w", unix.Errno(-errno))
+				}
+			}
+			return true, nil
+		default:
+			// inet_diag_msg: family@0 state@1, sockid@4 (48B) —
+			// dport is sockid+2 big-endian.
+			if length >= 16+4+sockidLen {
+				payload := buf[16:]
+				if payload[0] == family && payload[1] == tcpStateListen &&
+					binary.BigEndian.Uint16(payload[6:8]) == port {
+					var m sockMatch
+					m.family = payload[0]
+					copy(m.id[:], payload[4:4+sockidLen])
+					*matches = append(*matches, m)
+				}
+			}
+		}
+		advance := (length + 3) &^ 3
+		if advance > len(buf) {
+			advance = len(buf)
+		}
+		buf = buf[advance:]
+	}
+	return false, nil
+}
+
+// parseDiagAck reads one destroy-phase reply: NLMSG_ERROR with a
+// negative errno is a real failure; anything else (ACK, DONE) is
+// success — the kernel may also answer DONE for an id that no
+// longer exists, which is the desired idempotent outcome.
+func parseDiagAck(buf []byte) error {
+	for len(buf) >= 16 {
+		length := int(binary.LittleEndian.Uint32(buf[0:4]))
+		mtype := binary.LittleEndian.Uint16(buf[4:6])
+		if length < 16 || length > len(buf) {
+			return fmt.Errorf("sock_diag: bad nlmsg len %d", length)
+		}
+		if mtype == nlmsgError && length >= 20 {
+			errno := int32(binary.LittleEndian.Uint32(buf[16:20]))
+			if errno < 0 {
+				return fmt.Errorf("sock_diag destroy: %w", unix.Errno(-errno))
+			}
+		}
+		advance := (length + 3) &^ 3
+		if advance > len(buf) {
+			advance = len(buf)
+		}
+		buf = buf[advance:]
+	}
+	return nil
 }

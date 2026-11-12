@@ -304,7 +304,7 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	// cycling this node — the feeder must not stack a remediate
 	// restart on top. Checked after G5 so the stale-restart evidence
 	// still lands in the log, before any budget is spent.
-	if f.d.HoldLocalAction(ctx) {
+	if f.d.HoldEmergencyHeal(ctx) {
 		f.d.State.AppendLog("G6 PASS: cluster maintenance in progress — holding restart")
 		return
 	}

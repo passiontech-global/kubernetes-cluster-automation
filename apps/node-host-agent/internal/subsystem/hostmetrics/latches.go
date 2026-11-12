@@ -35,7 +35,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // Latches is the agent.Subsystem half of hostmetrics — the
@@ -148,7 +148,7 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 		p := c.state.Path(name)
 		if fi, err := os.Stat(p); err == nil {
 			now := c.cfg.Clock.Now()
-			if cerr := hostutil.TouchIfDue(p, fi, now,
+			if cerr := fsx.TouchIfDue(p, fi, now,
 				latchdefs.LatchTouchMinInterval); cerr != nil {
 				logger().Debug("hostmetrics: latch touch failed",
 					"path", p, "error", cerr)
@@ -161,7 +161,7 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 	for _, p := range snapStaleLatchPaths(c.state.Dir) {
 		if fi, err := os.Stat(p); err == nil {
 			now := c.cfg.Clock.Now()
-			if cerr := hostutil.TouchIfDue(p, fi, now,
+			if cerr := fsx.TouchIfDue(p, fi, now,
 				latchdefs.LatchTouchMinInterval); cerr != nil {
 				logger().Debug("hostmetrics: latch touch failed",
 					"path", p, "error", cerr)

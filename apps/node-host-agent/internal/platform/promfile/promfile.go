@@ -33,9 +33,30 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
+
+// promTouchInterval bounds how often an unchanged .prom render
+// refreshes the file's mtime — staleness watchers (and humans
+// reading ls -l) must see a live file even when the content has
+// been byte-identical for hours.
+const promTouchInterval = 10 * time.Minute
+
+// TextfileDir resolves the node-exporter textfile drop dir for
+// hostRoot — NODE_HOST_AGENT_TEXTFILE_DIR when set (the envnames
+// contract every subsystem already honors through hostctx), else
+// <hostRoot>/var/lib/node-exporter/textfile. This is the single
+// derivation: callers pass their host root and never re-derive the
+// path shape.
+func TextfileDir(hostRoot string) string {
+	if v := os.Getenv(envnames.EnvTextfileDir); v != "" {
+		return v
+	}
+	return filepath.Join(hostRoot, "var", "lib", "node-exporter", "textfile")
+}
 
 // Builder accumulates HELP/TYPE/sample lines for one textfile.
 // Headers (# HELP / # TYPE) are emitted once per metric family —
@@ -142,38 +163,54 @@ var promFileStates sync.Map
 // hostutil's ".tmp-" convention here would put scrapeable
 // ".*.prom" names in the collector's glob.
 func Write(dir, name string, content []byte) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	path := filepath.Join(dir, name)
 	sum := sha256.Sum256(content)
 	clean := filepath.Clean(path)
 	if v, ok := promFileStates.Load(clean); ok {
 		st := v.(promFileState)
 		if st.sum == sum {
-			if key, err := hostutil.FileStatKey(path); err == nil &&
-				key == st.key {
-				return nil
+			fi, err := os.Stat(path)
+			if err == nil {
+				if key, kerr := fsx.FileStatKey(path); kerr == nil &&
+					key == st.key {
+					// Content AND on-disk generation unchanged —
+					// keep the mtime fresh (≤1 touch per
+					// promTouchInterval) for staleness watchers,
+					// then skip the whole write. No MkdirAll:
+					// the file exists, so the dir does too.
+					_ = fsx.TouchIfDue(path, fi, time.Now(), promTouchInterval)
+					return nil
+				}
 			}
 		}
 	}
 	if cur, err := os.ReadFile(path); err == nil &&
 		string(cur) == string(content) {
 		// Adopt the on-disk generation into the fast path so the
-		// next identical render costs a Stat, not a read.
-		if key, kerr := hostutil.FileStatKey(path); kerr == nil {
-			promFileStates.Store(clean, promFileState{sum: sum, key: key})
+		// next identical render costs a Stat, not a read — and
+		// refresh the mtime on the same ≤1/10m budget.
+		if fi, ferr := os.Stat(path); ferr == nil {
+			_ = fsx.TouchIfDue(path, fi, time.Now(), promTouchInterval)
+			if key, kerr := fsx.FileStatKey(path); kerr == nil {
+				promFileStates.Store(clean, promFileState{sum: sum, key: key})
+			}
 		}
 		return nil
 	}
-	if err := hostutil.WriteAtomic(path, content, hostutil.AtomicOpts{
-		Stage:  hostutil.StageTempPattern(stagingPattern(name)),
+	// MkdirAll lands AFTER the unchanged-detection gates: an
+	// identical render over an existing dir must not pay for a
+	// directory walk it does not need.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := fsx.WriteFile(path, content, fsx.Opts{
+		Stage:  fsx.StageTempPattern(stagingPattern(name)),
 		Mode:   0o644,
 		NoSync: true,
 	}); err != nil {
 		return err
 	}
-	if key, kerr := hostutil.FileStatKey(path); kerr == nil {
+	if key, kerr := fsx.FileStatKey(path); kerr == nil {
 		promFileStates.Store(clean, promFileState{sum: sum, key: key})
 	}
 	return nil

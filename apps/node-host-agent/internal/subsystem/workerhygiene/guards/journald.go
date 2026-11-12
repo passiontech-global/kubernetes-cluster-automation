@@ -156,11 +156,13 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// the corrupt-warning answer — journald talked, A5 owns it).
 	unreadable := false
 	udetail := ""
-	switch {
-	case v.Err != nil:
-		unreadable, udetail = true, fmt.Sprintf("read failed: %v", v.Err)
-	case journalwatch.FilesGone(v.Out):
-		unreadable, udetail = true, "journalctl reports no journal files"
+	// Shared blindness classes (journalwatch.ClassifyRead) cover
+	// the exec-error and files-gone halves with the same detail
+	// strings; the integrity classifier's Empty verdict keeps its
+	// own disambiguated detail.
+	switch class, detail := journalwatch.ClassifyRead(v.Out, v.Err); {
+	case class == journalwatch.ClassFailed || class == journalwatch.ClassFilesGone:
+		unreadable, udetail = true, detail
 	case v.Empty:
 		unreadable, udetail = v.Detail != "", v.Detail
 	}

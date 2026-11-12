@@ -26,12 +26,59 @@ const (
 	// repackHeadroomFactor — free space must cover this multiple of
 	// (heap + WAL) before pg_repack may run.
 	repackHeadroomFactor = 2.5
-
-	// repackGlob finds a pg_repack binary inside the postgres
-	// container — the percona/pgsql versioned-path glob the bash
-	// maint script used.
-	repackGlob = `ls /usr/pgsql-*/bin/pg_repack /usr/lib/postgresql/*/bin/pg_repack 2>/dev/null | head -1`
 )
+
+// repackBinPath locates pg_repack inside the postgres container —
+// the shell-free port of the bash maint script's
+// `ls /usr/pgsql-*/bin/pg_repack /usr/lib/postgresql/*/bin/pg_repack
+// 2>/dev/null | head -1`. The two glob roots are enumerated with ls
+// (the binary the shell already relied on), each version dir
+// contributes its <dir>/bin/pg_repack candidate in the globs'
+// expansion order, and the first candidate ls confirms wins — ""
+// is the shell's empty-head case (no binary installed). A listing
+// failure on BOTH roots surfaces as an error — the exec/transport
+// failure the sh -c exit status used to report as
+// repack-lookup-fail; a single missing root is just an unmatched
+// glob and contributes nothing.
+func repackBinPath(ctx context.Context, d *kdeps.Deps, pg string) (string, error) {
+	var cands []string
+	listed := 0
+	var firstErr error
+	for _, root := range []struct {
+		dir    string
+		prefix string // "" matches every entry
+	}{
+		{"/usr", "pgsql-"},
+		{"/usr/lib/postgresql", ""},
+	} {
+		out, err := d.Exec(ctx, []string{d.Cfg.Runtime, "exec", pg,
+			"ls", root.dir}, "")
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		listed++
+		for _, e := range strings.Split(out, "\n") {
+			e = strings.TrimSpace(e)
+			if e == "" || (root.prefix != "" && !strings.HasPrefix(e, root.prefix)) {
+				continue
+			}
+			cands = append(cands, root.dir+"/"+e+"/bin/pg_repack")
+		}
+	}
+	if listed == 0 && firstErr != nil {
+		return "", firstErr
+	}
+	for _, c := range cands {
+		if _, err := d.Exec(ctx, []string{d.Cfg.Runtime, "exec", pg,
+			"ls", c}, ""); err == nil {
+			return c, nil
+		}
+	}
+	return "", nil
+}
 
 // readXidAge is the maint-cycle half of the wraparound item: the
 // probe owns the kine_db_xid_age_transactions series (2-minute

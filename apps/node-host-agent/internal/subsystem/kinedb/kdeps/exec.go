@@ -36,6 +36,18 @@ func (d *Deps) ExecEnv(ctx context.Context, env, argv []string, stdin string) (s
 	return d.Cfg.Run(cctx, env, argv, stdin)
 }
 
+// ExecCombined runs argv under the short command budget with the
+// child's stderr folded into the returned output — the `2>&1` the
+// pgbouncer `logs` scan needs (its log lines stream on stderr,
+// which Exec deliberately excludes). argv reaches the child
+// verbatim: no sh -c, so no quoting layer can mangle a configured
+// runtime/container name.
+func (d *Deps) ExecCombined(ctx context.Context, argv []string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, d.Cfg.CmdTimeout)
+	defer cancel()
+	return d.Cfg.RunCombined(cctx, nil, argv, "")
+}
+
 // ExecLongEnv runs argv under the maintenance budget with extra
 // child environment (see ExecEnv — the only channel a secret may
 // take).
@@ -86,6 +98,33 @@ func (d *Deps) PGBContainerName(ctx context.Context) string {
 func (d *Deps) ContainerRunning(ctx context.Context, name string) bool {
 	out, err := d.Exec(ctx, []string{d.Cfg.Runtime, "inspect", "-f", "{{.State.Running}}", name}, "")
 	return err == nil && strings.Contains(out, "true")
+}
+
+// ContainersRunning is ContainerRunning's batched sibling — ONE
+// `Runtime inspect -f {{.State.Running}}` exec answers every name
+// (docker/podman apply the template per object, one result per
+// line, in argv order). The probe cycle asks about pg AND pgb
+// every round; two inspect forks became one buffered pass. A
+// failed exec — including one bad name failing the whole inspect,
+// exactly like the per-name calls' AND verdict — answers false
+// for every slot; a short line count falses only the missing tail.
+func (d *Deps) ContainersRunning(ctx context.Context, names ...string) []bool {
+	out := make([]bool, len(names))
+	if len(names) == 0 {
+		return out
+	}
+	argv := append([]string{d.Cfg.Runtime, "inspect", "-f", "{{.State.Running}}"}, names...)
+	s, err := d.Exec(ctx, argv, "")
+	if err != nil {
+		return out
+	}
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := range out {
+		if i < len(lines) && strings.Contains(lines[i], "true") {
+			out[i] = true
+		}
+	}
+	return out
 }
 
 // Creds re-reads the stack .env every cycle — the backend_env check

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vishvananda/netlink"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
@@ -22,7 +23,7 @@ import (
 )
 
 // Check-name constants — the prometheus `check` label values. The
-// parent nethealth package aliases these for the checks.Group
+// parent nethealth package aliases these for the subframe.Group
 // registration (single source of truth for the metric-name
 // contract); keep the values byte-identical to the shell module
 // names they port.
@@ -47,7 +48,7 @@ const (
 // Deps bundles everything the nebula checks consume from the parent
 // nethealth subsystem. Parent-only consumer: the parent constructs
 // it in New and reaches it through one-line delegating wrappers, so
-// the checks.Group registration order stays byte-identical.
+// the subframe.Group registration order stays byte-identical.
 type Deps struct {
 	Cycles  *prometheus.CounterVec // check, result
 	Actions *prometheus.CounterVec // check, action
@@ -94,7 +95,11 @@ type Deps struct {
 	ProbeHTTP   func(ctx context.Context, url string, timeout time.Duration) error
 
 	// Parent-side helpers the nebula checks compose.
-	IP                       func(ctx context.Context, args ...string) (string, error)
+	IP func(ctx context.Context, args ...string) (string, error)
+	// LinkAddrs lists the addresses on one netns link — the
+	// netlinkx read behind hasIPv4Addr (the `ip -o addr show dev`
+	// replacement; callers pass pid 1 for the host netns).
+	LinkAddrs                func(pid int, name string) ([]netlink.Addr, error)
 	StateExit                func(name string)
 	UnitEnabledActive        func(ctx context.Context, unit string) bool
 	NebulaUpExists           func(wd *watchdogconf.Config) bool

@@ -28,7 +28,9 @@ func cliConfig(t *testing.T, rules []testutil.ExecRule) (Config, *testutil.FakeE
 		EnvFile: envFile,
 		Runtime: "podman",
 		Run:     fr.RunStdin,
-		WireFn:  func(context.Context, string) bool { return true },
+		// Combined shares the fake — rules match argv either way.
+		RunCombined: fr.RunStdin,
+		WireFn:      func(context.Context, string) bool { return true },
 	}, fr
 }
 
@@ -81,7 +83,7 @@ func TestRunCheckCLIAllOK(t *testing.T) {
 
 func TestRunCheckCLIFailures(t *testing.T) {
 	cfg, _ := cliConfig(t, []testutil.ExecRule{
-		{Substr: "inspect", Out: "true"},
+		{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 		{Substr: "SHOW POOLS",
 			Out: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
 		{Substr: "logs --since",

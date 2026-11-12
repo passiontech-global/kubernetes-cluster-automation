@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -56,6 +57,14 @@ type wiring struct {
 	built    map[string]bool
 
 	csOnce func() (kubernetes.Interface, error)
+
+	// coord is the ONE shared nodecoord.Coord every consumer gets —
+	// the annotation cache, confirmed-window memory and the
+	// singleflight fetch are process-wide state, so per-subsystem
+	// handles would each keep their own (and stampede the apiserver
+	// independently). Built lazily by coordOnce on first use.
+	coordMu sync.Mutex
+	coord   *nodecoord.Coord
 
 	// Deps is the shared watchdog/host context — embedded so the
 	// Build closures read w.Watchdog, w.HostPath(...), w.VarsDir
@@ -131,6 +140,21 @@ func std[D any, C any, S agent.Subsystem](w *wiring, deps D,
 	return subsOf(newFn(cfgFn(deps), w.reg))
 }
 
+// coordOnce returns the shared nodecoord.Coord bound to the shared
+// clock — every subsystem that needs the L1↔L3 maintenance gate
+// reads the same cached verdict instead of building (and fetching)
+// its own.
+func (w *wiring) coordOnce(cs kubernetes.Interface) *nodecoord.Coord {
+	w.coordMu.Lock()
+	defer w.coordMu.Unlock()
+	if w.coord == nil {
+		c := nodecoord.NewKube(w.Deps.NodeName, cs)
+		c.Now = w.Clock.Now
+		w.coord = c
+	}
+	return w.coord
+}
+
 // onOff adapts a bool default (the standalone-flipped defKube) to the
 // tri-state flag model.
 func onOff(b bool) envx.Mode {
@@ -153,7 +177,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Needs:   Needs{Kube: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
 				return std(w, sweeper.EnvDeps{Deps: w.Deps, Client: cs,
-					Coord: nodecoord.NewKube(w.Deps.NodeName, cs)},
+					Coord: w.coordOnce(cs)},
 					sweeper.ConfigFromEnv, sweeper.New)
 			},
 		},
@@ -260,7 +284,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
 				return std(w, workerhygiene.EnvDeps{Deps: w.Deps, Client: cs,
-					Coord: nodecoord.NewKube(w.Deps.NodeName, cs)},
+					Coord: w.coordOnce(cs)},
 					workerhygiene.ConfigFromEnv, workerhygiene.New)
 			},
 		},
@@ -323,7 +347,7 @@ func (w *wiring) descriptors() []Descriptor {
 				var coord *nodecoord.Coord
 				if w.NodeName != "" {
 					if cs, err := w.csOnce(); err == nil {
-						coord = nodecoord.NewKube(w.NodeName, cs)
+						coord = w.coordOnce(cs)
 					}
 				}
 				return std(w, controllerhygiene.EnvDeps{Deps: w.Deps, Coord: coord},

@@ -131,9 +131,9 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// query UDP first but truncated/large answers and TCP clients
 	// (zone transfers, some resolvers) ride TCP; a one-sided wedge
 	// still blackholes real queries.
-	udpOK := c.d.Cfg.Seams.Probe.DNSProbe(c.d.Cfg.Net.LocalDNSProbeAddr,
+	udpOK := c.d.Cfg.Seams.Probe.DNSProbe(ctx, c.d.Cfg.Net.LocalDNSProbeAddr,
 		c.d.Cfg.Net.LocalDNSProbeName, ciliumProbeTime)
-	tcpOK := c.d.Cfg.Seams.Probe.DNSProbeTCP(c.d.Cfg.Net.LocalDNSProbeAddr,
+	tcpOK := c.d.Cfg.Seams.Probe.DNSProbeTCP(ctx, c.d.Cfg.Net.LocalDNSProbeAddr,
 		c.d.Cfg.Net.LocalDNSProbeName, ciliumProbeTime)
 	if udpOK && tcpOK {
 		c.Fails = 0

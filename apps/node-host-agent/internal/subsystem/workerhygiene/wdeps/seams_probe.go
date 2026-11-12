@@ -45,7 +45,7 @@ type Probe struct {
 	// addr and reports whether a well-formed answer returns before
 	// the deadline — the node-local-dns :53 datapath probe
 	// (envoy-xds-lrp). Seam.
-	DNSProbe func(addr, name string, timeout time.Duration) bool
+	DNSProbe func(ctx context.Context, addr, name string, timeout time.Duration) bool
 	// PodLogFn returns a tail of one pod's current log — the
 	// clock-jump healer's konnectivity evidence read. Default the
 	// kube-client GetLogs call; tests stub with canned output.
@@ -53,7 +53,7 @@ type Probe struct {
 	// DNSProbeTCP sends one TCP DNS query — the :53 datapath
 	// probe's TCP half (a wedged TCP listener still serves UDP,
 	// and truncated/large answers ride TCP). Seam.
-	DNSProbeTCP func(addr, name string, timeout time.Duration) bool
+	DNSProbeTCP func(ctx context.Context, addr, name string, timeout time.Duration) bool
 	// KubeletMetricsFn GETs the kubelet :10250 /metrics body with
 	// the SA bearer — the syncloop check's PLEG relist/last-seen
 	// series source. Insecure TLS + Authorization header: kubelet

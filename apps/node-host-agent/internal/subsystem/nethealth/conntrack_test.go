@@ -12,10 +12,10 @@ import (
 
 	"github.com/vishvananda/netlink"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- conntrack-guard (H2) ---
@@ -187,7 +187,7 @@ func TestEgressSwitchFlushesPeerConntrack(t *testing.T) {
 	e.tcpOK["8.8.8.8:53"] = false
 	e.pingOK["8.8.8.8|true"] = false
 	e.n.Cycle(context.Background())
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	if !e.host.Ran("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
@@ -202,7 +202,7 @@ func TestEgressRecoveryFlushesPeerConntrack(t *testing.T) {
 	e.pingOK["8.8.8.8|true"] = true // underlay back
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background()) // 2nd fresh probe → flip to direct
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
 		t.Fatalf("committed=%q want direct", got)
 	}
 	if !e.host.Ran("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
@@ -230,7 +230,7 @@ func TestPeerConntrackFlushBestEffort(t *testing.T) {
 	e.n.Cycle(context.Background())
 	// The relay commit still lands — a missing conntrack binary must
 	// never block the path switch.
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	if !strings.Contains(logLines(t, e), "flush 8.8.8.8 skipped") {

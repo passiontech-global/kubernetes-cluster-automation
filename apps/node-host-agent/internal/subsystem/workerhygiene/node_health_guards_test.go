@@ -92,12 +92,14 @@ func TestCheckDStateRuntimeMinTrigger(t *testing.T) {
 
 func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	e := fixture(t)
-	e.SDReply["list-units --type=scope --state=failed"] =
+	// One shared list-units reply feeds the failed/deactivating/
+	// abandoned filters — only the failed rows survive.
+	e.SDReply["cri-containerd-*.scope"] =
 		"cri-containerd-aa11.scope loaded failed failed abandoned\n" +
 			"cri-containerd-bb22.scope loaded failed failed abandoned\n"
-	e.SDReply["reset-failed cri-containerd-*.scope"] = ""
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if !e.SDRan("reset-failed cri-containerd-*.scope") {
+	if !e.SDRan("reset-failed cri-containerd-aa11.scope") ||
+		!e.SDRan("reset-failed cri-containerd-bb22.scope") {
 		t.Fatal("systemctl reset-failed not invoked for failed scopes")
 	}
 	if !strings.Contains(e.LogLines(t), "ACTION: systemd-scopes reset-failed count=2") {
@@ -109,17 +111,18 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	if len(e.SDCmds) != before {
 		t.Fatal("scan re-ran inside SystemdScopeScanInterval")
 	}
-	// Past the interval the sweep runs again.
+	// Past the interval the sweep runs again: 1 list-units + 2
+	// per-unit reset-failed.
 	e.Now = e.Now.Add(31 * time.Minute)
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if len(e.SDCmds) != before+4 { // list + deactivating-list + abandoned-list + reset again
-		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+4)
+	if len(e.SDCmds) != before+3 {
+		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+3)
 	}
 }
 
 func TestCheckSystemdScopesClean(t *testing.T) {
 	e := fixture(t)
-	e.SDReply["list-units --type=scope --state=failed"] = ""
+	e.SDReply["cri-containerd-*.scope"] = ""
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if e.SDRan("reset-failed cri-containerd-") {
 		t.Fatal("reset-failed ran with zero failed scopes")
@@ -132,9 +135,9 @@ func TestCheckSystemdScopesClean(t *testing.T) {
 // pod is diagnose-only.
 func TestCheckSystemdScopesAbandonedReap(t *testing.T) {
 	e := fixture(t)
-	e.SDReply["list-units --type=scope --state=failed"] = ""
-	e.SDReply["list-units --type=scope --state=deactivating"] = ""
-	e.SDReply["list-units --type=scope --state=abandoned"] =
+	// The shared list-units reply carries only abandoned-state
+	// scopes — the failed/deactivating filters come up empty.
+	e.SDReply["cri-containerd-*.scope"] =
 		"cri-containerd-de01.scope loaded active abandoned abandoned\n" +
 			"cri-containerd-li02.scope loaded active abandoned abandoned\n"
 	e.SDReply["stop cri-containerd-"] = ""
@@ -168,14 +171,12 @@ func TestCheckSystemdScopesAbandonedReap(t *testing.T) {
 // never in one unbounded stop storm.
 func TestCheckSystemdScopesAbandonedCap(t *testing.T) {
 	e := fixture(t)
-	e.SDReply["list-units --type=scope --state=failed"] = ""
-	e.SDReply["list-units --type=scope --state=deactivating"] = ""
 	var b strings.Builder
 	for i := 0; i < 12; i++ {
 		fmt.Fprintf(&b,
 			"cri-containerd-c%02d.scope loaded active abandoned abandoned\n", i)
 	}
-	e.SDReply["list-units --type=scope --state=abandoned"] = b.String()
+	e.SDReply["cri-containerd-*.scope"] = b.String()
 	e.SDReply["stop cri-containerd-"] = ""
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
 		context.Background(), &wdeps.CycleEnv{APIOK: true, WorkerActive: true})
@@ -193,20 +194,19 @@ func TestCheckSystemdScopesAbandonedCap(t *testing.T) {
 	}
 }
 
-// TestCheckSystemdScopesAbandonedListFail: a failed abandoned
-// list-units is inconclusive — suspect logged, no stops attempted.
-func TestCheckSystemdScopesAbandonedListFail(t *testing.T) {
+// TestCheckSystemdScopesListFail: a failed sweep-level list-units
+// is inconclusive — suspect logged, no stops attempted, and the
+// scan does not stamp (the next cycle retries).
+func TestCheckSystemdScopesListFail(t *testing.T) {
 	e := fixture(t)
-	e.SDReply["list-units --type=scope --state=failed"] = ""
-	e.SDReply["list-units --type=scope --state=deactivating"] = ""
-	// abandoned list-units left unstubbed → ENOENT.
+	// The shared list-units left unstubbed → ENOENT.
 	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(
 		context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if e.SDRan("stop cri-containerd-") {
-		t.Fatal("stop attempted after abandoned list-units failure")
+		t.Fatal("stop attempted after list-units failure")
 	}
-	if !strings.Contains(e.LogLines(t), "abandoned list-units failed") {
-		t.Fatalf("missing abandoned list-units failure line:\n%s",
+	if !strings.Contains(e.LogLines(t), "systemd-scopes list-units failed") {
+		t.Fatalf("missing list-units failure line:\n%s",
 			e.LogLines(t))
 	}
 }
@@ -283,7 +283,7 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4343)
 	pod, _ := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-a1b2c", metav1.GetOptions{})
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
 	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
@@ -300,7 +300,7 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_host → dormant (calico node) — the probe must not run.
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool {
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool {
 		t.Fatal("dnsProbe ran without cilium datapath")
 		return false
 	}
@@ -342,7 +342,7 @@ func TestCheckCiliumLRPDNSTCPHalfWedge(t *testing.T) {
 	pod, _ := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-b2c3d", metav1.GetOptions{})
 	// UDP answers, TCP silent — a one-sided wedge still counts.
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return true }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return true }
 	e.DNSTCP = false
 	e.SvcErr = errors.New("map unreadable") // desync probe inconclusive
 	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
@@ -429,7 +429,7 @@ func TestCheckCiliumLRPDesyncSuppressesPodDelete(t *testing.T) {
 	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4343)
 	e.SvcBackends = map[string]int{"kube-system/kube-dns": 0, "default/kubernetes": 1}
 	// :53 is dead on both transports — the desync explains it.
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	for i := 0; i < 3; i++ {
 		wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{

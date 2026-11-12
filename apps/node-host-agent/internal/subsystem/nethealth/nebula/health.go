@@ -44,10 +44,20 @@ func (n *Deps) udpSocketBound(port int) bool {
 }
 
 // hasIPv4Addr mirrors `ip -4 -o addr show dev <dev> | grep .` — a
-// tun that failed to init has no address.
-func (n *Deps) hasIPv4Addr(ctx context.Context, dev string) bool {
-	out, err := n.IP(ctx, "-4", "-o", "addr", "show", "dev", dev)
-	return err == nil && strings.TrimSpace(out) != ""
+// tun that failed to init has no address. The read rides the
+// netlinkx LinkAddrs seam (host netns = pid 1, same target the
+// nsenter'd `ip` saw) instead of forking ip.
+func (n *Deps) hasIPv4Addr(_ context.Context, dev string) bool {
+	addrs, err := n.LinkAddrs(1, dev)
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if a.IPNet != nil && a.IPNet.IP.To4() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // NebulaRestart restarts nebula@<net> through the shared

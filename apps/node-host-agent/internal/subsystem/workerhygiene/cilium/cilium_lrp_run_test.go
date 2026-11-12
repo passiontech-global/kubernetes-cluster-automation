@@ -103,7 +103,7 @@ func noDesync(e *env) {
 // probe call on a path that must not reach the datapath verdict.
 func stubProbeFails(t *testing.T, e *env) {
 	t.Helper()
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool {
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool {
 		t.Error(":53 UDP probe ran on a gate path")
 		return false
 	}
@@ -172,7 +172,7 @@ func TestLRPRunAbortsWhenAPIUnreachable(t *testing.T) {
 func TestLRPRunHealthyProbeResetsStreak(t *testing.T) {
 	e := lrpFixture(t, kubeDNSEndpoints())
 	noDesync(e)
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return true }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return true }
 	e.DNSTCP = true
 	c := wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP)
 	c.Fails = 1
@@ -191,7 +191,7 @@ func TestLRPRunPodDeleteAfterConfirmedWedge(t *testing.T) {
 	pod := nldPod("node-local-dns-bbb222", wdepstest.UIDA)
 	e := lrpFixture(t, kubeDNSEndpoints(), pod)
 	noDesync(e)
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	cycle := &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true}
@@ -226,7 +226,7 @@ func TestLRPRunDeleteFailureThenCooldown(t *testing.T) {
 	pod := nldPod("node-local-dns-ccc333", wdepstest.UIDA)
 	e := lrpFixture(t, kubeDNSEndpoints(), pod)
 	noDesync(e)
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	e.CS.PrependReactor("delete", "pods",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -265,7 +265,7 @@ func TestLRPRunDesyncKillsAgentAndBouncesEnvoy(t *testing.T) {
 		"kube-system/kube-dns": 0, // desynced
 		"default/kubernetes":   1,
 	}
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool {
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool {
 		t.Error(":53 probe ran while the desync explained the failure")
 		return false
 	}
@@ -314,7 +314,7 @@ func TestLRPRunDesyncKillsAgentAndBouncesEnvoy(t *testing.T) {
 func TestLRPRunDesyncNoEnvoyTaskQuiet(t *testing.T) {
 	e := lrpFixture(t, kubeDNSSlice(true))
 	e.SvcBackends = map[string]int{"kube-system/kube-dns": 0}
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	cycle := &wdeps.CycleEnv{APIOK: true, WorkerActive: true}
 	lrpRun(t, e, cycle)
@@ -332,7 +332,7 @@ func TestLRPRunSliceAllNotReadyIsNoDesync(t *testing.T) {
 	pod := nldPod("node-local-dns-eee555", wdepstest.UIDA)
 	e := lrpFixture(t, kubeDNSSlice(false), pod)
 	e.SvcBackends = map[string]int{"kube-system/kube-dns": 0}
-	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	cycle := &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true}

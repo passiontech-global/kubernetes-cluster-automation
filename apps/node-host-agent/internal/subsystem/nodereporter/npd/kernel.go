@@ -31,9 +31,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
@@ -225,8 +225,8 @@ func (m *Monitor) SyncKernelMonitor(ctx context.Context, s Sink) error {
 		// hostUptimeSeconds read the first field of /proc/uptime —
 		// under hostPID this is the HOST uptime, which converts kmsg
 		// µs-since-boot timestamps into ages for the first-scan
-		// lookback (hostutil.UptimeSeconds is the shared parser).
-		if u, e := hostutil.UptimeSeconds(m.cfg().ProcUptimeFile); e == nil {
+		// lookback (procfs.UptimeSeconds is the shared parser).
+		if u, e := procfs.UptimeSeconds(m.cfg().ProcUptimeFile); e == nil {
 			uptime = u
 		}
 	}

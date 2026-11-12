@@ -204,7 +204,8 @@ func (c *Config) applyDefaults() {
 		c.ReadonlyFSTypes = defaultReadonlyFSTypes
 	}
 	if c.journalFetch == nil {
-		sd := systemd.New(systemd.Config{HostRoot: c.HostRoot})
+		sd := systemd.New(systemd.Config{HostRoot: c.HostRoot,
+			ScrubSystemdEnv: true})
 		c.journalFetch = func(ctx context.Context, args ...string) (string, error) {
 			return sd.Exec(ctx, "journalctl", args...)
 		}

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
@@ -58,7 +58,7 @@ func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
 	e := fixture(t)
 	wdepstest.WriteFile(t, e.CiliumRt,
 		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
-	got, ok := hostutil.RuntimeConfigMTU(e.CiliumRt)
+	got, ok := procfs.RuntimeConfigMTU(e.CiliumRt)
 	if !ok || got != 1500 {
 		t.Fatalf("RuntimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
 	}

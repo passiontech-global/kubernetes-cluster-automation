@@ -123,6 +123,15 @@ type Config struct {
 	// exec.CommandContext writing both streams into one capped
 	// buffer.
 	RunCmdCombined func(ctx context.Context, argv []string) (string, error)
+	// ScrubSystemdEnv drops NOTIFY_SOCKET/WATCHDOG_PID/WATCHDOG_USEC
+	// from every spawned child's environment — the Go-native form of
+	// the `env -u ... --` argv prefix (which cost an extra fork of
+	// the env binary per call). A child systemctl/journalctl that
+	// inherits NOTIFY_SOCKET sd_notifies back into OUR unit
+	// (systemd>=255 auto-sends EXIT_STATUS on exec). Applies only
+	// to the production default runners — a test RunCmd sees argv
+	// only, so the scrub is a spawn detail, not seam surface.
+	ScrubSystemdEnv bool
 }
 
 func (c *Config) applyDefaults() {
@@ -145,6 +154,7 @@ func (c *Config) applyDefaults() {
 			// returns (ErrWaitDelay) instead of hanging past
 			// Config.Timeout.
 			cmd := newCmd(ctx, argv)
+			cmd.Env = c.childEnv()
 			var buf cappedBuffer
 			cmd.Stdout = &buf
 			// Run waits for the copy goroutine — buf is complete
@@ -160,9 +170,48 @@ func (c *Config) applyDefaults() {
 			// Same container-side combined runner as the
 			// package-level helper — one implementation of the
 			// capped-buffer/WaitDelay contract.
-			return RunCombined(ctx, argv...)
+			return runCombined(ctx, c.childEnv(), argv)
 		}
 	}
+}
+
+// systemdScrubPrefixes are the sd_notify variables a spawned helper
+// must never inherit — see Config.ScrubSystemdEnv.
+var systemdScrubPrefixes = []string{
+	"NOTIFY_SOCKET=", "WATCHDOG_PID=", "WATCHDOG_USEC=",
+}
+
+// ScrubSystemdEnv returns env minus the sd_notify variables — the
+// env form of the `env -u NOTIFY_SOCKET -u WATCHDOG_PID -u
+// WATCHDOG_USEC --` argv prefix, applied natively by the runners
+// when Config.ScrubSystemdEnv is set (and by callers that build a
+// child env themselves, e.g. kine_storage's sqlite3).
+func ScrubSystemdEnv(env []string) []string {
+	out := env[:0]
+	for _, e := range env {
+		scrub := false
+		for _, p := range systemdScrubPrefixes {
+			if strings.HasPrefix(e, p) {
+				scrub = true
+				break
+			}
+		}
+		if !scrub {
+			out = append(out, e)
+		}
+	}
+	clear(env[len(out):]) // drop refs held by the filtered tail
+	return out
+}
+
+// childEnv is the spawn-time environment for the default runners:
+// nil (inherit the agent environ) unless Config.ScrubSystemdEnv
+// asks for the sd_notify scrub.
+func (c *Config) childEnv() []string {
+	if !c.ScrubSystemdEnv {
+		return nil
+	}
+	return ScrubSystemdEnv(os.Environ())
 }
 
 // cappedBuffer is a goroutine-safe io.Writer retaining at most

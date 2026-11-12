@@ -2,7 +2,6 @@ package hubsync
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,8 +16,8 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // Conn is the remote-host seam — one SSH session channel to a target.
@@ -63,205 +62,6 @@ func tmpPath(p, suffix string) string {
 		tmp += "." + suffix
 	}
 	return tmp
-}
-
-// remoteSHA256 returns the hex sha256 of a remote file. Exit 1
-// (file absent — sha256sum's missing-file status) reads as "" —
-// drift — while other non-zero exits (126/127 missing tool or
-// denied exec, sudo/shell failures) and transport errors propagate:
-// treating them as "absent" would re-upload on every cycle.
-// A DIRECTORY at remotePath is surfaced first: sha256sum exits 1
-// for a dir exactly like a missing file, and the follow-up
-// `mv tmp remotePath` would then silently NEST the staging file
-// inside the directory instead of replacing a file.
-func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error) {
-	if _, err := c.Run(ctx, "test -d "+hostutil.ShellQuote(remotePath)); err == nil {
-		return "", fmt.Errorf("%s is a directory", remotePath)
-	}
-	out, err := c.Run(ctx, "sha256sum "+hostutil.ShellQuote(remotePath))
-	if err != nil {
-		var ee ExitError
-		if errors.As(err, &ee) && ee.ExitStatus() == 1 {
-			return "", nil
-		}
-		return "", err
-	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		return "", nil
-	}
-	return fields[0], nil
-}
-
-// sha256sumCmdChunk bounds one sha256sum invocation's command line —
-// 32KiB keeps every target's ARG_MAX (Linux ~2MiB) and any
-// shell/sudo argv length limit comfortably clear even for the
-// largest mirrors.
-const sha256sumCmdChunk = 32 * 1024
-
-// remoteSHA256All hashes many remote files in ONE SSH session per
-// chunk — a single `sha256sum p1 p2 …` invocation (paths quoted,
-// command line chunked at sha256sumCmdChunk) instead of one session
-// per file, which over WAN round-trips dominated the sync. The
-// per-file semantics remoteSHA256 documents are preserved exactly:
-// an absent file produces no hash line (the coreutils "No such file
-// or directory" note rides stderr through the combined output) and
-// maps to "" — drift; a DIRECTORY is surfaced as an error naming
-// the path (sha256sum reports "Is a directory" and exits 1 exactly
-// like a missing file, and the follow-up `mv tmp path` would
-// silently NEST the staging file inside the directory); any other
-// non-zero exit (126/127 missing tool or denied exec, sudo/shell
-// failures) and transport errors propagate — treating them as
-// "absent" would re-upload on every cycle. Exit 1 from a chunk
-// (absent and/or directory paths) still parses the hash lines the
-// invocation did produce, so one stale path never blanks its
-// siblings' results.
-func remoteSHA256All(ctx context.Context, c Conn,
-	paths []string) (map[string]string, error) {
-	sums := make(map[string]string, len(paths))
-	for _, chunk := range sha256sumChunks(paths) {
-		out, err := c.Run(ctx, "sha256sum "+chunk)
-		if err != nil {
-			var ee ExitError
-			if errors.As(err, &ee) && ee.ExitStatus() == 1 {
-				if dir, isDir := directoryReport(out); isDir {
-					return nil, fmt.Errorf("%s is a directory", dir)
-				}
-				parseSHA256Lines(out, sums)
-				continue
-			}
-			return nil, err
-		}
-		parseSHA256Lines(out, sums)
-	}
-	return sums, nil
-}
-
-// sha256sumChunks splits the quoted-path command tail so no single
-// invocation exceeds sha256sumCmdChunk; one oversized path gets its
-// own chunk rather than being dropped.
-func sha256sumChunks(paths []string) []string {
-	var chunks []string
-	var b strings.Builder
-	flush := func() {
-		if b.Len() > 0 {
-			chunks = append(chunks, b.String())
-			b.Reset()
-		}
-	}
-	for _, p := range paths {
-		q := hostutil.ShellQuote(p)
-		if b.Len() > 0 && b.Len()+1+len(q) > sha256sumCmdChunk {
-			flush()
-		}
-		if b.Len() > 0 {
-			b.WriteByte(' ')
-		}
-		b.WriteString(q)
-	}
-	flush()
-	return chunks
-}
-
-// parseSHA256Lines reads coreutils `sha256sum` output lines —
-// `<64 hex>  <path>` in text mode, `<64 hex> *<path>` in binary
-// mode — into sums. Anything else in the combined output (the
-// per-file error notes for absent paths, warnings) carries no hash
-// shape and is skipped.
-func parseSHA256Lines(out string, sums map[string]string) {
-	for _, ln := range strings.Split(out, "\n") {
-		ln = strings.TrimSpace(ln)
-		if len(ln) < 66 || ln[64] != ' ' || !isHexHash(ln[:64]) {
-			continue
-		}
-		p := strings.TrimLeft(ln[65:], " *")
-		if p != "" {
-			sums[p] = ln[:64]
-		}
-	}
-}
-
-// isHexHash checks the 64-char sha256 hex prefix.
-func isHexHash(s string) bool {
-	for i := range len(s) {
-		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
-}
-
-// directoryReport scans sha256sum's combined output for its per-file
-// "Is a directory" note and returns the offending path.
-func directoryReport(out string) (string, bool) {
-	for _, ln := range strings.Split(out, "\n") {
-		ln = strings.TrimSpace(ln)
-		if rest, ok := strings.CutPrefix(ln, "sha256sum: "); ok {
-			if p, ok := strings.CutSuffix(rest, ": Is a directory"); ok && p != "" {
-				return p, true
-			}
-		}
-	}
-	return "", false
-}
-
-// putAtomic streams r into <path>'s staging file, chmods it and
-// atomically renames it over the destination — the order ansible's
-// copy module + mv produced, and the ordering the tests assert.
-func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode string) error {
-	tmp := tmpPath(remotePath, c.StageSuffix())
-	// Secret material (0600 mode: tokens, .key files) must never
-	// sit world-readable on the target — `cat >`/`tee` creates the
-	// tmp file under the remote umask (~0644), so pre-create it at
-	// 0600 BEFORE the upload: install(1) also fixes the mode of a
-	// stale tmp left by an interrupted run, and the subsequent
-	// `cat >`/`tee` only truncates — the inode keeps 0600.
-	if mode == "0600" || isKeyMaterial(path.Base(remotePath)) {
-		if _, err := c.Run(ctx, "install -m 600 /dev/null "+hostutil.ShellQuote(tmp)); err != nil {
-			return fmt.Errorf("install %s: %w", tmp, err)
-		}
-	}
-	if err := c.Write(ctx, tmp, r); err != nil {
-		return fmt.Errorf("upload %s: %w", tmp, err)
-	}
-	if _, err := c.Run(ctx, "chmod "+mode+" "+hostutil.ShellQuote(tmp)); err != nil {
-		return fmt.Errorf("chmod %s: %w", tmp, err)
-	}
-	// fsync the staged file before the mv — the SSH upload is plain
-	// buffered writes; a crash after mv must not expose truncated
-	// bytes at the target (the local writers' f.Sync() parity).
-	if _, err := c.Run(ctx, "sync "+hostutil.ShellQuote(tmp)); err != nil {
-		return fmt.Errorf("sync %s: %w", tmp, err)
-	}
-	if _, err := c.Run(ctx, "mv "+hostutil.ShellQuote(tmp)+" "+hostutil.ShellQuote(remotePath)); err != nil {
-		return fmt.Errorf("mv %s: %w", remotePath, err)
-	}
-	return nil
-}
-
-// --- real SSH implementation ---
-//
-// The dial mechanics (signer loading, client config, TCP dial +
-// bounded handshake, the ssh_proxyjump hop, per-op conn bounds) now
-// live in platform/sshclient — shared with the nebulasign host.pub
-// fetch that used to carry a second private copy. What stays here
-// is hubsync's own contract: the Conn/Dialer seams, the sudo
-// wrapping, streaming Write and ExitError.
-
-// sshDialer is the real Dialer — a thin Config→sshclient splice.
-// The signer is loaded inside Dial (sshclient.Config.LoadSigner
-// runs per dial) so Syncer.New succeeds while the optional:true
-// secret is not mounted yet, and a rotated key is picked up on the
-// next dial without a pod restart.
-type sshDialer struct {
-	cfg sshclient.Config
-	// policy resolves host-key trust per dialed hostname — pin
-	// spec (single or host=fp map), operator known_hosts, and the
-	// persistent TOFU store (hostkeys.go). nil only in hand-built
-	// test dialers, which keep the bare Config behavior.
-	policy *hostKeyPolicy
-	log    *slog.Logger
 }
 
 // newSSHDialer only records the dial config — nothing touches the
@@ -316,13 +116,82 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 	// here would race.
 	cfg := d.cfg
 	cfg.HostKeyVerify = d.policy.verify
-	link, err := cfg.Dial(ctx, t.SSHUser, t.IP, t.ProxyJump)
+	var link *sshclient.Link
+	var err error
+	if t.ProxyJump == "" {
+		link, err = cfg.Dial(ctx, t.SSHUser, t.IP, "")
+	} else {
+		link, err = d.dialViaBastion(ctx, &cfg, t)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &sshConn{link: link, sudo: needsSudo(t.SSHUser),
 		timeout: cfg.Timeout, log: d.log,
 		nonce: nextStageNonce()}, nil
+}
+
+// dialViaBastion resolves (or opens) the cached Bastion for the
+// target's ssh_proxyjump spec and dials the target through it. A
+// channel-open/handshake failure evicts the cached bastion and
+// retries once on a fresh one — a blackholed jump conn would
+// otherwise fail every remaining target of the cycle.
+func (d *sshDialer) dialViaBastion(ctx context.Context,
+	cfg *sshclient.Config, t Target) (*sshclient.Link, error) {
+	b, err := d.bastion(ctx, cfg, t.ProxyJump)
+	if err != nil {
+		return nil, err
+	}
+	link, err := cfg.DialVia(ctx, t.SSHUser, t.IP, b)
+	if err == nil {
+		return link, nil
+	}
+	d.dropBastion(t.ProxyJump, b)
+	b2, err2 := d.bastion(ctx, cfg, t.ProxyJump)
+	if err2 != nil {
+		return nil, err
+	}
+	return cfg.DialVia(ctx, t.SSHUser, t.IP, b2)
+}
+
+// bastion returns the cached Bastion for spec, opening it on first
+// use. The open itself runs outside the mutex (a WAN handshake must
+// not serialize unrelated specs); a lost insert race keeps the
+// first opener's conn and closes the duplicate.
+func (d *sshDialer) bastion(ctx context.Context,
+	cfg *sshclient.Config, spec string) (*sshclient.Bastion, error) {
+	d.mu.Lock()
+	if b := d.jumps[spec]; b != nil {
+		d.mu.Unlock()
+		return b, nil
+	}
+	d.mu.Unlock()
+	b, err := cfg.OpenBastion(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.jumps == nil {
+		d.jumps = map[string]*sshclient.Bastion{}
+	}
+	if old := d.jumps[spec]; old != nil {
+		_ = b.Close()
+		return old, nil
+	}
+	d.jumps[spec] = b
+	return b, nil
+}
+
+// dropBastion evicts b for spec — only when the cache still holds
+// THIS conn (a concurrent redial may already have replaced it).
+func (d *sshDialer) dropBastion(spec string, b *sshclient.Bastion) {
+	d.mu.Lock()
+	if d.jumps[spec] == b {
+		delete(d.jumps, spec)
+	}
+	d.mu.Unlock()
+	_ = b.Close()
 }
 
 // stageNonceSeq hands out per-dial staging suffixes — pid+counter
@@ -469,6 +338,54 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 // targets escalate through `sudo -n tee` instead (a `>` redirect
 // can't elevate — the shell opens the file as the SSH user).
 func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) error {
+	cmd := "cat > " + fsx.ShellQuote(remotePath)
+	if c.sudo {
+		cmd = "sudo -n tee " + fsx.ShellQuote(remotePath) + " >/dev/null"
+	}
+	return c.streamCmd(ctx, cmd, r)
+}
+
+// PutAtomic is putAtomic's single-session fast path: ONE ssh
+// session runs the whole stage→chmod→sync→mv chain under a shell
+// `trap 'rm -f "$tmp"' EXIT` cleanup — the four separate c.Run
+// sessions the fallback pays per file collapse into one, and an
+// interrupted upload no longer leaves its staging file behind
+// (the trap fires on every shell exit, success included — after
+// mv the tmp path is already gone so rm -f is a no-op).
+//
+// Secret material keeps the old pre-create contract INSIDE the
+// same script: `install -m 600 /dev/null "$tmp"` runs before cat
+// so the staging inode is never world-readable during upload and
+// a stale tmp from an interrupted run is re-moded first — cat >
+// only truncates, preserving the 0600 inode.
+//
+// sudo targets wrap the whole script in `sudo -n sh -c` — one
+// escalation for the chain replaces the per-op `sudo -n` wraps,
+// and stdin still reaches cat through sudo+sh.
+func (c *sshConn) PutAtomic(ctx context.Context, remotePath string,
+	r io.Reader, mode string) error {
+	tmp := tmpPath(remotePath, c.nonce)
+	script := "tmp=" + fsx.ShellQuote(tmp) +
+		"; trap 'rm -f \"$tmp\"' EXIT; "
+	if mode == "0600" || isKeyMaterial(path.Base(remotePath)) {
+		script += "install -m 600 /dev/null \"$tmp\" && "
+	}
+	script += "cat > \"$tmp\" && chmod " + mode +
+		" \"$tmp\" && sync \"$tmp\" && mv \"$tmp\" " +
+		fsx.ShellQuote(remotePath)
+	cmd := "sh -c " + fsx.ShellQuote(script)
+	if c.sudo {
+		cmd = "sudo -n " + cmd
+	}
+	if err := c.streamCmd(ctx, cmd, r); err != nil {
+		return fmt.Errorf("putAtomic %s: %w", remotePath, err)
+	}
+	return nil
+}
+
+// streamCmd runs cmd on one session with r piped to its stdin —
+// the shared body of Write and PutAtomic.
+func (c *sshConn) streamCmd(ctx context.Context, cmd string, r io.Reader) error {
 	sess, unbind, err := c.newSession(ctx)
 	if err != nil {
 		return err
@@ -478,10 +395,6 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	stdin, err := sess.StdinPipe()
 	if err != nil {
 		return err
-	}
-	cmd := "cat > " + hostutil.ShellQuote(remotePath)
-	if c.sudo {
-		cmd = "sudo -n tee " + hostutil.ShellQuote(remotePath) + " >/dev/null"
 	}
 	if err := sess.Start(cmd); err != nil {
 		return err

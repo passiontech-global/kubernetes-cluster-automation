@@ -12,9 +12,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- dns-fallback (20) ---
@@ -64,7 +64,7 @@ func TestDNSFallbackPinAndRecover(t *testing.T) {
 		t.Fatalf("pin files kept after recovery: %v", files)
 	}
 	// last-known-good cache kept the resolved IP.
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "dnsfb-lg-api.test.internal")); got != "10.0.0.1" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "dnsfb-lg-api.test.internal")); got != "10.0.0.1" {
 		t.Fatalf("last-good=%q want 10.0.0.1", got)
 	}
 }
@@ -164,18 +164,18 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 }
 
 // A file-level bind mount (the DaemonSet's /host/etc/hosts mount)
-// makes rename(2) return EBUSY — hostutil.WriteFileAtomic must fall
+// makes rename(2) return EBUSY — fsx.WriteFileAtomic must fall
 // back to a direct fsync'd write instead of never landing the pin.
 func TestWriteFileAtomicBusyFallback(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "hosts")
 	testutil.WriteFile(t, target, "127.0.0.1 localhost\n")
 
-	old := hostutil.RenameFile
-	defer func() { hostutil.RenameFile = old }()
-	hostutil.RenameFile = func(_, _ string) error { return unix.EBUSY }
+	old := fsx.RenameFile
+	defer func() { fsx.RenameFile = old }()
+	fsx.RenameFile = func(_, _ string) error { return unix.EBUSY }
 
-	if err := hostutil.WriteFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
+	if err := fsx.WriteFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
 		t.Fatalf("WriteFileAtomic EBUSY fallback failed: %v", err)
 	}
 	if got := testutil.ReadFile(t, target); got != "1.2.3.4 pinned.example\n" {
@@ -187,8 +187,8 @@ func TestWriteFileAtomicBusyFallback(t *testing.T) {
 
 	// A non-fallback rename error propagates and never touches the
 	// target — the fallback is EBUSY/EXDEV only.
-	hostutil.RenameFile = func(_, _ string) error { return unix.EPERM }
-	if err := hostutil.WriteFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
+	fsx.RenameFile = func(_, _ string) error { return unix.EPERM }
+	if err := fsx.WriteFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
 		t.Fatalf("WriteFileAtomic err=%v want EPERM", err)
 	}
 	if got := testutil.ReadFile(t, target); got != "1.2.3.4 pinned.example\n" {

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/nebula"
@@ -466,7 +467,10 @@ func TestDirectTCPAddFailureLogged(t *testing.T) {
 // restart evidence — the operator sees WHICH leg died.
 func TestNebulaNoTunAddrReason(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	e.host.On("addr show dev neb1", "") // interface up, no inet addr
+	// Interface up, no inet addr — the LinkAddrs seam answers empty.
+	e.n.cfg.linkAddrsFn = func(int, string) ([]netlink.Addr, error) {
+		return nil, nil
+	}
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background())
 	if !e.sd.Ran("restart nebula@interdc") {

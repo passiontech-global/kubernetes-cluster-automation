@@ -19,7 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -47,7 +47,7 @@ func ParseCiliumEncryptPeers(out string) (int, bool) {
 	var v any
 	if json.Unmarshal([]byte(out), &v) == nil {
 		var vals []int64
-		hostutil.JSONFindInts(v, &vals, "num-peers", "numpeers", "num_peers")
+		procfs.JSONFindInts(v, &vals, "num-peers", "numpeers", "num_peers")
 		if len(vals) > 0 {
 			return int(slices.Max(vals)), true
 		}

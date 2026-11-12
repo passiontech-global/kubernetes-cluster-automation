@@ -31,8 +31,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // kcm-queue-stall stall thresholds — a stalled KCM workqueue, never an
@@ -223,7 +223,7 @@ func (c *FreezeCheck) loadKCMSnapshot() *KCMQueueSnapshot {
 }
 
 // saveKCMSnapshot persists the scrape atomically — the
-// hostutil.WriteFileAtomic contract (a torn JSON just reads as
+// fsx.WriteFileAtomic contract (a torn JSON just reads as
 // "no baseline" next cycle; the shared primitive adds the payload
 // fsync + dir sync the hand-rolled tmp+rename lacked).
 func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
@@ -232,7 +232,7 @@ func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
 		return
 	}
 	path := filepath.Join(c.d.State.Dir, cdeps.FileKCMQueueSnap)
-	if err := hostutil.WriteFileAtomicBytes(path, b); err != nil {
+	if err := fsx.WriteFileAtomicBytes(path, b); err != nil {
 		c.d.State.AppendLogWarn(fmt.Sprintf(
 			"kcm snapshot write failed path=%s error=%v", path, err))
 	}
@@ -433,7 +433,7 @@ func (c *FreezeCheck) healFreeze(ctx context.Context, reason string) {
 		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "quorum_hold").Inc()
 		return
 	}
-	if c.d.HoldLocalAction(ctx) {
+	if c.d.HoldEmergencyHeal(ctx) {
 		c.d.State.SuspectLog(cdeps.StateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but cluster maintenance in progress — holding restart",
 			reason), c.d.Cfg.SuspectLogCadence)

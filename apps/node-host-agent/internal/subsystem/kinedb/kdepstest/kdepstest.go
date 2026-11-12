@@ -52,7 +52,10 @@ func Config(t *testing.T, rules []testutil.ExecRule) (kdeps.Config, *testutil.Fa
 		Runtime:       "podman",
 		Clock:         timex.NewCell(func() time.Time { return time.Unix(TestNow, 0) }),
 		Run:           fr.RunStdin,
-		WireFn:        func(context.Context, string) bool { return true },
+		// The combined seam shares the fake: rules match argv either
+		// way, and stderr-folding only differs on the real exec.
+		RunCombined: fr.RunStdin,
+		WireFn:      func(context.Context, string) bool { return true },
 	}, fr, dir
 }
 
@@ -90,7 +93,7 @@ pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
 // answers head|compact_rev|live_tup — no COUNT(*) (the row count is
 // the guard's job; a per-2min seq-scan bloats what it measures).
 var ProbeOKRules = []testutil.ExecRule{
-	{Substr: "inspect", Out: "true"},
+	{Substr: "inspect", Out: "true\ntrue\ntrue\ntrue\n"},
 	{Substr: "SHOW POOLS", Out: ShowPoolsOut},
 	{Substr: "logs --since", Out: "all quiet"},
 	{Substr: "MAX(id)", Out: "1000|200|290|1\n"},

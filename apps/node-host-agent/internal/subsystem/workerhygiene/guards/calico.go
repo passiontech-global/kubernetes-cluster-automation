@@ -184,7 +184,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", c.felixFails))
-			case c.d.HoldLocalAction(ctx):
+			case c.d.HoldEmergencyHeal(ctx):
 				c.d.State.AppendLog(
 					"suspect: calico-felix-down pod delete held — cluster maintenance in progress")
 			case !c.d.State.RateTrySpend("last-calico-restart", c.d.Cfg.MinRestartInterval):
@@ -269,7 +269,7 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		return
 	}
 	switch {
-	case c.d.HoldLocalAction(ctx):
+	case c.d.HoldEmergencyHeal(ctx):
 		c.d.State.AppendLog(
 			"suspect: calico-hygiene wireguard.cali pod delete held — cluster maintenance in progress")
 	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
@@ -340,17 +340,18 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 		if !d.State.RateOK("veth-seen-"+name, calicoVethGCMinAge) {
 			continue
 		}
-		if d.Cfg.Systemd == nil {
+		if d.Cfg.Seams.Host.LinkDelFn == nil {
 			d.State.AppendLog(fmt.Sprintf(
-				"suspect: calico-hygiene orphan veth %s down >%dm but no systemd client — skip delete",
+				"suspect: calico-hygiene orphan veth %s down >%dm but no link-delete client — skip delete",
 				name, int(calicoVethGCMinAge.Minutes())))
 			continue
 		}
-		out, derr := d.Cfg.Systemd.Exec(ctx, "ip", "link", "delete", name)
-		if derr != nil {
+		// netlinkx.LinkDel replaces the old `ip link delete` systemd
+		// exec — same host-netns target (pid 1), no fork per delete.
+		if derr := d.Cfg.Seams.Host.LinkDelFn(name); derr != nil {
 			d.State.AppendLog(fmt.Sprintf(
-				"suspect: calico-hygiene ip link delete %s failed: %v (%s)",
-				name, derr, strings.TrimSpace(out)))
+				"suspect: calico-hygiene ip link delete %s failed: %v",
+				name, derr))
 			continue
 		}
 		d.State.ClearBudget("veth-seen-" + name)

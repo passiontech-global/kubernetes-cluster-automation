@@ -171,7 +171,7 @@ func Counters(subsystem, cyclesHelp, actionsHelp string) (cycles, actions *prome
 // reloader is wired (hostconfig rewrites /etc/node-watchdog.conf
 // mid-run — the runner re-sourced it every run), then return the
 // freshest conf plus the sigOn kill-switch predicate
-// checks.Dispatch consumes: nil conf → every check runs (the
+// subframe.Dispatch consumes: nil conf → every check runs (the
 // documented pre-conf contract). The returned sigOn captures the
 // conf at refresh time — checks run synchronously on the calling
 // goroutine, so no conf change can interleave mid-dispatch.

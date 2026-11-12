@@ -199,10 +199,11 @@ type Config struct {
 	HTTPClient *http.Client
 	// Coord is the L1↔L3 nodecoord handle (platform/nodecoord) —
 	// nil disables the maintenance hold (tests, minimal wiring).
-	// Restart paths consult Deps.HoldLocalAction first: while the
+	// Restart paths consult Deps.HoldEmergencyHeal first: while the
 	// cluster holds the maintenance mutex (kured drain / control-
 	// plane upgrade) L1 must not bounce k0scontroller and add
-	// churn. A configured Coord fails closed inside nodecoord.
+	// churn. A configured Coord fails open inside nodecoord (only
+	// positively-known maintenance holds).
 	Coord *nodecoord.Coord
 
 	// JournalDirs are the host journal storage roots — the

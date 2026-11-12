@@ -195,3 +195,36 @@ func LinkByName(pid int, name string) (netlink.Link, error) {
 	defer h.Close()
 	return h.LinkByName(name)
 }
+
+// LinkAddrs lists every address bound to the named link in pid's
+// netns — `ip -o addr show dev <name>` parity without the fork.
+// A missing link surfaces the LinkByName error, the same
+// non-zero-exit shape the ip CLI gave callers.
+func LinkAddrs(pid int, name string) ([]netlink.Addr, error) {
+	h, err := routeHandle(pid)
+	if err != nil {
+		return nil, err
+	}
+	defer h.Close()
+	link, err := h.LinkByName(name)
+	if err != nil {
+		return nil, err
+	}
+	return h.AddrList(link, netlink.FAMILY_ALL)
+}
+
+// LinkDel deletes one interface by name in pid's netns —
+// `ip link delete <name>` parity for the calico orphan-veth GC,
+// minus the fork+exec the shell-out cost every confirmed delete.
+func LinkDel(pid int, name string) error {
+	h, err := routeHandle(pid)
+	if err != nil {
+		return err
+	}
+	defer h.Close()
+	l, err := h.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	return h.LinkDel(l)
+}

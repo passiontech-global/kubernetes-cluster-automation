@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // hostWriteRetryInterval bounds how often ONE write target may be
@@ -105,8 +105,8 @@ func (c *Collector) maybeRestoreClocksource() {
 // writes, so it goes through a plain truncating write — the same
 // semantics sysctl expects.
 func (c *Collector) maybeBumpAIOMax() {
-	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
-	mx, mxOK := hostutil.ReadUintFile(aioMaxFile)
+	nr, nrOK := fsx.ReadUintFile(aioNrFile)
+	mx, mxOK := fsx.ReadUintFile(aioMaxFile)
 	if !nrOK || !mxOK || mx == 0 || mx >= aioMaxTarget ||
 		float64(nr)/float64(mx) <= aioUsedRatioBump {
 		return

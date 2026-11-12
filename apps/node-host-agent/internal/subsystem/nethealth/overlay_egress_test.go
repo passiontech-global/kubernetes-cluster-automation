@@ -12,8 +12,8 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vishvananda/netlink"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 func TestEgressUnderlayDiesRelaysImmediately(t *testing.T) {
@@ -26,7 +26,7 @@ func TestEgressUnderlayDiesRelaysImmediately(t *testing.T) {
 	if !e.host.Ran("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
 		t.Fatalf("relay rule not added, cmds=%v", e.host.Cmds())
 	}
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	// Relay target itself unreachable through tunnel → suspect log.
@@ -50,7 +50,7 @@ func TestEgressRecoveryNeedsTwoFreshProbes(t *testing.T) {
 	if !e.host.Ran("rule del pref 1500 to 8.8.8.8/32 lookup 100") {
 		t.Fatalf("direct rule not restored, cmds=%v", e.host.Cmds())
 	}
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
 		t.Fatalf("committed=%q want direct", got)
 	}
 }
@@ -145,7 +145,7 @@ func TestEgressUnprobeableWindowCommitsToLive(t *testing.T) {
 
 	e.n.Cycle(context.Background())
 
-	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay (committed to live)", got)
 	}
 	log := logLines(t, e)

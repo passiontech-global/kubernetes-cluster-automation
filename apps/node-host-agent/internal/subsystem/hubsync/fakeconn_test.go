@@ -26,15 +26,20 @@ type fakeConn struct {
 	mu    sync.Mutex
 	files map[string][]byte
 	dirs  map[string]bool // seeded remote dirs (empty dirs the files map can't hold)
-	ops   []string        // ordered op log: "run:<cmd>" | "write:<path>"
-	sudo  bool            // non-root resolved user → sudo -n prefix
+	// staleTmp names files the `find -mmin +15` sweep reports —
+	// the fake has no mtimes, so tests mark a staging tmp "old"
+	// explicitly; unlisted tmps count as in-flight/young.
+	staleTmp map[string]bool
+	ops      []string // ordered op log: "run:<cmd>" | "write:<path>"
+	sudo     bool     // non-root resolved user → sudo -n prefix
 
 	runHook func(cmd string) (string, error) // optional override
 	closed  bool
 }
 
 func newFakeConn() *fakeConn {
-	return &fakeConn{files: map[string][]byte{}, dirs: map[string]bool{}}
+	return &fakeConn{files: map[string][]byte{}, dirs: map[string]bool{},
+		staleTmp: map[string]bool{}}
 }
 
 // seedFile plants remote content (pre-converged state).
@@ -158,9 +163,25 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 		}
 		sort.Strings(ns)
 		return strings.Join(ns, "\n"), nil
+	case strings.HasPrefix(exec, "find "):
+		// `find <dir> -maxdepth 1 -type f -name '.*.tmp*' -mmin +15
+		// -printf '%f\n'` — the tmp-orphan sweep. The fake has no
+		// mtimes, so staleTmp names the files find reports (tests
+		// mark a tmp "old" explicitly); everything else is young.
+		rest := strings.TrimPrefix(exec, "find ")
+		dir := unshq(strings.SplitN(rest, " ", 2)[0])
+		var ns []string
+		for p := range f.staleTmp {
+			if path.Dir(p) == dir {
+				ns = append(ns, path.Base(p))
+			}
+		}
+		sort.Strings(ns)
+		return strings.Join(ns, "\n"), nil
 	case strings.HasPrefix(exec, "rm -f "):
 		p := unshq(strings.TrimPrefix(exec, "rm -f "))
 		delete(f.files, p)
+		delete(f.staleTmp, p)
 		return "", nil
 	default:
 		// mkdir/chmod/systemctl/daemon-reload → success no-op.

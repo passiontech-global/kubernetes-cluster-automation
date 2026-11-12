@@ -21,9 +21,9 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // holdLease marks the lease held through the deadline — direct
@@ -965,10 +965,11 @@ func TestSyncDirEmptyKeepsetRefusesPrune(t *testing.T) {
 	}
 }
 
-// TestPruneRemoteDirStaleTmp: mirror pruning also removes orphaned
-// `.<name>.tmp` staging leftovers — but only names absent from the
-// kept set (a tmp whose file is still mirrored may be in-flight),
-// and never foreign dotfiles or subdirs.
+// TestPruneRemoteDirStaleTmp: mirror pruning removes orphaned
+// `.<name>.tmp` staging leftovers ONLY past the 15m in-flight
+// window — the fake's find reports staleTmp members, so the orphan
+// is marked old while the kept-name tmp stays young. Foreign
+// dotfiles and subdirs are never touched.
 func TestPruneRemoteDirStaleTmp(t *testing.T) {
 	s, err := New(testConfig(t, newClientsetWithSecret(), newFakeDialer(),
 		[]byte("bin")), nil)
@@ -979,7 +980,8 @@ func TestPruneRemoteDirStaleTmp(t *testing.T) {
 	c.seedFile("/d/kept.yaml", []byte("x"))
 	c.seedFile("/d/stale.yaml", []byte("x"))
 	c.seedFile("/d/.orphan.yaml.tmp", []byte("x"))
-	c.seedFile("/d/.kept.yaml.tmp", []byte("x")) // name still kept — in-flight
+	c.staleTmp["/d/.orphan.yaml.tmp"] = true     // >15m — orphaned
+	c.seedFile("/d/.kept.yaml.tmp", []byte("x")) // young — in-flight
 	c.seedFile("/d/.foreign", []byte("x"))
 	c.seedDir("/d/subdir")
 
@@ -1157,7 +1159,7 @@ func TestSHA256sumChunks(t *testing.T) {
 	// One oversized path is never dropped — its own chunk.
 	big := "/d/" + strings.Repeat("b", sha256sumCmdChunk)
 	got := sha256sumChunks([]string{big})
-	if len(got) != 1 || got[0] != hostutil.ShellQuote(big) {
+	if len(got) != 1 || got[0] != fsx.ShellQuote(big) {
 		t.Fatalf("oversized path chunks=%q, want the single quoted path", got)
 	}
 }

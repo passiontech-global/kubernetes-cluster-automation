@@ -13,10 +13,11 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // isKeyMaterial flags private-key-looking filenames — mirrored
@@ -94,15 +95,20 @@ func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode 
 // refuses outright: mirror semantics would rm every remote file,
 // but a locally-empty dir means the SOURCE is broken (empty
 // ConfigMap / failed mount), not that the target should be wiped.
-// `.<name>.tmp` staging leftovers from an interrupted put are
-// pruned too — but only for names absent from the kept set (a tmp
-// whose file is still mirrored may be an in-flight upload).
+//
+// Dotfiles are ALL left to sweepTmpOrphans: the `.<name>.tmp` /
+// `.<name>.tmp.<nonce>` staging scheme is only deleted past the
+// 15-minute in-flight window — a younger tmp may belong to a
+// CONCURRENT converge (the per-dial nonce makes names unique but
+// the pattern shared), and the old keep-set check could neither
+// see nonce-suffixed tmps nor age-gate them, so orphans accumulated
+// forever. Real (non-tmp) stale files still delete immediately.
 func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, names []string) error {
 	if len(names) == 0 {
 		return fmt.Errorf("prune %s: refusing to empty remote dir — local kept-set empty",
 			remoteDir)
 	}
-	out, err := c.Run(ctx, "ls -1pA "+hostutil.ShellQuote(remoteDir))
+	out, err := c.Run(ctx, "ls -1pA "+fsx.ShellQuote(remoteDir))
 	if err != nil {
 		return fmt.Errorf("ls %s: %w", remoteDir, err)
 	}
@@ -112,25 +118,55 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 	}
 	for _, rname := range strings.Split(out, "\n") {
 		rname = strings.TrimSpace(rname)
-		if rname == "" || local[rname] || strings.HasSuffix(rname, "/") {
+		if rname == "" || local[rname] || strings.HasSuffix(rname, "/") ||
+			strings.HasPrefix(rname, ".") {
 			continue
 		}
-		if strings.HasPrefix(rname, ".") {
-			// Dotfiles are bounded to the staging scheme — other
-			// hidden files in the managed dir are not ours to
-			// touch. A `.<name>.tmp` whose <name> is still kept may
-			// be an in-flight upload: leave it.
-			stem := strings.TrimPrefix(rname, ".")
-			if !strings.HasSuffix(stem, ".tmp") ||
-				local[strings.TrimSuffix(stem, ".tmp")] {
-				continue
-			}
-		}
-		if _, err := c.Run(ctx, "rm -f "+hostutil.ShellQuote(path.Join(remoteDir, rname))); err != nil {
+		if _, err := c.Run(ctx, "rm -f "+fsx.ShellQuote(path.Join(remoteDir, rname))); err != nil {
 			return fmt.Errorf("rm stale %s/%s: %w", remoteDir, rname, err)
 		}
 		s.cfg.Log.Info("hubsync: removed stale remote file",
 			"path", path.Join(remoteDir, rname))
+	}
+	return s.sweepTmpOrphans(ctx, c, remoteDir)
+}
+
+// tmpOrphanMinAge is the in-flight window sweepTmpOrphans honors:
+// a staging file younger than this may belong to a live upload
+// (the put streams for seconds, WAN included); older than it the
+// writer is gone — crash, cancel or a pre-trap build — and the
+// file is an orphan.
+const tmpOrphanMinAge = 15
+
+// sweepTmpOrphans deletes `.<name>.tmp[.<nonce>]` staging leftovers
+// older than tmpOrphanMinAge inside dir — one `find` listing plus
+// one `rm -f` per actual orphan (zero extra execs in the common
+// all-clean case). Best-effort by contract: a missing find(1) or a
+// failed rm logs and returns nil — orphan tmps are cosmetic (the
+// next put's trap or a later sweep collects them), never a reason
+// to fail the mirror.
+func (s *Syncer) sweepTmpOrphans(ctx context.Context, c Conn, dir string) error {
+	out, err := c.Run(ctx, "find "+fsx.ShellQuote(dir)+
+		" -maxdepth 1 -type f -name '.*.tmp*' -mmin +"+
+		strconv.Itoa(tmpOrphanMinAge)+" -printf '%f\\n'")
+	if err != nil {
+		s.cfg.Log.Debug("hubsync: tmp-orphan sweep skipped",
+			"dir", dir, "error", err)
+		return nil
+	}
+	for _, name := range strings.Split(out, "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, err := c.Run(ctx, "rm -f "+
+			fsx.ShellQuote(path.Join(dir, name))); err != nil {
+			s.cfg.Log.Warn("hubsync: tmp-orphan rm failed",
+				"path", path.Join(dir, name), "error", err)
+			continue
+		}
+		s.cfg.Log.Info("hubsync: removed orphan staging file",
+			"path", path.Join(dir, name))
 	}
 	return nil
 }

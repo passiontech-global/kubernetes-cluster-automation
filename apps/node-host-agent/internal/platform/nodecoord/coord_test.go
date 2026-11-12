@@ -1,8 +1,9 @@
 // coord_test.go — the L1↔L3 coordination protocol: cached
 // Cluster→Node verdicts, nodes/status + pod stamp writes, and the
-// fail-open HoldLocalAction contract (hold only inside a previously
-// CONFIRMED maintenance window; unverifiable state otherwise fails
-// open so a dead apiserver cannot freeze L1 self-heal).
+// two maintenance gates: HoldLocalAction fails CLOSED on API
+// errors (404 alone fails open — destructive heals must never run
+// mid-drain) while HoldEmergencyHeal fails OPEN and holds only on
+// positively-known maintenance.
 package nodecoord
 
 import (
@@ -70,7 +71,7 @@ func TestMaintenanceExpiredStamp(t *testing.T) {
 func TestMaintenanceKuredLock(t *testing.T) {
 	c := &Coord{
 		GetAnnos: func(context.Context) (map[string]string, error) {
-			return map[string]string{kuredLockAnno: "node-3"}, nil
+			return map[string]string{nodecond.KuredLockAnno: "node-3"}, nil
 		},
 	}
 	v, err := c.Maintenance(context.Background())
@@ -79,33 +80,55 @@ func TestMaintenanceKuredLock(t *testing.T) {
 	}
 }
 
-// TestHoldLocalActionFailsOpenOnError is the RBAC contract: a
-// controller VM with no Node object (404) or a dead apiserver must
-// NOT freeze L1 self-heal — HoldLocalAction returns false when no
-// previously confirmed maintenance window is still open.
-func TestHoldLocalActionFailsOpenOnError(t *testing.T) {
+// TestHoldLocalActionFailClosedOnError is the destructive-heal
+// contract: a node WITH a Node object whose annotation read fails
+// for any non-404 reason (network, timeout, 5xx) must HOLD —
+// deleting pvc-* state or evicting pods mid-drain is unrecoverable.
+// Only the 404 (standalone controller VM, no Node object) fails
+// open, because maintenance is unverifiable there by construction.
+func TestHoldLocalActionFailClosedOnError(t *testing.T) {
 	notFound := apierrors.NewNotFound(
 		schema.GroupResource{Resource: "nodes"}, "ctrl-vm")
-	for name, err := range map[string]error{
-		"404":     notFound,
-		"connref": errors.New("connection refused"),
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"404":       {notFound, false},
+		"connref":   {errors.New("connection refused"), true},
+		"deadline":  {context.DeadlineExceeded, true},
+		"forbidden": {apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "n", errors.New("rbac")), true},
+		"unavail":   {apierrors.NewServiceUnavailable("apiserver gone"), true},
 	} {
 		c := &Coord{
 			GetAnnos: func(context.Context) (map[string]string, error) {
-				return nil, err
+				return nil, tc.err
 			},
 		}
-		if c.HoldLocalAction(context.Background()) {
-			t.Fatalf("%s: HoldLocalAction must fail open with no confirmed window", name)
+		if got := c.HoldLocalAction(context.Background()); got != tc.want {
+			t.Fatalf("%s: HoldLocalAction = %v, want %v", name, got, tc.want)
 		}
 	}
 }
 
-// TestHoldLocalActionHoldsInsideConfirmedWindow: once a verdict
+// TestHoldEmergencyHealFailsOpenOnError: the self-heal gate must
+// never freeze controller/CNI recovery on an unreachable apiserver
+// — with no positively-known maintenance it returns false.
+func TestHoldEmergencyHealFailsOpenOnError(t *testing.T) {
+	c := &Coord{
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return nil, errors.New("apiserver gone")
+		},
+	}
+	if c.HoldEmergencyHeal(context.Background()) {
+		t.Fatal("HoldEmergencyHeal must fail open with no confirmed state")
+	}
+}
+
+// TestHoldEmergencyHealHoldsInsideConfirmedWindow: once a verdict
 // confirmed a live MaintenanceUntil, an API failure keeps holding
-// while now < until — a drain verified moments ago survives an
-// apiserver blip — and fails open once the window lapses.
-func TestHoldLocalActionHoldsInsideConfirmedWindow(t *testing.T) {
+// while now < lastMaintUntil — and fails open once the window
+// lapses (unlike HoldLocalAction, which holds on ANY error).
+func TestHoldEmergencyHealHoldsInsideConfirmedWindow(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	until := now.Add(10 * time.Minute)
 	fail := false
@@ -120,7 +143,7 @@ func TestHoldLocalActionHoldsInsideConfirmedWindow(t *testing.T) {
 			}, nil
 		},
 	}
-	if !c.HoldLocalAction(context.Background()) {
+	if !c.HoldEmergencyHeal(context.Background()) {
 		t.Fatal("want hold during confirmed window")
 	}
 	// API dies mid-window → still holds (confirmed window open).
@@ -128,23 +151,22 @@ func TestHoldLocalActionHoldsInsideConfirmedWindow(t *testing.T) {
 	c.Now = func() time.Time { return now.Add(5 * time.Minute) }
 	// Expire the read cache so the error path is exercised.
 	c.cachedAt = now.Add(-2 * CacheTTL)
-	if !c.HoldLocalAction(context.Background()) {
+	if !c.HoldEmergencyHeal(context.Background()) {
 		t.Fatal("want hold inside confirmed window despite API error")
 	}
 	// Window lapses → fail open.
 	c.Now = func() time.Time { return until.Add(time.Minute) }
 	c.cachedAt = now.Add(-2 * CacheTTL)
-	if c.HoldLocalAction(context.Background()) {
+	if c.HoldEmergencyHeal(context.Background()) {
 		t.Fatal("want fail-open after confirmed window lapses")
 	}
 }
 
-// TestHoldLocalActionKuredSurvivesFlap: a SUCCESSFULLY READ kured
-// drain lock keeps holding through kuredLockTTL of apiserver
-// failure — a brief flap must not drop the drain hold — then fails
-// open. And a cached FALSE verdict is never promoted to a hold by
-// the error itself (fresh evidence wins over the cache).
-func TestHoldLocalActionKuredSurvivesFlap(t *testing.T) {
+// TestHoldEmergencyHealKuredSurvivesFlap: a SUCCESSFULLY READ kured
+// drain lock keeps holding HoldEmergencyHeal through kuredHealTTL
+// (10m) of apiserver failure — a kured drain legitimately runs for
+// minutes — then fails open.
+func TestHoldEmergencyHealKuredSurvivesFlap(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	fail := false
 	c := &Coord{
@@ -153,26 +175,25 @@ func TestHoldLocalActionKuredSurvivesFlap(t *testing.T) {
 			if fail {
 				return nil, errors.New("apiserver gone")
 			}
-			return map[string]string{kuredLockAnno: "node-3"}, nil
+			return map[string]string{nodecond.KuredLockAnno: "node-3"}, nil
 		},
 	}
-	if !c.HoldLocalAction(context.Background()) {
+	if !c.HoldEmergencyHeal(context.Background()) {
 		t.Fatal("want hold on confirmed kured lock")
 	}
-	// API dies 10s later — inside kuredLockTTL the confirmed lock
+	// API dies 5m later — inside kuredHealTTL the confirmed lock
 	// still holds (cachedAt is forced stale so the error path runs).
 	fail = true
-	c.Now = func() time.Time { return t0.Add(10 * time.Second) }
+	c.Now = func() time.Time { return t0.Add(5 * time.Minute) }
 	c.cachedAt = t0.Add(-2 * CacheTTL)
-	if !c.HoldLocalAction(context.Background()) {
-		t.Fatal("want hold through flap inside kuredLockTTL")
+	if !c.HoldEmergencyHeal(context.Background()) {
+		t.Fatal("want hold through flap inside kuredHealTTL")
 	}
-	// Past the TTL the unverifiable lock drops → fail open (no
-	// maintenance window was ever confirmed).
-	c.Now = func() time.Time { return t0.Add(2 * kuredLockTTL) }
+	// Past the 10m window the unverifiable lock drops → fail open.
+	c.Now = func() time.Time { return t0.Add(kuredHealTTL + time.Minute) }
 	c.cachedAt = t0.Add(-2 * CacheTTL)
-	if c.HoldLocalAction(context.Background()) {
-		t.Fatal("want fail-open after kuredLockTTL of API failure")
+	if c.HoldEmergencyHeal(context.Background()) {
+		t.Fatal("want fail-open after kuredHealTTL of API failure")
 	}
 }
 

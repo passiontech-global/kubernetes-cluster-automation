@@ -1,7 +1,9 @@
-// clockskew.go — clock-skew checkClockSkew: chronyc tracking (adjtimex
-// offset fallback) → state-clock-skew (ClockSkewDetected) + a
-// rate-limited `chronyc makestep`. The kernelfail contract overview
-// lives in kernelfail.go.
+// clockskew.go — clock-skew checkClockSkew: adjtimex first (a
+// modes==0 read needs no fork), `chronyc tracking` only when the
+// kernel discipline does NOT prove a stably synced clock →
+// state-clock-skew (ClockSkewDetected) + a rate-limited
+// `chronyc makestep`. The kernelfail contract overview lives in
+// kernelfail.go.
 package kernelfail
 
 import (
@@ -37,21 +39,36 @@ const (
 
 // --- clock-skew: clock skew ---
 
-// clockSkewProbe returns (offsetSeconds, synchronized, ok). Primary
-// source is `chronyc tracking` — its "System time" offset is the
-// measured skew and "Leap status" the sync verdict. Fallback is a
-// read-only adjtimex: Timex.Offset (µs) is the kernel's offset
-// estimate and STA_UNSYNC the sync verdict — enough to makestep and
-// (when the estimate exceeds 2s) to latch.
+// clockSkewProbe returns (offsetSeconds, synchronized, ok). The
+// adjtimex read goes FIRST — a modes==0 syscall needs no fork and
+// no privilege, and a stably synced clock (sync bit set, offset
+// inside the makestep band) needs no chronyc verdict at all: the
+// fork is skipped outright on healthy nodes, which is every tick
+// on a disciplined host. Anything else — unsynced, offset past the
+// step threshold, or adjtimex failure — falls through to
+// `chronyc tracking`, whose "System time" offset is the measured
+// skew and "Leap status" the sync verdict; adjtimex's own numbers
+// remain the last resort when chronyc is absent or unparseable
+// (Timex.Offset µs is the kernel's offset estimate, STA_UNSYNC the
+// sync verdict — enough to makestep and, past 2s, to latch).
 func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
+	var tx unix.Timex
+	txOK := false
+	if _, err := r.deps.Adjtimex(&tx); err == nil {
+		txOK = true
+		off := float64(tx.Offset) / 1e6
+		if tx.Status&unix.STA_UNSYNC == 0 &&
+			math.Abs(off) <= clockSkewStepOffset {
+			return off, true, true
+		}
+	}
 	out, err := r.deps.RunHostCmd(ctx, "chronyc", "tracking")
 	if err == nil {
 		if off, synced, ok := parseChronycTracking(out); ok {
 			return off, synced, true
 		}
 	}
-	var tx unix.Timex
-	if _, err := r.deps.Adjtimex(&tx); err != nil {
+	if !txOK {
 		return 0, false, false
 	}
 	return float64(tx.Offset) / 1e6,

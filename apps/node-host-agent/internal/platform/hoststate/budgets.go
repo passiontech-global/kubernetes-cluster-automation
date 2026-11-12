@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- epoch files ---
@@ -47,7 +47,7 @@ func (s *Store) WriteEpochFile(path string, epoch int64) bool {
 // writeEpochFile is the error-returning core — InitHeartbeatFiles
 // propagates failures instead of warn-and-continue.
 func writeEpochFile(path string, epoch int64) error {
-	return hostutil.WriteFileAtomic(path,
+	return fsx.WriteFileAtomic(path,
 		strconv.FormatInt(epoch, 10)+"\n")
 }
 
@@ -59,7 +59,7 @@ func writeEpochFile(path string, epoch int64) error {
 // rate budgets keep the durable writeEpochFile: a lost budget
 // silently re-opens a cooldown, a lost latch clears a live fault.
 func writeEpochFileNoSync(path string, epoch int64) error {
-	return hostutil.WriteFileAtomicNoSync(path,
+	return fsx.WriteFileAtomicNoSync(path,
 		strconv.FormatInt(epoch, 10)+"\n")
 }
 

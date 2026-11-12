@@ -86,7 +86,7 @@ func TestPGBStarveReconnectAfterTwoProbes(t *testing.T) {
 		}
 	}
 
-	res = k.Cycle(context.Background())
+	k.Cycle(context.Background())
 	j := fr.Joined()
 	if !strings.Contains(j, "-d pgbouncer -Aqc RECONNECT") {
 		t.Fatalf("RECONNECT did not fire on the second starved probe:\n%s", j)

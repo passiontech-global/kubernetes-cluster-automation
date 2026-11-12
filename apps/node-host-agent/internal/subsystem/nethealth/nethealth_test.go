@@ -261,7 +261,14 @@ func nebulaEnv(t *testing.T, mutate func(*watchdogconf.Config)) *env {
 	// 45670 = 0xB266.
 	testutil.WriteFile(t, e.procudp, "  sl  local_address rem_address   st tx_queue rx_queue\n"+
 		"  1: 0100007F:B266 00000000:0000 07 00000000:00000000\n")
-	e.host.On("addr show dev neb1", "3: neb1    inet 10.8.0.10/24 scope global neb1\n")
+	// The tun-address probe reads netlinkx LinkAddrs (pid 1 = host
+	// netns) — stub the seam with one IPv4 addr on neb1.
+	e.n.cfg.linkAddrsFn = func(int, string) ([]netlink.Addr, error) {
+		return []netlink.Addr{{
+			IPNet: &net.IPNet{IP: net.ParseIP("10.8.0.10"),
+				Mask: net.CIDRMask(24, 32)},
+		}}, nil
+	}
 	for _, ip := range []string{"10.8.0.1", "10.8.0.2", "10.8.1.1", "10.8.1.2"} {
 		e.pingOK[ip+"|false"] = true
 		e.pingRTT[ip+"|false"] = 5

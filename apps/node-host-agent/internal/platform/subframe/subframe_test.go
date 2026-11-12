@@ -124,7 +124,7 @@ func TestBaseStoreMethods(t *testing.T) {
 	if s.Dir != wdDir || s.LogFile != wdLog {
 		t.Fatalf("Store fields = %q/%q", s.Dir, s.LogFile)
 	}
-	if s.Now().Sub(time.Now()) > time.Minute {
+	if time.Until(s.Now()) > time.Minute {
 		t.Fatalf("Store clock not Base.Clock: %v", s.Now())
 	}
 
@@ -133,7 +133,7 @@ func TestBaseStoreMethods(t *testing.T) {
 	if priv.Dir != privDir || priv.LogFile != "" {
 		t.Fatalf("StoreAt fields = %q/%q", priv.Dir, priv.LogFile)
 	}
-	if priv.Now().Sub(time.Now()) > time.Minute {
+	if time.Until(priv.Now()) > time.Minute {
 		t.Fatalf("StoreAt clock not Base.Clock: %v", priv.Now())
 	}
 	// The private dir is its OWN key — two StoreAt calls over it

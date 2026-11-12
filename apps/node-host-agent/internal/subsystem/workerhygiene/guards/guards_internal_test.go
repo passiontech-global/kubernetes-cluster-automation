@@ -7,6 +7,7 @@ package guards
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -109,15 +111,15 @@ func TestPodCgroupRelAndMemoryCurrent(t *testing.T) {
 
 func TestOwnedByStatefulSet(t *testing.T) {
 	p := &corev1.Pod{}
-	if ownedByStatefulSet(p) {
+	if wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("no ownerReferences must be false")
 	}
 	p.OwnerReferences = []metav1.OwnerReference{{Kind: "ReplicaSet"}}
-	if ownedByStatefulSet(p) {
+	if wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("ReplicaSet owner must be false")
 	}
 	p.OwnerReferences = append(p.OwnerReferences, metav1.OwnerReference{Kind: "StatefulSet"})
-	if !ownedByStatefulSet(p) {
+	if !wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("StatefulSet owner must be true")
 	}
 	// Database-operator owner kinds count too — CNPG Cluster,
@@ -128,7 +130,7 @@ func TestOwnedByStatefulSet(t *testing.T) {
 		"PerconaServerMongoDB", "PerconaXtraDBCluster", "PerconaPGCluster",
 	} {
 		q := &corev1.Pod{OwnerReferences: []metav1.OwnerReference{{Kind: kind}}}
-		if !ownedByStatefulSet(q) {
+		if !wdeps.OwnedByStatefulSet(q) {
 			t.Fatalf("owner kind %s must be true", kind)
 		}
 	}
@@ -147,11 +149,15 @@ func TestCarriesDBQuorumLabel(t *testing.T) {
 			"cnpg.io/cluster": "pg", "cnpg.io/instanceRole": "primary"}, want: true},
 		"crunchy role": {labels: map[string]string{
 			"postgres-operator.crunchydata.com/role": "master"}, want: true},
-		"cnpg cluster label alone is not quorum": {labels: map[string]string{
-			"cnpg.io/cluster": "pg"}, want: false},
+		// Union semantics (wdeps.DBQuorumTokens): the bare
+		// cnpg.io/cluster label every CNPG pod carries matches the
+		// "cnpg" token — disk-bloat always protected it, psi now
+		// does too.
+		"cnpg cluster label alone is quorum": {labels: map[string]string{
+			"cnpg.io/cluster": "pg"}, want: true},
 	} {
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
-		if got := carriesDBQuorumLabel(p); got != tc.want {
+		if got := wdeps.CarriesDBQuorumLabel(p); got != tc.want {
 			t.Fatalf("%s: carriesDBQuorumLabel=%v want %v", name, got, tc.want)
 		}
 	}
@@ -240,7 +246,7 @@ func TestHighestRSSPodTiersAndRails(t *testing.T) {
 	if evictablePodOnNode(&cnpg) {
 		t.Fatal("CNPG primary pod must not be evictable")
 	}
-	if ownedByStatefulSet(&cnpg) != true {
+	if wdeps.OwnedByStatefulSet(&cnpg) != true {
 		t.Fatal("CNPG Cluster owner must count as stateful-owned")
 	}
 	victim, _ = highestRSSPod(d3, []corev1.Pod{cnpg}, []int{31})
@@ -482,28 +488,39 @@ func TestGcCalicoOrphanVeths(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ifaceDir, "carrier"), []byte("0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// The systemd fake fails every argv by default (ENOENT) — the
-	// exec-failure path logs suspect and keeps the marker.
+	// The link-delete seam fails by default injection — the
+	// delete-failure path logs suspect and keeps the marker.
+	f.LinkDelErrs = map[string]error{"cali1234": errors.New("netlink denied")}
 	gcCalicoOrphanVeths(d, ctx)
 	marker := filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-cali1234")
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("candidate marker missing after first pass: %v", err)
 	}
 
-	// Age the marker past calicoVethGCMinAge with no systemd client →
-	// the skip-delete guard keeps the marker.
+	// Age the marker past calicoVethGCMinAge with no link-delete
+	// client → the skip-delete guard keeps the marker.
 	f.Now = f.Now.Add(time.Hour)
-	d.Cfg.Systemd = nil // no-systemd guard: skip delete, keep marker
+	d.Cfg.Seams.Host.LinkDelFn = nil // no-client guard: skip delete, keep marker
 	gcCalicoOrphanVeths(d, ctx)
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatal("no-systemd pass must keep the marker (skip delete)")
+		t.Fatal("no-client pass must keep the marker (skip delete)")
+	}
+
+	// Re-arm the seam with a failing delete — the suspect path
+	// keeps the marker for the next cycle.
+	f.Now = f.Now.Add(time.Hour)
+	d.Cfg.Seams.Host.LinkDelFn = func(name string) error {
+		return errors.New("netlink denied")
+	}
+	gcCalicoOrphanVeths(d, ctx)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("failed delete must keep the marker")
 	}
 }
 
-func TestGcCalicoOrphanVethsDeletesViaSystemd(t *testing.T) {
+func TestGcCalicoOrphanVethsDeletesViaLinkDel(t *testing.T) {
 	d, f := gDeps(t)
 	ctx := context.Background()
-	f.SDReply["ip link delete"] = ""
 	ifaceDir := filepath.Join(d.Cfg.SysClassNet, "caliabcd")
 	if err := os.MkdirAll(ifaceDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -513,9 +530,9 @@ func TestGcCalicoOrphanVethsDeletesViaSystemd(t *testing.T) {
 	}
 	gcCalicoOrphanVeths(d, ctx) // candidate + marker
 	f.Now = f.Now.Add(time.Hour)
-	gcCalicoOrphanVeths(d, ctx) // confirmed → ip link delete + prune
-	if !f.SDRan("ip link delete caliabcd") {
-		t.Fatal("confirmed orphan veth must be deleted via systemd")
+	gcCalicoOrphanVeths(d, ctx) // confirmed → link delete + prune
+	if !f.LinkDelRan("caliabcd") {
+		t.Fatal("confirmed orphan veth must be deleted via LinkDelFn")
 	}
 	if _, err := os.Stat(filepath.Join(d.Cfg.WatchdogStateDir,
 		"veth-seen-caliabcd")); !os.IsNotExist(err) {
@@ -667,44 +684,45 @@ func TestCheckDeactivating(t *testing.T) {
 	d, f := gDeps(t)
 	c := &ScopesCheck{d: d}
 	ctx := context.Background()
+	ce := &wdeps.CycleEnv{}
 
-	// list-units failure (no SDReply stub → ENOENT): inconclusive —
-	// the streak is kept, not reset, and no count is logged.
+	// scopeNamesInState keeps only .scope-suffixed names whose
+	// ActiveState or SubState matches — services and units in
+	// other states never reach the streak. (Scopes report
+	// "deactivating" in SUB while ACTIVE stays "active".)
+	units := []systemd.UnitInfo{
+		{Name: "cri-containerd-abc123.scope", LoadState: "loaded",
+			ActiveState: "active", SubState: "deactivating"},
+		{Name: "some.service", LoadState: "loaded",
+			ActiveState: "active", SubState: "deactivating"},
+		{Name: "cri-containerd-ok.scope", LoadState: "loaded",
+			ActiveState: "active", SubState: "running"},
+		{Name: "cri-containerd-failed.scope", LoadState: "loaded",
+			ActiveState: "failed", SubState: "failed"},
+	}
+	got := scopeNamesInState(units, "deactivating")
+	if len(got) != 1 || got[0] != "cri-containerd-abc123.scope" {
+		t.Fatalf("scopeNamesInState deactivating=%v want [cri-containerd-abc123.scope]",
+			got)
+	}
+
+	// Empty unit set → streak resets. A failed sweep-level
+	// list-units aborts in Run before this helper runs, so the
+	// streak-kept-on-transport-failure property is structural —
+	// TestScopesRunSweepAndReset pins the abort path.
 	c.deactStreak = 5
-	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
-	if c.deactStreak != 5 {
-		t.Fatalf("exec failure deactStreak=%d want kept at 5", c.deactStreak)
-	}
-	if log := f.LogLines(t); !strings.Contains(log,
-		"deactivating list-units failed") {
-		t.Fatalf("want list-units failure line, log=%q", log)
-	}
-
-	// Empty output → streak resets.
-	f.SDReply["state=deactivating"] = "\n"
-	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
+	c.checkDeactivating(ctx, ce, nil)
 	if c.deactStreak != 0 {
 		t.Fatalf("empty list deactStreak=%d want 0", c.deactStreak)
 	}
 
-	// Non-.scope lines don't count toward the wedge.
-	f.SDReply["state=deactivating"] =
-		"some.service loaded active deactivating stopping\n" +
-			"not-a-scope loaded active deactivating\n"
-	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
-	if c.deactStreak != 0 {
-		t.Fatalf("non-scope lines deactStreak=%d want 0", c.deactStreak)
-	}
-
 	// One wedged scope: streak 1 stays silent (alert needs ≥2).
-	f.SDReply["state=deactivating"] =
-		"cri-containerd-abc123.scope loaded active deactivating stopping\n"
-	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
+	c.checkDeactivating(ctx, ce, []string{"cri-containerd-abc123.scope"})
 	if c.deactStreak != 1 {
 		t.Fatalf("first wedged sweep deactStreak=%d want 1", c.deactStreak)
 	}
 	// Second consecutive sweep → the diagnose-only suspect line.
-	c.checkDeactivating(ctx, &wdeps.CycleEnv{})
+	c.checkDeactivating(ctx, ce, []string{"cri-containerd-abc123.scope"})
 	if c.deactStreak != 2 {
 		t.Fatalf("second wedged sweep deactStreak=%d want 2", c.deactStreak)
 	}
@@ -727,10 +745,8 @@ func TestReapDeactivatingOrphanedScopes(t *testing.T) {
 	orphanID := "9999deadbeef0000111122223333444455556666777788889999aaaabbbbcccc"
 	liveUnit := "cri-containerd-" + liveID + ".scope"
 	orphanUnit := "cri-containerd-" + orphanID + ".scope"
-	f.SDReply["state=deactivating"] = liveUnit +
-		" loaded active deactivating stopping\n" +
-		orphanUnit + " loaded active deactivating stopping\n"
-	f.SDReply["kill --signal=SIGKILL"] = ""
+	deactUnits := []string{liveUnit, orphanUnit}
+	f.SDReply["kill -s SIGKILL"] = ""
 	f.SDReply["stop cri-containerd-"] = ""
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "live"},
@@ -745,20 +761,20 @@ func TestReapDeactivatingOrphanedScopes(t *testing.T) {
 	ce := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}, APIOK: true}
 
 	// Sweep 1 — streak 1, the per-unit ledger is still empty: no reap.
-	c.checkDeactivating(ctx, ce)
-	if f.SDRan("kill --signal=SIGKILL") {
+	c.checkDeactivating(ctx, ce, deactUnits)
+	if f.SDRan("kill -s SIGKILL") {
 		t.Fatal("reaped on the first sighting — needs ≥2 sweeps")
 	}
 	// Sweep 2 — streak 2: the orphan is SIGKILLed + stopped, the
 	// live pod's scope is left alone.
-	c.checkDeactivating(ctx, ce)
-	if !f.SDRan("kill --signal=SIGKILL " + orphanUnit) {
+	c.checkDeactivating(ctx, ce, deactUnits)
+	if !f.SDRan("kill -s SIGKILL " + orphanUnit) {
 		t.Fatal("orphaned scope not SIGKILLed")
 	}
 	if !f.SDRan("stop " + orphanUnit) {
 		t.Fatal("orphaned scope not stopped")
 	}
-	if f.SDRan("kill --signal=SIGKILL "+liveUnit) ||
+	if f.SDRan("kill -s SIGKILL "+liveUnit) ||
 		f.SDRan("stop "+liveUnit) {
 		t.Fatal("live pod's scope was reaped — would be a pod kill")
 	}

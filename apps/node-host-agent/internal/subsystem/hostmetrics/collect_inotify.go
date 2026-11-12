@@ -12,7 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -142,8 +142,8 @@ var (
 // limit file parses (same per-source rule as conntrack).
 func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
 	inst, watch, top := c.inotifySnapshot()
-	maxI, instOK := hostutil.ReadUintFile(c.cfg.InotifyMaxInstancesFile)
-	maxW, watchOK := hostutil.ReadUintFile(c.cfg.InotifyMaxWatchesFile)
+	maxI, instOK := fsx.ReadUintFile(c.cfg.InotifyMaxInstancesFile)
+	maxW, watchOK := fsx.ReadUintFile(c.cfg.InotifyMaxWatchesFile)
 	if instOK && maxI > 0 {
 		r := float64(inst) / float64(maxI)
 		ch <- prometheus.MustNewConstMetric(descInotifyInst,

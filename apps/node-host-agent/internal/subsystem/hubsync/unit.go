@@ -7,7 +7,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // systemdUnit renders the remote node-host-agent.service for target
@@ -51,7 +51,7 @@ Environment=GOMEMLIMIT=400MiB
 
 [Install]
 WantedBy=multi-user.target
-`, remoteVarsDir, remoteCertsDir, remoteBinary, hostutil.ShellQuote(t.Name))
+`, remoteVarsDir, remoteCertsDir, remoteBinary, fsx.ShellQuote(t.Name))
 }
 
 // unitName derives the systemd unit name from UnitPath.

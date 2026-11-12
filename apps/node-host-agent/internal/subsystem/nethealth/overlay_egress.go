@@ -14,7 +14,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- Check: overlay-egress (12-overlay-egress.sh) ---
@@ -145,7 +145,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 	}
 	for _, r := range relays {
 		stf := filepath.Join(n.cfg.WatchdogStateDir, "egress-state-"+r)
-		comm := hostutil.ReadTrimmed(stf)
+		comm := fsx.ReadTrimmed(stf)
 		if comm != "relay" {
 			comm = "direct"
 		}
@@ -243,7 +243,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				if n.cfg.tcpProbe(ctx, r, port, 5*time.Second) == nil {
 					probe = "direct"
 					if _, err := os.Stat(icmpBlk); err != nil {
-						if werr := hostutil.WriteFileAtomic(icmpBlk,
+						if werr := fsx.WriteFileAtomic(icmpBlk,
 							strconv.FormatInt(n.cfg.Clock.Now().Unix(), 10)+"\n"); werr != nil {
 							logger().Warn("nethealth: egress "+
 								"icmp-blocked marker write failed",
@@ -284,7 +284,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 			ctr := n.egressCtr[r]
 			if ctr >= need {
 				delete(n.egressCtr, r)
-				if werr := hostutil.WriteFileAtomic(stf, probe+"\n"); werr != nil {
+				if werr := fsx.WriteFileAtomic(stf, probe+"\n"); werr != nil {
 					// Committed/live drift: the rule change below
 					// still runs; next cycle's heal converges.
 					logger().Warn("nethealth: egress state commit "+

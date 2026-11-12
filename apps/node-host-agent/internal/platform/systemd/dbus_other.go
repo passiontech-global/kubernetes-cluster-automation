@@ -10,3 +10,7 @@ package systemd
 type dbusBackend struct{}
 
 func newDBusBackend(hostRoot string) *dbusBackend { return nil }
+
+// close satisfies Client.Close's call on the (always-nil here)
+// backend — kept for signature parity with the linux build.
+func (b *dbusBackend) close() {}

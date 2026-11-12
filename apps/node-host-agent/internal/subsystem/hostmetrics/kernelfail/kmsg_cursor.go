@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // kmsgCursorFile is the resume-cursor file inside the watchdog
@@ -109,7 +109,7 @@ func (r *Runner) writeKmsgCursor(cur *kmsgCursor) {
 		content = fmt.Sprintf("dmesgRaw %d %d\n", cur.lines, cur.hash)
 	}
 	p := r.statePath(kmsgCursorFile)
-	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
+	if err := fsx.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Debug("hostmetrics: kmsg cursor write failed",
 			"path", p, "error", err)
 	}

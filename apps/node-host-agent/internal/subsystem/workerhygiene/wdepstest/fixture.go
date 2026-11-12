@@ -37,14 +37,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil/hostfixture"
 )
 
-// KillRecord is one stubbed signal delivery (was the unexported
-// killRecord in workerhygiene_test.go).
-type KillRecord struct {
-	PID int
-	Sig syscall.Signal
-}
+// KillRecord is the shared stubbed-signal record — see
+// internal/testutil/hostfixture (was the unexported killRecord in
+// workerhygiene_test.go).
+type KillRecord = hostfixture.KillRecord
 
 // Fixture is the shared test environment: tempdir host trees + a
 // stubbed kill function + a controllable clock. Tests run rootless —
@@ -79,6 +78,12 @@ type Fixture struct {
 	// (e.g. a D-Bus round trip taking seconds).
 	SDHook  func(joined string)
 	SDReply map[string]string // argv-substring → canned stdout
+
+	// LinkDels records every interface name LinkDelFn was asked to
+	// delete (the calico orphan-veth GC); LinkDelErrs injects a
+	// per-name failure — nil map entry means the delete succeeds.
+	LinkDels    []string
+	LinkDelErrs map[string]error
 
 	Probes   map[string]error  // url → error (nil = healthy)
 	Status   map[string]int    // url → canned HTTP status for probeHTTPStatus
@@ -121,6 +126,16 @@ func (f *Fixture) sdRun(_ context.Context, argv []string) (string, error) {
 		}
 	}
 	return "", syscall.ENOENT
+}
+
+// LinkDelRan reports whether LinkDelFn was asked to delete name.
+func (f *Fixture) LinkDelRan(name string) bool {
+	for _, n := range f.LinkDels {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // SDRan reports whether any recorded systemd argv contains sub.
@@ -175,7 +190,7 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 
 	f.CS = nhatestutil.FakeKube(objs...)
 	// Host up 2h — the uptime file feeds BOTH the Cycle G1 uptime
-	// gate (hostutil.UptimeSeconds) and systemd.ActiveAge's monotonic
+	// gate (procfs.UptimeSeconds) and systemd.ActiveAge's monotonic
 	// compare, so one file is one host clock.
 	// ActiveEnterTimestampMonotonic is µs since boot: uptimeµs - 1h →
 	// a 1h-old (settled) unit.
@@ -256,8 +271,14 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 			}
 			return syscall.ESRCH
 		}
-		f.Kills = append(f.Kills, KillRecord{pid, sig})
+		f.Kills = append(f.Kills, KillRecord{PID: pid, Sig: sig})
 		return nil
+	}
+	// The calico orphan-veth delete rides the netlink seam now —
+	// record names, answer from LinkDelErrs (absent = success).
+	d.Cfg.Seams.Host.LinkDelFn = func(name string) error {
+		f.LinkDels = append(f.LinkDels, name)
+		return f.LinkDelErrs[name]
 	}
 	d.Cfg.Seams.Host.Clock.Set(func() time.Time { return f.Now })
 	// Zombie-peer seams: the wg dump exec is canned as an error (tests
@@ -309,7 +330,7 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	}
 	// Newer probe seams — canned defaults keep tests hermetic (the
 	// production defaults would dial/exec on the test host).
-	d.Cfg.Seams.Probe.DNSProbeTCP = func(string, string, time.Duration) bool {
+	d.Cfg.Seams.Probe.DNSProbeTCP = func(context.Context, string, string, time.Duration) bool {
 		return f.DNSTCP
 	}
 	d.Cfg.Seams.Probe.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {

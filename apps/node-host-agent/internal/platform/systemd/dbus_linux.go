@@ -18,12 +18,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // errDBusUnavailable marks CONNECTION-level failures only (socket
@@ -38,15 +39,24 @@ type dbusBackend struct {
 	mu   sync.Mutex
 	conn *sdbus.Conn
 	// rawSys/rawSig are the godbus conns NewConnection dialed —
-	// sysconn first (the one LoadUnit needs), sigconn second (the
-	// one JobRemoved signals arrive on). Kept only to issue
-	// Manager.LoadUnit, which go-systemd v22 does not wrap, and to
+	// sysconn first (the one LoadUnit/ListUnitFiles needs), sigconn
+	// second (the one JobRemoved signals arrive on). Kept only to
+	// issue the Manager calls go-systemd v22 does not wrap, and to
 	// watch transport death (each godbus Conn's Context cancels on
 	// Close). Both nil until a conn is built and reset whenever the
 	// conn is.
 	rawSys *godbus.Conn
 	rawSig *godbus.Conn
 	path   string
+	// disabled latches the backend off for the process lifetime
+	// when the socket is PERMANENTLY unreachable (EACCES — the
+	// private socket is root-only and the agent runs unprivileged
+	// under some unit configs — or ENOENT — no systemd at all).
+	// Without the latch every verb would redial + re-warn each
+	// cycle; with it the CLI fallback serves silently after one
+	// warnOnce diagnostic.
+	disabled atomic.Bool
+	warnOnce sync.Once
 }
 
 // newDBusBackend returns the backend for hostRoot — the socket
@@ -106,6 +116,13 @@ func (b *dbusBackend) systemConn(ctx context.Context) (*sdbus.Conn, error) {
 // concurrent rebuild between the two reads would otherwise leave
 // the job wait watching a conn nobody is using).
 func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error) {
+	if b.disabled.Load() {
+		// Permanently unreachable socket (EACCES/ENOENT latched on
+		// an earlier dial) — skip straight to the unavailable
+		// verdict so the CLI fallback serves without re-dialing.
+		return nil, fmt.Errorf("%w: systemd dbus disabled (socket unreachable)",
+			errDBusUnavailable)
+	}
 	if b.conn != nil && b.conn.Connected() {
 		return b.conn, nil
 	}
@@ -131,14 +148,62 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 		return c, err
 	})
 	if err != nil {
+		b.maybeDisable(err)
 		return nil, fmt.Errorf("%w: systemd dbus dial %s: %v",
 			errDBusUnavailable, b.path, err)
 	}
-	_ = conn.Subscribe()
+	// Subscribe is REQUIRED, not best-effort: without it PID 1
+	// never emits the JobRemoved signals the job waits in dbusJob
+	// depend on — every restart would hang until ctx timeout. A
+	// refused Subscribe kills the conn and reports unavailable so
+	// the CLI fallback serves instead of a silently deaf bus.
+	if err := conn.Subscribe(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("%w: systemd dbus subscribe: %v",
+			errDBusUnavailable, err)
+	}
 	b.conn = conn
 	b.rawSys = rawSys
 	b.rawSig = rawSig
 	return conn, nil
+}
+
+// isFatalDialErr reports whether a dial/auth failure can NEVER
+// succeed later this boot: EACCES (socket is root-only) or ENOENT
+// (no systemd private socket at all). Transient failures — bus
+// restart, fd exhaustion — must keep retrying.
+func isFatalDialErr(err error) bool {
+	return errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrNotExist)
+}
+
+// maybeDisable latches the backend off + warns once when err is a
+// permanently-fatal dial failure; other errors leave the retry
+// path open.
+func (b *dbusBackend) maybeDisable(err error) {
+	if !isFatalDialErr(err) {
+		return
+	}
+	b.disabled.Store(true)
+	b.warnOnce.Do(func() {
+		logger().Warn("systemd: dbus socket permanently unreachable "+
+			"(EACCES/ENOENT) — dbus backend disabled, systemctl "+
+			"fallback serves for the process lifetime",
+			"path", b.path, "error", err)
+	})
+}
+
+// close releases the stored conn — Client.Close and tests call it;
+// safe on a never-connected or already-dropped backend.
+func (b *dbusBackend) close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.conn != nil {
+		b.conn.Close()
+		b.conn = nil
+		b.rawSys = nil
+		b.rawSig = nil
+	}
 }
 
 // dropConn tears down the stored conn when it is still the one the
@@ -198,41 +263,48 @@ func (b *dbusBackend) loadUnit(ctx context.Context, unit string) {
 			0, unit).Store(&path)
 }
 
-// unitProps fetches a unit's properties — LoadUnit + GetAll in one
-// call, the D-Bus equivalent of `systemctl show -p LoadState
-// ActiveState ActiveEnterTimestampMonotonic`.
-func (b *dbusBackend) unitProps(ctx context.Context, unit string) (map[string]any, error) {
+// unitProp fetches ONE unit property — GetUnitPropertyContext
+// (org.freedesktop.DBus.Properties.Get on the Unit interface)
+// instead of GetAllPropertiesContext, which decoded ~200 properties
+// per call to read one word. LoadUnit still runs first so an
+// inactive unit GC'd from systemd's unit table reports its real
+// state instead of UnknownObject. The returned any is the
+// variant's decoded Go value (string for state words, uint64 for
+// the monotonic timestamp).
+func (b *dbusBackend) unitProp(ctx context.Context, unit, prop string) (any, error) {
 	conn, err := b.systemConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	unit = normalizeUnit(unit)
 	b.loadUnit(ctx, unit)
-	return conn.GetAllPropertiesContext(ctx, unit)
+	p, err := conn.GetUnitPropertyContext(ctx, unit, prop)
+	if err != nil {
+		return nil, err
+	}
+	return p.Value.Value(), nil
 }
 
-// propString reads a string-typed unit property.
-func propString(props map[string]any, name string) string {
-	if v, ok := props[name]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
+// propString reads a string-typed property value.
+func propString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
 	}
 	return ""
 }
 
-// propUint64 reads an unsigned-64 unit property (timestamps are
+// propUint64 reads an unsigned-64 property value (timestamps are
 // "t" — uint64 microseconds since boot for the monotonic clock).
-func propUint64(props map[string]any, name string) (uint64, bool) {
-	switch v := props[name].(type) {
+func propUint64(v any) (uint64, bool) {
+	switch t := v.(type) {
 	case uint64:
-		return v, true
+		return t, true
 	case uint32:
-		return uint64(v), true
+		return uint64(t), true
 	case int64:
-		return uint64(v), true
+		return uint64(t), true
 	case string:
-		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		n, err := strconv.ParseUint(strings.TrimSpace(t), 10, 64)
 		return n, err == nil
 	}
 	return 0, false
@@ -261,14 +333,14 @@ func isNotFoundErr(err error) bool {
 // dbusActive mirrors `systemctl is-active` on the ActiveState
 // property — the same word vocabulary the systemctl path matches.
 func (b *dbusBackend) dbusActive(ctx context.Context, unit string) (bool, error) {
-	props, err := b.unitProps(ctx, unit)
+	v, err := b.unitProp(ctx, unit, "ActiveState")
 	if err != nil {
 		if isNotFoundErr(err) {
 			return false, nil // missing unit = definitively not active
 		}
-		return false, fmt.Errorf("dbus GetAllProperties %s: %w", unit, err)
+		return false, fmt.Errorf("dbus Get ActiveState %s: %w", unit, err)
 	}
-	switch state := propString(props, "ActiveState"); state {
+	switch state := propString(v); state {
 	case "active":
 		return true, nil
 	case "reloading", "activating", "deactivating", "inactive",
@@ -282,14 +354,14 @@ func (b *dbusBackend) dbusActive(ctx context.Context, unit string) (bool, error)
 // dbusExists mirrors `systemctl show -p LoadState` — the unit_load_
 // state_table vocabulary maps identically to the systemctl path.
 func (b *dbusBackend) dbusExists(ctx context.Context, unit string) (bool, error) {
-	props, err := b.unitProps(ctx, unit)
+	v, err := b.unitProp(ctx, unit, "LoadState")
 	if err != nil {
 		if isNotFoundErr(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("dbus GetAllProperties %s: %w", unit, err)
+		return false, fmt.Errorf("dbus Get LoadState %s: %w", unit, err)
 	}
-	switch state := propString(props, "LoadState"); state {
+	switch state := propString(v); state {
 	case "loaded", "merged":
 		return true, nil
 	case "stub", "not-found", "bad-setting", "error", "masked", "":
@@ -306,16 +378,17 @@ func (b *dbusBackend) dbusExists(ctx context.Context, unit string) (bool, error)
 // (µs since boot) vs /proc/uptime — same clock family, same math.
 func (b *dbusBackend) dbusActiveAge(ctx context.Context, unit string,
 	procUptimeFile string) (time.Duration, error) {
-	props, err := b.unitProps(ctx, unit)
+	v, err := b.unitProp(ctx, unit, "ActiveEnterTimestampMonotonic")
 	if err != nil {
-		return 0, fmt.Errorf("dbus GetAllProperties %s: %w", unit, err)
+		return 0, fmt.Errorf("dbus Get ActiveEnterTimestampMonotonic %s: %w",
+			unit, err)
 	}
-	monoUS, ok := propUint64(props, "ActiveEnterTimestampMonotonic")
+	monoUS, ok := propUint64(v)
 	if !ok || monoUS == 0 {
 		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic (not active)",
 			unit)
 	}
-	up, err := hostutil.UptimeSeconds(procUptimeFile)
+	up, err := procfs.UptimeSeconds(procUptimeFile)
 	if err != nil {
 		return 0, fmt.Errorf("%s: read %s: %w", unit, procUptimeFile, err)
 	}
@@ -325,191 +398,23 @@ func (b *dbusBackend) dbusActiveAge(ctx context.Context, unit string,
 	return 0, nil
 }
 
-// dbusJob runs a start-job verb (RestartUnit /
-// ReloadOrRestartUnit) and waits for the job's completion signal —
-// `systemctl restart` blocks until the job lands; the bare
-// StartUnit call returns at enqueue time, so the wait channel is
-// what preserves the blocking contract callers rely on.
-func (b *dbusBackend) dbusJob(ctx context.Context, unit, method string) error {
-	b.mu.Lock()
-	conn, err := b.systemConnLocked(ctx)
-	// Capture the raw transports of THIS conn generation under the
-	// same lock — the job wait below watches them for death.
-	rawSys, rawSig := b.rawSys, b.rawSig
-	b.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	unit = normalizeUnit(unit)
-	ch := make(chan string, 1)
-	var jobErr error
-	switch method {
-	case "restart":
-		_, jobErr = conn.RestartUnitContext(ctx, unit, "replace", ch)
-	case "reload-or-restart":
-		_, jobErr = conn.ReloadOrRestartUnitContext(ctx, unit, "replace", ch)
-	case "stop":
-		_, jobErr = conn.StopUnitContext(ctx, unit, "replace", ch)
-	default:
-		return fmt.Errorf("dbus job: unknown method %q", method)
-	}
-	if jobErr != nil {
-		return fmt.Errorf("dbus %s %s: %w", method, unit, jobErr)
-	}
-	// The completion channel is driven by JobRemoved signals on the
-	// connection's signal leg; a dead transport would leave this
-	// select parked until ctx timeout while the caller believed a
-	// restart was still queued. Watch both raw transports — godbus
-	// cancels Conn.Context() on Close or transport loss — and drop
-	// the stored conn so the next call rebuilds instead of waiting
-	// on signals a dead conn can never deliver.
-	transportDead := make(chan struct{}, 1)
-	for _, raw := range []*godbus.Conn{rawSys, rawSig} {
-		if raw == nil {
-			continue
-		}
-		go func(c *godbus.Conn) {
-			<-c.Context().Done()
-			select {
-			case transportDead <- struct{}{}:
-			default:
-			}
-		}(raw)
-	}
-	select {
-	case res := <-ch:
-		switch res {
-		case "done":
-			return nil
-		case "":
-			// Job completed before the listener saw the removal —
-			// treat as done (the enqueue itself succeeded).
-			return nil
-		default:
-			return fmt.Errorf("dbus %s %s: job %s", method, unit, res)
-		}
-	case <-ctx.Done():
-		b.dropConn(conn)
-		return ctx.Err()
-	case <-transportDead:
-		b.dropConn(conn)
-		return fmt.Errorf("%w: systemd dbus transport lost during %s %s",
-			errDBusUnavailable, method, unit)
-	}
-}
-
-// dbusSignal mirrors `systemctl kill -s <sig> <unit>` via
-// KillUnitWithTarget — the target is "all" (systemctl's default
-// --kill-whom) and the signal name maps to its number.
-func (b *dbusBackend) dbusSignal(ctx context.Context, unit, sig string) error {
-	n, ok := signalNumber(sig)
-	if !ok {
-		return fmt.Errorf("dbus kill %s: unknown signal %q", unit, sig)
-	}
-	conn, err := b.systemConn(ctx)
-	if err != nil {
-		return err
-	}
-	if err := conn.KillUnitWithTarget(ctx, normalizeUnit(unit), sdbus.All, n); err != nil {
-		return fmt.Errorf("dbus kill -s %s %s: %w", sig, unit, err)
-	}
-	return nil
-}
-
-// signalNumber maps the signal names callers pass (with or without
-// the SIG prefix) to D-Bus signal numbers — the common set
-// systemctl kill accepts by name.
-func signalNumber(sig string) (int32, bool) {
-	name := strings.ToUpper(strings.TrimPrefix(sig, "SIG"))
-	switch name {
-	case "HUP":
-		return 1, true
-	case "INT":
-		return 2, true
-	case "QUIT":
-		return 3, true
-	case "ILL":
-		return 4, true
-	case "TRAP":
-		return 5, true
-	case "ABRT":
-		return 6, true
-	case "BUS":
-		return 7, true
-	case "FPE":
-		return 8, true
-	case "KILL":
-		return 9, true
-	case "USR1":
-		return 10, true
-	case "SEGV":
-		return 11, true
-	case "USR2":
-		return 12, true
-	case "PIPE":
-		return 13, true
-	case "ALRM":
-		return 14, true
-	case "TERM":
-		return 15, true
-	case "STKFLT":
-		return 16, true
-	case "CHLD":
-		return 17, true
-	case "CONT":
-		return 18, true
-	case "STOP":
-		return 19, true
-	case "TSTP":
-		return 20, true
-	case "TTIN":
-		return 21, true
-	case "TTOU":
-		return 22, true
-	case "URG":
-		return 23, true
-	case "XCPU":
-		return 24, true
-	case "XFSZ":
-		return 25, true
-	case "VTALRM":
-		return 26, true
-	case "PROF":
-		return 27, true
-	case "WINCH":
-		return 28, true
-	case "IO":
-		return 29, true
-	case "PWR":
-		return 30, true
-	case "SYS":
-		return 31, true
-	}
-	return 0, false
-}
-
-// dbusDaemonReload mirrors `systemctl daemon-reload` —
-// Manager.Reload over the private bus.
-func (b *dbusBackend) dbusDaemonReload(ctx context.Context) error {
-	conn, err := b.systemConn(ctx)
-	if err != nil {
-		return err
-	}
-	if err := conn.ReloadContext(ctx); err != nil {
-		return fmt.Errorf("dbus daemon-reload: %w", err)
-	}
-	return nil
-}
-
-// dbusListUnits mirrors `systemctl list-units --all --no-legend
-// --plain` over ListUnits — every loaded unit with its state
-// triple, no text parsing.
-func (b *dbusBackend) dbusListUnits(ctx context.Context) ([]UnitInfo, error) {
+// dbusListUnitsByPatterns mirrors `systemctl list-units --all
+// --no-legend --plain <patterns...>` over Manager.ListUnitsByPatterns
+// — states nil means "every load/active state" (the --all flag's
+// equivalent); an empty pattern list is the unfiltered ListUnits
+// call. Unit-name glob matching stays PID 1's, exactly like the
+// systemctl argv form.
+func (b *dbusBackend) dbusListUnitsByPatterns(ctx context.Context, patterns []string) ([]UnitInfo, error) {
 	conn, err := b.systemConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	units, err := conn.ListUnitsContext(ctx)
+	var units []sdbus.UnitStatus
+	if len(patterns) == 0 {
+		units, err = conn.ListUnitsContext(ctx)
+	} else {
+		units, err = conn.ListUnitsByPatternsContext(ctx, nil, patterns)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("dbus ListUnits: %w", err)
 	}
@@ -524,4 +429,55 @@ func (b *dbusBackend) dbusListUnits(ctx context.Context) ([]UnitInfo, error) {
 		})
 	}
 	return out, nil
+}
+
+// dbusEnabled mirrors `systemctl is-enabled` via
+// Manager.ListUnitFiles — go-systemd v22 wraps no GetUnitFileState,
+// so the raw sysconn issues the call and the (unit,state) rows are
+// matched client-side. The state vocabulary is identical to
+// is-enabled's stdout words (enabled/enabled-runtime/static/
+// indirect/alias/generated/transient/linked vs disabled/masked/
+// masked-runtime/bad); a unit absent from the table is the
+// not-found case — reported as an error so callers keep the
+// "can't ask = error" distinction cliEnabled documents.
+func (b *dbusBackend) dbusEnabled(ctx context.Context, unit string) (bool, error) {
+	b.mu.Lock()
+	_, err := b.systemConnLocked(ctx)
+	raw := b.rawSys
+	b.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	if raw == nil {
+		return false, fmt.Errorf("%w: no sysconn for ListUnitFiles", errDBusUnavailable)
+	}
+	unit = normalizeUnit(unit)
+	var rows []struct {
+		UnitFile string
+		State    string
+		Preset   string
+	}
+	call := raw.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1").
+		CallWithContext(ctx, "org.freedesktop.systemd1.Manager.ListUnitFiles", 0)
+	if err := call.Store(&rows); err != nil {
+		return false, fmt.Errorf("dbus ListUnitFiles: %w", err)
+	}
+	for _, r := range rows {
+		if r.UnitFile != unit {
+			continue
+		}
+		switch r.State {
+		case "enabled", "enabled-runtime", "static", "indirect",
+			"alias", "generated", "transient", "linked", "linked-runtime":
+			return true, nil
+		case "disabled", "masked", "masked-runtime", "bad":
+			return false, nil
+		default:
+			logger().Warn("systemd: unexpected unit-file state word — "+
+				"treating unit as not enabled this probe",
+				"unit", unit, "state", r.State)
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("systemctl is-enabled %s: unit not found in ListUnitFiles", unit)
 }

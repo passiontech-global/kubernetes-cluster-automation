@@ -8,7 +8,7 @@ import (
 	"fmt"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -25,8 +25,8 @@ const (
 // ACTION cilium-mtu-drift: so nodereporter raises
 // CiliumMTUExceedsOverlay.
 //
-// The MTU readers themselves are hostutil.MTUOfIface /
-// hostutil.RuntimeConfigMTU (sysfs mtu file + agent-runtime-config.json
+// The MTU readers themselves are procfs.MTUOfIface /
+// procfs.RuntimeConfigMTU (sysfs mtu file + agent-runtime-config.json
 // fallback, MAX-wins over several `mtu` keys).
 
 // CiliumMTUCheck is the B4 MTU-drift guard as a Check (no streak —
@@ -41,22 +41,22 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckCiliumMTU) {
 		return
 	}
-	neb, nebOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)
-	cil, cilOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.Iface)
+	neb, nebOK := procfs.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)
+	cil, cilOK := procfs.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.Iface)
 	if !cilOK {
-		cil, cilOK = hostutil.RuntimeConfigMTU(c.d.Cfg.Cilium.RuntimeConfig)
+		cil, cilOK = procfs.RuntimeConfigMTU(c.d.Cfg.Cilium.RuntimeConfig)
 	}
 	// double-encap guard: on the WireGuard datapath cilium_wg0
 	// carries pod traffic INSIDE the nebula overlay — its MTU must
 	// leave room for the WG header (~60B) under the overlay MTU.
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
-	wg, wgOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
+	wg, wgOK := procfs.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
 	// lxc-mtu-drift: pod lxc* veths. A pod created before the MTU change
 	// keeps its stale MTU on its host-side veth even when every
 	// cilium_* datapath iface is aligned — the same FRAG_NEEDED
 	// blackhole, so the pod veth MAX votes on the same latch.
-	lxcMax, lxcOK := hostutil.MaxPodLxcMTU(c.d.Cfg.SysClassNet)
+	lxcMax, lxcOK := procfs.MaxPodLxcMTU(c.d.Cfg.SysClassNet)
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.

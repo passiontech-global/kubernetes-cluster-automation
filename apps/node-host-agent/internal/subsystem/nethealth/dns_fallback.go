@@ -11,7 +11,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const hostsBlockBegin = "# BEGIN node-watchdog-dns"
@@ -131,7 +131,7 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool, err error) {
 	if next == cur {
 		return false, nil
 	}
-	if werr := hostutil.WriteFileAtomic(n.cfg.HostsFile, next); werr != nil {
+	if werr := fsx.WriteFileAtomic(n.cfg.HostsFile, next); werr != nil {
 		logger().Warn("nethealth: hosts file write failed — dns-fallback "+
 			"block not applied",
 			"path", n.cfg.HostsFile,
@@ -197,7 +197,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		lg := filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-lg-"+e.Name)
 		pinf := filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-pin-"+e.Name)
 		curIP := ""
-		if pin := strings.Fields(hostutil.ReadTrimmed(pinf)); len(pin) >= 1 {
+		if pin := strings.Fields(fsx.ReadTrimmed(pinf)); len(pin) >= 1 {
 			curIP = pin[0]
 		}
 		resolved := ""
@@ -215,8 +215,8 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			}
 		}
 		if resolved != "" {
-			if hostutil.ReadTrimmed(lg) != resolved {
-				if err := hostutil.WriteFileAtomic(lg, resolved+"\n"); err != nil {
+			if fsx.ReadTrimmed(lg) != resolved {
+				if err := fsx.WriteFileAtomic(lg, resolved+"\n"); err != nil {
 					logger().Warn("nethealth: dns last-good write "+
 						"failed — fallback pick may lose the "+
 						"last-known-good IP",
@@ -265,7 +265,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		// hubs filter it).
 		if curIP == "" || n.cfg.tcpProbe(ctx, curIP, e.Port, 3*time.Second) != nil {
 			newIP := ""
-			cands := append([]string{hostutil.ReadTrimmed(lg)}, e.Candidates...)
+			cands := append([]string{fsx.ReadTrimmed(lg)}, e.Candidates...)
 			for _, c := range cands {
 				if c == "" || c == curIP {
 					continue
@@ -279,7 +279,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 				n.state.AppendLog(fmt.Sprintf(
 					"ACTION: dns-fallback pin %s -> %s (DNS fail %dx, was '%s')",
 					e.Name, newIP, fails, curIP))
-				if err := hostutil.WriteFileAtomic(pinf,
+				if err := fsx.WriteFileAtomic(pinf,
 					newIP+" "+e.Name+"\n"); err != nil {
 					n.state.AppendLog(fmt.Sprintf(
 						"dns-fallback: pin file write failed for %s -> %s: %v",
@@ -320,7 +320,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 	// Render the managed block from the pins.
 	var block strings.Builder
 	for _, f := range n.pinFiles() {
-		if c := hostutil.ReadTrimmed(f); c != "" {
+		if c := fsx.ReadTrimmed(f); c != "" {
 			block.WriteString(c + "\n")
 		}
 	}

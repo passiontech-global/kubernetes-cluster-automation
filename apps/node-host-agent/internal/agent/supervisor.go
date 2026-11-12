@@ -56,21 +56,6 @@ func superviseHealthyRun(elapsed, backoff time.Duration) bool {
 	return elapsed >= backoff*2 || elapsed >= superviseBackoffMax
 }
 
-// restartTimer re-arms the reusable backoff timer for the next wait.
-// A run that outlived the previous backoff leaves its fired tick
-// queued in timer.C — Reset does not drain it, so the select would
-// consume the stale tick immediately and restart with zero wait.
-// Stop + drain before Reset — the documented Timer.Reset pattern.
-func restartTimer(timer *time.Timer, wait time.Duration) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(wait)
-}
-
 // supervise launches the supervisor goroutine for every configured
 // subsystem and returns immediately. Run calls it before binding
 // the listeners so subsystem startup never blocks serving — and a
@@ -125,17 +110,18 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 			a.maxBackoffSubs.Add(-1)
 		}
 	}()
-	// Reusable backoff timer. A Run that outlives the armed wait —
-	// the normal healthy case: the timer fires 5s into every run
-	// longer than the backoff — leaves the fired tick QUEUED in
-	// timer.C. Reset does not drain it (the old "time.After parity"
-	// claim below was wrong for Reset: it holds for a fresh
-	// time.After channel, not for Timer.Reset), so a bare Reset let
-	// the select consume the stale tick instantly and restart with
-	// ZERO wait — the whole 5s→5m ladder silently skipped. Every
-	// re-arm goes through restartTimer, which stops and drains first.
-	timer := time.NewTimer(backoff)
-	defer timer.Stop()
+	// The backoff timer is allocated LAZILY on the first restart —
+	// the common case (a long healthy run) never creates one, and a
+	// fresh time.NewTimer per wait has no stale-tick hazard: the
+	// fired-tick drain the old reusable timer needed (restartTimer)
+	// existed only because Reset does not drain timer.C. A brand-new
+	// channel per restart makes the select's <-timer.C unambiguous.
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		began := time.Now()
 		up.Set(1)
@@ -222,7 +208,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		wait := backoff + time.Duration((rand.Float64()*2-1)*float64(backoff*3/20))
 		logger().Error("subsystem exited unexpectedly — restarting",
 			"subsystem", name, "backoff", backoff, "wait", wait)
-		restartTimer(timer, wait)
+		timer = time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			return

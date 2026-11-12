@@ -93,7 +93,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
@@ -128,7 +127,7 @@ type Hygiene struct {
 	// fills it; the ungated-then-uptime-gated grouping preserves
 	// the shell timer/module split (only module 22 carried
 	// WD_REQUIRES:uptime).
-	groups []checks.Group
+	groups []subframe.Group
 
 	// feeder is the sd_notify watchdog feeder — not a Check (it
 	// runs on its own faster ticker Spawned from Run, outside the
@@ -379,7 +378,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// BUG-H9: hostconfig rewrites /etc/node-watchdog.conf mid-run —
 	// refresh the conf-derived knobs before the checks consume them.
 	h.RefreshWatchdogConf()
-	checks.Dispatch(ctx, nil, h.Cycles, h.groups)
+	subframe.Dispatch(ctx, nil, h.Cycles, h.groups)
 }
 
 // --- /proc helpers ---

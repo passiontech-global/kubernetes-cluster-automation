@@ -134,7 +134,7 @@ func (c *DriftCheck) Run(ctx context.Context) {
 		if pair.Unit == c.d.Cfg.RestartUnit {
 			budget = cdeps.FileRateRestart
 		}
-		if c.d.HoldLocalAction(ctx) {
+		if c.d.HoldEmergencyHeal(ctx) {
 			c.d.State.SuspectLog(cdeps.StatePKIReloadStale, fmt.Sprintf(
 				"suspect: cp-cert-reload-stale %s but cluster maintenance in progress — holding restart",
 				pair.CertFile), c.d.Cfg.SuspectLogCadence)

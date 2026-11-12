@@ -97,17 +97,17 @@ func TestScanBloatAndWLayerShareWalkCache(t *testing.T) {
 // be churned by disk-bloat eviction.
 func TestDiskBloatOwnedByStatefulSet(t *testing.T) {
 	p := &corev1.Pod{}
-	if diskBloatOwnedByStatefulSet(p) {
+	if wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("no ownerReferences must be false")
 	}
 	p.OwnerReferences = []metav1.OwnerReference{
 		{Kind: "ReplicaSet"}, {Kind: "Deployment"}}
-	if diskBloatOwnedByStatefulSet(p) {
+	if wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("non-StatefulSet owners must be false")
 	}
 	p.OwnerReferences = append(p.OwnerReferences,
 		metav1.OwnerReference{Kind: "StatefulSet"})
-	if !diskBloatOwnedByStatefulSet(p) {
+	if !wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("StatefulSet owner must be true")
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -481,7 +481,7 @@ func TestActionCommandErrors(t *testing.T) {
 }
 
 // TestActiveAgeProbeAndClockErrors: ActiveAge surfaces a failed
-// systemctl probe, and hostutil.UptimeSeconds rejects an unparseable
+// systemctl probe, and procfs.UptimeSeconds rejects an unparseable
 // uptime file — both mean "not settled" to the caller.
 func TestActiveAgeProbeAndClockErrors(t *testing.T) {
 	f := newFake()
@@ -510,16 +510,16 @@ func TestActiveAgeProbeAndClockErrors(t *testing.T) {
 		t.Fatal("garbage uptime file want ActiveAge error")
 	}
 
-	// hostutil.UptimeSeconds (ActiveAge's parser) directly: empty
+	// procfs.UptimeSeconds (ActiveAge's parser) directly: empty
 	// file and missing file.
 	empty := filepath.Join(t.TempDir(), "uptime")
 	if err := os.WriteFile(empty, []byte("  \n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := hostutil.UptimeSeconds(empty); err == nil {
+	if _, err := procfs.UptimeSeconds(empty); err == nil {
 		t.Fatal("empty uptime file want error")
 	}
-	if _, err := hostutil.UptimeSeconds(filepath.Join(t.TempDir(), "missing")); err == nil {
+	if _, err := procfs.UptimeSeconds(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("missing uptime file want error")
 	}
 }

@@ -349,8 +349,8 @@ func TestConvergeTargetsAbortGuards(t *testing.T) {
 	s.mu.Unlock()
 	c, sk, f, complete = s.convergeTargets(context.Background(), targets,
 		nil, nil, "sum", true)
-	if c != 0 || complete {
-		t.Fatalf("lapsed lease tally=%d complete=%v", c, complete)
+	if c != 0 || sk != 0 || f != 0 || complete {
+		t.Fatalf("lapsed lease tally=%d/%d/%d complete=%v", c, sk, f, complete)
 	}
 	if dials := dialer.dials(); len(dials) != 0 {
 		t.Fatalf("dials after abort: %v", dials)

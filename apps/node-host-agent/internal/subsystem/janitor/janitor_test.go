@@ -701,7 +701,7 @@ func TestMonitorParentVanishedMidScanSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 	testutil.WriteFile(t, filepath.Join(pdir, "stat"),
-		fmt.Sprintf("5555 (dying) S 1 0 0 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 50 0 0 0\n"))
+		"5555 (dying) S 1 0 0 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 50 0 0 0\n")
 
 	e.j.Sweep(context.Background())
 

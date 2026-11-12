@@ -18,9 +18,8 @@ import (
 )
 
 // writeProcStat plants a /proc/stat body under the fixture ProcRoot:
-// one aggregate row (which the parser must SKIP — its sums are the
-// same as cpu0's here and would double-count) plus a single cpu0
-// row whose steal and total (=idle+steal) the caller controls.
+// the aggregate "cpu " row the parser reads (its sums ARE the cpuN
+// sum — the kernel folds them) plus a cpu0 row for realism.
 func writeProcStat(t *testing.T, procRoot string, steal, idle uint64) {
 	t.Helper()
 	row := func(label string) string {
@@ -36,8 +35,8 @@ func TestProcStatCPUSums(t *testing.T) {
 		t.Fatal("missing stat file reported ok")
 	}
 	testutil.WriteFile(t, file,
-		// Aggregate row is identical to the cpuN sum — the parser
-		// must not double-count it. Steal = column 8; the two
+		// The aggregate "cpu " row carries the cpuN sums — the
+		// parser reads it alone. Steal = column 8; the two
 		// trailing guest columns must stay out of total.
 		"cpu  10 0 10 80 0 0 0 4 2 1\n"+
 			"cpu0 5 0 5 40 0 0 0 2 1 0\n"+

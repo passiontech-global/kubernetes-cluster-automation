@@ -11,8 +11,8 @@ import (
 	"os"
 	"path"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // syncTarget converges one host over SSH: binary, vars (+ nebula
@@ -34,6 +34,26 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	prof := roleProfileFor(cfg, t)
 	if err := prepareHost(tctx, conn, cfg, t, prof); err != nil {
 		return err
+	}
+
+	// Orphan staging sweep for the non-mirror put dirs — the
+	// binary, unit and guard-credential puts all stage
+	// `.<name>.tmp[.<nonce>]` files no syncDir prune ever sees
+	// (that's how /usr/local/bin accumulated them). Same >15m
+	// in-flight gate; best-effort, never fails the converge.
+	{
+		dirs := []string{path.Dir(cfg.RemoteBinary), path.Dir(cfg.UnitPath)}
+		if prof.guard {
+			dirs = append(dirs, cfg.GuardDir)
+		}
+		seen := map[string]bool{}
+		for _, dir := range dirs {
+			if dir == "" || dir == "." || seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			_ = s.sweepTmpOrphans(tctx, conn, dir)
+		}
 	}
 
 	// a. binary — sha256 compare, stage + chmod + atomic mv on
@@ -116,16 +136,16 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	}
 	svc := unitName(cfg.UnitPath)
 	if binaryUpdated || (unitChanged && !freshUnit) {
-		if _, err := conn.Run(tctx, "systemctl enable "+hostutil.ShellQuote(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable "+fsx.ShellQuote(svc)); err != nil {
 			return err
 		}
-		if _, err := conn.Run(tctx, "systemctl restart "+hostutil.ShellQuote(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl restart "+fsx.ShellQuote(svc)); err != nil {
 			return err
 		}
 		s.cfg.Log.Info("hubsync: service restarted after update",
 			"target", t.Name, "unit", svc)
 	} else {
-		if _, err := conn.Run(tctx, "systemctl enable --now "+hostutil.ShellQuote(svc)); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable --now "+fsx.ShellQuote(svc)); err != nil {
 			return err
 		}
 	}

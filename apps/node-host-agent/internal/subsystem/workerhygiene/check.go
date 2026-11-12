@@ -6,14 +6,14 @@
 // existed (and the shell runner's module order before that).
 // Each check registers once via add(): it lands in h.checks (the
 // Check(name) lookup the domain tests use) AND in the static
-// checks.Entry table Cycle dispatches — the registration sequence
+// subframe.Entry table Cycle dispatches — the registration sequence
 // below IS the dispatch order.
 package workerhygiene
 
 import (
 	"context"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
@@ -32,7 +32,7 @@ import (
 // Interval.
 func (h *Hygiene) initChecks() {
 	d := h.Deps
-	var entries []checks.Entry
+	var entries []subframe.Entry
 	// add is the single-registration seam for one check: the check
 	// lands in h.checks (Check(name) walks it for the domain test
 	// packages) AND takes its place in the static dispatch table —
@@ -40,7 +40,7 @@ func (h *Hygiene) initChecks() {
 	// so each entry's Run closure binds its own check.
 	add := func(c wdeps.Check) {
 		h.checks = append(h.checks, c)
-		entries = append(entries, checks.Entry{
+		entries = append(entries, subframe.Entry{
 			Name: c.Name(),
 			Run:  func(ctx context.Context) { c.Run(ctx, h.envCell) },
 		})
@@ -108,5 +108,5 @@ func (h *Hygiene) initChecks() {
 	// (per-check cycles{check,"gated"}) — none map onto
 	// Group.GateOK, whose skip counts "uptime_gate" and would
 	// starve the "disabled" count of a kill-switched check.
-	h.groups = []checks.Group{{Entries: entries}}
+	h.groups = []subframe.Group{{Entries: entries}}
 }

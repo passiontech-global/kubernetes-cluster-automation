@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- kernel-log handlers (kernel-dmesg) ---
@@ -63,7 +63,7 @@ func (r *Runner) noteHostOOMKill(msg string, st *kernelScanState) {
 	now := r.deps.Clock.Now()
 	p := r.statePath(kmsgOOMVictimFile)
 	content := strconv.FormatInt(now.Unix(), 10) + " " + comm + "\n"
-	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
+	if err := fsx.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Warn("hostmetrics: host-oom victim marker write failed",
 			"path", p, "error", err)
 	}
@@ -81,7 +81,7 @@ func (r *Runner) noteKernelFsError(msg string) {
 	p := r.statePath(kmsgFsErrorFile)
 	content := strconv.FormatInt(r.deps.Clock.Now().Unix(), 10) + " " +
 		detail + "\n"
-	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
+	if err := fsx.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Warn("hostmetrics: kmsg fs-error marker write failed",
 			"path", p, "error", err)
 	}
@@ -157,7 +157,7 @@ func (r *Runner) maybeBumpConntrackMax() {
 	if !r.deps.Store.RateTrySpend(conntrackBumpBudgetFile, conntrackBumpEvery) {
 		return
 	}
-	cur, ok := hostutil.ReadUintFile(r.deps.ConntrackMaxFile)
+	cur, ok := fsx.ReadUintFile(r.deps.ConntrackMaxFile)
 	if !ok || cur == 0 || cur >= conntrackMaxCeiling {
 		return
 	}

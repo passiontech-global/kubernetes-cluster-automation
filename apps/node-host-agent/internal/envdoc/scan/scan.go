@@ -62,6 +62,15 @@ type ScanResult struct {
 	Unresolved []string          // "relpath:line (EnvFoo)" — no such const
 	Stragglers []string          // "relpath:line (literal)"
 	DupDecls   []string          // "relpath:line (Name)" — const decl outside envnames
+	// PackageRefs groups every resolvable reference the way the
+	// ENV.md "Knobs by package" table needs it: referencing dir
+	// ("cmd/agent", "internal/subsystem/hubsync") -> var value ->
+	// base filename -> first (minimum) line referencing it in that
+	// file. ENABLE_* values are collected too — the renderer owns
+	// the enable-table/knob-table split. Const-declaration literals
+	// count as references (the rg scan this replaces could not tell
+	// a decl site from a use site either).
+	PackageRefs map[string]map[string]map[string]int
 }
 
 // CollectContract parses internal/envnames/*.go (non-test) under root
@@ -162,7 +171,10 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 	}
 	sort.Strings(dirs)
 
-	res := ScanResult{Referenced: map[string]string{}}
+	res := ScanResult{
+		Referenced:  map[string]string{},
+		PackageRefs: map[string]map[string]map[string]int{},
+	}
 
 	site := func(fset *token.FileSet, pos token.Pos) string {
 		p := fset.Position(pos)
@@ -171,6 +183,26 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 			rel = p.Filename
 		}
 		return fmt.Sprintf("%s:%d", rel, p.Line)
+	}
+
+	// addRef records one pkg->var->file:line site — first line per
+	// file wins, matching the reference table's dedup rule.
+	addRef := func(pkgDir, v string, fset *token.FileSet, pos token.Pos) {
+		p := fset.Position(pos)
+		vars := res.PackageRefs[pkgDir]
+		if vars == nil {
+			vars = map[string]map[string]int{}
+			res.PackageRefs[pkgDir] = vars
+		}
+		files := vars[v]
+		if files == nil {
+			files = map[string]int{}
+			vars[v] = files
+		}
+		base := filepath.Base(p.Filename)
+		if cur, ok := files[base]; !ok || p.Line < cur {
+			files[base] = p.Line
+		}
 	}
 
 	for _, dir := range dirs {
@@ -198,6 +230,8 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 					"consts must stay qualified so the coverage "+
 					"scan can see them", path)
 			}
+			relFile, _ := filepath.Rel(root, path)
+			pkgDir := filepath.Dir(relFile)
 
 			// Const declarations carrying a contract literal outside
 			// envnames duplicate the source of truth — collect them
@@ -225,6 +259,7 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 							}
 							res.DupDecls = append(res.DupDecls,
 								fmt.Sprintf("%s (%s)", site(fset, lit.Pos()), who))
+							addRef(pkgDir, s, fset, lit.Pos())
 						}
 					}
 				}
@@ -239,6 +274,7 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 					if s, err := strconv.Unquote(e.Value); err == nil && EnvVarRE.MatchString(s) {
 						res.Stragglers = append(res.Stragglers,
 							fmt.Sprintf("%s (%q)", site(fset, e.Pos()), s))
+						addRef(pkgDir, s, fset, e.Pos())
 					}
 				case *ast.SelectorExpr:
 					recv, ok := e.X.(*ast.Ident)
@@ -253,6 +289,7 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 						if _, seen := res.Referenced[v]; !seen {
 							res.Referenced[v] = site(fset, e.Pos())
 						}
+						addRef(pkgDir, v, fset, e.Pos())
 						return true
 					}
 					if !c.Declared[sel] {

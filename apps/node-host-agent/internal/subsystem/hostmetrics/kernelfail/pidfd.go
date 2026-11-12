@@ -169,16 +169,16 @@ func (r *Runner) updatePidFDPressure() {
 
 // --- node_agent textfile metrics (node-exporter channel) ---
 
-// textfileDir resolves the node-exporter textfile drop dir —
-// <HostRoot>/var/lib/node-exporter/textfile (the controllerhygiene
-// textfile-dir override parity: K0sDir's sibling under the same
-// convention).
+// textfileDir resolves the node-exporter textfile drop dir through
+// the shared promfile.TextfileDir derivation — NODE_HOST_AGENT_
+// TEXTFILE_DIR when set, else <HostRoot>/var/lib/node-exporter/
+// textfile. textfileDirOverride wins over both in tests
+// (controllerhygiene's kineTextfileDirOverride parity).
 func (r *Runner) textfileDir() string {
 	if textfileDirOverride != "" {
 		return textfileDirOverride
 	}
-	return filepath.Join(r.deps.HostRoot,
-		"var", "lib", "node-exporter", "textfile")
+	return promfile.TextfileDir(r.deps.HostRoot)
 }
 
 // writeKernelUtilProm emits the pid-fd-pressure utilization gauges —

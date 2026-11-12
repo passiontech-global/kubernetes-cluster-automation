@@ -21,7 +21,8 @@ func TestDmesgHelpers(t *testing.T) {
 	if dmesgLineHash("a") == dmesgLineHash("b") {
 		t.Fatal("distinct lines hashed equal")
 	}
-	if dmesgLineHash("a") != dmesgLineHash("a") {
+	h1, h2 := dmesgLineHash("a"), dmesgLineHash("a")
+	if h1 != h2 {
 		t.Fatal("hash not stable")
 	}
 	if got := dmesgTailHash([]string{"", "x", ""}); got != dmesgLineHash("x") {
