@@ -39,10 +39,14 @@ func TestPortsGuardInetTableTightened(t *testing.T) {
 		strings.Contains(portsNFT, "table ip ") {
 		t.Fatalf("ports guard not on the inet table:\n%s", portsNFT)
 	}
+	// The blanket pod/VLAN accepts must stay gone — the ONLY pod-iface
+	// rules allowed are the dport-scoped hubble-peer exemptions.
 	for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
-		if strings.Contains(portsNFT, iface) {
-			t.Fatalf("ports guard still opens %s — the tenant-pod path the roadmap closes:\n%s",
-				iface, portsNFT)
+		for _, line := range strings.Split(portsNFT, "\n") {
+			if strings.Contains(line, iface) && !strings.Contains(line, "tcp dport") {
+				t.Fatalf("ports guard still opens %s unscoped — the tenant-pod path the roadmap closes:\n%s",
+					iface, portsNFT)
+			}
 		}
 	}
 	// The private ranges belong to the DNS guard only: a blanket
@@ -78,6 +82,31 @@ func TestPortsGuardPortCoverage(t *testing.T) {
 		if !strings.Contains(set, want) {
 			t.Fatalf("ports guard drop set missing %q:\n%s", want, portsNFT)
 		}
+	}
+}
+
+// TestPortsGuardHubblePeerExempt — the hubble-peer Service pins
+// internalTrafficPolicy: Local, so its consumers can only reach the
+// local node's :4244 over a pod-veth iif. The guard must exempt
+// exactly that port on the pod-veth wildcards (remote :4244 already
+// flows over neb1) while every other internal port stays closed.
+func TestPortsGuardHubblePeerExempt(t *testing.T) {
+	_, portsNFT := convergeNLDWithVars(t, "")
+	for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
+		if !strings.Contains(portsNFT, iface+" tcp dport 4244 accept") {
+			t.Fatalf("ports guard missing pod-exempt %s tcp dport 4244 accept:\n%s", iface, portsNFT)
+		}
+	}
+	// No other port may ride the pod-veth path — e.g. kubelet and the
+	// exporters must still drop for tenant pods.
+	for _, bad := range []string{"tcp dport 9100 accept", "tcp dport 10250 accept", "tcp dport 9962 accept"} {
+		if strings.Contains(portsNFT, bad) {
+			t.Fatalf("ports guard exempts %q on a pod iface — guard hole:\n%s", bad, portsNFT)
+		}
+	}
+	// The exemption must sit BEFORE the drop rule to take effect.
+	if strings.Index(portsNFT, "tcp dport 4244 accept") > strings.Index(portsNFT, "tcp dport {") {
+		t.Fatalf("ports guard exemption renders after the drop rule:\n%s", portsNFT)
 	}
 }
 

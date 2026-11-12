@@ -213,6 +213,23 @@ var hostPortsGuardPorts = []int{
 // underlay is never legitimate.
 const hostPortsGuardNodePortRange = "30000-32767"
 
+// hostPortsGuardPodExemptPorts are internal ports that must still
+// answer pod-originated LOCAL-delivery traffic. :4244 is the
+// cilium-agent hubble-peer listener and the hubble-peer Service
+// pins internalTrafficPolicy: Local — an in-cluster consumer can
+// therefore only ever reach its OWN node's endpoint, which arrives
+// on a pod-veth iif (never neb1) and would hit the drop below.
+// Pod→:4244 on every REMOTE node already traverses neb1 and is
+// accepted, so scoping this exemption to the pod-veth wildcards
+// opens nothing the overlay did not already expose — while every
+// other internal port stays closed to tenant pods.
+var hostPortsGuardPodExemptPorts = []int{4244}
+
+// hostPortsGuardPodIFaces are the pod-veth interface wildcards the
+// pre-roadmap-1.2 blanket accepts used, reused here ONLY in
+// combination with hostPortsGuardPodExemptPorts.
+var hostPortsGuardPodIFaces = []string{"cilium*", "lxc*", "cali*"}
+
 // convergeHostPortsGuard deploys the host-internal-ports nft guard
 // + its boot oneshot (host-internal-ports): inbound TCP to the internal
 // listeners is dropped unless it arrives via loopback, the nebula
@@ -277,6 +294,12 @@ func (c *cyc) convergeHostPortsGuard() {
 		fmt.Fprintf(&saddr, "        ip6 saddr { %s } accept\n",
 			strings.Join(allowV6, ", "))
 	}
+	var podExempt strings.Builder
+	for _, p := range hostPortsGuardPodExemptPorts {
+		for _, iface := range hostPortsGuardPodIFaces {
+			fmt.Fprintf(&podExempt, "        iifname %q tcp dport %d accept\n", iface, p)
+		}
+	}
 	nft := fmt.Sprintf(`# Managed by node-config-agent - drop non-cluster traffic to node-internal ports
 destroy table inet host_internal_ports_guard
 table inet host_internal_ports_guard {
@@ -285,10 +308,10 @@ table inet host_internal_ports_guard {
         iifname "lo" accept
         iifname "neb1" accept
         ct state { established, related } accept
-%s        tcp dport { %s } drop
+%s%s        tcp dport { %s } drop
     }
 }
-`, saddr.String(), ports.String())
+`, saddr.String(), podExempt.String(), ports.String())
 	c.applyNftUnit("host-internal-ports-guard", "/etc/host-internal-ports-guard.nft",
 		[]byte(nft), "host internal ports guard (drop non-cluster sources to node-internal listeners)")
 }
