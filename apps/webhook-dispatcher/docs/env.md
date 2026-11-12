@@ -13,7 +13,7 @@ of guaranteeing 401s/502s at request time.
 
 | Env var                | Default | Notes |
 |---|---|---|
-| `GITHUB_WEBHOOK_SECRET` | — | HMAC-SHA256 key configured on the GitHub org webhook. Deliveries whose `X-Hub-Signature-256` does not verify against it are rejected 401 before the body is read. |
+| `GITHUB_WEBHOOK_SECRET` | — | HMAC-SHA256 key configured on the GitHub org webhook. Verification flow: a malformed `X-Hub-Signature-256` (missing `sha256=` prefix or non-64-hex) is rejected 401 before the body is touched; a well-formed header is then verified against the body — streamed through the HMAC for event types the dispatcher never parses (acknowledged 202 on the signature alone, no 8 MiB buffer), buffered for the four handled events (`push`/`pull_request`/`release`/`create`). The compare is constant-time and an empty secret fails closed. |
 | `CI_WEBHOOK_TOKEN` | — | Concourse check-webhook token, sent as the `webhook_token` query parameter on every fan-out POST. It is the only credential on that endpoint (no basic auth); the client strips it out of transport-error strings so it can't leak into logs. |
 | `LOCAL_USERS` | — | Concourse credentials as `user:password`, split on the FIRST colon so passwords containing colons (e.g. bcrypt hashes) survive intact. The Concourse web node's comma-separated multi-user form is accepted — the FIRST entry that parses wins and the rest are ignored with a boot warning. Empty user or password parts are rejected at boot. Auth is dual-mode: the client prefers a bearer token minted at `/sky/issuer/token` (falling back to `/sky/token`, then permanently to HTTP basic when both endpoints 404/405). |
 
@@ -29,7 +29,9 @@ of guaranteeing 401s/502s at request time.
 ## Not env-tunable (for completeness)
 
 - **Index TTL (60s), forced-refresh throttle (30s), cold-start negative cache
-  (3s), fan-out budget/target timeout (30s/15s), body cap (8 MiB)** — constants
+  (3s), request-path index-wait budget (7s — deliberately under GitHub's ~10s
+  webhook timeout; the shared fetch itself runs on a 30s detached budget),
+  fan-out budget/target timeout (30s/15s), body cap (8 MiB)** — constants
   in the source (`internal/concourse`, `internal/handler`), not knobs: the
   webhook path is latency-critical and every value is either dictated by
   GitHub's ~10s webhook timeout or by the pod's 30s SIGKILL grace period, so

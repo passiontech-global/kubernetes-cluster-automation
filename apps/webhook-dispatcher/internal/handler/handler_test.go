@@ -35,9 +35,13 @@ func signedRequest(t *testing.T, event, body string) *http.Request {
 	return req
 }
 
-// fakeBackend returns a fixed index, a separately configured index on
-// Refresh, and records CheckWebhook calls. Mutable state is
-// mutex-guarded — the fan-out runs on background goroutines.
+// fakeBackend is the shared test Backend: a fixed index, a
+// separately configured index on RefreshIndex, and recorded
+// CheckWebhook calls. The ensureFn/checkFn hooks let a test replace
+// one behavior (a gated index fetch, a blocking or sequenced check
+// POST) without a new backend type — every handler test drives the
+// same fake. Mutable state is mutex-guarded — the fan-out runs on
+// background goroutines.
 type fakeBackend struct {
 	resources  []concourse.Resource
 	indexErr   error
@@ -46,27 +50,37 @@ type fakeBackend struct {
 	status     int
 	checkErr   error
 
+	// ensureFn, when set, replaces the default EnsureIndex body
+	// AFTER cur is published — e.g. a test that parks the request
+	// inside the index fetch. checkFn likewise replaces the default
+	// CheckWebhook response once the call is recorded.
+	ensureFn func(context.Context) error
+	checkFn  func(context.Context, concourse.Resource) (int, error)
+
 	mu        sync.Mutex
 	refreshed int
 	checks    []concourse.Resource
 	// cur mirrors what the real client's Match reads: the index the
-	// last fetch (Resources or Refresh) published.
+	// last fetch (EnsureIndex or RefreshIndex) published.
 	cur []concourse.Resource
 }
 
-func (f *fakeBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
+func (f *fakeBackend) EnsureIndex(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.cur = f.resources
-	return f.resources, f.indexErr
+	f.mu.Unlock()
+	if f.ensureFn != nil {
+		return f.ensureFn(ctx)
+	}
+	return f.indexErr
 }
 
-func (f *fakeBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+func (f *fakeBackend) RefreshIndex(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshed++
 	f.cur = f.refreshRes
-	return f.refreshRes, f.refreshErr
+	return f.refreshErr
 }
 
 func (f *fakeBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
@@ -75,10 +89,13 @@ func (f *fakeBackend) Match(wantType string, repos map[string]struct{}) []concou
 	return linearMatch(f.cur, wantType, repos)
 }
 
-func (f *fakeBackend) CheckWebhook(_ context.Context, r concourse.Resource) (int, error) {
+func (f *fakeBackend) CheckWebhook(ctx context.Context, r concourse.Resource) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.checks = append(f.checks, r)
+	f.mu.Unlock()
+	if f.checkFn != nil {
+		return f.checkFn(ctx, r)
+	}
 	if f.checkErr != nil {
 		return 0, f.checkErr
 	}
@@ -95,6 +112,54 @@ func (f *fakeBackend) refreshCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.refreshed
+}
+
+// checkStats is the shared CheckWebhook hook state for fan-out
+// tests: peak concurrency, call count and an optional per-call delay
+// — what throttledBackend used to be, now a checkFn closure body.
+type checkStats struct {
+	mu       sync.Mutex
+	inflight int
+	max      int
+	n        int
+	delay    time.Duration
+}
+
+// run sleeps delay (or until ctx ends), tracking inflight/max/n, and
+// returns status — the common checkFn body.
+func (s *checkStats) run(ctx context.Context, status int) (int, error) {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.max {
+		s.max = s.inflight
+	}
+	s.n++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.inflight--
+		s.mu.Unlock()
+	}()
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return status, nil
+}
+
+func (s *checkStats) maxInflight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.max
+}
+
+func (s *checkStats) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
 }
 
 // linearMatch is the reference matcher the test backends answer Match
@@ -474,13 +539,23 @@ func TestMatchViaAlternateRepoURL(t *testing.T) {
 
 func TestCheckFailuresNeverFailDelivery(t *testing.T) {
 	// 404 + 5xx must all be swallowed — the delivery is still
-	// accepted and every target gets its check attempt.
-	b := &sequencingBackend{
-		statuses: []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError},
+	// accepted and every target gets its check attempt. The checkFn
+	// hook sequences the statuses the old sequencingBackend returned.
+	statuses := []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError}
+	var seqMu sync.Mutex
+	seq := 0
+	b := &fakeBackend{
 		resources: []concourse.Resource{
 			{Pipeline: "p1", Name: "a", Type: "git", Repo: "org/repo"},
 			{Pipeline: "p1", Name: "b", Type: "git", Repo: "org/repo"},
 			{Pipeline: "p1", Name: "c", Type: "git", Repo: "org/repo"},
+		},
+		checkFn: func(_ context.Context, _ concourse.Resource) (int, error) {
+			seqMu.Lock()
+			defer seqMu.Unlock()
+			st := statuses[seq%len(statuses)]
+			seq++
+			return st, nil
 		},
 	}
 	h := New(testSecret, b)
@@ -493,48 +568,9 @@ func TestCheckFailuresNeverFailDelivery(t *testing.T) {
 		t.Fatalf("resources_matched=%d want 3", s.ResourcesMatched)
 	}
 	h.wg.Wait()
-	if got := b.calls(); got != 3 {
+	if got := len(b.checkList()); got != 3 {
 		t.Fatalf("check calls=%d want 3", got)
 	}
-}
-
-// sequencingBackend returns a different status per CheckWebhook call.
-type sequencingBackend struct {
-	resources []concourse.Resource
-	statuses  []int
-	mu        sync.Mutex
-	n         int
-	// cur is touched only on the request goroutine (Resources → Match
-	// → Refresh → Match all run inside ServeHTTP).
-	cur []concourse.Resource
-}
-
-func (s *sequencingBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
-	s.cur = s.resources
-	return s.resources, nil
-}
-
-func (s *sequencingBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
-	s.cur = s.resources
-	return s.resources, nil
-}
-
-func (s *sequencingBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
-	return linearMatch(s.cur, wantType, repos)
-}
-
-func (s *sequencingBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st := s.statuses[s.n%len(s.statuses)]
-	s.n++
-	return st, nil
-}
-
-func (s *sequencingBackend) calls() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.n
 }
 
 func TestIndexUnavailableReturns502(t *testing.T) {
@@ -565,7 +601,12 @@ func TestFanoutBoundsConcurrency(t *testing.T) {
 	// More targets than fanoutWorkers: in-flight CheckWebhook calls
 	// must never exceed the semaphore — a large match set can't
 	// stampede the ATC.
-	b := &throttledBackend{delay: 5 * time.Millisecond}
+	stats := &checkStats{delay: 5 * time.Millisecond}
+	b := &fakeBackend{
+		checkFn: func(ctx context.Context, _ concourse.Resource) (int, error) {
+			return stats.run(ctx, http.StatusCreated)
+		},
+	}
 	var resources []concourse.Resource
 	for i := 0; i < fanoutWorkers*4; i++ {
 		resources = append(resources, concourse.Resource{
@@ -582,13 +623,13 @@ func TestFanoutBoundsConcurrency(t *testing.T) {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
 	h.wg.Wait()
-	if got := b.maxInflight(); got > fanoutWorkers {
+	if got := stats.maxInflight(); got > fanoutWorkers {
 		t.Fatalf("max in-flight checks=%d want <= %d", got, fanoutWorkers)
 	}
-	if got := b.maxInflight(); got < 2 {
+	if got := stats.maxInflight(); got < 2 {
 		t.Fatalf("max in-flight checks=%d want > 1 (fan-out must be parallel)", got)
 	}
-	if got := b.calls(); got != len(resources) {
+	if got := stats.calls(); got != len(resources) {
 		t.Fatalf("check calls=%d want %d", got, len(resources))
 	}
 }
@@ -598,7 +639,12 @@ func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
 	// dispatch — several deliveries fanning out at once must keep
 	// TOTAL in-flight checks <= fanoutWorkers. A per-dispatch
 	// semaphore would let each run fanoutWorkers in parallel.
-	b := &throttledBackend{delay: 10 * time.Millisecond}
+	stats := &checkStats{delay: 10 * time.Millisecond}
+	b := &fakeBackend{
+		checkFn: func(ctx context.Context, _ concourse.Resource) (int, error) {
+			return stats.run(ctx, http.StatusCreated)
+		},
+	}
 	h := New(testSecret, b)
 	var resources []concourse.Resource
 	for i := 0; i < fanoutWorkers; i++ {
@@ -607,6 +653,7 @@ func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
 			Type: "git", Repo: "org/repo",
 		})
 	}
+	b.resources = resources
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -616,68 +663,13 @@ func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := b.maxInflight(); got > fanoutWorkers {
+	if got := stats.maxInflight(); got > fanoutWorkers {
 		t.Fatalf("max in-flight checks=%d want <= %d (semaphore must be shared across fan-outs)",
 			got, fanoutWorkers)
 	}
-	if got := b.calls(); got != 3*len(resources) {
+	if got := stats.calls(); got != 3*len(resources) {
 		t.Fatalf("check calls=%d want %d", got, 3*len(resources))
 	}
-}
-
-// throttledBackend sleeps per check and tracks peak concurrency.
-type throttledBackend struct {
-	resources []concourse.Resource
-	delay     time.Duration
-	mu        sync.Mutex
-	inflight  int
-	max       int
-	n         int
-}
-
-func (b *throttledBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
-	return b.resources, nil
-}
-
-func (b *throttledBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
-	return b.resources, nil
-}
-
-func (b *throttledBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
-	return linearMatch(b.resources, wantType, repos)
-}
-
-func (b *throttledBackend) CheckWebhook(ctx context.Context, _ concourse.Resource) (int, error) {
-	b.mu.Lock()
-	b.inflight++
-	if b.inflight > b.max {
-		b.max = b.inflight
-	}
-	b.n++
-	b.mu.Unlock()
-	defer func() {
-		b.mu.Lock()
-		b.inflight--
-		b.mu.Unlock()
-	}()
-	select {
-	case <-time.After(b.delay):
-		return http.StatusCreated, nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	}
-}
-
-func (b *throttledBackend) maxInflight() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.max
-}
-
-func (b *throttledBackend) calls() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.n
 }
 
 func TestMetricsRecorded(t *testing.T) {
@@ -767,10 +759,16 @@ func TestEventHeaderCannotCreateMetricSeries(t *testing.T) {
 func TestWaitDrainsInFlightFanout(t *testing.T) {
 	// Wait must block until every detached check goroutine finishes —
 	// the shutdown path in main depends on it.
-	b := &throttledBackend{delay: 20 * time.Millisecond, resources: []concourse.Resource{
-		{Pipeline: "p1", Name: "a", Type: "git", Repo: "org/repo"},
-		{Pipeline: "p1", Name: "b", Type: "git", Repo: "org/repo"},
-	}}
+	stats := &checkStats{delay: 20 * time.Millisecond}
+	b := &fakeBackend{
+		resources: []concourse.Resource{
+			{Pipeline: "p1", Name: "a", Type: "git", Repo: "org/repo"},
+			{Pipeline: "p1", Name: "b", Type: "git", Repo: "org/repo"},
+		},
+		checkFn: func(ctx context.Context, _ concourse.Resource) (int, error) {
+			return stats.run(ctx, http.StatusCreated)
+		},
+	}
 	h := New(testSecret, b)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
@@ -778,65 +776,31 @@ func TestWaitDrainsInFlightFanout(t *testing.T) {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
 	h.Wait(context.Background()) // exported drain path — same as main's shutdown
-	if got := b.calls(); got != 2 {
+	if got := stats.calls(); got != 2 {
 		t.Fatalf("check calls=%d want 2 after Wait", got)
 	}
 }
 
-// gateBackend parks Resources on a channel so a test can hold the
-// handler inside the index fetch — the exact window where a Wait
-// racing wg.Add used to slip through.
-type gateBackend struct {
-	resources   []concourse.Resource
-	inResources chan struct{} // signalled when Resources is entered
-	release     chan struct{} // closed to let Resources return
-	status      int
-
-	mu     sync.Mutex
-	checks int
-}
-
-func (g *gateBackend) Resources(context.Context) ([]concourse.Resource, error) {
-	g.inResources <- struct{}{}
-	<-g.release
-	return g.resources, nil
-}
-
-func (g *gateBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
-	return g.resources, nil
-}
-
-func (g *gateBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
-	return linearMatch(g.resources, wantType, repos)
-}
-
-func (g *gateBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
-	g.mu.Lock()
-	g.checks++
-	g.mu.Unlock()
-	return g.status, nil
-}
-
-func (g *gateBackend) checkCount() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.checks
-}
-
 func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
 	// wg.Add must run BEFORE the index fetch: otherwise a Wait()
-	// entering while a delivery sits inside Resources sees an empty
+	// entering while a delivery sits inside EnsureIndex sees an empty
 	// WaitGroup, returns immediately — and the fan-out started
 	// afterwards runs unwaited, so shutdown could exit the process
 	// while check POSTs are still in flight. The race window is
 	// exercised directly: Wait is started while the request is parked
-	// inside the fetch, every iteration, under -race.
+	// inside the fetch, every iteration, under -race. The ensureFn
+	// hook parks EnsureIndex the way gateBackend's Resources did.
 	for i := range 50 {
-		b := &gateBackend{
-			resources:   testIndex(),
-			inResources: make(chan struct{}, 1),
-			release:     make(chan struct{}),
-			status:      http.StatusCreated,
+		inResources := make(chan struct{}, 1)
+		release := make(chan struct{})
+		b := &fakeBackend{
+			resources: testIndex(),
+			status:    http.StatusCreated,
+			ensureFn: func(context.Context) error {
+				inResources <- struct{}{}
+				<-release
+				return nil
+			},
 		}
 		h := New(testSecret, b)
 		reqDone := make(chan struct{})
@@ -848,7 +812,7 @@ func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
 				t.Errorf("iteration %d: status=%d want 202", i, rec.Code)
 			}
 		}()
-		<-b.inResources // request parked inside the index fetch
+		<-inResources // request parked inside the index fetch
 
 		waitDone := make(chan struct{})
 		go func() {
@@ -866,10 +830,10 @@ func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
 		default:
 		}
 
-		close(b.release)
+		close(release)
 		<-reqDone
 		<-waitDone // must finish once the fan-out lands
-		if got := b.checkCount(); got != 2 {
+		if got := len(b.checkList()); got != 2 {
 			t.Fatalf("iteration %d: check calls=%d want 2", i, got)
 		}
 	}
@@ -919,37 +883,21 @@ func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
 	}
 }
 
-// blockingBackend parks every CheckWebhook on release — fan-outs that
-// cannot finish, exactly the shutdown-budget scenario.
-type blockingBackend struct {
-	release   chan struct{}
-	resources []concourse.Resource
-}
-
-func (b *blockingBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
-	return b.resources, nil
-}
-
-func (b *blockingBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
-	return b.resources, nil
-}
-
-func (b *blockingBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
-	return linearMatch(b.resources, wantType, repos)
-}
-
-func (b *blockingBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
-	<-b.release
-	return http.StatusCreated, nil
-}
-
 // TestWaitBudgetExpiresWithInFlightFanout: the shutdown contract —
 // Wait must RETURN when its budget expires even with a fan-out stuck
 // mid-flight, so Shutdown(10s)+Wait(15s) beats the pod's 30s SIGKILL.
 // The abandoned fan-out is counted and logged (dropped return value);
 // once the stuck POSTs finish, an unconstrained drain sees 0 left.
+// The checkFn hook parks every CheckWebhook on release — the old
+// blockingBackend's behavior.
 func TestWaitBudgetExpiresWithInFlightFanout(t *testing.T) {
-	b := &blockingBackend{release: make(chan struct{})}
+	release := make(chan struct{})
+	b := &fakeBackend{
+		checkFn: func(context.Context, concourse.Resource) (int, error) {
+			<-release
+			return http.StatusCreated, nil
+		},
+	}
 	for i := range 2 {
 		b.resources = append(b.resources, concourse.Resource{
 			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
@@ -976,7 +924,7 @@ func TestWaitBudgetExpiresWithInFlightFanout(t *testing.T) {
 		t.Fatalf("dropped=%d want 1 (the delivery's in-flight fan-out)", dropped)
 	}
 
-	close(b.release) // the parked POSTs land
+	close(release) // the parked POSTs land
 	if got := h.Wait(context.Background()); got != 0 {
 		t.Fatalf("dropped=%d want 0 once the stuck checks finish", got)
 	}

@@ -7,9 +7,16 @@
 // detached context (worker semaphore, per-target timeout) — the
 // response never waits on the ATC, so it cannot hit GitHub's ~10s
 // webhook timeout.
+//
+// This file owns request admission and the ServeHTTP front half —
+// headers, signature verification, payload parsing and the
+// pre-index filters. The post-verification half (index ensure, repo
+// match, the zero-match refresh retry and the detached fan-out) lives
+// in dispatch.go.
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,13 +69,28 @@ const (
 	maxInflightRequests = 128
 )
 
+// bodyPool recycles the request-body buffers of the four handled
+// event types — each delivery can hold up to maxBodyBytes, and
+// webhook volume is far higher than GC would reclaim them at. Buffers
+// are Reset before Put so a pooled 8 MiB slab never leaks stale body
+// bytes into the next delivery.
+var bodyPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
 // Backend is the slice of the Concourse client the handler needs —
-// an interface so tests can substitute a fake ATC.
+// an interface so tests can substitute a fake ATC. The index entry
+// points are error-only: the handler goes straight to Match against
+// the client's published lookup, so it never needed the index slice
+// cloned out per delivery.
 type Backend interface {
-	Resources(ctx context.Context) ([]concourse.Resource, error)
-	// Refresh bypasses the index cache TTL and returns a freshly
-	// fetched index; the previous index stays authoritative on error.
-	Refresh(ctx context.Context) ([]concourse.Resource, error)
+	// EnsureIndex runs the TTL/singleflight/backoff decision — the
+	// index is populated (or a stale one kept) by the time it
+	// returns nil.
+	EnsureIndex(ctx context.Context) error
+	// RefreshIndex forces an index refetch past the TTL — the
+	// zero-match retry. Its error is warn-only for the handler.
+	RefreshIndex(ctx context.Context) error
 	// Match returns the current index's fan-out targets: resources of
 	// wantType whose repo is one of repos. The concourse.Client
 	// answers from the (type, repo) map built once per fetch publish;
@@ -198,56 +220,6 @@ func (h *Handler) release() {
 	<-h.reqSem
 }
 
-// fanoutStart registers a delivery's would-be fan-out with the
-// WaitGroup — MUST run before the index fetch (see Wait for the race
-// this closes). fanoutDone releases it; every exit path that started
-// a registration Dones exactly once.
-func (h *Handler) fanoutStart() {
-	h.wg.Add(1)
-	h.inFlight.Add(1)
-}
-
-func (h *Handler) fanoutDone() {
-	// Counted down BEFORE wg.Done: a Wait that observes the WaitGroup
-	// drain must never read a stale inFlight count.
-	h.inFlight.Add(-1)
-	h.wg.Done()
-}
-
-// Wait blocks until every in-flight background fan-out has finished,
-// or ctx's budget expires — the graceful-shutdown path calls it once
-// the HTTP server has drained so the last check POSTs land before the
-// process exits (the fan-outs run on detached contexts and otherwise
-// outlive the listener). The budget is what makes the shutdown
-// contract honest: Shutdown(10s) + Wait ≤ ~25s, under the pod's 30s
-// SIGKILL grace. On expiry it logs how many fan-outs were abandoned
-// (their own fanoutBudget or the process kill ends them — they are
-// never left waiting forever) and returns that count; a clean drain
-// returns 0.
-func (h *Handler) Wait(ctx context.Context) int {
-	// Flip draining FIRST: requests still inside ServeHTTP finish
-	// normally, but anything reaching admit() from here on is
-	// rejected 503 — Wait's WaitGroup observation can't be raced by
-	// a request that slipped its Add in after the check.
-	h.drainMu.Lock()
-	h.draining = true
-	h.drainMu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		h.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return 0
-	case <-ctx.Done():
-		dropped := h.inFlight.Load()
-		logger().Warn("fan-out drain budget expired — in-flight check POSTs abandoned",
-			"in_flight_fanouts", dropped)
-		return int(dropped)
-	}
-}
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Header values are attacker-controlled until the HMAC check
 	// passes, and Go only rejects control characters in them — a
@@ -307,41 +279,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.release()
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	if err != nil {
-		// "Body over maxBodyBytes" (the sender's fault -> 413) and a
-		// transport failure like a client disconnect (-> 400) both
-		// surface as a ReadAll error — split them on MaxBytesError.
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
-			logger().Warn("webhook rejected: body exceeds size limit",
-				"remote_addr", r.RemoteAddr,
-				"delivery", delivery, "event", eventMetric, "error", err,
-				"status", http.StatusRequestEntityTooLarge)
-			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
-		} else {
-			deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
-			logger().Warn("webhook rejected: body read failed",
-				"remote_addr", r.RemoteAddr,
-				"delivery", delivery, "event", eventMetric, "error", err,
-				"status", http.StatusBadRequest)
-			http.Error(w, "bad request", http.StatusBadRequest)
+	wantType, handledEvent := resourceTypeForEvent[event]
+	if !handledEvent {
+		// Events outside the four handled types are acknowledged on
+		// the signature alone — the payload is never parsed, so
+		// stream it through the HMAC instead of buffering up to
+		// 8 MiB for a delivery that only earns a 202. The response
+		// ordering is identical to the buffered path: the
+		// MaxBytesReader still produces 413/400 before the 401
+		// verdict, and the metric outcomes are the same.
+		matched, err := verify.SignatureReader(h.secret,
+			http.MaxBytesReader(w, r.Body, maxBodyBytes), sig)
+		if err != nil {
+			h.failBodyRead(w, r, delivery, event, eventMetric, err)
+			return
 		}
-		return
-	}
-	if !verify.Signature(h.secret, body, sig) {
-		deliveriesTotal.WithLabelValues(eventMetric, "unauthorized").Inc()
-		logger().Warn("webhook rejected: signature mismatch",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", eventMetric,
-			"status", http.StatusUnauthorized)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
-	}
-
-	wantType, ok := resourceTypeForEvent[event]
-	if !ok {
+		if !matched {
+			h.rejectSignature(w, r, delivery, eventMetric)
+			return
+		}
 		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
 		logger().Info("webhook delivery ignored: unhandled event",
 			"remote_addr", r.RemoteAddr,
@@ -350,8 +306,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The four handled events DO parse the payload — borrow a
+	// MaxBytesReader-bounded buffer from the pool instead of
+	// io.ReadAll's fresh allocation per delivery.
+	buf := bodyPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		buf.Reset()
+		bodyPool.Put(buf)
+	}()
+	if _, err := io.Copy(buf, http.MaxBytesReader(w, r.Body, maxBodyBytes)); err != nil {
+		h.failBodyRead(w, r, delivery, event, eventMetric, err)
+		return
+	}
+	if !verify.Signature(h.secret, buf.Bytes(), sig) {
+		h.rejectSignature(w, r, delivery, eventMetric)
+		return
+	}
+
 	var p payload
-	if err := json.Unmarshal(body, &p); err != nil {
+	if err := json.Unmarshal(buf.Bytes(), &p); err != nil {
 		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
 		logger().Warn("webhook rejected: malformed JSON payload",
 			"remote_addr", r.RemoteAddr,
@@ -413,193 +387,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The event's repo identities — resources reference the same repo
-	// via ssh or https indifferently, so every URL form the payload
-	// carries is a match candidate.
-	repos := map[string]struct{}{}
-	for _, u := range []string{
-		p.Repository.FullName, p.Repository.SSHURL,
-		p.Repository.CloneURL, p.Repository.HTMLURL,
-	} {
-		if n := concourse.NormalizeRepo(u); n != "" {
-			repos[n] = struct{}{}
-		}
-	}
-
-	// The index fetch is the only ATC call still in the request path.
-	// It runs detached from the request lifetime: a client disconnect
-	// mid-fetch must not poison the shared cache the fetch populates.
-	// The wait budget (indexWaitBudget, 7s) stays under GitHub's ~10s
-	// webhook timeout; the client's fetchFlight runs the fetch itself
-	// on a longer detached budget, so this ctx expiring serves the
-	// stale index — it never aborts the shared fetch.
-	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(r.Context()), indexWaitBudget)
-	defer cancel()
-
-	// Register with the WaitGroup BEFORE the index fetch: the fan-out
-	// may or may not spawn (the match set can be empty, the fetch can
-	// fail), but a concurrent Wait must already see this delivery
-	// counted. Otherwise the graceful-shutdown path could race:
-	// wh.Wait() observing an empty WaitGroup in the window between the
-	// fetch and wg.Add(1) would return while this delivery's fan-out
-	// was still starting, and the process could exit with check POSTs
-	// unlanded. Every exit below either spawns the goroutine (which
-	// Dones) or Dones explicitly.
-	h.fanoutStart()
-	// The index slice itself is not needed — Match consults the
-	// backend's published (type, repo) lookup — but the fetch must
-	// run: it owns the TTL/singleflight decision that populates the
-	// lookup this match reads.
-	if _, err := h.backend.Resources(ctx); err != nil {
-		h.fanoutDone() // fetch failed — no fan-out will start
-		// With no index (and no stale copy) nothing can be checked —
-		// a 502 lets GitHub redeliver once the ATC is back instead of
-		// silently dropping the delivery.
-		deliveriesTotal.WithLabelValues(eventMetric, "index_unavailable").Inc()
-		logger().Error("resource index unavailable",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err,
-			"status", http.StatusBadGateway)
-		http.Error(w, "resource index unavailable", http.StatusBadGateway)
-		return
-	}
-
-	matched := h.backend.Match(wantType, repos)
-	if len(matched) == 0 && ctx.Err() == nil {
-		// A pipeline set since the last index fetch may not be in the
-		// cache — force one refresh and retry the match once. No loop:
-		// a second miss is a genuine "nothing to check". Skipped
-		// outright once the wait budget is spent — a Refresh on a dead
-		// ctx can only fail, and its error path would mask the real
-		// outcome (deadline → stale-index fallback below).
-		if _, err := h.backend.Refresh(ctx); err != nil {
-			logger().Warn("index refresh on zero match failed — keeping prior result",
-				"remote_addr", r.RemoteAddr,
-				"delivery", delivery, "event", event, "error", err)
-		} else {
-			matched = h.backend.Match(wantType, repos)
-		}
-	}
-
-	// Signature verified, resources matched — the delivery is accepted.
-	// The check POSTs fan out on a detached context so the 202 goes
-	// back immediately and GitHub's ~10s webhook timeout can't fire
-	// (a single resource failure never fails the delivery anyway —
-	// redelivery would re-trigger every resource, not just the one).
-	deliveriesTotal.WithLabelValues(eventMetric, "dispatched").Inc()
-	if len(matched) > 0 {
-		go func() {
-			defer h.fanoutDone()
-			h.dispatch(matched, delivery, event, p.Repository.FullName)
-		}()
-	} else {
-		h.fanoutDone() // nothing matched — no fan-out to wait for
-	}
-
-	logger().Info("webhook delivery accepted",
-		"remote_addr", r.RemoteAddr,
-		"delivery", delivery, "event", event,
-		"repo", p.Repository.FullName,
-		"resources_matched", len(matched))
-	writeJSON(w, http.StatusAccepted, summary{ResourcesMatched: len(matched)})
+	// Signature verified, payload parsed and actionable — hand the
+	// delivery to the index/match/fan-out half (dispatch.go).
+	h.accept(w, r, delivery, event, eventMetric, wantType, p)
 }
 
-// dispatch POSTs every matched resource's check webhook on a detached
-// context — the request is already answered. The whole fan-out runs
-// on a fixed budget (fanoutBudget, same 30s the request-path index
-// fetch gets): the Handler-wide worker semaphore bounds concurrency
-// so a large match set (or several deliveries at once) can't stampede
-// the ATC, and a target queued behind a full semaphore has no
-// per-target timeout yet — that starts only once a slot is taken —
-// so the budget is its escape hatch. Each admitted target then gets
-// its own 15s timeout so one wedged pipeline can't stall the rest of
-// the fan-out.
-//
-// The worker pool is per-dispatch, not process-lifetime: each pool
-// self-terminates when its jobs channel drains, so shutdown needs no
-// worker-lifetime bookkeeping — the TOTAL drain is bounded instead by
-// Wait's budget (WaitBudget), which is the property the shutdown
-// contract actually requires.
-func (h *Handler) dispatch(resources []concourse.Resource,
-	delivery, event, repo string) {
-	start := time.Now()
-	// Detached by construction (dispatch runs on its own goroutine
-	// outliving the request), but still bounded: nothing here may
-	// wait on the ATC without an exit path.
-	ctx, cancel := context.WithTimeout(context.Background(), h.budget)
-	defer cancel()
-	// Fixed worker pool instead of one goroutine per resource: a
-	// pathological match set must not spawn hundreds of goroutines
-	// all parked on the semaphore. Workers pull from a channel; the
-	// Handler-wide semaphore (h.sem) still bounds concurrent POSTs
-	// across ALL in-flight fan-outs.
-	workers := fanoutWorkers
-	if len(resources) < workers {
-		workers = len(resources)
+// failBodyRead maps a body-read failure onto the delivery metric and
+// the HTTP status — shared by the buffered and streaming verify
+// paths so their 413/400 ordering can never drift apart. "Body over
+// maxBodyBytes" (the sender's fault -> 413) and a transport failure
+// like a client disconnect (-> 400) both surface as a read error —
+// split them on MaxBytesError.
+func (h *Handler) failBodyRead(w http.ResponseWriter, r *http.Request,
+	delivery, event, eventMetric string, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
+		logger().Warn("webhook rejected: body exceeds size limit",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", eventMetric, "error", err,
+			"status", http.StatusRequestEntityTooLarge)
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+	} else {
+		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
+		logger().Warn("webhook rejected: body read failed",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", eventMetric, "error", err,
+			"status", http.StatusBadRequest)
+		http.Error(w, "bad request", http.StatusBadRequest)
 	}
-	jobs := make(chan concourse.Resource)
-	var wg sync.WaitGroup
-	var checked atomic.Int64
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for res := range jobs {
-				select {
-				case h.sem <- struct{}{}:
-				case <-ctx.Done():
-					// Budget spent queued — skip the POST and let
-					// the target go.
-					fanoutTotal.WithLabelValues("budget").Inc()
-					logger().Warn("check webhook skipped: fan-out budget expired while queued",
-						"pipeline", res.Pipeline, "resource", res.Name,
-						"repo", res.Repo, "delivery", delivery)
-					continue
-				}
-				func() {
-					defer func() { <-h.sem }()
-					tctx, cancel := context.WithTimeout(ctx, fanoutTimeout)
-					defer cancel()
-					status, err := h.backend.CheckWebhook(tctx, res)
-					switch {
-					case err != nil:
-						fanoutTotal.WithLabelValues("error").Inc()
-						logger().Error("check webhook request failed",
-							"pipeline", res.Pipeline, "resource", res.Name,
-							"repo", res.Repo, "delivery", delivery, "error", err)
-					case status/100 == 2:
-						fanoutTotal.WithLabelValues("ok").Inc()
-						checked.Add(1)
-						logger().Info("check webhook dispatched",
-							"pipeline", res.Pipeline, "resource", res.Name,
-							"repo", res.Repo, "delivery", delivery, "status", status)
-					case status == http.StatusUnauthorized || status == http.StatusNotFound:
-						fanoutTotal.WithLabelValues("rejected").Inc()
-						logger().Warn("check webhook rejected",
-							"pipeline", res.Pipeline, "resource", res.Name,
-							"repo", res.Repo, "delivery", delivery, "status", status)
-					default:
-						fanoutTotal.WithLabelValues("error").Inc()
-						logger().Error("check webhook unexpected status",
-							"pipeline", res.Pipeline, "resource", res.Name,
-							"repo", res.Repo, "delivery", delivery, "status", status)
-					}
-				}()
-			}
-		}()
-	}
-	for _, res := range resources {
-		jobs <- res
-	}
-	close(jobs)
-	wg.Wait()
-	fanoutDuration.Observe(time.Since(start).Seconds())
-	logger().Info("webhook fan-out complete",
-		"delivery", delivery, "event", event, "repo", repo,
-		"resources_matched", len(resources),
-		"resources_checked", checked.Load(),
-		"duration", time.Since(start).Round(time.Millisecond))
+}
+
+// rejectSignature is the shared 401 for a well-formed signature that
+// does not verify — buffered and streaming paths alike.
+func (h *Handler) rejectSignature(w http.ResponseWriter, r *http.Request,
+	delivery, eventMetric string) {
+	deliveriesTotal.WithLabelValues(eventMetric, "unauthorized").Inc()
+	logger().Warn("webhook rejected: signature mismatch",
+		"remote_addr", r.RemoteAddr,
+		"delivery", delivery, "event", eventMetric,
+		"status", http.StatusUnauthorized)
+	http.Error(w, "invalid signature", http.StatusUnauthorized)
 }
 
 // logSafe bounds an unauthenticated header value for logging: GitHub
@@ -610,8 +438,24 @@ func (h *Handler) dispatch(resources []concourse.Resource,
 // rejects them. Legit IDs survive intact for correlation.
 func logSafe(s string) string {
 	const maxLen = 64
-	if len(s) > maxLen {
-		s = s[:maxLen]
+	n := len(s)
+	if n > maxLen {
+		n = maxLen
+	}
+	// Fast path — the overwhelmingly common case: every byte already
+	// sits in the safe ASCII alphabet, so the string can be returned
+	// (truncated) with zero allocation instead of strings.Map's rune
+	// walk building a fresh string.
+	i := 0
+	for ; i < n; i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' ||
+			c >= 'A' && c <= 'Z' || c == '-' || c == '.' || c == '_') {
+			break
+		}
+	}
+	if i == n {
+		return s[:n]
 	}
 	return strings.Map(func(r rune) rune {
 		switch {
@@ -622,7 +466,7 @@ func logSafe(s string) string {
 			// Invalid UTF-8 decodes to RuneError and lands here too.
 			return -1
 		}
-	}, s)
+	}, s[:n])
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

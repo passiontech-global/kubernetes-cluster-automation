@@ -47,13 +47,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/http/pprof" // handlers wired explicitly below (Index, Profile, ...) — never on DefaultServeMux
 	"os"
 	"os/signal"
 	"strings"
@@ -68,6 +65,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/handler"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx/pprofx"
 )
 
 var version = "dev"
@@ -175,11 +173,12 @@ func main() {
 	// Connection pool tuned for the fan-out shape: 16 check-webhook
 	// workers + 8 index workers all share this client, so idle conns
 	// must cover the burst or every POST re-dials the ATC.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// httpx.PooledTransport clones http.DefaultTransport (dialer,
+	// HTTP/2, 90s IdleConnTimeout) with the per-host idle pool
+	// raised; the global caps are set on top.
+	transport := httpx.PooledTransport(32, nil)
 	transport.MaxIdleConns = 64
-	transport.MaxIdleConnsPerHost = 32
 	transport.MaxConnsPerHost = 32
-	transport.IdleConnTimeout = 90 * time.Second
 
 	client := &concourse.Client{
 		BaseURL:      envx.String("CONCOURSE_URL", "http://concourse-web:8080"),
@@ -201,14 +200,13 @@ func main() {
 	concourse.RegisterMetrics(reg)
 
 	// Internal listener: metrics scrape + pprof. Trusted-network
-	// surface — keep everything operational off LISTEN_ADDR.
+	// surface — keep everything operational off LISTEN_ADDR. The
+	// pprof handlers come from hostkit's pprofx — the only package
+	// allowed to import net/http/pprof (its init() would otherwise
+	// grow a DefaultServeMux surface every binary inherits).
 	internalMux := http.NewServeMux()
 	internalMux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	internalMux.HandleFunc("/debug/pprof/", pprof.Index)
-	internalMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	internalMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	internalMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	internalMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	pprofx.Register(internalMux)
 
 	publicMux := http.NewServeMux()
 	publicMux.Handle("POST /webhook", wh)
@@ -240,27 +238,26 @@ func main() {
 	// Bind BEFORE entering the wait-on-signal loop: a port collision
 	// or typo'd address must abort boot (log + exit), not surface
 	// asynchronously from a goroutine after readiness. httpx.New does
-	// the same bind-then-serve for the internal server.
-	publicLn, err := net.Listen("tcp", listenAddr)
+	// the bind synchronously for BOTH listeners.
+	//
+	// Public-server timeouts (the hostile-peer posture):
+	//   - ReadTimeout covers the whole request incl. the body (bounded
+	//     by MaxBytesReader at 8 MiB) — without it a slow-drip client
+	//     outlives ReadHeaderTimeout and holds the conn forever.
+	//   - WriteTimeout must cover the handler's 30s index-fetch budget
+	//     (fan-out itself is async — the response is a fast 202).
+	//   - GitHub sends a handful of modest headers; the tight cap keeps
+	//     a hostile peer from parking large header buffers per conn.
+	publicSrv, err := httpx.New(listenAddr, publicMux, httpx.Opts{
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      45 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	})
 	if err != nil {
 		logger().Error("binding public listener", "addr", listenAddr, "error", err)
 		os.Exit(1)
-	}
-	publicSrv := &http.Server{
-		Addr:    listenAddr,
-		Handler: publicMux,
-		// ReadTimeout covers the whole request incl. the body (bounded
-		// by MaxBytesReader at 8 MiB) — without it a slow-drip client
-		// outlives ReadHeaderTimeout and holds the conn forever.
-		ReadTimeout:       10 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		// WriteTimeout must cover the handler's 30s index-fetch budget
-		// (fan-out itself is async — the response is a fast 202).
-		WriteTimeout: 45 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		// GitHub sends a handful of modest headers; the tight cap keeps
-		// a hostile peer from parking large header buffers per conn.
-		MaxHeaderBytes: 64 << 10,
 	}
 	internalSrv, err := httpx.New(metricsAddr, internalMux, httpx.Opts{})
 	if err != nil {
@@ -269,13 +266,12 @@ func main() {
 	}
 
 	// Serve both. A serve-loop failure (accept error) is fatal — same
-	// as the old single ListenAndServe: log and exit non-zero.
-	publicErr := make(chan error, 1)
-	go func() {
-		if err := publicSrv.Serve(publicLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			publicErr <- err
-		}
-	}()
+	// as the old single ListenAndServe: log and exit non-zero. The
+	// httpx channels fold ErrServerClosed away (nil result, channel
+	// then closed); a result can only arrive here on a REAL failure —
+	// Shutdown has not run yet, and a nil would mean the listener died
+	// cleanly on its own, which the accept loop never does.
+	publicErr := publicSrv.Serve()
 	internalErr := internalSrv.Serve() // <-chan error; ErrServerClosed folded
 	ready.Store(true)
 
@@ -288,7 +284,7 @@ func main() {
 
 	select {
 	case err := <-publicErr:
-		logger().Error("server exited", "error", err)
+		logger().Error("public server exited", "error", err)
 		os.Exit(1)
 	case err := <-internalErr:
 		logger().Error("metrics server exited", "error", err)

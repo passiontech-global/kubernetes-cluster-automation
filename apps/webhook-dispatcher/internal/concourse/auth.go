@@ -60,14 +60,20 @@ const (
 	authModeBasic
 )
 
-// atcAuth is the Client's lazily-built auth state. It is created on
-// first use under c.mu so zero-value Clients (tests constructing
-// Client literals) work unchanged.
+// atcAuth is the Client's lazily-built auth state. It is created
+// exactly once — Client.authOnce (sync.Once, NOT c.mu) builds it and
+// publishes it through Client.authPtr — so zero-value Clients (tests
+// constructing Client literals) work unchanged and invalidateToken's
+// compare-and-clear never contends with the index mutex.
 type atcAuth struct {
 	client  *http.Client // token-endpoint transport (same as API calls)
 	baseURL string       // trimmed BaseURL — token paths are root-relative
 	user    string
 	pass    string
+	// form is the OAuth2 password-grant body, url-encoded ONCE at
+	// build time — mint used to re-encode the same five fields on
+	// every token request (and every /sky/token fallback retry).
+	form string
 
 	mu    sync.Mutex
 	mode  authMode
@@ -89,17 +95,26 @@ type tokenFlight struct {
 }
 
 // ensureAuth returns the client's auth state, building it on first
-// call. Caller must hold c.mu.
+// call. The build runs under authOnce — a sync.Once independent of
+// c.mu — and the result is published through authPtr, so concurrent
+// first callers share one construction and invalidateToken can read
+// the pointer without taking any lock.
 func (c *Client) ensureAuth() *atcAuth {
-	if c.auth == nil {
-		c.auth = &atcAuth{
+	c.authOnce.Do(func() {
+		c.authPtr.Store(&atcAuth{
 			client:  c.httpClient(),
 			baseURL: strings.TrimSuffix(c.BaseURL, "/"),
 			user:    c.User,
 			pass:    c.Password,
-		}
-	}
-	return c.auth
+			form: url.Values{
+				"grant_type": {"password"},
+				"username":   {c.User},
+				"password":   {c.Password},
+				"scope":      {"openid profile email federated:id groups"},
+			}.Encode(),
+		})
+	})
+	return c.authPtr.Load()
 }
 
 // authorize stamps credentials on req: bearer when a token is
@@ -108,31 +123,29 @@ func (c *Client) ensureAuth() *atcAuth {
 // EXACT credential that failed — never a newer token another worker
 // already re-minted.
 func (c *Client) authorize(ctx context.Context, req *http.Request) (string, error) {
-	c.mu.Lock()
-	a := c.ensureAuth()
-	c.mu.Unlock()
-	return a.authorize(ctx, req)
+	return c.ensureAuth().authorize(ctx, req)
 }
 
 // invalidateToken drops the cached token after a 401 — but ONLY when
 // the cache still holds badToken, the exact credential the failed
-// request carried. Without the match check, N workers whose requests
-// all 401'd on the same dead token would each wipe the cache in
-// turn, stampeding re-mints every time a fresher token lands.
+// request carried (compare-and-clear under a.mu). Without the match
+// check, N workers whose requests all 401'd on the same dead token
+// would each wipe the cache in turn, stampeding re-mints every time
+// a fresher token lands.
 func (c *Client) invalidateToken(badToken string) {
 	if badToken == "" {
 		return
 	}
-	c.mu.Lock()
-	if c.auth != nil {
-		c.auth.mu.Lock()
-		if c.auth.token == badToken {
-			c.auth.token = ""
-			c.auth.refreshAt = time.Time{}
-		}
-		c.auth.mu.Unlock()
+	a := c.authPtr.Load()
+	if a == nil {
+		return // auth never built — nothing cached to invalidate
 	}
-	c.mu.Unlock()
+	a.mu.Lock()
+	if a.token == badToken {
+		a.token = ""
+		a.refreshAt = time.Time{}
+	}
+	a.mu.Unlock()
 }
 
 func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, error) {
@@ -214,17 +227,11 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 // err). basic=true means both token endpoints 404/405'd — latch
 // basic-auth mode.
 func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
-	form := url.Values{
-		"grant_type": {"password"},
-		"username":   {a.user},
-		"password":   {a.pass},
-		"scope":      {"openid profile email federated:id groups"},
-	}
 	for _, path := range []string{"/sky/issuer/token", "/sky/token"} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			a.baseURL+path, strings.NewReader(form.Encode()))
+			a.baseURL+path, strings.NewReader(a.form))
 		if err != nil {
-			return "", time.Time{}, false, err
+			return "", time.Time{}, false, stripURLError(err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "application/json")
@@ -232,9 +239,12 @@ func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
 		req.SetBasicAuth("fly", "Zmx5")
 		resp, err := a.client.Do(req)
 		if err != nil {
-			return "", time.Time{}, false, err
+			return "", time.Time{}, false, stripURLError(err)
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody))
+		// 64 KiB is generous for a token response (a JWT plus a
+		// little metadata) — anything longer is a wedged/hostile
+		// peer, not a bigger token.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 		if err != nil {
 			return "", time.Time{}, false, err

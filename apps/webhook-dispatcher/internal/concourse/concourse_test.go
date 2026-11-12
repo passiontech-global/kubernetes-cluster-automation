@@ -263,8 +263,10 @@ func TestResourcesFailedRefreshBacksOff(t *testing.T) {
 	// old as the cache itself (it IS the fetch that populated it) —
 	// then break the ATC: the first call re-fetches, fails, and
 	// serves the stale index.
+	c.mu.Lock()
 	c.fetchedAt = time.Now().Add(-2 * c.ttl())
 	c.lastAttemptAt = c.fetchedAt
+	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	index, err := c.Resources(context.Background())
 	if err != nil || len(index) != 4 {
@@ -360,8 +362,8 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	// Past BOTH throttle windows — lastForceRefreshAt (Refresh's own
 	// clock) and fetchedAt (a successful fetch moments ago already
 	// IS the fresh index Refresh exists to produce).
-	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Lock()
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Unlock()
 
@@ -380,8 +382,8 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	}
 
 	// A failed refresh keeps the previous index.
-	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Lock()
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 500)
@@ -465,8 +467,11 @@ func TestFetchIndexColdStartListingFailureErrors(t *testing.T) {
 	if _, err := c.Resources(context.Background()); err == nil {
 		t.Fatal("Resources want error — the index is incomplete")
 	}
-	if c.index != nil {
-		t.Fatalf("c.index=%v want nil (incomplete index must not cache)", c.index)
+	c.mu.RLock()
+	cached := c.index
+	c.mu.RUnlock()
+	if cached != nil {
+		t.Fatalf("c.index=%v want nil (incomplete index must not cache)", cached)
 	}
 	// Cold-start negative cache: an immediate retry — even with the
 	// ATC recovered — shares the just-failed fetch's error inside
@@ -547,8 +552,8 @@ func TestRefreshFailedAttemptBacksOff(t *testing.T) {
 	if _, err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Lock()
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.fetchedAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 500)
@@ -596,7 +601,9 @@ func TestEmptyIndexIsCached(t *testing.T) {
 		t.Fatalf("pipeline-list hits=%d want 1 (cache hit)", got)
 	}
 	stub.fail("/api/v1/teams/main/pipelines", 500)
+	c.mu.Lock()
 	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.mu.Unlock()
 	if index, err := c.Resources(context.Background()); err != nil || index == nil {
 		t.Fatalf("stale empty index=%v err=%v want non-nil, nil", index, err)
 	}
@@ -1288,8 +1295,8 @@ func TestIndexFreshnessMetrics(t *testing.T) {
 
 	// A failed forced Refresh counts too.
 	stub.unfail("/api/v1/teams/main/pipelines")
-	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Lock()
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.fetchedAt = time.Now().Add(-2 * c.ttl())
 	c.mu.Unlock()
 	stub.fail("/api/v1/teams/main/pipelines", 503)
@@ -1302,8 +1309,8 @@ func TestIndexFreshnessMetrics(t *testing.T) {
 
 	// Recovery: the gauge moves again, the error counter holds.
 	stub.unfail("/api/v1/teams/main/pipelines")
-	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.mu.Lock()
+	c.lastForceRefreshAt = time.Now().Add(-c.minRefreshInterval())
 	c.fetchedAt = time.Now().Add(-2 * c.ttl())
 	c.lastAttemptAt = c.fetchedAt
 	c.mu.Unlock()
