@@ -3,6 +3,8 @@ package jinja
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -11,6 +13,68 @@ type scope struct {
 	env    *Env
 	lookup func(name string) any // external var resolver (checked first)
 }
+
+// builtinLookup/builtinRange are the two name-bound builtins
+// scope.get returns. They are package-level (not per-call closures)
+// because neither captures render state — the scope arrives as the
+// call's third argument — so a template calling lookup()/range()
+// repeatedly doesn't allocate a fresh func value per scope.get.
+var builtinLookup = builtinFunc(func(args []any, kw map[string]any, sc *scope) (any, error) {
+	return doLookup(args, sc)
+})
+
+var builtinRange = builtinFunc(func(args []any, kw map[string]any, _ *scope) (any, error) {
+	var lo, hi, step int64 = 0, 0, 1
+	if len(args) == 1 {
+		hi, _ = ToInt(args[0])
+	} else if len(args) >= 2 {
+		lo, _ = ToInt(args[0])
+		hi, _ = ToInt(args[1])
+	}
+	if len(args) > 2 {
+		step, _ = ToInt(args[2])
+	}
+	if step == 0 {
+		// lo<hi with step 0 never advances — unbounded
+		// append = hang+OOM. Python raises ValueError.
+		return nil, errors.New("range: step cannot be zero")
+	}
+	// Compute the length arithmetically BEFORE looping —
+	// a `for i += step` condition check can't see step
+	// wrap the counter (range(-1,-2,MinInt64): -1 wraps to
+	// MaxInt64 which still satisfies i>hi → unbounded
+	// append). hi-lo itself overflows int64 at the
+	// extremes, so count in unsigned space where the
+	// difference is exact.
+	var count uint64
+	if step > 0 && hi > lo {
+		d, u := uint64(hi)-uint64(lo), uint64(step)
+		count = d / u
+		if d%u != 0 {
+			count++
+		}
+	} else if step < 0 && lo > hi {
+		// -uint64(step) is |step| even for MinInt64,
+		// where -step can't exist as an int64.
+		d, u := uint64(lo)-uint64(hi), -uint64(step)
+		count = d / u
+		if d%u != 0 {
+			count++
+		}
+	}
+	if count > rangeMaxOut {
+		return nil, fmt.Errorf("range: %d elements exceeds cap %d", count, rangeMaxOut)
+	}
+	// Drive the loop by the precomputed count, not the
+	// boundary condition — i += step may wrap the counter,
+	// the count still terminates the append.
+	out := make([]any, 0, count)
+	for k, i := uint64(0), lo; k < count; k++ {
+		out = append(out, i)
+		i += step
+	}
+	return &List{out}, nil
+})
 
 func (s *scope) get(name string) any {
 	if s.lookup != nil {
@@ -25,62 +89,9 @@ func (s *scope) get(name string) any {
 	}
 	switch name {
 	case "lookup", "ansible.builtin.lookup":
-		return builtinFunc(func(args []any, kw map[string]any, sc *scope) (any, error) {
-			return doLookup(args, sc)
-		})
+		return builtinLookup
 	case "range":
-		return builtinFunc(func(args []any, kw map[string]any, _ *scope) (any, error) {
-			var lo, hi, step int64 = 0, 0, 1
-			if len(args) == 1 {
-				hi, _ = ToInt(args[0])
-			} else if len(args) >= 2 {
-				lo, _ = ToInt(args[0])
-				hi, _ = ToInt(args[1])
-			}
-			if len(args) > 2 {
-				step, _ = ToInt(args[2])
-			}
-			if step == 0 {
-				// lo<hi with step 0 never advances — unbounded
-				// append = hang+OOM. Python raises ValueError.
-				return nil, errors.New("range: step cannot be zero")
-			}
-			// Compute the length arithmetically BEFORE looping —
-			// a `for i += step` condition check can't see step
-			// wrap the counter (range(-1,-2,MinInt64): -1 wraps to
-			// MaxInt64 which still satisfies i>hi → unbounded
-			// append). hi-lo itself overflows int64 at the
-			// extremes, so count in unsigned space where the
-			// difference is exact.
-			var count uint64
-			if step > 0 && hi > lo {
-				d, u := uint64(hi)-uint64(lo), uint64(step)
-				count = d / u
-				if d%u != 0 {
-					count++
-				}
-			} else if step < 0 && lo > hi {
-				// -uint64(step) is |step| even for MinInt64,
-				// where -step can't exist as an int64.
-				d, u := uint64(lo)-uint64(hi), -uint64(step)
-				count = d / u
-				if d%u != 0 {
-					count++
-				}
-			}
-			if count > rangeMaxOut {
-				return nil, fmt.Errorf("range: %d elements exceeds cap %d", count, rangeMaxOut)
-			}
-			// Drive the loop by the precomputed count, not the
-			// boundary condition — i += step may wrap the counter,
-			// the count still terminates the append.
-			out := make([]any, 0, count)
-			for k, i := uint64(0), lo; k < count; k++ {
-				out = append(out, i)
-				i += step
-			}
-			return &List{out}, nil
-		})
+		return builtinRange
 	}
 	return Undefined{name}
 }
@@ -105,7 +116,10 @@ func (n exprNode) render(s *scope, b *strings.Builder) error {
 	if err != nil {
 		return err
 	}
-	b.WriteString(Stringify(v))
+	// writeStringify streams straight into the output builder —
+	// Stringify(v) would allocate an intermediate string only to
+	// copy it here.
+	writeStringify(v, b)
 	return nil
 }
 
@@ -181,33 +195,48 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	// block-local.
 	saved := s.vars
 	defer func() { s.vars = saved }()
-	inner := make(map[string]any, len(saved))
-	for k, x := range saved {
-		inner[k] = x
+	// maps.Clone is the same shallow copy the manual loop made;
+	// the nil guard keeps a nil vars map non-nil (Clone(nil) is
+	// nil and setNode would panic writing it).
+	inner := maps.Clone(saved)
+	if inner == nil {
+		inner = make(map[string]any)
 	}
 	s.vars = inner
+	items := ToIter(v)
 	// Apply the `if` filters first: the loop var is bound for each
 	// candidate and every condition must be Truthy for the item to
 	// iterate — loop.index/count then track the FILTERED sequence
-	// (jinja semantics).
+	// (jinja semantics). With no `if` filters and a single loop
+	// var, bind is a plain assignment, so the draft/filter pass is
+	// skipped entirely. kept still gets its own slice: ToIter hands
+	// back a *List's LIVE backing array, and a {% set x = l.pop(0) %}
+	// inside the body shifts that array — iterating the alias
+	// directly would skip/duplicate elements where the old
+	// append-built snapshot did not. One clone is still cheaper
+	// than the per-item bind+cond pass it replaces.
 	var kept []any
-	for _, it := range ToIter(v) {
-		if err := n.bind(s, it); err != nil {
-			return err
-		}
-		ok := true
-		for _, ce := range n.conds {
-			cv, err := ce.eval(s)
-			if err != nil {
+	if len(n.conds) == 0 && len(n.names) == 1 {
+		kept = slices.Clone(items)
+	} else {
+		for _, it := range items {
+			if err := n.bind(s, it); err != nil {
 				return err
 			}
-			if !Truthy(cv) {
-				ok = false
-				break
+			ok := true
+			for _, ce := range n.conds {
+				cv, err := ce.eval(s)
+				if err != nil {
+					return err
+				}
+				if !Truthy(cv) {
+					ok = false
+					break
+				}
 			}
-		}
-		if ok {
-			kept = append(kept, it)
+			if ok {
+				kept = append(kept, it)
+			}
 		}
 	}
 	ln := len(kept)
@@ -217,8 +246,9 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	// content every round. The s.vars["loop"] assignment must STAY
 	// inside the loop: a {% set loop = x %} inside the body writes
 	// this map slot, and the next iteration must re-install the
-	// shared loop OMap.
-	loop := NewOMap()
+	// shared loop OMap. NewOMapCap(7): the seven loop.* keys are
+	// known up front — no grow-realloc on first Set.
+	loop := NewOMapCap(7)
 	for i, it := range kept {
 		if err := n.bind(s, it); err != nil {
 			return err

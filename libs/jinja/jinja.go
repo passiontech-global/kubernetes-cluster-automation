@@ -10,18 +10,19 @@
 //	whitespace control via {%-/-%} {{-/-}} {#-/-#}
 //	expressions: literals (str/int/float/bool/none/list/dict), names,
 //	             .attr ['key'] [idx] calls, methods (items/append/get/
-//	             keys/values/endswith/startswith/split/strip),
+//	             keys/values/endswith/startswith/split/strip/index/pop),
 //	             filters |f(a), + - ~ * / // %, == != < <= > >=
 //	             in/not in, is [not] t, and/or/not, x if c else y
 //	tests: defined undefined none mapping iterable sequence string
-//	       number boolean bool search equalto eq sameas
-//	filters: basename bool b64decode b64encode default dict2items
+//	       number boolean bool search equalto eq sameas changed
+//	       failed succeeded skipped in
+//	filters: basename bool b64decode b64encode count d default dict2items
 //	         difference eq equalto first flatten float format from_json
 //	         from_yaml hash indent int items2dict join last length list
-//	         lower map min max regex_escape regex_findall regex_replace
-//	         regex_search reject rejectattr search select selectattr
-//	         sort split string ternary to_json to_yaml to_nice_yaml
-//	         trim unique upper zip
+//	         lower mandatory map min max regex_escape regex_findall
+//	         regex_replace regex_search reject rejectattr search select
+//	         selectattr sort split string ternary to_json to_yaml
+//	         to_nice_yaml trim union unique upper zip
 //	keyword args (jinja2/ansible parity): sort(reverse=, case_sensitive=,
 //	         attribute=), int(default=, base=), float(default=),
 //	         default(default_value=, boolean=), items2dict(key_name=,

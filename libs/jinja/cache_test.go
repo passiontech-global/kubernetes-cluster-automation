@@ -1,5 +1,5 @@
-// cache_test.go — the compiled-AST LRU (parsedTemplate) and the
-// regex compile cache. The AST cache's load-bearing property is that
+// cache_test.go — the compiled-AST clock cache (parsedTemplate) and
+// the regex compile cache. The AST cache's load-bearing property is that
 // sharing one parsed tree across renders is invisible: identical
 // output, no cross-talk under concurrent renders (this suite is the
 // -race exercise for the immutability argument in cache.go), bounded
@@ -67,9 +67,9 @@ func TestTemplateCacheEviction(t *testing.T) {
 			t.Fatalf("render %d = %q want %q", i, out, want)
 		}
 	}
-	templateCache.mu.Lock()
-	n := templateCache.lru.Len()
-	templateCache.mu.Unlock()
+	templateCache.mu.RLock()
+	n := len(templateCache.byKey)
+	templateCache.mu.RUnlock()
 	if n != templateCacheCap {
 		t.Fatalf("cache len = %d want cap %d", n, templateCacheCap)
 	}

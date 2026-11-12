@@ -7,9 +7,9 @@
 package jinja
 
 import (
-	"encoding/json"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	yaml3 "go.yaml.in/yaml/v3"
@@ -20,102 +20,15 @@ import (
 // toJSON renders v as a JSON document. *OMap insertion order is
 // preserved — routing through map[string]any + encoding/json would
 // sort the keys and silently reorder the mappings the ansible-
-// derived templates regenerate.
+// derived templates regenerate. The document is written straight
+// into one strings.Builder by writeJSONAt (stringify.go) instead of
+// allocating a []byte per node.
 func toJSON(v any) ([]byte, error) {
+	var sb strings.Builder
 	steps := 0
-	return jsonValueAt(v, 0, &steps)
-}
-
-// jsonValueAt walks under the walkMaxDepth recursion budget AND the
-// walkMaxSteps total-step budget — a cyclic value can't be marshaled
-// anyway, so past the depth cap a "[...]" string placeholder stands
-// in (marshal-safe), while an exponentially BRANCHING structure (a
-// list holding two copies of itself) stays shallow and instead burns
-// the shared step budget, which errors.
-func jsonValueAt(v any, depth int, steps *int) ([]byte, error) {
-	if depth > walkMaxDepth {
-		return []byte(`"[...]"`), nil
+	if err := writeJSONAt(v, &sb, 0, &steps); err != nil {
+		return nil, err
 	}
-	if stepBudgetExhausted(steps) {
-		return nil, fmt.Errorf("json: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
-	}
-	switch t := v.(type) {
-	case *OMap:
-		return jsonObjectAt(t.Keys(), func(k string) any {
-			vv, _ := t.Get(k)
-			return vv
-		}, depth, steps)
-	case *List:
-		if t == nil {
-			return jsonListAt(nil, depth, steps)
-		}
-		return jsonListAt(t.V, depth, steps)
-	case []any:
-		return jsonListAt(t, depth, steps)
-	case map[string]any:
-		// Plain Go maps carry no order — sort keys for deterministic
-		// output, same as encoding/json did.
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return jsonObjectAt(keys, func(k string) any { return t[k] }, depth, steps)
-	case map[string]string:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return jsonObjectAt(keys, func(k string) any { return t[k] }, depth, steps)
-	case Undefined:
-		return []byte("null"), nil
-	default:
-		// Scalars (and non-jinja container types) marshal exactly
-		// as encoding/json handled them before — including HTML
-		// escaping and json.Marshaler support.
-		return json.Marshal(v)
-	}
-}
-
-// jsonObjectAt emits {"k":v,...} walking keys in the given order.
-func jsonObjectAt(keys []string, get func(string) any, depth int, steps *int) ([]byte, error) {
-	var sb strings.Builder
-	sb.WriteByte('{')
-	for i, k := range keys {
-		cv, err := jsonValueAt(get(k), depth+1, steps)
-		if err != nil {
-			return nil, err
-		}
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		kb, err := json.Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		sb.Write(kb)
-		sb.WriteByte(':')
-		sb.Write(cv)
-	}
-	sb.WriteByte('}')
-	return []byte(sb.String()), nil
-}
-
-func jsonListAt(items []any, depth int, steps *int) ([]byte, error) {
-	var sb strings.Builder
-	sb.WriteByte('[')
-	for i, x := range items {
-		cv, err := jsonValueAt(x, depth+1, steps)
-		if err != nil {
-			return nil, err
-		}
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.Write(cv)
-	}
-	sb.WriteByte(']')
 	return []byte(sb.String()), nil
 }
 
@@ -155,19 +68,9 @@ func yamlValueAt(v any, depth int, steps *int) (*yaml3.Node, error) {
 	case []any:
 		return yamlSeqNode(t, depth, steps)
 	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return yamlMapNode(keys, func(k string) any { return t[k] }, depth, steps)
+		return yamlMapNode(slices.Sorted(maps.Keys(t)), func(k string) any { return t[k] }, depth, steps)
 	case map[string]string:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return yamlMapNode(keys, func(k string) any { return t[k] }, depth, steps)
+		return yamlMapNode(slices.Sorted(maps.Keys(t)), func(k string) any { return t[k] }, depth, steps)
 	case Undefined:
 		return yamlLeafNode(nil)
 	default:
@@ -242,13 +145,8 @@ func fromJSONAt(v any, depth int) (any, error) {
 	}
 	switch t := v.(type) {
 	case map[string]any:
-		m := NewOMap()
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
+		m := NewOMapCap(len(t))
+		for _, k := range slices.Sorted(maps.Keys(t)) {
 			cv, err := fromJSONAt(t[k], depth+1)
 			if err != nil {
 				return nil, err

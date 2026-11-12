@@ -195,8 +195,9 @@ func TestInt64OverflowPromotes(t *testing.T) {
 
 // |from_json rejects oversized input before json.Unmarshal — a
 // hostile multi-MB string is an unbounded CPU/memory sink.
+// (parseMaxBytes is the shared cap |from_yaml applies too.)
 func TestFromJSONSizeCap(t *testing.T) {
-	big := `"` + strings.Repeat("x", fromJSONMaxBytes) + `"`
+	big := `"` + strings.Repeat("x", parseMaxBytes) + `"`
 	_, err := renderBounded(t, `{{ j | from_json }}`, map[string]any{"j": big})
 	if err == nil {
 		t.Fatal("oversized from_json input did not error")
@@ -219,13 +220,14 @@ func TestRegexCacheBounded(t *testing.T) {
 			t.Fatalf("pattern %d: %v", i, err)
 		}
 	}
-	regexCache.RLock()
-	n := len(regexCache.m)
-	regexCache.RUnlock()
+	regexCache.mu.RLock()
+	n := len(regexCache.byKey)
+	regexCache.mu.RUnlock()
 	if n > regexCacheCap {
 		t.Fatalf("regexCache holds %d entries, cap %d", n, regexCacheCap)
 	}
-	// Over-cap patterns still compile correctly, just uncached.
+	// Past the cap the clock hand evicts cold entries — the map
+	// stays at cap and new patterns still compile correctly.
 	re, err := cachedRegexp("pat-overflow-check")
 	if err != nil || re == nil {
 		t.Fatalf("overflow pattern: %v", err)

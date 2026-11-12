@@ -10,18 +10,23 @@ the inversion point), no knowledge of any consumer.
 | File | Responsibility |
 |---|---|
 | `jinja.go` | Public API: `Render`, `RenderScoped`, `Env`, `Undefined`, `List`, budget constants |
-| `lex.go` | Expression tokenizer (string escapes, number literals) |
-| `parser.go` | `{{ }}`/`{% %}`/`{# #}` split + expression parser (precedence: ternary → or → and → not → compare → `~` → add → mul → unary → postfix) |
-| `expr.go` | Expression AST + `eval`; builds the per-call kwargs map (nil when empty) |
+| `lex.go` | Expression tokenizer (typed `tokKind`, string escapes, based/decimal number literals) |
+| `parser.go` | `{{ }}`/`{% %}`/`{# #}` split + statement AST (set/for/if) |
+| `parser_expr.go` | Expression parser — precedence: ternary → or → and → not → compare → `~` → add → mul → unary → postfix; `parseCallArgs` shared by filter/call |
+| `expr.go` | Expression AST + `eval`; `evalCallArgs` (kwargs map nil when empty); `binOp` binary-operator engine |
 | `render.go` | Statement nodes (`set`/`for`/`if`), `scope`, for-loop unpack rules |
-| `value.go` | Coercions (`Truthy`, `Stringify`, `ToInt`), binary ops, deep equality, attr/index lookup, walk budgets |
-| `filters.go` | Filter dispatch (`applyFilter`) + sort/indent helpers |
+| `value.go` | Coercions (`Truthy`, `ToInt`, `toFloat`), iteration (`ToIter`), numeric compare core (`numEq`/`numCmp`), walk budgets |
+| `methods.go` | Attr/index lookup, bound-method dispatch, deep equality, mapping view |
+| `stringify.go` | `Stringify`/`writeStringify` (python repr) + `writeJSONAt` (`to_json` writer) — one `*strings.Builder` threaded through |
+| `filters.go` | Filter dispatch (`applyFilter`) + scalar/string/codec/regex cases, `parseMaxBytes` input cap |
+| `filters_seq.go` | `unique`/`difference`/`union`/`flatten`/`min`/`max`/`zip`/`dict2items`/`items2dict` |
+| `filters_sort.go` | `|sort` + `sortKey`/`numSortKind` key machinery (exact >2^53 integers) |
 | `filters_select.go` | `map`/`select`/`reject`/`selectattr`/`rejectattr` family |
 | `filters_format.go` | printf-style `format` |
 | `tests.go` | `is <test>` predicate dispatch |
 | `convert.go` | `to_json`/`to_yaml`/`to_nice_yaml` (order-preserving), `from_json`/`from_yaml` |
 | `lookup.go` | `lookup('file'|'pipe', …)` dispatch via `Env` hooks |
-| `cache.go` | Compiled-AST LRU + regex compile cache (thread-safety contract below) |
+| `cache.go` | Compiled-AST + regex compile caches — CLOCK (second-chance) rings behind `sync.RWMutex` (thread-safety contract below) |
 | `omap.go` | `OMap` ordered map, YAML decode (`DecodeYAML`), typed getters |
 
 ## The OMap ordering guarantee
@@ -49,8 +54,8 @@ render empty, matching the registry helpers' expectations.
 
 ## Render / thread-safety
 
-- `Render`/`RenderScoped` share a compiled-AST LRU keyed by template
-  source (`cache.go`, cap 128). Parsed trees are immutable at render
+- `Render`/`RenderScoped` share a compiled-AST clock cache keyed by
+  template source (`cache.go`, cap 128). Parsed trees are immutable at render
   time — every node method reads its fields and writes only
   render-local state — so one tree is safely shared across concurrent
   renders. The full argument and the `-race` exercise

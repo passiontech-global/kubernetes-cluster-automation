@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -28,6 +30,14 @@ type OMap struct {
 }
 
 func NewOMap() *OMap { return &OMap{vals: map[string]any{}} }
+
+// NewOMapCap is NewOMap with both storages pre-sized — the hot
+// decode/render paths that know the entry count up front (YAML
+// mappings, from_json objects, dict literals, the for-loop var
+// OMap, dict2items/items2dict) skip the grow-realloc chain.
+func NewOMapCap(n int) *OMap {
+	return &OMap{keys: make([]string, 0, n), vals: make(map[string]any, n)}
+}
 
 // Keys returns the ordered key slice (live — do not mutate).
 func (m *OMap) Keys() []string {
@@ -145,27 +155,41 @@ func scalarStr(v any) string {
 		// A byte slice is a byte string, not a list of scalars —
 		// element-wise treatment would print "110,111" for "no".
 		return string(t)
+	case []string:
+		// Fast path ahead of the reflect fallback: a Go-native
+		// string slice coerces element-wise like []any (','-joined)
+		// but its elements are already scalar — no per-element
+		// scalarStr call needed. map[string]string needs no twin:
+		// it stays a container in the "" group above.
+		return strings.Join(t, ",")
 	}
+	// Integer types beyond int64 (int, int32, uint, ...) stringify
+	// decimal BEFORE the reflect walk — an int can never have
+	// Slice/Map kind, so checking them first costs nothing and
+	// spares the common Go-native-int case the reflection.
+	if i, ok := asInt64(v); ok {
+		return strconv.FormatInt(i, 10)
+	}
+	if u, ok := asUint64(v); ok {
+		return strconv.FormatUint(u, 10)
+	}
+	// ONE reflect.ValueOf feeds both container probes — the
+	// previous code called it once for Slice and again for Map.
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice {
-		// Concrete typed slices ([]string a Go caller stored via
-		// Set) used to fall through to fmt.Sprint's "[a b]" repr.
-		// Coerce element-wise — the same scalar treatment []any
-		// elements get — joined with ',' like the registry list
-		// spellings (join(',')).
+		// Concrete typed slices ([]int, []MyType, …) used to fall
+		// through to fmt.Sprint's "[a b]" repr. Coerce element-wise —
+		// the same scalar treatment []any elements get — joined
+		// with ',' like the registry list spellings (join(',')).
 		parts := make([]string, rv.Len())
 		for i := range parts {
 			parts[i] = scalarStr(rv.Index(i).Interface())
 		}
 		return strings.Join(parts, ",")
-	}
-	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Map {
+	} else if rv.Kind() == reflect.Map {
 		// Any other map shape (map[string]int, map[int]string, …)
 		// has no faithful scalar form: keys would be lost, values
 		// mis-keyed — drop to "" like the container cases above.
 		return ""
-	}
-	if i, ok := asInt64(v); ok {
-		return strconv.FormatInt(i, 10)
 	}
 	return fmt.Sprint(v)
 }
@@ -181,7 +205,10 @@ func (m *OMap) Bool(k string) bool {
 // BoolDef coerces the ansible/YAML truthy SCALAR spellings —
 // true/yes/1/on and false/no/0/off, case-insensitive, whitespace-
 // trimmed (a quoted YAML `True` decodes as a string, not a bool) —
-// with bool and int64 handled directly and non-zero float64 true.
+// with bool and int64 handled directly, non-zero float64/float32
+// true (NaN excluded: NaN != 0 is TRUE in Go and must not leak
+// through as truthy), and every other Go integer width via
+// asInt64/asUint64 (contexts feed plain Go ints, not just int64).
 // Anything unrecognized, missing, or nil → def. This is NOT jinja's
 // Truthy: an unrecognized non-empty string ("maybe") falls back to
 // def instead of truthing.
@@ -189,7 +216,8 @@ func (m *OMap) BoolDef(k string, def bool) bool {
 	if m == nil {
 		return def
 	}
-	switch t := m.vals[k].(type) {
+	v := m.vals[k]
+	switch t := v.(type) {
 	case bool:
 		return t
 	case string:
@@ -202,7 +230,15 @@ func (m *OMap) BoolDef(k string, def bool) bool {
 	case int64:
 		return t != 0
 	case float64:
-		return t != 0
+		return !math.IsNaN(t) && t != 0
+	case float32:
+		return !math.IsNaN(float64(t)) && t != 0
+	}
+	if i, ok := asInt64(v); ok {
+		return i != 0
+	}
+	if u, ok := asUint64(v); ok {
+		return u != 0
 	}
 	return def
 }
@@ -260,12 +296,10 @@ func (m *OMap) StrMap(k string) map[string]string {
 // sorted keys — dict2items needs the OMap item shape, and Go's
 // random map order would make the output nondeterministic.
 func omFromStringMap[V any](m map[string]V) *OMap {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	om := NewOMap()
+	// slices.Sorted(maps.Keys) — the collect-then-sort.Strings dance
+	// every map-key walk used to spell out by hand.
+	keys := slices.Sorted(maps.Keys(m))
+	om := NewOMapCap(len(m))
 	for _, k := range keys {
 		om.Set(k, m[k])
 	}
@@ -279,7 +313,7 @@ func (m *OMap) Items() []any {
 	}
 	out := make([]any, 0, len(m.keys))
 	for _, k := range m.keys {
-		p := NewOMap()
+		p := NewOMapCap(2)
 		p.Set("key", k)
 		p.Set("value", m.vals[k])
 		out = append(out, p)
@@ -372,16 +406,31 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	}
 	switch n.Kind {
 	case yaml3.MappingNode:
-		// Pass 1: collect every EXPLICIT (non-merge) key so merge
-		// sources can skip them no matter where `<<` sits in the
-		// document — an explicit key always wins over a merged one.
-		explicit := make(map[string]bool, len(n.Content)/2)
+		m := NewOMapCap(len(n.Content) / 2)
+		// Pass 1 (only when a merge key exists): collect every
+		// EXPLICIT (non-merge) key so merge sources can skip them
+		// no matter where `<<` sits in the document — an explicit
+		// key always wins over a merged one. 99% of mappings carry
+		// no `<<` at all, so a cheap pre-scan skips the explicit-set
+		// alloc entirely on the common path (a nil map reads as
+		// empty anyway, and yamlMergeInto is unreachable without a
+		// merge key).
+		hasMerge := false
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			if !isYAMLMergeKey(n.Content[i]) {
-				explicit[n.Content[i].Value] = true
+			if isYAMLMergeKey(n.Content[i]) {
+				hasMerge = true
+				break
 			}
 		}
-		m := NewOMap()
+		var explicit map[string]bool
+		if hasMerge {
+			explicit = make(map[string]bool, len(n.Content)/2)
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if !isYAMLMergeKey(n.Content[i]) {
+					explicit[n.Content[i].Value] = true
+				}
+			}
+		}
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			kn, vn := n.Content[i], n.Content[i+1]
 			if isYAMLMergeKey(kn) {
