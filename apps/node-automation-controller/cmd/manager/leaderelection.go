@@ -83,7 +83,7 @@ func leaderClientConfig(cfg *rest.Config,
 // as the fallback for the window before the watchdog's first pass).
 func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 	namespace string, renewDeadline time.Duration,
-	stolen *atomic.Bool) (resourcelock.Interface, error) {
+	stolen *atomic.Bool, done <-chan struct{}) (resourcelock.Interface, error) {
 
 	elCfg := leaderClientConfig(cfg, renewDeadline)
 	coreClient, err := corev1client.NewForConfig(elCfg)
@@ -110,6 +110,13 @@ func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 	// event namespace (the Lease's).
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartRecordingToSink(leaseEventSink{cs: cs})
+	// The broadcaster's writer goroutine outlives the lock otherwise —
+	// Shutdown drains it when the work context cancels (manager stop /
+	// leader loss), so a stopped manager never leaks the sink writer.
+	go func() {
+		<-done
+		broadcaster.Shutdown()
+	}()
 
 	lock, err := resourcelock.New(resourcelock.LeasesResourceLock,
 		namespace, leaderElectionID,

@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -89,4 +90,38 @@ func GetSecretCached(ctx context.Context, r CachedObjectReader,
 		return nil, err
 	}
 	return sec, nil
+}
+
+// ListPodsCached returns the Pods in namespace matching sel from the
+// informer cache when r is non-nil, else the direct paged ListAll
+// the call site always ran. The reader is the SAME minimal-List
+// shape CachedNodeReader declares (mgr.GetClient satisfies it) —
+// kept as that type so one field can feed both node and pod cached
+// reads.
+//
+// SCOPE CONTRACT: the cache only holds what the Pod informer's watch
+// selector covers (buildCacheOptions — kube-system pods labelled
+// k8s-app in (cilium,kube-dns)). A List for pods OUTSIDE that scope
+// returns an empty list, not an error — callers must only pass sel
+// values the informer watch covers, and only while the informer can
+// start (pods watch RBAC exists — the cilium component Role). A
+// failed informer start surfaces as a List error, which callers
+// treat like any other inconclusive read.
+func ListPodsCached(ctx context.Context, r CachedNodeReader,
+	cs kubernetes.Interface, namespace string,
+	sel labels.Selector) ([]corev1.Pod, error) {
+
+	if r == nil {
+		return ListAll(ctx, metav1.ListOptions{
+			LabelSelector: sel.String(),
+			Limit:         DefaultListPageSize,
+		}, Pods(cs, namespace))
+	}
+	var pl corev1.PodList
+	if err := r.List(ctx, &pl,
+		client.InNamespace(namespace),
+		client.MatchingLabelsSelector{Selector: sel}); err != nil {
+		return nil, err
+	}
+	return pl.Items, nil
 }

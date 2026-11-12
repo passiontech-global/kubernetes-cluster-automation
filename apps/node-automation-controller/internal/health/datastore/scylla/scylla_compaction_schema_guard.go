@@ -12,6 +12,8 @@
 package scylla
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -175,6 +177,20 @@ type scyllaOverloadSample struct {
 	cacheDrops     float64
 }
 
+// The six metric families one :9180/metrics body is scanned for —
+// collected in a SINGLE bufio.Scanner pass (the previous shape ran
+// six strings.Split passes + six ParseMetricValues scans over the
+// same body, peaking ~180 MiB of line-slice allocations on a large
+// exposition; the scanner peaks at one line buffer).
+const (
+	scyllaMetricBacklog      = "scylla_compaction_manager_pending_compactions"
+	scyllaMetricSchemaVer    = "scylla_storage_proxy_coordinator_schema_version"
+	scyllaMetricReactorUtil  = "scylla_reactor_utilization"
+	scyllaMetricReadTimeouts = "scylla_storage_proxy_coordinator_read_timeouts"
+	scyllaMetricSSTableQueue = "scylla_database_sstable_read_queue_overloads"
+	scyllaMetricQuerierCache = "scylla_database_querier_cache_drops"
+)
+
 // scyllaPodMetrics fetches the pod's :9180/metrics and returns every
 // signature the page carries. ok=false on fetch/parse failure —
 // inconclusive, not healthy (a dead endpoint and a sick pod are
@@ -193,64 +209,73 @@ func (p *scyllaCompactionSchemaGuardCheck) scyllaPodMetrics(ctx context.Context,
 	if err != nil {
 		return nil, false
 	}
-	text := string(body)
 	sc := &scyllaScrape{
 		versions: map[float64]bool{},
 		shards:   map[string]float64{},
 	}
-	for _, v := range probefw.ParseMetricValues(text,
-		"scylla_compaction_manager_pending_compactions") {
-		if v > sc.backlog {
-			sc.backlog = v
+	// One pass, six families. Each case re-checks the exact metric
+	// name through ParseMetricValue (CutPrefix + value parse +
+	// NaN/Inf rejection) — the HasPrefix dispatch only saves the
+	// parse call on non-matching lines; acceptance semantics are
+	// byte-identical to the old per-family scans.
+	var readTimeouts, queueOverloads, cacheDrops float64
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	// Exposition lines are small; the 4 MiB ceiling only exists so
+	// a pathological single line degrades to "inconclusive" instead
+	// of bufio's default 64 KiB token error.
+	scanner.Buffer(make([]byte, 64*1024), 4<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, scyllaMetricBacklog):
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricBacklog); ok &&
+				v > sc.backlog {
+				sc.backlog = v
+			}
+		case strings.HasPrefix(line, scyllaMetricSchemaVer):
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricSchemaVer); ok {
+				sc.versions[v] = true
+			}
+		case strings.HasPrefix(line, scyllaMetricReactorUtil):
+			// scylla-shard-imbalance — same body, per-shard reactor
+			// utilization; the shard label IS the series key.
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricReactorUtil); ok {
+				if lv, lok := scyllaLabelValue(line, "shard"); lok {
+					sc.shards[lv] = v
+				}
+			}
+		case strings.HasPrefix(line, scyllaMetricReadTimeouts):
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricReadTimeouts); ok &&
+				v > readTimeouts {
+				readTimeouts = v
+			}
+		case strings.HasPrefix(line, scyllaMetricSSTableQueue):
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricSSTableQueue); ok &&
+				v > queueOverloads {
+				queueOverloads = v
+			}
+		case strings.HasPrefix(line, scyllaMetricQuerierCache):
+			if v, ok := probefw.ParseMetricValue(line, scyllaMetricQuerierCache); ok &&
+				v > cacheDrops {
+				cacheDrops = v
+			}
 		}
 	}
-	for _, v := range probefw.ParseMetricValues(text,
-		"scylla_storage_proxy_coordinator_schema_version") {
-		sc.versions[v] = true
+	if err := scanner.Err(); err != nil {
+		// A scan failure (token over the ceiling, reader error)
+		// yields a partial scrape — inconclusive beats half-parsed
+		// evidence, same contract as a fetch failure.
+		return nil, false
 	}
-	// scylla-shard-imbalance — same body, per-shard reactor utilization and the
-	// overload stall counters.
-	sc.shards = scyllaShardValues(text, "scylla_reactor_utilization", "shard")
+	// The counters fan out per shard / scheduling group — the max
+	// is the conservative "some shard is stalling" read (a sum
+	// would multiply-count overlapping series).
 	sc.overload = scyllaOverloadSample{
-		readTimeouts: scyllaMaxMetricValue(text,
-			"scylla_storage_proxy_coordinator_read_timeouts"),
-		queueOverloads: scyllaMaxMetricValue(text,
-			"scylla_database_sstable_read_queue_overloads"),
-		cacheDrops: scyllaMaxMetricValue(text,
-			"scylla_database_querier_cache_drops"),
+		readTimeouts:   readTimeouts,
+		queueOverloads: queueOverloads,
+		cacheDrops:     cacheDrops,
 	}
 	return sc, true
-}
-
-// scyllaMaxMetricValue returns the largest sample of name in the
-// exposition — the counters this check reads fan out per shard /
-// scheduling group, and the max is the conservative "some shard is
-// stalling" read (a sum would multiply-count overlapping series).
-func scyllaMaxMetricValue(body, name string) float64 {
-	var max float64
-	for _, v := range probefw.ParseMetricValues(body, name) {
-		if v > max {
-			max = v
-		}
-	}
-	return max
-}
-
-// scyllaShardValues parses `name{...label="X"...} v` samples into a
-// label->value map — ParseMetricValues drops the labels, but the
-// per-shard skew IS the labels.
-func scyllaShardValues(body, name, label string) map[string]float64 {
-	out := map[string]float64{}
-	for _, line := range strings.Split(body, "\n") {
-		v, ok := probefw.ParseMetricValue(line, name)
-		if !ok {
-			continue
-		}
-		if lv, ok := scyllaLabelValue(line, label); ok {
-			out[lv] = v
-		}
-	}
-	return out
 }
 
 // scyllaLabelValue extracts key="value" from a metric line's
@@ -428,109 +453,4 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		probefw.Section("schema splits: %s", splitRep.Sorted()),
 		probefw.Section("shard imbalance: %s", shardRep.Sorted()),
 		probefw.Section("overload stalls: %s", overloadRep.Sorted()))
-}
-
-// carryScyllaPod re-asserts last sweep's evidence for one member
-// pod whose metrics scrape failed this sweep — "can't tell" is not
-// "resolved": the live tuples stay emitted, the skew first-seen
-// stamp keeps counting through shardLive, and the pod's schema
-// versions fold back into the split census so a one-sweep gap
-// can't make a live split look healed.
-func (p *scyllaCompactionSchemaGuardCheck) carryScyllaPod(
-	pod *corev1.Pod, podKey string,
-	backlogRep, shardRep, overloadRep *probefw.SweepReport,
-	clusterVersions map[string]map[string]map[float64]bool,
-	shardLive map[string]bool) {
-
-	ev, ok := p.carryLast[podKey]
-	if !ok {
-		return // never scraped successfully — nothing to carry
-	}
-	ck := pod.Namespace + "/" + pod.Labels[scyllaClusterLabel]
-	set := clusterVersions[ck]
-	if set == nil {
-		set = map[string]map[float64]bool{}
-		clusterVersions[ck] = set
-	}
-	set[pod.Name] = ev.versions
-	if ev.backlogHot {
-		backlogRep.Set(scyllaCompactionBacklogGauge, ev.backlog, podKey,
-			[]string{pod.Namespace, pod.Name})
-		backlogRep.Find(fmt.Sprintf("%s/%s=%.0f",
-			pod.Namespace, pod.Name, ev.backlog))
-	}
-	if ev.shardSkewed {
-		// Keep the first-seen stamp alive either way; only a tuple
-		// that was actually emitted re-asserts the gauge — an
-		// inside-window skew must not fire early off carried state.
-		shardLive[podKey] = true
-		if ev.shardEmitted {
-			shardRep.Emit(scyllaShardImbalanceGauge, podKey,
-				[]string{pod.Namespace, pod.Name}, ev.shardDetail)
-		}
-	}
-	for reason, delta := range ev.overload {
-		key := podKey + "/" + reason
-		overloadRep.Set(scyllaOverloadStallGauge, delta, key,
-			[]string{pod.Namespace, pod.Name, reason})
-		overloadRep.Find(fmt.Sprintf("%s/%s %s+%.0f",
-			pod.Namespace, pod.Name, reason, delta))
-	}
-}
-
-// shardSkew folds a pod's per-shard reactor utilization into
-// (max, avg, count) — the caller compares against the scylla-shard-imbalance hot /
-// idle thresholds.
-func shardSkew(shards map[string]float64) (max, avg float64, n int) {
-	for _, u := range shards {
-		if u > max {
-			max = u
-		}
-		avg += u
-		n++
-	}
-	if n > 0 {
-		avg /= float64(n)
-	}
-	return max, avg, n
-}
-
-// scyllaOverloadDelta emits the stall-counter increases one pod's
-// counters made since the previous scrape — a live tombstone/overload
-// stall. First sight of a pod only stores its baseline (a counter's
-// absolute value says nothing; the DELTA is the evidence). A counter
-// that decreased means the pod restarted — the baseline is simply
-// replaced.
-func (p *scyllaCompactionSchemaGuardCheck) scyllaOverloadDelta(
-	rep *probefw.SweepReport, pod *corev1.Pod, cur scyllaOverloadSample) map[string]float64 {
-
-	podKey := pod.Namespace + "/" + pod.Name
-	if p.overloadLast == nil {
-		p.overloadLast = map[string]scyllaOverloadSample{}
-	}
-	last, have := p.overloadLast[podKey]
-	p.overloadLast[podKey] = cur
-	deltas := map[string]float64{}
-	if !have {
-		return deltas
-	}
-	for _, d := range []struct {
-		reason string
-		delta  float64
-	}{
-		{scyllaOverloadReasonReadTimeouts, cur.readTimeouts - last.readTimeouts},
-		{scyllaOverloadReasonQueueOverload, cur.queueOverloads - last.queueOverloads},
-		{scyllaOverloadReasonCacheDrops, cur.cacheDrops - last.cacheDrops},
-	} {
-		if d.delta <= 0 {
-			continue
-		}
-		key := podKey + "/" + d.reason
-		rep.Set(scyllaOverloadStallGauge, d.delta, key,
-			[]string{pod.Namespace, pod.Name, d.reason})
-		rep.Find(fmt.Sprintf("%s/%s %s+%.0f", pod.Namespace, pod.Name,
-			d.reason, d.delta))
-		deltas[d.reason] = d.delta
-	}
-	return deltas
 }

@@ -59,7 +59,7 @@ func (a *Auditor) remediate(ctx context.Context, snap *guardstate.Snapshot,
 	// unmeshed-pod-auditor — the shared heal preamble gates the evictions
 	// (killing pods mid-drain/upgrade is exactly what the mutex
 	// exists to prevent).
-	proceed, unverifiable := heal.Gate(ctx, log, &g.Verdict, g.CS, g.Dyn,
+	proceed, unverifiable := heal.Gate(ctx, log, g.Verdict, g.CS, g.Dyn,
 		"unmeshed-pod-evict", now)
 	if unverifiable {
 		metrics.IncError(g.Queue)

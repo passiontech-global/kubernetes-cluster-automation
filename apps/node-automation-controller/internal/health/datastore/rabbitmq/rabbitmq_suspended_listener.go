@@ -267,7 +267,11 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			// earlier pod of the same cluster in this loop) already
 			// spent this workload's one-disruption slot this
 			// sweep; the quorum re-verification above already
-			// proved one delete safe, not two.
+			// proved one delete safe, not two. Clean deferral: this
+			// iteration's HealAllowed grant bought no heal — hand it
+			// back (each loop iteration is its own gate call, so the
+			// refund is per-iteration, not per-pass).
+			heal.RefundGrant(now)
 			continue
 		}
 		kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset

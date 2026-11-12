@@ -88,7 +88,7 @@ func (g *apiServerEndpointGuard) ssotPeerIPs(ctx context.Context) map[string]boo
 	for ip := range g.peerHighWater {
 		set[ip] = true
 	}
-	nodes, err := kube.ListNodes(ctx, g.cs)
+	nodes, err := kube.ListNodesCached(ctx, g.nodeReader, g.cs)
 	if err != nil {
 		logf.FromContext(ctx).Error(err,
 			"peer discovery failed — re-adds keep the reconciler-listing rule")

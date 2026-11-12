@@ -16,10 +16,11 @@ package kube
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // ParseAnnoTime parses an annotation timestamp — RFC3339 first,
@@ -27,16 +28,7 @@ import (
 // still carry). ok=false on absent/empty/unparseable input: callers
 // treat a stamp they cannot read as no stamp at all, never as now.
 func ParseAnnoTime(s string) (time.Time, bool) {
-	if s == "" {
-		return time.Time{}, false
-	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, true
-	}
-	if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.Unix(ts, 0), true
-	}
-	return time.Time{}, false
+	return nodecond.ParseAnnoTime(s)
 }
 
 // AnnoTime reads obj's annotation key as a timestamp via

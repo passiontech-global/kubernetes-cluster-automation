@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -48,7 +49,7 @@ import (
 // that persist their stamp on the object itself (the passiontech.dev/last-*
 // annotations read via kube.AnnoTime, see persisted.go) pass nil and
 // keep only the mutex gate.
-func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
+func AllowedV(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed bool, unverifiable bool) {
@@ -60,7 +61,7 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 	if v == nil {
 		// No memoization — a throwaway zero Verdict evaluates fresh
 		// (an unstamped verdict is always expired).
-		v = &kube.Verdict{}
+		v = &maintenance.Verdict{}
 	}
 	held, why, err := v.Active(ctx, cs, dyn, now)
 	if err != nil {
@@ -275,7 +276,7 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 // AllowedV unchanged (nil v = fresh mutex evaluation, nil heals = no
 // cooldown gate — a manual-stamp caller pairs this with its own
 // Stamp-on-delivered).
-func EvictPodV(ctx context.Context, log logr.Logger, v *kube.Verdict,
+func EvictPodV(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	pod *corev1.Pod, now time.Time) (proceed, unverifiable bool,
@@ -343,7 +344,7 @@ func OldestRunningPod(pods []corev1.Pod, prefixes ...string) *corev1.Pod {
 // with a nil dyn client keep their `dyn != nil` guard at the call
 // site (nil dyn there means "gate skipped, proceed", not
 // "deferred").
-func Gate(ctx context.Context, log logr.Logger, v *kube.Verdict,
+func Gate(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	cs kubernetes.Interface, dyn dynamic.Interface,
 	key string, now time.Time) (proceed, unverifiable bool) {
 	return AllowedV(ctx, log, v, cs, dyn, nil, key, 0, now)

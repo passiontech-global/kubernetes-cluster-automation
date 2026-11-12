@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -129,7 +130,7 @@ func StampPersistedMulti(ctx context.Context, obj metav1.Object,
 // memoization, unverifiable=true is fail-closed and the CALLER
 // IncErrors its queue).
 func AllowedVPersisted(ctx context.Context, log logr.Logger,
-	v *kube.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
+	v *maintenance.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
 	if obj == nil || annoKey == "" {

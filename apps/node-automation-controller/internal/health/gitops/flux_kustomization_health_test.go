@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/flux"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -431,7 +432,7 @@ func TestFluxKustHealthNudgesWhenSourceNudgeStale(t *testing.T) {
 			// requestedAt + last-source-nudge in one patch), which
 			// makes fluxSourceNudgeFresh true — the consumer-side
 			// nudge then defers instead of double-remediating.
-			srcGVR, _ := kube.FluxSourceGVR("GitRepository")
+			srcGVR, _ := flux.FluxSourceGVR("GitRepository")
 			repoGot, _ := p.Dyn.Resource(srcGVR).
 				Namespace("flux-system").Get(ctx, "repo", metav1.GetOptions{})
 			annos := repoGot.GetAnnotations()

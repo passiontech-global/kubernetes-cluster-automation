@@ -78,6 +78,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/leaderelect"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -105,6 +106,21 @@ func defaultCacheTransform(obj interface{}) (interface{}, error) {
 	}
 	return obj, nil
 }
+
+// podCacheLabelSelector is the Pod informer's watch selector —
+// k8s-app in (cilium,kube-dns): the two pod sets the manager's
+// cached reads consume (cilium-taint-reaper's own pods, coredns
+// watchdog's probe census). Parsed once at package init; a parse
+// failure degrades to the original cilium-only selector rather than
+// Everything() — an over-broad watch would pin every kube-system
+// pod in memory for no consumer.
+var podCacheLabelSelector = func() labels.Selector {
+	sel, err := labels.Parse("k8s-app in (cilium,kube-dns)")
+	if err != nil {
+		return labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"})
+	}
+	return sel
+}()
 
 // buildCacheOptions assembles the informer cache shape. The cache
 // must mirror RBAC: several types are list/watch-locked to a single
@@ -136,15 +152,17 @@ func buildCacheOptions() cache.Options {
 					fields.Set{"metadata.name": "passiontech-pipeline"}),
 			},
 			// cilium component Role: pods in kube-system — informer is
-			// only started when CILIUM_TAINT_REAPER_ENABLED=true (the
-			// registry gate in internal/registry hands the module
-			// Deps.Disabled, so it registers nothing when off), so
-			// clusters without the component (and thus without pods
-			// watch RBAC) never open this watch. No other module
-			// watches Pods.
+			// only started when a module actually reads Pods through
+			// the manager client (the cilium taint reaper's
+			// reconciler, or the coredns watchdog's cached probe
+			// census), so clusters without pods watch RBAC never open
+			// this watch. The selector covers BOTH consumers: the
+			// cilium pods the reaper owns and the kube-dns pods the
+			// watchdog probes — RBAC cannot filter by label, so the
+			// same kube-system pods Role covers both.
 			&corev1.Pod{}: {
 				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
+				Label:      podCacheLabelSelector,
 			},
 		},
 	}
@@ -391,6 +409,17 @@ func main() {
 	// is refused instead of wiping the new leader's Lease record.
 	var leaseStolen atomic.Bool
 	leaderNS := resolveLeaderNamespace()
+
+	// workCtx wraps the signal context so the LeaseLossWatchdog can
+	// stop the entire manager on a proven foreign lease holder —
+	// cancelling propagates to every runnable group (leader-gated
+	// modules included) and the deferred leader-election release
+	// runs under releaseGuardedLock, which leaseStolen has already
+	// armed against clobbering the new holder's record. Created
+	// before buildLeaderLock so the election broadcaster's
+	// Shutdown rides the same cancellation.
+	workCtx, workCancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer workCancel()
 	// The guarded resource lock is built only when election is on —
 	// ctrl.Options ignores the interface otherwise, and building it
 	// unconditionally would spend three client constructions on a
@@ -399,7 +428,7 @@ func main() {
 	if leaderElect {
 		var err error
 		leaderLock, err = buildLeaderLock(cfg, scheme, leaderNS,
-			renewDeadline, &leaseStolen)
+			renewDeadline, &leaseStolen, workCtx.Done())
 		if err != nil {
 			log.Error(err, "unable to build leader election lock")
 			os.Exit(1)
@@ -420,6 +449,7 @@ func main() {
 	}
 	cs, dyn, meta := clients.cs, clients.dyn, clients.meta
 	probeCS, probeDyn := clients.probeCS, clients.probeDyn
+	probeMeta := clients.probeMeta
 
 	// The global heal budget — the aggregate blast-radius cap every
 	// heal-gated module shares (platform/heal consults it inside
@@ -461,19 +491,11 @@ func main() {
 	shared.WireTargetBreaker(cs)
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Meta: meta,
-		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}
+		ProbeCS: probeCS, ProbeDyn: probeDyn, ProbeMeta: probeMeta,
+		Maintenance: &maintenance.Verdict{}, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}
-
-	// workCtx wraps the signal context so the LeaseLossWatchdog can
-	// stop the entire manager on a proven foreign lease holder —
-	// cancelling propagates to every runnable group (leader-gated
-	// modules included) and the deferred leader-election release
-	// runs under releaseGuardedLock, which leaseStolen has already
-	// armed against clobbering the new holder's record.
-	workCtx, workCancel := context.WithCancel(ctrl.SetupSignalHandler())
-	defer workCancel()
 
 	// selfheal-alert-coverage fast dead-leader lease preemption: without it a leader
 	// whose node dies holds the 180s LeaseDuration while every heal
@@ -520,7 +542,7 @@ func main() {
 	// Runnable ⇒ leader-gated when election is on, always-on in
 	// single-replica mode.
 	if err := mgr.Add(&maintenanceStamperRunnable{
-		cs: cs, dyn: dyn,
+		cs: cs, dyn: dyn, nodeReader: mgr.GetClient(),
 		log: ctrl.Log.WithName("cluster-maintenance-stamper"),
 	}); err != nil {
 		log.Error(err, "unable to add cluster maintenance stamper")

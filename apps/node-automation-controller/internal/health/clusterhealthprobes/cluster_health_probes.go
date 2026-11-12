@@ -181,6 +181,7 @@ func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthPr
 		nodeReader = d.Mgr.GetClient()
 	}
 	deps := probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg)
+	deps.Maintenance = d.Maintenance
 	// The metadata client feeds ListPartialOrFallback's preferred
 	// path (AllReplicaSets and the metadata-only censuses) — nil
 	// keeps the CS/Dyn fallback the test Deps shape relies on.

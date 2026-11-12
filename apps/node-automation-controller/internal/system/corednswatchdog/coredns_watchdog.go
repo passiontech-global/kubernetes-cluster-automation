@@ -35,16 +35,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	hosthttpx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -67,6 +68,13 @@ const (
 	probePoolSize = 4
 )
 
+// corednsPodLabelSelector is the parsed form of
+// corednsPodSelector for the cached pod census — the informer
+// watch selector (cmd/manager buildCacheOptions) covers exactly
+// this label set.
+var corednsPodLabelSelector = labels.SelectorFromSet(
+	labels.Set{"k8s-app": "kube-dns"})
+
 type coreDNSWatchdog struct {
 	cs kubernetes.Interface
 	// dyn feeds the maintenance mutex's autopilot-Plan signal —
@@ -81,7 +89,7 @@ type coreDNSWatchdog struct {
 	// verdict memoizes the maintenance-mutex evaluation inside
 	// recover() so back-to-back recovery runs pay one evaluation
 	// per TTL window.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
@@ -133,6 +141,10 @@ type coreDNSWatchdog struct {
 	// apiserver LIST. nil (tests, fixtures) falls back to the
 	// direct read.
 	nodeReader kube.CachedNodeReader
+	// podReader is the same informer-cache client for the kube-dns
+	// probe census (kube.ListPodsCached) — nil in tests falls back
+	// to the direct paged list.
+	podReader kube.CachedNodeReader
 }
 
 // probeFQDN returns the cached probe target while it is inside the
@@ -238,14 +250,16 @@ func Setup(d shared.Deps) error {
 	// change.
 	return shared.SetupNoConfig(d, func() error {
 		w := &coreDNSWatchdog{
-			cs:    d.CS,
-			dyn:   d.Dyn,
-			http:  &http.Client{Timeout: 5 * time.Second, Transport: httpx.Transport()},
-			queue: d.Name,
-			now:   shared.SystemClock,
+			verdict: d.Maintenance,
+			cs:      d.CS,
+			dyn:     d.Dyn,
+			http:    &http.Client{Timeout: 5 * time.Second, Transport: hosthttpx.PooledTransport(16, nil)},
+			queue:   d.Name,
+			now:     shared.SystemClock,
 		}
 		if d.Mgr != nil {
 			w.nodeReader = d.Mgr.GetClient()
+			w.podReader = d.Mgr.GetClient()
 		}
 		w.logHitFn = w.logHit
 		w.dnsFn = w.dnsProbe
@@ -260,12 +274,8 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// Paged like every sweep list — kube-system's pod population is
 	// small today, but the selector-scoped List still gets the shared
 	// 500-per-page bound so it stays cheap at fleet scale.
-	podItems, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			LabelSelector: corednsPodSelector,
-			Limit:         kube.DefaultListPageSize,
-		},
-		kube.Pods(w.cs, corednsNS))
+	podItems, err := kube.ListPodsCached(ctx, w.podReader, w.cs,
+		corednsNS, corednsPodLabelSelector)
 	if err != nil {
 		// Inconclusive — the next minute's run re-evaluates; returning
 		// nil avoids an error/retry hot loop on API flaps.

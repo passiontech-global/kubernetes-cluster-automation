@@ -288,7 +288,9 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		targets = append(targets, cj)
 	}
 	if len(targets) == 0 {
-		p.Heals.Stamp(ck, now)
+		// Nothing patched — no stamp: the relief cooldown marks a
+		// DELIVERED relief pass, and stamping an empty pass would
+		// suppress the next storm's real suspend for the window.
 		return
 	}
 	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals,
@@ -300,11 +302,7 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 	case !proceed:
 		return
 	}
-	// The pass ran — stamp the relief cooldown so the next storm
-	// sweep skips the list+mutex re-check for the window (the
-	// comment on relistStormReliefCooldown promises exactly this;
-	// an unstamped key would re-run every sweep).
-	p.Heals.Stamp(ck, now)
+	patched := 0
 	for _, cj := range targets {
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":true},"metadata":{"annotations":{%q:%q}}}`,
@@ -320,6 +318,14 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		log.Info("ACTION: suspended cronjob for relist-storm relief",
 			"cronjob", cj.Namespace+"/"+cj.Name)
 		p.suspended = true
+		patched++
+	}
+	// Stamp the relief cooldown only when the pass DELIVERED at
+	// least one suspend — a pass whose every patch failed (or
+	// whose gate deferred mid-loop) must not suppress the next
+	// storm sweep's retry for the whole window.
+	if patched > 0 {
+		p.Heals.Stamp(ck, now)
 	}
 }
 

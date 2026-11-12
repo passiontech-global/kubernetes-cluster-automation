@@ -124,11 +124,12 @@ func sharedBaseTransport(cfg *rest.Config) (http.RoundTripper, error) {
 // the shared-bucket direct pair every module reads through, and the
 // probe-bucket pair the Module.ProbeClients registry rows swap in.
 type kubeClients struct {
-	cs       kubernetes.Interface
-	dyn      dynamic.Interface
-	meta     metadata.Interface
-	probeCS  kubernetes.Interface
-	probeDyn dynamic.Interface
+	cs        kubernetes.Interface
+	dyn       dynamic.Interface
+	meta      metadata.Interface
+	probeCS   kubernetes.Interface
+	probeDyn  dynamic.Interface
+	probeMeta metadata.Interface
 }
 
 // buildKubeClients constructs the direct and probe client pairs off
@@ -212,7 +213,17 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to create metadata client: %w", err)
 	}
+	// The probe metadata twin draws from the probe token bucket so a
+	// latency-sensitive ProbeClients row's PartialObjectMetadata
+	// census is not queue-delayed behind janitor bursts on the
+	// shared limiter — same JSON negotiation as meta (the metadata
+	// endpoint has no per-resource scheme).
+	probeMeta, err := metadata.NewForConfig(probeCfg)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create probe metadata client: %w", err)
+	}
 	return &kubeClients{
 		cs: cs, dyn: dyn, meta: meta,
-		probeCS: probeCS, probeDyn: probeDyn}, nil
+		probeCS: probeCS, probeDyn: probeDyn,
+		probeMeta: probeMeta}, nil
 }

@@ -64,13 +64,13 @@ func cftGatewayFixture(class string) *unstructured.Unstructured {
 // (and unattributable ones, fail-open like cilium's filter) and
 // drops provably foreign classes.
 func TestCftOwnsGatewayObject(t *testing.T) {
-	if !cftOwnsGatewayObject(nil, nil, cftGatewayFixture("cloudflare-tunnel")) {
+	if !cftOwnsGatewayObject(ctx, nil, cftGatewayFixture("cloudflare-tunnel")) {
 		t.Fatal("cloudflare-tunnel Gateway must be owned by the cft row")
 	}
-	if cftOwnsGatewayObject(nil, nil, cftGatewayFixture("cilium")) {
+	if cftOwnsGatewayObject(ctx, nil, cftGatewayFixture("cilium")) {
 		t.Fatal("cilium-classed Gateway must NOT be owned by the cft row")
 	}
-	if !cftOwnsGatewayObject(nil, nil, cftGatewayFixture("")) {
+	if !cftOwnsGatewayObject(ctx, nil, cftGatewayFixture("")) {
 		t.Fatal("unattributable Gateway stays in the stuck set (fail-open)")
 	}
 }

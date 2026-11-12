@@ -1177,9 +1177,13 @@ func TestEndpointGuardStartCycles(t *testing.T) {
 		},
 		backends: map[string]*backendProbeState{},
 		log:      logr.Discard(),
-		// Pre-arm the quarantine cadence so the 10s re-tick is
-		// exercised after the erroring sweep.
-		quarantineActive: true,
+		// Pre-arm the quarantine cadence so the fast re-tick is
+		// exercised after the erroring sweep. The injected
+		// millisecond intervals keep the whole cycle test in the
+		// ~100ms range instead of ~40s of real timers.
+		quarantineActive:   true,
+		interval:           20 * time.Millisecond,
+		quarantineInterval: 10 * time.Millisecond,
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1187,7 +1191,7 @@ func TestEndpointGuardStartCycles(t *testing.T) {
 	go func() { done <- g.Start(cctx) }()
 
 	waitActions := func(want int) bool {
-		dl := time.Now().Add(endpointGuardInterval + endpointGuardQuarantineInterval + 10*time.Second)
+		dl := time.Now().Add(10 * time.Second)
 		for time.Now().Before(dl) {
 			if len(cs.Actions()) >= want {
 				return true
@@ -1212,7 +1216,7 @@ func TestEndpointGuardStartCycles(t *testing.T) {
 	}
 	select {
 	case <-probed:
-	case <-time.After(endpointGuardInterval + endpointGuardQuarantineInterval + 10*time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("second sweep never ran on the 10s quarantine cadence")
 	}
 	cancel()

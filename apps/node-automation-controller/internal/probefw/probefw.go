@@ -25,11 +25,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	hosthttpx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -114,12 +115,16 @@ type Deps struct {
 	// (the former deps.meshHealed map).
 	Heals state.CooldownSet
 
-	// verdict memoizes the maintenance-mutex evaluation every heal
-	// preamble in the sweep shares — DeletePodHeal plus every check
-	// gating through HealAllowed — one evaluation per Verdict TTL
-	// across the whole serial sweep instead of three API reads per
-	// target per check.
-	verdict kube.Verdict
+	// Maintenance is the shared maintenance-mutex verdict every heal
+	// gate in the sweep memoizes on — wired from
+	// shared.Deps.Maintenance by the sweep module so ALL checks pay
+	// one mutex evaluation per Verdict TTL across the whole sweep
+	// instead of three API reads per target per check. Nil
+	// (literally-constructed test Deps) falls back to the per-Deps
+	// verdictFallback — same memoization, just not shared across
+	// modules.
+	Maintenance     *maintenance.Verdict
+	verdictFallback maintenance.Verdict
 
 	// Prom is the shared Prometheus instant-query client the
 	// metrics-backed checks run through PromQuery; Timeout bounds
@@ -163,7 +168,7 @@ func NewDeps(name string, cs kubernetes.Interface, dyn dynamic.Interface,
 		NodeReader: nodeReader,
 		Cfg:        cfg,
 		LookupHost: (&net.Resolver{}).LookupHost,
-		HTTPClient: &http.Client{Transport: httpx.Transport()},
+		HTTPClient: &http.Client{Transport: hosthttpx.PooledTransport(16, nil)},
 		Now:        time.Now,
 	}
 	deps.Prom = promq.Client{HTTP: deps.HTTPClient, Timeout: cfg.Timeouts.Check}

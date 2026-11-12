@@ -9,6 +9,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 )
 
 // Deps bundles the process-wide dependencies every module's Setup
@@ -63,7 +65,15 @@ type Deps struct {
 	Meta      metadata.Interface
 	ProbeCS   kubernetes.Interface
 	ProbeDyn  dynamic.Interface
-	Log       logr.Logger
-	Disabled  bool
-	CheckRegs []CheckReg
+	ProbeMeta metadata.Interface
+	// Maintenance is the ONE maintenance-mutex verdict every heal
+	// gate in the process memoizes on (platform/maintenance.Verdict)
+	// — modules and the sweep share it so a drain in flight is
+	// evaluated once per Verdict TTL cluster-wide, not once per
+	// module. Nil (tests, StubManager wiring) leaves each consumer's
+	// own fallback verdict in place.
+	Maintenance *maintenance.Verdict
+	Log         logr.Logger
+	Disabled    bool
+	CheckRegs   []CheckReg
 }

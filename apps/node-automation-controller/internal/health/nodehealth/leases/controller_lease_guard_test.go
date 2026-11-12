@@ -27,6 +27,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // ---------------------------------------------------------------------------
@@ -451,7 +452,7 @@ func TestLeaseGuardExpiredLeaseMaintenanceGate(t *testing.T) {
 			"gated-op-7f9c4dbb68-y3", "10.0.0.13", nil),
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "kube-system", Name: "kured",
-			Annotations: map[string]string{kube.KuredLockAnno: "w1"}}})
+			Annotations: map[string]string{nodecond.KuredLockAnno: "w1"}}})
 	_, ch := leaseGuardProber(cs)
 
 	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {

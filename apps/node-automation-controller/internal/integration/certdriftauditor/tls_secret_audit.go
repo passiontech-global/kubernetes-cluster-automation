@@ -180,7 +180,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	// Fail-closed maintenance mutex — the shared preamble with no
 	// additional ledger cooldown (PersistedCooledDown already ran the
 	// wider-of check above).
-	proceed, unverifiable := heal.Gate(ctx, log, &a.verdict, a.cs, a.dyn,
+	proceed, unverifiable := heal.Gate(ctx, log, a.verdict, a.cs, a.dyn,
 		kube.LinkerdIdentityName, now)
 	switch {
 	case unverifiable:

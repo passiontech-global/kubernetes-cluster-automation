@@ -20,7 +20,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/flux"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -1135,15 +1135,15 @@ func TestFluxSourceHealerHelmRelease(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, flux.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-myapp", fluxReconcileAnno); got == "" {
 		t.Fatal("HelmChart source not stamped with requestedAt")
 	}
-	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, flux.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-myapp", fluxLastNudgeAnno); got == "" {
 		t.Fatal("HelmChart source not stamped with last-source-nudge")
 	}
-	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["HelmChart"], "flux-system",
+	if got := hrAnnotation(t, dyn, flux.FluxSourceGVRs["HelmChart"], "flux-system",
 		"apps-fresh", fluxReconcileAnno); got != "" {
 		t.Fatal("fresh artifact failure nudged its source — 15m gate broken")
 	}
@@ -1168,7 +1168,7 @@ func TestFluxSourceHealerKustomization(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	stamp := hrAnnotation(t, dyn, kube.FluxSourceGVRs["GitRepository"], "apps",
+	stamp := hrAnnotation(t, dyn, flux.FluxSourceGVRs["GitRepository"], "apps",
 		"flux-system", fluxReconcileAnno)
 	if stamp == "" {
 		t.Fatal("GitRepository source not stamped")
@@ -1177,7 +1177,7 @@ func TestFluxSourceHealerKustomization(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := hrAnnotation(t, dyn, kube.FluxSourceGVRs["GitRepository"], "apps",
+	if got := hrAnnotation(t, dyn, flux.FluxSourceGVRs["GitRepository"], "apps",
 		"flux-system", fluxReconcileAnno); got != stamp {
 		t.Fatal("source re-nudged inside the 30m per-source cooldown")
 	}

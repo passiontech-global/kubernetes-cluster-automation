@@ -131,7 +131,7 @@ func (a *veleroBackupAuditor) reinitStaleRepo(ctx context.Context,
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 	key := "backuprepository/" + ns + "/" + name
-	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs,
+	proceed, unverifiable := heal.AllowedV(ctx, log, a.verdict, a.cs,
 		a.dyn, &a.repoHealed, key, veleroRepoHealedCooldown, now)
 	switch {
 	case unverifiable:

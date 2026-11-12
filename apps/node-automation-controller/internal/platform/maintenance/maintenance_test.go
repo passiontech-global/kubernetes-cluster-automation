@@ -1,4 +1,4 @@
-package kube
+package maintenance
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
@@ -27,6 +28,10 @@ import (
 // kind (and every other CRD the modules list) via the shared
 // platform/testhelp table — the leaf-level home for the fake
 // testutil cannot host (testutil imports internal/shared).
+// ctx is the shared background context every test in this file
+// passes through — the moved kube maintenance tests all ran on it.
+var ctx = context.Background()
+
 func maintenanceDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testhelp.NewDynamicClient(objs...)
 }
@@ -35,14 +40,14 @@ func maintenanceDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 // at all (a brand-new Plan before the controller writes one).
 func maintenancePlan(name, state string) *unstructured.Unstructured {
 	u := testhelp.Unstructured(
-		AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", name, nil)
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", name, nil)
 	if state != "" {
 		u.Object["status"] = map[string]any{"state": state}
 	}
 	return u
 }
 
-// maintenanceKured builds the kured DaemonSet carrying `annos`.
+// maintenanceKured builds the kured kube.DaemonSet carrying `annos`.
 func maintenanceKured(annos map[string]string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace: kuredDaemonSetNS, Name: kuredDaemonSetName,
@@ -59,7 +64,7 @@ func maintenanceCordoned(name string, ago time.Duration) *corev1.Node {
 	if ago >= 0 {
 		t := metav1.NewTime(time.Now().Add(-ago))
 		n.Spec.Taints = []corev1.Taint{
-			{Key: UnschedulableTaintKey, TimeAdded: &t}}
+			{Key: kube.UnschedulableTaintKey, TimeAdded: &t}}
 	}
 	return n
 }
@@ -70,7 +75,7 @@ func TestNodeCordonEvidenceFreshOnly(t *testing.T) {
 	fresh := maintenanceCordoned("w1", 10*time.Minute)
 	stale := maintenanceCordoned("w2", 2*time.Hour)
 	cs := fake.NewSimpleClientset(fresh, stale)
-	ev, err := nodeCordonEvidence(ctx, cs, time.Now())
+	ev, err := nodeCordonEvidence(context.Background(), cs, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +84,7 @@ func TestNodeCordonEvidenceFreshOnly(t *testing.T) {
 	}
 }
 
-// A node LIST failure is an error — never a silent clear.
+// A node kube.LIST failure is an error — never a silent clear.
 func TestNodeCordonEvidenceListError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "nodes",
@@ -127,7 +132,7 @@ func TestNodeCordonEvidenceUsesInjectedClock(t *testing.T) {
 }
 
 // Signal (b): the held lock is evidence; an unlocked or absent kured
-// DaemonSet is none.
+// kube.DaemonSet is none.
 func TestKuredLockEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -235,13 +240,13 @@ func TestMaintenanceActiveMedik8sRemediation(t *testing.T) {
 		held bool
 	}{
 		{"self-node-remediation", []runtime.Object{remObj(
-			GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr", "")}, true},
+			kube.GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr", "")}, true},
 		{"fence-agents-remediation", []runtime.Object{remObj(
-			GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far", "")}, true},
+			kube.GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far", "")}, true},
 		{"node-maintenance running", []runtime.Object{remObj(
-			GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Running")}, true},
+			kube.GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Running")}, true},
 		{"node-maintenance succeeded", []runtime.Object{remObj(
-			GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Succeeded")}, false},
+			kube.GVRNodeMaintenance, "NodeMaintenance", "", "w1", "Succeeded")}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			held, why, err := MaintenanceActive(ctx, cs,
@@ -260,14 +265,14 @@ func TestMaintenanceActiveMedik8sRemediation(t *testing.T) {
 }
 
 // node-hang-precordon — a node cordoned BY node-hang-precordon (the defensive
-// quarantine, stamped AnnoPreCordonedBy) is not maintenance: its
+// quarantine, stamped kube.AnnoPreCordonedBy) is not maintenance: its
 // fresh unschedulable taint must not hold the mutex, or every
 // heal.AllowedV-gated remediation freezes for 45m exactly while the
 // cluster is sick.
 func TestMaintenanceActiveIgnoresPreCordoned(t *testing.T) {
 	n := maintenanceCordoned("w1", time.Minute)
 	n.Annotations = map[string]string{
-		AnnoPreCordonedBy: "node-hang-precordon"}
+		kube.AnnoPreCordonedBy: "node-hang-precordon"}
 	cs := fake.NewSimpleClientset(n)
 	held, why, err := MaintenanceActive(ctx, cs, maintenanceDynFake())
 	if err != nil {
@@ -305,8 +310,8 @@ func TestMaintenanceActiveWhyIsFirstSignalEvidence(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Pagination — the evidence helpers walk ListAllUnstructured, so a
-// cluster whose objects exceed one page (Limit=DefaultListPageSize)
+// Pagination — the evidence helpers walk kube.ListAllUnstructured, so a
+// cluster whose objects exceed one page (Limit=kube.DefaultListPageSize)
 // must contribute evidence from EVERY page via the Continue-token
 // walk, and the dynamic fake's single-page reply cannot prove that.
 // pagedDyn wraps the CRD-aware dynamic fake and serves each GVR's
@@ -363,7 +368,7 @@ func (p *pagedResource) List(ctx context.Context, opts metav1.ListOptions) (*uns
 }
 
 // Signal (c) across pages: plans in a non-terminal state on page 1
-// AND page 2 both land as evidence, and the walk really continued
+// kube.AND page 2 both land as evidence, and the walk really continued
 // (more than one List issued).
 func TestAutopilotPlanEvidencePagesThroughPlans(t *testing.T) {
 	plans := []runtime.Object{
@@ -397,15 +402,15 @@ func TestMedik8sRemediationEvidencePagesThroughObjects(t *testing.T) {
 		return testhelp.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name, nil)
 	}
 	objs := []runtime.Object{
-		rem(GVRNodeMaintenance, "NodeMaintenance", "", "done"),
+		rem(kube.GVRNodeMaintenance, "NodeMaintenance", "", "done"),
 	}
 	// Give the finished record its Succeeded phase, then two live
 	// objects — the second deliberately beyond a 2-per-page boundary.
 	objs[0].(*unstructured.Unstructured).Object["status"] =
 		map[string]any{"phase": "Succeeded"}
 	live := []runtime.Object{
-		rem(GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr"),
-		rem(GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far"),
+		rem(kube.GVRSelfNodeRemediation, "SelfNodeRemediation", "medik8s", "w1-snr"),
+		rem(kube.GVRFenceAgentsRemediation, "FenceAgentsRemediation", "medik8s", "w1-far"),
 	}
 	var lists int
 	dyn := &pagedDyn{
@@ -455,7 +460,7 @@ func TestVerdictActiveMemoizesWithinTTL(t *testing.T) {
 		Spec: corev1.NodeSpec{
 			Unschedulable: true,
 			Taints: []corev1.Taint{{
-				Key:       UnschedulableTaintKey,
+				Key:       kube.UnschedulableTaintKey,
 				TimeAdded: &metav1.Time{Time: base},
 			}},
 		},
@@ -537,7 +542,7 @@ func TestMedik8sTargetNodeLongestPrefix(t *testing.T) {
 	nodeNames := map[string]bool{"worker-1": true, "worker-1-gpu": true}
 	obj := func(name string, annos map[string]string) *unstructured.Unstructured {
 		u := testhelp.Unstructured(
-			GVRSelfNodeRemediation.GroupVersion().WithKind("SelfNodeRemediation"),
+			kube.GVRSelfNodeRemediation.GroupVersion().WithKind("SelfNodeRemediation"),
 			"medik8s", name, nil)
 		u.SetAnnotations(annos)
 		return u
@@ -569,7 +574,7 @@ func TestMedik8sTargetNodeLongestPrefix(t *testing.T) {
 	}
 }
 
-// Verdict.Active is READ-ONLY: a held verdict must never patch Nodes
+// Verdict.Active is READ-ONLY: a held verdict must never patch kube.Nodes
 // — stamping is the dedicated runnable's job. A fresh cordon holds
 // the verdict and the fake clientset must record ZERO writes.
 func TestVerdictActiveIsReadOnly(t *testing.T) {
@@ -603,7 +608,7 @@ func stampTestNode(name string, cordonAgo time.Duration,
 		n.Spec.Unschedulable = true
 		t := metav1.NewTime(time.Now().Add(-cordonAgo))
 		n.Spec.Taints = []corev1.Taint{{
-			Key: UnschedulableTaintKey, TimeAdded: &t}}
+			Key: kube.UnschedulableTaintKey, TimeAdded: &t}}
 	}
 	if stamp != "" {
 		n.Annotations = map[string]string{
@@ -626,7 +631,7 @@ func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 	w4 := stampTestNode("w4", 0, farFuture)        // out-of-domain → kept
 	cs := fake.NewSimpleClientset(w1, w2, w3, w4)
 
-	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), now)
+	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
 
 	get := func(name string) *corev1.Node {
 		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
@@ -637,7 +642,7 @@ func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 	}
 	if v := get("w1").Annotations["passiontech.dev/cluster-maintenance-until"]; v == "" {
 		t.Fatal("cordoned node w1 was not stamped")
-	} else if ts, ok := ParseAnnoTime(v); !ok ||
+	} else if ts, ok := kube.ParseAnnoTime(v); !ok ||
 		ts.Before(now.Add(maintenanceStampTTL-time.Minute)) ||
 		ts.After(now.Add(maintenanceStampTTL+time.Minute)) {
 		t.Fatalf("w1 stamp %q is not ~now+TTL", v)
@@ -668,7 +673,7 @@ func TestStampMaintenanceTargetsDegradedKeepsStamps(t *testing.T) {
 			return true, nil, errors.New("apiserver flap")
 		})
 
-	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), now)
+	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
 
 	w1n, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
 	if err != nil {
@@ -695,7 +700,7 @@ func TestStampMaintenanceTargetsClusterWide(t *testing.T) {
 	cs := fake.NewSimpleClientset(w1, w2)
 	dyn := maintenanceDynFake(maintenancePlan("upgrade", "InProgress"))
 
-	StampMaintenanceTargets(ctx, cs, dyn, now)
+	StampMaintenanceTargets(ctx, cs, dyn, nil, now)
 
 	for _, name := range []string{"w1", "w2"} {
 		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})

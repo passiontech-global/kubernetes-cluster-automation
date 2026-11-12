@@ -2,7 +2,7 @@
 // the cluster-health sweep plus the helpers several product families
 // share (downscaler awareness, split-brain/site-skew census, the
 // db-operator heal table): stateful-masterless-services lives here —
-// its dragonfly auto-heals included (dragonfly_heals.go); the
+// its dragonfly auto-heals included (stateful_masterless_heals.go); the
 // self-contained product checks moved to subpackages — nats
 // (nats-jetstream-health), scylla (scylla-cluster-health,
 // scylla-compaction-schema-guard), percona (percona-cluster-quorum),

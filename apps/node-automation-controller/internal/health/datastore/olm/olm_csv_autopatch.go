@@ -204,6 +204,11 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 				"csv", csv.GetNamespace()+"/"+csv.GetName())
 			continue
 		}
+		// Record the annotation half of the delivered patch on the
+		// sweep overlay — a later check reading this CSV's
+		// olmCSVPatchHealAnno through EffectiveAnno/AnnoTimeCtx sees
+		// the stamp this sweep instead of the pre-patch snapshot.
+		kube.RecordAnnoPatch(ctx, csv, patch)
 		p.csvPatched.Stamp(key, now) // delivered-only contract
 		log.Info("PATCH: olm csv durable spec patch re-applied",
 			"csv", csv.GetNamespace()+"/"+csv.GetName())

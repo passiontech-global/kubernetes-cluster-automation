@@ -4,7 +4,7 @@
 // (suspend / Ready=False / fragment / minAge with the
 // creationTimestamp fallback), the sourceRef resolution order, the
 // source-kind GVR map, and the nudge-cooldown freshness read.
-package kube
+package flux
 
 import (
 	"testing"
@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
@@ -198,7 +199,7 @@ func TestFluxSourceNudgeFresh(t *testing.T) {
 	obj := testhelp.Unstructured(fluxHRGVK, "apps", "hr-1", nil)
 	stamp := func(t time.Time) {
 		obj.SetAnnotations(map[string]string{
-			AnnoLastSourceNudge: t.UTC().Format(time.RFC3339)})
+			kube.AnnoLastSourceNudge: t.UTC().Format(time.RFC3339)})
 	}
 
 	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
@@ -212,7 +213,7 @@ func TestFluxSourceNudgeFresh(t *testing.T) {
 	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
 		t.Fatal("stale stamp read as fresh")
 	}
-	obj.SetAnnotations(map[string]string{AnnoLastSourceNudge: "garbage"})
+	obj.SetAnnotations(map[string]string{kube.AnnoLastSourceNudge: "garbage"})
 	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
 		t.Fatal("unparseable stamp read as fresh")
 	}

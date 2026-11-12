@@ -12,7 +12,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/helmprune"
 )
 
 const (
@@ -25,7 +25,7 @@ const (
 
 // pruneSupersededSecrets caps superseded helm release secrets per
 // release — the kine-bloat-guard hygiene sweep on the shared
-// kube.PruneSupersededHelmSecrets prune (its header documents the
+// helmprune.PruneSupersededHelmSecrets prune (its header documents the
 // deliberate duplication with api-object-sprawl-report-gc's census
 // and why both cluster-wide reads stay). This site keeps its failure
 // posture: a list failure must not fail the run — the next sweep
@@ -33,8 +33,8 @@ const (
 func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	pruned := 0
-	_, err := kube.PruneSupersededHelmSecrets(ctx, u.cs,
-		maxSupersededSecrets, kube.HelmSecretPruneHooks{
+	_, err := helmprune.PruneSupersededHelmSecrets(ctx, u.cs,
+		maxSupersededSecrets, helmprune.HelmSecretPruneHooks{
 			PreDelete: func(s *corev1.Secret, version, supersededTotal int) {
 				log.Info("ACTION: prune superseded helm release secret",
 					"release", s.Namespace+"/"+s.Labels["name"],

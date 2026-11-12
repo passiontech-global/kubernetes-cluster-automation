@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
@@ -426,7 +427,7 @@ func TestStormGateScalesDownOnKuredLock(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil),
-		kuredDaemonSet(map[string]string{kube.KuredLockAnno: "w1"}))
+		kuredDaemonSet(map[string]string{nodecond.KuredLockAnno: "w1"}))
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
@@ -1358,7 +1359,8 @@ func TestStormGateMaintenanceEvidenceMemoized(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	r := &deschedulerStormGate{cs: cs, dyn: dyn,
+		maintVerdict: &maintenance.Verdict{}}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}

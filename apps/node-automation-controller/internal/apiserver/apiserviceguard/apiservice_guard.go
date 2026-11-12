@@ -53,6 +53,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -98,7 +99,7 @@ type apiServiceGuard struct {
 	// healer's per-target heal preambles share within a run — one
 	// evaluation per Verdict TTL instead of three API reads per
 	// candidate.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 
 	// The three duties share cs/dyn/now through snap.g and hand
 	// each other nothing else; embedding keeps the guard's method
@@ -117,7 +118,7 @@ type apiServiceGuard struct {
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
 	return shared.SetupNoConfig(d, func() error {
-		g := &apiServiceGuard{cs: cs, dyn: dyn, queue: d.Name, now: shared.SystemClock}
+		g := &apiServiceGuard{cs: cs, dyn: dyn, queue: d.Name, now: shared.SystemClock, verdict: d.Maintenance}
 		return shared.AddPeriodic(mgr, g.queue, apiServiceGuardInterval, g.run)
 	})
 }

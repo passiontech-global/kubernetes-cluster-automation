@@ -379,7 +379,7 @@ loop:
 				gateChecked = true
 				if s.e.dyn != nil {
 					gateProceed, gateUnverifiable = heal.Gate(ctx, s.log,
-						&s.e.verdict, s.e.cs, s.e.dyn,
+						s.e.verdict, s.e.cs, s.e.dyn,
 						"partition-evictor", s.now)
 				} else {
 					gateProceed = true // nil dyn — gate skipped, proceed

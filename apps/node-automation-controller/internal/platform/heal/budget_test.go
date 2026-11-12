@@ -32,8 +32,11 @@ func resetBudget(t *testing.T) {
 func TestBudgetAllowCapsAndExpires(t *testing.T) {
 	b := NewBudget(2, time.Minute)
 	now := time.Now()
-	if !b.Allow(now) || !b.Allow(now) {
-		t.Fatal("first two grants denied under the cap")
+	if !b.Allow(now) {
+		t.Fatal("first grant denied under the cap")
+	}
+	if !b.Allow(now) {
+		t.Fatal("second grant denied under the cap")
 	}
 	if b.Allow(now) {
 		t.Fatal("third grant allowed past the cap")
@@ -111,8 +114,11 @@ func TestAllowedVNoBudgetIsInert(t *testing.T) {
 func TestBudgetRefundRestoresWindowExactly(t *testing.T) {
 	b := NewBudget(2, time.Minute)
 	now := time.Now()
-	if !b.Allow(now) || !b.Allow(now) {
-		t.Fatal("grants denied under the cap")
+	if !b.Allow(now) {
+		t.Fatal("first grant denied under the cap")
+	}
+	if !b.Allow(now) {
+		t.Fatal("second grant denied under the cap")
 	}
 	if b.Allow(now.Add(time.Second)) {
 		t.Fatal("third grant allowed past the cap")

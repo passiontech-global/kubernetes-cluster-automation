@@ -19,6 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/flux"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -61,7 +62,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	seen := map[fluxSourceRef]bool{}
 	for i := range hrs.Items {
 		hr := &hrs.Items[i]
-		if !kube.FluxArtifactStale(hr, now, artifactStuckMinAge) {
+		if !flux.FluxArtifactStale(hr, now, artifactStuckMinAge) {
 			continue
 		}
 		if ref, ok := hrSourceRef(hr); ok &&
@@ -76,7 +77,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	if kustomizations != nil {
 		for i := range kustomizations.Items {
 			k := &kustomizations.Items[i]
-			if !kube.FluxArtifactStale(k, now, artifactStuckMinAge) {
+			if !flux.FluxArtifactStale(k, now, artifactStuckMinAge) {
 				continue
 			}
 			if ref, ok := ksSourceRef(k); ok &&
@@ -93,7 +94,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 // spec.chart.spec.sourceRef (HelmRepository/GitRepository). The
 // namespace defaults to the HR's own (flux convention).
 func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, ns, name, ok := kube.FluxConsumerSourceRef(hr)
+	kind, ns, name, ok := flux.FluxConsumerSourceRef(hr)
 	if !ok {
 		return fluxSourceRef{}, false
 	}
@@ -119,7 +120,7 @@ func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // ksSourceRef is spec.sourceRef on a Kustomization — same flux
 // convention (namespace defaults to the object's own).
 func ksSourceRef(k *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, ns, name, ok := kube.FluxConsumerSourceRef(k)
+	kind, ns, name, ok := flux.FluxConsumerSourceRef(k)
 	if !ok {
 		return fluxSourceRef{}, false
 	}
@@ -145,7 +146,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	ref fluxSourceRef, consumer string, seen map[fluxSourceRef]bool) bool {
 	log := logf.FromContext(ctx)
 	key := ref.namespace + "/" + ref.name
-	gvr, ok := kube.FluxSourceGVR(ref.kind)
+	gvr, ok := flux.FluxSourceGVR(ref.kind)
 	if !ok {
 		log.Info("skip: source kind is not a nudgeable Flux source",
 			"kind", ref.kind, "consumer", consumer)
@@ -176,7 +177,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	// closed, the same posture every annotation nudge runs under.
 	// Unverifiable IncErrors the queue — the signal must reach the
 	// alert path.
-	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, &u.verdict,
+	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, u.verdict,
 		u.cs, u.dyn, nil, src, fluxLastNudgeAnno, key,
 		sourceNudgeCooldown, now)
 	if unverifiable {

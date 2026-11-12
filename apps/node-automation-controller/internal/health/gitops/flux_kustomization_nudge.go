@@ -18,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/flux"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -65,7 +66,7 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	// reasons (HealthCheckFailed with provably-Ready workloads) keep
 	// the current consumer-side behavior.
 	if fluxKustNudgeReasons[reason] ||
-		kube.FluxArtifactStale(kust, now, fluxKustStuckMinAge) {
+		flux.FluxArtifactStale(kust, now, fluxKustStuckMinAge) {
 		if p.fluxSourceNudgeFresh(ctx, kust, now) {
 			log.V(1).Info("skip: consumer nudge deferred — source nudge fresh",
 				"kustomization", key, "reason", reason)
@@ -123,11 +124,11 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 func (p *fluxKustomizationHealthCheck) nudgeFluxSourceArtifact(ctx context.Context,
 	log logr.Logger, kust *unstructured.Unstructured, now time.Time) {
 
-	kind, ns, name, ok := kube.FluxConsumerSourceRef(kust)
+	kind, ns, name, ok := flux.FluxConsumerSourceRef(kust)
 	if !ok {
 		return
 	}
-	gvr, ok := kube.FluxSourceGVR(kind)
+	gvr, ok := flux.FluxSourceGVR(kind)
 	if !ok {
 		return
 	}
@@ -187,11 +188,11 @@ func (p *fluxKustomizationHealthCheck) nudgeFluxSourceArtifact(ctx context.Conte
 func (p *fluxKustomizationHealthCheck) fluxSourceNudgeFresh(ctx context.Context,
 	kust *unstructured.Unstructured, now time.Time) bool {
 
-	kind, ns, name, ok := kube.FluxConsumerSourceRef(kust)
+	kind, ns, name, ok := flux.FluxConsumerSourceRef(kust)
 	if !ok {
 		return false
 	}
-	gvr, ok := kube.FluxSourceGVR(kind)
+	gvr, ok := flux.FluxSourceGVR(kind)
 	if !ok {
 		return false
 	}
@@ -203,7 +204,7 @@ func (p *fluxKustomizationHealthCheck) fluxSourceNudgeFresh(ctx context.Context,
 			"kind", kind, "source", ns+"/"+name, "error", err)
 		return false
 	}
-	return kube.FluxSourceNudgeFresh(src, now, sourceNudgeFreshWindow)
+	return flux.FluxSourceNudgeFresh(src, now, sourceNudgeFreshWindow)
 }
 
 // fluxKustDepsReady reports whether every spec.dependsOn entry of the

@@ -98,6 +98,20 @@ func (d *Deps) AllCronJobs(ctx context.Context) ([]batchv1.CronJob, error) {
 	})
 }
 
+// AllJobs is the batch/v1 Job census — lazy like AllCronJobs:
+// only the checks that resolve a Job owner (linkerd protocol-stall
+// heal, wedged-namespace owner chains) pay the LIST, once per sweep.
+func (d *Deps) AllJobs(ctx context.Context) ([]batchv1.Job, error) {
+	s := sweepSnap(ctx)
+	return s.jobs.get(func(bool) ([]batchv1.Job, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.Jobs(d.CS, metav1.NamespaceAll))
+	})
+}
+
 // AllPDBs is the policy/v1 PodDisruptionBudget census — the
 // eviction-respecting heals (linkerd outlier, protocol-stall)
 // resolve a pod's PDB coverage from it instead of a per-pod GET.

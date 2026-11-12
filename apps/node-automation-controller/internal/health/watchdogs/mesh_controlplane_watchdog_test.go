@@ -21,6 +21,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // mesh-net-guards — a wedged linkerd pod (started, never Ready, >5m) is
@@ -140,7 +141,7 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	kured := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace:   "kube-system",
 		Name:        "kured",
-		Annotations: map[string]string{kube.KuredLockAnno: "w1"},
+		Annotations: map[string]string{nodecond.KuredLockAnno: "w1"},
 	}}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), kured, pod)
 	p := testProberDyn(cs, probetest.OpDyn())

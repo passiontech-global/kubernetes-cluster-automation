@@ -92,6 +92,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -132,7 +133,7 @@ type helmReleaseUnlocker struct {
 	// verdict is the shared maintenance-mutex memo the unwedge
 	// pass folds into heal.Gate — one evaluation serves every
 	// due HR in the sweep instead of one API-read bundle each.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 
 	// One sub-struct per healer duty so run() prunes/resets each
 	// duty's ledgers as one block. Every ledger type is zero-value
@@ -214,10 +215,11 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, stallEnabledFromEnv,
 		func(stallEnabled bool) error {
 			u := &helmReleaseUnlocker{
-				cs:    d.CS,
-				dyn:   d.Dyn,
-				queue: d.Name,
-				now:   shared.SystemClock,
+				verdict: d.Maintenance,
+				cs:      d.CS,
+				dyn:     d.Dyn,
+				queue:   d.Name,
+				now:     shared.SystemClock,
 			}
 			u.stall.enabled = stallEnabled
 			u.stall.attempts = map[string]*stallAttempt{}

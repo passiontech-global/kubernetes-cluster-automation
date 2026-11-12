@@ -179,6 +179,9 @@ func SetupModules(deps shared.Deps, mods []shared.Module) error {
 			if deps.ProbeDyn != nil {
 				d.Dyn = deps.ProbeDyn
 			}
+			if deps.ProbeMeta != nil {
+				d.Meta = deps.ProbeMeta
+			}
 		}
 		if gatedOff[m.Name] {
 			d.Disabled = true

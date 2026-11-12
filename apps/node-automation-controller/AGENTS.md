@@ -25,6 +25,16 @@ byte-stable with the shell-operator alerts).
 - `internal/registry` — the single `[]shared.Module` registration
   table + `-modules` allowlist resolution + the boot wiring loop.
   Adding a module = one import + one row here.
+- `libs/hostkit` (repo root, separate Go module wired via replace +
+  go.work) — shared leaf libraries: `envx` (env knobs + the
+  SetWarnf warning hook), `envdoc` (the AST env-coverage scanner
+  internal/envdoc's test drives), `ledger` (CooldownSet/
+  FirstSeenLedger/StreakLedger/SeenSet — `internal/platform/state`
+  type-aliases them; GaugeLedger stays Prometheus-typed and local),
+  `nodecond` (node-condition + coordination-annotation helpers —
+  `kube.ParseAnnoTime` delegates to `nodecond.ParseAnnoTime`),
+  `httpx` (+ `httpx/pprofx`) for pooled transports, `timex`/`logx`/
+  `fsx` for the clock/logger/filesystem seams.
 - `internal/platform/*` — leaf libraries: `kube` (paged lists —
   `ListAllUnstructured` for the dynamic client — node/pod/patch
   helpers incl. `RestartTemplatePatch`, comma-set parsing, the GVR
@@ -43,7 +53,14 @@ byte-stable with the shell-operator alerts).
   `partial_meta.go` — `ListPartialOrFallback`, the
   PartialObjectMetadata read path: metadata client → dynamic →
   typed-core fallback for fake-client tests),
-  `state` (Cooldown/FirstSeen/Seen/Streak/Gauge ledgers),
+  `state` (type aliases onto `libs/hostkit/ledger` —
+  CooldownSet/FirstSeen/Seen/Streak — plus the Prometheus-typed
+  GaugeLedger), `maintenance` (the shared `Verdict` +
+  `MaintenanceActive`/`StampMaintenanceTargets` +
+  `MaintenanceSnapshotProvider` every gated module consults via
+  `shared.Deps.Maintenance`), `helmprune` (superseded Helm
+  secret pruning), `flux` (Flux artifact-stale signature +
+  source-nudge helpers),
   `heal` (cooldown → maintenance-mutex → UID-delete → stamp;
   `PersistedCooledDown`/`StampPersisted`/`StampPersistedMulti` for
   the wider-of in-RAM+annotation cooldown; `AllowedVPersisted`
@@ -103,15 +120,20 @@ byte-stable with the shell-operator alerts).
   (probe clientset, CRD-aware dynamic fake, `Unstructured`). Domain
   tests keep importing `testutil`; platform tests use `testhelp`
   directly.
-- `internal/envdoc` — test-only package keeping `docs/env.md` honest:
-  it walks the source for every env var and fails on undocumented
-  knobs.
+- `internal/envdoc` — test-only package keeping `docs/env.md`
+  honest: it drives the shared `libs/hostkit/envdoc` AST scanner
+  (`ScanTree` over `cmd/` + `internal/`, `RegistryDir:
+  internal/registry` for GateEnv literals, `AllowRawOS: false` so
+  raw `os.Getenv` sites land on RawReads and fail) and fails on
+  undocumented knobs.
 
 ## Layering (enforced by depguard in the root .golangci.yml)
 
-- `internal/platform`, `internal/metrics`, `internal/promq` are
-  leaves: they must NEVER import shared/registry/testutil or a domain
-  module (push shared logic down into platform).
+- `internal/platform`, `internal/metrics`, `internal/promq`,
+  `internal/probefw` are leaves: they must NEVER import
+  shared/registry/testutil or a domain module (push shared logic
+  down into platform; probefw → shared was the import cycle that
+  forced `CheckReg.New` to be `any`).
 - `internal/shared` may use metrics/platform but never a domain
   module or the registry.
 - Domain trees are self-contained: `health/*` may not import

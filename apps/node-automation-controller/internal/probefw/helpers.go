@@ -43,6 +43,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
@@ -142,7 +143,7 @@ func (d *Deps) RequireDyn(what string) *Result {
 		"no dynamic client — %s unverifiable", what)}
 }
 
-// maintSnapshot adapts the Deps census getters to kube's
+// maintSnapshot adapts the Deps census getters to maintenance's
 // MaintenanceSnapshotProvider — installed on the ctx every heal gate
 // hands the verdict, so the mutex's node/daemonset evidence reads
 // ride the per-sweep memoized census instead of paying their own
@@ -168,8 +169,8 @@ func (m maintSnapshot) DaemonSets(ctx context.Context) ([]appsv1.DaemonSet, erro
 func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed, unverifiable bool) {
-	ctx = kube.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedV(ctx, log, &d.verdict, d.CS, d.Dyn,
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedV(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
 		heals, key, cooldown, now)
 }
 
@@ -183,9 +184,21 @@ func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	ctx = kube.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedVPersisted(ctx, log, &d.verdict, d.CS, d.Dyn,
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedVPersisted(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
 		heals, obj, annoKey, key, cooldown, now)
+}
+
+// maintenanceVerdict resolves the verdict the heal gates memoize
+// on: the sweep-shared Maintenance pointer when the module wired
+// one, else this Deps' own fallback (nil Maintenance on a
+// literally-constructed test Deps must still memoize — a nil *Verdict
+// would re-evaluate the mutex on every gate call).
+func (d *Deps) maintenanceVerdict() *maintenance.Verdict {
+	if d.Maintenance != nil {
+		return d.Maintenance
+	}
+	return &d.verdictFallback
 }
 
 // DeletePodHeal is the pod-delete heal shape the self-healing checks

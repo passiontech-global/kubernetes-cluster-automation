@@ -3,7 +3,7 @@
 // routing to a ready StatefulSet's pods reporting 0 Ready endpoints
 // past the gauge window — the operator that assigns the role wedged.
 // The per-sweep phases live in stateful_masterless_sweep.go; the
-// dragonfly auto-heals live in dragonfly_heals.go, the generic
+// dragonfly auto-heals live in stateful_masterless_heals.go, the generic
 // db-operator heal in db_operator_heals.go, and the stateful-split-brain
 // split-brain/site-skew signatures in split_brain.go/site_skew.go.
 package datastore
@@ -29,7 +29,7 @@ import (
 
 // statefulMasterlessCheck is the stateful-masterless-services masterless service guard plus
 // the stateful-split-brain signature watches; the Dragonfly/db-operator
-// auto-heals live in dragonfly_heals.go / db_operator_heals.go.
+// auto-heals live in stateful_masterless_heals.go / db_operator_heals.go.
 type statefulMasterlessCheck struct {
 	*probefw.Deps
 

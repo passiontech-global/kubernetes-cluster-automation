@@ -45,11 +45,11 @@ func TestScanAgentSpinLines(t *testing.T) {
 	if errs != 15 || rec {
 		t.Fatalf("15 unresolved errors = %d,%v — want spin", errs, rec)
 	}
-	errs, rec = scanAgentSpinLines(strings.NewReader(spinLogBody(14, false)))
+	errs, _ = scanAgentSpinLines(strings.NewReader(spinLogBody(14, false)))
 	if errs >= 15 {
 		t.Fatalf("14 errors must stay under the threshold, got %d", errs)
 	}
-	errs, rec = scanAgentSpinLines(strings.NewReader(spinLogBody(30, true)))
+	_, rec = scanAgentSpinLines(strings.NewReader(spinLogBody(30, true)))
 	if !rec {
 		t.Fatal("reconnect AFTER the last error must disarm the log channel")
 	}

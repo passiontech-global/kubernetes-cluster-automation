@@ -45,6 +45,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -78,7 +79,7 @@ type fluentBitRoller struct {
 	// verdict memoizes the maintenance-mutex evaluation for this
 	// reconcile (AllowedV stamps the result into the field so a
 	// retry within the run pays no extra API reads).
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 }
 
 // onlyPipelineSecret is the exact predicate the For() watch below
@@ -97,7 +98,7 @@ var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool 
 // registration entirely.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock, verdict: d.Maintenance}
 		if d.Mgr != nil {
 			r.secretReader = d.Mgr.GetClient()
 			r.nodeReader = d.Mgr.GetClient()
@@ -237,7 +238,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// sharing r.verdict. Unverifiable fails closed: IncError the
 	// queue and skip; the drift clears on the next reconcile once
 	// maintenance is verifiable again.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &r.verdict,
+	proceed, unverifiable := heal.AllowedV(ctx, log, r.verdict,
 		r.cs, r.dyn, nil, "fluent-system/fluent-bit", 0, r.now.Now())
 	if unverifiable {
 		metrics.IncError(r.queue)

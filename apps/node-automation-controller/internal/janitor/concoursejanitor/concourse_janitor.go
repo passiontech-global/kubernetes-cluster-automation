@@ -79,7 +79,7 @@
 // 2.7 — Cluster Maintenance Mutex: the whole wipe cycle defers while
 // deliberate maintenance is in flight — replacing a worker pod
 // mid-drain/upgrade fights the operator doing the work and can wedge
-// a PDB for hours. The check itself is kube.MaintenanceActive —
+// a PDB for hours. The check itself is maintenance.MaintenanceActive —
 // the canonical implementation every deferring module runs (cordon/
 // drain, kured reboot lock, autopilot Plan):
 //
@@ -114,9 +114,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	hosthttpx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -232,7 +233,7 @@ func Setup(d shared.Deps) error {
 			cs:    cs,
 			queue: d.Name,
 			stats: &kubeletStatsReader{cs: cs},
-			atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout, Transport: httpx.Transport()}),
+			atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout, Transport: hosthttpx.PooledTransport(16, nil)}),
 			dyn:   dyn,
 			now:   shared.SystemClock,
 
@@ -265,12 +266,12 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// The mutex runs BEFORE the whole-run timeout installs, so the
 	// check gets its own bound — an apiserver hang must not pin the
 	// periodic sweep forever. One overall reqTimeout covers all
-	// three signal reads inside kube.MaintenanceActive (the old
+	// three signal reads inside maintenance.MaintenanceActive (the old
 	// in-package copy wrapped each call separately; an aggregate
 	// bound is strictly tighter and avoids growing a
 	// per-call-timeout variant of the shared API).
 	mctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
-	held, why, err := kube.MaintenanceActive(mctx, j.cs, j.dyn)
+	held, why, err := maintenance.MaintenanceActive(mctx, j.cs, j.dyn)
 	cancel()
 	if err != nil {
 		return err
@@ -319,7 +320,7 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 		// prevents for the first worker. Same fail-closed contract: an
 		// unverifiable check errors the run, "unknown" means "no".
 		mctx, mcancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
-		held, why, merr := kube.MaintenanceActive(mctx, j.cs, j.dyn)
+		held, why, merr := maintenance.MaintenanceActive(mctx, j.cs, j.dyn)
 		mcancel()
 		if merr != nil {
 			return merr

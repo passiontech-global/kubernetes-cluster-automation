@@ -173,35 +173,84 @@ func OwnerGone(ctx context.Context, cs kubernetes.Interface, ns string,
 }
 
 // OwnerGone is the Deps-level twin of the package function: inside
-// a sweep it resolves ReplicaSet owners against the shared
-// AllReplicaSets census first — a census HIT is authoritative
-// (the sweep snapshot is fresh enough that "present" cannot be
-// stale-gone), while a census MISS still falls through to the
-// point GET because a ReplicaSet created after the census loaded
-// would otherwise read as a false "owner gone" and unlock
-// finalizer strips on a live object. Every other kind keeps the
-// direct-GET path — their censuses are not wired here.
+// a sweep it resolves owners against the shared workload censuses
+// first — a census HIT is authoritative (the sweep snapshot is
+// fresh enough that "present" cannot be stale-gone), while a census
+// MISS still falls through to the point GET because an object
+// created after the census loaded would otherwise read as a false
+// "owner gone" and unlock finalizer strips on a live object. Every
+// kind keeps the same miss/error fallthrough: the GET is the
+// authoritative answer either way.
 func (d *Deps) OwnerGone(ctx context.Context, ns string,
 	ref *metav1.OwnerReference, kinds ...string) (gone, resolved bool) {
 
-	if ref != nil && ref.Kind == "ReplicaSet" &&
-		slices.Contains(kinds, "ReplicaSet") {
-		if rss, err := d.AllReplicaSets(ctx); err == nil {
-			for i := range rss {
-				o := &rss[i]
-				if o.Namespace != ns || o.Name != ref.Name {
-					continue
-				}
-				if ref.UID != "" && o.UID != "" && o.UID != ref.UID {
-					return true, true
-				}
-				return false, true
+	if ref != nil && slices.Contains(kinds, ref.Kind) {
+		var found bool
+		var liveUID types.UID
+		switch ref.Kind {
+		case "Pod":
+			if pods, err := d.AllPods(ctx); err == nil {
+				found, liveUID = censusHit(pods, ns, ref.Name,
+					func(p *corev1.Pod) metav1.Object { return p })
 			}
-			// Miss — could be a just-created RS the census predates;
-			// confirm with the authoritative GET below.
+		case "ReplicaSet":
+			if rss, err := d.AllReplicaSets(ctx); err == nil {
+				found, liveUID = censusHit(rss, ns, ref.Name,
+					func(o *metav1.PartialObjectMetadata) metav1.Object { return o })
+			}
+		case "Deployment":
+			if ds, err := d.AllDeployments(ctx); err == nil {
+				found, liveUID = censusHit(ds, ns, ref.Name,
+					func(o *appsv1.Deployment) metav1.Object { return o })
+			}
+		case "StatefulSet":
+			if ss, err := d.AllStatefulSets(ctx); err == nil {
+				found, liveUID = censusHit(ss, ns, ref.Name,
+					func(o *appsv1.StatefulSet) metav1.Object { return o })
+			}
+		case "DaemonSet":
+			if ds, err := d.AllDaemonSets(ctx); err == nil {
+				found, liveUID = censusHit(ds, ns, ref.Name,
+					func(o *appsv1.DaemonSet) metav1.Object { return o })
+			}
+		case "CronJob":
+			if cjs, err := d.AllCronJobs(ctx); err == nil {
+				found, liveUID = censusHit(cjs, ns, ref.Name,
+					func(o *batchv1.CronJob) metav1.Object { return o })
+			}
+		case "Job":
+			if jobs, err := d.AllJobs(ctx); err == nil {
+				found, liveUID = censusHit(jobs, ns, ref.Name,
+					func(o *batchv1.Job) metav1.Object { return o })
+			}
 		}
-		// Census error also falls through: the GET is the same
-		// authoritative answer either way.
+		if found {
+			// Same incarnation rule the direct GET applies: a
+			// same-name object carrying a DIFFERENT UID is a
+			// different incarnation — the referenced owner IS gone.
+			if ref.UID != "" && liveUID != "" && liveUID != ref.UID {
+				return true, true
+			}
+			return false, true
+		}
+		// Census miss or census error — could be a just-created
+		// object the census predates; confirm with the
+		// authoritative GET below.
 	}
 	return OwnerGone(ctx, d.CS, ns, ref, kinds...)
+}
+
+// censusHit scans one sweep census slice for a namespace+name match
+// and returns the object's UID — the census-side twin of the point
+// GET's liveUID read. found=false on no match (or empty items).
+func censusHit[T any](items []T, ns, name string,
+	meta func(*T) metav1.Object) (found bool, uid types.UID) {
+
+	for i := range items {
+		o := meta(&items[i])
+		if o.GetNamespace() == ns && o.GetName() == name {
+			return true, o.GetUID()
+		}
+	}
+	return false, ""
 }

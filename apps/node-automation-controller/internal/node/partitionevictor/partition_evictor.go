@@ -44,6 +44,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
@@ -121,7 +122,7 @@ type partitionEvictor struct {
 	queue string
 	// verdict memoizes the maintenance-mutex evaluation so the
 	// sweep pays one evaluation per TTL window.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 	// now is the wall-clock seam so tests can age a partition
 	// condition past partitionMinAge without sleeping. nil reads as
 	// system time — the standard unarmed-seam convention.
@@ -138,6 +139,7 @@ type partitionEvictor struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg evictorConfig) error {
 		e := &partitionEvictor{
+			verdict:    d.Maintenance,
 			cs:         d.CS,
 			dyn:        d.Dyn,
 			nodeReader: d.Mgr.GetClient(),

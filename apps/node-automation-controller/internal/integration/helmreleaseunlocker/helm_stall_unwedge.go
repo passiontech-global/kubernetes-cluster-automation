@@ -246,7 +246,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// deliberate disruption. Gate AFTER the analysis so a
 		// deferral burns neither the persisted cooldown nor one
 		// of the per-revision attempts.
-		proceed, unverifiable := heal.Gate(ctx, log, &u.verdict,
+		proceed, unverifiable := heal.Gate(ctx, log, u.verdict,
 			u.cs, u.dyn, key, now)
 		switch {
 		case unverifiable:

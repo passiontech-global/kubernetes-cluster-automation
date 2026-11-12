@@ -91,6 +91,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
@@ -185,7 +186,7 @@ type deschedulerStormGate struct {
 	// evaluation per verdict TTL (~1m, kube.verdictTTL), error
 	// verdicts sticky for the window too — fail closed. Zero value
 	// ready (expired — evaluates on first use).
-	maintVerdict kube.Verdict
+	maintVerdict *maintenance.Verdict
 	// now is the clock seam — tests pin it so the cordon-window and
 	// decision-stamp reads are deterministic. nil → time.Now.
 	now shared.Clock
@@ -196,8 +197,15 @@ func Setup(d shared.Deps) error {
 	// runs — a gated-off module registers no controller, no watch,
 	// no informer.
 	return shared.SetupNoConfig(d, func() error {
-		r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock,
+		r := &deschedulerStormGate{
+			maintVerdict: d.Maintenance, cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock,
 			recorder: d.Mgr.GetEventRecorder(d.Name)}
+		if r.maintVerdict == nil {
+			// Tests wire Deps literally (Maintenance unset): fall
+			// back to a private memoized verdict — the pre-extraction
+			// per-module kube.Verdict semantics.
+			r.maintVerdict = &maintenance.Verdict{}
+		}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the

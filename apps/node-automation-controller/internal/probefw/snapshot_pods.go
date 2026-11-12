@@ -34,7 +34,10 @@ func (d *Deps) AllPods(ctx context.Context) ([]corev1.Pod, error) {
 	if err != nil {
 		return nil, err
 	}
-	return kube.FilterPodTombstones(ctx, pods), nil
+	// The tombstone filter is generation-cached on the snapshot —
+	// repeated AllPods calls between pod deletes share the ONE
+	// filtered slice instead of re-copying the census each time.
+	return s.podCensusView(ctx, pods), nil
 }
 
 // PodsIn filters the shared census to one namespace — the client-side
@@ -91,6 +94,11 @@ func (d *Deps) PodsMatching(ctx context.Context, ns, selector string) ([]*corev1
 type podNodeIndex struct {
 	node map[string]string
 	uid  map[string]types.UID
+	// src is the filtered AllPods slice this index was built from —
+	// the podNodeView cache keys on its backing-array identity, so
+	// the placement view rebuilds exactly when the index does (a
+	// census invalidation) or the tombstone generation bumps.
+	src []corev1.Pod
 }
 
 // PodNodes is the pod twin: "ns/name" → spec.nodeName over the
@@ -105,9 +113,10 @@ type podNodeIndex struct {
 // O(1) MarkPodDeleted path deliberately does NOT invalidate the
 // derived join — a pod deleted after the first PodNodes call would
 // otherwise keep its placement entry for every later check in the
-// sweep. The returned map is a fresh filtered copy: the memoized
-// index stays untouched (snapshot payloads are read-only) and
-// callers cannot alias-corrupt it.
+// sweep. The filtered view itself is generation-cached on the
+// snapshot (podNodeView): between tombstone bumps every caller
+// shares the ONE map instead of re-walking the index per call. The
+// returned map is SHARED — snapshot payloads are read-only.
 func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
 	s := sweepSnap(ctx)
 	idx, err := s.podNodes.get(func(bool) (podNodeIndex, error) {
@@ -118,6 +127,7 @@ func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
 		idx := podNodeIndex{
 			node: make(map[string]string, len(pods)),
 			uid:  make(map[string]types.UID, len(pods)),
+			src:  pods,
 		}
 		for i := range pods {
 			key := pods[i].Namespace + "/" + pods[i].Name
@@ -129,12 +139,5 @@ func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(idx.node))
-	for key, node := range idx.node {
-		if uid, ok := idx.uid[key]; ok && kube.IsPodDeleted(ctx, uid) {
-			continue
-		}
-		out[key] = node
-	}
-	return out, nil
+	return s.podNodeView(ctx, idx.src, idx), nil
 }

@@ -337,6 +337,7 @@ type sweepSnapshot struct {
 	// stale census behind for the next check.
 	replicaSets memo[[]metav1.PartialObjectMetadata]
 	cronJobs    memo[[]batchv1.CronJob]
+	jobs        memo[[]batchv1.Job]
 	pdbs        memo[[]policyv1.PodDisruptionBudget]
 
 	// Derived joins — memoized like the censuses: the derived error
@@ -357,6 +358,23 @@ type sweepSnapshot struct {
 	// observe a map swap mid-read).
 	muUnstructs   sync.Mutex
 	unstructReads map[schema.GroupVersionResource]*memo[[]unstructured.Unstructured]
+
+	// podView caches the two tombstone-filtered pod views — the
+	// AllPods filtered census and the PodNodes placement map —
+	// keyed by (view-source identity, overlay podTombstoneGen).
+	// Between MarkPodDeleted bumps every check shares the ONE
+	// filtered slice/map instead of re-copying the census and
+	// re-walking the placement join per call (the 25–30x pod-list
+	// copies a heal-heavy sweep used to pay); a bump or a census
+	// invalidation rebuilds exactly once. podViewMu guards the
+	// trio — the check workers read concurrently.
+	podViewMu       sync.Mutex
+	podViewGen      uint64
+	podViewSrc      []corev1.Pod
+	podFiltered     []corev1.Pod
+	podNodesView    map[string]string
+	podNodesViewGen uint64
+	podNodesViewSrc []corev1.Pod
 
 	// promQueries dedupes identical instant PromQL strings inside
 	// one sweep — several checks issue the same vector (kube-state
@@ -389,7 +407,7 @@ func newSweepSnapshot(ctx context.Context) *sweepSnapshot {
 		s.services.reset, s.namespaces.reset, s.events.reset,
 		s.pvcs.reset, s.statefulSets.reset, s.deployments.reset,
 		s.daemonSets.reset, s.leases.reset,
-		s.replicaSets.reset, s.cronJobs.reset, s.pdbs.reset,
+		s.replicaSets.reset, s.cronJobs.reset, s.jobs.reset, s.pdbs.reset,
 		s.nodeZones.reset, s.podNodes.reset,
 		s.leaseIndex.reset, s.serviceIndex.reset,
 		s.resetUnstructs,
@@ -447,6 +465,78 @@ func WithSweepSnapshot(ctx context.Context) context.Context {
 	snap := newSweepSnapshot(ctx)
 	ctx = context.WithValue(ctx, sweepCtxKey{}, snap)
 	return kube.WithSweepOverlay(ctx)
+}
+
+// podSliceSame reports whether two pod slices share one backing
+// array — the census-identity half of the podView cache key. The
+// memoized census hands back the same slice header every read, so
+// first-element pointer equality is exact; an InvalidatePods
+// refetch allocates a fresh array (the old one stays referenced by
+// the cache, so its address cannot be recycled into a false hit).
+func podSliceSame(a, b []corev1.Pod) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
+}
+
+// podCensusView returns src minus this sweep's pod tombstones,
+// memoized per (census identity, podTombstoneGen): an unchanged
+// generation means the filtered slice computed earlier is still
+// exact, so every AllPods caller shares it — read-only like every
+// other snapshot payload. Outside a sweep the overlay is absent
+// (gen stays 0) and the src-identity half still keys the cache.
+func (s *sweepSnapshot) podCensusView(ctx context.Context,
+	src []corev1.Pod) []corev1.Pod {
+
+	gen := kube.PodTombstoneGen(ctx)
+	s.podViewMu.Lock()
+	defer s.podViewMu.Unlock()
+	if s.podFiltered != nil && s.podViewGen == gen &&
+		podSliceSame(s.podViewSrc, src) {
+		return s.podFiltered
+	}
+	out := kube.FilterPodTombstones(ctx, src)
+	s.podViewGen, s.podViewSrc, s.podFiltered = gen, src, out
+	return out
+}
+
+// podNodeView returns the PodNodes placement map minus the pods the
+// overlay has tombstoned, memoized per (index source identity,
+// podTombstoneGen). idxSrc is the filtered census slice the index
+// memo was built from — it changes exactly when the index rebuilds
+// (census invalidation), so the pair keys "same index + same
+// tombstone set" without re-walking the map per call. The returned
+// map is SHARED across callers — snapshot payloads are read-only.
+func (s *sweepSnapshot) podNodeView(ctx context.Context,
+	idxSrc []corev1.Pod, idx podNodeIndex) map[string]string {
+
+	gen := kube.PodTombstoneGen(ctx)
+	s.podViewMu.Lock()
+	if s.podNodesView != nil && s.podNodesViewGen == gen &&
+		podSliceSame(s.podNodesViewSrc, idxSrc) {
+		out := s.podNodesView
+		s.podViewMu.Unlock()
+		return out
+	}
+	s.podViewMu.Unlock()
+	// Build outside the lock — two racing readers may both build,
+	// last store wins, both results are identical.
+	out := make(map[string]string, len(idx.node))
+	for key, node := range idx.node {
+		if uid, ok := idx.uid[key]; ok && kube.IsPodDeleted(ctx, uid) {
+			continue
+		}
+		out[key] = node
+	}
+	s.podViewMu.Lock()
+	s.podNodesViewGen, s.podNodesViewSrc, s.podNodesView =
+		gen, idxSrc, out
+	s.podViewMu.Unlock()
+	return out
 }
 
 // snap returns the ctx-carried snapshot, or a fresh one when ctx
@@ -581,6 +671,7 @@ func (s *sweepSnapshot) verifyUnmutated() {
 	s.leases.verify()
 	s.replicaSets.verify()
 	s.cronJobs.verify()
+	s.jobs.verify()
 	s.pdbs.verify()
 	s.nodeZones.verify()
 	s.podNodes.verify()

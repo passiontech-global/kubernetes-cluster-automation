@@ -80,15 +80,15 @@ const nodeCordonActiveMaxAge = 45 * time.Minute
 // exactly while the cluster is sick (node-hang-precordon — self-inflicted
 // maintenance lockout).
 func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
-	return nodeCordonedFresh(n, now, nodeCordonActiveMaxAge)
+	return NodeCordonedFresh(n, now, nodeCordonActiveMaxAge)
 }
 
-// nodeCordonedFresh is NodeActivelyCordoned with the freshness window
+// NodeCordonedFresh is NodeActivelyCordoned with the freshness window
 // injected — the maintenance STAMP path uses a wider 2h horizon than
 // the 45m verdict window: a stamp is a hint to node-host-agents
 // (cheap to over-hold, expensive to under-hold), while the verdict
 // must not let a stale cordon freeze every heal gate.
-func nodeCordonedFresh(n *corev1.Node, now time.Time, maxAge time.Duration) bool {
+func NodeCordonedFresh(n *corev1.Node, now time.Time, maxAge time.Duration) bool {
 	if !n.Spec.Unschedulable {
 		return false
 	}

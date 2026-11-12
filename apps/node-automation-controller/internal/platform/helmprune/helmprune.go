@@ -26,7 +26,7 @@
 // with N). The trees cannot share a live read either (different
 // sweep ctx and cadence) — but the SELECTION and DELETE policy is
 // one contract, enforced here.
-package kube
+package helmprune
 
 import (
 	"context"
@@ -39,6 +39,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // helmReleaseSecretType is the Secret type helm writes per revision.
@@ -66,7 +68,7 @@ type HelmSecretPruneHooks struct {
 }
 
 // helmSecretsGVR is the core/v1 secrets GVR the metadata read lists —
-// helm release secrets are plain Secrets, so no dedicated GVR exists.
+// helm release secrets are plain kube.Secrets, so no dedicated GVR exists.
 var helmSecretsGVR = corev1.SchemeGroupVersion.WithResource("secrets")
 
 // PruneSupersededHelmSecrets caps the superseded helm release secrets
@@ -103,7 +105,7 @@ var helmSecretsGVR = corev1.SchemeGroupVersion.WithResource("secrets")
 //
 // This is the typed-only entry kept for callers that have no
 // metadata client to hand (and every fake-clientset unit test):
-// meta/dyn are nil, so the read stays the typed ListAll. Callers
+// meta/dyn are nil, so the read stays the typed kube.ListAll. Callers
 // holding a metadata.Interface (Deps.Meta / the check's p.Meta)
 // should call PruneSupersededHelmSecretsMeta instead — same
 // contract, metadata-only wire read.
@@ -117,7 +119,7 @@ func PruneSupersededHelmSecrets(ctx context.Context,
 
 // PruneSupersededHelmSecretsMeta is PruneSupersededHelmSecrets with
 // the metadata client threaded through: meta feeds
-// ListPartialOrFallback's preferred read (PartialObjectMetadata —
+// kube.ListPartialOrFallback's preferred read (PartialObjectMetadata —
 // ObjectMeta WITHOUT the compressed chart payload each revision
 // embeds, so a cluster-wide scan no longer decodes thousands of
 // .Data blobs into the heap just to count namespaces), cs serves
@@ -135,7 +137,7 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 	opts := metav1.ListOptions{
 		LabelSelector: "owner=helm,status=superseded",
 		FieldSelector: "type=" + helmReleaseSecretType,
-		Limit:         DefaultListPageSize}
+		Limit:         kube.DefaultListPageSize}
 
 	var secrets []corev1.Secret
 	var err error
@@ -208,7 +210,7 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 				hooks.PreDelete(cand.s, cand.v, len(superseded))
 			}
 			err := cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
-				cand.s.Name, UIDDeleteOptions(cand.s.UID, ""))
+				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, ""))
 			if apierrors.IsNotFound(err) {
 				// Already gone — another actor won the race; the
 				// prune goal for this slot is met, so it still
@@ -238,7 +240,7 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 // .Data — which is the entire point of the helper (a typed LIST
 // decodes each revision's compressed chart before the prune can
 // drop it). Secret.Type is not ObjectMeta and cannot cross the
-// metadata endpoint, so the projected Secrets carry the helm type
+// metadata endpoint, so the projected kube.Secrets carry the helm type
 // the field selector already guaranteed server-side; on the
 // unfiltered BadRequest retry the owner=helm,status=superseded
 // label pair is the remaining guard (same exposure the typed
@@ -248,14 +250,14 @@ func listHelmSecretsPartial(ctx context.Context,
 	meta metadata.Interface, cs kubernetes.Interface,
 	dyn dynamic.Interface, opts metav1.ListOptions) ([]corev1.Secret, error) {
 
-	poms, err := ListPartialOrFallback(ctx, meta, cs, dyn,
+	poms, err := kube.ListPartialOrFallback(ctx, meta, cs, dyn,
 		helmSecretsGVR, metav1.NamespaceAll, opts)
 	if err != nil && apierrors.IsBadRequest(err) {
 		// A field-selector-unsupported apiserver answers 400 —
 		// retry unfiltered rather than fail the sweep on what was
 		// only a wire-bytes optimization (mirrors the typed path).
 		opts.FieldSelector = ""
-		poms, err = ListPartialOrFallback(ctx, meta, cs, dyn,
+		poms, err = kube.ListPartialOrFallback(ctx, meta, cs, dyn,
 			helmSecretsGVR, metav1.NamespaceAll, opts)
 	}
 	if err != nil {
@@ -276,8 +278,8 @@ func listHelmSecretsPartial(ctx context.Context,
 }
 
 // listHelmSecretsTyped is the no-metadata-client read — the path
-// every fake-clientset unit test takes. It stays a typed ListAll
-// (NOT ListPartialOrFallback's typed fallback, which would project
+// every fake-clientset unit test takes. It stays a typed kube.ListAll
+// (NOT kube.ListPartialOrFallback's typed fallback, which would project
 // to PartialObjectMetadata and lose Secret.Type): the client-side
 // Type filter is load-bearing here because fakes do not enforce
 // field selectors — the Opaque-typed decoy fixtures rely on it.
@@ -286,14 +288,14 @@ func listHelmSecretsPartial(ctx context.Context,
 func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
 	opts metav1.ListOptions) ([]corev1.Secret, error) {
 
-	raw, err := ListAll(ctx, opts, Secrets(cs, metav1.NamespaceAll))
+	raw, err := kube.ListAll(ctx, opts, kube.Secrets(cs, metav1.NamespaceAll))
 	if err != nil && apierrors.IsBadRequest(err) {
 		// Same defensive retry as before: the client-side Type
 		// filter already guarantees correctness, so an apiserver
 		// that rejects the field selector costs wire bytes, not
 		// the sweep.
 		opts.FieldSelector = ""
-		raw, err = ListAll(ctx, opts, Secrets(cs, metav1.NamespaceAll))
+		raw, err = kube.ListAll(ctx, opts, kube.Secrets(cs, metav1.NamespaceAll))
 	}
 	if err != nil {
 		return nil, err

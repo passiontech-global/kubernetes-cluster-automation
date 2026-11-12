@@ -22,8 +22,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	hosthttpx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -47,7 +47,7 @@ var zombieSidecarShutdownTargets = map[string]struct {
 
 // zombieSidecarHTTPClient is the module's single http.Client — the
 // 2s timeout lives here so a wedged sidecar cannot hold the sweep.
-var zombieSidecarHTTPClient = &http.Client{Timeout: zombieSidecarShutdownTimeout, Transport: httpx.Transport()}
+var zombieSidecarHTTPClient = &http.Client{Timeout: zombieSidecarShutdownTimeout, Transport: hosthttpx.PooledTransport(16, nil)}
 
 // shutdownPod runs the graceful sidecar shutdown: the direct
 // pod-IP admin call first, then — when the dial fails or times out

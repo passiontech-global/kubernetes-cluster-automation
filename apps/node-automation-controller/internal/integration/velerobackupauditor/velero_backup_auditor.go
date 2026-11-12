@@ -60,6 +60,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -275,7 +276,7 @@ type veleroBackupAuditor struct {
 	// sweep's PVB-cleanup preambles — the deletes below are
 	// destructive (a PVB object AND a live node-agent pod), so they
 	// gate on heal.AllowedV and share one verdict per sweep.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 }
 
 // veleroInstallNS is the namespace the velero node-agent DaemonSet
@@ -296,6 +297,7 @@ func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
 	return shared.SetupNoConfig(d, func() error {
 		a := &veleroBackupAuditor{
+			verdict:  d.Maintenance,
 			cs:       cs,
 			dyn:      dyn,
 			veleroNS: envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault),

@@ -216,10 +216,19 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 		return &linkerdTemplateTarget{ds, "daemonset", ns, ds.Name,
 			kube.EffectiveTemplateAnnos(ctx, ds, ds.Spec.Template.Annotations), false}, true
 	case "Job":
-		job, err := p.CS.BatchV1().Jobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — job get failed",
-				"job", ns+"/"+ref.Name, "error", err)
+		// Same census rule as the other workloads: the per-sweep
+		// AllJobs LIST (memoized), filtered client-side to ns/name —
+		// the patch below stays a direct write.
+		jobList, jobErr := p.AllJobs(ctx)
+		if jobErr != nil {
+			log.Info("WARN: linkerd heal — job census failed",
+				"job", ns+"/"+ref.Name, "error", jobErr)
+			return nil, false
+		}
+		job := findJob(jobList, ns, ref.Name)
+		if job == nil {
+			log.Info("WARN: linkerd heal — job not in the census",
+				"job", ns+"/"+ref.Name)
 			return nil, false
 		}
 		return &linkerdTemplateTarget{job, "job", ns, job.Name,
@@ -603,6 +612,15 @@ func findReplicaSetMeta(items []metav1.PartialObjectMetadata, ns, name string) *
 }
 
 func findCronJob(items []batchv1.CronJob, ns, name string) *batchv1.CronJob {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func findJob(items []batchv1.Job, ns, name string) *batchv1.Job {
 	for i := range items {
 		if items[i].Namespace == ns && items[i].Name == name {
 			return &items[i]

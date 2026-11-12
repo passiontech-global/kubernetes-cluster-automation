@@ -56,7 +56,6 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,13 +68,6 @@ import (
 // sweepCtxKey: the sweep attaches it once and readers resolve it,
 // so no other package can inject one.
 type sweepOverlayCtxKey struct{}
-
-// disruptionReserveTTL bounds one ownerDisrupt slot. The overlay
-// itself dies with the sweep, so this only matters if a check calls
-// TryReserveWorkloadDisruption twice for the same owner inside one
-// sweep — the reservation must still be live for the second call to
-// see the first. Sized well past any plausible intra-sweep gap.
-const disruptionReserveTTL = 10 * time.Minute
 
 // SweepOverlay is the per-sweep delta store described in the file
 // header. All fields are guarded by one RWMutex: writers take the
@@ -90,9 +82,20 @@ type SweepOverlay struct {
 	annos map[types.UID]map[string]*string
 	// tombstones is the set of pod UIDs deleted this sweep.
 	tombstones map[types.UID]struct{}
-	// ownerDisrupt maps "<ns>/<kind>/<name>" -> reservation expiry —
-	// one live slot per workload controller identity.
-	ownerDisrupt map[string]time.Time
+	// podTombstoneGen counts MarkPodDeleted calls — the generation
+	// the sweep snapshot keys its filtered pod views on: a bump
+	// means "the tombstone set changed, rebuild the filtered
+	// census/map once", and between bumps every check shares the
+	// ONE cached view instead of re-copying the census per call.
+	podTombstoneGen uint64
+	// ownerDisrupt is the set of "<ns>/<kind>/<name>" workload
+	// identities that already spent their one-disruption slot this
+	// sweep. Presence IS the reservation — the overlay dies with
+	// the sweep, so no expiry is needed (a mid-sweep TTL could only
+	// ever fire on a >10-minute sweep, where re-allowing a second
+	// disruption is exactly the quorum breach the slot exists to
+	// prevent).
+	ownerDisrupt map[string]struct{}
 	// tmplAnnos maps object UID -> pod-template annotation key ->
 	// value (nil = delete) — the spec.template.metadata.annotations
 	// twin of annos. The linkerd opaque-ports heal mirrors its
@@ -109,7 +112,7 @@ func WithSweepOverlay(ctx context.Context) context.Context {
 	return context.WithValue(ctx, sweepOverlayCtxKey{}, &SweepOverlay{
 		annos:        map[types.UID]map[string]*string{},
 		tombstones:   map[types.UID]struct{}{},
-		ownerDisrupt: map[string]time.Time{},
+		ownerDisrupt: map[string]struct{}{},
 		tmplAnnos:    map[types.UID]map[string]*string{},
 	})
 }
@@ -341,7 +344,26 @@ func MarkPodDeleted(ctx context.Context, uid types.UID) {
 	}
 	ov.mu.Lock()
 	ov.tombstones[uid] = struct{}{}
+	ov.podTombstoneGen++
 	ov.mu.Unlock()
+}
+
+// PodTombstoneGen reports the overlay's tombstone generation — how
+// many MarkPodDeleted calls this sweep has seen. The sweep snapshot
+// keys its filtered pod views on it: an unchanged gen means the
+// filtered census/map computed earlier is still exact, a bump means
+// rebuild once. 0 outside a sweep (and for a fresh overlay — gen 0
+// is a valid generation, the src-identity half of the cache key
+// keeps it honest).
+func PodTombstoneGen(ctx context.Context) uint64 {
+	ov := sweepOverlay(ctx)
+	if ov == nil {
+		return 0
+	}
+	ov.mu.RLock()
+	gen := ov.podTombstoneGen
+	ov.mu.RUnlock()
+	return gen
 }
 
 // IsPodDeleted reports whether uid was deleted this sweep. False
@@ -410,13 +432,12 @@ func TryReserveWorkloadDisruption(ctx context.Context, pod *corev1.Pod) bool {
 		return true
 	}
 	key := disruptionKey(pod)
-	now := time.Now()
 	ov.mu.Lock()
 	defer ov.mu.Unlock()
-	if until, ok := ov.ownerDisrupt[key]; ok && now.Before(until) {
+	if _, taken := ov.ownerDisrupt[key]; taken {
 		return false
 	}
-	ov.ownerDisrupt[key] = now.Add(disruptionReserveTTL)
+	ov.ownerDisrupt[key] = struct{}{}
 	return true
 }
 

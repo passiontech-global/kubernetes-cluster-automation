@@ -51,6 +51,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -142,7 +143,7 @@ type cfTunnelProxyWatchdog struct {
 	lastResync state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation so the
 	// sweep pays one evaluation per TTL window.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
 	// syncErrLast is the namespace -> sweep time of the last log tail
@@ -221,7 +222,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg watchdogConfig) error {
 		logf.Log.WithName(d.Name).Info("registered",
 			"namespace", cfg.namespace, "interval", cfg.interval)
-		w := &cfTunnelProxyWatchdog{cs: d.CS, dyn: d.Dyn, queue: d.Name, namespace: cfg.namespace}
+		w := &cfTunnelProxyWatchdog{cs: d.CS, dyn: d.Dyn, queue: d.Name, namespace: cfg.namespace, verdict: d.Maintenance}
 		return shared.AddPeriodic(d.Mgr, w.queue, cfg.interval, w.run)
 	})
 }

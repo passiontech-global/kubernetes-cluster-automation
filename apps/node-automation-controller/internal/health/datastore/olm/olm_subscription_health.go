@@ -285,7 +285,10 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	}
 	if !didDelete {
 		// Quorum reservation denied — a sibling check already spent
-		// this workload's one-disruption slot this sweep.
+		// this workload's one-disruption slot this sweep. Clean
+		// deferral: no mutation ran, so the grant HealAllowedPersisted
+		// consumed bought no heal — hand it back (budget.go contract).
+		heal.RefundGrant(now)
 		log.Info("DEFER: workload disruption already reserved this sweep",
 			"pod", target.Namespace+"/"+target.Name)
 		return

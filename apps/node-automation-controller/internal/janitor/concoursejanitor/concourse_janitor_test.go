@@ -23,6 +23,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // ---------------------------------------------------------------------------
@@ -464,7 +465,7 @@ func TestConcourseJanitorMaintenanceMutexDefers(t *testing.T) {
 		}()}, nil},
 		{"kured lock", []runtime.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "kube-system", Name: "kured",
-			Annotations: map[string]string{kube.KuredLockAnno: "w1"}}}}, nil},
+			Annotations: map[string]string{nodecond.KuredLockAnno: "w1"}}}}, nil},
 		{"active plan", nil,
 			[]runtime.Object{cjAutopilotPlan("autopilot", "InProgress")}},
 	} {

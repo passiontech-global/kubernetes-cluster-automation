@@ -45,11 +45,7 @@ func qmEndpoints(subsets ...any) *unstructured.Unstructured {
 		"metadata": map[string]any{"name": "kubernetes", "namespace": "default"},
 	}}
 	if subsets != nil {
-		lst := make([]any, 0, len(subsets))
-		for _, s := range subsets {
-			lst = append(lst, s)
-		}
-		o.Object["subsets"] = lst
+		o.Object["subsets"] = append(make([]any, 0, len(subsets)), subsets...)
 	}
 	return o
 }

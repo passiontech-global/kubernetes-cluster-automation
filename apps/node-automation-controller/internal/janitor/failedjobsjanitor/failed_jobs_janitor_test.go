@@ -633,7 +633,6 @@ func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 		fjjBuildRun("cicd", "old-ok", "True", 25*time.Hour),
 		fjjRun(kube.GVRTektonTaskRun, "TaskRun", "cicd", "tr-live", "", 0))
 	for _, res := range []string{"pipelineruns", "taskruns"} {
-		res := res
 		dyn2.PrependReactor("list", res,
 			func(a ktesting.Action) (bool, runtime.Object, error) {
 				return true, nil, apierrors.NewNotFound(

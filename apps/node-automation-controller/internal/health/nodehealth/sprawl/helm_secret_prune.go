@@ -13,7 +13,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/helmprune"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
@@ -48,15 +48,15 @@ func init() {
 
 // pruneHelmSecrets counts helm release secrets into the census and
 // caps superseded revisions per release. The selection + delete
-// policy lives in the shared kube.PruneSupersededHelmSecrets (its
+// policy lives in the shared helmprune.PruneSupersededHelmSecrets (its
 // header documents the deliberate duplication with
 // helmrelease-unlocker and why both cluster-wide reads stay); this
 // site keeps only its census/report side effects.
 func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
 
-	secrets, err := kube.PruneSupersededHelmSecrets(ctx, p.CS,
-		sprawlMaxSuperseded, kube.HelmSecretPruneHooks{
+	secrets, err := helmprune.PruneSupersededHelmSecrets(ctx, p.CS,
+		sprawlMaxSuperseded, helmprune.HelmSecretPruneHooks{
 			Excess: func(ns, release string, superseded, cap int) {
 				helmRep.Set(helmSecretsExcessGauge,
 					float64(superseded-cap), ns+"/"+release,

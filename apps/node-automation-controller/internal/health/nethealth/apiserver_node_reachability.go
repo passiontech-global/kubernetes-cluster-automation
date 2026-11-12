@@ -48,15 +48,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -250,6 +247,32 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 		hasTaint := kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable)
 		_, wasDark := dark[n.Name]
 		if persistedDark[n.Name] && !hasTaint {
+			// Taint/untaint are scheduling mutations — same heal
+			// contract as the pod deletes below: the per-target
+			// circuit first (no grant spent on a denied target),
+			// then the shared HealAllowed gate (cooldown → mutex →
+			// fleet budget; a proceed consumes one grant, which the
+			// mutation below spends — a failed TaintNode is an
+			// attempted mutation, never refunded).
+			if allowed, reason := heal.TryAcquireTarget(
+				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
+				log.Info("DEFER: heal target circuit open — fence skipped",
+					"node", n.Name, "reason", reason)
+				continue
+			}
+			proceed, unverifiable := c.HealAllowed(ctx, log, &c.Heals,
+				CheckNameApiserverNodeReachability+"/fence/"+n.Name,
+				darkHealCool, now)
+			if unverifiable {
+				rep.InfraErr(fmt.Errorf(
+					"maintenance verdict unverifiable — fence %s deferred", n.Name))
+				continue
+			}
+			if !proceed {
+				log.Info("heal gate deferred apiserver-dark fence",
+					"node", n.Name)
+				continue
+			}
 			if err := kube.TaintNode(ctx, c.Deps.CS, n.Name,
 				kube.TaintApiserverUnreachable, "true", corev1.TaintEffectNoSchedule); err != nil {
 				rep.InfraErr(fmt.Errorf("taint %s: %w", n.Name, err))
@@ -260,6 +283,27 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 			log.Info("ACTION: fenced apiserver-dark node",
 				"node", n.Name, "taint", kube.TaintApiserverUnreachable)
 		} else if hasTaint && !wasDark {
+			// Same gate for the restorative untaint — a recovered
+			// node's fence release is still a node mutation.
+			if allowed, reason := heal.TryAcquireTarget(
+				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
+				log.Info("DEFER: heal target circuit open — unfence skipped",
+					"node", n.Name, "reason", reason)
+				continue
+			}
+			proceed, unverifiable := c.HealAllowed(ctx, log, &c.Heals,
+				CheckNameApiserverNodeReachability+"/unfence/"+n.Name,
+				darkHealCool, now)
+			if unverifiable {
+				rep.InfraErr(fmt.Errorf(
+					"maintenance verdict unverifiable — unfence %s deferred", n.Name))
+				continue
+			}
+			if !proceed {
+				log.Info("heal gate deferred apiserver-dark unfence",
+					"node", n.Name)
+				continue
+			}
 			if err := kube.UntaintNode(ctx, c.Deps.CS, n.Name,
 				kube.TaintApiserverUnreachable); err != nil {
 				rep.InfraErr(fmt.Errorf("untaint %s: %w", n.Name, err))
@@ -300,21 +344,23 @@ func (c *apiserverNodeReachabilityCheck) probeAll(ctx context.Context,
 	if workers > len(candidates) {
 		workers = len(candidates)
 	}
-	jobs := make(chan corev1.Node)
+	// Node names, not corev1.Node structs — a Node is ~4KB and the
+	// jobs channel would copy every candidate through every worker.
+	jobs := make(chan string)
 	results := make(chan result, len(candidates))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for n := range jobs {
-				results <- result{node: n.Name, ok: c.probeSafe(ctx, n.Name)}
+			for name := range jobs {
+				results <- result{node: name, ok: c.probeSafe(ctx, name)}
 			}
 		}()
 	}
 	go func() {
 		for i := range candidates {
-			jobs <- candidates[i]
+			jobs <- candidates[i].Name
 		}
 		close(jobs)
 		wg.Wait()
@@ -346,209 +392,4 @@ func (c *apiserverNodeReachabilityCheck) probeSafe(ctx context.Context,
 		}
 	}()
 	return c.probeFn(ctx, node)
-}
-
-// webhookBackendPods resolves every Ready endpoint pod backing a
-// failurePolicy=Fail admission webhook — Validating AND Mutating,
-// since an unreachable injector fails pod creation just as hard.
-// Returns podKey ("ns/name") → the webhook config names that route
-// through it, restricted to pods sitting on darkNodes.
-func (c *apiserverNodeReachabilityCheck) webhookBackendPods(
-	ctx context.Context, darkNodes map[string]bool) (map[string][]string, error) {
-
-	vwcs, err := c.Deps.CS.AdmissionregistrationV1().
-		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list validatingwebhookconfigurations: %w", err)
-	}
-	mwcs, err := c.Deps.CS.AdmissionregistrationV1().
-		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list mutatingwebhookconfigurations: %w", err)
-	}
-
-	// svcKey → webhook names, Fail-policy + service-backed only.
-	// ValidatingWebhook and MutatingWebhook are distinct types with
-	// identical admission fields — flatten both into refs first.
-	type svcRef struct {
-		ns, name string
-	}
-	type whRef struct {
-		name          string
-		failurePolicy *admissionv1.FailurePolicyType
-		service       *admissionv1.ServiceReference
-	}
-	backends := map[svcRef][]string{}
-	add := func(kind string, whs []whRef) {
-		for i := range whs {
-			w := &whs[i]
-			// failurePolicy unset defaults to Fail at the apiserver —
-			// only an explicit Ignore opts out of evacuation.
-			if w.failurePolicy != nil && *w.failurePolicy == admissionv1.Ignore {
-				continue
-			}
-			svc := w.service
-			if svc == nil || svc.Name == "" {
-				continue
-			}
-			ns := svc.Namespace
-			if ns == "" {
-				ns = "default"
-			}
-			ref := svcRef{ns: ns, name: svc.Name}
-			backends[ref] = append(backends[ref], kind+"/"+w.name)
-		}
-	}
-	for i := range vwcs.Items {
-		cfg := vwcs.Items[i]
-		refs := make([]whRef, 0, len(cfg.Webhooks))
-		for j := range cfg.Webhooks {
-			w := &cfg.Webhooks[j]
-			refs = append(refs, whRef{
-				name: w.Name, failurePolicy: w.FailurePolicy,
-				service: w.ClientConfig.Service})
-		}
-		add("vwc/"+cfg.Name, refs)
-	}
-	for i := range mwcs.Items {
-		cfg := mwcs.Items[i]
-		refs := make([]whRef, 0, len(cfg.Webhooks))
-		for j := range cfg.Webhooks {
-			w := &cfg.Webhooks[j]
-			refs = append(refs, whRef{
-				name: w.Name, failurePolicy: w.FailurePolicy,
-				service: w.ClientConfig.Service})
-		}
-		add("mwc/"+cfg.Name, refs)
-	}
-	if len(backends) == 0 {
-		return nil, nil
-	}
-
-	// EndpointSlice → backing pods: the kubernetes.io/service-name
-	// label binds a slice to its Service; ready endpoints only —
-	// a not-ready endpoint is already out of the apiserver's rotation.
-	slices, err := c.AllEndpointSlices(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list endpointslices: %w", err)
-	}
-	podKeys := map[string]bool{}
-	svcOfPod := map[string]svcRef{}
-	for i := range slices {
-		sl := &slices[i]
-		svcName := sl.Labels[discoveryv1.LabelServiceName]
-		if svcName == "" {
-			continue
-		}
-		ref := svcRef{ns: sl.Namespace, name: svcName}
-		if _, ok := backends[ref]; !ok {
-			continue
-		}
-		for j := range sl.Endpoints {
-			ep := &sl.Endpoints[j]
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-				continue
-			}
-			tr := ep.TargetRef
-			if tr == nil || tr.Kind != "Pod" || tr.Name == "" {
-				continue
-			}
-			ns := tr.Namespace
-			if ns == "" {
-				ns = sl.Namespace
-			}
-			key := ns + "/" + tr.Name
-			podKeys[key] = true
-			svcOfPod[key] = ref
-		}
-	}
-	if len(podKeys) == 0 {
-		return nil, nil
-	}
-
-	podNodes, err := c.PodNodes(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("pod→node census: %w", err)
-	}
-	out := map[string][]string{}
-	for key := range podKeys {
-		node := podNodes[key]
-		if node == "" || !darkNodes[node] {
-			continue
-		}
-		out[key] = backends[svcOfPod[key]]
-	}
-	return out, nil
-}
-
-// evictWebhookBackends deletes Ready backend pods sitting on
-// apiserver-dark nodes so their controllers reschedule them onto
-// reachable nodes. Eligibility mirrors partition-pod-evictor:
-// terminal/deleting/mirror/DaemonSet pods and pods with no
-// controller are never touched — a bare pod delete is data loss,
-// not a heal.
-func (c *apiserverNodeReachabilityCheck) evictWebhookBackends(
-	ctx context.Context, rep *probefw.SweepReport,
-	darkNodes map[string]bool, now time.Time, log logr.Logger) {
-
-	backends, err := c.webhookBackendPods(ctx, darkNodes)
-	if err != nil {
-		rep.InfraErr(err)
-		return
-	}
-	if len(backends) == 0 {
-		return
-	}
-	pods, err := c.AllPods(ctx)
-	if err != nil {
-		rep.InfraErr(fmt.Errorf("list pods for webhook backends: %w", err))
-		return
-	}
-	byKey := make(map[string]*corev1.Pod, len(pods))
-	for i := range pods {
-		p := &pods[i]
-		byKey[p.Namespace+"/"+p.Name] = p
-	}
-
-	deleted := 0
-	for key, webhooks := range backends {
-		if deleted >= darkHealCap {
-			break
-		}
-		pod := byKey[key]
-		if pod == nil || !webhookBackendEvictable(pod) {
-			continue
-		}
-		if c.DeletePodHeal(ctx, log, CheckNameApiserverNodeReachability,
-			kube.PodControllerKey(pod), pod, darkHealCool, now) {
-			deleted++
-			rep.Find(fmt.Sprintf(
-				"ACTION: deleted webhook backend %s on apiserver-dark node %s (%s)",
-				key, pod.Spec.NodeName, strings.Join(webhooks, ",")))
-		}
-	}
-}
-
-// webhookBackendEvictable reports whether pod p is safe to delete as
-// a webhook-backend heal — the partitionEvictable exclusions applied
-// to this check's narrower target set.
-func webhookBackendEvictable(p *corev1.Pod) bool {
-	if p.Status.Phase == corev1.PodSucceeded ||
-		p.Status.Phase == corev1.PodFailed ||
-		p.DeletionTimestamp != nil {
-		return false
-	}
-	if _, mirror := p.Annotations["kubernetes.io/config.mirror"]; mirror {
-		return false
-	}
-	controller := false
-	for _, o := range p.OwnerReferences {
-		if o.Kind == "DaemonSet" {
-			return false
-		}
-		if o.Controller != nil && *o.Controller {
-			controller = true
-		}
-	}
-	return controller
 }

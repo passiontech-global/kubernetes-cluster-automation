@@ -89,7 +89,7 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// gates apply here, shared via w.verdict so the sweep pays one
 	// evaluation.
 	if w.dyn != nil {
-		proceed, unverifiable := heal.Gate(ctx, log, &w.verdict,
+		proceed, unverifiable := heal.Gate(ctx, log, w.verdict,
 			w.cs, w.dyn, "cloudflared-wedges", now)
 		if unverifiable {
 			metrics.IncError(w.queue)

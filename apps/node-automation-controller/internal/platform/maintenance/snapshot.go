@@ -17,7 +17,7 @@
 // reads live) keeps the L1↔L3 stamp fresh regardless. Callers
 // outside a sweep (module heal gates, tests, ad-hoc runs) get nil
 // and keep the direct clientset reads — identical semantics.
-package kube
+package maintenance
 
 import (
 	"context"
@@ -27,6 +27,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // MaintenanceSnapshotProvider supplies the censuses the maintenance
@@ -74,7 +76,7 @@ func maintenanceNodeList(ctx context.Context,
 	if p := maintenanceSnapshotFrom(ctx); p != nil {
 		return p.Nodes(ctx)
 	}
-	return ListNodes(ctx, cs)
+	return kube.ListNodes(ctx, cs)
 }
 
 // maintenanceDaemonSet finds one DaemonSet for the kured-lock read —

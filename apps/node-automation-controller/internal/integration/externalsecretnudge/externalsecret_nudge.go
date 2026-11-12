@@ -47,6 +47,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -143,7 +144,7 @@ type externalSecretNudge struct {
 	// verdict memoizes the maintenance-mutex evaluation for the
 	// sweep's heal preambles — one evaluation per Verdict TTL
 	// instead of three API reads per target.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 	// emptyKeyEmitted: the ns/ES/key triples the empty-key-audit empty-key
 	// audit flagged on the previous sweep — a key that synced
 	// populated (or an ES that vanished) gets its series deleted so
@@ -189,6 +190,7 @@ type secretRead struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		n := &externalSecretNudge{
+			verdict:    d.Maintenance,
 			cs:         d.CS,
 			dyn:        d.Dyn,
 			meta:       d.Meta,

@@ -14,7 +14,7 @@
 // "retries exhausted" fragment — that one is deliberately NOT here:
 // exhausted controller retries are a backoff state on the consumer,
 // not a fetch failure, and refetching the source cannot fix them.
-package kube
+package flux
 
 import (
 	"strings"
@@ -23,6 +23,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // FluxArtifactFailMsgs is the Ready=False message-fragment list
@@ -57,10 +59,10 @@ func FluxArtifactFailMessage(message string) bool {
 func FluxArtifactStale(o *unstructured.Unstructured, now time.Time,
 	minAge time.Duration) bool {
 
-	if suspended, _ := NestedBool(o.Object, "spec", "suspend"); suspended {
+	if suspended, _ := kube.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false
 	}
-	c, ok := ConditionOf(o.Object, "Ready")
+	c, ok := kube.ConditionOf(o.Object, "Ready")
 	if !ok || c.Status != "False" {
 		return false
 	}
@@ -79,13 +81,13 @@ func FluxArtifactStale(o *unstructured.Unstructured, now time.Time,
 // artifact nudge actually lands on (helmrelease-unlocker's healer
 // and health/gitops' source-freshness probe share it).
 var FluxSourceGVRs = map[string]schema.GroupVersionResource{
-	"HelmChart":      GVRFluxHelmChart,
-	"GitRepository":  GVRFluxGitRepository,
-	"HelmRepository": GVRFluxHelmRepository,
-	"OCIRepository":  GVRFluxOCIRepository,
+	"HelmChart":      kube.GVRFluxHelmChart,
+	"GitRepository":  kube.GVRFluxGitRepository,
+	"HelmRepository": kube.GVRFluxHelmRepository,
+	"OCIRepository":  kube.GVRFluxOCIRepository,
 	// Bucket is a first-class v1 source kind — a Kustomization or HR
 	// sourcing artifacts from an S3/GCS bucket needs the same nudge.
-	"Bucket": GVRFluxBucket,
+	"Bucket": kube.GVRFluxBucket,
 }
 
 // FluxSourceGVR resolves a sourceRef kind to its GVR.
@@ -101,19 +103,19 @@ func FluxSourceGVR(kind string) (schema.GroupVersionResource, bool) {
 // convention). ok=false when the object carries no resolvable
 // sourceRef.
 func FluxConsumerSourceRef(o *unstructured.Unstructured) (kind, ns, name string, ok bool) {
-	kind, _ = NestedString(o.Object, "spec", "sourceRef", "kind")
-	name, _ = NestedString(o.Object, "spec", "sourceRef", "name")
-	ns, _ = NestedString(o.Object, "spec", "sourceRef", "namespace")
+	kind, _ = kube.NestedString(o.Object, "spec", "sourceRef", "kind")
+	name, _ = kube.NestedString(o.Object, "spec", "sourceRef", "name")
+	ns, _ = kube.NestedString(o.Object, "spec", "sourceRef", "namespace")
 	if kind == "" || name == "" {
-		kind, _ = NestedString(o.Object, "spec", "chartRef", "kind")
-		name, _ = NestedString(o.Object, "spec", "chartRef", "name")
-		ns, _ = NestedString(o.Object, "spec", "chartRef", "namespace")
+		kind, _ = kube.NestedString(o.Object, "spec", "chartRef", "kind")
+		name, _ = kube.NestedString(o.Object, "spec", "chartRef", "name")
+		ns, _ = kube.NestedString(o.Object, "spec", "chartRef", "namespace")
 		if kind == "" || name == "" {
-			kind, _ = NestedString(
+			kind, _ = kube.NestedString(
 				o.Object, "spec", "chart", "spec", "sourceRef", "kind")
-			name, _ = NestedString(
+			name, _ = kube.NestedString(
 				o.Object, "spec", "chart", "spec", "sourceRef", "name")
-			ns, _ = NestedString(
+			ns, _ = kube.NestedString(
 				o.Object, "spec", "chart", "spec", "sourceRef", "namespace")
 		}
 	}
@@ -128,13 +130,13 @@ func FluxConsumerSourceRef(o *unstructured.Unstructured) (kind, ns, name string,
 
 // FluxSourceNudgeFresh reports whether obj already carries a fresh
 // passiontech.dev/last-source-nudge stamp — helmrelease-unlocker's
-// cooldown annotation (RFC3339, read via AnnoTime). Consumers call
+// cooldown annotation (RFC3339, read via kube.AnnoTime). Consumers call
 // this to defer their own remediation while the source healer is
 // inside its cooldown window, so one stuck artifact is remediated
 // once, not twice.
 func FluxSourceNudgeFresh(obj metav1.Object, now time.Time,
 	cooldown time.Duration) bool {
 
-	t, ok := AnnoTime(obj, AnnoLastSourceNudge)
+	t, ok := kube.AnnoTime(obj, kube.AnnoLastSourceNudge)
 	return ok && now.Sub(t) < cooldown
 }

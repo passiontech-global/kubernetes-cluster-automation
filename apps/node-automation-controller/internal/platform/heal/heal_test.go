@@ -18,6 +18,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
@@ -133,7 +134,7 @@ func TestAllowedVSharedVerdictMemoizes(t *testing.T) {
 			lists++
 			return false, nil, nil // tracker serves the (empty) list
 		})
-	var v kube.Verdict
+	var v maintenance.Verdict
 	now := time.Now()
 	for i := 0; i < 2; i++ {
 		proceed, unverifiable := AllowedV(ctx, logr.Discard(), &v, cs,

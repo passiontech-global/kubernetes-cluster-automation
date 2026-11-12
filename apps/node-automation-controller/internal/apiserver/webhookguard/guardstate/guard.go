@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -50,7 +51,7 @@ type Guard struct {
 	// gates (pod bounce + unmeshed remediation) share within a run —
 	// one evaluation per Verdict TTL instead of three API reads per
 	// consumer.
-	Verdict kube.Verdict
+	Verdict *maintenance.Verdict
 	// NodeReader backs ListNodesCached — the manager's
 	// informer-backed client. A nil reader (literally-built test
 	// fixtures) falls back to the direct clientset read.

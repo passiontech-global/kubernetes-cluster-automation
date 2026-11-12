@@ -330,7 +330,10 @@ func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logge
 	}
 	if !deleted {
 		// Quorum reservation denied — a sibling check already spent
-		// this workload's one-disruption slot this sweep.
+		// this workload's one-disruption slot this sweep. Clean
+		// deferral: no mutation ran, so the grant HealAllowed
+		// consumed bought no heal — hand it back (budget.go contract).
+		heal.RefundGrant(now)
 		log.Info("DEFER: workload disruption already reserved this sweep",
 			"component", component, "pod", key)
 		return

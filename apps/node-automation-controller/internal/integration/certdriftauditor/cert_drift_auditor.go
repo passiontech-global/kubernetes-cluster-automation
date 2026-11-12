@@ -64,6 +64,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -203,7 +204,7 @@ type certDriftAuditor struct {
 	// single target (the linkerd-identity Deployment) once per 15m
 	// sweep, so the memo never serves a second call — kept for
 	// parity with the per-target heal loops, not for load.
-	verdict kube.Verdict
+	verdict *maintenance.Verdict
 }
 
 // Setup registers the 15m sweep — or nothing when the
@@ -214,10 +215,11 @@ func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
 	return shared.SetupNoConfig(d, func() error {
 		a := &certDriftAuditor{
-			cs:    cs,
-			dyn:   dyn,
-			queue: d.Name,
-			now:   shared.SystemClock,
+			verdict: d.Maintenance,
+			cs:      cs,
+			dyn:     dyn,
+			queue:   d.Name,
+			now:     shared.SystemClock,
 		}
 		return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 	})

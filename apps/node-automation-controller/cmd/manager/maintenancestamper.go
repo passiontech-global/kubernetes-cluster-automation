@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -48,6 +49,10 @@ const maintenanceStampInterval = 30 * time.Second
 type maintenanceStamperRunnable struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
+	// nodeReader is the manager's cache-backed client for the node
+	// census (kube.ListNodesCached) — nil in tests falls back to the
+	// direct clientset read.
+	nodeReader kube.CachedNodeReader
 	// now is the clock seam — zero value is system time; tests pin
 	// it instead of sleeping through the ticker.
 	now shared.Clock
@@ -76,5 +81,5 @@ func (r *maintenanceStamperRunnable) Start(ctx context.Context) error {
 // sweep census: this runnable is the freshness backstop for exactly
 // the mid-sweep changes a memoized census cannot see.
 func (r *maintenanceStamperRunnable) stamp(ctx context.Context) {
-	kube.StampMaintenanceTargets(ctx, r.cs, r.dyn, r.now.Now())
+	maintenance.StampMaintenanceTargets(ctx, r.cs, r.dyn, r.nodeReader, r.now.Now())
 }

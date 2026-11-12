@@ -12,16 +12,17 @@
 // ListPartialOrFallback is the single entry point. It prefers the
 // metadata client (Deps.Meta, built in cmd/manager off the shared
 // base transport). A metadata-client error NEVER falls back to a
-// full-object list: a genuine apiserver failure (RBAC, 5xx, timeout)
-// must surface as itself — silently re-issuing the same read as a
-// heavier full-object LIST would mask the outage AND double the
-// load. Fallback exists ONLY for "this client cannot serve the
-// metadata endpoint" — a nil meta client (the hundreds of unit
-// tests that construct Deps{CS: fakeCS} with no Meta: the fake
-// metadata client is opt-in, the fake clientsets are not) and a
-// RESTMapper NoMatchError (the GVR is not in the discovery
-// document — an uninstalled CRD or a resource the cluster does not
-// serve), where a full LIST is the honest degraded answer.
+// full-object list: a genuine apiserver failure (RBAC, 5xx, timeout,
+// 404/NoMatch, 429) must surface as itself — silently re-issuing the
+// same read as a heavier full-object LIST would mask the outage AND
+// double the load. Fallback exists ONLY for "this client cannot
+// serve the metadata endpoint" — a nil meta client (the hundreds of
+// unit tests that construct Deps{CS: fakeCS} with no Meta: the fake
+// metadata client is opt-in, the fake clientsets are not), an HTTP
+// 406 NotAcceptable (an apiserver or aggregated layer that does not
+// serve meta.k8s.io/v1 PartialObjectMetadata for the GVR), and the
+// client-go fake's unregistered-scheme rejection — all cases where
+// the metadata read itself is impossible, not merely failing.
 //
 // When a fallback IS needed the typed clientset runs BEFORE the
 // dynamic client for every built-in GVR (core/v1, apps/v1, batch/v1,
@@ -47,7 +48,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,10 +76,11 @@ const crdListPageSize int64 = 25
 //
 // opts carries LabelSelector/FieldSelector/Limit — Limit is the
 // PAGE size, not a result cap. A nil meta client skips straight to
-// the fallbacks; a meta-client NoMatchError (GVR not served)
-// degrades to them too, while every other meta error is returned
-// verbatim — the fallback must never mask a real apiserver failure
-// with a heavier read of the same broken endpoint.
+// the fallbacks; a meta error that means "the metadata endpoint
+// cannot serve this resource" (see metaUnsupported) degrades to
+// them too, while every other meta error is returned verbatim —
+// the fallback must never mask a real apiserver failure with a
+// heavier read of the same broken endpoint.
 func ListPartialOrFallback(ctx context.Context,
 	meta metadata.Interface,
 	fallbackCS kubernetes.Interface,
@@ -95,11 +97,11 @@ func ListPartialOrFallback(ctx context.Context,
 		}
 		// Only "the metadata endpoint cannot serve this GVR"
 		// degrades to the full-object fallbacks — a genuine API
-		// error (RBAC denial, 5xx, timeout) is returned as itself
-		// rather than masked by a heavier re-read that fails the
-		// same way while doubling the load on an already-sick
-		// apiserver.
-		if !apimeta.IsNoMatchError(err) {
+		// error (RBAC denial, 5xx, timeout, 404/NoMatch, 429, ctx
+		// cancellation) is returned as itself rather than masked by
+		// a heavier re-read that fails the same way while doubling
+		// the load on an already-sick apiserver.
+		if !metaUnsupported(err) {
 			return nil, err
 		}
 		firstErr = err
@@ -132,6 +134,26 @@ func ListPartialOrFallback(ctx context.Context,
 		return nil, firstErr
 	}
 	return nil, fmt.Errorf("no client available for metadata list of %s", gvr)
+}
+
+// metaUnsupported reports whether a metadata-list failure means the
+// metadata ENDPOINT itself cannot serve the resource — the only
+// error class allowed to trigger the heavier fallbacks. Everything
+// else surfaces verbatim: a 404/NoMatch (the GVR genuinely is not
+// served), 403 RBAC denial, 429 throttling, context cancellation,
+// or a plain transport failure must not be masked by a second,
+// heavier read of the same broken endpoint.
+func metaUnsupported(err error) bool {
+	// 406 Not Acceptable: the apiserver — or an aggregated apiserver
+	// in front of it — does not serve meta.k8s.io/v1
+	// PartialObjectMetadata for this resource.
+	if apierrors.IsNotAcceptable(err) {
+		return true
+	}
+	// The client-go metadata fake's scheme/tracker rejects resources
+	// it never registered — a test-harness limitation, not an API
+	// failure; the typed/dynamic fallbacks exist precisely for it.
+	return runtime.IsNotRegisteredError(err)
 }
 
 // listPartialViaMeta pages the metadata client. PartialObjectMetadataList
@@ -180,8 +202,20 @@ func listPartialViaDynamic(ctx context.Context, dyn dynamic.Interface,
 		}
 	}()
 
-	if gvr.Group != "" && opts.Limit == 0 {
-		opts.Limit = crdListPageSize
+	// Clamp the page bound both ways so no caller can request an
+	// unbounded first page of unstructured objects — the RAM spike
+	// this helper exists to avoid. An unset Limit gets the group
+	// default (CRDs page small — they are the payload-heavy case);
+	// an explicit Limit above the shared page ceiling is capped
+	// (pagination still reaches every item, just in smaller pages).
+	if opts.Limit <= 0 {
+		if gvr.Group != "" {
+			opts.Limit = crdListPageSize
+		} else {
+			opts.Limit = DefaultListPageSize
+		}
+	} else if opts.Limit > DefaultListPageSize {
+		opts.Limit = DefaultListPageSize
 	}
 	getter := dyn.Resource(gvr)
 	var ri dynamic.ResourceInterface = getter

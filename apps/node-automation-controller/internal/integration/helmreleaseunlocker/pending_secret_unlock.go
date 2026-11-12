@@ -210,7 +210,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// failed-hook-Job sweep that rides the unlock is terminal-object
 	// GC (exempt) covered by the same grant.
 	nowT := u.now.Now()
-	proceed, unverifiable := heal.Gate(ctx, log, &u.verdict,
+	proceed, unverifiable := heal.Gate(ctx, log, u.verdict,
 		u.cs, u.dyn, key, nowT)
 	switch {
 	case unverifiable:

@@ -1,4 +1,4 @@
-// dragonfly_heals.go — the dragonfly auto-heals of the
+// stateful_masterless_heals.go — the dragonfly auto-heals of the
 // stateful-masterless-services check (stateful-masterless-services step 1 + dual-replica-deadlock step 2):
 // the dragonfly-operator leader delete forcing master re-election,
 // and the dual-replica deadlock heal deleting the lowest-ordinal
@@ -136,7 +136,10 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	}
 	if !didDelete {
 		// Quorum reservation denied — a sibling check already spent
-		// this workload's one-disruption slot this sweep.
+		// this workload's one-disruption slot this sweep. Clean
+		// deferral: no mutation ran, so the grant HealAllowedPersisted
+		// consumed bought no heal — hand it back (budget.go contract).
+		heal.RefundGrant(now)
 		log.Info("DEFER: workload disruption already reserved this sweep",
 			"pod", target.Namespace+"/"+target.Name)
 		return
@@ -344,7 +347,10 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 	if !didDelete {
 		// Quorum reservation denied — a sibling check already spent
-		// this workload's one-disruption slot this sweep.
+		// this workload's one-disruption slot this sweep. Clean
+		// deferral: no mutation ran, so the grant HealAllowedPersisted
+		// consumed bought no heal — hand it back (budget.go contract).
+		heal.RefundGrant(now)
 		log.Info("DEFER: workload disruption already reserved this sweep",
 			"pod", target.Namespace+"/"+target.Name)
 		return

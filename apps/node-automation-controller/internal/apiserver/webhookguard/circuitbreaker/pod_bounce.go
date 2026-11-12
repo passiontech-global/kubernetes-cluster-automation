@@ -151,7 +151,7 @@ func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot
 	g := snap.G
 	log := logf.FromContext(ctx)
 	proceed, unverifiable, _, refused, err := heal.EvictPodV(ctx, log,
-		&g.Verdict, g.CS, g.Dyn, &b.bounceAt, svcKey, BounceCooldown,
+		g.Verdict, g.CS, g.Dyn, &b.bounceAt, svcKey, BounceCooldown,
 		target, now)
 	if !proceed {
 		// Cooldown / held mutex / spent budget — the preamble already

@@ -160,6 +160,10 @@ var endpointsGVR = schema.GroupVersionResource{Version: "v1", Resource: "endpoin
 
 type apiServerEndpointGuard struct {
 	cs kubernetes.Interface
+	// nodeReader is the manager's informer-cache client for the
+	// peer-IP node census (kube.ListNodesCached) — nil in tests
+	// falls back to the direct clientset read.
+	nodeReader kube.CachedNodeReader
 	// dyn is the dynamic client — used ONLY for the deprecated
 	// core/v1 Endpoints object (unstructured, so the deprecated type
 	// is never named); slices/discovery stay on the typed clientset.
@@ -192,6 +196,13 @@ type apiServerEndpointGuard struct {
 	clientMu sync.Mutex
 	backends map[string]*backendProbeState
 	log      logr.Logger
+	// interval/quarantineInterval are the test seam for Start's
+	// adaptive cadence — <=0 (production, unset) resolves to the
+	// endpointGuardInterval/endpointGuardQuarantineInterval consts;
+	// tests inject milliseconds so the cycle test doesn't sleep
+	// ~40s.
+	interval           time.Duration
+	quarantineInterval time.Duration
 	// quarantineActive switches Start to the faster re-apply cadence —
 	// set from the annotation each cycle.
 	quarantineActive bool
@@ -227,7 +238,7 @@ type apiServerEndpointGuard struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		mgr, cs := d.Mgr, d.CS
-		g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, backends: map[string]*backendProbeState{}}
+		g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, nodeReader: d.Mgr.GetClient(), backends: map[string]*backendProbeState{}}
 		g.probeFn = g.probe
 		g.log = mgr.GetLogger().WithName(g.queue)
 		// Dedicated dynamic client filtering the "v1 Endpoints is
@@ -268,7 +279,7 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 		log = logf.FromContext(ctx).WithName(g.queue)
 	}
 	ctx = logf.IntoContext(ctx, log)
-	interval := endpointGuardInterval
+	interval := g.sweepInterval()
 	// Startup jitter, same contract as shared.Periodic's first-tick
 	// offset: the first sweep lands in [0, interval) instead of a
 	// fixed interval, so a freshly-elected leader (or a pod restart
@@ -277,7 +288,7 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 	for {
 		wait := interval
 		if first {
-			wait = rand.N(endpointGuardInterval)
+			wait = rand.N(g.sweepInterval())
 			first = false
 		}
 		timer := time.NewTimer(wait)
@@ -319,9 +330,27 @@ func (g *apiServerEndpointGuard) runCycle(ctx context.Context,
 		log.Error(err, "sweep failed")
 	}
 	if g.quarantineActive {
-		return endpointGuardQuarantineInterval
+		return g.quarantineCadence()
+	}
+	return g.sweepInterval()
+}
+
+// sweepInterval resolves the steady-state cadence — the injected
+// test knob when positive, else the production const.
+func (g *apiServerEndpointGuard) sweepInterval() time.Duration {
+	if g.interval > 0 {
+		return g.interval
 	}
 	return endpointGuardInterval
+}
+
+// quarantineCadence resolves the fast re-apply cadence while the
+// quarantine set is non-empty — same <=0 → const contract.
+func (g *apiServerEndpointGuard) quarantineCadence() time.Duration {
+	if g.quarantineInterval > 0 {
+		return g.quarantineInterval
+	}
+	return endpointGuardQuarantineInterval
 }
 
 func (g *apiServerEndpointGuard) run(ctx context.Context) error {

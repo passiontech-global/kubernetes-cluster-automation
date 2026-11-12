@@ -4,7 +4,7 @@
 // master-role candidate pairing, the per-candidate zero-endpoint
 // streak + signature eval, the ledger/report close, the heal
 // dispatch for due candidates, and the verdict composition. The
-// dragonfly/db-operator heals themselves live in dragonfly_heals.go
+// dragonfly/db-operator heals themselves live in stateful_masterless_heals.go
 // / db_operator_heals.go.
 package datastore
 

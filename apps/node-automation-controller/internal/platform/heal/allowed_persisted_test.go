@@ -15,7 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
@@ -113,7 +113,7 @@ func TestAllowedVPersistedClearGateProceeds(t *testing.T) {
 	var ledger state.CooldownSet
 
 	proceed, unverifiable := AllowedVPersisted(context.Background(),
-		logr.Discard(), &kube.Verdict{}, fake.NewSimpleClientset(),
+		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
 		testhelp.NewDynamicClient(), &ledger, obj,
 		"passiontech.dev/last-heal", "k", time.Hour, now)
 	if !proceed || unverifiable {

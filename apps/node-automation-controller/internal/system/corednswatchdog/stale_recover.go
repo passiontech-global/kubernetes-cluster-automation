@@ -108,7 +108,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	// on time.Equal — a second w.now.Now() call would miss the stamp
 	// by nanoseconds and silently keep the grant.
 	gateNow := w.now.Now()
-	proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
+	proceed, unverifiable := heal.AllowedV(ctx, log, w.verdict,
 		w.cs, w.dyn, nil, "coredns", 0, gateNow)
 	if unverifiable {
 		metrics.IncError(w.queue)

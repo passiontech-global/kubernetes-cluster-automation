@@ -125,7 +125,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// Cordon/drain/kured or an in-flight upgrade defers the bounce,
 	// and "cannot verify" (unverifiable) skips it AND IncErrors the
 	// queue.
-	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, &n.verdict, n.cs, n.dyn,
+	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, n.verdict, n.cs, n.dyn,
 		&n.connectHeals, nil, "", esConnectPodPrefix, esConnectHealCooldown, now)
 	switch {
 	case unverifiable:

@@ -295,7 +295,7 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 	// mutex fails closed with the error surfaced on the queue. The
 	// cooldown key is the node-agent's node — the same key the
 	// caller stamped under.
-	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs, a.dyn,
+	proceed, unverifiable := heal.AllowedV(ctx, log, a.verdict, a.cs, a.dyn,
 		&a.pvbHealed, "node-agent/"+pvbNode(obj), veleroPVBCleanupCooldown, now)
 	switch {
 	case unverifiable:
