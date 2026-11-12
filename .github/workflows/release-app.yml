@@ -325,6 +325,13 @@ jobs:
           # exists (a failed gh release create leaves :latest alone)
           # and never for prereleases.
           if [ "$REL_PRERELEASE" != "true" ]; then
+            # --prefer-index=false: imagetools' default wraps the single
+            # source manifest in a manifest LIST, giving :latest a
+            # different digest than the semver tag (they no longer
+            # appear together on the package page). Forcing a plain
+            # manifest copy keeps :latest on the SAME digest, matching
+            # the old ko --tags "vX.Y.Z,latest" behavior.
             docker buildx imagetools create \
+              --prefer-index=false \
               -t "${IMAGE}:latest" "${IMAGE}:${REL_DOCKER_VERSION}"
           fi
