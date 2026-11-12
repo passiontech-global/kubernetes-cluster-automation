@@ -29,7 +29,7 @@ func TestCiliumDatapathMapGuard(t *testing.T) {
 		p.HTTPClient = srv.Client()
 		chk := probetest.MustCheck[*ciliumDatapathMapCheck](t, p)
 
-		res := chk.Run(ctx)
+		res := chk.Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatal("breached signatures must fail the check")
 		}
@@ -48,7 +48,7 @@ func TestCiliumDatapathMapGuard(t *testing.T) {
 		p := testProber(fake.NewSimpleClientset())
 		p.Cfg.HTTPContent.URL = srv.URL
 		p.HTTPClient = srv.Client()
-		res := probetest.MustCheck[*ciliumDatapathMapCheck](t, p).Run(ctx)
+		res := probetest.MustCheck[*ciliumDatapathMapCheck](t, p).Run(probetest.SweepCtx(ctx))
 		if !res.Pass {
 			t.Fatalf("clean datapath must pass: %+v", res)
 		}
@@ -67,7 +67,7 @@ func TestCiliumDatapathMapGuardQueryFailureCarryForward(t *testing.T) {
 		p := testProber(fake.NewSimpleClientset())
 		p.Cfg.HTTPContent.URL = dead
 		p.HTTPClient = http.DefaultClient
-		res := probetest.MustCheck[*ciliumDatapathMapCheck](t, p).Run(ctx)
+		res := probetest.MustCheck[*ciliumDatapathMapCheck](t, p).Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatalf("failed queries must not read healthy: %+v", res)
 		}
@@ -87,14 +87,14 @@ func TestCiliumDatapathMapGuardQueryFailureCarryForward(t *testing.T) {
 		p.Cfg.HTTPContent.URL = srv.URL
 		p.HTTPClient = srv.Client()
 		chk := probetest.MustCheck[*ciliumDatapathMapCheck](t, p)
-		if res := chk.Run(ctx); res.Pass {
+		if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Fatalf("breach must fail: %+v", res)
 		}
 
 		// Prometheus goes away — the previous gauge value must hold.
 		p.Cfg.HTTPContent.URL = dead
 		p.HTTPClient = http.DefaultClient
-		res := chk.Run(ctx)
+		res := chk.Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatalf("query outage must be Infra, not healthy: %+v", res)
 		}

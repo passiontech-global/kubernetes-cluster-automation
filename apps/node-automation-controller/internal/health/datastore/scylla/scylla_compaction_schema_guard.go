@@ -57,6 +57,27 @@ type scyllaCompactionSchemaGuardCheck struct {
 	emittedOverload    state.GaugeLedger[string]
 	shardImbalanceSeen state.FirstSeenLedger
 	overloadLast       map[string]scyllaOverloadSample
+	// carryLast is last sweep's per-pod evidence ("ns/pod" →
+	// scyllaPodEvidence), re-asserted verbatim for pods whose
+	// :9180 scrape failed this sweep — a dead metrics endpoint is
+	// inconclusive, not resolved: without the carry one transient
+	// fetch failure would prune live series, drop the split-brain
+	// member's version set and reset the shard-imbalance window.
+	carryLast map[string]scyllaPodEvidence
+}
+
+// scyllaPodEvidence is one member pod's last-sweep findings, kept so
+// an inconclusive scrape can re-assert them — the gauge VALUES
+// (backlog count, stall deltas) and the skew finding's detail text
+// are not recoverable from the emitted ledger's label tuples alone.
+type scyllaPodEvidence struct {
+	backlog      float64            // last pending-compactions reading
+	backlogHot   bool               // was over scyllaCompactionBacklogMax
+	shardSkewed  bool               // skew signature present (keeps the first-seen stamp)
+	shardEmitted bool               // past the window — the gauge tuple was live
+	shardDetail  string             // skew finding detail
+	overload     map[string]float64 // reason → last emitted stall delta
+	versions     map[float64]bool   // last coordinator schema-version set
 }
 
 // NewScyllaCompactionSchemaGuardCheck builds the guard — its only
@@ -161,8 +182,14 @@ type scyllaOverloadSample struct {
 func (p *scyllaCompactionSchemaGuardCheck) scyllaPodMetrics(ctx context.Context,
 	pod *corev1.Pod) (*scyllaScrape, bool) {
 
+	// 16 MiB ceiling: a ScyllaDB node's :9180/metrics carries
+	// per-shard, per-table and per-endpoint series — on a large
+	// cluster the exposition legitimately exceeds the generic 4 MiB
+	// cap, and FetchPodMetrics' maxBytes+1 read turns an over-cap
+	// body into an explicit truncation error instead of a silently
+	// parsed partial vector.
 	body, err := probefw.FetchPodMetrics(ctx, p.HTTPClient,
-		pod.Status.PodIP, scyllaMetricsPort, scyllaMetricsTimeout, 4<<20)
+		pod.Status.PodIP, scyllaMetricsPort, scyllaMetricsTimeout, 16<<20)
 	if err != nil {
 		return nil, false
 	}
@@ -261,8 +288,8 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 	// cluster -> namespace -> distinct schema versions across members.
 	clusterVersions := map[string]map[string]map[float64]bool{}
 	var backlogRep, shardRep, overloadRep probefw.SweepReport
-	scrapedLive := map[string]bool{} // "ns/pod" successfully scraped — the baselines' keep set
-	shardLive := map[string]bool{}   // "ns/pod" showing the skew THIS sweep — the imbalance ledger's
+	memberLive := map[string]bool{} // "ns/pod" still a scrape candidate — inconclusive keeps baselines + carry evidence
+	shardLive := map[string]bool{}  // "ns/pod" showing the skew THIS sweep (or carried) — the imbalance ledger's
 	// Candidate pods scrape through a bounded worker pool (max
 	// scyllaScrapeWorkers concurrent :9180 fetches); the signatures
 	// apply serially below.
@@ -280,7 +307,16 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 	g := errgroup.Group{}
 	g.SetLimit(scyllaScrapeWorkers)
 	for j, pod := range members {
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			// A panic in one pod's metrics scrape reads as that
+			// pod's inconclusive sample (nil scrape) — never a
+			// process crash.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Info("WARN: scylla pod metrics scrape panicked — evidence inconclusive",
+						"pod", pod.Namespace+"/"+pod.Name, "panic", r)
+				}
+			}()
 			sc, ok := p.scyllaPodMetrics(ctx, pod)
 			if ok {
 				scrapes[j] = sc
@@ -289,41 +325,53 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		})
 	}
 	_ = g.Wait()
+	if p.carryLast == nil {
+		p.carryLast = map[string]scyllaPodEvidence{}
+	}
 	for j, pod := range members {
+		podKey := pod.Namespace + "/" + pod.Name
+		memberLive[podKey] = true
 		sc := scrapes[j]
 		if sc == nil {
 			// A dead metrics endpoint is inconclusive — the pod may
-			// be mid-restart; never read as healthy OR sick.
+			// be mid-restart; never read as healthy OR sick. Carry
+			// last sweep's evidence so the flap can't prune live
+			// series or reset first-seen windows.
 			log.Info("WARN: scylla pod metrics fetch failed — compaction/schema evidence inconclusive",
-				"pod", pod.Namespace+"/"+pod.Name)
+				"pod", podKey)
+			p.carryScyllaPod(pod, podKey, &backlogRep, &shardRep,
+				&overloadRep, clusterVersions, shardLive)
 			continue
 		}
-		podKey := pod.Namespace + "/" + pod.Name
-		scrapedLive[podKey] = true
+		ev := scyllaPodEvidence{backlog: sc.backlog, versions: sc.versions}
 		if sc.backlog > scyllaCompactionBacklogMax {
 			backlogRep.Set(scyllaCompactionBacklogGauge, sc.backlog,
 				podKey,
 				[]string{pod.Namespace, pod.Name})
 			backlogRep.Find(fmt.Sprintf(
 				"%s/%s=%.0f", pod.Namespace, pod.Name, sc.backlog))
+			ev.backlogHot = true
 		}
 		// scylla-shard-imbalance — hot-partition skew: the busiest shard saturated
 		// while the pod's average shard idles, persisting 10m.
 		if max, avg, n := shardSkew(sc.shards); n >= scyllaShardImbalanceMinSets &&
 			max >= scyllaShardHotUtil && avg <= scyllaShardAvgUtilMax {
 			shardLive[podKey] = true
+			ev.shardSkewed = true
+			ev.shardDetail = fmt.Sprintf("%s/%s max_shard=%.2f avg_shard=%.2f",
+				pod.Namespace, pod.Name, max, avg)
 			if probefw.Persisted(&p.shardImbalanceSeen, podKey, p.Now(),
 				scyllaShardImbalanceMinAge, log) {
 				shardRep.Emit(scyllaShardImbalanceGauge, podKey,
-					[]string{pod.Namespace, pod.Name},
-					fmt.Sprintf("%s/%s max_shard=%.2f avg_shard=%.2f",
-						pod.Namespace, pod.Name, max, avg))
+					[]string{pod.Namespace, pod.Name}, ev.shardDetail)
+				ev.shardEmitted = true
 			}
 		}
 		// scylla-shard-imbalance — stall counters: a positive delta since the last
 		// scrape is a stall in progress; a drop means the pod
 		// restarted its counters, not evidence either way.
-		p.scyllaOverloadDelta(&overloadRep, pod, sc.overload)
+		ev.overload = p.scyllaOverloadDelta(&overloadRep, pod, sc.overload)
+		p.carryLast[podKey] = ev
 		ck := pod.Namespace + "/" + pod.Labels[scyllaClusterLabel]
 		set := clusterVersions[ck]
 		if set == nil {
@@ -332,14 +380,20 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		}
 		set[pod.Name] = sc.versions
 	}
-	// Resolved pods drop out of the imbalance window and the counter
-	// baselines — a fresh occurrence re-arms both.
+	// Resolved pods drop out of the imbalance window, the counter
+	// baselines and the carry evidence — a fresh occurrence re-arms
+	// all three. memberLive (not scrape success) is the keep set: a
+	// pod still in the census but mid-scrape-failure keeps its
+	// baseline so the post-gap delta still spans the stall.
 	p.shardImbalanceSeen.Prune(func(k string) bool { return shardLive[k] })
-	if p.overloadLast != nil {
-		for k := range p.overloadLast {
-			if !scrapedLive[k] {
-				delete(p.overloadLast, k)
-			}
+	for k := range p.overloadLast {
+		if !memberLive[k] {
+			delete(p.overloadLast, k)
+		}
+	}
+	for k := range p.carryLast {
+		if !memberLive[k] {
+			delete(p.carryLast, k)
 		}
 	}
 
@@ -376,6 +430,54 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		probefw.Section("overload stalls: %s", overloadRep.Sorted()))
 }
 
+// carryScyllaPod re-asserts last sweep's evidence for one member
+// pod whose metrics scrape failed this sweep — "can't tell" is not
+// "resolved": the live tuples stay emitted, the skew first-seen
+// stamp keeps counting through shardLive, and the pod's schema
+// versions fold back into the split census so a one-sweep gap
+// can't make a live split look healed.
+func (p *scyllaCompactionSchemaGuardCheck) carryScyllaPod(
+	pod *corev1.Pod, podKey string,
+	backlogRep, shardRep, overloadRep *probefw.SweepReport,
+	clusterVersions map[string]map[string]map[float64]bool,
+	shardLive map[string]bool) {
+
+	ev, ok := p.carryLast[podKey]
+	if !ok {
+		return // never scraped successfully — nothing to carry
+	}
+	ck := pod.Namespace + "/" + pod.Labels[scyllaClusterLabel]
+	set := clusterVersions[ck]
+	if set == nil {
+		set = map[string]map[float64]bool{}
+		clusterVersions[ck] = set
+	}
+	set[pod.Name] = ev.versions
+	if ev.backlogHot {
+		backlogRep.Set(scyllaCompactionBacklogGauge, ev.backlog, podKey,
+			[]string{pod.Namespace, pod.Name})
+		backlogRep.Find(fmt.Sprintf("%s/%s=%.0f",
+			pod.Namespace, pod.Name, ev.backlog))
+	}
+	if ev.shardSkewed {
+		// Keep the first-seen stamp alive either way; only a tuple
+		// that was actually emitted re-asserts the gauge — an
+		// inside-window skew must not fire early off carried state.
+		shardLive[podKey] = true
+		if ev.shardEmitted {
+			shardRep.Emit(scyllaShardImbalanceGauge, podKey,
+				[]string{pod.Namespace, pod.Name}, ev.shardDetail)
+		}
+	}
+	for reason, delta := range ev.overload {
+		key := podKey + "/" + reason
+		overloadRep.Set(scyllaOverloadStallGauge, delta, key,
+			[]string{pod.Namespace, pod.Name, reason})
+		overloadRep.Find(fmt.Sprintf("%s/%s %s+%.0f",
+			pod.Namespace, pod.Name, reason, delta))
+	}
+}
+
 // shardSkew folds a pod's per-shard reactor utilization into
 // (max, avg, count) — the caller compares against the scylla-shard-imbalance hot /
 // idle thresholds.
@@ -400,7 +502,7 @@ func shardSkew(shards map[string]float64) (max, avg float64, n int) {
 // that decreased means the pod restarted — the baseline is simply
 // replaced.
 func (p *scyllaCompactionSchemaGuardCheck) scyllaOverloadDelta(
-	rep *probefw.SweepReport, pod *corev1.Pod, cur scyllaOverloadSample) {
+	rep *probefw.SweepReport, pod *corev1.Pod, cur scyllaOverloadSample) map[string]float64 {
 
 	podKey := pod.Namespace + "/" + pod.Name
 	if p.overloadLast == nil {
@@ -408,8 +510,9 @@ func (p *scyllaCompactionSchemaGuardCheck) scyllaOverloadDelta(
 	}
 	last, have := p.overloadLast[podKey]
 	p.overloadLast[podKey] = cur
+	deltas := map[string]float64{}
 	if !have {
-		return
+		return deltas
 	}
 	for _, d := range []struct {
 		reason string
@@ -427,5 +530,7 @@ func (p *scyllaCompactionSchemaGuardCheck) scyllaOverloadDelta(
 			[]string{pod.Namespace, pod.Name, d.reason})
 		rep.Find(fmt.Sprintf("%s/%s %s+%.0f", pod.Namespace, pod.Name,
 			d.reason, d.delta))
+		deltas[d.reason] = d.delta
 	}
+	return deltas
 }

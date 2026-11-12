@@ -286,6 +286,9 @@ func TestClocksourceRestoreKvmClock(t *testing.T) {
 		clocksourceLabels("hpet")); !ok || v != 1 {
 		t.Fatalf("non_tsc=%v ok=%v want 1 (hpet drifted)", v, ok)
 	}
+	// Collect is read-only — the restore write fires on the latch
+	// tick's reconcileHostWrites pass.
+	c.reconcileHostWrites()
 	b, err := os.ReadFile(cfg.ClocksourceCurrentFile)
 	if err != nil || string(b) != "kvm-clock\n" {
 		t.Fatalf("current_clocksource=%q err=%v want kvm-clock restore", b, err)
@@ -395,6 +398,7 @@ func TestClocksourceRestoreWriteFailure(t *testing.T) {
 		map[string]string{"node": "node-a", "clocksource": "hpet"}); !ok || v != 1 {
 		t.Fatalf("degraded=%v ok=%v want 1 despite the failed restore", v, ok)
 	}
+	c.reconcileHostWrites()
 	if got := strings.TrimSpace(testutil.ReadFile(t, cfg.ClocksourceCurrentFile)); got != "hpet" {
 		t.Fatalf("current clocksource rewritten to %q through a failed write", got)
 	}

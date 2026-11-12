@@ -39,7 +39,7 @@ func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 		})
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("absent Application CRD must pass: %+v", res)
 	}
 }
@@ -53,11 +53,11 @@ func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	// First sighting stamps the first-seen ledger — still inside 45m.
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("young Progressing app must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("Progressing >45m must fail: %+v", res)
 	}
@@ -102,11 +102,11 @@ func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-only app must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-only app must still pass past the window: %+v", res)
 	}
 	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
@@ -151,11 +151,11 @@ func TestArgoCDAppStuckSkipsDownscaledRollout(t *testing.T) {
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-Rollout-only app must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-Rollout-only app must pass past the window: %+v", res)
 	}
 	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
@@ -195,11 +195,11 @@ func TestArgoCDAppStuckSkipsDownscaledStatefulSet(t *testing.T) {
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-StatefulSet-only app must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
-	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled-StatefulSet-only app must pass past the window: %+v", res)
 	}
 	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
@@ -236,9 +236,9 @@ func TestArgoCDAppStuckZeroReplicaNoAnnotationStillFlags(t *testing.T) {
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
 
-	probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("unexplained replicas:0 must still flag: %+v", res)
 	}
@@ -264,7 +264,7 @@ func TestArgoCDAppStuckPersistedFirstSeenResume(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "resume-app", "progressing>45m0s")
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("persisted Progressing must fail on the first post-restart sweep: %+v", res)
 	}
@@ -302,7 +302,7 @@ func TestArgoCDRefreshPersistedCooldownGate(t *testing.T) {
 	testutil.CleanupMetric(t, argoCDAppStuckGauge,
 		"argocd", "cooled-app", "progressing>45m0s")
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stuck app must still FAIL inside the refresh cooldown: %+v", res)
 	}
@@ -338,7 +338,7 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	cs := fake.NewSimpleClientset(older, newer)
 	p := testProberDyn(cs, dyn)
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("two ComparisonErrors must fail: %+v", res)
 	}
@@ -374,7 +374,7 @@ func TestArgoCDRepoServerPendingPodNotPicked(t *testing.T) {
 	cs := fake.NewSimpleClientset(pending, running)
 	p := testProberDyn(cs, dyn)
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("two ComparisonErrors must fail: %+v", res)
 	}
@@ -413,7 +413,7 @@ func TestArgoCDRepoServerUnownedPodNotDeleted(t *testing.T) {
 	cs := fake.NewSimpleClientset(lone)
 	p := testProberDyn(cs, testutil.NewDynamicClient(appA, appB))
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("two ComparisonErrors must still fail: %+v", res)
 	}
@@ -438,7 +438,7 @@ func TestArgoCDAppStuckCRDAbsentPrunesLedgers(t *testing.T) {
 	chk := probetest.MustCheck[*argoCDAppStuckCheck](t, p)
 	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "gone-app", "progressing>45m0s")
 
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("precondition: stuck app must FAIL: %+v", res)
 	}
 
@@ -453,7 +453,7 @@ func TestArgoCDAppStuckCRDAbsentPrunesLedgers(t *testing.T) {
 				schema.GroupResource{Group: "argoproj.io", Resource: "applications"}, "")
 		})
 	crdGone = true
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("absent CRD must pass: %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&chk.seen); len(keys) != 0 {
@@ -485,7 +485,7 @@ func TestArgoCDRefreshDefersUnderMaintenance(t *testing.T) {
 	testutil.CleanupMetric(t, argoCDAppStuckGauge,
 		"argocd", "maint-app", "progressing>45m0s")
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stuck app must still FAIL under maintenance: %+v", res)
 	}
@@ -542,7 +542,7 @@ func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
 	p := testProberDyn(cs, dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("downscaled-only apps must pass: %+v", res)
 	}

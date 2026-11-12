@@ -135,14 +135,28 @@ func FluxManagerOf(obj metav1.Object) string {
 
 // FluxPatchGate decides whether a desired-state heal patch may write
 // obj: proceed=true when no Flux manager owns fields on the object,
-// or when this key's repeat count inside the window is still below
-// the loop threshold. At the threshold the patch is the ping-pong
-// half of a Heal-Revert Loop — proceed=false SKIPS the write (the
-// conflict is reported, never fought) and the hook fires.
+// or when this key's in-window repeat count is still below the loop
+// threshold. At the threshold the patch is the ping-pong half of a
+// Heal-Revert Loop — proceed=false SKIPS the write (the conflict is
+// reported, never fought) and the hook fires.
+//
+// The sighting is recorded ONLY on an allowed patch: a denied call
+// must not re-arm the window. Recording on denial was the lockout
+// bug — every skipped sweep appended a fresh stamp, so the 30m
+// window never drained and the object stayed gated forever instead
+// of releasing one window after Flux stopped reverting. With
+// record-on-allow the count decays: max stamps inside window →
+// deny without stamping → window expires → allow again.
 //
 // kind is the patch site's kind spelling for the signal ("webhook
 // config", "csv", ...); key the site's stable object key. now comes
 // from the caller's clock seam, like every heal gate.
+//
+// Emergency writes — the webhookguard Fail->Ignore bootstrap flip —
+// do NOT call this gate at all: a Git-owned webhook config on a
+// cluster that cannot boot is not a drift fight, and gating it would
+// deadlock bring-up (Git cannot fix drift on a cluster it locks out
+// of existence).
 func FluxPatchGate(kind string, obj metav1.Object, key string,
 	now time.Time) bool {
 
@@ -155,25 +169,46 @@ func FluxPatchGate(kind string, obj metav1.Object, key string,
 		loop.forget(key) // not Git-owned — drop any stale loop history
 		return true
 	}
-	if n := loop.record(key, now); n < loop.max {
-		return true
+	// This call would be sighting #(count+1) — deny when it reaches
+	// the threshold, exactly the boundary the record-then-count
+	// shape enforced (max=3 denies the third repeat).
+	if loop.count(key, now)+1 >= loop.max {
+		if fn := fluxConflictHook.Load(); fn != nil {
+			(*fn)(FluxConflictSignal{
+				Kind: kind, Namespace: obj.GetNamespace(),
+				Name: obj.GetName(), Manager: manager, Key: key,
+			})
+		}
+		return false
 	}
-	if fn := fluxConflictHook.Load(); fn != nil {
-		(*fn)(FluxConflictSignal{
-			Kind: kind, Namespace: obj.GetNamespace(),
-			Name: obj.GetName(), Manager: manager, Key: key,
-		})
-	}
-	return false
+	loop.record(key, now)
+	return true
 }
 
-// record appends now to key's window and returns the in-window count.
-// Stamps expire oldest-first (append order); an all-expired key drops
-// entirely. The whole map sweeps for expired keys once the key set
-// passes the cap — the ledger is keyed by patched objects, so the
-// cap only trips on a pathological fleet-wide conflict storm, exactly
-// when unbounded growth would matter.
-func (l *fluxConflictLoop) record(key string, now time.Time) int {
+// count reports how many of key's stamps still sit inside the
+// window — the read half of the gate, run BEFORE record so a denied
+// call leaves the window untouched.
+func (l *fluxConflictLoop) count(key string, now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cut := now.Add(-l.window)
+	n := 0
+	for _, t := range l.hits[key] {
+		if t.After(cut) {
+			n++
+		}
+	}
+	return n
+}
+
+// record appends now to key's window — called only for an ALLOWED
+// patch (see FluxPatchGate). Stamps expire oldest-first (append
+// order); an all-expired key drops entirely. The whole map sweeps
+// for expired keys once the key set passes the cap — the ledger is
+// keyed by patched objects, so the cap only trips on a pathological
+// fleet-wide conflict storm, exactly when unbounded growth would
+// matter.
+func (l *fluxConflictLoop) record(key string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	cut := now.Add(-l.window)
@@ -196,7 +231,6 @@ func (l *fluxConflictLoop) record(key string, now time.Time) int {
 			}
 		}
 	}
-	return len(l.hits[key])
 }
 
 // forget drops key's loop history — a site whose object lost its

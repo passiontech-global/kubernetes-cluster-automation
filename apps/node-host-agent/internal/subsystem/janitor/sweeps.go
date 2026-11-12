@@ -113,10 +113,14 @@ func (j *Janitor) sweepLatches() {
 		default:
 			rule = "max-age"
 		}
-		p := filepath.Join(j.cfg.WatchdogStateDir, e.Name())
-		if err := os.Remove(p); err != nil {
+		// ReapStaleLatch removes the file AND the RAM owner holds
+		// in one critical section — a bare os.Remove would leave
+		// shared.owners claiming holds on a latch that no longer
+		// exists, so the next EnterFrom skips the post-restart seed
+		// and joins phantom holders.
+		if !j.state.ReapStaleLatch(key) {
 			j.state.AppendLog(fmt.Sprintf(
-				"suspect: rm stale latch %s failed: %v", e.Name(), err))
+				"suspect: rm stale latch %s failed", e.Name()))
 			continue
 		}
 		j.state.AppendLog(fmt.Sprintf(
@@ -129,33 +133,29 @@ func (j *Janitor) sweepLatches() {
 
 // --- B: ghost systemd units + orphan `ip monitor` ---
 
-// sweepLegacyUnits parses ONE `systemctl list-units --all` and heals
-// the retired-unit records systemd keeps after their files are gone:
+// sweepLegacyUnits lists ONE systemd unit inventory through
+// systemd.Client.ListUnits (D-Bus ListUnits when the private bus is
+// reachable, systemctl list-units otherwise) and heals the retired-
+// unit records systemd keeps after their files are gone:
 // Active=failed → reset-failed; LoadState=not-found but still
-// active/activating → stop (retired code still running) + reset-failed.
-// Only names on the legacy list are touched.
+// active/activating → stop (retired code still running) +
+// reset-failed. Only names on the legacy list are touched. The stop
+// goes through Client.Stop — same blocking job-wait contract the
+// forked `systemctl stop` had, without the fork.
 func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 	if j.cfg.Systemd == nil {
 		j.cycles.WithLabelValues(checkLegacyUnits, "gated").Inc()
 		return
 	}
-	out, err := j.cfg.Systemd.Exec(ctx, "systemctl", "list-units",
-		"--all", "--no-legend", "--no-pager", "--plain")
+	units, err := j.cfg.Systemd.ListUnits(ctx)
 	if err != nil {
 		j.cycles.WithLabelValues(checkLegacyUnits, "abort").Inc()
 		j.state.AppendLog(fmt.Sprintf(
-			"janitor: systemctl list-units failed: %v (%s)",
-			err, strings.TrimSpace(out)))
+			"janitor: systemd list-units failed: %v", err))
 		return
 	}
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		// UNIT LOAD ACTIVE SUB DESCRIPTION — the first four fields
-		// are what we need; DESCRIPTION may contain spaces.
-		if len(f) < 4 {
-			continue
-		}
-		unit, load, active := f[0], f[1], f[2]
+	for _, u := range units {
+		unit, load, active := u.Name, u.LoadState, u.ActiveState
 		if !isLegacyUnit(unit) {
 			continue
 		}
@@ -165,11 +165,10 @@ func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 		case load == "not-found" && (active == "active" || active == "activating"):
 			// Ghost still running retired code — stop it, then
 			// clear any residual failure state.
-			if sout, serr := j.cfg.Systemd.Exec(ctx,
-				"systemctl", "stop", unit); serr != nil {
+			if serr := j.cfg.Systemd.Stop(ctx, unit); serr != nil {
 				j.state.AppendLog(fmt.Sprintf(
-					"suspect: stop ghost unit %s failed: %v (%s)",
-					unit, serr, strings.TrimSpace(sout)))
+					"suspect: stop ghost unit %s failed: %v",
+					unit, serr))
 				continue
 			}
 			j.state.AppendLog(fmt.Sprintf(

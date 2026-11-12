@@ -322,3 +322,66 @@ func TestTypedPageFuncs(t *testing.T) {
 		})
 	}
 }
+
+// pageOpts sanitizes the apiserver-illegal combinations: a Continue
+// token already encodes the resourceVersion, so BOTH
+// ResourceVersion and ResourceVersionMatch must clear on every
+// paged call (RVM is part of the same consistency contract — leaving
+// it set earns the same 400 "specifying resource version is not
+// allowed when using continue"); and ResourceVersion="0" (the
+// watch-cache read) rejects Limit, so Limit clears there instead.
+func TestPageOptsSanitizesListOptions(t *testing.T) {
+	// Capture the opts each paged call actually receives.
+	var got []metav1.ListOptions
+	page := func(_ context.Context, opts metav1.ListOptions) ([]int, string, error) {
+		got = append(got, opts)
+		if len(got) == 1 {
+			return []int{1}, "tok-1", nil
+		}
+		return []int{2}, "", nil
+	}
+	if err := ListEach(ctx, metav1.ListOptions{
+		ResourceVersion:      "12345",
+		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+		Limit:                DefaultListPageSize,
+	}, page, func([]int) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("paged calls = %d, want 2", len(got))
+	}
+	// First page: no Continue yet — RV/RVM pass through verbatim.
+	if got[0].ResourceVersion != "12345" ||
+		got[0].ResourceVersionMatch != metav1.ResourceVersionMatchNotOlderThan {
+		t.Fatalf("first page opts mutated: %+v", got[0])
+	}
+	// Second page: Continue set — RV AND RVM must both be cleared.
+	if got[1].Continue != "tok-1" {
+		t.Fatalf("second page Continue = %q", got[1].Continue)
+	}
+	if got[1].ResourceVersion != "" || got[1].ResourceVersionMatch != "" {
+		t.Fatalf("Continue page kept RV fields: %+v", got[1])
+	}
+	if got[1].Limit != DefaultListPageSize {
+		t.Fatalf("Continue page lost Limit: %+v", got[1])
+	}
+
+	// ResourceVersion="0" (watch-cache read) clears Limit instead —
+	// the cache serves the whole list, pagination is meaningless.
+	got = nil
+	page2 := func(_ context.Context, opts metav1.ListOptions) ([]int, string, error) {
+		got = append(got, opts)
+		return []int{1}, "", nil
+	}
+	if err := ListEach(ctx, metav1.ListOptions{
+		ResourceVersion: "0", Limit: DefaultListPageSize},
+		page2, func([]int) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Limit != 0 {
+		t.Fatalf("RV=0 page kept Limit: %+v", got[0])
+	}
+	if got[0].ResourceVersion != "0" {
+		t.Fatalf("RV=0 page lost ResourceVersion: %+v", got[0])
+	}
+}

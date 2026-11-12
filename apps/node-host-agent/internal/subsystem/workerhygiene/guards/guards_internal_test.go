@@ -1,7 +1,7 @@
 // guards_internal_test.go — package-internal coverage for the
 // unexported guard helpers the external guards_test suites can only
 // reach through full Cycles: the PSI thrash eviction helpers
-// (procRSS, victim ranking, kernel slab-leak guard), the D-state
+// (pod memory.current, victim ranking, kernel slab-leak guard), the D-state
 // wchan/comm classifiers and the calico orphan-veth GC.
 package guards
 
@@ -35,6 +35,10 @@ func gDeps(t *testing.T) (*wdeps.Deps, *wdepstest.Fixture) {
 	f := wdepstest.New(t)
 	cfg := f.Cfg
 	cfg.ApplyDefaults()
+	// Isolate the cgroup-v2 root — pod memory.current fixtures are
+	// planted under it and the real /sys/fs/cgroup must never be
+	// touched by a unit test.
+	cfg.Runtime.CgroupRoot = filepath.Join(t.TempDir(), "cgroup")
 	d := &wdeps.Deps{
 		Cfg:  cfg,
 		Proc: procfs.New(cfg.ProcRoot),
@@ -50,38 +54,56 @@ func gDeps(t *testing.T) (*wdeps.Deps, *wdepstest.Fixture) {
 	return d, f
 }
 
-// mkRSSProc plants /proc/<pid>/{cgroup,status} attributing pid to a
-// pod uid with the given VmRSS kB.
-func mkRSSProc(t *testing.T, d *wdeps.Deps, pid int, uid string, rssKB int64) {
+// mkPodMemProc plants /proc/<pid>/cgroup attributing pid to a pod
+// uid plus the pod cgroup's memory.current under CgroupRoot — the
+// kernel-accounted footprint highestRSSPod ranks victims by. memKB
+// is the pod total in kB (memory.current bytes = memKB<<10).
+func mkPodMemProc(t *testing.T, d *wdeps.Deps, pid int, uid string, memKB int64) {
 	t.Helper()
 	pdir := filepath.Join(d.Cfg.ProcRoot, strconv.Itoa(pid))
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cg := "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" +
-		strings.ReplaceAll(uid, "-", "_") + ".slice/cri-containerd-x.scope\n"
+	podComp := "kubepods-burstable-pod" + strings.ReplaceAll(uid, "-", "_") + ".slice"
+	cg := "0::/kubepods.slice/kubepods-burstable.slice/" + podComp + "/cri-containerd-x.scope\n"
 	if err := os.WriteFile(filepath.Join(pdir, "cgroup"), []byte(cg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	status := "Name:\tx\n"
-	if rssKB > 0 {
-		status += "VmRSS:\t" + strconv.FormatInt(rssKB, 10) + " kB\n"
+	cgdir := filepath.Join(d.Cfg.Runtime.CgroupRoot,
+		"kubepods.slice", "kubepods-burstable.slice", podComp)
+	if err := os.MkdirAll(cgdir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pdir, "status"), []byte(status), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cgdir, "memory.current"),
+		[]byte(strconv.FormatInt(memKB<<10, 10)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
 // --- psi_thrash.go ---
 
-func TestProcRSSReadsKbAsBytes(t *testing.T) {
+func TestPodCgroupRelAndMemoryCurrent(t *testing.T) {
 	d, _ := gDeps(t)
-	mkRSSProc(t, d, 500, wdepstest.UIDA, 100)
-	if got := procRSS(d, 500); got != 100<<10 {
-		t.Fatalf("procRSS=%d want %d", got, 100<<10)
+	mkPodMemProc(t, d, 500, wdepstest.UIDA, 100)
+	rel := podCgroupRel(d, 500, wdepstest.UIDA)
+	want := "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" +
+		strings.ReplaceAll(wdepstest.UIDA, "-", "_") + ".slice"
+	if rel != want {
+		t.Fatalf("podCgroupRel=%q want %q", rel, want)
 	}
-	if got := procRSS(d, 424242); got != 0 {
-		t.Fatalf("procRSS on missing pid=%d want 0", got)
+	if got := podMemoryCurrent(d, rel); got != 100<<10 {
+		t.Fatalf("podMemoryCurrent=%d want %d", got, 100<<10)
+	}
+	// Missing cgroup dir and empty rel both report 0 — the fail-
+	// closed "below the floor" value.
+	if got := podMemoryCurrent(d, "kubepods.slice/nope.slice"); got != 0 {
+		t.Fatalf("podMemoryCurrent missing=%d want 0", got)
+	}
+	if got := podMemoryCurrent(d, ""); got != 0 {
+		t.Fatalf("podMemoryCurrent empty=%d want 0", got)
+	}
+	if got := podCgroupRel(d, 424242, wdepstest.UIDA); got != "" {
+		t.Fatalf("podCgroupRel missing pid=%q want empty", got)
 	}
 }
 
@@ -153,30 +175,30 @@ func TestHighestRSSPodTiersAndRails(t *testing.T) {
 	// Preferred (Burstable, not StatefulSet) vs fallback (Guaranteed):
 	// the preferred tier wins even when the fallback pod's RSS is bigger.
 	d1, _ := gDeps(t)
-	mkRSSProc(t, d1, 11, wdepstest.UIDA, big/2)
-	mkRSSProc(t, d1, 12, wdepstest.UIDB, big)
+	mkPodMemProc(t, d1, 11, wdepstest.UIDA, big/2)
+	mkPodMemProc(t, d1, 12, wdepstest.UIDB, big)
 	preferred := psiPod("pref", "app", wdepstest.UIDA, string(corev1.PodQOSBurstable))
 	fallback := psiPod("guar", "app", wdepstest.UIDB, string(corev1.PodQOSGuaranteed))
-	victim, rss := highestRSSPod(d1, []corev1.Pod{preferred, fallback}, []int{11, 12})
+	victim, mem := highestRSSPod(d1, []corev1.Pod{preferred, fallback}, []int{11, 12})
 	if victim == nil || victim.Name != "pref" {
 		t.Fatalf("victim=%v want preferred tier pod pref", victim)
 	}
-	if rss != big/2<<10 {
-		t.Fatalf("rss=%d want %d", rss, big/2<<10)
+	if mem != big/2<<10 {
+		t.Fatalf("mem=%d want %d", mem, big/2<<10)
 	}
 
 	// Below the floor everywhere → no victim at all.
 	d2, _ := gDeps(t)
-	mkRSSProc(t, d2, 21, wdepstest.UIDA, small)
-	victim, rss = highestRSSPod(d2, []corev1.Pod{psiPod("tiny", "app", wdepstest.UIDA, "")}, []int{21})
-	if victim != nil || rss != 0 {
-		t.Fatalf("below-floor victim=%v rss=%d want nil/0", victim, rss)
+	mkPodMemProc(t, d2, 21, wdepstest.UIDA, small)
+	victim, mem = highestRSSPod(d2, []corev1.Pod{psiPod("tiny", "app", wdepstest.UIDA, "")}, []int{21})
+	if victim != nil || mem != 0 {
+		t.Fatalf("below-floor victim=%v mem=%d want nil/0", victim, mem)
 	}
 
 	// Excluded namespaces / critical priority classes / terminating
 	// pods / db-quorum pods are never victims.
 	d3, _ := gDeps(t)
-	mkRSSProc(t, d3, 31, wdepstest.UIDA, big)
+	mkPodMemProc(t, d3, 31, wdepstest.UIDA, big)
 	sys := psiPod("sys", "kube-system", wdepstest.UIDA, "")
 	victim, _ = highestRSSPod(d3, []corev1.Pod{sys}, []int{31})
 	if victim != nil {

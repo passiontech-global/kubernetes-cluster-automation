@@ -105,6 +105,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -186,6 +187,20 @@ type Collector struct {
 	proc   procScanCache     // collect_procs_scan.go — shared /proc walk (daemon-fd + zombies)
 	scopes scopesCache       // collect_procs_cgroup.go — systemd scope-count TTL cache
 	certs  certNotAfterCache // certcache.go — stat-key memoized X.509 notAfter (pki + nebula)
+	// wr is the host-sysctl write bookkeeping (host_writes.go) —
+	// clocksource restore + aio-max-nr bump run on the latch tick,
+	// never on the scrape path.
+	wr writeState
+	// snapMu/snapAt/snapMetrics are the 10s Collect snapshot cache:
+	// Prometheus scrapes can arrive faster than the probe work
+	// inside a pass (psi avg60, the cpu-delivered busy loop, the
+	// TTL-cached but still costly fdinfo/inotify walks), so a
+	// fresh-enough snapshot is replayed instead of re-measuring
+	// the host. snapMu serializes Collect — concurrent scrapes
+	// must not run duplicate passes nor race the snapshot swap.
+	snapMu      sync.Mutex
+	snapAt      time.Time
+	snapMetrics []prometheus.Metric
 	// kf is the kernel deep-failure engine (kernelfail
 	// subpackage) — the kmsg tail session + the steal jiffie
 	// baseline live inside it. Owned by the Collector directly:
@@ -202,6 +217,7 @@ type Collector struct {
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg}
+	c.wr.tried = map[string]time.Time{}
 	c.seen.m = map[string]time.Time{}
 	c.fs.inflight = map[string]*fsFlight{}
 	c.fs.stalledLogged = map[string]bool{}
@@ -248,31 +264,74 @@ func (c *Collector) Register(reg prometheus.Registerer) error {
 // file plus ONE row there — the old split (a row in collectors()
 // AND a row per family in descTable) is gone.
 
-// Collect implements prometheus.Collector.
+// collectSnapshotTTL bounds how long one measured metric set is
+// replayed to repeat scrapes — 10s keeps staleness far under any
+// alerting window while collapsing scrape bursts (and the
+// textfile writer's extra passes) to a single host measurement.
+const collectSnapshotTTL = 10 * time.Second
+
+// Collect implements prometheus.Collector — a snapshot younger
+// than collectSnapshotTTL is replayed verbatim; anything older
+// (or the first call) runs the full measurement pass and becomes
+// the new snapshot. The pass itself is READ-ONLY by contract:
+// latch transitions live on the Latches ticker (refreshLatches)
+// and host sysctl writes on reconcileHostWrites — a scrape must
+// never stamp watchdog-state files or sysctls as a side effect.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	// Side-effect probes run BEFORE the state-dir scan so a latch
-	// they transition shows up in this scrape's watchdog_state.
-	// The shared probe results ride scrapeCtx into the domains that
-	// fold them in (watchdog, nebula-cert, psi, filesystem, fs-bytes).
+	c.snapMu.Lock()
+	defer c.snapMu.Unlock()
+	now := c.cfg.Clock.Now()
+	if c.cfg.collectCacheTTL > 0 && c.snapMetrics != nil &&
+		now.Sub(c.snapAt) < c.cfg.collectCacheTTL {
+		for _, m := range c.snapMetrics {
+			ch <- m
+		}
+		return
+	}
+	ms := c.collectFresh()
+	c.snapAt = now
+	c.snapMetrics = ms
+	for _, m := range ms {
+		ch <- m
+	}
+}
+
+// collect is the real measurement pass — the side-effect probes
+// feed scrapeCtx into the domains (watchdog, nebula-cert, psi,
+// filesystem, fs-bytes). One statfs per mount per pass: the
+// filesystem and fs-bytes domains share overlapping targets (the
+// k0s data dir, the OpenEBS local root), and each used to probe
+// them separately; probeFS's singleflight still bounds in-flight
+// goroutines at one per mount. NO latch updaters run here —
+// updateOverloadLatch/updateCertLatch/updateFSReadonlyLatch/
+// updateInodePressureLatch all belong to refreshLatches.
+func (c *Collector) collect(ch chan<- prometheus.Metric) {
 	var sc scrapeCtx
 	sc.avg60, sc.psiOK = c.psiAvg60()
-	if sc.psiOK {
-		c.updateOverloadLatch(sc.avg60)
-	}
 	c.maybeMeasureCPU()
-	// The cert is parsed once per scrape and shared between the
+	// The cert is parsed once per pass and shared between the
 	// watchdog-state latch bookkeeping and the days-left gauge.
 	sc.certDays, sc.certOK = c.nebulaCertDaysLeft()
-	c.updateCertLatch(sc.certDays, sc.certOK)
-	// One statfs per mount per scrape: the filesystem and fs-bytes
-	// domains share overlapping targets (the k0s data dir, the
-	// OpenEBS local root), and each used to probe them separately.
-	// The answers ride scrapeCtx into both; probeFS's singleflight
-	// still bounds in-flight goroutines at one per mount.
 	sc.fs = c.scrapeFSProbes()
 	for _, d := range domainTable {
 		d.run(c, ch, sc)
 	}
+}
+
+// collectFresh drains one full collect() pass into a slice — the
+// uncached half Collect caches and WriteTextfile renders. The
+// drain runs on a goroutine because the domains push into ch.
+func (c *Collector) collectFresh() []prometheus.Metric {
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		c.collect(ch)
+		close(ch)
+	}()
+	var out []prometheus.Metric
+	for m := range ch {
+		out = append(out, m)
+	}
+	return out
 }
 
 // --- node-exporter textfile rendering (standalone prom_emit port) ---
@@ -281,20 +340,14 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 // node-watchdog.prom, the same name prom_emit used.
 const TextfileName = "node-watchdog.prom"
 
-// collectAll drains a full Collect into a slice — the textfile
-// writer's scrape (Collect pushes; a reader must consume
-// concurrently or the collector blocks on the channel).
+// collectAll drains a full fresh collect into a slice — the
+// textfile writer's scrape (collect pushes; a reader must consume
+// concurrently or the collector blocks on the channel). It
+// deliberately bypasses the 10s snapshot cache: the textfile
+// render is already interval-driven and must reflect the latest
+// host state, not a scrape-side cache entry.
 func (c *Collector) collectAll() []prometheus.Metric {
-	ch := make(chan prometheus.Metric, 64)
-	go func() {
-		c.Collect(ch)
-		close(ch)
-	}()
-	var out []prometheus.Metric
-	for m := range ch {
-		out = append(out, m)
-	}
-	return out
+	return c.collectFresh()
 }
 
 // WriteTextfile renders the full metric set in node-exporter

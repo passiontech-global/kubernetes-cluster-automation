@@ -243,9 +243,14 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 	// downscaled", fail closed).
 	ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
 	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: gateway route health — rollout census failed, downscaler verdict off",
-			"namespace", ns, "error", err)
+		// NoMatch = the cluster has no Argo Rollouts CRD — there are
+		// simply no rollout workloads to exempt, the same verdict a
+		// successful empty list produces. Not an infra failure.
+		if !meta.IsNoMatchError(err) {
+			metrics.IncError(p.Name)
+			log.Info("WARN: gateway route health — rollout census failed, downscaler verdict off",
+				"namespace", ns, "error", err)
+		}
 		return
 	}
 	for i := range ros {

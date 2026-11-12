@@ -84,11 +84,11 @@ func TestKonnectivityHalfOpenHealsPastWindow(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	if res := check.Run(ctx); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight is inside the window — must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("half-open tunnel past the window must FAIL")
 	}
@@ -126,9 +126,9 @@ func TestKonnectivityAllHalfOpenNeverHeals(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	_ = check.Run(ctx)
+	_ = check.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("all-agents half-open must still FAIL the check")
 	}

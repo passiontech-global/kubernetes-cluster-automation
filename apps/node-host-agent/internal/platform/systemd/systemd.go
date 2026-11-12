@@ -24,6 +24,7 @@ package systemd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,11 +61,26 @@ func WithProcUptimeFile(path string) Option {
 // this file read).
 const defaultProcUptimeFile = "/proc/uptime"
 
+// UnitInfo is one row of `systemctl list-units` — the state triple
+// plus description, transport-agnostic so the D-Bus and systemctl
+// paths return the same shape.
+type UnitInfo struct {
+	Name        string
+	Description string
+	LoadState   string
+	ActiveState string
+	SubState    string
+}
+
 // Client runs host systemd commands.
 type Client struct {
 	cfg            Config // kept for Timeout: UnitExists' background bound
 	host           *hostexec.Runner
 	procUptimeFile string
+	// dbus is the zero-fork control path — non-nil only when the
+	// caller supplied no exec seams (production) on linux; tests
+	// injecting RunCmd/RunCmdCombined keep the systemctl path.
+	dbus *dbusBackend
 }
 
 // New returns a Client for cfg.
@@ -80,6 +96,18 @@ func New(cfg Config, opts ...Option) *Client {
 		cfg:            cfg,
 		host:           hostexec.New(cfg),
 		procUptimeFile: defaultProcUptimeFile,
+	}
+	// Zero-fork path: only when NO exec seam was injected — a fake
+	// RunCmd in tests must keep observing the exact systemctl argv,
+	// so the D-Bus backend never activates there. cfg is a value
+	// copy (hostexec.New defaults its own), so the nil check here
+	// still sees the caller's original seams.
+	if cfg.RunCmd == nil && cfg.RunCmdCombined == nil {
+		hostRoot := cfg.HostRoot
+		if hostRoot == "" {
+			hostRoot = hostexec.DefaultHostRoot
+		}
+		c.dbus = newDBusBackend(hostRoot)
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -120,6 +148,20 @@ func (c *Client) ExecCombinedBounded(ctx context.Context, budget time.Duration, 
 	return c.exec(ctx, budget, true, name, args...)
 }
 
+// dbusUnavailable reports whether err is a connection-level D-Bus
+// failure — the only class of error worth retrying over the
+// systemctl transport. Unit/job errors must NOT fall back: a
+// failed restart retried through a second transport would bounce
+// the unit twice.
+func (c *Client) dbusUnavailable(err error) bool {
+	if errors.Is(err, errDBusUnavailable) {
+		logger().Warn("systemd: dbus unavailable — falling back to systemctl",
+			"error", err)
+		return true
+	}
+	return false
+}
+
 // exec is the shared body of the Client quartet: every systemd
 // command enters NSAll, and the budget/combined pair selects which
 // hostexec seam runs it. budget <= 0 (the unbounded Exec/ExecCombined
@@ -145,6 +187,15 @@ func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) 
 // missing) — callers gating protective action on the result can
 // fail closed instead of reading the failure as "down".
 func (c *Client) Active(ctx context.Context, unit string) (bool, error) {
+	if c.dbus != nil {
+		active, err := c.dbus.dbusActive(ctx, unit)
+		if err == nil {
+			return active, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return false, err
+		}
+	}
 	out, err := c.systemctl(ctx, "is-active", unit)
 	switch strings.TrimSpace(out) {
 	case "active":
@@ -243,6 +294,15 @@ func (c *Client) IsEnabled(ctx context.Context, unit string) bool {
 //	                     absent, warned below so a weird systemd
 //	                     state stays diagnosable
 func (c *Client) Exists(ctx context.Context, unit string) (bool, error) {
+	if c.dbus != nil {
+		exists, err := c.dbus.dbusExists(ctx, unit)
+		if err == nil {
+			return exists, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return false, err
+		}
+	}
 	out, err := c.systemctl(ctx, "show", "-p", "LoadState", "--value", unit)
 	if err != nil {
 		return false, fmt.Errorf("systemctl show -p LoadState --value %s: %w (%s)",
@@ -283,6 +343,15 @@ func (c *Client) UnitExists(unit string) bool {
 // under any non-UTC zone. Error when the unit is not active or
 // either clock is unreadable (both mean "not settled" to the caller).
 func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, error) {
+	if c.dbus != nil {
+		age, err := c.dbus.dbusActiveAge(ctx, unit, c.procUptimeFile)
+		if err == nil {
+			return age, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return 0, err
+		}
+	}
 	out, err := c.systemctl(ctx, "show", "-p",
 		"ActiveEnterTimestampMonotonic", "--value", unit)
 	if err != nil {
@@ -315,6 +384,13 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 
 // Restart mirrors `systemctl restart <unit>`.
 func (c *Client) Restart(ctx context.Context, unit string) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusJob(ctx, unit, "restart"); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
 	out, err := c.systemctl(ctx, "restart", unit)
 	if err != nil {
 		return fmt.Errorf("systemctl restart %s: %w (%s)", unit, err,
@@ -323,8 +399,37 @@ func (c *Client) Restart(ctx context.Context, unit string) error {
 	return nil
 }
 
+// Stop mirrors `systemctl stop <unit>` — the same blocking job-wait
+// contract as Restart (the D-Bus StopUnit job completion is awaited,
+// not just the enqueue). Fallback rules match Restart: only a
+// connection-level failure retries over systemctl, never a method-
+// level error (a stop that reported failure must not be re-issued
+// through a second transport).
+func (c *Client) Stop(ctx context.Context, unit string) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusJob(ctx, unit, "stop"); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
+	out, err := c.systemctl(ctx, "stop", unit)
+	if err != nil {
+		return fmt.Errorf("systemctl stop %s: %w (%s)", unit, err,
+			strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // ReloadOrRestart mirrors `systemctl reload-or-restart <unit>`.
 func (c *Client) ReloadOrRestart(ctx context.Context, unit string) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusJob(ctx, unit, "reload-or-restart"); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
 	out, err := c.systemctl(ctx, "reload-or-restart", unit)
 	if err != nil {
 		return fmt.Errorf("systemctl reload-or-restart %s: %w (%s)",
@@ -337,6 +442,13 @@ func (c *Client) ReloadOrRestart(ctx context.Context, unit string) error {
 // unit's main processes (e.g. SIGUSR1 coredns reload paths) without a
 // full restart.
 func (c *Client) Signal(ctx context.Context, unit, sig string) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusSignal(ctx, unit, sig); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
 	out, err := c.systemctl(ctx, "kill", "-s", sig, unit)
 	if err != nil {
 		return fmt.Errorf("systemctl kill -s %s %s: %w (%s)",
@@ -347,12 +459,64 @@ func (c *Client) Signal(ctx context.Context, unit, sig string) error {
 
 // DaemonReload mirrors `systemctl daemon-reload`.
 func (c *Client) DaemonReload(ctx context.Context) error {
+	if c.dbus != nil {
+		if err := c.dbus.dbusDaemonReload(ctx); err == nil {
+			return nil
+		} else if !c.dbusUnavailable(err) {
+			return err
+		}
+	}
 	out, err := c.systemctl(ctx, "daemon-reload")
 	if err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w (%s)", err,
 			strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// ListUnits mirrors `systemctl list-units --all --no-legend
+// --plain` — every loaded unit with its state triple. The D-Bus
+// path answers from ListUnits directly; the systemctl path parses
+// the legend-free table (first four columns are the state fields,
+// the rest is the free-text description).
+func (c *Client) ListUnits(ctx context.Context) ([]UnitInfo, error) {
+	if c.dbus != nil {
+		units, err := c.dbus.dbusListUnits(ctx)
+		if err == nil {
+			return units, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return nil, err
+		}
+	}
+	out, err := c.Exec(ctx, "systemctl", "list-units",
+		"--all", "--no-legend", "--plain")
+	if err != nil {
+		return nil, fmt.Errorf("systemctl list-units: %w (%s)",
+			err, strings.TrimSpace(out))
+	}
+	var units []UnitInfo
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		u := UnitInfo{
+			Name:        f[0],
+			LoadState:   f[1],
+			ActiveState: f[2],
+			SubState:    f[3],
+		}
+		if len(f) > 4 {
+			u.Description = strings.Join(f[4:], " ")
+		}
+		units = append(units, u)
+	}
+	return units, nil
 }
 
 // Journal mirrors `journalctl -u <unit> --since <since> --no-pager` —

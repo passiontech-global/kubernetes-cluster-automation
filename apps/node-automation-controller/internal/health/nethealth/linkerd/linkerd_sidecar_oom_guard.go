@@ -238,10 +238,11 @@ func (p *linkerdSidecarOOMCheck) scanInitDeadlock(
 					// Container the read resolves to a regular
 					// container (PodInitializing 400 on a Pending
 					// pod), never seeing the dial-refused line.
-					Container: offender.Name,
-					TailLines: probefw.DefaultTailLines,
-					MaxBytes:  probefw.LogMaxBytes,
-					Timeout:   probefw.LogTimeout,
+					Container:    offender.Name,
+					TailLines:    probefw.DefaultTailLines,
+					SinceSeconds: 900,
+					MaxBytes:     probefw.LogMaxBytes,
+					Timeout:      probefw.LogTimeout,
 				}, func(line string) bool {
 					return strings.Contains(line, linkerdInitDeadlockRefused)
 				})

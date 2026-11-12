@@ -106,6 +106,15 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 // had (the ctx budgets stay caller-side so a stubbed seam still
 // sees the shell's `timeout N` contract).
 
+// HoldLocalAction reports whether cluster maintenance (kured drain /
+// control-plane upgrade) is active or unverifiable — restart paths
+// must not add churn while the cluster holds the maintenance mutex.
+// Nil Coord → false (unconfigured keeps prior behavior); a
+// configured Coord fails closed inside nodecoord.
+func (d *Deps) HoldLocalAction(ctx context.Context) bool {
+	return d.Cfg.Coord != nil && d.Cfg.Coord.HoldLocalAction(ctx)
+}
+
 // Restart restarts unit on the HOST systemd — `timeout 90
 // systemctl restart <unit>` parity. The 90s budget goes through the
 // seam's ExecBounded arg rather than a ctx wrap: a tighter wrap
@@ -115,6 +124,15 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 // raw exec had no dbus socket inside the DaemonSet and could never
 // work.
 func (d *Deps) Restart(ctx context.Context, unit string) error {
+	// StampLocalRemediation is best-effort attribution: the cluster
+	// side yields remote remediation while L1 self-heals. Nil Coord
+	// → no-op; a stamp failure must not block the restart itself.
+	if d.Cfg.Coord != nil {
+		if err := d.Cfg.Coord.StampLocalRemediation(ctx); err != nil {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"suspect: nodecoord remediation stamp failed (attribution hint only): %v", err))
+		}
+	}
 	_, err := d.Cfg.HostExecFn(ctx, true, defaultRestartBudget,
 		"systemctl", "restart", unit)
 	return err

@@ -109,8 +109,15 @@ func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge 
 			// "what the disk actually got back" — a sparse or
 			// tail-packed file's logical Size() can wildly exceed
 			// (sparse) or fall short of (block tail padding) its
-			// footprint.
-			bytes += info.Sys().(*syscall.Stat_t).Blocks * 512
+			// footprint. The type assertion is checked — a
+			// non-*Stat_t FileInfo (non-Linux dev box, exotic fs)
+			// falls back to logical Size() instead of panicking
+			// mid-sweep.
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				bytes += st.Blocks * 512
+			} else {
+				bytes += info.Size()
+			}
 		} else {
 			failed++
 			lastErr = err

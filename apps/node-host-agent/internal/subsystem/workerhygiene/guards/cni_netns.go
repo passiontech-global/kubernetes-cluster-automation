@@ -159,8 +159,9 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// A live process still sits in this netns — the mount
 			// is real. Drop any stale marker so a later orphan
 			// episode re-arms the full confirmation window.
-			_ = os.Remove(filepath.Join(
-				c.d.Cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+			// ClearBudget also drops the lastSpent RAM mirror a
+			// bare os.Remove would leave behind.
+			c.d.State.ClearBudget("cni-netns-seen-" + name)
 			continue
 		}
 		marker := "cni-netns-seen-" + name
@@ -242,8 +243,7 @@ func reapCNINetns(d *wdeps.Deps, ctx context.Context, name string) {
 			"suspect: cni-netns-gc rm %s failed: %v — mount detached, file remains",
 			filepath.Join(d.Cfg.Net.NetnsDir, name), rerr))
 	}
-	_ = os.Remove(filepath.Join(
-		d.Cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+	d.State.ClearBudget("cni-netns-seen-" + name)
 	d.State.AppendLog(fmt.Sprintf(
 		"ACTION: cni-netns-gc reaped orphan netns %s - unmounted + removed (no live process >%dm)",
 		name, int(cniNetnsMinAge.Minutes())))
@@ -265,7 +265,7 @@ func pruneCNINetnsMarkers(d *wdeps.Deps, seen map[string]bool) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(d.Cfg.Net.NetnsDir, name)); err != nil {
-			_ = os.Remove(m)
+			d.State.ClearBudget(filepath.Base(m))
 		}
 	}
 }

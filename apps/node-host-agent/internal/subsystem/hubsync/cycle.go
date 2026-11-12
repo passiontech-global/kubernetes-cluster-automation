@@ -9,6 +9,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 // Cycle is one full converge round — the hub_converge CronJob run:
@@ -128,6 +130,11 @@ func (s *Syncer) convergeTargets(ctx context.Context, targets []Target,
 				len(targets)-i)
 			return
 		}
+		// Per-target heartbeat: a long serial fan-out (SSH timeouts,
+		// slow remote agents) must not look like a wedged watcher —
+		// the liveness stamp proves the cycle is alive between
+		// targets, not just at the outer loop's edges.
+		cycle.Heartbeat(ctx)
 		if t.APILB && !guardOK {
 			s.cfg.Log.Error("hubsync: api-lb target skipped — guard credentials unavailable",
 				"target", t.Name, "ip", t.IP)

@@ -93,11 +93,19 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 	}
 	// (2) orphan .tmp sweep — files older than 2h under /run.
 	// Bounded: at most runTmpfsSweepMax removals per cycle. An
-	// fd-held file is skipped (runTmpfsFDOpen): unlinking it would
+	// fd-held file is skipped (runTmpfsFDHeld against the sweep's
+	// single /proc/*/fd pass): unlinking it would
 	// orphan the writer's inode — no space regained, data lost at
 	// close (incident parity with unlinked-open-files).
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	removed := 0
+	// The /proc/*/fd pass is built ONCE per sweep, lazily on the
+	// first stale .tmp — a busy /run can hold dozens of candidates
+	// and the old per-file rescan cost O(candidates × fds) stats.
+	// openFDsDone separates "not built yet" from "built, possibly
+	// empty/nil" so a failed pass doesn't rescan per file.
+	var openFDs map[fdID]struct{}
+	openFDsDone := false
 	_ = filepath.WalkDir(c.d.Cfg.Disk.HostRunDir,
 		func(path string, de fs.DirEntry, err error) error {
 			if err != nil || removed >= runTmpfsSweepMax {
@@ -111,7 +119,11 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 			if ierr != nil || now.Sub(fi.ModTime()) < runTmpfsMinAge {
 				return nil //nolint:nilerr // stat failures skip the entry, never fatal
 			}
-			if c.runTmpfsFDOpen(path, fi) {
+			if !openFDsDone {
+				openFDs = c.runTmpfsOpenFDs()
+				openFDsDone = true
+			}
+			if runTmpfsFDHeld(fi, openFDs) {
 				// SKIP open-fd — removing an fd-held spool file
 				// unlinks the name but not the inode: the writer
 				// keeps filling an orphan inode (no space regained)
@@ -137,22 +149,29 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 	}
 }
 
-// runTmpfsFDOpen reports whether any process holds an open fd on
-// the candidate file. The /proc fd walk runs only once a sweep
-// candidate exists (never on an empty walk) and compares
-// readlink targets under HostRunDir by Dev+Inode — the path check
-// alone would miss hardlinks/renames. Unreadable /proc/<pid>
-// entries are skipped: a process dying mid-scan is normal.
-func (c *RunTmpfsCheck) runTmpfsFDOpen(path string, fi os.FileInfo) bool {
-	cst, ok := fi.Sys().(*syscall.Stat_t) // os stat results expose syscall.Stat_t, not unix.Stat_t
-	if !ok {
-		return false // uncomparable — fail open like the old sweep
-	}
+// fdID is the (dev,ino) identity of an open file — the same
+// comparison the old per-candidate probe did, now computed once per
+// sweep for the whole /proc/*/fd pass.
+type fdID struct {
+	dev uint64
+	ino uint64
+}
+
+// runTmpfsOpenFDs builds the set of (dev,ino) pairs held open by
+// ANY process — ONE pass over /proc/<pid>/fd/<n> per sweep instead
+// of one per stale .tmp candidate. os.Stat follows each fd's magic
+// link to the OPEN file's inode, so no Readlink+Stat(target) pair
+// per fd and no path-prefix compare that hardlinks/renames would
+// defeat: the (dev,ino) set is the identity. Unreadable /proc/<pid>
+// entries are skipped: a process dying mid-scan is normal. A nil
+// map means the pass could not run (proc root unreadable) — every
+// candidate then fails open exactly like the old probe did.
+func (c *RunTmpfsCheck) runTmpfsOpenFDs() map[fdID]struct{} {
 	pids, err := c.d.Proc.PIDs()
 	if err != nil {
-		return false
+		return nil
 	}
-	runPrefix := c.d.Cfg.Disk.HostRunDir + "/"
+	set := make(map[fdID]struct{})
 	for _, pid := range pids {
 		fdDir := c.d.Proc.File(pid, "fd")
 		fds, rerr := os.ReadDir(fdDir)
@@ -160,19 +179,30 @@ func (c *RunTmpfsCheck) runTmpfsFDOpen(path string, fi os.FileInfo) bool {
 			continue // raced exit — normal, never fatal
 		}
 		for _, fd := range fds {
-			target, lerr := os.Readlink(filepath.Join(fdDir, fd.Name()))
-			if lerr != nil || !strings.HasPrefix(target, runPrefix) {
-				continue
-			}
-			tfi, serr := os.Stat(target)
+			// Stat the fd PATH, not its readlink target: the magic
+			// link resolves to the file the fd actually holds —
+			// including unlinked names whose target path no longer
+			// exists (the exact case this guard exists for).
+			tfi, serr := os.Stat(filepath.Join(fdDir, fd.Name()))
 			if serr != nil {
 				continue
 			}
-			if tst, tok := tfi.Sys().(*syscall.Stat_t); tok &&
-				tst.Dev == cst.Dev && tst.Ino == cst.Ino {
-				return true
+			if tst, tok := tfi.Sys().(*syscall.Stat_t); tok { // os stat results expose syscall.Stat_t, not unix.Stat_t
+				set[fdID{dev: tst.Dev, ino: tst.Ino}] = struct{}{}
 			}
 		}
 	}
-	return false
+	return set
+}
+
+// runTmpfsFDHeld reports whether the candidate file's (dev,ino) is
+// in the sweep's open-fd set — nil set (proc pass failed) or an
+// uncomparable stat both fail open like the old probe.
+func runTmpfsFDHeld(fi os.FileInfo, open map[fdID]struct{}) bool {
+	cst, ok := fi.Sys().(*syscall.Stat_t) // os stat results expose syscall.Stat_t, not unix.Stat_t
+	if !ok {
+		return false // uncomparable — fail open like the old sweep
+	}
+	_, held := open[fdID{dev: cst.Dev, ino: cst.Ino}]
+	return held
 }

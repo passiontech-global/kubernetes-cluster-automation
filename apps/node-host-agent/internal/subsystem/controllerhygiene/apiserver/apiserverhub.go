@@ -227,6 +227,32 @@ func (c *HubCheck) Run(ctx context.Context) {
 			c.d.Cfg.SuspectLogCadence)
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "fence_cooldown").Inc()
 	case peerFresh || soloOK:
+		// L1↔L3 maintenance hold outranks every other gate: a
+		// kured drain or control-plane upgrade is already bouncing
+		// this node — restarting the controller on top adds churn
+		// the drain did not budget for. Checked before the quorum
+		// probe so an unverifiable maintenance state fails closed
+		// without spending an API call.
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.SuspectLog(cdeps.StateCacheWedged, fmt.Sprintf(
+				"suspect: apiserver-cache-wedged %s (%dx) but cluster maintenance in progress — holding restart",
+				wreason, gn), c.d.Cfg.SuspectLogCadence)
+			c.d.Actions.WithLabelValues(cdeps.CheckHub, "maint_hold").Inc()
+			break
+		}
+		// Peer-quorum gate on the peer-fresh path: the kubernetes
+		// service must still report >=2 ready apiserver endpoints —
+		// bouncing the controller below quorum takes the last
+		// serving apiserver down with it. soloOK (first-hub, peer
+		// stale) is the degraded-cluster escape: no quorum evidence
+		// exists to check, restart anyway.
+		if peerFresh && !c.d.ControllerQuorumReady(ctx) {
+			c.d.State.SuspectLog(cdeps.StateCacheWedged, fmt.Sprintf(
+				"suspect: apiserver-cache-wedged %s (%dx) but default/kubernetes reports <2 ready endpoints — holding restart",
+				wreason, gn), c.d.Cfg.SuspectLogCadence)
+			c.d.Actions.WithLabelValues(cdeps.CheckHub, "quorum_hold").Inc()
+			break
+		}
 		switch c.d.Cfg.Sig13.Mode {
 		case cdeps.ModeEnforce:
 			c.d.State.AppendLog(fmt.Sprintf(
@@ -300,6 +326,12 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkStreak, fmt.Sprintf(
 			"suspect: apiserver dead, kine db ok — dead-fallback needs %d cycles + first-hub (dn=%d first=%v)",
 			c.d.StreakCycles(c.d.Cfg.Sig13.SoloCycles), dn, deadFirst), c.d.Cfg.SuspectLogCadence)
+		return
+	}
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool,
+			"suspect: apiserver dead + kine db ok but cluster maintenance in progress — holding restart",
+			c.d.Cfg.SuspectLogCadence)
 		return
 	}
 	if !c.d.State.RateOK(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {

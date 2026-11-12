@@ -34,6 +34,13 @@ import (
 // unpaged: they are tiny by definition.
 const ListPageSize = kube.DefaultListPageSize
 
+// crdPageSize bounds one page of the CRD census — tighter than
+// ListPageSize because a CRD page carries full OpenAPI schemas
+// (the fattest objects any census here lists); 25 keeps a page's
+// transient heap in the low MiB before compactCRDConversion drops
+// the schemas and the page is GC'd.
+const crdPageSize = 25
+
 // CRDs are read through kube.GVRCustomResourceDefinition — the typed
 // clientset has no apiextensions surface, so the objects reach
 // through dyn like every other CRD this controller consumes.
@@ -402,12 +409,13 @@ func collectProbeCandidates(ready *EndpointCensus,
 }
 
 // webhookUnhealthyNodeTaints are the taint keys marking a node whose
-// pod network is presumed dead for admission purposes — the passiontech.dev
-// pair this operator asserts itself plus the kubelet/node-controller
-// lifecycle taints.
+// pod network is presumed dead for admission purposes — the
+// passiontech.dev marks this operator asserts itself plus the
+// kubelet/node-controller lifecycle taints.
 var webhookUnhealthyNodeTaints = []string{
 	kube.TaintNetworkPartitioned,
 	kube.TaintKubeletUnresponsive,
+	kube.TaintApiserverUnreachable,
 	"node.kubernetes.io/unreachable",
 	"node.kubernetes.io/not-ready",
 	"node.kubernetes.io/out-of-service",

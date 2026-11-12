@@ -128,8 +128,8 @@ func TestHostSidePath(t *testing.T) {
 		"/run/k0s/containerd.sock":      "/run/k0s/containerd.sock",
 		"/hostile/path":                 "/hostile/path", // prefix, not the mount root
 	} {
-		if got := hostSidePath(in); got != want {
-			t.Fatalf("hostSidePath(%q)=%q want %q", in, got, want)
+		if got := wdeps.HostSidePath(in); got != want {
+			t.Fatalf("wdeps.HostSidePath(%q)=%q want %q", in, got, want)
 		}
 	}
 }

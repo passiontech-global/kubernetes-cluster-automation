@@ -55,6 +55,12 @@ type gatewayRouteHealthCheck struct {
 	zeroSince   state.FirstSeenLedger
 	zeroEmitted state.GaugeLedger[string]
 	zeroLast    map[string][]string
+	// liveLast is last sweep's full live-signature map
+	// ("kind/ns/name/reason" → label tuple) — the carry source for
+	// inconclusive verdicts. emitted.Last() only covers tuples past
+	// the 10m window; liveLast also holds the inside-window keys
+	// whose first-seen stamps must survive a transient read failure.
+	liveLast map[string][]string
 }
 
 // NewGatewayRouteHealthCheck builds the check — both ledgers are
@@ -152,6 +158,7 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 			p.scanRoute(ctx, log, census, &routes[i], rk.kind, live, zeroNow)
 		}
 	}
+	p.liveLast = live
 
 	p.since.Prune(func(k string) bool { _, ok := live[k]; return ok })
 	p.zeroSince.Prune(func(k string) bool { _, ok := zeroNow[k]; return ok })
@@ -209,13 +216,14 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 		if b.crossNS {
 			granted, conclusive := p.backendRefGranted(ctx, log, census, kind, ns, b)
 			if !conclusive {
-				// Carry-forward: same "can't tell" posture as the
-				// endpoint-census failure below — keep last sweep's
-				// ref_not_permitted verdict for THIS route live.
-				key := kind + "/" + ns + "/" + name + "/" + routeReasonRefNotPermitted
-				if lv, ok := p.emitted.Last()[key]; ok {
-					live[key] = lv
-				}
+				// Carry-forward: the grant census failed, so EVERY
+				// backend verdict behind it is unverifiable this
+				// sweep — keep last sweep's tuples live ("can't
+				// tell" is not "resolved") or one API flap would
+				// prune live series and reset their windows.
+				p.carryRouteSignature(kind, ns, name, routeReasonRefNotPermitted, live, zeroNow)
+				p.carryRouteSignature(kind, ns, name, routeReasonBackendUnresolved, live, zeroNow)
+				p.carryRouteSignature(kind, ns, name, routeReasonZeroEndpoints, live, zeroNow)
 				continue
 			}
 			if !granted {
@@ -225,7 +233,13 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 		}
 		unresolved, found := p.serviceBackendUnresolved(ctx, log, census, b)
 		if !found {
-			continue // inconclusive lookup — flag nothing on an API flap
+			// AllServices census failed — the backend resolution AND
+			// the zero-endpoints verdict behind it are unverifiable:
+			// carry last sweep's tuples instead of reading the flap
+			// as resolved (flag nothing fresh either way).
+			p.carryRouteSignature(kind, ns, name, routeReasonBackendUnresolved, live, zeroNow)
+			p.carryRouteSignature(kind, ns, name, routeReasonZeroEndpoints, live, zeroNow)
+			continue
 		}
 		if unresolved {
 			flag(routeReasonBackendUnresolved)
@@ -248,18 +262,7 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 			// ("can't tell", not "clean") — keep last sweep's
 			// zero-endpoints verdict for THIS route live so a
 			// transient list failure doesn't flap the alert off.
-			key := kind + "/" + ns + "/" + name + "/" + routeReasonZeroEndpoints
-			if lv, ok := p.emitted.Last()[key]; ok {
-				live[key] = lv
-			}
-			// Same carry-forward for the dedicated 5m gauge's live
-			// candidates so its first-seen window keeps counting.
-			prefix := kind + "/" + ns + "/" + name + "/"
-			for zk, zv := range p.zeroLast {
-				if strings.HasPrefix(zk, prefix) {
-					zeroNow[zk] = zv
-				}
-			}
+			p.carryRouteSignature(kind, ns, name, routeReasonZeroEndpoints, live, zeroNow)
 			continue
 		}
 		if len(census.esReady[b.ns+"/"+b.name]) > 0 {
@@ -271,5 +274,30 @@ func (p *gatewayRouteHealthCheck) scanRoute(ctx context.Context,
 		flag(routeReasonZeroEndpoints)
 		zeroNow[kind+"/"+ns+"/"+name+"/"+b.ns+"/"+b.name] =
 			[]string{kind, ns, name, b.ns, b.name}
+	}
+}
+
+// carryRouteSignature re-asserts last sweep's live tuple for one
+// (route, reason) into this sweep's live/zeroNow sets — "can't tell"
+// is not "resolved": an inconclusive verdict must not prune the
+// series or reset the first-seen window. liveLast covers the
+// inside-window keys emitted.Last() never saw; for
+// backend_zero_endpoints the dedicated 5m gauge's candidates carry
+// through zeroLast the same way.
+func (p *gatewayRouteHealthCheck) carryRouteSignature(kind, ns, name,
+	reason string, live, zeroNow map[string][]string) {
+
+	key := kind + "/" + ns + "/" + name + "/" + reason
+	if lv, ok := p.liveLast[key]; ok {
+		live[key] = lv
+	}
+	if reason != routeReasonZeroEndpoints {
+		return
+	}
+	prefix := kind + "/" + ns + "/" + name + "/"
+	for zk, zv := range p.zeroLast {
+		if strings.HasPrefix(zk, prefix) {
+			zeroNow[zk] = zv
+		}
 	}
 }

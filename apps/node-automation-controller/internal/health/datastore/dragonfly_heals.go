@@ -126,14 +126,22 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	if !proceed {
 		return
 	}
-	if _, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, target,
-		now); err != nil {
+	didDelete, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, target,
+		now)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "dragonfly operator delete failed",
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	p.InvalidatePods(ctx) // pod gone — drop the census
+	if !didDelete {
+		// Quorum reservation denied — a sibling check already spent
+		// this workload's one-disruption slot this sweep.
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"pod", target.Namespace+"/"+target.Name)
+		return
+	}
+	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	p.drOpHealed.Stamp(stsKey, now)
 	log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
 		"pod", target.Namespace+"/"+target.Name, "service", sig.ns+"/"+sig.svc,
@@ -144,6 +152,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// holding; nil ledger because the in-RAM key is the
 	// per-controller cooldown stamped above.
 	if err := heal.StampPersisted(ctx,
+		sig.sts,
 		func(ctx context.Context, data []byte) error {
 			if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
 				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
@@ -155,7 +164,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			// serial sweep sees no apiserver echo: without the mirror
 			// a second heal-due candidate reads the pre-patch
 			// annotations and double-heals the same operator.
-			probefw.MergeAnnoPatchLocally(sig.sts, data)
+			probefw.MergeAnnoPatchLocally(ctx, sig.sts, data)
 			return nil
 		},
 		dragonflyHealAnno, nil, "", now); err != nil {
@@ -326,13 +335,21 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 
 	// UID precondition (inside heal.DeletePod) closes the list→delete
 	// TOCTOU: a same-named replacement pod is not ours to reap.
-	if _, err := heal.DeletePod(ctx, p.CS, &p.drPodHealed, stsKey, target, now); err != nil {
+	didDelete, err := heal.DeletePod(ctx, p.CS, &p.drPodHealed, stsKey, target, now)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "dragonfly dual-replica pod delete failed",
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	p.InvalidatePods(ctx) // pod gone — drop the census
+	if !didDelete {
+		// Quorum reservation denied — a sibling check already spent
+		// this workload's one-disruption slot this sweep.
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"pod", target.Namespace+"/"+target.Name)
+		return
+	}
+	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	dragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",
@@ -345,6 +362,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	// the stamp lands nil-ledger here (delivered-only belongs to the
 	// delete, not the annotation write).
 	if err := heal.StampPersisted(ctx,
+		sig.sts,
 		func(ctx context.Context, data []byte) error {
 			if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
 				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
@@ -354,7 +372,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			// Same listed-copy mirror as the operator heal above —
 			// a shared StatefulSet must not be re-healed by a
 			// sibling Service's candidate later this sweep.
-			probefw.MergeAnnoPatchLocally(sig.sts, data)
+			probefw.MergeAnnoPatchLocally(ctx, sig.sts, data)
 			return nil
 		},
 		dragonflyPodHealAnno, nil, "", now); err != nil {

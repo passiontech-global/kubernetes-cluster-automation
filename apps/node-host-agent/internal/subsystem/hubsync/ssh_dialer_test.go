@@ -55,7 +55,7 @@ func TestSyncerName(t *testing.T) {
 // missing key file is NOT an error at construction (Dial loads the
 // signer), and a nil log falls back to the package logger.
 func TestNewSSHDialer(t *testing.T) {
-	d, err := newSSHDialer("/no/such/key", 2222, 7*time.Second, nil)
+	d, err := newSSHDialer("/no/such/key", 2222, 7*time.Second, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("construct err=%v", err)
 	}
@@ -65,6 +65,50 @@ func TestNewSSHDialer(t *testing.T) {
 	}
 	if d.cfg.Log == nil || d.log == nil {
 		t.Fatal("nil log not defaulted")
+	}
+}
+
+// TestSSHDialerHostKeyFailClosed: no fingerprint pin and no explicit
+// insecure allowance → Dial refuses BEFORE any transport opens;
+// either half of the pair re-enables dialing.
+func TestSSHDialerHostKeyFailClosed(t *testing.T) {
+	ctx := context.Background()
+	closed, err := newSSHDialer("/no/such/key", 22, time.Second, "", false, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := closed.Dial(ctx, Target{IP: "127.0.0.1", SSHUser: "root"}); err == nil ||
+		!strings.Contains(err.Error(), "host key verification unavailable") {
+		t.Fatalf("unpinned dial err=%v, want fail-closed", err)
+	}
+	allowed, err := newSSHDialer("/no/such/key", 22, time.Second, "", true, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Allowed → proceeds past the gate and fails on the missing key
+	// file instead (a DIFFERENT error proves the gate opened).
+	if _, err := allowed.Dial(ctx, Target{IP: "127.0.0.1", SSHUser: "root"}); err == nil ||
+		strings.Contains(err.Error(), "host key verification unavailable") {
+		t.Fatalf("allowed dial err=%v, want past the pin gate", err)
+	}
+}
+
+// TestStageNonceUnique: per-dial suffixes never repeat within a
+// process — overlapping runs cannot share a staging inode.
+func TestStageNonceUnique(t *testing.T) {
+	seen := map[string]bool{}
+	for range 100 {
+		n := nextStageNonce()
+		if seen[n] {
+			t.Fatalf("duplicate stage nonce %q", n)
+		}
+		seen[n] = true
+	}
+	if tmpPath("/usr/local/bin/agent", "") != "/usr/local/bin/.agent.tmp" {
+		t.Fatal("empty suffix must keep the deterministic tmp path")
+	}
+	if tmpPath("/usr/local/bin/agent", "p-1") != "/usr/local/bin/.agent.tmp.p-1" {
+		t.Fatal("suffix must append to the tmp path")
 	}
 }
 
@@ -287,7 +331,7 @@ func TestSSHConnLiveServer(t *testing.T) {
 			}
 		})
 
-	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, nil)
+	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +383,7 @@ func TestSSHConnLiveServer(t *testing.T) {
 	_ = conn.Close()
 
 	// Dial against a closed port → transport error.
-	down, err := newSSHDialer(keyPath, 1, time.Second, nil)
+	down, err := newSSHDialer(keyPath, 1, time.Second, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,11 @@ tasks:
     toolchains: 'system'
     inputs:
       - 'Dockerfile'
+      # Apps have no per-project .dockerignore — the build context's
+      # ignore file lives at the workspace root, so the input must be
+      # root-relative or moon warns it doesn't exist and the cache
+      # never sees root .dockerignore edits.
+      - '/.dockerignore'
       # hadolint is pinned in mise.toml — a toolchain bump must
       # invalidate the lint cache.
       - '/mise.toml'

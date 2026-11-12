@@ -31,20 +31,20 @@ func TestHubMetricsFWRenders(t *testing.T) {
 	if !strings.Contains(di, "--collector.textfile.directory=/var/lib/node-exporter/textfile") {
 		t.Fatalf("bad textfile drop-in:\n%s", di)
 	}
-	calls := sr.CallsMatching("iptables -N HUBMETRICS")
+	calls := sr.CallsMatching("iptables -w 5 -N HUBMETRICS")
 	if len(calls) == 0 {
 		t.Fatal("HUBMETRICS rebuild not run")
 	}
 	script := calls[len(calls)-1]
 	for _, want := range []string{
-		"iptables -A HUBMETRICS -p tcp -s 10.0.1.10 --dport 9100 -j ACCEPT",
-		"iptables -A HUBMETRICS -p tcp -s 10.0.2.20 --dport 9100 -j ACCEPT",
-		"iptables -A HUBMETRICS -p tcp -s 172.29.0.0/24 --dport 9100 -j ACCEPT",
-		"iptables -A HUBMETRICS -p tcp --dport 9100 -j DROP",
-		"iptables -A HUBMETRICS -p tcp --dport 9115 -j DROP",
-		"iptables -A HUBMETRICS -p tcp --dport 2380 -j DROP",
-		"iptables -A HUBMETRICS -p tcp --dport 2381 -j DROP",
-		"iptables -I INPUT 1 -p tcp --dport 2380 -j HUBMETRICS",
+		"iptables -w 5 -A HUBMETRICS -p tcp -s 10.0.1.10 --dport 9100 -j ACCEPT",
+		"iptables -w 5 -A HUBMETRICS -p tcp -s 10.0.2.20 --dport 9100 -j ACCEPT",
+		"iptables -w 5 -A HUBMETRICS -p tcp -s 172.29.0.0/24 --dport 9100 -j ACCEPT",
+		"iptables -w 5 -A HUBMETRICS -p tcp --dport 9100 -j DROP",
+		"iptables -w 5 -A HUBMETRICS -p tcp --dport 9115 -j DROP",
+		"iptables -w 5 -A HUBMETRICS -p tcp --dport 2380 -j DROP",
+		"iptables -w 5 -A HUBMETRICS -p tcp --dport 2381 -j DROP",
+		"iptables -w 5 -I INPUT 1 -p tcp --dport 2380 -j HUBMETRICS",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("HUBMETRICS script missing %q:\n%s", want, script)

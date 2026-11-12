@@ -97,8 +97,12 @@ func (m *Maint) urgentReindex(ctx context.Context, pg, user, pass string,
 		logger().Warn("kinedb: urgent reindex skipped — compact-guard advisory lock busy")
 		return
 	}
+	t0 := m.d.Cfg.Clock.Now()
 	if _, serr := m.d.PsqlScript(ctx, pg, user, pass,
 		m.buildHeavyScript(false)); serr != nil {
+		if m.d.LongBudgetExceeded(t0, serr) {
+			m.reapOrphanedMaint(ctx, pg, user, pass, note)
+		}
 		res.urgentState = "fail"
 		res.okUrgent = false
 		note(fmt.Sprintf("urgent-reindex-fail: %v", serr))

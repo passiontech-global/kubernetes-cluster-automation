@@ -180,7 +180,16 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				storm, identity, lerr := p.linkerdH2LogSignals(ctx, cands[i])
+				// A panic in one pod's log-tail fetch reads as that
+				// pod's inconclusive scan — never a process crash.
+				storm, identity, lerr := func() (s, id bool, err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							err = fmt.Errorf("log signals panicked: %v", r)
+						}
+					}()
+					return p.linkerdH2LogSignals(ctx, cands[i])
+				}()
 				sigs[i] = logSignals{storm: storm, identity: identity, err: lerr}
 			}
 		}()

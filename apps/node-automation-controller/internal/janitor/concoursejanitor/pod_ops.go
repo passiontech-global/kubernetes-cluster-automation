@@ -7,6 +7,7 @@ package concoursejanitor
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,6 +28,34 @@ func (j *concourseWorkdirJanitor) getPod(ctx context.Context, name string) (*cor
 	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	return j.cs.CoreV1().Pods(cjNamespace).Get(cctx, name, metav1.GetOptions{})
+}
+
+// readyWorkerSiblings counts the OTHER concourse-worker pods
+// (same StatefulSet name prefix, not terminating) currently Ready —
+// the "keep at least one worker serving" census the wipe loop
+// consults before deleting pod `exclude`. A LIST per call is one
+// apiserver round trip per worker per run; the namespace is
+// dedicated so the list stays small.
+func (j *concourseWorkdirJanitor) readyWorkerSiblings(ctx context.Context, exclude string) (int, error) {
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
+	defer cancel()
+	pods, err := j.cs.CoreV1().Pods(cjNamespace).List(cctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("list worker pods: %w", err)
+	}
+	prefix := cjStatefulSet + "-"
+	ready := 0
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Name == exclude || p.DeletionTimestamp != nil ||
+			!strings.HasPrefix(p.Name, prefix) {
+			continue
+		}
+		if kube.PodReadyCond(p) {
+			ready++
+		}
+	}
+	return ready, nil
 }
 
 func (j *concourseWorkdirJanitor) workerReplicas(ctx context.Context) (int32, error) {

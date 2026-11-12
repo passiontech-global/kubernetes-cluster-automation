@@ -26,11 +26,13 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
@@ -124,6 +126,17 @@ const (
 	kernelDeadlockProblemReason = "KernelDeadlock"
 )
 
+// kernelLine is one drained kernel record — msg is the payload text,
+// usec the µs-since-boot timestamp (-1 when unknown, e.g. the
+// journald path where the lookback age filter already bounded the
+// window), entry the mux Entry the record came from (nil on the
+// kmsg path — ring reads have no cursor to requeue against).
+type kernelLine struct {
+	msg   string
+	usec  int64
+	entry *journalwatch.Entry
+}
+
 // kernelLines returns new kernel records and whether they must pass
 // the first-scan lookback filter. kmsg path: the tailer lazily opens
 // the device (a reopen after a read error re-arms the lookback
@@ -133,20 +146,33 @@ const (
 // past the cap is still replay, not live history (a stale hung-task
 // line would otherwise latch a PERMANENT KernelDeadlock on a fresh
 // agent start). Journald fallback: permanent once kmsg cannot be
-// opened, bounded by its own cursor so replay is never needed.
-// Records come back as kmsg.Record — Msg is the payload text,
-// Usec the µs-since-boot timestamp (-1 when unknown, e.g. the
-// journald path where the cursor already bounds the window).
-func (m *Monitor) kernelLines(ctx context.Context) ([]kmsg.Record, bool, error) {
+// opened, fed by the shared journalwatch mux — the pending queue's
+// lookback age filter below is the replay bound.
+func (m *Monitor) kernelLines(ctx context.Context) ([]kernelLine, bool, error) {
 	for {
 		if m.kmsgJournalMode {
-			entries, err := m.fetchJournal(ctx, &m.kernelJournalUS, "-k")
+			entries, err := m.pollJournal(ctx, journalSubKernel)
 			if err != nil {
 				return nil, false, err
 			}
-			lines := make([]kmsg.Record, 0, len(entries))
-			for _, e := range entries {
-				lines = append(lines, kmsg.Record{Msg: e.Msg, Usec: -1})
+			lines := make([]kernelLine, 0, len(entries))
+			now := m.deps.Now()
+			lookback := m.cfg().LogLookback
+			for i := range entries {
+				e := &entries[i]
+				// The mux pending queue can hold kernel entries
+				// fetched while kmsg still owned the source — or
+				// ones a stalled consumer never drained. Age-filter
+				// them exactly like the kmsg replay path so an
+				// ancient oops never fires live rules on fallback
+				// activation; a missing timestamp is processed
+				// (unknown age is not proof of staleness).
+				if e.TSUS > 0 &&
+					now.Sub(time.UnixMicro(e.TSUS)) > lookback {
+					continue
+				}
+				lines = append(lines, kernelLine{
+					msg: e.Msg, usec: -1, entry: e})
 			}
 			return lines, false, nil
 		}
@@ -157,7 +183,7 @@ func (m *Monitor) kernelLines(ctx context.Context) ([]kmsg.Record, bool, error) 
 			// fallback for the process lifetime.
 			m.kmsgJournalMode = true
 			logger().Warn("nodereporter: /dev/kmsg unreadable, kernel monitor "+
-				"falls back to journalctl -k for the process lifetime",
+				"falls back to the shared journal tail for the process lifetime",
 				"kmsg", m.cfg().KmsgFile, "hostRoot", m.cfg().HostRoot)
 			continue
 		case err != nil:
@@ -169,9 +195,10 @@ func (m *Monitor) kernelLines(ctx context.Context) ([]kmsg.Record, bool, error) 
 		// (the field name predates the EAGAIN semantics); the
 		// tailer's post-read flag mirrors it.
 		m.kmsgScanned = res.CaughtUp
-		lines := make([]kmsg.Record, 0, len(raw))
+		lines := make([]kernelLine, 0, len(raw))
 		for _, l := range raw {
-			lines = append(lines, kmsg.ParseRecord(l))
+			rec := kmsg.ParseRecord(l)
+			lines = append(lines, kernelLine{msg: rec.Msg, usec: rec.Usec})
 		}
 		return lines, replay, nil
 	}
@@ -203,41 +230,69 @@ func (m *Monitor) SyncKernelMonitor(ctx context.Context, s Sink) error {
 			uptime = u
 		}
 	}
+	var failed []journalwatch.Entry
 	for _, l := range lines {
 		if replay {
 			// kmsg records: age = uptime - usec. Unknown ts or an
 			// unreadable uptime → drop the backlog line rather than
 			// replay ancient ring history as live (filelog parity).
-			if l.Usec <= 0 || uptime < 0 {
+			if l.usec <= 0 || uptime < 0 {
 				continue
 			}
-			if uptime-float64(l.Usec)/1e6 > m.cfg().LogLookback.Seconds() {
+			if uptime-float64(l.usec)/1e6 > m.cfg().LogLookback.Seconds() {
 				continue
 			}
 		}
-		m.processKernelLine(ctx, s, l.Msg)
+		if !m.processKernelLine(ctx, s, l.msg) && l.entry != nil {
+			failed = append(failed, *l.entry)
+		}
+	}
+	// Journal-mode emit failures requeue their entries — the shared
+	// cursor advanced at fetch, so the pending queue is the
+	// per-consumer retry position (the filelog offset rollback's
+	// journal-side equivalent). kmsg records have entry==nil: ring
+	// reads carry no cursor, so a failed emit there is best-effort
+	// loss, same as before the mux.
+	if err := m.journal.Requeue(journalSubKernel, failed); err != nil {
+		logger().Error("nodereporter: journal requeue failed",
+			"subscriber", journalSubKernel, "error", err)
 	}
 	return nil
 }
 
 // processKernelLine applies the temporary kernel rules plus the
-// permanent KernelDeadlock latch to one kernel message. The
+// permanent KernelDeadlock latch to one kernel message and reports
+// whether every matched Event write succeeded — false tells the
+// caller to requeue the journal entry for retry. The
 // soft-lockup/RCU-stall signatures additionally Enter their
 // KernelHungTasks evidence latches — the sink's state store carries
 // an empty LogFile, so the STATE-ENTER never circles back into the
 // filelog rules the reporter tails.
-func (m *Monitor) processKernelLine(ctx context.Context, s Sink, msg string) {
-	m.matchEventRules(ctx, s, kernelTempRules, msg)
+func (m *Monitor) processKernelLine(ctx context.Context, s Sink, msg string) bool {
+	ok := m.matchEventRules(ctx, s, kernelTempRules, msg)
 	if kernelDeadlockRe.MatchString(msg) {
 		s.BumpCounter(kernelDeadlockProblemReason)
 		if !m.kernelDeadlock {
 			// Permanent: latch True for the agent lifetime (NPD
-			// permanent-rule parity) and emit the transition Event.
+			// permanent-rule parity). The CONDITION must not wait
+			// on the Events API — a refused emit retries through
+			// kernelDeadlockEventSent below, it never blocks the
+			// latch.
 			m.kernelDeadlock = true
 			m.kernelDeadlockMsg = msg
-			if err := s.EmitEvent(ctx, kernelDeadlockProblemReason, msg); err != nil {
+		}
+		if !m.kernelDeadlockEventSent {
+			// The transition Event is emit-once — a refused write
+			// returns false so the journal entry requeues and the
+			// emit retries (kmsg records retry on the next matching
+			// line instead — ring reads carry no cursor).
+			if err := s.EmitEvent(ctx, kernelDeadlockProblemReason,
+				m.kernelDeadlockMsg); err != nil {
 				logger().Error("nodereporter: event emit failed",
 					"reason", kernelDeadlockProblemReason, "error", err)
+				ok = false
+			} else {
+				m.kernelDeadlockEventSent = true
 			}
 		}
 	}
@@ -246,4 +301,5 @@ func (m *Monitor) processKernelLine(ctx context.Context, s Sink, msg string) {
 			s.EnterLatch(hr.latch, msg)
 		}
 	}
+	return ok
 }

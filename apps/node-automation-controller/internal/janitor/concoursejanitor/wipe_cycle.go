@@ -133,7 +133,7 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	if np, err := j.getPod(ctx, podName); err != nil {
 		log.Info("WARN: re-read pod after wipe failed", "pod", podName, "error", err)
 	} else {
-		s2 := j.readStats(ctx, np)
+		s2 := j.readStatsMetered(ctx, np, false) // post-wipe re-read feeds no decision — never metered
 		if s2.nodefsOK {
 			if err := j.annotateBaseline(ctx, podName, s2.usedGiB); err != nil {
 				log.Info("WARN: baseline annotate failed", "pod", podName, "error", err)

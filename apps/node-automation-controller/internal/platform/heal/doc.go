@@ -12,10 +12,13 @@
 //	-> stamp the ledger ONLY when the delete is delivered
 //
 // The budget grant the preamble consumes is part of that sequence:
-// EvictPodV pairs the grant with the eviction and refunds it when the
-// eviction is PDB-refused (a deferral delivered no heal — see
-// budget.go), so a PDB-hung target cannot burn one fleet grant per
-// sweep.
+// EvictPodV pairs the grant with the eviction and refunds it when
+// the eviction is refused (PDB 429, L1 hold or quorum denial — any
+// clean deferral that delivered no heal; see budget.go), so a
+// PDB-hung target cannot burn one fleet grant per sweep. Refunds
+// live at the GATE OWNER only — low-level DeletePod/EvictPod never
+// refund, because they cannot know whether a gate charged the
+// budget (exactly-once contract in budget.go).
 //
 // heal is a leaf platform package: it imports only platform/kube and
 // platform/state, returns verdicts and errors, and NEVER calls

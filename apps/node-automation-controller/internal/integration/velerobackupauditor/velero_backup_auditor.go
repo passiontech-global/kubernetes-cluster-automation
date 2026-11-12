@@ -58,6 +58,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -145,11 +146,18 @@ const veleroRepoHealedCooldown = 2 * time.Hour
 // veleroList pages a full dynamic List through the shared page bound —
 // same contract as a raw .List but bounded per response (Velero and
 // Everest CRDs are cluster-scoped here, so every audit read is
-// cluster-wide).
+// cluster-wide). ResourceVersion "0" routes the read to the
+// apiserver's watch cache: these censuses are point-in-time audit
+// snapshots, and under kube-apiserver-on-Kine every paged page was a
+// separate SQL round-trip — one cache-served response replaces them
+// (pageOpts strips the Limit companion on the wire).
 func (a *veleroBackupAuditor) veleroList(ctx context.Context,
 	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	return kube.ListAllUnstructured(ctx, a.dyn.Resource(gvr),
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		})
 }
 
 // veleroMissingBackupMaxAge is the zero-backup-guard zero-backup threshold:
@@ -299,10 +307,24 @@ func Setup(d shared.Deps) error {
 }
 
 func (a *veleroBackupAuditor) run(ctx context.Context) error {
-	a.seenBSL.Begin()    // drop any aborted sweep's leftover emissions
-	a.seenBad.Begin()    // drop any aborted sweep's leftover emissions
-	a.seenPaused.Begin() // drop any aborted sweep's leftover emissions
-	a.seenRepo.Begin()   // drop any aborted sweep's leftover emissions
+	// Begin EVERY emitted-gauge ledger up front — not just the four
+	// this function prunes itself. The audit helpers Begin their own
+	// ledgers at their start, but an early return BELOW (a failed
+	// veleroObjects list, a BSL/repo audit error) can strand
+	// "current" emissions an aborted sweep left behind; resetting
+	// here means every ledger's next Prune rolls forward only what
+	// THIS sweep measured. Begin is idempotent — the per-audit
+	// Begins stay so a direct audit call (tests) is still safe.
+	a.seenBSL.Begin()          // drop any aborted sweep's leftover emissions
+	a.seenBad.Begin()          // drop any aborted sweep's leftover emissions
+	a.seenPaused.Begin()       // drop any aborted sweep's leftover emissions
+	a.seenRepo.Begin()         // drop any aborted sweep's leftover emissions
+	a.seenEverest.Begin()      // drop any aborted sweep's leftover emissions
+	a.seenCNPG.Begin()         // drop any aborted sweep's leftover emissions
+	a.seenStuckBackup.Begin()  // drop any aborted sweep's leftover emissions
+	a.seenWedgedPVB.Begin()    // drop any aborted sweep's leftover emissions
+	a.seenWedgedPVR.Begin()    // drop any aborted sweep's leftover emissions
+	a.seenDataMovement.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// backup-posture-audit — the Everest DB-backup audit is independent of Velero:
@@ -322,7 +344,27 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	if schedules == nil {
 		// Clusters without Velero have no CRDs — quiet skip, same
-		// contract as externalsecret-nudge.
+		// contract as externalsecret-nudge. Every seen ledger still
+		// gets its prune BEFORE the early return: series emitted
+		// while Velero was installed must not linger as stale
+		// gauges after the CRDs go away (the normal prunes live
+		// inside the audit passes this path skips). That includes
+		// the four ledgers owned by audits BELOW this return —
+		// in-flight transfers, wedged PVB/PVR and data movement
+		// never ran, so without these prunes their series pin at 1
+		// forever. seenEverest/seenCNPG are NOT pruned here: their
+		// audits already ran and self-pruned above (a second Prune
+		// would delete series they just re-asserted).
+		a.seenPaused.Prune(metrics.VeleroSchedulePaused.DeleteLabelValues)
+		a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
+		a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
+		a.seenRepo.Prune(metrics.VeleroRepoUnhealthy.DeleteLabelValues)
+		a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
+		a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
+		a.seenWedgedPVR.Prune(metrics.VeleroPodVolumeRestoreWedged.DeleteLabelValues)
+		a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
+		a.firstSeenPaused.Prune(func(string) bool { return false })
+		a.firstSeenRepoNotReady.Prune(func(string) bool { return false })
 		log.Info("skip: velero CRDs not installed")
 		return dbErr
 	}

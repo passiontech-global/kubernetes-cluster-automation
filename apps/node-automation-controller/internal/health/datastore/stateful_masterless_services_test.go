@@ -111,7 +111,7 @@ func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("deadlocked masterless service must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("db").
@@ -153,7 +153,7 @@ func TestDeadlockWaitsForOperatorSettle(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while the operator heal is still settling")
@@ -175,7 +175,7 @@ func TestDeadlockRequiresOperatorHeal(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted with no operator heal on record")
@@ -199,7 +199,7 @@ func TestDeadlockSkipsWhenMasterPresent(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while a pod already holds the master role")
@@ -224,7 +224,7 @@ func TestDeadlockHealCooldown(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drPodHealed.
 		Stamp("db/dragonfly", base.Add(-10*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the 30m deadlock cooldown")
@@ -259,7 +259,7 @@ func TestDeadlockOperatorHealLedgerPruned(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).
 		drOpHealed.Stamp("db/other", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).
 		drOpHealed.Last("db/retired"); ok {
 		t.Fatal("drOpHealed stamp past the 30m heal cooldown must be pruned")
@@ -294,7 +294,7 @@ func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("downscaled statefulset must pass: %+v", res)
 	}
 }
@@ -349,10 +349,10 @@ func TestMasterlessMultipleMastersSplitBrain(t *testing.T) {
 		endpointSliceWithZones("db", "dragonfly-master", "", ""))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first multi-master sighting must pass: %+v", res)
 	}
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("multi-master for 2 sweeps did not fail the check")
 	}
@@ -384,7 +384,7 @@ func TestMasterlessSiteSkewTriggerA(t *testing.T) {
 		endpointSliceWithZones("db", "dragonfly-master", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("master pinned to lanit with datahub replicas must fail")
 	}
@@ -413,7 +413,7 @@ func TestMasterlessSiteSkewPinRatio(t *testing.T) {
 		endpointSliceWithZones("db", "m2", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("100% masters pinned to lanit must fail")
 	}
@@ -438,7 +438,7 @@ func TestMasterlessSiteSkewSingleZoneSkips(t *testing.T) {
 		zoneNode("ln-worker", "lanit"),
 		endpointSliceWithZones("db", "m1", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("single-zone cluster must pass: %+v", res)
 	}
 }
@@ -460,7 +460,7 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted during maintenance")

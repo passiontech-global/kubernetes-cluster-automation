@@ -11,6 +11,7 @@ import (
 	"embed"
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
@@ -150,6 +151,15 @@ func (c *cyc) group(name string, fn func()) {
 }
 
 func (c *cyc) v(name string) string { return c.t.Vars.Str(name) }
+
+// dpkgInstalled reports whether pkg is fully installed
+// ("install ok installed") — the apt-get skip gate so a converge
+// doesn't fork apt (and take the dpkg lock) for packages the host
+// already satisfies.
+func (c *cyc) dpkgInstalled(ctx context.Context, pkg string) bool {
+	out, _ := c.r.run(ctx, "dpkg-query", "-W", "-f=${Status}", pkg)
+	return strings.Contains(out, "install ok installed")
+}
 
 func (c *cyc) vb(name string) bool { return c.t.Vars.Bool(name) }
 

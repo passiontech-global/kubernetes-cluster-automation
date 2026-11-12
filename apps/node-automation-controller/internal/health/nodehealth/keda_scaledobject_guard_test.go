@@ -69,11 +69,11 @@ func TestKedaGuardFlagsUnhealthyPastWindowAndRescuesZero(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting inside window must pass: %+v", res)
 	}
 	base = base.Add(16 * time.Minute)
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("unhealthy scaledobject past window must fail: %+v", res)
 	}
@@ -103,9 +103,9 @@ func TestKedaGuardRescuesZeroRollout(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	base = base.Add(16 * time.Minute)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("unhealthy scaledobject past window must fail: %+v", res)
 	}
 	got, err := dyn.Resource(kube.GVRArgoRollout).Namespace("apps").
@@ -128,9 +128,9 @@ func TestKedaGuardSkipsDownscalerManagedZero(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	base = base.Add(16 * time.Minute)
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("active_unknown scaledobject past window must fail: %+v", res)
 	}
@@ -156,7 +156,7 @@ func TestKedaGuardRestartResume(t *testing.T) {
 	dep := zeroDeploy("apps", "worker", nil)
 	cs := fake.NewSimpleClientset(dep)
 	p := testProberDyn(cs, probetest.OpDyn(so))
-	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("persisted window did not resume on the first post-restart sweep: %+v", res)
 	}
@@ -173,7 +173,7 @@ func TestKedaGuardPassesOnHealthyObjects(t *testing.T) {
 	so := kedaObj("apps", "worker-scaler", "worker", 1, "True", "True")
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(so))
-	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("healthy scaledobject must pass: %+v", res)
 	}

@@ -10,6 +10,7 @@ package circuitbreaker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -151,8 +152,20 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		// window drains before one probe patch re-arms. The series
 		// state carries forward untouched (the annotation, the SSOT,
 		// still lists whatever it listed).
-		if !heal.FluxPatchGate(job.kind, job.cfgObj,
-			job.kind+"/"+job.name, s.now) {
+		//
+		// P0-4: the gate applies ONLY to the recovery direction
+		// (Ignore -> Fail). A payload flipping any hook TO Ignore is
+		// the breaker's emergency actuation — a Fail-closed webhook on
+		// a dead backend keeps paralyzing kube-apiserver until it is
+		// tripped, so it must never sit behind the loop window (a
+		// blocked trip also left carryBrokenForward reporting a
+		// circuit that was never actually broken). The ping-pong
+		// rate-limit still guards Ignore -> Fail recoveries; a mixed
+		// payload rides the emergency write since its trips need it
+		// anyway.
+		if !emergencyPatch(payload) &&
+			!heal.FluxPatchGate(job.kind, job.cfgObj,
+				job.kind+"/"+job.name, s.now) {
 			s.b.carryBrokenForward(job.kind, job.name, job.views)
 			s.log.Info("skip heal: Flux Heal-Revert Loop detected — circuit patch deferred",
 				"kind", job.kind, "config", job.name)
@@ -181,4 +194,29 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		}
 		circuitMetrics(&s.b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
 	}
+}
+
+// emergencyPatch reports whether the circuit patch flips any
+// sub-webhook's failurePolicy TO Ignore — the breaker's emergency
+// Fail -> Ignore actuation, which bypasses the Flux heal-revert
+// gate (see runJobs). Annotation-only payloads and pure
+// Ignore -> Fail recoveries return false and stay gated. An
+// undecodable payload fails closed to gated: the write is skipped
+// either way only when the gate also denies, and a corrupt payload
+// would fail the Patch call regardless.
+func emergencyPatch(payload []byte) bool {
+	var doc struct {
+		Webhooks []struct {
+			FailurePolicy string `json:"failurePolicy"`
+		} `json:"webhooks"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return false
+	}
+	for _, w := range doc.Webhooks {
+		if w.FailurePolicy == string(admissionv1.Ignore) {
+			return true
+		}
+	}
+	return false
 }

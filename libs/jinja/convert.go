@@ -46,6 +46,9 @@ func jsonValueAt(v any, depth int, steps *int) ([]byte, error) {
 			return vv
 		}, depth, steps)
 	case *List:
+		if t == nil {
+			return jsonListAt(nil, depth, steps)
+		}
 		return jsonListAt(t.V, depth, steps)
 	case []any:
 		return jsonListAt(t, depth, steps)
@@ -145,6 +148,9 @@ func yamlValueAt(v any, depth int, steps *int) (*yaml3.Node, error) {
 			return vv
 		}, depth, steps)
 	case *List:
+		if t == nil {
+			return yamlSeqNode(nil, depth, steps)
+		}
 		return yamlSeqNode(t.V, depth, steps)
 	case []any:
 		return yamlSeqNode(t, depth, steps)
@@ -215,7 +221,25 @@ func yamlLeafNode(v any) (*yaml3.Node, error) {
 
 // ---------------- from_json ----------------
 
-func fromJSON(v any) any {
+// fromJSONMaxDepth bounds the re-boxing walk — json.Unmarshal
+// already rejects documents nested past its own limit, but the
+// decoded tree still deserves an explicit recursion budget so a
+// hostile-but-parseable document can't stack the re-boxer.
+const fromJSONMaxDepth = 64
+
+// fromJSONChecked re-boxes a json.Unmarshal tree into OMap/List
+// values. Unlike the old silent fromJSON it returns an explicit
+// error when the document nests past fromJSONMaxDepth — a truncated
+// nil would render as a WRONG value downstream (a vars file quietly
+// losing a subtree), which is worse than a loud filter failure.
+func fromJSONChecked(v any) (any, error) {
+	return fromJSONAt(v, 0)
+}
+
+func fromJSONAt(v any, depth int) (any, error) {
+	if depth > fromJSONMaxDepth {
+		return nil, fmt.Errorf("from_json: document nests past %d levels", fromJSONMaxDepth)
+	}
 	switch t := v.(type) {
 	case map[string]any:
 		m := NewOMap()
@@ -225,23 +249,31 @@ func fromJSON(v any) any {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			m.Set(k, fromJSON(t[k]))
+			cv, err := fromJSONAt(t[k], depth+1)
+			if err != nil {
+				return nil, err
+			}
+			m.Set(k, cv)
 		}
-		return m
+		return m, nil
 	case []any:
 		out := make([]any, len(t))
 		for i, x := range t {
-			out[i] = fromJSON(x)
+			cv, err := fromJSONAt(x, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = cv
 		}
-		return &List{out}
+		return &List{out}, nil
 	case float64:
 		// floatToInt64, not int64(t): NaN/±Inf/out-of-range floats
 		// truncate into platform garbage (usually MinInt64).
 		if i, ok := floatToInt64(t); ok && t == float64(i) {
-			return i
+			return i, nil
 		}
-		return t
+		return t, nil
 	default:
-		return v
+		return v, nil
 	}
 }

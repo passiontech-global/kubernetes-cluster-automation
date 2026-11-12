@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
@@ -53,6 +54,11 @@ type env struct {
 	pingOK   map[string]bool    // "ip|marked" → alive
 	pingRTT  map[string]float64
 	httpErr  map[string]error
+	// nlRules is the rulesFn seam's canned policy-routing dump —
+	// the netlink read that replaced the egress check's
+	// `ip rule list` forks (empty = "no rules", like the old
+	// unstubbed listing).
+	nlRules []netlink.Rule
 }
 
 func fixture(t *testing.T, wd *watchdogconf.Config) *env {
@@ -136,8 +142,30 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 		*buf = e.timex
 		return 0, e.adjErr
 	}
+	n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
+		return e.nlRules, nil
+	}
 	e.n = n
 	return e
+}
+
+// nlRule builds one policy-routing rule for the rulesFn seam:
+// priority + lookup table + optional host dst ("to <ip>", the
+// /32-or-/128 shape iproute2 prints for a bare address).
+func nlRule(pref, table int, dst string) netlink.Rule {
+	r := netlink.Rule{Priority: pref, Table: table}
+	if dst != "" {
+		ip := net.ParseIP(dst)
+		if ip == nil {
+			return r
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+		bits := 8 * len(ip)
+		r.Dst = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+	}
+	return r
 }
 
 func logLines(t *testing.T, e *env) string {
@@ -205,7 +233,6 @@ func overlayEnv(t *testing.T, extra func(*watchdogconf.Config)) *env {
 	e := fixture(t, wd)
 	e.sd.On("is-enabled nebula@interdc", "enabled\n")
 	e.sd.On("is-active nebula@interdc", "active\n")
-	e.host.On("rule list", "0:\tfrom all lookup local\n")
 	return e
 }
 

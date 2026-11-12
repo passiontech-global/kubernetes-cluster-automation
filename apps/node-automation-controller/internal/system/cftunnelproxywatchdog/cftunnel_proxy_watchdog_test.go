@@ -1011,7 +1011,7 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 			})
 		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
 			now: shared.Clock(func() time.Time { return now })}
-		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err == nil {
+		if _, err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs", now); err == nil {
 			t.Fatal("precondition miss must propagate the Conflict error")
 		}
 		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
@@ -1025,8 +1025,12 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 		cs := fake.NewSimpleClientset()
 		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
 			now: shared.Clock(func() time.Time { return now })}
-		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err != nil {
+		delivered, err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs", now)
+		if err != nil {
 			t.Fatalf("already-gone pod must be nil: %v", err)
+		}
+		if delivered {
+			t.Fatal("a 404 delete is not a delivered heal — must report false")
 		}
 		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
 			t.Fatalf("a delete we did not deliver counted %v heals", got)
@@ -1043,7 +1047,7 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 			})
 		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
 			now: shared.Clock(func() time.Time { return now })}
-		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err == nil {
+		if _, err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs", now); err == nil {
 			t.Fatal("api failure must propagate")
 		}
 		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
@@ -1057,8 +1061,12 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 		cs := fake.NewSimpleClientset(pod)
 		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
 			now: shared.Clock(func() time.Time { return now })}
-		if err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs"); err != nil {
+		delivered, err := w.deleteConnectorPod(context.Background(), pod, "fatal_logs", now)
+		if err != nil {
 			t.Fatalf("clean delete failed: %v", err)
+		}
+		if !delivered {
+			t.Fatal("delivered delete must report true")
 		}
 		if got := wedgeDeletedCount(t, "fatal_logs"); got != 1 {
 			t.Fatalf("delivered delete counter = %v, want 1", got)

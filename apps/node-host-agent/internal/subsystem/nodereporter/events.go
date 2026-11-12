@@ -66,14 +66,32 @@ type emittedEvent struct {
 // rules, bumps problem_counter and emits/aggregates Events. A missing
 // log file is not an error (nodes without the watchdog simply have
 // nothing to report).
+//
+// The log offset commits ONLY when every Event write in the batch
+// succeeded: readNewLogLines advances r.logOffset while reading, so
+// a failed emit would otherwise lose those lines permanently (the
+// next scan resumes past them). On any emit failure the pre-read
+// offset/pending/scanned state is restored and the whole window
+// replays next cycle — emitEvent's reason+message dedup absorbs the
+// re-emission, and problem_counter recounts the replayed matches
+// (a counter of observed problems, not delivered events).
 func (r *Reporter) syncLogEvents(ctx context.Context) error {
+	savedOffset, savedPending := r.logOffset, r.logPending
+	savedScanned, savedFi := r.logScanned, r.logFi
 	lines, replayCount, err := r.readNewLogLines()
 	if err != nil {
 		return err
 	}
 	r.pruneEmitted()
+	allEmitted := true
 	for i, line := range lines {
-		r.processLogLine(ctx, line, i < replayCount)
+		if !r.processLogLine(ctx, line, i < replayCount) {
+			allEmitted = false
+		}
+	}
+	if !allEmitted {
+		r.logOffset, r.logPending = savedOffset, savedPending
+		r.logScanned, r.logFi = savedScanned, savedFi
 	}
 	return nil
 }
@@ -332,18 +350,21 @@ func splitLogLine(line []byte) (msg string, ts time.Time) {
 	return msg, ts
 }
 
-// processLogLine applies all rules to one line. On the first scan
-// (replay) only lines inside LogLookback with a parseable timestamp
-// are emitted — unparseable/older lines are skipped so a restart
-// doesn't re-report ancient history.
-func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool) {
+// processLogLine applies all rules to one line and reports whether
+// every matched Event write succeeded — false tells syncLogEvents to
+// roll the log offset back so the line replays next cycle. On the
+// first scan (replay) only lines inside LogLookback with a parseable
+// timestamp are emitted — unparseable/older lines are skipped so a
+// restart doesn't re-report ancient history.
+func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool) bool {
 	if len(line) == 0 {
-		return
+		return true
 	}
 	msg, ts := splitLogLine(line)
 	if replay && (ts.IsZero() || r.cfg.Clock.Now().Sub(ts) > r.cfg.LogLookback) {
-		return
+		return true
 	}
+	ok := true
 	for _, rule := range logRules {
 		if !rule.re.MatchString(msg) {
 			continue
@@ -354,6 +375,7 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 			// match and the next identical line retries the Event.
 			logger().Error("nodereporter: event emit failed",
 				"reason", rule.reason, "error", err)
+			ok = false
 		}
 	}
 	for _, rule := range exitLogRules {
@@ -364,8 +386,10 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 		if err := r.emitEvent(ctx, rule.reason, msg, corev1.EventTypeNormal); err != nil {
 			logger().Error("nodereporter: exit event emit failed",
 				"reason", rule.reason, "error", err)
+			ok = false
 		}
 	}
+	return ok
 }
 
 // emitEvent creates or aggregates one Event of the given type on this

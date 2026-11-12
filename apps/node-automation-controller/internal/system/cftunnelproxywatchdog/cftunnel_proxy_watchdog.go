@@ -44,6 +44,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -153,6 +154,64 @@ type cfTunnelProxyWatchdog struct {
 	// hand-rolled map it replaced did exactly its Stamp/CooledDown/
 	// Forget job.
 	syncErrLast state.CooldownSet
+	// podCensus memoizes the per-sweep pod lists — the three duties
+	// (resync, wedge scan, sync-error audit) each used to LIST the
+	// same namespaces under different selectors; one unfiltered
+	// list per namespace per sweep serves all three with the label
+	// match moved client-side. run() rebuilds it every sweep so a
+	// deleted pod never lingers into the next pass; a nil census
+	// (direct test calls bypassing run) lazily self-initializes.
+	podCensus *podCensus
+}
+
+// podCensus is the per-sweep pod-list memo — keyed by namespace,
+// error cached with the list so every consumer sees the same
+// verdict without re-hitting the apiserver.
+type podCensus struct {
+	lists map[string]nsPodList
+}
+
+type nsPodList struct {
+	pods []corev1.Pod
+	err  error
+}
+
+// podsInNS returns the sweep's pod list for one namespace,
+// listing at most once per census.
+func (w *cfTunnelProxyWatchdog) podsInNS(ctx context.Context,
+	ns string) ([]corev1.Pod, error) {
+	if w.podCensus == nil {
+		w.podCensus = &podCensus{lists: map[string]nsPodList{}}
+	}
+	if l, ok := w.podCensus.lists[ns]; ok {
+		return l.pods, l.err
+	}
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+		Limit: kube.DefaultListPageSize,
+	}, kube.Pods(w.cs, ns))
+	if err != nil {
+		err = fmt.Errorf("list pods in %s: %w", ns, err)
+	}
+	w.podCensus.lists[ns] = nsPodList{pods: pods, err: err}
+	return pods, err
+}
+
+// matchPodSelector filters a census pod list by a label-selector
+// string — the census reads pods unfiltered so every duty shares
+// the one apiserver List per namespace per sweep; the match the
+// server-side LabelSelector used to do moves client-side.
+func matchPodSelector(pods []corev1.Pod, selStr string) ([]corev1.Pod, error) {
+	sel, err := labels.Parse(selStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse pod selector %q: %w", selStr, err)
+	}
+	var out []corev1.Pod
+	for i := range pods {
+		if sel.Matches(labels.Set(pods[i].Labels)) {
+			out = append(out, pods[i])
+		}
+	}
+	return out, nil
 }
 
 // Setup registers the periodic sweep — only on
@@ -187,6 +246,10 @@ func configFromEnv() watchdogConfig {
 
 func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	// Fresh pod census for this sweep — the three duties share it
+	// (see podCensus); rebuilt here so last sweep's deletes and
+	// creations never leak into this pass's verdicts.
+	w.podCensus = &podCensus{lists: map[string]nsPodList{}}
 	resynced, err := w.resyncUnreadyProxies(ctx)
 	if err != nil {
 		return err
@@ -218,12 +281,13 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
 	now := w.now.Now()
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: cfTunnelProxyPodSelector,
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(w.cs, w.namespace))
+	all, err := w.podsInNS(ctx, w.namespace)
 	if err != nil {
-		return 0, fmt.Errorf("list proxy pods in %s: %w", w.namespace, err)
+		return 0, err
+	}
+	pods, err := matchPodSelector(all, cfTunnelProxyPodSelector)
+	if err != nil {
+		return 0, err
 	}
 	var unready []string
 	for i := range pods {

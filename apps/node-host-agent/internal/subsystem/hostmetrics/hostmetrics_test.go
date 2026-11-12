@@ -78,9 +78,17 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		// (~20 concurrent goroutines during a suite run).
 		cpuMeasure: func() (float64, float64, bool) { return 0, 0, false },
 		// Default stubs keep unrelated scrapes hermetic — the real
-		// adjtimex/statfs would feed live host data into assertions.
+		// adjtimex/statfs/sock_diag would feed live host data into
+		// assertions (same contract as cpuMeasure above).
 		adjtimexFn: func(*unix.Timex) (int, error) { return 0, unix.ENOSYS },
 		statfsFn:   func(string, *unix.Statfs_t) error { return unix.ENOENT },
+		TCPStatesFn: func(int) (map[uint8]int, error) {
+			return nil, errors.New("sock_diag disabled in tests")
+		},
+		// The 10s Collect snapshot would serve stale reads across
+		// the fixture mutations every scrape test performs — the
+		// cache gets its own dedicated test instead.
+		collectCacheTTL: -1,
 		// Never wait the real 2s in tests — the stall tests inject
 		// their own hanging statfsFn against this shortened deadline.
 		fsProbeTimeout: 50 * time.Millisecond,
@@ -103,8 +111,10 @@ func fixtureSeams(root string) {
 	kmsgDevicePaths = func(string) []string {
 		return []string{filepath.Join(root, "dev", "kmsg")}
 	}
-	runHostCmd = func(context.Context, ...string) (string, error) {
-		return "", errors.New("exec disabled in tests")
+	runHostCmd = func(string) func(context.Context, ...string) (string, error) {
+		return func(context.Context, ...string) (string, error) {
+			return "", errors.New("exec disabled in tests")
+		}
 	}
 }
 
@@ -205,11 +215,14 @@ func TestApplyDefaults(t *testing.T) {
 	if c.cfg.fsProbeTimeout != defaultFSProbeTimeout {
 		t.Fatalf("fsProbeTimeout=%v want %v", c.cfg.fsProbeTimeout, defaultFSProbeTimeout)
 	}
+	if c.cfg.collectCacheTTL != collectSnapshotTTL {
+		t.Fatalf("collectCacheTTL=%v want %v", c.cfg.collectCacheTTL, collectSnapshotTTL)
+	}
 }
 
 func TestDescribe(t *testing.T) {
 	c := New(Config{})
-	ch := make(chan *prometheus.Desc, 80) // > total descs — Describe blocks on a full buffer
+	ch := make(chan *prometheus.Desc, 96) // > total descs — Describe blocks on a full buffer
 	c.Describe(ch)
 	// 10 base descs + the 2 legacy prom_emit aliases
 	// (node_watchdog_state, node_watchdog_egress_relay) + 16
@@ -234,8 +247,9 @@ func TestDescribe(t *testing.T) {
 	//   memory.events unit set).
 	// + 3 A6 descs (per-tuple max + per-tuple hot endpoint +
 	//   TCPTimeWaitOverflow — the sockstat/netstat rows).
-	if got := len(ch); got != 80 {
-		t.Fatalf("Describe emitted %d descs want 80", got)
+	// + 1 sock_diag per-state census desc (netlinkx TCPStates).
+	if got := len(ch); got != 81 {
+		t.Fatalf("Describe emitted %d descs want 81", got)
 	}
 }
 

@@ -71,6 +71,22 @@ const (
 	// EnvHubsyncLocalBinary points hubsync at a local binary to
 	// push instead of downloading one.
 	EnvHubsyncLocalBinary = "NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY"
+	// EnvHubsyncSSHHostKeyFingerprint pins the expected SSH host
+	// key of converge targets — either one "SHA256:<b64>" fingerprint
+	// applied to every host (ssh.FingerprintSHA256 format) or a
+	// per-host map "host1=SHA256:..,host2=SHA256:..,*=SHA256:.."
+	// matched against the dial hostname. With no pin, trust falls
+	// back to known_hosts next to the converge key and then the
+	// persistent TOFU store; only when ALL of those are absent does
+	// EnvHubsyncSSHAllowInsecureHostKey (or a hard dial failure)
+	// decide.
+	EnvHubsyncSSHHostKeyFingerprint = "NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT"
+	// EnvHubsyncSSHAllowInsecureHostKey explicitly permits the
+	// historical audit-log-only host-key acceptance for targets
+	// whose keys rotate on rebuild — the last resort after pins,
+	// known_hosts and TOFU all decline to vouch. Without it and
+	// without any trust source, hubsync dials fail closed.
+	EnvHubsyncSSHAllowInsecureHostKey = "NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY"
 	// EnvTextfileInterval is the cadence of the standalone
 	// hostmetrics textfile writer (wired in cmd/agent).
 	EnvTextfileInterval = "NODE_HOST_AGENT_TEXTFILE_INTERVAL"

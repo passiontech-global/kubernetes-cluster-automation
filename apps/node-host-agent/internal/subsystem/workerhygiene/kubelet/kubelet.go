@@ -150,10 +150,16 @@ func k0sWorkerSettled(d *wdeps.Deps, ctx context.Context) bool {
 
 // restartK0sWorker wraps Systemd.Restart — a nil client can't act
 // (unwired agent) and reports so the action is logged not counted.
+// The L1↔L3 stamp rides BEFORE the restart: LocalRemediationInProgress
+// tells the cluster side to yield remote remediation while L1
+// self-heals (best-effort, nil-Coord no-op). The maintenance HOLD
+// itself is the callers' job — it must be checked before the
+// last-restart budget is spent, never here after the spend.
 func restartK0sWorker(d *wdeps.Deps, ctx context.Context) error {
 	if d.Cfg.Systemd == nil {
 		return errors.New("no systemd client wired")
 	}
+	d.StampLocalRemediation(ctx)
 	return d.Cfg.Systemd.Restart(ctx, "k0sworker.service")
 }
 
@@ -231,6 +237,10 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - API unreachable (isolated?), skip restart k0sworker", reason))
 	case !k0sWorkerSettled(c.d, ctx):
 		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - k0sworker not settled (<180s), skip restart", reason))
+	case c.d.HoldLocalAction(ctx):
+		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
+		// restart never burns the shared last-restart cooldown.
+		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - cluster maintenance in progress, skip restart k0sworker", reason))
 	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - in restart cooldown (<30m), skip", reason))
 	default:
@@ -357,6 +367,11 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	case !k0sWorkerSettled(c.d, ctx):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - k0sworker not settled (<180s), skip restart", missing))
+	case c.d.HoldLocalAction(ctx):
+		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
+		// restart never burns the shared last-restart cooldown.
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge unseen=%d - cluster maintenance in progress, skip restart k0sworker", missing))
 	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - in restart cooldown (<30m), skip", missing))

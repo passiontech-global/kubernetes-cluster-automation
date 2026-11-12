@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // healStrandedEphemeral runs the queued ephemeral-volume rescues.
@@ -77,14 +79,23 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 		// claim release landed and the pod slot is free either way —
 		// so the stamp stays manual rather than riding
 		// heal.DeletePod's delivered-delete stamp.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", h.pod, now); err != nil &&
-			!apierrors.IsNotFound(err) {
+		didDelete, err := heal.DeletePod(ctx, p.CS, nil, "", h.pod, now)
+		if err != nil && !apierrors.IsNotFound(err) {
 			metrics.IncError(p.Name)
 			log.Error(err, "stranded pod delete failed",
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
 			continue
 		}
-		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
+		if err == nil && !didDelete {
+			// Quorum reservation denied — a sibling check already
+			// spent this workload's one-disruption slot this sweep.
+			// The PVC release already landed; the stranded pod is
+			// dead weight either way, so next sweep's re-detection
+			// finishes the job. (A NotFound err still falls through
+			// to the bookkeeping below — pod already gone counts.)
+			continue
+		}
+		kube.MarkPodDeleted(ctx, h.pod.UID) // O(1) tombstone — no census reset
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
@@ -130,58 +141,35 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	}
 	// Confirm a provisioner pod exists BEFORE the persisted-cooldown
 	// + mutex + budget preamble — an empty/absent pod set must not
-	// spend a global heal token.
-	pods, err := p.PodsIn(ctx, openebsProvisionerNS)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: list provisioner pods failed — heal deferred",
-			"error", err)
+	// spend a global heal token. BounceOperatorPod runs that same
+	// confirm on its own fresh list (pick → empty ⇒ return before
+	// the gate), so the persisted half is all that remains here.
+	if obj != nil && heal.PersistedCooledDown(ctx, &p.pvcProvHealed, obj,
+		pvcProvHealAnno, openebsProvisionerName, pvcProvisionerHealCooldown, now) {
 		return
 	}
-	hasTarget := false
-	for i := range pods {
-		if strings.HasPrefix(pods[i].Name, openebsProvisionerPrefix) {
-			hasTarget = true
-			break
-		}
-	}
-	if !hasTarget {
-		return
-	}
-	// Free in-RAM cooldown before the persisted/mutex/budget gate.
-	if p.pvcProvHealed.CooledDown(openebsProvisionerName,
-		pvcProvisionerHealCooldown, now) {
-		return
-	}
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
-		&p.pvcProvHealed, obj, pvcProvHealAnno, openebsProvisionerName,
+	// BounceOperatorPod: in-RAM cooldown → fresh pod list → pick →
+	// HealAllowed (memoized mutex + budget) → UID deletes. The pick
+	// caps the bounce at ONE controller-owned pod — the old loop
+	// deleted every prefix match, including stray pods no
+	// controller would recreate.
+	deleted := p.BounceOperatorPod(ctx, log, CheckNameLocalPVStranded,
+		openebsProvisionerNS,
+		func(pods []corev1.Pod) []*corev1.Pod {
+			for i := range pods {
+				pod := &pods[i]
+				if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) ||
+					pod.DeletionTimestamp != nil ||
+					metav1.GetControllerOf(pod) == nil {
+					continue
+				}
+				return []*corev1.Pod{pod}
+			}
+			return nil
+		},
+		&p.pvcProvHealed, openebsProvisionerName,
 		pvcProvisionerHealCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	deleted := false
-	for i := range pods {
-		pod := pods[i]
-		if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) {
-			continue
-		}
-		if _, err := heal.DeletePod(ctx, p.CS, &p.pvcProvHealed,
-			openebsProvisionerName, pod, now); err != nil {
-			metrics.IncError(p.Name)
-			log.Error(err, "localpv provisioner delete failed",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		p.InvalidatePods(ctx) // pod gone — drop the snapshot census
-		deleted = true
-		log.Info("DELETE: wedged localpv provisioner — stalled claims need a resync",
-			"pod", pod.Namespace+"/"+pod.Name)
-	}
-	if !deleted {
+	if deleted == 0 {
 		return
 	}
 	pvcProvisionerHealsTotal.
@@ -190,7 +178,7 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	// cooldown. A patch failure leaves the in-RAM half (the delivered
 	// delete already stamped pvcProvHealed) holding; nil ledger
 	// because the in-RAM key is shared with DeletePod's own stamps.
-	if err := heal.StampPersisted(ctx,
+	if err := heal.StampPersisted(ctx, nil,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().Deployments(openebsProvisionerNS).
 				Patch(ctx, openebsProvisionerName, types.MergePatchType, data,

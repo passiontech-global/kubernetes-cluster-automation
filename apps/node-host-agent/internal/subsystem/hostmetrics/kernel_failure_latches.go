@@ -21,6 +21,7 @@ package hostmetrics
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -30,16 +31,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
 
-// runHostCmd executes a host binary for the deep-failure probes that have
-// no Config seam (chronyc, dmesg) — a package var so tests stub it.
-// The 30s cap matches the nethealth runHostCmd convention; the exec
-// itself is hostexec.RunCombined — capped output + WaitDelay, no
-// second timeout stacked underneath. Reached by the engine through
-// Deps.RunHostCmd's late-bound closure.
-var runHostCmd = func(ctx context.Context, argv ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	return hostexec.RunCombined(cctx, argv...)
+// runHostCmd builds the host-command executor for hostRoot — a
+// package var so tests stub the whole factory. Production gets a
+// hostexec.Runner entering every host PID-1 namespace: the probes
+// it serves (chronyc, dmesg, nvme smart-log) read HOST state —
+// sockets, /dev nodes, the kernel ring — that a container-side
+// exec cannot see. HostRoot "/" (standalone) runs unwrapped.
+// The 30s cap matches the nethealth runHostCmd convention; the
+// exec itself is Runner.ExecCombined — capped output + WaitDelay,
+// no second timeout stacked underneath. Reached by the engine
+// through Deps.RunHostCmd's late-bound closure.
+var runHostCmd = func(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
+	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot})
+	return func(ctx context.Context, argv ...string) (string, error) {
+		if len(argv) == 0 {
+			return "", errors.New("hostmetrics: empty host argv")
+		}
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return runner.ExecCombined(cctx, hostexec.NSAll, argv[0], argv[1:]...)
+	}
 }
 
 // kmsgDevicePaths returns the /dev/kmsg candidates — a package var
@@ -71,9 +82,7 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		Adjtimex: func(tx *unix.Timex) (int, error) {
 			return c.cfg.adjtimexFn(tx)
 		},
-		RunHostCmd: func(ctx context.Context, argv ...string) (string, error) {
-			return runHostCmd(ctx, argv...)
-		},
+		RunHostCmd: runHostCmd(c.cfg.HostRoot),
 		KmsgDevicePaths: func(hostRoot string) []string {
 			return kmsgDevicePaths(hostRoot)
 		},

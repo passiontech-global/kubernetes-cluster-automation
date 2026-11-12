@@ -3,11 +3,14 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vishvananda/netlink"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
@@ -32,20 +35,54 @@ func (n *NetHealth) overlayUp(ctx context.Context) bool {
 		n.unitEnabledActive(ctx, "tinc@"+wd.TincNet)
 }
 
-// ruleTablesFor returns every lookup table referenced by rules for ip.
-func ruleTablesFor(rules, ip string) []int {
+// ruleTablesFor returns every lookup table referenced by pref-1500
+// rules whose dst selector is exactly ip as a host route (/32 v4,
+// /128 v6) — the netlink read's `ip rule list pref 1500` + `to <ip>`
+// text match. The host-route requirement mirrors the old exact-token
+// match: a covering prefix like `to 8.8.8.0/24` never attributed its
+// table to relay 8.8.8.8.
+func ruleTablesFor(rules []netlink.Rule, ip string) []int {
+	relay := net.ParseIP(ip)
+	if relay == nil {
+		return nil
+	}
 	var out []int
-	for _, line := range strings.Split(rules, "\n") {
-		if !strings.Contains(line, "to "+ip) {
+	for _, r := range rules {
+		if r.Priority != 1500 || r.Dst == nil || r.Table == 0 {
 			continue
 		}
-		f := strings.Fields(line)
-		for i, w := range f {
-			if w == "lookup" && i+1 < len(f) {
-				if t, err := strconv.Atoi(f[i+1]); err == nil {
-					out = append(out, t)
-				}
-			}
+		ones, bits := r.Dst.Mask.Size()
+		if ones != bits || !r.Dst.IP.Equal(relay) {
+			continue
+		}
+		out = append(out, r.Table)
+	}
+	return out
+}
+
+// hasFwmark2000Rule reports whether the dump carries the pref-1390
+// underlay-pin rule (`ip rule add pref 1390 fwmark 0x2000 lookup
+// main`) — the netlink read of the old `ip rule list | grep
+// "fwmark 0x2000"`. Mark equality is the honest check: the text
+// substring also matched lookalike marks (0x20000), netlink does
+// not.
+func hasFwmark2000Rule(rules []netlink.Rule) bool {
+	for _, r := range rules {
+		if r.Mark == 0x2000 {
+			return true
+		}
+	}
+	return false
+}
+
+// prefRules filters the shared rule dump to one priority — the
+// `ip rule list pref <n>` half of the read the check used to fork
+// twice per cycle.
+func prefRules(rules []netlink.Rule, pref int) []netlink.Rule {
+	var out []netlink.Rule
+	for _, r := range rules {
+		if r.Priority == pref {
+			out = append(out, r)
 		}
 	}
 	return out
@@ -83,27 +120,24 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		return
 	}
 
-	rules, err := n.ip(ctx, "rule", "list")
+	// One netlink dump replaces the two `ip rule list` forks the
+	// shell ran per cycle: the fwmark-0x2000 presence check and
+	// every relay's pref-1500 table scan derive from the same
+	// []netlink.Rule (netlinkx.Rules binds a handle inside the
+	// host netns — the runHostCmd nsenter wrap's Go-native
+	// sibling). Writes below stay on n.ip: netlinkx is read-only.
+	allRules, err := n.cfg.rulesFn(1)
 	if err != nil {
 		n.state.SuspectLog("egress-rulelist", fmt.Sprintf(
-			"overlay-egress: ip rule list failed: %v — cycle aborted", err),
+			"overlay-egress: rule list failed: %v — cycle aborted", err),
 			suspectLogCadence)
 		n.cycles.WithLabelValues(checkEgress, "abort").Inc()
 		return
 	}
-	if !strings.Contains(rules, "fwmark 0x2000") {
+	if !hasFwmark2000Rule(allRules) {
 		_, _ = n.ip(ctx, "rule", "add", "pref", "1390", "fwmark", "0x2000", "lookup", "main")
 	}
-	rules1500, err := n.ip(ctx, "rule", "list", "pref", "1500")
-	if err != nil {
-		// A failed list reads as "no pref-1500 rules" — every
-		// relay then looks live=direct, driving redundant
-		// del/add churn and a rigged probe path. Warn so the
-		// blind cycle is visible.
-		logger().Warn("nethealth: ip rule list pref 1500 failed — "+
-			"relays read as unruled this cycle",
-			"error", err)
-	}
+	rules1500 := prefRules(allRules, 1500)
 
 	inSet := map[string]bool{}
 	for _, r := range relays {

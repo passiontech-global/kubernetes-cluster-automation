@@ -84,6 +84,14 @@ type sharedState struct {
 	// set, so a worker-only node does not seed phantom holds for
 	// producers that never run here.
 	active map[string]bool
+	// lastSpent is the RAM mirror of the last-* rate budgets —
+	// key → spend epoch. RateSpendIn stamps it BEFORE the disk
+	// write so an ENOSPC/EROFS failure still enforces the
+	// cooldown: without the mirror a failed budget write leaves
+	// RateOK passing every cycle and the gated action (a
+	// systemctl restart above all) storms until the disk recovers.
+	// Bounded by the fixed set of budget names callers use.
+	lastSpent map[string]int64
 }
 
 // New returns a Store for dir/logFile. now and log may be nil. The
@@ -359,6 +367,22 @@ func (s *Store) EnterFrom(name, owner, extra string) {
 	} else {
 		s.AppendLog(latchdefs.StateEnterPrefix + name)
 	}
+}
+
+// ReapStaleLatch removes state-<name> AND its RAM owner holds —
+// the janitor's stale-file reap must not leave shared.owners
+// claiming holds on a latch that no longer exists: a surviving
+// hold-set makes the next EnterFrom skip the post-restart seed and
+// join phantom holders, and a later ExitFrom can then "release" a
+// latch another producer never re-entered. Returns whether the
+// file was actually removed (same contract as exitLocked).
+func (s *Store) ReapStaleLatch(name string) bool {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+	if s.shared.owners != nil {
+		delete(s.shared.owners, name)
+	}
+	return s.exitLocked(name)
 }
 
 // ExitFrom releases one owner's hold on a shared latch: the

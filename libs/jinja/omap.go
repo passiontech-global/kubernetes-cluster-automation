@@ -30,18 +30,42 @@ type OMap struct {
 func NewOMap() *OMap { return &OMap{vals: map[string]any{}} }
 
 // Keys returns the ordered key slice (live — do not mutate).
-func (m *OMap) Keys() []string { return m.keys }
+func (m *OMap) Keys() []string {
+	if m == nil {
+		return nil
+	}
+	return m.keys
+}
 
-func (m *OMap) Len() int { return len(m.keys) }
+func (m *OMap) Len() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.keys)
+}
 
 // Get returns (value, present).
 func (m *OMap) Get(k string) (any, bool) {
+	if m == nil {
+		return nil, false
+	}
 	v, ok := m.vals[k]
 	return v, ok
 }
 
-// Set inserts or replaces, preserving first-insert order.
+// Set inserts or replaces, preserving first-insert order. A typed-nil
+// *OMap has no storage — Set is a no-op rather than a panic (same
+// nil-safety contract as the typed getters below).
 func (m *OMap) Set(k string, v any) {
+	if m == nil {
+		return
+	}
+	if m.vals == nil {
+		// &OMap{} literals carry no storage — lazily allocate so a
+		// zero-value OMap behaves like NewOMap (the typed getters
+		// are already nil-map safe; Set must be too).
+		m.vals = map[string]any{}
+	}
 	if _, ok := m.vals[k]; !ok {
 		m.keys = append(m.keys, k)
 	}
@@ -50,6 +74,9 @@ func (m *OMap) Set(k string, v any) {
 
 // Del removes a key (keeps order of the rest).
 func (m *OMap) Del(k string) {
+	if m == nil {
+		return
+	}
 	if _, ok := m.vals[k]; !ok {
 		return
 	}
@@ -202,6 +229,9 @@ func (m *OMap) Slice(k string) []any {
 	case []any:
 		return t
 	case *List:
+		if t == nil {
+			return nil
+		}
 		return t.V
 	}
 	return nil
@@ -244,6 +274,9 @@ func omFromStringMap[V any](m map[string]V) *OMap {
 
 // Items returns ordered [key,value] pairs (jinja dict2items shape).
 func (m *OMap) Items() []any {
+	if m == nil {
+		return nil
+	}
 	out := make([]any, 0, len(m.keys))
 	for _, k := range m.keys {
 		p := NewOMap()
@@ -339,9 +372,24 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	}
 	switch n.Kind {
 	case yaml3.MappingNode:
+		// Pass 1: collect every EXPLICIT (non-merge) key so merge
+		// sources can skip them no matter where `<<` sits in the
+		// document — an explicit key always wins over a merged one.
+		explicit := make(map[string]bool, len(n.Content)/2)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if !isYAMLMergeKey(n.Content[i]) {
+				explicit[n.Content[i].Value] = true
+			}
+		}
 		m := NewOMap()
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			kn, vn := n.Content[i], n.Content[i+1]
+			if isYAMLMergeKey(kn) {
+				if err := yamlMergeInto(m, vn, explicit, depth+1, steps); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			v, err := yamlNodeAt(vn, depth+1, steps)
 			if err != nil {
 				return nil, err
@@ -406,4 +454,54 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported yaml node kind %v", n.Kind)
 	}
+}
+
+// isYAMLMergeKey reports whether kn is a `<<` merge key. yaml.v3 tags
+// the unquoted form !!merge; a PLAIN (unquoted, untagged) scalar whose
+// value is "<<" is the same key. A QUOTED "<<" (DoubleQuotedStyle /
+// SingleQuotedStyle) is a literal string key, NOT a merge — checking
+// Kind+Style keeps `"<<": 1` in a vars file from silently splicing.
+func isYAMLMergeKey(kn *yaml3.Node) bool {
+	if kn == nil || kn.Kind != yaml3.ScalarNode {
+		return false
+	}
+	return kn.Tag == "!!merge" || (kn.Style == 0 && kn.Value == "<<")
+}
+
+// yamlMergeInto splices the mapping(s) referenced by a `<<` value
+// into m. The value is an alias to a mapping (single merge) or a
+// sequence of such aliases (multi-merge, earlier sources win per the
+// YAML spec). Keys already explicit in the enclosing mapping — or
+// already merged from an earlier source — are skipped.
+func yamlMergeInto(m *OMap, n *yaml3.Node, explicit map[string]bool, depth int, steps *int) error {
+	switch n.Kind {
+	case yaml3.AliasNode, yaml3.MappingNode:
+		v, err := yamlNodeAt(n, depth, steps)
+		if err != nil {
+			return err
+		}
+		om, ok := v.(*OMap)
+		if !ok || om == nil {
+			return errors.New("yaml: merge source is not a mapping")
+		}
+		for _, k := range om.Keys() {
+			if explicit[k] {
+				continue
+			}
+			if _, dup := m.Get(k); dup {
+				continue
+			}
+			vv, _ := om.Get(k)
+			m.Set(k, vv)
+		}
+		return nil
+	case yaml3.SequenceNode:
+		for _, c := range n.Content {
+			if err := yamlMergeInto(m, c, explicit, depth, steps); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("yaml: unsupported merge source kind %v", n.Kind)
 }

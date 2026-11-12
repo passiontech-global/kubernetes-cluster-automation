@@ -41,20 +41,6 @@ func shimFlagValue(argv []string, name string) (string, bool) {
 	return "", false
 }
 
-// hostSidePath maps an in-pod /host-mounted path back to the path a
-// host process reports — the shim's -address carries the HOST socket
-// path (/run/k0s/containerd.sock) while config paths live under the
-// host-root mount (/host/run/k0s/containerd.sock).
-func hostSidePath(p string) string {
-	if rest, ok := strings.CutPrefix(p, "/host/"); ok {
-		return "/" + rest
-	}
-	if p == "/host" {
-		return "/"
-	}
-	return p
-}
-
 // normalizeCtrAddr canonicalizes a containerd grpc socket address so
 // a cosmetic difference can't mark our own shim foreign: the unix://
 // scheme and the /var/run symlink collapse to the canonical /run path.
@@ -78,13 +64,13 @@ func normalizeCtrAddr(a string) string {
 // root dir, not inside it).
 func ctrShimSockets(d *wdeps.Deps) map[string]bool {
 	out := map[string]bool{}
-	if s := normalizeCtrAddr(hostSidePath(d.Cfg.CtrSocket)); s != "" {
+	if s := normalizeCtrAddr(wdeps.HostSidePath(d.Cfg.CtrSocket)); s != "" {
 		out[s] = true
 	}
 	derived := filepath.Join(
 		filepath.Dir(filepath.Dir(filepath.Dir(d.Cfg.CtrTaskRoot))),
 		"containerd.sock")
-	if s := normalizeCtrAddr(hostSidePath(derived)); s != "" {
+	if s := normalizeCtrAddr(wdeps.HostSidePath(derived)); s != "" {
 		out[s] = true
 	}
 	return out

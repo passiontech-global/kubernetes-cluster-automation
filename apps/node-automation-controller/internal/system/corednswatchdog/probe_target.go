@@ -37,9 +37,13 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 	log := logf.FromContext(ctx)
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
-	// keeps each request cheap at fleet scale.
+	// keeps each request cheap at fleet scale. ResourceVersion=0
+	// serves the watch cache: this probe runs every cycle and only
+	// needs a seconds-fresh view of the endpoint set, not a quorum
+	// read — and the watch cache rejects Limit entirely, so no page
+	// bound is set here at all.
 	svcItems, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{ResourceVersion: "0"},
 		kube.Services(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
@@ -52,6 +56,7 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 	type svcCand struct {
 		ns, name string
 		created  time.Time
+		headless bool
 	}
 	n := len(svcItems)
 	if n > 8 { // bash: top-8 newest BEFORE the age filter
@@ -64,30 +69,75 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 			ns:      s.Namespace,
 			name:    s.Name,
 			created: s.CreationTimestamp.Time,
+			// Headless is EXACTLY ClusterIP "None" — a headless
+			// A record IS the live endpoint set, so its answers
+			// are verifiable. "" (unallocated/ExternalName) takes
+			// the any-answer ClusterIP path: there is no stable
+			// IP set to verify against, but a fresh service name
+			// resolving at all still proves the watch is live.
+			headless: s.Spec.ClusterIP == corev1.ClusterIPNone,
 		})
 	}
-	for _, svc := range cands {
+	// Headless candidates win over ClusterIP ones (P0-11): a
+	// ClusterIP answer is blind to a frozen watch — the IP is
+	// allocated once — while a headless A record IS the live
+	// endpoint set. Scan every <10m candidate for the newest
+	// headless service with a ready endpoint; the newest
+	// ClusterIP service is kept only as the fallback answer.
+	var clusterIPPick *svcCand
+	for i := range cands {
+		svc := &cands[i]
 		if w.now.Now().Sub(svc.created) >= corednsLogSinceS*time.Second {
 			continue
 		}
 		eps, err := kube.ListAll(ctx,
 			metav1.ListOptions{
-				Limit:         kube.DefaultListPageSize,
-				LabelSelector: "kubernetes.io/service-name=" + svc.name},
+				ResourceVersion: "0",
+				LabelSelector:   "kubernetes.io/service-name=" + svc.name},
 			kube.EndpointSlices(w.cs, svc.ns))
 		if err != nil {
 			log.Info("dns: cannot list endpointslices — skipping probe candidate",
 				"service", svc.ns+"/"+svc.name, "error", err)
 			continue
 		}
+		ready := false
 		for _, es := range eps {
 			for _, ep := range es.Endpoints {
 				// bash: conditions.ready == true — nil does NOT count.
 				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-					return svc.name + "." + svc.ns + ".svc.cluster.local", nil
+					ready = true
+					break
 				}
 			}
+			if ready {
+				break
+			}
 		}
+		if !ready {
+			continue
+		}
+		if svc.headless {
+			want, err := w.headlessWantSet(ctx, svc.ns, svc.name)
+			if err != nil {
+				log.Info("dns: headless probe want-set failed — trying next candidate",
+					"service", svc.ns+"/"+svc.name, "error", err)
+				continue
+			}
+			if len(want) == 0 {
+				continue // endpoints vanished between the two reads
+			}
+			return svc.name + "." + svc.ns + ".svc.cluster.local", want
+		}
+		if clusterIPPick == nil {
+			clusterIPPick = svc
+		}
+	}
+	if clusterIPPick != nil {
+		// Newest ClusterIP service with a ready endpoint — any
+		// answer proves freshness for a <10m-old service (its IP
+		// was just allocated, so a frozen watch cannot know it).
+		return clusterIPPick.name + "." + clusterIPPick.ns +
+			".svc.cluster.local", nil
 	}
 	svcItems = nil
 	return w.probeFQDNFromSlices(ctx)
@@ -99,17 +149,31 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 // the recency proxy) with at least one ready endpoint. The answer set
 // comes from the slice's Service: clusterIPs for a normal service,
 // the ready endpoint pod IPs for a headless one.
+//
+// P0-11: a ClusterIP answer is BLIND to a frozen watch — the IP is
+// allocated once and never changes, so CoreDNS serving a months-old
+// cache still answers "correctly". The fallback therefore prefers
+// HEADLESS services: their A records ARE the live endpoint set,
+// which churns on every rollout/restart, so a stale answer is
+// detectable. Candidates are tried in resourceVersion order (top 8)
+// until a headless service resolves; a ClusterIP service is kept
+// only as the last resort — strictly better than nothing, still no
+// worse than the old single-pick behavior.
 func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[string]bool) {
 	log := logf.FromContext(ctx)
-	var best *discoveryv1.EndpointSlice
-	var bestRV int64
+	type cand struct {
+		ns, svc string
+		rv      int64
+	}
+	var cands []cand
 	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{ResourceVersion: "0"},
 		kube.EndpointSlices(w.cs, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for i := range items {
 				es := &items[i]
-				if es.Labels[discoveryv1.LabelServiceName] == "" {
+				svcName := es.Labels[discoveryv1.LabelServiceName]
+				if svcName == "" {
 					continue
 				}
 				ready := false
@@ -123,10 +187,10 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 					continue
 				}
 				rv, err := strconv.ParseInt(es.ResourceVersion, 10, 64)
-				if err != nil || rv <= bestRV {
+				if err != nil {
 					continue
 				}
-				best, bestRV = es, rv
+				cands = append(cands, cand{es.Namespace, svcName, rv})
 			}
 			return nil
 		})
@@ -134,50 +198,83 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 		log.Info("dns: cannot list endpointslices — fallback inconclusive", "error", err)
 		return "", nil
 	}
-	if best == nil {
+	if len(cands) == 0 {
 		return "", nil
 	}
-	ns, svcName := best.Namespace, best.Labels[discoveryv1.LabelServiceName]
-	svc, err := w.cs.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{})
-	if err != nil {
-		log.Info("dns: fallback slice's service unresolvable — inconclusive",
-			"service", ns+"/"+svcName, "error", err)
+	sort.Slice(cands, func(i, j int) bool { return cands[i].rv > cands[j].rv })
+	if len(cands) > 8 {
+		cands = cands[:8]
+	}
+	// Try candidates newest-first: first HEADLESS service wins;
+	// the newest ClusterIP service is the fallback answer.
+	var clusterIPFallback *corev1.Service
+	var clusterIPRef cand
+	for _, c := range cands {
+		svc, err := w.cs.CoreV1().Services(c.ns).Get(ctx, c.svc, metav1.GetOptions{})
+		if err != nil {
+			continue // service gone or unreadable — try the next slice
+		}
+		if svc.Spec.ClusterIP == corev1.ClusterIPNone {
+			want, err := w.headlessWantSet(ctx, c.ns, c.svc)
+			if err != nil {
+				log.Info("dns: headless fallback want-set failed — inconclusive",
+					"service", c.ns+"/"+c.svc, "error", err)
+				return "", nil
+			}
+			if len(want) == 0 {
+				continue
+			}
+			return c.svc + "." + c.ns + ".svc.cluster.local", want
+		}
+		if clusterIPFallback == nil {
+			clusterIPFallback, clusterIPRef = svc, c
+		}
+	}
+	if clusterIPFallback == nil {
+		log.Info("dns: no fallback slice's service resolvable — inconclusive")
 		return "", nil
 	}
-	want := map[string]bool{}
-	if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != corev1.ClusterIPNone {
-		want[svc.Spec.ClusterIP] = true
-		for _, ip := range svc.Spec.ClusterIPs {
+	// want is the expected answer set — nil (any answer counts)
+	// when the service carries no usable IPs (unallocated
+	// ClusterIP): an empty non-nil set would fail every real
+	// answer in dnsAnswerFresh.
+	var want map[string]bool
+	if clusterIPFallback.Spec.ClusterIP != "" ||
+		len(clusterIPFallback.Spec.ClusterIPs) > 0 {
+		want = map[string]bool{}
+		if clusterIPFallback.Spec.ClusterIP != "" {
+			want[clusterIPFallback.Spec.ClusterIP] = true
+		}
+		for _, ip := range clusterIPFallback.Spec.ClusterIPs {
 			want[ip] = true
 		}
-	} else {
-		// Headless: the A record IS the endpoint set — and that set
-		// spans EVERY slice the Service owns, not just the freshest:
-		// a Ready IP in a second slice is a valid DNS answer the
-		// single-slice want set would wrongly judge stale.
-		eps, err := kube.ListAll(ctx,
-			metav1.ListOptions{
-				Limit:         kube.DefaultListPageSize,
-				LabelSelector: discoveryv1.LabelServiceName + "=" + svcName},
-			kube.EndpointSlices(w.cs, ns))
-		if err != nil {
-			log.Info("dns: cannot list sibling endpointslices — inconclusive",
-				"service", ns+"/"+svcName, "error", err)
-			return "", nil
-		}
-		for _, es := range eps {
-			for _, ep := range es.Endpoints {
-				if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
-					continue
-				}
-				for _, a := range ep.Addresses {
-					want[a] = true
-				}
+	}
+	return clusterIPRef.svc + "." + clusterIPRef.ns + ".svc.cluster.local", want
+}
+
+// headlessWantSet builds the expected A-record set for a headless
+// service: every Ready endpoint address across ALL slices the
+// Service owns — a Ready IP in a second slice is a valid DNS answer
+// the single-slice want set would wrongly judge stale.
+func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context, ns, svcName string) (map[string]bool, error) {
+	eps, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			ResourceVersion: "0",
+			LabelSelector:   discoveryv1.LabelServiceName + "=" + svcName},
+		kube.EndpointSlices(w.cs, ns))
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]bool{}
+	for _, es := range eps {
+		for _, ep := range es.Endpoints {
+			if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+				continue
+			}
+			for _, a := range ep.Addresses {
+				want[a] = true
 			}
 		}
 	}
-	if len(want) == 0 {
-		return "", nil
-	}
-	return svcName + "." + ns + ".svc.cluster.local", want
+	return want, nil
 }

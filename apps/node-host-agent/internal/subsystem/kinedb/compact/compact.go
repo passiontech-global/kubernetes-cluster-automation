@@ -173,6 +173,55 @@ END $$;
 	return b.String()
 }
 
+// buildSweepScript renders the below-horizon backlog sweep: when
+// the compaction marker already sits at/ahead of head-Tail there is
+// no forward window to advance through, but dead rows BELOW
+// compact_rev can still pile up (a marker moved without its
+// deletes, or chunk ranges a previous run never reached). Rows
+// under the marker are already-compacted history — watchers resume
+// from compact_rev and eat a 410 Gone below it — so the same
+// shadowed/deleted-row DELETE semantics run over [minID, crev] in
+// bounded chunks WITHOUT the compact_rev_key UPDATE: the marker
+// must not move (there is no forward progress to record), it only
+// gates what may be deleted.
+func (g *Guard) buildSweepScript(minID, crev int64) string {
+	t := kdeps.SQLIdent(g.d.Cfg.Table)
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
+		g.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\gset\n\\if :kcg_locked\n")
+	b.WriteString("CREATE TEMP TABLE kcg_deleted(n int);\n")
+	for cur, chunks := minID, 0; cur < crev && chunks < g.d.Cfg.MaxChunks; chunks++ {
+		next := cur + g.d.Cfg.ChunkRevisions
+		if next > crev {
+			next = crev
+		}
+		fmt.Fprintf(&b, `DO $$
+DECLARE n int;
+BEGIN
+  DELETE FROM %s AS kv USING (
+      SELECT kp.prev_revision AS id FROM %s AS kp
+      WHERE kp.name != '%s' AND kp.prev_revision != 0
+        AND kp.id > %d AND kp.id <= %d
+      UNION ALL
+      SELECT kd.id AS id FROM %s AS kd
+      WHERE kd.deleted != 0 AND kd.id > %d AND kd.id <= %d
+  ) AS ks WHERE kv.id = ks.id;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  INSERT INTO kcg_deleted VALUES (n);
+  RAISE NOTICE 'deleted=%%', n;
+END $$;
+`, t, t, kdeps.CompactRevKey, cur, next, t, cur, next)
+		cur = next
+	}
+	b.WriteString("SELECT 'deleted=' || n AS deleted FROM kcg_deleted;\n")
+	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", t)
+	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", g.d.Cfg.AdvisoryLockID)
+	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
+	return b.String()
+}
+
 // sumDeleted totals the deleted=N notices from the chunk run.
 func sumDeleted(out string) int64 {
 	var total int64
@@ -253,14 +302,14 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 	out, err := g.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
-			"COUNT(*) FROM %[1]s",
+			"COUNT(*), COALESCE(MIN(id),0) FROM %[1]s",
 		kdeps.SQLIdent(g.d.Cfg.Table), kdeps.SQLIdent(g.d.Cfg.Table), kdeps.CompactRevKey))
 	if err != nil {
 		res.ok = false
 		note(fmt.Sprintf("stats query fail: %v", err))
 		return
 	}
-	head, crev, rows, perr := kdeps.ParseTriple(out)
+	head, crev, rows, minID, perr := kdeps.ParseQuad(out)
 	if perr != nil {
 		res.ok = false
 		note(fmt.Sprintf("stats unparsed: %v", perr))
@@ -285,27 +334,70 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 		return
 	}
 	res.reason = reason
+	// head <= Tail means the entire retained history already fits
+	// inside the watch tail — there is no safely-deletable range.
+	// compacting to head here would advance compact_rev past every
+	// revision a watcher could resume from (apiserver 410 Gone
+	// storm), so skip the session entirely. Unreachable under the
+	// default thresholds (every trigger needs retained/rows far
+	// above Tail) but config drift must not open the hole.
+	if head <= g.d.Cfg.Tail {
+		note(fmt.Sprintf("compact skipped: head=%d <= tail=%d — nothing safely deletable",
+			head, g.d.Cfg.Tail))
+		return
+	}
 	res.fired = true
 
 	// Marker off-by-one parity with the shell: compact to head-TAIL,
-	// except when the marker is already ahead (then to head).
+	// except when the marker is already ahead (then hold at crev).
+	// target <= crev implies crev > 0 — the head <= Tail / crev == 0
+	// combinations that used to fall back to target=head are skipped
+	// above, so no never-compacted overshoot remains.
 	target := head - g.d.Cfg.Tail
+	sweepBelow := false
 	if target <= crev {
 		// Fewer than Tail new revisions since the last compact —
 		// pushing compact_revision to head would erase the watch
 		// tail buffer and storm the apiserver with 410 Gone. Hold
-		// at crev instead so the DELETE only sweeps history; a
-		// never-compacted DB (crev==0) still falls back to head.
-		if crev > 0 {
-			target = crev
-		} else {
-			target = head
+		// at crev instead so the DELETE only sweeps history.
+		target = crev
+		// rows-debt with the marker already at/ahead of the safe
+		// horizon: the forward compact has NO window to advance
+		// through (cur == target → zero chunks), yet dead rows
+		// BELOW compact_rev keep piling up — the table stays over
+		// RowsMax and every cycle re-fires into an empty session.
+		// Sweep [minID, crev] in bounded chunks instead: rows under
+		// the marker are already-compacted history, safe to drop
+		// WITHOUT advancing compact_rev_key (there is no forward
+		// progress to record — the marker only gates deletions).
+		sweepBelow = rows > g.d.Cfg.RowsMax && minID < crev
+		if sweepBelow {
+			note(fmt.Sprintf(
+				"below-horizon sweep: rows=%d min_id=%d compact_rev=%d",
+				rows, minID, crev))
 		}
 	}
 	// compact-step-cap: never step the whole window in one cycle.
 	target = g.clampStepTarget(crev, target)
-	sout, err := g.d.PsqlScript(ctx, pg, user, pass,
-		g.buildCompactScript(crev, target))
+	t0 := g.d.Cfg.Clock.Now()
+	var script string
+	if sweepBelow {
+		script = g.buildSweepScript(minID, crev)
+	} else {
+		script = g.buildCompactScript(crev, target)
+	}
+	sout, err := g.d.PsqlScript(ctx, pg, user, pass, script)
+	if err != nil && g.d.LongBudgetExceeded(t0, err) {
+		// The client kill can orphan the server-side session —
+		// still holding the advisory lock. Reap it now.
+		if n, rerr := g.d.ReapOrphanedMaintSessions(ctx, pg, user, pass); rerr != nil {
+			note(fmt.Sprintf("orphan-reap-fail: %v", rerr))
+		} else if n > 0 {
+			note(fmt.Sprintf("terminated %d orphaned maintenance backend(s) after exec timeout", n))
+			logger().Warn("kinedb: terminated orphaned maintenance backends after exec timeout",
+				"count", n)
+		}
+	}
 	switch {
 	case err != nil:
 		res.ok = false

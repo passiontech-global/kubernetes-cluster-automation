@@ -235,6 +235,47 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	ids = nil
 
 	used := map[string]struct{}{}
+
+	// Pods FIRST, CEP/CES after — the TOCTOU order matters: cilium-
+	// agent writes CiliumEndpoints/CiliumEndpointSlices
+	// asynchronously AFTER pod creation, so a pod that exists at
+	// pod-list time may not have its endpoint object yet. Listing
+	// pods first captures the freshest pod set, and the endpoint
+	// lists that follow still see endpoints materialized during
+	// the pod read — an identity referenced by either side of the
+	// window stays "used". The reverse order leaves a gap where a
+	// new pod's endpoint exists in neither snapshot and its live
+	// identity reads orphaned.
+	//
+	// Server-side phase filter + continue-token pagination:
+	// terminal pods hold no live endpoints, and the all-namespaces
+	// pod read is the biggest this module makes — page it at the
+	// shared bound so no single response dominates. The in-code
+	// phase check stays — fake clientsets ignore field selectors
+	// and the belt costs nothing.
+	podOpts := metav1.ListOptions{
+		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+		Limit:         kube.DefaultListPageSize,
+	}
+	err = kube.ListEach(ctx, podOpts, kube.Pods(a.cs, metav1.NamespaceAll),
+		func(items []corev1.Pod) error {
+			for i := range items {
+				p := &items[i]
+				if p.Status.Phase == corev1.PodSucceeded ||
+					p.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				if v := strings.TrimSpace(
+					p.Annotations[ciliumIDAnnotation]); v != "" {
+					used[v] = struct{}{}
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
+	}
+
 	eps, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
@@ -274,35 +315,6 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		// cluster, nothing to merge.
 	default:
 		return fmt.Errorf("list ciliumendpointslices: %w", err) // wrapper IncErrors — a returned error must not count itself
-	}
-
-	// Server-side phase filter + continue-token pagination: terminal
-	// pods hold no live endpoints, and the all-namespaces pod read is
-	// the biggest this module makes — page it at the shared bound so
-	// no single response dominates. The in-code phase check stays —
-	// fake clientsets ignore field selectors and the belt costs
-	// nothing.
-	podOpts := metav1.ListOptions{
-		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-		Limit:         kube.DefaultListPageSize,
-	}
-	err = kube.ListEach(ctx, podOpts, kube.Pods(a.cs, metav1.NamespaceAll),
-		func(items []corev1.Pod) error {
-			for i := range items {
-				p := &items[i]
-				if p.Status.Phase == corev1.PodSucceeded ||
-					p.Status.Phase == corev1.PodFailed {
-					continue
-				}
-				if v := strings.TrimSpace(
-					p.Annotations[ciliumIDAnnotation]); v != "" {
-					used[v] = struct{}{}
-				}
-			}
-			return nil
-		})
-	if err != nil {
-		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 
 	// orphanSet doubles as the prune filter: entries whose identity is

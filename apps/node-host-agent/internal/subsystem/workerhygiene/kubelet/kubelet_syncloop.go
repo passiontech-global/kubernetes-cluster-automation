@@ -159,6 +159,10 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: kubelet-syncloop-down - node overloaded, skip restart k0sworker (err=%v)", lastErr))
 	case !k0sWorkerSettled(c.d, ctx):
 		c.d.State.AppendLog("suspect: kubelet-syncloop-down - k0sworker not settled (<180s), skip restart")
+	case c.d.HoldLocalAction(ctx):
+		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
+		// restart never burns the shared last-restart cooldown.
+		c.d.State.AppendLog("suspect: kubelet-syncloop-down - cluster maintenance in progress, skip restart k0sworker")
 	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog("suspect: kubelet-syncloop-down - in restart cooldown (<30m), skip")
 	default:
@@ -442,6 +446,10 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: containerd-sock-down - node overloaded, skip restart k0sworker (err=%v)", err))
 	case !k0sWorkerSettled(c.d, ctx):
 		c.d.State.AppendLog("suspect: containerd-sock-down - k0sworker not settled (<180s), skip restart")
+	case c.d.HoldLocalAction(ctx):
+		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
+		// restart never burns the shared last-restart cooldown.
+		c.d.State.AppendLog("suspect: containerd-sock-down - cluster maintenance in progress, skip restart k0sworker")
 	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog("suspect: containerd-sock-down - in restart cooldown (<30m), skip")
 	default:

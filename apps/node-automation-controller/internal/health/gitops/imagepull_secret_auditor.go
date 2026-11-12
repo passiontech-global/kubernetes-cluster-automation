@@ -36,6 +36,15 @@ type imagePullSecretAuditorCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops being
 	// reported gets DeleteLabelValues'd rather than leaking a stale 1.
 	emitted state.GaugeLedger[string]
+
+	// cycle counts Runs for the HeavyScanCycles cadence — the
+	// pull-secret census (pods + ServiceAccounts + every workload
+	// pod template, then the typed Secret list) is heavy enough to
+	// audit every 6th sweep (~30m); between audits the last tuples
+	// and findings carry forward so neither the gauge nor the
+	// verdict flaps on "not evaluated this cycle".
+	cycle        uint64
+	lastFindings []string
 }
 
 // NewImagePullSecretAuditorCheck builds the pullsecret-audit check — the
@@ -98,8 +107,32 @@ type dockerConfig struct {
 // incomplete data.
 func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
+
+	// Cadence divider: cycles 2..HeavyScanCycles skip the census
+	// entirely and carry the last audit's tuples + findings — an
+	// unhealthy pull secret does not heal itself in 5 minutes, so a
+	// 30-minute detection bound is the right cost/benefit for the
+	// heaviest read in the gitops tree. A FAILED audit gives its
+	// cadence slot back (cycle--) so the next sweep retries the
+	// census — a pass-1 failure must not carry stale tuples through
+	// passes 2-6 and mask fresh evidence for 25 minutes.
+	p.cycle++
+	if p.cycle%probefw.HeavyScanCycles != 1 {
+		var carried probefw.SweepReport
+		for k, lv := range p.emitted.Last() {
+			carried.Carry(k, lv)
+		}
+		for _, f := range p.lastFindings {
+			carried.Find(f)
+		}
+		return carried.Result(&p.emitted,
+			imagePullSecretUnhealthyGauge.DeleteLabelValues,
+			"unhealthy image pull secrets: ", ", ")
+	}
+
 	refs, err := p.collectPullSecretRefs(ctx)
 	if err != nil {
+		p.cycle-- // failed audit — retry next sweep, don't consume the slot
 		return probefw.Result{Infra: err}
 	}
 
@@ -118,6 +151,7 @@ func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 		},
 		kube.Secrets(p.CS, metav1.NamespaceAll))
 	if err != nil {
+		p.cycle-- // failed audit — retry next sweep, don't consume the slot
 		return probefw.Result{Infra: fmt.Errorf("list pull secrets: %w", err)}
 	}
 	byRef := make(map[pullSecretRef]*corev1.Secret, len(secs))
@@ -143,8 +177,18 @@ func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 				// A single unreadable Secret is a tolerated
 				// sub-failure: the audit continues on the rest and the
 				// sweep still reports the Infra so the error counts.
+				// The ref's last-emitted tuple(s) Carry + re-Find —
+				// "can't tell" is not "resolved": dropping them here
+				// would prune a live series and read the flap as a
+				// healed secret.
 				rep.InfraErr(fmt.Errorf("get secret %s/%s: %w",
 					ref.ns, ref.name, err))
+				for k, lv := range p.emitted.Last() {
+					if len(lv) == 3 && lv[0] == ref.ns && lv[1] == ref.name {
+						rep.Carry(k, lv)
+						rep.Find(fmt.Sprintf("%s/%s(%s)", lv[0], lv[1], lv[2]))
+					}
+				}
 				continue
 			}
 		}
@@ -158,6 +202,9 @@ func (p *imagePullSecretAuditorCheck) Run(ctx context.Context) probefw.Result {
 			[]string{ref.ns, ref.name, reason},
 			fmt.Sprintf("%s/%s(%s)", ref.ns, ref.name, reason))
 	}
+	// Snapshot the findings for the carry-forward cycles — rep is
+	// per-Run, lastFindings is what the skipped sweeps re-assert.
+	p.lastFindings = append([]string(nil), rep.Findings()...)
 	return rep.Result(&p.emitted, imagePullSecretUnhealthyGauge.DeleteLabelValues,
 		"unhealthy image pull secrets: ", ", ")
 }

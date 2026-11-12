@@ -256,12 +256,21 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		if !proceed {
 			continue
 		}
-		if _, err := heal.DeletePod(ctx, p.CS, &p.rbHealed, key, pod, now); err != nil {
+		didDelete, err := heal.DeletePod(ctx, p.CS, &p.rbHealed, key, pod, now)
+		if err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
-		p.InvalidatePods(ctx) // pod gone — drop the census
+		if !didDelete {
+			// Quorum reservation denied — a sibling check (or an
+			// earlier pod of the same cluster in this loop) already
+			// spent this workload's one-disruption slot this
+			// sweep; the quorum re-verification above already
+			// proved one delete safe, not two.
+			continue
+		}
+		kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 		rabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

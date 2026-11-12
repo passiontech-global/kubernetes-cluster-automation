@@ -221,7 +221,7 @@ func (r *Runner) nvmeSmartPages(ctx context.Context) []nvmeSmart {
 // NVMe controller trips an early SMART indicator; Exit clears only
 // when BOTH evidence classes are absent (an unreadable source
 // contributes nothing — fail-safe, not fail-latch).
-func (r *Runner) updateDiskPreFailEvidence() {
+func (r *Runner) updateDiskPreFailEvidence(ctx context.Context) {
 	var evidence []string
 	ext4ByDev := map[string]uint64{}
 	ext4Readable := 0
@@ -238,7 +238,7 @@ func (r *Runner) updateDiskPreFailEvidence() {
 				fmt.Sprintf("ext4 %s errors_count=%d", dev, count))
 		}
 	}
-	smarts := r.nvmeSmartPages(context.Background())
+	smarts := r.nvmeSmartPages(ctx)
 	for _, s := range smarts {
 		if s.ok() {
 			evidence = append(evidence, s.evidence())

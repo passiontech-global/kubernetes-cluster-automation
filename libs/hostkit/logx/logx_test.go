@@ -50,7 +50,11 @@ func TestForConcurrentIdentity(t *testing.T) {
 	const (
 		workers  = 8
 		hotIters = 5000 // hits on the cached names — the atomic fast path
-		newIters = 50   // fresh names — the copy-on-write rebuild path
+		// Fresh names exercise the copy-on-write rebuild path. The
+		// distinct-name total must stay UNDER forCacheCap: past the
+		// cap For serves an uncached logger per call (identity is
+		// only guaranteed for cached names — see TestForCacheCap).
+		newIters = 20 // 8*20+3 = 163 < 256
 	)
 	var wg sync.WaitGroup
 	for w := range workers {
@@ -132,5 +136,45 @@ func TestForConcurrentDefaultSwap(t *testing.T) {
 	if line := bufA.String(); !strings.Contains(line, "logger=envx") ||
 		!strings.Contains(line, "msg=after-swap") {
 		t.Fatalf("final default did not emit the tagged record: %q", line)
+	}
+}
+
+// forCacheCap bounds the per-name table: past it For must still hand
+// back a WORKING logger (correct "logger" attribute, current default)
+// without growing the snapshot — and without breaking identity for
+// the names already cached.
+func TestForCacheCap(t *testing.T) {
+	old := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	// Fill the cache exactly to the cap.
+	first := For("cap-first")
+	for i := 1; i < forCacheCap; i++ {
+		For(fmt.Sprintf("cap-fill-%d", i))
+	}
+	s := forSnap.Load()
+	if s == nil || len(s.loggers) != forCacheCap {
+		t.Fatalf("snapshot holds %d loggers, want %d", len(s.loggers), forCacheCap)
+	}
+
+	// Overflow names resolve correctly but stay uncached: two calls
+	// return distinct loggers and the table size is unchanged.
+	over := For("cap-overflow")
+	over.Info("overflow-line")
+	if over2 := For("cap-overflow"); over2 == over {
+		t.Fatal("overflow name was cached past forCacheCap")
+	}
+	if s2 := forSnap.Load(); len(s2.loggers) != forCacheCap {
+		t.Fatalf("overflow grew the table to %d", len(s2.loggers))
+	}
+	if !strings.Contains(buf.String(), "logger=cap-overflow") {
+		t.Fatalf("overflow logger did not emit its attribute: %q", buf.String())
+	}
+
+	// Cached names keep their identity and stay warm.
+	if got := For("cap-first"); got != first {
+		t.Fatal("cached name lost identity after overflow resolves")
 	}
 }

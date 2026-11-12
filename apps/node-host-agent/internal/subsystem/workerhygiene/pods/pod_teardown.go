@@ -106,6 +106,16 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if ndel >= c.d.Cfg.Teardown.MaxForceDelete {
 			continue // per-cycle cap bounds the blast radius
 		}
+		// L1↔L3 hold: force-deleting pods mid cluster-maintenance is
+		// churn the drain then has to un-wedge — stop this cycle.
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("cleanup: pod-teardown force-delete held — " +
+				"cluster maintenance in progress")
+			break
+		}
+		// The heal stamp rides BEFORE the delete so the cluster side
+		// sees the attribution even if this process dies mid-call.
+		c.d.StampPodHealed(ctx, p.Namespace, p.Name)
 		if err := c.d.ForceDeletePod(ctx, p); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf("suspect: force-delete %s/%s failed: %v",
 				p.Namespace, p.Name, err))
@@ -183,22 +193,33 @@ func proxyAgentHost(d *wdeps.Deps, pid int, argv []string) string {
 }
 
 // deleteKonnectivityPod deletes this node's konnectivity-agent pod in
-// kube-system (grace 0) — the Go equivalent of SIGKILL on its pause
-// task: the DaemonSet recreates the pod with freshly baked env.
+// kube-system (grace 5 — the Running DaemonSet pod gets a bounded
+// shutdown window instead of an instant SIGKILL) — the DaemonSet
+// recreates the pod with freshly baked env.
 // Anchored name match + namespace pin (see KonnPodRe comment).
 func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod) bool {
+	// L1↔L3 hold: deleting the konnectivity agent mid cluster-
+	// maintenance severs the very control path a drain needs.
+	if d.HoldLocalAction(ctx) {
+		d.State.AppendLog("suspect: konnectivity pod delete held — " +
+			"cluster maintenance in progress")
+		return false
+	}
 	for i := range pods {
 		p := &pods[i]
 		if p.Namespace != "kube-system" || !KonnPodRe.MatchString(p.Name) ||
 			p.DeletionTimestamp != nil {
 			continue
 		}
+		// The heal stamp rides BEFORE the delete so the cluster side
+		// sees the attribution even if this process dies mid-call.
+		d.StampPodHealed(ctx, p.Namespace, p.Name)
 		if err := d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 			metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](0),
+				GracePeriodSeconds: ptr.To[int64](5),
 				// UID precondition: the listing→delete window can
 				// outlive this pod — a same-named recycle (DS churn)
-				// is not ours to grace-0 kill.
+				// is not ours to kill.
 				Preconditions: &metav1.Preconditions{UID: &p.UID},
 			}); err != nil {
 			d.State.AppendLog(fmt.Sprintf(

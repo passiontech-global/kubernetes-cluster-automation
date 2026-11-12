@@ -390,10 +390,17 @@ func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// apiServiceUnblockSweepCap: ONE pod restart per sweep — the
+	// survivor waits for the next cooldown window.
+	evicted := 0
 	for _, name := range []string{"ms-0", "ms-1"} {
-		if asgPodExists(t, cs, "kube-system", name) {
-			t.Fatalf("backing pod %s not restarted", name)
+		if !asgPodExists(t, cs, "kube-system", name) {
+			evicted++
 		}
+	}
+	if evicted != apiServiceUnblockSweepCap {
+		t.Fatalf("evicted = %d, want exactly %d backing pod per sweep",
+			evicted, apiServiceUnblockSweepCap)
 	}
 	if !asgExists(t, dyn, "v1beta1.metrics.k8s.io") {
 		t.Fatal("APIService object itself deleted — only pods should restart")

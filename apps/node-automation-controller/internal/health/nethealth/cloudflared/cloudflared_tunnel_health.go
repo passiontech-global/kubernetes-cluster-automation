@@ -155,9 +155,10 @@ func (p *cloudflaredTunnelHealthCheck) cfTunnelLogQUICStorm(ctx context.Context,
 	pod *corev1.Pod) (bool, error) {
 
 	return kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
-		TailLines: probefw.DefaultTailLines,
-		MaxBytes:  probefw.LogMaxBytes,
-		Timeout:   probefw.LogTimeout,
+		TailLines:    probefw.DefaultTailLines,
+		SinceSeconds: 900,
+		MaxBytes:     probefw.LogMaxBytes,
+		Timeout:      probefw.LogTimeout,
 	}, func(line string) bool {
 		l := strings.ToLower(line)
 		for _, marker := range cfTunnelQUICMarkers {
@@ -239,10 +240,16 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			// Carry the key through the keep-set so the Prune below
 			// cannot wipe a streak the sweep could not evaluate —
 			// a dead tunnel with flaky evidence would otherwise
-			// never reach cfTunnelMinStreak.
+			// never reach cfTunnelMinStreak. The emitted tuple
+			// carries too: "can't tell" is not "resolved", or one
+			// metrics+logs flap would prune a live degraded series.
 			log.Info("WARN: cloudflared metrics + logs both unreadable — wedge unverifiable",
 				"pod", key, "error", lerr)
 			streakKeep[sig] = true
+			if lv, held := p.emitted.Last()[key]; held {
+				rep.Carry(key, lv)
+				rep.Find(key + "(evidence unverifiable — carried)")
+			}
 			continue
 		}
 		if !bad {

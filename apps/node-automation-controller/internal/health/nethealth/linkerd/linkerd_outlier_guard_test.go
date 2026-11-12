@@ -120,7 +120,7 @@ func TestLinkerdOutlierDetected(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	p := testProber(cs)
 	wireProm(t, p, outlierRPS(), outlierFails())
-	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("outlier pod must fail: %+v", res)
 	}
@@ -163,7 +163,7 @@ func TestLinkerdOutlierRolloutCohortDetected(t *testing.T) {
 			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 1.8},
 			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 0.01},
 		})
-	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stable Rollout cohort outlier must fail: %+v", res)
 	}
@@ -194,7 +194,7 @@ func TestLinkerdOutlierRolloutCanaryStandsDown(t *testing.T) {
 			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-bad"}, Value: 1.8},
 			{Labels: map[string]string{"namespace": "apps", "rollout": "api", "pod": "api-sib"}, Value: 0.01},
 		})
-	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("mid-canary Rollout cohort must stand down and pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_outlier_pods",
@@ -215,7 +215,7 @@ func TestLinkerdOutlierFleetFailureNotOutlier(t *testing.T) {
 		promSample("apps", "web", "web-sib1", 0.6), // 60% err — downstream is down
 		promSample("apps", "web", "web-sib2", 0.5),
 	})
-	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("fleet-wide failure must not flag as outlier: %+v", res)
 	}
@@ -240,7 +240,7 @@ func TestLinkerdOutlierLowTrafficSkipped(t *testing.T) {
 		promSample("apps", "web", "web-sib1", 0.01),
 		promSample("apps", "web", "web-sib2", 0.01),
 	})
-	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("sub-MinRPS pod must pass: %+v", res)
 	}
 }
@@ -256,7 +256,7 @@ func TestLinkerdOutlierRolloutCohortSkipped(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	p := testProber(cs)
 	wireProm(t, p, outlierRPS(), outlierFails())
-	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("mixed-revision cohort must pass: %+v", res)
 	}
 }
@@ -272,7 +272,7 @@ func TestLinkerdOutlierNoSiblingControlSkipped(t *testing.T) {
 	}, []probetest.PromTestSample{
 		promSample("apps", "web", "web-bad", 1.9),
 	})
-	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("no-control-sample pod must pass: %+v", res)
 	}
@@ -284,7 +284,7 @@ func TestLinkerdOutlierNoSiblingControlSkipped(t *testing.T) {
 func TestLinkerdOutlierPromDownInconclusive(t *testing.T) {
 	bad, sib1, sib2 := outlierFixtures()
 	p := testProber(fake.NewSimpleClientset(bad, sib1, sib2)) // dead Prom endpoint
-	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("prometheus outage must be inconclusive-pass: %+v", res)
 	}
 }
@@ -305,14 +305,14 @@ func TestLinkerdOutlierEvicted(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("first-seen outlier must fail (signature)")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod evicted inside the persistence window: %v", err)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted outlier must still fail")
 	}
@@ -342,19 +342,19 @@ func TestLinkerdOutlierInconclusiveSweepResetsPersistence(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("first-seen outlier must fail (signature)")
 	}
 	// Inconclusive sweep — every Prom query fails; the ledgers prune.
 	wireProm(t, p, nil, nil)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("a Prom outage is inconclusive, not healthy: %+v", res)
 	}
 	// Recovered sweep — one fresh sighting past the old window; the
 	// pruned persistence ledger must hold the evict back.
 	wireProm(t, p, outlierRPS(), outlierFails())
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted-again outlier must still fail (signature)")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
@@ -374,11 +374,11 @@ func TestLinkerdOutlierEvictDisabled(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("outlier signature must still fail when evict is off")
 	}
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted outlier must still fail when evict is off")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
@@ -405,9 +405,9 @@ func TestLinkerdOutlierNoReadySiblingSurvives(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("outlier signature must still fail")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
@@ -438,9 +438,9 @@ func TestLinkerdOutlierPDBBlocksEvict(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("outlier signature must still fail")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {
@@ -464,9 +464,9 @@ func TestLinkerdOutlierControllerCooldown(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	_ = chk.Run(ctx) // evicts web-bad, stamps the RS cooldown
+	_ = chk.Run(probetest.SweepCtx(ctx)) // evicts web-bad, stamps the RS cooldown
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("first outlier should be evicted, err=%v", err)
 	}
@@ -483,9 +483,9 @@ func TestLinkerdOutlierControllerCooldown(t *testing.T) {
 	}
 	wireProm(t, p, rps2, fail2)
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+2*time.Minute))
-	_ = chk.Run(ctx) // web-sib1 first seen
+	_ = chk.Run(probetest.SweepCtx(ctx)) // web-sib1 first seen
 	probetest.FreezeNow(p.Deps, base.Add(2*linkerdOutlierPersistence+2*time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("second outlier signature must still fail")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-sib1", metav1.GetOptions{}); err != nil {
@@ -512,9 +512,9 @@ func TestLinkerdOutlierYoungPodSurvives(t *testing.T) {
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(linkerdOutlierPersistence+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("outlier signature must still fail")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-bad", metav1.GetOptions{}); err != nil {

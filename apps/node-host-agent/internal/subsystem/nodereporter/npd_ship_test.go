@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // TestMonitorConditionsShip: a kmsg hung-task record latches the
@@ -48,5 +49,34 @@ func TestMonitorConditionsShip(t *testing.T) {
 		c.Reason != "FilesystemIsReadOnly" {
 		t.Fatalf("ReadonlyFilesystem = {%s %s}, want True/FilesystemIsReadOnly",
 			c.Status, c.Reason)
+	}
+}
+
+// TestMonitorSeedFromLiveNode: a restarted agent's monitor latches
+// are empty — without seeding, the first syncConditions would
+// evaluate KernelDeadlock (permanent-class) and ReadonlyFilesystem
+// as False and PATCH the previous instance's True values away.
+// syncConditions folds the node's live conditions into the monitor
+// BEFORE evaluating, so the True values survive the restart.
+func TestMonitorSeedFromLiveNode(t *testing.T) {
+	now := metav1.Now()
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: "KernelDeadlock", Status: corev1.ConditionTrue,
+				Reason: "KernelDeadlock", Message: "INFO: task x blocked",
+				LastHeartbeatTime: now, LastTransitionTime: now},
+			{Type: "ReadonlyFilesystem", Status: corev1.ConditionTrue,
+				Reason: "FilesystemIsReadOnly", Message: "ro mount",
+				LastHeartbeatTime: now, LastTransitionTime: now},
+		}},
+	}
+	e := fixture(t, node)
+	e.cycle()
+	if c := e.cond(t, "KernelDeadlock"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("KernelDeadlock = %s, want True (seeded, not patched away)", c.Status)
+	}
+	if c := e.cond(t, "ReadonlyFilesystem"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("ReadonlyFilesystem = %s, want True (seeded, not patched away)", c.Status)
 	}
 }

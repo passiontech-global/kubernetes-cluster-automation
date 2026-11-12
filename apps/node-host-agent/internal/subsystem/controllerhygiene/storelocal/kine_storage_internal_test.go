@@ -81,7 +81,7 @@ func TestSqlite3WALCheckpoint(t *testing.T) {
 		}
 	})
 
-	t.Run("argv and env scrub", func(t *testing.T) {
+	t.Run("argv contract and inherited env", func(t *testing.T) {
 		t.Setenv("NOTIFY_SOCKET", "/run/notify.sock")
 		t.Setenv("WATCHDOG_PID", "5")
 		t.Setenv("KEEP_ME", "1")
@@ -103,27 +103,50 @@ exit 1`)
 		for _, want := range []string{
 			"DB:/db/state.db",
 			"SQL:PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);",
-			"NS:",   // scrubbed — never "NS:set"
-			"WP:",   // scrubbed
-			"KEEP:", // never "KEEP:set" would be a scrub regression
+			// sqlite3 implements no sd_notify protocol, so the
+			// daemon env rides through unscrubbed — only the
+			// systemctl/journalctl paths needed the drop.
+			"NS:set",
+			"WP:set",
+			"KEEP:set",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("missing %q in: %s", want, err)
 			}
 		}
-		if strings.Contains(err.Error(), "NS:set") ||
-			strings.Contains(err.Error(), "WP:set") {
-			t.Fatalf("daemon env leaked into the sqlite3 child: %s", err)
-		}
-		if !strings.Contains(err.Error(), "KEEP:set") {
-			t.Fatalf("ordinary env dropped: %s", err)
-		}
 	})
 	t.Run("success", func(t *testing.T) {
-		bin := fakeSqlite3(t, `exit 0`)
+		// The wal_checkpoint result row (busy|log|ckpt) must parse
+		// clean — busy=0 is the only success shape.
+		bin := fakeSqlite3(t, `printf '5000\n0|10|10\n'; exit 0`)
 		t.Setenv("PATH", filepath.Dir(bin))
 		if err := sqlite3WALCheckpoint(ctx, "/db/state.db"); err != nil {
 			t.Fatalf("err=%v want nil", err)
+		}
+	})
+	t.Run("busy checkpoint row is an error", func(t *testing.T) {
+		// busy=1 exits 0 — the exit code alone would read a
+		// no-op checkpoint as success while the WAL keeps growing.
+		bin := fakeSqlite3(t, `printf '1|10|3\n'; exit 0`)
+		t.Setenv("PATH", filepath.Dir(bin))
+		err := sqlite3WALCheckpoint(ctx, "/db/state.db")
+		if err == nil || !strings.Contains(err.Error(), "busy") {
+			t.Fatalf("err=%v want the busy-checkpoint failure", err)
+		}
+	})
+	t.Run("host mount path is unrooted for the nsenter side", func(t *testing.T) {
+		// /host/var/lib/k0s/... is the DaemonSet mount view; inside
+		// the host mount namespace the same file is /var/lib/k0s/...
+		// — sqlite3Host owns that translation (a real nsenter exec
+		// is not unit-testable).
+		for _, tc := range []struct{ in, want string }{
+			{"/host/var/lib/k0s/db/state.db", "/var/lib/k0s/db/state.db"},
+			{"/var/lib/k0s/db/state.db", "/var/lib/k0s/db/state.db"}, // standalone: already host-side
+			{"/host/db/state.db", "/db/state.db"},
+		} {
+			if _, host := sqlite3Host(tc.in); host != tc.want {
+				t.Fatalf("sqlite3Host(%q) host=%q want %q", tc.in, host, tc.want)
+			}
 		}
 	})
 }
@@ -175,7 +198,7 @@ exit 0`)
 			!strings.Contains(err.Error(), "kine large objects") ||
 			!strings.Contains(err.Error(), "disk I/O error") ||
 			!strings.Contains(err.Error(),
-				"Q:PRAGMA busy_timeout=2000; SELECT name, length(value) "+
+				"Q:PRAGMA busy_timeout=5000; SELECT name, length(value) "+
 					"FROM kine WHERE deleted = 0 ORDER BY length(value) DESC LIMIT 10;") {
 			t.Fatalf("err=%v want the wrapped scan failure with its query", err)
 		}

@@ -94,6 +94,32 @@ const (
 	KernelHungTasks = "KernelHungTasks"
 )
 
+// Node/Pod annotation keys carrying the L1 ↔ L3 cooperative
+// remediation protocol (node-host-agent ↔ node-automation-controller).
+// The cluster side stamps AnnoClusterMaintenanceUntil while a
+// cluster-wide operation (Autopilot upgrade, kured drain, Medik8s
+// fencing) owns the node; the agent caches it ~30s and pauses local
+// service restarts and pod deletion for the window. The agent stamps
+// AnnoLocalRemediationUntil (+3m) before restarting a node-local
+// service and AnnoLastPodHealedAt after bouncing an infra pod, so the
+// cluster side defers remote eviction while L1 self-heals first.
+// Untyped strings for the same depguard reason as the conditions.
+const (
+	AnnoClusterMaintenanceUntil = "passiontech.dev/cluster-maintenance-until"
+	AnnoLocalRemediationUntil   = "passiontech.dev/local-remediation-until"
+	AnnoLastPodHealedAt         = "passiontech.dev/last-pod-healed-at"
+)
+
+// CondLocalRemediation is the NodeCondition node-host-agent writes
+// through the nodes/status subresource while L1 self-heals — the
+// RBAC-safe Node→Cluster signal (the ClusterRole grants
+// nodes/status patch but NOT nodes metadata patch). The condition
+// self-expires via LastHeartbeatTime: the cluster side only trusts
+// it while the heartbeat is fresh (< ~3m), so a crashed agent
+// cannot freeze remote remediation. NOT in HeartbeatSweptNames —
+// nodereporter does not own or re-stamp it.
+const CondLocalRemediation = "LocalRemediationInProgress"
+
 // Monitor- and kubelet-owned NodeConditions — not latch-backed.
 // KernelDeadlock and ReadonlyFilesystem are the NPD monitor ports
 // the nodereporter evaluates from kmsg signatures and the host
@@ -169,6 +195,11 @@ var HangPreCordonNames = []string{
 	CgroupDyingLeak, CiliumAgentDown, CiliumInitStuck,
 	CiliumEnvoyDown, CalicoFelixDown, NebulaIsolated,
 	KubeletPLEGUnhealthy, DiskSlowIO,
+	// KernelPageAllocFailure and DiskBloatRunaway join the hang
+	// class: a kernel that cannot allocate pages and a disk in
+	// runaway growth are both "cordon before it dies" signals on
+	// the same fuse as the PSI/slab exhaustion latches.
+	KernelPageAllocFailure, DiskBloatRunaway,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
@@ -211,6 +242,15 @@ var StormGateNames = []string{
 	ControlPlaneCertReloadStale, DiskSlowIO,
 	ClocksourceUnstable, KernelNetShimDegraded,
 	ReadonlyFilesystem, KernelDeadlock,
+	// Wave-26 classifications: the five conditions that shipped
+	// latch-backed but unclassified. KernelPageAllocFailure and
+	// DiskBloatRunaway are hang-class (kernel OOM-adjacent /
+	// disk-filling node — cordon before read-only); the Cilium
+	// xDS reject streak and the two degraded (not partitioned)
+	// Nebula paths gate storms only.
+	KernelPageAllocFailure, DiskBloatRunaway,
+	CiliumEnvoyXDSReject, NebulaSlowpath, NebulaSiteedge,
+	NebulaMTUBlackhole,
 }
 
 // PartitionNames are the network-partition conditions the
@@ -220,7 +260,7 @@ var StormGateNames = []string{
 var PartitionNames = []string{
 	HostNetworkProblems, ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
-	NebulaIsolated, NebulaPMTUBlackhole,
+	NebulaIsolated, NebulaPMTUBlackhole, NebulaMTUBlackhole,
 }
 
 // heartbeatSweptSet backs AgentHeartbeatManaged — built once from

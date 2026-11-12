@@ -36,7 +36,7 @@ const (
 	defaultAPIFallbackURL = "https://localhost:7443/livez"
 
 	// pods domain (was pod_teardown.go).
-	defaultStuckDeleteAge = 15 * time.Minute // shell STUCK_DELETE_S=900
+	defaultStuckDeleteAge = 20 * time.Minute // audit: pods get 20m before force-delete
 	defaultStuckWedgeAge  = 30 * time.Minute // shell STUCK_WEDGE_S=1800
 	defaultMaxForceDelete = 5                // bounds per-cycle churn (shell used 3; 5 keeps parity headroom)
 
@@ -106,7 +106,7 @@ const (
 	// knob relocates it where a cluster keeps its snapshots), and
 	// the host systemd coredump store (both /host-prefixed agent
 	// views).
-	defaultWLayerSnapshotsDir = "/host/run/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots"
+	defaultWLayerSnapshotsDir = "/host/var/lib/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots"
 	defaultCoredumpDir        = "/host/var/lib/systemd/coredump"
 
 	// guards domain (was dstate_scopes.go / psi_thrash.go /

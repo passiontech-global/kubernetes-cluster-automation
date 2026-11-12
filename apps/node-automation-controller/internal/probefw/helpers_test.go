@@ -187,9 +187,21 @@ func TestPromEndpoint(t *testing.T) {
 	t.Run("derives scheme://host from http-content target", func(t *testing.T) {
 		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
 		d := &Deps{Cfg: Config{HTTPContent: HTTPContentConfig{
-			URL: "http://prom:9090/health/content"}}}
+			URL: "http://prom:9090/-/healthy"}}}
 		got, err := d.PromEndpoint()
 		if err != nil || got != "http://prom:9090/api/v1/query" {
+			t.Fatalf("PromEndpoint = (%q,%v)", got, err)
+		}
+	})
+	t.Run("keeps a reverse-proxy subpath mount", func(t *testing.T) {
+		// VictoriaMetrics/Thanos behind an ingress subpath: the
+		// mount prefix survives into the derived query endpoint.
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
+		d := &Deps{Cfg: Config{HTTPContent: HTTPContentConfig{
+			URL: "https://mon.example.com/prometheus/-/healthy"}}}
+		got, err := d.PromEndpoint()
+		if err != nil ||
+			got != "https://mon.example.com/prometheus/api/v1/query" {
 			t.Fatalf("PromEndpoint = (%q,%v)", got, err)
 		}
 	})
@@ -209,7 +221,8 @@ func TestPromQuery(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if q := r.URL.Query().Get("query"); q != `up{job="x"}` {
+		_ = r.ParseForm()
+		if q := r.FormValue("query"); q != `up{job="x"}` {
 			t.Errorf("query = %q", q)
 		}
 		_, _ = fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"pod":"p1"},"value":[1700000000,"3.5"]}]}}`)
@@ -361,7 +374,7 @@ func TestMergeAnnoPatchLocally(t *testing.T) {
 
 	// A merge-patch doc: set two keys, delete one — applied to the
 	// listed copy exactly like the apiserver merge would.
-	MergeAnnoPatchLocally(pod, []byte(
+	MergeAnnoPatchLocally(context.Background(), pod, []byte(
 		`{"metadata":{"annotations":{"new":"v","over":"new","del":null}}}`))
 
 	want := map[string]string{"keep": "1", "new": "v", "over": "new"}
@@ -377,7 +390,7 @@ func TestMergeAnnoPatchLocally(t *testing.T) {
 
 	// A nil annotation map materializes on first write.
 	bare := &corev1.Pod{}
-	MergeAnnoPatchLocally(bare, []byte(
+	MergeAnnoPatchLocally(context.Background(), bare, []byte(
 		`{"metadata":{"annotations":{"k":"v"}}}`))
 	if bare.GetAnnotations()["k"] != "v" {
 		t.Fatalf("nil-map annotations = %v", bare.GetAnnotations())
@@ -386,7 +399,7 @@ func TestMergeAnnoPatchLocally(t *testing.T) {
 	// Malformed payloads are ignored — the input is always
 	// kube.MergePatchAnnos output, but a bad read must never corrupt
 	// the listed copy.
-	MergeAnnoPatchLocally(pod, []byte(`{not json`))
+	MergeAnnoPatchLocally(context.Background(), pod, []byte(`{not json`))
 	if pod.GetAnnotations()["new"] != "v" {
 		t.Fatal("malformed patch mutated the object")
 	}

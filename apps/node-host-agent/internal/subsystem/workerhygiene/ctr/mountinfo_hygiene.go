@@ -71,8 +71,8 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
 		return
 	}
-	hostTaskRoot := strings.TrimPrefix(c.d.Cfg.CtrTaskRoot, "/host")
-	hostPodsDir := strings.TrimPrefix(c.d.Cfg.PodsDir, "/host")
+	hostTaskRoot := wdeps.HostSidePath(c.d.Cfg.CtrTaskRoot)
+	hostPodsDir := wdeps.HostSidePath(c.d.Cfg.PodsDir)
 
 	// podByUID only counts when the apiserver answered — an
 	// inconclusive LIST must never rehome a mounted volume
@@ -116,9 +116,10 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// record exists (ctr-tasks owns the wedged-dir case).
 			if taskDirListed(c.d.Cfg.CtrTaskRoot, id) ||
 				taskDirListed(c.d.Cfg.SandboxCtlRoot, id) {
-				// Recovered → drop any pending confirmation.
-				_ = os.Remove(filepath.Join(
-					c.d.Cfg.WatchdogStateDir, "mi-task-seen-"+id))
+				// Recovered → drop any pending confirmation —
+				// ClearBudget removes file AND the RAM lastSpent
+				// mirror so the 30m window truly resets.
+				c.d.State.ClearBudget("mi-task-seen-" + id)
 				continue
 			}
 			seen["mi-task-seen-"+id] = true
@@ -143,8 +144,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue // skip the pointless stat/glob/marker work
 			} else if c.umountOrphan(ctx, mount) {
 				reaped++
-				_ = os.Remove(filepath.Join(
-					c.d.Cfg.WatchdogStateDir, marker))
+				c.d.State.ClearBudget(marker)
 			}
 		case podVolEligible && tasksComplete &&
 			strings.HasPrefix(mount, hostPodsDir+"/"):
@@ -286,8 +286,8 @@ func pruneMountinfoMarkers(d *wdeps.Deps, seen map[string]bool) {
 		return
 	}
 	for _, m := range ms {
-		if !seen[filepath.Base(m)] {
-			_ = os.Remove(m)
+		if base := filepath.Base(m); !seen[base] {
+			d.State.ClearBudget(base)
 		}
 	}
 }

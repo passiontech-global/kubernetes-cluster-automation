@@ -240,3 +240,90 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 	}
 	return rv, true
 }
+
+// APIServerReadyEndpoints counts the distinct ready apiserver
+// addresses the `kubernetes` service's Endpoints object reports —
+// the peer-quorum evidence a k0scontroller restart needs before it
+// can bounce a LIVE controller: with >=2 ready endpoints the peer
+// keeps serving the API through the restart; with <2 the restart
+// would take the last serving apiserver down with it. subsets[].
+// addresses[] ARE the ready set (notReadyAddresses is a separate
+// field), deduped by IP because one apiserver can appear under
+// several port groups. ok=false on transport/HTTP/parse failure —
+// an unreadable endpoints object is inconclusive, never "zero".
+// The peer endpoint is queried first (the healthy witness); the
+// self endpoint is the fallback when no peer is configured.
+func (d *Deps) APIServerReadyEndpoints(ctx context.Context) (ready int, ok bool) {
+	ep := d.Cfg.Hub.PeerAPI
+	if ep == "" {
+		ep = d.Cfg.Hub.SelfAPI
+	}
+	if ep == "" {
+		return 0, false
+	}
+	client := d.EnsureClient()
+	if client == nil {
+		return 0, false
+	}
+	qctx, cancel := context.WithTimeout(ctx, d.Cfg.QueryTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
+		"https://"+ep+"/api/v1/namespaces/default/endpoints/kubernetes", nil)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger().Warn("controllerhygiene: endpoints probe failed",
+			"endpoint", ep, "error", err)
+		return 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		logger().Warn("controllerhygiene: endpoints probe non-200",
+			"endpoint", ep, "status", resp.StatusCode)
+		return 0, false
+	}
+	var eps struct {
+		Subsets []struct {
+			Addresses []struct {
+				IP string `json:"ip"`
+			} `json:"addresses"`
+		} `json:"subsets"`
+	}
+	if err := json.Unmarshal(body, &eps); err != nil {
+		return 0, false
+	}
+	seen := map[string]struct{}{}
+	for _, sub := range eps.Subsets {
+		for _, a := range sub.Addresses {
+			if a.IP != "" {
+				seen[a.IP] = struct{}{}
+			}
+		}
+	}
+	return len(seen), true
+}
+
+// ControllerQuorumReady is the shared peer-quorum gate every
+// RestartUnit restart must pass: single-controller topologies
+// (no Hub.PeerAPI) have nothing to protect and always pass; an
+// UNREADABLE endpoints object fails open — the peer-fresh/streak
+// gates already proved liveness where they apply, and blocking a
+// needed restart on an inconclusive read would wedge the healer.
+// Only a successfully-read count below 2 holds the restart.
+func (d *Deps) ControllerQuorumReady(ctx context.Context) bool {
+	if d.Cfg.Hub.PeerAPI == "" {
+		return true
+	}
+	ready, ok := d.APIServerReadyEndpoints(ctx)
+	if !ok {
+		return true
+	}
+	return ready >= 2
+}

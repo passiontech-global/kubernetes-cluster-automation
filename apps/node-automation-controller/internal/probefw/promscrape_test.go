@@ -107,15 +107,28 @@ func TestFetchPodMetrics(t *testing.T) {
 			t.Fatal("want error for transport failure")
 		}
 	})
-	t.Run("maxBytes caps the body", func(t *testing.T) {
+	t.Run("maxBytes+1 detects truncation", func(t *testing.T) {
 		client := &http.Client{Transport: &testhelp.StubTransport{
 			Fn: func(r *http.Request) (*http.Response, error) {
 				return testhelp.ProbeResponse(200, "metric 12\n"), nil
 			}}}
+		// "metric 12\n" is 10 bytes > cap 5 — a silent cap would
+		// return "metri" as if it were the whole body; the +1 probe
+		// byte proves truncation and the fetch must error instead.
+		if _, err := FetchPodMetrics(ctx, client, "10.1.2.3", 9180,
+			time.Second, 5); err == nil {
+			t.Fatal("truncated body must error, not return a partial parse")
+		}
+	})
+	t.Run("body exactly at maxBytes is legal", func(t *testing.T) {
+		client := &http.Client{Transport: &testhelp.StubTransport{
+			Fn: func(r *http.Request) (*http.Response, error) {
+				return testhelp.ProbeResponse(200, "12345"), nil
+			}}}
 		body, err := FetchPodMetrics(ctx, client, "10.1.2.3", 9180,
 			time.Second, 5)
-		if err != nil || string(body) != "metri" {
-			t.Fatalf("FetchPodMetrics = (%q,%v), want capped 5 bytes", body, err)
+		if err != nil || string(body) != "12345" {
+			t.Fatalf("FetchPodMetrics = (%q,%v), want exact-cap body", body, err)
 		}
 	})
 }

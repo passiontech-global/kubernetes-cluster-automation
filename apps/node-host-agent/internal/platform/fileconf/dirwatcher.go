@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -81,9 +82,19 @@ func (w *DirWatcher) fingerprint() string {
 					"dir", d, "path", p, "error", err)
 				return nil
 			}
-			if !e.IsDir() {
-				files = append(files, p)
+			if e.IsDir() {
+				return nil
 			}
+			// Kubelet's ConfigMap/Secret volume mounts materialize as
+			// dot-prefixed entries — the `..data` symlink and its
+			// `..2026_*` timestamped target dirs. They are mount
+			// plumbing, not watched content: hashing them both
+			// churns the fingerprint on every sync and follows the
+			// symlink into a directory readFile can never serve.
+			if strings.HasPrefix(e.Name(), ".") {
+				return nil
+			}
+			files = append(files, p)
 			return nil
 		})
 	}
@@ -97,6 +108,12 @@ func (w *DirWatcher) fingerprint() string {
 		if err != nil {
 			w.log().Debug("hostconfig: watcher cannot stat file — excluded from fingerprint",
 				"file", f, "error", err)
+			continue
+		}
+		// os.Stat follows symlinks — a link whose target is a
+		// directory (the `..data` shape minus the dot-prefix guard)
+		// must not reach readFile.
+		if st.IsDir() {
 			continue
 		}
 		if c, ok := w.stats[f]; ok && c.size == st.Size() && c.mtimeNS == st.ModTime().UnixNano() {

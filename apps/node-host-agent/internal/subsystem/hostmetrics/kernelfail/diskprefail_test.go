@@ -54,7 +54,7 @@ func TestDiskPreFailExt4ErrorsCountLatches(t *testing.T) {
 	writePrefailFile(t, filepath.Join(root, "sys", "fs", "ext4", "vda1", "errors_count"), "3\n")
 	writePrefailFile(t, filepath.Join(root, "sys", "fs", "ext4", "vdb1", "errors_count"), "0\n")
 
-	f.r.updateDiskPreFailEvidence()
+	f.r.updateDiskPreFailEvidence(context.Background())
 	if !prefailLatchSet(f.r) {
 		t.Fatal("state-disk-pre-fail not latched on errors_count=3")
 	}
@@ -82,12 +82,12 @@ func TestDiskPreFailCleanExitsLatch(t *testing.T) {
 	f := kfixture(t)
 	root := seedPrefailFixture(t, f.r)
 	writePrefailFile(t, filepath.Join(root, "sys", "fs", "ext4", "vda1", "errors_count"), "3\n")
-	f.r.updateDiskPreFailEvidence()
+	f.r.updateDiskPreFailEvidence(context.Background())
 	if !prefailLatchSet(f.r) {
 		t.Fatal("latch did not arm")
 	}
 	writePrefailFile(t, filepath.Join(root, "sys", "fs", "ext4", "vda1", "errors_count"), "0\n")
-	f.r.updateDiskPreFailEvidence()
+	f.r.updateDiskPreFailEvidence(context.Background())
 	if prefailLatchSet(f.r) {
 		t.Fatal("latch held on clean evidence")
 	}
@@ -111,7 +111,7 @@ func TestDiskPreFailNVMeSysfsPageEvidence(t *testing.T) {
 	writePrefailFile(t,
 		filepath.Join(root, "sys", "class", "nvme", "nvme0", "smart_log"),
 		string(page))
-	f.r.updateDiskPreFailEvidence()
+	f.r.updateDiskPreFailEvidence(context.Background())
 	if !prefailLatchSet(f.r) {
 		t.Fatal("state-disk-pre-fail not latched on nvme media_errors=7")
 	}
@@ -153,7 +153,7 @@ func TestDiskPreFailNVMeCLIFallback(t *testing.T) {
 		}
 		return "", os.ErrNotExist
 	}
-	f.r.updateDiskPreFailEvidence()
+	f.r.updateDiskPreFailEvidence(context.Background())
 	if !prefailLatchSet(f.r) {
 		t.Fatal("state-disk-pre-fail not latched on percentage_used=95 (nvme-cli)")
 	}

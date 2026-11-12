@@ -12,7 +12,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -49,14 +48,18 @@ func init() {
 func (w *cfTunnelProxyWatchdog) auditControllerSyncErrors(ctx context.Context) {
 	log := logf.FromContext(ctx)
 	now := w.now.Now()
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: cfTunnelGatewayCtrlSelector,
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(w.cs, w.namespace))
+	all, err := w.podsInNS(ctx, w.namespace)
 	if err != nil {
 		metrics.IncError(w.queue)
 		log.Info("WARN: gateway controller pod list failed — sync-error audit skipped",
 			"namespace", w.namespace, "error", err.Error())
+		return
+	}
+	pods, err := matchPodSelector(all, cfTunnelGatewayCtrlSelector)
+	if err != nil {
+		metrics.IncError(w.queue)
+		log.Info("WARN: gateway controller selector parse failed — sync-error audit skipped",
+			"error", err.Error())
 		return
 	}
 	errSeen := false

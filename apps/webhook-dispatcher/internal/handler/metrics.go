@@ -10,7 +10,8 @@ var deliveriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "webhook_dispatcher_deliveries_total",
 	Help: "GitHub webhook deliveries handled, by event (normalized to " +
 		"push|pull_request|release|create|none|other) and outcome " +
-		"(dispatched|ignored|unauthorized|payload_too_large|bad_request|index_unavailable).",
+		"(dispatched|ignored|unauthorized|payload_too_large|bad_request|" +
+		"index_unavailable|overloaded|draining).",
 }, []string{"event", "status"})
 
 // metricEventLabel maps an X-GitHub-Event header value onto the fixed

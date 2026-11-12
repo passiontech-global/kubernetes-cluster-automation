@@ -48,7 +48,7 @@ func TestGuardTrigger(t *testing.T) {
 func TestGuardFreezeCounter(t *testing.T) {
 	k, _, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect", Out: "true"},
-		{Substr: "MAX(id)", Out: "300|50|1000\n"},
+		{Substr: "MAX(id)", Out: "300|50|1000|1\n"},
 	})
 	dir := k.d.Cfg.GuardStateDir
 	// Previous run: head 100, compact_rev 50, 3 frozen cycles.
@@ -69,7 +69,7 @@ func TestGuardFreezeCounter(t *testing.T) {
 	// compact_rev moved → counter resets.
 	k.d.Cfg.Run = testutil.NewFakeExec(
 		testutil.ExecRule{Substr: "inspect", Out: "true"},
-		testutil.ExecRule{Substr: "MAX(id)", Out: "400|300|1000\n"},
+		testutil.ExecRule{Substr: "MAX(id)", Out: "400|300|1000|1\n"},
 	).RunStdin
 	res = k.Cycle(context.Background())
 	if res.frozen != 0 {
@@ -110,7 +110,7 @@ func TestBuildCompactScript(t *testing.T) {
 	}
 }
 
-var guardStatsRule = testutil.ExecRule{Substr: "MAX(id)", Out: "600000|100|700000\n"}
+var guardStatsRule = testutil.ExecRule{Substr: "MAX(id)", Out: "600000|100|700000|1\n"}
 
 // guardAfterRule answers the post-compact re-read (compact_rev|rows)
 // — the only query that opens with MAX(prev_revision).
@@ -251,7 +251,7 @@ func TestGuardCycleLockBusy(t *testing.T) {
 func TestGuardCycleQuiet(t *testing.T) {
 	k, fr, dir := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect", Out: "true"},
-		{Substr: "MAX(id)", Out: "2000|1000|3000\n"},
+		{Substr: "MAX(id)", Out: "2000|1000|3000|1\n"},
 	})
 	res := k.Cycle(context.Background())
 	if !res.ok || res.fired {
@@ -362,7 +362,8 @@ func TestGuardCycleStatsReadFailures(t *testing.T) {
 
 // The marker-off-by-one hold: head-Tail at or under compact_rev
 // holds the marker at crev (zero chunk windows — only the vacuum
-// runs), while a never-compacted DB (crev==0) falls back to head.
+// runs). The head <= Tail overshoot is covered by
+// TestGuardCycleHeadWithinTailSkips.
 func TestGuardCycleTargetHoldAndNeverCompacted(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -370,11 +371,9 @@ func TestGuardCycleTargetHoldAndNeverCompacted(t *testing.T) {
 		wantPrevTarget string // "prev_revision = N" in the chunk window
 		wantChunks     int
 	}{
-		// head=1000, crev=900, Tail=1000 → target 0 <= crev → hold at
-		// crev: no DO block, only the vacuum round.
-		{"hold at crev", "1000|900|500000\n", "", 0},
-		// crev=0 (never compacted) → hold branch falls back to head.
-		{"never compacted", "1000|0|500000\n", "prev_revision = 1000", 1},
+		// head=5000, crev=4900, Tail=1000 → target 4000 <= crev →
+		// hold at crev: no DO block, only the vacuum round.
+		{"hold at crev", "5000|4900|500000|4900\n", "", 0},
 	}
 	for _, tc := range cases {
 		k, fr, _ := fixture(t, []testutil.ExecRule{
@@ -394,6 +393,79 @@ func TestGuardCycleTargetHoldAndNeverCompacted(t *testing.T) {
 			t.Fatalf("%s: chunks=%d want %d, prevTarget %q in:\n%s",
 				tc.name, got, tc.wantChunks, tc.wantPrevTarget, script)
 		}
+	}
+}
+
+// rows-debt with the marker already at/ahead of head-Tail: the
+// forward compact has no window to advance through, so the guard
+// sweeps dead rows BELOW compact_rev in bounded chunks — the same
+// shadowed/deleted-row DELETE semantics — WITHOUT the
+// compact_rev_key UPDATE (there is no forward progress to record).
+func TestGuardCycleBelowHorizonSweep(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "ON_ERROR_STOP", Out: "NOTICE:  deleted=42\n"},
+		guardAfterRule,
+		// head=5000 crev=4900 rows=500000 (>RowsMax) min_id=100
+		// (<crev) → target 4000 <= crev → sweep [100,4900].
+		{Substr: "MAX(id)", Out: "5000|4900|500000|100\n"},
+	})
+	res := k.Cycle(context.Background())
+	if !res.ok || !res.fired {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	script := fr.LastStdin()
+	if !strings.Contains(script, "kp.id > 100 AND kp.id <= 4900") {
+		t.Fatalf("sweep window wrong:\n%s", script)
+	}
+	if strings.Contains(script, "SET prev_revision") {
+		t.Fatalf("below-horizon sweep must not advance compact_rev_key:\n%s", script)
+	}
+	if res.deleted != 42 {
+		t.Fatalf("deleted=%d", res.deleted)
+	}
+}
+
+// The same hold-at-crev shape WITHOUT the rows-debt backlog (min_id
+// already at the marker) keeps the vacuum-only session — no sweep
+// chunks, no marker move.
+func TestGuardCycleHoldAtCrevNoBacklog(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "ON_ERROR_STOP", Out: "NOTICE:  deleted=7\n"},
+		guardAfterRule,
+		// min_id == crev → nothing below the horizon to sweep.
+		{Substr: "MAX(id)", Out: "5000|4900|500000|4900\n"},
+	})
+	res := k.Cycle(context.Background())
+	if !res.fired || !res.ok {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	if got := strings.Count(fr.LastStdin(), "DO $$"); got != 0 {
+		t.Fatalf("chunks=%d want 0:\n%s", got, fr.LastStdin())
+	}
+}
+
+// head <= Tail leaves no safely-deletable range: the whole retained
+// history already fits inside the watch tail, so the guard must not
+// fire a compact session at all — even when a trigger (here
+// rows-debt) evaluates true. The old crev==0 fallback used to
+// compact to head and erase every revision a watcher could resume
+// from.
+func TestGuardCycleHeadWithinTailSkips(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "MAX(id)", Out: "1000|0|500000|0\n"}, // head=Tail, crev=0
+	})
+	res := k.Cycle(context.Background())
+	if !res.ok || res.fired {
+		t.Fatalf("head<=tail must skip cleanly: res=%+v notes=%v", res, res.notes)
+	}
+	if !containsGuardNote(res.notes, "nothing safely deletable") {
+		t.Fatalf("missing skip note: %v", res.notes)
+	}
+	if script := fr.LastStdin(); strings.Contains(script, "ON_ERROR_STOP") {
+		t.Fatalf("compact script must not run when head<=tail:\n%s", script)
 	}
 }
 

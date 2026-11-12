@@ -554,7 +554,7 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	putGateway(t, p.Dyn, gwFixture("apps", "gw-foreign", "cloudflare-tunnel", 1))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("foreign-owned stuck route must pass quietly: %+v", res)
 	}
 	for _, k := range probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
@@ -580,7 +580,7 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	putGateway(t, p.Dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	want := "cilium-operator/httproutes/apps/r-cilium/" + opReasonStaleGWStatus
@@ -611,7 +611,7 @@ func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
 	p := testProberDyn(cs, dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	if _, ok := probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
@@ -646,7 +646,7 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("cilium-operator/gatewayclasses//cilium/"+opReasonStaleGWStatus, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stale cilium GatewayClass past the window must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cilium-operator", opReasonStaleGWStatus); v != 1 {
@@ -666,7 +666,7 @@ func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
 	p := testProberDyn(cs, dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy accepted class must keep the check quiet: %+v", res)
 	}
 	for _, k := range probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {

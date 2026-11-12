@@ -280,12 +280,22 @@ func (s *natsSweep) logScan(ctx context.Context) {
 	g.SetLimit(natsLogScanWorkers)
 	for j, key := range scanKeys {
 		pod := s.census.memberByName[key]
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			// A panic in one pod's log scan must not kill the sweep —
+			// it reads as that pod's inconclusive scan (err slot),
+			// never a process crash.
+			defer func() {
+				if r := recover(); r != nil {
+					scans[j] = logScan{key: key,
+						err: fmt.Errorf("log scan panicked: %v", r)}
+				}
+			}()
 			reason := ""
 			hit, lerr := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{
-				TailLines: probefw.DefaultTailLines,
-				MaxBytes:  probefw.LogMaxBytes,
-				Timeout:   probefw.LogTimeout,
+				TailLines:    probefw.DefaultTailLines,
+				SinceSeconds: 900,
+				MaxBytes:     probefw.LogMaxBytes,
+				Timeout:      probefw.LogTimeout,
 			}, func(line string) bool {
 				if r := natsLogReason(line); r != "" {
 					reason = r // the first marker wins

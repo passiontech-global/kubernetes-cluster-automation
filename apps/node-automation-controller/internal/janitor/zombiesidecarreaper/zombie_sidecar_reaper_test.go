@@ -457,7 +457,7 @@ func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
 			}
 			return nil
 		},
-		poked: map[string]bool{}, tried: map[string]bool{}}
+		poked: map[string]bool{}}
 
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -510,9 +510,13 @@ func TestZombieSidecarProxyFallbackNoPodIP(t *testing.T) {
 	}
 }
 
-// sidecar-shutdown-fallback — backoffLimit==0 Jobs spawn no replacement pod, so an
-// all-exit-0 zombie may be reaped even while job.Status.Succeeded is
-// still 0 — but only AFTER a shutdown attempt already ran.
+// BUG-C1: deleting a still-Running pod counts as a pod failure
+// against the Job's backoffLimit — on a backoffLimit==0 Job that is an
+// instant BackoffLimitExceeded, failing a Job whose app containers all
+// exited 0. There is NO backoffLimit exemption: an all-exit-0 zombie
+// stays put until the Job records Complete (JobComplete=True or
+// status.succeeded >= spec.completions), at which point the delete
+// costs the Job nothing.
 func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 	zero := int32(0)
 	job := &batchv1.Job{
@@ -522,7 +526,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 		// Job controller count the completion.
 	}
 
-	t.Run("graceful-then-reap", func(t *testing.T) {
+	t.Run("graceful-then-still-kept", func(t *testing.T) {
 		testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 		cs := fake.NewSimpleClientset(
 			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
@@ -533,15 +537,20 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("pod reaped on the graceful cycle")
 		}
-		if err := r.run(ctx); err != nil {
-			t.Fatal(err)
+		// Cycle 2+: the shutdown attempt already ran, but deleting the
+		// Running pod would count as its failure — vetoed forever
+		// while the Job is incomplete.
+		for i := 0; i < 3; i++ {
+			if err := r.run(ctx); err != nil {
+				t.Fatal(err)
+			}
 		}
-		if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
-			t.Fatal("backoffLimit=0 zombie kept after the shutdown cycle")
+		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("backoffLimit=0 zombie reaped while Job incomplete — instant BackoffLimitExceeded")
 		}
 	})
 
-	t.Run("failed-shutdown-prior-cycle", func(t *testing.T) {
+	t.Run("failed-shutdown-still-kept", func(t *testing.T) {
 		testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
 		cs := fake.NewSimpleClientset(
 			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
@@ -549,20 +558,41 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 		r.proxyFn = func(_ context.Context, _ *corev1.Pod, _ string) error {
 			return errors.New("proxy refused")
 		}
-		// Cycle 1: both shutdown paths failed but NO prior attempt
-		// exists — the pod is kept (the plan's "prior cycle" rule).
+		// Both shutdown paths fail — the pod reaches the delete step
+		// every cycle, but the Job gate vetoes it while incomplete.
+		for i := 0; i < 3; i++ {
+			if err := r.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("backoffLimit=0 zombie reaped while Job incomplete")
+		}
+	})
+
+	t.Run("reaped-once-job-complete", func(t *testing.T) {
+		testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
+		cs := fake.NewSimpleClientset(
+			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
+		r := zsrReaper(cs, &zsrShutdownProbe{})
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
-			t.Fatal("reaped on first sight — shutdown attempt must precede")
+		// The Job controller records the completion (Succeeded=1 meets
+		// the default single completion) — NOW the delete is free.
+		j, err := cs.BatchV1().Jobs("jobs").Get(ctx, "job-x", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
 		}
-		// Cycle 2: a shutdown attempt ran last cycle — reap now.
+		j.Status.Succeeded = 1
+		if _, err := cs.BatchV1().Jobs("jobs").UpdateStatus(ctx, j, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
-			t.Fatal("backoffLimit=0 zombie kept after a prior shutdown attempt")
+			t.Fatal("backoffLimit=0 zombie kept after Job completion recorded")
 		}
 	})
 
@@ -640,7 +670,7 @@ func TestZombieSidecarShutdownTargets(t *testing.T) {
 }
 
 // The graceful-shutdown cap: only zombieShutdownCapPerCycle dials per
-// cycle — the rest defer untouched (no tried/poked stamp) and get
+// cycle — the rest defer untouched (no poked stamp) and get
 // their attempt on the next sweep, while the already-poked pods flow
 // to the delete step without spending a dial.
 func TestZombieSidecarShutdownCapPerCycle(t *testing.T) {
@@ -664,9 +694,6 @@ func TestZombieSidecarShutdownCapPerCycle(t *testing.T) {
 	// ledger stamp at all — their graceful cycle is intact.
 	if len(r.poked) != zombieShutdownCapPerCycle {
 		t.Fatalf("poked ledger = %d, want cap %d", len(r.poked), zombieShutdownCapPerCycle)
-	}
-	if len(r.tried) != zombieShutdownCapPerCycle {
-		t.Fatalf("tried ledger = %d, want cap %d", len(r.tried), zombieShutdownCapPerCycle)
 	}
 	deferred := 0
 	for _, p := range objs {
@@ -708,7 +735,7 @@ func TestJobAllowsReapJobObjectGone(t *testing.T) {
 	cs := fake.NewSimpleClientset() // no Job object at all
 	r := zsrReaper(cs, &zsrShutdownProbe{})
 	p := zsrPod("jobs", "orphaned-xyz", 10*time.Minute, 0)
-	if !r.jobAllowsReap(ctx, p, false) {
+	if !r.jobAllowsReap(ctx, p) {
 		t.Fatal("reap vetoed while the parent Job object no longer exists")
 	}
 }
@@ -726,7 +753,7 @@ func TestJobAllowsReapGetErrorFailsClosed(t *testing.T) {
 	p := zsrPod("jobs", "unverified-xyz", 10*time.Minute, 0)
 
 	before := testutil.QueueErrorCount(t, "zombie-sidecar-reaper")
-	if r.jobAllowsReap(ctx, p, false) {
+	if r.jobAllowsReap(ctx, p) {
 		t.Fatal("reap allowed despite an unverifiable Job lookup — fail closed violated")
 	}
 	if got := testutil.QueueErrorCount(t, "zombie-sidecar-reaper") - before; got != 1 {
@@ -750,7 +777,7 @@ func TestJobAllowsReapParallelJobIncompleteVetoed(t *testing.T) {
 	cs := fake.NewSimpleClientset(job)
 	r := zsrReaper(cs, &zsrShutdownProbe{})
 	p := zsrPod("jobs", "parallel-0", 10*time.Minute, 0)
-	if r.jobAllowsReap(ctx, p, false) {
+	if r.jobAllowsReap(ctx, p) {
 		t.Fatal("incomplete parallel Job (1/3 succeeded) allowed reap prematurely")
 	}
 
@@ -758,7 +785,7 @@ func TestJobAllowsReapParallelJobIncompleteVetoed(t *testing.T) {
 	if _, err := cs.BatchV1().Jobs("jobs").UpdateStatus(ctx, job, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if !r.jobAllowsReap(ctx, p, false) {
+	if !r.jobAllowsReap(ctx, p) {
 		t.Fatal("completed parallel Job (3/3 succeeded) vetoed reap")
 	}
 }
@@ -812,9 +839,9 @@ func TestProxyShutdownUnknownSidecarFallsBackToLinkerd(t *testing.T) {
 	}
 }
 
-// A zero-value-ish reaper literal without the poked/tried maps and
+// A zero-value-ish reaper literal without the poked map and
 // without shutdownFn runs one full cycle without a nil dereference:
-// the lazy-arm in run() seeds the ledgers, the unreachable shutdown
+// the lazy-arm in run() seeds the ledger, the unreachable shutdown
 // paths fail, and the qualifying zombie is reaped on the spot.
 func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
 	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
@@ -837,7 +864,7 @@ func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
 		metrics.ZombieSidecarPodsReapedTotal.WithLabelValues("jobs")); got != 1 {
 		t.Fatalf("reaped counter = %v, want 1", got)
 	}
-	if r.poked == nil || r.tried == nil {
-		t.Fatal("lazy-arm did not seed the poked/tried ledgers")
+	if r.poked == nil {
+		t.Fatal("lazy-arm did not seed the poked ledger")
 	}
 }

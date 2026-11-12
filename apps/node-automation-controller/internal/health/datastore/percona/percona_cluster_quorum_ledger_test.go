@@ -46,12 +46,12 @@ func TestPerconaDegradedGaugeSurvivesPartialSignatureRecovery(t *testing.T) {
 	chk := probetest.MustCheck[*perconaQuorumCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting inside the window must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(perconaDegradedMinAge+time.Minute))
 	wsrepOn = true // both signatures now fire on the same tuple
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("degraded quorum + wsrep evidence must fail past the window")
 	}
 	m := probetest.FindMetric(t, "node_automation_percona_cluster_degraded",
@@ -65,7 +65,7 @@ func TestPerconaDegradedGaugeSurvivesPartialSignatureRecovery(t *testing.T) {
 	// the cluster's series must NOT be pruned with the resolved
 	// signature's ledger entry.
 	wsrepOn = false
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still-degraded quorum must keep failing")
 	}
 	m = probetest.FindMetric(t, "node_automation_percona_cluster_degraded",

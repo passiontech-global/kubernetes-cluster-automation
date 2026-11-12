@@ -7,6 +7,7 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
@@ -28,6 +29,10 @@ import (
 //     grants no watch on most types, so module reads go through it.
 //   - Dyn is the dynamic client for CRD types (helmreleases,
 //     cert-manager, externalsecrets, ...).
+//   - Meta is the metadata client — PartialObjectMetadata reads
+//     (labels/annotations/ownerRefs without the resource payload)
+//     through kube.ListPartialOrFallback. Nil in literally-
+//     constructed test Deps; the helper falls back to CS/Dyn.
 //   - Log is the manager logger, for Setup-time registration lines.
 //   - Disabled is set by setupModules when the module's registration
 //     gate (Module.GateEnv) evaluated off. Setup STILL RUNS so
@@ -55,6 +60,7 @@ type Deps struct {
 	Mgr       manager.Manager
 	CS        kubernetes.Interface
 	Dyn       dynamic.Interface
+	Meta      metadata.Interface
 	ProbeCS   kubernetes.Interface
 	ProbeDyn  dynamic.Interface
 	Log       logr.Logger

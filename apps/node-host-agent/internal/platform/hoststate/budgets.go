@@ -72,6 +72,10 @@ func (s *Store) RateOK(name string, interval time.Duration) bool {
 	return s.RateOKIn(s.Dir, name, interval)
 }
 
+// rateSpendKey is the lastSpent map key — dir+name under a NUL
+// separator no path component can contain.
+func rateSpendKey(dir, name string) string { return dir + "\x00" + name }
+
 // RateOKIn is RateOK with an explicit dir — controllerhygiene's
 // rateOK(dir, name, interval) parity for budgets outside Dir.
 // A clock step-back (NTP correction, manual set) must not open the
@@ -80,11 +84,27 @@ func (s *Store) RateOK(name string, interval time.Duration) bool {
 // Clamp to 0: a future stamp is simply not expired yet. This is the
 // ONLY now-last comparison in the package, so RateTrySpend's check
 // branch (and everything built on RateOK) inherits the clamp.
+//
+// The verdict is max(disk epoch, RAM lastSpent): a spend whose
+// disk write failed (ENOSPC/EROFS) still counts — the RAM mirror
+// is what stops the restart storm a dead state dir would otherwise
+// cause. Runs under s.shared.mu so a racing RateSpendIn cannot
+// slip a spend between the read and the caller's act.
 func (s *Store) RateOKIn(dir, name string, interval time.Duration) bool {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+	return s.rateOKInLocked(dir, name, interval)
+}
+
+// rateOKInLocked is RateOKIn's body — the caller HOLDS s.shared.mu.
+func (s *Store) rateOKInLocked(dir, name string, interval time.Duration) bool {
 	if dir == "" {
 		dir = s.Dir
 	}
 	last := s.Epoch(filepath.Join(dir, name))
+	if ram := s.shared.lastSpent[rateSpendKey(dir, name)]; ram > last {
+		last = ram
+	}
 	age := s.Now().Unix() - last
 	if age < 0 {
 		age = 0
@@ -103,10 +123,39 @@ func (s *Store) RateSpend(name string) {
 
 // RateSpendIn is RateSpend with an explicit dir.
 func (s *Store) RateSpendIn(dir, name string) {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+	s.rateSpendInLocked(dir, name)
+}
+
+// rateSpendInLocked is RateSpendIn's body — the caller HOLDS
+// s.shared.mu. The RAM lastSpent stamp lands BEFORE the disk write:
+// an ENOSPC/EROFS WriteEpochFile failure must still consume the
+// budget, or RateOKIn keeps passing and the gated action storms.
+func (s *Store) rateSpendInLocked(dir, name string) {
 	if dir == "" {
 		dir = s.Dir
 	}
-	s.WriteEpochFile(filepath.Join(dir, name), s.Now().Unix())
+	now := s.Now().Unix()
+	if s.shared.lastSpent == nil {
+		s.shared.lastSpent = map[string]int64{}
+	}
+	s.shared.lastSpent[rateSpendKey(dir, name)] = now
+	s.WriteEpochFile(filepath.Join(dir, name), now)
+}
+
+// ClearBudget removes a rate-budget file AND its RAM lastSpent
+// mirror — required wherever a budget file is deleted outside
+// RateSpend: the mirror would otherwise keep the cooldown alive
+// after the file is gone (RateOKIn verdicts on max(disk, ram)).
+// Best-effort like ClearSuspect: an absent file is already clear.
+func (s *Store) ClearBudget(name string) {
+	if err := os.Remove(filepath.Join(s.Dir, name)); err != nil &&
+		!os.IsNotExist(err) {
+		s.log().Debug("hoststate: failed to clear budget file",
+			"name", name, "error", err)
+	}
+	s.forgetSpent(name)
 }
 
 // RateTrySpend is the atomic check+spend used for the budgets two
@@ -118,9 +167,9 @@ func (s *Store) RateSpendIn(dir, name string) {
 func (s *Store) RateTrySpend(name string, interval time.Duration) bool {
 	s.shared.mu.Lock()
 	defer s.shared.mu.Unlock()
-	if !s.RateOK(name, interval) {
+	if !s.rateOKInLocked(s.Dir, name, interval) {
 		return false
 	}
-	s.RateSpend(name)
+	s.rateSpendInLocked(s.Dir, name)
 	return true
 }

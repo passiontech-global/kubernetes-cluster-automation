@@ -7,6 +7,7 @@
 package percona
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -73,11 +75,11 @@ func TestPerconaDegradedQuorumPersists(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(pxcCluster("db", "pxc-main", 2, 3)))
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting inside the window must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(perconaDegradedMinAge+time.Minute))
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("degraded quorum past 20m did not fail the check")
 	}
@@ -96,9 +98,9 @@ func TestPerconaFullSizePasses(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(pxcCluster("db", "pxc-main", 3, 3)))
 	probetest.FreezeNow(p.Deps, base)
-	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(perconaDegradedMinAge+time.Minute))
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("full-size cluster must pass: %+v", res)
 	}
 }
@@ -112,9 +114,9 @@ func TestPerconaSmallClusterSkipsDegraded(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(
 		pxcCluster("db", "pxc-two", 1, 2)))
 	probetest.FreezeNow(p.Deps, base)
-	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(perconaDegradedMinAge+time.Minute))
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	// ready=1 of size=2 is degraded-by-count but below the size>=3
 	// floor — and ready<1 doesn't apply (ready=1). Pass.
 	if !res.Pass {
@@ -142,7 +144,7 @@ func TestPerconaWsrepDonorDesyncedFails(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("Donor/Desynced member evidence must fail the check")
 	}
@@ -173,11 +175,11 @@ func TestPerconaPatroniLeaderLock(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first lock sighting inside the window must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(perconaPatroniLockMinAge+time.Minute))
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("patroni leader lock past 10m did not fail the check")
 	}
@@ -197,9 +199,9 @@ func TestPerconaPatroniBothSurfacesAbsentNoLock(t *testing.T) {
 	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"))
 	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
 	probetest.FreezeNow(p.Deps, base)
-	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(perconaPatroniLockMinAge+time.Minute))
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("404 on both DCS surfaces must not read as leader loss: %+v", res)
 	}
 }
@@ -217,7 +219,7 @@ func TestPerconaPatroniHeldLeasePasses(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(pgMember("db", "pg-main-0", "pg-main"), lease)
 	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("a held patroni leader lease must pass: %+v", res)
 	}
 }
@@ -229,9 +231,9 @@ func TestPerconaPatroniNoPodsNoLock(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(pgCluster("db", "pg-main")))
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
-	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(perconaPatroniLockMinAge+time.Minute))
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("no running pods must not read as a patroni lock: %+v", res)
 	}
 }
@@ -341,8 +343,41 @@ func TestPatroniLeaderVacant(t *testing.T) {
 			cr(false), false},
 	}
 	for _, tc := range cases {
-		if got := check(tc.objs...).patroniLeaderVacant(ctx, logr.Discard(), tc.cr); got != tc.want {
-			t.Errorf("%s: patroniLeaderVacant=%v, want %v", tc.name, got, tc.want)
+		got, inconclusive := check(tc.objs...).patroniLeaderVacant(
+			ctx, logr.Discard(), &probefw.SweepReport{}, tc.cr)
+		if got != tc.want || inconclusive {
+			t.Errorf("%s: patroniLeaderVacant=(%v,%v), want (%v,false)",
+				tc.name, got, inconclusive, tc.want)
 		}
+	}
+}
+
+// patroniLeaderVacant's inconclusive half: a non-NotFound Lease or
+// Endpoints read failure is "can't tell", never vacant evidence —
+// the caller carries the last verdict instead of letting an API
+// flap fence a healthy failover.
+func TestPatroniLeaderVacantInconclusive(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		verb     string
+		resource string
+	}{
+		{"lease list error", "list", "leases"},
+		{"leader endpoints get error", "get", "endpoints"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			cs.Fake.PrependReactor(tc.verb, tc.resource,
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("apiserver flap")
+				})
+			c := &perconaQuorumCheck{Deps: &probefw.Deps{CS: cs}}
+			vacant, inconclusive := c.patroniLeaderVacant(ctx,
+				logr.Discard(), &probefw.SweepReport{}, pgCluster("db", "pg-main"))
+			if !inconclusive || vacant {
+				t.Fatalf("patroniLeaderVacant=(%v,%v), want (false,true)",
+					vacant, inconclusive)
+			}
+		})
 	}
 }

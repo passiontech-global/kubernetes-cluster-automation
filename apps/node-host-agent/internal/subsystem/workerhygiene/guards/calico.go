@@ -184,6 +184,9 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", c.felixFails))
+			case c.d.HoldLocalAction(ctx):
+				c.d.State.AppendLog(
+					"suspect: calico-felix-down pod delete held — cluster maintenance in progress")
 			case !c.d.State.RateTrySpend("last-calico-restart", c.d.Cfg.MinRestartInterval):
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but pod restart in cooldown (<30m), skip", c.felixFails))
@@ -192,13 +195,16 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				// Preconditions{UID} closes the listing→delete race:
 				// DaemonSet churn recycling the pod name between the
 				// CycleEnv list and this call must 409, not kill the
-				// unrelated replacement pod.
+				// unrelated replacement pod. The heal stamp rides
+				// BEFORE the delete so attribution survives a
+				// mid-call crash.
 				c.d.State.AppendLog(fmt.Sprintf(
 					"ACTION: calico-hygiene deleted pod %s/%s - felix readiness down %dx",
 					felix.Namespace, felix.Name, c.felixFails))
+				c.d.StampPodHealed(ctx, felix.Namespace, felix.Name)
 				if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
 					ctx, felix.Name, metav1.DeleteOptions{
-						GracePeriodSeconds: ptr.To[int64](0),
+						GracePeriodSeconds: ptr.To[int64](5),
 						Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
 					c.d.State.AppendLog(fmt.Sprintf(
 						"suspect: calico-hygiene delete %s/%s failed: %v",
@@ -263,6 +269,9 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		return
 	}
 	switch {
+	case c.d.HoldLocalAction(ctx):
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene wireguard.cali pod delete held — cluster maintenance in progress")
 	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 		c.d.State.AppendLog(
 			"suspect: calico-hygiene wireguard.cali down but node overloaded — skip pod restart")
@@ -274,10 +283,13 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 			"ACTION: calico-hygiene deleted pod %s/%s - wireguard.cali down/no-carrier",
 			felix.Namespace, felix.Name))
 		// Same UID precondition as the felix remedy above — the
-		// name-reuse race applies identically here.
+		// name-reuse race applies identically here. The heal stamp
+		// rides BEFORE the delete so attribution survives a
+		// mid-call crash.
+		c.d.StampPodHealed(ctx, felix.Namespace, felix.Name)
 		if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
 			ctx, felix.Name, metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](0),
+				GracePeriodSeconds: ptr.To[int64](5),
 				Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene delete %s/%s failed: %v",
@@ -306,15 +318,16 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 		if !strings.HasPrefix(name, "cali") {
 			continue
 		}
-		marker := filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-"+name)
 		carrier, err := os.ReadFile(filepath.Join(d.Cfg.SysClassNet, name, "carrier"))
 		if err != nil {
 			continue // racing an iface add/remove — neither up nor down
 		}
 		if strings.TrimSpace(string(carrier)) != "0" {
 			// Live veth — a stale marker from an earlier leak
-			// episode must not carry into this one.
-			_ = os.Remove(marker)
+			// episode must not carry into this one. ClearBudget
+			// also drops the lastSpent RAM mirror a bare
+			// os.Remove would leave behind.
+			d.State.ClearBudget("veth-seen-" + name)
 			continue
 		}
 		if !d.StateFileExists("veth-seen-" + name) {
@@ -340,7 +353,7 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 				name, derr, strings.TrimSpace(out)))
 			continue
 		}
-		_ = os.Remove(marker)
+		d.State.ClearBudget("veth-seen-" + name)
 		d.State.AppendLog(fmt.Sprintf(
 			"ACTION: calico-hygiene deleted orphan veth %s - carrier down >%dm (CNI DEL leak)",
 			name, int(calicoVethGCMinAge.Minutes())))
@@ -352,7 +365,7 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 		for _, m := range ms {
 			name := strings.TrimPrefix(filepath.Base(m), "veth-seen-")
 			if _, err := os.Stat(filepath.Join(d.Cfg.SysClassNet, name)); err != nil {
-				_ = os.Remove(m)
+				d.State.ClearBudget(filepath.Base(m))
 			}
 		}
 	}

@@ -42,7 +42,7 @@ func TestCheckPerconaClusterQuorum(t *testing.T) {
 		errCluster, paused, ready))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("error-state cluster must FAIL")
 	}
@@ -70,7 +70,7 @@ func TestCheckPerconaClusterQuorumReadyZero(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(pxc, pg))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("ready<1 clusters must FAIL")
 	}
@@ -90,12 +90,12 @@ func TestCheckPerconaClusterQuorumInitializing(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(init))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("fresh initializing must pass: %+v", res)
 	}
 	// 31m later — still initializing → FAIL.
 	p.Now = func() time.Time { return base.Add(31 * time.Minute) }
-	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("initializing >30m must FAIL")
 	}
 }

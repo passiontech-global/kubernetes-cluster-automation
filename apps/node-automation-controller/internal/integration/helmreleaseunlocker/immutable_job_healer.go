@@ -77,7 +77,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		}
 		key := k.GetNamespace() + "/" + k.GetName()
 		// Cooldown: wider of the in-RAM ledger and the persisted stamp.
-		if heal.PersistedCooledDown(&u.immutableJob.healed, k,
+		if heal.PersistedCooledDown(ctx, &u.immutableJob.healed, k,
 			immutableJobHealAnno, key, immutableJobCooldown, now) {
 			continue
 		}

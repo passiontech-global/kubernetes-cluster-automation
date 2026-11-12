@@ -153,17 +153,23 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	if g.Dyn == nil {
 		s.CRDErr = errors.New("no dynamic client — CRD list skipped")
 	} else {
-		s.CRDs, s.CRDErr = kube.ListAll(ctx,
-			metav1.ListOptions{Limit: ListPageSize},
-			kube.DynamicPage(g.Dyn.Resource(kube.GVRCustomResourceDefinition)))
-		if s.CRDErr == nil {
-			// The duties only read spec.conversion.* — drop the
-			// OpenAPI schemas (the bulk of a CRD census's heap) so
-			// they don't pin 80–150 MiB for the rest of the run.
-			for i := range s.CRDs {
-				kube.StripCRDSchemaVersions(&s.CRDs[i])
-			}
-		}
+		// ListEach at the CRD page bound: each page's full objects
+		// (OpenAPI schemas included) are projected to name +
+		// spec.conversion inside the visit and die with the page —
+		// retaining the raw census pinned ~80–150 MiB of schema for
+		// the whole run. The duties only ever read spec.conversion.*
+		// and the name, so the compact objects are value-identical
+		// for every consumer.
+		s.CRDErr = kube.ListEach(ctx,
+			metav1.ListOptions{Limit: crdPageSize},
+			kube.DynamicPage(g.Dyn.Resource(kube.GVRCustomResourceDefinition)),
+			func(page []unstructured.Unstructured) error {
+				for i := range page {
+					s.CRDs = append(s.CRDs,
+						compactCRDConversion(&page[i]))
+				}
+				return nil
+			})
 	}
 	// Services — paged cluster census shared by the probe-port
 	// resolver (was one Get per webhook backend) and any duty that

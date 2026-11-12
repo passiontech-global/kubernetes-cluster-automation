@@ -62,6 +62,7 @@ package clusterhealthprobes
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -179,8 +180,13 @@ func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthPr
 	if d.Mgr != nil {
 		nodeReader = d.Mgr.GetClient()
 	}
+	deps := probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg)
+	// The metadata client feeds ListPartialOrFallback's preferred
+	// path (AllReplicaSets and the metadata-only censuses) — nil
+	// keeps the CS/Dyn fallback the test Deps shape relies on.
+	deps.Meta = d.Meta
 	p := &clusterHealthProber{
-		Deps:     probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg),
+		Deps:     deps,
 		boot:     time.Now(),
 		lastPass: map[string]time.Time{},
 	}
@@ -315,17 +321,8 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 			// dying pod never ran — the surviving leader's next
 			// cycle reports it.
 			if ctx.Err() == nil {
-				cctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.PerCheck)
-				res := entry.check.Run(cctx)
-				cancel()
-				outcomes[idx] = checkOutcome{
-					name:     entry.name,
-					ran:      true,
-					pass:     res.Pass,
-					why:      res.Why,
-					infra:    res.Infra,
-					timedOut: cctx.Err() == context.DeadlineExceeded,
-				}
+				outcomes[idx] = runCheckIsolated(entry, ctx,
+					p.Cfg.Timeouts.PerCheck)
 			}
 			return nil
 		})
@@ -376,6 +373,36 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// runCheckIsolated runs one check under its PerCheck deadline with a
+// panic guard: a panic inside any of the ~50 check bodies used to
+// take down the whole binary — one bad nil-map write in a single
+// check killed every module the process hosts. The recovered panic
+// surfaces as the check's Infra error (FAIL + queue IncError via the
+// normal report path) so the sweep keeps its accounting contract:
+// the check failed, the run did not.
+func runCheckIsolated(entry checkEntry, ctx context.Context,
+	perCheck time.Duration) (out checkOutcome) {
+
+	out = checkOutcome{name: entry.name, ran: true}
+	defer func() {
+		if r := recover(); r != nil {
+			out = checkOutcome{
+				name:  entry.name,
+				ran:   true,
+				infra: fmt.Errorf("check panicked: %v", r),
+			}
+		}
+	}()
+	cctx, cancel := context.WithTimeout(ctx, perCheck)
+	defer cancel()
+	res := entry.check.Run(cctx)
+	out.pass = res.Pass
+	out.why = res.Why
+	out.infra = res.Infra
+	out.timedOut = cctx.Err() == context.DeadlineExceeded
+	return out
 }
 
 // report updates the kuberhealthy-compatible series for one check.

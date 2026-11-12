@@ -52,7 +52,8 @@ func writeThrashFilesSlab(t *testing.T, e *env, avg60 float64,
 }
 
 // procRSSProc registers a fake process whose cgroup attributes it to
-// pod uid and whose VmRSS is rssKB — the PSI victim-ranking inputs.
+// pod uid and plants the pod cgroup's memory.current — the PSI
+// victim-ranking input (rssKB is the pod total in kB).
 func procRSSProc(t *testing.T, e *env, pid int, uid string, rssKB int) {
 	t.Helper()
 	d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
@@ -60,10 +61,16 @@ func procRSSProc(t *testing.T, e *env, pid int, uid string, rssKB int) {
 		t.Fatal(err)
 	}
 	underscored := strings.ReplaceAll(uid, "-", "_")
+	podComp := "kubepods-burstable-pod" + underscored + ".slice"
 	wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
-		"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
-	wdepstest.WriteFile(t, filepath.Join(d, "status"),
-		fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rssKB))
+		"0::/kubepods.slice/kubepods-burstable.slice/"+podComp+"\n")
+	cgdir := filepath.Join(e.H.Cfg.Runtime.CgroupRoot,
+		"kubepods.slice", "kubepods-burstable.slice", podComp)
+	if err := os.MkdirAll(cgdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(cgdir, "memory.current"),
+		strconv.FormatInt(int64(rssKB)<<10, 10))
 }
 
 // psiPod builds a Running pod on node-a for the eviction tests.
@@ -283,7 +290,7 @@ func TestPSIEvictorRSSFloor(t *testing.T) {
 	e2 := fixture(t)
 	thrashEnv(t, e2)
 	pods2 := []corev1.Pod{*psiPod("edge", "app", wdepstest.UIDA)}
-	procRSSProc(t, e2, 5001, wdepstest.UIDA, guards.MinEvictRSSBytes/1024+1)
+	procRSSProc(t, e2, 5001, wdepstest.UIDA, guards.MinEvictMemBytes/1024+1)
 	drivePSI(t, e2, pods2, wdepstest.PidsOf(5001))
 	if evs := wdepstest.EvictActions(e2.CS); len(evs) != 1 || evs[0] != "edge" {
 		t.Fatalf("evictions at the RSS floor = %v, want edge", evs)

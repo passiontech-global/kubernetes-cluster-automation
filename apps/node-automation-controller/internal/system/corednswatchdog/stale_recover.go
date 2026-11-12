@@ -103,8 +103,13 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	// evaluation. A held mutex defers with no error (the defer log
 	// with the why comes from AllowedV); only UNVERIFIABLE fails
 	// closed as an error and IncErrors the queue below.
+	// gateNow is captured ONCE: the budget grant AllowedV consumes is
+	// stamped with this instant, and RefundGrant's un-consume matches
+	// on time.Equal — a second w.now.Now() call would miss the stamp
+	// by nanoseconds and silently keep the grant.
+	gateNow := w.now.Now()
 	proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
-		w.cs, w.dyn, nil, "coredns", 0, w.now.Now())
+		w.cs, w.dyn, nil, "coredns", 0, gateNow)
 	if unverifiable {
 		metrics.IncError(w.queue)
 		return nil
@@ -146,34 +151,71 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 			return fmt.Errorf("rollout-restart patch deployment %s/coredns: %w", corednsNS, err)
 		}
 	} else {
-		// Delete only the stale pods — healthy replicas keep serving.
-		// The UID precondition closes the TOCTOU between the sweep's
-		// pod list and the delete: a same-named pod recreated since
+		// Evict only the stale pods through the PDB-respecting
+		// Eviction API — a raw Delete would bypass every
+		// PodDisruptionBudget and could strip the last Ready DNS
+		// replica mid-outage (the same contract heal.EvictPodV
+		// enforces elsewhere; here the maintenance/budget preamble
+		// already ran once above, so the plain EvictPod half is the
+		// right pairing — one grant covers the batch). The UID
+		// precondition closes the TOCTOU between the sweep's pod
+		// list and the eviction: a same-named pod recreated since
 		// is a fresh replica, not ours to kill. Every suspect name
 		// has a podUID entry (same list); an absent entry yields an
 		// empty-UID precondition that can never match a live pod —
-		// fail closed, delete nothing.
-		log.Info("ACTION: delete stale pods", "pods", suspects)
+		// fail closed, evict nothing.
+		log.Info("ACTION: evict stale pods", "pods", suspects)
+		// Per-pass eviction cap: max(1, ready/4). The batch shares
+		// ONE AllowedV grant, but the pods it evicts do NOT all sit
+		// under a PDB on clusters that never installed one — an
+		// uncapped loop could take N-1 of N CoreDNS replicas down
+		// in a single pass and blackhole DNS exactly while the
+		// cluster needs it most. Quarter-of-ready keeps a floor of
+		// surviving replicas; the remainder is picked up next
+		// sweep.
+		evictCap := max(1, int(deploy.Status.ReadyReplicas)/4)
 		deleted := 0
 		for _, name := range suspects {
-			if err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name,
-				kube.UIDDeleteOptions(podUID[name], "")); err != nil {
-				if apierrors.IsNotFound(err) {
-					// Already gone — a previous cycle's delete (or the
-					// Deployment controller) got there first. Not a
-					// failure; the fleet is exactly where we wanted it.
-					log.Info("stale pod already gone", "pod", corednsNS+"/"+name)
-					continue
-				}
-				return fmt.Errorf("delete stale pod %s/%s: %w", corednsNS, name, err)
+			if deleted >= evictCap {
+				log.Info("DEFER: per-pass CoreDNS eviction cap reached — rest next sweep",
+					"cap", evictCap, "deleted", deleted, "remaining", len(suspects)-deleted)
+				break
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: corednsNS, UID: podUID[name],
+			}}
+			evicted, refused, err := heal.EvictPod(ctx, w.cs, nil, "",
+				pod, w.now.Now())
+			switch {
+			case refused:
+				// PDB at its floor — a deferral, not a failure:
+				// the replica budget is spoken for, the pod stays,
+				// and nothing is metered (same contract as
+				// heal.EvictPodV's refund path).
+				log.Info("DEFER: PDB refused stale pod eviction — keeping pod alive",
+					"pod", corednsNS+"/"+name)
+				continue
+			case apierrors.IsNotFound(err):
+				// Already gone — a previous cycle's eviction (or the
+				// Deployment controller) got there first. Not a
+				// failure; the fleet is exactly where we wanted it.
+				log.Info("stale pod already gone", "pod", corednsNS+"/"+name)
+				continue
+			case err != nil:
+				return fmt.Errorf("evict stale pod %s/%s: %w", corednsNS, name, err)
+			case !evicted:
+				continue
 			}
 			deleted++
 		}
 		// The cooldown annotation is stamped only for recovery we
 		// DELIVERED — zero deletes means nothing happened this cycle,
 		// and stamping anyway would suppress a needed recovery for a
-		// full cooldown window.
+		// full cooldown window. The batch's single AllowedV grant
+		// bought no heal either, so it goes back — same contract
+		// heal.EvictPodV applies per PDB refusal.
 		if deleted == 0 {
+			heal.RefundGrant(gateNow)
 			log.Info("sweep done: no stale pod deleted (all already gone)", "pods", suspects)
 			return nil
 		}

@@ -91,11 +91,19 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
+	// sum by (namespace, pod) — NOT sum by (pod): bare pod names
+	// collide across namespaces (two clusters' kube-system/coredns-*
+	// aside, node-local-dns DaemonSets exist per-node but named
+	// identically across namespaces is the real case), and an
+	// aggregation that drops `namespace` both merges the colliding
+	// series into one value AND leaves s.Metric["namespace"] empty —
+	// the record() below then flags "unknown/<name>" and the heal
+	// resolves the wrong namespace's pod.
 	healthSeries, errH := p.PromQuery(ctx,
-		`sum by (pod) (rate(coredns_ForwardHealthcheckFailureCount_total[5m])) > 0.5`)
+		`sum by (namespace, pod) (rate(coredns_ForwardHealthcheckFailureCount_total[5m])) > 0.5`)
 	servfailSeries, errS := p.PromQuery(ctx,
-		`sum by (pod) (rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m]))`+
-			` / clamp_min(sum by (pod) (rate(coredns_dns_responses_total[5m])), 1) > 0.15`)
+		`sum by (namespace, pod) (rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m]))`+
+			` / clamp_min(sum by (namespace, pod) (rate(coredns_dns_responses_total[5m])), 1) > 0.15`)
 	if errH != nil {
 		log.Info("WARN: coredns healthcheck-failure query failed", "error", errH)
 	}

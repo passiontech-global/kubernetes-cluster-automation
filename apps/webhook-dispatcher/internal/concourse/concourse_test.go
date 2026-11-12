@@ -654,6 +654,11 @@ func TestCheckWebhookPostsToken(t *testing.T) {
 func TestGetJSONSendsBasicAuth(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sky/") {
+			// No token endpoint on this stub — auth latches basic.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `[]`)
@@ -707,7 +712,11 @@ func TestGetJSONBodyOverCapFails(t *testing.T) {
 }
 
 func TestGetJSONDecodes2xxBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sky/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true,"n":2}`))
 	}))
@@ -1317,6 +1326,12 @@ func TestIndexFreshnessMetrics(t *testing.T) {
 // with a live context fetches normally.
 func TestResourcesCallerCancelNotAnATCFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sky/") {
+			// No token endpoint — auth latches basic so the fetch
+			// under test exercises the API paths below.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		time.Sleep(300 * time.Millisecond) // outlive the caller's patience
 		body := pipelinesBody
 		if strings.HasSuffix(r.URL.Path, "/pipelines/p1/resources") {
@@ -1373,6 +1388,15 @@ func TestResourcesCallerCancelNotAnATCFailure(t *testing.T) {
 	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore {
 		t.Fatalf("fetch errors after cancelled Refresh=%v want %v", got, errBefore)
 	}
+	// The cancelled Refresh's fetch is DETACHED — it outlives the
+	// caller on purpose. Drain it before the test ends: a joined
+	// Refresh waits on the flight's done, so the stub server stays
+	// up until the fetch settles instead of the fetch failing
+	// against the closed listener and leaking an
+	// indexFetchErrorsTotal increment into the next test.
+	if _, err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("drain Refresh err=%v want nil", err)
+	}
 }
 
 // Cold-start waiters surface the flight's error: the first caller
@@ -1383,6 +1407,12 @@ func TestResourcesCallerCancelNotAnATCFailure(t *testing.T) {
 func TestColdStartWaiterSurfacesFlightError(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sky/") {
+			// No token endpoint — auth latches basic; only API
+			// fetches count as pipeline-list hits below.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		hits.Add(1)
 		time.Sleep(150 * time.Millisecond) // hold the flight open for the joiner
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -1413,5 +1443,212 @@ func TestColdStartWaiterSurfacesFlightError(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(indexFetchErrorsTotal); got != errBefore+1 {
 		t.Fatalf("fetch errors=%v want %v (one fetch, two callers)", got, errBefore+1)
+	}
+}
+
+// TestInstanceVarsQuery pins the ATC dot-notation contract
+// (atc/pipeline.go QueryParams over vars.Flatten): nested maps
+// flatten to dot paths, separator chars in a segment force %q
+// quoting, leaves are JSON values, pairs sort by rendered ref.
+func TestInstanceVarsQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		in   map[string]any
+		want string
+	}{
+		{"nil", nil, ""},
+		{"empty", map[string]any{}, ""},
+		{"flat string", map[string]any{"branch": "master"},
+			`vars.branch=%22master%22`},
+		{"flat number", map[string]any{"replicas": float64(3)},
+			`vars.replicas=3`},
+		{"nested map flattens", map[string]any{
+			"release": map[string]any{"line": "1.2", "channel": "stable"},
+		}, `vars.release.channel=%22stable%22&vars.release.line=%221.2%22`},
+		{"dotted key stays one segment", map[string]any{
+			"release.line": "1.2",
+		}, `vars.%22release.line%22=%221.2%22`},
+		{"mixed nested + dotted", map[string]any{
+			"a": map[string]any{"b.c": 1.0},
+		}, `vars.a.%22b.c%22=1`},
+		{"list is a leaf not a map", map[string]any{
+			"zones": []any{"a", "b"},
+		}, `vars.zones=%5B%22a%22%2C%22b%22%5D`},
+		{"empty map vanishes", map[string]any{
+			"gone": map[string]any{}, "here": "x",
+		}, `vars.here=%22x%22`},
+		{"sort by rendered ref", map[string]any{
+			"z": "1", "a": "2", "m.n": "3",
+			// Rendered refs sort byte-wise like Concourse's
+			// Ref.String(): the quoted `"m.n"` (0x22) precedes `a`.
+		}, `vars.%22m.n%22=%223%22&vars.a=%222%22&vars.z=%221%22`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := instanceVarsQuery(tc.in); got != tc.want {
+				t.Fatalf("instanceVarsQuery(%v)=%q want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFetchIndexInstancedPipeline: an instanced pipeline's
+// /resources listing must carry the vars.<key>= fragment, the
+// Resource must retain it, and the check webhook must re-append it —
+// without it the ATC cannot resolve which instance to check.
+func TestFetchIndexInstancedPipeline(t *testing.T) {
+	var mu sync.Mutex
+	var resQueries []string
+	var checkQueries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v1/teams/main/pipelines":
+			fmt.Fprint(w, `[{"name":"p1","instance_vars":{"release":{"line":"1.2"},"channel":"stable"}}]`)
+		case r.URL.Path == "/api/v1/teams/main/pipelines/p1/resources":
+			resQueries = append(resQueries, r.URL.RawQuery)
+			fmt.Fprint(w, `[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/check/webhook"):
+			checkQueries = append(checkQueries, r.URL.RawQuery)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{BaseURL: srv.URL, Team: "main", User: "u", Password: "p",
+		WebhookToken: "tok"}
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(index) != 1 {
+		t.Fatalf("index=%v want 1 resource", index)
+	}
+	wantQuery := "vars.channel=%22stable%22&vars.release.line=%221.2%22"
+	mu.Lock()
+	gotQueries := append([]string(nil), resQueries...)
+	mu.Unlock()
+	if len(gotQueries) != 1 || gotQueries[0] != wantQuery {
+		t.Fatalf("resources queries=%v want [%q]", gotQueries, wantQuery)
+	}
+	if index[0].InstanceVarsQuery != wantQuery {
+		t.Fatalf("InstanceVarsQuery=%q want %q", index[0].InstanceVarsQuery, wantQuery)
+	}
+
+	code, err := c.CheckWebhook(context.Background(), index[0])
+	if err != nil || code != http.StatusCreated {
+		t.Fatalf("CheckWebhook=(%d,%v) want 201", code, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(checkQueries) != 1 {
+		t.Fatalf("check webhook calls=%v want 1", checkQueries)
+	}
+	// webhook_token first, then the vars fragment — the ATC needs
+	// both to resolve the instanced pipeline's check.
+	if !strings.Contains(checkQueries[0], "webhook_token=tok") ||
+		!strings.Contains(checkQueries[0], wantQuery) {
+		t.Fatalf("check webhook query=%q want token + vars fragment %q",
+			checkQueries[0], wantQuery)
+	}
+}
+
+// TestFetchIndexSkipsArchived: archived pipelines are dropped before
+// their /resources is ever listed — their entries are dead weight
+// and their listings can 404/hang.
+func TestFetchIndexSkipsArchived(t *testing.T) {
+	var mu sync.Mutex
+	var listed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v1/teams/main/pipelines":
+			fmt.Fprint(w, `[{"name":"live"},{"name":"dead","archived":true}]`)
+		case strings.HasPrefix(r.URL.Path, "/api/v1/teams/main/pipelines/"):
+			listed = append(listed, r.URL.Path)
+			fmt.Fprint(w, `[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{BaseURL: srv.URL, Team: "main", User: "u", Password: "p"}
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(index) != 1 || index[0].Pipeline != "live" {
+		t.Fatalf("index=%v want only live pipeline's resource", index)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range listed {
+		if strings.Contains(p, "dead") {
+			t.Fatalf("archived pipeline was listed: %v", listed)
+		}
+	}
+}
+
+// TestGetJSONBearerAuth: a web node with a token endpoint gets Bearer
+// auth — the token is minted once via /sky/issuer/token with the fly
+// client pair and reused; a 401 on the bearer request invalidates
+// and re-mints exactly once.
+func TestGetJSONBearerAuth(t *testing.T) {
+	var mu sync.Mutex
+	var authHeaders []string
+	var mints int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/sky/issuer/token":
+			mints++
+			user, pass, _ := r.BasicAuth()
+			if user != "fly" || pass != "Zmx5" {
+				t.Errorf("token endpoint basic auth = %q/%q want fly/Zmx5", user, pass)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"access_token":"tok-%d","expires_in":3600}`, mints)
+		case "/api/v1/teams/main/pipelines":
+			authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+			// First bearer call 401s once to exercise the
+			// invalidate+remint path.
+			if len(authHeaders) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprint(w, `[]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{BaseURL: srv.URL, Team: "main", User: "u", Password: "p"}
+	var out []struct {
+		Name string `json:"name"`
+	}
+	if err := c.getJSON(context.Background(),
+		"/api/v1/teams/main/pipelines", &out); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if mints != 2 {
+		t.Fatalf("token mints=%d want 2 (initial + post-401 remint)", mints)
+	}
+	want := []string{"Bearer tok-1", "Bearer tok-2"}
+	if len(authHeaders) != 2 {
+		t.Fatalf("api auth headers=%v want %v", authHeaders, want)
+	}
+	for i := range want {
+		if authHeaders[i] != want[i] {
+			t.Fatalf("api auth[%d]=%q want %q", i, authHeaders[i], want[i])
+		}
 	}
 }

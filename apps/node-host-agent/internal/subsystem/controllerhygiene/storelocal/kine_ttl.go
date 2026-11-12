@@ -85,6 +85,21 @@ func (c *TTLCheck) Run(ctx context.Context) {
 			since = floor
 		}
 	}
+	// The window must also stop at the unit's CURRENT activation:
+	// journalctl --since reaches back across a unit restart, so a
+	// kine pid whose age exceeds the unit's active age (a leftover
+	// process the supervisor adopted, a pid-namespace edge) would
+	// read TTL errors logged by the PREVIOUS activation and flag a
+	// healthy respawn as wedged. ActiveAge errors (unit inactive,
+	// clocks unreadable) leave the pid-age window — best effort,
+	// same posture as the age-unreadable note above.
+	if sd := c.d.Cfg.Systemd; sd != nil {
+		if uage, uerr := sd.ActiveAge(ctx, c.d.Cfg.JournalUnit); uerr == nil && uage > 0 {
+			if unitStart := now.Add(-uage); since.Before(unitStart) {
+				since = unitStart
+			}
+		}
+	}
 	ttlDead := cdeps.CountMatches(ttlErrRe, c.d.JournalText(ctx, since)) > 0
 	if !ttlDead {
 		// Pid living clean past the seed window → loop broken:

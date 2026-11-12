@@ -8,6 +8,7 @@ package hoststate
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -58,6 +59,17 @@ func (s *Store) ClearSuspect(name string) {
 		s.log().Debug("hoststate: failed to clear suspect budget",
 			"key", name, "error", err)
 	}
+	s.forgetSpent(SuspectBudgetPrefix + name)
+}
+
+// forgetSpent drops the RAM lastSpent mirror for one budget under
+// s.Dir — required wherever a budget FILE is removed outside
+// RateSpend: the mirror would otherwise keep the cooldown alive
+// after the file is gone (RateOKIn verdicts on max(disk, ram)).
+func (s *Store) forgetSpent(name string) {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+	delete(s.shared.lastSpent, rateSpendKey(s.Dir, name))
 }
 
 // ClearAllSuspects drops every last-suspect-* dedupe budget in the
@@ -76,6 +88,15 @@ func (s *Store) ClearAllSuspects() {
 				"key", filepath.Base(f), "error", err)
 		}
 	}
+	// Drop the matching RAM mirrors — see ClearSuspect.
+	s.shared.mu.Lock()
+	prefix := rateSpendKey(s.Dir, SuspectBudgetPrefix)
+	for k := range s.shared.lastSpent {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.shared.lastSpent, k)
+		}
+	}
+	s.shared.mu.Unlock()
 }
 
 // SuspectLog emits msg at most once per cadence per key — a

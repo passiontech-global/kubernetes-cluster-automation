@@ -251,25 +251,53 @@ func guardNegativeDentry(d *wdeps.Deps, m memInfo) {
 	d.Actions.WithLabelValues(wdeps.CheckPSIThrash, "dentry_drop_caches").Inc()
 }
 
-// procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
-// footprint used to rank eviction victims.
-func procRSS(d *wdeps.Deps, pid int) int64 {
-	data, err := os.ReadFile(d.Proc.File(pid, "status"))
+// podCgroupRel returns the pod's cgroup-v2 path relative to
+// CgroupRoot — the /proc/<pid>/cgroup `0::` line walked up to and
+// including the pod<uid> component (kubepods-*.slice naming embeds
+// the uid with underscores). memory.current on THAT cgroup is the
+// pod's real footprint: it counts every container plus pod
+// overhead exactly once, where summing /proc VmRSS per pid
+// double-counts CoW-shared pages. "" when the line or component is
+// absent (v1 hierarchy, non-pod cgroup).
+func podCgroupRel(d *wdeps.Deps, pid int, uid string) string {
+	data, err := os.ReadFile(d.Proc.File(pid, "cgroup"))
 	if err != nil {
-		return 0
+		return ""
 	}
+	want := "pod" + strings.ReplaceAll(uid, "-", "_")
 	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "VmRSS:") {
+		if !strings.HasPrefix(line, "0::") {
 			continue
 		}
-		f := strings.Fields(line)
-		if len(f) >= 2 {
-			if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil {
-				return kb << 10 // VmRSS is reported in kB
+		rel := strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(line, "0::")), "/")
+		parts := strings.Split(rel, "/")
+		for i, p := range parts {
+			if strings.Contains(p, want) {
+				return strings.Join(parts[:i+1], "/")
 			}
 		}
 	}
-	return 0
+	return ""
+}
+
+// podMemoryCurrent reads the pod cgroup's memory.current — the
+// kernel-accounted byte total for the whole pod, immune to the CoW
+// double-counting a VmRSS sum suffers. 0 when the cgroup file is
+// unreadable or unparsable — callers treat 0 as "below the floor",
+// never evicting on inconclusive memory evidence.
+func podMemoryCurrent(d *wdeps.Deps, rel string) int64 {
+	if rel == "" {
+		return 0
+	}
+	data, err := os.ReadFile(filepath.Join(d.Cfg.Runtime.CgroupRoot, rel, "memory.current"))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // psiEvictExcludedNamespaces are namespaces the PSI evictor never
@@ -309,10 +337,11 @@ var dbQuorumTokens = []string{
 	"scylla", "dragonfly", "rabbitmq", "pxc", "psmdb", "postgresql",
 }
 
-// MinEvictRSSBytes is the victim floor — below 512 MiB RSS a pod is
-// not worth an eviction: the API churn + PDB slot buys back almost
-// nothing while the thrash persists.
-const MinEvictRSSBytes = 512 * 1024 * 1024
+// MinEvictMemBytes is the victim floor — below 512 MiB of pod
+// cgroup memory.current a pod is not worth an eviction: the API
+// churn + PDB slot buys back almost nothing while the thrash
+// persists.
+const MinEvictMemBytes = 512 * 1024 * 1024
 
 // statefulOwnerKinds are ownerReference kinds whose pods hold
 // stateful/quorum workloads — a plain StatefulSet plus the database
@@ -387,11 +416,11 @@ func evictablePodOnNode(p *corev1.Pod) bool {
 
 // highestRSSPod returns the eviction victim for the
 // psi-memory-thrash guard: the eligible non-system pod on this node
-// whose summed /proc VmRSS is largest, subject to the psi-thrash-victim-selection safety
+// whose pod-cgroup memory.current is largest, subject to the psi-thrash-victim-selection safety
 // rails —
 //
-//   - MinEvictRSSBytes floor: no candidate >= 512 MiB RSS → no
-//     eviction at all (victim=nil).
+//   - MinEvictMemBytes floor: no candidate >= 512 MiB memory.current
+//     → no eviction at all (victim=nil).
 //   - psiEvictExcludedNamespaces + critical priority classes are
 //     never candidates.
 //   - Pods carrying database/quorum labels are never candidates —
@@ -405,10 +434,10 @@ func evictablePodOnNode(p *corev1.Pod) bool {
 //
 // Pids are attributed to pods via the same /proc/<pid>/cgroup uid
 // extraction the zombie check uses.
-func highestRSSPod(d *wdeps.Deps, pods []corev1.Pod, pids []int) (victim *corev1.Pod, rss int64) {
+func highestRSSPod(d *wdeps.Deps, pods []corev1.Pod, pids []int) (victim *corev1.Pod, mem int64) {
 	type candidate struct {
 		pod       *corev1.Pod
-		rss       int64
+		mem       int64
 		preferred bool // Burstable/BestEffort && !StatefulSet-owned
 	}
 	byUID := map[string]*candidate{}
@@ -431,29 +460,42 @@ func highestRSSPod(d *wdeps.Deps, pods []corev1.Pod, pids []int) (victim *corev1
 	if len(byUID) == 0 || len(pids) == 0 {
 		return nil, 0
 	}
+	// One pod cgroup read per pod — memory.current already accounts
+	// every container in the pod, so per-pid reads would only repeat
+	// the same number. First-seen cgroup rel wins; every pid of a pod
+	// resolves to the same pod<uid> component.
+	relByUID := map[string]string{}
 	for _, pid := range pids {
 		uid := podUIDForPID(d, pid)
 		if uid == "unknown" {
 			continue
 		}
+		if _, ok := byUID[uid]; !ok {
+			continue
+		}
+		if _, seen := relByUID[uid]; !seen {
+			relByUID[uid] = podCgroupRel(d, pid, uid)
+		}
+	}
+	for uid, rel := range relByUID {
 		if c, ok := byUID[uid]; ok {
-			c.rss += procRSS(d, pid)
+			c.mem = podMemoryCurrent(d, rel)
 		}
 	}
 	// Tiered selection: preferred candidates first; only when none
-	// clears the RSS floor does the fallback tier compete.
+	// clears the memory floor does the fallback tier compete.
 	for _, wantPreferred := range []bool{true, false} {
 		var best *candidate
 		for _, c := range byUID {
-			if c.preferred != wantPreferred || c.rss < MinEvictRSSBytes {
+			if c.preferred != wantPreferred || c.mem < MinEvictMemBytes {
 				continue
 			}
-			if best == nil || c.rss > best.rss {
+			if best == nil || c.mem > best.mem {
 				best = c
 			}
 		}
 		if best != nil {
-			return best.pod, best.rss
+			return best.pod, best.mem
 		}
 	}
 	return nil, 0
@@ -541,9 +583,9 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}
-	victim, rss := highestRSSPod(c.d, e.Pods, e.PidsOnce())
+	victim, mem := highestRSSPod(c.d, e.Pods, e.PidsOnce())
 	if victim == nil {
-		// No eligible victim above the RSS floor — latch only;
+		// No eligible victim above the memory floor — latch only;
 		// the kernel OOM verdict then stands (nothing ours worth
 		// giving it).
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
@@ -551,8 +593,16 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if !c.d.State.RateTrySpend("last-psi-evict", psiEvictInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: psi-memory-thrash victim %s/%s rss=%d - in evict cooldown (<15m), skip",
-			victim.Namespace, victim.Name, rss))
+			"suspect: psi-memory-thrash victim %s/%s mem=%d - in evict cooldown (<15m), skip",
+			victim.Namespace, victim.Name, mem))
+		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
+		return
+	}
+	// L1↔L3 hold: a policy eviction during cluster maintenance is
+	// exactly the churn a drain has to un-wedge — skip this cycle.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("cleanup: psi-memory-thrash evict held — " +
+			"cluster maintenance in progress")
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}
@@ -568,8 +618,8 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		},
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: psi-memory-thrash evicted pod %s/%s - rss=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
-		victim.Namespace, victim.Name, rss, avg60, free))
+		"ACTION: psi-memory-thrash evicted pod %s/%s - mem=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
+		victim.Namespace, victim.Name, mem, avg60, free))
 	if err := c.d.Cfg.Client.PolicyV1().Evictions(victim.Namespace).
 		Evict(ctx, ev); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(

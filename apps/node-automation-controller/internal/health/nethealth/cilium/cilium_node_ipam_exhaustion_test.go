@@ -43,7 +43,7 @@ func TestCiliumIPAMExhaustionFailsAndReapsTerminalPods(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs) // dead prom -> pod-count fallback
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("exhausted node must fail: %+v", res)
 	}
@@ -65,7 +65,7 @@ func TestCiliumIPAMHealthyNodePasses(t *testing.T) {
 		Spec: corev1.NodeSpec{PodCIDR: "10.240.1.0/24"}}
 	cs := fake.NewSimpleClientset(node)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("empty /24 must pass: %+v", res)
 	}
 }
@@ -136,7 +136,7 @@ func TestCiliumIPAMPrometheusAccountingWins(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("operator-reported 4.8%% free must fail despite an empty pod census: %+v", res)
 	}
@@ -177,7 +177,7 @@ func TestCiliumIPAMPrometheusPartialCoverage(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("exhausted nodes must fail")
 	}
@@ -201,7 +201,8 @@ func TestCiliumIPAMAvailableQueryErrorFallsBack(t *testing.T) {
 	cs := fake.NewSimpleClientset(node)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Query().Get("query"), "available_ips") {
+		_ = r.ParseForm()
+		if strings.Contains(r.FormValue("query"), "available_ips") {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -215,7 +216,7 @@ func TestCiliumIPAMAvailableQueryErrorFallsBack(t *testing.T) {
 
 	// Pod census says 100% free — only the (broken) prom path could
 	// have failed this node.
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("avail-query failure must degrade to pod-count, got %+v", res)
 	}
 }
@@ -234,7 +235,7 @@ func TestCiliumIPAMPodCountSkipsNonIPShapes(t *testing.T) {
 	cs := fake.NewSimpleClientset(node, hostNet, unscheduled, terminal, live)
 	p := testProber(cs) // dead prom -> pod-count fallback
 
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("only 1 IP-holding pod on a /30 must pass: %+v", res)
 	}
 }
@@ -252,7 +253,7 @@ func TestCiliumIPAMFreeClampsAtZero(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("3 pods on a 2-IP podCIDR must fail")
 	}
@@ -276,7 +277,7 @@ func TestCiliumIPAMSkipsBadPodCIDRNodes(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("unusable podCIDRs must be skipped, not failed: %+v", res)
 	}
 }
@@ -293,7 +294,7 @@ func TestCiliumIPAMReapSkipsDeletingPod(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("exhausted node must fail")
 	}
@@ -318,7 +319,7 @@ func TestCiliumIPAMReapCap(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("exhausted node must fail")
 	}
@@ -353,7 +354,7 @@ func TestCiliumIPAMInfraErrors(t *testing.T) {
 					return true, nil, errors.New("api down")
 				})
 			p := testProber(cs)
-			res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+			res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
 			if res.Infra == nil {
 				t.Fatalf("%s list failure must surface as Infra, got %+v", tc.name, res)
 			}

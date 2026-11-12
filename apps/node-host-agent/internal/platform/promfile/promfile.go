@@ -26,11 +26,13 @@
 package promfile
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
@@ -109,16 +111,34 @@ func EscapeLabelValue(v string) string {
 // match ANY name ending in .prom (the * swallows a leading dot).
 func stagingPattern(name string) string { return "." + name + ".*" }
 
+// promFileState is the RAM record of one path's last install —
+// the content SHA-256 plus the on-disk FileStatKey (dev:ino:size:
+// mtime) captured right after the write. Write's hot path is then
+// one Stat + one hash instead of a full-file ReadFile + byte
+// compare every cycle: an unchanged render over an untouched file
+// skips EVERYTHING — no temp file, no rename, no fsync pair, no
+// read. ~27k writes/day/node of mostly-identical .prom output made
+// the read-compare alone the expensive part.
+type promFileState struct {
+	sum [32]byte
+	key string
+}
+
+// promFileStates is keyed by filepath.Clean(path) — .prom writers
+// are few and long-lived, so the map never needs eviction.
+var promFileStates sync.Map
+
 // Write atomically installs content as <dir>/<name>: MkdirAll, then
 // hostutil.WriteAtomic (CreateTemp staging, rename) — the textfile
 // collector rejects partially-written files. The fsyncs are skipped
 // (AtomicOpts.NoSync): a .prom file is ephemeral — node_exporter
 // re-reads it every scrape and the next cycle rewrites it, so a
 // crash losing the newest render costs one scrape interval of
-// metrics, not correctness. The read-compare gate skips the whole
-// staging+rename when the rendered content is unchanged (the
-// apibe-gap pattern) — most ticks render identical output. The
-// staging shape stays promfile's own: see stagingPattern — sharing
+// metrics, not correctness. Two unchanged-detection gates skip the
+// whole staging+rename: the RAM promFileStates fast path (hash +
+// one Stat) and, for files this process didn't write (or whose
+// on-disk generation changed), the full read-compare. The staging
+// shape stays promfile's own: see stagingPattern — sharing
 // hostutil's ".tmp-" convention here would put scrapeable
 // ".*.prom" names in the collector's glob.
 func Write(dir, name string, content []byte) error {
@@ -126,15 +146,37 @@ func Write(dir, name string, content []byte) error {
 		return err
 	}
 	path := filepath.Join(dir, name)
+	sum := sha256.Sum256(content)
+	clean := filepath.Clean(path)
+	if v, ok := promFileStates.Load(clean); ok {
+		st := v.(promFileState)
+		if st.sum == sum {
+			if key, err := hostutil.FileStatKey(path); err == nil &&
+				key == st.key {
+				return nil
+			}
+		}
+	}
 	if cur, err := os.ReadFile(path); err == nil &&
 		string(cur) == string(content) {
+		// Adopt the on-disk generation into the fast path so the
+		// next identical render costs a Stat, not a read.
+		if key, kerr := hostutil.FileStatKey(path); kerr == nil {
+			promFileStates.Store(clean, promFileState{sum: sum, key: key})
+		}
 		return nil
 	}
-	return hostutil.WriteAtomic(path, content, hostutil.AtomicOpts{
+	if err := hostutil.WriteAtomic(path, content, hostutil.AtomicOpts{
 		Stage:  hostutil.StageTempPattern(stagingPattern(name)),
 		Mode:   0o644,
 		NoSync: true,
-	})
+	}); err != nil {
+		return err
+	}
+	if key, kerr := hostutil.FileStatKey(path); kerr == nil {
+		promFileStates.Store(clean, promFileState{sum: sum, key: key})
+	}
+	return nil
 }
 
 // FailureLogger receives one install failure from WriteLogged. The

@@ -187,8 +187,10 @@ func TestRunnerRefreshClose(t *testing.T) {
 }
 
 // TestDefaultRunHostCmd: the nil-seam default execs with a 30s cap.
+// HostRoot "/" keeps the exec unwrapped so the fixture runs anywhere.
 func TestDefaultRunHostCmd(t *testing.T) {
-	out, err := defaultRunHostCmd(context.Background(), "echo", "hi")
+	fn := defaultRunHostCmd("/")
+	out, err := fn(context.Background(), "echo", "hi")
 	if err != nil || strings.TrimSpace(out) != "hi" {
 		t.Fatalf("out=%q err=%v", out, err)
 	}

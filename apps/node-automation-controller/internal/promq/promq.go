@@ -13,7 +13,9 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -58,9 +60,19 @@ type Client struct {
 }
 
 // ResolveEndpoint returns the /api/v1/query URL to query: override
-// wins when non-empty, else the endpoint is derived from fallbackURL's
-// scheme://host (the same Prometheus the HTTP health probe targets).
+// wins when non-empty, else the endpoint is derived from fallbackURL.
 // An error means neither source produced a usable endpoint.
+//
+// The fallback URL is a HEALTH endpoint (…/-/healthy, …/metrics),
+// not the API root — but when Prometheus/VictoriaMetrics/Thanos sits
+// behind a reverse-proxy SUBPATH mount (https://host/prometheus/-/healthy)
+// the mount prefix must survive into the derived endpoint or every
+// query 404s at the proxy's bare root. path.Dir drops exactly the
+// last segment — the probe endpoint itself — and url.JoinPath (not
+// string concatenation) rebuilds the API path under whatever mount
+// prefix remains, so "/prometheus/-/healthy" derives
+// "/prometheus/api/v1/query" while "/-/healthy" still derives the
+// root "/api/v1/query".
 func ResolveEndpoint(override, fallbackURL string) (string, error) {
 	if override != "" {
 		return override, nil
@@ -69,7 +81,17 @@ func ResolveEndpoint(override, fallbackURL string) (string, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("cannot derive prometheus base from %q", fallbackURL)
 	}
-	return u.Scheme + "://" + u.Host + "/api/v1/query", nil
+	mount := path.Dir(u.EscapedPath())
+	// Prometheus-family health endpoints live under the reserved
+	// "/-/" namespace (…/-/healthy, …/-/ready) — the "-" segment is
+	// part of the endpoint, not the proxy mount, so drop it too.
+	if mount == "/-" || strings.HasSuffix(mount, "/-") {
+		mount = path.Dir(mount)
+	}
+	if mount == "." || mount == "/" {
+		mount = ""
+	}
+	return url.JoinPath(u.Scheme+"://"+u.Host+mount, "api", "v1", "query")
 }
 
 // InstantQuery runs query against endpoint (a full /api/v1/query
@@ -86,11 +108,18 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		endpoint+"?query="+url.QueryEscape(query), nil)
+	// POST + form body, not GET ?query=: real PromQL strings run
+	// hundreds of bytes and some checks issue queries with label
+	// matchers full of quotes/braces — the GET form rides the URL
+	// into access logs, proxy request lines and any middlebox with a
+	// URL-length cap. The query API accepts both; POST keeps the
+	// payload out of every hop's logs.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		endpoint, strings.NewReader(url.Values{"query": {query}}.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("build prometheus query: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("prometheus query: %w", err)

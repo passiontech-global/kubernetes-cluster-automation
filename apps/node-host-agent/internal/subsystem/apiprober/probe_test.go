@@ -320,9 +320,16 @@ func TestListRVDrainsBodyPastReadCap(t *testing.T) {
 	if fc != failNone || rv != 42 {
 		t.Fatalf("listRV = %d, %v want 42, failNone", rv, fc)
 	}
-	if body.total != int64(len(payload)) {
-		t.Fatalf("body read %d/%d bytes — tail past the cap not drained",
+	// The drain is bounded at 64 KiB — a multi-MiB items tail is
+	// abandoned (Close drops keep-alive reuse) rather than read to
+	// EOF unboundedly. Assert the cap held: well under the payload.
+	if body.total >= int64(len(payload)) {
+		t.Fatalf("body read %d/%d bytes — drain exceeded the 64KiB cap",
 			body.total, len(payload))
+	}
+	if body.total > (64<<10)+4096 {
+		t.Fatalf("body read %d bytes — drain cap (64KiB + decode head) exceeded",
+			body.total)
 	}
 }
 

@@ -220,7 +220,7 @@ func TestPSIThrashRunEvictsVictimThenCooldown(t *testing.T) {
 
 	// 1 GiB-RSS Burstable pod attributed via its /proc cgroup line.
 	victim := psiPod("hog", "app", wdepstest.UIDA, string(corev1.PodQOSBurstable))
-	mkRSSProc(t, d, 500, wdepstest.UIDA, 1<<20)
+	mkPodMemProc(t, d, 500, wdepstest.UIDA, 1<<20)
 	e := runEnv(victim)
 	e.PidsOnce = wdepstest.PidsOf(500)
 
@@ -242,7 +242,7 @@ func TestPSIThrashRunEvictsVictimThenCooldown(t *testing.T) {
 		t.Fatalf("cooldown cycle evicted %v, want no second evict", got)
 	}
 	if log := f.LogLines(t); !strings.Contains(log,
-		"victim app/hog rss=") || !strings.Contains(log, "in evict cooldown") {
+		"victim app/hog mem=") || !strings.Contains(log, "in evict cooldown") {
 		t.Fatalf("want cooldown skip line, log=%q", log)
 	}
 

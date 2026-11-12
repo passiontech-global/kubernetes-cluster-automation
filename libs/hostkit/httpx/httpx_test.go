@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,5 +177,151 @@ func TestTimeoutWrapsRoute(t *testing.T) {
 	}
 	if string(body) != "probe timed out" {
 		t.Fatalf("body=%q, want probe timed out", body)
+	}
+}
+
+// A bound-but-never-Served Server still owns a socket: Shutdown must
+// close the listener itself (http.Server.Shutdown cannot see a
+// listener it was never handed), Addr must go empty, and a later
+// Serve must resolve nil rather than hang or panic. Repeated
+// teardown must be safe.
+func TestShutdownBeforeServeClosesListener(t *testing.T) {
+	srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := srv.Addr()
+	if addr == "" {
+		t.Fatal("Addr empty before Serve")
+	}
+
+	done := srv.Serve()
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := srv.Addr(); got != "" {
+		t.Fatalf("Addr after Shutdown = %q, want empty", got)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve result after pre-Serve Shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve channel never resolved")
+	}
+	// The port must actually be released.
+	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("listener still accepting after Shutdown")
+	}
+
+	// Repeated teardown is a no-op, and Serve-after-teardown resolves
+	// nil instead of accepting on the dead listener.
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close after Shutdown: %v", err)
+	}
+	done2 := srv.Serve()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("Serve after teardown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-teardown Serve hung")
+	}
+}
+
+// Close must release the socket immediately — no drain — and be
+// safe before Serve, during serving, and repeated.
+func TestCloseImmediate(t *testing.T) {
+	srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := srv.Addr()
+	done := srv.Serve()
+
+	start := time.Now()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close blocked for %v", elapsed)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve channel never resolved after Close")
+	}
+	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("listener still accepting after Close")
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// Opts.IdleTimeout must land on the http.Server — an unset value
+// would inherit ReadHeaderTimeout (10s) via net/http's derivation
+// and sever keep-alive connections every scrape interval.
+func TestIdleTimeoutApplied(t *testing.T) {
+	srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	if srv.srv.IdleTimeout != DefaultIdleTimeout {
+		t.Fatalf("IdleTimeout = %v, want %v", srv.srv.IdleTimeout, DefaultIdleTimeout)
+	}
+	custom, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{IdleTimeout: 7 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = custom.Close() }()
+	if custom.srv.IdleTimeout != 7*time.Second {
+		t.Fatalf("custom IdleTimeout = %v", custom.srv.IdleTimeout)
+	}
+}
+
+// Close racing Serve must resolve the serve channel cleanly —
+// net/http's "use of closed network connection" is teardown, not a
+// serve failure, and the closed flag must make a LATER Serve call
+// resolve nil instead of accepting on the dead listener. Run under
+// -race: the flag lives under s.mu.
+func TestCloseRacesServe(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := srv.Serve()
+		// Hammer teardown from two goroutines while Serve may still
+		// be binding/accepting — every interleaving must end with a
+		// nil serve result and a released port.
+		var wg sync.WaitGroup
+		for _, fn := range []func(){
+			func() { _ = srv.Close() },
+			func() { _ = srv.Shutdown(context.Background()) },
+		} {
+			wg.Add(1)
+			go func(f func()) {
+				defer wg.Done()
+				f()
+			}(fn)
+		}
+		wg.Wait()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("iter %d: serve result = %v, want nil", i, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: serve channel never resolved", i)
+		}
 	}
 }

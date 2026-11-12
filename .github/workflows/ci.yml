@@ -51,6 +51,30 @@ jobs:
       - name: Run affected tasks
         run: moon ci :format :vet :lint :lint-dockerfile :test :build
 
+      # Verify the ko image builds the release pipeline performs —
+      # `moon run <app>:image` runs the same `ko build` flags below.
+      # Nothing else exercises .ko.yaml + `ko` before a release, and
+      # a broken ko config would only surface at release time.
+      # KO_DOCKER_REPO=ko.local + --push=false keeps the build
+      # registry-free; working-directory picks up each app's
+      # .ko.yaml. node-host-agent ships via Dockerfile, not ko.
+      - name: Verify ko build (node-automation-controller)
+        working-directory: apps/node-automation-controller
+        env:
+          KO_DOCKER_REPO: ko.local
+          # .ko.yaml templates main.version from .Env.VERSION — ko
+          # renders missing map keys as an error, so the var must
+          # exist even for a throwaway CI build.
+          VERSION: ci
+        run: ko build --bare --sbom=none --push=false ./cmd/...
+
+      - name: Verify ko build (webhook-dispatcher)
+        working-directory: apps/webhook-dispatcher
+        env:
+          KO_DOCKER_REPO: ko.local
+          VERSION: ci
+        run: ko build --bare --sbom=none --push=false ./cmd/...
+
   lint-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

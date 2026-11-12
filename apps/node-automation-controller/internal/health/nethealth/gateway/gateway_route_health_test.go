@@ -129,11 +129,11 @@ func driveRouteCheck(t *testing.T, p *probetest.Prober, base time.Time) probefw.
 	t.Helper()
 	chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	r0 := chk.Run(ctx)
+	r0 := chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
-	r1 := chk.Run(ctx)
+	r1 := chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteUnhealthyMinAge+time.Minute))
-	r2 := chk.Run(ctx)
+	r2 := chk.Run(probetest.SweepCtx(ctx))
 	if !r0.Pass || !r1.Pass {
 		t.Fatalf("signature must not flag inside the persistence window: r0=%+v r1=%+v", r0, r1)
 	}
@@ -285,13 +285,13 @@ func TestGatewayRouteHealthZeroEndpointsGaugeAt5m(t *testing.T) {
 	chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, base)
-	if r := chk.Run(ctx); !r.Pass {
+	if r := chk.Run(probetest.SweepCtx(ctx)); !r.Pass {
 		t.Fatalf("fresh zero-endpoints must not flag: %+v", r)
 	}
 	// Inside the 10m unhealthy window but PAST the 5m zero window —
 	// the dedicated gauge is live while the check still passes.
 	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteZeroEndpointsMinAge+time.Minute))
-	r := chk.Run(ctx)
+	r := chk.Run(probetest.SweepCtx(ctx))
 	if !r.Pass {
 		t.Fatalf("zero gauge must not fail the check before 10m: %+v", r)
 	}
@@ -303,7 +303,7 @@ func TestGatewayRouteHealthZeroEndpointsGaugeAt5m(t *testing.T) {
 	}
 	// Past 10m the unhealthy reason lands too.
 	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteUnhealthyMinAge+time.Minute))
-	if r := chk.Run(ctx); r.Pass {
+	if r := chk.Run(probetest.SweepCtx(ctx)); r.Pass {
 		t.Fatal("persisted zero-endpoints did not fail at 10m")
 	}
 	// Endpoints appear — both gauges must drain on the next sweep.
@@ -312,7 +312,7 @@ func TestGatewayRouteHealthZeroEndpointsGaugeAt5m(t *testing.T) {
 		t.Fatal(err)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(2*gatewayRouteUnhealthyMinAge+time.Minute))
-	if r := chk.Run(ctx); !r.Pass {
+	if r := chk.Run(probetest.SweepCtx(ctx)); !r.Pass {
 		t.Fatalf("healed backend must pass: %+v", r)
 	}
 	if m := probetest.FindMetric(t, "node_automation_gateway_route_zero_endpoints",
@@ -544,9 +544,9 @@ func TestGatewayRouteHealthResolvedClearsGauge(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteUnhealthyMinAge+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted Accepted=False did not fail")
 	}
 	// The controller re-accepts the route — next sweep must heal.
@@ -556,7 +556,7 @@ func TestGatewayRouteHealthResolvedClearsGauge(t *testing.T) {
 		t.Fatal(err)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(2*gatewayRouteUnhealthyMinAge+time.Minute))
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healed route must pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",

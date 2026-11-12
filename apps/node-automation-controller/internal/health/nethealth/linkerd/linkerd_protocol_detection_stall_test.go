@@ -40,7 +40,7 @@ func TestLinkerdOpaquePortsHealPatchesTemplateAndRolls(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, pod)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("unannotated binary port must fail: %+v", res)
 	}
@@ -77,7 +77,7 @@ func TestLinkerdOpaquePortsCoveredTemplateDeletesPod(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, pod)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stale pre-rollout pod must still fail: %+v", res)
 	}
@@ -90,7 +90,7 @@ func TestLinkerdOpaquePortsAnnotatedPasses(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379}, "6379", "")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("annotated port must pass: %+v", res)
 	}
 }
@@ -99,7 +99,7 @@ func TestLinkerdSkipInboundCoversPort(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379}, "", "6379")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("skip-inbound-ports must cover the port: %+v", res)
 	}
 }
@@ -112,7 +112,7 @@ func TestLinkerdSkipOutboundCoversPort(t *testing.T) {
 	pod.Annotations["config.linkerd.io/skip-outbound-ports"] = "5432"
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("skip-outbound-ports must cover the port: %+v", res)
 	}
 }
@@ -127,7 +127,7 @@ func TestLinkerdTemplatePatchStampsWorkload(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep, pod)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("unannotated binary port must fail: %+v", res)
 	}
 	got, err := cs.AppsV1().Deployments("apps").Get(ctx, "web", metav1.GetOptions{})
@@ -159,7 +159,7 @@ func TestLinkerdGitOpsDriftNotRepatch(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep, pod)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("drifted GitOps workload must still fail (ports missing)")
 	}
@@ -196,7 +196,7 @@ func TestLinkerdGitOpsDriftArgoCD(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep, pod)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("drifted GitOps workload must fail")
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_gitops_opaque_drift",
@@ -218,7 +218,7 @@ func TestLinkerdNonGitOpsRevertHonorsCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep, pod)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("reverted workload must still fail (ports missing)")
 	}
 	got, err := cs.AppsV1().Deployments("apps").Get(ctx, "web", metav1.GetOptions{})
@@ -248,7 +248,7 @@ func TestLinkerdStaleStampAllowsRepatch(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep, pod)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("unannotated binary port must fail")
 	}
 	got, err := cs.AppsV1().Deployments("apps").Get(ctx, "web", metav1.GetOptions{})
@@ -264,7 +264,7 @@ func TestLinkerdNonBinaryPortPasses(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "web-0", []int32{8080, 9090}, "", "")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("non-binary ports must pass: %+v", res)
 	}
 }
@@ -300,7 +300,7 @@ func TestLinkerdTemplatePatchPatchesRollout(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod, rs)
 	p := testProberDyn(cs, dyn)
 
-	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("unannotated Rollout binary port must fail: %+v", res)
 	}
 	got, err := dyn.Resource(kube.GVRArgoRollout).Namespace("apps").
@@ -523,7 +523,7 @@ func TestLinkerdOpaquePortsHealPatchesDaemonSetTemplate(t *testing.T) {
 	cs := fake.NewSimpleClientset(ds, pod)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("unannotated binary port must fail: %+v", res)
 	}
@@ -567,10 +567,12 @@ func emptyDaemonSet(ns, name string) *appsv1.DaemonSet {
 }
 
 // When patchLinkerdTemplate returns covered=false (e.g. the pod's
-// owner Deployment does not exist), healLinkerdStalledPod still stamps
-// the controller cooldown so subsequent sweeps inside the window do
-// not burn additional fleet budget tokens.
-func TestLinkerdOpaquePortsUncoveredTemplateStampsCooldown(t *testing.T) {
+// owner Deployment does not exist), the refusal must NOT stamp the
+// controller cooldown: a stamped window skips the drift re-evaluation
+// every sweep, the gauge ledger prunes the series, and the alert's
+// `for:` never completes — the audit's exact kill chain. The budget
+// grant is refunded instead, so the retry stays budget-neutral.
+func TestLinkerdOpaquePortsUncoveredTemplateNoCooldownStamp(t *testing.T) {
 	heal.ConfigureBudget(1, time.Hour)
 	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
 
@@ -580,11 +582,16 @@ func TestLinkerdOpaquePortsUncoveredTemplateStampsCooldown(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p)
 
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("stalled pod must fail: %+v", res)
 	}
-	if _, ok := chk.Heals.Last(probefw.SelfHealKey(
-		CheckNameLinkerdOpaqueStall, "apps/missing-web")); !ok {
-		t.Fatal("uncovered template path did not stamp the controller cooldown")
+	key := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, "apps/missing-web")
+	if _, ok := chk.Heals.Last(key); ok {
+		t.Fatal("uncovered template refusal stamped the controller cooldown — drift alerts would be suppressed")
+	}
+	// The grant was refunded: a second sweep re-evaluates instead of
+	// being budget-starved by the first refusal.
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+		t.Fatalf("second sweep must still fail (re-evaluated, not cooled down): %+v", res)
 	}
 }

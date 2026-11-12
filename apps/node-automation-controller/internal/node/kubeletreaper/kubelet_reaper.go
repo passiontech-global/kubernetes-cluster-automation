@@ -45,7 +45,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 const (
@@ -70,6 +72,18 @@ const (
 	// renewals of headroom without letting a dead kubelet wait more
 	// than the next 2m cycle for its taint.
 	kubeletReaperLeaseStale = 60 * time.Second
+	// kubeletReaperLeaseFreshGrace is how long a probe-fail must
+	// PERSIST while the kubelet Lease stays fresh before the node
+	// is tainted anyway. The fresh lease proves kubelet↔apiserver
+	// liveness, NOT that :10250 serves — the fake-ready incident
+	// this module exists for is exactly "lease renews, healthz
+	// hangs". What a fresh lease + failed probe CAN also mean is a
+	// broken proxy path (konnectivity-agent dead on the node, mesh
+	// flap) where kubelet itself is healthy — so the fresh-lease
+	// case demands cross-sweep persistence (~2 cycles) instead of
+	// the old unconditional skip that suppressed the only scenario
+	// the reaper was built to catch.
+	kubeletReaperLeaseFreshGrace = 4 * time.Minute
 )
 
 type kubeletReaper struct {
@@ -87,6 +101,12 @@ type kubeletReaper struct {
 	// which the fake clientset cannot serve — a field so tests can
 	// stub the healthz outcome per node.
 	probeFn func(ctx context.Context, node string) bool
+	// freshFail tracks how long each node's probe-fail has persisted
+	// while its kubelet Lease stayed fresh — the cross-sweep
+	// persistence window that separates a wedged :10250 (fake-ready,
+	// taint it) from a transient proxy-path flap (skip it). run() is
+	// the only writer and sweeps sequentially, so no lock.
+	freshFail state.FirstSeenLedger
 }
 
 func Setup(d shared.Deps) error {
@@ -149,12 +169,38 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		ok[res.node] = res.ok
 		anyOK = anyOK || res.ok
 	}
-	// Guard: zero successes = the probe path itself is broken
-	// (apiserver/konnectivity server) — apply no decision. Mass-taint
-	// on a broken probe path is worse than one wedged node.
-	if !anyOK {
+	// Guard: zero successes across MULTIPLE probed nodes = the probe
+	// path itself is broken (apiserver/konnectivity server) — apply
+	// no decision. Mass-taint on a broken probe path is worse than
+	// one wedged node.
+	if !anyOK && len(ok) > 1 {
 		log.Info("ABORT: no node probe succeeded — probe path broken?", "results", ok)
 		return nil
+	}
+	// One-worker tunnel protection: with a SINGLE probed node a
+	// failed probe cannot be cross-checked against sibling
+	// successes — and it carries the exact signature a dead
+	// konnectivity-agent produces cluster-wide (every node's
+	// healthz proxy path dies together). Before letting the sweep
+	// taint the cluster's only worker, verify the proxy path
+	// itself: degraded konnectivity-agent pods mean the fault is
+	// in the tunnel, not the kubelet — fail OPEN (skip the whole
+	// sweep; there is only the one node anyway). An unverifiable
+	// agent list fails open too: tainting the sole worker on our
+	// own read failure is the mass-taint-on-broken-path failure
+	// this guard exists to prevent.
+	if !anyOK && len(ok) == 1 {
+		degraded, err := r.konnectivityDegraded(ctx)
+		if err != nil {
+			log.Info("one-worker probe failed — konnectivity check errored, failing open",
+				"error", err, "results", ok)
+			return nil
+		}
+		if degraded {
+			log.Info("ABORT: single worker probe failed and konnectivity-agent degraded — tunnel suspect, not tainting",
+				"results", ok)
+			return nil
+		}
 	}
 
 	sweepErrs := 0
@@ -173,6 +219,17 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
 		}
 	}
+	// Prune freshFail against the live node list: a deleted (or
+	// promoted-to-control-plane) node's persistence stamp would
+	// otherwise linger in the ledger forever — and silently
+	// re-fire its grace window if the name is ever reused.
+	live := make(map[string]bool, len(nodes))
+	for i := range nodes {
+		if !kube.IsControlPlane(&nodes[i]) {
+			live[nodes[i].Name] = true
+		}
+	}
+	r.freshFail.Prune(func(key string) bool { return live[key] })
 	healthy := 0
 	for _, o := range ok {
 		if o {
@@ -182,6 +239,44 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	log.Info("sweep done", "probed", len(ok), "healthy", healthy,
 		"sweepErrors", sweepErrs)
 	return nil
+}
+
+// konnectivityAgentNS is where the konnectivity-agent DaemonSet
+// pods live — the server→node proxy path every kubelet healthz
+// probe traverses.
+const konnectivityAgentNS = "kube-system"
+
+// konnectivityDegraded reports whether the cluster runs
+// konnectivity-agent pods AND none of them is Ready — the evidence
+// that a cluster-wide probe failure is a broken proxy tunnel rather
+// than a dead kubelet. Matching is by pod-name prefix, not label:
+// distributions label the agent differently (k8s-app vs app) but
+// every implementation names the pods konnectivity-agent-*. Zero
+// agent pods means "no tunnel evidence" — the caller treats that
+// as not-degraded and lets the per-node lease+grace gates decide.
+func (r *kubeletReaper) konnectivityDegraded(ctx context.Context) (bool, error) {
+	pods, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Pods(r.cs, konnectivityAgentNS))
+	if err != nil {
+		return false, err
+	}
+	found, ready := 0, 0
+	for i := range pods {
+		p := &pods[i]
+		if !strings.HasPrefix(p.Name, "konnectivity-agent") ||
+			p.DeletionTimestamp != nil {
+			continue
+		}
+		found++
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+				ready++
+				break
+			}
+		}
+	}
+	return found > 0 && ready == 0, nil
 }
 
 // probe asks kube.KubeletHealthz up to 4 times (10s apart, 8s per
@@ -250,10 +345,10 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 
 	if ok {
 		// The kubelet serves :10250 — the node's own convergence
-		// evidence: clear its breaker history now so the next real
-		// episode starts from zero instead of inheriting a stale
-		// count (and so a half-open episode cannot trip on an
-		// unrelated later taint).
+		// evidence: clear its breaker history AND any fresh-lease
+		// persistence stamp now so the next real episode starts
+		// from zero instead of inheriting a stale count.
+		r.freshFail.Forget(listed.Name)
 		heal.RecordTargetHealthy(r.queue, listed.Name)
 		if kube.HasTaint(listed.Spec.Taints, kubeletReaperTaint) {
 			// kube.UntaintNode re-Gets the node inside before patching,
@@ -277,6 +372,22 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", listed.Name, err)
 	}
+	// L1<->L3 yield: node-host-agent stamps
+	// passiontech.dev/local-remediation-until (+3m) before
+	// restarting a node-local service — the cluster side defers
+	// remote tainting while L1 self-heals first (this reaper is
+	// the last resort, not a racer). The stamp is read off the
+	// fresh Get, not the listed snapshot. An absent, unparseable
+	// or expired stamp yields nothing; returning before
+	// freshFail.Observe also keeps the persistence window from
+	// burning while the agent owns the episode.
+	if until, ok := kube.ParseAnnoTime(
+		node.Annotations[nodecond.AnnoLocalRemediationUntil]); ok &&
+		until.After(r.now.Now()) {
+		log.Info("YIELD: node-host-agent local remediation in flight — taint deferred",
+			"node", listed.Name, "until", until.Format(time.RFC3339))
+		return nil
+	}
 	has := kube.HasTaint(node.Spec.Taints, kubeletReaperTaint)
 	name := listed.Name
 
@@ -298,44 +409,59 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 		// path meters it; the next 2m cycle retries.
 		return fmt.Errorf("get lease %s/%s: %w", kubeletLeaseNamespace, name, err)
 	}
-	if !alive {
-		if !has {
-			// Per-target non-convergent circuit breaker — the 4th
-			// taint of the same node inside the breaker window
-			// defers: a kubelet this module keeps tainting without
-			// it ever coming back is not converging, and re-patching
-			// every 2m cycle is exactly the churn the breaker stops.
-			// Same semantics as the module's other no-action paths:
-			// log, skip, return nil — never an error (IncError would
-			// page on our own fail-safe). The history clears the
-			// moment a probe succeeds (the ok branch above), so a
-			// kubelet restart ends the episode instead of banking
-			// against the next one.
-			if allowed, reason := heal.TryAcquireTarget(r.queue, name, r.now.Now()); !allowed {
-				log.Info("DEFER: heal target circuit open — taint skipped",
-					"node", name, "reason", reason)
-				return nil
+	if alive {
+		// Fresh Lease + failed probe is AMBIGUOUS: the fake-ready
+		// wedge this module exists for (lease renews, :10250 hangs)
+		// looks identical to a broken proxy path (konnectivity-agent
+		// dead, mesh flap) where kubelet is healthy. The old code
+		// read "fresh lease" as proof of health and skipped —
+		// self-eliminating the only case it was built to catch.
+		// Resolution: demand the probe-fail PERSIST across sweeps
+		// for kubeletReaperLeaseFreshGrace before tainting; a
+		// transient flap heals inside the window, a wedged kubelet
+		// does not. Inconclusive evidence also never UNTAINTS —
+		// only a succeeding probe clears the taint (the ok branch).
+		first, seen := r.freshFail.Observe(name, r.now.Now())
+		if !seen || r.now.Now().Sub(first) < kubeletReaperLeaseFreshGrace {
+			if has {
+				log.Info("KEEP-TAINT: probe fail persists but lease fresh — inside grace", "node", name)
+			} else {
+				log.Info("SKIP-TAINT: probe fail but kubelet alive (lease fresh) — persistence window", "node", name)
 			}
-			if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
-				corev1.TaintEffectNoSchedule); err != nil {
-				return fmt.Errorf("taint %s on node %s: %w",
-					kubeletReaperTaint, name, err)
-			}
-			log.Info("TAINT: kubelet :10250 down + lease stale/missing -> NoSchedule",
-				"node", name, "probes", kubeletReaperProbes)
-		} else {
-			log.Info("KEEP-TAINT: lease stale/missing", "node", name)
+			return nil
 		}
-		return nil
+		// Grace expired with the lease still fresh — fake-ready
+		// confirmed; fall through to the taint path.
+		r.freshFail.Forget(name)
+	} else {
+		r.freshFail.Forget(name)
 	}
-	if has {
-		if err := kube.UntaintNode(ctx, r.cs, name, kubeletReaperTaint); err != nil {
-			return fmt.Errorf("remove taint %s on node %s: %w",
+	if !has {
+		// Per-target non-convergent circuit breaker — the 4th
+		// taint of the same node inside the breaker window
+		// defers: a kubelet this module keeps tainting without
+		// it ever coming back is not converging, and re-patching
+		// every 2m cycle is exactly the churn the breaker stops.
+		// Same semantics as the module's other no-action paths:
+		// log, skip, return nil — never an error (IncError would
+		// page on our own fail-safe). The history clears the
+		// moment a probe succeeds (the ok branch above), so a
+		// kubelet restart ends the episode instead of banking
+		// against the next one.
+		if allowed, reason := heal.TryAcquireTarget(r.queue, name, r.now.Now()); !allowed {
+			log.Info("DEFER: heal target circuit open — taint skipped",
+				"node", name, "reason", reason)
+			return nil
+		}
+		if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
+			corev1.TaintEffectNoSchedule); err != nil {
+			return fmt.Errorf("taint %s on node %s: %w",
 				kubeletReaperTaint, name, err)
 		}
-		log.Info("UNTAINT: kubelet alive (lease fresh) -> taint removed", "node", name)
+		log.Info("TAINT: kubelet :10250 down -> NoSchedule",
+			"node", name, "probes", kubeletReaperProbes)
 	} else {
-		log.Info("SKIP-TAINT: probe fail but kubelet alive (lease fresh)", "node", name)
+		log.Info("KEEP-TAINT: kubelet dead (lease stale/missing or fake-ready persisted)", "node", name)
 	}
 	return nil
 }

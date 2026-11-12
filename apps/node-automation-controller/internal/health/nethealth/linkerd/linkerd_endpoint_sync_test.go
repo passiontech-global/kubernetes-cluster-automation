@@ -37,7 +37,7 @@ func TestCheckLinkerdEndpointSyncHealthy(t *testing.T) {
 		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.5"),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("synced endpoints must pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -57,7 +57,7 @@ func TestCheckLinkerdEndpointSyncSkipsUninjected(t *testing.T) {
 		// No EndpointSlice at all — would desync if audited.
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("uninjected namespace must pass: %+v", res)
 	}
 }
@@ -82,18 +82,18 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting: tracked, still passing.
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen desync must pass: %+v", res)
 	}
 	// Inside the window: still quiet.
 	p.Now = func() time.Time { return base.Add(5 * time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("desync inside window must pass: %+v", res)
 	}
 	// Past the window: FAIL + gauge + oldest destination pod gone.
 	at := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync did not fail the check")
 	}
 	m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -113,7 +113,7 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	// Inside the 1h per-service cooldown the newer pod survives even
 	// though the desync persists.
 	p.Now = func() time.Time { return at.Add(30 * time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync stopped failing inside cooldown")
 	}
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
@@ -135,9 +135,9 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync did not fail")
 	}
 	// EndpointSlice resyncs — the tuple must drop off /metrics.
@@ -150,7 +150,7 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Now = func() time.Time { return base.Add(2*linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("resynced service must pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -175,11 +175,11 @@ func TestLinkerdEndpointSyncBounceRefusedWithoutSibling(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(5 * time.Minute) }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync must still fail past the window")
 	}
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
@@ -217,7 +217,7 @@ func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
 	p.Now = func() time.Time { return base }
 	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "resume-svc")
 
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync must fail on the first post-restart sweep")
 	}
 	m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -259,7 +259,7 @@ func TestLinkerdDestinationBounceSpendsOneBudgetToken(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted desync must fail")
 	}
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
@@ -301,7 +301,7 @@ func TestCheckLinkerdEndpointSyncBounceEscalatesAndStops(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	run := func(at time.Time) probefw.Result {
 		p.Now = func() time.Time { return at }
-		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	}
 	alive := func(name string) bool {
 		_, err := cs.CoreV1().Pods(kube.LinkerdNS).
@@ -381,7 +381,7 @@ func TestCheckLinkerdEndpointSyncConvergeResetsLadder(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	run := func(at time.Time) probefw.Result {
 		p.Now = func() time.Time { return at }
-		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+		return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	}
 	testutil.CleanupMetric(t, linkerdEndpointDesyncGauge, "app", "headless-svc")
 
@@ -449,10 +449,10 @@ func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	at := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
 	p.Now = func() time.Time { return at }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
 		Get(ctx, destA.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("bounce did not delete the destination pod")
@@ -488,7 +488,7 @@ func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p2 := testProberDyn(cs2, probetest.OpDyn())
 	p2.Now = func() time.Time { return at.Add(30 * time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("desync stopped failing across the restart")
 	}
 	if _, err := cs2.CoreV1().Pods(kube.LinkerdNS).
@@ -498,7 +498,7 @@ func TestCheckLinkerdEndpointSyncHealStampSurvivesRestart(t *testing.T) {
 	// Past the window the bounce resumes — at the BASE tier, since a
 	// fresh process starts the ladder from zero.
 	p2.Now = func() time.Time { return at.Add(2 * time.Hour) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("desync stopped failing after the stamp expired")
 	}
 	if _, err := cs2.CoreV1().Pods(kube.LinkerdNS).
@@ -631,9 +631,9 @@ func TestLinkerdEndpointSyncKeepsHealthySlice(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("synced endpoints must pass: %+v", res)
 	}
 	if _, err := cs.DiscoveryV1().EndpointSlices("desyncapp").
@@ -882,11 +882,11 @@ func linkerdDestinationPod(name string, age time.Duration) *corev1.Pod {
 func driveEndpointDesync(t *testing.T, p *probetest.Prober, base time.Time) probefw.Result {
 	t.Helper()
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(5 * time.Minute) }
-	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +915,7 @@ func TestLinkerdSockLBConflictFlagged(t *testing.T) {
 		ciliumConfig(map[string]string{"bpf-lb-sock": "true"}),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("socket-LB conflict must fail: %+v", res)
 	}
@@ -948,7 +948,7 @@ func TestLinkerdSockLBSafeShapes(t *testing.T) {
 				ciliumConfig(tc.data),
 				probetest.ReadyWorkerNode("w1", "", 0, false))
 			p := testProberDyn(cs, probetest.OpDyn())
-			res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+			res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 			if !res.Pass {
 				t.Fatalf("%s must pass: %+v", tc.name, res)
 			}
@@ -969,7 +969,7 @@ func TestLinkerdSockLBNoCiliumNoMesh(t *testing.T) {
 		linkerdNamespace(),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("no cilium-config must pass: %+v", res)
 	}
 
@@ -977,7 +977,7 @@ func TestLinkerdSockLBNoCiliumNoMesh(t *testing.T) {
 		ciliumConfig(map[string]string{"bpf-lb-sock": "true"}),
 		probetest.ReadyWorkerNode("w1", "", 0, false))
 	p = testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("no linkerd namespace must pass: %+v", res)
 	}
 }

@@ -25,6 +25,9 @@ tasks:
       - '/libs/hostkit/**/*.go'
       - '/libs/hostkit/go.mod'
       - '/libs/hostkit/go.sum'
+      # envdoc's source-coverage test reads docs/env.md — a doc-only
+      # edit must invalidate this task or CI skips the check.
+      - 'docs/env.md'
 
   vet:
     inputs:

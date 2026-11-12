@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -213,7 +214,7 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 			WatchMinAge: 15 * time.Minute,
 		},
 		Teardown: wdeps.TeardownConfig{
-			StuckDeleteAge: 15 * time.Minute,
+			StuckDeleteAge: 20 * time.Minute,
 			StuckWedgeAge:  30 * time.Minute,
 			MaxForceDelete: 5,
 		},
@@ -229,6 +230,12 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 		},
 		Pressure: wdeps.PressureConfig{
 			ZombieStormThreshold: 500,
+		},
+		// Cgroup-v2 root under the fixture — pod memory.current
+		// fixtures plant here; the real /sys/fs/cgroup is never
+		// touched by a unit test.
+		Runtime: wdeps.RuntimeConfig{
+			CgroupRoot: filepath.Join(root, "cgroup"),
 		},
 		Journal: wdeps.JournalConfig{
 			Dirs: []string{f.JDir},
@@ -364,11 +371,25 @@ func (f *Fixture) MkTask(t *testing.T, uid, containerName string, pid int) {
 }
 
 // MkProc puts a fake process under ProcDir: stat with the given
-// state char + optional cmdline/environ content.
+// state char + optional cmdline/environ content. When a cmdline is
+// given the comm field mirrors the kernel contract — argv[0]'s
+// basename truncated to TASK_COMM_LEN-1 (15 chars) — so comm-gated
+// checks (ctr_tasks' runtime-kill allowlist) see the same comm a
+// real process would expose; procs without a cmdline keep the
+// "fakeproc" placeholder.
 func (f *Fixture) MkProc(t *testing.T, pid int, state, cmdline, environ string) {
 	t.Helper()
+	comm := "fakeproc"
+	if cmdline != "" {
+		if argv0 := strings.SplitN(cmdline, "\x00", 2)[0]; argv0 != "" {
+			comm = path.Base(argv0)
+			if len(comm) > 15 {
+				comm = comm[:15]
+			}
+		}
+	}
 	WriteFile(t, filepath.Join(f.ProcDir, strconv.Itoa(pid), "stat"),
-		fmt.Sprintf("%d (fakeproc) %s 0 0 0", pid, state))
+		fmt.Sprintf("%d (%s) %s 0 0 0", pid, comm, state))
 	f.Live[pid] = state != "Z"
 	if cmdline != "" {
 		WriteFile(t, filepath.Join(f.ProcDir, strconv.Itoa(pid), "cmdline"), cmdline)

@@ -49,6 +49,26 @@ func drainBody(resp *http.Response, limit int64) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
 }
 
+// probeBodyCap bounds every body a probe retains — metrics scrapes
+// and admin endpoints never legitimately exceed it.
+const probeBodyCap = 4 << 20
+
+// readCapped reads the body up to maxBytes and reports a truncated
+// capture as an error: LimitReader alone cannot tell "exactly
+// maxBytes" from "cut off at maxBytes", and a partial metrics body
+// or healthz payload must not parse as complete evidence. Reads
+// maxBytes+1 to make the distinction.
+func readCapped(r io.Reader, maxBytes int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte cap", maxBytes)
+	}
+	return b, nil
+}
+
 // clientOrDefault resolves a probe's optional injected client: the
 // variadic trailing *http.Client every HTTP probe accepts, nil (or
 // absent) meaning the probe's package default (insecureClient or
@@ -143,7 +163,7 @@ func HTTPBody(ctx context.Context, url string, timeout time.Duration,
 				drainBody(resp, 64<<10)
 				return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 			}
-			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			return readCapped(resp.Body, probeBodyCap)
 		})
 }
 
@@ -160,7 +180,7 @@ func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration,
 	client ...*http.Client) (string, error) {
 	return httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
 		func(resp *http.Response) (string, error) {
-			b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			b, err := readCapped(resp.Body, probeBodyCap)
 			if err != nil {
 				return "", err
 			}
@@ -179,7 +199,10 @@ func BodyOK(ctx context.Context, url string, timeout time.Duration,
 	client ...*http.Client) bool {
 	ok, _ := httpGet(ctx, clientOrDefault(client, plainClient), url, "", timeout,
 		func(resp *http.Response) (bool, error) {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			body, err := readCapped(resp.Body, 1<<20)
+			if err != nil {
+				return false, err
+			}
 			return strings.TrimSpace(string(body)) == "ok", nil
 		})
 	return ok

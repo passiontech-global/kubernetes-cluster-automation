@@ -86,7 +86,6 @@ func TestApplyDefaultsFullTable(t *testing.T) {
 		c.Feeder.MaxFail != 4 || c.Feeder.GraceFails != 8 ||
 		c.Feeder.ProbeURL != "https://127.0.0.1:6443/readyz" ||
 		c.Feeder.ProbeTO != 5*time.Second ||
-		c.Feeder.StateDir != "/host/var/lib/k0s-systemd-watchdog" ||
 		c.Feeder.RemediateMinRestart != 30*time.Minute ||
 		c.Feeder.RemediateFreshGrace != 90*time.Second ||
 		c.Feeder.RemediatePeerFile != "/host/etc/default/k0scontroller-watchdog" ||

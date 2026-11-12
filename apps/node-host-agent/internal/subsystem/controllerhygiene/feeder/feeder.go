@@ -281,26 +281,33 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	}
 
 	// G5: rate-limit — at most one restart per RemediateMinRestart,
-	// budget file last-restart under FeederStateDir. The
-	// read-epoch/compare/write-epoch runs under rateMu: the file
-	// stays the cross-process contract, but in-process
-	// check-then-act without the mutex lets two overlapping
-	// remediate passes both see "allowed" inside one window
-	// (TOCTOU double-restart — workerhygiene rateTrySpend parity).
-	// Store.RateTrySpend can't serve this budget: it operates on
-	// the Store's Dir (WatchdogStateDir), and last-restart lives
-	// under FeederStateDir instead.
-	f.d.RateMu.Lock()
-	lastPath := filepath.Join(fcfg.StateDir, cdeps.FileFeederLastRst)
-	delta := f.d.Cfg.Clock.Now().Unix() - f.d.State.Epoch(lastPath)
+	// on the SHARED k0scontroller budget (FileRateRestart under
+	// WatchdogStateDir): a sig13/cp-freeze/pki-drift restart
+	// seconds earlier must cool this remediate down too — one
+	// floor for every k0scontroller restart this subsystem can
+	// fire. The epoch read below only feeds the log line; the
+	// atomic check+spend is RateTrySpend at the G6 spend point
+	// (the old feeder-private last-restart file under
+	// FeederStateDir could not see the other checks' spends).
+	lastShared := f.d.State.Epoch(
+		filepath.Join(f.d.State.Dir, cdeps.FileRateRestart))
+	delta := f.d.Cfg.Clock.Now().Unix() - lastShared
 	if delta < int64(fcfg.RemediateMinRestart.Seconds()) {
-		f.d.RateMu.Unlock()
 		f.d.State.AppendLog(fmt.Sprintf(
 			"G5 PASS: last restart %ds ago (< %ds) — rate-limit, stop",
 			delta, int(fcfg.RemediateMinRestart.Seconds())))
 		return
 	}
 	f.d.State.AppendLog(fmt.Sprintf("G5: previous restart %ds ago — allowed", delta))
+
+	// L1↔L3 maintenance hold: a cluster-side drain/upgrade is already
+	// cycling this node — the feeder must not stack a remediate
+	// restart on top. Checked after G5 so the stale-restart evidence
+	// still lands in the log, before any budget is spent.
+	if f.d.HoldLocalAction(ctx) {
+		f.d.State.AppendLog("G6 PASS: cluster maintenance in progress — holding restart")
+		return
+	}
 
 	// G6: restart. The unit's PartOf fans the restart out to the
 	// watchdog unit → feeder gets fresh startup grace.
@@ -309,17 +316,15 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	// epoch on success, but the remediate script ran as a oneshot —
 	// a watchdog kill mid-restart could not restart it again). In-agent
 	// a killed/hung restart exec with an unwritten budget would allow a
-	// second restart inside the 1800s window. FeederStateDir may not
-	// exist yet (mkdir -p parity) — create it so the mark lands.
-	if err := os.MkdirAll(fcfg.StateDir, 0o755); err != nil {
-		f.d.RateMu.Unlock()
-		f.d.State.AppendLogWarn(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
-			fcfg.StateDir, err))
+	// second restart inside the 1800s window. RateTrySpend re-checks
+	// and stamps atomically under the Store mutex — a sig13/cp-freeze/
+	// pki spend landing between G5 and here fails the try and the
+	// restart is skipped instead of double-bouncing the controller.
+	f.d.State.AppendLog("G6: all gates passed — systemctl restart " + unit)
+	if !f.d.State.RateTrySpend(cdeps.FileRateRestart, fcfg.RemediateMinRestart) {
+		f.d.State.AppendLog("G6 PASS: shared restart budget spent concurrently — stop")
 		return
 	}
-	f.d.State.AppendLog("G6: all gates passed — systemctl restart " + unit)
-	f.d.State.WriteEpochFile(lastPath, f.d.Cfg.Clock.Now().Unix())
-	f.d.RateMu.Unlock()
 	if err := f.d.Restart(ctx, unit); err != nil {
 		f.d.State.AppendLogWarn(fmt.Sprintf("G6: restart %s FAIL: %v (budget spent)", unit, err))
 		return

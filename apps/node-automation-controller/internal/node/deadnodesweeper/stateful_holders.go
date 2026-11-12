@@ -51,30 +51,89 @@ func (s *deadNodeSweeper) volumeAttachments(ctx context.Context,
 	return vac.items, vac.err
 }
 
-// nodeHasStatefulHolders reports whether the node holds
-// anything that makes force-detaching its volumes dangerous: a
-// VolumeAttachment whose volume carries a ReadWriteOnce access mode
-// (RWO is the single-writer contract a not-really-dead node breaks
-// loudly), or a Pod owned by a StatefulSet (its identity is
-// volume-bound even when the current spec lost the claim). A list
-// failure is an error — the caller fails closed.
-func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string,
-	vac *volumeAttachmentCache) (bool, error) {
-	// One PV census for the whole check: PV-referenced attachments
-	// carry only the volume NAME — the access modes live on the PV
-	// object itself (inline CSI specs carry their own). PVs are
-	// cluster-scoped and number in the dozens, so one paged list is
-	// the cheap shape.
-	pvModes := map[string][]corev1.PersistentVolumeAccessMode{}
-	err := kube.ListEach(ctx,
+// pvCache memoizes the once-per-sweep PersistentVolume census —
+// PV-referenced VolumeAttachments carry only the volume NAME, so
+// nodeHasStatefulHolders resolves access modes off the PV object
+// itself. PVs are cluster-scoped and number in the dozens; without
+// the cache every suspect node re-paged the whole list.
+type pvCache struct {
+	fetched bool
+	modes   map[string][]corev1.PersistentVolumeAccessMode // pv name -> accessModes
+	err     error
+}
+
+// pvAccessModes returns PV name → access modes, listing at most
+// once per cache.
+func (s *deadNodeSweeper) pvAccessModes(ctx context.Context,
+	pc *pvCache) (map[string][]corev1.PersistentVolumeAccessMode, error) {
+	if pc.fetched {
+		return pc.modes, pc.err
+	}
+	pc.fetched = true
+	pc.modes = map[string][]corev1.PersistentVolumeAccessMode{}
+	pc.err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PersistentVolumes(s.cs),
 		func(items []corev1.PersistentVolume) error {
 			for i := range items {
-				pvModes[items[i].Name] = items[i].Spec.AccessModes
+				pc.modes[items[i].Name] = items[i].Spec.AccessModes
 			}
 			return nil
 		})
+	return pc.modes, pc.err
+}
+
+// pvcCache memoizes the once-per-sweep PVC census — the same
+// listing serves every suspect node (previously each node would
+// re-list all claims). Keyed "namespace/name" → bound PV name.
+type pvcCache struct {
+	fetched bool
+	pvOf    map[string]string // claim "ns/name" -> spec.volumeName
+	err     error
+}
+
+// pvClaims returns claim→PV bindings, listing at most once per cache.
+func (s *deadNodeSweeper) pvClaims(ctx context.Context,
+	pc *pvcCache) (map[string]string, error) {
+	if pc.fetched {
+		return pc.pvOf, pc.err
+	}
+	pc.fetched = true
+	pc.pvOf = map[string]string{}
+	pc.err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.PersistentVolumeClaims(s.cs, metav1.NamespaceAll),
+		func(items []corev1.PersistentVolumeClaim) error {
+			for i := range items {
+				c := &items[i]
+				if c.Spec.VolumeName != "" {
+					pc.pvOf[c.Namespace+"/"+c.Name] = c.Spec.VolumeName
+				}
+			}
+			return nil
+		})
+	return pc.pvOf, pc.err
+}
+
+// nodeHasStatefulHolders reports whether the node holds
+// anything that makes force-detaching its volumes dangerous: a
+// VolumeAttachment whose volume carries a ReadWriteOnce or
+// ReadWriteOncePod access mode (RWO/RWOP are the single-writer
+// contracts a not-really-dead node breaks loudly), a Pod owned by
+// a StatefulSet (its identity is volume-bound even when the current
+// spec lost the claim), or ANY pod — whatever its controller —
+// bound to a PVC whose volume is RWO/RWOP (CloudNativePG Cluster
+// pods, bare DB pods, Jobs with claims: none are StatefulSet-owned
+// yet all hold single-writer disks). A list failure is an error —
+// the caller fails closed.
+func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string,
+	vac *volumeAttachmentCache, pc *pvcCache, pvC *pvCache) (bool, error) {
+	// One PV census for the whole sweep (pvCache): PV-referenced
+	// attachments carry only the volume NAME — the access modes
+	// live on the PV object itself (inline CSI specs carry their
+	// own). PVs are cluster-scoped and number in the dozens, so
+	// one paged list per sweep is the cheap shape.
+	pvModes, err := s.pvAccessModes(ctx, pvC)
 	if err != nil {
 		return false, fmt.Errorf("list persistentvolumes: %w", err)
 	}
@@ -94,7 +153,15 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 
 	// Server-side node filter with the in-code check kept — fake
 	// clientsets ignore field selectors (the belt every paged pod
-	// list in this codebase wears).
+	// list in this codebase wears). One pass decides BOTH holder
+	// classes: StatefulSet-owned pods AND any pod bound to an
+	// RWO/RWOP claim. The claim→PV census is one cached list per
+	// sweep, paid here because the pod scan needs it to resolve
+	// claim names to volumes.
+	claims, claimsErr := s.pvClaims(ctx, pc)
+	if claimsErr != nil {
+		return false, fmt.Errorf("list persistentvolumeclaims: %w", claimsErr)
+	}
 	stsPod := false
 	err = kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + nodeName,
@@ -111,6 +178,25 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 						stsPod = true
 					}
 				}
+				if stsPod {
+					continue
+				}
+				for _, vol := range p.Spec.Volumes {
+					claim := vol.PersistentVolumeClaim
+					if claim == nil {
+						continue
+					}
+					pvName, ok := claims[p.Namespace+"/"+claim.ClaimName]
+					if !ok {
+						continue // unbound claim — no volume to split yet
+					}
+					for _, mode := range pvModes[pvName] {
+						if mode == corev1.ReadWriteOnce ||
+							mode == corev1.ReadWriteOncePod {
+							stsPod = true
+						}
+					}
+				}
 			}
 			return nil
 		})
@@ -121,23 +207,26 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 }
 
 // volumeAttachmentRWO reports whether the attachment's volume carries
-// a ReadWriteOnce access mode: inline CSI specs resolve off their own
-// spec, PV-referenced ones off the pvModes census. A volume with no
-// modes anywhere (attachment still in flight, PV since deleted)
-// cannot prove multi-writer safety either way and reads as NOT RWO —
+// a single-writer access mode (ReadWriteOnce or ReadWriteOncePod —
+// RWOP landed in the access-mode enum after the original RWO-only
+// check and a not-really-dead node breaks it just as loudly):
+// inline CSI specs resolve off their own spec, PV-referenced ones
+// off the pvModes census. A volume with no modes anywhere
+// (attachment still in flight, PV since deleted) cannot prove
+// multi-writer safety either way and reads as NOT single-writer —
 // logVolumeAttachments still names it for forensics.
 func volumeAttachmentRWO(va *storagev1.VolumeAttachment,
 	pvModes map[string][]corev1.PersistentVolumeAccessMode) bool {
 	if va.Spec.Source.InlineVolumeSpec != nil {
 		for _, mode := range va.Spec.Source.InlineVolumeSpec.AccessModes {
-			if mode == corev1.ReadWriteOnce {
+			if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
 				return true
 			}
 		}
 	}
 	if name := va.Spec.Source.PersistentVolumeName; name != nil {
 		for _, mode := range pvModes[*name] {
-			if mode == corev1.ReadWriteOnce {
+			if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
 				return true
 			}
 		}

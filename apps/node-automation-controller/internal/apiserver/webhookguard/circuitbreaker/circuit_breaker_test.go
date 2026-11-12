@@ -94,3 +94,24 @@ func TestCircuitPatchUnmeasurableRefFreezesRecovery(t *testing.T) {
 		t.Fatalf("malformed-ref entry's recover streak = %d, want 0 (never advances)", n)
 	}
 }
+
+func TestEmergencyPatch(t *testing.T) {
+	// Fail -> Ignore trips are the emergency actuation: the payload
+	// must bypass the Flux heal-revert gate. Pure Ignore -> Fail
+	// recoveries and annotation-only payloads stay gated.
+	for _, tc := range []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"trip to Ignore", `{"webhooks":[{"name":"h","failurePolicy":"Ignore"}]}`, true},
+		{"mixed payload", `{"webhooks":[{"name":"a","failurePolicy":"Fail"},{"name":"b","failurePolicy":"Ignore"}]}`, true},
+		{"recover to Fail", `{"webhooks":[{"name":"h","failurePolicy":"Fail"}]}`, false},
+		{"annotation only", `{"metadata":{"annotations":{"x":"y"}}}`, false},
+		{"undecodable", `not json`, false},
+	} {
+		if got := emergencyPatch([]byte(tc.payload)); got != tc.want {
+			t.Errorf("%s: emergencyPatch = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

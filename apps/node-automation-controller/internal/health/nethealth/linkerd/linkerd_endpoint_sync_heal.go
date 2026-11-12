@@ -178,13 +178,21 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		// or pod delete) landed; the shared key stamps here so the
 		// NEXT service's heal sees the destination bounce even
 		// though this sweep's stamp landed first.
-		if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, target, now); err != nil {
+		didDelete, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, target, now)
+		if err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "linkerd-destination delete failed",
 				"pod", target.Namespace+"/"+target.Name)
+		} else if !didDelete {
+			// Quorum reservation denied — a sibling check already
+			// spent this workload's one-disruption slot this sweep.
+			// healed stays false so the svcKey stamp does not land
+			// for a bounce that never happened.
+			log.Info("DEFER: workload disruption already reserved this sweep",
+				"pod", target.Namespace+"/"+target.Name)
 		} else {
 			healed = true
-			p.InvalidatePods(ctx) // pod gone — drop the census
+			kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 			metrics.ControlPlanePodHealsTotal.WithLabelValues(kube.LinkerdDestinationName).Inc()
 			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
 				"pod", target.Namespace+"/"+target.Name, "service", svcKey)
@@ -210,7 +218,7 @@ func (p *linkerdEndpointSyncCheck) stampLinkerdDestinationHeal(
 	p.linkerdDesyncBounceFails.Hit(svcKey)
 	// The Service already carries the first-seen stamp through the
 	// same patch closure — reuse it for the heal stamp.
-	if err := heal.StampPersisted(ctx, p.linkerdSvcPatch(svc),
+	if err := heal.StampPersisted(ctx, svc, p.linkerdSvcPatch(svc),
 		linkerdDestHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "persist linkerd endpoint heal stamp failed",

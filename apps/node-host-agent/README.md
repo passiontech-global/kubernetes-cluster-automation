@@ -99,7 +99,16 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
   converge of the standalone targets (controller VMs, DB VMs, API-LB
   VMs: binary mirror, systemd unit, config push, restart) behind a
   `coordination.k8s.io` Lease (`node-ops/node-host-agent-hubsync`) so
-  only one replica converges at a time. Metrics:
+  only one replica converges at a time. SSH host-key trust resolves
+  per dialed host: `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT`
+  (single `SHA256:..` pin or a `host=fp,...,*=fp` map), then
+  `known_hosts` next to the converge key
+  (`/etc/node-converge-ssh/known_hosts`), then the persistent TOFU
+  store `<watchdog-state-dir>/hubsync_known_hosts` (0600, atomic —
+  first contact records the key, a later change hard-blocks); only
+  with none of those does
+  `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY=1` keep the
+  historical accept-and-log behavior. Metrics:
   `node_host_agent_hubsync_target_up{target}`,
   `node_host_agent_hubsync_last_success_seconds`,
   `node_host_agent_hubsync_cycles_total`.
@@ -107,7 +116,9 @@ VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
 Interface contract: `:9115/metrics`, `:8081/healthz|readyz` (the
 DaemonSet passes `--health-probe-bind-address=:8091` to avoid a
 `hostNetwork` clash with `liqo-fabric`), `--version`, node identity
-via downward API (`NODE_NAME`, `POD_NAME`, `POD_NAMESPACE`). The kube
+via downward API (`NODE_NAME`, `POD_NAME`, `POD_NAMESPACE`). The hubsync-written
+standalone unit binds its probe to `127.0.0.1:9117` — loopback only,
+chosen because `lixo-fabric` owns `:8081` on those targets. The kube
 client is built lazily — only when a subsystem that needs it
 (sweeper, workerhygiene, nodereporter, hubsync) is enabled, so the
 standalone binary runs without one.

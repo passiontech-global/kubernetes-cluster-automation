@@ -1065,3 +1065,39 @@ func TestSkippedDeliveriesBypassIndex(t *testing.T) {
 		t.Fatalf("Refresh calls=%d want 0 (all deliveries skipped or matched)", n)
 	}
 }
+
+// TestAdmissionRefusalsReturn503 covers both admit() refusals: the
+// shutdown drain flag and a full request semaphore each answer 503 —
+// GitHub must see a retryable refusal, never a hang or a 202 that
+// silently drops the delivery.
+func TestAdmissionRefusalsReturn503(t *testing.T) {
+	t.Run("draining", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		h.drainMu.Lock()
+		h.draining = true
+		h.drainMu.Unlock()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+	})
+	t.Run("overloaded", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		// Saturate the admission semaphore — every slot held means
+		// the next authenticated delivery is refused, not queued.
+		for i := 0; i < maxInflightRequests; i++ {
+			h.reqSem <- struct{}{}
+		}
+		defer func() {
+			for i := 0; i < maxInflightRequests; i++ {
+				<-h.reqSem
+			}
+		}()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+	})
+}

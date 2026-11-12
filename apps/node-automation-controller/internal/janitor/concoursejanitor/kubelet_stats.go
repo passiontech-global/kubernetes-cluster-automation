@@ -44,13 +44,22 @@ type cjStats struct {
 // errored node-proxy read, missing nodefs counters, no usable
 // baseline) IncErrors the queue exactly ONCE — the wipe decision in
 // processPod logs the blind wipe but must not count the same broken
-// read a second time.
+// read a second time. Callers whose read feeds NO decision (the
+// post-wipe baseline re-read, bash's `|| true`) pass meter=false:
+// its failures are logged but never metered — the pre-wipe read of
+// the same pod already counted the broken path this run.
 func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod) cjStats {
+	return j.readStatsMetered(ctx, pod, true)
+}
+
+func (j *concourseWorkdirJanitor) readStatsMetered(ctx context.Context, pod *corev1.Pod, meter bool) cjStats {
 	s := cjStats{node: pod.Spec.NodeName}
 	if s.node == "" {
 		// An unscheduled worker pod has no node to read — the wipe
 		// decision will run blind, so the missing reading is metered.
-		metrics.IncError(j.queue)
+		if meter {
+			metrics.IncError(j.queue)
+		}
 		logf.FromContext(ctx).Info(
 			"WARN: worker pod has no node — disk unknown, fail-open",
 			"pod", pod.Name)
@@ -63,7 +72,9 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 		// Fail-open is deliberate, but a persistently-broken
 		// stats/summary path must show up on the error metric —
 		// every pod will blind-wipe until it is fixed.
-		metrics.IncError(j.queue)
+		if meter {
+			metrics.IncError(j.queue)
+		}
 		logf.FromContext(ctx).Info(
 			"WARN: stats/summary unreadable — disk unknown, fail-open",
 			"pod", pod.Name, "node", s.node, "error", err)
@@ -78,7 +89,9 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 	if !s.nodefsOK {
 		// A summary without usable fs counters is the same broken
 		// metrics path as an errored read — meter it too.
-		metrics.IncError(j.queue)
+		if meter {
+			metrics.IncError(j.queue)
+		}
 		logf.FromContext(ctx).Info(
 			"WARN: stats/summary counters missing — disk unknown, fail-open",
 			"pod", pod.Name, "node", s.node)
@@ -101,7 +114,9 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 		wd = s.usedGiB - imgUsed/gib - cjOSBaselineGiB
 	default:
 		// No baseline path at all → workdir unknown → fail-open wipe.
-		metrics.IncError(j.queue)
+		if meter {
+			metrics.IncError(j.queue)
+		}
 		logf.FromContext(ctx).Info(
 			"WARN: no usable baseline (imageFs missing) — workdir unknown, fail-open",
 			"pod", pod.Name, "annotation", pod.Annotations[cjBaselineAnno])

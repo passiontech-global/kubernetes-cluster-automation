@@ -134,6 +134,17 @@ type Config struct {
 	SSHPort       int           // default 22
 	SSHTimeout    time.Duration // dial+handshake deadline
 	TargetTimeout time.Duration // per-target converge deadline
+	// SSHHostKeyFingerprint pins the converge targets' expected SSH
+	// host key ("SHA256:<base64>"). Empty + SSHAllowInsecureHostKey
+	// unset → dials fail closed; empty + allow → the historical
+	// audit-log-only acceptance for rotating-key infra VMs.
+	SSHHostKeyFingerprint   string
+	SSHAllowInsecureHostKey bool
+	// StateDir parents the persistent TOFU host-key store
+	// (<StateDir>/hubsync_known_hosts) — the shared watchdog state
+	// dir via EnvDeps.WatchdogStateDir. Empty disables TOFU, so an
+	// unpinned dial falls back to known_hosts or fails closed.
+	StateDir string
 
 	// Dialer overrides the real SSH dialer — the test seam
 	// (fake exec/write recording conns).
@@ -306,7 +317,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 	s := &Syncer{cfg: cfg, cycleCh: make(chan struct{}, 1)}
 	s.dialer = cfg.Dialer
 	if s.dialer == nil {
-		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout, cfg.Log)
+		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout,
+			cfg.SSHHostKeyFingerprint, cfg.SSHAllowInsecureHostKey,
+			cfg.StateDir, cfg.Log)
 		if err != nil {
 			return nil, fmt.Errorf("hubsync: ssh key: %w", err)
 		}
@@ -395,6 +408,11 @@ func (s *Syncer) Run(ctx context.Context) {
 				s.Cycle(ctx)
 			}
 		}
+		// Liveness heartbeat fires on EVERY outer-loop iteration —
+		// lease held or not, leader or follower. A non-leader pod
+		// that only heartbeats while holding the Lease would look
+		// wedged to /healthz and get the whole DaemonSet killed.
+		cycle.Heartbeat(ctx)
 	}
 }
 

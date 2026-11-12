@@ -50,10 +50,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -64,6 +66,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -163,13 +166,35 @@ func pprofHandlers() map[string]http.Handler {
 	}
 }
 
+// resolveLeaderNamespace resolves the namespace the leader-election
+// Lease lives in — read ONCE here (cmd/manager is the only place
+// raw filesystem access is allowed) so controller-runtime's elector
+// and the dead-leader Preemptor can never disagree about it: two
+// different defaults would have the standby preempting a Lease in a
+// namespace the leader never uses. The service-account namespace
+// file is the pod's own namespace; the "node-ops" fallback matches
+// the deployment's pinned namespace for out-of-cluster runs
+// (envtest, local dev).
+func resolveLeaderNamespace() string {
+	const saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	if b, err := os.ReadFile(saNamespaceFile); err == nil {
+		if ns := strings.TrimSpace(string(b)); ns != "" {
+			return ns
+		}
+	}
+	return leaderelect.DefaultNamespace
+}
+
 // buildMgrOptions assembles ctrl.Options from the parsed flag values.
 // leaseDuration/renewDeadline/retryPeriod carry the flag values where
 // 0 means "operator did not set it": the matching Options fields are
 // *time.Duration and nil means "controller-runtime default", which is
-// exactly what the zero flag value keeps.
+// exactly what the zero flag value keeps. leaderNS is the resolved
+// election namespace — passed explicitly so it can never drift from
+// the Preemptor's view of the same Lease.
 func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
-	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration) ctrl.Options {
+	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration,
+	leaderNS string, leaderLock resourcelock.Interface) ctrl.Options {
 	mgrOptions := ctrl.Options{
 		Scheme: scheme,
 		// pprof rides the metrics listener (:9115 — ClusterIP/headless
@@ -190,13 +215,20 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		// standbys. ReleaseOnCancel hands the Lease over on graceful
 		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
 		// on crash (15s default; deployments pass 180s).
-		LeaderElection: leaderElect,
+		LeaderElection:          leaderElect,
+		LeaderElectionNamespace: leaderNS,
 		// Lease name follows the upstream election-id convention
 		// (<name>.<domain> — cf. e1f13584.medik8s.io); domain is the
 		// same passiontech.dev registry the annotations use.
-		LeaderElectionID:              "node-automation-controller.passiontech.dev",
+		LeaderElectionID:              leaderElectionID,
 		LeaderElectionReleaseOnCancel: true,
-		Cache:                         buildCacheOptions(),
+		// Custom lock: releaseGuardedLock refuses a release write
+		// when the Lease's holder is already another replica —
+		// without it a demoted leader's deferred tryRelease wipes
+		// the NEW leader's record after the LeaseLossWatchdog
+		// preemption (see leaderelection.go).
+		LeaderElectionResourceLockInterface: leaderLock,
+		Cache:                               buildCacheOptions(),
 	}
 	if leaseDuration > 0 {
 		mgrOptions.LeaseDuration = &leaseDuration
@@ -226,6 +258,17 @@ type leasePreemptRunnable struct {
 func (r *leasePreemptRunnable) NeedLeaderElection() bool { return false }
 
 func (r *leasePreemptRunnable) Start(ctx context.Context) error {
+	// Startup jitter: every standby replica wires this runnable at
+	// boot — without a staggered first pass all of them GET the
+	// Lease (and prime their frozen-window clocks) in lockstep.
+	// A random delay inside one sweep interval de-synchronizes the
+	// first observation; the ticker cadence is unchanged after.
+	jitter := time.Duration(rand.Int64N(int64(leaderelect.SweepInterval)))
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-time.After(jitter):
+	}
 	ticker := time.NewTicker(leaderelect.SweepInterval)
 	defer ticker.Stop()
 	for {
@@ -341,9 +384,30 @@ func main() {
 	// TLS connection pool just to silence one warning header.
 	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
 
+	// leaseStolen is the LeaseLossWatchdog's flag, shared with the
+	// releaseGuardedLock: once the watchdog proves a foreign holder it
+	// sets the flag BEFORE cancelling the work context, so the old
+	// leader's deferred tryRelease (LeaderElectionReleaseOnCancel)
+	// is refused instead of wiping the new leader's Lease record.
+	var leaseStolen atomic.Bool
+	leaderNS := resolveLeaderNamespace()
+	// The guarded resource lock is built only when election is on —
+	// ctrl.Options ignores the interface otherwise, and building it
+	// unconditionally would spend three client constructions on a
+	// binary that never campaigns.
+	var leaderLock resourcelock.Interface
+	if leaderElect {
+		var err error
+		leaderLock, err = buildLeaderLock(cfg, scheme, leaderNS,
+			renewDeadline, &leaseStolen)
+		if err != nil {
+			log.Error(err, "unable to build leader election lock")
+			os.Exit(1)
+		}
+	}
 	mgr, err := ctrl.NewManager(cfg,
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
-			leaseDuration, renewDeadline, retryPeriod))
+			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock))
 	if err != nil {
 		log.Error(err, "unable to create manager")
 		os.Exit(1)
@@ -354,7 +418,7 @@ func main() {
 		log.Error(err, "unable to create kube clients")
 		os.Exit(1)
 	}
-	cs, dyn := clients.cs, clients.dyn
+	cs, dyn, meta := clients.cs, clients.dyn, clients.meta
 	probeCS, probeDyn := clients.probeCS, clients.probeDyn
 
 	// The global heal budget — the aggregate blast-radius cap every
@@ -396,11 +460,20 @@ func main() {
 	// healthy (RecordTargetHealthy from each module's recovery path).
 	shared.WireTargetBreaker(cs)
 
-	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn,
+	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Meta: meta,
 		ProbeCS: probeCS, ProbeDyn: probeDyn, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}
+
+	// workCtx wraps the signal context so the LeaseLossWatchdog can
+	// stop the entire manager on a proven foreign lease holder —
+	// cancelling propagates to every runnable group (leader-gated
+	// modules included) and the deferred leader-election release
+	// runs under releaseGuardedLock, which leaseStolen has already
+	// armed against clobbering the new holder's record.
+	workCtx, workCancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer workCancel()
 
 	// selfheal-alert-coverage fast dead-leader lease preemption: without it a leader
 	// whose node dies holds the 180s LeaseDuration while every heal
@@ -410,12 +483,48 @@ func main() {
 	// is no Lease object to preempt.
 	if leaderElect {
 		if err := mgr.Add(&leasePreemptRunnable{
-			preemptor: &leaderelect.Preemptor{CS: cs},
+			// probeCS, not cs: the preemptor's Lease/pod/node reads
+			// are exactly the watch-cache-served snapshots the probe
+			// clientset exists for — a dead-holder proof must not
+			// queue behind the shared client's heavier reads.
+			preemptor: &leaderelect.Preemptor{CS: probeCS, Namespace: leaderNS},
 			log:       ctrl.Log.WithName("leader-lease-preemptor"),
 		}); err != nil {
 			log.Error(err, "unable to add leader lease preemptor")
 			os.Exit(1)
 		}
+		// LeaseLossWatchdog: the leader-side half of the same
+		// contract — poll the Lease every 5s and, on a foreign
+		// holder, cancel the work context below so all leader-gated
+		// modules stop inside one poll interval instead of riding
+		// out the Active-Active Split-Brain window.
+		if err := mgr.Add(&leaseLossWatchdog{
+			cs:        probeCS,
+			namespace: leaderNS,
+			selfID:    leaderLock.Identity(),
+			stolen:    &leaseStolen,
+			cancel:    workCancel,
+			log:       ctrl.Log.WithName("lease-loss-watchdog"),
+		}); err != nil {
+			log.Error(err, "unable to add lease loss watchdog")
+			os.Exit(1)
+		}
+	}
+
+	// cluster-maintenance-stamper: the dedicated L1↔L3 write half —
+	// the ONLY writer of passiontech.dev/cluster-maintenance-until
+	// (Verdict.Active is read-only): stamps it on every node under
+	// cluster upgrade, or only the target node under node-level
+	// maintenance, and removes controller-owned stamps once
+	// maintenance ends. First pass on Start, then every 30s. Plain
+	// Runnable ⇒ leader-gated when election is on, always-on in
+	// single-replica mode.
+	if err := mgr.Add(&maintenanceStamperRunnable{
+		cs: cs, dyn: dyn,
+		log: ctrl.Log.WithName("cluster-maintenance-stamper"),
+	}); err != nil {
+		log.Error(err, "unable to add cluster maintenance stamper")
+		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -434,7 +543,7 @@ func main() {
 		// flag comments above.
 		"leaseDuration", leaseDuration, "renewDeadline", renewDeadline,
 		"retryPeriod", retryPeriod)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(workCtx); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}

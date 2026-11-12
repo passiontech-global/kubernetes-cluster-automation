@@ -115,6 +115,42 @@ func TestRateOKSpendLifecycle(t *testing.T) {
 	}
 }
 
+// TestClearBudgetDropsRamMirror: a bare file delete leaves the
+// lastSpent RAM mirror alive and RateOKIn verdicts on
+// max(disk, ram) — the cooldown would survive the file's removal
+// for the rest of the process. ClearBudget must drop both halves.
+func TestClearBudgetDropsRamMirror(t *testing.T) {
+	s, _, _ := newTestStore(t)
+
+	s.RateSpend("wedged-seen-abc")
+	if s.RateOK("wedged-seen-abc", time.Hour) {
+		t.Fatal("just-spent budget should be blocked")
+	}
+	// Simulate the old raw os.Remove: file gone, RAM mirror stays.
+	if err := os.Remove(filepath.Join(s.Dir, "wedged-seen-abc")); err != nil {
+		t.Fatal(err)
+	}
+	if s.RateOK("wedged-seen-abc", time.Hour) {
+		t.Fatal("phantom cooldown: RAM lastSpent outlived the file")
+	}
+	// ClearBudget on the mirror-only state still clears it.
+	s.ClearBudget("wedged-seen-abc")
+	if !s.RateOK("wedged-seen-abc", time.Hour) {
+		t.Fatal("ClearBudget must drop the RAM mirror")
+	}
+	// File+mirror together: the normal dynamic-marker path.
+	s.RateSpend("veth-seen-cali1")
+	s.ClearBudget("veth-seen-cali1")
+	if !s.RateOK("veth-seen-cali1", time.Hour) {
+		t.Fatal("ClearBudget must clear file and mirror together")
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, "veth-seen-cali1")); !os.IsNotExist(err) {
+		t.Fatal("budget file still present after ClearBudget")
+	}
+	// Absent file is already clear — no error, mirror still dropped.
+	s.ClearBudget("never-spent")
+}
+
 func TestRateOKGarbageIsOK(t *testing.T) {
 	s, _, _ := newTestStore(t)
 	p := filepath.Join(s.Dir, "last-x")

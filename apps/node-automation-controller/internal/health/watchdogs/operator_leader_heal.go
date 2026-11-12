@@ -143,13 +143,20 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 		// The UID precondition inside heal.DeletePod closes the
 		// list→delete TOCTOU: a same-named replacement pod is not
 		// ours to reap.
-		if _, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now); err != nil {
+		didDelete, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now)
+		if err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "stuck operator leader delete failed",
 				"pod", pod.Namespace+"/"+pod.Name, "operator", op.name)
 			continue
 		}
-		p.InvalidatePods(ctx) // drop the pod census the delete just invalidated
+		if !didDelete {
+			// Quorum reservation denied — sibling pods of this
+			// operator already spent the workload's one-disruption
+			// slot this sweep; one leader bounce is the heal.
+			continue
+		}
+		kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 		deleted = true
 		log.Info("DELETE: stuck operator leader pod — forcing re-election",
 			"operator", op.name, "pod", pod.Namespace+"/"+pod.Name,
@@ -173,7 +180,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	if lease == nil {
 		return
 	}
-	if err := heal.StampPersisted(ctx,
+	if err := heal.StampPersisted(ctx, lease,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.CoordinationV1().Leases(lease.Namespace).
 				Patch(ctx, lease.Name, types.MergePatchType, data,
@@ -249,6 +256,19 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 		}
 	}
 	pods = live
+	// hostNetwork leader identity: "<nodeHostname>-<rand>" never
+	// equals a pod name, so the name GETs above all miss and the
+	// oldest-pod heuristic below would bounce an arbitrary standby.
+	// Match the holder's hostname prefix against each live pod's
+	// scheduled node — positive attribution beats the age guess.
+	if holder != "" {
+		for i := range pods {
+			if pods[i].Spec.NodeName != "" &&
+				strings.HasPrefix(holder, pods[i].Spec.NodeName+"-") {
+				return []corev1.Pod{*pods[i]}, nil
+			}
+		}
+	}
 	// The selector fallback cannot tell the leader from its
 	// standbys — deleting every matched replica wedges the operator
 	// outright (the 2026-11-04 cilium-operator triple-delete). Cap

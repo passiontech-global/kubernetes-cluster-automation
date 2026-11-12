@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -50,8 +51,20 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *apiServiceSnapshot
 		return nil
 	}
 	namespaces := make(map[string]bool, len(nss))
+	// Terminating census: a namespace still present but already
+	// DeletionTimestamp'd can linger indefinitely on finalizers —
+	// including the very APIService wedge this sweep exists to
+	// break — while its backend Service is already gone. Those
+	// APIservices are orphaned NOW, not whenever the namespace
+	// finally finishes terminating, so they get their own confirm
+	// path keyed on the Service's absence instead of the
+	// namespace's.
+	terminating := make(map[string]bool)
 	for _, ns := range nss {
 		namespaces[ns.Name] = true
+		if ns.DeletionTimestamp != nil {
+			terminating[ns.Name] = true
+		}
 	}
 	if snap.err != nil {
 		return fmt.Errorf("list apiservices — abort orphan pass: %w", snap.err)
@@ -65,31 +78,56 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *apiServiceSnapshot
 			continue // no Service backend — nothing to orphan-check
 		}
 		if namespaces[svcNs] {
-			continue
-		}
-		// The snapshot says the namespace is gone — but a List can be
-		// stale where a Get is fresh, so the delete only fires after
-		// the apiserver itself confirms NotFound (fail closed).
-		_, getErr := g.cs.CoreV1().Namespaces().Get(ctx, svcNs, metav1.GetOptions{})
-		gone, err := kube.ConfirmAbsent(getErr)
-		if err != nil {
-			log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
-				"apiservice", svc.GetName(), "namespace", svcNs, "error", err)
-			metrics.IncError(g.queue)
-			continue
-		}
-		if !gone {
-			// Namespace actually exists — the snapshot was stale.
-			continue
+			if !terminating[svcNs] {
+				continue
+			}
+			// Terminating namespace: the APIService is cluster-scoped
+			// so namespace GC will never reap it — once its backend
+			// Service is confirmed gone it is orphaned immediately.
+			// A Service that still exists means the backend may
+			// still be serving; keep it (next cycle re-checks, and
+			// the namespace-gone path below takes over once the
+			// namespace object finally disappears).
+			_, svcErr := g.cs.CoreV1().Services(svcNs).Get(ctx, svcName, metav1.GetOptions{})
+			svcGone, err := kube.ConfirmAbsent(svcErr)
+			if err != nil {
+				log.Info("WARN: backend service confirm failed — APIService kept (fail closed)",
+					"apiservice", svc.GetName(), "service", svcNs+"/"+svcName, "error", err)
+				metrics.IncError(g.queue)
+				continue
+			}
+			if !svcGone {
+				continue
+			}
+		} else {
+			// The snapshot says the namespace is gone — but a List can be
+			// stale where a Get is fresh, so the delete only fires after
+			// the apiserver itself confirms NotFound (fail closed).
+			_, getErr := g.cs.CoreV1().Namespaces().Get(ctx, svcNs, metav1.GetOptions{})
+			gone, err := kube.ConfirmAbsent(getErr)
+			if err != nil {
+				log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
+					"apiservice", svc.GetName(), "namespace", svcNs, "error", err)
+				metrics.IncError(g.queue)
+				continue
+			}
+			if !gone {
+				// Namespace actually exists — the snapshot was stale.
+				continue
+			}
 		}
 		log.Info("DELETE: orphan APIService (backend namespace gone)",
 			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName)
 		// UID precondition closes the TOCTOU window between the
-		// IsNotFound re-confirm and the delete — a same-named
-		// APIService recreated in between is not ours to reap.
+		// confirm and the delete — a same-named APIService recreated
+		// in between is not ours to reap.
 		uid := svc.GetUID()
 		if err := g.dyn.Resource(apiServiceGVR).
 			Delete(ctx, svc.GetName(), kube.UIDDeleteOptions(uid, "")); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Raced with another reaper — resolved.
+				continue
+			}
 			log.Error(err, "orphan apiservice delete failed",
 				"apiservice", svc.GetName())
 			metrics.IncError(g.queue)

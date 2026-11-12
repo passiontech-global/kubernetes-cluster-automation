@@ -68,6 +68,10 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// STOPPING=1 tells systemd the shutdown is deliberate —
+			// without it a clean exit inside WatchdogSec still
+			// reads as an unclean stop to Type=notify bookkeeping.
+			send("STOPPING=1\n")
 			return
 		case <-tick.C:
 		}
@@ -87,8 +91,10 @@ func (a *Agent) probeSelfURL() string {
 	if err != nil {
 		return ""
 	}
-	if host == "" {
-		host = "127.0.0.1" // ":8091" binds wildcard — self-dial loopback
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		// Wildcard binds (":8091", "0.0.0.0:8091", "[::]:8091")
+		// can't be self-dialed — probe loopback instead.
+		host = "127.0.0.1"
 	}
 	return "http://" + net.JoinHostPort(host, port) + "/healthz"
 }

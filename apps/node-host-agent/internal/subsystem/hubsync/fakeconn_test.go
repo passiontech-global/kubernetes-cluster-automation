@@ -187,6 +187,10 @@ func (f *fakeConn) Close() error {
 	return nil
 }
 
+// StageSuffix stays "" — fakes keep the deterministic `.tmp`
+// staging path the command-sequence assertions pin.
+func (f *fakeConn) StageSuffix() string { return "" }
+
 // fakeDialer hands out seeded conns per target IP and records dials.
 type fakeDialer struct {
 	mu      sync.Mutex

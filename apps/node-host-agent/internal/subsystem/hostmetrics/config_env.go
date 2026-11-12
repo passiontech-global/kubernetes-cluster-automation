@@ -54,7 +54,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.StringKnob(envnames.EnvNebulaIface, &cfg.NebulaIface, defaultNebulaIface),
 		envx.StringKnob(envnames.EnvHostRouteFile, &cfg.RouteFile, defaultRouteFile),
 		envx.StringKnob(envnames.EnvK0sConfig, &cfg.K0sConfigFile,
-			defaultK0sConfigFile),
+			hostPath(defaultK0sConfigFile)),
 		envx.StringKnob(envnames.EnvK0sUnit, &cfg.K0sUnitFile,
 			hostPath(defaultK0sUnitFile)),
 		envx.StringKnob(envnames.EnvNebulaCert, &cfg.NebulaCertFile,
@@ -69,11 +69,15 @@ func ConfigFromEnv(d EnvDeps) Config {
 			defaultConntrackStatFile),
 		envx.StringKnob(envnames.EnvArpTableFile, &cfg.ARPTableFile,
 			defaultARPTableFile),
-		// Clocksource files.
+		// Clocksource files — hostPath-wrapped like K0sConfig so the
+		// env DEFAULT lands under HostRoot in pod mode; an explicit
+		// env value is taken verbatim (operator override).
 		envx.StringKnob(envnames.EnvClocksourceCurrentFile,
-			&cfg.ClocksourceCurrentFile, defaultClocksourceCurrentFile),
+			&cfg.ClocksourceCurrentFile,
+			hostPath(defaultClocksourceCurrentFile)),
 		envx.StringKnob(envnames.EnvClocksourceAvailableFile,
-			&cfg.ClocksourceAvailableFile, defaultClocksourceAvailableFile),
+			&cfg.ClocksourceAvailableFile,
+			hostPath(defaultClocksourceAvailableFile)),
 		envx.ListKnob(envnames.EnvCgroupMemUnits, &cfg.CgroupMemUnits),
 		// envList → default-closure: a set env wins verbatim (even an
 		// empty-looking parse is nil → defaults); unset falls back to

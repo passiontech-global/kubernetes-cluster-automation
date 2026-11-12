@@ -79,6 +79,63 @@ func parseLocalUsers(s string) (user, password string, ok bool) {
 	return user, password, ok && user != "" && password != ""
 }
 
+// parseLocalUsersEnv resolves LOCAL_USERS, which the Concourse web
+// node accepts as a comma-separated "user:pass" list. The dispatcher
+// needs exactly one credential pair — it takes the FIRST entry that
+// parses and warns about the rest (extra users would silently never
+// authenticate, which is almost certainly a config mistake).
+func parseLocalUsersEnv(s string) (user, password string, ok bool) {
+	var parts []string
+	for _, entry := range splitLocalUsers(strings.TrimSpace(s)) {
+		// Trim each entry and drop empties — "u:p, ,v:q" or a
+		// trailing comma must not produce a phantom second user.
+		if entry = strings.TrimSpace(entry); entry != "" {
+			parts = append(parts, entry)
+		}
+	}
+	if len(parts) == 1 {
+		return parseLocalUsers(parts[0])
+	}
+	for i, entry := range parts {
+		if u, p, good := parseLocalUsers(entry); good {
+			logger().Warn("LOCAL_USERS lists multiple users — only the first valid entry is used",
+				"users_total", len(parts),
+				"entry_index", i)
+			return u, p, true
+		}
+	}
+	return "", "", false
+}
+
+// splitLocalUsers cuts LOCAL_USERS on commas — but ONLY at commas
+// that actually separate entries. A comma is a separator when the
+// segment after it carries the "user:pass" shape (contains ':'), so
+// a password containing a comma ("user:pa,ss") is not silently
+// truncated to "pa".
+func splitLocalUsers(s string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != ',' || !usersSeparatorAhead(s, i) {
+			continue
+		}
+		parts = append(parts, s[start:i])
+		start = i + 1
+	}
+	return append(parts, s[start:])
+}
+
+// usersSeparatorAhead reports whether the comma at s[i] separates
+// two entries: the segment after it (up to the next comma or EOS)
+// must contain a ':' — the user:pass marker.
+func usersSeparatorAhead(s string, i int) bool {
+	seg := s[i+1:]
+	if j := strings.IndexByte(seg, ','); j >= 0 {
+		seg = seg[:j]
+	}
+	return strings.Contains(seg, ":")
+}
+
 func main() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -106,8 +163,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// LOCAL_USERS carries Concourse basic auth as "user:password".
-	user, password, ok := parseLocalUsers(os.Getenv("LOCAL_USERS"))
+	// LOCAL_USERS carries Concourse basic auth as "user:password" —
+	// the Concourse web node also accepts a comma-separated user list;
+	// the first valid entry wins (see parseLocalUsersEnv).
+	user, password, ok := parseLocalUsersEnv(os.Getenv("LOCAL_USERS"))
 	if !ok {
 		logger().Error("LOCAL_USERS must be in 'user:password' form")
 		os.Exit(1)

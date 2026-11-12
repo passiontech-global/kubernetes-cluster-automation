@@ -24,6 +24,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 // Subsystem is a long-running periodic component of the agent. Run
@@ -73,9 +75,75 @@ type Agent struct {
 	// reflects the degraded state; /healthz stays 200 so the pod is
 	// not restarted and the healthy subsystems keep running.
 	maxBackoffSubs atomic.Int64
-	info           *prometheus.GaugeVec
-	restarts       *prometheus.CounterVec
-	subUp          *prometheus.GaugeVec
+	// beats is the per-subsystem liveness registry supervisor.go
+	// maintains: name -> *subBeat. /healthz fails when an ACTIVE
+	// subsystem's cycle heartbeat goes stale — a wedged loop is a
+	// liveness failure kubelet (or systemd's watchdog standalone)
+	// must recycle, unlike a crash-looping one which /readyz
+	// reports without restarting healthy siblings.
+	beats    sync.Map
+	info     *prometheus.GaugeVec
+	restarts *prometheus.CounterVec
+	subUp    *prometheus.GaugeVec
+}
+
+// subBeat pairs a subsystem's liveness registry with the
+// supervisor's active flag — /healthz only judges subsystems
+// currently inside Run (one in restart backoff is /readyz's
+// concern, and its beats are legitimately paused).
+type subBeat struct {
+	live   *cycle.Liveness
+	active atomic.Bool
+}
+
+// subsystemLivenessStaleAfter is the DEFAULT staleness bound for
+// beats that carry no budget of their own (the shared fallback
+// beat) — comfortably above the longest per-cycle deadline so a
+// slow-but-alive sweep never trips it; only a genuinely wedged
+// loop does. cycle.Runner loops get their own larger budgets
+// (max(3*interval+cycle budget, 15m)) so a 1h sweeper or 6h kinedb
+// maint pass is not killed by a constant sized for 30s loops.
+const subsystemLivenessStaleAfter = 15 * time.Minute
+
+// livenessWedged reports whether any active subsystem has a loop
+// beat stale beyond ITS OWN budget. Subsystems in restart backoff
+// (active=false), exempt registries (cycle.Idle parked loops) and
+// never-yet-stamped beats are exempt. The shared fallback beat is
+// judged only for subsystems with NO Runner loops — Runner-only
+// registries stamp it once at run entry and judging it would
+// false-positive every 15 minutes.
+func (a *Agent) livenessWedged() bool {
+	now := time.Now()
+	wedged := false
+	a.beats.Range(func(_, v any) bool {
+		sb := v.(*subBeat)
+		if !sb.active.Load() || sb.live == nil || sb.live.IsExempt() {
+			return true
+		}
+		stale := func(b *cycle.Beat) bool {
+			last := b.LastProgress.Load()
+			if last == 0 {
+				return false
+			}
+			budget := b.StaleAfter()
+			if budget <= 0 {
+				budget = subsystemLivenessStaleAfter
+			}
+			return now.Sub(time.Unix(0, last)) > budget
+		}
+		for _, b := range sb.live.LoopBeats() {
+			if stale(b) {
+				wedged = true
+				return false
+			}
+		}
+		if sb.live.LoopCount() == 0 && stale(sb.live.Fallback()) {
+			wedged = true
+			return false
+		}
+		return true
+	})
+	return wedged
 }
 
 // New returns an Agent for cfg and registers the built-in identity
@@ -178,6 +246,16 @@ func (a *Agent) pprofMux() *http.ServeMux {
 func (a *Agent) probeMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// Liveness: listeners are up by construction (probeMux only
+		// serves after bind), so the remaining failure mode is a
+		// subsystem loop wedged hard enough that its cycle
+		// heartbeat went stale — report 503 so kubelet/systemd
+		// recycles the agent instead of letting one hung check
+		// starve the node's remediation forever.
+		if a.livenessWedged() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {

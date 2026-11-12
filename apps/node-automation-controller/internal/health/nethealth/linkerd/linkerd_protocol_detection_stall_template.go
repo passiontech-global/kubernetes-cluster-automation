@@ -67,35 +67,54 @@ func linkerdGitOpsManaged(obj metav1.Object) bool {
 	return false
 }
 
-// patchLinkerdTemplate resolves the pod's controller owner to
-// its workload and merges the missing ports into the pod-template
-// opaque-ports annotation. Returns covered=true when the template now
-// covers the ports (patched now, or already covered — the pod just
-// needs a restart) and patched=true only when THIS call landed the
-// template patch — the caller lets the workload controller run the
-// rolling update instead of deleting pods itself in that case.
-// covered=false means no workload owner resolves or the patch fails
-// (RBAC/not-found) — the caller must not delete the pod then.
-func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Context,
-	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
-	rep *probefw.SweepReport, driftNow map[string][]string) (covered, patched bool) {
+// linkerdTemplateTarget is one sweep's resolved patch target: the
+// owning workload object (drift/stamp reads + patch destination),
+// its kind label, ns/name and the template's effective annotations.
+// cronJob marks the JobTemplate-nested patch shape.
+type linkerdTemplateTarget struct {
+	obj      metav1.Object
+	kind     string
+	ns, name string
+	existing map[string]string
+	cronJob  bool
+}
+
+// resolveLinkerdTemplate performs the READ-ONLY half of the heal:
+// resolve the pod's controller owner to its workload and read the
+// pod template's effective annotations. ok=false means no workload
+// owner resolves or a census/get failed — the caller fails closed
+// (no heal, and no drift verdict either: an unreadable template
+// cannot prove a revert).
+func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.Context,
+	log logr.Logger, pod *corev1.Pod, missing []int) (*linkerdTemplateTarget, bool) {
 
 	ref := metav1.GetControllerOf(pod)
 	if ref == nil {
-		return false, false
+		return nil, false
 	}
 	ns := pod.Namespace
 	switch ref.Kind {
 	case "ReplicaSet":
-		rs, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — replicaset get failed",
-				"rs", ns+"/"+ref.Name, "error", err)
-			return false, false
+		// The ReplicaSet hop only needs the RS's controller
+		// reference — metadata, nothing else — so it rides the
+		// per-sweep PartialObjectMetadata census (AllReplicaSets)
+		// instead of a per-pod RS GET: one cluster-wide LIST per
+		// sweep, memoized, filtered client-side to ns/name.
+		rsList, rsErr := p.AllReplicaSets(ctx)
+		if rsErr != nil {
+			log.Info("WARN: linkerd heal — replicaset census failed",
+				"rs", ns+"/"+ref.Name, "error", rsErr)
+			return nil, false
+		}
+		rs := findReplicaSetMeta(rsList, ns, ref.Name)
+		if rs == nil {
+			log.Info("WARN: linkerd heal — replicaset not in the census",
+				"rs", ns+"/"+ref.Name)
+			return nil, false
 		}
 		dref := metav1.GetControllerOf(rs)
 		if dref == nil {
-			return false, false
+			return nil, false
 		}
 		if dref.Kind == "Rollout" {
 			// rollout-scale-flap — a Rollout-owned ReplicaSet: patch the parent
@@ -111,7 +130,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 			if err != nil {
 				log.Info("WARN: linkerd heal — rollout census failed",
 					"rollout", ns+"/"+dref.Name, "error", err)
-				return false, false
+				return nil, false
 			}
 			var ro *unstructured.Unstructured
 			for i := range ros {
@@ -123,15 +142,15 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 			if ro == nil {
 				log.Info("WARN: linkerd heal — rollout gone from the census",
 					"rollout", ns+"/"+dref.Name)
-				return false, false
+				return nil, false
 			}
 			annos, _ := kube.NestedStringMap(ro.Object,
 				"spec", "template", "metadata", "annotations")
-			return p.patchTemplatePorts(ctx, log, ro, "rollout", ns, ro.GetName(),
-				annos, missing, false, now, rep, driftNow)
+			return &linkerdTemplateTarget{ro, "rollout", ns, ro.GetName(),
+				kube.EffectiveTemplateAnnos(ctx, ro, annos), false}, true
 		}
 		if dref.Kind != "Deployment" {
-			return false, false
+			return nil, false
 		}
 		// Workload Gets go through the per-sweep snapshot LISTs —
 		// cluster-wide, memoized per kind, filtered client-side to
@@ -141,82 +160,180 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 		if depErr != nil {
 			log.Info("WARN: linkerd heal — deployment census failed",
 				"deployment", ns+"/"+dref.Name, "error", depErr)
-			return false, false
+			return nil, false
 		}
 		dep := findDeployment(depList, ns, dref.Name)
 		if dep == nil {
 			log.Info("WARN: linkerd heal — deployment not in the census",
 				"deployment", ns+"/"+dref.Name)
-			return false, false
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, dep, "deployment", ns, dep.Name,
-			dep.Spec.Template.Annotations, missing, false, now, rep, driftNow)
+		return &linkerdTemplateTarget{dep, "deployment", ns, dep.Name,
+			kube.EffectiveTemplateAnnos(ctx, dep, dep.Spec.Template.Annotations), false}, true
 	case "Deployment":
 		depList, depErr := p.AllDeployments(ctx)
 		if depErr != nil {
 			log.Info("WARN: linkerd heal — deployment census failed",
 				"deployment", ns+"/"+ref.Name, "error", depErr)
-			return false, false
+			return nil, false
 		}
 		dep := findDeployment(depList, ns, ref.Name)
 		if dep == nil {
 			log.Info("WARN: linkerd heal — deployment not in the census",
 				"deployment", ns+"/"+ref.Name)
-			return false, false
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, dep, "deployment", ns, dep.Name,
-			dep.Spec.Template.Annotations, missing, false, now, rep, driftNow)
+		return &linkerdTemplateTarget{dep, "deployment", ns, dep.Name,
+			kube.EffectiveTemplateAnnos(ctx, dep, dep.Spec.Template.Annotations), false}, true
 	case "StatefulSet":
 		stsList, stsErr := p.AllStatefulSets(ctx)
 		if stsErr != nil {
 			log.Info("WARN: linkerd heal — statefulset census failed",
 				"statefulset", ns+"/"+ref.Name, "error", stsErr)
-			return false, false
+			return nil, false
 		}
 		sts := findStatefulSet(stsList, ns, ref.Name)
 		if sts == nil {
 			log.Info("WARN: linkerd heal — statefulset not in the census",
 				"statefulset", ns+"/"+ref.Name)
-			return false, false
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, sts, "statefulset", ns, sts.Name,
-			sts.Spec.Template.Annotations, missing, false, now, rep, driftNow)
+		return &linkerdTemplateTarget{sts, "statefulset", ns, sts.Name,
+			kube.EffectiveTemplateAnnos(ctx, sts, sts.Spec.Template.Annotations), false}, true
 	case "DaemonSet":
 		dsList, dsErr := p.AllDaemonSets(ctx)
 		if dsErr != nil {
 			log.Info("WARN: linkerd heal — daemonset census failed",
 				"daemonset", ns+"/"+ref.Name, "error", dsErr)
-			return false, false
+			return nil, false
 		}
 		ds := findDaemonSet(dsList, ns, ref.Name)
 		if ds == nil {
 			log.Info("WARN: linkerd heal — daemonset not in the census",
 				"daemonset", ns+"/"+ref.Name)
-			return false, false
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, ds, "daemonset", ns, ds.Name,
-			ds.Spec.Template.Annotations, missing, false, now, rep, driftNow)
+		return &linkerdTemplateTarget{ds, "daemonset", ns, ds.Name,
+			kube.EffectiveTemplateAnnos(ctx, ds, ds.Spec.Template.Annotations), false}, true
 	case "Job":
 		job, err := p.CS.BatchV1().Jobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
 		if err != nil {
 			log.Info("WARN: linkerd heal — job get failed",
 				"job", ns+"/"+ref.Name, "error", err)
-			return false, false
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, job, "job", ns, job.Name,
-			job.Spec.Template.Annotations, missing, false, now, rep, driftNow)
+		return &linkerdTemplateTarget{job, "job", ns, job.Name,
+			kube.EffectiveTemplateAnnos(ctx, job, job.Spec.Template.Annotations), false}, true
 	case "CronJob":
-		cj, err := p.CS.BatchV1().CronJobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			log.Info("WARN: linkerd heal — cronjob get failed",
-				"cronjob", ns+"/"+ref.Name, "error", err)
-			return false, false
+		// Same census rule as Deployment/StatefulSet/DaemonSet: the
+		// CronJob resolves off the per-sweep AllCronJobs LIST (the
+		// patch below stays a direct write — writes never ride the
+		// snapshot).
+		cjList, cjErr := p.AllCronJobs(ctx)
+		if cjErr != nil {
+			log.Info("WARN: linkerd heal — cronjob census failed",
+				"cronjob", ns+"/"+ref.Name, "error", cjErr)
+			return nil, false
 		}
-		return p.patchTemplatePorts(ctx, log, cj, "cronjob", ns, cj.Name,
-			cj.Spec.JobTemplate.Spec.Template.Annotations, missing, true, now, rep, driftNow)
+		cj := findCronJob(cjList, ns, ref.Name)
+		if cj == nil {
+			log.Info("WARN: linkerd heal — cronjob not in the census",
+				"cronjob", ns+"/"+ref.Name)
+			return nil, false
+		}
+		return &linkerdTemplateTarget{cj, "cronjob", ns, cj.Name,
+			kube.EffectiveTemplateAnnos(ctx, cj,
+				cj.Spec.JobTemplate.Spec.Template.Annotations), true}, true
 	default:
-		return false, false
+		return nil, false
 	}
+}
+
+// templateMissingPorts returns the subset of missing still absent
+// from the template's effective annotations — opaque-ports plus the
+// skip-inbound/skip-outbound spellings all count as coverage.
+func templateMissingPorts(existing map[string]string, missing []int) []int {
+	covers := parsePortSet(existing[linkerdOpaquePortsAnno])
+	for pt := range parsePortSet(existing[linkerdSkipInboundAnno]) {
+		covers[pt] = true
+	}
+	for pt := range parsePortSet(existing[linkerdSkipOutboundAnno]) {
+		covers[pt] = true
+	}
+	var still []int
+	for _, pt := range missing {
+		if !covers[pt] {
+			still = append(still, pt)
+		}
+	}
+	return still
+}
+
+// linkerdTemplateDriftProbe is the READ-ONLY GitOps-drift half of the
+// heal, run BEFORE the cooldown/maintenance/budget gates: a Flux/
+// ArgoCD revert of our template patch is detection evidence, not a
+// heal decision — gating it let a stamped controller key, a held
+// maintenance mutex or an exhausted heal budget skip the evaluation
+// entirely, and driftNow's reconcile then DeleteLabelValues'd a
+// still-live node_automation_linkerd_gitops_opaque_drift series.
+// The write path re-derives the same verdict inside
+// patchTemplatePorts — emitting the tuple twice in one sweep is
+// idempotent (same key, same labels, gauge stays 1) — so the caller
+// early-exits on drifted=true instead of letting the write path
+// re-detect and re-Find the same tuple a second time.
+//
+// drifted reports "this pod's workload is GitOps-reverting our
+// template patch right now": the caller must stop — no gate, no
+// patch, no pod kill — because the refusal IS the verdict and
+// re-deriving it downstream would only duplicate the finding.
+func (p *linkerdProtocolDetectionStallCheck) linkerdTemplateDriftProbe(ctx context.Context,
+	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
+	rep *probefw.SweepReport, driftNow map[string][]string) bool {
+
+	target, ok := p.resolveLinkerdTemplate(ctx, log, pod, missing)
+	if !ok || len(templateMissingPorts(target.existing, missing)) == 0 {
+		return false
+	}
+	stamped, ok := kube.AnnoTimeCtx(ctx, target.obj, kube.AnnoLastLinkerdOpaquePatch)
+	if !ok || now.Sub(stamped) >= linkerdOpaquePatchCool ||
+		!linkerdGitOpsManaged(target.obj) {
+		return false
+	}
+	lv := []string{target.ns, target.kind, target.name}
+	linkerdGitOpsOpaqueDriftGauge.WithLabelValues(lv...).Set(1)
+	driftNow[target.ns+"/"+target.kind+"/"+target.name] = lv
+	rep.Find(fmt.Sprintf("%s/%s %s opaque-ports reverted by GitOps — "+
+		"last patch %s ago, not re-patching",
+		target.ns, target.name, target.kind,
+		now.Sub(stamped).Round(time.Minute)))
+	log.Info("GITOPS-DRIFT: workload template lost opaque-ports after our patch — "+
+		"Flux/ArgoCD selfHeal owns it, refusing the revert fight",
+		"kind", target.kind, "workload", target.ns+"/"+target.name,
+		"lastPatch", stamped)
+	return true
+}
+
+// patchLinkerdTemplate resolves the pod's controller owner to
+// its workload and merges the missing ports into the pod-template
+// opaque-ports annotation. Returns covered=true when the template now
+// covers the ports (patched now, or already covered — the pod just
+// needs a restart) and patched=true only when THIS call landed the
+// template patch — the caller lets the workload controller run the
+// rolling update instead of deleting pods itself in that case.
+// covered=false means no workload owner resolves or the patch fails
+// (RBAC/not-found) — the caller must not delete the pod then. drift
+// reports the GitOps-revert refusal specifically: the caller treats
+// it as "keep evaluating, never cool down" (the read-only probe
+// already emitted the drift tuple before the gates).
+func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Context,
+	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
+	rep *probefw.SweepReport, driftNow map[string][]string) (covered, patched, drift bool) {
+
+	target, ok := p.resolveLinkerdTemplate(ctx, log, pod, missing)
+	if !ok {
+		return false, false, false
+	}
+	return p.patchTemplatePorts(ctx, log, target, missing, now, rep, driftNow)
 }
 
 // patchTemplatePorts merge-patches the opaque-ports annotation
@@ -229,12 +346,15 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 // covered=false on patch failure or when the durable stamp says the
 // template was patched inside linkerdOpaquePatchCool and already
 // reverted — re-patching inside the window is a fight with whoever
-// reverted it.
+// reverted it. drift=true ONLY on the GitOps-managed revert refusal —
+// the caller treats it as "keep evaluating, never cool down".
 func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Context,
-	log logr.Logger, obj metav1.Object, kind, ns, name string,
-	existing map[string]string, missing []int, cronJob bool,
+	log logr.Logger, target *linkerdTemplateTarget, missing []int,
 	now time.Time, rep *probefw.SweepReport, driftNow map[string][]string,
-) (covered, patched bool) {
+) (covered, patched, drift bool) {
+
+	obj, kind, ns, name := target.obj, target.kind, target.ns, target.name
+	existing, cronJob := target.existing, target.cronJob
 
 	covers := parsePortSet(existing[linkerdOpaquePortsAnno])
 	for pt := range parsePortSet(existing[linkerdSkipInboundAnno]) {
@@ -252,7 +372,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	if len(stillMissing) == 0 {
 		log.Info("linkerd heal: template already covers ports — pod restart suffices",
 			"kind", kind, "workload", ns+"/"+name)
-		return true, false
+		return true, false, false
 	}
 	// template-patch-stamp durable stamp: a workload we already patched that lost
 	// opaque-ports again inside the window was reverted by its owner.
@@ -261,7 +381,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	// 30m patch→revert→re-roll fight is the incident class); emit the
 	// drift gauge + finding so the fix goes to Git. Unmanaged
 	// workloads still honor the window silently.
-	if stamped, ok := kube.AnnoTime(obj, kube.AnnoLastLinkerdOpaquePatch); ok &&
+	if stamped, ok := kube.AnnoTimeCtx(ctx, obj, kube.AnnoLastLinkerdOpaquePatch); ok &&
 		now.Sub(stamped) < linkerdOpaquePatchCool {
 		if linkerdGitOpsManaged(obj) {
 			lv := []string{ns, kind, name}
@@ -274,16 +394,16 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 				"Flux/ArgoCD selfHeal owns it, refusing the revert fight",
 				"kind", kind, "workload", ns+"/"+name,
 				"lastPatch", stamped)
-		} else {
-			// Not GitOps-owned: honor the window silently AND drop
-			// any drift series this workload emitted earlier — a
-			// workload whose GitOps marker was removed between
-			// sweeps must not keep a stale drift=1 live.
-			linkerdGitOpsOpaqueDriftGauge.DeleteLabelValues(ns, kind, name)
-			log.Info("linkerd heal: template reverted inside patch cooldown — not re-patching",
-				"kind", kind, "workload", ns+"/"+name, "lastPatch", stamped)
+			return false, false, true
 		}
-		return false, false
+		// Not GitOps-owned: honor the window silently AND drop
+		// any drift series this workload emitted earlier — a
+		// workload whose GitOps marker was removed between
+		// sweeps must not keep a stale drift=1 live.
+		linkerdGitOpsOpaqueDriftGauge.DeleteLabelValues(ns, kind, name)
+		log.Info("linkerd heal: template reverted inside patch cooldown — not re-patching",
+			"kind", kind, "workload", ns+"/"+name, "lastPatch", stamped)
+		return false, false, false
 	}
 	for pt := range stillMissing {
 		covers[pt] = true
@@ -326,7 +446,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd heal: marshal template patch failed",
 			"kind", kind, "workload", ns+"/"+name)
-		return false, false
+		return false, false, false
 	}
 	var patchErr error
 	switch kind {
@@ -356,7 +476,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		// daemonsets / jobs — log and fail closed (no pod delete).
 		log.Info("WARN: linkerd heal — template patch failed",
 			"kind", kind, "workload", ns+"/"+name, "error", patchErr)
-		return false, false
+		return false, false, false
 	}
 	// Mirror the landed patch into the snapshot's in-memory workload
 	// copy — the serial sweep sees no apiserver echo, so a second
@@ -366,11 +486,19 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	// re-patching. mergeTemplateAnnos also allocates a missing
 	// template-annotation map through the concrete workload: the
 	// caller's `existing` binding cannot write nil back.
-	probefw.MergeAnnoPatchLocally(obj, payload)
-	mergeTemplateAnnos(obj, anno)
+	probefw.MergeAnnoPatchLocally(ctx, obj, payload)
+	// The template-annotation mirror rides the sweep overlay when
+	// one is installed — the census object stays read-only and a
+	// sibling check's EffectiveTemplateAnnos read resolves the
+	// landed patch. Outside a sweep (direct GET, caller-private
+	// object) RecordTemplateAnnos declines and the legacy in-place
+	// mirror keeps same-run re-reads honest.
+	if !kube.RecordTemplateAnnos(ctx, obj, anno) {
+		mergeTemplateAnnos(obj, anno)
+	}
 	log.Info("PATCH: linkerd opaque-ports added to workload template",
 		"kind", kind, "workload", ns+"/"+name, "ports", value)
-	return true, true
+	return true, true, false
 }
 
 // mergeTemplateAnnos writes anno into obj's pod-template annotation
@@ -382,12 +510,17 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 // in-place update through `existing` cannot express).
 func mergeTemplateAnnos(obj metav1.Object, anno map[string]string) {
 	set := func(meta *metav1.ObjectMeta) {
-		if meta.Annotations == nil {
-			meta.Annotations = map[string]string{}
+		// Clone before merge: meta.Annotations may alias a shared
+		// census object's map — writing into it in place corrupts
+		// every other reader of the snapshot.
+		merged := make(map[string]string, len(meta.Annotations)+len(anno))
+		for k, v := range meta.Annotations {
+			merged[k] = v
 		}
 		for k, v := range anno {
-			meta.Annotations[k] = v
+			merged[k] = v
 		}
+		meta.Annotations = merged
 	}
 	switch w := obj.(type) {
 	case *appsv1.Deployment:
@@ -404,9 +537,17 @@ func mergeTemplateAnnos(obj metav1.Object, anno map[string]string) {
 		// Merge onto the annotations the object ALREADY carries —
 		// a blind SetNestedMap would drop keys patched earlier in
 		// the same sweep (skip-inbound-ports / skip-outbound-ports).
-		existing, _ := kube.NestedStringMap(w.Object,
-			"spec", "template", "metadata", "annotations")
-		if existing == nil {
+		// Clone first: NestedStringMap's result may alias the
+		// unstructured's nested map, and in-place writes would
+		// corrupt the shared census object.
+		var existing map[string]string
+		if raw, _ := kube.NestedStringMap(w.Object,
+			"spec", "template", "metadata", "annotations"); raw != nil {
+			existing = make(map[string]string, len(raw)+len(anno))
+			for k, v := range raw {
+				existing[k] = v
+			}
+		} else {
 			existing = map[string]string{}
 		}
 		for k, v := range anno {
@@ -440,6 +581,28 @@ func findStatefulSet(items []appsv1.StatefulSet, ns, name string) *appsv1.Statef
 }
 
 func findDaemonSet(items []appsv1.DaemonSet, ns, name string) *appsv1.DaemonSet {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+// findReplicaSetMeta resolves ns/name inside the metadata-only
+// ReplicaSet census — the same client-side filter findDeployment
+// applies, over PartialObjectMetadata (owner references live in
+// ObjectMeta, so the controller hop still resolves).
+func findReplicaSetMeta(items []metav1.PartialObjectMetadata, ns, name string) *metav1.PartialObjectMetadata {
+	for i := range items {
+		if items[i].Namespace == ns && items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func findCronJob(items []batchv1.CronJob, ns, name string) *batchv1.CronJob {
 	for i := range items {
 		if items[i].Namespace == ns && items[i].Name == name {
 			return &items[i]

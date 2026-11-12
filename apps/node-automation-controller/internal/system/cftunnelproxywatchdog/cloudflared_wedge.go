@@ -8,7 +8,6 @@ package cftunnelproxywatchdog
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -102,9 +101,17 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	}
 	healed := 0
 	for _, c := range candidates {
-		if err := w.deleteConnectorPod(ctx, c.pod, c.reason); err != nil {
+		delivered, err := w.deleteConnectorPod(ctx, c.pod, c.reason, now)
+		if err != nil {
 			log.Error(err, "delete wedged connector pod failed",
 				"pod", c.pod.Namespace+"/"+c.pod.Name)
+			continue
+		}
+		if !delivered {
+			// 404 (already gone — goal state), a local-remediation
+			// hold or the sweep's one-disruption reservation: no
+			// heal landed, so no cooldown stamp either — the next
+			// sweep re-evaluates the pod.
 			continue
 		}
 		w.lastHeal.Stamp(kube.PodControllerKey(c.pod), now)
@@ -113,6 +120,11 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	}
 	if healed > 0 {
 		log.Info("ACTION: deleted wedged cloudflared pod(s)", "deleted", healed)
+	} else {
+		// The gate consumed one fleet grant but every candidate
+		// delete was refused or already-gone — nothing was
+		// delivered, so the grant goes back (refund-on-skip).
+		heal.RefundGrant(now)
 	}
 	return healed, nil
 }
@@ -135,20 +147,20 @@ type cfTunnelWedge struct {
 func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 	tgt cfTunnelConnectorTarget, now time.Time, log logr.Logger,
 ) ([]cfTunnelWedge, error) {
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: tgt.selector,
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(w.cs, tgt.namespace))
+	all, err := w.podsInNS(ctx, tgt.namespace)
 	if err != nil {
-		return nil, fmt.Errorf("list connector pods in %s: %w",
-			tgt.namespace, err)
+		return nil, err
+	}
+	pods, err := matchPodSelector(all, tgt.selector)
+	if err != nil {
+		return nil, err
 	}
 	var running []*corev1.Pod
 	var unreadyStale []*corev1.Pod
 	ready := 0
 	for i := range pods {
 		p := &pods[i]
-		if p.Status.Phase != corev1.PodRunning {
+		if p.Status.Phase != corev1.PodRunning || p.DeletionTimestamp != nil {
 			continue
 		}
 		running = append(running, p)
@@ -236,7 +248,11 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
 	p *corev1.Pod, now time.Time) bool {
 	var rs metav1.Object
-	if ref := metav1.GetControllerOf(p); ref != nil && ref.Name != "" {
+	// Only a ReplicaSet controller ref resolves to a ReplicaSet —
+	// a bare name match would GET/PATCH whatever kind actually
+	// owns the pod (a Job, a bare pod's owner) under the RS GVR.
+	if ref := metav1.GetControllerOf(p); ref != nil && ref.Name != "" &&
+		ref.Kind == "ReplicaSet" {
 		got, err := w.cs.AppsV1().ReplicaSets(p.Namespace).
 			Get(ctx, ref.Name, metav1.GetOptions{})
 		if err != nil {
@@ -247,7 +263,7 @@ func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
 			rs = got
 		}
 	}
-	return heal.PersistedCooledDown(&w.lastHeal, rs, cfTunnelHealAnno,
+	return heal.PersistedCooledDown(ctx, &w.lastHeal, rs, cfTunnelHealAnno,
 		kube.PodControllerKey(p), cfTunnelHealCooldown, now)
 }
 
@@ -260,10 +276,11 @@ func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
 func (w *cfTunnelProxyWatchdog) stampHealPersisted(ctx context.Context,
 	p *corev1.Pod, now time.Time) {
 	ref := metav1.GetControllerOf(p)
-	if ref == nil || ref.Name == "" {
-		return // standalone pod — no ReplicaSet to persist on
+	if ref == nil || ref.Name == "" || ref.Kind != "ReplicaSet" {
+		return // standalone pod or non-RS owner — no ReplicaSet to persist on
 	}
 	err := heal.StampPersisted(ctx,
+		nil,
 		func(ctx context.Context, data []byte) error {
 			_, err := w.cs.AppsV1().ReplicaSets(p.Namespace).
 				Patch(ctx, ref.Name, types.MergePatchType, data, metav1.PatchOptions{})
@@ -276,24 +293,35 @@ func (w *cfTunnelProxyWatchdog) stampHealPersisted(ctx context.Context,
 	}
 }
 
-// deleteConnectorPod deletes a connector pod with a UID precondition
-// — the listed pod could already have been replaced by a same-named
-// fresh pod, and killing the replacement would undo the heal.
+// deleteConnectorPod deletes a connector pod through heal.DeletePod —
+// the shared UID-preconditioned delete every pod heal uses: the
+// listed pod could already have been replaced by a same-named fresh
+// pod (killing the replacement would undo the heal), the sweep
+// overlay's local-remediation hold and one-disruption-per-workload
+// reservation apply, and the pod's UID is tombstoned for the rest of
+// the sweep. heals is nil — this module's pacing is the lastHeal
+// ledger the CALLER stamps on a delivered delete only. Returns
+// (delivered, err): a 404 or a hold/reservation refusal is
+// (false, nil) — the pod is gone or the delete deferred, and no
+// cooldown may stamp on either.
 func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
-	p *corev1.Pod, reason string) error {
-	err := w.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-		kube.UIDDeleteOptions(p.UID, ""))
-	if apierrors.IsNotFound(err) {
-		return nil // already gone — not a delete we delivered
-	}
+	p *corev1.Pod, reason string, now time.Time) (bool, error) {
+	deleted, err := heal.DeletePod(ctx, w.cs, nil,
+		kube.PodControllerKey(p), p, now)
 	if err != nil {
-		return err
+		if apierrors.IsNotFound(err) {
+			return false, nil // already gone — not a delete we delivered
+		}
+		return false, err
+	}
+	if !deleted {
+		return false, nil
 	}
 	// Count only delivered deletes — incrementing before the call
 	// recorded every API failure as a heal that never happened.
 	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
 		p.Namespace, reason).Inc()
-	return nil
+	return true, nil
 }
 
 // podLogWedged fetches the tail of the pod's log and matches the

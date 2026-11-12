@@ -90,7 +90,7 @@ func TestEndpointSliceZoneStarved(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("starved zone must fail: %+v", res)
 	}
@@ -129,7 +129,7 @@ func TestEndpointSliceZoneStarvedEventDeduped(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p)
 	for i := 0; i < 3; i++ {
-		if res := chk.Run(ctx); res.Pass {
+		if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Fatalf("sweep %d: starved zone must fail", i)
 		}
 	}
@@ -151,7 +151,7 @@ func TestEndpointSliceZonesCoveredPass(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}, "10.0.0.2": {"zone-b"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("covered zones must pass: %+v", res)
 	}
 	evs, _ := cs.EventsV1().Events("apps").List(ctx, metav1.ListOptions{})
@@ -170,7 +170,7 @@ func TestEndpointSliceZeroReadySkipped(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("zero-endpoint outage must pass (not topology starvation): %+v", res)
 	}
 }
@@ -185,7 +185,7 @@ func TestEndpointSliceNonAuditedServiceSkipped(t *testing.T) {
 		map[string][]string{"10.0.0.1": nil})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("non-audited service must pass: %+v", res)
 	}
 }
@@ -200,7 +200,7 @@ func TestEndpointSliceHintedServiceAudited(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("hinted service with a starved zone must fail: %+v", res)
 	}
@@ -222,7 +222,7 @@ func TestEndpointSlicePreferCloseAudited(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("PreferClose service with a starved zone must fail: %+v", res)
 	}
 	t.Cleanup(func() {
@@ -240,7 +240,7 @@ func TestEndpointSliceInactiveZoneNotFlagged(t *testing.T) {
 		map[string][]string{"10.0.0.1": {"zone-a"}})
 	cs := fake.NewSimpleClientset(nA, nB, cA, svc, slice)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("zone without running pods must not be flagged: %+v", res)
 	}
 }
@@ -255,7 +255,7 @@ func TestEndpointSliceZoneStarvedGaugeClears(t *testing.T) {
 	cs := fake.NewSimpleClientset(nA, nB, cA, cB, svc, slice)
 	p := testProber(cs)
 	chk := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("starved zone must fail")
 	}
 	if m := probetest.FindMetric(t, "node_automation_service_topology_zone_starved",
@@ -274,7 +274,7 @@ func TestEndpointSliceZoneStarvedGaugeClears(t *testing.T) {
 		Update(ctx, slice, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update slice: %v", err)
 	}
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("re-covered zones must pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_service_topology_zone_starved",

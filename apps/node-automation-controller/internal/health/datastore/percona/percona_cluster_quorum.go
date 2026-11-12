@@ -43,6 +43,13 @@ type perconaQuorumCheck struct {
 	perconaInitSeen        state.FirstSeenLedger
 	perconaDegradedSeen    state.FirstSeenLedger
 	perconaDegradedEmitted state.GaugeLedger[string]
+	// wsrepLast maps each wsrep-sourced emitted ledger key
+	// ("PerconaXtraDBCluster/ns/name") to its finding detail — the
+	// carry source for a Prometheus flap: the three wsrep queries
+	// share the one gauge kind, so a failed query cannot tell which
+	// live tuples it owned; wsrepLast remembers exactly the tuples
+	// the wsrep section emitted or carried last sweep.
+	wsrepLast map[string]string
 }
 
 // newPerconaQuorumCheck builds the percona-cluster-quorum check — the first-seen
@@ -134,6 +141,10 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	live := map[string]bool{}         // every scanned CR — the init ledger's prune set
 	degradedLive := map[string]bool{} // signatures observed THIS sweep — the degraded ledger's
 	var pgClusters []*unstructured.Unstructured
+	// failedGVRs tracks CRDs whose LIST errored this sweep — their
+	// clusters' first-seen windows and gauge series must survive the
+	// transient failure instead of pruning as "resolved".
+	failedGVRs := map[schema.GroupVersionResource]bool{}
 	for _, gvr := range perconaClusterGVRs {
 		list, err := p.AllUnstructured(ctx, gvr)
 		if err != nil {
@@ -141,6 +152,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				continue // operator/CRD not installed on this cluster
 			}
 			rep.InfraErr(fmt.Errorf("list %s: %w", gvr.Resource, err))
+			failedGVRs[gvr] = true
 			continue
 		}
 		for i := range list {
@@ -221,8 +233,25 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	// percona-degraded-quorum (c) — Galera member state the CR status cannot see:
 	// wsrep non-Primary, OFF, or a Donor/Desynced member stuck for
 	// >=30m. Unresolvable endpoint skips the section; a query failure
-	// is tolerated evidence loss, never a false FAIL.
-	if _, err := p.PromEndpoint(); err == nil {
+	// is tolerated evidence loss, never a false FAIL — but the tuples
+	// wsrepLast vouches for still Carry + re-Find, or one Prometheus
+	// flap would prune live Galera series and drop their findings.
+	carryWsrep := func(carried map[string]string) {
+		for k, detail := range p.wsrepLast {
+			if lv, held := p.perconaDegradedEmitted.Last()[k]; held {
+				rep.Carry(k, lv)
+				rep.Find(detail)
+				carried[k] = detail
+			}
+		}
+	}
+	wsrepThis := map[string]string{} // fresh wsrep emits this sweep
+	carriedWsrep := map[string]string{}
+	wsrepOK := true
+	if _, err := p.PromEndpoint(); err != nil {
+		wsrepOK = false
+		carryWsrep(carriedWsrep)
+	} else {
 		for _, q := range []struct{ query, detail string }{
 			{`mysql_global_status_wsrep_cluster_status != 1`,
 				"wsrep_cluster_status!=Primary"},
@@ -234,8 +263,10 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 		} {
 			series, qerr := p.PromQuery(ctx, q.query)
 			if qerr != nil {
+				wsrepOK = false
 				log.Info("WARN: wsrep query failed — Galera evidence incomplete",
 					"error", qerr)
+				carryWsrep(carriedWsrep)
 				continue
 			}
 			for _, s := range series {
@@ -246,18 +277,75 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				ns := s.Label("namespace")
 				// Ledger key is the LABEL TUPLE, not the
 				// signature — see the degraded branch above.
-				rep.Emit(perconaClusterDegradedGauge,
-					"PerconaXtraDBCluster/"+ns+"/"+name,
-					[]string{"PerconaXtraDBCluster", ns, name},
-					fmt.Sprintf("%s/%s %s", ns, name, q.detail))
+				key := "PerconaXtraDBCluster/" + ns + "/" + name
+				detail := fmt.Sprintf("%s/%s %s", ns, name, q.detail)
+				rep.Emit(perconaClusterDegradedGauge, key,
+					[]string{"PerconaXtraDBCluster", ns, name}, detail)
+				wsrepThis[key] = detail
 			}
 		}
 	}
+	// wsrepLast tracks what the section currently vouches for: a
+	// fully clean sweep replaces it with the fresh emits; a partial
+	// failure merges fresh emits with the carried survivors so the
+	// next flap still knows every tuple it must preserve.
+	if wsrepOK {
+		p.wsrepLast = wsrepThis
+	} else {
+		merged := map[string]string{}
+		for k, d := range wsrepThis {
+			merged[k] = d
+		}
+		for k, d := range carriedWsrep {
+			merged[k] = d
+		}
+		p.wsrepLast = merged
+	}
 
 	// Prune first-seen timers for signatures that resolved or whose
-	// objects disappeared entirely.
-	p.perconaInitSeen.Prune(func(k string) bool { return live[k] })
-	p.perconaDegradedSeen.Prune(func(k string) bool { return degradedLive[k] })
+	// objects disappeared entirely — but NOT for objects whose GVR
+	// failed to list: an unverifiable census is "can't tell", and
+	// dropping their windows would re-arm the persistence clock on
+	// every API flap.
+	p.perconaInitSeen.Prune(func(k string) bool {
+		if live[k] {
+			return true
+		}
+		for gvr := range failedGVRs {
+			if strings.HasPrefix(k, gvr.Resource+"/") {
+				return true
+			}
+		}
+		return false
+	})
+	p.perconaDegradedSeen.Prune(func(k string) bool {
+		if degradedLive[k] {
+			return true
+		}
+		for gvr := range failedGVRs {
+			if strings.HasPrefix(k, "degraded/"+gvr.Resource+"/") {
+				return true
+			}
+		}
+		// patroni/* windows key off the PGC census — same failure.
+		return failedGVRs[kube.GVRPerconaPGCluster] &&
+			strings.HasPrefix(k, "patroni/")
+	})
+
+	// Carry last sweep's gauge series for kinds whose census failed —
+	// Reconcile would otherwise DeleteLabelValues a still-firing
+	// alert on a transient list error.
+	for gvr := range failedGVRs {
+		kind, ok := perconaGVRKind[gvr]
+		if !ok {
+			continue
+		}
+		for k, lv := range p.perconaDegradedEmitted.Last() {
+			if len(lv) > 0 && lv[0] == kind {
+				rep.Carry(k, lv)
+			}
+		}
+	}
 
 	return rep.Result(&p.perconaDegradedEmitted,
 		perconaClusterDegradedGauge.DeleteLabelValues,
@@ -302,25 +390,57 @@ func (p *perconaQuorumCheck) checkPatroniLeaderLock(ctx context.Context,
 		running, err := p.perconaPGRunningPods(ctx, ns, name)
 		if err != nil {
 			rep.InfraErr(err)
+			// Can't tell — the pod census failed so the lock verdict
+			// is unverifiable, not resolved: keep the patroni
+			// first-seen stamp and carry any emitted tuple, or one
+			// LIST flap would prune a live series and re-arm the
+			// 10m window.
+			degradedLive["patroni/"+ns+"/"+name] = true
+			gkey := "PerconaPGCluster/" + ns + "/" + name
+			if lv, held := p.perconaDegradedEmitted.Last()[gkey]; held {
+				rep.Carry(gkey, lv)
+				rep.Find(fmt.Sprintf("%s/%s patroni leader lock >=%s "+
+					"(carried — pod census failed)",
+					ns, name, perconaPatroniLockMinAge))
+			}
 			continue
 		}
 		if running == 0 {
 			continue
 		}
-		if !p.patroniLeaderVacant(ctx, log, cr) {
-			continue
-		}
-		pkey := "patroni/" + ns + "/" + name
-		degradedLive[pkey] = true
-		if probefw.Persisted(&p.perconaDegradedSeen, pkey, now,
-			perconaPatroniLockMinAge, log) {
-			// Ledger key is the LABEL TUPLE — see the degraded
-			// branch in Run.
-			rep.Emit(perconaClusterDegradedGauge,
-				"PerconaPGCluster/"+ns+"/"+name,
-				[]string{"PerconaPGCluster", ns, name},
-				fmt.Sprintf("%s/%s patroni leader lock >=%s",
+		vacant, inconclusive := p.patroniLeaderVacant(ctx, log, rep, cr)
+		switch {
+		case inconclusive:
+			// Can't tell — a Lease/Endpoints read failed, so the
+			// lock verdict is unverifiable, not vacant: keep the
+			// patroni first-seen stamp and carry any emitted tuple,
+			// or one API flap would BOTH read as "leader vacant"
+			// evidence AND prune a live series / re-arm the 10m
+			// window (the same contract the pod-census failure
+			// above follows).
+			degradedLive["patroni/"+ns+"/"+name] = true
+			gkey := "PerconaPGCluster/" + ns + "/" + name
+			if lv, held := p.perconaDegradedEmitted.Last()[gkey]; held {
+				rep.Carry(gkey, lv)
+				rep.Find(fmt.Sprintf("%s/%s patroni leader lock >=%s "+
+					"(carried — patroni surface read failed)",
 					ns, name, perconaPatroniLockMinAge))
+			}
+		case !vacant:
+			continue
+		default:
+			pkey := "patroni/" + ns + "/" + name
+			degradedLive[pkey] = true
+			if probefw.Persisted(&p.perconaDegradedSeen, pkey, now,
+				perconaPatroniLockMinAge, log) {
+				// Ledger key is the LABEL TUPLE — see the degraded
+				// branch in Run.
+				rep.Emit(perconaClusterDegradedGauge,
+					"PerconaPGCluster/"+ns+"/"+name,
+					[]string{"PerconaPGCluster", ns, name},
+					fmt.Sprintf("%s/%s patroni leader lock >=%s",
+						ns, name, perconaPatroniLockMinAge))
+			}
 		}
 	}
 }
@@ -351,10 +471,16 @@ func (p *perconaQuorumCheck) perconaPGRunningPods(ctx context.Context,
 // runs — a surface that simply doesn't exist in the active mode is
 // not evidence), or — when the CR declares a pgbouncer proxy — the
 // <cr>-pgbouncer Endpoints carrying no addresses (clients have no
-// path even if a primary exists). A non-NotFound read error is
-// "can't tell", not a lock — it is logged and reads clean.
+// path even if it exists). A 404 is absence of evidence, not
+// vacancy; a non-NotFound read error is "can't tell" — reported as
+// inconclusive=true so the caller carries the last verdict instead
+// of letting an API flap fence a healthy failover (the old shape
+// read a failed Lease GET as leaseVacant=false only for the BOTH-
+// vacant branch, while a vacant pgbouncer Endpoints could still
+// return vacant=true off the failed read).
 func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
-	log logr.Logger, cr *unstructured.Unstructured) bool {
+	log logr.Logger, rep *probefw.SweepReport,
+	cr *unstructured.Unstructured) (vacant, inconclusive bool) {
 
 	ns, name := cr.GetNamespace(), cr.GetName()
 
@@ -368,9 +494,11 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 	leaseVacant, leaseSeen := true, false
 	lease, err := p.Lease(ctx, ns, name+"-leader")
 	if err != nil {
-		leaseVacant = false
-		log.Info("WARN: patroni leader lease fetch failed — lock evidence inconclusive",
+		log.Info("WARN: patroni leader lease fetch failed — lock verdict inconclusive",
 			"lease", ns+"/"+name+"-leader", "error", err)
+		rep.InfraErr(fmt.Errorf("get patroni leader lease %s/%s: %w",
+			ns, name+"-leader", err))
+		return false, true
 	} else if lease != nil {
 		leaseSeen = true
 		leaseVacant = lease.Spec.HolderIdentity == nil ||
@@ -390,15 +518,17 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 		epVacant = corev1EndpointsVacant(ep)
 	case apierrors.IsNotFound(err):
 	default:
-		epVacant = false
-		log.Info("WARN: patroni leader endpoints fetch failed — lock evidence inconclusive",
+		log.Info("WARN: patroni leader endpoints fetch failed — lock verdict inconclusive",
 			"endpoints", ns+"/"+name+"-leader", "error", err)
+		rep.InfraErr(fmt.Errorf("get patroni leader endpoints %s/%s: %w",
+			ns, name+"-leader", err))
+		return false, true
 	}
 
 	// At least one surface must ACTUALLY exist (seen), and both must
 	// be vacant, before the absence of a primary holder is evidence.
 	if (leaseSeen || epSeen) && leaseVacant && epVacant {
-		return true // no primary holder in either DCS mode
+		return true, false // no primary holder in either DCS mode
 	}
 
 	// Pooler path: when the CR deploys pgbouncer, an empty pooler
@@ -406,19 +536,21 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 	// Patroni believes exists.
 	if _, ok := kube.NestedMap(cr.Object,
 		"spec", "proxy", "pgBouncer"); !ok {
-		return false
+		return false, false
 	}
 	pooler, err := p.CS.CoreV1().Endpoints(ns).Get(ctx,
 		name+"-pgbouncer", metav1.GetOptions{})
 	switch {
 	case err == nil:
-		return corev1EndpointsVacant(pooler)
+		return corev1EndpointsVacant(pooler), false
 	case apierrors.IsNotFound(err):
-		return true
+		return true, false
 	default:
-		log.Info("WARN: pgbouncer endpoints fetch failed — lock evidence inconclusive",
+		log.Info("WARN: pgbouncer endpoints fetch failed — lock verdict inconclusive",
 			"endpoints", ns+"/"+name+"-pgbouncer", "error", err)
-		return false
+		rep.InfraErr(fmt.Errorf("get patroni pgbouncer endpoints %s/%s: %w",
+			ns, name+"-pgbouncer", err))
+		return false, true
 	}
 }
 

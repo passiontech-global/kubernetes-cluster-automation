@@ -186,6 +186,11 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 			for k, lv := range p.emitted.Last() {
 				if strings.HasPrefix(k, key+"/") {
 					rep.Carry(k, lv)
+					// A carried series IS an active warning — record
+					// the finding too, or Result.Pass reports true
+					// while a spin alert stays live.
+					rep.Find("argocd-agent spin " + key +
+						" (carried — evidence channels unavailable)")
 				}
 			}
 			continue
@@ -243,9 +248,10 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod) (bool, error) {
 
 	text, err := kube.ReadPodLogText(ctx, p.CS, pod, kube.PodLogOpts{
-		TailLines: argocdAgentTail,
-		MaxBytes:  argocdAgentLogCap,
-		Timeout:   30 * time.Second,
+		TailLines:    argocdAgentTail,
+		SinceSeconds: 900,
+		MaxBytes:     argocdAgentLogCap,
+		Timeout:      30 * time.Second,
 	})
 	if err != nil {
 		log.Info("WARN: argocd-agent spin — log channel unavailable",

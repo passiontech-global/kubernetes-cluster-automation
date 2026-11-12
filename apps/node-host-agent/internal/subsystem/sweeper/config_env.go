@@ -5,6 +5,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -18,6 +19,10 @@ import (
 type EnvDeps struct {
 	hostctx.Deps
 	Client kubernetes.Interface
+	// Coord is the optional L1↔L3 nodecoord handle — the caller
+	// (cmd/agent) builds it via nodecoord.NewKube; nil leaves the
+	// maintenance hold disabled.
+	Coord *nodecoord.Coord
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob the orphan-dir
@@ -30,6 +35,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
 		Base:   subframe.FromDeps(d.Deps),
 		Client: d.Client,
+		Coord:  d.Coord,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

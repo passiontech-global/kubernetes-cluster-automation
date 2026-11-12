@@ -204,8 +204,8 @@ func TestLRPRunPodDeleteAfterConfirmedWedge(t *testing.T) {
 	if dels := wdepstest.DeleteActions(e.CS); len(dels) != 1 ||
 		dels[0].GetName() != "node-local-dns-bbb222" {
 		t.Fatalf("pod delete missing: %+v", dels)
-	} else if gp := dels[0].GetDeleteOptions().GracePeriodSeconds; gp == nil || *gp != 0 {
-		t.Fatalf("grace period %v want 0", gp)
+	} else if gp := dels[0].GetDeleteOptions().GracePeriodSeconds; gp == nil || *gp != 5 {
+		t.Fatalf("grace period %v want 5", gp)
 	}
 	if _, err := os.Stat(filepath.Join(e.StateDir, "last-nld-restart")); err != nil {
 		t.Fatal("last-nld-restart budget not spent before the delete")

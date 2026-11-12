@@ -26,7 +26,7 @@ func TestCheckSchedulerFrozen(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false),
 		probetest.PendingUnscheduledPod("apps", "stuck-1", 10*time.Minute, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("frozen scheduler shape passed")
 	}
 	m := probetest.FindMetric(t, "node_automation_scheduler_frozen", map[string]string{})
@@ -40,7 +40,7 @@ func TestCheckSchedulerFrozenHealthy(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false),
 		probetest.PendingUnscheduledPod("apps", "verdict", 10*time.Minute, true))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("PodScheduled=False verdict pod misread as frozen: %+v", res)
 	}
 }
@@ -75,7 +75,7 @@ func TestCheckSchedulerPreemptionStorm(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("preemption storm must fail: %+v", res)
 	}
@@ -98,7 +98,7 @@ func TestCheckSchedulerStormZeroPendingVerdict(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("preemption storm must fail: %+v", res)
 	}
@@ -130,7 +130,7 @@ func TestCheckSchedulerPreemptionChurnQuiet(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("under-ceiling churn must pass: %+v", res)
 	}
@@ -152,7 +152,7 @@ func TestCheckSchedulerPreemptionListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatalf("events list failure must surface as Infra: %+v", res)
 	}
@@ -168,7 +168,7 @@ func TestCheckSchedulerFrozenIgnoresSchedulingGates(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false),
 		gated)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("scheduling-gated pod misread as frozen scheduler: %+v", res)
 	}
 	m := probetest.FindMetric(t, "node_automation_scheduler_frozen", map[string]string{})

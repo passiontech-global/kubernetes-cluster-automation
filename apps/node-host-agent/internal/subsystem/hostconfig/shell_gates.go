@@ -86,6 +86,31 @@ func (c *cyc) cfgShellVal(what, s string) bool {
 	return false
 }
 
+// shExecToken is shToken for values landing in a systemd Exec line
+// or its sh -c/bash -c wait-loops — SHToken's charset plus the
+// square brackets IPv6 literals need (kine listen/bind addresses,
+// TLS paths). Non-empty required, like the *Req variants.
+func (c *cyc) shExecToken(what, s string) bool {
+	if converge.SHExecToken(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe value refused for exec interpolation",
+		"what", what, "value", s)
+	return false
+}
+
+// cfgEnvVal is cfgScalar for systemd EnvironmentFile KEY=value
+// lines — printable ASCII minus the env-file's own quote hazard
+// (kine.env's KINE_ENDPOINT DSN keeps its :/?&=).
+func (c *cyc) cfgEnvVal(what, s string) bool {
+	if converge.CfgEnvVal(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe value refused for env-file render",
+		"what", what, "value", s)
+	return false
+}
+
 // cfgSysctlKey / cfgSysctlVal gate the /etc/sysctl.d pair renders —
 // a newline-bearing value would splice further `key = value` lines
 // into the drop-in, applied verbatim by `sysctl --system`.

@@ -34,6 +34,17 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
+func init() {
+	// Snapshot immutability guardrail: every test binary that links
+	// this scaffolding verifies each memoized sweep census was not
+	// mutated in place between reads — the shared-map write bug
+	// class the sweep overlay exists to eliminate gets a permanent
+	// CI tripwire instead of a silent cross-check corruption.
+	// Production binaries never import probetest, so the flag can
+	// never arm outside tests.
+	probefw.EnableSnapshotVerify()
+}
+
 // NewDeps builds a probefw.Deps with the env-equivalent defaults but
 // deterministic seams: DNS always resolves, and the HTTP check points
 // at a dead address (fast connection-refused FAIL) unless the test
@@ -91,6 +102,43 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 // clock is the same plain func var production wires to time.Now).
 func FreezeNow(d *probefw.Deps, base time.Time) {
 	d.Now = func() time.Time { return base }
+}
+
+// SweepCtx returns ctx carrying a FRESH probefw sweep snapshot +
+// write-overlay — the same wrapper the production sweep root
+// installs once per run. Check tests must drive Run through it:
+// on a bare ctx every census call spawns its own throwaway
+// snapshot, so the memoized reads never share within a Run AND
+// the EnableSnapshotVerify fingerprint guard can never observe a
+// second read of the same census — the mutation tripwire this
+// package exists to arm would be dead code. A fresh snapshot per
+// call keeps each Run an isolated "sweep" exactly like production.
+//
+// Keep the returned ctx and pass it to VerifySweep AFTER the check
+// Run returns: the per-read fingerprint guard only fires when a
+// memo is read again, so a census object mutated in place AFTER
+// its memo's last read is invisible until the post-sweep verify
+// re-checks every loaded memo (probefw.VerifySweepSnapshotUnmutated
+// — same panic contract).
+func SweepCtx(ctx context.Context) context.Context {
+	return probefw.WithSweepSnapshot(ctx)
+}
+
+// VerifySweep is the post-Run half of the snapshot mutation guard:
+// it re-verifies every census memo the sweepCtx-carrying Run
+// loaded against its load-time fingerprint, panicking on the first
+// in-place write the per-read guard could not observe (a mutation
+// after the memo's last read). Call it with the SAME ctx SweepCtx
+// returned, after the check's Run completes:
+//
+//	sctx := probetest.SweepCtx(ctx)
+//	res := check.Run(sctx)
+//	probetest.VerifySweep(sctx)
+//
+// Outside a sweep snapshot (or in a binary that never armed
+// EnableSnapshotVerify — production) it is a no-op.
+func VerifySweep(sweepCtx context.Context) {
+	probefw.VerifySweepSnapshotUnmutated(sweepCtx)
 }
 
 // OpDyn returns the shared CRD-aware dynamic fake — every GVR the
@@ -339,7 +387,11 @@ func PromTestServer(t *testing.T, respond func(query string) []PromTestSample) (
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		lastQuery = r.URL.Query().Get("query")
+		// promq issues POST + form body (query strings stay out of
+		// URL access logs); ParseForm covers both that and any
+		// legacy GET caller.
+		_ = r.ParseForm()
+		lastQuery = r.FormValue("query")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, promTestBody(respond(lastQuery)))
 	}))

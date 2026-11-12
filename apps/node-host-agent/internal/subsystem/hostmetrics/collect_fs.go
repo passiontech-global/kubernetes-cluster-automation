@@ -231,12 +231,9 @@ func (c *Collector) scrapeFSProbes() map[string]fsProbe {
 // boring" stays distinguishable from "never probed". Inode gauges
 // emit only on a successful statfs — a failed/hung probe emits no
 // fake numbers. A successful probe also exports the ST_RDONLY flag
-// (filesystem-readonly): one read-only mount latches state-filesystem-readonly for
-// nodereporter's FilesystemReadOnly condition.
+// (filesystem-readonly): the state-filesystem-readonly latch itself
+// is driven by refreshLatches on the ticker, never by this scrape.
 func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric, sc scrapeCtx) {
-	anyRO := false
-	probed := false        // at least one statfs answered — the latch's evidence base
-	var ie fsInodeEvidence // inode-pressure inode-pressure verdict for this pass
 	for _, mount := range c.cfg.FilesystemTargets {
 		pr := sc.fs[mount]
 		st, stalled, ok := pr.st, pr.stalled, pr.ok
@@ -265,12 +262,9 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric, sc scrapeCtx)
 		if !ok {
 			continue
 		}
-		probed = true
-		c.noteInodeEvidence(&ie, mount, st)
 		ro := 0.0
 		if st.Flags&unix.ST_RDONLY != 0 {
 			ro = 1
-			anyRO = true
 		}
 		ch <- prometheus.MustNewConstMetric(descFSReadonly,
 			prometheus.GaugeValue, ro, c.cfg.NodeName, mount)
@@ -286,8 +280,9 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric, sc scrapeCtx)
 				prometheus.GaugeValue, used, c.cfg.NodeName, mount)
 		}
 	}
-	c.updateFSReadonlyLatch(anyRO, probed)
-	c.updateInodePressureLatch(ie)
+	// The filesystem-readonly + inode-pressure latch transitions
+	// are NOT made here — Collect is read-only; refreshLatches
+	// owns every state-* write on the 30s ticker.
 }
 
 // updateFSReadonlyLatch drives state-filesystem-readonly (filesystem-readonly):

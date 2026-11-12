@@ -33,7 +33,9 @@ func (s *eventServer) handler(t *testing.T) http.HandlerFunc {
 		switch {
 		case r.URL.Path == "/api/v1/events" && r.Method == http.MethodGet:
 			q := r.URL.Query()
-			if q.Get("limit") != "500" || q.Get("resourceVersion") != "0" {
+			// No resourceVersion pin — rv=0 pages inconsistently;
+			// the purge wants clean 500-event batches.
+			if q.Get("limit") != "500" || q.Get("resourceVersion") != "" {
 				t.Errorf("unexpected list query: %s", r.URL.RawQuery)
 			}
 			w.Header().Set("Content-Type", "application/json")

@@ -5,6 +5,7 @@ package jinja
 
 import (
 	"errors"
+	"slices"
 	"strings"
 )
 
@@ -25,7 +26,9 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 		return &List{out}, nil
 	}
 	if len(args) == 0 {
-		return &List{ToIter(v)}, nil
+		// Clone like `|list` — ToIter hands back the LIVE backing
+		// slice; wrapping it unchecked aliases the caller's value.
+		return &List{slices.Clone(ToIter(v))}, nil
 	}
 	name := Stringify(args[0])
 	// map('basename') / map('regex_replace', p, r) — filter by name.
@@ -62,7 +65,7 @@ func selectAttrKey(v any, path string) any {
 
 func filterSelectAttr(v any, args []any, keep bool) (any, error) {
 	if len(args) == 0 {
-		return &List{ToIter(v)}, nil
+		return &List{slices.Clone(ToIter(v))}, nil
 	}
 	path := Stringify(args[0])
 	testName := ""

@@ -36,7 +36,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 )
 
 // helmReleaseSecretType is the Secret type helm writes per revision.
@@ -62,6 +64,10 @@ type HelmSecretPruneHooks struct {
 	// next-oldest candidate is still tried.
 	DeleteFailed func(s *corev1.Secret, err error)
 }
+
+// helmSecretsGVR is the core/v1 secrets GVR the metadata read lists —
+// helm release secrets are plain Secrets, so no dedicated GVR exists.
+var helmSecretsGVR = corev1.SchemeGroupVersion.WithResource("secrets")
 
 // PruneSupersededHelmSecrets caps the superseded helm release secrets
 // kept per release, deleting the OLDEST excess with a UID
@@ -94,36 +100,66 @@ type HelmSecretPruneHooks struct {
 // Only the LIST error is returned (the caller owns its failure
 // posture); delete failures surface through hooks.DeleteFailed and
 // never abort the sweep.
-func PruneSupersededHelmSecrets(ctx context.Context, cs kubernetes.Interface,
-	maxSuperseded int, hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
+//
+// This is the typed-only entry kept for callers that have no
+// metadata client to hand (and every fake-clientset unit test):
+// meta/dyn are nil, so the read stays the typed ListAll. Callers
+// holding a metadata.Interface (Deps.Meta / the check's p.Meta)
+// should call PruneSupersededHelmSecretsMeta instead — same
+// contract, metadata-only wire read.
+func PruneSupersededHelmSecrets(ctx context.Context,
+	cs kubernetes.Interface, maxSuperseded int,
+	hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
 
-	secrets, err := ListAll(ctx, metav1.ListOptions{
+	return PruneSupersededHelmSecretsMeta(ctx, nil, cs, nil,
+		maxSuperseded, hooks)
+}
+
+// PruneSupersededHelmSecretsMeta is PruneSupersededHelmSecrets with
+// the metadata client threaded through: meta feeds
+// ListPartialOrFallback's preferred read (PartialObjectMetadata —
+// ObjectMeta WITHOUT the compressed chart payload each revision
+// embeds, so a cluster-wide scan no longer decodes thousands of
+// .Data blobs into the heap just to count namespaces), cs serves
+// the typed fallback when meta cannot, and dyn is the last-resort
+// fallback for a metadata client that cannot serve the GVR.
+func PruneSupersededHelmSecretsMeta(ctx context.Context,
+	meta metadata.Interface, cs kubernetes.Interface,
+	dyn dynamic.Interface, maxSuperseded int,
+	hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
+
+	// The field selector pushes the Secret.type filter to the
+	// apiserver — helm release secrets are a tiny slice of the
+	// secrets table, and the compressed chart payloads behind every
+	// other type never cross the wire.
+	opts := metav1.ListOptions{
 		LabelSelector: "owner=helm,status=superseded",
-		Limit:         DefaultListPageSize},
-		Secrets(cs, metav1.NamespaceAll))
+		FieldSelector: "type=" + helmReleaseSecretType,
+		Limit:         DefaultListPageSize}
+
+	var secrets []corev1.Secret
+	var err error
+	if meta != nil {
+		secrets, err = listHelmSecretsPartial(ctx, meta, cs, dyn, opts)
+	} else {
+		secrets, err = listHelmSecretsTyped(ctx, cs, opts)
+	}
 	if err != nil {
 		return nil, err
 	}
-	// Group by storage namespace + release name.
+	// Group by storage namespace + release name. Values, not
+	// pointers: byRelease must not pin pointers into the
+	// cluster-wide `secrets` backing array — `secrets = nil` below
+	// is only a real release once nothing references its elements.
 	type relKey struct{ ns, name string }
-	byRelease := map[relKey][]*corev1.Secret{}
+	byRelease := map[relKey][]corev1.Secret{}
 	var helmTyped []corev1.Secret
 	for i := range secrets {
 		s := &secrets[i]
-		if s.Type != corev1.SecretType(helmReleaseSecretType) {
-			continue
-		}
-		// The decision needs only metadata — each revision embeds
-		// the compressed chart (MBs), and the cluster-wide list can
-		// hold thousands of them. Drop the payload before the
-		// helmTyped copy and the byRelease grouping pin it in RAM
-		// for the whole sweep; deletes and the census count
-		// namespaces/labels only.
-		s.Data = nil
 		helmTyped = append(helmTyped, *s)
 		if release := s.Labels["name"]; release != "" {
 			k := relKey{s.Namespace, release}
-			byRelease[k] = append(byRelease[k], s)
+			byRelease[k] = append(byRelease[k], *s)
 		}
 	}
 	secrets = nil // release the cluster-wide slice before issuing deletes
@@ -137,7 +173,8 @@ func PruneSupersededHelmSecrets(ctx context.Context, cs kubernetes.Interface,
 		// is never pruned even when it is itself superseded.
 		highest := -1
 		var superseded []supersededSecret
-		for _, s := range relSecrets {
+		for i := range relSecrets {
+			s := &relSecrets[i]
 			v, err := strconv.Atoi(s.Labels["version"])
 			if err != nil {
 				continue // unversioned — never ours to judge
@@ -194,4 +231,85 @@ func PruneSupersededHelmSecrets(ctx context.Context, cs kubernetes.Interface,
 		}
 	}
 	return helmTyped, nil
+}
+
+// listHelmSecretsPartial is the metadata-client read: every listed
+// object arrives as PartialObjectMetadata — ObjectMeta only, no
+// .Data — which is the entire point of the helper (a typed LIST
+// decodes each revision's compressed chart before the prune can
+// drop it). Secret.Type is not ObjectMeta and cannot cross the
+// metadata endpoint, so the projected Secrets carry the helm type
+// the field selector already guaranteed server-side; on the
+// unfiltered BadRequest retry the owner=helm,status=superseded
+// label pair is the remaining guard (same exposure the typed
+// path's client-side check covers for fakes — a secret wearing
+// helm's full label set is already impersonating a revision).
+func listHelmSecretsPartial(ctx context.Context,
+	meta metadata.Interface, cs kubernetes.Interface,
+	dyn dynamic.Interface, opts metav1.ListOptions) ([]corev1.Secret, error) {
+
+	poms, err := ListPartialOrFallback(ctx, meta, cs, dyn,
+		helmSecretsGVR, metav1.NamespaceAll, opts)
+	if err != nil && apierrors.IsBadRequest(err) {
+		// A field-selector-unsupported apiserver answers 400 —
+		// retry unfiltered rather than fail the sweep on what was
+		// only a wire-bytes optimization (mirrors the typed path).
+		opts.FieldSelector = ""
+		poms, err = ListPartialOrFallback(ctx, meta, cs, dyn,
+			helmSecretsGVR, metav1.NamespaceAll, opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	secrets := make([]corev1.Secret, 0, len(poms))
+	for i := range poms {
+		secrets = append(secrets, corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Secret",
+				APIVersion: "v1",
+			},
+			ObjectMeta: poms[i].ObjectMeta,
+			Type:       corev1.SecretType(helmReleaseSecretType),
+		})
+	}
+	return secrets, nil
+}
+
+// listHelmSecretsTyped is the no-metadata-client read — the path
+// every fake-clientset unit test takes. It stays a typed ListAll
+// (NOT ListPartialOrFallback's typed fallback, which would project
+// to PartialObjectMetadata and lose Secret.Type): the client-side
+// Type filter is load-bearing here because fakes do not enforce
+// field selectors — the Opaque-typed decoy fixtures rely on it.
+// .Data still decodes on this path, but it only ever serves tests
+// and meta-less degraded wiring; production always has Deps.Meta.
+func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
+	opts metav1.ListOptions) ([]corev1.Secret, error) {
+
+	raw, err := ListAll(ctx, opts, Secrets(cs, metav1.NamespaceAll))
+	if err != nil && apierrors.IsBadRequest(err) {
+		// Same defensive retry as before: the client-side Type
+		// filter already guarantees correctness, so an apiserver
+		// that rejects the field selector costs wire bytes, not
+		// the sweep.
+		opts.FieldSelector = ""
+		raw, err = ListAll(ctx, opts, Secrets(cs, metav1.NamespaceAll))
+	}
+	if err != nil {
+		return nil, err
+	}
+	secrets := make([]corev1.Secret, 0, len(raw))
+	for i := range raw {
+		s := &raw[i]
+		if s.Type != corev1.SecretType(helmReleaseSecretType) {
+			continue
+		}
+		// The decision needs only metadata — each revision embeds
+		// the compressed chart (MBs). Drop the payload before the
+		// byRelease grouping pins it in RAM for the whole sweep;
+		// deletes and the census count namespaces/labels only.
+		s.Data = nil
+		secrets = append(secrets, *s)
+	}
+	return secrets, nil
 }

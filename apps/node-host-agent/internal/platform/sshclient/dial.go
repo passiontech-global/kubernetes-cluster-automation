@@ -76,7 +76,7 @@ func (c Config) Dial(ctx context.Context, user, host, proxyJump string) (*Link, 
 			jport = strconv.Itoa(port)
 		}
 		jnc, jump, err := c.DialTCP(ctx, net.JoinHostPort(jhost, jport),
-			c.ClientConfig(juser, signer))
+			c.jumpClientConfig(juser, signer))
 		if err != nil {
 			return nil, fmt.Errorf("jump %s: %w", proxyJump, err)
 		}
@@ -105,6 +105,18 @@ func (c Config) Dial(ctx context.Context, user, host, proxyJump string) (*Link, 
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 	return &Link{Client: client, Net: nc}, nil
+}
+
+// jumpClientConfig is ClientConfig for the bastion hop: the jump
+// host's key is pinned by JumpHostKeyFingerprint when set, else by
+// the shared HostKeyFingerprint — the two hops are different
+// machines, so an operator pinning both needs the split field.
+func (c Config) jumpClientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
+	pin := c.JumpHostKeyFingerprint
+	if pin == "" {
+		pin = c.HostKeyFingerprint
+	}
+	return c.clientConfigFor(user, signer, pin)
 }
 
 // DialTCP opens the TCP conn under ctx + the dial timeout and runs

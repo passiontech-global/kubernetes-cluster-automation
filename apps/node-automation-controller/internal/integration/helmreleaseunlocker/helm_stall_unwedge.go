@@ -88,6 +88,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -179,7 +180,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// No ledger fold needed here: unlike the unlock ledger the
 		// unwedged set is never pruned (stamps self-expire), so an
 		// anno-only cooldown needs no in-RAM mirror.
-		if heal.PersistedCooledDown(&u.stall.unwedged, hr, helmLastStallUnwedgeAnno,
+		if heal.PersistedCooledDown(ctx, &u.stall.unwedged, hr, helmLastStallUnwedgeAnno,
 			key, helmUnlockCooldown, now) {
 			u.alertStallOnce(ctx, key, now,
 				fmt.Sprintf("HR re-stalled inside the %s unwedge cooldown — previous unwedge did not fix it",
@@ -207,12 +208,44 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		if att.count > 0 && now.Sub(att.last) < stallAttemptCooldown {
 			continue // inside the 6h attempt gap — let the last unwedge land
 		}
+		// Read-only analysis BEFORE the gate: stalledDeployment +
+		// deadlockPlan are pure LISTs/GETs, and running them first
+		// means a stalled HR that is not the surge-deadlock shape
+		// never spends a fleet heal grant on a heal that cannot
+		// actuate — the grant is only worth buying once a plan
+		// exists to execute.
+		dep, plan, refuse, err := u.unwedgeAnalyze(ctx, hr)
+		if err != nil {
+			// Tolerated per-HR failure — absorbed like the
+			// actuation error path below; IncError keeps it on
+			// the alert path. The attempt budget is spared — an
+			// API error is not a verdict on the signature.
+			metrics.IncError(u.queue)
+			log.Error(err, "helmrelease stall unwedge analysis failed", "hr", key)
+			continue
+		}
+		if plan == nil {
+			// Every non-error analysis outcome burns one of the
+			// stallMaxAttemptsPerRevision tries: a clean no-op
+			// (already-opened window) AND refusals — an
+			// uncounted refusal would re-run the full
+			// workload-layer analysis every sweep forever and
+			// never reach the cap. No gate was consulted, so no
+			// grant needs refunding.
+			att.count++
+			att.last = now
+			if refuse != "" {
+				u.alertStallOnce(ctx, key, now,
+					"stalled HR is not the surge-deadlock shape — refusing to scale: "+refuse)
+			}
+			continue
+		}
 		// Fail-closed maintenance mutex — the scale-down below
 		// removes live pods' ReplicaSet replicas: during a
 		// cordon/drain/upgrade the unwedge would compound the
-		// deliberate disruption. Gate AFTER the cooldown/attempt
-		// checks so a deferral burns neither the persisted
-		// cooldown nor one of the per-revision attempts.
+		// deliberate disruption. Gate AFTER the analysis so a
+		// deferral burns neither the persisted cooldown nor one
+		// of the per-revision attempts.
 		proceed, unverifiable := heal.Gate(ctx, log, &u.verdict,
 			u.cs, u.dyn, key, now)
 		switch {
@@ -225,16 +258,18 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		case !proceed:
 			continue
 		}
-		acted, refuse, err := u.unwedge(ctx, gvr, hr)
+		acted, err := u.unwedgeAct(ctx, gvr, hr, dep, plan)
 		if err == nil {
-			// Every non-error outcome burns one of the
-			// stallMaxAttemptsPerRevision tries: acted, a clean
-			// no-op AND refusals — an uncounted refusal would
-			// re-run the full workload-layer analysis every
-			// sweep forever and never reach the cap. API errors
-			// are the only outcome that spares the budget.
 			att.count++
 			att.last = now
+			if !acted {
+				// The Gate grant above bought no heal — hand it
+				// back (same contract as heal.EvictPodV's
+				// PDB-429 refund). Errors keep the grant — an
+				// attempted actuation that failed mid-patch is
+				// the documented "spent a cheap token" case.
+				heal.RefundGrant(now)
+			}
 		}
 		switch {
 		case err != nil:
@@ -242,9 +277,6 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 			// nil return) — IncError keeps it on the alert path.
 			metrics.IncError(u.queue)
 			log.Error(err, "helmrelease stall unwedge failed", "hr", key)
-		case refuse != "":
-			u.alertStallOnce(ctx, key, now,
-				"stalled HR is not the surge-deadlock shape — refusing to scale: "+refuse)
 		case acted:
 			u.stall.unwedged.Stamp(key, now)
 			unwedged++
@@ -266,32 +298,39 @@ func (u *helmReleaseUnlocker) alertStallOnce(ctx context.Context, key string, no
 	logf.FromContext(ctx).Info("ALERT: "+msg, "hr", key)
 }
 
-// unwedge evaluates one stalled HR end to end: resolve the stalled
-// Deployment, verify the surge-deadlock shape, scale the old
-// ReplicaSet down, stamp the HR retry token. refuse != "" means the
-// signature matched but the shape or a safety guard did not — the
-// caller alerts instead of acting. acted=false + refuse="" means
-// nothing needed doing (already opened window).
-func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
-	gvr schema.GroupVersionResource, hr *unstructured.Unstructured) (bool, string, error) {
-	log := logf.FromContext(ctx)
-	key := hr.GetNamespace() + "/" + hr.GetName()
+// unwedgeAnalyze is the READ-ONLY half of the unwedge: resolve the
+// stalled Deployment, verify the surge-deadlock shape, and return
+// the scale plan — or a refusal reason. Every refusal is a
+// deliberate fail-closed: the HR stays stalled for a human rather
+// than risk a wrong-target scale-down. It runs BEFORE heal.Gate so
+// a non-deadlock HR never spends a fleet grant; only a non-nil
+// plan reaches the gate and the actuation half.
+func (u *helmReleaseUnlocker) unwedgeAnalyze(ctx context.Context,
+	hr *unstructured.Unstructured) (*appsv1.Deployment, *stallPlan,
+	string, error) {
 
 	dep, refuse, err := u.stalledDeployment(ctx, hr)
-	if err != nil {
-		return false, "", err
+	if err != nil || dep == nil {
+		return nil, nil, refuse, err
 	}
-	if dep == nil {
-		return false, refuse, nil
-	}
-
 	plan, refuse, err := u.deadlockPlan(ctx, dep)
-	if err != nil {
-		return false, "", err
+	if err != nil || plan == nil {
+		return dep, nil, refuse, err
 	}
-	if plan == nil {
-		return false, refuse, nil
-	}
+	return dep, plan, "", nil
+}
+
+// unwedgeAct is the MUTATING half: scale the old ReplicaSet down by
+// the minimum that provably frees a node, reap the failed hook Jobs,
+// stamp the HR retry token. Runs only after heal.Gate granted — the
+// caller owns cooldown/attempt accounting. acted=false + err=nil is
+// unreachable today (a verified plan always actuates) but keeps the
+// RefundGrant pairing honest if a future early-exit lands here.
+func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
+	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
+	dep *appsv1.Deployment, plan *stallPlan) (bool, error) {
+	log := logf.FromContext(ctx)
+	key := hr.GetNamespace() + "/" + hr.GetName()
 
 	// Scale the OLD ReplicaSet down by the minimum that provably
 	// frees a node. The merge patch pins metadata.resourceVersion —
@@ -311,13 +350,20 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 		"spec":     map[string]any{"replicas": desired},
 	})
 	if err != nil {
-		return false, "", err
+		return false, err
 	}
 	if _, err := u.cs.AppsV1().ReplicaSets(dep.Namespace).Patch(ctx, plan.target.Name,
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-		return false, "", fmt.Errorf("scale down replicaset %s/%s: %w",
+		return false, fmt.Errorf("scale down replicaset %s/%s: %w",
 			dep.Namespace, plan.target.Name, err)
 	}
+	// The destructive half already landed — stamp the 24h cooldown
+	// in RAM NOW, before the HR annotation patch: if that patch
+	// fails, the next sweep must still see this HR inside its
+	// cooldown window instead of re-planning a scale-down that
+	// already happened (the persisted half lands with the HR patch
+	// below; the RAM half cannot wait for it).
+	u.stall.unwedged.Stamp(key, u.now.Now())
 
 	// helm-stall-unwedge: the failed upgrade usually left a Failed helm-hook Job
 	// behind in the release namespace — helm refuses to re-run a
@@ -340,15 +386,15 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 		helmLastStallUnwedgeAnno: token,
 	})
 	if err != nil {
-		return false, "", err
+		return false, err
 	}
 	if _, err := u.dyn.Resource(gvr).Namespace(hr.GetNamespace()).Patch(ctx, hr.GetName(),
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-		return false, "", fmt.Errorf("annotate helmrelease %s: %w", key, err)
+		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
 	log.Info("ACTION: requested HR reconcile + failure-counter reset",
 		"hr", key, "deployment", dep.Namespace+"/"+dep.Name)
 	metrics.HelmStallUnwedgesTotal.
 		WithLabelValues(dep.Namespace, dep.Name).Inc()
-	return true, "", nil
+	return true, nil
 }

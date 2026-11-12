@@ -47,8 +47,10 @@ func (c *cyc) groupNebula() {
 			pub, c.markerBase(), mark, pub, mark))
 		return
 	}
-	// T5b: kernel TUN device required (ansible assert).
-	if fi, err := os.Stat("/dev/net/tun"); err != nil {
+	// T5b: kernel TUN device required (ansible assert) — stat through
+	// HostRoot: the pod's own /dev/net/tun says nothing about the
+	// host kernel module the nebula daemon actually needs.
+	if fi, err := os.Stat(r.hp("/dev/net/tun")); err != nil {
 		c.err("T5b: /dev/net/tun stat failed — modprobe tun before nebula",
 			"error", err)
 		return
@@ -435,8 +437,8 @@ func (c *cyc) nebulaRouting() {
 	for _, p := range []string{"dport", "sport"} {
 		for _, chain := range []string{"OUTPUT", "PREROUTING"} {
 			fmt.Fprintf(&rs,
-				"iptables -t mangle -C %s -p udp --%s %s -j MARK --set-mark 0x1000 2>/dev/null || "+
-					"iptables -t mangle -A %s -p udp --%s %s -j MARK --set-mark 0x1000\n",
+				"iptables -w 5 -t mangle -C %s -p udp --%s %s -j MARK --set-mark 0x1000 2>/dev/null || "+
+					"iptables -w 5 -t mangle -A %s -p udp --%s %s -j MARK --set-mark 0x1000\n",
 				chain, p, port(c), chain, p, port(c))
 		}
 	}
@@ -454,8 +456,8 @@ func (c *cyc) nebulaRouting() {
 		for _, dev := range []string{"neb1", "cilium_wg0"} {
 			fmt.Fprintf(&rs,
 				`if ip link show dev %s >/dev/null 2>&1; then `+
-					`iptables -t mangle -C %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
-					`iptables -t mangle -A %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; fi`+"\n",
+					`iptables -w 5 -t mangle -C %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
+					`iptables -w 5 -t mangle -A %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; fi`+"\n",
 				dev, chain, dev, chain, dev)
 		}
 		// liqo interfaces are numbered (liqo-*, liqo0, …) — probe the
@@ -463,8 +465,8 @@ func (c *cyc) nebulaRouting() {
 		// match traffic with the iptables `liqo+` pattern.
 		fmt.Fprintf(&rs,
 			`ls /sys/class/net | grep -q '^liqo' && { `+
-				`iptables -t mangle -C %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
-				`iptables -t mangle -A %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; }; true`+"\n",
+				`iptables -w 5 -t mangle -C %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+
+				`iptables -w 5 -t mangle -A %s -o liqo+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; }; true`+"\n",
 			chain, chain)
 	}
 

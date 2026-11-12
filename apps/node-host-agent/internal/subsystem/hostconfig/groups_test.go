@@ -120,6 +120,25 @@ func loadCyc(t *testing.T, r *Reconciler, varsDir, node string) *cyc {
 	return c
 }
 
+// plantTunDevice gives a temp HostRoot a /dev/net/tun the T5b
+// char-device assert can stat — a symlink to the REAL device (mknod
+// needs CAP_MKNOD a test binary doesn't have). Skipped silently
+// when the host lacks tun, matching the pre-hostPath behavior which
+// stat'ed /dev/net/tun directly and failed the same way.
+func plantTunDevice(t *testing.T, hostRoot string) {
+	t.Helper()
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		return
+	}
+	dir := filepath.Join(hostRoot, "dev/net")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/net/tun", filepath.Join(dir, "tun")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func hostWrite(t *testing.T, r *Reconciler, path, content string) {
 	t.Helper()
 	dst := filepath.Join(r.cfg.HostRoot, path)
@@ -556,6 +575,26 @@ func TestCfgGatesRefuseUnsafe(t *testing.T) {
 			gate: func(c *cyc, s string) bool { return c.cfgScalar("x", s) },
 			in:   []string{"100", "60s", "a:b", "a#b", "line\nbreak", "", `q"uote`, "sq'x"},
 			want: []bool{true, true, false, false, false, false, false, false},
+		},
+		"shExecToken": {
+			gate: func(c *cyc, s string) bool { return c.shExecToken("x", s) },
+			in: []string{
+				"unix:///run/k0s/kine.sock", "tcp://127.0.0.1:2379",
+				"tcp://[::1]:2379", ":2380", "/etc/kine/pki/ca.crt",
+				"", "has space", "sq'x", "dq\"x", "semi;colon",
+				"dol$lar", "back`tick", "line\nbreak",
+			},
+			want: []bool{true, true, true, true, true, false, false,
+				false, false, false, false, false, false},
+		},
+		"cfgEnvVal": {
+			gate: func(c *cyc, s string) bool { return c.cfgEnvVal("x", s) },
+			in: []string{
+				"postgres://u:p@h:5432/db?sslmode=disable",
+				"sqlite:///var/lib/kine/kine.db", "a=b&c=d",
+				"", "line\nbreak", `q"uote`, "tab\there",
+			},
+			want: []bool{true, true, true, false, false, false, false},
 		},
 		"cfgLimitNOFILE": {
 			gate: func(c *cyc, s string) bool { return c.cfgLimitNOFILE("x", s) },

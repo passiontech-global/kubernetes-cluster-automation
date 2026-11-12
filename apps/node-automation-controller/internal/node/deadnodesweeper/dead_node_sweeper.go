@@ -91,6 +91,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// and shared by the stateful-holder check and the fence's
 	// forensics log (previously two full cluster lists per fence).
 	vaCache := &volumeAttachmentCache{}
+	pvcCache := &pvcCache{}
+	// The PV access-mode census is likewise fetched once per sweep —
+	// every non-SNR suspect resolves attachment volume names off it.
+	pvModes := &pvCache{}
 	// One canary for the whole sweep: the Ready=True node that
 	// transport-level probe verdicts must be certified against ("" —
 	// every node Unknown — itself smells like a global proxy outage).
@@ -146,7 +150,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		// otherwise.
 		hasVolumes := false
 		if !viaSNR {
-			holds, holdsErr := s.nodeHasStatefulHolders(ctx, nodeName, vaCache)
+			holds, holdsErr := s.nodeHasStatefulHolders(ctx, nodeName, vaCache, pvcCache, pvModes)
 			if holdsErr != nil {
 				log.Error(holdsErr, "stateful-holder check failed — node skipped (fail closed)",
 					"node", nodeName, "stuckPods", count)

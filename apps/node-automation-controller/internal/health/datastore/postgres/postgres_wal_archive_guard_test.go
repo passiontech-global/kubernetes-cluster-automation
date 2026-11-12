@@ -48,7 +48,7 @@ func TestPostgresWALArchiveConditionFails(t *testing.T) {
 	cr := cnpgCluster("db", "pg-main", time.Hour)
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stale archiving condition must fail: %+v", res)
 	}
@@ -67,7 +67,7 @@ func TestPostgresWALDiskFullLogEvidence(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		`2026-01-01 FATAL: PANIC: could not write to file "pg_wal/xlogtemp.42": No space left on device`+"\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("pg_wal disk-full evidence must fail: %+v", res)
 	}
@@ -82,7 +82,7 @@ func TestPostgresHealthyClusterPasses(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"INFO archive-push succeeded\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("clean cluster must pass: %+v", res)
 	}
@@ -114,7 +114,7 @@ func TestPostgresInactiveSlotWALBloat(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("inactive slot retaining >5GiB must fail")
 	}
@@ -157,7 +157,7 @@ func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("active-flag spelling of slot bloat must fail")
 	}
@@ -214,7 +214,7 @@ func TestCNPGStuckPhaseTimestampFlags(t *testing.T) {
 	cr := cnpgClusterHealth("db", "pg-fo", "Failing over",
 		20*time.Minute, 3, 1)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stuck failover phase must fail: %+v", res)
 	}
@@ -235,13 +235,13 @@ func TestCNPGStuckPhaseLedgerPath(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		if v, ok := cnpgSeries(t, "db", "pg-wait", "stuck_phase"); ok {
 			t.Fatalf("stuck_phase flagged on first sight: %v", v)
 		}
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("phase held past the window must fail")
 	}
@@ -260,11 +260,11 @@ func TestCNPGUnderReplicatedFlags(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight of the shortfall must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("ready<instances held past the window must fail")
 	}
@@ -287,7 +287,7 @@ func TestCNPGArchivingDisabledFlags(t *testing.T) {
 
 	now := time.Now()
 	probetest.FreezeNow(p.Deps, now)
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("ContinuousArchiving=False must fail: %+v", res)
 	}
@@ -296,7 +296,7 @@ func TestCNPGArchivingDisabledFlags(t *testing.T) {
 		t.Fatal("archiving_disabled flagged on first sight")
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res = chk.Run(ctx)
+	res = chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("ContinuousArchiving=False held past the window must fail: %+v", res)
 	}
@@ -312,7 +312,7 @@ func TestCNPGHealthyClusterPasses(t *testing.T) {
 	cr := cnpgClusterHealth("db", "pg-ok", "Healthy",
 		2*time.Hour, 3, 3)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("healthy cluster must pass: %+v", res)
 	}
@@ -336,7 +336,7 @@ func TestCNPGRecoveryPrunesSeries(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck phase must fail first")
 	}
 	if _, ok := cnpgSeries(t, "db", "pg-heal", "stuck_phase"); !ok {
@@ -357,7 +357,7 @@ func TestCNPGRecoveryPrunesSeries(t *testing.T) {
 	}
 
 	probetest.FreezeNow(p.Deps, now.Add(31*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		// under_replicated resolves too — the replica count caught up.
 		t.Fatalf("healed cluster must pass: %+v", res)
@@ -425,7 +425,7 @@ func TestPostgresWALVolumePressureEmitsClusterName(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("data volume past 60%% must fail: %+v", res)
 	}
@@ -564,7 +564,7 @@ func TestPostgresWALPromQueryStrings(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("no series — sweep must pass quietly: %+v", res)
 	}
@@ -622,7 +622,7 @@ func TestPostgresWALPromArchiverClassified(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("archiver-failure series must fail the check")
 	}

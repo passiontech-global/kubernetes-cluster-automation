@@ -7,8 +7,9 @@ standalone systemd service on out-of-cluster hosts (`--standalone` /
 interface contract is Prometheus metrics on `:9115/metrics` plus
 `/healthz`+`/readyz` on the probe port — `:8081` in pod mode, `:8091`
 on standalone targets (hubsync picks 8091 because lixo-fabric owns
-8081 there). All periodic subsystems are env-gated behind
-`NODE_HOST_AGENT_ENABLE_*` knobs.
+8081 there); the units hubsync writes bind `127.0.0.1:9117` — loopback
+only, for the same lixo-fabric reason. All periodic subsystems are
+env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
 
 ## Directory map
 
@@ -50,7 +51,7 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   hoststate (`state-*`/`last-*` latch files; the latch NAMES'
   registry lives in `internal/latchdefs`), hostexec, hostutil,
   systemd, watchdogconf, probee, procfs, journalwatch, promfile,
-  kmsg, pagecache, sshclient.
+  kmsg, pagecache, sshclient, netlinkx, fileconf.
 - `internal/subsystem/*` — the 12 periodic subsystems (sweeper,
   concoursecache, apiprober, hostmetrics, workerhygiene, nethealth,
   janitor, nodereporter, controllerhygiene, hostconfig, hubsync,

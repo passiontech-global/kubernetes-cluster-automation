@@ -18,6 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
@@ -151,7 +152,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return std(w, sweeper.EnvDeps{Deps: w.Deps, Client: cs},
+				return std(w, sweeper.EnvDeps{Deps: w.Deps, Client: cs,
+					Coord: nodecoord.NewKube(w.Deps.NodeName, cs)},
 					sweeper.ConfigFromEnv, sweeper.New)
 			},
 		},
@@ -257,7 +259,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return std(w, workerhygiene.EnvDeps{Deps: w.Deps, Client: cs},
+				return std(w, workerhygiene.EnvDeps{Deps: w.Deps, Client: cs,
+					Coord: nodecoord.NewKube(w.Deps.NodeName, cs)},
 					workerhygiene.ConfigFromEnv, workerhygiene.New)
 			},
 		},
@@ -311,7 +314,19 @@ func (w *wiring) descriptors() []Descriptor {
 				return controllerhygiene.ShouldRun(w.HostRoot)
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return std(w, controllerhygiene.EnvDeps{Deps: w.Deps},
+				// nodecoord is optional: controllerhygiene must keep
+				// running where no kube clientset exists (the mTLS
+				// admin.conf client is a separate transport), so the
+				// handle is built only when BOTH a node name and a
+				// clientset resolve — either missing leaves Coord nil
+				// and the maintenance hold disabled.
+				var coord *nodecoord.Coord
+				if w.NodeName != "" {
+					if cs, err := w.csOnce(); err == nil {
+						coord = nodecoord.NewKube(w.NodeName, cs)
+					}
+				}
+				return std(w, controllerhygiene.EnvDeps{Deps: w.Deps, Coord: coord},
 					controllerhygiene.ConfigFromEnv, controllerhygiene.New)
 			},
 		},

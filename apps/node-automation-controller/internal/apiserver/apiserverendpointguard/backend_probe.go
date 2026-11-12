@@ -45,7 +45,6 @@ type apiProbeResult struct {
 // one-sample verdict (same convention as kubeletReaperProbes).
 type backendProbeState struct {
 	ip            string // the backend this streak state belongs to
-	gapStreak     int    // consecutive cycles with live_rv-cache_rv >= threshold
 	frozenStreak  int    // consecutive cycles cache_rv flat while live_rv grew
 	okStreak      int    // consecutive healthy cycles (recovery latch)
 	errStreak     int    // consecutive probe transport/5xx failures
@@ -57,21 +56,34 @@ type backendProbeState struct {
 }
 
 // probe measures live_rv and cache_rv of one apiserver backend.
-// live_rv uses a consistent (quorum) list; cache_rv uses
-// resourceVersion=0 which the apiserver answers from its watch cache —
-// the gap between them IS the wedge signal.
+// The pair isolates the watch cache's own lag: live_rv is a
+// consistent (quorum) list, cache_rv the same list at
+// resourceVersion=0 served from the watch cache. BOTH reads are the
+// CLUSTER-WIDE coordination.k8s.io/v1 Lease list: kube-system
+// leader-election leases renew every ~10s and control-plane
+// component leases every 2-5s, so the cache RV keeps advancing even
+// when 100% of workers lose connectivity — the earlier
+// kube-node-lease-only pairing froze cache_rv in exactly that
+// scenario (worker kubelet lease writes are the ONLY writers there)
+// while live_rv kept growing on unrelated writes, tripping a false
+// watch-cache-wedged verdict and quarantining healthy backends.
+// Unrelated write storms still cannot fake a wedge: a frozen
+// cache_rv while live_rv grows remains the signature.
 func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeResult {
 	client, err := g.probeClient()
 	if err != nil {
 		return apiProbeResult{err: err}
 	}
 	liveRV, err := fetchListRV(ctx, client, ip,
-		"/api/v1/namespaces/default/services?limit=1")
+		"/apis/coordination.k8s.io/v1/leases?limit=1")
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("live rv: %w", err)}
 	}
+	// resourceVersion=0 + no limit: the watch cache rejects Limit
+	// on RV=0 reads anyway, and the cluster-wide lease set is what
+	// keeps cache_rv advancing through a total worker outage.
 	cacheRV, err := fetchListRV(ctx, client, ip,
-		"/api/v1/nodes?limit=1&resourceVersion=0")
+		"/apis/coordination.k8s.io/v1/leases?resourceVersion=0")
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("cache rv: %w", err)}
 	}

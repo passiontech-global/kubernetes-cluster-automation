@@ -10,6 +10,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -30,6 +31,10 @@ import (
 type EnvDeps struct {
 	hostctx.Deps
 	Client kubernetes.Interface
+	// Coord is the optional L1↔L3 nodecoord handle — cmd/agent
+	// builds it via nodecoord.NewKube; nil leaves the maintenance
+	// hold disabled.
+	Coord *nodecoord.Coord
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob workerhygiene
@@ -56,6 +61,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 			UnreadableNeeded: d.JournalUnreadableNeeded,
 		},
 		Client: d.Client,
+		Coord:  d.Coord,
 	}
 	// The shared timex.Cell lives in the Host seams group — nil
 	// d.Clock leaves it unset so ApplyDefaults arms its own cell.

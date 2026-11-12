@@ -251,7 +251,7 @@ func TestLeaseGuardAmbiguousFallbackSkipsHeal(t *testing.T) {
 	cs := fake.NewSimpleClientset(lease, cainjector, webhook)
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("expired lease with running pods must fail")
 	}
 	for _, name := range []string{"cert-manager-cainjector-abc", "cert-manager-webhook-def"} {
@@ -351,7 +351,7 @@ func TestLeaseGuardFlapping(t *testing.T) {
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first transitions sighting must pass: %+v", res)
 	}
 
@@ -367,7 +367,7 @@ func TestLeaseGuardFlapping(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("flapping lease did not fail the check")
 	}
 	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
@@ -389,7 +389,7 @@ func TestLeaseGuardExpiredLeaseBouncesHolder(t *testing.T) {
 			"cilium-operator-7d9f4d5b8c-x1", "10.0.0.9", nil))
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("expired lease with running pods must fail")
 	}
 	if _, err := cs.CoreV1().Pods("kube-system").
@@ -414,7 +414,7 @@ func TestLeaseGuardExpiredLeaseCooldown(t *testing.T) {
 			"cool-op-5bd4f9b7c9-x2", "10.0.0.11", nil))
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("expired lease with running pods must fail")
 	}
 	if _, err := cs.CoreV1().Pods("kube-system").
@@ -431,7 +431,7 @@ func TestLeaseGuardExpiredLeaseCooldown(t *testing.T) {
 		Create(ctx, respawn, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still-stale lease must keep failing")
 	}
 	if _, err := cs.CoreV1().Pods("kube-system").
@@ -454,7 +454,7 @@ func TestLeaseGuardExpiredLeaseMaintenanceGate(t *testing.T) {
 			Annotations: map[string]string{kube.KuredLockAnno: "w1"}}})
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("expired lease must still fail under maintenance")
 	}
 	if _, err := cs.CoreV1().Pods("kube-system").
@@ -474,7 +474,7 @@ func TestLeaseGuardThrashing(t *testing.T) {
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first transitions sighting must pass: %+v", res)
 	}
 
@@ -490,7 +490,7 @@ func TestLeaseGuardThrashing(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base.Add(8*time.Minute))
 
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("4 transitions inside 10m did not fail the check")
 	}
@@ -517,7 +517,7 @@ func TestLeaseGuardFreshLeaseNoAction(t *testing.T) {
 			"fresh-op-6cd9e7f5a4-z4", "10.0.0.14", nil))
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("fresh lease must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("kube-system").
@@ -536,7 +536,7 @@ func TestLeaseGuardLongStaleLeaseIgnored(t *testing.T) {
 			"corpse-op-8bf4d7c9a5-w5", "10.0.0.15", nil))
 	_, ch := leaseGuardProber(cs)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("lease stale past the ceiling must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("node-ops").
@@ -562,12 +562,12 @@ func TestLeaseGuardKSMWedgeBounce(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first wedge sighting inside the window must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(ksmWedgeMinAge+time.Minute))
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted ksm wedge did not fail the check")
 	}
 	if _, err := cs.CoreV1().Pods("monitoring").
@@ -601,7 +601,7 @@ func TestLeaseGuardKSMWedgeRestartResume(t *testing.T) {
 		return leaseReasonKSMUnauthorized, nil
 	}
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted wedge window did not resume on the first post-restart sweep")
 	}
 	if _, err := cs.CoreV1().Pods("monitoring").
@@ -633,15 +633,15 @@ func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
 
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Pass || res.Infra == nil {
 		t.Fatalf("pods list failure must infra-fail the sweep: %+v", res)
 	}
 	if !strings.Contains(res.Infra.Error(), "list pods in kube-system") {
 		t.Fatalf("Infra = %v, want the kube-system pods list error", res.Infra)
 	}
-	if podLists != 2 {
-		t.Fatalf("pods listed %d times in one sweep, want 2 — one census for the lease loop (memoized across kube-system's stale leases) and one for the KSM wedge scan", podLists)
+	if podLists != 1 {
+		t.Fatalf("pods listed %d times in one sweep, want 1 — the sweep snapshot shares ONE census between the lease loop and the KSM wedge scan, and its memoized error reaches both", podLists)
 	}
 
 	// kube-system's stale leases are skipped (no pods to judge the
@@ -660,7 +660,7 @@ func TestLeaseGuardPodsListErrorOncePerNamespace(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("flux-system flap must still fail the sweep")
 	}
 	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",

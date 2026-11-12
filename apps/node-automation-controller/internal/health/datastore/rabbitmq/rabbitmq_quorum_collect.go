@@ -15,6 +15,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // rabbitCensus is one sweep's view of the RabbitMQ fleet: member
@@ -25,6 +26,7 @@ import (
 type rabbitCensus struct {
 	byName     map[string]*corev1.Pod // "ns/name" — findings key on it
 	byPodName  map[string]*corev1.Pod // bare name — raft-term series fallback
+	ambiguous  map[string]bool        // bare names colliding across namespaces
 	members    []*corev1.Pod
 	unlabeled  []corev1.Pod
 	downscaled map[string]bool
@@ -52,6 +54,7 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 	c := &rabbitCensus{
 		byName:     map[string]*corev1.Pod{},
 		byPodName:  map[string]*corev1.Pod{},
+		ambiguous:  map[string]bool{},
 		downscaled: downscaled,
 	}
 	for i := range pods {
@@ -61,7 +64,17 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 			continue
 		}
 		c.byName[pod.Namespace+"/"+pod.Name] = pod
-		c.byPodName[pod.Name] = pod // ns fallback for series w/o namespace label
+		// Bare-name fallback serves only series with NO namespace
+		// label — and only while the name is unambiguous: two
+		// RabbitMQ clusters in different namespaces can run
+		// same-named pods (rabbitmq-server-0), and silently keeping
+		// the last one would pool one cluster's raft terms into the
+		// other's skew verdict.
+		if prev, dup := c.byPodName[pod.Name]; dup &&
+			(prev == nil || prev.Namespace != pod.Namespace) {
+			c.ambiguous[pod.Name] = true
+		}
+		c.byPodName[pod.Name] = pod
 		c.members = append(c.members, pod)
 		if rabbitClusterKey(pod) == "" {
 			c.unlabeled = append(c.unlabeled, *pod)
@@ -81,6 +94,11 @@ func (c *rabbitCensus) resolvePod(ns, name string) *corev1.Pod {
 	if ns != "" {
 		return c.byName[ns+"/"+name]
 	}
+	// An ambiguous bare name resolves to NOTHING — guessing would
+	// attribute one cluster's raft evidence to another's pod.
+	if c.ambiguous[name] {
+		return nil
+	}
 	return c.byPodName[name]
 }
 
@@ -96,6 +114,17 @@ func rabbitPromFindings(ctx context.Context, d *probefw.Deps,
 	rabbitLeaderlessFindings(ctx, d, log, c, findings)
 	rabbitSkewFindings(ctx, d, log, c, findings)
 	return findings
+}
+
+// rabbitSeriesClusterID picks the best cluster discriminator a
+// pod-less series carries — rabbitmq_cluster/cluster name first,
+// then the erlang node name, then instance — so two RabbitMQ
+// clusters sharing a namespace never pool into one finding key.
+func rabbitSeriesClusterID(s promq.Sample) string {
+	if id := s.Label("rabbitmq_cluster", "cluster", "node", "instance"); id != "" {
+		return id
+	}
+	return "-"
 }
 
 // rabbitAlarmFindings runs the four watermark / dist-partition
@@ -133,7 +162,12 @@ func rabbitAlarmFindings(ctx context.Context, d *probefw.Deps,
 			}
 			key := ns + "/" + podName
 			if podName == "" {
-				key = "cluster/" + q.reason
+				// Cluster-level series (no pod label) still
+				// attribute by namespace + cluster discriminator —
+				// the bare "cluster/<reason>" key dropped the
+				// namespace AND the emission path could never map
+				// it back, silently hiding a fleet-wide alarm.
+				key = "cluster/" + ns + "/" + rabbitSeriesClusterID(s)
 			}
 			if findings[key] == nil {
 				findings[key] = map[string]bool{}

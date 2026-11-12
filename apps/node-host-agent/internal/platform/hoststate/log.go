@@ -7,6 +7,8 @@ package hoststate
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -34,23 +36,40 @@ func (s *Store) AppendLogWarn(msg string) {
 // SHRINK (the rename-to-.1 case) it first drains the unread tail
 // from the rotated .1 generation, then restarts the fresh file at
 // offset 0 (events.go readNewLogLines). The rotate decision + rename
-// run under s.shared.mu so two concurrent appends cannot both rename.
+// run under the per-path logFileLock so two concurrent appends
+// cannot both rename.
 const watchdogLogMaxBytes = 10 << 20
+
+// logFileLocks serializes appendFile per LogFile PATH, not per
+// sharedState: two Stores over different state dirs can still share
+// one watchdog log, and s.shared.mu only covers stores on the same
+// dir — a cross-dir pair could both stat an oversized log and
+// double-rename. Keyed by filepath.Clean(LogFile).
+var logFileLocks sync.Map // clean path -> *sync.Mutex
+
+func logFileLock(path string) *sync.Mutex {
+	key := filepath.Clean(path)
+	if v, ok := logFileLocks.Load(key); ok {
+		return v.(*sync.Mutex)
+	}
+	v, _ := logFileLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 func (s *Store) appendFile(msg string) {
 	if s.LogFile == "" {
 		return
 	}
-	// The rotate decision + rename run under s.shared.mu: two concurrent
-	// appends that both stat an oversized log can otherwise BOTH
-	// rename — the second rename throwing away the fresh file the
-	// first rotation just started (and its early lines) by replacing
-	// the .1 generation wholesale. The append itself stays outside
-	// the lock — O_APPEND makes each write atomic, and an append
-	// whose open raced the rename simply follows its fd into the
-	// rotated .1 file (no loss, one stray line in the old
-	// generation).
-	s.shared.mu.Lock()
+	// Stat + rename + open + write run as ONE critical section under
+	// the per-path mutex: splitting the rotate decision from the
+	// append let a second writer's open land between the rename and
+	// the first writer's append — its fd then followed into the
+	// rotated .1 generation while a THIRD writer created a fresh
+	// log, interleaving generations. O_APPEND keeps each individual
+	// Write atomic; the mutex keeps the generation boundary clean.
+	mu := logFileLock(s.LogFile)
+	mu.Lock()
+	defer mu.Unlock()
 	if fi, err := os.Stat(s.LogFile); err == nil &&
 		fi.Size() >= watchdogLogMaxBytes {
 		// Single-file rotation: <log> → <log>.1, then append to a
@@ -61,7 +80,6 @@ func (s *Store) appendFile(msg string) {
 				"file", s.LogFile, "error", rerr)
 		}
 	}
-	s.shared.mu.Unlock()
 	f, err := os.OpenFile(s.LogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

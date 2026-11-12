@@ -319,6 +319,13 @@ func (s *partitionSweep) evictPods(ctx context.Context) {
 	// budget cannot refill inside one sweep.
 	gateChecked, gateProceed, gateUnverifiable := false, false, false
 	evicted := 0
+	// delivered/errN account the sweep grant's outcome — a pass
+	// that delivered nothing and saw no actuation error refunds
+	// the grant below (same contract as heal.EvictPodV's refusal
+	// refund, applied sweep-wide since this module spends ONE
+	// grant per pass, not per pod; refused attempts need no
+	// counter — they are the no-delivery case by definition).
+	deliveredN, errN := 0, 0
 loop:
 	for _, name := range names {
 		// Never evict off a node whose NoSchedule fence did not
@@ -418,7 +425,7 @@ loop:
 			// kill the replacement. NotFound is already the goal
 			// state (another actor finished the eviction first) —
 			// tolerated, no error accounting.
-			_, refused, err := heal.EvictPod(ctx, s.e.cs, nil, name, p, s.now)
+			delivered, refused, err := heal.EvictPod(ctx, s.e.cs, nil, name, p, s.now)
 			switch {
 			case refused:
 				// HTTP 429 — a PDB with disruptionsAllowed==0 refused
@@ -432,12 +439,30 @@ loop:
 					"pod", p.Namespace+"/"+p.Name, "node", name)
 				continue
 			case err != nil && !apierrors.IsNotFound(err):
+				errN++
 				metrics.IncError(s.e.queue)
 				s.log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)
 			}
+			if delivered {
+				deliveredN++
+			}
 			evicted++ // every attempt but a 429 refusal counts against the cap
 		}
+	}
+	// The sweep grant bought no heal when NOTHING was delivered and
+	// no actuation even errored — every attempt PDB/hold/reservation-
+	// refused, every candidate breaker-deferred (zero attempts), or
+	// every eviction answered NotFound (pod already gone — goal
+	// state, no mutation by us). Hand it back so a PDB-hung or
+	// breaker-open partition cannot burn the fleet budget every
+	// sweep (same accounting as EvictPodV's per-pod refund, folded
+	// to the one-grant-per-pass shape this module uses). Any
+	// delivery keeps the grant; an API error keeps it too — an
+	// attempted actuation that failed is the documented "spent
+	// token" case.
+	if gateProceed && deliveredN == 0 && errN == 0 {
+		heal.RefundGrant(s.now)
 	}
 	s.log.Info("sweep done", "evicted", evicted, "flaggedNodes", len(s.flagged))
 }

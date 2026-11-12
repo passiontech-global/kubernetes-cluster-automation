@@ -118,7 +118,7 @@ func TestCiliumL2LeaseGuardFlagsAndDeletes(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
 
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stale holder must fail the check: %+v", res)
 	}
@@ -147,7 +147,7 @@ func TestCiliumL2LeaseGuardFlagsAndDeletes(t *testing.T) {
 	}
 	// The ledger reconciled: after the heal the flagged tuple no
 	// longer re-asserts, so a second sweep passes (lease gone).
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("post-heal sweep must pass: %+v", res)
 	}
 	ciliumL2StaleLeaseGauge.DeleteLabelValues("cilium-l2announce-web_dead",
@@ -169,7 +169,7 @@ func TestCiliumL2LeaseGuardAgentStreak(t *testing.T) {
 	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
 
 	for cycle := 1; cycle <= 3; cycle++ {
-		res := chk.Run(ctx)
+		res := chk.Run(probetest.SweepCtx(ctx))
 		flagged := ciliumL2StaleLeaseGauge.DeleteLabelValues(
 			"cilium-l2announce-web_apps", "w-ag", l2ReasonAgentNotReady)
 		if cycle == 1 && flagged {
@@ -191,7 +191,7 @@ func TestCiliumL2LeaseGuardAgentStreak(t *testing.T) {
 				UpdateStatus(ctx, agent, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			if res := chk.Run(ctx); !res.Pass {
+			if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 				t.Fatalf("ready agent sweep must pass: %+v", res)
 			}
 			agent.Status.Conditions = nil
@@ -199,7 +199,7 @@ func TestCiliumL2LeaseGuardAgentStreak(t *testing.T) {
 				UpdateStatus(ctx, agent, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			res := chk.Run(ctx)
+			res := chk.Run(probetest.SweepCtx(ctx))
 			if flagged := ciliumL2StaleLeaseGauge.DeleteLabelValues(
 				"cilium-l2announce-web_apps", "w-ag", l2ReasonAgentNotReady); flagged || !res.Pass {
 				t.Fatalf("reset streak: one not-Ready cycle must not flag (res=%+v)", res)
@@ -227,7 +227,7 @@ func TestCiliumL2LeaseGuardOperatorNotReadyNeverFlags(t *testing.T) {
 	// Well past the streak threshold — an operator not-Ready never
 	// accumulates, so agent_not_ready never flags on a healthy node.
 	for range 4 {
-		res := chk.Run(ctx)
+		res := chk.Run(probetest.SweepCtx(ctx))
 		if flagged := ciliumL2StaleLeaseGauge.DeleteLabelValues(
 			"cilium-l2announce-web_apps", "w-op", l2ReasonAgentNotReady); flagged || !res.Pass {
 			t.Fatalf("operator not-Ready must never flag agent_not_ready (res=%+v)", res)
@@ -256,7 +256,7 @@ func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
 
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	if chk.agentNotReadyStreak.Count("w-gone") != 1 ||
 		chk.agentNotReadyStreak.Count("w-keep") != 1 {
 		t.Fatalf("streaks after one not-Ready sweep = %d/%d, want both 1",
@@ -269,7 +269,7 @@ func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
 		metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	if got := chk.agentNotReadyStreak.Count("w-gone"); got != 0 {
 		t.Fatalf("streak for a deleted node must be pruned, got %d", got)
 	}

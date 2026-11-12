@@ -86,7 +86,7 @@ func TestRunCheckCLIFailures(t *testing.T) {
 			Out: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
 		{Substr: "logs --since",
 			Out: "server_login_retry\npassword authentication failed\n"},
-		{Substr: "MAX(id)", Out: "1000|200|290\n"},
+		{Substr: "MAX(id)", Out: "1000|200|290|1\n"},
 		{Substr: "select 1", Out: "1\n"},
 	})
 	cfg.WireFn = func(context.Context, string) bool { return false }

@@ -52,7 +52,7 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("retries-exhausted HelmRelease must FAIL")
 	}
@@ -81,7 +81,7 @@ func TestCheckFluxHelmReleaseRetriesFreshQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("fresh failure must pass: %+v", res)
 	}
 }
@@ -100,7 +100,7 @@ func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr, dep))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck HR must FAIL even when remediation is deferred")
 	}
@@ -128,7 +128,7 @@ func TestCheckFluxHelmReleaseRetriesPersistedGate(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("still-stuck HR must keep FAILING")
 	}
@@ -163,7 +163,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("precondition: stuck HR must FAIL")
 	}
 	first, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
@@ -173,7 +173,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 
 	// 10m later — still inside the 30m cooldown.
 	p.Now = func() time.Time { return base.Add(10 * time.Minute) }
-	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still-stuck HR must keep FAILING")
 	}
 	got, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").

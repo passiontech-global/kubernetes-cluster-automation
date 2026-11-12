@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 )
 
@@ -97,8 +98,7 @@ const (
 	defaultFeedMaxFail     = 4                // WDFEED_MAX_FAIL
 	defaultFeedGraceFails  = 8                // WDFEED_STARTUP_GRACE_FAILS
 	defaultFeedProbeURL    = "https://127.0.0.1:6443/readyz"
-	defaultFeedProbeTO     = 5 * time.Second // curl --max-time 5
-	defaultFeederStateDir  = "/host/var/lib/k0s-systemd-watchdog"
+	defaultFeedProbeTO     = 5 * time.Second  // curl --max-time 5
 	defaultRemediateMinRst = 30 * time.Minute // WDREM_MIN_RESTART_INTERVAL=1800
 	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
 	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
@@ -197,6 +197,13 @@ type Config struct {
 	// HTTPClient, when set, is used for ALL apiserver queries (rv
 	// probes) and overrides the credential files — test seam.
 	HTTPClient *http.Client
+	// Coord is the L1↔L3 nodecoord handle (platform/nodecoord) —
+	// nil disables the maintenance hold (tests, minimal wiring).
+	// Restart paths consult Deps.HoldLocalAction first: while the
+	// cluster holds the maintenance mutex (kured drain / control-
+	// plane upgrade) L1 must not bounce k0scontroller and add
+	// churn. A configured Coord fails closed inside nodecoord.
+	Coord *nodecoord.Coord
 
 	// JournalDirs are the host journal storage roots — the
 	// journal-unreadable latch may only fire while at least one

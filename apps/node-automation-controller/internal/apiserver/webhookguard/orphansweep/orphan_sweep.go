@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -171,7 +170,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		// webhook list every reconcile — dropping entries past the
 		// Heal-Revert-Loop threshold fights Flux (the orphans are
 		// IN Git). Skip + report; fix the source in Git.
-		if !heal.FluxPatchGate(kind, p.cfgObj, kind+"/"+p.name, time.Now()) {
+		if !heal.FluxPatchGate(kind, p.cfgObj, kind+"/"+p.name, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — orphan-entry patch deferred",
 				"kind", kind, "config", p.name)
 			continue

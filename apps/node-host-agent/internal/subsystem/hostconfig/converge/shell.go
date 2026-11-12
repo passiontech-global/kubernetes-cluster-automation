@@ -57,6 +57,22 @@ func SHMarkerBase(s string) bool {
 	return err == nil
 }
 
+// shExecRe is SHTokenRe plus the square brackets IPv6 literals
+// legitimately carry ([::1]:2379 in a listen address or a metrics
+// bind) — still no space, quote, $, `, ;, &, |, <, > or newline.
+var shExecRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/@%+=\[\]-]+$`)
+
+// SHExecToken reports whether a NON-EMPTY value may be interpolated
+// into a systemd Exec line or the sh -c/bash -c wait-loop scripts
+// hostconfig renders (kine --listen-address/--metrics-bind-address,
+// TLS cert paths, the unix-socket path and the /dev/tcp probe
+// host): SHToken's injection surface plus the bracket pair IPv6
+// needs. Empty refuses — every gated slot is required or
+// conditionally rendered only when set.
+func SHExecToken(s string) bool {
+	return s != "" && shExecRe.MatchString(s)
+}
+
 // SHPort is SHToken for TCP/UDP ports destined for --dport or
 // /dev/tcp interpolation: digits only, 1-65535.
 func SHPort(s string) bool {
@@ -110,6 +126,16 @@ var (
 // and splice arbitrary directives after it).
 func CfgScalar(s string) bool {
 	return printableASCII(s) && !strings.ContainsAny(s, `:#"'`)
+}
+
+// CfgEnvVal gates a scalar rendered as KEY=value into a systemd
+// EnvironmentFile (kine.env's KINE_ENDPOINT — a DSN legitimately
+// carries :/?&= so CfgScalar's separator bans would refuse it):
+// printable ASCII only — a newline splices a whole extra VAR= line
+// into the unit's environment — and no '"', which re-opens
+// systemd's value quoting. Empty refuses.
+func CfgEnvVal(s string) bool {
+	return printableASCII(s) && !strings.Contains(s, `"`)
 }
 
 // CfgShellVal gates a scalar rendered inside a double-quoted shell

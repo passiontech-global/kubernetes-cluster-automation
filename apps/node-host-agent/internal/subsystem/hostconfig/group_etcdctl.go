@@ -5,6 +5,7 @@
 package hostconfig
 
 import (
+	"net"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -142,7 +143,10 @@ func (c *cyc) groupKineService() {
 			host = host[:i]
 		}
 		host = strings.Trim(host, "[]")
-		if host != "127.0.0.1" && host != "localhost" {
+		// Loopback stays unrestricted in every spelling — v4
+		// literal, name and the IPv6 loopback the mTLS cutover
+		// binds ([::1]:2379 parses to "::1" after the bracket trim).
+		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
 			missing := make([]string, 0, 3)
 			for _, name := range []string{
 				"kine_ca_file", "kine_server_cert_file", "kine_server_key_file",
@@ -160,6 +164,36 @@ func (c *cyc) groupKineService() {
 					"listen", listen, "missing", strings.Join(missing, ", "))
 				return
 			}
+		}
+	}
+
+	// Render-bound kine_* gates — every value that lands in
+	// kine.env or the unit's Exec lines must fit its sink's
+	// charset BEFORE the binary download runs, so a refused var
+	// keeps last-good unit+env (same fail-closed contract as the
+	// mTLS guard above). The TLS paths are optional — empty passes
+	// and renders no flag; the required scalars cannot be empty
+	// here (ep=="" returned above, defStr defaults the rest).
+	// kine_bin_{url,sha256} and kine_service_hosts stay ungated:
+	// they feed the sha256-verified HTTP transport and a list
+	// membership compare, never a render — a hostile value there
+	// fails the download or matches nothing.
+	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
+	caFile := c.t.Vars.StrDef("kine_ca_file", "")
+	certFile := c.t.Vars.StrDef("kine_server_cert_file", "")
+	keyFile := c.t.Vars.StrDef("kine_server_key_file", "")
+	if !c.cfgEnvVal("kine_endpoint", ep) ||
+		!c.shExecToken("kine_listen_address", listen) ||
+		!c.shExecToken("kine_metrics_bind_address", metrics) {
+		return
+	}
+	for _, kv := range []struct{ name, val string }{
+		{"kine_ca_file", caFile},
+		{"kine_server_cert_file", certFile},
+		{"kine_server_key_file", keyFile},
+	} {
+		if kv.val != "" && !c.shExecToken(kv.name, kv.val) {
+			return
 		}
 	}
 
@@ -219,20 +253,21 @@ func (c *cyc) groupKineService() {
 	// Defaults mirror the invocation k0s uses for embedded kine:
 	// --listen-address=unix://<KineSocketPath> + --metrics-bind-address
 	// =:2380 (HUBMETRICS whitelist + hub-kine-metrics ServiceMonitor).
-	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
+	// metrics/caFile/certFile/keyFile were read and gated above —
+	// before the binary download — so the render reuses those locals.
 	// Phase-3 mTLS cutover (spec.storage.etcd.externalCluster over
 	// TCP :2379): when the cert vars are declared they become kine's
 	// etcd-client TLS flags — unset vars render no flag at all, so a
 	// plaintext-TCP or unix-socket deployment stays byte-identical.
 	tls := ""
-	if s := c.t.Vars.StrDef("kine_ca_file", ""); s != "" {
-		tls += " --ca-file=" + s
+	if caFile != "" {
+		tls += " --ca-file=" + caFile
 	}
-	if s := c.t.Vars.StrDef("kine_server_cert_file", ""); s != "" {
-		tls += " --server-cert-file=" + s
+	if certFile != "" {
+		tls += " --server-cert-file=" + certFile
 	}
-	if s := c.t.Vars.StrDef("kine_server_key_file", ""); s != "" {
-		tls += " --server-key-file=" + s
+	if keyFile != "" {
+		tls += " --server-key-file=" + keyFile
 	}
 	// unix socket: /run is tmpfs — create the parent dir before start
 	// (k0scontroller creates that dir, but it starts AFTER because of
@@ -257,10 +292,23 @@ func (c *cyc) groupKineService() {
 		// fail-the-unit contract as the unix wait: a 30s no-show
 		// exits non-zero so Restart=always retries instead of
 		// booting the apiserver on a dead endpoint.
-		execPost = "ExecStartPost=/bin/bash -c 'i=0; while ! (echo > /dev/tcp/" +
-			strings.Replace(hp, ":", "/", 1) +
-			") 2>/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; (echo > /dev/tcp/" +
-			strings.Replace(hp, ":", "/", 1) + ") 2>/dev/null'\n"
+		//
+		// IPv6: net.SplitHostPort strips the [::1] brackets and
+		// bash /dev/tcp accepts the bare v6 literal (the LAST '/'
+		// separates host from port, colons inside are fine) — the
+		// old strings.Replace(hp, ":", "/", 1) turned
+		// "[::1]:2379" into "[/:1]:2379" and the wait-loop could
+		// never succeed.
+		tcpHost, tcpPort := hp, ""
+		if h, p, err := net.SplitHostPort(hp); err == nil {
+			tcpHost, tcpPort = h, p
+		} else if h, p, _ := strings.Cut(hp, ":"); h != "" && p != "" {
+			tcpHost, tcpPort = h, p
+		}
+		devtcp := "/dev/tcp/" + tcpHost + "/" + tcpPort
+		execPost = "ExecStartPost=/bin/bash -c 'i=0; while ! (echo > " + devtcp +
+			") 2>/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; (echo > " +
+			devtcp + ") 2>/dev/null'\n"
 	}
 	// unit file rendered from templates/kine.service.j2 — the
 	// ExecStart line concatenates the optional ExecStartPre/Post

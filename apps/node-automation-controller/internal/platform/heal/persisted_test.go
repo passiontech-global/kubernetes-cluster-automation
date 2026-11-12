@@ -57,7 +57,7 @@ func TestPersistedCooledDownWiderOfBoth(t *testing.T) {
 				// relative to a matching now.
 				when = time.Unix(1762871400, 0).Add(time.Minute)
 			}
-			got := PersistedCooledDown(tc.ledger, tc.obj,
+			got := PersistedCooledDown(ctx, tc.ledger, tc.obj,
 				"passiontech.dev/last-heal", tc.ledgerKey, cool, when)
 			if got != tc.want {
 				t.Fatalf("PersistedCooledDown = %v, want %v", got, tc.want)
@@ -72,7 +72,7 @@ func TestStampPersistedStampsOnlyOnDelivery(t *testing.T) {
 	now := time.Now()
 
 	var ledger state.CooldownSet
-	err := StampPersisted(ctx,
+	err := StampPersisted(ctx, nil,
 		func(context.Context, []byte) error { return errors.New("patch rejected") },
 		"passiontech.dev/last-heal", &ledger, "k", now)
 	if err == nil {
@@ -83,7 +83,7 @@ func TestStampPersistedStampsOnlyOnDelivery(t *testing.T) {
 	}
 
 	var payload []byte
-	err = StampPersisted(ctx,
+	err = StampPersisted(ctx, nil,
 		func(_ context.Context, data []byte) error {
 			payload = data
 			return nil
@@ -106,7 +106,7 @@ func TestStampPersistedStampsOnlyOnDelivery(t *testing.T) {
 
 // A nil ledger skips the in-RAM half — the annotation alone persists.
 func TestStampPersistedNilLedger(t *testing.T) {
-	if err := StampPersisted(ctx,
+	if err := StampPersisted(ctx, nil,
 		func(context.Context, []byte) error { return nil },
 		"passiontech.dev/last-heal", nil, "k", time.Now()); err != nil {
 		t.Fatal(err)

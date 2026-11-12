@@ -198,7 +198,31 @@ var (
 		"node_host_agent_max_user_namespaces",
 		"/proc/sys/user/max_user_namespaces — userns creation ceiling (kernel-resource-table-tuning).",
 		[]string{"node"}, nil)
+	// The NETLINK_SOCK_DIAG per-state census (netlinkx) — the full
+	// TCP state histogram /proc/net/sockstat can't express (it only
+	// breaks out inuse/orphan/tw). Emitted for every named state
+	// when the dump succeeds: a 0 is data, an absent series is an
+	// inconclusive read.
+	descSockTCPState = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_state_sockets",
+		"TCP sockets per kernel state from the NETLINK_SOCK_DIAG dump — the full census sockstat's inuse/orphan/tw split can't express.",
+		[]string{"node", "state"}, nil)
 )
+
+// tcpStateNames maps the kernel idiag_state ids the sock_diag dump
+// reports (include/net/tcp_states.h — the same numbering
+// /proc/net/tcp's st column uses) to stable label values. States
+// past CLOSING (NEW_SYN_RECV and friends) are kernel-internal and
+// stay unlabeled — the census covers the operator-visible set.
+var tcpStateNames = []struct {
+	id   uint8
+	name string
+}{
+	{1, "established"}, {2, "syn_sent"}, {3, "syn_recv"},
+	{4, "fin_wait1"}, {5, "fin_wait2"}, {6, "time_wait"},
+	{7, "close"}, {8, "close_wait"}, {9, "last_ack"},
+	{10, "listen"}, {11, "closing"},
+}
 
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
 // max" (fields 0 and 2; the middle "unused" field is always ~0 on
@@ -252,29 +276,9 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 	nr, nrOK := hostutil.ReadUintFile(aioNrFile)
 	mx, mxOK := hostutil.ReadUintFile(aioMaxFile)
-	if nrOK && mxOK {
-		// kernel-resource-table-tuning — runtime aio-max-nr bump: past 75% of the table
-		// with headroom left, double the limit in place (direct
-		// sysctl write — /proc/sys rejects atomic-rename writes)
-		// so io_setup() does not EAGAIN while hostconfig's
-		// convergence pass is still pending. A failed write is
-		// silent: the gauges below still report the truth. Runs
-		// BEFORE the maximum emit so the series shows the bumped
-		// ceiling, not the pre-bump one.
-		if mx > 0 && mx < aioMaxTarget &&
-			float64(nr)/float64(mx) > aioUsedRatioBump {
-			bumped := mx * 2
-			if bumped > aioMaxTarget {
-				bumped = aioMaxTarget
-			}
-			if hostutil.WriteFileDirect(aioMaxFile,
-				strconv.FormatUint(bumped, 10)) == nil {
-				if v, ok := hostutil.ReadUintFile(aioMaxFile); ok {
-					mx = v
-				}
-			}
-		}
-	}
+	// kernel-resource-table-tuning — the runtime aio-max-nr bump
+	// WRITE lives in reconcileHostWrites (host_writes.go) on the
+	// 30s latch tick; Collect stays read-only.
 	if nrOK {
 		ch <- prometheus.MustNewConstMetric(descAIOAllocated,
 			prometheus.GaugeValue, float64(nr), c.cfg.NodeName)
@@ -324,6 +328,10 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(stateCounts[0x08]), c.cfg.NodeName)
 		c.emitPerTupleHotspot(ch, perTuple)
 	}
+	// The sock_diag census is independent of the /proc tables — it
+	// must emit (or stay absent) regardless of the file reads, so
+	// it runs before the sockstat file's early return too.
+	c.collectTCPStates(ch)
 	f, err := os.Open(c.cfg.SockstatFile)
 	if err != nil {
 		return
@@ -407,6 +415,23 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 	}
 }
 
+// collectTCPStates emits the NETLINK_SOCK_DIAG per-state histogram
+// through the netlinkx seam — pid 1 is the host init under
+// hostPID:true, the same convention every /proc/1/net read in this
+// file follows. A failed dump emits nothing: inconclusive, never a
+// fabricated zero census.
+func (c *Collector) collectTCPStates(ch chan<- prometheus.Metric) {
+	states, err := c.cfg.TCPStatesFn(1)
+	if err != nil {
+		return
+	}
+	for _, s := range tcpStateNames {
+		ch <- prometheus.MustNewConstMetric(descSockTCPState,
+			prometheus.GaugeValue, float64(states[s.id]),
+			c.cfg.NodeName, s.name)
+	}
+}
+
 // ephemeralPortWidth returns the ip_local_port_range span — the
 // count of ports the kernel picks source ports from. The sysctl
 // file carries "<low> <high>"; an unreadable/malformed file or an
@@ -457,10 +482,19 @@ func hexSockAddr(s string) string {
 	if len(raw) == 4 {
 		return fmt.Sprintf("%d.%d.%d.%d:%d", raw[3], raw[2], raw[1], raw[0], pn)
 	}
-	// tcp6 renders the 16 in6_addr bytes contiguously in network
-	// order (the per-u32 little-endian shuffle is the v4-only
-	// artifact) — net.IP formats it straight.
-	return fmt.Sprintf("[%s]:%d", net.IP(raw).String(), pn)
+	// tcp6 prints the 16 in6_addr bytes as four u32 words, EACH in
+	// host (little-endian) byte order — the same per-word shuffle
+	// the v4 column gets, applied inside every 4-byte group. A
+	// contiguous decode yields a wrong address (::1 reads back as
+	// ::100:0), so reverse each word before handing to net.IP.
+	var v6 [16]byte
+	for i := 0; i < 4; i++ {
+		v6[i*4+0] = raw[i*4+3]
+		v6[i*4+1] = raw[i*4+2]
+		v6[i*4+2] = raw[i*4+1]
+		v6[i*4+3] = raw[i*4+0]
+	}
+	return fmt.Sprintf("[%s]:%d", net.IP(v6[:]).String(), pn)
 }
 
 // tcpTableScan is one streaming pass over the /proc/net/tcp{,6}

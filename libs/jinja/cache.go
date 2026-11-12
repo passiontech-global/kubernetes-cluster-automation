@@ -95,20 +95,41 @@ func parsedTemplate(src string) ([]tnode, error) {
 // regexCache memoizes compiled patterns for the regex_* filters and
 // the `is search` test — templates reuse a handful of fixed patterns
 // and regexp.Compile parsed and NFA-built per call. Patterns
-// originate in vendored template files (a bounded set), so the map
-// needs no eviction; compile FAILURES are not cached (a bad pattern
-// is rare, re-erroring is identical, and failures stay off the hot
-// path they'd never benefit from).
-var regexCache sync.Map // pattern (string) -> *regexp.Regexp
+// normally originate in vendored template files (a bounded set), but
+// a template can build a pattern from data (regex_replace on a
+// user-controlled string), so the map is capped like logx's logger
+// cache: past the cap new patterns compile per call — correct,
+// just slower — rather than the map leaking.
+var regexCache = struct {
+	sync.RWMutex
+	m map[string]*regexp.Regexp
+}{m: make(map[string]*regexp.Regexp)}
+
+// regexCacheCap bounds regexCache's live entries.
+const regexCacheCap = 512
 
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
-	if re, ok := regexCache.Load(pattern); ok {
-		return re.(*regexp.Regexp), nil
+	regexCache.RLock()
+	re, ok := regexCache.m[pattern]
+	regexCache.RUnlock()
+	if ok {
+		return re, nil
 	}
-	re, err := regexp.Compile(pattern)
+	compiled, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
-	regexCache.Store(pattern, re)
-	return re, nil
+	regexCache.Lock()
+	defer regexCache.Unlock()
+	// A racer may have cached the same pattern while we compiled —
+	// keep the first (identical) result.
+	if re, ok := regexCache.m[pattern]; ok {
+		return re, nil
+	}
+	// At cap the pattern compiles fresh every call — correct,
+	// uncached — rather than the map leaking.
+	if len(regexCache.m) < regexCacheCap {
+		regexCache.m[pattern] = compiled
+	}
+	return compiled, nil
 }

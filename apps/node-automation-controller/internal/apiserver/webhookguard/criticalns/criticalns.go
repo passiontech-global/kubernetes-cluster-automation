@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
-	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -298,7 +297,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		// Past the Heal-Revert-Loop threshold the patch SKIPS — the
 		// missing-exclusion series stays live (onFail) and the
 		// conflict counter fires, so the drift gets fixed in Git.
-		if !heal.FluxPatchGate(kind, cfgObj, kind+"/"+cfgName, time.Now()) {
+		if !heal.FluxPatchGate(kind, cfgObj, kind+"/"+cfgName, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — exclusion patch deferred",
 				"kind", kind, "config", cfgName)
 			onFail()

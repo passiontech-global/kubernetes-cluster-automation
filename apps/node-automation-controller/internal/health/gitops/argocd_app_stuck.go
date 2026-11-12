@@ -167,7 +167,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 				data, metav1.PatchOptions{}); err != nil {
 				return err
 			}
-			probefw.MergeAnnoPatchLocally(app, data)
+			probefw.MergeAnnoPatchLocally(ctx, app, data)
 			return nil
 		}
 

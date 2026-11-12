@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -52,7 +53,11 @@ var ErrNoSQLite3 = errors.New("sqlite3 binary not found on host")
 
 const (
 	kineCheckpointBudget = 2 * time.Minute // per-checkpoint exec bound
-	kineStoreMaxFiles    = 1 << 16         // bounded filestore walk
+	// kineLargeObjectsBudget bounds the read-only top-N size query —
+	// a diagnostic SELECT needs seconds, not the checkpoint's 2m;
+	// a wedged DB must not stall the hygiene cycle on it.
+	kineLargeObjectsBudget = 15 * time.Second
+	kineStoreMaxFiles      = 1 << 16 // bounded filestore walk
 
 	// Metric names — the Prometheus alerts (KineDatabaseSizeCritical,
 	// NodeKubeconfigCertExpiringSoon) key on these exact series.
@@ -210,27 +215,76 @@ func dirSizeBounded(root string, maxFiles int) (int64, error) {
 	return total, err
 }
 
-// sqlite3WALCheckpoint is the default CheckpointFn: run
-// `PRAGMA wal_checkpoint(TRUNCATE)` through the host sqlite3 CLI.
-// busy_timeout=5000 caps lock waits at 5s — effectively
-// non-blocking for the agent cycle (a busy WAL just errors out and
-// retries after the cooldown). ErrNoSQLite3 when the binary is
-// absent so the caller skips without spending the cooldown.
-func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
-	bin, err := exec.LookPath("sqlite3")
-	if err != nil {
-		return ErrNoSQLite3
+// sqlite3Host splits a pod-view db path into the hostexec runner +
+// host-side path the nsenter wrap needs. "/host/..." is the
+// DaemonSet host mount (the cdeps path convention); anything else is
+// already a host path — standalone hostRoot "/" runs unwrapped, so
+// container-side IS host-side there.
+func sqlite3Host(dbPath string) (*hostexec.Runner, string) {
+	hr, host := "/", dbPath
+	if rest, ok := strings.CutPrefix(dbPath, "/host/"); ok {
+		hr, host = "/host", "/"+rest
 	}
-	cctx, cancel := context.WithTimeout(ctx, kineCheckpointBudget)
-	defer cancel()
-	// cdeps.ScrubSystemdEnv through the env slot, not scrubArgv: the
-	// `env -u` prefix would have to resolve `env` on the pod
-	// image's PATH — the filtered environ is applied directly.
-	out, err := hostexec.RunCombinedEnv(cctx, cdeps.ScrubSystemdEnv(os.Environ()),
-		bin, dbPath, "PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
+	return hostexec.New(hostexec.Config{HostRoot: hr,
+		Timeout: kineCheckpointBudget}), host
+}
+
+// sqlite3Missing reports whether an exec failure means "no sqlite3
+// binary" — the unwrapped standalone case surfaces exec.ErrNotFound
+// ("executable file not found in $PATH"); the nsenter-wrapped
+// DaemonSet case surfaces the child's own ENOENT text ("failed to
+// execute sqlite3: No such file or directory"). A missing DB file
+// does NOT match — sqlite3 runs and prints "unable to open" instead.
+func sqlite3Missing(err error) bool {
+	return errors.Is(err, exec.ErrNotFound) ||
+		strings.Contains(err.Error(), "executable file not found") ||
+		strings.Contains(err.Error(), "No such file or directory")
+}
+
+// reCheckpointRow matches the `busy|log_frames|checkpointed_frames`
+// result row `PRAGMA wal_checkpoint` prints.
+var reCheckpointRow = regexp.MustCompile(`^\s*(\d+)\|(\d+)\|(\d+)`)
+
+// walCheckpointBusy reports whether the checkpoint result row shows
+// busy=1 — the pragma exits 0 even when it could not finish (readers
+// pinning the WAL), so the exit code alone reads a no-op checkpoint
+// as success and the WAL keeps growing behind a "ok" cycle.
+func walCheckpointBusy(out string) bool {
+	for _, ln := range strings.Split(out, "\n") {
+		if m := reCheckpointRow.FindStringSubmatch(strings.TrimSpace(ln)); m != nil {
+			return m[1] == "1"
+		}
+	}
+	return false
+}
+
+// sqlite3WALCheckpoint is the default CheckpointFn: run
+// `PRAGMA wal_checkpoint(TRUNCATE)` through the HOST sqlite3 —
+// nsenter-wrapped like every other host binary (journalctl/ss), so
+// the pod image does not need to carry sqlite3 and the binary is the
+// host's own build against the host's DB. busy_timeout=5000 caps
+// lock waits at 5s — effectively non-blocking for the agent cycle (a
+// busy WAL just errors out and retries after the cooldown); the
+// ExecCombinedBounded budget is the hard deadline on top. A busy
+// checkpoint row (busy=1) is an error, not a success. ErrNoSQLite3
+// when the host has no sqlite3 so the caller skips without spending
+// the cooldown. No NOTIFY_SOCKET/WATCHDOG_* scrub: sqlite3
+// implements no sd_notify protocol — the scrub guarded the
+// systemctl/journalctl paths only.
+func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
+	r, hostDB := sqlite3Host(dbPath)
+	out, err := r.ExecCombinedBounded(ctx, hostexec.NSAll,
+		kineCheckpointBudget, "sqlite3", hostDB,
+		"PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
+		if sqlite3Missing(err) {
+			return ErrNoSQLite3
+		}
 		return fmt.Errorf("sqlite3 wal_checkpoint: %w: %s",
 			err, strings.TrimSpace(out))
+	}
+	if walCheckpointBusy(out) {
+		return errors.New("sqlite3 wal_checkpoint: busy (readers pin the WAL)")
 	}
 	return nil
 }
@@ -273,22 +327,24 @@ func (c *StorageCheck) runLargeObjectScan(ctx context.Context) {
 }
 
 // sqlite3KineLargeObjects is the default LargeObjectsFn: run the
-// top-N value-size query through the host sqlite3 CLI.
-// busy_timeout=2000 caps lock waits at 2s — a busy DB just errors
-// out and retries after the cooldown. ErrNoSQLite3 when the binary
-// is absent so the caller skips without spending the cooldown.
+// top-N value-size query through the HOST sqlite3 — same
+// hostexec/nsenter contract as sqlite3WALCheckpoint (the pod image
+// need not ship sqlite3). busy_timeout=5000 matches the checkpoint
+// pragma (a busy DB waits up to 5s for the lock, then errors out
+// and retries after the cooldown); the 15s exec budget is the hard
+// deadline — this is a read-only diagnostic, not a maintenance op.
+// ErrNoSQLite3 when the host has no sqlite3 so the caller skips
+// without spending the cooldown.
 func sqlite3KineLargeObjects(ctx context.Context, dbPath string) ([]KineLargeObject, error) {
-	bin, err := exec.LookPath("sqlite3")
-	if err != nil {
-		return nil, ErrNoSQLite3
-	}
-	cctx, cancel := context.WithTimeout(ctx, kineCheckpointBudget)
-	defer cancel()
-	// Same env-scrub contract as sqlite3WALCheckpoint.
-	out, err := hostexec.RunCombinedEnv(cctx, cdeps.ScrubSystemdEnv(os.Environ()),
-		bin, dbPath, "PRAGMA busy_timeout=2000; SELECT name, length(value) "+
+	r, hostDB := sqlite3Host(dbPath)
+	out, err := r.ExecCombinedBounded(ctx, hostexec.NSAll,
+		kineLargeObjectsBudget, "sqlite3", hostDB,
+		"PRAGMA busy_timeout=5000; SELECT name, length(value) "+
 			"FROM kine WHERE deleted = 0 ORDER BY length(value) DESC LIMIT 10;")
 	if err != nil {
+		if sqlite3Missing(err) {
+			return nil, ErrNoSQLite3
+		}
 		return nil, fmt.Errorf("sqlite3 kine large objects: %w: %s",
 			err, strings.TrimSpace(out))
 	}

@@ -13,6 +13,7 @@ package leases
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,6 +133,11 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			for k, lv := range p.emitted.Last() {
 				if strings.HasPrefix(k, key+"/") {
 					rep.Carry(k, lv)
+					// A held series with no finding reads Pass
+					// while the gauge still shows 1 — re-assert the
+					// warning in the same "ns/name(reason)" shape
+					// the live emit uses.
+					rep.Find(key + "(" + strings.TrimPrefix(k, key+"/") + ")")
 				}
 			}
 			continue
@@ -237,9 +243,10 @@ func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
 
 	reason := ""
 	hit, err := kube.ReadPodLogTail(ctx, cs, pod, kube.PodLogOpts{
-		TailLines: ksmLogTailLines,
-		MaxBytes:  ksmLogMaxBytes,
-		Timeout:   ksmLogTimeout,
+		TailLines:    ksmLogTailLines,
+		SinceSeconds: 900,
+		MaxBytes:     ksmLogMaxBytes,
+		Timeout:      ksmLogTimeout,
 	}, func(line string) bool {
 		l := strings.ToLower(line)
 		for _, sig := range ksmWedgeSignatures {
@@ -271,8 +278,8 @@ func (p *controllerLeaseGuardCheck) ksmReflectorErrorIncrease(
 	// only ever produced watch errors would sum to nothing and the
 	// signal would never fire.
 	samples, err := p.PromQuery(ctx, fmt.Sprintf(
-		`(sum(increase(kube_state_metrics_list_total{result="error",pod="%s"}[10m])) or vector(0)) + (sum(increase(kube_state_metrics_watch_total{result="error",pod="%s"}[10m])) or vector(0))`,
-		pod.Name, pod.Name))
+		`(sum(increase(kube_state_metrics_list_total{result="error",pod=%s}[10m])) or vector(0)) + (sum(increase(kube_state_metrics_watch_total{result="error",pod=%s}[10m])) or vector(0))`,
+		strconv.Quote(pod.Name), strconv.Quote(pod.Name)))
 	if err != nil {
 		return 0, err
 	}

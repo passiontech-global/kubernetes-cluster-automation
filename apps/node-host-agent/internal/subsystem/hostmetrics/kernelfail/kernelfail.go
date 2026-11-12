@@ -41,6 +41,8 @@ package kernelfail
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -84,13 +86,14 @@ type Deps struct {
 	// (roadmap A5) — /sys/fs/ext4/<dev>/errors_count, the
 	// superblock-resident count that survives agent restarts AND
 	// remounts; > 0 means the kernel logged metadata errors on that
-	// filesystem at some point. Empty → defaultExt4ErrorsGlob.
+	// filesystem at some point. Empty → the default glob
+	// HostRoot-joined (pod mode reads /host/sys/...).
 	Ext4ErrorsGlob string
 	// NVMeSmartGlob globs the NVMe controller SMART sysfs pages —
 	// /sys/class/nvme/nvme*/smart_log, the packed nvme_smart_log
 	// struct where mainline kernels ship it (vendor kernels do; the
 	// missing-attribute case falls back to `nvme smart-log` via
-	// RunHostCmd). Empty → defaultNVMeSmartGlob.
+	// RunHostCmd). Empty → the default glob HostRoot-joined.
 	NVMeSmartGlob string
 
 	// TickInterval is the latch ticker's expected cadence — carried
@@ -124,9 +127,10 @@ type Deps struct {
 	// stubs via cfg.adjtimexFn still land).
 	Adjtimex func(*unix.Timex) (int, error)
 	// RunHostCmd executes a host binary for the deep-failure probes
-	// that have no Config seam (chronyc, dmesg). Nil selects
-	// defaultRunHostCmd — the 30s-cap hostexec.RunCombined
-	// convention nethealth shares.
+	// that have no Config seam (chronyc, dmesg, nvme smart-log).
+	// Nil selects defaultRunHostCmd — a hostexec.Runner entering
+	// every host PID-1 namespace (nsenter -t 1 -m -u -i -n -p),
+	// HostRoot-aware so standalone layouts run unwrapped.
 	RunHostCmd func(ctx context.Context, argv ...string) (string, error)
 	// KmsgDevicePaths returns the /dev/kmsg candidates — nil
 	// selects defaultKmsgDevicePaths ("/dev/kmsg" plus the
@@ -166,7 +170,7 @@ func (d Deps) warpDelta(now, prev time.Time) time.Duration {
 // New applies the seam defaults and returns the engine.
 func New(d Deps) *Runner {
 	if d.RunHostCmd == nil {
-		d.RunHostCmd = defaultRunHostCmd
+		d.RunHostCmd = defaultRunHostCmd(d.HostRoot)
 	}
 	if d.KmsgDevicePaths == nil {
 		d.KmsgDevicePaths = defaultKmsgDevicePaths
@@ -174,11 +178,16 @@ func New(d Deps) *Runner {
 	if d.TickInterval <= 0 {
 		d.TickInterval = defaultTickInterval
 	}
+	// The sysfs globs are host-side paths — HostRoot-joined like the
+	// clocksource/bpffs defaults so pod mode reads /host/sys/... and
+	// standalone "/" stays /sys/... . An explicitly-set glob is used
+	// verbatim (tests point them at fixture trees; a caller that
+	// wants the host view passes the joined path itself).
 	if d.Ext4ErrorsGlob == "" {
-		d.Ext4ErrorsGlob = defaultExt4ErrorsGlob
+		d.Ext4ErrorsGlob = filepath.Join(d.HostRoot, defaultExt4ErrorsGlob)
 	}
 	if d.NVMeSmartGlob == "" {
-		d.NVMeSmartGlob = defaultNVMeSmartGlob
+		d.NVMeSmartGlob = filepath.Join(d.HostRoot, defaultNVMeSmartGlob)
 	}
 	if d.Clock == nil {
 		d.Clock = timex.NewCell(nil)
@@ -207,7 +216,9 @@ func (r *Runner) Refresh(ctx context.Context) {
 	// disk-pre-fail (A5) — ext4 errors_count + NVMe SMART early
 	// indicators: the death-bed warning BEFORE the filesystem
 	// aborts read-only, while the LocalPV data is still evacuable.
-	r.updateDiskPreFailEvidence()
+	// ctx rides through so the nvme-cli fallback probes cancel with
+	// the ticker instead of pinning context.Background().
+	r.updateDiskPreFailEvidence(ctx)
 }
 
 // Close releases the /dev/kmsg fd the session holds — the
@@ -218,14 +229,26 @@ func (r *Runner) Close() {
 	r.closeKMSSession(&r.kscan)
 }
 
-// defaultRunHostCmd is the nil-seam default — a 30s cap over
-// hostexec.RunCombined (capped output + WaitDelay, no second
-// timeout stacked underneath), the nethealth runHostCmd
-// convention.
-func defaultRunHostCmd(ctx context.Context, argv ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	return hostexec.RunCombined(cctx, argv...)
+// defaultRunHostCmd builds the nil-seam host-command executor for
+// hostRoot — a hostexec.Runner entering EVERY host PID-1 namespace
+// (NSAll: mount for /dev/nvme nodes and the host fs view, network
+// for chronyc's /var/run/chrony socket and DNS, pid for process
+// tools), with HostRoot "/" collapsing to an unwrapped exec on
+// standalone hosts. The probes it serves are HOST probes — a
+// container-side RunCombined would resolve chronyc/nvme against
+// the pod's namespaces and silently misread (or miss) the host
+// state they exist to check. The 30s cap sits on top of the
+// runner's own Config.Timeout default.
+func defaultRunHostCmd(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
+	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot})
+	return func(ctx context.Context, argv ...string) (string, error) {
+		if len(argv) == 0 {
+			return "", errors.New("kernelfail: empty host argv")
+		}
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return runner.ExecCombined(cctx, hostexec.NSAll, argv[0], argv[1:]...)
+	}
 }
 
 // defaultKmsgDevicePaths is the nil-seam default — the real

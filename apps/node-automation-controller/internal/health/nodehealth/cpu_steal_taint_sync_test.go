@@ -40,7 +40,7 @@ func TestCPUStealTaintsPressuredWorkerWithHeadroom(t *testing.T) {
 	w3 := testutil.Node("w3", corev1.ConditionTrue, nil)
 	cs := fake.NewSimpleClientset(w1, w2, w3)
 	p := testProber(cs)
-	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("sustained steal pressure must fail: %+v", res)
 	}
@@ -67,7 +67,7 @@ func TestCPUStealZombieHeartbeatDoesNotTaint(t *testing.T) {
 		testutil.Node("w3", corev1.ConditionTrue, nil),
 		testutil.Node("w4", corev1.ConditionTrue, nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("zombie steal latch must not fail the check: %+v", res)
 	}
@@ -81,7 +81,7 @@ func TestCPUStealZombieHeartbeatDoesNotTaint(t *testing.T) {
 	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, w1, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("fresh steal latch must fail the check: %+v", res)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
@@ -138,7 +138,7 @@ func TestCPUStealSkipsTaintWithoutHeadroom(t *testing.T) {
 	w2 := stealNode("w2", corev1.ConditionTrue, 20*time.Minute)
 	cs := fake.NewSimpleClientset(w1, w2)
 	p := testProber(cs)
-	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("sustained steal pressure must fail: %+v", res)
 	}
@@ -159,7 +159,7 @@ func TestCPUStealUntaintsAfterClearWindow(t *testing.T) {
 	chk := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p)
 	base := time.Now()
 	p.Now = func() time.Time { return base }
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("sustained steal pressure must fail: %+v", res)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
@@ -176,14 +176,14 @@ func TestCPUStealUntaintsAfterClearWindow(t *testing.T) {
 	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, w1n, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update node status: %v", err)
 	}
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("cleared pressure should pass: %+v", res)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("taint lifted inside the clear window")
 	}
 	base = base.Add(11 * time.Minute)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("cleared pressure should pass: %+v", res)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
@@ -208,7 +208,7 @@ func TestCPUStealUntaintRestartResume(t *testing.T) {
 			time.Now().Add(-(cpuStealClearMinAge + time.Minute)).
 				UTC().Format(time.RFC3339) + `"}`}
 	cs := fake.NewSimpleClientset(w1)
-	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(ctx)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("cleared pressure should pass: %+v", res)
 	}
@@ -235,7 +235,7 @@ func TestCPUStealTaintDefersUnderOpenCircuit(t *testing.T) {
 	for range 3 {
 		heal.TryAcquireTarget(CheckNameCPUStealTaintSync, "w1", now)
 	}
-	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(ctx)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("sustained steal pressure must still fail: %+v", res)
 	}

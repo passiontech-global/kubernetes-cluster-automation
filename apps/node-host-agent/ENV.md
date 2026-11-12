@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (137 knobs
+source location of every reference in that package (139 knobs
 referenced across 16 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -155,6 +155,8 @@ subsystem has no env gate.
 ### `internal/subsystem/hubsync`
 
 - `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `config_env.go:45`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY` — `config_env.go:47, ssh.go:298`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT` — `config_env.go:46, ssh.go:297`
 - `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:44`
 
 ### `internal/subsystem/janitor`

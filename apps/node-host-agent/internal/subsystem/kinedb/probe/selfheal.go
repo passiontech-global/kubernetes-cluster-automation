@@ -63,23 +63,33 @@ const (
 // stuckSessionPredicate is the reaper's pg_stat_activity WHERE
 // clause — shared by the terminate query and the read-only COUNT
 // so the two paths can never disagree on what "stuck" means.
-// Maintenance tooling is exempt: pg_repack/pg_dump copy the whole
-// table inside one long transaction (their sessions legitimately
-// sit active >10m or idle-in-transaction >5m between cursor
-// fetches), and node_host_agent_maint is the maint block's own
-// marker — reaping those would abort the very remediation that
-// fixes the bloat. The query ILIKE guards catch the same tools'
-// VACUUM/ANALYZE/REINDEX/DROP INDEX statements that carry no
-// application_name (psql -qc children of our own maint block).
+// Maintenance tooling is exempt ONLY up to maintSessionMaxAge:
+// pg_repack/pg_dump copy the whole table inside one long
+// transaction (their sessions legitimately sit active >10m or
+// idle-in-transaction >5m between cursor fetches), and
+// node_host_agent_maint is the maint block's own marker — reaping
+// those would abort the very remediation that fixes the bloat. But
+// a maintenance session older than 45 minutes cannot be legitimate
+// work: every maint exec runs under the ~15m long budget, so an
+// older session is an orphan left behind by a killed docker exec —
+// the cap reaps it instead of letting it hold the advisory lock or
+// a repack shadow table forever. The query ILIKE guards catch the
+// same tools' VACUUM/ANALYZE/REINDEX/DROP INDEX statements that
+// carry no application_name (psql -qc children of our own maint
+// block).
+const maintSessionMaxAge = "45 minutes"
+
 const stuckSessionPredicate = "WHERE datname IN ('postgres', 'kine') " +
-	"AND application_name NOT IN ('pg_repack', 'pg_dump', 'node_host_agent_maint') " +
+	"AND ((application_name IN ('pg_repack', 'pg_dump', 'node_host_agent_maint') " +
+	"AND backend_start < now() - interval '" + maintSessionMaxAge + "') OR " +
+	"(application_name NOT IN ('pg_repack', 'pg_dump', 'node_host_agent_maint') " +
 	"AND ((state = 'idle in transaction' " +
 	"AND state_change < now() - interval '5 minutes') OR " +
 	"(state = 'active' AND query_start < now() - interval '10 minutes' " +
 	"AND query NOT ILIKE '%VACUUM%' AND query NOT ILIKE '%REINDEX%' " +
 	"AND query NOT ILIKE '%pg_repack%' " +
 	"AND query NOT ILIKE '%repack.%' AND query NOT ILIKE '%ANALYZE%' " +
-	"AND query NOT ILIKE '%DROP INDEX%'))"
+	"AND query NOT ILIKE '%DROP INDEX%'))))"
 
 func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	note func(string)) {

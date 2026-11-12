@@ -142,9 +142,12 @@ func TestRemediateG5RateLimited(t *testing.T) {
 	e.Active["k0scontroller.service"] = "active"
 	e.SetUnitStart("k0scontroller.service", time.Hour)
 	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
-	// Fresh budget: last restart just now.
+	// Fresh budget: last restart just now — on the SHARED
+	// k0scontroller budget file, the same one sig13/cp-freeze/pki
+	// spend, so a controller restart by any check cools this
+	// remediate.
 	h := e.H
-	h.State.WriteEpochFile(filepath.Join(e.FState, cdeps.FileFeederLastRst),
+	h.State.WriteEpochFile(filepath.Join(e.State, cdeps.FileRateRestart),
 		h.Cfg.Clock.Now().Unix())
 	e.H.Feeder().RunRemediate(context.Background())
 	if e.RstN() != 0 {
@@ -218,7 +221,7 @@ func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 	e.H.Cfg.HostExecFn = func(ctx context.Context, combined bool,
 		budget time.Duration, name string, args ...string) (string, error) {
 		if name == "systemctl" && len(args) >= 2 && args[0] == "restart" {
-			if _, err := os.Stat(filepath.Join(e.FState, cdeps.FileFeederLastRst)); err != nil {
+			if _, err := os.Stat(filepath.Join(e.State, cdeps.FileRateRestart)); err != nil {
 				t.Errorf("G5 budget not marked before restart: %v", err)
 			}
 			e.Mu.Lock()
@@ -234,20 +237,20 @@ func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 	}
 }
 
-func TestRemediateCreatesFeederStateDir(t *testing.T) {
+func TestRemediateSpendsSharedBudgetFile(t *testing.T) {
 	e := fixture(t)
 	e.Active["k0scontroller.service"] = "active"
 	e.SetUnitStart("k0scontroller.service", time.Hour)
 	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
-	if err := os.RemoveAll(e.FState); err != nil {
-		t.Fatal(err)
-	}
+	// The shared budget file must land under WatchdogStateDir — the
+	// same file the sig13/cp-freeze/pki checks read — so a remediate
+	// restart cools every other k0scontroller restart path.
 	e.H.Feeder().RunRemediate(context.Background())
 	if e.RstN() != 1 {
-		t.Fatal("restart blocked by absent FeederStateDir")
+		t.Fatal("restart did not run")
 	}
-	if _, err := os.Stat(filepath.Join(e.FState, cdeps.FileFeederLastRst)); err != nil {
-		t.Fatal("budget file not written into created dir")
+	if _, err := os.Stat(filepath.Join(e.State, cdeps.FileRateRestart)); err != nil {
+		t.Fatal("shared budget file not written into WatchdogStateDir")
 	}
 }
 
@@ -452,23 +455,28 @@ func TestRemediateG4PeerDeadWarnsAndRestarts(t *testing.T) {
 	}
 }
 
-func TestRemediateG6MkdirFailSkipsRestart(t *testing.T) {
+func TestRemediateUnwritableBudgetDirStillRestarts(t *testing.T) {
 	e := fixture(t)
 	e.Active["k0scontroller.service"] = "active"
 	e.SetUnitStart("k0scontroller.service", time.Hour)
 	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
-	// StateDir occupied by a regular file — the mkdir -p parity fails
-	// (ENOTDIR regardless of uid) and the restart must not run blind.
-	if err := os.RemoveAll(e.FState); err != nil {
+	// WatchdogStateDir occupied by a regular file — the budget's
+	// disk write fails (ENOTDIR) but the Store's RAM lastSpent
+	// mirror still consumes the budget, so the restart proceeds
+	// instead of storming or dying blind (ENOSPC/EROFS parity).
+	if err := os.RemoveAll(e.State); err != nil {
 		t.Fatal(err)
 	}
-	testutil.WriteFile(t, e.FState, "not a dir")
+	testutil.WriteFile(t, e.State, "not a dir")
 	e.H.Feeder().RunRemediate(context.Background())
-	if e.RstN() != 0 {
-		t.Fatal("restarted although the budget dir is unwritable")
+	if e.RstN() != 1 {
+		t.Fatal("restart blocked by unwritable budget dir")
 	}
-	if e.CountLogLines("restart skipped") == 0 {
-		t.Fatal("mkdir failure not logged")
+	// The RAM mirror must still hold the budget: an immediate
+	// second remediate is rate-limited even though no file landed.
+	e.H.Feeder().RunRemediate(context.Background())
+	if e.RstN() != 1 {
+		t.Fatal("RAM-mirror budget did not rate-limit the second remediate")
 	}
 }
 
@@ -491,8 +499,8 @@ func TestRemediateG6RestartFailSpendsBudget(t *testing.T) {
 	if e.RstN() != 0 {
 		t.Fatal("restart recorded although systemctl failed")
 	}
-	if _, err := os.Stat(filepath.Join(e.FState, cdeps.FileFeederLastRst)); err != nil {
-		t.Fatalf("budget not spent before the failing restart: %v", err)
+	if _, err := os.Stat(filepath.Join(e.State, cdeps.FileRateRestart)); err != nil {
+		t.Fatalf("shared budget not spent before the failing restart: %v", err)
 	}
 	if e.CountLogLines("budget spent") == 0 {
 		t.Fatal("restart failure not logged")

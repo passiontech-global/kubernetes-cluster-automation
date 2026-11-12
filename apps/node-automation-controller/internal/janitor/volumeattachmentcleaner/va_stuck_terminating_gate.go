@@ -153,7 +153,7 @@ func (c *volumeAttachmentCleaner) sightStuckReadyUnused(ctx context.Context,
 	if c.stuckReadyUnused(ctx, va, nodeByName, nodePods, pvcPVs, pvNames, log) {
 		stuckReadyNow[va.Name] = true
 		_, stuckReadyPrior[va.Name] =
-			c.stuckReadyFirstSeen.Observe(va.Name, now)
+			c.stuckReadyFirstSeen.Observe(vaFirstSeenKey(va), now)
 	}
 }
 
@@ -162,8 +162,8 @@ func (c *volumeAttachmentCleaner) sightStuckReadyUnused(ctx context.Context,
 // unReady or the VA resolved) — resetting the two-cycle count.
 func (c *volumeAttachmentCleaner) forgetSettledStuckReady(
 	stuckReadyNow map[string]bool) {
-	c.stuckReadyFirstSeen.Prune(func(name string) bool {
-		return stuckReadyNow[name]
+	c.stuckReadyFirstSeen.Prune(func(key string) bool {
+		return stuckReadyNow[vaLedgerName(key)]
 	})
 }
 

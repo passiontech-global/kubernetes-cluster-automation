@@ -18,7 +18,8 @@
 //	         crosses 150M — the wraparound remediation rides this
 //	         window because a FREEZE vacuum is a full-table rewrite
 //	         storm, not a probe-time action (freeze.go).
-//	repack   pg_repack --no-superuser-check --no-order -t public.kine
+//	repack   pg_repack --no-superuser-check --no-order
+//	         --wait-timeout=10 --no-kill-backend -t public.kine
 //	         — ONLY when the heap is genuinely bloated
 //	         (dead_tuple_percent > 40 AND heap > 200MB, measured via
 //	         pg_stat_user_tables + pg_relation_size) and the data
@@ -266,8 +267,15 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	// session is mid-run — skip the heavy block this cycle (it
 	// repeats daily; the compact ends in VACUUM anyway) without
 	// failing the maint cycle.
+	t0 := m.d.Cfg.Clock.Now()
 	sout, serr := m.d.PsqlScript(ctx, pg, user, pass,
 		m.buildHeavyScript(freeze))
+	if serr != nil && m.d.LongBudgetExceeded(t0, serr) {
+		// The client kill can orphan the server-side session —
+		// still holding the advisory lock. Reap it now instead of
+		// waiting out the session.
+		m.reapOrphanedMaint(ctx, pg, user, pass, note)
+	}
 	switch {
 	case serr != nil:
 		// ON_ERROR_STOP aborted the script — attribute the failure
@@ -334,7 +342,7 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		logger().Warn("kinedb: pg_repack skipped — insufficient disk headroom, VACUUM only",
 			"free", free, "heap", res.heapBytes, "wal", wal)
 		res.repackState = "skipped-headroom"
-		if _, err := m.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), m.d.PsqlArgs(pg, user, false,
+		if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), m.d.PsqlMaintArgs(pg, user, false,
 			"-qc", "VACUUM (ANALYZE) "+kdeps.SQLIdent(m.d.Cfg.Table)), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
@@ -376,16 +384,44 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("repack-ext-fail: %v", err))
 		return
 	}
-	if _, err := m.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), []string{m.d.Cfg.Runtime, "exec",
-		"-e", "PGPASSWORD", pg, repackBin,
+	// --wait-timeout=10 bounds each lock wait inside pg_repack so a
+	// wedged table lock fails the run instead of hanging to the
+	// client kill; --no-kill-backend keeps it from terminating the
+	// client backends it waits on (the session reaper owns that
+	// decision, not the repack tool).
+	rt0 := m.d.Cfg.Clock.Now()
+	if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), []string{m.d.Cfg.Runtime, "exec",
+		"-e", "PGPASSWORD", "-e", "PGOPTIONS", pg, repackBin,
 		"-h", "127.0.0.1", "-U", user, "-d", "postgres",
 		"-t", "public." + m.d.Cfg.Table,
-		"--no-superuser-check", "--no-order"}, ""); err == nil {
+		"--no-superuser-check", "--no-order",
+		"--wait-timeout=10", "--no-kill-backend"}, ""); err == nil {
 		res.repackState = "done"
 	} else {
+		if m.d.LongBudgetExceeded(rt0, err) {
+			m.reapOrphanedMaint(ctx, pg, user, pass, note)
+		}
 		res.okRepack = false
 		res.repackState = "fail"
 		note(fmt.Sprintf("repack-fail: %v", err))
+	}
+}
+
+// reapOrphanedMaint is the exec-timeout backstop for the heavy
+// script and pg_repack: when the long-budget client is killed the
+// server-side session can survive it, so terminate our own
+// maintenance backends that are old enough to be orphans. Best
+// effort — a failed reap only notes.
+func (m *Maint) reapOrphanedMaint(ctx context.Context, pg, user, pass string,
+	note func(string)) {
+	n, err := m.d.ReapOrphanedMaintSessions(ctx, pg, user, pass)
+	switch {
+	case err != nil:
+		note(fmt.Sprintf("orphan-reap-fail: %v", err))
+	case n > 0:
+		note(fmt.Sprintf("terminated %d orphaned maintenance backend(s) after exec timeout", n))
+		logger().Warn("kinedb: terminated orphaned maintenance backends after exec timeout",
+			"count", n)
 	}
 }
 
@@ -450,7 +486,7 @@ func (m *Maint) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 			logger().Warn("kinedb: invalid index on kine table kept (not a reindex orphan)",
 				"index", base)
 		default:
-			if _, derr := m.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), m.d.PsqlArgs(pg, user, false,
+			if _, derr := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), m.d.PsqlMaintArgs(pg, user, false,
 				"-qc", "DROP INDEX CONCURRENTLY IF EXISTS "+
 					kdeps.SQLIdent(base)), ""); derr != nil {
 				note(fmt.Sprintf("drop-index-%s-fail: %v", base, derr))

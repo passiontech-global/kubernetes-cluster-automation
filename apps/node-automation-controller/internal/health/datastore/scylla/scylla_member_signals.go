@@ -10,6 +10,7 @@ package scylla
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
@@ -82,7 +83,8 @@ func memberDesyncFindings(svcs []corev1.Service,
 // signature). A fetch error is inconclusive, not clean — a broken
 // pod-log path must not silently read as "no stall".
 func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
-	log logr.Logger, pods []corev1.Pod, pending map[string]scyllaFinding) {
+	log logr.Logger, pods []corev1.Pod, pending map[string]scyllaFinding,
+	inconclusive map[string]bool) {
 	type stallScan struct {
 		pod    *corev1.Pod
 		reason string
@@ -99,9 +101,17 @@ func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
 	g := errgroup.Group{}
 	g.SetLimit(scyllaStallLogWorkers)
 	for j, pod := range troubled {
-		g.Go(func() error {
-			reason, err := p.scyllaStallLogHit(ctx, pod)
-			scans[j] = stallScan{pod: pod, reason: reason, err: err}
+		g.Go(func() (err error) {
+			// A panic in one pod's log scan reads as that pod's
+			// inconclusive scan — never a process crash.
+			defer func() {
+				if r := recover(); r != nil {
+					scans[j] = stallScan{pod: pod,
+						err: fmt.Errorf("log scan panicked: %v", r)}
+				}
+			}()
+			reason, lerr := p.scyllaStallLogHit(ctx, pod)
+			scans[j] = stallScan{pod: pod, reason: reason, err: lerr}
 			return nil
 		})
 	}
@@ -110,6 +120,7 @@ func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
 		if s.err != nil {
 			log.Info("WARN: scylla log fetch failed — stall signature inconclusive",
 				"pod", s.pod.Namespace+"/"+s.pod.Name, "error", s.err)
+			inconclusive[s.pod.Namespace+"/"+s.pod.Name+"/"+string(s.pod.UID)] = true
 			continue
 		}
 		if s.reason == "" {

@@ -337,11 +337,14 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		return nil
 	}
 
-	// Mesh-wide guard: >50% of EVICTABLE nodes flagged means the
+	// Mesh-wide guard: >=50% of EVICTABLE nodes flagged means the
 	// partition is not node-local — evicting just churns pods
-	// between broken nodes. Live-healed nodes left the set above;
-	// unconfirmable ones (live Get failed) deliberately still count.
-	if nFlagged*2 > s.total {
+	// between broken nodes. The >= (not >) matters on even-sized
+	// clusters: exactly half flagged IS the mesh-wide shape the
+	// doc promises to abort, and nFlagged*2 > total let it through.
+	// Live-healed nodes left the set above; unconfirmable ones
+	// (live Get failed) deliberately still count.
+	if nFlagged*2 >= s.total {
 		log.Info("ABORT: nodes flagged — mesh-wide partition, no evict",
 			"flagged", nFlagged, "total", s.total, "nodes", s.sortedFlagged())
 		return nil

@@ -466,3 +466,74 @@ func TestGateBudgetExhaustedDefers(t *testing.T) {
 			proceed, unverifiable)
 	}
 }
+
+// The sweep overlay's quorum reservation: two pods of the same
+// controller inside one sweep share ONE disruption slot — the
+// second DeletePod defers (false, nil) with no API call and no
+// ledger stamp, so two parallel checks cannot each delete a pod of
+// the same 2-replica workload and take it to zero.
+func TestDeletePodQuorumReservation(t *testing.T) {
+	ctrl := true
+	owner := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "web-6d9f", Controller: &ctrl,
+	}
+	p1 := pod("ns1", "web-0", "u1", corev1.PodRunning, time.Now())
+	p1.OwnerReferences = []metav1.OwnerReference{owner}
+	p2 := pod("ns1", "web-1", "u2", corev1.PodRunning, time.Now())
+	p2.OwnerReferences = []metav1.OwnerReference{owner}
+	cs := fake.NewSimpleClientset(p1, p2)
+	var heals state.CooldownSet
+	sctx := kube.WithSweepOverlay(ctx)
+	now := time.Now()
+
+	deleted, err := DeletePod(sctx, cs, &heals, "k1", p1, now)
+	if err != nil || !deleted {
+		t.Fatalf("first DeletePod = (%v,%v), want (true,nil)", deleted, err)
+	}
+	deleted, err = DeletePod(sctx, cs, &heals, "k2", p2, now)
+	if err != nil || deleted {
+		t.Fatalf("second same-owner DeletePod = (%v,%v), want (false,nil) deferral",
+			deleted, err)
+	}
+	if _, gerr := cs.CoreV1().Pods("ns1").Get(ctx, "web-1",
+		metav1.GetOptions{}); gerr != nil {
+		t.Fatal("denied pod must survive — no API delete was issued")
+	}
+	if heals.CooledDown("k2", time.Hour, now) {
+		t.Fatal("denied delete must not stamp the ledger")
+	}
+}
+
+// EvictPod reports the same reservation denial as refused=true —
+// the existing "PDB said no, deferral" contract every caller
+// already handles (EvictPodV refunds the grant on refused).
+func TestEvictPodQuorumReservation(t *testing.T) {
+	ctrl := true
+	owner := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "web-6d9f", Controller: &ctrl,
+	}
+	p1 := pod("ns1", "web-0", "u1", corev1.PodRunning, time.Now())
+	p1.OwnerReferences = []metav1.OwnerReference{owner}
+	p2 := pod("ns1", "web-1", "u2", corev1.PodRunning, time.Now())
+	p2.OwnerReferences = []metav1.OwnerReference{owner}
+	cs := fake.NewSimpleClientset(p1, p2)
+	sctx := kube.WithSweepOverlay(ctx)
+	now := time.Now()
+
+	evicted, refused, err := EvictPod(sctx, cs, nil, "k1", p1, now)
+	if err != nil || !evicted || refused {
+		t.Fatalf("first EvictPod = (%v,%v,%v), want (true,false,nil)",
+			evicted, refused, err)
+	}
+	evicted, refused, err = EvictPod(sctx, cs, nil, "k2", p2, now)
+	if err != nil || evicted || !refused {
+		t.Fatalf("second same-owner EvictPod = (%v,%v,%v), want (false,true,nil)",
+			evicted, refused, err)
+	}
+	if _, gerr := cs.CoreV1().Pods("ns1").Get(ctx, "web-1",
+		metav1.GetOptions{}); gerr != nil {
+		t.Fatal("denied pod must survive — no eviction was issued")
+	}
+}

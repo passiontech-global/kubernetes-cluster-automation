@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
@@ -25,6 +30,12 @@ type Conn interface {
 	Run(ctx context.Context, cmd string) (string, error)
 	Write(ctx context.Context, remotePath string, r io.Reader) error
 	Close() error
+	// StageSuffix is the per-connection staging nonce appended to
+	// putAtomic's tmp path — "" keeps the deterministic
+	// `.<name>.tmp` (test fakes); the real dialer returns a
+	// per-dial nonce so two overlapping converge runs can never
+	// write the same staging inode.
+	StageSuffix() string
 }
 
 // Dialer opens a Conn to a target — the unit-test seam (fakes record
@@ -43,9 +54,15 @@ type ExitError interface {
 
 // tmpPath is the staging path for an atomic write:
 // /usr/local/bin/node-host-agent → /usr/local/bin/.node-host-agent.tmp
-// (hub_converge copy-then-mv parity).
-func tmpPath(p string) string {
-	return path.Dir(p) + "/." + path.Base(p) + ".tmp"
+// (+ ".<nonce>" when the conn carries a StageSuffix — the real
+// dialer stamps one per run so overlapping syncs never share a
+// staging inode; the deterministic form stays for fakes).
+func tmpPath(p, suffix string) string {
+	tmp := path.Dir(p) + "/." + path.Base(p) + ".tmp"
+	if suffix != "" {
+		tmp += "." + suffix
+	}
+	return tmp
 }
 
 // remoteSHA256 returns the hex sha256 of a remote file. Exit 1
@@ -193,7 +210,7 @@ func directoryReport(out string) (string, bool) {
 // atomically renames it over the destination — the order ansible's
 // copy module + mv produced, and the ordering the tests assert.
 func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode string) error {
-	tmp := tmpPath(remotePath)
+	tmp := tmpPath(remotePath, c.StageSuffix())
 	// Secret material (0600 mode: tokens, .key files) must never
 	// sit world-readable on the target — `cat >`/`tee` creates the
 	// tmp file under the remote umask (~0644), so pre-create it at
@@ -239,15 +256,32 @@ func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode
 // next dial without a pod restart.
 type sshDialer struct {
 	cfg sshclient.Config
-	log *slog.Logger
+	// policy resolves host-key trust per dialed hostname — pin
+	// spec (single or host=fp map), operator known_hosts, and the
+	// persistent TOFU store (hostkeys.go). nil only in hand-built
+	// test dialers, which keep the bare Config behavior.
+	policy *hostKeyPolicy
+	log    *slog.Logger
 }
 
 // newSSHDialer only records the dial config — nothing touches the
-// key path until Dial (see sshDialer above).
+// key path until Dial (see sshDialer above). stateDir parents the
+// TOFU known_hosts (<stateDir>/hubsync_known_hosts); "" disables
+// TOFU. The operator known_hosts is the file next to the converge
+// key (/etc/node-converge-ssh/known_hosts by default).
 func newSSHDialer(keyPath string, port int, timeout time.Duration,
+	hostKeySpec string, allowInsecureHostKey bool, stateDir string,
 	log *slog.Logger) (*sshDialer, error) {
 	if log == nil {
 		log = logger()
+	}
+	knownHosts := ""
+	if dir := filepath.Dir(sshclient.ExpandHome(keyPath)); dir != "" && dir != "." {
+		knownHosts = filepath.Join(dir, "known_hosts")
+	}
+	tofu := ""
+	if stateDir != "" {
+		tofu = filepath.Join(stateDir, "hubsync_known_hosts")
 	}
 	return &sshDialer{
 		cfg: sshclient.Config{
@@ -257,17 +291,47 @@ func newSSHDialer(keyPath string, port int, timeout time.Duration,
 			// hubsync audit-logs every accepted host key — Log set.
 			Log: log,
 		},
+		policy: newHostKeyPolicy(hostKeySpec, knownHosts, tofu,
+			port, allowInsecureHostKey, log),
 		log: log,
 	}, nil
 }
 
 func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
-	link, err := d.cfg.Dial(ctx, t.SSHUser, t.IP, t.ProxyJump)
+	// Fail closed when NO trust source exists — pins, a readable
+	// known_hosts, a TOFU state dir, or the explicit insecure opt-out.
+	// With TOFU configured an empty pin spec is no longer fatal:
+	// first contact records the key instead of breaking prod.
+	if d.policy == nil || !d.policy.active() {
+		return nil, fmt.Errorf("ssh host key verification unavailable "+
+			"(%s unset, no known_hosts next to the converge key, "+
+			"no watchdog state dir for TOFU) — set the fingerprint, "+
+			"mount known_hosts, or %s=1 to allow insecure acceptance "+
+			"explicitly",
+			envnames.EnvHubsyncSSHHostKeyFingerprint,
+			envnames.EnvHubsyncSSHAllowInsecureHostKey)
+	}
+	// cfg is a per-dial copy: HostKeyVerify is policy state and
+	// d.cfg is shared across concurrent target dials — mutating it
+	// here would race.
+	cfg := d.cfg
+	cfg.HostKeyVerify = d.policy.verify
+	link, err := cfg.Dial(ctx, t.SSHUser, t.IP, t.ProxyJump)
 	if err != nil {
 		return nil, err
 	}
 	return &sshConn{link: link, sudo: needsSudo(t.SSHUser),
-		timeout: d.cfg.Timeout, log: d.log}, nil
+		timeout: cfg.Timeout, log: d.log,
+		nonce: nextStageNonce()}, nil
+}
+
+// stageNonceSeq hands out per-dial staging suffixes — pid+counter
+// keeps them unique across overlapping runs AND across agent
+// restarts on the same target dir.
+var stageNonceSeq atomic.Uint64
+
+func nextStageNonce() string {
+	return fmt.Sprintf("%d-%d", os.Getpid(), stageNonceSeq.Add(1))
 }
 
 // needsSudo reports whether remote ops on the target must escalate —
@@ -285,9 +349,14 @@ type sshConn struct {
 	sudo    bool // non-root SSH user → wrap ops in sudo -n
 	timeout time.Duration
 	log     *slog.Logger
+	nonce   string // per-dial staging suffix (StageSuffix)
 }
 
 func (c *sshConn) Close() error { return c.link.Close() }
+
+// StageSuffix returns this dial's staging nonce — putAtomic appends
+// it to the tmp path so concurrent runs never share a staging inode.
+func (c *sshConn) StageSuffix() string { return c.nonce }
 
 // newSession opens a session channel and returns it together with
 // the body-deadline release func the caller MUST defer for the
@@ -311,6 +380,47 @@ func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, func(), error) 
 		c.link.DeadlineConn(), c.timeout), nil
 }
 
+// maxRemoteOutputBytes caps one Run's retained combined output —
+// CombinedOutput buffers unbounded, so a remote command flooding
+// stdout/stderr (a broken script looping errors, a huge sha256sum
+// stderr storm) would grow agent memory without limit. The head is
+// kept — error banners and the first hash lines come first — and
+// the excess is drained so the remote never blocks on a full pipe.
+const maxRemoteOutputBytes = 1 << 20
+
+// cappedOut is the stdout+stderr sink for one Run — same keep-head
+// contract as hostexec's cappedBuffer.
+type cappedOut struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *cappedOut) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if rem := maxRemoteOutputBytes - w.buf.Len(); rem > 0 {
+		if rem > len(p) {
+			rem = len(p)
+		}
+		_, _ = w.buf.Write(p[:rem])
+	}
+	return len(p), nil
+}
+
+// combinedOutputCapped is sess.CombinedOutput with the output sink
+// capped: Stdout and Stderr point at the SAME writer so the remote
+// streams merge in wire order exactly like CombinedOutput, while
+// retention stops at maxRemoteOutputBytes.
+func combinedOutputCapped(sess *ssh.Session, cmd string) ([]byte, error) {
+	var out cappedOut
+	sess.Stdout = &out
+	sess.Stderr = &out
+	// Keep the partial head on failure — the sudo-error path reads
+	// remote stderr out of it ("sudo: a password is required").
+	err := sess.Run(cmd)
+	return []byte(out.buf.String()), err
+}
+
 func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	if c.sudo {
 		cmd = "sudo -n " + cmd
@@ -326,7 +436,7 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	var runErr error
 	go func() {
 		defer close(done)
-		out, runErr = sess.CombinedOutput(cmd)
+		out, runErr = combinedOutputCapped(sess, cmd)
 	}()
 	select {
 	case <-ctx.Done():

@@ -155,14 +155,19 @@ func TestKubeletReaperRunListError(t *testing.T) {
 	}
 }
 
-// Zero successful probes means the probe PATH is broken (apiserver or
-// konnectivity), not that every kubelet died — the run aborts before
-// any taint decision rather than mass-tainting the fleet.
+// Zero successful probes across MULTIPLE nodes means the probe PATH
+// is broken (apiserver or konnectivity), not that every kubelet
+// died — the run aborts before any taint decision rather than
+// mass-tainting the fleet. (A single failing node is NOT abort
+// evidence: on a one-worker cluster it is exactly the fake-ready
+// case the reaper exists for — the per-node lease/persistence
+// gates decide.)
 func TestKubeletReaperRunAbortsWhenNoProbeSucceeds(t *testing.T) {
 	cp := testutil.Node("cp1", corev1.ConditionTrue,
 		map[string]string{"node-role.kubernetes.io/control-plane": ""})
 	w1 := krStaleNode("w1")
-	cs := fake.NewSimpleClientset(cp, w1)
+	w2 := krStaleNode("w2")
+	cs := fake.NewSimpleClientset(cp, w1, w2)
 	var probed []string
 	var mu sync.Mutex
 	r := krRunReaper(cs, time.Now(),
@@ -183,8 +188,13 @@ func TestKubeletReaperRunAbortsWhenNoProbeSucceeds(t *testing.T) {
 			t.Fatal("control-plane node was probed — k0s CPs run no kubelet")
 		}
 	}
-	if len(probed) != 1 || probed[0] != "w1" {
-		t.Fatalf("probed = %v, want [w1]", probed)
+	if len(probed) != 2 {
+		t.Fatalf("probed = %v, want both workers", probed)
+	}
+	for _, w := range []string{"w1", "w2"} {
+		if kube.HasTaint(testutil.GetNode(t, cs, w).Spec.Taints, kubeletReaperTaint) {
+			t.Fatalf("%s tainted on a dead probe path — the mass-taint guard failed", w)
+		}
 	}
 }
 
@@ -198,8 +208,8 @@ func TestKubeletReaperRunTaintsOnlyTheDeadWorker(t *testing.T) {
 	wDead := krStaleNode("w-dead")
 	wDead.Spec.Taints = []corev1.Taint{{
 		Key: kubeletReaperTaint, Effect: corev1.TaintEffectNoSchedule}}
-	// w-alive: probe fails (broken proxy path) but the kubelet renews
-	// its heartbeat Lease — proof of life, no taint.
+	// w-alive: probe fails but the kubelet renews its heartbeat
+	// Lease — inside the persistence grace, no taint.
 	wAlive := krStaleNode("w-alive") // stale heartbeat does NOT mean dead
 	cs := fake.NewSimpleClientset(cp, wOK, wDead, wAlive)
 	for _, lease := range []*coordinationv1.Lease{
@@ -359,6 +369,116 @@ func TestKubeletReaperLeaseGetErrorFailsClosed(t *testing.T) {
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 		t.Fatal("node tainted while its lease was unreadable")
+	}
+}
+
+// THE P0-11 REGRESSION: the fake-ready wedge — kubelet renews its
+// Lease (node stays Ready) while :10250 hangs — must NOT be
+// suppressed by the fresh lease. First observation skips (a proxy
+// flap gets the grace window); once the probe-fail persists past
+// kubeletReaperLeaseFreshGrace with the lease still fresh, the
+// node taints.
+func TestKubeletReaperFreshLeaseFakeReadyTaintsAfterGrace(t *testing.T) {
+	n := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(n)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	r := &kubeletReaper{
+		cs:    cs,
+		queue: "kubelet-liveness-reaper",
+		now:   shared.NewClock(func() time.Time { return now }),
+	}
+	// renewLease keeps the heartbeat fresh as the fake clock
+	// advances — a live kubelet renews every ~10s, so each sweep
+	// sees a renewal stamped at "now".
+	renewLease := func() {
+		t.Helper()
+		l, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Get(ctx, "w1", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Spec.RenewTime = &metav1.MicroTime{Time: now}
+		if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Update(ctx, l, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// First observation — inside the grace window, no taint.
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("tainted inside the fresh-lease grace window")
+	}
+	// Still inside grace — second sweep must not taint either.
+	now = now.Add(kubeletReaperLeaseFreshGrace / 2)
+	renewLease()
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("tainted before the grace window elapsed")
+	}
+	// Grace elapsed, lease still fresh — fake-ready confirmed.
+	now = now.Add(kubeletReaperLeaseFreshGrace)
+	renewLease()
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("persisted fake-ready (fresh lease + dead :10250) not tainted")
+	}
+}
+
+// A probe that recovers inside the grace window re-arms the
+// persistence stamp — a flap must not bank toward a later taint.
+func TestKubeletReaperFreshLeaseRecoveryRearms(t *testing.T) {
+	n := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(n)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	r := &kubeletReaper{
+		cs:    cs,
+		queue: "kubelet-liveness-reaper",
+		now:   shared.NewClock(func() time.Time { return now }),
+	}
+	renewLease := func() {
+		t.Helper()
+		l, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Get(ctx, "w1", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Spec.RenewTime = &metav1.MicroTime{Time: now}
+		if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Update(ctx, l, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(kubeletReaperLeaseFreshGrace / 2)
+	renewLease()
+	if err := r.sweep(ctx, n, true); err != nil { // probe recovers
+		t.Fatal(err)
+	}
+	now = now.Add(kubeletReaperLeaseFreshGrace)
+	renewLease()
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("recovered flap tainted — persistence stamp was not re-armed")
 	}
 }
 

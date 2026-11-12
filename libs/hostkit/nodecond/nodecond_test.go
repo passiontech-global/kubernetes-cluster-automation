@@ -78,27 +78,120 @@ func TestConstantsNonEmptyAndUnique(t *testing.T) {
 	}
 }
 
-func TestListLengths(t *testing.T) {
-	// HeartbeatSweptNames: 49 latch-backed (incl. InodePressure,
-	// agent-latched since inode-pressure) + ReadonlyFilesystem; KernelDeadlock
-	// (permanent) excluded.
-	if got, want := len(HeartbeatSweptNames), 50; got != want {
-		t.Errorf("len(HeartbeatSweptNames) = %d, want %d", got, want)
+// conditionClass is the explicit triage decision for one
+// HeartbeatSweptNames member: which reaction lists it belongs to.
+// Every swept condition MUST appear in conditionClasses — adding a
+// latch-backed condition without a classification decision fails
+// TestAllConditionsExplicitlyClassified, so the agent and the
+// controller can never drift on how a new condition is handled.
+type conditionClass struct {
+	partition     bool // PartitionNames — evict pods off a partitioned node
+	stormGate     bool // StormGateNames — suppress descheduler storms
+	hangPreCordon bool // HangPreCordonNames — sustained True cordons the node
+	clockSkew     bool // ClockSkewPreCordonNames — the longer clock fuse
+}
+
+// conditionClasses is the exhaustive {Partition, StormGate,
+// HangPreCordon, ClockSkew} matrix for HeartbeatSweptNames. Names
+// absent from every list (NodeOverloaded, DNSFallbackActive, …)
+// carry the all-false row — silence is a decision too.
+var conditionClasses = map[string]conditionClass{
+	NodeOverloaded:              {},
+	WatchdogStale:               {stormGate: true},
+	CiliumAgentDown:             {stormGate: true, hangPreCordon: true},
+	CiliumInitStuck:             {stormGate: true, hangPreCordon: true},
+	KubeletRuntimeStall:         {stormGate: true, hangPreCordon: true},
+	DNSFallbackActive:           {},
+	DNSResolvStale:              {},
+	PodTeardownWedged:           {stormGate: true, hangPreCordon: true},
+	KubeletWatchWedge:           {stormGate: true, hangPreCordon: true},
+	JournaldUnreadable:          {stormGate: true},
+	FilesystemReadOnly:          {stormGate: true, hangPreCordon: true},
+	KernelHungTasks:             {stormGate: true, hangPreCordon: true},
+	NebulaIsolated:              {stormGate: true, hangPreCordon: true, partition: true},
+	NebulaDegraded:              {stormGate: true},
+	CiliumEnvoyDown:             {stormGate: true, hangPreCordon: true},
+	CiliumIPAMExhausted:         {stormGate: true},
+	CiliumBPFMapPressure:        {stormGate: true},
+	CiliumMTUDrift:              {stormGate: true},
+	CiliumWGStale:               {stormGate: true},
+	SpegelMirrorDegraded:        {},
+	CalicoVethLeak:              {},
+	CalicoFelixDown:             {stormGate: true, hangPreCordon: true},
+	Fail2banDown:                {},
+	ConntrackPressure:           {stormGate: true},
+	KernelKeysPressure:          {},
+	ControlPlaneCertReloadStale: {stormGate: true},
+	MemoryPSIThrashing:          {stormGate: true, hangPreCordon: true},
+	ClockUnsynchronized:         {stormGate: true, clockSkew: true},
+	KernelSlabLeak:              {stormGate: true, hangPreCordon: true},
+	NebulaPMTUBlackhole:         {stormGate: true, partition: true},
+	KernelResourceExhaustion:    {stormGate: true, hangPreCordon: true},
+	ClockSkewDetected:           {stormGate: true, clockSkew: true},
+	KubeconfigCertExpiring:      {},
+	CPUStealPressure:            {},
+	CgroupDyingLeak:             {stormGate: true, hangPreCordon: true},
+	SystemdSessionBloat:         {stormGate: true},
+	KubeletPLEGUnhealthy:        {stormGate: true, hangPreCordon: true},
+	DiskSlowIO:                  {stormGate: true, hangPreCordon: true},
+	KernelNetShimDegraded:       {stormGate: true},
+	ClocksourceUnstable:         {stormGate: true, clockSkew: true},
+	InodePressure:               {stormGate: true, hangPreCordon: true},
+	ReadonlyFilesystem:          {stormGate: true, hangPreCordon: true},
+	KonnectivityIPMismatch:      {},
+	CiliumEnvoyXDSReject:        {stormGate: true},
+	DiskBloatRunaway:            {stormGate: true, hangPreCordon: true},
+	NebulaMTUBlackhole:          {stormGate: true, partition: true},
+	NebulaSlowpath:              {stormGate: true},
+	NebulaSiteedge:              {stormGate: true},
+	KernelPageAllocFailure:      {stormGate: true, hangPreCordon: true},
+	ApiserverWatchCacheWedged:   {},
+}
+
+// TestAllConditionsExplicitlyClassified replaces the old
+// TestListLengths: instead of pinning list cardinalities (which
+// silently drift when a condition is added to one list but not
+// classified), every HeartbeatSweptNames member must carry an
+// explicit {Partition, StormGate, HangPreCordon, ClockSkew}
+// decision in conditionClasses, and the actual lists must match it
+// exactly. Non-swept members (KernelDeadlock, the NPD network
+// spellings, the foreign storm-gate names) are covered by
+// TestListEntriesAreDeclaredConstantsOrPinnedForeign.
+func TestAllConditionsExplicitlyClassified(t *testing.T) {
+	swept := make(map[string]bool, len(HeartbeatSweptNames))
+	for _, name := range HeartbeatSweptNames {
+		swept[name] = true
+		if _, ok := conditionClasses[name]; !ok {
+			t.Errorf("HeartbeatSweptNames member %q has no explicit classification", name)
+		}
 	}
-	if got, want := len(HangPreCordonNames), 19; got != want {
-		t.Errorf("len(HangPreCordonNames) = %d, want %d", got, want)
+	for name := range conditionClasses {
+		if !swept[name] {
+			t.Errorf("conditionClasses entry %q is not a HeartbeatSweptNames member", name)
+		}
 	}
-	if got, want := len(ClockSkewPreCordonNames), 3; got != want {
-		t.Errorf("len(ClockSkewPreCordonNames) = %d, want %d", got, want)
+	lists := []struct {
+		name string
+		list []string
+		pick func(conditionClass) bool
+	}{
+		{"PartitionNames", PartitionNames, func(c conditionClass) bool { return c.partition }},
+		{"StormGateNames", StormGateNames, func(c conditionClass) bool { return c.stormGate }},
+		{"HangPreCordonNames", HangPreCordonNames, func(c conditionClass) bool { return c.hangPreCordon }},
+		{"ClockSkewPreCordonNames", ClockSkewPreCordonNames, func(c conditionClass) bool { return c.clockSkew }},
 	}
-	// 37 storm-gate conditions minus 4 legacy spellings, plus
-	// CiliumBPFMapPressure and the 4 foreign names already counted
-	// in the original list.
-	if got, want := len(StormGateNames), 42; got != want {
-		t.Errorf("len(StormGateNames) = %d, want %d", got, want)
-	}
-	if got, want := len(PartitionNames), 6; got != want {
-		t.Errorf("len(PartitionNames) = %d, want %d", got, want)
+	for _, l := range lists {
+		inList := make(map[string]bool, len(l.list))
+		for _, entry := range l.list {
+			inList[entry] = true
+		}
+		for name := range swept {
+			want := l.pick(conditionClasses[name])
+			if inList[name] != want {
+				t.Errorf("%s membership of swept condition %q = %v, want %v (classification table)",
+					l.name, name, inList[name], want)
+			}
+		}
 	}
 }
 
@@ -274,6 +367,7 @@ func TestPartitionNamesMembership(t *testing.T) {
 		ClusterNetworkProblem:  true,
 		NebulaIsolated:         true,
 		NebulaPMTUBlackhole:    true,
+		NebulaMTUBlackhole:     true,
 	}
 	got := make(map[string]bool, len(PartitionNames))
 	for _, name := range PartitionNames {

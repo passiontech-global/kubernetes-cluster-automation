@@ -280,14 +280,24 @@ func (s *deadNodeSweeper) remediationItems(ctx context.Context,
 }
 
 // hasRemediationCR reports whether any medik8s remediation object
-// targets the node: the remediation.medik8s.io/node-name annotation
-// (AUTHORITATIVE when present — a CR stamped for another node is
+// targets the node AND has actually fenced it: the remediation.medik8s.io/node-name
+// annotation (AUTHORITATIVE when present — a CR stamped for another node is
 // never evidence here), CR name == node name (the 1:1 shape both
 // CRDs historically use), or a "<nodeName>-" name prefix (the
 // template-suffixed shape NHC v0.6+ emits). The prefix fallback is
 // guarded by the known node set: a CR like "worker-1-gpu" or
 // "worker-1-gpu-<tpl>" belongs to the node worker-1-gpu, and a bare
 // HasPrefix match would otherwise let it fence worker-1.
+//
+// P1 fix: CR EXISTENCE is not fencing. A SelfNodeRemediation or
+// FenceAgentsRemediation is created when the drain STARTS and only
+// certifies the node once its status conditions report success —
+// treating mere existence as fenced skipped the stateful-holder
+// split-brain gate at the 15m mark while medik8s was still mid-
+// drain on a node that could come back and corrupt RWO/RWOP volumes.
+// A matched CR without a Succeeded condition (still running, failed,
+// or conditions not yet reconciled) is NOT evidence; the caller
+// falls through to the probe path and owes the stateful gate.
 func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string,
 	rem *remediationCache, nodeNames map[string]bool) (bool, error) {
 	items, err := s.remediationItems(ctx, rem)
@@ -295,26 +305,57 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string,
 		return false, err
 	}
 	for i := range items {
-		crName := items[i].GetName()
-		if anno := items[i].GetAnnotations()[remediationNodeNameAnno]; anno != "" {
+		cr := &items[i]
+		if cr.GetDeletionTimestamp() != nil {
+			continue // being deleted — stale evidence, not a live fence
+		}
+		crName := cr.GetName()
+		matched := false
+		if anno := cr.GetAnnotations()[remediationNodeNameAnno]; anno != "" {
 			// The annotation is the fencing target — when it is
 			// present it decides alone: no name or prefix match can
 			// override it (a "worker-1-gpu-<tpl>" CR annotated for
 			// worker-1-gpu must not fence worker-1).
-			if anno == nodeName {
-				return true, nil
-			}
-			continue
-		}
-		if crName == nodeName {
-			return true, nil
-		}
-		if strings.HasPrefix(crName, nodeName+"-") &&
+			matched = anno == nodeName
+		} else if crName == nodeName {
+			matched = true
+		} else if strings.HasPrefix(crName, nodeName+"-") &&
 			!ownedByLongerNode(crName, nodeName, nodeNames) {
+			matched = true
+		}
+		if matched && remediationCRSucceeded(cr) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// remediationCRSucceeded reports whether the remediation CR's status
+// conditions certify the fence/drain COMPLETED: a condition whose
+// type ends in "Succeeded" (medik8s SNR reports "Succeeded";
+// FenceAgentsRemediation reports "FenceAgentSucceeded") reading
+// True. A "Failed"=True condition is an explicit non-success — the
+// remediation gave up, which is the opposite of fencing evidence.
+// CRs with no conditions yet (just created, status unreconciled)
+// read as not-fenced.
+func remediationCRSucceeded(cr *unstructured.Unstructured) bool {
+	conds, found, err := unstructured.NestedSlice(cr.Object,
+		"status", "conditions")
+	if err != nil || !found {
+		return false
+	}
+	for _, c := range conds {
+		m, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _ := m["type"].(string)
+		status, _ := m["status"].(string)
+		if strings.HasSuffix(typ, "Succeeded") {
+			return status == "True"
+		}
+	}
+	return false
 }
 
 // ownedByLongerNode reports whether crName is actually named after a

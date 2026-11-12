@@ -39,12 +39,15 @@ import (
 )
 
 // firstSeenEntries decodes the per-key first-seen map an
-// AnnoFirstSeen* annotation carries. Absent/garbage annotations
-// read as an empty map — a stamp that cannot be parsed cannot
-// prove an older window (same "unparseable = absent" posture as
-// kube.ParseAnnoTime).
-func firstSeenEntries(obj metav1.Object, annoKey string) map[string]string {
-	raw := obj.GetAnnotations()[annoKey]
+// AnnoFirstSeen* annotation carries — read through
+// kube.EffectiveAnno so a stamp recorded on the sweep overlay this
+// cycle (RecordAnnoPatch) resolves instead of the pre-patch
+// snapshot copy. Absent/garbage annotations read as an empty map —
+// a stamp that cannot be parsed cannot prove an older window (same
+// "unparseable = absent" posture as kube.ParseAnnoTime).
+func firstSeenEntries(ctx context.Context, obj metav1.Object,
+	annoKey string) map[string]string {
+	raw := kube.EffectiveAnno(ctx, obj, annoKey)
 	if raw == "" {
 		return map[string]string{}
 	}
@@ -90,25 +93,12 @@ func stampFirstSeen(ctx context.Context, obj metav1.Object,
 	if err := patch(ctx, data); err != nil {
 		return err
 	}
-	syncFirstSeenAnno(obj, annoKey, firstSeenValue(m))
+	// Record on the sweep overlay — the shared snapshot object is
+	// never mutated (EffectiveAnno resolves the recorded value for
+	// every later check this sweep; outside a sweep the helper
+	// keeps the legacy in-place mirror).
+	kube.RecordAnnoPatch(ctx, obj, data)
 	return nil
-}
-
-// syncFirstSeenAnno mirrors a just-persisted first-seen annotation
-// onto the in-memory object — every probe holding the pre-patch
-// snapshot would otherwise keep reading the stale map for the rest
-// of the sweep (and re-stamp or mis-window the next check).
-func syncFirstSeenAnno(obj metav1.Object, annoKey string, v any) {
-	ann := obj.GetAnnotations()
-	if ann == nil {
-		ann = map[string]string{}
-	}
-	if s, ok := v.(string); ok {
-		ann[annoKey] = s
-	} else {
-		delete(ann, annoKey)
-	}
-	obj.SetAnnotations(ann)
 }
 
 // FirstSeenPersisted is the persisted variant of the first-seen
@@ -151,7 +141,7 @@ func FirstSeenPersisted(ctx context.Context, log logr.Logger,
 	if fs != nil {
 		first, tracked = fs.Observe(key, now)
 	}
-	m := firstSeenEntries(obj, annoKey)
+	m := firstSeenEntries(ctx, obj, annoKey)
 	annoT, annoOK := kube.ParseAnnoTime(m[key])
 	switch {
 	case annoOK && annoT.Before(first):
@@ -211,7 +201,7 @@ func ClearPersistedFirstSeen(ctx context.Context, log logr.Logger,
 	if fs != nil {
 		fs.Forget(key)
 	}
-	m := firstSeenEntries(obj, annoKey)
+	m := firstSeenEntries(ctx, obj, annoKey)
 	if _, ok := m[key]; !ok {
 		return nil // never stamped on the object — nothing persisted
 	}
@@ -231,6 +221,6 @@ func ClearPersistedFirstSeen(ctx context.Context, log logr.Logger,
 			"key", key, "anno", annoKey, "error", err)
 		return err
 	}
-	syncFirstSeenAnno(obj, annoKey, firstSeenValue(m))
+	kube.RecordAnnoPatch(ctx, obj, data)
 	return nil
 }

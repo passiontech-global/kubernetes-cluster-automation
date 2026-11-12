@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,18 +25,26 @@ func TestPSIGaugeAndOverloadLatch(t *testing.T) {
 		t.Fatalf("psi=%v,%v want 45.5", v, ok)
 	}
 	latch := filepath.Join(dirs["state"], "state-node-overloaded")
+	// The gauge is scrape-side; the state-* latch is the ticker's
+	// job — Collect is read-only, so the scrape above must NOT have
+	// minted the latch file.
+	if _, err := os.Stat(latch); !os.IsNotExist(err) {
+		t.Fatal("scrape wrote state-node-overloaded — Collect must stay read-only")
+	}
+	// Drive one refreshLatches pass (the Run() equivalent).
+	c.Latches().refreshLatches(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("overload latch not created at avg60>=40: %v", err)
 	}
 	// Hysteresis: 30% is between 40/25 — latch persists.
 	testutil.WriteFile(t, cfg.PSIFile, "some avg10=5.00 avg60=30.00 avg300=10.00 total=9\n")
-	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
+	c.Latches().refreshLatches(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatal("latch dropped inside hysteresis band")
 	}
 	// Below 25 → released.
 	testutil.WriteFile(t, cfg.PSIFile, "some avg10=1.00 avg60=20.00 avg300=5.00 total=4\n")
-	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
+	c.Latches().refreshLatches(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept below the 25% release threshold")
 	}

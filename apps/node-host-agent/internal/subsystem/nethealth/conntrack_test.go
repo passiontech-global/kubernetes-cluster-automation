@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vishvananda/netlink"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -180,7 +182,6 @@ func TestNebulaIsolatedFlushesPeerConntrack(t *testing.T) {
 
 func TestEgressSwitchFlushesPeerConntrack(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	// Underlay dead → committed state flips direct -> relay; the
 	// peer's udp/<nebula-port> conntrack gets flushed.
 	e.tcpOK["8.8.8.8:53"] = false
@@ -196,7 +197,7 @@ func TestEgressSwitchFlushesPeerConntrack(t *testing.T) {
 
 func TestEgressRecoveryFlushesPeerConntrack(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "1500:\tfrom all to 8.8.8.8 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = true // underlay back
 	e.n.Cycle(context.Background())
@@ -213,7 +214,6 @@ func TestPeerConntrackFlushHonoursNebulaPort(t *testing.T) {
 	e := overlayEnv(t, func(wd *watchdogconf.Config) {
 		wd.NebulaPort = 45671
 	})
-	e.host.On("rule list pref 1500", "")
 	e.tcpOK["8.8.8.8:53"] = false
 	e.pingOK["8.8.8.8|true"] = false
 	e.n.Cycle(context.Background())
@@ -224,7 +224,6 @@ func TestPeerConntrackFlushHonoursNebulaPort(t *testing.T) {
 
 func TestPeerConntrackFlushBestEffort(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	e.tcpOK["8.8.8.8:53"] = false
 	e.pingOK["8.8.8.8|true"] = false
 	e.host.FailOn("conntrack", errCmdFail) // binary absent → skip, never fail

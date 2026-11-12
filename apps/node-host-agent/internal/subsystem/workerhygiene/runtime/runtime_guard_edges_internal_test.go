@@ -137,8 +137,10 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 		"volumes", "kubernetes.io~empty-dir", "scratch")
 	wdepstest.WriteFile(t, filepath.Join(vol, "data"), strings.Repeat("x", 100))
 	// (2) unresolved containerd snapshot (hits-only, no pod billing).
-	snap := filepath.Join(d.Cfg.K0sDataDir, "containerd",
-		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "7", "fs")
+	snapRoot := filepath.Join(d.Cfg.K0sDataDir, "containerd",
+		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
+	d.Cfg.Disk.WLayerSnapshotsDir = snapRoot
+	snap := filepath.Join(snapRoot, "7", "fs")
 	wdepstest.WriteFile(t, filepath.Join(snap, "layer"), strings.Repeat("y", 60))
 	// (3) pod stdout log dir billed to uid-b via the dir name.
 	logDir := filepath.Join(d.Cfg.Disk.PodLogsDir, "default_web_"+wdepstest.UIDB)
@@ -715,4 +717,58 @@ func TestLocalPVQuotaThrottleCycle(t *testing.T) {
 
 	// API flake → the quota scan is inconclusive, never acts.
 	c2.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: false})
+}
+
+// --- run_tmpfs.go: the single-pass open-fd set ---
+
+// runTmpfsOpenFDs builds the (dev,ino) set in ONE /proc/*/fd pass and
+// runTmpfsFDHeld answers membership for every stale .tmp candidate —
+// the sweep no longer rescans /proc per file.
+func TestRunTmpfsOpenFDSet(t *testing.T) {
+	d, _ := rtDeps(t)
+	// Point the proc view at a fake root: pid 4242 holds an fd on
+	// the "spool" file via the same symlink shape a real fd dir has.
+	procRoot := t.TempDir()
+	d.Proc = procfs.New(procRoot)
+	runDir := t.TempDir()
+	held := filepath.Join(runDir, "spool.tmp")
+	other := filepath.Join(runDir, "other.tmp")
+	wdepstest.WriteFile(t, held, "data")
+	wdepstest.WriteFile(t, other, "data")
+	fdDir := filepath.Join(procRoot, "4242", "fd")
+	if err := os.MkdirAll(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(held, filepath.Join(fdDir, "3")); err != nil {
+		t.Fatal(err)
+	}
+	c := NewRunTmpfs(d)
+	set := c.runTmpfsOpenFDs()
+	if set == nil {
+		t.Fatal("open-fd set is nil on a readable proc root")
+	}
+	hfi, err := os.Stat(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ofi, err := os.Stat(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runTmpfsFDHeld(hfi, set) {
+		t.Fatal("held file not in the open-fd set")
+	}
+	if runTmpfsFDHeld(ofi, set) {
+		t.Fatal("unheld file reported as fd-held")
+	}
+	// A nil set (proc pass failed) fails open for every candidate.
+	if runTmpfsFDHeld(hfi, nil) {
+		t.Fatal("nil set must fail open")
+	}
+	// No pid dirs at all → empty non-nil set, still fail-open reads.
+	empty := procfs.New(t.TempDir())
+	d.Proc = empty
+	if got := c.runTmpfsOpenFDs(); got == nil || len(got) != 0 {
+		t.Fatalf("empty proc root set=%v want empty non-nil", got)
+	}
 }

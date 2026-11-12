@@ -78,7 +78,7 @@ func TestKargoPromotionStuckFlags(t *testing.T) {
 	)
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 
-	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("a >60m Running promotion must FAIL the check")
 	}
@@ -104,7 +104,7 @@ func TestKargoWarehouseUnhealthyRefreshes(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("a >30m unready warehouse must FAIL the check")
 	}
@@ -131,7 +131,7 @@ func TestKargoWarehouseUnhealthyRefreshes(t *testing.T) {
 	// Second sweep inside the 1h cooldown: the persisted stamp must
 	// suppress a re-patch — the annotation value must not move.
 	probetest.FreezeNow(p.Deps, base.Add(10*time.Minute))
-	_ = probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	got2, _ := dyn.Resource(kube.GVRKargoWarehouse).Namespace("kargo").
 		Get(ctx, "wh-bad", metav1.GetOptions{})
 	if got2.GetAnnotations()[kube.AnnoKargoRefresh] !=
@@ -153,7 +153,7 @@ func TestKargoWarehouseRefreshRespectsPersistedStamp(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("unhealthy warehouse must still FAIL")
 	}
@@ -172,7 +172,7 @@ func TestKargoAnalysisRunZombieFlags(t *testing.T) {
 	)
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 
-	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("a >60m Running analysisrun must FAIL the check")
 	}
@@ -198,7 +198,7 @@ func TestKargoFamilyAbsenceTolerated(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	probetest.FreezeNow(p.Deps, base)
 
-	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass || res.Infra != nil {
 		t.Fatalf("one absent CRD family must not blind the others: %+v", res)
 	}
@@ -217,7 +217,8 @@ func TestMaybeRefreshKargoWarehousePatchError(t *testing.T) {
 			return true, nil, errors.New("apiserver down")
 		})
 	p := &kargoPromotionHealthCheck{Deps: &probefw.Deps{
-		Name: CheckNameKargoPromotionHealth, Dyn: dyn}}
+		Name: CheckNameKargoPromotionHealth,
+		CS:   fake.NewSimpleClientset(), Dyn: dyn}}
 	before := testutil.QueueErrorCount(t, CheckNameKargoPromotionHealth)
 	p.maybeRefreshKargoWarehouse(ctx, logr.Discard(), wh,
 		"kargo/wh-bad", now)

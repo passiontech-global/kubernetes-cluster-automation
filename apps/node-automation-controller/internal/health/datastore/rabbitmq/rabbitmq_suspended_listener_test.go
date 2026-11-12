@@ -53,7 +53,7 @@ func TestCheckRabbitMQSuspendedUnderCountUnsafe(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended pod must still FAIL — the quorum gate only blocks the heal")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -79,7 +79,7 @@ func TestCheckRabbitMQSuspendedUnreadySiblingUnsafe(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended pod must FAIL — only the heal is gated")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -105,7 +105,7 @@ func TestCheckRabbitMQSuspendedMaintenanceDefers(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("maintenance must defer the heal, not the detection")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -124,7 +124,7 @@ func TestCheckRabbitMQSuspendedPodListInfra(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatal("a pod list failure must mark the check infra-failed")
 	}
@@ -143,7 +143,7 @@ func TestRabbitSuspendedTerminatingIgnored(t *testing.T) {
 	// And end-to-end: a terminating pod is not even tracked.
 	cs := fake.NewSimpleClientset(pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("terminating pod must keep the check quiet: %+v", res)
 	}
 }

@@ -142,11 +142,11 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	} else {
-		// The pod list is the mesh-net-guards scan's only input — a failure
-		// must count like every swallowed infra error in the heal
-		// path, or a wedged linkerd control plane reads as clean
-		// while the scan silently no-ops.
-		metrics.IncError(p.Name)
+		// The pod list is the mesh-net-guards scan's only input — a
+		// failure must surface as Infra, not a false PASS: without
+		// this a wedged linkerd control plane reads clean while the
+		// scan silently no-ops.
+		rep.InfraErr(fmt.Errorf("list pods in %s: %w", kube.LinkerdNS, err))
 		log.Info("WARN: list linkerd pods failed — wedge scan skipped",
 			"ns", kube.LinkerdNS, "error", err)
 	}
@@ -230,11 +230,13 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 // names the elected holder — deleting a standby just churns a
 // healthy replica while the wedged leader keeps the broken IPAM
 // bookkeeping. holderIdentity is "<pod>_<uuid>" on client-go leader
-// election, so the prefix-stripped name is tried before the verbatim
-// identity. When the Lease is unreadable/absent or its holder does
-// not match a live pod, the fallback is the first Running
-// cilium-operator-* pod — still better than an arbitrary pick since
-// only Running pods are re-rollable targets.
+// election for networked pods, but cilium-operator runs
+// hostNetwork:true so its identity is "<nodeHostname>-<rand>" —
+// matched here by pod.Spec.NodeName + "-" prefix. When the Lease is
+// unreadable/absent or its holder does not match a live pod, the
+// fallback is the first Running cilium-operator-* pod — still
+// better than an arbitrary pick since only Running pods are
+// re-rollable targets.
 func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 	log logr.Logger, pods []*corev1.Pod) *corev1.Pod {
 	var fallback *corev1.Pod
@@ -276,6 +278,19 @@ func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 			}
 		}
 	}
+	// hostNetwork identity: "<nodeHostname>-<rand>" never equals a
+	// pod name — match the holder's hostname prefix against each
+	// candidate pod's scheduled node instead.
+	for i := range pods {
+		pod := pods[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning ||
+			pod.Spec.NodeName == "" {
+			continue
+		}
+		if strings.HasPrefix(holder, pod.Spec.NodeName+"-") {
+			return pod
+		}
+	}
 	return fallback
 }
 
@@ -307,12 +322,20 @@ func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logge
 	if !proceed {
 		return
 	}
-	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, component, pod, now); err != nil {
+	deleted, err := heal.DeletePod(ctx, p.CS, &p.Heals, component, pod, now)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "control-plane pod delete failed", "pod", key)
 		return
 	}
-	p.InvalidatePods(ctx) // drop the pod census the delete just invalidated
+	if !deleted {
+		// Quorum reservation denied — a sibling check already spent
+		// this workload's one-disruption slot this sweep.
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"component", component, "pod", key)
+		return
+	}
+	kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(component).Inc()
 	log.Info("DELETE: wedged control-plane pod — forcing re-roll",
 		"component", component, "pod", key)

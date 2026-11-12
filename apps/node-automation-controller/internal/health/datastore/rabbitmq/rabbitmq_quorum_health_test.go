@@ -39,7 +39,7 @@ func TestRabbitMQQuorumAlarmFails(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("fd-limit alarm must fail: %+v", res)
 	}
@@ -76,7 +76,7 @@ func TestRabbitMQQuorumPromResumeHeals(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted quorum window past 10m must FAIL on the first sweep")
 	}
@@ -96,7 +96,7 @@ func TestRabbitMQQuorumStuckUnreadyHeal(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, r1, r2)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stuck-unready quorum member must fail: %+v", res)
 	}
@@ -137,7 +137,7 @@ func TestRabbitMQQuorumUnreadyDeleteKeepsReadyCensus(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck-unready + mnesia partition must FAIL")
 	}
@@ -183,7 +183,7 @@ func TestRabbitMQQuorumDownscaledClusterSkipped(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("downscaled cluster must pass: %+v", res)
 	}
@@ -200,7 +200,7 @@ func TestRabbitMQQuorumHealthyPasses(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(pods...)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy quorum must pass: %+v", res)
 	}
 }
@@ -229,7 +229,7 @@ func TestRabbitMQQuorumPerClusterCensus(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, a1, a2, b0, b1, b2)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck-unready member must still FAIL the check")
 	}
@@ -256,7 +256,7 @@ func TestRabbitMQQuorumOwnerFallbackCensus(t *testing.T) {
 		cs := fake.NewSimpleClientset(bad, a1, b0, b1, b2)
 		p := testProber(cs)
 
-		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Fatal("stuck-unready member must still FAIL the check")
 		}
 		if _, err := cs.CoreV1().Pods("mq").Get(ctx, "x-server-0",
@@ -274,7 +274,7 @@ func TestRabbitMQQuorumOwnerFallbackCensus(t *testing.T) {
 		cs := fake.NewSimpleClientset(bad, a1, a2)
 		p := testProber(cs)
 
-		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Fatal("stuck-unready member must FAIL the check")
 		}
 		if _, err := cs.CoreV1().Pods("mq").Get(ctx, "x-server-0",
@@ -314,7 +314,7 @@ func TestRabbitMQQuorumReadyAlarmDoesNotSelfCount(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted alarm must FAIL the check")
 	}
@@ -352,7 +352,7 @@ func TestRabbitMQQuorumDiskWatermarkNeverHeals(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("disk_watermark_alarm must FAIL the check")
 	}
@@ -400,7 +400,7 @@ func TestRabbitMQQuorumDiskPlusHealableHeals(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stacked alarms must FAIL the check")
 	}
 	if _, err := cs.CoreV1().Pods("mq").Get(ctx, "rabbitmq-server-0",
@@ -475,7 +475,7 @@ func TestRabbitMQQuorumLeaderlessFlagged(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("quorum_leaderless must fail: %+v", res)
 	}
@@ -602,7 +602,7 @@ func TestRabbitMQQuorumSkewFlagsLaggingMember(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("an in-cluster term laggard must fail: %+v", res)
 	}
@@ -657,7 +657,7 @@ func TestRabbitMQQuorumOnePodPerClusterPerSweep(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("the sweep must still FAIL on the findings")
 	}

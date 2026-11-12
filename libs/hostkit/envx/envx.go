@@ -402,8 +402,33 @@ func GetenvFloatPositive(key string, def float64) float64 {
 // misspelling warned about — one line per key per process (Gate
 // resolves in every sweep; a stale "True" in a ConfigMap must not
 // spam the log), the same once-per pattern hostutil uses for its
-// rename-fallback warning.
-var gateIntentWarned sync.Map
+// rename-fallback warning. The table is capped: env keys are
+// compile-time constants in practice, but nothing stops a caller
+// resolving dynamic key names — on overflow the table is cleared so
+// warn-once restarts rather than the map leaking.
+var gateIntentWarned = struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}{m: map[string]struct{}{}}
+
+// gateIntentWarnCap bounds gateIntentWarned.m.
+const gateIntentWarnCap = 1024
+
+// gateIntentWarnOnce reports whether this is the first warning for
+// key — atomic under the mutex so concurrent Gate resolutions still
+// warn exactly once.
+func gateIntentWarnOnce(key string) bool {
+	gateIntentWarned.mu.Lock()
+	defer gateIntentWarned.mu.Unlock()
+	if _, ok := gateIntentWarned.m[key]; ok {
+		return false
+	}
+	if len(gateIntentWarned.m) >= gateIntentWarnCap {
+		clear(gateIntentWarned.m)
+	}
+	gateIntentWarned.m[key] = struct{}{}
+	return true
+}
 
 // looksLikeGateIntent reports whether v reads as boolean intent Gate
 // will silently drop: Bool's lenient vocabulary (1/0, true/false,
@@ -439,9 +464,7 @@ func Gate(key string, defaultOn bool) bool {
 		return true
 	}
 	if looksLikeGateIntent(v) {
-		// LoadOrStore makes the warn-once decision atomic: exactly one
-		// concurrent resolver becomes the warner for this key.
-		if _, dup := gateIntentWarned.LoadOrStore(key, struct{}{}); !dup {
+		if gateIntentWarnOnce(key) {
 			Warnf("bool-like gate value not applied — set exactly \"true\" or \"false\", using default",
 				"key", key, "value", v, "default_on", defaultOn)
 		}

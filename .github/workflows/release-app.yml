@@ -78,6 +78,7 @@ jobs:
           # execute in a job holding contents:write. Route every
           # input through env indirection instead.
           VERSION_INPUT: ${{ inputs.version }}
+          PRERELEASE_INPUT: ${{ inputs.prerelease }}
           LEGACY_V_TAGS: ${{ inputs.legacy_v_tags }}
           LIB_PATHS: ${{ inputs.lib_paths }}
           # gh release view below needs API auth to catch a release
@@ -163,29 +164,43 @@ jobs:
             # echoes the same version; force a patch bump so the
             # release tag never collides.
             if [ "$rel_version" = "$last_ver" ]; then
-              case "$last_ver" in
+              # Strip "+build" metadata BEFORE the prerelease check:
+              # a '-' inside build metadata ("v0.1.0+build-x") is not
+              # a prerelease marker — matching *-* on the raw tag
+              # would misclassify it and skip the patch bump.
+              last_core="${last_ver%%+*}"
+              case "$last_core" in
                 *-*)
                   # Last tag is a prerelease ("v0.1.0-rc.1") — this
                   # release IS its base version: strip the "-rc.N"
-                  # suffix AND any "+build" metadata after it (a
-                  # prerelease sorts before its release, so the base
-                  # tag cannot exist yet). Bumping patch here would
-                  # skip v0.1.0 entirely.
-                  rel_version="${last_ver%%+*}"    # drop "+build" (if any)
-                  rel_version="${rel_version%%-*}" # drop "-rc.N"
+                  # suffix (a prerelease sorts before its release, so
+                  # the base tag cannot exist yet). Bumping patch here
+                  # would skip v0.1.0 entirely.
+                  rel_version="${last_core%%-*}"
                   ;;
                 *)
-                  IFS=. read -r major minor patch <<<"${last_ver#v}"
-                  # Strip a build-metadata '+' suffix from the last
-                  # component ("0+meta") or the arithmetic crashes.
-                  major="${major%%+*}"
-                  minor="${minor%%+*}"
-                  patch="${patch%%+*}"
+                  IFS=. read -r major minor patch <<<"${last_core#v}"
                   rel_version="v$major.$minor.$((patch + 1))"
                   ;;
               esac
             fi
           fi
+          # Prerelease detection runs on the CORE semver — the
+          # docker-safe REL_DOCKER_VERSION below swaps '+' for '-',
+          # so testing '-' on it would misread "+build" metadata as
+          # a prerelease, and testing only '-rc' would miss
+          # -alpha/-beta/-SNAPSHOT suffixes. Strip "+build" first,
+          # then any '-' in what remains is a real prerelease.
+          rel_core="${rel_version%%+*}"
+          case "$rel_core" in
+            *-*) rel_prerelease=true ;;
+            *)   rel_prerelease=false ;;
+          esac
+          # The workflow_dispatch prerelease checkbox must force the
+          # flag even on a stable-looking version — otherwise a manual
+          # release of v0.2.0 with prerelease=true would ship stable
+          # AND move :latest onto it.
+          [ "$PRERELEASE_INPUT" != "true" ] || rel_prerelease=true
           # Docker-safe image-tag variant of REL_VERSION: swap the
           # semver '+' separator for '-' (v1.2.3+build.5 ->
           # v1.2.3-build.5; plain releases and prereleases carry over
@@ -224,6 +239,7 @@ jobs:
 
           echo "REL_VERSION=$rel_version" >>"$GITHUB_ENV"
           echo "REL_DOCKER_VERSION=$rel_docker_version" >>"$GITHUB_ENV"
+          echo "REL_PRERELEASE=$rel_prerelease" >>"$GITHUB_ENV"
           echo "REL_TAG=$rel_tag" >>"$GITHUB_ENV"
           # Job outputs for callers that need the resolved tag (e.g.
           # the binary-attach job must not re-derive it from git —
@@ -270,15 +286,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ env.REL_VERSION }}
-          # Prereleases get the version tag only — they must not move
-          # the floating :latest pointer onto a non-stable build. The
-          # '-rc' term guards a manually dispatched prerelease version
-          # (v1.2.3-rc.1) even when the caller left the prerelease
-          # checkbox unticked; it keys on the RESOLVED version so an
-          # auto-bump onto a prerelease is caught the same way.
-          # REL_DOCKER_VERSION is REL_VERSION with '+' swapped for '-':
-          # docker/ko tags cannot contain '+'.
-          TAGS: "${{ env.REL_DOCKER_VERSION }}${{ (inputs.prerelease == true || contains(env.REL_VERSION, '-rc')) && '' || ',latest' }}"
+          # Only the resolved version tag is pushed here — the
+          # floating :latest pointer is attached AFTER `gh release
+          # create` via `docker buildx imagetools create` (see the
+          # publish step), so a failed release never leaves :latest
+          # moved onto an unpublished build, and prereleases never
+          # touch :latest at all. REL_DOCKER_VERSION is REL_VERSION
+          # with '+' swapped for '-' (docker/ko tags cannot contain
+          # '+').
+          TAGS: "${{ env.REL_DOCKER_VERSION }}"
           KO_DOCKER_REPO: ${{ env.IMAGE }}
         run: |
           set -euo pipefail
@@ -290,10 +306,10 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Same effective-prerelease rule as the image TAGS above: a
-          # dispatched -rc version is a prerelease even when the caller
-          # forgot the checkbox.
-          REL_PRERELEASE: ${{ inputs.prerelease == true || contains(env.REL_VERSION, '-rc') }}
+          # REL_PRERELEASE was resolved in the version step from the
+          # CORE semver (any '-' prerelease suffix, '+' build metadata
+          # stripped first) — covers both the dispatched checkbox and
+          # an auto-bumped -alpha/-beta/-rc version alike.
         run: |
           set -euo pipefail
           args=(--title "$APP $REL_VERSION" --notes-file notes.md --target "$GITHUB_SHA")
@@ -301,3 +317,14 @@ jobs:
           # Positional args are uploaded release ASSETS — notes.md is
           # already passed via --notes-file and must not ship as one.
           gh release create "$REL_TAG" "apps/$APP/dist/"* "${args[@]}"
+
+          # Attach the floating :latest pointer to the EXACT manifest
+          # digest just pushed — imagetools retags server-side, so no
+          # second `ko build` can drift :latest onto a different digest
+          # than the released version tag. Runs only AFTER the release
+          # exists (a failed gh release create leaves :latest alone)
+          # and never for prereleases.
+          if [ "$REL_PRERELEASE" != "true" ]; then
+            docker buildx imagetools create \
+              -t "${IMAGE}:latest" "${IMAGE}:${REL_DOCKER_VERSION}"
+          fi

@@ -149,26 +149,47 @@ func budgetGate(now time.Time) bool {
 }
 
 // budgetRefund hands one grant back to the process-global budget —
-// the refused-eviction counterpart of budgetGate, called by
-// EvictPodV when the eviction it just attempted is PDB-refused (a
-// deferral delivered no heal, so it must not spend a fleet grant).
-// No budget configured consumed nothing, so it is a no-op; a refund
-// fires no hook — only denials are metered.
+// the no-heal-delivered counterpart of budgetGate. Callers: EvictPodV
+// on ANY refused=true outcome (PDB 429, L1 hold, quorum denial — all
+// clean deferrals that executed no mutation). No budget configured
+// consumed nothing, so it is a no-op; a refund fires no hook — only
+// denials are metered.
 func budgetRefund(now time.Time) {
 	if b := defaultBudget.Load(); b != nil {
 		b.Refund(now)
 	}
 }
 
-// RefundGrant is budgetRefund's exported face for BATCH-gated
-// callers: a pass that took one up-front grant via heal.Gate /
-// AllowedV and then had EVERY actuation refused (PDB 429 — a
-// deferral that delivered no heal) hands the grant back, the same
-// contract EvictPodV applies per pod. Callers refund only when
-// nothing was delivered — a pass with even one landed action keeps
-// its grant. No budget configured consumed nothing, so it is a
-// no-op; a refund for an instant that consumed nothing finds no
-// stamp and is itself a no-op.
+// RefundGrant is budgetRefund's exported face for GATE-OWNING
+// callers — the functions that consumed a grant via heal.Gate /
+// AllowedV / HealAllowed and then ran their own actuation loop.
+//
+// THE CONTRACT — exactly once per gate call, and only when NO
+// delete/patch mutation was executed:
+//
+//   - The gate consumed ONE grant for the whole call. Refund at
+//     most once per gate call — never once per skipped target in a
+//     batch (BounceOperatorPod's per-target deletes share the one
+//     grant; refunding per deferral would over-credit the window).
+//   - Refund only when the pass delivered nothing AND attempted
+//     nothing: every target cleanly deferred (L1 hold, quorum
+//     denial, sibling guard) means the grant bought no heal.
+//   - Do NOT refund when a mutation was attempted and failed —
+//     "a grant whose delete then fails simply spent a cheap token"
+//     (budget.go header). An attempted write is not a free retry.
+//   - Do NOT refund inside low-level helpers (heal.DeletePod /
+//     heal.EvictPod): they cannot know whether the caller's gate
+//     charged the budget at all — a bare DeletePod call may follow
+//     no gate, and a gated caller that also refunds would
+//     double-credit. The pre-fix shape did exactly that (the helper
+//     refunded the hold/quorum deferral AND the V-wrapper refunded
+//     again on refused=true), which could eat a SIBLING gate's
+//     grant stamped at the same `now`.
+//
+// A refund for an instant that consumed nothing finds no stamp and
+// is itself a no-op, so an extra call cannot push the window
+// negative — but the exactly-once rule still stands: relying on the
+// no-op makes correctness depend on stamp timing, not contract.
 func RefundGrant(now time.Time) {
 	budgetRefund(now)
 }

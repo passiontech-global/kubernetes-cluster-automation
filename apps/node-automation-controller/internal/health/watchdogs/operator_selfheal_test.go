@@ -153,7 +153,7 @@ func TestOperatorStuckPredicates(t *testing.T) {
 // No Lease at all → nothing to judge, the check stays quiet.
 func TestCheckOperatorWorkqueuesNoLeaseQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn())
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass || res.Infra != nil {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass || res.Infra != nil {
 		t.Fatalf("absent leases must pass quietly, got %+v", res)
 	}
 }
@@ -170,7 +170,7 @@ func TestCheckOperatorWorkqueuesStaleLeaseQuiet(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("stale lease must pass quietly, got %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen); len(keys) != 0 {
@@ -205,7 +205,7 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
 	// First sighting — tracked, not frozen, no heal.
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen); len(keys) != 1 {
@@ -223,7 +223,7 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	at := base.Add(21 * time.Minute)
 	shRenewLease(t, cs, "scylla-operator", "scylla-operator-lock", at)
 	p.Now = func() time.Time { return at }
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck >=20m with a renewing lease must FAIL")
 	}
@@ -273,7 +273,7 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("precondition: stuck signature must FAIL")
 	}
@@ -301,7 +301,7 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Now = func() time.Time { return at }
-	res = probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res = probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("still-stuck signature must keep FAILING")
 	}
@@ -338,7 +338,7 @@ func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck signature must FAIL regardless of heal cooldown")
 	}
@@ -375,7 +375,7 @@ func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("maintenance must defer the heal, not the detection")
 	}
@@ -404,7 +404,7 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("helm-controller/helmreleases/apps/hr/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("suspended HelmRelease must not freeze the check: %+v", res)
 	}
 	if _, ok := probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
@@ -439,7 +439,7 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck dragonfly must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("dragonfly-operator-system").
@@ -481,7 +481,7 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, base.Add(-time.Hour))
 
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck certificate must FAIL")
 	}
@@ -519,7 +519,7 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stuck dragonfly with live pod must FAIL (leaseOptional)")
 	}
@@ -572,7 +572,7 @@ func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 		Observe("node-healthcheck-operator/nodehealthchecks/operators/nhc/"+opReasonNoStatus,
 			base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("never-reconciled NodeHealthCheck must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "node-healthcheck-operator",
@@ -607,7 +607,7 @@ func TestCheckOperatorWorkqueuesUnownedPodSpendsNoBudget(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck signature must FAIL")
 	}
 	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, probetest.OpDyn(), "probe", base)

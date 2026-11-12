@@ -23,6 +23,7 @@ import (
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -37,6 +38,18 @@ import (
 // webhook guard's census. Kept as an exported alias of the shared
 // page bound so the domain checks' spelling stays stable.
 const HealthListPageSize = kube.DefaultListPageSize
+
+// HeavyScanCycles is the internal cadence divider for the cluster's
+// heaviest censuses — the checks that page EVERY ConfigMap/Secret
+// (or the full pull-secret reference set) cluster-wide cannot afford
+// a fresh read every 5m sweep. A check counts its Runs and audits on
+// cycles 1, 1+HeavyScanCycles, … — every 6th sweep ≈ 30m at the
+// default interval — carrying its last emitted tuples and findings
+// forward between audits (state.GaugeLedger.Last + a stored finding
+// slice) so neither the gauge nor the verdict flaps on "not
+// evaluated this cycle". Bloat/secret-hygiene drift is slow; a
+// 30-minute detection bound is the right cost/benefit.
+const HeavyScanCycles = 6
 
 // Result is one check's verdict. Pass=false + Infra=nil is an
 // observed health failure (the metric's FAIL=1); Infra!=nil is a
@@ -71,6 +84,11 @@ type Deps struct {
 	// run-error counters and the registered periodic.
 	Name string
 	CS   kubernetes.Interface
+	// Meta is the metadata-only client ListPartialOrFallback prefers
+	// for census reads that only need ObjectMeta (ReplicaSets today)
+	// — nil in tests, where the CS/Dyn fallbacks serve the same
+	// objects heavier but identically.
+	Meta metadata.Interface
 	// NodeReader is the informer-cache reader AllNodes prefers —
 	// mgr.GetClient() in production, nil in tests (falls back to the
 	// direct ListNodes). Read-only censuses only; destructive acts

@@ -275,14 +275,22 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	if !proceed {
 		return
 	}
-	if _, err := heal.DeletePod(ctx, p.CS, &p.olmHealed, key, target,
-		now); err != nil {
+	didDelete, err := heal.DeletePod(ctx, p.CS, &p.olmHealed, key, target,
+		now)
+	if err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "olm-operator pod delete failed",
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	p.InvalidatePods(ctx) // pod gone — drop the census
+	if !didDelete {
+		// Quorum reservation denied — a sibling check already spent
+		// this workload's one-disruption slot this sweep.
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"pod", target.Namespace+"/"+target.Name)
+		return
+	}
+	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	for _, r := range reasons {
 		olmOperatorHealsTotal.WithLabelValues(r).Inc()
 	}
@@ -292,7 +300,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	// cooldown. A patch failure leaves the in-RAM half (the delivered
 	// delete already stamped olmHealed) holding; nil ledger because
 	// the in-RAM key is the per-controller cooldown stamped above.
-	if err := heal.StampPersisted(ctx,
+	if err := heal.StampPersisted(ctx, nil,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().Deployments(olmOperatorNS).
 				Patch(ctx, olmOperatorPodPrefix, types.MergePatchType, data,

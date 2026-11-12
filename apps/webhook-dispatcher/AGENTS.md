@@ -46,11 +46,11 @@ optional via `envx.String`. Env is read in exactly one place —
 ## Directory map
 
 - `cmd/dispatcher` — entrypoint: required-env check, `LOCAL_USERS`
-  split (first colon), transport tuning (idle conns sized for
-  16 fan-out + 8 index workers sharing one client), both muxes,
-  bind-then-serve, the signal select, and the ordered shutdown
-  (drain → `wh.Wait(waitCtx)` → `CloseIdleConnections`). `main.go`
-  is the only file that reads env.
+  split (first valid comma-entry, first colon), transport tuning
+  (idle conns sized for 16 fan-out + 8 index workers sharing one
+  client), both muxes, bind-then-serve, the signal select, and the
+  ordered shutdown (drain → `wh.Wait(waitCtx)` →
+  `CloseIdleConnections`). `main.go` is the only file that reads env.
 - `internal/verify` — the HMAC check: constant-time `sha256=` digest
   compare, empty-secret fails closed, `HasValidSignatureFormat` lets
   the handler reject malformed signatures before allocating for the
@@ -59,17 +59,34 @@ optional via `envx.String`. Env is read in exactly one place —
   resource-type mapping and payload filtering (non-actionable
   pull_request actions, branch deletions, non-published releases are
   skipped before the index lookup — they would only burn forced-
-  refresh slots), the detached fan-out, and `Wait`. Metrics live in
-  `metrics.go` (`webhook_dispatcher_deliveries_total{event,status}`,
+  refresh slots), request admission (`maxInflightRequests`, 503 when
+  saturated or draining), the detached fan-out, and `Wait`. Metrics
+  live in `metrics.go` (`webhook_dispatcher_deliveries_total{event,status}`,
   `webhook_dispatcher_fanout_total{result}`,
   `webhook_dispatcher_fanout_duration_seconds`).
 - `internal/concourse` — the small ATC API slice: pipeline/resource
   listing → repo index, `CheckWebhook` POSTs, `NormalizeRepo`
   (scp-like SSH / SSH / HTTPS / bare `org/repo` → lowercase
   `org/repo`; the `github.com` host prefix strips only where github.com
-  can actually be the host). Metrics in `metrics.go`
+  can actually be the host). `auth.go` owns dual-mode credentials:
+  bearer JWT minted at `/sky/issuer/token` (fallback `/sky/token`,
+  singleflight refresh 60s early, one re-mint on a 401) latching to
+  HTTP basic permanently when both token endpoints 404/405.
+  Archived pipelines are skipped; instanced pipelines carry
+  `instance_vars` flattened to ATC dot-notation
+  (`Resource.InstanceVarsQuery`) into both the `/resources` listing
+  and the check-webhook POST — one `vars.<key>=<json>` param per
+  leaf, nested maps flattened to dot paths, separator chars in a
+  segment %q-quoted (mirrors `atc/pipeline.go` `QueryParams` over
+  `vars.Flatten`; the ATC does NOT accept a single `?vars=<json>`).
+  Metrics in `metrics.go`
   (`webhook_dispatcher_concourse_index_last_refresh_timestamp_seconds`,
   `webhook_dispatcher_concourse_index_fetch_errors_total`).
+- `internal/envdoc` — test-only package keeping `docs/env.md`
+  honest: it walks `cmd/dispatcher` + `internal/` for every env var
+  the code can read (envx helpers, `os.Getenv`-family, range-bound
+  `[]string` key lists, package string consts) and fails on
+  undocumented knobs.
 
 ## Conventions
 

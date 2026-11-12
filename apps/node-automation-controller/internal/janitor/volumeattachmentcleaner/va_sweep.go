@@ -11,6 +11,7 @@ package volumeattachmentcleaner
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -79,6 +80,27 @@ func newVaCycle() *vaCycle {
 		stuckReadyNow:   map[string]bool{},
 		stuckReadyPrior: map[string]bool{},
 	}
+}
+
+// vaFirstSeenKey keys a FirstSeen ledger entry by name AND UID —
+// VolumeAttachment names are deterministic csi-hash names, so a
+// volume re-attaching between cycles recreates the SAME name with
+// a new UID; keying on name alone would let the replacement inherit
+// the dead object's sighting window and detach on its first cycle.
+// VA names and UIDs are both DNS/UUID-safe — neither contains "/",
+// so vaLedgerName can recover the bare name for the per-cycle maps.
+func vaFirstSeenKey(va *storagev1.VolumeAttachment) string {
+	if va.UID == "" {
+		return va.Name // no UID to disambiguate — name is the only identity
+	}
+	return va.Name + "/" + string(va.UID)
+}
+
+// vaLedgerName recovers the bare VA name from a vaFirstSeenKey
+// ledger key — the per-cycle sighting maps stay name-keyed.
+func vaLedgerName(key string) string {
+	name, _, _ := strings.Cut(key, "/")
+	return name
 }
 
 // vaTarget is one listed VA carried into the sweep — strip tags
@@ -179,7 +201,7 @@ func (c *volumeAttachmentCleaner) sweep(ctx context.Context, log logr.Logger,
 				return err
 			}
 			metrics.VolumeAttachmentsCleanedTotal.WithLabelValues(t.reason).Inc()
-			c.orphanFirstSeen.Forget(t.va.Name)
+			c.orphanFirstSeen.Forget(vaFirstSeenKey(t.va))
 			return nil
 		},
 		OnError: func(log logr.Logger, t *vaTarget, err error) {
@@ -257,22 +279,30 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 	}
 	// The live Get found the node — the census snapshot may
 	// have been stale. The LIVE node wins: re-run the
-	// destructive branch against it.
+	// destructive branch against it. The pod census is re-read
+	// FRESH off the apiserver too — the cycle caches were
+	// populated by the census pass and a pod may have mounted
+	// the volume (or the node) since; the Confirm exists to
+	// close exactly that TOCTOU. PVC/PV binding caches stay
+	// cycle-scoped — claim→volume bindings move far slower than
+	// pod mounts and the audit scopes the live read to pods.
+	livePods := map[string]podListProbe{}
+	liveNodePods := map[string]podListProbe{}
 	if t.strip {
 		liveNodes := map[string]*corev1.Node{t.va.Spec.NodeName: live}
 		if !c.stuckTerminatingNodeDead(ctx, t.va, liveNodes,
-			cyc.livePods, cyc.stuckReadyPrior, now) {
+			livePods, cyc.stuckReadyPrior, now) {
 			return false, nil
 		}
 		// Ready-node branch: the two-cycle unused-volume sighting ran
 		// against the informer snapshot — a pod may have mounted the
-		// volume since. Re-run the proof against the LIVE node so its
-		// Status.VolumesInUse/VolumesAttached (and the pod census)
-		// decide, never the stale copy.
+		// volume since. Re-run the proof against the LIVE node and a
+		// LIVE pod list so its Status.VolumesInUse/VolumesAttached
+		// (and the pod census) decide, never the stale copy.
 		if kube.NodeReady(live) &&
 			!kube.HasTaint(live.Spec.Taints, vaOutOfServiceTaint) {
 			return c.stuckReadyUnused(ctx, t.va, liveNodes,
-				cyc.nodePods, cyc.pvcPVs, cyc.pvNames, log), nil
+				liveNodePods, cyc.pvcPVs, cyc.pvNames, log), nil
 		}
 		return true, nil
 	}
@@ -282,14 +312,16 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 		// Clear it so the two-sighting window re-arms (same
 		// convention as the orphanendpointslicecleaner's
 		// stale-snapshot reset).
-		c.orphanFirstSeen.Forget(t.va.Name)
+		c.orphanFirstSeen.Forget(vaFirstSeenKey(t.va))
 		log.Info("KEEP: live node confirm found the node — census snapshot stale",
 			"va", t.va.Name, "node", t.va.Spec.NodeName)
 		return false, nil
 	}
 	// out_of_service_node — re-run the gate on the LIVE
-	// node: Ready again or the taint dropped keeps the VA;
-	// still fenced-and-dead holds the verdict (the pod
-	// census re-reads the cycle's cache).
-	return c.nodeFencedDead(ctx, live, cyc.livePods, now), nil
+	// node AND a fresh pod census: Ready again or the taint
+	// dropped keeps the VA; still fenced-and-dead holds the
+	// verdict — but only if no pod mounted the volume since
+	// the census pass (livePods is confirm-local, not the
+	// cycle cache).
+	return c.nodeFencedDead(ctx, live, livePods, now), nil
 }

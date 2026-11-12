@@ -59,10 +59,10 @@ func TestCloudflaredZeroHAConnectionsDeletesWithSibling(t *testing.T) {
 		"10.0.0.2": "cloudflared_tunnel_ha_connections 4\n",
 	})}
 	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first degraded sighting inside streak must pass: %+v", res)
 	}
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("persistent ha_connections=0 must fail: %+v", res)
 	}
@@ -82,7 +82,7 @@ func TestCloudflaredHealthyHAConnectionsPass(t *testing.T) {
 		"10.0.0.1": "cloudflared_tunnel_ha_connections 4\n",
 	})}
 	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy tunnel must pass: %+v", res)
 	}
 }
@@ -151,7 +151,7 @@ func TestCfTunnelBufferWarningIsNotADeadTunnel(t *testing.T) {
 	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
 
 	for i := 0; i <= cfTunnelMinStreak; i++ {
-		if res := chk.Run(ctx); !res.Pass {
+		if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 			t.Fatalf("benign buffer warning must not degrade the connector (sweep %d): %+v", i, res)
 		}
 	}
@@ -176,7 +176,7 @@ func TestCfTunnelInconclusiveSweepKeepsStreak(t *testing.T) {
 	p.HTTPClient = &http.Client{Transport: cfMetricsTransport(metrics)}
 	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
 
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first degraded sighting inside streak must pass: %+v", res)
 	}
 	// Both channels die: the transport drops the body and the kubelet
@@ -184,11 +184,11 @@ func TestCfTunnelInconclusiveSweepKeepsStreak(t *testing.T) {
 	delete(metrics, "10.0.0.1")
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"", errors.New("kubelet log read boom")))
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	// Metrics revive: the second degraded sighting rides the
 	// preserved streak straight to cfTunnelMinStreak.
 	metrics["10.0.0.1"] = "cloudflared_tunnel_ha_connections 0\n"
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("cf").Get(ctx, "cf-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("flaky-evidence dead tunnel must still reach the streak threshold, err=%v", err)
 	}
@@ -209,7 +209,7 @@ func TestCloudflaredEndpointBounceDetected(t *testing.T) {
 	chk := probetest.MustCheck[*cloudflaredTunnelHealthCheck](t, p)
 
 	// Sweep 1: the connector arms the ledger — healthy, no bounce.
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("arming sweep must pass: %+v", res)
 	}
 	if v := ptestutil.ToFloat64(cloudflaredEndpointBouncedTotal.WithLabelValues("cf")); v != 0 {
@@ -224,7 +224,7 @@ func TestCloudflaredEndpointBounceDetected(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("cf").Update(ctx, replaced, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("replace connector: %v", err)
 	}
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy replacement must pass: %+v", res)
 	}
 	if v := ptestutil.ToFloat64(cloudflaredEndpointBouncedTotal.WithLabelValues("cf")); v != 1 {
@@ -232,7 +232,7 @@ func TestCloudflaredEndpointBounceDetected(t *testing.T) {
 	}
 
 	// Sweep 3: same UID — no repeat count.
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("stable connector must pass: %+v", res)
 	}
 	if v := ptestutil.ToFloat64(cloudflaredEndpointBouncedTotal.WithLabelValues("cf")); v != 1 {

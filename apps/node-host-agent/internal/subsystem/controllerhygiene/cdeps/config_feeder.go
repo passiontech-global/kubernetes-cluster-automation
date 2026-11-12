@@ -24,9 +24,9 @@ type FeederConfig struct {
 	GraceFails   int           // fail budget before first success
 	ProbeURL     string        // readyz-ish endpoint; any HTTP code = alive
 	ProbeTO      time.Duration
-	// StateDir holds the remediate rate-limit file (shell
-	// STATE_DIR=/var/lib/k0s-systemd-watchdog).
-	StateDir            string
+	// The G5 restart budget is NOT a feeder-private file: it spends
+	// the shared FileRateRestart epoch under WatchdogStateDir so a
+	// sig13/cp-freeze/pki-drift restart cools this remediate too.
 	RemediateMinRestart time.Duration // G5 budget
 	RemediateFreshGrace time.Duration // G3 fresh-start grace
 	RemediatePeerFile   string        // PEER_APISERVER= override file
@@ -47,9 +47,6 @@ func (c *Config) applyFeederDefaults() {
 	}
 	if c.Feeder.ProbeTO <= 0 {
 		c.Feeder.ProbeTO = defaultFeedProbeTO
-	}
-	if c.Feeder.StateDir == "" {
-		c.Feeder.StateDir = defaultFeederStateDir
 	}
 	if c.Feeder.RemediateMinRestart <= 0 {
 		c.Feeder.RemediateMinRestart = defaultRemediateMinRst

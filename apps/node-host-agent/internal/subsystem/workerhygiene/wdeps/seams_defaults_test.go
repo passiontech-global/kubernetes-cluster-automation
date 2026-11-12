@@ -144,7 +144,7 @@ func TestApplyDefaultsPodLogFnDelegation(t *testing.T) {
 func TestTeardownApplyDefaults(t *testing.T) {
 	var cfg wdeps.Config
 	cfg.ApplyDefaults()
-	if cfg.Teardown.StuckDeleteAge != 15*time.Minute ||
+	if cfg.Teardown.StuckDeleteAge != 20*time.Minute ||
 		cfg.Teardown.StuckWedgeAge != 30*time.Minute ||
 		cfg.Teardown.MaxForceDelete != 5 {
 		t.Fatalf("teardown defaults = %+v", cfg.Teardown)

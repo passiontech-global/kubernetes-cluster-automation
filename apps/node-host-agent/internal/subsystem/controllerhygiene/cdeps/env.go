@@ -5,6 +5,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sdnotify"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -24,6 +25,10 @@ import (
 // in the caller.
 type EnvDeps struct {
 	hostctx.Deps
+	// Coord is the optional L1↔L3 nodecoord handle — cmd/agent
+	// builds it via nodecoord.NewKube; nil leaves the maintenance
+	// hold disabled (tests, minimal wiring).
+	Coord *nodecoord.Coord
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob controllerhygiene
@@ -48,7 +53,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 		wd = *d.Watchdog
 	}
 	cfg := Config{
-		Base: subframe.FromDeps(d.Deps),
+		Base:  subframe.FromDeps(d.Deps),
+		Coord: d.Coord,
 		// No env knob — PathJoin-derived like the Admin* paths.
 		K0sControllerUnitFile: d.PathJoin("/etc/systemd/system/k0scontroller.service"),
 		// The snapshot verifier's second default dir is a host path —
@@ -79,7 +85,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// the same override, not re-derive the dir.
 		TextfileDir: d.TextfileDir,
 		Feeder: FeederConfig{
-			StateDir:          d.PathJoin("/var/lib/k0s-systemd-watchdog"),
 			RemediatePeerFile: d.PathJoin("/etc/default/k0scontroller-watchdog"),
 		},
 		JournalDirs:             d.JournalDirs,

@@ -140,6 +140,7 @@ func nebulaConvergeFixture(t *testing.T) (vars, certs, hostRoot, dl string) {
 	if err := os.MkdirAll(filepath.Join(hostRoot, "usr/local/bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	plantTunDevice(t, hostRoot)
 	return vars, certs, hostRoot, t.TempDir()
 }
 

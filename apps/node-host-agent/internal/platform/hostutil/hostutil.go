@@ -377,3 +377,19 @@ func FileStatKey(path string) (string, error) {
 	return fmt.Sprintf("%d:%d:%d:%d",
 		st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano()), nil
 }
+
+// HostSidePath maps an in-pod /host-mounted path back to the path a
+// host process reports: "/host/x" → "/x", "/host" → "/", anything
+// else unchanged (standalone "/" HostRoot paths and fixture paths
+// carry no prefix and pass through verbatim). The strip is
+// boundary-checked — strings.TrimPrefix(p, "/host") would also
+// mangle legitimate paths like "/hostname/..." or "/hostile/...".
+func HostSidePath(p string) string {
+	if rest, ok := strings.CutPrefix(p, "/host/"); ok {
+		return "/" + rest
+	}
+	if p == "/host" {
+		return "/"
+	}
+	return p
+}

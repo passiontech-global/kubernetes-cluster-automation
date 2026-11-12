@@ -479,3 +479,77 @@ func TestKineServiceTCPLoopbackNoCertRequirement(t *testing.T) {
 		t.Fatal("kine.service not enabled on loopback listener")
 	}
 }
+
+// IPv6 loopback is loopback: tcp://[::1]:2379 converges without the
+// mTLS cert set exactly like 127.0.0.1 — the bracketed literal must
+// not fall into the non-loopback guard.
+func TestKineServiceTCPLoopbackV6NoCertRequirement(t *testing.T) {
+	r, sr := kineTCPEnv(t, `kine_listen_address: "tcp://[::1]:2379"
+`, nil)
+	if !hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit not written for an IPv6 loopback tcp listener without certs")
+	}
+	unit := hostRead(t, r, "/etc/systemd/system/kine.service")
+	if !strings.Contains(unit, "--listen-address=tcp://[::1]:2379") {
+		t.Fatalf("IPv6 loopback listen address not rendered:\n%s", unit)
+	}
+	if len(sr.CallsMatching("systemctl enable kine.service")) == 0 {
+		t.Fatal("kine.service not enabled on IPv6 loopback listener")
+	}
+}
+
+// Every kine_* value bound for kine.env or the unit's Exec lines
+// passes its sink's charset gate — a refused var keeps last-good
+// unit+env and skips even the binary download.
+func TestKineServiceUnsafeVarsRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"endpoint newline splices env line",
+			"kine_endpoint: \"postgres://x\\nEVIL_INJECTED=1\""},
+		{"endpoint quote reopens env quoting",
+			"kine_endpoint: \"postgres://x\\\"EVIL=1\""},
+		{"listen single-quote breaks wait-loop",
+			"kine_listen_address: \"unix:///run/k0s/kine.sock';id;#\""},
+		{"listen space splits exec args",
+			"kine_listen_address: \"unix:///run/k0s/kine.sock --evil\""},
+		{"metrics bind space splits exec args",
+			"kine_metrics_bind_address: \":2380 --evil\""},
+		{"cert path semicolon",
+			"kine_ca_file: \"/etc/kine/ca.crt;id\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := []byte("fake-kine-binary")
+			sum := sha256.Sum256(bin)
+			vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "http://127.0.0.1:1/never-used"
+kine_bin_sha256: "%x"
+kine_endpoint: "postgres://x"
+%s
+`, sum, tc.yaml))
+			sr := newScripted(nil, nil)
+			r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+				VarsDir: vars, Runner: sr}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Verified binary present → the refusal must come from
+			// the var gate, not the binary pin path.
+			hostWrite(t, r, "/usr/local/bin/kine", "fake-kine-binary")
+			c := loadCyc(t, r, vars, "node-a")
+			c.groupKineService()
+			if hostExists(r, "/etc/systemd/system/kine.service") ||
+				hostExists(r, "/etc/kine/kine.env") {
+				t.Fatalf("unit/env rendered with unsafe var:\n%s", tc.yaml)
+			}
+			for _, call := range sr.Calls() {
+				if strings.Contains(call, "systemctl enable kine") ||
+					strings.Contains(call, "systemctl start kine") {
+					t.Fatalf("kine.service started with unsafe var: %s", call)
+				}
+			}
+		})
+	}
+}

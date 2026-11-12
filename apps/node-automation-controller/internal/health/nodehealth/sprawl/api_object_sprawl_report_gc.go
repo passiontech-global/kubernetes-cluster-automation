@@ -15,7 +15,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -49,6 +48,16 @@ type apiObjectSprawlReportGCCheck struct {
 	// the map collapses to one lookup per distinct owner. Reset at
 	// the top of every Run.
 	ownerSeen map[string]bool
+
+	// kineCycle counts Runs for the HeavyScanCycles cadence — the
+	// kine large-object census (cluster-wide ConfigMap+Secret pages
+	// plus CRD schemas) is the heaviest read in the sweep, so it
+	// audits every 6th cycle (~30m) and carries its last tuples +
+	// findings forward between audits: the bloat objects are not
+	// self-remediating, so the verdict stays honest without paying
+	// the census every 5m.
+	kineCycle        uint64
+	kineLastFindings []string
 }
 
 // NewAPIObjectSprawlReportGCCheck builds the sprawl-gc check — its
@@ -179,12 +188,15 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	orphanBudget := sprawlMaxOrphanDeletes
 	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
-		// The snapshot's per-GVR census: trivy emits one report per
-		// workload revision, so an unpaginated List is exactly the
-		// etcd-serializes-everything shape this check exists to
-		// fight. The raw apiserver error is memoized verbatim — the
+		// The census only ever reads ObjectMeta (name/ns/labels/
+		// ownerRefs/creationTimestamp/UID) — ListPartialOrFallback
+		// serves exactly that through the metadata endpoint and only
+		// pays a full-object LIST when the endpoint is unavailable.
+		// The raw apiserver error is memoized verbatim — the
 		// IsNotFound/NoMatch interpretation stays here.
-		items, err := p.AllUnstructured(ctx, rk.gvr)
+		items, err := kube.ListPartialOrFallback(ctx, p.Meta, p.CS, p.Dyn,
+			rk.gvr, metav1.NamespaceAll,
+			metav1.ListOptions{Limit: probefw.HealthListPageSize})
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 			continue // report CRD absent on this cluster — no census, no GC
@@ -229,6 +241,32 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	// crosses the sprawl ceiling (retention knobs missing upstream).
 	ciTotal := 0
 	for _, rk := range sprawlCIKinds {
+		if !rk.gcCompleted {
+			// Census-only kinds need nothing but ObjectMeta — same
+			// metadata-endpoint read as the report census above.
+			items, err := kube.ListPartialOrFallback(ctx, p.Meta, p.CS,
+				p.Dyn, rk.gvr, metav1.NamespaceAll,
+				metav1.ListOptions{Limit: probefw.HealthListPageSize})
+			switch {
+			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+				continue // CRD absent on this cluster — skip silently
+			case err != nil:
+				return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.resource, err)}
+			}
+			perNS := map[string]int{}
+			for i := range items {
+				perNS[items[i].GetNamespace()]++
+				ciTotal++
+			}
+			for ns, count := range perNS {
+				objects.Set(apiObjectCountGauge, float64(count),
+					rk.resource+"/"+ns, []string{rk.resource, ns})
+			}
+			continue
+		}
+		// gcCompleted kinds GC on status.phase — a payload field the
+		// metadata endpoint does not serve, so these keep the
+		// full-object census.
 		items, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
 		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
@@ -247,8 +285,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			// UID-preconditioned delete, same evidence surface. The
 			// phase test gates it — a Running/Pending analysis is a
 			// live canary gate.
-			if !rk.gcCompleted ||
-				now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
+			if now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
 				continue
 			}
 			phase, _ := kube.NestedString(obj.Object, "status", "phase")
@@ -296,8 +333,32 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	// objects. Same failed-read posture as the report census above:
 	// bail before any ledger Prune so live series are not dropped on
 	// a flap.
-	if err := p.auditKineLargeObjects(ctx, &objects, &kineRep); err != nil {
-		return probefw.Result{Infra: err}
+	//
+	// Cadence: the census is the sweep's heaviest read, so it runs
+	// every HeavyScanCycles-th sweep (~30m). Between audits the last
+	// audit's tuples Carry (series keep their byte values — nothing
+	// re-measures them) and its findings re-Find (the bloat objects
+	// persist until someone shrinks them, so the verdict must not
+	// flap to pass on a cycle that simply didn't look). A FAILED
+	// audit gives its cadence slot back (kineCycle--) so the next
+	// sweep retries the census — otherwise a pass-1 failure would
+	// carry stale tuples for five more sweeps and mask fresh bloat.
+	p.kineCycle++
+	if p.kineCycle%probefw.HeavyScanCycles == 1 {
+		before := len(objects.Findings())
+		if err := p.auditKineLargeObjects(ctx, &objects, &kineRep); err != nil {
+			p.kineCycle--
+			return probefw.Result{Infra: err}
+		}
+		p.kineLastFindings = append([]string(nil),
+			objects.Findings()[before:]...)
+	} else {
+		for k, lv := range p.emittedLargeObjects.Last() {
+			kineRep.Carry(k, lv)
+		}
+		for _, f := range p.kineLastFindings {
+			objects.Find(f)
+		}
 	}
 
 	objects.Close(&p.emittedObjects, apiObjectCountGauge.DeleteLabelValues)
@@ -314,7 +375,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 // parent-report), fail closed: not evidence of orphanhood. Lookup
 // errors other than NotFound also fail closed.
 func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
-	obj *unstructured.Unstructured) bool {
+	obj metav1.Object) bool {
 
 	// Only the Pod/ReplicaSet kinds are whitelisted — any other
 	// shape (unresolvable, lookup error, no owner, object still
@@ -326,7 +387,11 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	if p.ownerSeen == nil {
 		p.ownerSeen = map[string]bool{} // lazy init — Run seeds it
 	}
-	key := ref.Kind + "/" + obj.GetNamespace() + "/" + ref.Name
+	// The UID joins the memo key: same-name ownerRefs with different
+	// UIDs are different questions (a recreated pod/RS answers "gone"
+	// for the old incarnation and "alive" for the new one).
+	key := ref.Kind + "/" + obj.GetNamespace() + "/" + ref.Name +
+		"/" + string(ref.UID)
 	if gone, memo := p.ownerSeen[key]; memo {
 		return gone // same owner already resolved this sweep
 	}
@@ -334,12 +399,20 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	if ref.Kind == "Pod" {
 		// The sweep's shared pod census resolves Pod owners with
 		// zero API calls; an unverifiable census fails closed the
-		// same way a lookup error did (owner presumed alive).
+		// same way a lookup error did (owner presumed alive). A
+		// same-name pod carrying a different UID is a different
+		// incarnation — the referenced pod IS gone (the
+		// OwnerGone UID-match contract, applied to the census).
 		pods, err := p.AllPods(ctx)
-		gone = err == nil &&
-			probefw.PodFromList(pods, obj.GetNamespace(), ref.Name) == nil
+		if err != nil {
+			gone = false
+		} else {
+			pod := probefw.PodFromList(pods, obj.GetNamespace(), ref.Name)
+			gone = pod == nil ||
+				(ref.UID != "" && pod.UID != "" && pod.UID != ref.UID)
+		}
 	} else {
-		gone, _ = probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(),
+		gone, _ = p.OwnerGone(ctx, obj.GetNamespace(),
 			ref, "Pod", "ReplicaSet")
 	}
 	p.ownerSeen[key] = gone
@@ -351,7 +424,7 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 // the "delete the object I vetted" shape every reaper in this
 // codebase uses.
 func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
-	log logr.Logger, rk sprawlKindRef, obj *unstructured.Unstructured) bool {
+	log logr.Logger, rk sprawlKindRef, obj metav1.Object) bool {
 
 	err := p.Dyn.Resource(rk.gvr).Namespace(obj.GetNamespace()).Delete(ctx,
 		obj.GetName(), kube.UIDDeleteOptions(obj.GetUID(), ""))

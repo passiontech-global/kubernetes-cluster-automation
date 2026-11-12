@@ -15,17 +15,19 @@
 // passiontech.dev/quarantined-endpoints), then probes EACH backend directly at
 // https://<ip>:6443 with the pod's ServiceAccount credentials:
 //
-//	live_rv  = list RV of GET /api/v1/namespaces/default/services?limit=1
-//	           (plan said /leases — the SA has no leases read in ns
-//	           default and /api/v1 has no leases resource; any
-//	           consistent list returns the same quorum RV, and
-//	           services get/list is already in the ClusterRole)
-//	cache_rv = list RV of GET /api/v1/nodes?limit=1&resourceVersion=0
-//	           (served from the watch cache, not etcd)
+//	live_rv  = list RV of GET /apis/coordination.k8s.io/v1/namespaces/
+//	           kube-node-lease/leases?limit=1 (consistent/quorum read)
+//	cache_rv = the SAME LeaseList at resourceVersion=0 (watch cache)
+//	           — same-resource RVs; node-lease renewals (~10s/node)
+//	           guarantee steady churn a healthy cache must track, so
+//	           a cache_rv frozen across cycles while live_rv grows is
+//	           the wedge signature (the raw gap is storm noise)
 //
 // A backend is wedged when ANY of:
-//   - live_rv - cache_rv >= 200 for 2 consecutive cycles, or
-//   - cache_rv unchanged for 3 cycles while live_rv advanced, or
+//   - cache_rv stays flat for 3 consecutive cycles while live_rv
+//     keeps advancing (frozen watch cache — the only rv signal: the
+//     instantaneous gap counts unrelated writes and false-positived
+//     under storms), or
 //   - the probe errored (timeout / non-2xx incl. 5xx) for 2
 //     consecutive cycles.
 //
@@ -81,6 +83,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"runtime/debug"
 	"slices"
@@ -115,11 +118,13 @@ const (
 	endpointGuardRunTimeout         = 25 * time.Second
 	endpointGuardErrCycles          = 2
 	endpointGuardProbeTO            = 8 * time.Second // same budget as the kubelet reaper probes
-	endpointGuardRVGap              = 200             // live_rv - cache_rv at/above = lagging cache
-	endpointGuardGapCycles          = 2               // consecutive gapped cycles before wedge
-	endpointGuardFrozenCyc          = 3               // cache_rv frozen cycles (live_rv growing)
-	endpointGuardRecoverCyc         = 2               // consecutive healthy cycles to re-add
-	endpointGuardKidSkewCycles      = 3               // consecutive JWKS kid-set minority cycles (jwks-kid-skew)
+	// endpointGuardFrozenCyc: consecutive cycles the watch-cache RV
+	// stays flat while the quorum RV grows — the ONLY rv-based wedge
+	// signal. The instantaneous live-cache gap was removed: it counts
+	// unrelated cluster writes and false-positived under storms.
+	endpointGuardFrozenCyc     = 3 // cache_rv frozen cycles (live_rv growing)
+	endpointGuardRecoverCyc    = 2 // consecutive healthy cycles to re-add
+	endpointGuardKidSkewCycles = 3 // consecutive JWKS kid-set minority cycles (jwks-kid-skew)
 	// endpointGuardExpireCyc: consecutive probe-error cycles after
 	// which a quarantined IP that is ALSO absent from the current
 	// address sets is declared decommissioned and dropped from
@@ -205,6 +210,14 @@ type apiServerEndpointGuard struct {
 	// (and re-pulling) the wedged IP instead of stranding it outside
 	// the set with no evidence left.
 	memQuarantine map[string]bool
+	// peerHighWater is the process-lifetime set of every backend IP
+	// that ever validly appeared in default/kubernetes
+	// Endpoints/EndpointSlices — unioned into ssotPeerIPs so a
+	// hosted control plane or workerless k0s controller (no CP Node
+	// objects at all) still has peer evidence to re-add a recovered
+	// quarantined backend. Bounded by distinct backend IPs ever
+	// seen; run() is the only writer and sweeps serially.
+	peerHighWater map[string]bool
 }
 
 // Setup registers the 30s wedge sweep. Gated through
@@ -256,8 +269,18 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 	}
 	ctx = logf.IntoContext(ctx, log)
 	interval := endpointGuardInterval
+	// Startup jitter, same contract as shared.Periodic's first-tick
+	// offset: the first sweep lands in [0, interval) instead of a
+	// fixed interval, so a freshly-elected leader (or a pod restart
+	// during an incident) doesn't probe every backend in lockstep.
+	first := true
 	for {
-		timer := time.NewTimer(interval)
+		wait := interval
+		if first {
+			wait = rand.N(endpointGuardInterval)
+			first = false
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -373,6 +396,21 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		routableIPs = routableEndpointIPs(ep)
 		quarantinedIPs = parseQuarantineAnnotation(ep)
 	}
+	// High-water peer evidence: every IP the SSOT currently carries
+	// as an ACTIVE backend joins the persistent peer set
+	// ssotPeerIPs unions with the CP node InternalIPs. Quarantined
+	// IPs are deliberately NOT recorded — the suspect must never
+	// vouch for itself (a pulled backend re-adding on its own
+	// annotation would bypass SKIP-RE-ADD entirely). This is what
+	// lets a hosted/workerless plane re-add a recovered backend it
+	// has no Node object to vouch for: the IP was recorded while it
+	// was still a valid active member.
+	if g.peerHighWater == nil {
+		g.peerHighWater = map[string]bool{}
+	}
+	for _, ip := range activeIPs {
+		g.peerHighWater[ip] = true
+	}
 	// The endpoints reconciler may rebuild the SSOT object wholesale
 	// and drop our annotation — the in-memory copy keeps a quarantined
 	// backend tracked until it recovers or this pod restarts (the
@@ -401,8 +439,22 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		return nil
 	}
 
+	// Re-add membership verdict inputs (P0-3): reconcilerDriven marks
+	// planes where the apiserver's own endpoint reconciler re-lists
+	// live backends every ~10s — there activeIPs stays the
+	// authoritative membership answer. Hosted planes have no such
+	// reconciler (their kubernetes slice is a mirror projection or
+	// absent), so a recovered quarantined IP needs independent peer
+	// evidence — ssotPeerIPs, the control-plane node InternalIPs —
+	// fetched lazily only when a re-add decision is actually pending.
+	reconcilerDriven := primary != nil && !mirrorManagedSlice(primary)
+	var peerIPs map[string]bool
+	if len(quarantinedIPs) > 0 && !reconcilerDriven {
+		peerIPs = g.ssotPeerIPs(ctx)
+	}
+
 	toRemove, toAdd, healthyActive := g.decideQuarantine(log, results,
-		activeIPs, routableIPs, quarantinedIPs)
+		activeIPs, routableIPs, quarantinedIPs, reconcilerDriven, peerIPs)
 
 	// On the Endpoints-SSOT path the sweep also mirrors the decision
 	// onto the EndpointSlices below — a slice update that failed last

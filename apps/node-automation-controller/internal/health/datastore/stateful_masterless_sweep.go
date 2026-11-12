@@ -202,7 +202,7 @@ func (p *statefulMasterlessCheck) stampTarget(c masterSvc) (metav1.Object,
 			// copy: without the mirror a second stamp computes its
 			// first-seen map from pre-patch state and drops the
 			// sibling's just-written key.
-			probefw.MergeAnnoPatchLocally(c.sts, data)
+			probefw.MergeAnnoPatchLocally(ctx, c.sts, data)
 			return nil
 		}
 	}
@@ -212,7 +212,7 @@ func (p *statefulMasterlessCheck) stampTarget(c masterSvc) (metav1.Object,
 			metav1.PatchOptions{}); err != nil {
 			return err
 		}
-		probefw.MergeAnnoPatchLocally(c.svcObj, data)
+		probefw.MergeAnnoPatchLocally(ctx, c.svcObj, data)
 		return nil
 	}
 }

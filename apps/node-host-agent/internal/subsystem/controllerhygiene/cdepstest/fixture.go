@@ -59,15 +59,15 @@ type Fixture struct {
 	Cfg cdeps.Config
 
 	// Host-tree paths under the per-test tempdir.
-	State  string // WatchdogStateDir — state-* latches + last-* budgets
-	Proc   string // ProcRoot — fake /proc
-	FState string // Feeder.StateDir
-	Unit   string // K0sControllerUnitFile — the worker gate
-	CG     string // OOMLoop.CGroupEventsFile
-	JDir   string // JournalDirs[0]
+	State string // WatchdogStateDir — state-* latches + last-* budgets
+	Proc  string // ProcRoot — fake /proc
+	Unit  string // K0sControllerUnitFile — the worker gate
+	CG    string // OOMLoop.CGroupEventsFile
+	JDir  string // JournalDirs[0]
 
 	Now     time.Time
 	RV      map[string]map[bool]RVResult // endpoint -> cached -> result
+	EPReady map[string]int               // endpoint -> ready endpoints count (absent = unreadable)
 	Journal string
 	JErr    error
 	JAny    string
@@ -102,11 +102,10 @@ func New(t *testing.T) *Fixture {
 	}
 	f.State = filepath.Join(root, "watchdog")
 	f.Proc = filepath.Join(root, "proc")
-	f.FState = filepath.Join(root, "feeder-state")
 	f.Unit = filepath.Join(root, "k0scontroller.service")
 	f.CG = filepath.Join(root, "memory.events")
 	f.JDir = filepath.Join(root, "journal")
-	for _, d := range []string{f.State, f.Proc, f.FState, f.JDir} {
+	for _, d := range []string{f.State, f.Proc, f.JDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -129,7 +128,6 @@ func New(t *testing.T) *Fixture {
 		AdminCert:       filepath.Join(root, "missing-admin.crt"),
 		OOMLoop:         cdeps.OOMLoopConfig{Mode: cdeps.ModeEnforce, CGroupEventsFile: f.CG},
 		Feeder: cdeps.FeederConfig{
-			StateDir:          f.FState,
 			RemediatePeerFile: filepath.Join(root, "peer.conf"),
 		},
 		Sig13:       cdeps.Sig13Config{Mode: cdeps.ModeEnforce},
@@ -225,6 +223,32 @@ type rvTransport struct{ f *Fixture }
 
 // RoundTrip answers one LIST probe from the scripted RV table.
 func (rt rvTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// The peer-quorum endpoints read is NOT an RV LIST — it has its
+	// own scripted table (EPReady) so tests control the ready count
+	// independently of the wedge evidence.
+	if strings.HasSuffix(req.URL.Path, "/endpoints/kubernetes") {
+		n, ok := rt.f.EPReady[req.URL.Host]
+		if !ok {
+			return nil, fmt.Errorf("cdepstest: endpoints %s unreadable",
+				req.URL.Host)
+		}
+		var b strings.Builder
+		b.WriteString(`{"subsets":[{"addresses":[`)
+		for i := range n {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"ip":"10.9.9.%d"}`, i+1)
+		}
+		b.WriteString(`]}]}`)
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(b.String())),
+			Request:    req,
+		}, nil
+	}
 	cached := req.URL.Query().Get("resourceVersion") == "0"
 	r, ok := rt.f.RV[req.URL.Host][cached]
 	if !ok || !r.OK {

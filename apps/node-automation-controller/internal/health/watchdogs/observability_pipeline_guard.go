@@ -19,6 +19,7 @@ package watchdogs
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -201,7 +202,13 @@ func (p *observabilityPipelineCheck) emitDegradedEvent(
 	now := p.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("observability-pipeline.%x", now.UnixNano()),
+			// The component rides the name (underscores are not
+			// DNS-1123 — map them to dashes): one sweep can degrade
+			// several components and every emission shares this
+			// sweep's `now` — without the component in the name the
+			// second Create hits 409 AlreadyExists.
+			Name: fmt.Sprintf("observability-pipeline.%s.%x",
+				strings.ReplaceAll(component, "_", "-"), now.UnixNano()),
 			Namespace: obsPipelineEventNS,
 		},
 		EventTime:           metav1.NewMicroTime(now),

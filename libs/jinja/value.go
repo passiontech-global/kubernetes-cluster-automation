@@ -82,7 +82,8 @@ func Truthy(v any) bool {
 	case []any:
 		return len(t) > 0
 	case *List:
-		return len(t.V) > 0
+		// A typed-nil *List is an empty list, not a panic.
+		return t != nil && len(t.V) > 0
 	case *OMap:
 		return t.Len() > 0
 	case map[string]any:
@@ -166,6 +167,9 @@ func stringifyAt(v any, depth int, steps *int) string {
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case *List:
+		if t == nil {
+			return "[]"
+		}
 		return stringifyAt(t.V, depth+1, steps)
 	case *OMap:
 		parts := make([]string, 0, t.Len())
@@ -206,10 +210,16 @@ func stringifyStringMap[V any](m map[string]V, depth int, steps *int) string {
 func ToIter(v any) []any {
 	switch t := v.(type) {
 	case *List:
+		if t == nil {
+			return nil
+		}
 		return t.V
 	case []any:
 		return t
 	case *OMap:
+		if t == nil {
+			return nil
+		}
 		out := make([]any, 0, t.Len())
 		for _, k := range t.Keys() {
 			out = append(out, k)
@@ -315,6 +325,9 @@ func getIndex(v any, k any) (any, error) {
 		}
 		return Undefined{Stringify(k)}, nil
 	case *List:
+		if t == nil {
+			return Undefined{"index"}, nil
+		}
 		return getIndex(t.V, k)
 	case []any:
 		i, ok := ToInt(k)
@@ -404,14 +417,65 @@ func toFloat(v any) (float64, bool) {
 func numNeg(v any) (any, error) {
 	switch t := v.(type) {
 	case int64:
+		// -MinInt64 wraps to itself in int64 — promote to float64
+		// (exact: 2^63 is a power of two) like python's bignum.
+		if t == math.MinInt64 {
+			return -float64(t), nil
+		}
 		return -t, nil
 	case float64:
 		return -t, nil
 	}
 	if i, ok := asInt64(v); ok {
+		if i == math.MinInt64 {
+			return -float64(i), nil
+		}
 		return -i, nil
 	}
 	return nil, fmt.Errorf("cannot negate %v", v)
+}
+
+// addInt64/subInt64/mulInt64 are the exact int64 fast paths for
+// binOp's arithmetic: ok=false means the true result does not fit
+// int64 and the caller promotes to float64 — a silent wraparound
+// would flip the sign and corrupt template math (python ints are
+// arbitrary precision).
+func addInt64(a, b int64) (int64, bool) {
+	s := a + b
+	if (b > 0 && s < a) || (b < 0 && s > a) {
+		return 0, false
+	}
+	return s, true
+}
+
+func subInt64(a, b int64) (int64, bool) {
+	d := a - b
+	if (b < 0 && d < a) || (b > 0 && d > a) {
+		return 0, false
+	}
+	return d, true
+}
+
+func mulInt64(a, b int64) (int64, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	if a == -1 {
+		// p/a below would be MinInt64/-1 → SIGFPE when b is
+		// MinInt64; handle the sign flip directly.
+		if b == math.MinInt64 {
+			return 0, false
+		}
+		return -b, true
+	}
+	p := a * b
+	// Two's-complement wrap makes p/a != b exactly when the true
+	// product left int64 range (a == 0 and a == -1 excluded above,
+	// so the division can never panic).
+	if p/a != b {
+		return 0, false
+	}
+	return p, true
 }
 
 // numAsFloat converts only plain, finite numbers — no strings, no
@@ -519,10 +583,17 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	}
 	switch lt := l.(type) {
 	case *List:
-		if lt == r {
-			return true
+		if lt == nil {
+			// Typed-nil unwraps to an EMPTY slice — same shape
+			// (*OMap)(nil) takes through asMapping — so it compares
+			// equal to [] and unequal to None, like python's [].
+			l = []any(nil)
+		} else {
+			if lt == r {
+				return true
+			}
+			l = lt.V
 		}
-		l = lt.V
 	case *OMap:
 		if lt == r {
 			return true
@@ -530,10 +601,14 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	}
 	switch rt := r.(type) {
 	case *List:
-		if rt == l {
-			return true
+		if rt == nil {
+			r = []any(nil)
+		} else {
+			if rt == l {
+				return true
+			}
+			r = rt.V
 		}
-		r = rt.V
 	}
 	// Mappings compare order-insensitively across *OMap,
 	// map[string]any and map[string]string — a vars-file OMap and a
@@ -644,6 +719,9 @@ func IsNilOrUndef(v any) bool {
 func seqElems(v any) ([]any, bool) {
 	switch t := v.(type) {
 	case *List:
+		if t == nil {
+			return nil, true
+		}
 		return t.V, true
 	case []any:
 		return t, true
@@ -695,7 +773,9 @@ func binOp(op string, l, r any) (any, error) {
 				ri, rInt := ToInt(r)
 				if lInt && rInt && isNum(l) && isNum(r) &&
 					!isFloatNum(l) && !isFloatNum(r) {
-					return li + ri, nil
+					if s, ok := addInt64(li, ri); ok {
+						return s, nil
+					}
 				}
 				return lf + rf, nil
 			}
@@ -722,9 +802,15 @@ func binOp(op string, l, r any) (any, error) {
 			!isFloatNum(l) && !isFloatNum(r) && op != "/" {
 			switch op {
 			case "-":
-				return li - ri, nil
+				if d, ok := subInt64(li, ri); ok {
+					return d, nil
+				}
+				return lf - rf, nil
 			case "*":
-				return li * ri, nil
+				if p, ok := mulInt64(li, ri); ok {
+					return p, nil
+				}
+				return lf * rf, nil
 			case "//":
 				if ri == 0 {
 					return nil, errors.New("division by zero")
@@ -835,7 +921,11 @@ func binOp(op string, l, r any) (any, error) {
 		case string:
 			return strings.Contains(rt, Stringify(l)), nil
 		case *List:
-			return binOp("in", l, rt.V)
+			var rv []any
+			if rt != nil {
+				rv = rt.V
+			}
+			return binOp("in", l, rv)
 		case []any:
 			for _, it := range rt {
 				if deepEq(it, l) {
@@ -951,7 +1041,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			return &List{pairs}, nil
 		}
 	case "append":
-		if l, ok := m.obj.(*List); ok {
+		if l, ok := m.obj.(*List); ok && l != nil {
 			l.V = append(l.V, args...)
 			return nil, nil
 		}
@@ -1013,7 +1103,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 		}
 		return nil, errors.New("index: not found")
 	case "pop":
-		if l, ok := m.obj.(*List); ok {
+		if l, ok := m.obj.(*List); ok && l != nil {
 			if len(l.V) == 0 {
 				return nil, errors.New("pop: empty list")
 			}

@@ -125,7 +125,7 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 		}
 		rep.Find(fmt.Sprintf("%s/%s ports=%s",
 			pod.Namespace, pod.Name, joinPorts(missing)))
-		p.healLinkerdOpaquePorts(ctx, log, pod, missing, now, &rep, driftNow)
+		p.healLinkerdOpaquePorts(ctx, log, pod, missing, now, pods, &rep, driftNow)
 	}
 	p.driftEmitted.Reconcile(driftNow, linkerdGitOpsOpaqueDriftGauge.DeleteLabelValues)
 	return rep.Result(&p.emitted, linkerdOpaquePortMissingGauge.DeleteLabelValues,

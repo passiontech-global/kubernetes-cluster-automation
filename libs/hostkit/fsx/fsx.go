@@ -11,7 +11,9 @@
 package fsx
 
 import (
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -40,16 +42,17 @@ type Opts struct {
 	// CreateTemp stages 0600 and an OpenFile create-mode is
 	// umask-masked, but every consumer of these files
 	// (node_exporter, systemd units) reads them as another user.
-	// Applied verbatim: zero makes the file mode 0 (unreadable), so
-	// callers always set it, matching hostutil's contract.
+	// Zero does NOT mean mode 0: the target's existing permission
+	// bits are preserved, and a new file gets 0644 — chmod 0000
+	// would make the just-written file unreadable to its readers.
 	Mode os.FileMode
 	// DirSync fsyncs the target's parent directory after a
 	// successful rename, so the directory entry itself is durable.
 	// Without it a crash after the rename can lose the file entirely
-	// (old name already unlinked, new entry not yet flushed). The
-	// directory open is best-effort (a dir that vanished between
-	// rename and sync must not fail an already-installed write); a
-	// Sync failure IS reported.
+	// (old name already unlinked, new entry not yet flushed). A
+	// failure to open OR sync the directory is reported — silently
+	// skipping it would hide a durability hole behind a successful
+	// write.
 	DirSync bool
 	// AfterSync, when set, runs after the payload fsync and before
 	// Close — converge passes pagecache.Drop so a staged binary's
@@ -126,8 +129,31 @@ func Promote(f *os.File, path string, opts Opts) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	// Force the final mode before sync+rename (see Opts.Mode).
-	if err := f.Chmod(opts.Mode); err != nil {
+	// Force the final mode before sync+rename (see Opts.Mode). A
+	// zero Mode preserves the target's existing permission bits —
+	// or 0644 for a new file — instead of chmod-ing the staged
+	// file to 0000.
+	mode := opts.Mode
+	if mode == 0 {
+		if st, err := os.Stat(path); err == nil {
+			mode = st.Mode().Perm()
+			if mode == 0 {
+				// A target with NO permission bits (corrupt or
+				// deliberately stripped) must not propagate 0000 —
+				// the staged file would be unreadable after rename.
+				mode = 0o644
+			}
+		} else if errors.Is(err, fs.ErrNotExist) {
+			mode = 0o644
+		} else {
+			// Any OTHER stat failure (EACCES, EIO, ENOTDIR) means
+			// the target's real mode is unverifiable — returning
+			// 0644 could silently downgrade a sensitive 0600 file.
+			// Fail the promote instead of guessing.
+			return fail(err)
+		}
+	}
+	if err := f.Chmod(mode); err != nil {
 		return fail(err)
 	}
 	// fsync the payload before the rename — without it a crash can
@@ -150,12 +176,14 @@ func Promote(f *os.File, path string, opts Opts) error {
 		return err
 	}
 	if opts.DirSync && !opts.NoSync {
-		if d, err := os.Open(filepath.Dir(path)); err == nil {
-			err = d.Sync()
-			_ = d.Close()
-			if err != nil {
-				return err
-			}
+		d, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		err = d.Sync()
+		_ = d.Close()
+		if err != nil {
+			return err
 		}
 	}
 	return nil

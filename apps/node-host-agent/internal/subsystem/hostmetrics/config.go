@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -164,9 +165,18 @@ type Config struct {
 	// 30s. Seamed so tests don't wait real seconds.
 	LatchInterval time.Duration
 
+	// collectCacheTTL overrides the Collect snapshot TTL — 0 →
+	// collectSnapshotTTL (10s); a NEGATIVE value disables the cache
+	// (the test fixture pins -1: its scrapes mutate host state
+	// between gathers and async probes must converge across them).
+	collectCacheTTL time.Duration
 	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
 	// tests: returns (ratio, wallSeconds, ok).
 	cpuMeasure func() (ratio, wall float64, ok bool)
+	// TCPStatesFn reads pid's netns TCP state histogram through
+	// NETLINK_SOCK_DIAG (netlinkx.TCPStates) — the sockstat
+	// domain's full-state census. nil → netlinkx.TCPStates.
+	TCPStatesFn func(pid int) (map[uint8]int, error)
 	// adjtimexFn reads kernel clock-sync state (H1) — seam for
 	// tests (default unix.Adjtimex).
 	adjtimexFn func(*unix.Timex) (int, error)
@@ -179,6 +189,18 @@ type Config struct {
 }
 
 func (c *Config) applyDefaults() {
+	// HostRoot resolves FIRST — the host-side file defaults below
+	// (k0s.yaml, PKI dirs, cgroup/bpffs roots) join under it so the
+	// DaemonSet's /host mount and standalone "/" both land right.
+	if c.HostRoot == "" {
+		// Auto-detect: "/host" when the DaemonSet mount is there,
+		// "/" otherwise (standalone systemd binary on the host).
+		if fi, err := os.Stat("/host"); err == nil && fi.IsDir() {
+			c.HostRoot = "/host"
+		} else {
+			c.HostRoot = "/"
+		}
+	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
 	}
@@ -195,10 +217,13 @@ func (c *Config) applyDefaults() {
 		c.RouteFile = defaultRouteFile
 	}
 	if c.K0sConfigFile == "" {
-		c.K0sConfigFile = defaultK0sConfigFile
+		// HostRoot-joined — /host/etc/k0s/k0s.yaml in the pod,
+		// /etc/k0s/k0s.yaml standalone (EnvK0sConfig's env default
+		// gets the same hostPath() wrap in config_env.go).
+		c.K0sConfigFile = filepath.Join(c.HostRoot, defaultK0sConfigFile)
 	}
 	if c.K0sUnitFile == "" {
-		c.K0sUnitFile = defaultK0sUnitFile
+		c.K0sUnitFile = filepath.Join(c.HostRoot, defaultK0sUnitFile)
 	}
 	if c.NebulaCertFile == "" {
 		c.NebulaCertFile = defaultNebulaCertFile
@@ -266,17 +291,14 @@ func (c *Config) applyDefaults() {
 	if c.statfsFn == nil {
 		c.statfsFn = unix.Statfs
 	}
+	if c.TCPStatesFn == nil {
+		c.TCPStatesFn = netlinkx.TCPStates
+	}
+	if c.collectCacheTTL == 0 {
+		c.collectCacheTTL = collectSnapshotTTL
+	}
 	if c.fsProbeTimeout <= 0 {
 		c.fsProbeTimeout = defaultFSProbeTimeout
-	}
-	if c.HostRoot == "" {
-		// Auto-detect: "/host" when the DaemonSet mount is there,
-		// "/" otherwise (standalone systemd binary on the host).
-		if fi, err := os.Stat("/host"); err == nil && fi.IsDir() {
-			c.HostRoot = "/host"
-		} else {
-			c.HostRoot = "/"
-		}
 	}
 	if len(c.PKICertPaths) == 0 {
 		c.PKICertPaths = make([]string, 0, len(defaultPKIHostPaths))
@@ -320,10 +342,14 @@ func (c *Config) applyDefaults() {
 		c.ARPTableFile = defaultARPTableFile
 	}
 	if c.ClocksourceCurrentFile == "" {
-		c.ClocksourceCurrentFile = defaultClocksourceCurrentFile
+		// HostRoot-joined — /host/sys/... in the pod, /sys/... on a
+		// standalone host; sysfs is a host mount like the PKI dirs.
+		c.ClocksourceCurrentFile = filepath.Join(c.HostRoot,
+			defaultClocksourceCurrentFile)
 	}
 	if c.ClocksourceAvailableFile == "" {
-		c.ClocksourceAvailableFile = defaultClocksourceAvailableFile
+		c.ClocksourceAvailableFile = filepath.Join(c.HostRoot,
+			defaultClocksourceAvailableFile)
 	}
 	if len(c.CgroupMemUnits) == 0 {
 		c.CgroupMemUnits = defaultCgroupMemUnits

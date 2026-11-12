@@ -39,12 +39,14 @@ func patchPod(ns, name, ownerKind, ownerName string) *corev1.Pod {
 }
 
 // patchTemplate drives one patchLinkerdTemplate call against missing
-// port 5432 and returns its (covered, patched) verdict.
+// port 5432 and returns its (covered, patched) verdict — the drift
+// flag is asserted separately by the drift tests.
 func patchTemplate(t *testing.T, chk *linkerdProtocolDetectionStallCheck,
 	pod *corev1.Pod, cs *fake.Clientset) (bool, bool) {
 	t.Helper()
-	return chk.patchLinkerdTemplate(ctx, logr.Discard(), pod,
+	covered, patched, _ := chk.patchLinkerdTemplate(ctx, logr.Discard(), pod,
 		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	return covered, patched
 }
 
 // A pod with no controller ownerRef resolves no workload — fail
@@ -315,9 +317,10 @@ func TestPatchTemplatePortsSkipInboundAlreadyCovers(t *testing.T) {
 	existing := map[string]string{
 		"config.linkerd.io/skip-inbound-ports": "5432",
 	}
-	covered, patched := chk.patchTemplatePorts(ctx, logr.Discard(), dep,
-		"deployment", "apps", "web", existing, []int{5432},
-		false, time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
+		ns: "apps", name: "web", existing: existing}
+	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || patched {
 		t.Fatalf("skip-inbound-covered template: covered=%v patched=%v, want covered only", covered, patched)
 	}
@@ -343,9 +346,10 @@ func TestPatchTemplatePortsSkipOutboundAlreadyCovers(t *testing.T) {
 	existing := map[string]string{
 		"config.linkerd.io/skip-outbound-ports": "5432",
 	}
-	covered, patched := chk.patchTemplatePorts(ctx, logr.Discard(), dep,
-		"deployment", "apps", "web", existing, []int{5432},
-		false, time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
+		ns: "apps", name: "web", existing: existing}
+	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || patched {
 		t.Fatalf("skip-outbound-covered template: covered=%v patched=%v, want covered only", covered, patched)
 	}
@@ -363,9 +367,10 @@ func TestPatchTemplatePortsMergesExistingCoverage(t *testing.T) {
 	existing := map[string]string{
 		"config.linkerd.io/opaque-ports": "6379",
 	}
-	covered, patched := chk.patchTemplatePorts(ctx, logr.Discard(), dep,
-		"deployment", "apps", "web", existing, []int{5432},
-		false, time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
+		ns: "apps", name: "web", existing: existing}
+	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || !patched {
 		t.Fatalf("partial cover patch: covered=%v patched=%v, want both", covered, patched)
 	}

@@ -25,15 +25,26 @@ type natsCensus struct {
 	namespaces    map[string]bool
 	memberByName  map[string]*corev1.Pod // "ns/name"
 	memberByShort map[string]*corev1.Pod // bare name — series w/o namespace label
-	readyBySTS    map[string]int         // "ns/stsName" -> Running+Ready members
+	// ambiguousShort marks bare names claimed by pods in MORE THAN
+	// ONE namespace — two NATS clusters can both run "nats-0", and a
+	// series without a namespace label must never resolve to an
+	// arbitrary cluster's member (the heal would bounce the wrong
+	// StatefulSet's pod).
+	ambiguousShort map[string]bool
+	readyBySTS     map[string]int // "ns/stsName" -> Running+Ready members
 }
 
 // resolvePod maps a Prometheus series' (namespace, pod) labels back
 // to a member pod; an empty namespace falls back to the bare-name
-// index (series without a namespace label).
+// index (series without a namespace label). An ambiguous bare name
+// resolves to nil — unattributable evidence is skipped, never
+// guessed.
 func (c *natsCensus) resolvePod(ns, name string) *corev1.Pod {
 	if ns != "" {
 		return c.memberByName[ns+"/"+name]
+	}
+	if c.ambiguousShort[name] {
+		return nil
 	}
 	return c.memberByShort[name]
 }
@@ -61,10 +72,11 @@ func collectNATS(ctx context.Context, d *probefw.Deps) (*natsCensus, error) {
 		return nil, nil
 	}
 	c := &natsCensus{
-		namespaces:    map[string]bool{},
-		memberByName:  map[string]*corev1.Pod{},
-		memberByShort: map[string]*corev1.Pod{},
-		readyBySTS:    map[string]int{},
+		namespaces:     map[string]bool{},
+		memberByName:   map[string]*corev1.Pod{},
+		memberByShort:  map[string]*corev1.Pod{},
+		ambiguousShort: map[string]bool{},
+		readyBySTS:     map[string]int{},
 	}
 	for i := range stss {
 		c.namespaces[stss[i].Namespace] = true
@@ -80,7 +92,14 @@ func collectNATS(ctx context.Context, d *probefw.Deps) (*natsCensus, error) {
 			continue
 		}
 		c.memberByName[pod.Namespace+"/"+pod.Name] = pod
-		if c.memberByShort[pod.Name] == nil {
+		if prev := c.memberByShort[pod.Name]; prev != nil {
+			if prev.Namespace != pod.Namespace {
+				// Same pod name in two namespaces — the bare-name
+				// index can no longer attribute ns-less series.
+				delete(c.memberByShort, pod.Name)
+				c.ambiguousShort[pod.Name] = true
+			}
+		} else if !c.ambiguousShort[pod.Name] {
 			c.memberByShort[pod.Name] = pod
 		}
 		if probefw.PodRunningReady(pod) {

@@ -242,7 +242,11 @@ func (p *endpointSliceZoneStarvationCheck) emitStarvedEvent(
 	now := p.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", svc, now.UnixNano()),
+			// The zone rides the name: one sweep can starve several
+			// zones of the same Service, and every emission shares
+			// this sweep's `now` — without the zone in the name the
+			// second Create hits 409 AlreadyExists.
+			Name:      fmt.Sprintf("%s.%s.%x", svc, zone, now.UnixNano()),
 			Namespace: ns,
 		},
 		EventTime:           metav1.NewMicroTime(now),

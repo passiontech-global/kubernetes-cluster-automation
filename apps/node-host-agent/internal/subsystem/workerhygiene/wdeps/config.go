@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -91,6 +92,12 @@ type Config struct {
 	NebulaIface    string // overlay iface MTU baseline (neb1 = 1300)
 	HostResolvConf string // host resolv.conf (dns drift baseline)
 	Client         kubernetes.Interface
+	// Coord is the L1↔L3 nodecoord handle (platform/nodecoord) —
+	// nil disables the maintenance hold (tests, minimal wiring).
+	// Destructive paths (pod deletes, policy evictions) consult
+	// Deps.HoldLocalAction first: while the cluster holds the
+	// maintenance mutex L1 must not add churn.
+	Coord *nodecoord.Coord
 	// APIBackends are the "ip[:port]" apiserver endpoints module 06
 	// gates on — wired from watchdogconf.APIBackendIPs() by main
 	// (kept current by WatchdogSrc when set).

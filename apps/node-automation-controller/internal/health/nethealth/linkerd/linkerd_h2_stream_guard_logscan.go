@@ -59,10 +59,11 @@ func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 	pod *corev1.Pod) (storm, identity bool, err error) {
 
 	_, err = kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
-		Container: kube.LinkerdProxyContainer,
-		TailLines: probefw.DefaultTailLines,
-		MaxBytes:  probefw.LogMaxBytes,
-		Timeout:   probefw.LogTimeout,
+		Container:    kube.LinkerdProxyContainer,
+		TailLines:    probefw.DefaultTailLines,
+		SinceSeconds: 900,
+		MaxBytes:     probefw.LogMaxBytes,
+		Timeout:      probefw.LogTimeout,
 	}, func(line string) bool {
 		l := strings.ToLower(line)
 		for _, marker := range linkerdH2StormMarkers {
@@ -91,37 +92,55 @@ type logSignals struct {
 }
 
 // linkerdSuspectPods pre-filters the log scan through Prometheus:
-// pods whose linkerd-proxy restarted recently or is closing
-// connections on errors are the only ones worth a log tail — the
-// healthy majority never costs a kubelet round-trip. nil means
-// "no conclusive verdict" (no endpoint, every query failed, or the
-// metrics pipeline simply has nothing) and the caller falls back
-// to the legacy full scan — a prefilter must never hide a wedge
-// behind a monitoring gap.
+// pods whose linkerd-proxy restarted recently, is closing
+// connections on errors, or is serving HTTP failures are the only
+// ones worth a log tail — the healthy majority never costs a
+// kubelet round-trip. nil means "no conclusive verdict" (no
+// endpoint, every query failed, or the metrics pipeline simply has
+// nothing) and the caller falls back to the legacy full scan — a
+// prefilter must never hide a wedge behind a monitoring gap.
+//
+// The linkerd-native families (tcp_close_total, response_total)
+// only exist where linkerd's own scrape is alive — an EMPTY vector
+// is ambiguous (family absent vs genuinely zero signal), so a
+// count() presence probe runs first: family absent → nil → full
+// scan. That ambiguity was the audit's blind spot: tcp_close_total
+// unscraped (or an H2 ENHANCE_YOUR_CALM on a still-open connection,
+// which produces neither restart nor close) returned [] without
+// error, conclusive=true marked the suspect set empty, and 100% of
+// the log scan was skipped forever.
 func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
 	ctx context.Context, log logr.Logger) map[string]bool {
 
 	if _, err := p.PromEndpoint(); err != nil {
 		return nil
 	}
+	// Family presence: any live tcp_close_total series proves the
+	// linkerd scrape pipeline is up — count() keeps the probe to a
+	// single sample regardless of fleet size.
+	presence, err := p.PromQuery(ctx, `count(tcp_close_total)`)
+	if err != nil || len(presence) == 0 || presence[0].Value <= 0 {
+		log.Info("linkerd-h2-stream-guard: linkerd metrics family absent — full log scan",
+			"error", err)
+		return nil
+	}
 	queries := []string{
 		`sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{container="linkerd-proxy"}[30m])) > 0`,
 		`sum by (namespace, pod) (increase(tcp_close_total{error!=""}[30m])) > 0`,
+		// HTTP/H2 failure signal: response_total's failure
+		// classification is the proxy-observed request error the
+		// close/restart counters never see (a wedged h2 stream
+		// keeps the TCP connection open AND the pod Running).
+		`sum by (namespace, pod) (increase(response_total{classification="failure"}[30m])) > 0`,
 	}
 	suspect := map[string]bool{}
-	conclusive := false
+	conclusive := true
 	for _, q := range queries {
 		series, err := p.PromQuery(ctx, q)
 		if err != nil {
+			conclusive = false
 			continue
 		}
-		// A query that ANSWERED is conclusive even with an empty
-		// vector — "no restarting proxies, no error closes" is a real
-		// result that narrows the log scan to nobody; only a query
-		// FAILURE leaves the prefilter inconclusive (nil → legacy
-		// full scan). Without this, a healthy mesh pays the full
-		// kubelet round-trip per pod forever.
-		conclusive = true
 		for _, s := range series {
 			if s.Value <= 0 {
 				continue

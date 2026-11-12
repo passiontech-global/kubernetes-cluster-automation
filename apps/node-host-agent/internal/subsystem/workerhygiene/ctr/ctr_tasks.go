@@ -34,6 +34,25 @@ var (
 	hexTaskIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
+// runtimeKillComm reports whether comm names a containerd runtime
+// process the wedged-task sweeps may SIGKILL — shim or runc only.
+// /proc stat comm truncates at TASK_COMM_LEN-1 (15 chars), so
+// "containerd-shim-runc-v2" surfaces as "containerd-shim": the
+// prefix covers all three spellings. A cmdlines-only match is not
+// enough — `sh -c '... <task-id> ...'` or a monitor holding the id
+// in argv must never eat the signal.
+func runtimeKillComm(comm string) bool {
+	return comm == "runc" || strings.HasPrefix(comm, "containerd-shim")
+}
+
+// commKillable reads /proc/<pid>/stat's comm field and applies the
+// runtimeKillComm gate — ok=false (unreadable stat, no comm) means
+// "cannot prove it is a runtime process" → do NOT kill.
+func (c *CtrTasksCheck) commKillable(pid int) bool {
+	st, ok := c.d.Proc.Stat(pid)
+	return ok && st.HasComm && runtimeKillComm(st.Comm)
+}
+
 // CtrTasksCheck cleans wedged containerd task dirs and orphan shims —
 // the filesystem port of the shell's ctr-based checks (no ctr socket
 // needed in the agent pod):
@@ -162,6 +181,12 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
 			pid, sid, ns))
+		if !c.commKillable(pid) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: orphan shim candidate pid=%d comm not a runtime process — kill refused",
+				pid))
+			continue
+		}
 		if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
@@ -175,7 +200,9 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		filepath.Join(c.d.Cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
 		for _, m := range ms {
 			if !liveDirs[strings.TrimPrefix(filepath.Base(m), "wedged-seen-")] {
-				_ = os.Remove(m)
+				// ClearBudget drops the lastSpent RAM mirror too —
+				// a bare os.Remove leaves a phantom cooldown.
+				c.d.State.ClearBudget(filepath.Base(m))
 			}
 		}
 	}
@@ -216,7 +243,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		if !dead {
 			// Recovered between runs → cancel the pending confirm.
-			_ = os.Remove(filepath.Join(c.d.Cfg.WatchdogStateDir, marker))
+			c.d.State.ClearBudget(marker)
 			continue
 		}
 		if !c.d.StateFileExists(marker) {
@@ -242,7 +269,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// cleaned: a dir dropped by the cap must KEEP its
 		// confirmed marker — removing it first made over-cap
 		// dirs re-confirm for another 5m forever.
-		_ = os.Remove(filepath.Join(c.d.Cfg.WatchdogStateDir, "wedged-seen-"+id))
+		c.d.State.ClearBudget("wedged-seen-" + id)
 		// Live init with missing log.json → SIGKILL it first so the
 		// shim can drain and exit (shell's kill -9 init).
 		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
@@ -258,8 +285,14 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
-		// record once the shim is gone.
+		// record once the shim is gone. The comm gate keeps the
+		// cmdline match honest: only runtime processes may eat the
+		// signal, never an unrelated process that happens to carry
+		// the id in argv.
 		for _, pid := range c.d.PidsWithCmdline(id, pids) {
+			if !c.commKillable(pid) {
+				continue
+			}
 			if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
@@ -318,7 +351,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 					c.d.Cfg.Ctr.MaxTaskClean))
 				break
 			}
-			_ = os.Remove(filepath.Join(c.d.Cfg.WatchdogStateDir, marker))
+			c.d.State.ClearBudget(marker)
 			if err := os.RemoveAll(d); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: rm orphan sandbox dir %.12s failed: %v", id, err))
@@ -336,7 +369,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		"sandbox-orphan-seen-*")); err == nil {
 		for _, m := range ms {
 			if !sbDirs[strings.TrimPrefix(filepath.Base(m), "sandbox-orphan-seen-")] {
-				_ = os.Remove(m)
+				c.d.State.ClearBudget(filepath.Base(m))
 			}
 		}
 	}
@@ -361,7 +394,7 @@ func (c *CtrTasksCheck) lazyUnmountRootfs(ctx context.Context, d, id string) {
 	if _, err := os.Stat(rootfs); err != nil {
 		return // not mounted (or already gone) — nothing to unmount
 	}
-	host := strings.TrimPrefix(rootfs, "/host")
+	host := wdeps.HostSidePath(rootfs)
 	if c.d.Cfg.Systemd == nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-tasks rootfs %s of task %.12s still mounted but no systemd client — skip umount",

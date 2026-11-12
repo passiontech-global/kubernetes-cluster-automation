@@ -60,9 +60,21 @@ func unknownNode(name string, age time.Duration) *corev1.Node {
 }
 
 // remediationObj builds a medik8s remediation CR (unstructured).
+// Fixtures default to a COMPLETED fence — status.conditions carries
+// Succeeded=True, the evidence hasRemediationCR now requires (CR
+// existence alone is a drain in flight, not fencing). Callers
+// building a not-yet-fenced CR clear the status afterwards.
 func remediationObj(gvr schema.GroupVersionResource, kind, ns, name string) *unstructured.Unstructured {
 	// remediation CRs are named after the node.
-	return testutil.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name, nil)
+	cr := testutil.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name, map[string]any{
+		"status": map[string]any{
+			"conditions": []any{map[string]any{
+				"type":   "Succeeded",
+				"status": "True",
+			}},
+		},
+	})
+	return cr
 }
 
 func selfNodeRemediation(ns, name string) *unstructured.Unstructured {
@@ -390,6 +402,32 @@ func TestDeadNodeSweeperRemediationCRNameVariants(t *testing.T) {
 		}
 		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node-name annotation not accepted as fencing evidence")
+		}
+	})
+
+	t.Run("CR present but drain still in flight is not fencing", func(t *testing.T) {
+		// P1 regression: a SelfNodeRemediation is created when the
+		// drain STARTS — only a Succeeded condition certifies the
+		// fence. Existence alone must fall through to the probe
+		// path (and its stateful-holder gate), not skip it.
+		cr := selfNodeRemediation("medik8s", "w1")
+		cr.Object["status"] = map[string]any{
+			"conditions": []any{map[string]any{
+				"type":   "Succeeded",
+				"status": "False",
+			}},
+		}
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionFalse, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake(cr)
+		s := deadNodeSweeperFor(cs, dyn, nil)
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("unsucceeded remediation CR accepted as fencing evidence")
 		}
 	})
 

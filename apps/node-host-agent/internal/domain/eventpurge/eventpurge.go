@@ -256,18 +256,20 @@ func doReq(ctx context.Context, client *http.Client, method, u string) (int, htt
 	return resp.StatusCode, resp.Header, body, nil
 }
 
-// listStale walks the paginated event LIST once (limit=500,
-// resourceVersion=0 — the script's exact query; rv=0 is a possibly-
-// stale cache read, acceptable for a one-shot purge since a freshly
-// missed event simply survives to the next run) and returns the
-// delete path of every item older than cutoff.
+// listStale walks the paginated event LIST once (limit=500 — no
+// resourceVersion pin: rv=0 reads the watch cache and its continue
+// tokens page inconsistently, so a fixed-rv walk can skip or repeat
+// batches; an unpinned LIST pages cleanly at 500 events per batch
+// under the 8 MiB cap. A freshly missed event simply survives to
+// the next run) and returns the delete path of every item older
+// than cutoff.
 func listStale(ctx context.Context, client *http.Client,
 	base string, cutoff time.Time) ([]string, error) {
 	var paths []string
 	cont := ""
 	for {
 		code, _, body, err := doReq(ctx, client, http.MethodGet,
-			base+"/api/v1/events?limit=500&resourceVersion=0"+cont)
+			base+"/api/v1/events?limit=500"+cont)
 		if err != nil {
 			return nil, fmt.Errorf("list events: %w", err)
 		}

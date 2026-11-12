@@ -48,7 +48,7 @@ func TestLinkerdSidecarOOMGuard(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*linkerdSidecarOOMCheck](t, p)
 
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass || res.Why == "" {
 		t.Fatalf("OOM pods must fail the check: %+v", res)
 	}
@@ -176,7 +176,7 @@ func TestLinkerdInitDeadlockFlagsAndClears(t *testing.T) {
 	// Seed the old pod's signature past the 5m window (the young one
 	// stays unstamped → first sight).
 	chk.deadlockSince.Seed("apps/web-old", time.Now().Add(-10*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass || res.Why == "" {
 		t.Fatalf("deadlocked pod must fail the check: %+v", res)
 	}
@@ -198,7 +198,7 @@ func TestLinkerdInitDeadlockFlagsAndClears(t *testing.T) {
 
 	// The young pod crosses the window on its next sweep.
 	chk.deadlockSince.Seed("apps/web-young", time.Now().Add(-6*time.Minute))
-	if res := chk.Run(ctx); res.Pass ||
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass ||
 		!linkerdInitDeadlockGauge.DeleteLabelValues("apps", "web-young") {
 		t.Fatalf("young pod must flag once persisted: %+v", res)
 	}
@@ -211,7 +211,7 @@ func TestLinkerdInitDeadlockFlagsAndClears(t *testing.T) {
 		metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	res = chk.Run(ctx)
+	res = chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass ||
 		linkerdInitDeadlockGauge.DeleteLabelValues("apps", "web-old") {
 		t.Fatalf("healed pod's series must be reconciled away: %+v", res)
@@ -233,7 +233,7 @@ func TestLinkerdInitDeadlockWindowMaturesAcrossSweeps(t *testing.T) {
 
 	base := time.Now()
 	probetest.FreezeNow(chk.Deps, base)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sweep stamps the signature — must stay quiet: %+v", res)
 	}
 	if linkerdInitDeadlockGauge.DeleteLabelValues("apps", "web") {
@@ -243,7 +243,7 @@ func TestLinkerdInitDeadlockWindowMaturesAcrossSweeps(t *testing.T) {
 	// A later sweep with the shape still holding crosses the window
 	// on the stamp laid by the FIRST sweep — no seeding allowed.
 	probetest.FreezeNow(chk.Deps, base.Add(6*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass || res.Why == "" {
 		t.Fatalf("deadlock must flag once the window matured: %+v", res)
 	}

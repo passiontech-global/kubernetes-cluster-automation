@@ -33,7 +33,7 @@ func (c *volumeAttachmentCleaner) sightMissingNodeOrphans(
 		}
 		if _, ok := nodeByName[va.Spec.NodeName]; !ok {
 			orphanNow[va.Name] = true
-			_, seenPrior[va.Name] = c.orphanFirstSeen.Observe(va.Name, now)
+			_, seenPrior[va.Name] = c.orphanFirstSeen.Observe(vaFirstSeenKey(va), now)
 			if !seenPrior[va.Name] {
 				log.Info("orphaned VA sighted — tracking for next cycle",
 					"va", va.Name, "node", va.Spec.NodeName)
@@ -63,11 +63,11 @@ func (c *volumeAttachmentCleaner) missingNodeReason(
 // vanished between cycles).
 func (c *volumeAttachmentCleaner) forgetReattachedOrphans(
 	orphanNow map[string]bool, log logr.Logger) {
-	c.orphanFirstSeen.Prune(func(name string) bool {
-		if orphanNow[name] {
+	c.orphanFirstSeen.Prune(func(key string) bool {
+		if orphanNow[vaLedgerName(key)] {
 			return true
 		}
-		log.Info("orphan sighting cleared — node reappeared or VA gone", "va", name)
+		log.Info("orphan sighting cleared — node reappeared or VA gone", "va", vaLedgerName(key))
 		return false
 	})
 }

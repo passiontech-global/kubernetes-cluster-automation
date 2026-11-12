@@ -31,3 +31,41 @@ func TestParseLocalUsers(t *testing.T) {
 		})
 	}
 }
+
+func TestParseLocalUsersEnv(t *testing.T) {
+	cases := []struct {
+		name           string
+		in             string
+		user, password string
+		ok             bool
+	}{
+		{"single", "admin:pw", "admin", "pw", true},
+		{"surrounding space", "  admin:pw  ", "admin", "pw", true},
+		{"two users first wins", "admin:pw,ops:secret", "admin", "pw", true},
+		// A comma is a separator ONLY when the segment after it has
+		// the user:pass shape — a comma inside a password survives.
+		{"comma in password", "admin:pa,ss", "admin", "pa,ss", true},
+		{"comma then user", "admin:pa,ss,ops:pw", "admin", "pa,ss", true},
+		// A comma with no user:pass-shaped segment after it is NOT a
+		// separator — it stays inside the password (",," included).
+		{"trailing comma stays in password", "admin:pw,", "admin", "pw,", true},
+		{"leading comma dropped", ",admin:pw", "admin", "pw", true},
+		{"space-only entries dropped", " , admin:pw", "admin", "pw", true},
+		{"first invalid second valid", "broken,ops:pw", "ops", "pw", true},
+		{"all invalid", "a,b,c", "", "", false},
+		{"empty", "", "", "", false},
+		{"whitespace only", "   ", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			user, password, ok := parseLocalUsersEnv(tc.in)
+			if ok != tc.ok {
+				t.Fatalf("parseLocalUsersEnv(%q) ok=%v want %v", tc.in, ok, tc.ok)
+			}
+			if ok && (user != tc.user || password != tc.password) {
+				t.Fatalf("parseLocalUsersEnv(%q)=(%q,%q) want (%q,%q)",
+					tc.in, user, password, tc.user, tc.password)
+			}
+		})
+	}
+}

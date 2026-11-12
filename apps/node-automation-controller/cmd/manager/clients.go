@@ -15,6 +15,7 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/flowcontrol"
@@ -125,6 +126,7 @@ func sharedBaseTransport(cfg *rest.Config) (http.RoundTripper, error) {
 type kubeClients struct {
 	cs       kubernetes.Interface
 	dyn      dynamic.Interface
+	meta     metadata.Interface
 	probeCS  kubernetes.Interface
 	probeDyn dynamic.Interface
 }
@@ -200,5 +202,17 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to create probe dynamic client: %w", err)
 	}
-	return &kubeClients{cs: cs, dyn: dyn, probeCS: probeCS, probeDyn: probeDyn}, nil
+	// The metadata client serves PartialObjectMetadata LISTs — the
+	// audit/census consumers that only read labels/annotations/
+	// ownerRefs get the same objects minus the resource payload.
+	// Built off directCfg (JSON, shared base transport + rate
+	// limiter): protobuf negotiation does not apply — the metadata
+	// endpoint has no per-resource scheme.
+	meta, err := metadata.NewForConfig(directCfg)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create metadata client: %w", err)
+	}
+	return &kubeClients{
+		cs: cs, dyn: dyn, meta: meta,
+		probeCS: probeCS, probeDyn: probeDyn}, nil
 }

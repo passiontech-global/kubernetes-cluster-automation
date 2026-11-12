@@ -17,6 +17,7 @@ import (
 type Runner struct {
 	name     string
 	interval time.Duration
+	budget   time.Duration
 	fn       func(context.Context)
 }
 
@@ -27,7 +28,8 @@ type Runner struct {
 // interval panics in time.NewTicker, same as the hand-rolled loops
 // this replaces.
 func Every(name string, interval time.Duration, fn func(context.Context)) *Runner {
-	return &Runner{name: name, interval: interval, fn: fn}
+	return &Runner{name: name, interval: interval,
+		budget: DefaultCycleBudget, fn: fn}
 }
 
 // EverySafe is Every with per-tick panic recovery — the safeCycle
@@ -41,18 +43,19 @@ func Every(name string, interval time.Duration, fn func(context.Context)) *Runne
 // cycles{loop,"panic"}); nil means the log line alone suffices.
 func EverySafe(name string, interval time.Duration,
 	fn func(context.Context), onPanic func(name string, recovered any)) *Runner {
-	return &Runner{name: name, interval: interval, fn: func(ctx context.Context) {
-		defer func() {
-			if r := recover(); r != nil {
-				logger().Error(name+" tick panicked — cycle "+
-					"skipped, loop keeps ticking", "panic", r)
-				if onPanic != nil {
-					onPanic(name, r)
+	return &Runner{name: name, interval: interval,
+		budget: DefaultCycleBudget, fn: func(ctx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger().Error(name+" tick panicked — cycle "+
+						"skipped, loop keeps ticking", "panic", r)
+					if onPanic != nil {
+						onPanic(name, r)
+					}
 				}
-			}
-		}()
-		fn(ctx)
-	}}
+			}()
+			fn(ctx)
+		}}
 }
 
 // Name identifies the runner for logging.
@@ -62,8 +65,25 @@ func (r *Runner) Name() string { return r.name }
 // is created, then once per interval. It never returns an error —
 // transient failures are the fn's problem (log and retry next tick),
 // matching the agent.Subsystem contract.
+//
+// Liveness: under an agent-supervised ctx (WithLiveness) the runner
+// registers its own Beat with a staleness budget of
+// max(3*interval + budget, LivenessFloor) and stamps it at the START
+// and END of every run — the start stamp is the startup grace that
+// lets a legitimately long first cycle finish, the end stamp keeps
+// the cadence honest. A hung fn stops stamping and /healthz reports
+// 503 once ITS OWN budget is exceeded (a panicking fn under
+// EverySafe is recovered inside fn, so the stamp still lands: a
+// crash-looping cycle is alive, a wedged one is not). Outside a
+// supervised ctx the beat is nil and stamping is a no-op.
 func (r *Runner) Run(ctx context.Context) {
+	var beat *Beat
+	if l := LivenessFrom(ctx); l != nil {
+		beat = l.RegisterLoop(r.name, r.interval, r.budget)
+	}
+	stampLoop(beat)
 	r.fn(ctx)
+	stampLoop(beat)
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
 	for {
@@ -71,7 +91,9 @@ func (r *Runner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			stampLoop(beat)
 			r.fn(ctx)
+			stampLoop(beat)
 		}
 	}
 }
@@ -79,5 +101,12 @@ func (r *Runner) Run(ctx context.Context) {
 // Idle blocks until ctx is cancelled — the body for a subsystem that
 // is constructed but disabled. Run must NOT return while ctx is live:
 // agent.Run restarts a returned Run after a backoff, so a disabled
-// subsystem parks here instead of exiting.
-func Idle(ctx context.Context) { <-ctx.Done() }
+// subsystem parks here instead of exiting. The parked loop is alive
+// by definition, so Idle exempts the ctx's liveness registry from
+// the /healthz staleness check — otherwise the run-entry stamp would
+// go stale 15 minutes in and kubelet would kill a perfectly healthy
+// agent for doing nothing.
+func Idle(ctx context.Context) {
+	Exempt(ctx)
+	<-ctx.Done()
+}

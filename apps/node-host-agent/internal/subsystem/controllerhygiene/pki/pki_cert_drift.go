@@ -116,7 +116,31 @@ func (c *DriftCheck) Run(ctx context.Context) {
 			pair.CertFile, pair.Addr,
 			disk.NotAfter.UTC().Format(time.RFC3339),
 			sock.NotAfter.UTC().Format(time.RFC3339)))
-		if !c.d.State.RateOK(cdeps.FileRatePKIRestart,
+		// Peer-quorum gate for controller restarts: bouncing
+		// RestartUnit below 2 ready kubernetes endpoints takes the
+		// last serving apiserver down with it. Other units
+		// (kine.service) carry no apiserver quorum to protect.
+		if pair.Unit == c.d.Cfg.RestartUnit && !c.d.ControllerQuorumReady(ctx) {
+			c.d.State.SuspectLog(cdeps.StatePKIReloadStale, fmt.Sprintf(
+				"suspect: cp-cert-reload-stale %s but default/kubernetes reports <2 ready endpoints — holding restart",
+				pair.CertFile), c.d.Cfg.SuspectLogCadence)
+			continue
+		}
+		// Budget file follows the unit being restarted: pairs that
+		// bounce RestartUnit share the controller-wide
+		// FileRateRestart budget with the sig13/cp-freeze heals;
+		// other units (kine.service) keep the pki-private file.
+		budget := cdeps.FileRatePKIRestart
+		if pair.Unit == c.d.Cfg.RestartUnit {
+			budget = cdeps.FileRateRestart
+		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.SuspectLog(cdeps.StatePKIReloadStale, fmt.Sprintf(
+				"suspect: cp-cert-reload-stale %s but cluster maintenance in progress — holding restart",
+				pair.CertFile), c.d.Cfg.SuspectLogCadence)
+			continue
+		}
+		if !c.d.State.RateOK(budget,
 			c.d.Cfg.PKIDrift.RestartInterval) {
 			c.d.State.SuspectLog(cdeps.StatePKIReloadStale, fmt.Sprintf(
 				"suspect: cp-cert-reload-stale %s but in restart cooldown (<%dm), skip",
@@ -129,7 +153,7 @@ func (c *DriftCheck) Run(ctx context.Context) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION: restarting %s - cp-cert-reload-stale %s newer than %s",
 				pair.Unit, pair.CertFile, pair.Addr))
-			c.d.State.RateSpend(cdeps.FileRatePKIRestart)
+			c.d.State.RateSpend(budget)
 			c.d.State.ResetCounter(ctr)
 			if err := c.d.Restart(ctx, pair.Unit); err != nil {
 				c.d.State.AppendLogWarn(fmt.Sprintf(

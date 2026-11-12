@@ -130,7 +130,7 @@ func TestOnePasswordConnectSyncCrashloopWindow(t *testing.T) {
 	cs := fake.NewSimpleClientset(live, stable)
 	p := testProber(cs)
 	p.Now = func() time.Time { return now }
-	res := probetest.MustCheck[*onePasswordConnectSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*onePasswordConnectSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("live crashloop must fail the check")
 	}

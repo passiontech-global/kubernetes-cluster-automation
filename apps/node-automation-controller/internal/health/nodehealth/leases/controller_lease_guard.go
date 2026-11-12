@@ -224,6 +224,14 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			l := allLeases[i]
 			leasesByNS[l.Namespace] = append(leasesByNS[l.Namespace], l)
 		}
+		// renewTime staleness measures against the moment the census
+		// was FETCHED, not p.Now() at this check's run time — the
+		// worker pool can delay a check minutes behind the sweep's
+		// first reader, and a lease renewed just before the fetch
+		// would read artificially stale (and get bounced) to a late
+		// runner. Flap/thrash ledgers keep `now`: their windows are
+		// check-local bookkeeping, not apiserver-clock comparisons.
+		leaseNow := p.LeasesFetchedAt(ctx)
 		for _, ns := range leaseGuardNamespaces {
 			leases := leasesByNS[ns]
 			// podsNSFailed gates the per-namespace pods-list error
@@ -248,7 +256,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 						[]string{ns, lease.Name})
 					rep.Find(key + "(thrashing)")
 				}
-				if !leaseStaleWindow(lease, now) {
+				if !leaseStaleWindow(lease, leaseNow) {
 					continue
 				}
 				pods, err := podsInNS(ns)

@@ -23,13 +23,13 @@
 //     transitions the pod itself; the pod is recorded in the
 //     `poked` ledger and left alone for exactly one cycle.
 //  2. Next cycle: a pod STILL qualifying (or a pod whose shutdown
-//     call failed outright on both paths) is deleted — the Job
-//     controller recreates or completes it, and
-//     zombie_sidecar_pods_reaped_total counts the reap. A Job with
-//     spec.backoffLimit==0 spawns no replacement pod, so once a
-//     shutdown attempt already ran (this or a prior cycle —
-//     tracked in the `tried` ledger) an all-exit-0 zombie may be
-//     reaped even while job.Status.Succeeded is still 0.
+//     call failed outright on both paths) is deleted — but ONLY once
+//     the parent Job is Complete (jobAllowsReap): deleting a
+//     still-Running pod of an unfinished Job counts as a pod failure
+//     — an instant BackoffLimitExceeded on backoffLimit==0 Jobs —
+//     and zombie_sidecar_pods_reaped_total counts the reap. A Job
+//     whose sidecar never exits keeps its zombie pod and stays
+//     visibly stuck rather than being failed by the reaper itself.
 //
 // Qualification (fail closed — every clause must hold): phase
 // Running and not already terminating, an ownerReference of kind
@@ -107,11 +107,6 @@ type zombieSidecarReaper struct {
 	// one graceful cycle, then delete. UID is part of the key so a
 	// same-named replacement pod never inherits the ledger entry.
 	poked map[string]bool
-	// tried records "ns/name/uid" of pods for which ANY shutdown
-	// attempt (direct or proxy, success or failure) already ran —
-	// sidecar-shutdown-fallback lets jobAllowsReap force a backoffLimit==0 reap only
-	// after one full attempt cycle, never on first sight.
-	tried map[string]bool
 }
 
 // Setup registers the 5-minute sweep. Disabled
@@ -122,7 +117,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
 			now: shared.SystemClock, shutdownFn: zombieSidecarShutdown,
-			poked: map[string]bool{}, tried: map[string]bool{}}
+			poked: map[string]bool{}}
 		return shared.AddPeriodic(d.Mgr, r.queue, zombieSidecarReaperInterval, r.run)
 	})
 }
@@ -136,9 +131,6 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	}
 	if r.poked == nil {
 		r.poked = map[string]bool{}
-	}
-	if r.tried == nil {
-		r.tried = map[string]bool{}
 	}
 
 	// Server-side phase filter — zombies are always Running; the
@@ -157,14 +149,13 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 
 	// zombieTarget is a pod that reached the delete step this cycle —
 	// either poked last cycle and still stuck, or freshly attempted
-	// with both shutdown paths failing. attempted records whether a
-	// shutdown call already ran (the sidecar-shutdown-fallback backoffLimit==0
-	// exemption needs it); reason feeds the DELETE log line.
+	// with both shutdown paths failing. The Job-completion gate
+	// (jobAllowsReap) decides inside Confirm; reason feeds the
+	// DELETE log line.
 	type zombieTarget struct {
-		pod       *corev1.Pod
-		key       string
-		reason    string
-		attempted bool
+		pod    *corev1.Pod
+		key    string
+		reason string
 	}
 	var targets []zombieTarget
 	// shutdownAttempts counts graceful sidecar shutdown calls this
@@ -183,15 +174,14 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		if r.poked[key] {
 			// Already sent the admin quit call last cycle and the
 			// pod STILL qualifies — the sidecar ignored the
-			// graceful path, so the pod itself goes away. poked
-			// implies a shutdown attempt already ran — the
-			// backoffLimit==0 exemption applies.
+			// graceful path, so the pod itself goes away (subject
+			// to the Job-completion gate in Confirm).
 			targets = append(targets, zombieTarget{pod: p, key: key,
-				reason: "still stuck after sidecar shutdown", attempted: true})
+				reason: "still stuck after sidecar shutdown"})
 			continue
 		}
 		if shutdownAttempts >= zombieShutdownCapPerCycle {
-			// Past the cap: no dial, no tried-stamp — the pod keeps
+			// Past the cap: no dial, no poked stamp — the pod keeps
 			// its graceful cycle for the next sweep, unmodified.
 			shutdownSkipped++
 			continue
@@ -201,18 +191,14 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		// pods/<name>:<port>/proxy fallback when the direct dial is
 		// unreachable (netpol) or the pod has no IP (sidecar-shutdown-fallback). A pod
 		// with no podIP skips straight to the proxy attempt.
-		attemptedBefore := r.tried[key]
 		err := r.shutdownPod(ctx, p, sidecar)
-		r.tried[key] = true
 		if err != nil {
 			// Both shutdown paths failed — graceful is impossible,
-			// so delete now rather than burn a cycle. BUG-C1: with
-			// every app container at exit 0 the Job must already be
-			// Complete first — the jobAllowsReap gate in the sweep
-			// decides.
+			// so the pod goes to the delete step; the
+			// jobAllowsReap gate inside Confirm decides whether
+			// the Job may spare it (BUG-C1 / backoffLimit).
 			targets = append(targets, zombieTarget{pod: p, key: key,
-				reason:    fmt.Sprintf("sidecar shutdown failed: %v", err),
-				attempted: attemptedBefore})
+				reason: fmt.Sprintf("sidecar shutdown failed: %v", err)})
 			continue
 		}
 		r.poked[key] = true
@@ -227,7 +213,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		// path: deleting a still-Running pod of an unfinished Job
 		// recreates it and re-runs the Job (BUG-C1).
 		Confirm: func(ctx context.Context, t zombieTarget) (bool, error) {
-			if r.jobAllowsReap(ctx, t.pod, t.attempted) {
+			if r.jobAllowsReap(ctx, t.pod) {
 				return true, nil
 			}
 			// The Job gate vetoed the delete — release the poked
@@ -235,9 +221,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 			// still in `poked` skips the shutdown path every cycle
 			// and re-lands here unconfirmed (the delete step was the
 			// only poked release — the catch-22). Dropping it makes
-			// the next cycle retry the graceful /shutdown; `tried`
-			// still holds, so the backoffLimit==0 exemption keeps
-			// working through the same gate.
+			// the next cycle retry the graceful /shutdown.
 			delete(r.poked, t.key)
 			return false, nil
 		},
@@ -248,7 +232,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		Delete: func(ctx context.Context, t zombieTarget) error {
 			// The graceful ledger entry is spent whether the delete
 			// lands or not — a failed delete re-arms the shutdown
-			// path next cycle (tried still holds the key).
+			// path next cycle.
 			delete(r.poked, t.key)
 			// UID precondition: the listed object is the zombie we
 			// vetted — a same-named replacement must start its own
@@ -273,11 +257,6 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	for k := range r.poked {
 		if !seen[k] {
 			delete(r.poked, k)
-		}
-	}
-	for k := range r.tried {
-		if !seen[k] {
-			delete(r.tried, k)
 		}
 	}
 	if shutdownSkipped > 0 {

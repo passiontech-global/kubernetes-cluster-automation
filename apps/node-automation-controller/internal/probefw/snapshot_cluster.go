@@ -7,6 +7,7 @@ package probefw
 
 import (
 	"context"
+	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,7 +26,7 @@ func (d *Deps) AllEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSli
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.EndpointSlices(d.CS, metav1.NamespaceAll))
 	})
 }
@@ -37,7 +38,7 @@ func (d *Deps) AllServices(ctx context.Context) ([]corev1.Service, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.Services(d.CS, metav1.NamespaceAll))
 	})
 }
@@ -49,7 +50,7 @@ func (d *Deps) AllNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.Namespaces(d.CS))
 	})
 }
@@ -65,7 +66,7 @@ func (d *Deps) AllEvents(ctx context.Context) ([]corev1.Event, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.Events(d.CS, metav1.NamespaceAll))
 	})
 }
@@ -103,9 +104,25 @@ func (d *Deps) AllLeases(ctx context.Context) ([]coordinationv1.Lease, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.Leases(d.CS, metav1.NamespaceAll))
 	})
+}
+
+// LeasesFetchedAt reports the wall-clock instant the memoized Lease
+// census was fetched — the correct "now" for spec.renewTime staleness
+// windows. p.Now() at check-run time lags the fetch by however long
+// the worker queue delayed this check, which would overstate lease
+// staleness (a lease renewed 9m before the fetch reads 11m-stale to a
+// check that ran 2m late and gets bounced for nothing). Outside a
+// sweep — or before the census loads — it falls back to d.Now(), the
+// pre-snapshot semantics.
+func (d *Deps) LeasesFetchedAt(ctx context.Context) time.Time {
+	s := sweepSnap(ctx)
+	if t := s.leases.fetched(); !t.IsZero() {
+		return t
+	}
+	return d.Now()
 }
 
 // Lease finds one Lease in the AllLeases census — the snapshot

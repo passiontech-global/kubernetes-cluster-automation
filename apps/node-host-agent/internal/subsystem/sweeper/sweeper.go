@@ -57,6 +57,8 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -107,6 +109,13 @@ type Config struct {
 	MountsFile     string        // host mount table (/proc/1/mounts under hostPID)
 	RequestTimeout time.Duration // per-call apiserver deadline
 	Client         kubernetes.Interface
+	// Coord is the L1↔L3 coordination handle (platform/nodecoord) —
+	// nil disables the maintenance hold (tests, minimal wiring).
+	// When set, Sweep consults HoldLocalAction before the
+	// destructive half: a cluster upgrade / kured drain stamps
+	// AnnoClusterMaintenanceUntil and L1 must not delete volumes
+	// mid-migration.
+	Coord *nodecoord.Coord
 
 	// statfsFn measures used bytes on the BaseDir filesystem — seam for
 	// tests; nil → syscall.Statfs.
@@ -261,7 +270,7 @@ func (s *Sweeper) mountPoints() ([]string, error) {
 // comparing them un-normalized makes the guard silently miss every
 // live mount (and rm straight through its contents).
 func mountedInside(dir string, mounts []string) bool {
-	dir = strings.TrimPrefix(dir, "/host")
+	dir = hostutil.HostSidePath(dir)
 	for _, mp := range mounts {
 		if mp == dir || strings.HasPrefix(mp, dir+"/") {
 			return true

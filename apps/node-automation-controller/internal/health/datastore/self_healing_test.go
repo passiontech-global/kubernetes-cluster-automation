@@ -103,7 +103,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting — tracked, quiet.
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen zero endpoints must pass: %+v", res)
 	}
 	key := "db/dragonfly-master/dragonfly"
@@ -114,7 +114,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	// 4m in — gauge fires, but under the 5m heal window.
 	at := base.Add(4 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("zero endpoints >=3m must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "db", "dragonfly-master", "dragonfly"); v != 1 {
@@ -128,7 +128,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	// 6m in — the dragonfly operator leader is bounced.
 	at = base.Add(6 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still masterless — must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
@@ -157,9 +157,9 @@ func TestDragonflyOperatorHealMaintenanceDefers(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// Seed the streak, then sweep past the 5m heal window.
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time { return base.Add(6 * time.Minute) }
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless under maintenance must still FAIL")
 	}
 	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
@@ -187,7 +187,7 @@ func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted masterless window must FAIL on the first sweep")
 	}
 	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
@@ -225,7 +225,7 @@ func TestDragonflyOperatorHealSkipsUnreadyPods(t *testing.T) {
 	// Seed the zero-endpoint streak past the 5m heal window.
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-6*time.Minute))
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless streak must still FAIL")
 	}
 	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
@@ -278,7 +278,7 @@ func TestDragonflyOperatorHealDeletesOnePodPerSweep(t *testing.T) {
 	// Seed the zero-endpoint streak past the 5m heal window.
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-6*time.Minute))
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless streak must still FAIL")
 	}
 	if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
@@ -296,7 +296,7 @@ func TestDragonflyOperatorHealDeletesOnePodPerSweep(t *testing.T) {
 	// A follow-up sweep inside the cooldown window deletes nothing
 	// further — one pod per cycle, never a rolling wipe.
 	p.Now = func() time.Time { return base.Add(time.Minute) }
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	for _, survivor := range []*corev1.Pod{old2, new1} {
 		if _, err := cs.CoreV1().Pods(kube.DragonflyOperatorNS).
 			Get(ctx, survivor.Name, metav1.GetOptions{}); err != nil {
@@ -323,7 +323,7 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("cache/redis-master/redis", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless redis must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "cache", "redis-master", "redis"); v != 1 {
@@ -350,7 +350,7 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("precondition: masterless service must FAIL")
 	}
 	// Endpoint comes back.
@@ -371,7 +371,7 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	}
 	at := base.Add(time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("recovered master must pass: %+v", res)
 	}
 	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
@@ -400,7 +400,7 @@ func TestCheckStatefulMasterlessNonCandidates(t *testing.T) {
 		sts, notReadySTS, headless, noRole, wrongSel, roleOnly), probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("non-candidates must pass, got %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince); len(keys) != 0 {

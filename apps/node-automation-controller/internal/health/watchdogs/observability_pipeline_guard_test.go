@@ -35,7 +35,7 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 		p.HTTPClient = srv.Client()
 		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
 
-		res := chk.Run(ctx)
+		res := chk.Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatal("degraded pipeline must fail the check")
 		}
@@ -72,7 +72,7 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 		p := testProber(fake.NewSimpleClientset())
 		p.Cfg.HTTPContent.URL = srv.URL
 		p.HTTPClient = srv.Client()
-		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(ctx)
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx))
 		if !res.Pass {
 			t.Fatalf("healthy pipeline must pass: %+v", res)
 		}
@@ -97,7 +97,7 @@ func TestObservabilityPipelineGuard(t *testing.T) {
 		p := testProber(cs)
 		p.Cfg.HTTPContent.URL = srv.URL
 		p.HTTPClient = srv.Client()
-		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(ctx)
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatal("dropped notifications + zero discovered alertmanagers must fail the check")
 		}
@@ -152,7 +152,7 @@ func TestOnePasswordConnectSyncProbe(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(degraded, healthy)
 	p := testProber(cs)
-	res := probetest.MustCheck[*onePasswordConnectSyncCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*onePasswordConnectSyncCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("degraded connect-sync must fail the check")
 	}
@@ -190,7 +190,7 @@ func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
 	chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
 
 	// Episode 1 — degraded: one Warning Event, marker armed.
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("degraded pipeline must fail")
 	}
 	if !chk.evented.Has("watchdog_heartbeat") {
@@ -199,7 +199,7 @@ func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
 	// Inconclusive cycle (query error) — the marker must NOT be
 	// pruned (a flap must not re-page the same episode).
 	p.HTTPClient = failingHTTPClient(t)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("inconclusive cycle must not pass")
 	}
 	if !chk.evented.Has("watchdog_heartbeat") {
@@ -208,7 +208,7 @@ func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	// Recovery — conclusive healthy cycle prunes the marker.
 	healthy.Store(true)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy pipeline must pass: %+v", res)
 	}
 	if chk.evented.Has("watchdog_heartbeat") {
@@ -216,7 +216,7 @@ func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
 	}
 	// Relapse — a FRESH event is emitted (marker re-armed).
 	healthy.Store(false)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("relapsed pipeline must fail")
 	}
 	evs, err := cs.EventsV1().Events(obsPipelineEventNS).List(ctx, metav1.ListOptions{})

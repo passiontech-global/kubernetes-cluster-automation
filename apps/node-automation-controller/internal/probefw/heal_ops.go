@@ -134,13 +134,22 @@ func (d *Deps) BounceOperatorPod(ctx context.Context, log logr.Logger,
 	if heals != nil && heals.CooledDown(key, cooldown, now) {
 		return 0
 	}
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(d.CS, nsScope(ns)))
+	// Shared sweep census, not a fresh LIST — every check that
+	// touches pods this sweep pays one cluster read total, and a
+	// pod deleted earlier in the sweep is already tombstoned out.
+	allPods, err := d.AllPods(ctx)
 	if err != nil {
 		metrics.IncError(d.Name)
 		log.Info("WARN: list pods failed — operator heal deferred",
 			"check", checkName, "namespace", ns, "error", err)
 		return 0
+	}
+	var pods []corev1.Pod
+	for i := range allPods {
+		if ns != "" && ns != metav1.NamespaceAll && allPods[i].Namespace != ns {
+			continue
+		}
+		pods = append(pods, allPods[i])
 	}
 	var targets []*corev1.Pod
 	if pick != nil {
@@ -166,29 +175,42 @@ func (d *Deps) BounceOperatorPod(ctx context.Context, log logr.Logger,
 	if !proceed {
 		return 0
 	}
+	// attempted tracks whether ANY target reached the delete call —
+	// a mutation that ran and failed keeps the grant ("a grant whose
+	// delete then fails simply spent a cheap token"), while a pass
+	// where every target cleanly deferred (L1 hold, quorum denial)
+	// executed nothing and hands the one gate grant back below.
+	attempted := false
 	for _, pod := range targets {
-		if _, err := heal.DeletePod(ctx, d.CS, heals, key, pod, now); err != nil {
+		didDelete, err := heal.DeletePod(ctx, d.CS, heals, key, pod, now)
+		if err != nil {
+			attempted = true
 			metrics.IncError(d.Name)
 			log.Error(err, "operator pod delete failed",
 				"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
+		if !didDelete {
+			// Clean deferral (L1 hold or quorum reservation) — no
+			// mutation ran. The gate grant is refunded ONCE below if
+			// the whole pass delivers and attempts nothing; never
+			// per-target (one grant covered the batch).
+			continue
+		}
+		attempted = true
+		// heal.DeletePod already dropped the O(1) UID tombstone on
+		// the sweep overlay — no InvalidatePods re-LIST needed.
 		metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 		deleted++
 		log.Info("DELETE: pod heal — forcing operator resync",
 			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 	}
-	if deleted > 0 {
-		d.InvalidatePods(ctx) // pods gone — drop the census once
+	if deleted == 0 && !attempted {
+		// Every target deferred before any mutation — the grant
+		// HealAllowed consumed bought no heal. Exactly once for the
+		// whole bounce: the per-target deletes share the one grant,
+		// so a per-skip refund would over-credit the window.
+		heal.RefundGrant(now)
 	}
 	return deleted
-}
-
-// nsScope maps the primitive's "" = cluster-wide spelling onto the
-// clientset's namespace-all spelling.
-func nsScope(ns string) string {
-	if ns == "" {
-		return metav1.NamespaceAll
-	}
-	return ns
 }

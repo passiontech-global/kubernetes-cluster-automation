@@ -56,6 +56,13 @@ func init() {
 func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context,
 	objects, kineRep *probefw.SweepReport) error {
 
+	// Hits buffer until EVERY read source has succeeded: a partial
+	// census must never publish — a ConfigMap page that measured
+	// fine followed by a failed Secret list would otherwise leave
+	// half the gauge tuples and findings live on an Infra-aborted
+	// sweep. Flush happens once, after the last source returns.
+	var hits []kineLargeHit
+
 	// Stream pages instead of materializing the whole census — a
 	// cluster-wide ConfigMap+Secret list is the biggest read this
 	// check makes, and only objects near the size guard ever earn
@@ -70,7 +77,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 					strMapLen(cm.Data)+bytesMapLen(cm.BinaryData)) < kineMarshalFloor {
 					continue
 				}
-				p.recordKineLargeObject(ctx, objects, kineRep, "configmap",
+				p.recordKineLargeObject(ctx, &hits, "configmap",
 					cm.Namespace, cm.Name, cm)
 			}
 			return nil
@@ -88,7 +95,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 					strMapLen(s.StringData)) < kineMarshalFloor {
 					continue
 				}
-				p.recordKineLargeObject(ctx, objects, kineRep, "secret",
+				p.recordKineLargeObject(ctx, &hits, "secret",
 					s.Namespace, s.Name, s)
 			}
 			return nil
@@ -125,7 +132,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 				func(items []unstructured.Unstructured) error {
 					for i := range items {
 						obj := &items[i]
-						p.recordKineLargeObject(ctx, objects, kineRep,
+						p.recordKineLargeObject(ctx, &hits,
 							rk.kind, obj.GetNamespace(), obj.GetName(), obj)
 					}
 					return nil
@@ -147,9 +154,20 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 		}
 		for i := range items {
 			obj := &items[i]
-			p.recordKineLargeObject(ctx, objects, kineRep, rk.kind,
+			p.recordKineLargeObject(ctx, &hits, rk.kind,
 				obj.GetNamespace(), obj.GetName(), obj)
 		}
+	}
+
+	// All three read sources returned — publish the buffered hits:
+	// gauge tuples on kineRep (the kine gauge's own scope) plus a
+	// finding per hit on the shared verdict.
+	for _, h := range hits {
+		kineRep.Set(kineLargeObjectBytesGauge, float64(h.size),
+			h.kind+"/"+h.ns+"/"+h.name,
+			[]string{h.kind, h.ns, h.name})
+		objects.Find(fmt.Sprintf("%s %s/%s carries %d bytes (Kine row guard %d)",
+			h.kind, h.ns, h.name, h.size, kineLargeObjectThreshold))
 	}
 	return nil
 }
@@ -211,17 +229,26 @@ func approxObjectSize(obj metav1.Object, payload int) int {
 	return size
 }
 
+// kineLargeHit is one over-threshold object buffered by
+// recordKineLargeObject — published only after every census source
+// succeeds (see auditKineLargeObjects).
+type kineLargeHit struct {
+	kind, ns, name string
+	size           int64
+}
+
 // recordKineLargeObject measures obj's serialized size — the bytes the
 // datastore row actually stores, so Data/BinaryData payloads AND
 // metadata (a runaway last-applied-configuration annotation counts —
 // it historically duplicated whole manifests) — and past the
-// threshold emits the gauge tuple on kineRep (the kine gauge's own
-// scope) plus a finding on the shared verdict. The size counts
-// through kube.JSONSize: a full json.Marshal would allocate a
-// multi-MB []byte per CRD schema just to read its length. A marshal
-// failure is unmeasurable, not large: logged and skipped.
+// threshold appends the hit to hits for the caller's end-of-audit
+// flush (the gauge tuple lands on kineRep's own scope, the finding
+// on the shared verdict). The size counts through kube.JSONSize: a
+// full json.Marshal would allocate a multi-MB []byte per CRD schema
+// just to read its length. A marshal failure is unmeasurable, not
+// large: logged and skipped.
 func (p *apiObjectSprawlReportGCCheck) recordKineLargeObject(ctx context.Context,
-	objects, kineRep *probefw.SweepReport, kind, ns, name string, obj any) {
+	hits *[]kineLargeHit, kind, ns, name string, obj any) {
 
 	size, err := kube.JSONSize(obj)
 	if err != nil {
@@ -232,8 +259,5 @@ func (p *apiObjectSprawlReportGCCheck) recordKineLargeObject(ctx context.Context
 	if size <= kineLargeObjectThreshold {
 		return
 	}
-	kineRep.Set(kineLargeObjectBytesGauge, float64(size),
-		kind+"/"+ns+"/"+name, []string{kind, ns, name})
-	objects.Find(fmt.Sprintf("%s %s/%s carries %d bytes (Kine row guard %d)",
-		kind, ns, name, size, kineLargeObjectThreshold))
+	*hits = append(*hits, kineLargeHit{kind, ns, name, size})
 }

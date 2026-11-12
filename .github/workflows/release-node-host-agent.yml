@@ -16,8 +16,10 @@ on:
       - "libs/jinja/**"
       - ".moon/**"
       - "mise.toml"
+      - ".dockerignore"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-node-host-agent.yml"
+      - '!**/*.md'
   workflow_dispatch:
     inputs:
       version:

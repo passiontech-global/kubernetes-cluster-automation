@@ -83,6 +83,22 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 	// to this once-per-cycle read (see the pre-rm guard below).
 	mounts, mountsErr := s.mountPoints()
 
+	// L1↔L3 coordination: while the cluster holds the maintenance
+	// mutex (upgrade / kured drain), L1 must not run the destructive
+	// half — a Released-PV delete or dir rm mid-migration is exactly
+	// the churn L3 then has to un-wedge. The hold is checked once
+	// per cycle before the first delete; a Coord read failure
+	// resolves to "not held" (the annotations are hints, never
+	// mutexes — HoldLocalAction's own error path already treats an
+	// unreadable verdict as no-hold).
+	if s.cfg.Coord != nil && s.cfg.Coord.HoldLocalAction(ctx) {
+		log.Info("sweep held: cluster maintenance in progress — "+
+			"deletes skipped this cycle", "candidates", len(dirs))
+		s.dirsExamined.Set(float64(len(dirs)))
+		s.cycles.WithLabelValues("ok").Inc()
+		return
+	}
+
 	ndel := 0
 	ndir := 0
 	for _, d := range dirs {

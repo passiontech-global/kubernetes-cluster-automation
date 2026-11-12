@@ -231,6 +231,8 @@ var domainTable = []domainEntry{
 				"Max sockets to one (dstIP,dstPort) — tuple hot-spot."},
 			{descTCPPerTupleHot, "node_host_agent_tcp_per_tuple_sockets",
 				"Sockets per hot (dstIP,dstPort) endpoint past the 40k threshold (bounded series)."},
+			{descSockTCPState, "node_host_agent_sockstat_tcp_state_sockets",
+				"TCP sockets per kernel state from the NETLINK_SOCK_DIAG dump."},
 		}},
 	{name: "pki-certs",
 		emit: (*Collector).collectPKICerts,

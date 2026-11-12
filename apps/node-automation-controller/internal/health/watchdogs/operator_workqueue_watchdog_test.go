@@ -128,7 +128,7 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("source-controller/gitrepositories/apps/repo/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -156,7 +156,7 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
@@ -184,7 +184,7 @@ func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted first-seen must trip on the first post-restart sweep")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
@@ -209,7 +209,7 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("shipwright-operator/shipwrightbuilds//build-1/"+opReasonNoConditions, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("never-reconciled ShipwrightBuild must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "shipwright-operator", opReasonNoConditions); v != 1 {
@@ -292,9 +292,12 @@ func TestOperatorCRScanPagesListRequests(t *testing.T) {
 	if len(dyn.listOpts) != 1 {
 		t.Fatalf("certificate List requests = %d, want 1 (one fetch shared by both signatures)", len(dyn.listOpts))
 	}
-	if dyn.listOpts[0].Limit != kube.DefaultListPageSize {
-		t.Fatalf("List Limit = %d, want DefaultListPageSize (%d)",
-			dyn.listOpts[0].Limit, kube.DefaultListPageSize)
+	// Census reads run at ResourceVersion "0" (watch-cache single
+	// response) — pageOpts deliberately strips Limit under RV="0",
+	// so Limit==0 is the intended shape, not an unpaged regression.
+	if dyn.listOpts[0].ResourceVersion != "0" {
+		t.Fatalf("List ResourceVersion = %q, want \"0\" (watch-cache census)",
+			dyn.listOpts[0].ResourceVersion)
 	}
 	for _, reason := range []string{opReasonNoConditions, kcmReasonStaleGen} {
 		if !scan.live["cert-manager/certificates/apps/tls/"+reason] {

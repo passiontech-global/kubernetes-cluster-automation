@@ -71,7 +71,14 @@ const (
 // On-disk bookkeeping file names under WatchdogStateDir — same names
 // as the shell scripts so concurrent shell pieces share the budget.
 const (
-	FileRateRestart   = "last-sig13-restart" // shared restart budget
+	// FileRateRestart is THE shared restart budget for every
+	// k0scontroller.service restart this subsystem can fire — the
+	// sig13 wedge guard, the cp-component-frozen heal and the
+	// pki-cert-drift pairs all spend it so three different
+	// detectors cannot triple-bounce the controller inside one
+	// window. Each check still enforces its own MinRestart floor
+	// against the shared epoch.
+	FileRateRestart   = "last-sig13-restart"
 	FileRateTTLKill   = "last-ttl-restart"
 	FileRatePoolKill  = "last-kinepool-kill"
 	FileRateEtcdGuard = "last-etcd-guard" // eventpurge+rescue budget
@@ -95,11 +102,11 @@ const (
 	FileOOMSeen         = "oomloop-seen"
 	FileOOMKills        = "oomloop-kills"
 	FileOOMShielded     = "oomloop-shielded"
-	FileFeederLastRst   = "last-restart" // under FeederStateDir
 	// cp-freeze-heal (KCM/scheduler freeze auto-heal) + pki-cert-drift (PKI reload
-	// drift) bookkeeping.
-	FileRateCPRestart  = "last-cp-restart"
-	FileRatePKIRestart = "last-cp-cert-restart"
+	// drift) bookkeeping. cp-freeze restarts RestartUnit and therefore
+	// spends FileRateRestart — the shared controller budget — not a
+	// check-private file.
+	FileRatePKIRestart = "last-cp-cert-restart" // non-controller units only
 	FileCtrCPFreeze    = "consecutive-cp-freeze"
 	FileCtrKCMQuiet    = "consecutive-kcm-quiet"
 	FileCtrPKIDriftPre = "consecutive-cp-cert-stale-"

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -200,40 +201,35 @@ func apiHealthyProbe(rv int64) *apiProbeResult {
 	return &apiProbeResult{liveRV: rv, cacheRV: rv}
 }
 
-// A backend holding rv_gap >= threshold for 2 consecutive cycles is
-// pulled out of Endpoints AND EndpointSlice and lands in the quarantine
-// annotation — the first gapped cycle only arms the streak.
-func TestEndpointGuardQuarantineOnRVGap(t *testing.T) {
+// P0-3: a large STATIC live-cache gap is NOT a wedge signal — the gap
+// counts every unrelated cluster write since the last lease renewal,
+// so it stays inflated on a perfectly healthy backend under ordinary
+// write storms. Only a cache_rv frozen across cycles while live_rv
+// grows (TestEndpointGuardQuarantineOnFrozenCache) or consecutive
+// probe errors may quarantine.
+func TestEndpointGuardStaticGapDoesNotWedge(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}))
 	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil))
 	probes := probeTable{
-		"10.0.0.1": {liveRV: 1000, cacheRV: 100}, // gap 900 — wedged
+		"10.0.0.1": {liveRV: 1000, cacheRV: 100}, // gap 900 but live_rv flat
 		"10.0.0.2": apiHealthyProbe(1000),
 		"10.0.0.3": apiHealthyProbe(1000),
 	}
 	g := newEndpointGuard(cs, dyn, probes)
 
-	if err := g.run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := endpointAddrSet(getKubeEndpoints(t, dyn)); !got["10.0.0.1"] {
-		t.Fatal("wedged backend removed after a single gapped cycle")
-	}
-
-	if err := g.run(ctx); err != nil {
-		t.Fatal(err)
+	for i := 0; i < endpointGuardFrozenCyc+2; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ep := getKubeEndpoints(t, dyn)
-	if got := endpointAddrSet(ep); got["10.0.0.1"] || !got["10.0.0.2"] || !got["10.0.0.3"] {
-		t.Fatalf("wedged backend not quarantined, addresses=%v", got)
+	if got := endpointAddrSet(ep); !got["10.0.0.1"] {
+		t.Fatalf("static-gap backend quarantined on storm noise, addresses=%v", got)
 	}
-	if ann := ep.GetAnnotations()[endpointGuardAnno]; ann != "10.0.0.1" {
-		t.Fatalf("quarantine annotation = %q, want 10.0.0.1", ann)
-	}
-	if got := sliceAddrSet(getKubeSlice(t, cs)); got["10.0.0.1"] {
-		t.Fatalf("wedged backend still in EndpointSlice: %v", got)
+	if ann := ep.GetAnnotations()[endpointGuardAnno]; ann != "" {
+		t.Fatalf("quarantine annotation = %q, want empty", ann)
 	}
 }
 
@@ -438,6 +434,93 @@ func TestEndpointGuardSkipsReaddOfAbsentQuarantinedBackend(t *testing.T) {
 	}
 }
 
+// P0-3 hosted-plane re-add: on a mirror-slice (hosted) plane NO
+// endpoint reconciler re-lists a pulled IP — activeIPs can never
+// contain it again, so the reconciler-listing rule alone deadlocked
+// every recovered backend out of the set forever. Membership is
+// instead proven against ssotPeerIPs (control-plane node
+// InternalIPs): 10.0.0.1 stays a CP node address and must come
+// back; 10.0.0.3 is quarantined, absent, and NOT a node address —
+// decommissioned evidence — so it stays out.
+func TestEndpointGuardHostedReaddViaPeerDiscovery(t *testing.T) {
+	cpNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "cp-0",
+			Labels: map[string]string{"node-role.kubernetes.io/control-plane": ""},
+		},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+			{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+			{Type: corev1.NodeInternalIP, Address: "10.0.0.2"},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.2"}),
+		cpNode)
+	dyn := testutil.NewDynamicClient(
+		// 10.0.0.1 + 10.0.0.3 quarantined and absent from the
+		// address lists — the guard pulled them and nothing
+		// re-lists them on a hosted plane.
+		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1", "10.0.0.3"}))
+	fakeServerVersion(cs, "1", "37")
+	g := newEndpointGuard(cs, dyn, probeTable{
+		"10.0.0.1": apiHealthyProbe(1000), // CP node IP — recovers back
+		"10.0.0.2": apiHealthyProbe(1000),
+		"10.0.0.3": apiHealthyProbe(1000), // absent AND not a peer — stays out
+	})
+
+	for i := 0; i < endpointGuardRecoverCyc+1; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, dyn)
+	got := endpointAddrSet(ep)
+	if !got["10.0.0.1"] {
+		t.Fatal("recovered CP backend not re-added — SKIP-RE-ADD deadlock on hosted plane")
+	}
+	if got["10.0.0.3"] {
+		t.Fatal("non-peer quarantined backend re-added — decommissioned evidence ignored")
+	}
+	if ann := ep.GetAnnotations()[endpointGuardAnno]; ann != "10.0.0.3" {
+		t.Fatalf("quarantine annotation = %q, want only 10.0.0.3", ann)
+	}
+	// The mirror slice converges to the same post-decision set.
+	s, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+		Get(ctx, "kubernetes-89b87", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slice := sliceAddrSet(s)
+	if !slice["10.0.0.1"] || slice["10.0.0.3"] {
+		t.Fatalf("mirror slice not converged: %v", slice)
+	}
+}
+
+// Same hosted shape but peer discovery finds NO control-plane nodes
+// (managed plane / list failure shape): with no independent peer
+// evidence the strict rule stays — an absent quarantined IP is never
+// re-added on streak alone.
+func TestEndpointGuardHostedReaddFailsClosedWithoutPeers(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.2"})) // no nodes at all
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}))
+	fakeServerVersion(cs, "1", "37")
+	g := newEndpointGuard(cs, dyn, probeTable{
+		"10.0.0.1": apiHealthyProbe(1000),
+		"10.0.0.2": apiHealthyProbe(1000),
+	})
+	for i := 0; i < endpointGuardRecoverCyc+1; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, dyn)
+	if endpointAddrSet(ep)["10.0.0.1"] {
+		t.Fatal("absent backend re-added with zero peer evidence — fail closed violated")
+	}
+}
+
 // A quarantined backend that is STILL failing keeps its annotation —
 // okStreak resets on every failed cycle and recovery never latches.
 func TestEndpointGuardKeepsStillWedgedQuarantine(t *testing.T) {
@@ -446,7 +529,7 @@ func TestEndpointGuardKeepsStillWedgedQuarantine(t *testing.T) {
 	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}))
 	probes := probeTable{
-		"10.0.0.1": {liveRV: 900, cacheRV: 100}, // gap 800 — still wedged
+		"10.0.0.1": {err: errors.New("still wedged")}, // keeps failing — stays out
 		"10.0.0.2": apiHealthyProbe(900),
 	}
 	g := newEndpointGuard(cs, dyn, probes)
@@ -798,9 +881,9 @@ func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("dead")},
-		// gapped but under the 2-cycle latch: not wedged AND not
-		// healthy — healthyActive stays 0 while 10.0.0.1 wedges.
-		"10.0.0.2": {liveRV: 1000, cacheRV: 100},
+		// also failing: neither backend is a healthy peer, so the
+		// last-healthy guard vetoes every removal.
+		"10.0.0.2": {err: errors.New("dead too")},
 	}
 	g := newEndpointGuard(cs, dyn, probes)
 

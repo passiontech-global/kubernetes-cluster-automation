@@ -71,7 +71,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 				u.pending.unlocked.Stamp(key, t)
 			}
 		}
-		if heal.PersistedCooledDown(&u.pending.unlocked, hr, helmLastUnlockAnno,
+		if heal.PersistedCooledDown(ctx, &u.pending.unlocked, hr, helmLastUnlockAnno,
 			key, helmUnlockCooldown, now) {
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
@@ -202,6 +202,24 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 		return false, nil
 	}
 
+	// Maintenance mutex + heal budget — the pending-secret delete
+	// below mutates release state, so it defers while a
+	// cordon/drain/upgrade is in flight and "cannot verify" fails
+	// closed. The gate sits AFTER every skip condition so a
+	// refused or non-deadlocked HR never spends a grant, and the
+	// failed-hook-Job sweep that rides the unlock is terminal-object
+	// GC (exempt) covered by the same grant.
+	nowT := u.now.Now()
+	proceed, unverifiable := heal.Gate(ctx, log, &u.verdict,
+		u.cs, u.dyn, key, nowT)
+	switch {
+	case unverifiable:
+		return false, fmt.Errorf("maintenance gate unverifiable for pending-secret unlock %s", key)
+	case !proceed:
+		log.Info("DEFER: pending-secret unlock gated by maintenance", "hr", key)
+		return false, nil
+	}
+
 	log.Info("ACTION: delete stuck pending release secret",
 		"hr", key, "secret", pending.Name, "status", pending.Labels["status"], "rev", pendingRev)
 	if err := u.cs.CoreV1().Secrets(pending.Namespace).Delete(ctx, pending.Name,
@@ -211,12 +229,23 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 			// unlock) — the object this sweep vetted is already gone.
 			// A benign race is a skip, not an error, and not an
 			// unlock: no cooldown stamp, the next sweep re-evaluates.
+			// No mutation executed, so the gate grant goes back.
+			heal.RefundGrant(nowT)
 			log.Info("skip: pending release secret already gone — raced with helm-controller",
 				"hr", key, "secret", pending.Namespace+"/"+pending.Name)
 			return false, nil
 		}
+		// An attempted delete that errored is a spent grant —
+		// refund only on the no-mutation paths.
 		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
+	// The destructive half already landed — stamp the 24h cooldown
+	// in RAM NOW, before the HR annotation patch: if that patch
+	// fails, the next sweep must still see this HR inside its
+	// cooldown instead of re-deleting release state that already
+	// moved (the persisted half rides the same patch below; the
+	// RAM half cannot wait for it).
+	u.pending.unlocked.Stamp(key, u.now.Now())
 
 	// reconcile.fluxcd.io/requestedAt is flux's "reconcile now" hint —
 	// only the value changing matters; RFC3339 is the convention. The

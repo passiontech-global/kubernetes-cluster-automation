@@ -35,8 +35,14 @@ const (
 	// those backends, and only when the wedge is proven: unavailable
 	// >=15m AND a namespace stuck Terminating >=15m whose
 	// conditions/events name the group.
-	apiServiceUnblockMinAge   = 15 * time.Minute
-	apiServiceUnblockPodCap   = 10
+	apiServiceUnblockMinAge = 15 * time.Minute
+	apiServiceUnblockPodCap = 10
+	// apiServiceUnblockSweepCap bounds DELIVERED evictions across the
+	// whole sweep (every candidate, both unblock paths) — one pod
+	// restart unblocks an aggregation backend; a wider fan-out only
+	// churns replicas. apiServiceUnblockPodCap stays as the
+	// per-candidate-list bound inside deleteBackingPods.
+	apiServiceUnblockSweepCap = 1
 	apiServiceUnblockCooldown = 15 * time.Minute
 	// apiservice-standalone-unblock standalone unblock: an aggregated APIService in a
 	// protected namespace that stays Available=False >=30m gets its
@@ -84,6 +90,13 @@ type unblockHealer struct {
 	// separate keyspace so a standalone heal cannot mask or be
 	// masked by a wedge-evidence heal on the same APIService.
 	standaloneUnblocked state.CooldownSet
+	// sweepEvicted counts DELIVERED evictions in the current sweep —
+	// apiServiceUnblockSweepCap bounds the whole pass, not each
+	// candidate: restarting one pod is enough to unstick an
+	// aggregation backend, and a fan-out across several wedged
+	// APIService at once would churn replicas the PDBs were asked
+	// to protect. Reset at the top of sweepUnblock.
+	sweepEvicted int
 }
 
 // unblockCandidate is one APIService that passed the cheap
@@ -119,6 +132,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	// accumulate in the first place.
 	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
 	u.standaloneUnblocked.PruneExpired(now, apiServiceStandaloneUnblockCooldown)
+	u.sweepEvicted = 0
 	if snap.err != nil {
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", snap.err)
 	}
@@ -234,6 +248,12 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 	// opens the window. Checking here also skips the target lookup
 	// (Service get + pod list) for the whole cooldown.
 	if cooldown != nil && cooldown.CooledDown(svc.GetName(), cooldownDur, now) {
+		return false
+	}
+	// One pod restart per sweep across ALL candidates — checked
+	// before the target lookup so a spent sweep does not pay the
+	// Service get + pod list per remaining candidate.
+	if u.sweepEvicted >= apiServiceUnblockSweepCap {
 		return false
 	}
 	svcNs, svcName, _ := apiServiceBackend(svc)
@@ -445,7 +465,8 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 	log := logf.FromContext(ctx)
 	deleted := 0
 	for i := range targets {
-		if deleted >= apiServiceUnblockPodCap {
+		if deleted >= apiServiceUnblockPodCap ||
+			u.sweepEvicted+deleted >= apiServiceUnblockSweepCap {
 			break
 		}
 		p := &targets[i]
@@ -479,6 +500,7 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 			continue // proceeded but nothing landed — treat like a race
 		}
 		deleted++
+		u.sweepEvicted++
 	}
 	return deleted
 }

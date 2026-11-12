@@ -402,11 +402,19 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// Evict through the policy/v1 subresource, NOT a raw pod delete:
 	// the apiserver enforces the PDB budget and consumes a disruption
 	// slot atomically — the gate-2 pre-check above stays as a
-	// fast-path skip, and a refused eviction just errors this STS's
-	// roll (retried next sweep, no pod lost). The UID precondition
-	// closes the TOCTOU between the owned-pods snapshot and the
-	// evict — a same-named pod recreated in between is a fresh
-	// member already on its own schedule, not ours to roll.
+	// fast-path skip. The UID precondition closes the TOCTOU between
+	// the owned-pods snapshot and the evict — a same-named pod
+	// recreated in between is a fresh member already on its own
+	// schedule, not ours to roll.
+	//
+	// The three "expected" answers are DEFERRALS, not errors — none
+	// reaches metrics.IncError: a PDB 429 (disruptionsAllowed hit
+	// zero between the gate-2 read and the evict — the grant is
+	// refunded like every other refused heal), a 404 (the pod is
+	// already gone — another actor finished the roll, the goal
+	// state), and a 409 (the UID precondition fired — the pod was
+	// recreated since ownedPods listed it). All three retry cleanly
+	// next sweep; only a genuine API failure is an error.
 	ev := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: candidate.Name, Namespace: sts.Namespace},
@@ -414,8 +422,32 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	}
 	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
 		Evict(ctx, ev); err != nil {
-		if apierrors.IsTooManyRequests(err) {
+		switch {
+		case apierrors.IsTooManyRequests(err):
 			heal.RefundGrant(now)
+			log.Info("DEFER: PDB refused eviction — roll retries next sweep",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", candidate.Name)
+			return false, nil
+		case apierrors.IsNotFound(err):
+			// The pod is already gone — another actor finished the
+			// roll, the goal state — but OUR eviction never
+			// executed, so the gate's grant goes back (refund-on-
+			// skip: no delete/patch/eviction actually ran).
+			heal.RefundGrant(now)
+			log.Info("SKIP: candidate pod already gone — roll objective met",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", candidate.Name)
+			return false, nil
+		case apierrors.IsConflict(err):
+			// The UID precondition fired — the pod was recreated
+			// since ownedPods listed it, so this eviction mutated
+			// nothing. Same refund-on-skip contract as the 404.
+			heal.RefundGrant(now)
+			log.Info("SKIP: candidate pod recreated since the list — UID precondition fired",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", candidate.Name)
+			return false, nil
 		}
 		return false, fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
 	}

@@ -395,9 +395,10 @@ func TestCollectAIO(t *testing.T) {
 }
 
 // TestCollectAIOBump: past 75% of the table with headroom left, the
-// runtime bump doubles aio-max-nr in place (capped at the target) —
-// and the maximum gauge shows the POST-bump ceiling, not the stale
-// one. A failed sysctl write is silent: the gauges keep the truth.
+// latch tick's reconcileHostWrites doubles aio-max-nr in place
+// (capped at the target) — Collect itself stays read-only and the
+// maximum gauge shows the POST-bump ceiling on the next scrape. A
+// failed sysctl write is silent: the gauges keep the truth.
 func TestCollectAIOBump(t *testing.T) {
 	cfg, _ := fixture(t)
 	root := t.TempDir()
@@ -408,10 +409,14 @@ func TestCollectAIOBump(t *testing.T) {
 	t.Cleanup(func() { aioNrFile, aioMaxFile = oldNr, oldMax })
 	labels := map[string]string{"node": "node-a"}
 
-	// 100/100 → ratio 1.0 > 0.75 → doubled to 200 (far under the cap).
+	// 100/100 → ratio 1.0 > 0.75 → reconcile doubles to 200.
 	testutil.WriteFile(t, nrFile, "100\n")
 	testutil.WriteFile(t, maxFile, "100\n")
 	c := New(cfg)
+	if got, ok := metricValue(t, c, "node_host_agent_aio_maximum", labels); !ok || got != 100 {
+		t.Fatalf("aio_maximum pre-bump=%v ok=%v want the read truth 100", got, ok)
+	}
+	c.reconcileHostWrites()
 	if got, ok := metricValue(t, c, "node_host_agent_aio_maximum", labels); !ok || got != 200 {
 		t.Fatalf("aio_maximum after bump=%v ok=%v want 200", got, ok)
 	}
@@ -424,6 +429,7 @@ func TestCollectAIOBump(t *testing.T) {
 	testutil.WriteFile(t, nrFile, "3000000\n")
 	testutil.WriteFile(t, maxFile, "3000000\n")
 	c2 := New(cfg)
+	c2.reconcileHostWrites()
 	if got, ok := metricValue(t, c2, "node_host_agent_aio_maximum", labels); !ok || got != float64(aioMaxTarget) {
 		t.Fatalf("aio_maximum capped=%v ok=%v want %d", got, ok, uint64(aioMaxTarget))
 	}
@@ -432,10 +438,8 @@ func TestCollectAIOBump(t *testing.T) {
 		t.Fatalf("aio_used_ratio capped=%v ok=%v want %v", got, ok, want)
 	}
 
-	// An unwritable sysctl (read-only file — WriteFileDirect opens
-	// the existing node in place, so a read-only parent dir alone
-	// does not stop it) fails the bump silently — the gauges still
-	// report the on-disk truth.
+	// An unwritable sysctl (read-only file) fails the bump silently —
+	// the gauges still report the on-disk truth.
 	roDir := filepath.Join(root, "ro")
 	if err := os.MkdirAll(roDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -448,6 +452,7 @@ func TestCollectAIOBump(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(aioMaxFile, 0o644) })
 	c3 := New(cfg)
+	c3.reconcileHostWrites()
 	if got, ok := metricValue(t, c3, "node_host_agent_aio_maximum", labels); !ok || got != 3000000 {
 		t.Fatalf("aio_maximum through a failed bump=%v ok=%v want the read truth 3000000", got, ok)
 	}
@@ -498,6 +503,56 @@ func TestEphemeralPortWidthDefaults(t *testing.T) {
 	testutil.WriteFile(t, p, "10240 65535\n")
 	if got := ephemeralPortWidth(p); got != 55296 {
 		t.Fatalf("10240-65535 width=%v want 55296", got)
+	}
+}
+
+// TestSockstatTCPStates: the NETLINK_SOCK_DIAG census emits every
+// named state — a zero count is data, not absence — and the seam is
+// invoked for pid 1 (the host init under hostPID:true, the same
+// convention every /proc/1/net read in this domain follows).
+func TestSockstatTCPStates(t *testing.T) {
+	cfg, _ := fixture(t)
+	var gotPID int
+	cfg.TCPStatesFn = func(pid int) (map[uint8]int, error) {
+		gotPID = pid
+		return map[uint8]int{1: 42, 6: 7, 8: 3, 10: 1}, nil
+	}
+	c := New(cfg)
+	for _, s := range tcpStateNames {
+		want := float64(0)
+		switch s.name {
+		case "established":
+			want = 42
+		case "time_wait":
+			want = 7
+		case "close_wait":
+			want = 3
+		case "listen":
+			want = 1
+		}
+		if got, ok := metricValue(t, c,
+			"node_host_agent_sockstat_tcp_state_sockets",
+			map[string]string{"node": "node-a", "state": s.name}); !ok || got != want {
+			t.Fatalf("tcp_state{%s}=%v ok=%v want %v", s.name, got, ok, want)
+		}
+	}
+	if gotPID != 1 {
+		t.Fatalf("TCPStatesFn pid=%d want 1", gotPID)
+	}
+}
+
+// TestSockstatTCPStatesAbsentOnError: a failed sock_diag dump emits
+// no series at all — inconclusive, never a fabricated zero census.
+// (The fixture's default TCPStatesFn already errors.)
+func TestSockstatTCPStatesAbsentOnError(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	for _, s := range tcpStateNames {
+		if _, ok := metricValue(t, c,
+			"node_host_agent_sockstat_tcp_state_sockets",
+			map[string]string{"node": "node-a", "state": s.name}); ok {
+			t.Fatalf("tcp_state{%s} emitted on a failed dump", s.name)
+		}
 	}
 }
 
@@ -606,9 +661,13 @@ func TestTCPTimeWaitOverflowCounter(t *testing.T) {
 
 func TestHexSockAddrDecode(t *testing.T) {
 	for raw, want := range map[string]string{
-		"0100007F:1F90":                         "127.0.0.1:8080",
-		"AC1E90AF:8C3A":                         "175.144.30.172:35898",
-		"00000000000000000000000000000001:0016": "[::1]:22",
+		"0100007F:1F90": "127.0.0.1:8080",
+		"AC1E90AF:8C3A": "175.144.30.172:35898",
+		// tcp6 fixtures use the REAL kernel layout — each u32 word
+		// little-endian (verified against /proc/net/tcp6: a [::1]
+		// listener prints ...01000000, not ...00000001).
+		"00000000000000000000000001000000:0016": "[::1]:22",
+		"B80D0120000000000000000001000000:1F90": "[2001:db8::1]:8080",
 		"junk":                                  "junk",
 		"0100007F":                              "0100007F",
 	} {

@@ -30,18 +30,19 @@ package probefw
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
@@ -70,6 +71,13 @@ func (d *Deps) PromEndpoint() (string, error) {
 // endpoint and returns the vector samples. d.Prom carries the client
 // config; HTTP is re-read per call so the HTTPClient seam (tests
 // swap it after construction) keeps working.
+//
+// Inside a sweep the query dedupes through the snapshot's promMemo:
+// several checks issue byte-identical PromQL and each used to pay a
+// full Prometheus round-trip — the first caller's (samples, err) is
+// shared with every later identical query in the cycle. Outside a
+// sweep the per-call snapshot means no dedup — the pre-cache
+// semantics.
 func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, error) {
 	endpoint, err := d.PromEndpoint()
 	if err != nil {
@@ -77,7 +85,28 @@ func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, err
 	}
 	c := d.Prom
 	c.HTTP = d.HTTPClient
-	return c.InstantQuery(ctx, endpoint, query)
+	s := sweepSnap(ctx)
+	// Memo key is (endpoint, query): two checks pointing at
+	// different Prometheus endpoints must never share a result,
+	// and the same query text against a re-resolved endpoint is a
+	// different question.
+	m := s.promMemo(endpoint + "\x00" + query)
+	// getLive, not get: a failed query must NOT be memoized — the
+	// next identical query retries the wire. (The old get+reset
+	// pair raced: a sibling get between the unlock and the reset
+	// replayed the just-cached error to the whole sweep.)
+	v, err := m.getLive(func() ([]promq.Sample, error) {
+		// The query runs under the SNAPSHOT's ctx (sweep parent +
+		// snapshotListTimeout), not the calling check's PerCheck
+		// ctx — the census-listCtx contract: one check's expiring
+		// deadline must not cache a DeadlineExceeded every later
+		// identical query then reads as a real Prometheus failure.
+		// c.Timeout still bounds the wire call itself.
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return c.InstantQuery(lctx, endpoint, query)
+	})
+	return v, err
 }
 
 // SelfHealKey composes the shared heal-ledger key —
@@ -113,6 +142,22 @@ func (d *Deps) RequireDyn(what string) *Result {
 		"no dynamic client — %s unverifiable", what)}
 }
 
+// maintSnapshot adapts the Deps census getters to kube's
+// MaintenanceSnapshotProvider — installed on the ctx every heal gate
+// hands the verdict, so the mutex's node/daemonset evidence reads
+// ride the per-sweep memoized census instead of paying their own
+// LIST/GET per Verdict TTL. Outside a sweep the census getters
+// degrade to fresh reads, preserving pre-snapshot semantics.
+type maintSnapshot struct{ d *Deps }
+
+func (m maintSnapshot) Nodes(ctx context.Context) ([]corev1.Node, error) {
+	return m.d.AllNodes(ctx)
+}
+
+func (m maintSnapshot) DaemonSets(ctx context.Context) ([]appsv1.DaemonSet, error) {
+	return m.d.AllDaemonSets(ctx)
+}
+
 // HealAllowed is the shared preamble every check's heal gate runs
 // before picking its target: the per-target cooldown on heals (a nil
 // ledger skips it, matching heal.AllowedV's nil-heals contract),
@@ -123,6 +168,7 @@ func (d *Deps) RequireDyn(what string) *Result {
 func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed, unverifiable bool) {
+	ctx = kube.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
 	return heal.AllowedV(ctx, log, &d.verdict, d.CS, d.Dyn,
 		heals, key, cooldown, now)
 }
@@ -137,6 +183,7 @@ func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	ctx = kube.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
 	return heal.AllowedVPersisted(ctx, log, &d.verdict, d.CS, d.Dyn,
 		heals, obj, annoKey, key, cooldown, now)
 }
@@ -149,35 +196,59 @@ func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 // does the UID-preconditioned delete and stamps the ledger only on
 // delivery, and the shared ControlPlanePodHealsTotal counter stays
 // under the check name here (heal never touches metrics).
+//
+// The bool return reports whether a delete was actually DELIVERED —
+// callers whose bookkeeping must not run on a denied/failed heal
+// (agentHealed flags, "healed" result reasons) gate on it; cooldown
+// gates, mutex refusals and the sweep overlay's quorum reservation
+// all return false. Callers that don't care may ignore it.
 func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	checkName, targetKey string, pod *corev1.Pod,
-	cooldown time.Duration, now time.Time) {
+	cooldown time.Duration, now time.Time) bool {
 
 	key := SelfHealKey(checkName, targetKey)
 	proceed, unverifiable := d.HealAllowed(ctx, log,
 		&d.Heals, key, cooldown, now)
 	if unverifiable {
 		metrics.IncError(d.Name)
-		return
+		return false
 	}
 	if !proceed {
-		return
+		return false
 	}
-	if _, err := heal.DeletePod(ctx, d.CS, &d.Heals, key, pod, now); err != nil {
+	deleted, err := heal.DeletePod(ctx, d.CS, &d.Heals, key, pod, now)
+	if err != nil {
 		metrics.IncError(d.Name)
 		log.Error(err, "heal pod delete failed",
 			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
-		return
+		return false
+	}
+	if !deleted {
+		// Clean deferral — the L1 hold or the sweep overlay's
+		// quorum reservation denied the delete before any mutation
+		// ran, so the grant HealAllowed consumed bought no heal:
+		// hand it back, exactly once, at this gate. An err!=nil
+		// outcome above keeps the grant (an attempted delete that
+		// failed spent a cheap token — budget.go contract).
+		heal.RefundGrant(now)
+		// The sweep overlay's quorum reservation denied the delete —
+		// a sibling check already spent this workload's one-
+		// disruption slot this sweep. Deferral, not a heal: no
+		// tombstone, no metric, no ledger stamp (DeletePod only
+		// stamps on delivery); the next sweep retries.
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+		return false
 	}
 	// The pod census the next check reads must not contain the pod
-	// this delete just removed — drop the pod snapshot so it
-	// re-lists. The other censuses (nodes/slices/services/
-	// namespaces) cannot have gone stale from a pod delete, so they
-	// keep their memoized reads.
-	d.InvalidatePods(ctx)
+	// this delete just removed — heal.DeletePod already dropped the
+	// O(1) UID tombstone on the sweep overlay (AllPods filters it on
+	// every later read), the InvalidatePods cluster-wide re-LIST
+	// this used to pay per heal is gone.
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 	log.Info("DELETE: pod heal — forcing pod restart",
 		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+	return true
 }
 
 // PodUnreadySince returns when the pod's Ready condition last went
@@ -225,34 +296,20 @@ func LinkerdPodMatchesComponent(pod *corev1.Pod, component string) bool {
 }
 
 // MergeAnnoPatchLocally applies a landed
-// {"metadata":{"annotations":{k:v|null}}} merge patch to the LISTED
-// copy of obj — the serial sweep sees no apiserver echo, so without
-// the mirror a second annotation write this sweep would compute its
-// patch from the pre-write state (several reason-keys share one
-// object's annotation map, so a stale read can resurrect a cleared
-// key or drop a just-stamped one). Malformed payloads are ignored —
-// the input is always kube.MergePatchAnnos output.
-func MergeAnnoPatchLocally(obj metav1.Object, data []byte) {
-	var doc struct {
-		Metadata struct {
-			Annotations map[string]*string `json:"annotations"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return
-	}
-	annos := obj.GetAnnotations()
-	if annos == nil {
-		annos = map[string]string{}
-	}
-	for k, v := range doc.Metadata.Annotations {
-		if v == nil {
-			delete(annos, k)
-			continue
-		}
-		annos[k] = *v
-	}
-	obj.SetAnnotations(annos)
+// {"metadata":{"annotations":{k:v|null}}} merge patch so later
+// readers this run see the post-patch state — the serial sweep sees
+// no apiserver echo, so without the mirror a second annotation write
+// this sweep would compute its patch from the pre-write state
+// (several reason-keys share one object's annotation map, so a stale
+// read can resurrect a cleared key or drop a just-stamped one).
+// Delegates to kube.RecordAnnoPatch: inside a sweep the delta lands
+// on the overlay (the shared object is NEVER mutated — readers use
+// kube.EffectiveAnno/AnnoTimeCtx); outside a sweep the helper keeps
+// the legacy in-place mirror on the caller-private object.
+// Malformed payloads are ignored — the input is always
+// kube.MergePatchAnnos output.
+func MergeAnnoPatchLocally(ctx context.Context, obj metav1.Object, data []byte) {
+	kube.RecordAnnoPatch(ctx, obj, data)
 }
 
 // Section renders one findings family into a Why part: "" when

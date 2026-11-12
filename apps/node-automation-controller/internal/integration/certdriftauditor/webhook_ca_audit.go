@@ -36,6 +36,13 @@ import (
 // Check A — webhook CA bundle drift
 // ---------------------------------------------------------------------------
 
+// crdAuditPageSize bounds one page of the CRD conversion-webhook
+// census — tighter than the shared list bound because a CRD page
+// carries full OpenAPI schemas (the fattest objects any audit here
+// lists); 25 keeps a page's transient heap in the low MiB before
+// the visit drops it.
+const crdAuditPageSize = 25
+
 func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	a.seenWebhookExpiry.Begin() // drop any aborted sweep's leftover emissions
 	a.seenWebhooks.Begin()      // drop any aborted sweep's leftover emissions
@@ -74,24 +81,28 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	if a.dyn == nil {
 		return errors.New("list customresourcedefinitions: no dynamic client")
 	}
-	crds, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)))
+	// ListEach at the CRD page bound: the audit consumes each object
+	// inside the visit, so a page's full CRDs — OpenAPI schemas are
+	// the bulk of a CRD object's heap — are garbage-collected with
+	// the page instead of a cluster-wide census pinning ~80–150 MiB
+	// for the whole sweep.
+	err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: crdAuditPageSize},
+		kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				crd := &page[i]
+				entry, ok := crdConversionEntry(crd)
+				if !ok {
+					continue
+				}
+				a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
+					crd.GetName(), crd.GetAnnotations(), []webhookEntry{entry})
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list customresourcedefinitions: %w", err)
-	}
-	for i := range crds {
-		crd := &crds[i]
-		// Only spec.conversion is read below — strip the OpenAPI
-		// schemas (the bulk of a CRD object's heap) before the
-		// audit walks the census.
-		kube.StripCRDSchemaVersions(crd)
-		entry, ok := crdConversionEntry(crd)
-		if !ok {
-			continue
-		}
-		a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
-			crd.GetName(), crd.GetAnnotations(), []webhookEntry{entry})
 	}
 
 	// Prune series for entries no longer covered — a webhook entry

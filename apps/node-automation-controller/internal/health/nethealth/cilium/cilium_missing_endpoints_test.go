@@ -49,10 +49,10 @@ func TestCiliumMissingCEPDeletesPodAfterPersistence(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs) // no CEP seeded -> missing endpoint
 	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting inside streak window must pass: %+v", res)
 	}
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("persistent missing CEP must fail: %+v", res)
 	}
@@ -69,8 +69,8 @@ func TestCiliumMissingCEPOwnerlessPodSurvives(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs) // no CEP seeded -> missing endpoint
 	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
-	chk.Run(ctx)
-	if res := chk.Run(ctx); res.Pass {
+	chk.Run(probetest.SweepCtx(ctx))
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persistent missing CEP must still fail (signature)")
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "app-bare", metav1.GetOptions{}); err != nil {
@@ -94,8 +94,8 @@ func TestCiliumMissingCEPAgentBounceOnNodeMassMiss(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProber(cs)
 	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
-	chk.Run(ctx)
-	res := chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("mass missing CEP must fail: %+v", res)
 	}
@@ -115,7 +115,7 @@ func TestCiliumProgrammedEndpointPasses(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	cep := cepObj("apps", "app-ok", 4242)
 	p := testProberDyn(cs, probetest.OpDyn(cep))
-	if res := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("programmed endpoint must pass: %+v", res)
 	}
 }
@@ -127,8 +127,8 @@ func TestCiliumReservedWorldIdentityIsUnprogrammed(t *testing.T) {
 	cep := cepObj("apps", "app-world", 2) // reserved:world
 	p := testProberDyn(cs, probetest.OpDyn(cep))
 	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
-	chk.Run(ctx)
-	res := chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("reserved:world identity must fail: %+v", res)
 	}

@@ -106,6 +106,13 @@ func fixture(t *testing.T) *env {
 		},
 		Now: func() time.Time { return e.now },
 	})
+	// Negative PollEvery disables the mux's fetch throttle — every
+	// Poll execs, so each sync maps to exactly one journalFetch
+	// call like the pre-mux per-consumer cursors did. The sharing
+	// half (one exec feeding both subscribers inside a window) is
+	// journalwatch's own mux_test contract; production keeps the
+	// 30s default.
+	e.m.journal.PollEvery = -1
 	t.Cleanup(e.m.Close)
 	return e
 }

@@ -28,7 +28,7 @@ func TestCheckScyllaHealthDegradedCondition(t *testing.T) {
 	dyn := probetest.OpDyn(scyllaClusterCR("bino-scylla", "bino-scylla",
 		"Degraded", "True", 20*time.Minute))
 	p := testProberDyn(cs, dyn)
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("degraded ScyllaCluster passed")
 	}
 	m := probetest.FindMetric(t, "node_automation_scylla_unhealthy", map[string]string{
@@ -47,7 +47,7 @@ func TestCheckScyllaHealthDegradedTooFresh(t *testing.T) {
 	dyn := probetest.OpDyn(scyllaClusterCR("bino-scylla", "bino-scylla",
 		"Degraded", "True", 5*time.Minute))
 	p := testProberDyn(cs, dyn)
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("fresh Degraded must pass: %+v", res)
 	}
 }
@@ -69,13 +69,13 @@ func TestCheckScyllaHealthMemberDesync(t *testing.T) {
 	}
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen member desync must pass: %+v", res)
 	}
 	p.Now = func() time.Time {
 		return base.Add(scyllaSignatureMinAge + time.Minute)
 	}
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted member desync did not fail")
 	}
 	m := probetest.FindMetric(t, "node_automation_scylla_unhealthy", map[string]string{
@@ -97,7 +97,7 @@ func TestCheckScyllaHealthMemberSynced(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false), pod, svc,
 		probetest.EndpointSliceForService("bino-scylla", svc.Name, "10.244.1.5"))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("synced member service must pass: %+v", res)
 	}
 }
@@ -118,13 +118,13 @@ func TestCheckScyllaHealthGossipStall(t *testing.T) {
 			nil))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen gossip stall must pass: %+v", res)
 	}
 	p.Now = func() time.Time {
 		return base.Add(scyllaSignatureMinAge + time.Minute)
 	}
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted gossip stall did not fail")
 	}
 	m := probetest.FindMetric(t, "node_automation_scylla_unhealthy", map[string]string{
@@ -152,13 +152,13 @@ func TestCheckScyllaHealthTombstoneStall(t *testing.T) {
 			"WARN storage_proxy - Read 3 live cells and 91204 tombstones for query\n", nil))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen tombstone stall must pass: %+v", res)
 	}
 	p.Now = func() time.Time {
 		return base.Add(scyllaSignatureMinAge + time.Minute)
 	}
-	res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted tombstone stall did not fail")
 	}
@@ -181,11 +181,11 @@ func TestCheckScyllaHealthCleanLogsPass(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	base := time.Now()
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx)
+	probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	p.Now = func() time.Time {
 		return base.Add(scyllaSignatureMinAge + time.Minute)
 	}
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("clean logs must pass: %+v", res)
 	}
 }
@@ -203,7 +203,7 @@ func TestCheckScyllaHealthHealthy(t *testing.T) {
 	dyn := probetest.OpDyn(scyllaClusterCR("bino-scylla", "bino-scylla",
 		"Available", "True", time.Hour))
 	p := testProberDyn(cs, dyn)
-	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy scylla stack must pass: %+v", res)
 	}
 }

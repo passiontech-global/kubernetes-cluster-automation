@@ -651,7 +651,11 @@ func veleroPVB(ns, name, phase string, age time.Duration,
 }
 
 // nodeAgentPod builds the velero node-agent DaemonSet pod — start
-// times drive the "agent restarted mid-backup" verdict.
+// times drive the "agent restarted mid-backup" verdict. The pod
+// reports Ready=True by default: pvbAgentWedged now requires the
+// Ready condition (a Running pod that never became Ready cannot own
+// a live Kopia thread) — tests modelling a wedged agent override
+// Status.Conditions afterwards.
 func nodeAgentPod(ns, name, node string, podStart, containerStart time.Time) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -662,6 +666,10 @@ func nodeAgentPod(ns, name, node string, podStart, containerStart time.Time) *co
 		Status: corev1.PodStatus{
 			Phase:     corev1.PodRunning,
 			StartTime: &metav1.Time{Time: podStart},
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name:  "node-agent",
 				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Time{Time: containerStart}}},

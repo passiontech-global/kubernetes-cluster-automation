@@ -10,9 +10,11 @@ import (
 	"net"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -46,7 +48,9 @@ const (
 	defaultUptimeFile         = "/proc/uptime"
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
-	defaultConntrackStatFile  = "/proc/net/stat/nf_conntrack"
+	// /proc/1/net/ — the host net namespace under hostPID:true
+	// (same contract as the ProcNetUDP{,6} defaults above).
+	defaultConntrackStatFile = "/proc/1/net/stat/nf_conntrack"
 )
 
 // defaultNebulaDirectTCPPorts is the pref-1499 Direct-Underlay TCP
@@ -129,6 +133,12 @@ type Config struct {
 	// socket watches under hostNetwork (same convention as
 	// hostmetrics' SysClassNet; tests point it at a fixture).
 	sysClassNet string
+	// rulesFn dumps pid's policy-routing rules through netlink —
+	// the Go-native replacement for the overlay-egress check's two
+	// `ip rule list` nsenter forks per cycle (netlinkx.Rules binds
+	// a handle inside the host netns). Writes (rule add/del) stay
+	// on runHostCmd — netlinkx is read-only by contract.
+	rulesFn func(pid int) ([]netlink.Rule, error)
 	// adjtimexFn reads the kernel clock discipline — a modes==0
 	// (read-only) adjtimex(2) needs no CAP_SYS_TIME. Tests inject.
 	adjtimexFn func(buf *unix.Timex) (int, error)
@@ -279,6 +289,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.sysClassNet == "" {
 		c.sysClassNet = defaultSysClassNet
+	}
+	if c.rulesFn == nil {
+		c.rulesFn = netlinkx.Rules
 	}
 	if c.adjtimexFn == nil {
 		c.adjtimexFn = unix.Adjtimex

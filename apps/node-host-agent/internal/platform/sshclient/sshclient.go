@@ -77,6 +77,24 @@ type Config struct {
 	// the authentication boundary — the pin is the opt-in
 	// tightening for callers that can distribute one.
 	HostKeyFingerprint string
+	// JumpHostKeyFingerprint pins the JUMP (bastion) host's key
+	// independently of the destination's — the two are different
+	// machines with different key material, so one pin cannot
+	// cover both once a caller wants the bastion verified under
+	// its own fingerprint. Same "SHA256:<base64>" format. Empty
+	// falls back to HostKeyFingerprint (the historical shared-pin
+	// contract); a caller that wants the jump unpinned while the
+	// target stays pinned cannot express that — split the Configs
+	// instead.
+	JumpHostKeyFingerprint string
+	// HostKeyVerify, when non-nil, replaces the pin/tolerant
+	// callback on BOTH hops: it receives the dial hostname and the
+	// presented key and returns nil to accept. hubsync uses it for
+	// its per-host pin map + known_hosts + persistent-TOFU policy —
+	// the verifier resolves trust per hostname, so the bastion hop
+	// verifies against its own entries. nil keeps the
+	// HostKeyFingerprint/tolerant behavior.
+	HostKeyVerify func(hostname string, key ssh.PublicKey) error
 }
 
 // port resolves the effective SSH port — the <=0 fallback exists so
@@ -128,18 +146,50 @@ func (c Config) LoadSigner() (ssh.Signer, error) {
 // passing silently (hubsync parity); a nil Log is the silent
 // InsecureIgnoreHostKey the nebulasign fetch used.
 func (c Config) ClientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
+	return c.clientConfigFor(user, signer, c.HostKeyFingerprint)
+}
+
+// clientConfigFor is ClientConfig with an explicit pin — the jump
+// hop passes JumpHostKeyFingerprint (falling back to the shared
+// HostKeyFingerprint) so a bastion with different key material is
+// not forced under the destination's pin.
+func (c Config) clientConfigFor(user string, signer ssh.Signer, pin string) *ssh.ClientConfig {
 	cb := ssh.InsecureIgnoreHostKey() // documented parity above
 	switch {
-	case c.HostKeyFingerprint != "":
+	case c.HostKeyVerify != nil:
+		verify := c.HostKeyVerify
+		log := c.Log
 		cb = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			remoteAddr := "<nil>"
 			if remote != nil {
 				remoteAddr = remote.String()
 			}
-			if err := checkHostKeyFingerprint(c.HostKeyFingerprint, key); err != nil {
+			if err := verify(hostname, key); err != nil {
+				if log != nil {
+					log.Warn("sshclient: host key rejected by verifier",
+						"addr", hostname, "remote", remoteAddr,
+						"fingerprint", ssh.FingerprintSHA256(key),
+						"error", err)
+				}
+				return err
+			}
+			if log != nil {
+				log.Info("sshclient: host key verified",
+					"addr", hostname, "remote", remoteAddr,
+					"fingerprint", ssh.FingerprintSHA256(key))
+			}
+			return nil
+		}
+	case pin != "":
+		cb = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			remoteAddr := "<nil>"
+			if remote != nil {
+				remoteAddr = remote.String()
+			}
+			if err := checkHostKeyFingerprint(pin, key); err != nil {
 				c.log().Warn("sshclient: host key fingerprint mismatch — rejecting",
 					"addr", hostname, "remote", remoteAddr,
-					"expected", c.HostKeyFingerprint,
+					"expected", pin,
 					"got", ssh.FingerprintSHA256(key))
 				return err
 			}
@@ -167,21 +217,29 @@ func (c Config) ClientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
 	}
 }
 
-// checkHostKeyFingerprint pins a host key by its SHA256 fingerprint —
-// the wire-format key bytes (ssh.PublicKey.Marshal) hashed and
+// FingerprintMatches reports whether key's SHA256 fingerprint equals
+// pin — the wire-format key bytes (ssh.PublicKey.Marshal) hashed and
 // base64'd exactly as ssh.FingerprintSHA256 / `ssh -o
 // FingerprintHash=sha256` print them. The pin may carry the
 // "SHA256:" prefix and trailing '=' padding; both are stripped
 // before a constant-time compare, so a mismatch reveals nothing
-// about how close the presented key was to the pin.
-func checkHostKeyFingerprint(pin string, key ssh.PublicKey) error {
+// about how close the presented key was to the pin. Exported for
+// callers (hubsync's per-host pin map) that resolve pins themselves
+// instead of going through HostKeyFingerprint.
+func FingerprintMatches(pin string, key ssh.PublicKey) bool {
 	sum := sha256.Sum256(key.Marshal())
 	got := base64.RawStdEncoding.EncodeToString(sum[:])
 	want := strings.TrimPrefix(strings.TrimSpace(pin), "SHA256:")
 	want = strings.TrimRight(want, "=")
-	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// checkHostKeyFingerprint is the pin-callback error form of
+// FingerprintMatches.
+func checkHostKeyFingerprint(pin string, key ssh.PublicKey) error {
+	if !FingerprintMatches(pin, key) {
 		return fmt.Errorf("sshclient: host key fingerprint mismatch: got SHA256:%s, want pinned %s",
-			got, pin)
+			ssh.FingerprintSHA256(key), pin)
 	}
 	return nil
 }

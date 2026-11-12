@@ -144,7 +144,7 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(ociRepo))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("OCI HelmRepository must not freeze the check: %+v", res)
 	}
 	for _, k := range probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
@@ -161,7 +161,7 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
 		Observe("source-controller/helmrepositories/flux-system/http-repo/"+kcmReasonStaleGen,
 			base.Add(-time.Hour))
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stale type=default HelmRepository must still FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -249,7 +249,7 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 		Observe("scylla-operator/scyllaclusters/scylla/db/"+kcmReasonStaleGen, base.Add(-time.Hour))
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck ScyllaCluster past 20m with a renewing lease must FAIL")
 	}
 
@@ -340,7 +340,7 @@ func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(alert, provider, receiver))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("static notification objects must keep the check quiet: %+v", res)
 	}
 	// Zero resources means nothing is even scanned — no first-seen

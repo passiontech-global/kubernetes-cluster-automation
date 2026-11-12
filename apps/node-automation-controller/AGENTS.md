@@ -29,17 +29,35 @@ byte-stable with the shell-operator alerts).
   `ListAllUnstructured` for the dynamic client — node/pod/patch
   helpers incl. `RestartTemplatePatch`, comma-set parsing, the GVR
   registry, annotation keys + timestamp stamps, maintenance mutex,
-  the Flux artifact-stale signature `fluxconditions.go`),
+  the Flux artifact-stale signature `fluxconditions.go`,
+  `sweep_overlay.go` — the per-sweep write overlay
+  `probefw.WithSweepSnapshot` installs: annotation deltas
+  (`EffectiveAnno`/`RecordAnnoPatch`), pod-template annotation
+  deltas (`EffectiveTemplateAnnos`/`RecordTemplateAnnos` — the
+  spec.template.metadata.annotations path RecordAnnoPatch cannot
+  express), pod tombstones, and per-workload disruption
+  reservations, all keyed by `overlayObjKey` (UID, else a
+  kind/ns/name synthetic key) so mid-sweep writes are visible to
+  later checks without mutating shared snapshot objects or
+  re-listing the pod census per delete — and
+  `partial_meta.go` — `ListPartialOrFallback`, the
+  PartialObjectMetadata read path: metadata client → dynamic →
+  typed-core fallback for fake-client tests),
   `state` (Cooldown/FirstSeen/Seen/Streak/Gauge ledgers),
   `heal` (cooldown → maintenance-mutex → UID-delete → stamp;
-  `PersistedCooledDown`/`StampPersisted` for the wider-of
-  in-RAM+annotation cooldown; `AllowedVPersisted` folding that
-  cooldown into the AllowedV preamble for sites that heal against
-  a persisted stamp), `reap` (the janitor
+  `PersistedCooledDown`/`StampPersisted`/`StampPersistedMulti` for
+  the wider-of in-RAM+annotation cooldown; `AllowedVPersisted`
+  folding that cooldown into the AllowedV preamble for sites that
+  heal against a persisted stamp), `reap` (the janitor
   collect-cap-confirm-UID-delete sweep skeleton),
   `leaderelect` (the selfheal-alert-coverage fast dead-leader Lease preemption sweep —
   the standby that must shorten a provably-dead holder's Lease,
-  wired as a `NeedLeaderElection()=false` runnable in main.go),
+  wired as a `NeedLeaderElection()=false` runnable in main.go;
+  staleness is proven by an observed-change watch on
+  (renewTime, holderIdentity) measured on the standby's own clock,
+  and the election namespace is resolved once in cmd/manager from
+  the service-account namespace file and shared by the controller-
+  runtime elector and the Preemptor),
   `testhelp` (leaf-level k8s fakes — importable by platform tests,
   which `internal/testutil` cannot reach).
 - `internal/metrics`, `internal/promq`, `internal/probefw` — leaf

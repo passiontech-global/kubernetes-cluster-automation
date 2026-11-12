@@ -36,6 +36,14 @@ var (
 	forMu sync.Mutex
 )
 
+// forCacheCap bounds the per-name logger table inside one snapshot.
+// Component names are a small fixed set in practice, but For is a
+// public API — a caller passing dynamic names (hostnames, request
+// ids) would otherwise grow every snapshot without limit. Past the
+// cap a name resolves to an UNCACHED logger: correct output, just
+// no memoization for the overflow names.
+const forCacheCap = 256
+
 // For returns a logger tagged with the given name. The name is emitted as
 // the "logger" attribute on every record. Loggers are cached keyed on the
 // current slog.Default(): if slog.SetDefault swaps in a new handler the
@@ -71,6 +79,12 @@ func For(name string) *slog.Logger {
 		return l
 	}
 	l := def.With("logger", name)
+	if len(s.loggers) >= forCacheCap {
+		// Cache full — serve the logger without caching it (see
+		// forCacheCap). The snapshot is left untouched so the
+		// bounded entries stay warm.
+		return l
+	}
 	next := &forSnapshot{
 		def:     def,
 		loggers: make(map[string]*slog.Logger, len(s.loggers)+1),

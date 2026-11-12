@@ -63,7 +63,7 @@ func TestPullSecretMalformed(t *testing.T) {
 	)
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("malformed pull secret must FAIL")
 	}
@@ -79,7 +79,7 @@ func TestPullSecretMissing(t *testing.T) {
 	cs := fake.NewSimpleClientset(pullPod("apps", "web-1", "ghost"))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("missing pull secret must FAIL")
 	}
@@ -113,7 +113,7 @@ func TestPullSecretJWTExpiry(t *testing.T) {
 			p := testProberDyn(cs, probetest.OpDyn())
 			p.Now = func() time.Time { return base }
 
-			res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx)
+			res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx))
 			if res.Pass == tc.wantFail {
 				t.Fatalf("exp=%v pass=%v wantFail=%v", tc.exp, res.Pass, tc.wantFail)
 			}
@@ -151,7 +151,7 @@ func TestPullSecretViaDeploymentTemplate(t *testing.T) {
 	)
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("template-referenced malformed secret must FAIL")
 	}
@@ -173,7 +173,7 @@ func TestPullSecretHealthyAndType(t *testing.T) {
 	)
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("opaque-typed pull secret must FAIL")
 	}
@@ -191,7 +191,7 @@ func TestPullSecretHealthyAndType(t *testing.T) {
 // Quiet: a cluster with no pull-secret references passes.
 func TestPullSecretQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn())
-	if res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullSecretAuditorCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("no pull secrets must pass: %+v", res)
 	}
 }

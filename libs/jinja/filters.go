@@ -1,6 +1,7 @@
 package jinja
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -9,7 +10,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -29,6 +30,10 @@ var errUnknownFilter = errors.New("unsupported filter")
 // huge count allocates without bound (OOM). 10k spaces per line is
 // already far past any sane template.
 const maxIndentWidth = 10_000
+
+// fromJSONMaxBytes caps |from_json input — json.Unmarshal on a
+// hostile multi-MB string is an unbounded CPU/memory sink.
+const fromJSONMaxBytes = 4 << 20 // 4 MiB
 
 // floatToInt64 converts only finite, int64-range floats — Go's
 // int64() on NaN/±Inf or an out-of-range value yields platform
@@ -83,7 +88,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return strings.Join(parts, sep), nil
 	case "list":
-		return &List{ToIter(v)}, nil
+		// Clone: ToIter hands back the LIVE backing slice of a
+		// *List/[]any — wrapping it unchecked let .pop()/.append()
+		// on the result mutate the caller's original value.
+		return &List{slices.Clone(ToIter(v))}, nil
 	case "length", "count":
 		switch t := v.(type) {
 		case string:
@@ -94,6 +102,9 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		case []any:
 			return int64(len(t)), nil
 		case *List:
+			if t == nil {
+				return int64(0), nil
+			}
 			return int64(len(t.V)), nil
 		case *OMap:
 			return int64(t.Len()), nil
@@ -138,7 +149,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		// re-stringified operands on EVERY comparison, O(n log n)
 		// times per element; the key is now computed exactly once.
 		type keyed struct {
-			key  any // string keys arrive case-folded (jinja2 ignore_case)
+			skey sortKey // precomputed rank/num/str — compare is O(1)
 			elem any
 		}
 		pairs := make([]keyed, len(elems))
@@ -147,21 +158,21 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			if err != nil {
 				return nil, err
 			}
-			pairs[i] = keyed{key: k, elem: el}
+			pairs[i] = keyed{skey: newSortKey(k), elem: el}
 		}
 		// Stable, like python's sorted — equal keys keep relative
 		// order (the chaining idiom in the jinja2 docstring relies
 		// on it). reverse=True is an INVERTED comparator, not a
 		// post-hoc slice reversal: python keeps equal elements in
 		// original order with reverse=True, and reversing a stable
-		// ascending result would swap them.
-		less := sortKeyLess
+		// ascending result would swap them. sortKeyCompare is a
+		// strict weak ordering on MIXED key types (rank buckets),
+		// so SortStableFunc can never see an intransitive less.
+		less := func(a, b keyed) int { return sortKeyCompare(a.skey, b.skey) }
 		if reverse {
-			less = func(a, b any) bool { return sortKeyLess(b, a) }
+			less = func(a, b keyed) int { return sortKeyCompare(b.skey, a.skey) }
 		}
-		sort.SliceStable(pairs, func(i, j int) bool {
-			return less(pairs[i].key, pairs[j].key)
-		})
+		slices.SortStableFunc(pairs, less)
 		out := make([]any, len(pairs))
 		for i, p := range pairs {
 			out[i] = p.elem
@@ -441,11 +452,15 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return string(b), nil
 	case "from_json":
+		raw := Stringify(v)
+		if len(raw) > fromJSONMaxBytes {
+			return nil, fmt.Errorf("from_json: input exceeds %d bytes", fromJSONMaxBytes)
+		}
 		var out any
-		if err := json.Unmarshal([]byte(Stringify(v)), &out); err != nil {
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
 			return nil, err
 		}
-		return fromJSON(out), nil
+		return fromJSONChecked(out)
 	case "from_yaml":
 		return DecodeYAML([]byte(Stringify(v)))
 	case "to_yaml", "to_nice_yaml":
@@ -541,6 +556,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			var items []any
 			switch t := x.(type) {
 			case *List:
+				if t == nil {
+					// A typed-nil *List is an EMPTY list — it
+					// contributes no elements, not a nil atom.
+					return nil
+				}
 				items = t.V
 			case []any:
 				items = t
@@ -692,56 +712,167 @@ func allDigits(s string) bool {
 	return true
 }
 
-// sortKeyLess orders two pre-resolved sort keys. Element parity with
-// the pre-Schwartzian comparator: numeric pairs on numCmp (exact,
-// NaN-aware), strings on the already-folded byte order, sequence
-// elements on their first item, everything else on the stringified
-// form (the Stringify walker is step-budgeted, so cyclic sequences
-// terminate). Tuple keys (multi-attribute sortTuple) compare
-// element-wise with deepEq for the equal-skip, exactly like python
-// tuple ordering — the dedicated type keeps a plain []any element on
-// the sequence path instead of recursing here without bound.
-func sortKeyLess(a, b any) bool {
-	if at, ok := a.(sortTuple); ok {
-		if bt, ok2 := b.(sortTuple); ok2 {
-			for i := range min(len(at), len(bt)) {
-				if deepEq(at[i], bt[i]) {
-					continue
-				}
-				return sortKeyLess(at[i], bt[i])
+// sortKey is the precomputed decoration the |sort comparator works
+// on — resolving attribute paths and stringifying operands once per
+// ELEMENT (not once per comparison) keeps the sort O(n log n)
+// stringify-free, and bucketing every key into a rank makes the
+// comparator a strict weak ordering on MIXED types.
+type sortKey struct {
+	rank   int
+	num    float64   // rank 0 primary (NaN/±Inf mapped to ±Inf sentinels)
+	str    string    // rank 0/1/2/3 secondary (or sole) key
+	tup    []sortKey // rank 4 only — multi-attribute key, PRE-DECORATED per element
+	hasInt bool      // rank 0: the key is an exact integer (i64 is authoritative)
+	i64    int64     // rank 0: exact integer value — float64(num) loses >2^53
+	finite bool      // rank 0: num came from a real finite number, not a NaN/±Inf sentinel
+}
+
+// sortKeyRank buckets a resolved sort key so cross-type pairs never
+// reach a value comparison: the OLD comparator compared numbers
+// numerically but everything else via Stringify, which is
+// intransitive on mixed input ([10, "2", 3] could cycle 10<"2"<3<10)
+// — an intransitive less is exactly what slices.SortFunc must never
+// see. Ranks make every cross-type pair decided by rank alone.
+func sortKeyRank(v any) int {
+	switch {
+	case isNum(v):
+		return 0
+	}
+	if _, ok := v.(string); ok {
+		return 1
+	}
+	switch v.(type) {
+	case *List, []any:
+		return 2
+	}
+	return 3
+}
+
+// newSortKey decorates one resolved sort key. String keys arrive
+// already case-folded by sortKeyOf (jinja2 ignore_case).
+func newSortKey(v any) sortKey {
+	if t, ok := v.(sortTuple); ok {
+		// Decorate tuple elements ONCE here — the comparator then
+		// compares sortKey-to-sortKey directly instead of re-running
+		// newSortKey per comparison (O(n log n) re-decoration).
+		tup := make([]sortKey, len(t))
+		for i, e := range t {
+			tup[i] = newSortKey(e)
+		}
+		return sortKey{rank: 4, tup: tup}
+	}
+	switch sortKeyRank(v) {
+	case 0:
+		f, ok := toFloat(v)
+		var k sortKey
+		if !ok {
+			// NaN/±Inf have no float order — map them to sentinels
+			// so the (num, str) pair stays a total preorder; the
+			// string half still distinguishes NaN from +Inf.
+			if fv, isF := v.(float64); isF && math.IsInf(fv, -1) {
+				f = math.Inf(-1)
+			} else {
+				f = math.Inf(1)
 			}
-			return false
+		} else {
+			k.finite = true
+		}
+		k.rank, k.num, k.str = 0, f, Stringify(v)
+		// Exact integer path: int64 magnitudes past 2^53 do not fit
+		// float64(num) — keep the int64 so the comparator can order
+		// them exactly instead of collapsing to the float rounding.
+		if i, isInt := asInt64(v); isInt {
+			k.hasInt, k.i64 = true, i
+		}
+		return k
+	case 1:
+		s, _ := v.(string)
+		return sortKey{rank: 1, str: s}
+	case 2:
+		// Sequence elements compare on their first item — *List
+		// (template literals/filters) and []any (YAML-decoded vars)
+		// are the same value in two representations.
+		if first, ok := seqSortFirst(v); ok {
+			return sortKey{rank: 2, str: Stringify(first)}
+		}
+		return sortKey{rank: 2, str: Stringify(v)}
+	default:
+		return sortKey{rank: 3, str: Stringify(v)}
+	}
+}
+
+// seqSortFirst returns the first element of a sequence sort key, or
+// ok=false for an empty one.
+func seqSortFirst(v any) (any, bool) {
+	switch t := v.(type) {
+	case *List:
+		if t != nil && len(t.V) > 0 {
+			return t.V[0], true
+		}
+	case []any:
+		if len(t) > 0 {
+			return t[0], true
 		}
 	}
-	if isNum(a) && isNum(b) {
-		// numCmp keeps the ok flag — a NaN/±Inf operand used to
-		// compare as 0.0 — and compares int64 pairs exactly past
-		// 2^53.
-		if c, ok := numCmp(a, b); ok {
-			return c < 0
-		}
+	return nil, false
+}
+
+// sortKeyCompare is a strict weak ordering: rank decides cross-type
+// pairs; within a rank the (num, str) or str pair is lexicographic —
+// a total preorder by construction, so SortStableFunc stays safe on
+// any mixture of ints, floats, bools, strings, sequences and maps.
+func sortKeyCompare(a, b sortKey) int {
+	if a.rank != b.rank {
+		return cmp.Compare(a.rank, b.rank)
 	}
-	// Sequence elements compare on their first item — *List
-	// (template literals/filters) and []any (YAML-decoded vars) are
-	// the same value in two representations, so both must take this
-	// branch or a mixed list sorts []any elements by Stringify.
-	first := func(x any) (any, bool) {
-		switch t := x.(type) {
-		case *List:
-			if len(t.V) > 0 {
-				return t.V[0], true
+	if a.rank == 4 {
+		// Both multi-attribute tuples: element-wise like python
+		// tuple ordering — first non-equal pair decides, the
+		// shorter tuple is smaller on a shared prefix. Elements are
+		// already sortKeys (decorated once in newSortKey).
+		for i := 0; i < min(len(a.tup), len(b.tup)); i++ {
+			if c := sortKeyCompare(a.tup[i], b.tup[i]); c != 0 {
+				return c
 			}
-		case []any:
-			if len(t) > 0 {
-				return t[0], true
+		}
+		return cmp.Compare(len(a.tup), len(b.tup))
+	}
+	if a.rank == 0 {
+		// Exact integer comparison when BOTH sides resolve to an
+		// int64 — an int64 past 2^53 and an integral float64 in
+		// range both land here, so 9007199254740993 sorts above
+		// 9007199254740992.0 instead of collapsing on the float.
+		if ai, aok := sortKeyInt64(a); aok {
+			if bi, bok := sortKeyInt64(b); bok {
+				return cmp.Compare(ai, bi)
 			}
 		}
-		return nil, false
-	}
-	if fi, oki := first(a); oki {
-		if fj, okj := first(b); okj {
-			return Stringify(fi) < Stringify(fj)
+		if a.num != b.num {
+			return cmp.Compare(a.num, b.num)
+		}
+		if a.finite && b.finite {
+			// Numerically equal FINITE values (1 vs 1.0, True vs 1)
+			// are equal keys — return 0 so SortStableFunc keeps
+			// input order like python's sorted(). The str fallback
+			// stays for the NaN/±Inf sentinels, which share a num
+			// but are NOT equal values.
+			return 0
 		}
 	}
-	return Stringify(a) < Stringify(b)
+	return strings.Compare(a.str, b.str)
+}
+
+// sortKeyInt64 resolves a rank-0 sort key to an exact int64 when
+// possible: hasInt keys carry it directly; finite integral floats
+// inside int64 range convert losslessly (a float64 that big is
+// always integral — fraction bits don't exist past 2^52).
+func sortKeyInt64(k sortKey) (int64, bool) {
+	if k.hasInt {
+		return k.i64, true
+	}
+	if k.finite && k.num == math.Trunc(k.num) &&
+		k.num >= -9223372036854775808.0 && k.num < 9223372036854775808.0 {
+		return int64(k.num), true
+	}
+	return 0, false
 }

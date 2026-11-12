@@ -502,3 +502,208 @@ func TestVerdictActiveSticksErrorWithinTTL(t *testing.T) {
 		t.Fatalf("post-TTL re-evaluation kept the stale error: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// kured lock parsing / medik8s target resolution / verdict read-only /
+// StampMaintenanceTargets convergence — the Phase-3 reliability work.
+// ---------------------------------------------------------------------------
+
+// kuredLockNodeID decodes the documented {"nodeID":"<node>"} JSON
+// shape and falls back to the raw value for anything else — an
+// unresolvable value must reach the caller intact so it can degrade
+// to the conservative cluster-wide hold instead of silently reading
+// as "no lock".
+func TestKuredLockNodeID(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{`{"nodeID":"w1"}`, "w1"},
+		{`{"nodeID":"w1","extra":1}`, "w1"},
+		{"w1", "w1"},                       // legacy raw-node-name writer
+		{`{"nodeID":""}`, `{"nodeID":""}`}, // JSON without usable nodeID → raw
+		{`{"other":"x"}`, `{"other":"x"}`},
+		{"not-json{", "not-json{"},
+	} {
+		if got := kuredLockNodeID(tc.in); got != tc.want {
+			t.Fatalf("kuredLockNodeID(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// medik8sTargetNode: the annotation wins outright, an exact node-name
+// match beats prefix inference, and among "<node>-<suffix>" CR names
+// the LONGEST matching node prefix wins — map iteration order must
+// never decide which node a remediation holds.
+func TestMedik8sTargetNodeLongestPrefix(t *testing.T) {
+	nodeNames := map[string]bool{"worker-1": true, "worker-1-gpu": true}
+	obj := func(name string, annos map[string]string) *unstructured.Unstructured {
+		u := testhelp.Unstructured(
+			GVRSelfNodeRemediation.GroupVersion().WithKind("SelfNodeRemediation"),
+			"medik8s", name, nil)
+		u.SetAnnotations(annos)
+		return u
+	}
+	for _, tc := range []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want string
+	}{
+		{"annotation wins", obj("cr-x", map[string]string{
+			remediationNodeNameAnno: "annotated-node"}), "annotated-node"},
+		{"exact node name", obj("worker-1", nil), "worker-1"},
+		{"shortest prefix", obj("worker-1-reboot", nil), "worker-1"},
+		// The bug shape: both "worker-1" and "worker-1-gpu" prefix the
+		// CR name — the longer node name is the real target.
+		{"longest prefix wins", obj("worker-1-gpu-reboot", nil), "worker-1-gpu"},
+		{"no match", obj("other-node-x", nil), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Run the resolution repeatedly — a first-prefix-hit
+			// implementation flips answers across map orders.
+			for i := 0; i < 50; i++ {
+				if got := medik8sTargetNode(tc.obj, nodeNames); got != tc.want {
+					t.Fatalf("medik8sTargetNode(%q) = %q, want %q",
+						tc.obj.GetName(), got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// Verdict.Active is READ-ONLY: a held verdict must never patch Nodes
+// — stamping is the dedicated runnable's job. A fresh cordon holds
+// the verdict and the fake clientset must record ZERO writes.
+func TestVerdictActiveIsReadOnly(t *testing.T) {
+	ctx := context.Background()
+	n := maintenanceCordoned("w1", time.Minute)
+	cs := fake.NewSimpleClientset(n)
+	dyn := maintenanceDynFake()
+
+	var v Verdict
+	held, why, err := v.Active(ctx, cs, dyn, time.Now())
+	if err != nil || !held {
+		t.Fatalf("verdict = (%v,%q,%v), want held on the fresh cordon",
+			held, why, err)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "patch" || a.GetVerb() == "update" ||
+			a.GetVerb() == "create" || a.GetVerb() == "delete" {
+			t.Fatalf("verdict evaluation issued a write: %v %v",
+				a.GetVerb(), a.GetResource())
+		}
+	}
+}
+
+// stampTestNode builds a node carrying an optional
+// cluster-maintenance-until stamp, cordoned `cordonAgo` ago (0 = no
+// cordon at all — a fresh taint would need a nonzero ago).
+func stampTestNode(name string, cordonAgo time.Duration,
+	stamp string) *corev1.Node {
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if cordonAgo > 0 {
+		n.Spec.Unschedulable = true
+		t := metav1.NewTime(time.Now().Add(-cordonAgo))
+		n.Spec.Taints = []corev1.Taint{{
+			Key: UnschedulableTaintKey, TimeAdded: &t}}
+	}
+	if stamp != "" {
+		n.Annotations = map[string]string{
+			"passiontech.dev/cluster-maintenance-until": stamp}
+	}
+	return n
+}
+
+// StampMaintenanceTargets converges the annotation set: the cordoned
+// node takes a fresh stamp (~now+15m), a node outside the target set
+// loses a stamp THIS controller could have written, and foreign
+// values are never touched.
+func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	owned := now.Add(maintenanceStampTTL).UTC().Format(time.RFC3339)
+	farFuture := now.Add(3 * time.Hour).UTC().Format(time.RFC3339)
+	w1 := stampTestNode("w1", time.Minute, "")     // cordoned → target
+	w2 := stampTestNode("w2", 0, owned)            // owned stamp → removed
+	w3 := stampTestNode("w3", 0, "manual-forever") // foreign → kept
+	w4 := stampTestNode("w4", 0, farFuture)        // out-of-domain → kept
+	cs := fake.NewSimpleClientset(w1, w2, w3, w4)
+
+	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), now)
+
+	get := func(name string) *corev1.Node {
+		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		return n
+	}
+	if v := get("w1").Annotations["passiontech.dev/cluster-maintenance-until"]; v == "" {
+		t.Fatal("cordoned node w1 was not stamped")
+	} else if ts, ok := ParseAnnoTime(v); !ok ||
+		ts.Before(now.Add(maintenanceStampTTL-time.Minute)) ||
+		ts.After(now.Add(maintenanceStampTTL+time.Minute)) {
+		t.Fatalf("w1 stamp %q is not ~now+TTL", v)
+	}
+	if v, ok := get("w2").Annotations["passiontech.dev/cluster-maintenance-until"]; ok {
+		t.Fatalf("w2's controller-owned stamp survived maintenance end: %q", v)
+	}
+	if v := get("w3").Annotations["passiontech.dev/cluster-maintenance-until"]; v != "manual-forever" {
+		t.Fatalf("w3's foreign stamp was touched: %q", v)
+	}
+	if v := get("w4").Annotations["passiontech.dev/cluster-maintenance-until"]; v != farFuture {
+		t.Fatalf("w4's out-of-domain stamp was touched: %q", v)
+	}
+}
+
+// A degraded signal read disables ONLY the unstamp half: with the
+// kured GET failing, the cordoned node still gets stamped but the
+// owned stamp on the quiet node must survive — dropping a hold on a
+// signal we failed to observe is the unsafe direction.
+func TestStampMaintenanceTargetsDegradedKeepsStamps(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	owned := now.Add(maintenanceStampTTL).UTC().Format(time.RFC3339)
+	w1 := stampTestNode("w1", time.Minute, "")
+	w2 := stampTestNode("w2", 0, owned)
+	cs := fake.NewSimpleClientset(w1, w2)
+	cs.PrependReactor("get", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver flap")
+		})
+
+	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), now)
+
+	w1n, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w1n.Annotations["passiontech.dev/cluster-maintenance-until"] == "" {
+		t.Fatal("degraded read must not block stamping the cordoned node")
+	}
+	w2n, err := cs.CoreV1().Nodes().Get(ctx, "w2", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := w2n.Annotations["passiontech.dev/cluster-maintenance-until"]; v != owned {
+		t.Fatalf("degraded read dropped an owned hold: got %q want %q", v, owned)
+	}
+}
+
+// A live autopilot Plan is cluster-wide maintenance: EVERY node
+// takes the stamp, including ones with no cordon and no remediation.
+func TestStampMaintenanceTargetsClusterWide(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	w1 := stampTestNode("w1", 0, "")
+	w2 := stampTestNode("w2", 0, "")
+	cs := fake.NewSimpleClientset(w1, w2)
+	dyn := maintenanceDynFake(maintenancePlan("upgrade", "InProgress"))
+
+	StampMaintenanceTargets(ctx, cs, dyn, now)
+
+	for _, name := range []string{"w1", "w2"} {
+		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n.Annotations["passiontech.dev/cluster-maintenance-until"] == "" {
+			t.Fatalf("cluster-wide maintenance left %s unstamped", name)
+		}
+	}
+}

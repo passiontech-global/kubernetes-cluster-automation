@@ -12,14 +12,20 @@ on:
     branches: [main]
     paths:
       - "apps/node-automation-controller/**"
+      # Only the hostkit subpackages this app actually imports
+      # (envx/nodecond/timex + transitive logx) — a blanket
+      # libs/hostkit/** would fire releases on fsx/httpx changes the
+      # controller never consumes, producing empty releases.
       - "libs/hostkit/envx/**"
       - "libs/hostkit/logx/**"
       - "libs/hostkit/nodecond/**"
       - "libs/hostkit/timex/**"
       - ".moon/**"
       - "mise.toml"
+      - ".dockerignore"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-node-automation-controller.yml"
+      - '!**/*.md'
   workflow_dispatch:
     inputs:
       version:

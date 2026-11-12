@@ -330,6 +330,23 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 			return nil
 		}
 		pod := fmt.Sprintf("%s-%d", cjStatefulSet, i)
+		// Keep-at-least-one-Ready guard: wiping the LAST serving
+		// worker leaves zero builds capacity for the whole
+		// init-rm + Ready window (a single-replica Concourse hits
+		// this every run; a multi-replica one hits it when every
+		// sibling is already down). An unverifiable census fails
+		// closed like the maintenance mutex — the wipe is
+		// destructive enough that "unknown" means "no".
+		readySibs, rerr := j.readyWorkerSiblings(ctx, pod)
+		if rerr != nil {
+			return rerr
+		}
+		if readySibs == 0 {
+			log.Info("SKIP: no other Ready worker — wiping would leave zero serving capacity",
+				"pod", pod)
+			skipped++
+			continue
+		}
 		w, err := j.processPod(ctx, pod, flyOK, log)
 		if err != nil {
 			return err // bash `exit 1` — abort the whole run

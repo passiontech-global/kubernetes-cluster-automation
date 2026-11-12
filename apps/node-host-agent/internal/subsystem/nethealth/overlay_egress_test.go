@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -18,7 +19,6 @@ import (
 func TestEgressUnderlayDiesRelaysImmediately(t *testing.T) {
 	e := overlayEnv(t, nil)
 	// fwmark rule present, no pref-1500 rules.
-	e.host.On("rule list pref 1500", "")
 	// Marked ping fails; TCP fallback fails too → underlay dead.
 	e.tcpOK["8.8.8.8:53"] = false
 	e.pingOK["8.8.8.8|true"] = false
@@ -38,7 +38,7 @@ func TestEgressUnderlayDiesRelaysImmediately(t *testing.T) {
 
 func TestEgressRecoveryNeedsTwoFreshProbes(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "1500:\tfrom all to 8.8.8.8 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = true // underlay back
 	// Cycle 1: probe=direct, ctr 1 < 2 → stays relay.
@@ -58,7 +58,6 @@ func TestEgressRecoveryNeedsTwoFreshProbes(t *testing.T) {
 func TestEgressDriftHeal(t *testing.T) {
 	e := overlayEnv(t, nil)
 	// Committed relay but live rule missing → re-add immediately.
-	e.host.On("rule list pref 1500", "")
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = false
 	e.tcpOK["8.8.8.8:53"] = false
@@ -73,7 +72,6 @@ func TestEgressDriftHeal(t *testing.T) {
 
 func TestEgressICMPBlockedTCPAliveIsDirect(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	e.pingOK["8.8.8.8|true"] = false // ICMP filtered
 	e.tcpOK["8.8.8.8:53"] = true     // but TCP answers
 	e.n.Cycle(context.Background())
@@ -89,7 +87,7 @@ func TestEgressNoOverlayCleanup(t *testing.T) {
 	e := overlayEnv(t, nil)
 	// Nebula down → overlayUp false → full cleanup.
 	e.sd.Reset()
-	e.host.On("rule list pref 1500", "1500:\tfrom all to 8.8.8.8 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.n.Cycle(context.Background())
 	if !e.host.Ran("rule del pref 1390 fwmark 0x2000") {
@@ -102,7 +100,7 @@ func TestEgressNoOverlayCleanup(t *testing.T) {
 
 func TestEgressRemovedRelayCleaned(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "1500:\tfrom all to 9.9.9.9 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "9.9.9.9")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-9.9.9.9"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = true
 	e.n.Cycle(context.Background())
@@ -120,7 +118,6 @@ func TestEgressHealedRelayDropsRuleForTCPProbe(t *testing.T) {
 	// (pre-heal snapshot would have said hadRule=false → connect
 	// through the overlay → false "direct" → relay/direct flap).
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = false
 	e.tcpOK["8.8.8.8:53"] = true // underlay actually alive via TCP
@@ -140,7 +137,7 @@ func TestEgressUnprobeableWindowCommitsToLive(t *testing.T) {
 	e := overlayEnv(t, nil)
 	// Committed direct but a live relay rule (drift); the heal del
 	// AND the probe-window del both fail → no probe runs.
-	e.host.On("rule list pref 1500", "1500:\tfrom all to 8.8.8.8 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "direct\n")
 	e.host.FailOn("rule del", errCmdFail)
 	e.pingOK["8.8.8.8|true"] = false
@@ -164,7 +161,9 @@ func TestEgressUnprobeableWindowCommitsToLive(t *testing.T) {
 // rules must never be added/removed on a blind read.
 func TestEgressRuleListFailureAborts(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.FailOn("rule list", errCmdFail)
+	e.n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
+		return nil, errCmdFail
+	}
 	e.pingOK["8.8.8.8|true"] = false
 	e.n.checkOverlayEgress(context.Background())
 	if e.host.Ran("rule add pref 1500") || e.host.Ran("rule del pref 1500") {
@@ -176,32 +175,12 @@ func TestEgressRuleListFailureAborts(t *testing.T) {
 	}
 }
 
-// A failed `ip rule list pref 1500` reads as "unruled": the cycle
-// continues (the pref-1390 fwmark rule and the probes still run) and
-// a committed relay gets healed back in on the blind snapshot.
-func TestEgressPref1500ListFailureReadsUnruled(t *testing.T) {
-	e := overlayEnv(t, nil)
-	e.host.FailOn("rule list pref 1500", errCmdFail)
-	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
-	e.pingOK["8.8.8.8|true"] = true // underlay ok → no relay commit
-	e.n.checkOverlayEgress(context.Background())
-	// committed relay vs live "unruled" → drift heal re-adds.
-	if !e.host.Ran("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
-		t.Fatalf("committed relay not healed on the blind snapshot: %v", e.host.Cmds())
-	}
-	if got := promtest.ToFloat64(e.n.cycles.WithLabelValues(
-		checkEgress, "abort")); got != 0 {
-		t.Fatalf("pref-1500 list failure must not abort the cycle, abort=%v", got)
-	}
-}
-
 // Rules pointing at a table other than the active one are pruned —
 // an overlay flip (tinc↔nebula) must not leave stale-table rules
 // pushing traffic into the dead table.
 func TestEgressStaleTableRulePruned(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500",
-		"1500:\tfrom all to 8.8.8.8 lookup 102\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 102, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = true
 	e.n.checkOverlayEgress(context.Background())
@@ -223,8 +202,7 @@ func TestEgressStaleTableRulePruned(t *testing.T) {
 // healed back in: its current-table rule is genuinely missing.
 func TestEgressStaleTableOnlyRuleNotHealFailed(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500",
-		"1500:\tfrom all to 8.8.8.8 lookup 102\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 102, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "direct\n")
 	e.pingOK["8.8.8.8|true"] = true
 	e.n.checkOverlayEgress(context.Background())
@@ -254,7 +232,6 @@ func TestEgressStaleTableOnlyRuleNotHealFailed(t *testing.T) {
 // direct verdict itself still stands.
 func TestEgressICMPMarkerWriteFailureDegrades(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	if err := os.Chmod(e.state, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -274,8 +251,7 @@ func TestEgressProbeWindowRestoreFailureRetriesOnce(t *testing.T) {
 	e := overlayEnv(t, nil)
 	// Committed relay + live relay rule → the TCP fallback drops the
 	// rule for the probe window and must restore it afterwards.
-	e.host.On("rule list pref 1500",
-		"1500:\tfrom all to 8.8.8.8 lookup 100\n")
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
 	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
 	e.pingOK["8.8.8.8|true"] = false
 	e.tcpOK["8.8.8.8:53"] = true
@@ -297,7 +273,6 @@ func TestEgressProbeWindowRestoreFailureRetriesOnce(t *testing.T) {
 // commit/converge heals the file next cycle (the warn is the trail).
 func TestEgressCommitWriteFailureHealsRuleAnyway(t *testing.T) {
 	e := overlayEnv(t, nil)
-	e.host.On("rule list pref 1500", "")
 	if err := os.Chmod(e.state, 0o555); err != nil {
 		t.Fatal(err)
 	}

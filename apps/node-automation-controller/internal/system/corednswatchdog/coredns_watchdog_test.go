@@ -86,6 +86,7 @@ func cdnsProbeService(name, ns string, age time.Duration, ready *bool) (*corev1.
 // newCDNSWatchdog returns a watchdog with every external probe stubbed
 // to the "all clean" result — each test overrides the layer it exercises.
 func newCDNSWatchdog(cs *fake.Clientset) *coreDNSWatchdog {
+	emulateEviction(cs) // recover() evicts via the PDB-respecting API
 	return &coreDNSWatchdog{
 		cs: cs,
 		// NewDynamicClient (not StubDyn): recover()'s maintenance
@@ -724,13 +725,19 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
-		cs.PrependReactor("delete", "pods",
-			func(ktesting.Action) (bool, runtime.Object, error) {
-				return true, nil, errors.New("delete rejected")
-			})
 		w := newCDNSWatchdog(cs)
+		// Prepended AFTER emulateEviction so this reactor wins: the
+		// eviction subresource create is what recover() issues now.
+		cs.PrependReactor("create", "pods",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				if ca, ok := a.(ktesting.CreateAction); ok &&
+					ca.GetSubresource() == "eviction" {
+					return true, nil, errors.New("eviction rejected")
+				}
+				return false, nil, nil
+			})
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err == nil {
-			t.Fatal("expected error when the pod delete fails")
+			t.Fatal("expected error when the pod eviction fails")
 		}
 	})
 }

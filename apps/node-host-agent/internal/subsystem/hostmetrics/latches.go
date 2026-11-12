@@ -101,6 +101,11 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)
 	}
+	// Host sysctl writes (clocksource kvm-clock restore, aio-max-nr
+	// bump) — scrape-independent by design: Collect only READS, this
+	// 30s tick owns every host mutation (mutex + per-target
+	// cooldown inside reconcileHostWrites).
+	c.reconcileHostWrites()
 	// checkKernelDmesg/updatePidFDPressure/checkClockSkew + fs-readonly + cpu-steal-guard: the kernel
 	// deep-failure block — the kmsg drain (evidence markers
 	// kmsg-fs-error, kmsg-conntrack-drops, kmsg-host-oom-* the

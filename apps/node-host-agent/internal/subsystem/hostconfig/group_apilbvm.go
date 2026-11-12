@@ -113,7 +113,19 @@ func (c *cyc) groupAPILBVM() {
 
 	// prereqs — best-effort like ansible failed_when: false. runLong:
 	// apt on a slow-egress infra VM outlives the interactive budget.
-	_, _ = r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "socat", "curl")
+	// dpkg-query gates the install: converge used to fork apt every
+	// cycle even with socat+curl already satisfied.
+	var missing []string
+	for _, p := range []string{"socat", "curl"} {
+		if !c.dpkgInstalled(ctx, p) {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) > 0 {
+		argv := append([]string{"apt-get", "install", "-y"}, missing...)
+		_, _ = r.runLong(ctx, "env", append(
+			[]string{"DEBIAN_FRONTEND=noninteractive"}, argv...)...)
+	}
 
 	// tmpfiles.d: recreate the bind-mount source owned by the
 	// container's haproxy uid on every boot (/run is tmpfs — docker

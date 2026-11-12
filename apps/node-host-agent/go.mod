@@ -3,10 +3,14 @@ module github.com/passiontech-global/kubernetes-cluster-automation/apps/node-hos
 go 1.27.3
 
 require (
+	github.com/coreos/go-systemd/v22 v22.7.0
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit v0.0.0
 	github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja v0.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
+	github.com/vishvananda/netlink v1.3.1
+	github.com/vishvananda/netns v0.0.5
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0

@@ -36,6 +36,14 @@ func cnpgClusterPrimary(ns, name, current, target string) *unstructured.Unstruct
 // fencedInstances annotation — the fenced_instances signature.
 func cnpgClusterFenced(ns, name, fenced string) *unstructured.Unstructured {
 	cr := cnpgClusterHealth(ns, name, "Healthy", 2*time.Hour, 3, 3)
+	// The unfence guard never touches the elected primary or a
+	// cluster mid-failover — point status.primary at an instance the
+	// fence lists never name so the fixture exercises the
+	// stale-fence path, not the primary-protection block.
+	_ = unstructured.SetNestedField(cr.Object, name+"-0",
+		"status", "currentPrimary")
+	_ = unstructured.SetNestedField(cr.Object, name+"-0",
+		"status", "targetPrimary")
 	cr.SetAnnotations(map[string]string{cnpgFencedInstancesAnno: fenced})
 	return cr
 }
@@ -79,13 +87,13 @@ func TestCNPGPrimaryMismatchFlags(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		if _, ok := cnpgSeries(t, "db", "pg-pm", "primary_mismatch"); ok {
 			t.Fatal("primary_mismatch flagged on first sight")
 		}
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("primary mismatch held past the window must fail")
 	}
@@ -100,7 +108,7 @@ func TestCNPGPrimaryMismatchFlags(t *testing.T) {
 func TestCNPGPrimaryMatchPasses(t *testing.T) {
 	cr := cnpgClusterPrimary("db", "pg-pm-ok", "pg-pm-ok-1", "pg-pm-ok-1")
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("matching primaries must pass: %+v", res)
 	}
@@ -123,11 +131,11 @@ func TestCNPGPrimaryEmptyFlags(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("missing primary held past the window must fail")
 	}
@@ -144,7 +152,7 @@ func TestCNPGPrimaryEmptyZeroInstancesPasses(t *testing.T) {
 		-1, 0, 0)
 	unstructured.RemoveNestedField(cr.Object, "status", "currentPrimary")
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
-	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("zero-instance cluster must pass: %+v", res)
 	}
@@ -166,13 +174,13 @@ func TestCNPGFencedInstancesDetectOnly(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		if _, ok := cnpgSeries(t, "db", "pg-f", "fenced_instances"); ok {
 			t.Fatal("fenced_instances flagged on first sight")
 		}
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("fenced instances held past the window must fail")
 	}
@@ -201,11 +209,11 @@ func TestCNPGFencedInstanceAutoUnfence(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
@@ -239,9 +247,9 @@ func TestCNPGUnfencePatchPinsResourceVersion(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	_ = chk.Run(ctx)
+	_ = chk.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	chk.Run(ctx)
+	chk.Run(probetest.SweepCtx(ctx))
 	if body == "" {
 		t.Fatal("stale fence with a verified-healthy pod must unfence")
 	}
@@ -277,11 +285,11 @@ func TestCNPGFencedInstanceTaintedNodeStays(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
@@ -304,11 +312,11 @@ func TestCNPGFencedInstanceUnschedulableStays(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
@@ -331,11 +339,11 @@ func TestCNPGFencedWholeClusterStarStays(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
@@ -358,7 +366,7 @@ func TestCNPGFencedInstanceFirstSweepStays(t *testing.T) {
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
 	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-1" {

@@ -58,7 +58,7 @@ func TestPVCFileSystemResizePendingStalled(t *testing.T) {
 	pvc := pvcWithCondition("db", "data-pg-0",
 		corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
 	p := testProber(fake.NewSimpleClientset(pvc))
-	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stalled resize must fail: %+v", res)
 	}
@@ -77,7 +77,7 @@ func TestPVCResizingConditionStalled(t *testing.T) {
 	pvc := pvcWithCondition("data", "vol-1",
 		corev1.PersistentVolumeClaimResizing, 45*time.Minute)
 	p := testProber(fake.NewSimpleClientset(pvc))
-	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("stalled Resizing must fail: %+v", res)
 	}
@@ -97,7 +97,7 @@ func TestPVCResizeInsideWindowPasses(t *testing.T) {
 		corev1.PersistentVolumeClaimResizing, 2*time.Hour)
 	done.Status.Conditions[0].Status = corev1.ConditionFalse
 	p := testProber(fake.NewSimpleClientset(fresh, done))
-	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("in-window/resolved conditions must pass: %+v", res)
 	}
@@ -123,11 +123,11 @@ func TestPVCResizeZeroTimestampLedger(t *testing.T) {
 	chk := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, now)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("zero-timestamp condition must arm, not flag: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, now.Add(31*time.Minute))
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("zero-timestamp condition held past the window must fail")
 	}
@@ -146,7 +146,7 @@ func TestPVCResizeResolvedPrunesSeries(t *testing.T) {
 	p := testProber(cs)
 	chk := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p)
 
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stalled condition must fail first")
 	}
 	if _, ok := pvcStalledSeries(t, "db", "heals",
@@ -165,7 +165,7 @@ func TestPVCResizeResolvedPrunesSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("resolved condition must pass: %+v", res)
 	}
 	if pvcResizeStalledGauge.DeleteLabelValues("db", "heals",
@@ -181,7 +181,7 @@ func TestPVCTerminatingClaimSkipped(t *testing.T) {
 		corev1.PersistentVolumeClaimResizing, 2*time.Hour)
 	pvc.DeletionTimestamp = &metav1.Time{Time: time.Now().Add(-time.Minute)}
 	p := testProber(fake.NewSimpleClientset(pvc))
-	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if !res.Pass {
 		t.Fatalf("terminating claim must not flag: %+v", res)
 	}

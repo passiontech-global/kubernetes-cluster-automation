@@ -204,7 +204,7 @@ func TestKSMWedgeInconclusiveKeepsTracking(t *testing.T) {
 	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
 		return leaseReasonKSMUnauthorized, nil
 	}
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first wedge sighting must pass: %+v", res)
 	}
 	key := "monitoring/kube-state-metrics-inc"
@@ -219,7 +219,7 @@ func TestKSMWedgeInconclusiveKeepsTracking(t *testing.T) {
 		return "", errors.New("log tail unreachable")
 	}
 	probetest.FreezeNow(p.Deps, base.Add(ksmWedgeMinAge+time.Minute))
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("monitoring").
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("inconclusive wedge deleted the pod: %v", err)
@@ -251,7 +251,7 @@ func TestKSMWedgeResolveClearsPersistedStamp(t *testing.T) {
 		return "", nil // clean tail AND a quiet counter — resolved
 	}
 
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if _, err := cs.CoreV1().Pods("monitoring").
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("healthy ksm pod deleted: %v", err)
@@ -287,7 +287,7 @@ func TestKSMWedgePodListErrorIsInfraAndCarries(t *testing.T) {
 	// Seed the window already past minAge so this sweep emits.
 	ch.wedgeSeen.Observe("monitoring/kube-state-metrics-carry",
 		base.Add(-(ksmWedgeMinAge + time.Minute)))
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted wedge must fail the check")
 	}
 	m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
@@ -308,7 +308,7 @@ func TestKSMWedgePodListErrorIsInfraAndCarries(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatal("a pod list failure must mark the check infra-failed")
 	}
@@ -342,7 +342,7 @@ func TestKSMWedgeRealTailBouncesAndReports(t *testing.T) {
 			"monitoring", "kube-state-metrics-e2e", "ksm_unauthorized")
 	})
 
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted 401 wedge must fail")
 	}
@@ -426,7 +426,7 @@ func TestKSMWedgeUnownedPodNotBounced(t *testing.T) {
 			"monitoring", "kube-state-metrics-lone", "ksm_unauthorized")
 	})
 
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("wedged controller-less ksm pod must still fail the check")
 	}
@@ -470,7 +470,7 @@ func TestKSMWedgeCooldownFollowsController(t *testing.T) {
 			"monitoring", "kube-state-metrics-6cc5c9d9b4-x2", "ksm_unauthorized")
 	})
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("precondition: first wedge must fail")
 	}
 	if _, err := cs.CoreV1().Pods("monitoring").Get(ctx, podA.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
@@ -487,7 +487,7 @@ func TestKSMWedgeCooldownFollowsController(t *testing.T) {
 		t.Fatal(err)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(time.Minute))
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("respawned wedge must keep failing the check")
 	}
 	if _, err := cs.CoreV1().Pods("monitoring").Get(ctx, podB.Name, metav1.GetOptions{}); err != nil {

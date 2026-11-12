@@ -57,8 +57,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -66,6 +64,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -269,19 +268,30 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Result(&p.emitted, linkerdOutlierPodsGauge.DeleteLabelValues,
 			why, ", ")
 	}
-	// doneFresh is the early-exit tail — an inconclusive sweep (Prom
-	// outage) or an empty candidate list still reconciles BOTH
+	// doneFresh is the CONCLUSIVE early-exit tail — an empty
+	// candidate list after successful queries still reconciles BOTH
 	// ledgers: the emitted gauge closes and the persistence window
 	// drops its holds, so a recovered sweep never inherits a phantom
-	// series or a stale 5m persistence stamp. (Pruning all of seen is
-	// the safe direction: the next sweep re-arms from zero evidence.)
+	// series or a stale 5m persistence stamp.
 	doneFresh := func() probefw.Result {
 		p.seen.Prune(func(string) bool { return false })
 		return done()
 	}
+	// doneInconclusive is the early-exit tail for sweeps that could
+	// not evaluate at all (Prometheus outage): last sweep's emitted
+	// tuples Carry + re-Find and the persistence ledger keeps every
+	// stamp — "can't tell" is not "resolved", or one scrape flap
+	// would prune live outlier series and re-arm every 5m window.
+	doneInconclusive := func() probefw.Result {
+		for k, lv := range p.emitted.Last() {
+			rep.Carry(k, lv)
+			rep.Find(k + " (carried — prometheus inconclusive)")
+		}
+		return done()
+	}
 
 	if _, err := p.PromEndpoint(); err != nil {
-		return doneFresh()
+		return doneInconclusive()
 	}
 	// `rollout` MUST stay in the sum-by list: dropping it makes
 	// Prometheus collapse Rollout-owned series into unlabeled
@@ -293,14 +303,14 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		log.Info("WARN: linkerd outlier rps query failed — check inconclusive",
 			"error", err)
-		return doneFresh()
+		return doneInconclusive()
 	}
 	failSeries, err := p.PromQuery(ctx,
 		`sum by (namespace, deployment, rollout, pod) (rate(response_total{direction="inbound",classification="failure"}[5m]))`)
 	if err != nil {
 		log.Info("WARN: linkerd outlier failure-ratio query failed — check inconclusive",
 			"error", err)
-		return doneFresh()
+		return doneInconclusive()
 	}
 	rps := linkerdOutlierSamples(rpsSeries)
 	fails := linkerdOutlierSamples(failSeries)
@@ -445,29 +455,33 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 	if !proceed {
 		return
 	}
-	deleteOpts := kube.UIDDeleteOptions(pod.UID, "")
-	if err := p.CS.CoreV1().Pods(pod.Namespace).EvictV1(ctx,
-		&policyv1.Eviction{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
-			},
-			DeleteOptions: &deleteOpts,
-		}); err != nil {
-		if apierrors.IsTooManyRequests(err) {
-			// HTTP 429 — a PDB with disruptionsAllowed==0 refused
-			// between the pre-check and the kill: a deferral, not a
-			// failure.
-			log.Info("DEFER: PDB refused outlier eviction — keeping pod alive",
-				"pod", podKey)
-			return
-		}
+	// The kill rides heal.EvictPod — the shared UID-preconditioned
+	// policy/v1 Eviction every pod heal uses: the apiserver enforces
+	// the PDB and consumes a disruption slot atomically, the sweep
+	// overlay's local-remediation hold and one-disruption-per-
+	// workload reservation apply, the pod's UID is tombstoned for
+	// the rest of the sweep, and the heals ledger stamps only on a
+	// DELIVERED eviction. The PDB pre-check above stays as the
+	// fast-path skip ahead of the budget gate.
+	evicted, refused, err := heal.EvictPod(ctx, p.CS, &p.Heals, ck, pod, now)
+	switch {
+	case err != nil:
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd outlier pod eviction failed", "pod", podKey)
 		return
+	case refused:
+		// PDB 429, a local-remediation hold, or the sweep's
+		// one-disruption reservation — every refused shape delivered
+		// no heal, so the AllowedV gate's grant goes back (a
+		// PDB-held sweep must not burn the fleet budget every
+		// cycle).
+		heal.RefundGrant(now)
+		log.Info("DEFER: outlier eviction refused — keeping pod alive",
+			"pod", podKey)
+		return
+	case !evicted:
+		return
 	}
-	p.Heals.Stamp(ck, now)
-	p.InvalidatePods(ctx) // pod evicted — drop the census
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameLinkerdOutlierGuard).Inc()
 	log.Info("EVICT: linkerd outlier pod — gray-failed replica recreated",
 		"pod", podKey, "deployment", s.deploy)
@@ -481,14 +495,18 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 func (p *linkerdOutlierGuardCheck) pdbAllows(ctx context.Context,
 	pod *corev1.Pod) (bool, error) {
 
-	pdbs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PodDisruptionBudgets(p.CS, pod.Namespace))
+	// Cluster-wide PDB census, namespace-filtered client-side —
+	// the sweep snapshot pays ONE list for every check that needs
+	// PDBs instead of a per-pod-namespace LIST here.
+	all, err := p.AllPDBs(ctx)
 	if err != nil {
 		return false, err
 	}
-	for i := range pdbs {
-		pdb := &pdbs[i]
+	for i := range all {
+		pdb := &all[i]
+		if pdb.Namespace != pod.Namespace {
+			continue
+		}
 		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 		if err != nil {
 			sel = labels.Everything() // unparseable — fail closed

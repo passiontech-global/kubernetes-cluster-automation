@@ -157,7 +157,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 		log.Error(err, "linkerd-identity get failed")
 		return
 	}
-	if heal.PersistedCooledDown(&a.linkerdIssuerHeals, deploy,
+	if heal.PersistedCooledDown(ctx, &a.linkerdIssuerHeals, deploy,
 		kube.AnnoLastLinkerdIssuerRollout, kube.LinkerdIdentityName,
 		linkerdIssuerCooldown, now) {
 		// Deliberately NOT latching the serial here: sealing the new
@@ -215,7 +215,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	a.linkerdIssuerHeals.Stamp(kube.LinkerdIdentityName, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(kube.LinkerdIdentityName).Inc()
 	log.Info("ACTION: issuer cert rotated (serial changed) — stamped rollout annotation on linkerd-identity")
-	if err := heal.StampPersisted(ctx,
+	if err := heal.StampPersisted(ctx, deploy,
 		func(ctx context.Context, data []byte) error {
 			_, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx,
 				kube.LinkerdIdentityName, types.StrategicMergePatchType,

@@ -275,7 +275,7 @@ func TestCNPGMasterlessZeroEndpoints(t *testing.T) {
 	chk := probetest.MustCheck[*statefulMasterlessCheck](t, p)
 	chk.stsZeroSince.Observe("db/pg-ro/pg", base.Add(-12*time.Minute))
 
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("masterless CNPG service must FAIL")
 	}
@@ -325,7 +325,7 @@ func TestCNPGMasterlessResolutionClearsStamp(t *testing.T) {
 	chk := probetest.MustCheck[*statefulMasterlessCheck](t, p)
 	chk.stsZeroSince.Observe("db/pg-ro/pg", base.Add(-12*time.Minute))
 
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("first sweep must FAIL — 0 ready endpoints")
 	}
 	// The master comes back — one Ready endpoint on the Service.
@@ -333,7 +333,7 @@ func TestCNPGMasterlessResolutionClearsStamp(t *testing.T) {
 		cnpgMLEndpointSlice("db", "pg-ro"), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("resolved masterless service must pass: %+v", res)
 	}
 	gotSvc, err := cs.CoreV1().Services("db").
@@ -382,7 +382,7 @@ func TestCNPGMasterlessManagedByCloudNativePGBouncesOperator(t *testing.T) {
 	chk := probetest.MustCheck[*statefulMasterlessCheck](t, p)
 	chk.stsZeroSince.Observe("db/pg-rw/pg", base.Add(-12*time.Minute))
 
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("masterless CNPG service must FAIL")
 	}
@@ -408,7 +408,7 @@ func TestCNPGMasterlessPodListErrorIsInfra(t *testing.T) {
 				fmt.Errorf("apiserver down"))
 		})
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatalf("pod list failure must surface as infra error: %+v", res)
 	}

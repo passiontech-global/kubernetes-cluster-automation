@@ -122,6 +122,9 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"imagepull-secret-auditor",
 		// argocd-agent-spin — the argocd-agent spin healer is the newest row.
 		"argocd-agent-spin",
+		// apiserver-node-reachability — the apiserver-dark detector is
+		// the newest row; appended last so existing order is stable.
+		"apiserver-node-reachability",
 	}
 	var got []string
 	for _, m := range Modules {

@@ -86,6 +86,16 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s holds stale containerd.sock inode (socket recreated after pod start)",
 			sp.Namespace, sp.Name))
+		// Hold check BEFORE the budget spend: a held delete must not
+		// burn the restart cooldown — otherwise the next ungated
+		// window waits a full MinRestartInterval for an action that
+		// never ran. Same ordering the other guarded deletes carry.
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("suspect: spegel-mirror pod delete held — " +
+				"cluster maintenance in progress")
+			c.d.CycleResult(wdeps.CheckSpegel, "ok")
+			return
+		}
 		if !c.d.State.RateTrySpend("last-spegel-restart",
 			c.d.Cfg.MinRestartInterval) {
 			c.d.State.AppendLog(
@@ -93,16 +103,19 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.CycleResult(wdeps.CheckSpegel, "ok")
 			return
 		}
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: spegel-mirror deleted pod %s/%s - stale containerd.sock inode (k0sworker/containerd restarted under it)",
-			sp.Namespace, sp.Name))
 		// Preconditions{UID} closes the listing→delete race: the
 		// DaemonSet recycling the pod name between the CycleEnv list
 		// and this call must 409, not kill the replacement pod (same
-		// precondition the calico remedies carry).
+		// precondition the calico remedies carry). The heal stamp
+		// rides BEFORE the delete so the cluster side sees the
+		// attribution even if this process dies mid-call.
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: spegel-mirror deleted pod %s/%s - stale containerd.sock inode (k0sworker/containerd restarted under it)",
+			sp.Namespace, sp.Name))
+		c.d.StampPodHealed(ctx, sp.Namespace, sp.Name)
 		if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
 			metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](0),
+				GracePeriodSeconds: ptr.To[int64](5),
 				Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: spegel-mirror delete %s/%s failed: %v",
@@ -130,6 +143,15 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.State.Enter(latchdefs.LatchSpegelMirrorDegraded,
 		fmt.Sprintf("pod=%s/%s ready_fails=%d", sp.Namespace, sp.Name, c.Fails))
+	// Hold BEFORE budget spend (same rule as the stale-socket path
+	// above): a maintenance-held delete must not consume the restart
+	// cooldown for an action that never ran.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("suspect: spegel-mirror pod delete held — " +
+			"cluster maintenance in progress")
+		c.d.CycleResult(wdeps.CheckSpegel, "ok")
+		return
+	}
 	if !c.d.State.RateTrySpend("last-spegel-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s Ready=False %dx but restart in cooldown (<30m), skip",
@@ -138,12 +160,15 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	// The heal stamp rides BEFORE the delete so the cluster side sees
+	// the attribution even if this process dies mid-call.
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: spegel-mirror deleted pod %s/%s - Ready=False %dx (containerd mirror points at a wedged peer)",
 		sp.Namespace, sp.Name, c.Fails))
+	c.d.StampPodHealed(ctx, sp.Namespace, sp.Name)
 	if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
 		metav1.DeleteOptions{
-			GracePeriodSeconds: ptr.To[int64](0),
+			GracePeriodSeconds: ptr.To[int64](5),
 			Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror delete %s/%s failed: %v",

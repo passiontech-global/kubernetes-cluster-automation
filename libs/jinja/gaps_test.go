@@ -183,14 +183,22 @@ func TestIfStatementRender(t *testing.T) {
 // become *List, integral floats collapse to int64 — non-integral
 // floats, strings and bools pass through.
 func TestFromJSONReboxing(t *testing.T) {
-	out := fromJSON(map[string]any{
+	mustJSON := func(v any) any {
+		t.Helper()
+		out, err := fromJSONChecked(v)
+		if err != nil {
+			t.Fatalf("fromJSONChecked: %v", err)
+		}
+		return out
+	}
+	out := mustJSON(map[string]any{
 		"zeta":  2.0,
 		"alpha": []any{1.5, "s", true},
 		"mid":   map[string]any{"k": nil},
 	})
 	m, ok := out.(*OMap)
 	if !ok {
-		t.Fatalf("fromJSON(map) = %T want *OMap", out)
+		t.Fatalf("fromJSONChecked(map) = %T want *OMap", out)
 	}
 	if got := strings.Join(m.Keys(), ","); got != "alpha,mid,zeta" {
 		t.Fatalf("keys = %q want alpha,mid,zeta", got)
@@ -218,14 +226,14 @@ func TestFromJSONReboxing(t *testing.T) {
 		t.Fatalf("zeta = %#v want int64(2)", zeta)
 	}
 
-	if got := fromJSON(3.5); got != 3.5 {
-		t.Fatalf("fromJSON(3.5) = %v want 3.5", got)
+	if got := mustJSON(3.5); got != 3.5 {
+		t.Fatalf("fromJSONChecked(3.5) = %v want 3.5", got)
 	}
-	if got := fromJSON("x"); got != "x" {
+	if got := mustJSON("x"); got != "x" {
 		t.Fatalf("fromJSON scalar = %v want x", got)
 	}
-	if got := fromJSON(nil); got != nil {
-		t.Fatalf("fromJSON(nil) = %v want nil", got)
+	if got := mustJSON(nil); got != nil {
+		t.Fatalf("fromJSONChecked(nil) = %v want nil", got)
 	}
 }
 

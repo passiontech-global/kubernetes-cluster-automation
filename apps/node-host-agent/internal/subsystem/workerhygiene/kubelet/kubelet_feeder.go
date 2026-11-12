@@ -272,6 +272,16 @@ func (f *Feeder) remediate(ctx context.Context) {
 		return
 	}
 
+	// L1↔L3 maintenance hold — BEFORE the budget spend so a held
+	// restart never burns the shared last-restart cooldown (the
+	// Cycle checks gate identically). During a drain the
+	// systemd-watchdog trip is usually the drain's own symptom.
+	if d.HoldLocalAction(ctx) {
+		d.State.AppendLog("kubelet-remediate: SKIP(maintenance) cluster maintenance in progress — " +
+			"k0sworker restart held")
+		return
+	}
+
 	// G5 rate-limit — the last-restart budget is SHARED with every
 	// other k0sworker restart source (30m), including the Cycle checks
 	// running on their own goroutine — the check+spend is atomic

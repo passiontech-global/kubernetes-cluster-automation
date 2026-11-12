@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,6 +40,11 @@ type scyllaHealthCheck struct {
 	//     DeleteLabelValues hygiene as the other emitted sets.
 	scyllaFirstSeen state.FirstSeenLedger
 	scyllaEmitted   state.GaugeLedger[string]
+	// lastPending is last sweep's pending-signature map — the carry
+	// source for pods whose log scan failed this sweep: their prior
+	// "stall/…" entries restore into pending so the first-seen stamp
+	// and any emitted tuple survive the inconclusive read.
+	lastPending map[string]scyllaFinding
 }
 
 // newScyllaHealthCheck builds the scylla-cluster-health check — both ledgers arm
@@ -183,10 +189,11 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 func (p *scyllaHealthCheck) scyllaStallLogHit(ctx context.Context, pod *corev1.Pod) (string, error) {
 	var reason string
 	hit, err := kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
-		Container: scyllaContainerName,
-		TailLines: probefw.DefaultTailLines,
-		MaxBytes:  probefw.LogMaxBytes,
-		Timeout:   probefw.LogTimeout,
+		Container:    scyllaContainerName,
+		TailLines:    probefw.DefaultTailLines,
+		SinceSeconds: 900,
+		MaxBytes:     probefw.LogMaxBytes,
+		Timeout:      probefw.LogTimeout,
 	}, func(line string) bool {
 		for _, re := range scyllaGossipPatterns {
 			if re.MatchString(line) {
@@ -296,8 +303,22 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// (b) member_service_desync + (c) gossip/raft + tombstone stall
 	// — the member-level signature phases (scylla_member_signals.go).
+	inconclusive := map[string]bool{} // "ns/pod/uid" — log scan failed
 	memberDesyncFindings(svcs, podsByKey, esAddrs, pending)
-	p.memberStallFindings(ctx, log, pods, pending)
+	p.memberStallFindings(ctx, log, pods, pending, inconclusive)
+	// A pod whose log scan failed is "can't tell", not "resolved":
+	// restore last sweep's pending entries for it so the first-seen
+	// stamp survives and a past-window signature re-emits instead of
+	// flapping off for one kubelet read error.
+	for ik := range inconclusive {
+		prefix := "stall/" + ik + "/"
+		for k, f := range p.lastPending {
+			if strings.HasPrefix(k, prefix) {
+				pending[k] = f
+			}
+		}
+	}
+	p.lastPending = pending
 
 	// Persistence window + gauge emission — same first-seen /
 	// DeleteLabelValues hygiene as the OLM and masterless checks.

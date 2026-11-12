@@ -295,8 +295,10 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	snap := filepath.Join(e.H.Cfg.K0sDataDir, "containerd",
-		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "snapctr1", "fs")
+	snapRoot := filepath.Join(e.H.Cfg.K0sDataDir, "containerd",
+		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
+	e.H.Cfg.Disk.WLayerSnapshotsDir = snapRoot
+	snap := filepath.Join(snapRoot, "snapctr1", "fs")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -547,21 +549,28 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	pods := []corev1.Pod{*hog, *small}
-	// Two pids: 5001 belongs to memhog (big VmRSS), 5002 to tiny.
+	// Two pids: 5001 belongs to memhog (big pod memory.current),
+	// 5002 to tiny.
 	for pid, uid := range map[int]string{5001: wdepstest.UIDA, 5002: wdepstest.UIDB} {
 		d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		underscored := strings.ReplaceAll(uid, "-", "_")
+		podComp := "kubepods-burstable-pod" + underscored + ".slice"
 		wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
-			"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
-		rss := 100
+			"0::/kubepods.slice/kubepods-burstable.slice/"+podComp+"\n")
+		memKB := int64(100)
 		if pid == 5001 {
-			rss = 900000
+			memKB = 900000
 		}
-		wdepstest.WriteFile(t, filepath.Join(d, "status"),
-			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
+		cgdir := filepath.Join(e.H.Cfg.Runtime.CgroupRoot,
+			"kubepods.slice", "kubepods-burstable.slice", podComp)
+		if err := os.MkdirAll(cgdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wdepstest.WriteFile(t, filepath.Join(cgdir, "memory.current"),
+			strconv.FormatInt(memKB<<10, 10))
 	}
 	pids := wdepstest.PidsOf(5001, 5002)
 
@@ -647,17 +656,23 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 			t.Fatal(err)
 		}
 		underscored := strings.ReplaceAll(uid, "-", "_")
+		podComp := "kubepods-burstable-pod" + underscored + ".slice"
 		wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
-			"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
-		rss := 900000 // the SYSTEM pod holds the most RSS
+			"0::/kubepods.slice/kubepods-burstable.slice/"+podComp+"\n")
+		memKB := int64(900000) // the SYSTEM pod holds the most memory
 		if pid == 5002 {
 			// Above the 512MiB victim floor (524288 kB) but
 			// below the system pod — still the only eligible
 			// victim.
-			rss = 600000
+			memKB = 600000
 		}
-		wdepstest.WriteFile(t, filepath.Join(d, "status"),
-			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
+		cgdir := filepath.Join(e.H.Cfg.Runtime.CgroupRoot,
+			"kubepods.slice", "kubepods-burstable.slice", podComp)
+		if err := os.MkdirAll(cgdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wdepstest.WriteFile(t, filepath.Join(cgdir, "memory.current"),
+			strconv.FormatInt(memKB<<10, 10))
 	}
 	for i := 0; i < 2; i++ {
 		wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{

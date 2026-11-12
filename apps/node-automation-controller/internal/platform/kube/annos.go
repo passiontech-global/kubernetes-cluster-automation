@@ -183,20 +183,28 @@ const (
 	// confirmed so the scheduler stops packing new pods onto a node
 	// that is about to be fenced.
 	TaintNodeHangPreCordon = "passiontech.dev/node-hang-precordon"
+	// TaintApiserverUnreachable is apiserver-node-reachability's
+	// mark on a node whose kubelet stays alive (fresh node-lease)
+	// while the apiserver's proxied path to it fails — the
+	// asymmetric "apiserver-dark" partition where node-side
+	// conditions all read healthy (incident 2026-11-12 nonprod
+	// lanit-04: webhook EOFs on linkerd-destination pods).
+	TaintApiserverUnreachable = "passiontech.dev/apiserver-unreachable"
 )
 
 // RemediationTaints is the canonical list of EVERY remediation
 // taint this platform stamps — kubelet-reaper, partition-evictor,
-// nodehealth (node-hang pre-cordon), and cpu-steal-taint-sync.
+// nodehealth (node-hang pre-cordon), cpu-steal-taint-sync, and
+// apiserver-node-reachability.
 // Callers that must survive or reason about remediation nodes
 // (storm gate census, Cilium L2 stale-holder checks, fencing
 // decisions) iterate this single list so adding a new remediation
-// taint touches one place — mirrors the 4-key REQUIRED_TAINTS
+// taint touches one place — mirrors the REQUIRED_TAINTS
 // list in passiontech-fluxcd scripts/check-taint-sync.sh, which is
 // its own static gate across descheduler/node-ops/SNR manifests.
 var RemediationTaints = []string{
 	TaintKubeletUnresponsive, TaintNetworkPartitioned,
-	TaintNodeHangPreCordon, TaintCPUSteal,
+	TaintNodeHangPreCordon, TaintCPUSteal, TaintApiserverUnreachable,
 }
 
 // ---------------------------------------------------------------------------

@@ -95,17 +95,20 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	// emptySweepClose is the ledger-hygiene tail for the early
-	// returns: with no series (or no pod census to judge them) the
-	// first-seen entries drop so the next real signal re-arms the
-	// FULL window, and the emitted ledger reconciles against an
-	// empty set so stale gauge series DeleteLabelValues instead of
-	// leaking a 1 past the incident.
-	emptySweepClose := func() probefw.Result {
-		p.seen.Prune(func(string) bool { return false })
-		var empty probefw.SweepReport
-		return empty.Result(&p.emitted,
+	// infraClose is the ledger-hygiene tail for transient-evidence
+	// early returns: a failed query/list is "can't tell", not
+	// "clean" — the first-seen windows keep counting and last
+	// sweep's firing gauge series carry forward instead of being
+	// pruned/deleted by an empty reconcile.
+	infraClose := func(err error) probefw.Result {
+		var rep probefw.SweepReport
+		for k, lv := range p.emitted.Last() {
+			rep.Carry(k, lv)
+		}
+		res := rep.Result(&p.emitted,
 			dragonflyReplicaSyncStormGauge.DeleteLabelValues, "", ", ")
+		res.Infra = err
+		return res
 	}
 
 	// Evidence phase (dragonfly_sync_storm_signals.go): the primary
@@ -114,9 +117,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	// sustained Prometheus outage as a healthy fleet.
 	ev, err := p.collectStormEvidence(ctx, log)
 	if err != nil {
-		res := emptySweepClose()
-		res.Infra = fmt.Errorf("dragonfly master-link query: %w", err)
-		return res
+		return infraClose(fmt.Errorf("dragonfly master-link query: %w", err))
 	}
 
 	// A Dragonfly CR the go-kube-downscaler parked at
@@ -137,9 +138,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		// The link findings this far stay unjudged — but the ledger
 		// hygiene still runs so a stale gauge series does not
 		// outlive the sweep that could not verify it.
-		res := emptySweepClose()
-		res.Infra = fmt.Errorf("list pods: %w", err)
-		return res
+		return infraClose(fmt.Errorf("list pods: %w", err))
 	}
 	podByKey := map[string]*corev1.Pod{}
 	for i := range pods {

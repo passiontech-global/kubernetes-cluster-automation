@@ -305,12 +305,12 @@ func (n *Deps) clampMSSOn(ctx context.Context, dev string) error {
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
 	if _, err := n.RunMountCmd(ctx,
-		append([]string{"iptables"}, args...)); err == nil {
+		append([]string{"iptables", "-w", "5"}, args...)); err == nil {
 		// Rule already present — nothing to do.
 		return nil
 	}
 	out, err := n.RunMountCmd(ctx,
-		[]string{"iptables", "-t", "mangle", "-A",
+		[]string{"iptables", "-w", "5", "-t", "mangle", "-A",
 			"POSTROUTING", "-o", dev, "-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS", "--clamp-mss-to-pmtu"})
@@ -335,11 +335,11 @@ func (n *Deps) UnclampMSSOn(ctx context.Context, dev string) {
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
 	if _, err := n.RunMountCmd(ctx,
-		append([]string{"iptables"}, args...)); err != nil {
+		append([]string{"iptables", "-w", "5"}, args...)); err != nil {
 		return // rule absent (or uncheckable) — nothing to remove
 	}
 	if out, err := n.RunMountCmd(ctx,
-		[]string{"iptables", "-t", "mangle", "-D",
+		[]string{"iptables", "-w", "5", "-t", "mangle", "-D",
 			"POSTROUTING", "-o", dev, "-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS", "--clamp-mss-to-pmtu"}); err != nil {

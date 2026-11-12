@@ -126,7 +126,7 @@ func (p *olmHealthCheck) olmCRPatch(gvr schema.GroupVersionResource,
 			o.GetName(), types.MergePatchType, data, metav1.PatchOptions{}); err != nil {
 			return err
 		}
-		probefw.MergeAnnoPatchLocally(o, data)
+		probefw.MergeAnnoPatchLocally(ctx, o, data)
 		return nil
 	}
 }

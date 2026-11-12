@@ -30,6 +30,7 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -98,8 +99,8 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 
 	csvs, err := p.AllUnstructured(ctx, olmCSVGVR)
 	switch {
-	case apierrors.IsNotFound(err):
-		return // OLM not installed
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		return // OLM not installed (or its CRDs absent — same quiet skip)
 	case err != nil:
 		metrics.IncError(p.Name)
 		log.Info("WARN: olm csv auto-patch — list failed", "error", err)
@@ -107,12 +108,18 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 	}
 	for i := range csvs {
 		csv := &csvs[i]
+		// The ensure/strip mutators write through unstructured
+		// SetNested* — run them on a CLONE: csvs is the sweep's
+		// memoized census, and mutating csv.Object in place would
+		// corrupt every sibling reader (and leave phantom spec
+		// behind when the heal gate below refuses the patch).
+		work := csv.DeepCopy()
 		var changed bool
 		switch {
 		case strings.HasPrefix(csv.GetName(), "argocd-operator."):
-			changed = ensureArgocdOperatorProbes(csv.Object)
+			changed = ensureArgocdOperatorProbes(work.Object)
 		case strings.HasPrefix(csv.GetName(), "node-maintenance-operator."):
-			changed = stripManagerLeaderElect(csv.Object)
+			changed = stripManagerLeaderElect(work.Object)
 		}
 		if !changed {
 			continue
@@ -139,6 +146,10 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		// threshold is the Heal-Revert Loop. Skip + report; the
 		// spec belongs in Git.
 		if !heal.FluxPatchGate("csv", csv, key, now) {
+			// Gate proceeded (grant consumed) but the revert-loop
+			// guard refuses the write — no patch executes, so the
+			// grant goes back (refund-on-skip contract).
+			heal.RefundGrant(now)
 			log.Info("skip heal: Flux Heal-Revert Loop detected — olm csv spec patch deferred",
 				"csv", key)
 			continue
@@ -158,7 +169,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		// the existing map) so one write lands the heal and its
 		// persisted cooldown together.
 		deployments, _ := kube.NestedSlice(
-			csv.Object, "spec", "install", "spec", "deployments")
+			work.Object, "spec", "install", "spec", "deployments")
 		// metadata.resourceVersion pins the write — the listed
 		// snapshot's deployments array goes back wholesale, so an
 		// OLM write landing in the List→Patch window (mid-upgrade
@@ -180,6 +191,9 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		})
 		if err != nil {
 			metrics.IncError(p.Name)
+			// Marshal failed BEFORE the patch was attempted — no
+			// mutation executed, hand the grant back.
+			heal.RefundGrant(now)
 			continue
 		}
 		if _, err := p.Dyn.Resource(olmCSVGVR).
@@ -395,7 +409,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 
 	plans, err := p.AllUnstructured(ctx, olmInstallPlanGVR)
 	switch {
-	case apierrors.IsNotFound(err):
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		return
 	case err != nil:
 		metrics.IncError(p.Name)
@@ -448,6 +462,9 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		})
 		if err != nil {
 			metrics.IncError(p.Name)
+			// Marshal failed BEFORE the patch was attempted — no
+			// mutation executed, hand the grant back.
+			heal.RefundGrant(now)
 			continue
 		}
 		if _, err := p.Dyn.Resource(olmInstallPlanGVR).

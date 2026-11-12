@@ -211,7 +211,8 @@ func TestDriftRunNoDrift(t *testing.T) {
 
 // Drift held for the streak length latches
 // state-cp-cert-reload-stale and restarts the owning unit under the
-// last-cp-cert-restart budget; the streak resets after the restart.
+// shared last-sig13-restart controller budget; the streak resets
+// after the restart.
 func TestDriftRunLatchesAndRestarts(t *testing.T) {
 	sock, _ := mintLeafPEM(t, 1, time.Now().Add(24*time.Hour))
 	_, diskPEM := mintLeafPEM(t, 2, time.Now().Add(48*time.Hour))
@@ -242,7 +243,7 @@ func TestDriftRunLatchesAndRestarts(t *testing.T) {
 	if got := e.H.State.Counter(cdeps.FileCtrPKIDriftPre + "0"); got != 0 {
 		t.Fatalf("streak counter=%d want 0 (reset after restart)", got)
 	}
-	if e.H.State.RateOK(cdeps.FileRatePKIRestart,
+	if e.H.State.RateOK(cdeps.FileRateRestart,
 		e.H.Cfg.PKIDrift.RestartInterval) {
 		t.Fatal("restart budget not spent")
 	}
@@ -284,7 +285,7 @@ func TestDriftRunRestartFails(t *testing.T) {
 		cdeps.CheckPKIDrift, "restart_unit")); v != 1 {
 		t.Fatalf("restart_unit counter=%v want 1 (attempt counts)", v)
 	}
-	if e.H.State.RateOK(cdeps.FileRatePKIRestart,
+	if e.H.State.RateOK(cdeps.FileRateRestart,
 		e.H.Cfg.PKIDrift.RestartInterval) {
 		t.Fatal("failed restart did not spend the budget")
 	}
@@ -296,7 +297,7 @@ func TestDriftRunCooldownSkipsRestart(t *testing.T) {
 	sock, _ := mintLeafPEM(t, 1, time.Now().Add(24*time.Hour))
 	_, diskPEM := mintLeafPEM(t, 2, time.Now().Add(48*time.Hour))
 	e := driftEnv(t, sock, nil, diskPEM)
-	e.H.State.RateSpend(cdeps.FileRatePKIRestart) // budget just spent
+	e.H.State.RateSpend(cdeps.FileRateRestart) // shared budget just spent
 	streak := e.H.StreakCycles(e.H.Cfg.PKIDrift.Cycles)
 
 	for range streak {
@@ -348,12 +349,40 @@ func TestDriftRunDryRun(t *testing.T) {
 	if got := e.H.State.Counter(cdeps.FileCtrPKIDriftPre + "0"); got != streak {
 		t.Fatalf("streak counter=%d want %d (dry-run keeps the streak)", got, streak)
 	}
-	if !e.H.State.RateOK(cdeps.FileRatePKIRestart,
+	if !e.H.State.RateOK(cdeps.FileRateRestart,
 		e.H.Cfg.PKIDrift.RestartInterval) {
 		t.Fatal("dry-run spent the restart budget")
 	}
 	if v := promtest.ToFloat64(e.H.Actions.WithLabelValues(
 		cdeps.CheckPKIDrift, "restart_unit")); v != 0 {
 		t.Fatalf("restart_unit counter=%v want 0 in dry-run", v)
+	}
+}
+
+// A pair targeting a non-controller unit (kine.service) spends the
+// pki-private budget file and leaves the shared controller budget
+// untouched — the two budgets must not cross-cool each other.
+func TestDriftRunNonControllerUnitKeepsPrivateBudget(t *testing.T) {
+	sock, _ := mintLeafPEM(t, 1, time.Now().Add(24*time.Hour))
+	_, diskPEM := mintLeafPEM(t, 2, time.Now().Add(48*time.Hour))
+	e := driftEnv(t, sock, nil, diskPEM)
+	e.H.Cfg.PKIDrift.Pairs[0].Unit = "kine.service"
+	streak := e.H.StreakCycles(e.H.Cfg.PKIDrift.Cycles)
+
+	for range streak {
+		cdepstest.Check[*pki.DriftCheck](e.H, cdeps.CheckPKIDrift).Run(context.Background())
+	}
+
+	if e.RstN() != 1 || e.RstAt(0) != "kine.service" {
+		t.Fatalf("restarts=%d first=%q want kine.service",
+			e.RstN(), e.RstAt(0))
+	}
+	if e.H.State.RateOK(cdeps.FileRatePKIRestart,
+		e.H.Cfg.PKIDrift.RestartInterval) {
+		t.Fatal("kine.service restart did not spend the pki-private budget")
+	}
+	if !e.H.State.RateOK(cdeps.FileRateRestart,
+		e.H.Cfg.Sig13.MinRestart) {
+		t.Fatal("kine.service restart leaked into the shared controller budget")
 	}
 }

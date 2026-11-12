@@ -43,7 +43,7 @@ func pemKeyFile(t *testing.T) string {
 // shares.
 func dialLive(t *testing.T, keyPath string, port int, user string) (Conn, context.CancelFunc) {
 	t.Helper()
-	d, err := newSSHDialer(keyPath, port, 5*time.Second, nil)
+	d, err := newSSHDialer(keyPath, port, 5*time.Second, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

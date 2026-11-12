@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -82,11 +83,29 @@ const (
 // Preemptor audits the controller's leader-election Lease and
 // shortens its duration when the holder is provably dead. The zero
 // value uses node-ops defaults and the system clock.
+//
+// renewWatch is the frozen-renewTime detector: spec.renewTime is
+// stamped by the HOLDER's clock, so comparing it against this
+// replica's wall clock reads skew as staleness (a fast standby
+// clock would "prove" a healthy leader dead). Instead the watch
+// records WHEN (on this replica's own clock — one clock domain, no
+// skew possible) the observed (renewTime, holderIdentity) pair last
+// CHANGED; a pair frozen past PreemptStaleAfter is the dead-holder
+// proof. A standby that just booted has no baseline — its first
+// sweep primes the watch and it waits one PreemptStaleAfter window
+// before it can preempt, which costs ≤30s against the 180s lease it
+// replaces and eliminates the false-positive class entirely.
 type Preemptor struct {
 	CS        kubernetes.Interface
 	Now       timex.Clock
 	Namespace string // zero → DefaultNamespace
 	LeaseName string // zero → DefaultLeaseName
+
+	mu           sync.Mutex
+	primed       bool
+	lastRenew    time.Time
+	lastHolder   string
+	lastChangeAt time.Time
 }
 
 func (p *Preemptor) ns() string {
@@ -142,18 +161,49 @@ func (p *Preemptor) Sweep(ctx context.Context) (string, error) {
 	return reason, nil
 }
 
-// holderDead reports whether the lease's renewTime is stale past
-// PreemptStaleAfter AND the holder pod is provably dead — deleted,
-// terminating, or scheduled on a node that is NotReady/Unknown or
-// carries a dead-node taint. The renewTime gate runs FIRST: a
-// recently-renewed lease is healthy regardless of what the pod
-// lookup would say (the holder may be mid-restart with a fresh
-// standby about to take over).
+// renewFrozen reports whether the lease's (renewTime, holderIdentity)
+// pair has not changed for longer than PreemptStaleAfter ON THIS
+// REPLICA'S CLOCK — the skew-free staleness proof that replaces the
+// old holder-clock-vs-standby-clock subtraction. Any observed change
+// (a renew landing, a new holder acquiring) resets the window
+// immediately, so a recovered leader is never preempted for a stale
+// baseline.
+func (p *Preemptor) renewFrozen(lease *coordinationv1.Lease) bool {
+	now := p.Now.Now()
+	renew := time.Time{}
+	if lease.Spec.RenewTime != nil {
+		renew = lease.Spec.RenewTime.Time
+	}
+	holder := ""
+	if lease.Spec.HolderIdentity != nil {
+		holder = *lease.Spec.HolderIdentity
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.primed || !renew.Equal(p.lastRenew) || holder != p.lastHolder {
+		p.primed = true
+		p.lastRenew = renew
+		p.lastHolder = holder
+		p.lastChangeAt = now
+		return false // first observation or a live change — not frozen
+	}
+	// >= not >: the frozen window IS PreemptStaleAfter — waiting for
+	// the strict inequality added a full extra sweep interval of
+	// dead-leader tolerance on top of the proof window.
+	return now.Sub(p.lastChangeAt) >= PreemptStaleAfter
+}
+
+// holderDead reports whether the lease's renew/holder pair is frozen
+// past PreemptStaleAfter AND the holder pod is provably dead —
+// deleted, terminating, or scheduled on a node that is
+// NotReady/Unknown or carries a dead-node taint. The frozen gate
+// runs FIRST: a recently-changed pair is healthy regardless of what
+// the pod lookup would say (the holder may be mid-restart with a
+// fresh standby about to take over).
 func (p *Preemptor) holderDead(ctx context.Context,
 	lease *coordinationv1.Lease) (reason string, dead bool) {
 
-	if lease.Spec.RenewTime == nil ||
-		p.Now.Now().Sub(lease.Spec.RenewTime.Time) <= PreemptStaleAfter {
+	if !p.renewFrozen(lease) {
 		return "", false
 	}
 	holder := ""

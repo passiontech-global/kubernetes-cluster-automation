@@ -24,11 +24,11 @@ func TestImagePullStormSingleNamespace(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting stamps the first-seen ledger — inside 10m.
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting inside the window must pass: %+v", res)
 	}
 	base = base.Add(11 * time.Minute)
-	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("pull backoff persisting past the window must fail: %+v", res)
 	}
@@ -45,9 +45,9 @@ func TestImagePullStormMultiNamespaceIsOutage(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 
-	probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+	probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 	base = base.Add(11 * time.Minute)
-	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("multi-namespace pull failures must fail: %+v", res)
 	}
@@ -69,9 +69,9 @@ func TestImagePullStormRegistryMarkerIsOutage(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 
-	probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+	probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 	base = base.Add(11 * time.Minute)
-	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("registry-rate-limit message must fail: %+v", res)
 	}
@@ -98,9 +98,9 @@ func TestImagePullStormMarkerPrecision(t *testing.T) {
 			p := testProber(cs)
 			base := time.Now()
 			p.Now = func() time.Time { return base }
-			probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 			base = base.Add(11 * time.Minute)
-			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 			if res.Pass {
 				t.Fatalf("single-namespace pull failure must still fail: %+v", res)
 			}
@@ -128,9 +128,9 @@ func TestImagePullStormMarkerPrecision(t *testing.T) {
 			p := testProber(cs)
 			base := time.Now()
 			p.Now = func() time.Time { return base }
-			probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 			base = base.Add(11 * time.Minute)
-			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx)
+			res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx))
 			if !strings.Contains(res.Why, "cluster_registry_pull_outage") {
 				t.Fatalf("outage marker %q missed: %q", msg, res.Why)
 			}
@@ -152,11 +152,11 @@ func TestImagePullStormOldPodNewStormInsideWindow(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("old pod with a fresh pull failure must pass: %+v", res)
 	}
 	base = base.Add(11 * time.Minute)
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("storm persisting past the window must fail: %+v", res)
 	}
 }
@@ -171,7 +171,7 @@ func TestImagePullStormRecoveredContainerReArms(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting must pass: %+v", res)
 	}
 	// Container recovers, then storms again — the re-armed window
@@ -182,7 +182,7 @@ func TestImagePullStormRecoveredContainerReArms(t *testing.T) {
 		t.Fatal(err)
 	}
 	base = base.Add(9 * time.Minute)
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("recovered pod must pass: %+v", res)
 	}
 	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
@@ -191,7 +191,7 @@ func TestImagePullStormRecoveredContainerReArms(t *testing.T) {
 		t.Fatal(err)
 	}
 	base = base.Add(2 * time.Minute)
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("re-armed storm inside its own window must pass: %+v", res)
 	}
 }
@@ -204,7 +204,7 @@ func TestImagePullStormHealthyPasses(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*imagePullStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy pod must pass: %+v", res)
 	}
 }

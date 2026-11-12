@@ -42,8 +42,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -112,8 +114,9 @@ type esEmptyKey struct {
 }
 
 type externalSecretNudge struct {
-	cs  kubernetes.Interface // connect-pod heal target lists + deletes
-	dyn dynamic.Interface
+	cs   kubernetes.Interface // connect-pod heal target lists + deletes
+	dyn  dynamic.Interface
+	meta metadata.Interface // ListPartialOrFallback's preferred read for the secret index
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -147,10 +150,23 @@ type externalSecretNudge struct {
 	// /metrics never leaks a stale "empty" series.
 	emptyKeyEmitted state.GaugeLedger[esEmptyKey]
 	// secretReads memoizes one nudge pass's target-Secret Gets by
-	// "ns/name" — the empty-key audit reads every Ready ES's target
-	// and the skeleton reaper re-reads the same Secret for a stuck
-	// ES, so identical ns/name lookups collapse to one Get each.
+	// "ns/name" — the cache-miss path of secretVerdict re-reads the
+	// same Secret for a stuck ES's audit + skeleton check, so
+	// identical ns/name lookups collapse to one Get each. Reset at
+	// the top of every nudge pass: it must never outlive the pass.
 	secretReads map[string]secretRead
+	// secretIndex / secretIndexOK are the per-pass metadata LIST
+	// census of target Secrets (secret_probe.go): index["ns/name"]
+	// carries UID+resourceVersion, indexOK marks the namespaces
+	// whose LIST actually succeeded. Rebuilt every nudge pass.
+	secretIndex   map[string]secretMeta
+	secretIndexOK map[string]bool
+	// secretVerdicts is the persistent RV-keyed verdict cache —
+	// an entry replays only while the ES's RV, the target Secret's
+	// UID and RV all still match (validFor), so steady-state passes
+	// cost zero Secret GETs. Entries for vanished ExternalSecrets
+	// are pruned each pass alongside storeReady.
+	secretVerdicts map[string]esSecretVerdict
 	// syncDegradedSince: "ns/pod" of a connect pod whose connect-sync
 	// container is degraded → first sweep it was observed — the
 	// persistence clock for the connect-sync auto-heal trigger (a
@@ -175,12 +191,30 @@ func Setup(d shared.Deps) error {
 		n := &externalSecretNudge{
 			cs:         d.CS,
 			dyn:        d.Dyn,
+			meta:       d.Meta,
 			queue:      d.Name,
 			now:        shared.SystemClock,
 			storeReady: map[string]bool{},
 		}
 		return shared.AddPeriodic(d.Mgr, n.queue, esNudgeInterval, n.run)
 	})
+}
+
+// resetESOState drops every ESO-scoped in-memory tracking map when
+// the ExternalSecret/SecretStore CRDs disappear — the verified-empty
+// census counterpart of the per-pass prunes: store readiness edges,
+// down/storm/degradation persistence clocks, the verdict cache and
+// the connect-heal cooldown all describe objects that no longer
+// exist, and a reinstall must start from a clean slate.
+func (n *externalSecretNudge) resetESOState() {
+	n.storeReady = map[string]bool{}
+	n.storeDownSince.Prune(func(string) bool { return false })
+	n.stormSince = time.Time{}
+	n.syncDegradedSince.Prune(func(string) bool { return false })
+	n.connectHeals.Prune(func(string, time.Time) bool { return false })
+	if n.secretVerdicts != nil {
+		n.secretVerdicts = map[string]esSecretVerdict{}
+	}
 }
 
 func (n *externalSecretNudge) run(ctx context.Context) error {
@@ -194,6 +228,22 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		// error — skip quietly instead of spamming "could not find
 		// the requested resource" every 10 minutes.
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			// CRD removal is a verified-empty census, not an
+			// unverifiable read: prune every emitted empty-key
+			// series so gauges flagged while ESO was installed do
+			// not linger after the CRDs go away. Begin first so a
+			// previously-aborted sweep's leftover "current"
+			// emissions cannot survive the prune as pinned series.
+			n.emptyKeyEmitted.Begin()
+			n.emptyKeyEmitted.Prune(metrics.ExternalSecretEmptyKey.DeleteLabelValues)
+			// The storm-suppression gauge and every ESO-scoped
+			// in-memory map/ledger reset with the CRDs — a
+			// reinstall must re-observe store health, storm
+			// persistence and connect-pod degradation from zero
+			// instead of inheriting the uninstalled operator's
+			// stale clocks.
+			metrics.ExternalSecretStormSuppressed.Set(0)
+			n.resetESOState()
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}

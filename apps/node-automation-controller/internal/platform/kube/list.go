@@ -42,6 +42,25 @@ const DefaultListPageSize = 500
 // below do the adapting.
 type PageFunc[T any] func(ctx context.Context, opts metav1.ListOptions) (items []T, next string, err error)
 
+// pageOpts sanitizes ListOptions for one paginated fetch — the
+// apiserver rejects the combinations callers legitimately build: a
+// Continue token already encodes the resourceVersion (RV + Continue
+// → 400 "specifying resource version is not allowed when using
+// continue" — ResourceVersionMatch is part of that same
+// consistency contract and must clear with it), and
+// ResourceVersion="0" (watch-cache read) rejects Limit — the cache
+// serves the whole list in one page, so pagination is meaningless
+// there anyway.
+func pageOpts(opts metav1.ListOptions) metav1.ListOptions {
+	if opts.Continue != "" {
+		opts.ResourceVersion = ""
+		opts.ResourceVersionMatch = ""
+	} else if opts.ResourceVersion == "0" {
+		opts.Limit = 0
+	}
+	return opts
+}
+
 // ListEach drives a paginated List to completion, invoking visit once
 // per page with that page's items (a page may legitimately be empty —
 // visit still runs so per-page side effects stay ordered). The first
@@ -53,7 +72,7 @@ type PageFunc[T any] func(ctx context.Context, opts metav1.ListOptions) (items [
 func ListEach[T any](ctx context.Context, opts metav1.ListOptions,
 	page PageFunc[T], visit func(items []T) error) error {
 	for {
-		items, next, err := page(ctx, opts)
+		items, next, err := page(ctx, pageOpts(opts))
 		if err != nil {
 			return err
 		}
@@ -199,6 +218,17 @@ func ResourceQuotas(cs kubernetes.Interface, namespace string) PageFunc[corev1.R
 		func(l *corev1.ResourceQuotaList) []corev1.ResourceQuota { return l.Items })
 }
 
+// Endpoints lists core Endpoints in namespace.
+//
+//nolint:staticcheck // SA1019: the deprecated kind is still served and still written by endpoints-DCS consumers (Patroni); the metadata-fallback path needs it.
+func Endpoints(cs kubernetes.Interface, namespace string) PageFunc[corev1.Endpoints] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.EndpointsList, error) {
+			return cs.CoreV1().Endpoints(namespace).List(ctx, o)
+		},
+		func(l *corev1.EndpointsList) []corev1.Endpoints { return l.Items })
+}
+
 // EndpointSlices lists discovery EndpointSlices in namespace.
 func EndpointSlices(cs kubernetes.Interface, namespace string) PageFunc[discoveryv1.EndpointSlice] {
 	return typedPage(
@@ -235,6 +265,15 @@ func Events(cs kubernetes.Interface, namespace string) PageFunc[corev1.Event] {
 			return cs.CoreV1().Events(namespace).List(ctx, o)
 		},
 		func(l *corev1.EventList) []corev1.Event { return l.Items })
+}
+
+// LimitRanges lists core LimitRanges in namespace.
+func LimitRanges(cs kubernetes.Interface, namespace string) PageFunc[corev1.LimitRange] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.LimitRangeList, error) {
+			return cs.CoreV1().LimitRanges(namespace).List(ctx, o)
+		},
+		func(l *corev1.LimitRangeList) []corev1.LimitRange { return l.Items })
 }
 
 // PersistentVolumeClaims lists PersistentVolumeClaims in namespace.

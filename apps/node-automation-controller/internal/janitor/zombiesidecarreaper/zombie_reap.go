@@ -4,8 +4,11 @@
 // of the reap.Sweep delete loop in zombie_sidecar_reaper.go.
 // Deleting a pod whose Job has not counted its exit-0
 // completion makes the job-controller recreate it and re-run the
-// Job (BUG-C1); the backoffLimit==0 exemption (sidecar-shutdown-fallback) exists
-// because such a Job can spawn no replacement.
+// Job (BUG-C1). There is NO backoffLimit exemption: deleting a
+// still-Running pod counts as a pod failure against backoffLimit,
+// so on a backoffLimit==0 Job the delete is an instant
+// BackoffLimitExceeded — the one shape where force-reaping is
+// strictly worse than leaving the zombie for a human.
 package zombiesidecarreaper
 
 import (
@@ -56,14 +59,19 @@ func allZeroExit(p *corev1.Pod) bool {
 // no controller can recreate the pod — safe to reap; any other Get
 // failure is "cannot verify" and fails closed.
 //
-// sidecar-shutdown-fallback exception: a Job with spec.backoffLimit==0 spawns NO
-// replacement pod once its single pod terminates, so the BUG-C1
-// re-run hazard cannot happen — once a shutdown attempt already ran
-// (shutdownAttempted: this cycle's failed call counted only from
-// the NEXT cycle on via the `tried` ledger, or unconditionally on
-// the poked path), the zombie may be reaped even while
-// job.Status.Succeeded is still 0.
-func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, shutdownAttempted bool) bool {
+// P1 fix — NO backoffLimit==0 exemption: the old code reasoned "no
+// replacement pod can spawn, so the BUG-C1 re-run hazard cannot
+// happen" and force-reaped the zombie once a shutdown attempt had
+// run. But deleting a still-Running pod is itself a pod FAILURE in
+// the job-controller's accounting — on a backoffLimit==0 Job that
+// single failure is an instant BackoffLimitExceeded, turning a
+// recoverable stuck Job into a permanently Failed one (linkerd's
+// admin :4191/shutdown 403s non-loopback callers, so both graceful
+// paths can be unreachable and the delete fired on cycle 2 while
+// job.Status.Succeeded was still 0). The zombie now stays until the
+// Job completes on its own or a human intervenes — the reap metric
+// and per-cycle log keep the stuck state visible.
+func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod) bool {
 	if !allZeroExit(p) {
 		return true
 	}
@@ -90,18 +98,11 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 		return false
 	case jobComplete(job):
 		return true
-	case shutdownAttempted && job.Spec.BackoffLimit != nil &&
-		*job.Spec.BackoffLimit == 0 && singleCompletionJob(job):
-		// backoffLimit==0: no replacement pod can spawn, so the
-		// BUG-C1 re-run hazard is impossible — reap the zombie
-		// even though the Job never counted the exit-0 completion.
-		log.Info("REAP: backoffLimit=0 Job cannot respawn — allowing zombie reap",
-			"pod", p.Namespace+"/"+p.Name, "job", jobName)
-		return true
 	default:
-		log.Info("KEEP: Job not Complete — deleting the Running pod would re-run it",
+		log.Info("KEEP: Job not Complete — deleting the Running pod counts as a failure (backoffLimit) or re-runs it",
 			"pod", p.Namespace+"/"+p.Name, "job", jobName,
-			"succeeded", job.Status.Succeeded)
+			"succeeded", job.Status.Succeeded,
+			"backoffLimit", job.Spec.BackoffLimit)
 		return false
 	}
 }
@@ -127,13 +128,4 @@ func jobComplete(job *batchv1.Job) bool {
 		}
 	}
 	return false
-}
-
-// singleCompletionJob reports whether the Job schedules exactly one
-// pod (spec.completions unset or 1) — the shape the backoffLimit==0
-// exemption was designed for. On a parallel Job a deleted pod counts
-// as a failure against backoffLimit, so reaping a zombie sibling
-// would fail the whole Job rather than merely skip a respawn.
-func singleCompletionJob(job *batchv1.Job) bool {
-	return job.Spec.Completions == nil || *job.Spec.Completions <= 1
 }

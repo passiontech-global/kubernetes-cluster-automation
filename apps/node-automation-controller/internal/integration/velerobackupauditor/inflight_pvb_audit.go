@@ -336,7 +336,18 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 	// the error log and the IncError, but there is nothing left to
 	// re-drive the retry against (the census will not list the
 	// deleted PVB/PVR again).
-	if agent != nil && agent.Status.Phase != corev1.PodRunning {
+	//
+	// The not-Ready half of the bounce is AGE-GATED: a Running pod
+	// that never reached Ready AND predates the transfer start was
+	// unready through the whole wedge window — its thread is dead
+	// and only a recreate fixes it. A pod created AFTER objStart is
+	// a fresh replacement still inside init — bouncing it would
+	// restart a healthy startup, so it keeps its Phase==Running
+	// exemption.
+	predatesTransfer := agent != nil &&
+		agent.CreationTimestamp.Time.Before(objStart)
+	if agent != nil && (agent.Status.Phase != corev1.PodRunning ||
+		(!kube.PodReadyCond(agent) && predatesTransfer)) {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
 			kube.UIDDeleteOptions(agentUID, "")); err != nil && !apierrors.IsNotFound(err) {
@@ -403,14 +414,18 @@ func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 
 // pvbAgentWedged reports whether the agent pod provably lost its
 // Kopia thread: the pod is gone, not Running, was (re)created after
-// the PVB started, or any container restarted/terminated after the
-// PVB started — in every case the in-process kopia backup is dead
-// while the PVB object still claims InProgress.
+// the PVB started, a container restarted/terminated after the PVB
+// started, or the pod never reached Ready — in every case the
+// in-process kopia backup is dead while the PVB object still claims
+// InProgress. Phase==Running alone is NOT proof the thread lives:
+// the node-agent's readiness gate covers the kopia serve path, so a
+// pod that stayed Running+NotReady through the whole >6h window
+// never owned a working thread (pod-health-audit).
 func pvbAgentWedged(pvbStart time.Time, pod *corev1.Pod) bool {
 	if pod == nil {
 		return true // agent gone — nothing owns the thread
 	}
-	if pod.Status.Phase != corev1.PodRunning {
+	if pod.Status.Phase != corev1.PodRunning || !kube.PodReadyCond(pod) {
 		return true
 	}
 	if pod.Status.StartTime != nil && pod.Status.StartTime.After(pvbStart) {

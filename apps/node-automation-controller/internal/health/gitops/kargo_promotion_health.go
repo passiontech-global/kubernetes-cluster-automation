@@ -29,7 +29,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -221,16 +220,26 @@ func kargoPhaseStuck(phase string) bool {
 // starved Warehouse so the controller retries artifact discovery —
 // 1h per-Warehouse cooldown, the wider of the in-RAM ledger and the
 // last-kargo-refresh stamp the previous patch (ours or an
-// operator's) left behind. The write side stays hand-rolled:
+// operator's) left behind. The gate is the shared persisted shape
+// (Deps.HealAllowedPersisted → heal.AllowedVPersisted): cooldown →
+// maintenance mutex → heal budget, fail closed on unverifiable —
+// the nudge makes the warehouse controller do real fetch work, so
+// it rides the same protection as every other write-heal instead of
+// the bare PersistedCooledDown that skipped mutex + budget.
 // StampPersisted emits a single-annotation patch and this nudge
 // needs AnnoKargoRefresh AND AnnoLastKargoRefresh landed together —
 // the same shape maybePatchHRRetry uses for its annotation triple.
-// Annotation nudges are non-destructive: no maintenance mutex.
 func (p *kargoPromotionHealthCheck) maybeRefreshKargoWarehouse(ctx context.Context,
 	log logr.Logger, wh *unstructured.Unstructured, key string, now time.Time) {
 
-	if heal.PersistedCooledDown(&p.warehouseRefreshHealed, wh,
-		kube.AnnoLastKargoRefresh, key, kargoWarehouseRefreshCool, now) {
+	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+		&p.warehouseRefreshHealed, wh, kube.AnnoLastKargoRefresh, key,
+		kargoWarehouseRefreshCool, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 	token := now.UTC().Format(time.RFC3339)

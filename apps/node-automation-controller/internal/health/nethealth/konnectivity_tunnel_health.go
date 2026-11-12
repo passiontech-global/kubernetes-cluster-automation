@@ -130,19 +130,34 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 
 	// The connection counts only exist where a Prometheus endpoint
 	// resolves — same "no endpoint configured, skip" gate the other
-	// metrics-backed checks use.
+	// metrics-backed checks use. An unreadable endpoint or failed
+	// query is "can't tell", NOT "resolved": every tuple the last
+	// sweep fired Carries + re-Finds (the imagepull_secret_auditor
+	// pattern) so a monitoring flap cannot prune live half-open
+	// series — and the seen ledger stays untouched so the 10m
+	// persistence windows do not re-arm on a Prometheus outage.
+	var rep probefw.SweepReport
+	carry := func(what string, err error) probefw.Result {
+		log.Info("WARN: "+what+" — half-open signal carried, not evaluated",
+			"error", err)
+		for k, lv := range p.emitted.Last() {
+			rep.Carry(k, lv)
+			rep.Find(k + "(prometheus unreadable — carried)")
+		}
+		return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
+			"konnectivity-agent pods with half-open tunnels: ", ", ")
+	}
 	if _, err := p.PromEndpoint(); err != nil {
-		return probefw.Result{Pass: true}
+		return carry("konnectivity prometheus endpoint unavailable", err)
 	}
 	series, err := p.PromQuery(ctx,
 		`konnectivity_network_proxy_agent_open_server_connections`)
 	if err != nil {
 		// An unreachable Prometheus is inconclusive, not a clean
 		// bill — warn and pass rather than fail the sweep on a
-		// monitoring outage (the coredns/rabbitmq posture).
-		log.Info("WARN: konnectivity agent connections query failed — "+
-			"half-open signal skipped", "error", err)
-		return probefw.Result{Pass: true}
+		// monitoring outage (the coredns/rabbitmq posture), but the
+		// previously-firing tuples still carry forward.
+		return carry("konnectivity agent connections query failed", err)
 	}
 	conns := map[string]float64{}
 	for _, s := range series {
@@ -156,7 +171,8 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	// proof and the heal target) is skipped on the common path. A
 	// wholly empty result reads as healthy here: konnectivity-agent
 	// never scraped is a monitoring gap, not tunnel evidence.
-	var rep probefw.SweepReport
+	// (rep was declared above for the Prometheus-error carry path —
+	// this sweep's emits reuse it.)
 	deficit := false
 	for _, v := range conns {
 		if v < float64(expectedCP) {
@@ -164,12 +180,15 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			break
 		}
 	}
-	if !deficit {
-		// Healthy — but the reconcile still owes the ledgers: a tuple
-		// emitted last sweep must be DeleteLabelValues'd now that the
-		// deficit is gone, and seen entries must drop so a recovering
-		// agent re-arms the window. Returning Pass without the
-		// reconcile leaks a series pinned at 1 forever.
+	if !deficit && len(p.emitted.Last()) == 0 {
+		// Healthy AND nothing held from last sweep — but the
+		// reconcile still owes the ledgers: seen entries must drop
+		// so a recovering agent re-arms the window. (Returning Pass
+		// without the reconcile would leak series pinned at 1.)
+		// The cheap exit only applies when the emitted ledger is
+		// empty: with held tuples a pod whose series VANISHED this
+		// sweep is indistinguishable from a resolved one until the
+		// pod census runs — "can't tell" must carry, not prune.
 		p.seen.Prune(func(string) bool { return false })
 		return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
 			"konnectivity-agent pods with half-open tunnels: ", ", ")
@@ -192,7 +211,16 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		if !ok {
 			// The pod has no series — inconclusive, never evidence:
 			// it cannot count as the "servers are reachable" peer
-			// and it is not flagged either.
+			// and it is not flagged either. But "can't tell" is not
+			// "resolved": keep its first-seen stamp and carry any
+			// emitted tuple, or a one-sweep metrics gap would prune
+			// a live half-open series and re-arm the 10m window.
+			key := pod.Namespace + "/" + pod.Name
+			halfOpen[key] = true
+			if lv, held := p.emitted.Last()[key]; held {
+				rep.Carry(key, lv)
+				rep.Find(key + "(connections series missing — carried)")
+			}
 			continue
 		}
 		if v >= float64(expectedCP) {

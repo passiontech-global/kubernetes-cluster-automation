@@ -11,22 +11,30 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // AllPods returns the sweep's cluster-wide pod census — one paged
 // LIST per run(), memoized; outside a sweep it lists fresh per call
-// (the pre-snapshot semantics).
+// (the pre-snapshot semantics). Pods deleted mid-sweep are hidden
+// by the overlay tombstones (kube.FilterPodTombstones) — the O(1)
+// replacement for the per-delete InvalidatePods re-LIST storm: the
+// memoized census stays valid, the tombstone set does the hiding.
 func (d *Deps) AllPods(ctx context.Context) ([]corev1.Pod, error) {
 	s := sweepSnap(ctx)
-	return s.pods.get(func(bool) ([]corev1.Pod, error) {
+	pods, err := s.pods.get(func(bool) ([]corev1.Pod, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+			snapshotListOpts(),
 			kube.Pods(d.CS, metav1.NamespaceAll))
 	})
+	if err != nil {
+		return nil, err
+	}
+	return kube.FilterPodTombstones(ctx, pods), nil
 }
 
 // PodsIn filters the shared census to one namespace — the client-side
@@ -74,25 +82,59 @@ func (d *Deps) PodsMatching(ctx context.Context, ns, selector string) ([]*corev1
 	return out, nil
 }
 
+// podNodeIndex is the memoized PodNodes payload: the "ns/name" →
+// spec.nodeName placement map plus the parallel "ns/name" → UID
+// lookup the per-read tombstone filter needs — the placement keys
+// carry no UID and kube.IsPodDeleted is keyed by UID, so the join
+// must remember it. One memo so the pair can never diverge across
+// an invalidation.
+type podNodeIndex struct {
+	node map[string]string
+	uid  map[string]types.UID
+}
+
 // PodNodes is the pod twin: "ns/name" → spec.nodeName over the
 // shared pod census — the placement join the endpoint zone
 // resolvers walk as their last fallback (a slice's own zone and
 // nodeName hints can lag a rebinding; the pod's bound node is the
 // ground truth) and the targetRef → node hop the skew checks make.
-// Same memoized-error posture as NodeZones, and pod-derived — a
-// mid-sweep pod delete stales it, so InvalidatePods drops it
-// alongside the census. Read-only like every snapshot payload.
+// Same memoized-error posture as NodeZones.
+//
+// Deleted pods are filtered on EVERY read, not just at memo build:
+// AllPods hides tombstoned pods (kube.FilterPodTombstones) but the
+// O(1) MarkPodDeleted path deliberately does NOT invalidate the
+// derived join — a pod deleted after the first PodNodes call would
+// otherwise keep its placement entry for every later check in the
+// sweep. The returned map is a fresh filtered copy: the memoized
+// index stays untouched (snapshot payloads are read-only) and
+// callers cannot alias-corrupt it.
 func (d *Deps) PodNodes(ctx context.Context) (map[string]string, error) {
 	s := sweepSnap(ctx)
-	return s.podNodes.get(func(bool) (map[string]string, error) {
+	idx, err := s.podNodes.get(func(bool) (podNodeIndex, error) {
 		pods, err := d.AllPods(ctx)
 		if err != nil {
-			return nil, err
+			return podNodeIndex{}, err
 		}
-		m := make(map[string]string, len(pods))
+		idx := podNodeIndex{
+			node: make(map[string]string, len(pods)),
+			uid:  make(map[string]types.UID, len(pods)),
+		}
 		for i := range pods {
-			m[pods[i].Namespace+"/"+pods[i].Name] = pods[i].Spec.NodeName
+			key := pods[i].Namespace + "/" + pods[i].Name
+			idx.node[key] = pods[i].Spec.NodeName
+			idx.uid[key] = pods[i].UID
 		}
-		return m, nil
+		return idx, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(idx.node))
+	for key, node := range idx.node {
+		if uid, ok := idx.uid[key]; ok && kube.IsPodDeleted(ctx, uid) {
+			continue
+		}
+		out[key] = node
+	}
+	return out, nil
 }

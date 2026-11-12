@@ -27,8 +27,13 @@ Cache=yes
 	// disciplined instead of drifting unsynced.
 	if c.r.serviceState(c.ctx, "systemd-timesyncd.service") != "" ||
 		c.r.fileExists("/etc/systemd/system/systemd-timesyncd.service") ||
-		fileExistsNoRoot("/usr/lib/systemd/system/systemd-timesyncd.service") ||
-		fileExistsNoRoot("/lib/systemd/system/systemd-timesyncd.service") {
+		// Host paths — the unit lives on the HOST filesystem, so the
+		// probe must go through HostRoot like every other host-side
+		// fileExists in this file (fileExistsNoRoot would stat the
+		// agent container's own /usr/lib and never see the host unit
+		// in pod mode).
+		c.r.fileExists("/usr/lib/systemd/system/systemd-timesyncd.service") ||
+		c.r.fileExists("/lib/systemd/system/systemd-timesyncd.service") {
 		_ = c.r.ensureDir("/etc/systemd/timesyncd.conf.d", 0o755)
 		if ch, _ := c.r.writeManaged("/etc/systemd/timesyncd.conf.d/99-fallback.conf",
 			[]byte(`# Managed by node-config-agent - public NTP fallbacks

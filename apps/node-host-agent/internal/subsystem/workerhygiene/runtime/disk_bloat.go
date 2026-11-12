@@ -130,16 +130,18 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	// plugin uses the container ID (== the task dir name) as the
 	// snapshot key, so a live task dir maps the snapshot back to
 	// its pod's uid for the eviction decision; unresolvable
-	// snapshots stay hits-only.
-	snapRoot := filepath.Join(c.d.Cfg.K0sDataDir, "containerd",
-		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
+	// snapshots stay hits-only. The root is the configured ACTIVE
+	// snapshotter (WLayerSnapshotsDir) — the same knob the
+	// writable-layer scan walks, not a second hardcoded derivation.
+	snapRoot := c.d.Cfg.Disk.WLayerSnapshotsDir
+	mountIDs := snapshotMountIDs(c.d)
 	for _, snap := range readDirNames(snapRoot) {
 		id := filepath.Base(snap)
 		size, _ := walkBytes(c.d, e, filepath.Join(snap, "fs"))
 		if size <= 0 {
 			continue
 		}
-		if uid := snapshotPodUID(c.d, id); uid != "" {
+		if uid := snapshotPodUID(c.d, id, mountIDs); uid != "" {
 			podTotals[uid] += size
 		}
 		if size > threshold {
@@ -169,13 +171,72 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	return hits, podTotals, podByUID
 }
 
-// snapshotPodUID resolves a containerd snapshot id back to the pod
-// uid owning it — the CRI plugin uses the container ID as the
-// snapshot key, and the runtime-v2 task dir of that ID carries the
-// io.kubernetes.pod.uid annotation in config.json (either task root
-// may hold it). "" when no task dir resolves (leaked/orphan
-// snapshot — no pod to bill it to).
-func snapshotPodUID(d *wdeps.Deps, id string) string {
+// snapshotMountIDs parses the host /proc/1/mountinfo once and maps
+// each overlayfs snapshot ("<snapRoot>/<id>/fs" used as a mount's
+// upperdir=) to the containerd task id whose rootfs mount consumes
+// it — the mount point is <taskRoot>/<id>/rootfs. containerd names
+// snapshot dirs numerically, so the dir name alone can never key a
+// task dir; the live mount is the only snapshot→container binding.
+// "" map on an unreadable mountinfo (callers fall back to the
+// name-keyed lookup).
+func snapshotMountIDs(d *wdeps.Deps) map[string]string {
+	data, err := os.ReadFile(d.Cfg.MountinfoFile)
+	if err != nil {
+		return nil
+	}
+	hostTaskRoot := wdeps.HostSidePath(d.Cfg.CtrTaskRoot)
+	hostSandboxRoot := wdeps.HostSidePath(d.Cfg.SandboxCtlRoot)
+	hostSnapRoot := wdeps.HostSidePath(d.Cfg.Disk.WLayerSnapshotsDir) + "/"
+	out := map[string]string{}
+	for _, ln := range strings.Split(string(data), "\n") {
+		sep := strings.LastIndex(ln, " - ")
+		if sep < 0 {
+			continue
+		}
+		f := strings.Fields(ln[:sep])
+		if len(f) < 5 {
+			continue
+		}
+		mount := unescapeOverlayPath(f[4])
+		var taskID string
+		for _, root := range []string{hostTaskRoot, hostSandboxRoot} {
+			if strings.HasPrefix(mount, root+"/") &&
+				strings.HasSuffix(mount, "/rootfs") {
+				taskID = filepath.Base(strings.TrimSuffix(mount, "/rootfs"))
+				break
+			}
+		}
+		if taskID == "" {
+			continue
+		}
+		for _, opt := range strings.Split(ln[sep+3:], ",") {
+			if !strings.HasPrefix(opt, "upperdir=") {
+				continue
+			}
+			up := unescapeOverlayPath(strings.TrimPrefix(opt, "upperdir="))
+			if rel, ok := strings.CutPrefix(up, hostSnapRoot); ok {
+				// rel = "<id>/fs" — the snapshot dir name.
+				if fsDir, ok := strings.CutSuffix(rel, "/fs"); ok &&
+					!strings.Contains(fsDir, "/") {
+					out[fsDir] = taskID
+				}
+			}
+		}
+	}
+	return out
+}
+
+// unescapeOverlayPath decodes the kernel's octal escapes in
+// mountinfo fields — same set ctr/mountinfo_hygiene.go handles.
+func unescapeOverlayPath(s string) string {
+	return strings.NewReplacer(`\040`, " ", `\011`, "\t",
+		`\012`, "\n", `\134`, `\`).Replace(s)
+}
+
+// taskDirPodUID resolves a containerd task/sandbox dir id back to
+// the pod uid via its config.json io.kubernetes.pod.uid annotation —
+// either task root may hold it. "" when no dir resolves.
+func taskDirPodUID(d *wdeps.Deps, id string) string {
 	for _, root := range []string{d.Cfg.CtrTaskRoot, d.Cfg.SandboxCtlRoot} {
 		cfgData, err := os.ReadFile(filepath.Join(root, id, "config.json"))
 		if err != nil {
@@ -186,6 +247,22 @@ func snapshotPodUID(d *wdeps.Deps, id string) string {
 		}
 	}
 	return ""
+}
+
+// snapshotPodUID resolves a containerd snapshot id back to the pod
+// uid owning it. mountIDs (snapshotMountIDs) wins: snapshot dir
+// names are numeric, so the mountinfo upperdir→rootfs binding maps
+// them to the 64-hex task id first; the direct name-as-task-dir
+// lookup stays as the fallback for name-keyed snapshotters and
+// tests. "" when nothing resolves (leaked/orphan snapshot — no pod
+// to bill it to).
+func snapshotPodUID(d *wdeps.Deps, id string, mountIDs map[string]string) string {
+	if cid := mountIDs[id]; cid != "" {
+		if uid := taskDirPodUID(d, cid); uid != "" {
+			return uid
+		}
+	}
+	return taskDirPodUID(d, id)
 }
 
 // diskBloatEvictProtectedNamespaces — namespaces the critical-band
@@ -218,13 +295,68 @@ var diskBloatEvictCriticalPriorityClasses = map[string]bool{
 	"system-cluster-critical": true,
 }
 
+// diskBloatStatefulOwnerKinds are ownerReference kinds whose pods
+// hold stateful/quorum workloads — psi_thrash statefulOwnerKinds
+// parity: a plain StatefulSet plus the database operators that raise
+// pods under their own CRD kinds (CloudNativePG Cluster,
+// Dragonfly, ScyllaCluster/ScyllaDBDatacenter, Percona
+// PGv2/PSMDB/PXC). The critical disk band must not churn them.
+var diskBloatStatefulOwnerKinds = map[string]bool{
+	"StatefulSet":          true,
+	"Cluster":              true, // CloudNativePG postgresql.cnpg.io
+	"Dragonfly":            true,
+	"ScyllaCluster":        true,
+	"ScyllaDBDatacenter":   true,
+	"PerconaServerMongoDB": true,
+	"PerconaXtraDBCluster": true,
+	"PerconaPGCluster":     true,
+}
+
 // diskBloatOwnedByStatefulSet reports whether any ownerReference is
-// a StatefulSet — a stateful workload's pod holds identity-bound
-// storage; the critical band must not churn it (psi parity).
+// a stateful/quorum workload owner — a stateful workload's pod holds
+// identity-bound storage; the critical band must not churn it.
 func diskBloatOwnedByStatefulSet(p *corev1.Pod) bool {
 	for _, ref := range p.OwnerReferences {
-		if ref.Kind == "StatefulSet" {
+		if diskBloatStatefulOwnerKinds[ref.Kind] {
 			return true
+		}
+	}
+	return false
+}
+
+// diskBloatDBQuorumTokens mark StatefulSet/operator-owned pods
+// carrying database / quorum state — losing one replica while the
+// disk is at 92% can cost quorum, far worse than the space freed.
+// Matched case-insensitively against label keys AND values
+// (psi dbQuorumTokens parity).
+var diskBloatDBQuorumTokens = []string{
+	"scylla", "dragonfly", "rabbitmq", "pxc", "psmdb", "postgresql",
+	"cnpg", "percona",
+}
+
+// diskBloatDBQuorumLabelKeys are label KEYS that mark database /
+// quorum pods regardless of value — CNPG's instanceRole and the
+// CrunchyData postgres-operator role selector carry no token
+// substring (psi dbQuorumLabelKeys parity).
+var diskBloatDBQuorumLabelKeys = map[string]bool{
+	"cnpg.io/instancerole":                   true,
+	"postgres-operator.crunchydata.com/role": true,
+}
+
+// diskBloatCarriesDBQuorumLabel reports whether the pod's labels
+// name a database/quorum workload — an INDEPENDENT gate like psi's
+// carriesDBQuorumLabel: a CNPG/Percona/Scylla/Dragonfly pod is never
+// the eviction victim no matter which CRD owns it.
+func diskBloatCarriesDBQuorumLabel(p *corev1.Pod) bool {
+	for k, v := range p.Labels {
+		lk, lv := strings.ToLower(k), strings.ToLower(v)
+		if diskBloatDBQuorumLabelKeys[lk] {
+			return true
+		}
+		for _, tok := range diskBloatDBQuorumTokens {
+			if strings.Contains(lk, tok) || strings.Contains(lv, tok) {
+				return true
+			}
 		}
 	}
 	return false
@@ -302,6 +434,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			p.DeletionTimestamp != nil ||
 			diskBloatEvictProtectedNamespaces[p.Namespace] ||
 			diskBloatEvictCriticalPriorityClasses[p.Spec.PriorityClassName] ||
+			diskBloatCarriesDBQuorumLabel(p) ||
 			diskBloatOwnedByStatefulSet(p) {
 			continue
 		}
@@ -317,6 +450,14 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat victim %s/%s bytes=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, victimBytes))
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
+		return
+	}
+	// L1↔L3 hold: a policy eviction during cluster maintenance is
+	// exactly the churn a drain has to un-wedge — skip this cycle.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("cleanup: disk-bloat evict held — " +
+			"cluster maintenance in progress")
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}

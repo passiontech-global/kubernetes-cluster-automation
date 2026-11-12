@@ -15,7 +15,7 @@ for p in {{ nebula_direct_tcp_ports | default([22, 6443, 8132, 9443, 39901]) | j
   ip rule del pref 1499 ipproto tcp dport $p lookup main 2>/dev/null
 done
 for p in dport sport; do
-  iptables -t mangle -D OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null
-  iptables -t mangle -D PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null
+  iptables -w 5 -t mangle -D OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null
+  iptables -w 5 -t mangle -D PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null
 done
 exit 0

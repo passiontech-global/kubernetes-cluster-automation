@@ -54,6 +54,9 @@ const (
 	ciliumCEPMinStreak   = 2
 	ciliumCEPHealCool    = 30 * time.Minute
 	ciliumCEPNodeMinPods = 3
+	// ciliumAgentFreshMinAge: an agent pod younger than this means a
+	// heal already landed — its informer resync covers the node.
+	ciliumAgentFreshMinAge = 5 * time.Minute
 )
 
 var (
@@ -180,9 +183,24 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		if n < ciliumCEPNodeMinPods {
 			continue
 		}
-		if agent := ciliumAgentPodOnNode(pods, node); agent != nil {
-			p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
-				"agent/"+node, agent, ciliumCEPHealCool, now)
+		agent := ciliumAgentPodOnNode(pods, node)
+		if agent == nil {
+			continue
+		}
+		// A sub-5m agent pod means a heal already landed (this
+		// check's earlier delete or the DaemonSet's own
+		// reschedule) — its informer resync covers the node's
+		// missing CEPs; bouncing it again just churns.
+		if now.Sub(agent.CreationTimestamp.Time) < ciliumAgentFreshMinAge {
+			agentHealed[node] = true
+			continue
+		}
+		// Only a DELIVERED delete covers the node's pods — a
+		// denied, cooled-down or failed heal leaves the wedge
+		// live, and marking the node healed would suppress the
+		// per-pod deletes that are the remaining remedy.
+		if p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
+			"agent/"+node, agent, ciliumCEPHealCool, now) {
 			agentHealed[node] = true
 		}
 	}

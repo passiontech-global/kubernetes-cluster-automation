@@ -73,7 +73,7 @@ func TestCheckOLMHealthAbsentCRDsQuiet(t *testing.T) {
 				olmSubGVR.GroupResource(), "")
 		})
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("absent OLM CRDs must pass quietly: %+v", res)
 	}
 }
@@ -97,14 +97,14 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting — tracked, quiet.
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen CSV must pass: %+v", res)
 	}
 
 	// 16m — gauge fires, still under the heal window.
 	at := base.Add(16 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("CSV stuck >=15m must FAIL")
 	}
 	m := probetest.FindMetric(t, "node_automation_olm_unhealthy_resources",
@@ -121,7 +121,7 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 	// 21m — the operator is bounced.
 	at = base.Add(21 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still stuck — must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -152,7 +152,7 @@ func TestCheckOLMHealthRestartResumeHeals(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(csv))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted CSV window past the heal window must FAIL on the first sweep")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -183,7 +183,7 @@ func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 		Observe("Subscription/operators/keda/"+olmReasonCatalogUnhealthy,
 			base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("unhealthy subscription must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -214,7 +214,7 @@ func TestCheckOLMHealthCertRotationOverdue(t *testing.T) {
 		Observe("ClusterServiceVersion/operators/nhc.v1/"+olmReasonCertOverdue,
 			base.Add(-25*time.Minute))
 
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("overdue cert rotation past the heal window must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -228,7 +228,7 @@ func TestCheckOLMHealthHealthyPasses(t *testing.T) {
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
 		"operators", "nhc.v1", map[string]any{"phase": "Succeeded"})
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(csv))
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("healthy OLM state must pass: %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&probetest.MustCheck[*olmHealthCheck](t, p).olmFirstSeen); len(keys) != 0 {
@@ -259,7 +259,7 @@ func TestCheckOLMHealthHealStampPersistedOnDeployment(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(opPod, dep), probetest.OpDyn(csv))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck CSV past the heal window must FAIL")
 	}
 	if _, err := p.CS.CoreV1().Pods("olm").
@@ -290,7 +290,7 @@ func TestCheckOLMHealthHealStampPersistedOnDeployment(t *testing.T) {
 			base.Add(-21*time.Minute).UTC().Format(time.RFC3339) + `"}`})
 	p2 := testProberDyn(fake.NewSimpleClientset(opPod2, dep2), probetest.OpDyn(csv2))
 	p2.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*olmHealthCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck CSV must still FAIL under the persisted cooldown")
 	}
 	if _, err := p2.CS.CoreV1().Pods("olm").
@@ -426,7 +426,7 @@ func TestOLMOperatorHealOnePodPerCycle(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(csv))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("stuck CSV past the heal window must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -518,7 +518,7 @@ func TestOLMCollectSignaturesListErrorIsInfra(t *testing.T) {
 	if _, err := chk.collectOLMSignatures(ctx, time.Now()); err == nil {
 		t.Fatal("CSV list failure must surface an error")
 	}
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatalf("CSV list failure must be an Infra verdict: %+v", res)
 	}

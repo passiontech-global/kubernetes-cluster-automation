@@ -182,15 +182,15 @@ func (c *cyc) hubMetricsScript() string {
 	}
 	mb := c.markerBase()
 	var sb strings.Builder
-	sb.WriteString("iptables -N HUBMETRICS 2>/dev/null; iptables -F HUBMETRICS;")
+	sb.WriteString("iptables -w 5 -N HUBMETRICS 2>/dev/null; iptables -w 5 -F HUBMETRICS;")
 	for _, mport := range ports {
 		for _, ip := range ips {
-			fmt.Fprintf(&sb, " iptables -A HUBMETRICS -p tcp -s %s --dport %s -j ACCEPT;", ip, mport)
+			fmt.Fprintf(&sb, " iptables -w 5 -A HUBMETRICS -p tcp -s %s --dport %s -j ACCEPT;", ip, mport)
 		}
-		fmt.Fprintf(&sb, " iptables -A HUBMETRICS -p tcp -s %s.0/24 --dport %s -j ACCEPT;", mb, mport)
-		fmt.Fprintf(&sb, " iptables -A HUBMETRICS -p tcp --dport %s -j DROP;", mport)
-		fmt.Fprintf(&sb, " iptables -C INPUT -p tcp --dport %s -j HUBMETRICS 2>/dev/null"+
-			" || iptables -I INPUT 1 -p tcp --dport %s -j HUBMETRICS;", mport, mport)
+		fmt.Fprintf(&sb, " iptables -w 5 -A HUBMETRICS -p tcp -s %s.0/24 --dport %s -j ACCEPT;", mb, mport)
+		fmt.Fprintf(&sb, " iptables -w 5 -A HUBMETRICS -p tcp --dport %s -j DROP;", mport)
+		fmt.Fprintf(&sb, " iptables -w 5 -C INPUT -p tcp --dport %s -j HUBMETRICS 2>/dev/null"+
+			" || iptables -w 5 -I INPUT 1 -p tcp --dport %s -j HUBMETRICS;", mport, mport)
 	}
 	sb.WriteString(" command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true")
 	return sb.String()

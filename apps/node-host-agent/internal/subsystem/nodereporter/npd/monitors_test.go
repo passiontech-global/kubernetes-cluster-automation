@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -28,9 +29,20 @@ import (
 // journald source (kubelet-stale monitor + kernel fallback)
 // ---------------------------------------------------------------------------
 
+// journalJSON emits a kubelet-unit journal line — the mux match is
+// client-side now (_SYSTEMD_UNIT == KubeletJournalUnit), so the
+// fixture must carry the field journalctl -u used to filter on.
 func journalJSON(tsUS int64, msg string) string {
 	m, _ := json.Marshal(msg)
-	return fmt.Sprintf("{\"__REALTIME_TIMESTAMP\":\"%d\",\"MESSAGE\":%s}", tsUS, m)
+	return fmt.Sprintf("{\"__REALTIME_TIMESTAMP\":\"%d\",\"__CURSOR\":\"cur-%d\",\"_SYSTEMD_UNIT\":\"k0sworker.service\",\"MESSAGE\":%s}", tsUS, tsUS, m)
+}
+
+// journalKernelJSON emits a kernel-transport line — _TRANSPORT=kernel
+// is journalctl -k's own match, applied client-side by the mux's
+// kernel subscriber.
+func journalKernelJSON(tsUS int64, msg string) string {
+	m, _ := json.Marshal(msg)
+	return fmt.Sprintf("{\"__REALTIME_TIMESTAMP\":\"%d\",\"__CURSOR\":\"cur-%d\",\"_TRANSPORT\":\"kernel\",\"MESSAGE\":%s}", tsUS, tsUS, m)
 }
 
 // TestParseJournalJSON: MESSAGE arrives as a JSON string or a byte
@@ -107,17 +119,20 @@ func TestKubeletJournalScan(t *testing.T) {
 	}
 }
 
-// TestJournalCursorAdvancement: the µs cursor makes each fetch
-// return only strictly-new entries — a journal line replayed at the
-// boundary is not double-counted, a later line is.
+// TestJournalCursorAdvancement: the __CURSOR resume position makes
+// each fetch strictly-forward — the first call is --since-bounded
+// to LogLookback, the second is an --after-cursor=<opaque> read
+// carrying only genuinely new entries (real journalctl never
+// replays past the cursor — and --after-cursor, not --cursor,
+// keeps the boundary entry from being served twice).
 func TestJournalCursorAdvancement(t *testing.T) {
 	e := fixture(t)
 	var calls [][]string
+	ts1 := e.now.UnixMicro() - 1000
+	ts2 := e.now.UnixMicro() + 1000
 	payloads := []string{
-		journalJSON(e.now.UnixMicro()-1000, `err="node \"n1\" not found"`),
-		// Same entry re-shown at the boundary plus a new one.
-		journalJSON(e.now.UnixMicro()-1000, `err="node \"n1\" not found"`) + "\n" +
-			journalJSON(e.now.UnixMicro()+1000, "no relationship found between node \"n1\" and pod \"x\""),
+		journalJSON(ts1, `err="node \"n1\" not found"`),
+		journalJSON(ts2, "no relationship found between node \"n1\" and pod \"x\""),
 	}
 	i := 0
 	e.journalFetch = func(_ context.Context, args ...string) (string, error) {
@@ -136,7 +151,7 @@ func TestJournalCursorAdvancement(t *testing.T) {
 	}
 
 	if got := e.sink.counter("KubeletNodeNotFound"); got != 1 {
-		t.Fatalf("counter = %v, want 1 (boundary replay filtered)", got)
+		t.Fatalf("counter = %v, want 1", got)
 	}
 	if got := e.sink.counter("KubeletObjectNotRegistered"); got != 1 {
 		t.Fatalf("counter = %v, want 1 (newer line counted)", got)
@@ -144,15 +159,20 @@ func TestJournalCursorAdvancement(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("journalFetch calls = %d, want 2", len(calls))
 	}
-	since1 := calls[0][len(calls[0])-4]
-	since2 := calls[1][len(calls[1])-4]
+	// argv tail: --since @<epoch-s> --lines=10000 -o json
+	// --no-pager, then --after-cursor=<last __CURSOR> --lines=10000
+	// -o json --no-pager. No -u: the unit filter is the mux's
+	// client-side match now — the shared tail reads the whole
+	// journal once for every subscriber.
 	want1 := "@" + strconv.FormatInt(e.now.Add(-e.cfg.LogLookback).Unix(), 10)
-	// The cursor parks on the newest KEPT entry's timestamp — it no
-	// longer jumps to `now`, so the second window re-opens one sec
-	// earlier and the <= cursor filter absorbs the replay.
-	want2 := "@" + strconv.FormatInt((e.now.UnixMicro()-1000)/1e6, 10)
-	if since1 != want1 || since2 != want2 {
-		t.Fatalf("--since args = %q then %q, want %q then %q", since1, since2, want1, want2)
+	if calls[0][len(calls[0])-6] != "--since" || calls[0][len(calls[0])-5] != want1 ||
+		calls[0][len(calls[0])-4] != "--lines=10000" {
+		t.Fatalf("fetch-1 argv tail = %q, want --since %s --lines=10000", calls[0][len(calls[0])-7:], want1)
+	}
+	wantCursor := "--after-cursor=cur-" + strconv.FormatInt(ts1, 10)
+	if calls[1][len(calls[1])-5] != wantCursor ||
+		calls[1][len(calls[1])-4] != "--lines=10000" {
+		t.Fatalf("fetch-2 argv tail = %q, want %s --lines=10000", calls[1][len(calls[1])-6:], wantCursor)
 	}
 }
 
@@ -179,6 +199,44 @@ func TestJournalFetchErrorKeepsCursor(t *testing.T) {
 	}
 	if got := e.sink.counter("KubeletNodeNotFound"); got != 1 {
 		t.Fatalf("counter after retry = %v, want 1", got)
+	}
+}
+
+// TestJournalEmitErrorRequeues: the shared __CURSOR advanced at
+// fetch time, so a refused Event emit cannot rely on the cursor —
+// the entry goes back on the subscriber's pending queue and the
+// NEXT sync retries it without any new journal line (the filelog
+// offset rollback's journal-side equivalent).
+func TestJournalEmitErrorRequeues(t *testing.T) {
+	e := fixture(t)
+	s := newErrSink()
+	// The fixture's PollEvery=-1 maps every sync to a fetch — this
+	// test needs the throttle ON so the second sync drains ONLY the
+	// requeued pending entry (the static clock never crosses the
+	// window, so no refetch happens).
+	e.m.journal.PollEvery = time.Hour
+	var calls int
+	e.journalFetch = func(_ context.Context, args ...string) (string, error) {
+		calls++
+		return journalJSON(e.now.UnixMicro(), `err="node \"n1\" not found"`), nil
+	}
+	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.counter("KubeletNodeNotFound"); got != 1 {
+		t.Fatalf("counter = %v, want 1", got)
+	}
+	// Second sync: the fetch interval hasn't elapsed AND no new
+	// lines exist — the ONLY thing to process is the requeued
+	// pending entry. The counter recounts it (filelog parity).
+	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.counter("KubeletNodeNotFound"); got != 2 {
+		t.Fatalf("counter after requeue retry = %v, want 2", got)
+	}
+	if calls != 1 {
+		t.Fatalf("journalFetch calls = %d, want 1 (pending retry needs no refetch)", calls)
 	}
 }
 
@@ -405,22 +463,19 @@ func TestKmsgTailCaughtUpFlag(t *testing.T) {
 }
 
 // TestKernelJournalFallback: when kmsg cannot be opened the monitor
-// falls back to journalctl -k for the process lifetime.
+// falls back to the shared journal tail for the process lifetime —
+// journalctl -k's _TRANSPORT=kernel match applied client-side by
+// the mux's kernel subscriber, so the fetch argv carries no -k.
 func TestKernelJournalFallback(t *testing.T) {
 	e := fixture(t)
 	// Point both kmsg candidates at nonexistent paths — Cfg() is
 	// re-read per sync, so the post-New re-point lands.
 	e.cfg.KmsgFile = "/nonexistent/kmsg"
-	var kernelCalls int
+	var calls [][]string
 	e.journalFetch = func(_ context.Context, args ...string) (string, error) {
-		for _, a := range args {
-			if a == "-k" {
-				kernelCalls++
-				return journalJSON(e.now.UnixMicro(),
-					"EXT4-fs error (device vda1): via journal"), nil
-			}
-		}
-		return "", nil
+		calls = append(calls, args)
+		return journalKernelJSON(e.now.UnixMicro(),
+			"EXT4-fs error (device vda1): via journal"), nil
 	}
 	if err := e.m.SyncKernelMonitor(context.Background(), e.sink); err != nil {
 		t.Fatal(err)
@@ -429,13 +484,18 @@ func TestKernelJournalFallback(t *testing.T) {
 		t.Fatal("kmsgJournalMode not set after open failure")
 	}
 	if got := e.sink.counter("Ext4Error"); got != 1 {
-		t.Fatalf("Ext4Error = %v, want 1 via journalctl -k", got)
+		t.Fatalf("Ext4Error = %v, want 1 via the journal fallback", got)
 	}
 	if n := len(e.sink.eventsByReason("Ext4Error")); n != 1 {
 		t.Fatalf("events = %d, want 1", n)
 	}
-	if kernelCalls != 1 {
-		t.Fatalf("journalctl -k calls = %d, want 1", kernelCalls)
+	if len(calls) != 1 {
+		t.Fatalf("journalFetch calls = %d, want 1", len(calls))
+	}
+	for _, a := range calls[0] {
+		if a == "-k" || a == "-u" || a == "k0sworker.service" {
+			t.Fatalf("fallback argv = %q, want the whole-journal mux read", calls[0])
+		}
 	}
 }
 
@@ -669,6 +729,30 @@ func (s *errSink) EmitEvent(_ context.Context, reason, note string) error {
 	return errors.New("event emit refused")
 }
 
+// flakySink refuses the first `refuse` EmitEvent calls then delegates
+// to fakeSink — the pending-transition retry fixture: refused
+// attempts are NOT recorded, so eventsByReason counts delivered
+// transitions only. Single-goroutine tests, plain counter is fine.
+type flakySink struct {
+	fakeSink
+	refuse int
+}
+
+func newFlakySink(n int) *flakySink {
+	return &flakySink{
+		fakeSink: fakeSink{counters: map[string]int{}, latches: map[string]string{}},
+		refuse:   n,
+	}
+}
+
+func (s *flakySink) EmitEvent(ctx context.Context, reason, note string) error {
+	if s.refuse > 0 {
+		s.refuse--
+		return errors.New("event emit refused")
+	}
+	return s.fakeSink.EmitEvent(ctx, reason, note)
+}
+
 // TestKubeletJournalEmitErrorKeepsCounting: a refused Event emit must
 // neither drop the counter bump nor fail the scan.
 func TestKubeletJournalEmitErrorKeepsCounting(t *testing.T) {
@@ -742,12 +826,16 @@ func TestKernelReplayInLookbackClassifies(t *testing.T) {
 	}
 }
 
-// TestKernelDeadlockEmitErrorStillLatches: a refused Event emit must
-// not block the permanent latch — the deadlock is latched once, the
-// second identical record never re-emits.
+// TestKernelDeadlockEmitErrorStillLatches: a refused transition
+// Event must not block the permanent latch — the latch sets on the
+// first signature, the emit stays pending, and the NEXT matching
+// record retries it (journal entries requeue the same way).
 func TestKernelDeadlockEmitErrorStillLatches(t *testing.T) {
 	e := fixture(t)
-	s := newErrSink()
+	// The deadlock signature also matches the TaskHung temp rule —
+	// refuse its emit AND the KernelDeadlock transition; the retry
+	// pass then lands both.
+	s := newFlakySink(2)
 	deadlock := "INFO: task jbd2/vda1-8:1 blocked for more than 120 seconds."
 	e.appendKmsg(t, "6,1,3540000000,-;"+deadlock)
 	if err := e.m.SyncKernelMonitor(context.Background(), s); err != nil {
@@ -756,14 +844,24 @@ func TestKernelDeadlockEmitErrorStillLatches(t *testing.T) {
 	if !e.m.kernelDeadlock {
 		t.Fatal("KernelDeadlock not latched despite the sink error")
 	}
-	if got := len(s.eventsByReason("KernelDeadlock")); got != 1 {
-		t.Fatalf("KernelDeadlock events = %d, want exactly the transition", got)
+	if got := len(s.eventsByReason("KernelDeadlock")); got != 0 {
+		t.Fatalf("KernelDeadlock events = %d, want 0 (emit refused)", got)
 	}
 	if c := condFor(t, e.m, "KernelDeadlock"); c.Status != corev1.ConditionTrue {
 		t.Fatalf("KernelDeadlock = %s, want True", c.Status)
 	}
 
-	// A repeat signature refreshes nothing event-wise.
+	// The pending transition retries on the next matching record —
+	// exactly one Event lands.
+	e.appendKmsg(t, "6,1,3541000000,-;"+deadlock)
+	if err := e.m.SyncKernelMonitor(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.eventsByReason("KernelDeadlock")); got != 1 {
+		t.Fatalf("KernelDeadlock events after retry = %d, want 1", got)
+	}
+
+	// Once delivered, further signatures never re-emit.
 	e.appendKmsg(t, "6,2,3545000000,-;"+deadlock)
 	if err := e.m.SyncKernelMonitor(context.Background(), s); err != nil {
 		t.Fatal(err)

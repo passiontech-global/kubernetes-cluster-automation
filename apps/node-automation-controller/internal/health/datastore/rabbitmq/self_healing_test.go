@@ -102,7 +102,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 	})
 
 	// First sighting — tracked, quiet, pod kept.
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen suspended pod must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -112,7 +112,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 
 	at := base.Add(11 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended >=10m with quorum safe must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -158,7 +158,7 @@ func TestCheckRabbitMQSuspendedRestartResume(t *testing.T) {
 		rabbitMQSuspendedHealsTotal.DeleteLabelValues("mq", "rabbitmq-0")
 	})
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted suspended window past 10m must FAIL on the first sweep")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -186,7 +186,7 @@ func TestCheckRabbitMQSuspendedQuorumUnsafe(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended pod must still FAIL — quorum gate only blocks the heal")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -207,7 +207,7 @@ func TestCheckRabbitMQSuspendedNoSTSOwner(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended pod must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -236,7 +236,7 @@ func TestCheckRabbitMQSuspendedCooldown(t *testing.T) {
 	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbHealed.
 		Stamp("mq/rabbitmq-0", base.Add(-10*time.Minute))
 
-	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("suspended pod must FAIL even inside the heal cooldown")
 	}
 	if _, err := cs.CoreV1().Pods("mq").

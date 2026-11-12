@@ -276,6 +276,26 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 		// already unfenced THIS sweep so a second patch cannot
 		// resurrect the first removal.
 		removed := map[string]bool{}
+		// curRV is the resourceVersion the NEXT unfence patch
+		// preconditions on — threaded as a LOCAL, never written
+		// back onto cr: the clusters slice is the sweep snapshot's
+		// memoized census and mutating its objects in place is the
+		// data race VerifySweepSnapshotUnmutated exists to kill.
+		curRV := cr.GetResourceVersion()
+		// Primary-safety: never auto-unfence the instance CNPG
+		// believes is (or is becoming) the primary — stripping its
+		// fence mid-failover removes the protection the operator
+		// just wrote. currentPrimary==targetPrimary==inst means the
+		// fence guards the LIVE primary; a current/target
+		// disagreement means a failover is in flight and every
+		// fence is protective until it lands.
+		curPrimary, _ := kube.NestedString(cr.Object, "status", "currentPrimary")
+		tgtPrimary, _ := kube.NestedString(cr.Object, "status", "targetPrimary")
+		// targetPrimary is only populated while a switchover/
+		// failover is targeted — an empty target is "no operation
+		// planned", NOT a disagreement (blocking on it would
+		// disable unfence on every steady-state cluster).
+		failoverInFlight := tgtPrimary != "" && curPrimary != tgtPrimary
 		for _, inst := range instances {
 			if inst == "*" {
 				continue
@@ -285,7 +305,8 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 			if !probefw.Persisted(&p.cnpgFenceSeen, fk, now, minAge, log) {
 				continue
 			}
-			if !cnpgInstanceOnHealthyNode(pods, nodeByName, ns, name, inst) ||
+			if inst == curPrimary || inst == tgtPrimary || failoverInFlight ||
+				!cnpgInstanceOnHealthyNode(pods, nodeByName, ns, name, inst) ||
 				!canUnfence {
 				continue
 			}
@@ -300,12 +321,16 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 			if !proceed {
 				continue
 			}
-			if err := p.unfenceCNPGInstance(ctx, cr, inst,
-				instances, removed); err != nil {
+			var nextRV string
+			if err := p.unfenceCNPGInstance(ctx, cr, curRV, inst,
+				instances, removed, &nextRV); err != nil {
 				metrics.IncError(p.Name)
 				log.Error(err, "cnpg unfence patch failed",
 					"cluster", ns+"/"+name, "instance", inst)
 				continue
+			}
+			if nextRV != "" {
+				curRV = nextRV
 			}
 			removed[inst] = true
 			p.Heals.Stamp(key, now)
@@ -345,11 +370,19 @@ func cnpgInstanceOnHealthyNode(pods []corev1.Pod,
 		if p.Namespace != ns {
 			continue
 		}
+		// The unfence evidence must come from a pod that verifiably
+		// belongs to THIS cluster — a bare name match would let an
+		// unrelated same-named pod in the namespace prove a fenced
+		// instance "healthy" and strip a fence the operator set for
+		// cause (the fenced set must be preserved, not evicted on
+		// ambiguous attribution).
+		if p.Labels["cnpg.io/cluster"] != cluster {
+			continue
+		}
 		// CNPG stamps cnpg.io/instanceName on instance pods; the
 		// pod name also equals the instance name in the standard
 		// <cluster>-<ordinal> layout — either match counts.
-		if p.Labels["cnpg.io/instanceName"] == inst || p.Name == inst ||
-			(p.Labels["cnpg.io/cluster"] == cluster && p.Name == inst) {
+		if p.Labels["cnpg.io/instanceName"] == inst || p.Name == inst {
 			pod = p
 			break
 		}
@@ -380,16 +413,20 @@ func cnpgInstanceOnHealthyNode(pods []corev1.Pod,
 // deletion when empty) is computed from the SAME parse the detection
 // used so a second unfence in one sweep cannot resurrect the first
 // removal, and concurrent annotation drift cannot resurrect a
-// just-cleared instance either. The patch pins the List snapshot's
-// resourceVersion (same shape stripFinalizers uses for
-// VolumeAttachments) so a fence the CNPG operator added between List
-// and Patch turns this into a conflict — skipped this cycle, the
-// operator's protective write survives — instead of being silently
-// dropped by the merge. Returns the patch error; the caller stamps
-// the cooldown only on success.
+// just-cleared instance either. The patch pins curRV — the resource
+// version threaded through the caller — so a fence the CNPG operator
+// added between List and Patch turns this into a conflict — skipped
+// this cycle, the operator's protective write survives — instead of
+// being silently dropped by the merge. nextRV receives the patched
+// object's fresh resourceVersion for the caller's NEXT patch in the
+// same sweep: the pinned RV is stale the moment the apiserver bumps
+// it, and threading it as a local keeps the sweep snapshot's shared
+// census object untouched (an in-place SetResourceVersion here was
+// the data race VerifySweepSnapshotUnmutated catches). Returns the
+// patch error; the caller stamps the cooldown only on success.
 func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
-	ctx context.Context, cr *unstructured.Unstructured, inst string,
-	all []string, removed map[string]bool) error {
+	ctx context.Context, cr *unstructured.Unstructured, curRV, inst string,
+	all []string, removed map[string]bool, nextRV *string) error {
 
 	var next []string
 	for _, s := range all {
@@ -400,7 +437,7 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	}
 	patch := map[string]any{
 		"metadata": map[string]any{
-			"resourceVersion": cr.GetResourceVersion(),
+			"resourceVersion": curRV,
 			"annotations": map[string]any{
 				cnpgFencedInstancesAnno: nil,
 			},
@@ -420,13 +457,10 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	if err != nil {
 		return err
 	}
-	// The pinned resourceVersion is now stale — the apiserver
-	// bumped it on this patch. Refresh the in-memory object so a
-	// SECOND unfence of the same cluster in this sweep preconditions
-	// on the fresh RV instead of eating a guaranteed 409 Conflict
-	// (which also burned a heal-budget token for nothing).
+	// Hand the fresh RV back OUT — never onto cr itself (the census
+	// object is shared read-only state for the rest of the sweep).
 	if patched != nil {
-		cr.SetResourceVersion(patched.GetResourceVersion())
+		*nextRV = patched.GetResourceVersion()
 	}
 	return nil
 }

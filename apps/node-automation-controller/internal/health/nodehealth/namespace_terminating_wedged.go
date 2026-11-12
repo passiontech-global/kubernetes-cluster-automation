@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -27,6 +28,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -213,6 +215,18 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 	if p.Heals.CooledDown(ck, nsFinalizerSweepCooldown, now) {
 		return
 	}
+	// Finalizer stripping is a live-object mutation — it rides the
+	// same maintenance mutex + heal budget every destructive sweep
+	// does (fail closed: unverifiable counts as held).
+	proceed, unverifiable := p.HealAllowed(ctx, log,
+		&p.Heals, ck, nsFinalizerSweepCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
+		return
+	}
 	lists, err := p.CS.Discovery().ServerPreferredResources()
 	if err != nil {
 		// ServerPreferredResources returns the resolved group lists
@@ -224,6 +238,10 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 		// sweep behind an unrelated backend's outage.
 		var groupErr *discovery.ErrGroupDiscoveryFailed
 		if !errors.As(err, &groupErr) || len(lists) == 0 {
+			// The gate consumed a grant but discovery failed
+			// before ANY strip could run — no mutation executed,
+			// hand the grant back (refund-on-skip contract).
+			heal.RefundGrant(now)
 			log.Info("WARN: namespace finalizer sweep — discovery failed, skipping",
 				"namespace", nsName, "error", err)
 			return
@@ -292,14 +310,34 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 				return
 			}
 			if err != nil {
-				continue // no permission / absent — not evidence
+				// Forbidden (RBAC pending) and NoMatch (resource
+				// gone mid-sweep) are expected skips — everything
+				// else is a real list failure the sweep must not
+				// swallow into a silent "nothing to strip".
+				if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) {
+					continue
+				}
+				metrics.IncError(p.Name)
+				log.Info("WARN: namespace finalizer sweep — resource list failed",
+					"namespace", nsName, "gvr", gvr.String(), "error", err)
+				continue
 			}
 		}
 	}
-	p.Heals.Stamp(ck, now)
+	// Cooldown stamps ONLY on delivered strips: a sweep that found
+	// nothing strippable must re-run next cycle — newly-wedged CRs
+	// appearing inside a blind 30m window would otherwise wait out
+	// the whole cooldown before the sweep looks again. The same
+	// split drives the grant: strips>0 means a mutation executed
+	// (grant legitimately spent); stripped==0 — every candidate
+	// clean, owner alive, patch refused or errored before landing —
+	// delivered nothing, so the gate's grant goes back.
 	if stripped > 0 {
+		p.Heals.Stamp(ck, now)
 		log.Info("namespace finalizer sweep done",
 			"namespace", nsName, "stripped", stripped)
+	} else {
+		heal.RefundGrant(now)
 	}
 }
 
@@ -378,7 +416,7 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	obj *unstructured.Unstructured) bool {
 
 	ref := metav1.GetControllerOf(obj)
-	gone, resolved := probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(), ref,
+	gone, resolved := p.OwnerGone(ctx, obj.GetNamespace(), ref,
 		"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob")
 	// A nil ref resolves (gone=false): "no owner" is not a dead
 	// owner — and the RS chain needs ref non-nil below.
@@ -396,7 +434,7 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	if dref := metav1.GetControllerOf(rs); dref != nil {
 		switch dref.Kind {
 		case "Deployment":
-			gone, _ := probefw.OwnerGone(ctx, p.CS, ns, dref, "Deployment")
+			gone, _ := p.OwnerGone(ctx, ns, dref, "Deployment")
 			return gone
 		case "Rollout":
 			// argo-rollout-gates — a Rollout-owned ReplicaSet whose argoproj.io
@@ -404,9 +442,22 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 			// the typed clientset has no argoproj.io access, so the
 			// existence check rides the dynamic client (any error
 			// other than NotFound fails closed: owner presumed alive).
-			_, err := p.Dyn.Resource(kube.GVRArgoRollout).
+			// A same-name Rollout with a different UID is a different
+			// incarnation — the referenced one IS gone (the
+			// OwnerGone UID-match contract, applied to the dynamic
+			// read the typed whitelist cannot reach).
+			o, err := p.Dyn.Resource(kube.GVRArgoRollout).
 				Namespace(ns).Get(ctx, dref.Name, metav1.GetOptions{})
-			return apierrors.IsNotFound(err)
+			switch {
+			case apierrors.IsNotFound(err):
+				return true
+			case err != nil:
+				return false
+			}
+			if dref.UID != "" && o.GetUID() != "" && o.GetUID() != dref.UID {
+				return true
+			}
+			return false
 		}
 	}
 	return false

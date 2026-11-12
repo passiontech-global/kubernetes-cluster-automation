@@ -135,7 +135,15 @@ func (s *walGuardSweep) scanPodLogs(ctx context.Context) error {
 	g.SetLimit(postgresWALLogWorkers)
 	for j, i := range scanIdx {
 		pod := pods[i]
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			// A panic in one pod's log scan reads as that pod's
+			// inconclusive scan — never a process crash.
+			defer func() {
+				if r := recover(); r != nil {
+					scans[j] = logScan{
+						err: fmt.Errorf("log scan panicked: %v", r)}
+				}
+			}()
 			reason, lerr := s.p.pgWALLogHit(ctx, &pod)
 			scans[j] = logScan{reason: reason, err: lerr}
 			return nil // tolerated sub-failure — applied below

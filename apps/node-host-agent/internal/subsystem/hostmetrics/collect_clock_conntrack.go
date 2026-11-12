@@ -18,9 +18,12 @@ const (
 	// H2 conntrack table sources.
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
-	// telemetry sources: conntrack per-CPU stats + ARP table.
-	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
-	defaultARPTableFile      = "/proc/net/arp"
+	// telemetry sources: conntrack per-CPU stats + ARP table —
+	// /proc/1/net/ so the reads land in the HOST net namespace
+	// under hostPID:true (the pod's own /proc/net view would
+	// report the pod sandbox's conntrack/ARP tables instead).
+	defaultConntrackStatFile = "/proc/1/net/stat/nf_conntrack"
+	defaultARPTableFile      = "/proc/1/net/arp"
 	// Clocksource sources (sysfs clocksource0).
 	defaultClocksourceCurrentFile   = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 	defaultClocksourceAvailableFile = "/sys/devices/system/clocksource/clocksource0/available_clocksource"
@@ -110,18 +113,9 @@ func (c *Collector) collectClocksource(ch chan<- prometheus.Metric) {
 		// (the desired clock on KVM guests) is healthy too.
 		degraded = !fastClocksources[current] &&
 			(available["tsc"] || available["kvm-clock"])
-		// Restore path: a slow fallback with kvm-clock available is
-		// exactly the lost-pvclock-vDSO drift — write it back.
-		if slowClocksources[current] && available["kvm-clock"] {
-			if err := os.WriteFile(c.cfg.ClocksourceCurrentFile,
-				[]byte("kvm-clock\n"), 0o644); err != nil {
-				logger().Warn("hostmetrics: clocksource kvm-clock restore write failed",
-					"path", c.cfg.ClocksourceCurrentFile, "error", err)
-			} else {
-				logger().Warn("hostmetrics: clocksource drifted to "+current+
-					" — restored kvm-clock", "path", c.cfg.ClocksourceCurrentFile)
-			}
-		}
+		// The kvm-clock restore WRITE lives in reconcileHostWrites
+		// (host_writes.go) on the 30s latch tick — Collect is
+		// read-only so scrapes can't stamp sysctl writes.
 	} else {
 		// available unreadable: fall back to the current-clock name
 		// alone — an active hpet/acpi_pm/jiffies is degraded; tsc or

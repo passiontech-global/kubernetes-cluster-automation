@@ -176,7 +176,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	// closed, the same posture every annotation nudge runs under.
 	// Unverifiable IncErrors the queue — the signal must reach the
 	// alert path.
-	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, nil,
+	proceed, unverifiable := heal.AllowedVPersisted(ctx, log, &u.verdict,
 		u.cs, u.dyn, nil, src, fluxLastNudgeAnno, key,
 		sourceNudgeCooldown, now)
 	if unverifiable {

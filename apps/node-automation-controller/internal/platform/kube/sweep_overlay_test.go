@@ -1,0 +1,140 @@
+// sweep_overlay_test.go — regression coverage for the per-sweep
+// write overlay: annotation deltas, pod tombstones, and the
+// ownerDisrupt quorum reservation that stops two parallel checks
+// from each deleting a pod of the same workload in one sweep.
+package kube
+
+import (
+	"context"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+func overlayPod(name string, owner *metav1.OwnerReference) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "ns",
+			UID:       types.UID(name + "-uid"),
+		},
+	}
+	if owner != nil {
+		p.OwnerReferences = []metav1.OwnerReference{*owner}
+	}
+	return p
+}
+
+func controllerRef(kind, name string) *metav1.OwnerReference {
+	ctrl := true
+	return &metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: kind, Name: name, Controller: &ctrl,
+	}
+}
+
+func TestTryReserveWorkloadDisruption(t *testing.T) {
+	ctx := WithSweepOverlay(context.Background())
+
+	// Two pods of the same ReplicaSet share ONE disruption slot —
+	// the second reservation is denied so a sibling check cannot
+	// take the workload to zero in the same sweep.
+	rs := controllerRef("ReplicaSet", "web-6d9f")
+	if !TryReserveWorkloadDisruption(ctx, overlayPod("web-0", rs)) {
+		t.Fatal("first reservation for a workload must succeed")
+	}
+	if TryReserveWorkloadDisruption(ctx, overlayPod("web-1", rs)) {
+		t.Fatal("second pod of the same owner must be denied — quorum guard")
+	}
+
+	// A different workload gets its own slot.
+	other := controllerRef("ReplicaSet", "api-77bc")
+	if !TryReserveWorkloadDisruption(ctx, overlayPod("api-0", other)) {
+		t.Fatal("a different owner must get its own slot")
+	}
+
+	// Bare pods (no controller ownerRef) key on themselves — each
+	// is an independent slot.
+	if !TryReserveWorkloadDisruption(ctx, overlayPod("bare-0", nil)) {
+		t.Fatal("bare pod reservation must succeed")
+	}
+	if !TryReserveWorkloadDisruption(ctx, overlayPod("bare-1", nil)) {
+		t.Fatal("a second bare pod is a different workload — must succeed")
+	}
+}
+
+func TestTryReserveWorkloadDisruptionOutsideSweep(t *testing.T) {
+	// No overlay on ctx — every call is permissive (direct-Run
+	// checks and module periodics never share a sweep).
+	ctx := context.Background()
+	rs := controllerRef("ReplicaSet", "web-6d9f")
+	for i := 0; i < 3; i++ {
+		if !TryReserveWorkloadDisruption(ctx, overlayPod("web-"+string(rune('0'+i)), rs)) {
+			t.Fatal("outside a sweep the reservation must always succeed")
+		}
+	}
+}
+
+func TestPodTombstones(t *testing.T) {
+	ctx := WithSweepOverlay(context.Background())
+	pods := []corev1.Pod{
+		*overlayPod("a", nil), *overlayPod("b", nil), *overlayPod("c", nil),
+	}
+	if IsPodDeleted(ctx, pods[0].UID) {
+		t.Fatal("unmarked pod must not read as deleted")
+	}
+	MarkPodDeleted(ctx, pods[1].UID)
+	if !IsPodDeleted(ctx, pods[1].UID) {
+		t.Fatal("marked pod must read as deleted")
+	}
+	got := FilterPodTombstones(ctx, pods)
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("FilterPodTombstones = %v, want [a c]", got)
+	}
+	// Empty tombstone set returns the input slice unchanged.
+	ctx2 := WithSweepOverlay(context.Background())
+	if got := FilterPodTombstones(ctx2, pods); len(got) != 3 {
+		t.Fatalf("no tombstones must return all pods, got %d", len(got))
+	}
+}
+
+func TestEffectiveAnnoAndRecordPatch(t *testing.T) {
+	obj := overlayPod("p", nil)
+	obj.SetAnnotations(map[string]string{"keep": "base", "stale": "old"})
+
+	// Outside a sweep: RecordAnnoPatch mirrors in place (the
+	// caller-private-object contract), EffectiveAnno reads through.
+	ctx := context.Background()
+	RecordAnnoPatch(ctx, obj, []byte(
+		`{"metadata":{"annotations":{"stale":"new","added":"yes","keep":null}}}`))
+	if got := EffectiveAnno(ctx, obj, "stale"); got != "new" {
+		t.Fatalf("EffectiveAnno stale = %q, want new", got)
+	}
+	if got := EffectiveAnno(ctx, obj, "keep"); got != "" {
+		t.Fatalf("EffectiveAnno keep = %q, want deleted", got)
+	}
+	if _, ok := obj.GetAnnotations()["keep"]; ok {
+		t.Fatal("outside a sweep the in-place mirror must apply the delete")
+	}
+
+	// Inside a sweep the shared object is NEVER mutated — readers
+	// resolve through the overlay instead.
+	ctx = WithSweepOverlay(context.Background())
+	obj2 := overlayPod("p2", nil)
+	obj2.SetAnnotations(map[string]string{"k": "base"})
+	RecordAnnoPatch(ctx, obj2, []byte(
+		`{"metadata":{"annotations":{"k":"patched","extra":"e"}}}`))
+	if obj2.GetAnnotations()["k"] != "base" {
+		t.Fatal("sweep overlay must not mutate the shared snapshot object")
+	}
+	if got := EffectiveAnno(ctx, obj2, "k"); got != "patched" {
+		t.Fatalf("EffectiveAnno k = %q, want patched", got)
+	}
+	if got := EffectiveAnno(ctx, obj2, "extra"); got != "e" {
+		t.Fatalf("EffectiveAnno extra = %q, want e", got)
+	}
+	if got := EffectiveAnno(ctx, obj2, "absent"); got != "" {
+		t.Fatalf("EffectiveAnno absent = %q, want empty", got)
+	}
+}

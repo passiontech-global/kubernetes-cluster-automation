@@ -101,7 +101,7 @@ func TestRelistStormQuietPasses(t *testing.T) {
 			base := time.Now()
 			probetest.FreezeNow(p.Deps, base)
 			ch := relistStormCheck(t, p)
-			if res := ch.Run(ctx); !res.Pass {
+			if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 				t.Fatalf("quiet signature failed: %+v", res)
 			}
 			if keys := probetest.LedgerKeys(&ch.seen); len(keys) != 0 {
@@ -124,15 +124,15 @@ func TestRelistStormPersistenceWindow(t *testing.T) {
 	ch := relistStormCheck(t, p)
 
 	probetest.FreezeNow(p.Deps, base)
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first breaching sweep must pass inside the window: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(relistStormMinAge-time.Minute))
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("sweep inside the persistence window must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(relistStormMinAge+time.Minute))
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("storm persisted past relistStormMinAge must fail the check")
 	}
@@ -164,7 +164,7 @@ func TestRelistStormEmitsGaugeAndDedupedEvent(t *testing.T) {
 		apiserverRelistStormGauge.DeleteLabelValues("k9s", "nodes")
 	})
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("proven storm must fail the check")
 	}
 	for _, lv := range [][2]string{{"popeye", "pods"}, {"k9s", "nodes"}} {
@@ -184,7 +184,7 @@ func TestRelistStormEmitsGaugeAndDedupedEvent(t *testing.T) {
 
 	// A second proven sweep inside the event cooldown adds no event.
 	probetest.FreezeNow(p.Deps, base.Add(time.Minute))
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still-storming sweep must fail")
 	}
 	events, _ = cs.EventsV1().Events("kube-system").List(ctx, metav1.ListOptions{})
@@ -215,7 +215,7 @@ func TestRelistStormSuspendsOptedInCronJobs(t *testing.T) {
 		apiserverRelistStormGauge.DeleteLabelValues("popeye", "pods")
 	})
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("proven storm must fail")
 	}
 	get := func(name string) *batchv1.CronJob {
@@ -256,7 +256,7 @@ func TestRelistStormRestoresOnlySelfSuspendedCronJobs(t *testing.T) {
 	ch := relistStormCheck(t, p)
 	probetest.FreezeNow(p.Deps, base)
 
-	if res := ch.Run(ctx); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("quiet sweep must pass: %+v", res)
 	}
 	get := func(name string) *batchv1.CronJob {
@@ -298,7 +298,7 @@ func TestRelistStormQueryErrorIsInfraAndCarries(t *testing.T) {
 		apiserverRelistStormGauge.DeleteLabelValues("popeye", "pods")
 	})
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("proven storm must fail")
 	}
 	m := probetest.FindMetric(t, "node_automation_apiserver_relist_storm",
@@ -311,7 +311,7 @@ func TestRelistStormQueryErrorIsInfraAndCarries(t *testing.T) {
 	// reads fail.
 	p.Cfg.HTTPContent.URL = "http://127.0.0.1:1/"
 	p.HTTPClient = &http.Client{Timeout: time.Second}
-	res := ch.Run(ctx)
+	res := ch.Run(probetest.SweepCtx(ctx))
 	if res.Infra == nil {
 		t.Fatal("query failure must mark the check infra-failed")
 	}
@@ -336,7 +336,8 @@ func TestRelistStormTopTalkerFailureAndEmptyLabels(t *testing.T) {
 
 		t.Helper()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			q := r.URL.Query().Get("query")
+			_ = r.ParseForm()
+			q := r.FormValue("query")
 			w.Header().Set("Content-Type", "application/json")
 			switch {
 			case strings.Contains(q, "terminated_watchers"):
@@ -390,7 +391,7 @@ func TestRelistStormTopTalkerFailureAndEmptyLabels(t *testing.T) {
 			apiserverRelistStormGauge.DeleteLabelValues("-", "-")
 		})
 
-		res := ch.Run(ctx)
+		res := ch.Run(probetest.SweepCtx(ctx))
 		if res.Pass {
 			t.Fatal("storm with a failed topk query must still fail")
 		}
@@ -419,7 +420,7 @@ func TestRelistStormTopTalkerFailureAndEmptyLabels(t *testing.T) {
 			apiserverRelistStormGauge.DeleteLabelValues("-", "-")
 		})
 
-		if res := ch.Run(ctx); res.Pass {
+		if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Fatal("proven storm must fail")
 		}
 		m := probetest.FindMetric(t, "node_automation_apiserver_relist_storm",
@@ -461,7 +462,7 @@ func TestRelistStormNoOptedInCronJobsSpendsNoBudget(t *testing.T) {
 		apiserverRelistStormGauge.DeleteLabelValues("popeye", "pods")
 	})
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("proven storm must fail")
 	}
 	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, probetest.OpDyn(), "probe", base)

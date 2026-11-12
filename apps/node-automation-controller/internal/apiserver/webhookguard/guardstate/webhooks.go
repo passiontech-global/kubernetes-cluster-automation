@@ -113,3 +113,25 @@ func CRDConversionServiceKey(crd *unstructured.Unstructured) (key, ns, name stri
 	}
 	return ns + "/" + name, ns, name, true
 }
+
+// compactCRDConversion projects one listed CRD down to the slice the
+// conversion duties actually read — metadata.name plus the whole
+// spec.conversion subtree — inside the ListEach page visit, so the
+// page's full objects (OpenAPI v3 schemas are the bulk of a CRD
+// census's heap, ~80–150 MiB cluster-wide) are garbage-collected
+// with the page instead of pinning the snapshot for the whole run.
+// The retained object keeps the unstructured shape every consumer
+// (CRDConversionServiceKey, NestedInt64 port reads, GetName) already
+// understands — only the unread fields are dropped.
+func compactCRDConversion(crd *unstructured.Unstructured) unstructured.Unstructured {
+	out := unstructured.Unstructured{Object: map[string]any{}}
+	out.SetName(crd.GetName())
+	if conv, found, _ := unstructured.NestedFieldNoCopy(
+		crd.Object, "spec", "conversion"); found {
+		// NestedFieldNoCopy aliases the page object's subtree — safe
+		// here: the snapshot contract is read-only, and the alias is
+		// exactly the data the compact object exists to keep.
+		_ = unstructured.SetNestedField(out.Object, conv, "spec", "conversion")
+	}
+	return out
+}

@@ -87,7 +87,7 @@ func TestCheckOperatorWorkqueuesPausedPerconaIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(paused))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("paused PerconaXtraDBCluster must not freeze the check: %+v", res)
 	}
 	for _, k := range probetest.LedgerKeys(
@@ -105,7 +105,7 @@ func TestCheckOperatorWorkqueuesPausedPerconaIgnored(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
 		Observe("percona-xtradb-cluster-operator/perconaxtradbclusters/db/live/"+kcmReasonStaleGen,
 			base.Add(-time.Hour))
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("unpaused stale PerconaXtraDBCluster must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t,

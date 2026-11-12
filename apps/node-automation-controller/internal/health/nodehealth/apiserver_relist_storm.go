@@ -239,7 +239,7 @@ func (p *apiserverRelistStormCheck) emitRelistStormEvent(ctx context.Context,
 	}
 	if _, err := p.CS.EventsV1().Events("kube-system").
 		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		metrics.IncError(CheckNameAPIServerRelistStorm)
+		metrics.IncError(p.Name)
 		log.Info("WARN: relist storm event create failed (RBAC?)",
 			"error", err)
 		return
@@ -262,11 +262,9 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 	if p.Heals.CooledDown(ck, relistStormReliefCooldown, now) {
 		return
 	}
-	cjs, err := kube.ListAll(ctx, metav1.ListOptions{
-		Limit: kube.DefaultListPageSize,
-	}, kube.CronJobs(p.CS, metav1.NamespaceAll))
+	cjs, err := p.AllCronJobs(ctx)
 	if err != nil {
-		metrics.IncError(CheckNameAPIServerRelistStorm)
+		metrics.IncError(p.Name)
 		log.Info("WARN: relist storm cronjob list failed", "error", err)
 		return
 	}
@@ -297,7 +295,7 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		ck, relistStormReliefCooldown, now)
 	switch {
 	case unverifiable:
-		metrics.IncError(CheckNameAPIServerRelistStorm)
+		metrics.IncError(p.Name)
 		return
 	case !proceed:
 		return
@@ -314,7 +312,7 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 			now.Format(time.RFC3339)))
 		if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).Patch(ctx,
 			cj.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-			metrics.IncError(CheckNameAPIServerRelistStorm)
+			metrics.IncError(p.Name)
 			log.Error(err, "relist storm cronjob suspend failed",
 				"cronjob", cj.Namespace+"/"+cj.Name)
 			continue
@@ -335,11 +333,9 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context,
 	log logr.Logger, now time.Time) bool {
 
-	cjs, err := kube.ListAll(ctx, metav1.ListOptions{
-		Limit: kube.DefaultListPageSize,
-	}, kube.CronJobs(p.CS, metav1.NamespaceAll))
+	cjs, err := p.AllCronJobs(ctx)
 	if err != nil {
-		metrics.IncError(CheckNameAPIServerRelistStorm)
+		metrics.IncError(p.Name)
 		log.Info("WARN: relist storm cronjob restore list failed", "error", err)
 		return false
 	}
@@ -354,7 +350,7 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 			kube.AnnoRelistStormSuspendedBy))
 		if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).Patch(ctx,
 			cj.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-			metrics.IncError(CheckNameAPIServerRelistStorm)
+			metrics.IncError(p.Name)
 			log.Error(err, "relist storm cronjob restore failed",
 				"cronjob", cj.Namespace+"/"+cj.Name)
 			ok = false

@@ -13,7 +13,6 @@
 package externalsecretnudge
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strconv"
@@ -57,13 +56,40 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	list, esGVR, err := n.listES(ctx)
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			// CRD removal is a verified-empty census — prune every
+			// emitted empty-key series so nothing flagged while ESO
+			// was installed lingers after the CRDs go away. Begin
+			// first so a previously-aborted pass's leftover
+			// "current" emissions cannot survive the prune, then
+			// reset the ESO-scoped maps/clocks with the CRDs.
+			n.emptyKeyEmitted.Begin()
+			n.emptyKeyEmitted.Prune(metrics.ExternalSecretEmptyKey.DeleteLabelValues)
 			metrics.ExternalSecretStormSuppressed.Set(0)
+			n.resetESOState()
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}
 		return fmt.Errorf("list externalsecrets: %w", err)
 	}
 	now := n.now.Now()
+
+	// secret-probe index (secret_probe.go): one metadata LIST per
+	// ES namespace replaces the per-ES target-Secret GETs whenever
+	// the Secret's RV is unchanged. Rebuilt every pass — the census
+	// must never outlive it.
+	n.buildSecretIndex(ctx, esProbeNamespaces(list))
+	// Drop verdict-cache entries for ExternalSecrets that vanished —
+	// same lifecycle as storeReady: a delete+recreate re-probes
+	// fresh instead of inheriting the old object's verdicts.
+	esLive := map[string]bool{}
+	for i := range list.Items {
+		esLive[list.Items[i].GetNamespace()+"/"+list.Items[i].GetName()] = true
+	}
+	for k := range n.secretVerdicts {
+		if !esLive[k] {
+			delete(n.secretVerdicts, k)
+		}
+	}
 
 	// externalsecret-storm-guard — storm census over the WHOLE population: totalES is
 	// every ExternalSecret, failingES every Ready=False one. The
@@ -229,15 +255,15 @@ func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
 		}
 		ns, name := es.GetNamespace(), es.GetName()
 		target := esTargetSecretName(es)
-		secret, err := n.readTargetSecret(ctx, ns, target)
-		switch {
-		case apierrors.IsNotFound(err):
+		v, status, perr := n.secretVerdict(ctx, es)
+		switch status {
+		case probeNotFound:
 			continue // no Secret yet — nothing to audit, not an error
-		case err != nil:
+		case probeError:
 			// Unverifiable is not "clean": re-emit this ES's last-sweep
 			// keys so a transient read flap doesn't drop a live alert.
 			metrics.IncError(n.queue)
-			log.Error(err, "target secret read failed — keeping last verdict",
+			log.Error(perr, "target secret probe failed — keeping last verdict",
 				"es", ns+"/"+name, "secret", target)
 			for k, lv := range n.emptyKeyEmitted.Last() {
 				if k.ns == ns && k.name == name {
@@ -246,15 +272,8 @@ func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
 			}
 			continue
 		}
-		for k := range esDeclaredKeys(es) {
-			if _, present := secret.Data[k]; !present {
-				n.flagEmptyKey(log, es, k, "declared key missing from target secret")
-			}
-		}
-		for k, v := range secret.Data {
-			if len(bytes.TrimSpace(v)) == 0 {
-				n.flagEmptyKey(log, es, k, "key is empty/whitespace-only")
-			}
+		for k, why := range v.emptyKeys {
+			n.flagEmptyKey(log, es, k, why)
 		}
 	}
 	n.emptyKeyEmitted.Prune(metrics.ExternalSecretEmptyKey.DeleteLabelValues)
@@ -339,35 +358,21 @@ func (n *externalSecretNudge) deleteEmptySkeletonSecret(ctx context.Context,
 	log := logf.FromContext(ctx)
 	ns, name := es.GetNamespace(), es.GetName()
 	target := esTargetSecretName(es)
-	secret, err := n.readTargetSecret(ctx, ns, target)
-	switch {
-	case apierrors.IsNotFound(err):
+	v, status, perr := n.secretVerdict(ctx, es)
+	switch status {
+	case probeNotFound:
 		return // no skeleton at all — the common path
-	case err != nil:
+	case probeError:
 		metrics.IncError(n.queue)
-		log.Error(err, "target secret read failed — skeleton kept (fail closed)",
+		log.Error(perr, "target secret probe failed — skeleton kept (fail closed)",
 			"es", ns+"/"+name, "secret", target)
 		return
 	}
-	if len(secret.Data) != 0 {
-		return // carries data — not the empty-skeleton failure shape
-	}
-	// Only a Secret provably owned by THIS ExternalSecret may go: a
-	// same-named hand-made or differently-owned Secret (UID differs —
-	// the ES was recreated) is never ours to delete.
-	owned := false
-	for _, or := range secret.OwnerReferences {
-		if or.Kind == "ExternalSecret" && or.Name == name &&
-			or.UID == es.GetUID() {
-			owned = true
-			break
-		}
-	}
-	if !owned {
-		return
+	if !v.skeleton {
+		return // carries data or not ESO-owned — not the empty-skeleton shape
 	}
 	if err := n.cs.CoreV1().Secrets(ns).Delete(ctx, target,
-		kube.UIDDeleteOptions(secret.UID, metav1.DeletePropagationBackground)); err != nil {
+		kube.UIDDeleteOptions(v.skeletonUID, metav1.DeletePropagationBackground)); err != nil {
 		metrics.IncError(n.queue)
 		log.Error(err, "empty skeleton secret delete failed",
 			"es", ns+"/"+name, "secret", target)

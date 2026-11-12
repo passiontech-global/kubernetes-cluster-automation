@@ -68,3 +68,42 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 			Preconditions:      &metav1.Preconditions{UID: &p.UID},
 		})
 }
+
+// HoldLocalAction is the L1↔L3 maintenance gate every destructive
+// path consults before a pod delete or policy eviction: true while
+// the cluster verifiably holds the maintenance mutex (upgrade /
+// kured drain) OR the verdict is unverifiable — nodecoord fails
+// closed. Nil Coord (tests, unwired builds) never holds.
+func (d *Deps) HoldLocalAction(ctx context.Context) bool {
+	return d.Cfg.Coord != nil && d.Cfg.Coord.HoldLocalAction(ctx)
+}
+
+// StampLocalRemediation marks NodeCondition LocalRemediationInProgress
+// on nodes/status — call BEFORE a node-local restart (k0sworker)
+// so the cluster side yields remote remediation while L1 self-heals.
+// Best-effort, rides nodecoord's own StampTimeout, errors only
+// logged. Nil Coord is a no-op.
+func (d *Deps) StampLocalRemediation(ctx context.Context) {
+	if d.Cfg.Coord == nil {
+		return
+	}
+	if err := d.Cfg.Coord.StampLocalRemediation(ctx); err != nil {
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: local-remediation stamp failed (attribution hint only): %v", err))
+	}
+}
+
+// StampPodHealed records that L1 bounced infra pod ns/name — patches
+// the pod's last-pod-healed-at annotation and refreshes the
+// LocalRemediationInProgress node condition so the L3 side can
+// attribute the churn — best-effort, rides nodecoord's own
+// StampTimeout, errors only logged. Nil Coord is a no-op.
+func (d *Deps) StampPodHealed(ctx context.Context, ns, name string) {
+	if d.Cfg.Coord == nil {
+		return
+	}
+	if err := d.Cfg.Coord.StampPodHealed(ctx, ns, name); err != nil {
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: pod-healed stamp failed (attribution hint only): %v", err))
+	}
+}

@@ -37,12 +37,15 @@ func ConfigFromEnv(d EnvDeps) Config {
 		Identity:    d.Identity,
 		VarsDir:     d.VarsDir,
 		LocalBinary: d.LocalBinary,
+		StateDir:    d.WatchdogStateDir,
 		Clock:       d.Clock,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
 		envx.StringKnob(envnames.EnvNebulaCertsDir, &cfg.NebulaCertsDir, defaultNebulaCertsDir),
 		envx.StringKnob(envnames.EnvConvergeSSHKey, &cfg.SSHKeyPath, defaultSSHKeyPath),
+		envx.StringKnob(envnames.EnvHubsyncSSHHostKeyFingerprint, &cfg.SSHHostKeyFingerprint, ""),
+		envx.BoolKnob(envnames.EnvHubsyncSSHAllowInsecureHostKey, &cfg.SSHAllowInsecureHostKey, false),
 	})
 	return cfg
 }

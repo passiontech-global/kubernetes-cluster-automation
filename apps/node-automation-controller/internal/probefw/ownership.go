@@ -17,6 +17,8 @@ import (
 	"context"
 	"slices"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,21 +106,50 @@ func OwnerGone(ctx context.Context, cs kubernetes.Interface, ns string,
 		return false, false
 	}
 	var err error
+	var liveUID types.UID
 	switch ref.Kind {
 	case "Pod":
-		_, err = cs.CoreV1().Pods(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *corev1.Pod
+		o, err = cs.CoreV1().Pods(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "Deployment":
-		_, err = cs.AppsV1().Deployments(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *appsv1.Deployment
+		o, err = cs.AppsV1().Deployments(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "StatefulSet":
-		_, err = cs.AppsV1().StatefulSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *appsv1.StatefulSet
+		o, err = cs.AppsV1().StatefulSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "DaemonSet":
-		_, err = cs.AppsV1().DaemonSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *appsv1.DaemonSet
+		o, err = cs.AppsV1().DaemonSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "ReplicaSet":
-		_, err = cs.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *appsv1.ReplicaSet
+		o, err = cs.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "Job":
-		_, err = cs.BatchV1().Jobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *batchv1.Job
+		o, err = cs.BatchV1().Jobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	case "CronJob":
-		_, err = cs.BatchV1().CronJobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		var o *batchv1.CronJob
+		o, err = cs.BatchV1().CronJobs(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+		if o != nil {
+			liveUID = o.UID
+		}
 	default:
 		return false, false // whitelisted kind with no resolver — fail closed
 	}
@@ -128,5 +159,49 @@ func OwnerGone(ctx context.Context, cs kubernetes.Interface, ns string,
 	case err != nil:
 		return false, false
 	}
+	// A same-name object carrying a DIFFERENT UID is a different
+	// incarnation: StatefulSet pod churn and RS/Deployment rollouts
+	// recreate same-name objects constantly, and the ownerRef's UID
+	// points at the deleted original — the referenced owner IS gone
+	// even though its name resolves. An empty ref.UID (hand-built
+	// fixtures, pre-1.20 objects) or an unreadable live UID fails
+	// closed: name-match alone still counts as alive.
+	if ref.UID != "" && liveUID != "" && liveUID != ref.UID {
+		return true, true
+	}
 	return false, true
+}
+
+// OwnerGone is the Deps-level twin of the package function: inside
+// a sweep it resolves ReplicaSet owners against the shared
+// AllReplicaSets census first — a census HIT is authoritative
+// (the sweep snapshot is fresh enough that "present" cannot be
+// stale-gone), while a census MISS still falls through to the
+// point GET because a ReplicaSet created after the census loaded
+// would otherwise read as a false "owner gone" and unlock
+// finalizer strips on a live object. Every other kind keeps the
+// direct-GET path — their censuses are not wired here.
+func (d *Deps) OwnerGone(ctx context.Context, ns string,
+	ref *metav1.OwnerReference, kinds ...string) (gone, resolved bool) {
+
+	if ref != nil && ref.Kind == "ReplicaSet" &&
+		slices.Contains(kinds, "ReplicaSet") {
+		if rss, err := d.AllReplicaSets(ctx); err == nil {
+			for i := range rss {
+				o := &rss[i]
+				if o.Namespace != ns || o.Name != ref.Name {
+					continue
+				}
+				if ref.UID != "" && o.UID != "" && o.UID != ref.UID {
+					return true, true
+				}
+				return false, true
+			}
+			// Miss — could be a just-created RS the census predates;
+			// confirm with the authoritative GET below.
+		}
+		// Census error also falls through: the GET is the same
+		// authoritative answer either way.
+	}
+	return OwnerGone(ctx, d.CS, ns, ref, kinds...)
 }

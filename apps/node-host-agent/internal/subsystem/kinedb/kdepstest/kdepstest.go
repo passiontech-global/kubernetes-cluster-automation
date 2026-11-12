@@ -93,6 +93,6 @@ var ProbeOKRules = []testutil.ExecRule{
 	{Substr: "inspect", Out: "true"},
 	{Substr: "SHOW POOLS", Out: ShowPoolsOut},
 	{Substr: "logs --since", Out: "all quiet"},
-	{Substr: "MAX(id)", Out: "1000|200|290\n"},
+	{Substr: "MAX(id)", Out: "1000|200|290|1\n"},
 	{Substr: "select 1", Out: "1\n"},
 }

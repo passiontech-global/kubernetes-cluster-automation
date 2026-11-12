@@ -41,6 +41,48 @@ func TestGapWedgePeerFreshRestarts(t *testing.T) {
 	}
 }
 
+// The peer-fresh wedge restart must hold when the kubernetes
+// service reports fewer than 2 ready apiserver endpoints — bouncing
+// the controller below quorum takes the last serving apiserver
+// down with it.
+func TestGapWedgePeerFreshQuorumHold(t *testing.T) {
+	e := fixture(t)
+	self := "127.0.0.1:6443"
+	peer := "10.0.0.2:6443"
+	e.SetRV(self, false, 20000, true)
+	e.SetRV(self, true, 5000, true)
+	e.SetRV(peer, true, 19900, true)
+	e.EPReady = map[string]int{peer: 1} // only one apiserver serving
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateCacheWedged) {
+		t.Fatal("state-apiserver-cache-wedged missing")
+	}
+	if e.RstN() != 0 {
+		t.Fatalf("restart fired below endpoint quorum: %v", e.RstAt(0))
+	}
+	if n := e.CountLogLines("<2 ready endpoints"); n == 0 {
+		t.Fatalf("quorum hold not suspect-logged:\n%s", e.LogLines())
+	}
+}
+
+// >=2 ready endpoints lets the same wedge restart through — the
+// quorum gate only holds below quorum.
+func TestGapWedgePeerFreshQuorumPass(t *testing.T) {
+	e := fixture(t)
+	self := "127.0.0.1:6443"
+	peer := "10.0.0.2:6443"
+	e.SetRV(self, false, 20000, true)
+	e.SetRV(self, true, 5000, true)
+	e.SetRV(peer, true, 19900, true)
+	e.EPReady = map[string]int{peer: 2}
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if e.RstN() != 1 {
+		t.Fatalf("quorum-satisfied wedge did not restart: %d", e.RstN())
+	}
+}
+
 func TestGapWedgePeerStaleHeld(t *testing.T) {
 	e := fixture(t)
 	self := "127.0.0.1:6443"

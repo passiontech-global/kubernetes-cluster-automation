@@ -48,7 +48,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -58,7 +57,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -190,18 +188,13 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			continue
 		}
 
-		// SSA ping-pong defense: the fail-open flip fights Flux when
-		// the config is Git-owned — past the Heal-Revert-Loop
-		// threshold the patch skips (the webhook stays fail-closed
-		// against Git's wish) and the conflict counter fires so the
-		// failurePolicy is fixed at the Git source.
-		if !heal.FluxPatchGate(guardstate.KindValidating, cfg,
-			guardstate.KindValidating+"/"+cfg.Name, time.Now()) {
-			log.Info("skip heal: Flux Heal-Revert Loop detected — boot-webhook fail-open patch deferred",
-				"config", cfg.Name)
-			continue
-		}
-
+		// NO FluxPatchGate here — deliberate emergency bypass. This
+		// is the bootstrap fail-open flip: on a cluster that cannot
+		// boot, a Git-owned webhook config is not a drift fight —
+		// gating the write on the Heal-Revert-Loop threshold would
+		// deadlock bring-up (Git cannot fix drift on a cluster it
+		// locks out of existence). Steady-state fail-open flips in
+		// the sweep duties still pass the gate.
 		payload, err := json.Marshal(patch)
 		if err != nil { // unreachable for this shape, but keep the guard honest
 			errs = append(errs, fmt.Errorf("boot-webhook fail-open: marshal patch %s: %w", cfg.Name, err))

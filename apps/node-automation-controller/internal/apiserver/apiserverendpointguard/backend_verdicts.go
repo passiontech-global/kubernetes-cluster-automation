@@ -35,8 +35,8 @@ type backendOutcome struct {
 
 // foldStreaks folds one backend's probe result into its streak state
 // and returns this cycle's verdict — wedge signals only after
-// endpointGuardErrCycles consecutive failures, the RV-gap and
-// frozen-cache streaks, and the ok-streak healthy backends accumulate.
+// endpointGuardErrCycles consecutive failures and the frozen-cache
+// streak, and the ok-streak healthy backends accumulate.
 // A run budget that expired mid-probe defers the verdict without
 // touching the streaks (a starved or cancelled request is not
 // evidence the backend is wedged). All state passed in — no globals,
@@ -59,7 +59,7 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 		// reset so a flap doesn't resume mid-count on recovery.
 		st.errStreak++
 		o.wedged = st.errStreak >= endpointGuardErrCycles
-		st.gapStreak, st.frozenStreak, st.okStreak = 0, 0, 0
+		st.frozenStreak, st.okStreak = 0, 0
 		st.haveLast = false
 		log.Error(res.err, "backend probe failed — wedge signal", "ip", st.ip)
 		metrics.ObserveAPIBackend(st.ip, -1, quarantined)
@@ -67,11 +67,14 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 	}
 	st.errStreak = 0
 	gap := res.liveRV - res.cacheRV
-	if gap >= endpointGuardRVGap {
-		st.gapStreak++
-	} else {
-		st.gapStreak = 0
-	}
+	// Frozen-cache wedge — the ONLY rv-based signal. cache_rv is the
+	// watch cache's synced RV for the SAME LeaseList the quorum read
+	// hit, and node-lease renewals (~10s/node) guarantee it advances
+	// every sweep on a healthy backend: cache_rv flat across
+	// consecutive cycles while live_rv keeps growing is the wedge
+	// signature. The instantaneous gap is NOT a signal — it counts
+	// every unrelated cluster write since the last lease renewal, so
+	// it false-positived under ordinary write storms (P0-3).
 	if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
 		st.frozenStreak++
 	} else if res.cacheRV == st.lastCacheRV && res.liveRV > res.cacheRV {
@@ -87,9 +90,8 @@ func foldStreaks(log logr.Logger, st *backendProbeState, res apiProbeResult,
 	}
 	st.lastLiveRV, st.lastCacheRV, st.haveLast = res.liveRV, res.cacheRV, true
 	st.lastKIDs = res.jwksKIDs
-	o.wedged = st.gapStreak >= endpointGuardGapCycles ||
-		st.frozenStreak >= endpointGuardFrozenCyc
-	o.healthy = gap < endpointGuardRVGap && st.frozenStreak < endpointGuardFrozenCyc
+	o.wedged = st.frozenStreak >= endpointGuardFrozenCyc
+	o.healthy = st.frozenStreak < endpointGuardFrozenCyc
 	if o.healthy {
 		st.okStreak++
 	} else {
@@ -246,10 +248,15 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 // decideQuarantine turns the per-backend verdicts into this cycle's
 // removal/re-add lists. It runs only after run()'s min-backends gate:
 // the SKIP/recovering logs below exist to explain edit decisions, so
-// on probe-only clusters they must stay silent.
+// on probe-only clusters they must stay silent. reconcilerDriven tells
+// whether the apiserver's own endpoint reconciler owns the SSOT
+// objects (self-hosted planes — it re-lists live backends every ~10s);
+// peerIPs is the independently discovered control-plane peer set used
+// only when no such reconciler exists (hosted planes — P0-3).
 func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 	results map[string]backendOutcome, activeIPs []string,
-	routableIPs, quarantinedIPs map[string]bool) (toRemove, toAdd []string, healthyActive int) {
+	routableIPs, quarantinedIPs map[string]bool,
+	reconcilerDriven bool, peerIPs map[string]bool) (toRemove, toAdd []string, healthyActive int) {
 	// ---- Decide removals -------------------------------------------------
 	// A wedged active IP may be quarantined only while at least one
 	// OTHER ROUTABLE IP is healthy this cycle — processed in sorted
@@ -306,22 +313,35 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 	// okStreak proves the HOST answers :6443, not that the backend is
 	// still a member of default/kubernetes: a decommissioned backend
 	// whose node keeps serving TLS passes every probe (okStreak climbs
-	// forever, errStreak stays 0) while the endpoints reconciler keeps
-	// dropping its address — re-adding on streak alone made the guard
-	// re-write the IP into default/kubernetes every 10s cycle against
-	// the reconciler, and kube-proxy flapped the kubernetes.default
-	// route cluster-wide. So re-add only IPs the reconciler still
-	// lists; an absent quarantined IP leaves via expireQuarantine's
-	// decommission evidence instead of this loop.
+	// forever, errStreak stays 0) — re-adding on streak alone made the
+	// guard re-write the IP every cycle against whatever authority
+	// dropped it, and kube-proxy flapped kubernetes.default. The
+	// membership verdict therefore depends on who owns the objects:
+	//
+	//   - reconcilerDriven (self-hosted): the apiserver's endpoint
+	//     reconciler re-lists live backends every ~10s, so activeIPs
+	//     IS the authoritative membership answer — an absent IP is
+	//     being deliberately dropped and stays quarantined (it leaves
+	//     via expireQuarantine's decommission evidence instead).
+	//   - hosted planes: NO reconciler exists — nothing re-lists a
+	//     pulled IP, so activeIPs can never contain it again and the
+	//     old check deadlocked every recovered backend out of the set
+	//     forever (P0-3 SKIP-RE-ADD). Membership is instead proven
+	//     against ssotPeerIPs, the control-plane node InternalIPs
+	//     discovered independently of the mutated objects; a nil
+	//     peer set (discovery failed) keeps the strict rule.
 	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
 		if g.backends[ip].okStreak < endpointGuardRecoverCyc {
 			log.Info("quarantined backend still recovering",
 				"ip", ip, "okStreak", g.backends[ip].okStreak, "need", endpointGuardRecoverCyc)
 			continue
 		}
-		if !slices.Contains(activeIPs, ip) {
-			log.Info("SKIP-RE-ADD: recovered backend absent from current endpoints — not re-added",
-				"ip", ip, "okStreak", g.backends[ip].okStreak)
+		listed := slices.Contains(activeIPs, ip)
+		peer := !reconcilerDriven && peerIPs[ip]
+		if !listed && !peer {
+			log.Info("SKIP-RE-ADD: recovered backend not vouched by endpoints or peer discovery — not re-added",
+				"ip", ip, "okStreak", g.backends[ip].okStreak,
+				"reconcilerDriven", reconcilerDriven)
 			continue
 		}
 		toAdd = append(toAdd, ip)

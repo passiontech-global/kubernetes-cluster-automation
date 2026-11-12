@@ -85,27 +85,47 @@ type Cond struct {
 }
 
 // Monitor owns the three NPD monitor ports and their tail state —
-// the kmsg Tailer (handle, carry, backlog gates), the journald µs
-// cursors and the monitor-computed condition latches. Not
-// goroutine-safe — the parent's Cycle loop is the only driver.
+// the kmsg Tailer (handle, carry, backlog gates), the shared
+// journalwatch Multiplexer cursors and the monitor-computed
+// condition latches. Not goroutine-safe — the parent's Cycle loop
+// is the only driver.
 type Monitor struct {
 	deps Deps
 
-	// Journal cursors are µs wall timestamps — 0 bounds the first
-	// fetch to LogLookback.
-	kmsgTail         *kmsg.Tailer // the /dev/kmsg tail — handle, carry, backlog gates
-	kmsgScanned      bool         // mirrors the tail's caught-up flag (kernelLines)
-	kmsgJournalMode  bool         // permanent fallback once kmsg can't be opened
-	kubeletJournalUS int64        // kubelet-stale monitor cursor
-	kernelJournalUS  int64        // journalctl -k fallback cursor
+	// journal is the ONE shared `journalctl -o json` tail both
+	// journald consumers poll — the kubelet-stale monitor's
+	// _SYSTEMD_UNIT match and the kernel fallback's
+	// _TRANSPORT=kernel match (journalctl -k's own match, applied
+	// client-side) fan out of a single exec per poll window instead
+	// of two journalctl forks per cycle. The shared __CURSOR and
+	// per-subscriber pending queues live inside the mux.
+	journal *journalwatch.Multiplexer
+
+	kmsgTail        *kmsg.Tailer // the /dev/kmsg tail — handle, carry, backlog gates
+	kmsgScanned     bool         // mirrors the tail's caught-up flag (kernelLines)
+	kmsgJournalMode bool         // permanent fallback once kmsg can't be opened
 
 	// Permanent-condition bookkeeping — KernelDeadlock latches True
 	// for the process lifetime (NPD permanent parity);
 	// ReadonlyFilesystem follows the live mounts.
-	kernelDeadlock    bool
-	kernelDeadlockMsg string
-	readonlyFS        bool
-	readonlyFSMsg     string
+	// kernelDeadlockEventSent tracks the transition Event separately
+	// from the latch: the latch sets unconditionally on the first
+	// signature (the CONDITION must not wait on the Events API) while
+	// a refused emit stays pending and retries — journal entries
+	// requeue, kmsg records retry on the next matching line.
+	kernelDeadlock          bool
+	kernelDeadlockMsg       string
+	kernelDeadlockEventSent bool
+	readonlyFS              bool
+	readonlyFSMsg           string
+	// seeded marks the ONE startup seed pass SeedConditions runs —
+	// the parent's syncConditions calls it every cycle, but only the
+	// first may fold the live conditions in. Re-seeding each pass
+	// would re-assert ReadonlyFilesystem=True from a STALE api
+	// snapshot every cycle, permanently masking the live mount scan
+	// that is supposed to clear it after a remount-rw. KernelDeadlock
+	// is permanent-class so a one-shot seed is also all it needs.
+	seeded bool
 }
 
 // New returns the monitor set. The kmsg Tailer opens its device
@@ -113,6 +133,19 @@ type Monitor struct {
 // (re)open so cfg/test re-points stay live.
 func New(d Deps) *Monitor {
 	m := &Monitor{deps: d}
+	m.journal = journalwatch.New(d.JournalFetch)
+	m.journal.Now = d.Now
+	// The kernel fallback subscribes from birth: its pending queue
+	// accumulates _TRANSPORT=kernel entries even while kmsg owns the
+	// source (bounded by the mux cap, oldest dropped), so the
+	// fallback's first drain replays exactly the lookback window —
+	// the same coverage the old `journalctl -k --since` first fetch
+	// gave — instead of missing the gap between kmsg failure and
+	// subscription.
+	// Subscribe cannot fail on a constant non-empty id.
+	_ = m.journal.Subscribe(journalSubKernel, func(e journalwatch.Entry) bool {
+		return e.Transport == "kernel"
+	})
 	m.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{
 		Paths: func() []string {
 			c := m.cfg()
@@ -131,6 +164,45 @@ func New(d Deps) *Monitor {
 // defers it so subsystem shutdown doesn't leak the descriptor.
 func (m *Monitor) Close() {
 	m.kmsgTail.Close()
+}
+
+// SeedConditions folds the node's LIVE conditions into the monitor
+// latches ONCE — the first syncConditions pass after startup (the
+// parent's per-cycle call is a no-op after that via the seeded
+// flag). Without it a restarted agent evaluates kernelDeadlock/
+// readonlyFS as False and PATCHES the node's True values away:
+// KernelDeadlock is permanent-class (NPD parity — it must survive
+// an agent restart), and ReadonlyFilesystem would flap False for
+// one cycle before the next mount scan recomputes it. Seeding is
+// set-only — a condition the monitors themselves cleared stays
+// cleared — and it must run exactly once: a per-cycle re-seed
+// re-reads the apiserver's LAST-WRITTEN condition, so a remounted-
+// rw filesystem would keep being re-asserted True from stale state
+// and never recover.
+func (m *Monitor) SeedConditions(conds []corev1.NodeCondition) {
+	if m.seeded {
+		return
+	}
+	m.seeded = true
+	for _, c := range conds {
+		switch c.Type {
+		case condKernelDeadlock:
+			if c.Status == corev1.ConditionTrue {
+				if !m.kernelDeadlock {
+					m.kernelDeadlock = true
+					m.kernelDeadlockMsg = c.Message
+				}
+				// The previous instance's transition Event either
+				// landed or is unrecoverable — don't re-emit.
+				m.kernelDeadlockEventSent = true
+			}
+		case condReadonlyFS:
+			if c.Status == corev1.ConditionTrue && !m.readonlyFS {
+				m.readonlyFS = true
+				m.readonlyFSMsg = c.Message
+			}
+		}
+	}
 }
 
 // cfg is the current monitor config snapshot.

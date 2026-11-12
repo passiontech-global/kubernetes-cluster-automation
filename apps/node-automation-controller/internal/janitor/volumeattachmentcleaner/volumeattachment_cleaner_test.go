@@ -1512,3 +1512,24 @@ func TestVolumeOnNodeAttachedAndLookupFailure(t *testing.T) {
 		t.Fatalf("pv lookup failure metered %v times, want 1", got)
 	}
 }
+
+// vaFirstSeenKey must distinguish a recreated VA (same deterministic
+// csi-hash name, new UID) from the dead object — otherwise the
+// replacement inherits the sighting window and detaches on cycle
+// one. UID-less fixtures keep the bare-name key.
+func TestVAFirstSeenKeyUIDDisambiguation(t *testing.T) {
+	va1 := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
+		Name: "csi-abc", UID: "uid-1"}}
+	va2 := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
+		Name: "csi-abc", UID: "uid-2"}}
+	if vaFirstSeenKey(va1) == vaFirstSeenKey(va2) {
+		t.Fatal("same-name VAs with different UIDs share a ledger key")
+	}
+	if got := vaLedgerName(vaFirstSeenKey(va1)); got != "csi-abc" {
+		t.Fatalf("vaLedgerName = %q, want csi-abc", got)
+	}
+	bare := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "csi-abc"}}
+	if vaFirstSeenKey(bare) != "csi-abc" {
+		t.Fatalf("UID-less key = %q, want bare name", vaFirstSeenKey(bare))
+	}
+}

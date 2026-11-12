@@ -45,9 +45,11 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 	for i := range e.Pods {
 		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
 	}
-	// (a) overlayfs snapshot upperdirs — the CRI plugin keys the
-	// snapshot by container id and snapshotPodUID resolves it back
-	// through the task dirs' pod-uid annotation.
+	// (a) overlayfs snapshot upperdirs — snapshot dir names are
+	// numeric on containerd; snapshotMountIDs binds each to its
+	// task id through the live rootfs mount's upperdir=, and
+	// taskDirPodUID resolves that to the pod uid annotation.
+	mountIDs := snapshotMountIDs(c.d)
 	for _, snap := range readDirNames(c.d.Cfg.Disk.WLayerSnapshotsDir) {
 		fsDir := filepath.Join(snap, "fs")
 		size, _ := walkBytes(c.d, e, fsDir)
@@ -55,7 +57,7 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 			continue
 		}
 		var pod *corev1.Pod
-		if uid := snapshotPodUID(c.d, filepath.Base(snap)); uid != "" {
+		if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
 			pod = podByUID[uid]
 		}
 		if podDeclaresEphemeralStorage(pod) {

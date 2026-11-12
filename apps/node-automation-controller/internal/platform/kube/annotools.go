@@ -14,6 +14,7 @@
 package kube
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"time"
@@ -46,6 +47,19 @@ func AnnoTime(obj metav1.Object, key string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return ParseAnnoTime(obj.GetAnnotations()[key])
+}
+
+// AnnoTimeCtx is AnnoTime resolved through the sweep overlay —
+// EffectiveAnno supplies the value, so an annotation patch recorded
+// mid-sweep (kube.RecordAnnoPatch) reads back instead of the
+// pre-patch snapshot copy. Heal gates MUST use this variant: the
+// object's own map is frozen at LIST time for the rest of the sweep.
+// Outside a sweep it is byte-identical to AnnoTime.
+func AnnoTimeCtx(ctx context.Context, obj metav1.Object, key string) (time.Time, bool) {
+	if obj == nil {
+		return time.Time{}, false
+	}
+	return ParseAnnoTime(EffectiveAnno(ctx, obj, key))
 }
 
 // MergePatchAnnos builds a MergePatchType patch doc setting (or, for

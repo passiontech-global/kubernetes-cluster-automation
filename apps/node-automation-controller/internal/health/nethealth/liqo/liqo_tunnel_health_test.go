@@ -75,7 +75,7 @@ func TestLiqoDeadPeerBouncesGateway(t *testing.T) {
 		corev1.PodRunning, true, time.Hour)
 	cs := fake.NewSimpleClientset(gw)
 	p := testProberDyn(cs, probetest.OpDyn(conn))
-	res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("dead peer must fail: %+v", res)
 	}
@@ -102,7 +102,7 @@ func TestLiqoBounceMatchesFailingPeer(t *testing.T) {
 		"liqo-gateway-wireguard-peer-b-0", corev1.PodRunning, true, time.Hour)
 	cs := fake.NewSimpleClientset(healthy, failing)
 	p := testProberDyn(cs, probetest.OpDyn(conn))
-	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("dead peer must fail")
 	}
 	if _, err := cs.CoreV1().Pods("liqo-tenant").
@@ -135,7 +135,7 @@ func TestLiqoVirtualNodeNoPeerMatchSkipsBounce(t *testing.T) {
 		"liqo-gateway-wireguard-peer-a-0", corev1.PodRunning, true, time.Hour)
 	cs := fake.NewSimpleClientset(gw, node)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("dead virtual node must fail (finding)")
 	}
 	if _, err := cs.CoreV1().Pods("liqo-tenant").
@@ -161,7 +161,7 @@ func TestLiqoVirtualNodeZeroTransitionTimeUsesAge(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(node)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatal("a 1m-old virtual node must not read as a dead peer")
 	}
 	if m := probetest.FindMetric(t, "node_automation_liqo_peer_unhealthy",
@@ -175,7 +175,7 @@ func TestLiqoConnectedPeerPasses(t *testing.T) {
 	conn := liqoConnection("liqo-tenant", "conn-peer-b", "True", time.Hour)
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(conn))
-	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("connected peer must pass: %+v", res)
 	}
 }
@@ -210,7 +210,7 @@ func TestLiqoCRNoPeerMatchMultiGatewaySkipsBounce(t *testing.T) {
 		"liqo-gateway-wireguard-peer-b-0", corev1.PodRunning, true, time.Hour)
 	cs := fake.NewSimpleClientset(gwA, gwB)
 	p := testProberDyn(cs, probetest.OpDyn(conn))
-	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*liqoTunnelHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("dead peer with no matching gateway must fail (finding)")
 	}
 	for _, gw := range []*corev1.Pod{gwA, gwB} {
@@ -356,7 +356,7 @@ func TestLiqoEndpointChangeBouncesGateway(t *testing.T) {
 	check := probetest.MustCheck[*liqoTunnelHealthCheck](t, p)
 
 	// Sweep 1: endpoint arms the ledger — connected peer, no bounce.
-	if res := check.Run(ctx); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first sighting must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("liqo-tenant").Get(ctx, "liqo-gateway-peer-b-0", metav1.GetOptions{}); err != nil {
@@ -374,7 +374,7 @@ func TestLiqoEndpointChangeBouncesGateway(t *testing.T) {
 		Namespace("liqo-tenant").Update(ctx, moved, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update gatewayclient: %v", err)
 	}
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatalf("endpoint move must be a finding: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("liqo-tenant").Get(ctx, "liqo-gateway-peer-b-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
@@ -387,7 +387,7 @@ func TestLiqoEndpointChangeBouncesGateway(t *testing.T) {
 	// Sweep 3: the ledger now holds the new endpoint — no repeat
 	// bounce (the cooldown key would suppress it anyway, but the
 	// finding must not re-fire either).
-	if res := check.Run(ctx); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("unchanged endpoint must pass: %+v", res)
 	}
 	if v := ptestutil.ToFloat64(liqoEndpointChangedTotal.WithLabelValues("peer-b")); v != 1 {

@@ -1,8 +1,9 @@
 // preemptor_test.go — the dead-leader lease preemptor's contract:
 // preempt ONLY on provably-dead holders (pod gone/terminating,
-// node NotReady or unreachable-tainted) with a stale renewTime;
-// preserve the 180s tolerance for a live leader; stay idempotent
-// once the Lease is already shortened.
+// node NotReady or unreachable-tainted) whose (renewTime,
+// holderIdentity) pair stayed frozen past PreemptStaleAfter on the
+// standby's own clock; preserve the 180s tolerance for a live
+// leader; stay idempotent once the Lease is already shortened.
 package leaderelect
 
 import (
@@ -20,6 +21,33 @@ import (
 )
 
 var testNow = time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+// preemptorWith builds a Preemptor on a MUTABLE fake clock — the
+// frozen-renewTime watch needs time to advance between sweeps, so
+// tests hold the clock variable and bump it via the returned
+// pointer. primeSweep runs the first observation that seeds the
+// watch; freezeSweep advances past PreemptStaleAfter and sweeps
+// again — the pair being unchanged across the gap is the
+// dead-holder proof.
+func preemptorWith(objs ...runtime.Object) (*Preemptor, *time.Time) {
+	now := testNow
+	p := &Preemptor{CS: fake.NewSimpleClientset(objs...),
+		Now: timex.NewClock(func() time.Time { return now })}
+	return p, &now
+}
+
+func (p *Preemptor) primeSweep(t *testing.T) {
+	t.Helper()
+	if _, err := p.Sweep(context.Background()); err != nil {
+		t.Fatalf("prime sweep: %v", err)
+	}
+}
+
+func (p *Preemptor) freezeSweep(t *testing.T, now *time.Time) (string, error) {
+	t.Helper()
+	*now = now.Add(PreemptStaleAfter + time.Second)
+	return p.Sweep(context.Background())
+}
 
 func staleLease() *coordinationv1.Lease {
 	renew := metav1.NewMicroTime(testNow.Add(-time.Minute))
@@ -49,11 +77,25 @@ func TestSweepFreshRenewNoPreempt(t *testing.T) {
 	lease := staleLease()
 	fresh := metav1.NewMicroTime(testNow.Add(-5 * time.Second))
 	lease.Spec.RenewTime = &fresh
-	p := &Preemptor{CS: fake.NewSimpleClientset(lease),
-		Now: timex.NewClock(func() time.Time { return testNow })}
+	p, now := preemptorWith(lease)
+	p.primeSweep(t)
+	// A live leader keeps renewing: bump renewTime to the advanced
+	// clock between sweeps — the pair CHANGED, so the frozen watch
+	// resets and no amount of elapsed standby time can prove death.
+	*now = now.Add(PreemptStaleAfter + time.Second)
+	got, err := p.CS.CoordinationV1().Leases(DefaultNamespace).
+		Get(context.Background(), DefaultLeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	got.Spec.RenewTime = &metav1.MicroTime{Time: *now}
+	if _, err := p.CS.CoordinationV1().Leases(DefaultNamespace).
+		Update(context.Background(), got, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update lease: %v", err)
+	}
 	reason, err := p.Sweep(context.Background())
 	if err != nil || reason != "" {
-		t.Fatalf("fresh renew: reason=%q err=%v, want no-op", reason, err)
+		t.Fatalf("renewing leader: reason=%q err=%v, want no-op", reason, err)
 	}
 }
 
@@ -106,9 +148,9 @@ func TestSweepDeadHolderReasons(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &Preemptor{CS: fake.NewSimpleClientset(tc.objs...),
-				Now: timex.NewClock(func() time.Time { return testNow })}
-			reason, err := p.Sweep(context.Background())
+			p, now := preemptorWith(tc.objs...)
+			p.primeSweep(t)
+			reason, err := p.freezeSweep(t, now)
 			if err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
@@ -127,6 +169,33 @@ func TestSweepDeadHolderReasons(t *testing.T) {
 					*lease.Spec.LeaseDurationSeconds, PreemptLeaseDurationSeconds)
 			}
 		})
+	}
+}
+
+func TestSweepFrozenWatchResetsOnChange(t *testing.T) {
+	// The frozen window is measured from the LAST observed change,
+	// not lease creation: a pair that changed 20s ago is healthy
+	// even though the standby has watched for 40s total.
+	p, now := preemptorWith(staleLease())
+	p.primeSweep(t)
+	*now = now.Add(20 * time.Second)
+	// Holder identity changes (new leader acquired mid-window).
+	got, err := p.CS.CoordinationV1().Leases(DefaultNamespace).
+		Get(context.Background(), DefaultLeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	newHolder := "node-automation-controller-zzz99_new-uuid"
+	got.Spec.HolderIdentity = &newHolder
+	if _, err := p.CS.CoordinationV1().Leases(DefaultNamespace).
+		Update(context.Background(), got, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update lease: %v", err)
+	}
+	// 20s more — 40s since prime but only 20s since the change.
+	*now = now.Add(20 * time.Second)
+	reason, err := p.Sweep(context.Background())
+	if err != nil || reason != "" {
+		t.Fatalf("changed pair: reason=%q err=%v, want no-op", reason, err)
 	}
 }
 

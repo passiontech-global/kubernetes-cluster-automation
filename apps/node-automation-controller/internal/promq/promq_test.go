@@ -76,6 +76,19 @@ func TestResolveEndpoint(t *testing.T) {
 			fallback: "http://10.0.0.9:9090",
 			want:     "http://10.0.0.9:9090/api/v1/query",
 		},
+		{
+			// VictoriaMetrics/Thanos behind a reverse-proxy subpath:
+			// the mount prefix must survive into the query endpoint
+			// or every PromQL call 404s at the proxy's bare root.
+			name:     "proxy subpath mount preserved",
+			fallback: "https://mon.example.com/prometheus/-/healthy",
+			want:     "https://mon.example.com/prometheus/api/v1/query",
+		},
+		{
+			name:     "nested proxy mount preserved",
+			fallback: "https://mon.example.com/obs/vm/-/healthy?x=1",
+			want:     "https://mon.example.com/obs/vm/api/v1/query",
+		},
 		{name: "both empty", wantErr: true},
 		{name: "relative fallback", fallback: "/metrics", wantErr: true},
 		{name: "hostless scheme", fallback: "prom:9090", wantErr: true},
@@ -109,7 +122,10 @@ func TestResolveEndpoint(t *testing.T) {
 func TestInstantQuerySuccess(t *testing.T) {
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.Query().Get("query")
+		// promq POSTs the query as a form body — ParseForm covers
+		// both that and any GET caller.
+		_ = r.ParseForm()
+		gotQuery = r.FormValue("query")
 		_, _ = w.Write([]byte(`{
 			"status": "success",
 			"data": {"resultType": "vector", "result": [

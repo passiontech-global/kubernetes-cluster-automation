@@ -173,6 +173,17 @@ type wantedCond struct {
 // failure skips the patch only — gauges are purely local and
 // always update.
 func (r *Reporter) syncConditions(ctx context.Context) error {
+	// The node GET moved ahead of the evals: the NPD monitor latches
+	// seed from the LIVE conditions first, so a restarted agent
+	// cannot evaluate KernelDeadlock/ReadonlyFilesystem as False and
+	// patch the previous instance's True values away (the permanent
+	// parity the plan calls out). A GET failure skips the seed AND
+	// the patch — the evals below still run so problem_gauge keeps
+	// updating (the gauges-are-local contract).
+	node, getErr := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName, metav1.GetOptions{})
+	if getErr == nil {
+		r.monitors.SeedConditions(node.Status.Conditions)
+	}
 	var all []wantedCond
 	for _, e := range r.evalConditions() {
 		all = append(all, wantedCond{e.def.typ, e.status, e.reason,
@@ -190,10 +201,8 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 		}
 		r.problemGauge.WithLabelValues(string(w.typ), w.gaugeReason).Set(v)
 	}
-
-	node, err := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get node %s: %w", r.cfg.NodeName, err)
+	if getErr != nil {
+		return fmt.Errorf("get node %s: %w", r.cfg.NodeName, getErr)
 	}
 	live := make(map[corev1.NodeConditionType]corev1.NodeCondition, len(node.Status.Conditions))
 	for _, c := range node.Status.Conditions {

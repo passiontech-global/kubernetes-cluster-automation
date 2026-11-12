@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
@@ -277,5 +279,122 @@ func TestBounceOperatorPodNilPickTakesAll(t *testing.T) {
 	if n := d.BounceOperatorPod(ctx, logr.Discard(), "prov-health",
 		"opns", nil, &d.Heals, "provisioner", time.Hour, now); n != 2 {
 		t.Fatalf("nil pick deleted %d pods, want all 2", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Budget-grant refunds — the exactly-once contract at the probefw gate
+// owners. heal.ConfigureBudget is process-global; each test restores
+// the inert gate on cleanup.
+// ---------------------------------------------------------------------------
+
+// A DeletePodHeal whose delete is cleanly deferred by the sweep
+// overlay's quorum reservation must hand the gate's budget grant
+// back exactly once — proven by window accounting: budget=2, the
+// first heal spends one grant for real, the second heal's grant is
+// refunded on deferral, and a third gate still proceeds.
+func TestDeletePodHealRefundsOnQuorumDenial(t *testing.T) {
+	heal.ConfigureBudget(2, time.Hour)
+	defer heal.ConfigureBudget(0, 0)
+
+	// Two pods of the SAME controller — the second delete inside one
+	// sweep defers at the quorum guard.
+	p1 := ownedPod("apps", "web-1", "u1", true, false)
+	p2 := ownedPod("apps", "web-2", "u2", true, false)
+	cs := fake.NewSimpleClientset(&p1, &p2)
+	d := safePodDeleteDeps(cs)
+	sctx := WithSweepSnapshot(context.Background())
+	now := time.Now()
+
+	if !d.DeletePodHeal(sctx, logr.Discard(), "check-a", "t1", &p1,
+		time.Hour, now) {
+		t.Fatal("first heal should deliver")
+	}
+	if d.DeletePodHeal(sctx, logr.Discard(), "check-b", "t2", &p2,
+		time.Hour, now) {
+		t.Fatal("second same-owner heal must defer at the quorum guard")
+	}
+	// The deferred heal's grant went back: with budget=2 and one
+	// grant genuinely spent, a third gate still proceeds. Without
+	// the refund the window would read 2/2 and deny.
+	proceed, unverifiable := d.HealAllowed(sctx, logr.Discard(),
+		nil, "selfheal/check-c/t3", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("post-deferral gate = (%v,%v), want (true,false) — "+
+			"the deferred heal's grant was not refunded", proceed, unverifiable)
+	}
+}
+
+// BounceOperatorPod refunds its ONE gate grant only when the whole
+// pass delivers and attempts nothing — every target cleanly
+// deferred. Here the workload's disruption slot is pre-reserved so
+// both targets defer; budget=1 means the refund is the difference
+// between proceed and deny on the next gate.
+func TestBounceOperatorPodRefundsOnceOnAllDeferred(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	defer heal.ConfigureBudget(0, 0)
+
+	p1 := ownedPod("ops", "op-1", "u1", true, false)
+	p2 := ownedPod("ops", "op-2", "u2", true, false)
+	cs := fake.NewSimpleClientset(&p1, &p2)
+	d := safePodDeleteDeps(cs)
+	sctx := WithSweepSnapshot(context.Background())
+	now := time.Now()
+
+	// Spend the shared workload slot up front — both bounce targets
+	// then defer at the quorum guard with no mutation attempted.
+	if !kube.TryReserveWorkloadDisruption(sctx, &p1) {
+		t.Fatal("pre-reserve failed")
+	}
+	deleted := d.BounceOperatorPod(sctx, logr.Discard(),
+		"bounce-check", "ops", nil, nil, "bounce-key", time.Hour, now)
+	if deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 — every target deferred", deleted)
+	}
+	// The gate's grant was refunded exactly once: the next gate
+	// proceeds (without the refund the single grant stays spent).
+	proceed, unverifiable := d.HealAllowed(sctx, logr.Discard(),
+		nil, "selfheal/other/t", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("post-bounce gate = (%v,%v), want (true,false) — "+
+			"the all-deferred bounce did not refund its grant",
+			proceed, unverifiable)
+	}
+}
+
+// A bounce that DELIVERS keeps its grant — the refund path must not
+// fire when even one mutation executed.
+func TestBounceOperatorPodDeliveredKeepsGrant(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	defer heal.ConfigureBudget(0, 0)
+
+	p1 := ownedPod("ops", "op-1", "u1", true, false)
+	p2 := ownedPod("ops", "op-2", "u2", true, false)
+	cs := fake.NewSimpleClientset(&p1, &p2)
+	d := safePodDeleteDeps(cs)
+	sctx := WithSweepSnapshot(context.Background())
+	now := time.Now()
+
+	// Only p1 is picked — its delete delivers (the first reservation
+	// for the workload wins the slot).
+	deleted := d.BounceOperatorPod(sctx, logr.Discard(),
+		"bounce-check", "ops",
+		func(pods []corev1.Pod) []*corev1.Pod {
+			var out []*corev1.Pod
+			for i := range pods {
+				if pods[i].Name == "op-1" {
+					out = append(out, &pods[i])
+				}
+			}
+			return out
+		}, nil, "bounce-key", time.Hour, now)
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	proceed, unverifiable := d.HealAllowed(sctx, logr.Discard(),
+		nil, "selfheal/other/t", 0, now)
+	if proceed || unverifiable {
+		t.Fatalf("post-delivery gate = (%v,%v), want (false,false) — "+
+			"a delivered heal refunded its grant", proceed, unverifiable)
 	}
 }

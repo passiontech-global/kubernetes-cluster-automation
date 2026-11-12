@@ -10,6 +10,8 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 const (
@@ -20,7 +22,25 @@ const (
 	// breathing room a permanently sick subsystem gets between
 	// restart attempts.
 	superviseBackoffMax = 5 * time.Minute
+	// superviseHealthyCap bounds the mid-run healthy threshold —
+	// min(2*backoff, this): a run stable this long proves the
+	// crash-loop is over even when backoff sits at the 5m cap.
+	superviseHealthyCap = superviseBackoffMax
 )
+
+// superviseHealthyAfter is the elapsed time after which a RUNNING
+// (not yet exited) subsystem counts as healthy: min(2*backoff,
+// superviseHealthyCap). It mirrors superviseHealthyRun's post-exit
+// bar so the mid-run reset and the exit-path reset agree — a run
+// that would reset the ladder on exit resets it as soon as it
+// proves stable, without waiting for the exit that may never come.
+func superviseHealthyAfter(backoff time.Duration) time.Duration {
+	d := backoff * 2
+	if d > superviseHealthyCap {
+		d = superviseHealthyCap
+	}
+	return d
+}
 
 // superviseHealthyRun reports whether a run that lasted elapsed
 // counts as healthy enough to reset the exponential restart ladder
@@ -79,6 +99,13 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	logger().Info("subsystem started", "name", name)
 	up := a.subUp.WithLabelValues(name)
 	restarts := a.restarts.WithLabelValues(name)
+	// Liveness registry: /healthz reads per-loop staleness while
+	// active is set — registered for the supervise goroutine's
+	// whole life so a subsystem that never reaches Run still gets
+	// judged on its run-entry stamp.
+	sb := &subBeat{live: cycle.NewLiveness()}
+	a.beats.Store(name, sb)
+	defer a.beats.Delete(name)
 	// Restart backoff doubles per early exit (5s → 5m cap) so a
 	// subsystem that returns instantly can't spam a restart + error
 	// log every cycle. The reset to the initial backoff is gated by
@@ -112,16 +139,52 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	for {
 		began := time.Now()
 		up.Set(1)
-		func() {
+		sb.active.Store(true)
+		// Run-entry stamp doubles as the startup grace: the first
+		// cycle gets the full stale window to complete before
+		// /healthz can call the subsystem wedged. It lands on the
+		// shared fallback beat — Runner loops stamp their own
+		// beats from inside Run.
+		lctx := cycle.WithLiveness(ctx, sb.live)
+		cycle.Heartbeat(lctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
 			defer func() {
 				if r := recover(); r != nil {
 					logger().Error("subsystem panicked — restarting",
 						"subsystem", name, "panic", r)
 				}
 			}()
-			sub.Run(ctx)
+			sub.Run(lctx)
 		}()
+		// Mid-run healthy watch: a run that stays up past
+		// superviseHealthyAfter(backoff) proves the crash-loop is
+		// over — clear the /readyz degraded flag and reset the
+		// ladder NOW. Without this a subsystem that stabilised
+		// after reaching the 5m cap kept maxBackoffSubs elevated
+		// until its next exit — for a permanently healthy run
+		// that exit never comes, so /readyz sat at 503 forever.
+		healthy := time.NewTimer(superviseHealthyAfter(backoff))
+		select {
+		case <-done:
+			healthy.Stop()
+		case <-ctx.Done():
+			healthy.Stop()
+			<-done
+			up.Set(0)
+			sb.active.Store(false)
+			return
+		case <-healthy.C:
+			if atMax {
+				a.maxBackoffSubs.Add(-1)
+				atMax = false
+			}
+			backoff = superviseBackoffInitial
+			<-done
+		}
 		up.Set(0)
+		sb.active.Store(false)
 		if ctx.Err() != nil {
 			return
 		}

@@ -103,7 +103,7 @@ func TestNatsJetstreamDisabledEmitsThenHeals(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("jetstream_disabled member must FAIL the check")
 	}
@@ -119,7 +119,7 @@ func TestNatsJetstreamDisabledEmitsThenHeals(t *testing.T) {
 	}
 
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res = check.Run(ctx)
+	res = check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted jetstream_disabled must keep failing")
 	}
@@ -159,11 +159,11 @@ func TestNatsJetstreamHealCooldownKeysOnController(t *testing.T) {
 
 	// Arm the 10m window, then sweep past it — nats-0 is bounced.
 	probetest.FreezeNow(p.Deps, base)
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("jetstream_disabled member must FAIL the check")
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted jetstream_disabled must keep failing")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -191,7 +191,7 @@ func TestNatsJetstreamHealCooldownKeysOnController(t *testing.T) {
 		base.Add(-time.Hour))
 
 	probetest.FreezeNow(p.Deps, base.Add(12*time.Minute))
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("wedged replacement must keep the check failing")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -222,7 +222,7 @@ func TestNatsJetstreamMetaLeaderlessEmits(t *testing.T) {
 	cs := fake.NewSimpleClientset(natsFixture()...)
 	p := natsProber(cs, srv)
 
-	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("leaderless meta-group must FAIL the check")
 	}
@@ -264,7 +264,7 @@ func TestNatsJetstreamAckFloorEmits(t *testing.T) {
 	cs := fake.NewSimpleClientset(natsFixture()...)
 	p := natsProber(cs, srv)
 
-	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("consumer ack-floor stall must FAIL the check")
 	}
@@ -300,9 +300,9 @@ func TestNatsJetstreamQuorumGuardSkipsHeal(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	_ = check.Run(ctx)
+	_ = check.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted wedge must still FAIL the check")
 	}
@@ -326,11 +326,11 @@ func TestNatsJetstreamLogMarkerAfterWindow(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	if res := check.Run(ctx); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatal("a fresh log marker must wait out its window")
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("a persisted log marker must FAIL the check")
 	}
@@ -404,7 +404,7 @@ func TestNatsJetstreamStreamLeaderlessEmitsThenHeals(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stream_leaderless member must FAIL the check")
 	}
@@ -420,7 +420,7 @@ func TestNatsJetstreamStreamLeaderlessEmitsThenHeals(t *testing.T) {
 	}
 
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res = check.Run(ctx)
+	res = check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("persisted stream_leaderless must still FAIL the check")
 	}
@@ -461,9 +461,9 @@ func TestNatsJetstreamStreamLeaderlessQuorumGuard(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	_ = check.Run(ctx)
+	_ = check.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted wedge must still FAIL the check")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -489,7 +489,7 @@ func TestNatsJetstreamStreamLeaderlessNamespaceScope(t *testing.T) {
 	cs := fake.NewSimpleClientset(natsFixture()...)
 	p := natsProber(cs, srv)
 
-	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("namespace-scope stream leader loss must FAIL the check")
 	}
@@ -537,7 +537,7 @@ func TestNatsJetstreamStreamLeaderlessPartialLoss(t *testing.T) {
 	cs := fake.NewSimpleClientset(natsFixture()...)
 	p := natsProber(cs, srv)
 
-	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*natsJetstreamHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("partial stream leader loss must FAIL the check")
 	}
@@ -582,7 +582,7 @@ func TestNatsJetstreamStreamLeaderlessSparesLeadershipHolder(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*natsJetstreamHealthCheck](t, p)
-	res := check.Run(ctx)
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("stream_leaderless member must FAIL the check")
 	}
@@ -601,7 +601,7 @@ func TestNatsJetstreamStreamLeaderlessSparesLeadershipHolder(t *testing.T) {
 	}
 
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := check.Run(ctx); res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("persisted stream_leaderless must still FAIL the check")
 	}
 	if _, err := cs.CoreV1().Pods("mq").

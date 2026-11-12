@@ -277,7 +277,7 @@ func (p *operatorWorkqueueCheck) opCRPatch(gvr schema.GroupVersionResource,
 				metav1.PatchOptions{}); err != nil {
 			return err
 		}
-		probefw.MergeAnnoPatchLocally(o, data)
+		probefw.MergeAnnoPatchLocally(ctx, o, data)
 		return nil
 	}
 }

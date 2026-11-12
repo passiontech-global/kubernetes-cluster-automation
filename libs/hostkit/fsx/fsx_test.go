@@ -134,3 +134,144 @@ func TestWriteFileRenameFailureSweepsStaging(t *testing.T) {
 		t.Fatalf("staging file leaked after failure: dir holds %d entries", len(entries))
 	}
 }
+
+// Opts.Mode == 0 must NOT chmod the staged file to 0000: an existing
+// target keeps its permission bits, a new file gets 0644.
+func TestWriteFileZeroMode(t *testing.T) {
+	dir := t.TempDir()
+
+	// New file → 0644.
+	fresh := filepath.Join(dir, "fresh.conf")
+	if err := WriteFile(fresh, []byte("x"), Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != 0o644 {
+		t.Fatalf("new file mode = %o, want 644", got)
+	}
+
+	// Existing 0600 file keeps 0600 across a Mode==0 rewrite.
+	strict := filepath.Join(dir, "strict.conf")
+	if err := os.WriteFile(strict, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFile(strict, []byte("new"), Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	st, err = os.Stat(strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != 0o600 {
+		t.Fatalf("existing file mode = %o, want 600 preserved", got)
+	}
+	b, err := os.ReadFile(strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "new" {
+		t.Fatalf("content = %q, want %q", b, "new")
+	}
+}
+
+// stageFile creates a same-dir staging file for Promote tests.
+func stageFile(t *testing.T, dir, content string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(dir, ".stage-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		t.Fatalf("WriteString: %v", err)
+	}
+	return f
+}
+
+// Opts.Mode == 0 must resolve the target's existing permission bits:
+// a NEW file gets 0644 (CreateTemp's 0600 must not leak through).
+func TestPromoteNewFileGets0644(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh-state")
+
+	f := stageFile(t, dir, "payload")
+	if err := Promote(f, path, Opts{}); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("new file mode=%v, want 0644", fi.Mode().Perm())
+	}
+}
+
+// An existing target's mode is preserved when Opts.Mode == 0 —
+// rewriting a 0600 state file must not silently widen it to 0644.
+func TestPromotePreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret-state")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f := stageFile(t, dir, "new")
+	if err := Promote(f, path, Opts{}); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("existing file mode=%v, want preserved 0600", fi.Mode().Perm())
+	}
+}
+
+// A target stripped to Perm()==0 must NOT propagate 0000 — the
+// promoted file would be unreadable; 0644 is the fallback.
+func TestPromoteZeroPermTargetGets0644(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stripped-state")
+	if err := os.WriteFile(path, []byte("old"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	f := stageFile(t, dir, "new")
+	if err := Promote(f, path, Opts{}); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("zero-perm target mode=%v, want 0644 fallback", fi.Mode().Perm())
+	}
+}
+
+// A Stat failure that is NOT ErrNotExist (here ENOTDIR — path under
+// a regular file) means the target's real mode is unverifiable:
+// guessing 0644 could downgrade a sensitive file, so Promote must
+// fail and sweep the staging file.
+func TestPromoteStatErrorFails(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(blocker, "child") // stat -> ENOTDIR
+
+	f := stageFile(t, dir, "payload")
+	stageName := f.Name()
+	if err := Promote(f, path, Opts{}); err == nil {
+		t.Fatal("Promote on ENOTDIR stat must fail, not guess 0644")
+	}
+	if _, err := os.Stat(stageName); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging file leaked after failed Promote: %v", err)
+	}
+}

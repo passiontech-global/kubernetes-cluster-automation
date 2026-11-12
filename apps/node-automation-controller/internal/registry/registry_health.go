@@ -113,4 +113,7 @@ var healthRows = []shared.Module{
 	// argocd-agent-spin — the argocd-agent reconnect hot-loop auto-healer closes
 	// the roster after the gated block.
 	{Name: "argocd-agent-spin", Group: groupHealth, CheckReg: &shared.CheckReg{Name: gitops.CheckNameArgoCDAgentSpin, New: gitops.NewArgoCDAgentSpinCheck}},
+	// apiserver-node-reachability — the apiserver-dark node detector +
+	// webhook-backend evacuee (2026-11-12 lanit-04 webhook EOF incident).
+	{Name: "apiserver-node-reachability", Group: groupHealth, GateEnv: "NODE_AUTOMATION_APISERVER_NODE_REACHABILITY_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameApiserverNodeReachability, New: nethealth.NewApiserverNodeReachabilityCheck}},
 }

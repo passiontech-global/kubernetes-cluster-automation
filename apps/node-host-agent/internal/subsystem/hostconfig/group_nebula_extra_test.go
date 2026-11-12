@@ -33,6 +33,7 @@ func nebulaExtraFixture(t *testing.T, members map[string]string) (vars, certs, h
 	if err := os.MkdirAll(filepath.Join(hostRoot, "usr/local/bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	plantTunDevice(t, hostRoot)
 	dl = t.TempDir()
 	url, sum := tarballServer(t, members)
 	dp := filepath.Join(vars, "defaults.yaml")

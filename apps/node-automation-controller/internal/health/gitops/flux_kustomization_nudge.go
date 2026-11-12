@@ -94,6 +94,7 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	// stamps the in-RAM ledger only when the patch lands — a failed
 	// patch must not suppress the next attempt for the window.
 	err := heal.StampPersisted(ctx,
+		kust,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.Dyn.Resource(fluxKustomizationGVR).
 				Namespace(kust.GetNamespace()).
@@ -149,14 +150,24 @@ func (p *fluxKustomizationHealthCheck) nudgeFluxSourceArtifact(ctx context.Conte
 	if !proceed {
 		return
 	}
-	if err := heal.StampPersisted(ctx,
+	// The source stamp must carry BOTH annotations in one patch —
+	// the same pair helmrelease-unlocker's nudgeSource writes:
+	// requestedAt is this check's persisted cooldown, while
+	// last-source-nudge is the in-flight signal
+	// fluxSourceNudgeFresh and the unlocker's own cooldown gate
+	// read. Stamping only requestedAt left the source looking
+	// un-nudged, so every 5m cycle re-bought a heal-budget slot
+	// for the same broken GitRepository.
+	if err := heal.StampPersistedMulti(ctx,
+		src,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.Dyn.Resource(gvr).Namespace(ns).
 				Patch(ctx, name, types.MergePatchType,
 					data, metav1.PatchOptions{})
 			return err
 		},
-		kube.AnnoFluxRequestedAt, &p.sourceNudgeHealed, ck, now); err != nil {
+		[]string{kube.AnnoFluxRequestedAt, kube.AnnoLastSourceNudge},
+		&p.sourceNudgeHealed, ck, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "flux source requestedAt patch failed",
 			"source", kind+"/"+ns+"/"+name)

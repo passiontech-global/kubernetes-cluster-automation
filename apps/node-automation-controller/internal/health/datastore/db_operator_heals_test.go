@@ -59,7 +59,7 @@ func TestDBOperatorHealBouncesOperatorPod(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/pxc-master/pxc-cluster", base.Add(-12*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless pxc STS must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("pxc-operator").
@@ -87,7 +87,7 @@ func TestDBOperatorHealFindsAliasedPodNames(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/pxc-master/pxc-cluster", base.Add(-12*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless STS must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("everest").
@@ -120,7 +120,7 @@ func TestDBOperatorHealCooldownSuppressesRepeat(t *testing.T) {
 	// stamp 10m old sits inside the 30m cooldown.
 	ch.Heals.Stamp("pxc-operator", base.Add(-10*time.Minute))
 
-	if res := ch.Run(ctx); res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("still-masterless STS must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods("pxc-operator").
@@ -150,7 +150,7 @@ func TestDBOperatorHealNoRunningPodDefers(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/pxc-master/pxc-cluster", base.Add(-12*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("masterless STS must FAIL even with no heal target")
 	}
 	for _, a := range cs.Actions() {

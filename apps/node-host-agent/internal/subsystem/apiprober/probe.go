@@ -211,10 +211,11 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 		}
 		return 0, failBody, err
 	}
-	// Drain the rest of the body to EOF (uncapped) so keep-alive can
-	// reuse the connection; the remainder of a big items array is
-	// discarded, never buffered.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// Drain a bounded tail so keep-alive can reuse the connection;
+	// the remainder of a huge items array is discarded, never
+	// buffered — and never read to EOF unboundedly either: past
+	// 64 KiB the connection is not worth keeping, Close aborts it.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	rv, err = strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
 	if err != nil {
 		return 0, failParse,

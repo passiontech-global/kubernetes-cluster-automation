@@ -136,7 +136,7 @@ func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 		envx.StringKnob(envnames.EnvDevShmDir, &d.HostShmDir,
 			hostPath("/dev/shm")),
 		envx.StringKnob(envnames.EnvWLayerSnapshotsDir, &d.WLayerSnapshotsDir,
-			hostPath("/run/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots")),
+			hostPath("/var/lib/k0s/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots")),
 		envx.StringKnob(envnames.EnvCoredumpDir, &d.CoredumpDir,
 			hostPath("/var/lib/systemd/coredump")),
 		envx.Int64Knob(envnames.EnvWLayerBloatThresholdBytes,

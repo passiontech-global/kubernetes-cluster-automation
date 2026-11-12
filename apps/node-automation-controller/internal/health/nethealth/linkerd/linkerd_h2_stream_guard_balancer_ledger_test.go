@@ -65,11 +65,11 @@ func TestLinkerdBalancerPartialRecoveryKeepsGauge(t *testing.T) {
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
 
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(ctx); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first-seen wedges must pass (inside window): %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(linkerdBalancerWedgeMinAge+time.Minute))
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("two persisted wedges must fail")
 	}
 	m := probetest.FindMetric(t, "node_automation_linkerd_outbound_balancer_wedged",
@@ -84,7 +84,7 @@ func TestLinkerdBalancerPartialRecoveryKeepsGauge(t *testing.T) {
 	// One of the two targets recovers: the still-wedged target must
 	// keep the pod's series — the ledger prune must not delete it.
 	targets = targets[:1]
-	res := chk.Run(ctx)
+	res := chk.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("the surviving wedge must still fail")
 	}

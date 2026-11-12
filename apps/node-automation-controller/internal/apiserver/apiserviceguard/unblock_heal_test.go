@@ -179,12 +179,12 @@ func TestDeleteBackingPodsEvictionErrorsCounted(t *testing.T) {
 	}
 }
 
-// apiServiceUnblockPodCap bounds one wedged APIService's churn per
-// sweep: with more targets than the cap the loop evicts exactly the
-// cap and stops — the rest wait for the next cooldown window.
+// apiServiceUnblockSweepCap bounds delivered evictions per sweep:
+// even a single wedged APIService with more live targets than the
+// cap restarts exactly one pod — the rest wait for the next sweep.
 func TestDeleteBackingPodsCap(t *testing.T) {
 	var names []string
-	for i := 0; i < apiServiceUnblockPodCap+2; i++ {
+	for i := 0; i < apiServiceUnblockSweepCap+2; i++ {
 		names = append(names, "ms-"+string(rune('a'+i)))
 	}
 	targets := backingTargets("kube-system", names...)
@@ -199,14 +199,21 @@ func TestDeleteBackingPodsCap(t *testing.T) {
 	u := &unblockHealer{}
 
 	if deleted := u.deleteBackingPods(ctx, g, "v1beta1.metrics.k8s.io",
-		targets, time.Now()); deleted != apiServiceUnblockPodCap {
-		t.Fatalf("deleted = %d, want the %d-pod cap", deleted, apiServiceUnblockPodCap)
+		targets, time.Now()); deleted != apiServiceUnblockSweepCap {
+		t.Fatalf("deleted = %d, want the %d-pod sweep cap",
+			deleted, apiServiceUnblockSweepCap)
 	}
-	// The last two targets must survive — the cap, not a failure.
-	for _, name := range names[apiServiceUnblockPodCap:] {
-		if !asgPodExists(t, cs, "kube-system", name) {
-			t.Fatalf("pod %s evicted past the per-APIService cap", name)
+	// Every target past the first delivered eviction must survive —
+	// the sweep cap, not a failure.
+	alive := 0
+	for _, name := range names {
+		if asgPodExists(t, cs, "kube-system", name) {
+			alive++
 		}
+	}
+	if alive != len(names)-apiServiceUnblockSweepCap {
+		t.Fatalf("alive pods = %d, want %d — evictions past the sweep cap landed",
+			alive, len(names)-apiServiceUnblockSweepCap)
 	}
 }
 

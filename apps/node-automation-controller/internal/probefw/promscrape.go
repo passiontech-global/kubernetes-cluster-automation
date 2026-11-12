@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -38,8 +39,10 @@ func FetchPodMetrics(ctx context.Context, client *http.Client,
 	}
 	lctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// net.JoinHostPort, not fmt %s:%d — a bare IPv6 pod IP needs
+	// brackets or the URL parses as host "::1" port garbage.
 	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
-		fmt.Sprintf("http://%s:%d/metrics", ip, port), nil)
+		"http://"+net.JoinHostPort(ip, strconv.Itoa(port))+"/metrics", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -54,9 +57,17 @@ func FetchPodMetrics(ctx context.Context, client *http.Client,
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 	}()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	// Read maxBytes+1: a body that exactly fills the cap is legal,
+	// but one byte MORE proves truncation — ScyllaDB-class /metrics
+	// payloads exceed 4 MiB and a silent cut parses as a valid EOF,
+	// dropping the tail series and skewing every per-shard ratio
+	// the caller computes (P1: false drift alerts).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("pod metrics endpoint body exceeds %d bytes (truncated)", maxBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pod metrics endpoint returned %s", resp.Status)

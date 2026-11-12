@@ -168,14 +168,24 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 			rs = append(rs, r)
 		}
 		sort.Strings(rs)
-		parts := strings.SplitN(key, "/", 2)
-		ns := parts[0]
-		if pod, ok := census.byName[key]; ok {
-			joined := strings.Join(rs, "+")
+		joined := strings.Join(rs, "+")
+		if strings.HasPrefix(key, "cluster/") {
+			// Cluster-level series carry no pod — the key is
+			// "cluster/<ns>/<cluster-id>"; the cluster id fills
+			// the pod slot so two clusters in one namespace keep
+			// distinct series (and the alert still names its
+			// subject).
+			parts := strings.SplitN(key, "/", 3)
+			if len(parts) == 3 {
+				rep.Flag(rabbitMQQuorumUnhealthyGauge, key+"/"+joined,
+					[]string{parts[1], parts[2], joined})
+			}
+		} else if pod, ok := census.byName[key]; ok {
+			ns := strings.SplitN(key, "/", 2)[0]
 			rep.Flag(rabbitMQQuorumUnhealthyGauge, key+"/"+joined,
 				[]string{ns, pod.Name, joined})
 		}
-		rep.Find(key + "(" + strings.Join(rs, "+") + ")")
+		rep.Find(key + "(" + joined + ")")
 	}
 	return rep.Result(&p.emitted, rabbitMQQuorumUnhealthyGauge.DeleteLabelValues,
 		"rabbitmq quorum/partition signals: ", ", ")

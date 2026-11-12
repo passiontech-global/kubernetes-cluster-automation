@@ -48,6 +48,18 @@ const (
 	// so main builds its wait context from the same constant it
 	// documents.
 	WaitBudget = 15 * time.Second
+	// indexWaitBudget bounds the synchronous index fetch on the
+	// request path — deliberately under GitHub's ~10s webhook
+	// timeout so the handler always answers in time. The fetch
+	// itself runs detached on the client's 30s flight budget; a
+	// timeout here serves the stale index instead of 502ing.
+	indexWaitBudget = 7 * time.Second
+	// maxInflightRequests caps concurrent post-signature requests —
+	// each one holds a body buffer (up to 8 MiB) plus goroutine
+	// stack, so an unbounded flood is a memory/CPU exhaustion
+	// vector. Over the cap the delivery gets an immediate 503
+	// (GitHub retries) instead of queueing thousands of goroutines.
+	maxInflightRequests = 128
 )
 
 // Backend is the slice of the Concourse client the handler needs —
@@ -124,15 +136,24 @@ type Handler struct {
 	// graceful-shutdown path (Wait) can wait for the last check to
 	// land.
 	wg sync.WaitGroup
-	// inFlight mirrors wg's outstanding count — a WaitGroup has no
-	// "how many are still running" read, and Wait's budget-expiry
-	// path reports the abandoned count from here. Mutated only via
-	// fanoutStart/fanoutDone so the two counters can't drift.
+	// inFlight mirrors the outstanding FAN-OUT count only —
+	// fanoutStart/fanoutDone are the sole mutators, so Wait's
+	// budget-expiry report ("in_flight_fanouts") counts exactly the
+	// detached check POSTs it abandoned, never requests still inside
+	// ServeHTTP (those are covered by wg but aren't fan-outs).
 	inFlight atomic.Int64
 	// budget bounds one dispatch — the semaphore queue included
 	// (fanoutBudget in production; tests shorten it so the budget
 	// path stays deterministic).
 	budget time.Duration
+	// reqSem bounds concurrent admitted requests (maxInflightRequests).
+	reqSem chan struct{}
+	// drainMu guards draining + the request-scope wg.Add: Wait sets
+	// draining under this lock, and admit() takes the same lock to
+	// register — so once draining flips, no new request can slip a
+	// wg.Add past Wait's observation of an empty WaitGroup.
+	drainMu  sync.Mutex
+	draining bool
 }
 
 // New returns a Handler verifying signatures against secret and
@@ -143,7 +164,38 @@ func New(secret string, b Backend) *Handler {
 		backend: b,
 		sem:     make(chan struct{}, fanoutWorkers),
 		budget:  fanoutBudget,
+		reqSem:  make(chan struct{}, maxInflightRequests),
 	}
+}
+
+// admit registers an authenticated request for the shutdown drain
+// and takes an in-flight slot — MUST run before the body read so a
+// slow-loris flood can't pile up unbounded goroutines+buffers, and
+// so Wait covers every request that passed the signature gate (the
+// fan-out's own fanoutStart only fires much later, after the index
+// fetch). ok=false means the caller answers 503; draining reports
+// WHICH refusal (shutdown vs capacity) for the metric label — it is
+// read under drainMu so it can't race Wait's flip.
+func (h *Handler) admit() (ok, draining bool) {
+	select {
+	case h.reqSem <- struct{}{}:
+	default:
+		return false, false
+	}
+	h.drainMu.Lock()
+	defer h.drainMu.Unlock()
+	if h.draining {
+		<-h.reqSem
+		return false, true
+	}
+	h.wg.Add(1)
+	return true, false
+}
+
+// release pairs admit — called once per admitted request via defer.
+func (h *Handler) release() {
+	h.wg.Done()
+	<-h.reqSem
 }
 
 // fanoutStart registers a delivery's would-be fan-out with the
@@ -173,6 +225,13 @@ func (h *Handler) fanoutDone() {
 // never left waiting forever) and returns that count; a clean drain
 // returns 0.
 func (h *Handler) Wait(ctx context.Context) int {
+	// Flip draining FIRST: requests still inside ServeHTTP finish
+	// normally, but anything reaching admit() from here on is
+	// rejected 503 — Wait's WaitGroup observation can't be raced by
+	// a request that slipped its Add in after the check.
+	h.drainMu.Lock()
+	h.draining = true
+	h.drainMu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		h.wg.Wait()
@@ -226,6 +285,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
+
+	// Admission gate: bounded concurrency + shutdown drain, taken
+	// BEFORE the body read — the signature format check above is
+	// cheap, but the body buffer (8 MiB cap) and HMAC are not, and
+	// an unbounded flood of well-formed-signature probes would
+	// otherwise stack goroutines without limit.
+	if ok, draining := h.admit(); !ok {
+		status := "overloaded"
+		if draining {
+			status = "draining"
+		}
+		code := http.StatusServiceUnavailable
+		deliveriesTotal.WithLabelValues(eventMetric, status).Inc()
+		logger().Warn("webhook rejected: admission refused",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", eventMetric,
+			"status", code)
+		http.Error(w, "service unavailable", code)
+		return
+	}
+	defer h.release()
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -349,9 +429,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The index fetch is the only ATC call still in the request path.
 	// It runs detached from the request lifetime: a client disconnect
 	// mid-fetch must not poison the shared cache the fetch populates.
-	// A 30s budget keeps a wedged ATC from hanging the handler forever.
+	// The wait budget (indexWaitBudget, 7s) stays under GitHub's ~10s
+	// webhook timeout; the client's fetchFlight runs the fetch itself
+	// on a longer detached budget, so this ctx expiring serves the
+	// stale index — it never aborts the shared fetch.
 	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(r.Context()), 30*time.Second)
+		context.WithoutCancel(r.Context()), indexWaitBudget)
 	defer cancel()
 
 	// Register with the WaitGroup BEFORE the index fetch: the fan-out
@@ -383,10 +466,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	matched := h.backend.Match(wantType, repos)
-	if len(matched) == 0 {
+	if len(matched) == 0 && ctx.Err() == nil {
 		// A pipeline set since the last index fetch may not be in the
 		// cache — force one refresh and retry the match once. No loop:
-		// a second miss is a genuine "nothing to check".
+		// a second miss is a genuine "nothing to check". Skipped
+		// outright once the wait budget is spent — a Refresh on a dead
+		// ctx can only fail, and its error path would mask the real
+		// outcome (deadline → stale-index fallback below).
 		if _, err := h.backend.Refresh(ctx); err != nil {
 			logger().Warn("index refresh on zero match failed — keeping prior result",
 				"remote_addr", r.RemoteAddr,

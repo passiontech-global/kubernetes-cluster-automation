@@ -17,10 +17,10 @@ OVERLAY=$(cat "$NETDIR/overlay" 2>/dev/null || echo tinc)
 # hut vao lai tunnel => routing loop. fwmark rule 1400 shared voi tinc.
 ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main
 for p in dport sport; do
-  iptables -t mangle -C OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
-    || iptables -t mangle -A OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
-  iptables -t mangle -C PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
-    || iptables -t mangle -A PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
+  iptables -w 5 -t mangle -C OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
+    || iptables -w 5 -t mangle -A OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
+  iptables -w 5 -t mangle -C PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
+    || iptables -w 5 -t mangle -A PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
 done
 
 sysctl -qw net.ipv4.conf.$DEV.rp_filter=0

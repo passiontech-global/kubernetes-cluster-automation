@@ -139,7 +139,7 @@ func TestNamespaceTerminatingWedged(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged, fresh)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("wedged namespace must fail: %+v", res)
 	}
@@ -569,7 +569,7 @@ func TestNsFinalizerSweepEndToEnd(t *testing.T) {
 		disc: sweepDiscovery{lists: nsSweepLists()}}
 	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
 
-	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatal("wedged namespace must FAIL")
 	}
@@ -621,7 +621,7 @@ func TestNsFinalizerSweepCooldown(t *testing.T) {
 		probefw.SelfHealKey(CheckNameNamespaceWedged, "finalsweep/dead-app"),
 		time.Now())
 
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("wedged namespace must FAIL even inside the sweep cooldown")
 	}
 	got, err := dyn.Resource(fooGVR).Namespace("dead-app").
@@ -743,7 +743,7 @@ func TestNsFinalizerSweepNilDyn(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged)
 	deps := probetest.NewDeps(cs, nil)
 	chk := &namespaceTerminatingWedgedCheck{Deps: deps}
-	if res := chk.Run(ctx); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("wedged namespace must FAIL with nil dyn")
 	}
 }

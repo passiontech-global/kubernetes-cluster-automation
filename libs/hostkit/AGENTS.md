@@ -53,5 +53,6 @@ Consequences:
   (`envx.Warnf = f`) predates `SetWarnf` and is kept for the
   controller's startup init(): it must run before the first getter
   call and cannot be combined with `SetWarnf`. `Gate`'s intent-like
-  misspelling warning is once per key per process (`sync.Map`), safe
-  under concurrent resolution.
+  misspelling warning is once per key per process (a mutex-guarded
+  table capped at 1024 keys — overflow clears and warn-once
+  restarts), safe under concurrent resolution.

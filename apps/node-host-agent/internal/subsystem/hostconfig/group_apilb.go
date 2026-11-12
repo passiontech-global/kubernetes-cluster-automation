@@ -128,11 +128,16 @@ func (c *cyc) groupAPILB() {
 	// unit template — the table dies with the LB.
 	nftChanged := false
 	if vip := c.t.Vars.StrDef("api_lb_vip_ip", ""); vip != "" {
-		// runLong: same slow-egress budget as the haproxy deb.
-		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-			"apt-get", "install", "-y", "nftables"); err != nil {
-			c.err("T12: nftables install failed — nft -c may fail below",
-				"error", err)
+		// runLong: same slow-egress budget as the haproxy deb —
+		// and only when nftables isn't already installed (the
+		// dpkg-query gate keeps converge from forking apt every
+		// cycle).
+		if !c.dpkgInstalled(ctx, "nftables") {
+			if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+				"apt-get", "install", "-y", "nftables"); err != nil {
+				c.err("T12: nftables install failed — nft -c may fail below",
+					"error", err)
+			}
 		}
 		var rules strings.Builder
 		for _, p := range c.apiLBDnatPorts() {

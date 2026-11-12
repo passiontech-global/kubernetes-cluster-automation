@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // resetBudget restores the inert (unconfigured) gate after a test —
@@ -571,5 +573,125 @@ func TestRefundGrantGlobalRestoresSlot(t *testing.T) {
 	proceed, unverifiable = Gate(ctx, logr.Discard(), nil, cs, planAwareDyn(), "k2", now)
 	if !proceed || unverifiable {
 		t.Fatalf("Gate after RefundGrant = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Low-level helpers never refund — the exactly-once contract.
+//
+// DeletePod/EvictPod cannot know whether the caller's gate
+// (AllowedV/Gate/HealAllowed) consumed a budget grant, so a refund
+// inside them would double-credit gate owners that also refund at
+// their own level (the pre-fix shape: helper refunded the
+// hold/quorum deferral AND EvictPodV refunded the same grant again
+// on refused=true). The helpers report the deferral — (false,nil)
+// / refused=true — and the GATE OWNER refunds once via RefundGrant.
+// Proven here by window accounting: one gate grant + a helper-level
+// deferral must leave the budget FULL — the next gate still denies.
+// ---------------------------------------------------------------------------
+
+// A quorum-denied DeletePod must not hand the caller's grant back.
+func TestDeletePodDeferralNeverRefunds(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	cs := fake.NewSimpleClientset()
+	dyn := planAwareDyn()
+	now := time.Now()
+
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("first gate = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+	// Pre-reserve the workload's one sweep disruption slot so the
+	// delete defers at the quorum guard — a clean (false,nil), no
+	// mutation, no API call.
+	p := pod("ns1", "w-0", "u1", corev1.PodRunning, now)
+	sctx := kube.WithSweepOverlay(ctx)
+	if !kube.TryReserveWorkloadDisruption(sctx, p) {
+		t.Fatal("pre-reserve failed")
+	}
+	deleted, err := DeletePod(sctx, cs, nil, "gate2", p, now)
+	if err != nil || deleted {
+		t.Fatalf("DeletePod = (%v,%v), want quorum deferral (false,nil)",
+			deleted, err)
+	}
+	// The helper must NOT have refunded: the window is still full.
+	proceed, unverifiable = AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate3", 0, now)
+	if proceed || unverifiable {
+		t.Fatalf("post-deferral gate = (%v,%v), want (false,false) — "+
+			"the helper refunded a grant it does not own", proceed, unverifiable)
+	}
+}
+
+// Same contract for EvictPod: a refused=true deferral (here the
+// quorum guard standing in for the PDB 429) leaves the grant spent.
+func TestEvictPodDeferralNeverRefunds(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	cs := fake.NewSimpleClientset()
+	dyn := planAwareDyn()
+	now := time.Now()
+
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("first gate = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+	p := pod("ns1", "w-0", "u1", corev1.PodRunning, now)
+	sctx := kube.WithSweepOverlay(ctx)
+	if !kube.TryReserveWorkloadDisruption(sctx, p) {
+		t.Fatal("pre-reserve failed")
+	}
+	evicted, refused, err := EvictPod(sctx, cs, nil, "gate2", p, now)
+	if err != nil || evicted || !refused {
+		t.Fatalf("EvictPod = (%v,%v,%v), want quorum deferral (false,true,nil)",
+			evicted, refused, err)
+	}
+	proceed, unverifiable = AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate3", 0, now)
+	if proceed || unverifiable {
+		t.Fatalf("post-deferral gate = (%v,%v), want (false,false) — "+
+			"the helper refunded a grant it does not own", proceed, unverifiable)
+	}
+}
+
+// The gate-owner half of the contract: RefundGrant restores exactly
+// one slot — and only the gate owner may call it. EvictPodV already
+// pairs its grant with the actuation (TestEvictPodVRefusalRefunds
+// Grant); this pins the bare-helper shape the batch callers use:
+// gate → all targets deferred → RefundGrant once → window restored,
+// never over-credited by a second refund.
+func TestGateOwnerRefundExactlyOnce(t *testing.T) {
+	resetBudget(t)
+	ConfigureBudget(1, time.Hour)
+	cs := fake.NewSimpleClientset()
+	dyn := planAwareDyn()
+	now := time.Now()
+
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("first gate = (%v,%v), want (true,false)", proceed, unverifiable)
+	}
+	// The pass delivered nothing — every target deferred before any
+	// mutation — so the owner hands the one grant back, exactly once.
+	RefundGrant(now)
+	RefundGrant(now) // a second call must be inert, not over-credit
+
+	proceed, unverifiable = AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate2", 0, now)
+	if !proceed || unverifiable {
+		t.Fatalf("post-refund gate = (%v,%v), want (true,false)",
+			proceed, unverifiable)
+	}
+	// And the window holds the cap: the double refund did not
+	// conjure a second slot.
+	proceed, unverifiable = AllowedV(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "gate3", 0, now)
+	if proceed || unverifiable {
+		t.Fatalf("over-refunded gate = (%v,%v), want (false,false)",
+			proceed, unverifiable)
 	}
 }

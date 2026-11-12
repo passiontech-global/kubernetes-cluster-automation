@@ -203,6 +203,9 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 			delete(r.resets, key)
 		}
 	}
+	// Same live-key prune for the stuck-CR cooldown ledger — without
+	// it crReaped grows one entry per cert ever reaped, forever.
+	r.crReaped.Prune(func(key string, _ time.Time) bool { return seen[key] })
 	log.Info("sweep done", "candidates", candidates, "ordersReset", reset)
 	return nil
 }

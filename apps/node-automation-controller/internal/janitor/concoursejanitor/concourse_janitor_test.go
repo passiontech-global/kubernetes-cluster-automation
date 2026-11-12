@@ -111,6 +111,15 @@ func cjWorkerSTS(replicas int32) *appsv1.StatefulSet {
 	}
 }
 
+// cjReadySibling is the always-Ready second worker the keep-one-Ready
+// guard requires: single-worker fixtures add it so the wipe under
+// test still has a serving sibling (the guard skips a wipe that
+// would leave zero Ready workers — a lone worker is never a wipe
+// candidate).
+func cjReadySibling() *corev1.Pod {
+	return cjWorkerPod("concourse-worker-99", "uid-sibling", "node-b", true, nil)
+}
+
 func cjLocalUsers() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: cjNamespace, Name: cjSecretName},
@@ -237,6 +246,7 @@ func TestConcourseJanitorStalledWorkerWipedDespiteUnderCapCache(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjSteadyWorkerPod("concourse-worker-0", "uid-0", "node-a", old),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -275,6 +285,7 @@ func TestConcourseJanitorMaxContainersLogWiped(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjSteadyWorkerPod("concourse-worker-0", "uid-0", "node-a", old),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -344,7 +355,7 @@ func TestConcourseJanitorWedgedNotReadyPodReplacedDespiteUnderCap(t *testing.T) 
 		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
 			LastTransitionTime: metav1.NewTime(old)},
 	}
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers(), cjReadySibling())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
@@ -375,7 +386,7 @@ func TestConcourseJanitorYoungNotReadyPodKeptDespiteUnderCap(t *testing.T) {
 		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
 			LastTransitionTime: metav1.NewTime(time.Now().Add(-5 * time.Minute))},
 	}
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers(), cjReadySibling())
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
@@ -413,7 +424,7 @@ func TestConcourseJanitorInitRmNotReadyPodUntouched(t *testing.T) {
 			Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(old)},
 		},
 	}}
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers(), cjReadySibling())
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 50 * gib, 200 * gib, 10 * gib, nil // under caps
@@ -493,6 +504,7 @@ func TestConcourseJanitorNilDynFailsClosed(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	j := cjTestJanitor(cs,
 		&cjFakeStats{events: &events, calls: map[string]int{},
@@ -564,6 +576,7 @@ func TestConcourseJanitorKeepCache(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
@@ -640,6 +653,7 @@ func TestConcourseJanitorNoFlyStillDeletes(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -671,14 +685,15 @@ func TestConcourseJanitorNoFlyStillDeletes(t *testing.T) {
 
 // Unreadable stats fail OPEN to a wipe — the cleanup must never be
 // lost to a broken metrics path — and the blind wipe IS metered by
-// readStats itself, exactly once per unreadable read (the pre-decision
-// read and the post-wipe re-read; the wipe decision no longer adds a
-// duplicate count for the same broken fetch).
+// readStats itself, exactly once (the pre-decision read; the
+// post-wipe re-read feeds no decision so it is never metered — the
+// same broken path must not count twice per pod per run).
 func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	var events []string
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -703,11 +718,12 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	if !found {
 		t.Fatalf("expected a delete in events %v", events)
 	}
-	// Exactly two unreadable reads happen (pre-decision + post-wipe
-	// re-read), each metered once by readStats — no third count from
-	// the wipe decision.
-	if got := testutil.QueueErrorCount(t, "concourse-workdir-janitor") - before; got != 2 {
-		t.Fatalf("fail-open wipe metered %v times, want exactly 2 (one per unreadable read)", got)
+	// Exactly one unreadable read is metered — the pre-decision read
+	// that drove the wipe. The post-wipe baseline re-read is
+	// best-effort (`|| true` in bash) and feeds no decision, so its
+	// failure is logged but never counted.
+	if got := testutil.QueueErrorCount(t, "concourse-workdir-janitor") - before; got != 1 {
+		t.Fatalf("fail-open wipe metered %v times, want exactly 1 (pre-decision read only)", got)
 	}
 }
 
@@ -743,6 +759,7 @@ func TestConcourseJanitorNewPodNeverAppears(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	// Default tracker delete — object vanishes, nothing replaces it.
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -764,6 +781,7 @@ func TestConcourseJanitorReadyTimeout(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, false) // successor never Ready
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -798,7 +816,7 @@ func TestConcourseJanitorSkipsYoungNotReadyPod(t *testing.T) {
 	base := time.Now()
 	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
 	p.CreationTimestamp = metav1.NewTime(base) // younger than readyTimeout
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers(), cjReadySibling())
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 160 * gib, 200 * gib, 10 * gib, nil // 80% — would wipe
@@ -826,7 +844,7 @@ func TestConcourseJanitorWipesOldNotReadyPod(t *testing.T) {
 	var events []string
 	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", false, nil)
 	p.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers())
+	cs := fake.NewSimpleClientset(cjWorkerSTS(1), p, cjLocalUsers(), cjReadySibling())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) {
@@ -855,6 +873,7 @@ func TestConcourseJanitorDrainKeepsPollingOnATCError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -894,6 +913,7 @@ func TestConcourseJanitorLandFailShortensDrain(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},
@@ -934,6 +954,7 @@ func TestConcourseJanitorPruneWaitsForStateSettle(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		cjWorkerSTS(1),
 		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
 		cjLocalUsers())
 	cjReplaceOnDelete(cs, &events, true)
 	st := &cjFakeStats{events: &events, calls: map[string]int{},

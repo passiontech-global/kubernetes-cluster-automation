@@ -309,9 +309,15 @@ func stageDNS(t *Topology, c *deriveCtx) {
 			}
 			mk, hasMk := t.Markers[nodeNameOf(om)]
 			if ip := om.Str("ip"); ip != "" {
-				ips = append(ips, ip, mk)
+				ips = append(ips, ip)
+				// The marker is a DNS name sibling of the node IP —
+				// an empty marker string would join as a "," gap and
+				// parse downstream as a {"": ""} fallback entry.
+				if mk != "" {
+					ips = append(ips, mk)
+				}
 			}
-			if hasMk {
+			if hasMk && mk != "" {
 				resolvers = append(resolvers, mk)
 			}
 		})

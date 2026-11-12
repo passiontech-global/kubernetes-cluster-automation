@@ -30,7 +30,7 @@ func TestNodeCondSweeperClearsZombie(t *testing.T) {
 	cs := fake.NewSimpleClientset(n,
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("zombie condition did not fail the check")
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-zombie", metav1.GetOptions{})
@@ -52,7 +52,7 @@ func TestNodeCondSweeperKeepsLiveLatch(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		probetest.ReadyWorkerNode("w-live", "KernelHungTasks", 5*time.Minute, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("live latch failed the check: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-live", metav1.GetOptions{})
@@ -69,7 +69,7 @@ func TestNodeCondSweeperKeepsFreshNoHeartbeat(t *testing.T) {
 	n.Status.Conditions[1].LastHeartbeatTime = metav1.Time{}
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("fresh no-heartbeat latch failed the check: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-fresh", metav1.GetOptions{})
@@ -93,7 +93,7 @@ func TestNodeCondSweeperIgnoresForeignConditions(t *testing.T) {
 	})
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("foreign condition failed the check: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-foreign", metav1.GetOptions{})
@@ -118,11 +118,11 @@ func TestNodeCondSweeperThenAutoUncordon(t *testing.T) {
 	})
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("zombie condition did not fail the check")
 	}
 	// The precordon's own sweep now sees no active latch → auto-uncordon.
-	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("precordon sweep after clear failed: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-held", metav1.GetOptions{})
@@ -149,7 +149,7 @@ func TestNodeCondSweeperSweepsFrozenInodePressure(t *testing.T) {
 	})
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("frozen InodePressure zombie did not fail the check")
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-inode", metav1.GetOptions{})
@@ -182,7 +182,7 @@ func TestNodeCondSweeperCoversHeartbeatSweptSuperset(t *testing.T) {
 		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("zombie WatchdogStale did not fail the check")
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-watchdog", metav1.GetOptions{})
@@ -220,7 +220,7 @@ func TestNodeCondSweeperSweepsEveryAgentEmittedCondition(t *testing.T) {
 		n.Status.Conditions[1].LastHeartbeatTime = old
 		cs := fake.NewSimpleClientset(n)
 		p := testProberDyn(cs, probetest.OpDyn())
-		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); res.Pass {
+		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
 			t.Errorf("%s: zombie True did not fail the check", name)
 			continue
 		}
@@ -331,7 +331,7 @@ func TestNodeCondSweeperSkipsNotReadyNode(t *testing.T) {
 	cs := fake.NewSimpleClientset(n,
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("NotReady node's zombie must be left for the rescue path: %+v", res)
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-notready", metav1.GetOptions{})
@@ -358,7 +358,7 @@ func TestNodeCondSweeperTTLBoundary(t *testing.T) {
 		metav1.NewTime(time.Now().Add(-20 * time.Minute))
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("20m-frozen condition must survive inside the TTL: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-mid", metav1.GetOptions{})

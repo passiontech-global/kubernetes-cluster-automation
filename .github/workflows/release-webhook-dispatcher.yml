@@ -12,13 +12,18 @@ on:
     branches: [main]
     paths:
       - "apps/webhook-dispatcher/**"
+      # Only the hostkit subpackages this app actually imports
+      # (envx/httpx/logx) — see the controller workflow for why the
+      # blanket libs/hostkit/** glob is avoided.
       - "libs/hostkit/envx/**"
       - "libs/hostkit/httpx/**"
       - "libs/hostkit/logx/**"
       - ".moon/**"
       - "mise.toml"
+      - ".dockerignore"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-webhook-dispatcher.yml"
+      - '!**/*.md'
   workflow_dispatch:
     inputs:
       version:

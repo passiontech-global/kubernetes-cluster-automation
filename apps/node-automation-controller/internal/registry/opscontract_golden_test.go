@@ -115,8 +115,11 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"workload-scale-flapping", "health"},
 	{"imagepull-secret-auditor", "health"},
 	{"cluster-health-probes", "health"},
-	// argocd-agent-spin — argocd-agent spin healer, last row (see registry.go).
+	// argocd-agent-spin — argocd-agent spin healer.
 	{"argocd-agent-spin", "health"},
+	// apiserver-node-reachability — apiserver-dark node detector +
+	// webhook-backend evacuee, last row.
+	{"apiserver-node-reachability", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -267,8 +270,10 @@ var goldenMetricFamilies = []string{
 	"node_automation_webhook_missing_critical_ns_exclusion",
 	"node_automation_workload_scale_flapping",
 	"node_automation_zombie_sidecar_pods_reaped_total",
-	// argocd-agent-spin — argocd-agent spin gauge (not alphabetical, new row).
+	// argocd-agent-spin — argocd-agent spin gauge.
 	"node_automation_argocd_agent_spin",
+	// apiserver-node-reachability — apiserver-dark node gauge (new row).
+	"node_automation_apiserver_node_dark",
 	"shell_operator_hook_run_errors_total",
 }
 
@@ -321,6 +326,7 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"TaintKubeletUnresponsive", "passiontech.dev/kubelet-unresponsive"},
 	{"TaintNetworkPartitioned", "passiontech.dev/network-partitioned"},
 	{"TaintCPUSteal", "passiontech.dev/cpu-steal"},
+	{"TaintApiserverUnreachable", "passiontech.dev/apiserver-unreachable"},
 	{"AnnoFluentConfigHash", "fluent.io/config-hash"},
 	{"TaintKuredNodeReboot", "weave.works/kured-node-reboot"},
 	{"AnnoFluxRequestedAt", "reconcile.fluxcd.io/requestedAt"},
@@ -542,6 +548,8 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.TaintNetworkPartitioned
 	case "TaintCPUSteal":
 		return kube.TaintCPUSteal
+	case "TaintApiserverUnreachable":
+		return kube.TaintApiserverUnreachable
 	case "AnnoFluentConfigHash":
 		return kube.AnnoFluentConfigHash
 	case "TaintKuredNodeReboot":

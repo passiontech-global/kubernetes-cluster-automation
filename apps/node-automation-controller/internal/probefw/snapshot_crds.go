@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -36,22 +35,27 @@ func (d *Deps) AllUnstructured(ctx context.Context,
 			gvr.Resource)
 	}
 	s := sweepSnap(ctx)
+	// The map mutex guards only the lookup — each GVR's memo
+	// serializes its own load, so two workers reading DIFFERENT
+	// GVRs never queue behind one another (the old single
+	// muUnstructs made every CRD census in the sweep serialize).
 	s.muUnstructs.Lock()
-	defer s.muUnstructs.Unlock()
 	if s.unstructReads == nil {
-		s.unstructReads = map[schema.GroupVersionResource]*unstructRead{}
+		s.unstructReads = map[schema.GroupVersionResource]*memo[[]unstructured.Unstructured]{}
 	}
-	read := s.unstructReads[gvr]
-	if read == nil {
-		read = &unstructRead{}
-		s.unstructReads[gvr] = read
+	m, ok := s.unstructReads[gvr]
+	if !ok {
+		m = &memo[[]unstructured.Unstructured]{}
+		s.unstructReads[gvr] = m
+	}
+	s.muUnstructs.Unlock()
+	return m.get(func(bool) ([]unstructured.Unstructured, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
-		read.items, read.err = kube.ListAll(lctx,
-			metav1.ListOptions{Limit: HealthListPageSize},
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
 			kube.DynamicPage(d.Dyn.Resource(gvr)))
-	}
-	return read.items, read.err
+	})
 }
 
 // AllUnstructuredFirst is AllUnstructured's first-serving-GVR

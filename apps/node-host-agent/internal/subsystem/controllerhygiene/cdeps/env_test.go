@@ -68,10 +68,9 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 		t.Errorf("admin paths unprefixed: %s %s %s %s",
 			cfg.AdminKubeconfig, cfg.AdminCert, cfg.AdminKey, cfg.AdminCA)
 	}
-	if cfg.Feeder.StateDir != "/host2/var/lib/k0s-systemd-watchdog" ||
-		cfg.Feeder.RemediatePeerFile != "/host2/etc/default/k0scontroller-watchdog" {
-		t.Errorf("feeder paths: %s %s",
-			cfg.Feeder.StateDir, cfg.Feeder.RemediatePeerFile)
+	if cfg.Feeder.RemediatePeerFile != "/host2/etc/default/k0scontroller-watchdog" {
+		t.Errorf("feeder paths: %s",
+			cfg.Feeder.RemediatePeerFile)
 	}
 	if cfg.K0sDir != "/host2/var/lib/k0s" {
 		t.Errorf("K0sDir=%s", cfg.K0sDir)

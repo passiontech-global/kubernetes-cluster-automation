@@ -148,11 +148,23 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	}
 	// DeletePod UID-preconditions the delete and stamps the cooldown
 	// on a DELIVERED delete only — a failed delete leaves the pod
-	// stuck and the next sweep retries.
-	if _, err := heal.DeletePod(ctx, n.cs, &n.connectHeals,
-		esConnectPodPrefix, pod, now); err != nil {
+	// stuck and the next sweep retries. The AllowedVPersisted gate
+	// above already spent one fleet grant: a (false, nil) return —
+	// local-remediation hold or the sweep's one-disruption
+	// reservation — delivered no heal, so the grant goes back
+	// (refund-on-skip contract; an API error is an attempted
+	// actuation and keeps it).
+	deleted, err := heal.DeletePod(ctx, n.cs, &n.connectHeals,
+		esConnectPodPrefix, pod, now)
+	if err != nil {
 		metrics.IncError(n.queue)
 		log.Error(err, "connect pod delete failed",
+			"pod", pod.Namespace+"/"+pod.Name)
+		return
+	}
+	if !deleted {
+		heal.RefundGrant(now)
+		log.Info("DEFER: connect pod delete refused (hold/disruption reservation)",
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
@@ -182,20 +194,36 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 	if n.cs == nil {
 		return degraded // no typed client wired — cannot inspect pods
 	}
+	// live/listedOK feed the ledger prune below: a pod that VANISHED
+	// entirely is never visited by the loop, so without the prune its
+	// syncDegradedSince entry leaks forever (FirstSeen clocks must
+	// re-arm for a same-named pod recreated months later). A
+	// namespace whose list failed keeps its entries — an unverifiable
+	// census must not reset live heal clocks.
+	live := map[string]bool{}
+	listedOK := map[string]bool{}
 	for _, ns := range esConnectNamespaces {
 		pods, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: kube.DefaultListPageSize},
 			kube.Pods(n.cs, ns))
 		if err != nil {
-			if !apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
+				// A 404 namespace is VERIFIED gone — its pods are
+				// gone with it, so the prune below must clear this
+				// namespace's syncDegradedSince entries instead of
+				// keeping them as "unverifiable" forever.
+				listedOK[ns] = true
+			} else {
 				metrics.IncError(n.queue)
 				log.Error(err, "connect pod list failed", "namespace", ns)
 			}
 			continue
 		}
+		listedOK[ns] = true
 		for i := range pods {
 			p := &pods[i]
 			key := ns + "/" + p.Name
+			live[key] = true
 			if p.DeletionTimestamp != nil ||
 				p.Status.Phase != corev1.PodRunning ||
 				!strings.HasPrefix(p.Name, esConnectPodPrefix) {
@@ -215,6 +243,12 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 			}
 		}
 	}
+	// Prune vanished-pod keys — but ONLY inside namespaces whose pod
+	// list succeeded this pass (the empty-keep-set wipe hazard).
+	n.syncDegradedSince.Prune(func(key string) bool {
+		ns, _, _ := strings.Cut(key, "/")
+		return !listedOK[ns] || live[key]
+	})
 	return degraded
 }
 

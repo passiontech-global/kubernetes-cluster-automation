@@ -147,6 +147,15 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
+	// Hold BEFORE the budget spend (same rule the spegel/calico
+	// remedies carry): a maintenance-held delete must not consume
+	// the restart cooldown for an action that never ran.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("suspect: cilium-lrp-dns pod delete held — " +
+			"cluster maintenance in progress")
+		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
+		return
+	}
 	if !c.d.State.RateTrySpend("last-nld-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe fails %dx but pod restart in cooldown (<30m), skip",
@@ -155,15 +164,18 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	// The heal stamp rides BEFORE the delete so the cluster side sees
+	// the attribution even if this process dies mid-call.
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
 		nld.Namespace, nld.Name, c.Fails))
+	c.d.StampPodHealed(ctx, nld.Namespace, nld.Name)
 	if err := c.d.Cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
 		metav1.DeleteOptions{
-			GracePeriodSeconds: ptr.To[int64](0),
+			GracePeriodSeconds: ptr.To[int64](5),
 			// Same precondition the calico/spegel remedies carry: the
 			// listing→delete window can outlive this pod, and a
-			// same-named DS recycle is not ours to grace-0 kill.
+			// same-named DS recycle is not ours to kill.
 			Preconditions: &metav1.Preconditions{UID: &nld.UID},
 		}); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(

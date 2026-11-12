@@ -15,7 +15,7 @@ of guaranteeing 401s/502s at request time.
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | — | HMAC-SHA256 key configured on the GitHub org webhook. Deliveries whose `X-Hub-Signature-256` does not verify against it are rejected 401 before the body is read. |
 | `CI_WEBHOOK_TOKEN` | — | Concourse check-webhook token, sent as the `webhook_token` query parameter on every fan-out POST. It is the only credential on that endpoint (no basic auth); the client strips it out of transport-error strings so it can't leak into logs. |
-| `LOCAL_USERS` | — | Concourse basic auth as `user:password`, split on the FIRST colon so passwords containing colons (e.g. bcrypt hashes) survive intact. Empty user or password parts are rejected at boot. |
+| `LOCAL_USERS` | — | Concourse credentials as `user:password`, split on the FIRST colon so passwords containing colons (e.g. bcrypt hashes) survive intact. The Concourse web node's comma-separated multi-user form is accepted — the FIRST entry that parses wins and the rest are ignored with a boot warning. Empty user or password parts are rejected at boot. Auth is dual-mode: the client prefers a bearer token minted at `/sky/issuer/token` (falling back to `/sky/token`, then permanently to HTTP basic when both endpoints 404/405). |
 
 ## Optional
 

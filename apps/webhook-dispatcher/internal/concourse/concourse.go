@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,13 @@ type Resource struct {
 	Name     string
 	Type     string
 	Repo     string
+	// InstanceVarsQuery is the pipeline's instance_vars rendered as
+	// the ATC dot-notation query fragment ("vars.k=<json>&…", "" for
+	// non-instanced pipelines). Instanced pipelines only resolve
+	// their resources/checks under ?vars.<key>=, so the fragment
+	// rides every Resource and is appended to both the /resources
+	// listing and the check-webhook POST.
+	InstanceVarsQuery string
 }
 
 // Client talks to a single Concourse ATC team.
@@ -96,6 +104,11 @@ type Client struct {
 	// success; consulted only while c.index == nil.
 	lastErr   error
 	lastErrAt time.Time
+
+	// auth is the lazily-built dual-mode credential state (bearer
+	// token with basic fallback — see auth.go). Built under c.mu on
+	// first authorize so zero-value Clients work unchanged.
+	auth *atcAuth
 }
 
 // fetchFlight tracks one in-flight index fetch. done is closed by the
@@ -207,7 +220,78 @@ func (c *Client) negCacheTTL() time.Duration {
 // concurrent first deliveries must not stampede the ATC with
 // duplicate full-index fetches. The wait is bounded by the caller's
 // context, so a wedged ATC still can't hang the handler forever.
+// fetchFlightBudget bounds the DETACHED fetch context — deliberately
+// longer than the handler's synchronous wait budget (7s) so a caller
+// timing out never kills the shared fetch every other caller joined.
+const fetchFlightBudget = 30 * time.Second
+
+// runFetch executes one index fetch on a caller-detached context and
+// publishes the outcome: success replaces the index/lookup wholesale,
+// failure records the cold-start negative cache and wakes joiners
+// via flight.err. It owns the flight's whole lifecycle — install,
+// clear, done-close — so EVERY caller (starter included) is just a
+// waiter on done; no caller blocks inside fetchIndex itself.
+func (c *Client) runFetch(callerCtx context.Context, flight *fetchFlight, prev []Resource) {
+	// WithoutCancel strips the caller's deadline AND cancellation:
+	// the fetch is shared work — a 7s wait-budget expiring on one
+	// delivery must not abort the fetch other deliveries joined.
+	fetchCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(callerCtx), fetchFlightBudget)
+	defer cancel()
+	index, err := c.fetchIndex(fetchCtx, prev)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.flight == flight {
+		c.flight = nil
+	}
+	if err != nil {
+		flight.err = err // before close(done) — joiners read it
+		// Negative-cache the failure (NegCacheTTL) — waiters waking
+		// on done re-loop into this check and share the error
+		// rather than serializing fetches.
+		c.lastErr, c.lastErrAt = err, time.Now()
+		indexFetchErrorsTotal.Inc()
+		if c.index != nil {
+			logger().Warn("resource index refresh failed — serving stale",
+				"concourse_url", c.BaseURL, "team", c.Team,
+				"error", err)
+		}
+	} else {
+		// The client keeps its OWN copy of the fetched index — the
+		// caller's slice must not alias the cache, or a caller
+		// mutating its return value would corrupt what every later
+		// delivery matches against. Serve paths below clone out too.
+		c.index = slices.Clone(index)
+		c.fetchedAt = time.Now()
+		c.lookup = newLookup(c.index)
+		c.lastErr = nil
+		// Freshness signal: this gauge moves only here and in
+		// Refresh's success path — a stalled value is the
+		// stale-index alarm.
+		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
+	}
+	close(flight.done)
+}
+
+// Resources returns the repo -> resource index, served from a ~60s
+// cache and refreshed on a miss (absent or expired). A failed refresh
+// falls back to the stale index when one exists, and further calls
+// inside the TTL window keep serving it — lastAttemptAt backs the
+// fetch off so an ATC outage doesn't serialize every webhook request
+// behind the HTTP timeout.
+//
+// The mutex is never held across the network fetch: callers only ever
+// WAIT on a fetchFlight's done channel — the fetch itself runs
+// detached on fetchFlightBudget inside runFetch, so a caller's wait
+// budget expiring (the handler's 7s synchronous window vs GitHub's
+// ~10s webhook timeout) returns the stale index — or ctx.Err() on a
+// cold start with nothing to serve — while the fetch keeps running
+// for whoever joined it.
 func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for {
 		c.mu.Lock()
 		if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
@@ -215,9 +299,48 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 			c.mu.Unlock()
 			return index, nil
 		}
-		// The last attempt failed inside the same TTL window — serve the
-		// stale index without re-fetching. Without this backoff every
-		// request re-takes the mutex and blocks on a doomed fetch.
+		// A fetch is already in flight — never start a second one on
+		// top of it. With an index to serve, even a stale one, this
+		// caller is answered immediately (stale-while-revalidate:
+		// the in-flight fetch will replace it momentarily); only a
+		// cold start has nothing to serve and must wait on done,
+		// sharing the fetch's result instead of stampeding the ATC.
+		if c.flight != nil {
+			f := c.flight
+			index := c.index
+			c.mu.Unlock()
+			if index != nil {
+				return slices.Clone(index), nil
+			}
+			select {
+			case <-f.done:
+				// The flight settled. Serve whatever it left
+				// behind directly rather than re-running the
+				// TTL checks above: a SUCCESS publishes a fresh
+				// index, a FAILURE leaves the index nil — both
+				// are the answer this call exists to produce,
+				// and re-deciding would spin a fresh fetch per
+				// wake whenever the fetch outlasts the TTL.
+				c.mu.Lock()
+				index = c.index
+				c.mu.Unlock()
+				if index != nil {
+					return slices.Clone(index), nil
+				}
+				// Cold start, fetch failed — loop into the
+				// negative-cache check, which hands back the
+				// flight's shared error within NegCacheTTL
+				// instead of serializing doomed rebuilds.
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		// The last attempt failed inside the same TTL window — serve
+		// the stale index without re-fetching. Without this backoff
+		// every request re-takes the mutex and blocks on a doomed
+		// fetch. Reached only when NO fetch is in flight: a running
+		// one was joined above.
 		if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
 			index := slices.Clone(c.index)
 			c.mu.Unlock()
@@ -225,115 +348,59 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		}
 		// Cold-start negative cache: the last fetch failed with
 		// nothing to serve — hand back the SHARED error instead of
-		// letting this caller (and every waiter that just woke on
-		// the failed flight's done channel) stamp a fresh attempt
-		// and start the next doomed rebuild. Gated on index==nil:
-		// with a stale index to serve the backoff checks above
-		// already own the retry decision.
+		// letting this caller stamp a fresh attempt and start the
+		// next doomed rebuild. Gated on index==nil: with a stale
+		// index to serve the backoff check above already owns the
+		// retry decision.
 		if c.index == nil && c.lastErr != nil &&
 			time.Since(c.lastErrAt) < c.negCacheTTL() {
 			err := c.lastErr
 			c.mu.Unlock()
 			return nil, err
 		}
-		// A fetch is already in flight — never start a second one on
-		// top of it. With an index to serve (even a stale one) this
-		// caller is answered immediately; on a cold start it waits for
-		// the in-flight fetch to settle and re-runs the cache checks
-		// against whatever that fetch published.
-		if c.flight != nil {
-			done := c.flight.done
-			index := c.index
-			c.mu.Unlock()
-			if index != nil {
-				return slices.Clone(index), nil
-			}
-			select {
-			case <-done:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		// Stamp the attempt before starting the fetch: concurrent callers
-		// hitting the checks above while this fetch is in flight must see
-		// a fresh lastAttemptAt and be served the existing index instead
-		// of starting their own fetch behind this one. The pre-stamp
-		// value is kept so a caller-cancelled fetch can restore it —
-		// an aborted attempt must not throttle the next caller.
-		prevAttemptAt := c.lastAttemptAt
+		// No fetch running: stamp the attempt (concurrent callers
+		// hitting the checks above must see a fresh lastAttemptAt
+		// and be served the existing index / join this flight
+		// instead of starting their own) and install the flight.
+		// The fetch itself is detached — see runFetch.
 		c.lastAttemptAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
 		prev := slices.Clone(c.index)
 		c.mu.Unlock()
-		// The flight's done channel is closed exactly once, when this
-		// fetch settles (even if fetchIndex panics) — cold-start waiters
-		// rely on it. A later fetch may have replaced c.flight by then;
-		// only this fetch's own marker is this fetch's to clear.
-		defer func() {
+		go c.runFetch(ctx, flight, prev)
+		// The starter waits on ITS OWN flight rather than looping:
+		// joiners with a stale index are answered instantly above,
+		// but this caller asked for the refresh — it gets the
+		// fetch's outcome (fresh index, stale on failure, the
+		// shared error on a cold start).
+		select {
+		case <-flight.done:
 			c.mu.Lock()
-			if c.flight == flight {
-				c.flight = nil
+			index := c.index
+			c.mu.Unlock()
+			if index != nil {
+				return slices.Clone(index), nil
 			}
-			close(flight.done)
-			c.mu.Unlock()
-		}()
-
-		index, err := c.fetchIndex(ctx, prev)
-
-		// A caller-cancelled context (request shutdown, handler
-		// deadline) is not an ATC failure: the fetch died because
-		// THIS caller went away. Recording it would negative-cache
-		// the caller's own unwind for NegCacheTTL — every later
-		// cold-start caller shares a shutdown error that says
-		// nothing about the ATC — and count healthy unwinds in
-		// indexFetchErrorsTotal. Publish and record nothing; the
-		// defer still clears the flight and closes done, so
-		// cold-start waiters wake and re-decide on their own
-		// (possibly still-live) contexts. The attempt stamp is
-		// restored for the same reason — nothing was learned about
-		// the ATC, so the next caller must not be throttled by an
-		// attempt that only this caller's unwind aborted.
-		if err != nil && ctx.Err() != nil {
+			if flight.err != nil {
+				return nil, flight.err
+			}
+			continue // unreachable — re-decide defensively
+		case <-ctx.Done():
+			// Same rule as the join wait: cancellation reports
+			// itself; only a wait-budget DEADLINE falls back to
+			// the stale index (a cold start still errors).
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil, ctx.Err()
+			}
 			c.mu.Lock()
-			c.lastAttemptAt = prevAttemptAt
+			stale := c.index
 			c.mu.Unlock()
+			if stale != nil {
+				return slices.Clone(stale), nil
+			}
 			return nil, ctx.Err()
 		}
-
-		c.mu.Lock()
-		if err != nil {
-			flight.err = err
-			// Negative-cache the failure (NegCacheTTL) — cold-start
-			// waiters waking on done re-loop into this check and
-			// share the error rather than serializing fetches.
-			c.lastErr, c.lastErrAt = err, time.Now()
-			indexFetchErrorsTotal.Inc()
-			if c.index != nil {
-				logger().Warn("resource index refresh failed — serving stale",
-					"concourse_url", c.BaseURL, "team", c.Team,
-					"error", err)
-				stale := slices.Clone(c.index)
-				c.mu.Unlock()
-				return stale, nil
-			}
-			c.mu.Unlock()
-			return nil, err
-		}
-		// The client keeps its OWN copy of the fetched index — the
-		// caller's slice must not alias the cache, or a caller mutating
-		// its return value would corrupt what every later delivery
-		// matches against. Serve paths below clone out too.
-		c.index = slices.Clone(index)
-		c.fetchedAt = time.Now()
-		c.lookup = newLookup(c.index)
-		c.lastErr = nil
-		// Freshness signal: this gauge moves only here and in Refresh's
-		// success path — a stalled value is the stale-index alarm.
-		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
-		c.mu.Unlock()
-		return index, nil
 	}
 }
 
@@ -360,6 +427,9 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 // MinRefreshInterval, nor fires a second index rebuild at the ATC.
 // Only when no fetch is running does the throttle apply.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for {
 		c.mu.Lock()
 		if f := c.flight; f != nil {
@@ -378,8 +448,29 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 				// and serve whatever it published.
 				continue
 			case <-ctx.Done():
+				// Same rule as Resources: cancellation reports
+				// itself; only a wait-budget DEADLINE falls back
+				// to the stale index (cold start still errors).
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, ctx.Err()
+				}
+				c.mu.Lock()
+				stale := c.index
+				c.mu.Unlock()
+				if stale != nil {
+					return slices.Clone(stale), nil
+				}
 				return nil, ctx.Err()
 			}
+		}
+		// Cold-start negative cache — same shared lastErr window
+		// Resources consults, so a failed fetch can't be re-armed
+		// in a tight retry loop by alternating entry points.
+		if c.index == nil && c.lastErr != nil &&
+			time.Since(c.lastErrAt) < c.negCacheTTL() {
+			err := c.lastErr
+			c.mu.Unlock()
+			return nil, err
 		}
 		// The throttle watches lastForceRefreshAt AND fetchedAt: a
 		// successful fetch — Resources' opportunistic refresh or a
@@ -402,62 +493,60 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 			c.mu.Unlock()
 			return index, nil
 		}
-		// Stamp before the fetch so concurrent Refresh callers take the
-		// throttle branch instead of queueing a second doomed fetch behind
-		// this one; a failure keeps that stamp so the next forced refresh
-		// inside the throttle window still serves the cached index instead
-		// of immediately re-fetching a just-failed ATC. The pre-stamp
-		// value is kept so a caller-cancelled fetch can restore it.
-		prevForceRefreshAt := c.lastForceRefreshAt
+		// Stamp before spawning so concurrent Refresh callers take
+		// the throttle branch (or join this flight) instead of
+		// queueing a second fetch behind this one; a failure keeps
+		// that stamp so the next forced refresh inside the throttle
+		// window still serves the cached index instead of
+		// immediately re-fetching a just-failed ATC. The fetch runs
+		// detached — see runFetch — so this stamp can never be
+		// "restored" by a caller unwind: a started fetch really did
+		// happen.
 		c.lastForceRefreshAt = time.Now()
 		flight := &fetchFlight{done: make(chan struct{})}
 		c.flight = flight
 		prev := slices.Clone(c.index)
 		c.mu.Unlock()
-		defer func() {
-			c.mu.Lock()
-			if c.flight == flight {
-				c.flight = nil
+		go c.runFetch(ctx, flight, prev)
+		// Wait on OUR OWN flight directly — same shape as
+		// Resources' starter path. Looping back to the top would
+		// re-decide through the throttle: lastForceRefreshAt was
+		// stamped milliseconds ago, so a fetch that already
+		// settled (or one whose c.flight pointer was cleared
+		// before we re-locked) could fall into the throttle
+		// branch and answer the OLD index with a nil error —
+		// hiding the fetch outcome this call exists to surface.
+		select {
+		case <-flight.done:
+			// Same ordering as the join wait above: a failed
+			// fetch reports its error — serving the stale index
+			// with a nil error would hide the failure this
+			// forced refresh exists to surface.
+			if flight.err != nil {
+				return nil, flight.err
 			}
-			close(flight.done)
-			c.mu.Unlock()
-		}()
-
-		index, err := c.fetchIndex(ctx, prev)
-		if err != nil && ctx.Err() != nil {
-			// Caller shutdown, not an ATC failure — same rule as
-			// Resources: no negative-cache write, no counter, and the
-			// throttle stamp rolls back so the next forced refresh is
-			// not suppressed by an attempt this caller's unwind
-			// aborted. The flight's done closes via the defer with
-			// err unset, so joiners loop back and re-decide instead
-			// of reading a shutdown as an ATC outage.
 			c.mu.Lock()
-			c.lastForceRefreshAt = prevForceRefreshAt
+			index := c.index
 			c.mu.Unlock()
+			if index != nil {
+				return slices.Clone(index), nil
+			}
+			continue // unreachable — re-decide defensively
+		case <-ctx.Done():
+			// Same rule as Resources/the join wait: cancellation
+			// reports itself; only a wait-budget DEADLINE falls
+			// back to the stale index (cold start still errors).
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil, ctx.Err()
+			}
+			c.mu.Lock()
+			stale := c.index
+			c.mu.Unlock()
+			if stale != nil {
+				return slices.Clone(stale), nil
+			}
 			return nil, ctx.Err()
 		}
-		if err != nil {
-			flight.err = err // before the deferred close(done) — joiners read it
-			// Same cold-start negative cache as Resources — a
-			// Resources caller that joined THIS flight re-loops
-			// into the lastErr check on a cold index.
-			c.mu.Lock()
-			c.lastErr, c.lastErrAt = err, time.Now()
-			c.mu.Unlock()
-			indexFetchErrorsTotal.Inc()
-			return nil, err
-		}
-		c.mu.Lock()
-		// Same own-copy rule as Resources' publish — the caller's
-		// slice must not alias the cache.
-		c.index = slices.Clone(index)
-		c.fetchedAt = time.Now()
-		c.lookup = newLookup(c.index)
-		c.lastErr = nil
-		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
-		c.mu.Unlock()
-		return index, nil
 	}
 }
 
@@ -477,25 +566,51 @@ func (c *Client) fetchIndex(ctx context.Context,
 	prev []Resource) ([]Resource, error) {
 	start := time.Now()
 	var pipelines []struct {
-		Name string `json:"name"`
+		Name         string         `json:"name"`
+		Archived     bool           `json:"archived"`
+		InstanceVars map[string]any `json:"instance_vars"`
 	}
 	if err := c.getJSON(ctx, c.apiPath("pipelines"), &pipelines); err != nil {
 		return nil, err
 	}
+	// Archived pipelines are gone for check purposes — listing their
+	// resources would index dead entries (and their /resources calls
+	// can 404 or hang on the archived flag). Drop them up front.
+	live := pipelines[:0]
+	for _, p := range pipelines {
+		if !p.Archived {
+			live = append(live, p)
+		}
+	}
+	pipelines = live
 
-	// Snapshot the previous index per pipeline: a transient
-	// per-pipeline listing failure below must carry its last-known
-	// resources into the new index rather than silently unregistering
-	// them — err stays nil, so a partial result would otherwise
-	// overwrite c.index with a silently smaller view. (Copied from
-	// c.index under c.mu by the caller before this fetch started, so
-	// no lock is needed here.)
+	// Snapshot the previous index per (pipeline, varsQuery): a
+	// transient per-pipeline listing failure below must carry its
+	// last-known resources into the new index rather than silently
+	// unregistering them — err stays nil, so a partial result would
+	// otherwise overwrite c.index with a silently smaller view. The
+	// varsQuery half of the key matters: a set_pipeline step can
+	// re-instance a pipeline under DIFFERENT vars while keeping the
+	// name — carrying the old instance's resources over would index
+	// entries the new instance does not have. (Copied from c.index
+	// under c.mu by the caller before this fetch started, so no
+	// lock is needed here.)
 	prevByPipeline := make(map[string][]Resource)
 	for _, r := range prev {
-		prevByPipeline[r.Pipeline] = append(prevByPipeline[r.Pipeline], r)
+		key := r.Pipeline + "\x00" + r.InstanceVarsQuery
+		prevByPipeline[key] = append(prevByPipeline[key], r)
 	}
 
 	results := make([][]Resource, len(pipelines))
+	// varsQuery[i] is the pipeline's instance_vars rendered as the
+	// ATC dot-notation query fragment — instanced pipelines only
+	// resolve /resources and check webhooks under ?vars.<key>=, so
+	// the same fragment rides every Resource and both call sites.
+	// Empty for non-instanced pipelines.
+	varsQuery := make([]string, len(pipelines))
+	for i, p := range pipelines {
+		varsQuery[i] = instanceVarsQuery(p.InstanceVars)
+	}
 	// lost[i] records a pipeline whose listing failed with nothing in
 	// the previous index to carry over — the refreshed index would be
 	// silently missing its resources, so the fetch must fail instead
@@ -521,6 +636,9 @@ func (c *Client) fetchIndex(ctx context.Context,
 				Source source `json:"source"`
 			}
 			path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
+			if varsQuery[i] != "" {
+				path += "?" + varsQuery[i]
+			}
 			if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
 				var se *statusError
 				if errors.As(err, &se) && se.status == http.StatusNotFound {
@@ -535,10 +653,14 @@ func (c *Client) fetchIndex(ctx context.Context,
 				// retain the previous index's entries for it (the
 				// pipeline still exists — only its listing failed).
 				// Pipelines truly gone drop out via the pipeline list
-				// itself, not through this path.
-				results[i] = append(results[i], prevByPipeline[p.Name]...)
+				// itself, not through this path. The carry-over key
+				// includes the vars fragment — resources of a
+				// re-instanced pipeline under different vars must
+				// not leak into the new instance's index.
+				carryKey := p.Name + "\x00" + varsQuery[i]
+				results[i] = append(results[i], prevByPipeline[carryKey]...)
 				failed[i] = true
-				if len(prevByPipeline[p.Name]) == 0 {
+				if len(prevByPipeline[carryKey]) == 0 {
 					// Nothing to carry over — the new index would
 					// silently lack this pipeline's resources.
 					lost[i] = p.Name
@@ -554,10 +676,11 @@ func (c *Client) fetchIndex(ctx context.Context,
 					continue
 				}
 				results[i] = append(results[i], Resource{
-					Pipeline: p.Name,
-					Name:     r.Name,
-					Type:     r.Type,
-					Repo:     repo,
+					Pipeline:          p.Name,
+					Name:              r.Name,
+					Type:              r.Type,
+					Repo:              repo,
+					InstanceVarsQuery: varsQuery[i],
 				})
 			}
 		}()
@@ -626,6 +749,12 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		"pipelines/"+url.PathEscape(r.Pipeline)+
 			"/resources/"+url.PathEscape(r.Name)+"/check/webhook") +
 		"?webhook_token=" + url.QueryEscape(c.WebhookToken)
+	if r.InstanceVarsQuery != "" {
+		// Instanced pipelines check under their instance vars —
+		// without ?vars.<key>= the ATC can't resolve which instance
+		// to check (and may 404 the resource outright).
+		u += "&" + r.InstanceVarsQuery
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
 		// url.Parse failures surface as *url.Error embedding the raw
@@ -654,6 +783,89 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 }
 
 // apiPath prefixes p with the team-scoped API root.
+// instanceVarsQuery renders a pipeline's instance_vars as the ATC
+// dot-notation query fragment, mirroring Concourse's own encoder
+// (atc/pipeline.go QueryParams over vars.StaticVariables.Flatten):
+// nested maps are FLATTENED into dot-joined leaf paths — the ATC
+// parses vars.a.b back into {"a":{"b":...}}, so a nested instance_vars
+// must never be sent as one JSON blob — and every path segment that
+// contains a dot (or any of ",.:/ ") is %q-quoted so a literal
+// "release.line" key stays one segment instead of reading as nesting.
+// One vars.<key>=<json-val> param per leaf, keys sorted by rendered
+// ref so two fetches of the same vars produce byte-identical
+// fragments (cache-friendly, diff-friendly logs). "" for
+// non-instanced pipelines; empty maps flatten to zero pairs (the var
+// vanishes, matching Flatten); a leaf whose value fails to marshal
+// is skipped rather than failing the whole listing.
+func instanceVarsQuery(vars map[string]any) string {
+	if len(vars) == 0 {
+		return ""
+	}
+	pairs := flattenInstanceVars(vars)
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ref < pairs[j].ref })
+	var b strings.Builder
+	for _, p := range pairs {
+		v, err := json.Marshal(p.value)
+		if err != nil {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape("vars." + p.ref))
+		b.WriteByte('=')
+		b.WriteString(url.QueryEscape(string(v)))
+	}
+	return b.String()
+}
+
+// instanceVarPair is one flattened leaf: the dot-notation ref the
+// ATC parses (segments already quoting-applied) plus its JSON value.
+type instanceVarPair struct {
+	ref   string
+	value any
+}
+
+// flattenInstanceVars walks the instance_vars tree the way
+// vars.StaticVariables.Flatten does: only map[string]any nodes
+// recurse — every other value (including lists and nil) is a leaf.
+// An empty map contributes zero pairs.
+func flattenInstanceVars(vars map[string]any) []instanceVarPair {
+	var pairs []instanceVarPair
+	for k, v := range vars {
+		pairs = append(pairs, flattenInstanceVar(k, nil, v)...)
+	}
+	return pairs
+}
+
+func flattenInstanceVar(path string, fields []string, value any) []instanceVarPair {
+	if m, ok := value.(map[string]any); ok {
+		var out []instanceVarPair
+		for k, v := range m {
+			out = append(out, flattenInstanceVar(path, append(fields, k), v)...)
+		}
+		return out
+	}
+	var b strings.Builder
+	b.WriteString(instanceVarSegment(path))
+	for _, f := range fields {
+		b.WriteByte('.')
+		b.WriteString(instanceVarSegment(f))
+	}
+	return []instanceVarPair{{ref: b.String(), value: value}}
+}
+
+// instanceVarSegment quotes a path segment exactly like Concourse's
+// refSegmentString: segments containing a separator char (",.:/ ")
+// are wrapped in Go quoting so the ATC's dot-notation parser keeps
+// them as ONE field.
+func instanceVarSegment(seg string) string {
+	if strings.ContainsAny(seg, ",.:/ ") {
+		return fmt.Sprintf("%q", seg)
+	}
+	return seg
+}
+
 func (c *Client) apiPath(p string) string {
 	return "/api/v1/teams/" + url.PathEscape(c.Team) + "/" + p
 }
@@ -666,34 +878,51 @@ func (c *Client) apiPath(p string) string {
 const maxJSONBody = 8 << 20 // 8 MiB
 
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		strings.TrimSuffix(c.BaseURL, "/")+path, nil)
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(c.User, c.Password)
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		// Drain (bounded) so the keep-alive connection can be reused.
+	// Up to two attempts: a 401 on a bearer-token request invalidates
+	// the cached token and re-mints exactly once (auth.go) — a
+	// revoked/expired-early token self-heals instead of failing the
+	// whole index fetch. Basic-mode requests never retry: their 401
+	// is a credential problem, not a stale token.
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			strings.TrimSuffix(c.BaseURL, "/")+path, nil)
+		if err != nil {
+			return err
+		}
+		usedToken, err := c.authorize(ctx, req)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.httpClient().Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && usedToken != "" && attempt == 0 {
+			_ = resp.Body.Close()
+			// Invalidate only the token THIS request carried — a
+			// fresher token another worker already minted survives.
+			c.invalidateToken(usedToken)
+			continue
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode/100 != 2 {
+			// Drain (bounded) so the keep-alive connection can be reused.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			return &statusError{status: resp.StatusCode, path: path}
+		}
+		// Bound the decode: without LimitReader a 2xx body longer than
+		// maxJSONBody (an ATC streaming forever) would be buffered whole.
+		err = json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
+		// Drain whatever the decoder left before the body closes: a decode
+		// that finished before EOF (trailing newline, whitespace, extra
+		// documents) or one that failed at the maxJSONBody cap would
+		// otherwise strand the keep-alive connection, forcing every later
+		// call to re-dial. Bounded like the error path — an endless
+		// hostile stream is abandoned, not drained forever.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return &statusError{status: resp.StatusCode, path: path}
+		return err
 	}
-	// Bound the decode: without LimitReader a 2xx body longer than
-	// maxJSONBody (an ATC streaming forever) would be buffered whole.
-	err = json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
-	// Drain whatever the decoder left before the body closes: a decode
-	// that finished before EOF (trailing newline, whitespace, extra
-	// documents) or one that failed at the maxJSONBody cap would
-	// otherwise strand the keep-alive connection, forcing every later
-	// call to re-dial. Bounded like the error path — an endless
-	// hostile stream is abandoned, not drained forever.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return err
 }
 
 // source is the slice of a resource's source config the index needs:
