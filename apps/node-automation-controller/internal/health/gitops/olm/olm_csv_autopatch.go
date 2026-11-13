@@ -199,6 +199,17 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		if _, err := p.Dyn.Resource(olmCSVGVR).
 			Namespace(csv.GetNamespace()).Patch(ctx, csv.GetName(),
 			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				// The CSV was deleted under us or changed since the
+				// snapshot — a raced outcome retries next sweep,
+				// not an error.
+				log.Info("SKIP: olm csv auto-patch raced — csv gone or changed",
+					"csv", csv.GetNamespace()+"/"+csv.GetName(),
+					"notFound", apierrors.IsNotFound(err),
+					"conflict", apierrors.IsConflict(err))
+				heal.RefundGrant(now)
+				continue
+			}
 			metrics.IncError(p.Name)
 			log.Error(err, "olm csv auto-patch failed",
 				"csv", csv.GetNamespace()+"/"+csv.GetName())

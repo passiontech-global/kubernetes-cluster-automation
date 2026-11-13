@@ -204,7 +204,7 @@ func (p *fluxKustomizationHealthCheck) fluxSourceNudgeFresh(ctx context.Context,
 			"kind", kind, "source", ns+"/"+name, "error", err)
 		return false
 	}
-	return flux.FluxSourceNudgeFresh(src, now, sourceNudgeFreshWindow)
+	return flux.FluxSourceNudgeFresh(ctx, src, now, sourceNudgeFreshWindow)
 }
 
 // fluxKustDepsReady reports whether every spec.dependsOn entry of the

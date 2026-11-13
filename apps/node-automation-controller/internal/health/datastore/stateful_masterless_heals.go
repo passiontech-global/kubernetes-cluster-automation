@@ -184,9 +184,9 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 // patch failure; CooldownSet.Last reports the stamp back, which a
 // plain CooledDown gate cannot). ok=false means no heal has landed
 // yet: the dual-replica heal must not skip ahead of step 1.
-func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
+func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(ctx context.Context, sig masterSvc) (time.Time, bool) {
 	latest, _ := p.drOpHealed.Last(sig.sts.Namespace + "/" + sig.sts.Name)
-	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok && t.After(latest) {
+	if t, ok := kube.AnnoTimeCtx(ctx, sig.sts, dragonflyHealAnno); ok && t.After(latest) {
 		latest = t
 	}
 	return latest, !latest.IsZero()
@@ -247,7 +247,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	p.drPodHealed.PruneExpired(now, dragonflyPodHealCooldown)
 
 	// Gate 1 — the operator heal must have settled first.
-	opHealedAt, healed := p.dragonflyOperatorHealedAt(sig)
+	opHealedAt, healed := p.dragonflyOperatorHealedAt(ctx, sig)
 	switch {
 	case !healed:
 		log.Info("dual-replica deadlock: no operator heal recorded — waiting for step 1",

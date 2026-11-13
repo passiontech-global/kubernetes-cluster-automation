@@ -30,9 +30,10 @@ import (
 // BEFORE the cordon pass so freed capacity counts toward the 35%
 // ratio. Returns the updated cordoned-worker count.
 func (p *nodeHangCheck) uncordonCleared(ctx context.Context, log logr.Logger,
-	uncordon []string, cordoned int) int {
+	uncordon []string, cordoned int, nodes []corev1.Node) int {
 	slices.Sort(uncordon)
 	for _, name := range uncordon {
+		target := nodeByName(nodes, name)
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			nodeHangPreCordonAnno: nil, // merge-patch delete — lift our stamp
 		})
@@ -55,6 +56,12 @@ func (p *nodeHangCheck) uncordonCleared(ctx context.Context, log logr.Logger,
 			continue
 		}
 		p.InvalidateNodes(ctx) // node spec changed — drop the node census, arm a CS re-read
+		if target != nil {
+			// Record the stamp lift on the sweep overlay — a later
+			// check reading EffectiveAnno must not resurrect the
+			// cleared stamp off the pre-patch snapshot.
+			kube.RecordAnnoPatch(ctx, target, payload)
+		}
 		cordoned--
 		nodeHangUncordonsTotal.WithLabelValues(name).Inc()
 		p.hangCounters.mark(name)
@@ -69,9 +76,10 @@ func (p *nodeHangCheck) uncordonCleared(ctx context.Context, log logr.Logger,
 // ours to clean, otherwise a later deliberate cordon would inherit
 // the auto-uncordon.
 func (p *nodeHangCheck) clearStaleStamps(ctx context.Context, log logr.Logger,
-	staleStamp []string) {
+	staleStamp []string, nodes []corev1.Node) {
 	slices.Sort(staleStamp)
 	for _, name := range staleStamp {
+		target := nodeByName(nodes, name)
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			nodeHangPreCordonAnno: nil,
 		})
@@ -87,9 +95,24 @@ func (p *nodeHangCheck) clearStaleStamps(ctx context.Context, log logr.Logger,
 			continue
 		}
 		p.InvalidateNodes(ctx) // node annotations changed — drop the node census, arm a CS re-read
+		if target != nil {
+			kube.RecordAnnoPatch(ctx, target, payload)
+		}
 		log.Info("CORDON STAMP CLEARED: schedulable node carried a stale pre-cordon annotation",
 			"node", name)
 	}
+}
+
+// nodeByName resolves a node name back to its census object so a
+// landed patch can be recorded on the sweep overlay under the same
+// overlayObjKey (UID) later readers compute.
+func nodeByName(nodes []corev1.Node, name string) *corev1.Node {
+	for i := range nodes {
+		if nodes[i].Name == name {
+			return &nodes[i]
+		}
+	}
+	return nil
 }
 
 // cordonLatched patches spec.unschedulable=true + the precordon
@@ -101,13 +124,7 @@ func (p *nodeHangCheck) cordonLatched(ctx context.Context, log logr.Logger,
 	rep *probefw.SweepReport, nodes []corev1.Node, workers, cordoned int) int {
 	for _, entry := range rep.Sorted() {
 		name, _, _ := strings.Cut(entry, ":")
-		var target *corev1.Node
-		for i := range nodes {
-			if nodes[i].Name == name {
-				target = &nodes[i]
-				break
-			}
-		}
+		target := nodeByName(nodes, name)
 		if target == nil || target.Spec.Unschedulable {
 			continue
 		}
@@ -148,6 +165,9 @@ func (p *nodeHangCheck) cordonLatched(ctx context.Context, log logr.Logger,
 			continue
 		}
 		p.InvalidateNodes(ctx) // node spec changed — drop the node census, arm a CS re-read
+		// Record the landed stamp on the sweep overlay — later
+		// checks must see the cordon evidence this pass wrote.
+		kube.RecordAnnoPatch(ctx, target, payload)
 		cordoned++
 		nodeHangCordonsTotal.WithLabelValues(name).Inc()
 		p.hangCounters.mark(name)

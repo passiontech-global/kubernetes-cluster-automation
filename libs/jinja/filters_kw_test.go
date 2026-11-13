@@ -175,9 +175,10 @@ func TestIntFloatDefaultKwargs(t *testing.T) {
 		// python float() does not) don't convert via the fallback.
 		{"{{ '0x1p-2' | int }}", "0"},
 		{"{{ '0x10' | int }}", "0"}, // no implicit base-0 parsing
-		// Underflow below MinInt64 clamps instead of using default.
-		{"{{ '-1e300' | int }}", "-9223372036854775808"},
-		{"{{ (0 - 1e300) | int }}", "-9223372036854775808"},
+		// Out-of-range on EITHER end is a conversion failure → the
+		// default, never a clamped MinInt64 (no int64 holds -1e300).
+		{"{{ '-1e300' | int }}", "0"},
+		{"{{ (0 - 1e300) | int }}", "0"},
 		// Overflow above MaxInt64 stays a failure → default.
 		{"{{ 1e300 | int(default=7) }}", "7"},
 	}

@@ -123,7 +123,8 @@ func NormalizeRepo(s string) string {
 		atHost := i == 0 ||
 			strings.HasSuffix(s[:i], "://") || strings.HasSuffix(s[:i], "@")
 		rest := s[i+len("github.com"):]
-		if atHost && rest != "" && (rest[0] == '/' || rest[0] == ':') {
+		if atHost && hostInAuthority(s[:i]) && rest != "" &&
+			(rest[0] == '/' || rest[0] == ':') {
 			return normalizeRepoRest(s[:i], rest)
 		}
 		next := i + len("github.com")
@@ -134,6 +135,22 @@ func NormalizeRepo(s string) string {
 		i = next + j
 	}
 	return s
+}
+
+// hostInAuthority reports whether a "github.com" match at the end of
+// prefix sits in the URL authority component — no '/' between the
+// last "://" (or the string start) and the match. The "@" boundary
+// check alone is not enough: "https://evil.com/git@github.com:org/repo"
+// has a literal "git@" right before the match, but that "@" lives in
+// the URL PATH, not the userinfo — without this guard the lookalike
+// host collapses the whole URL to "org/repo" and matches resources
+// it has no business matching.
+func hostInAuthority(prefix string) bool {
+	auth := prefix
+	if k := strings.LastIndex(auth, "://"); k >= 0 {
+		auth = auth[k+3:]
+	}
+	return !strings.ContainsRune(auth, '/')
 }
 
 // normalizeRepoRest strips the host's separator (scp colon, or an

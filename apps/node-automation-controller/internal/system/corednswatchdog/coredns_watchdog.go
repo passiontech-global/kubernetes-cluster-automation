@@ -29,6 +29,7 @@ package corednswatchdog
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"slices"
 	"sync"
@@ -321,8 +322,18 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// re-logs the reflector death every retry, so the hits keep
 	// coming). Per-pod like before — only layer-2 carries the
 	// fleet-wide abort.
-	for name := range podIP {
-		if hit := w.logHitFn(ctx, name); hit != "" {
+	// The log streams fan out through the same bounded pool as
+	// layer 2 (one pod-log stream per pod would serialize the
+	// sweep on API latency); only the probes run concurrently —
+	// streak writes and the stale map stay in this sequential
+	// pass so verdicts land in one deterministic order.
+	l1names := slices.Sorted(maps.Keys(podIP))
+	l1hits := make([]string, len(l1names))
+	boundedForEach(l1names, func(i int) {
+		l1hits[i] = w.logHitFn(ctx, l1names[i])
+	})
+	for i, name := range l1names {
+		if hit := l1hits[i]; hit != "" {
 			if s := w.logStreak.Hit(name); s >= corednsStreakMax {
 				stale[name] = true
 				log.Info("log: STALE — informer death signature",
@@ -394,19 +405,37 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	}
 
 	// ===== Layer 3: metrics :9153 per pod =====
+	// Same bounded fan-out as layers 1-2: each scrape is an HTTP
+	// GET with its own timeout, so serializing them multiplied the
+	// sweep's wall time by the replica count. Scrapes run through
+	// the pool; the stale/streak writes below stay sequential.
+	var l3names []string
 	for name, ip := range podIP {
 		if ip == "" || stale[name] {
 			continue
 		}
-		panics, ok := w.panicsFn(ctx, ip)
-		if !ok {
+		l3names = append(l3names, name)
+	}
+	slices.Sort(l3names)
+	type panicVerdict struct {
+		panics float64
+		ok     bool
+	}
+	l3res := make([]panicVerdict, len(l3names))
+	boundedForEach(l3names, func(i int) {
+		p, ok := w.panicsFn(ctx, podIP[l3names[i]])
+		l3res[i] = panicVerdict{p, ok}
+	})
+	for i, name := range l3names {
+		v := l3res[i]
+		if !v.ok {
 			log.Info("metrics: UNKNOWN — cannot fetch :9153/metrics", "pod", name)
 			continue
 		}
-		if panics > 0 {
+		if v.panics > 0 {
 			stale[name] = true
 			w.streak.Set(name, corednsStreakMax)
-			log.Info("metrics: STALE — coredns_panics_total>0", "pod", name, "panics", panics)
+			log.Info("metrics: STALE — coredns_panics_total>0", "pod", name, "panics", v.panics)
 		}
 	}
 

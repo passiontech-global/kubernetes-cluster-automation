@@ -49,7 +49,11 @@ var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // that EXISTS is enforced — an unlisted host or a key mismatch
 // fails the fetch closed.
 func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) error, error) {
-	p := filepath.Join(filepath.Dir(keyPath), "known_hosts")
+	// ExpandHome BEFORE deriving the known_hosts dir: the default
+	// --ssh-key is "~/.ssh/id_ed25519", and filepath.Dir on the raw
+	// string yields "~/.ssh" — os.Stat then always ENOENTs and the
+	// fetch silently falls back to InsecureIgnoreHostKey.
+	p := filepath.Join(filepath.Dir(sshclient.ExpandHome(keyPath)), "known_hosts")
 	if _, err := os.Stat(p); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil // no trust material — tolerant parity

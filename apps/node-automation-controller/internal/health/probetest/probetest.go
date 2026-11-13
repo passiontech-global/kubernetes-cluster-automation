@@ -19,9 +19,11 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -81,6 +83,17 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 			Datastore: probefw.DatastoreConfig{
 				CNPGUnhealthyMinAge:  15 * time.Minute,
 				PVCResizeStallMinAge: 30 * time.Minute,
+			},
+			// Env-equivalent cilium/linkerd defaults — same
+			// domain-free posture as Datastore above (the
+			// nethealth defaults live in a sibling package this
+			// scaffold must not import, so the literals repeat).
+			Cilium: probefw.CiliumConfig{
+				BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
+				NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
+			},
+			Linkerd: probefw.LinkerdConfig{
+				OutlierEvictEnabled: true, // = nethealth.LinkerdOutlierEvictEnabledDefault
 			},
 		},
 		LookupHost: func(context.Context, string) ([]string, error) {
@@ -397,4 +410,45 @@ func PromTestServer(t *testing.T, respond func(query string) []PromTestSample) (
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &lastQuery
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-client + counter assertions
+// ---------------------------------------------------------------------------
+
+// DynExists reports whether the dynamic fake still holds the
+// ns/name object — the "was it deleted / did the write land"
+// assertion for CR fixtures. A non-NotFound GET error fails the
+// test: an unreadable fake is a broken fixture, not an absence.
+func DynExists(ctx context.Context, t *testing.T, dyn dynamic.Interface,
+	gvr schema.GroupVersionResource, ns, name string) bool {
+
+	t.Helper()
+	_, err := dyn.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	t.Fatalf("dyn get %s %s/%s: %v", gvr.Resource, ns, name, err)
+	return false
+}
+
+// CounterSnapshot reads the queue's legacy hook-error counter —
+// pair with AssertCounterDelta after the action under test.
+func CounterSnapshot(t *testing.T, queue string) float64 {
+	t.Helper()
+	return testutil.QueueErrorCount(t, queue)
+}
+
+// AssertCounterDelta fails unless the queue error counter grew by
+// exactly want since before — the one-liner form of the
+// QueueErrorCount-before/after pairs every IncError assertion
+// hand-rolls.
+func AssertCounterDelta(t *testing.T, queue string, before, want float64) {
+	t.Helper()
+	if d := testutil.QueueErrorCount(t, queue) - before; d != want {
+		t.Fatalf("queue %q error counter delta = %v, want %v", queue, d, want)
+	}
 }

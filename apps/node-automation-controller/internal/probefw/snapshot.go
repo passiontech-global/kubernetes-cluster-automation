@@ -361,6 +361,16 @@ type sweepSnapshot struct {
 	cronJobsIdx     censusIndex[batchv1.CronJob]
 	jobsIdx         censusIndex[batchv1.Job]
 
+	// podPlacement/sliceSvc are the content indexes over the pod
+	// and EndpointSlice censuses (PodsIn/PodsOnNode/
+	// EndpointSlicesForService) — see snapshot_index.go. Unlike the
+	// censusIndex family they self-validate on (tombstone gen,
+	// census slice identity) per call, so they join NO resets list:
+	// an invalidated or tombstone-bumped census changes the key and
+	// the next lookup rebuilds on its own.
+	podPlacement podPlacementIndex
+	sliceSvc     sliceServiceIndex
+
 	// AllUnstructured memoizes per GVR instead of per field — see
 	// the type comment above. Each entry is a full memo[T] so one
 	// GVR's LIST serializes on ITS OWN lock: the parallel check

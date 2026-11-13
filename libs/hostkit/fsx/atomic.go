@@ -29,14 +29,14 @@ var (
 // warnRenameFallback emits the once-per-path fallback warning.
 func warnRenameFallback(path string, err error) {
 	renameFallbackMu.Lock()
-	if _, logged := renameFallbackLogged[path]; !logged {
-		if len(renameFallbackLogged) >= renameFallbackLogCap {
-			renameFallbackMu.Unlock()
-			return
-		}
-		renameFallbackLogged[path] = true
+	defer renameFallbackMu.Unlock()
+	if renameFallbackLogged[path] {
+		return
 	}
-	renameFallbackMu.Unlock()
+	if len(renameFallbackLogged) >= renameFallbackLogCap {
+		return
+	}
+	renameFallbackLogged[path] = true
 	logx.For("fsx").Warn("atomic rename refused (bind-mounted "+
 		"target?) — falling back to direct fsync'd write",
 		"path", path, "error", err)

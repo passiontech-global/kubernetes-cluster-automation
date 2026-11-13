@@ -17,6 +17,7 @@
 package flux
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -134,9 +135,9 @@ func FluxConsumerSourceRef(o *unstructured.Unstructured) (kind, ns, name string,
 // this to defer their own remediation while the source healer is
 // inside its cooldown window, so one stuck artifact is remediated
 // once, not twice.
-func FluxSourceNudgeFresh(obj metav1.Object, now time.Time,
+func FluxSourceNudgeFresh(ctx context.Context, obj metav1.Object, now time.Time,
 	cooldown time.Duration) bool {
 
-	t, ok := kube.AnnoTime(obj, kube.AnnoLastSourceNudge)
+	t, ok := kube.AnnoTimeCtx(ctx, obj, kube.AnnoLastSourceNudge)
 	return ok && now.Sub(t) < cooldown
 }

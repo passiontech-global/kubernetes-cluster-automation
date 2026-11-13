@@ -78,6 +78,10 @@ type Agent struct {
 	// must recycle, unlike a crash-looping one which /readyz
 	// reports without restarting healthy siblings.
 	beats sync.Map
+	// backoffInitial is the supervisor's first restart wait —
+	// superviseBackoffInitial in production; tests shrink it so the
+	// restart-backoff behavior doesn't cost real seconds.
+	backoffInitial time.Duration
 	// probeAddr caches the BOUND probe listener address — the
 	// sd_notify self-probe dials the real bound addr (a ":0" or
 	// rewritten bind can never be derived from cfg.ProbeAddr).
@@ -94,7 +98,7 @@ func New(cfg Config) *Agent {
 	if reg == nil {
 		reg = prometheus.NewRegistry()
 	}
-	a := &Agent{cfg: cfg, reg: reg}
+	a := &Agent{cfg: cfg, reg: reg, backoffInitial: superviseBackoffInitial}
 
 	// Go runtime + process metrics (go_memstats_*, process_rss, fds,
 	// network) on the shared registry — the memory-triage evidence for

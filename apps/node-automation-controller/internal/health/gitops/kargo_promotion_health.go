@@ -261,6 +261,10 @@ func (p *kargoPromotionHealthCheck) maybeRefreshKargoWarehouse(ctx context.Conte
 			"warehouse", key)
 		return
 	}
+	// Record the landed patch on the sweep overlay — a later check
+	// reading these keys through EffectiveAnno/AnnoTimeCtx sees the
+	// stamp this sweep instead of the pre-patch snapshot.
+	kube.RecordAnnoPatch(ctx, wh, patch)
 	p.warehouseRefreshHealed.Stamp(key, now)
 	log.Info("PATCH: kargo warehouse refresh annotation",
 		"warehouse", key)

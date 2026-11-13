@@ -79,6 +79,11 @@ func leaderClientConfig(cfg *rest.Config,
 	}
 	elCfg.Timeout = max(renewDeadline/2, time.Second)
 	elCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	// Same accept-fallback posture as the manager/typed configs:
+	// protobuf is sent AND preferred, JSON is the negotiated
+	// fallback for anything without a protobuf scheme.
+	elCfg.AcceptContentTypes =
+		"application/vnd.kubernetes.protobuf,application/json"
 	elCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
 		leaderElectionClientQPS, leaderElectionClientBurst)
 	return elCfg

@@ -83,8 +83,11 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	if serr != nil && m.d.LongBudgetExceeded(t0, serr) {
 		// The client kill can orphan the server-side session —
 		// still holding the advisory lock. Reap it now instead of
-		// waiting out the session.
+		// waiting out the session, then clear any pg_repack debris
+		// the reaped session leaves behind (trigger + shadow tables
+		// pin disk until dropped).
 		m.reapOrphanedMaint(ctx, pg, user, pass, note)
+		m.dropRepackLeftovers(ctx, pg, user, pass, note)
 	}
 	switch {
 	case serr != nil:
@@ -219,6 +222,11 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	} else {
 		if m.d.LongBudgetExceeded(rt0, err) {
 			m.reapOrphanedMaint(ctx, pg, user, pass, note)
+			// A killed pg_repack leaves repack_trigger plus
+			// repack.log_<oid>/repack.table_<oid> shadow objects —
+			// clear them now or they inflate every table until the
+			// next daily window's dropRepackLeftovers.
+			m.dropRepackLeftovers(ctx, pg, user, pass, note)
 		}
 		res.okRepack = false
 		res.repackState = "fail"

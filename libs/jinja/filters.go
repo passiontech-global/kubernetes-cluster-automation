@@ -52,18 +52,21 @@ func hexish(s string) bool {
 // floatToInt64 converts NaN/±Inf-free floats into int64: Go's
 // int64() on NaN/±Inf or an out-of-range value yields platform
 // garbage (typically MinInt64), which |int must never return.
-// Finite underflow below MinInt64 clamps to MinInt64 (python
-// int(-1e300) is a huge negative int, not a failure); overflow above
-// MaxInt64 and the non-finites report false — callers fall back to
-// the filter's default instead.
+// Out-of-range on EITHER end reports false — callers fall back to
+// the filter's default instead of a clamped lie (python's bignum
+// has no int64 form here, so the default is the honest answer).
 func floatToInt64(f float64) (int64, bool) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, false
 	}
-	if f <= math.MinInt64 {
-		return math.MinInt64, true
-	}
-	if f >= math.MaxInt64 {
+	// float64(math.MinInt64) is exactly -2^63 and float64(math.MaxInt64)
+	// rounds UP to 2^63 — both bounds are exact powers of two, so a
+	// strict compare keeps every in-range float (f == -2^63 still
+	// yields MinInt64) and rejects genuine overflow on BOTH ends.
+	// The old `f <= MinInt64` clamp reported MinInt64 for -1e300 —
+	// a value no int64 holds; the filter's default is the honest
+	// answer, same as positive overflow.
+	if f < float64(math.MinInt64) || f >= float64(math.MaxInt64) {
 		return 0, false
 	}
 	return int64(f), true
@@ -218,7 +221,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			// python's float() rejects, and int("0x10", 16) parses
 			// the digits via ParseInt above anyway.
 			if base == 10 && !hexish(t) {
-				if f, err := strconv.ParseFloat(t, 64); err == nil {
+				// TrimSpace like the ParseInt above — " 1.5 " | int
+				// must not fail the decimal fallback on padding
+				// python's float() tolerates.
+				if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
 					// NaN/±Inf/out-of-int64-range floats used to
 					// truncate into platform garbage — the
 					// default is the honest answer for those,

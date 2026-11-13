@@ -867,3 +867,6 @@ func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
 		t.Fatal("lazy-arm did not seed the poked ledger")
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

@@ -1,6 +1,7 @@
 package apiserviceguard
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -783,3 +784,6 @@ func TestAPIServiceGuardUnblockPDBRefusalDefers(t *testing.T) {
 		t.Fatalf("PDB refusal metered as an error: delta = %v, want 0", got)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

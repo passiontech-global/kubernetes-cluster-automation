@@ -7,6 +7,7 @@
 package flux
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -202,19 +203,19 @@ func TestFluxSourceNudgeFresh(t *testing.T) {
 			kube.AnnoLastSourceNudge: t.UTC().Format(time.RFC3339)})
 	}
 
-	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
+	if FluxSourceNudgeFresh(context.Background(), obj, now, 15*time.Minute) {
 		t.Fatal("no stamp read as fresh")
 	}
 	stamp(now.Add(-time.Minute))
-	if !FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
+	if !FluxSourceNudgeFresh(context.Background(), obj, now, 15*time.Minute) {
 		t.Fatal("fresh stamp read as stale")
 	}
 	stamp(now.Add(-time.Hour))
-	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
+	if FluxSourceNudgeFresh(context.Background(), obj, now, 15*time.Minute) {
 		t.Fatal("stale stamp read as fresh")
 	}
 	obj.SetAnnotations(map[string]string{kube.AnnoLastSourceNudge: "garbage"})
-	if FluxSourceNudgeFresh(obj, now, 15*time.Minute) {
+	if FluxSourceNudgeFresh(context.Background(), obj, now, 15*time.Minute) {
 		t.Fatal("unparseable stamp read as fresh")
 	}
 }

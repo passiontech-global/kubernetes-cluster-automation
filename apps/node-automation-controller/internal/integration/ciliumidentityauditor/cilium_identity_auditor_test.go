@@ -1,6 +1,7 @@
 package ciliumidentityauditor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -686,3 +687,6 @@ func TestCiliumIdentityAuditorHighCardinalityWarn(t *testing.T) {
 		t.Fatalf("top cardinality key not named:\n%s", joined)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

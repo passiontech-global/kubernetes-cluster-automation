@@ -146,6 +146,50 @@ jobs:
       - name: Test leaf libs
         run: moon run hostkit:test jinja:test
 
+  # Resolve which app images a PR actually touches BEFORE the
+  # docker-build matrix is evaluated (strategy.matrix cannot read a
+  # same-job step output). apps/<app>/** maps to that app; libs/
+  # changes map to the apps whose dependency graph consumes them —
+  # the same split the release workflows' lib_paths encode. An empty
+  # result makes docker-build's matrix empty and the job skips.
+  docker-detect:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect affected apps
+        id: detect
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_REF"
+          changed=$(git diff --name-only FETCH_HEAD...HEAD)
+          matrix=$(jq -nc --arg changed "$changed" '
+            def consumers($p):
+              if ($p | startswith("apps/")) then
+                ($p | split("/"))[1] |
+                if . == "node-host-agent" or . == "node-automation-controller" or . == "webhook-dispatcher" then [.] else [] end
+              elif ($p | startswith("libs/jinja/")) then ["node-host-agent"]
+              elif ($p | startswith("libs/hostkit/envx/")) or ($p | startswith("libs/hostkit/httpx/")) or $p == "libs/hostkit/go.mod" or $p == "libs/hostkit/go.sum" then
+                ["node-host-agent","node-automation-controller","webhook-dispatcher"]
+              elif ($p | startswith("libs/hostkit/logx/")) then ["node-host-agent","webhook-dispatcher"]
+              elif ($p | startswith("libs/hostkit/nodecond/")) or ($p | startswith("libs/hostkit/timex/")) then ["node-host-agent","node-automation-controller"]
+              elif ($p | startswith("libs/hostkit/fsx/")) then ["node-host-agent"]
+              elif ($p | startswith("libs/hostkit/ledger/")) then ["node-automation-controller"]
+              elif $p == ".dockerignore" then ["node-host-agent","node-automation-controller","webhook-dispatcher"]
+              else [] end;
+            [ $changed | split("\n")[] | select(length > 0) | consumers(.) ]
+            | add // [] | unique | {app: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "affected apps: $matrix"
+
   # Build every app image WITHOUT pushing. The release workflows only
   # fire on app-path changes, so nothing else exercises the Dockerfiles
   # (or the root .dockerignore they depend on) before merge. Mirrors the
@@ -155,13 +199,14 @@ jobs:
   # coverage comes from the release builds themselves. GHA registry
   # cache keeps a cold Dockerfile from rebuilding every Go layer on
   # each PR, scoped per app so matrix legs never poison each other.
+  # docker-detect narrows the matrix to apps the PR actually touches.
   docker-build:
+    needs: docker-detect
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        app: [node-host-agent, node-automation-controller, webhook-dispatcher]
+      matrix: ${{ fromJSON(needs.docker-detect.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

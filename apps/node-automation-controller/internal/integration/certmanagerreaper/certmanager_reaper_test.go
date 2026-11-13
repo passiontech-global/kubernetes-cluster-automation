@@ -1,6 +1,7 @@
 package certmanagerreaper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -908,3 +909,6 @@ func TestCertNameForCR(t *testing.T) {
 		}
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

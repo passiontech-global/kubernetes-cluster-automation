@@ -102,7 +102,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	// original "outlived the current backoff" rule let a crash-loop
 	// with 5.1s runs reset the ladder every round and stay pinned
 	// at a 5s restart cadence forever.
-	backoff := superviseBackoffInitial
+	backoff := a.backoffInitial
 	// atMax tracks whether THIS goroutine currently counts toward
 	// a.maxBackoffSubs — the /readyz degraded signal (selfheal-alert-coverage). The
 	// counter moves only on transitions so concurrent subsystems
@@ -137,7 +137,14 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		// /healthz can call the subsystem wedged. It lands on the
 		// shared fallback beat — Runner loops stamp their own
 		// beats from inside Run.
-		lctx := cycle.WithLiveness(ctx, sb.live.Load())
+		// Each run gets its OWN cancelable context: sub.Run spawns
+		// child goroutines (probers, guards, feeders) that must die
+		// with the run — a panic-recovered restart that reused the
+		// parent ctx would orphan every child of the dead run AND
+		// keep heartbeating into the liveness registry entry the
+		// next attempt already replaced.
+		runCtx, runCancel := context.WithCancel(ctx)
+		lctx := cycle.WithLiveness(runCtx, sb.live.Load())
 		cycle.Heartbeat(lctx)
 		done := make(chan struct{})
 		go func() {
@@ -148,6 +155,10 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 						"subsystem", name, "panic", r)
 				}
 			}()
+			// Registered last so it runs FIRST on exit — the run's
+			// children are cancelled before done closes and the
+			// supervisor starts the next attempt.
+			defer runCancel()
 			sub.Run(lctx)
 		}()
 		// Mid-run healthy watch: a run that stays up past
@@ -172,7 +183,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 				a.maxBackoffSubs.Add(-1)
 				atMax = false
 			}
-			backoff = superviseBackoffInitial
+			backoff = a.backoffInitial
 			<-done
 		}
 		up.Set(0)
@@ -182,7 +193,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		}
 		restarts.Inc()
 		if superviseHealthyRun(time.Since(began), backoff) {
-			backoff = superviseBackoffInitial
+			backoff = a.backoffInitial
 		}
 		// selfheal-alert-coverage: a subsystem whose restart penalty sits at the 5m cap
 		// is crash-looping hard enough that readiness should report

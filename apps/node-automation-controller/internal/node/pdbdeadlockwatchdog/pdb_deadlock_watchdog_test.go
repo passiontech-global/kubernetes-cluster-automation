@@ -1,6 +1,7 @@
 package pdbdeadlockwatchdog
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -555,3 +556,6 @@ func TestPDBWatchdogPDBListError(t *testing.T) {
 		t.Fatal("expected error when the PDB list fails")
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

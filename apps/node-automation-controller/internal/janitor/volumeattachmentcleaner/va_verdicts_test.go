@@ -6,6 +6,7 @@
 package volumeattachmentcleaner
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -543,3 +544,6 @@ func TestVolumeOnNodeAttachedAndLookupFailure(t *testing.T) {
 		t.Fatalf("pv lookup failure metered %v times, want 1", got)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

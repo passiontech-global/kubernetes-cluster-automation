@@ -115,7 +115,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		for _, f := range n.egressFiles("egress-state-", "egress-ctr-", "egress-icmpblk-") {
 			_ = os.Remove(f)
 		}
-		n.egressCtr = map[string]int{}
+		n.egressCtr.Clear()
 		n.cycles.WithLabelValues(checkEgress, "ok").Inc()
 		return
 	}
@@ -274,16 +274,15 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 			}
 		}
 		if probe == comm {
-			delete(n.egressCtr, r)
+			n.egressCtr.Reset(r)
 		} else {
 			need := 1 // underlay dead → relay NOW (route is ready)
 			if probe == "direct" {
 				need = n.cfg.ConsecNeeded // recovery needs hysteresis
 			}
-			n.egressCtr[r]++
-			ctr := n.egressCtr[r]
+			ctr := n.egressCtr.Hit(r)
 			if ctr >= need {
-				delete(n.egressCtr, r)
+				n.egressCtr.Reset(r)
 				if werr := fsx.WriteFileAtomic(stf, probe+"\n"); werr != nil {
 					// Committed/live drift: the rule change below
 					// still runs; next cycle's heal converges.
@@ -352,7 +351,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		}
 		n.ipRuleDel1500(ctx, ip, allTables)
 		_ = os.Remove(f)
-		delete(n.egressCtr, ip)
+		n.egressCtr.Reset(ip)
 		if !pruned[ip] {
 			pruned[ip] = true
 			n.state.AppendLog(fmt.Sprintf(

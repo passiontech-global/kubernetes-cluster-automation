@@ -20,10 +20,10 @@ package ciliumtaintreaper
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -93,7 +93,7 @@ var ciliumTaintChanges = predicate.Funcs{
 		if !ok1 || !ok2 {
 			return true
 		}
-		return !reflect.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
+		return !equality.Semantic.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
 	},
 }
 

@@ -1,6 +1,7 @@
 package csrwatcher
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -539,3 +540,6 @@ func TestCSRWatcherApprovalErrorContinues(t *testing.T) {
 		t.Fatalf("approval write failure did not IncError, delta %v", got)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

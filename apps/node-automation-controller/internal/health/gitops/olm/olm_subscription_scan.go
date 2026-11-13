@@ -184,7 +184,7 @@ func (p *olmHealthCheck) clearOLMResolvedStamps(ctx context.Context,
 
 	for obj, gvr := range scan.audited {
 		stamped := map[string]string{}
-		if raw := obj.GetAnnotations()[kube.AnnoFirstSeenOLMUnhealthy]; raw != "" {
+		if raw := kube.EffectiveAnno(ctx, obj, kube.AnnoFirstSeenOLMUnhealthy); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &stamped); err != nil {
 				continue // unparseable = absent — same posture as the helper
 			}

@@ -20,8 +20,12 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // censusIndex is one census's lazy ns/name map. The sweep drives its
@@ -135,4 +139,100 @@ func (d *Deps) Job(ctx context.Context, ns, name string) (*batchv1.Job, error) {
 	return indexLookup(&s.jobsIdx,
 		func() ([]batchv1.Job, error) { return d.AllJobs(ctx) },
 		ns, name)
+}
+
+// ---------------------------------------------------------------------------
+// Pod placement + EndpointSlice service indexes
+// ---------------------------------------------------------------------------
+
+// elemSliceSame is the generic twin of podSliceSame for non-pod
+// censuses: two slices share one backing array iff their first
+// elements alias — the memoized census hands back the same slice
+// header every read, so this is the exact "same census" test.
+func elemSliceSame[T any](a, b []T) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
+}
+
+// podPlacementIndex lazily indexes the tombstone-FILTERED pod census
+// two ways — namespace → pods (PodsIn) and spec.nodeName → pods
+// (PodsOnNode) — so repeat lookups in one sweep stop re-scanning the
+// whole census per call. It self-validates on every lookup against
+// (podTombstoneGen, filtered-census identity): a MarkPodDeleted bump
+// or an InvalidatePods refetch changes the key and the next call
+// rebuilds, so the index needs no resets-list entry — the same
+// identity-keyed laziness podCensusView/podNodeView already use.
+// Elements alias the snapshot's pod structs — read-only like every
+// other census payload.
+type podPlacementIndex struct {
+	mu     sync.Mutex
+	gen    uint64
+	src    []corev1.Pod
+	byNS   map[string][]*corev1.Pod
+	byNode map[string][]*corev1.Pod
+	built  bool
+}
+
+// lookup returns the (byNS, byNode) pair for pods — the filtered
+// census slice AllPods hands out. Both maps are built together:
+// they share one pass and one validity key.
+func (ix *podPlacementIndex) lookup(ctx context.Context,
+	pods []corev1.Pod) (map[string][]*corev1.Pod, map[string][]*corev1.Pod) {
+
+	gen := kube.PodTombstoneGen(ctx)
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.built && ix.gen == gen && podSliceSame(ix.src, pods) {
+		return ix.byNS, ix.byNode
+	}
+	byNS := make(map[string][]*corev1.Pod)
+	byNode := make(map[string][]*corev1.Pod)
+	for i := range pods {
+		p := &pods[i]
+		byNS[p.Namespace] = append(byNS[p.Namespace], p)
+		byNode[p.Spec.NodeName] = append(byNode[p.Spec.NodeName], p)
+	}
+	ix.gen, ix.src, ix.byNS, ix.byNode, ix.built =
+		gen, pods, byNS, byNode, true
+	return byNS, byNode
+}
+
+// sliceServiceIndex lazily indexes the EndpointSlice census by its
+// kubernetes.io/service-name binding (ns + label → slices) — the
+// per-service join EndpointSlicesForService resolves without a
+// cluster-wide rescan per call. Self-validating on census slice
+// identity like podPlacementIndex (a slice delete invalidates the
+// memo → new backing array → rebuild), so it needs no resets entry.
+type sliceServiceIndex struct {
+	mu    sync.Mutex
+	src   []discoveryv1.EndpointSlice
+	byKey map[types.NamespacedName][]*discoveryv1.EndpointSlice
+	built bool
+}
+
+func (ix *sliceServiceIndex) lookup(
+	slices []discoveryv1.EndpointSlice) map[types.NamespacedName][]*discoveryv1.EndpointSlice {
+
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.built && elemSliceSame(ix.src, slices) {
+		return ix.byKey
+	}
+	m := make(map[types.NamespacedName][]*discoveryv1.EndpointSlice)
+	for i := range slices {
+		s := &slices[i]
+		name := s.Labels[discoveryv1.LabelServiceName]
+		if name == "" {
+			continue
+		}
+		k := types.NamespacedName{Namespace: s.Namespace, Name: name}
+		m[k] = append(m[k], s)
+	}
+	ix.src, ix.byKey, ix.built = slices, m, true
+	return m
 }

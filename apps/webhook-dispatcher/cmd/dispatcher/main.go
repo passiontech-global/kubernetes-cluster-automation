@@ -270,7 +270,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      45 * time.Second,
 		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    64 << 10,
+		MaxHeaderBytes:    httpx.DefaultMaxHeaderBytes,
 	})
 	if err != nil {
 		logger().Error("binding public listener", "addr", listenAddr, "error", err)

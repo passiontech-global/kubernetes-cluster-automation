@@ -290,12 +290,39 @@ func (s *StreakLedger) Count(key string) int {
 	return s.streaks[key]
 }
 
+// Len reports how many keys carry a streak — the size assertion
+// tests and diagnostics need that Count cannot express (Count is
+// per-key; streaks are always >=1 once tracked, so Count==0 means
+// absent).
+func (s *StreakLedger) Len() int {
+	return len(s.streaks)
+}
+
 // Reset drops key — the next Hit restarts at 1. Call where a live
 // re-confirm disproved the condition (the snapshot was stale) so
 // the next genuine occurrence re-arms from zero instead of
 // inheriting the streak.
 func (s *StreakLedger) Reset(key string) {
 	delete(s.streaks, key)
+}
+
+// Clear drops every streak — the feature-disabled/empty-config
+// reset the map-literal `= map[string]int{}` sites used to express.
+func (s *StreakLedger) Clear() {
+	s.streaks = nil
+}
+
+// Max returns the highest tracked streak — 0 when empty. The
+// "worst offender" read for trackers that fold several owners into
+// one verdict (journalwatch's Fails).
+func (s *StreakLedger) Max() int {
+	best := 0
+	for _, n := range s.streaks {
+		if n > best {
+			best = n
+		}
+	}
+	return best
 }
 
 // Prune deletes every tracked key for which keep returns false and

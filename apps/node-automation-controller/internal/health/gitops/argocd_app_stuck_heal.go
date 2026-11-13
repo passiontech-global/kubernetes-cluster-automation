@@ -66,6 +66,10 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 			"application", app.GetNamespace()+"/"+app.GetName())
 		return
 	}
+	// Record the landed patch on the sweep overlay — a later check
+	// reading these keys through EffectiveAnno/AnnoTimeCtx sees the
+	// stamp this sweep instead of the pre-patch snapshot.
+	kube.RecordAnnoPatch(ctx, app, payload)
 	p.Heals.Stamp(ck, now)
 	log.Info("PATCH: argocd application refresh=hard",
 		"application", app.GetNamespace()+"/"+app.GetName())

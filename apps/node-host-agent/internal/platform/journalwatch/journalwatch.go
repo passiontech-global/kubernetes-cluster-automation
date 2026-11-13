@@ -46,6 +46,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/ledger"
 )
 
 // DefaultNeeded is the consecutive-failed-read budget before the
@@ -101,7 +102,7 @@ type Tracker struct {
 	// same contract for hand-built trackers that carry the store.
 	LatchedSeed func() bool
 
-	streaks map[string]int // owner → consecutive failures (RAM fast path)
+	streaks ledger.StreakLedger // owner → consecutive failures (RAM fast path)
 	latched bool
 	seeded  bool
 }
@@ -157,9 +158,8 @@ func (t *Tracker) seed(owner, name string) {
 		return
 	}
 	t.seeded = true
-	t.streaks = map[string]int{}
 	if t.counterWired() {
-		t.streaks[owner] = t.Counter.Counter(t.counterName(owner))
+		t.streaks.Set(owner, t.Counter.Counter(t.counterName(owner)))
 		t.Counter.ResetCounter(t.CounterName)
 	}
 	switch {
@@ -200,8 +200,7 @@ func (t *Tracker) Present() bool {
 func (t *Tracker) EnterFrom(owner, name string) bool {
 	owner = t.resolveOwner(owner)
 	t.seed(owner, name)
-	n := t.streaks[owner] + 1
-	t.streaks[owner] = n
+	n := t.streaks.Hit(owner)
 	if t.counterWired() {
 		// The file is authoritative — Incr returns the new on-disk
 		// value, so a restart-resumed streak wins over the RAM guess.
@@ -209,7 +208,7 @@ func (t *Tracker) EnterFrom(owner, name string) bool {
 		// keep the RAM count, never invent a streak.
 		if v := t.Counter.Incr(t.counterName(owner)); v > 0 {
 			n = v
-			t.streaks[owner] = n
+			t.streaks.Set(owner, n)
 		}
 	}
 	if t.latched {
@@ -235,7 +234,7 @@ func (t *Tracker) EnterFrom(owner, name string) bool {
 func (t *Tracker) ExitFrom(owner, name string) bool {
 	owner = t.resolveOwner(owner)
 	t.seed(owner, name)
-	delete(t.streaks, owner)
+	t.streaks.Reset(owner)
 	if t.counterWired() {
 		t.Counter.ResetCounter(t.counterName(owner))
 	}
@@ -250,13 +249,7 @@ func (t *Tracker) ExitFrom(owner, name string) bool {
 // (tests/debug — a tracker in production carries exactly one feeding
 // owner, so this is that owner's streak).
 func (t *Tracker) Fails() int {
-	best := 0
-	for _, n := range t.streaks {
-		if n > best {
-			best = n
-		}
-	}
-	return best
+	return t.streaks.Max()
 }
 
 // Latched reports whether the tracker currently holds the latched

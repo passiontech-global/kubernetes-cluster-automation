@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
@@ -128,8 +129,28 @@ func (c *cyc) guardAllowSources() []string {
 	allow := append(c.vs("nodelocaldns_guard_allow_private"),
 		c.vs("nodelocaldns_guard_allow_extra")...)
 	allow = append(allow, c.registryNodeIPs()...)
+	allow = c.nftAllowFilter("nodelocaldns_guard_allow", allow)
 	slices.Sort(allow)
 	return allow
+}
+
+// nftAllowFilter drops allow-list entries that are not valid IP/CIDR
+// literals — every survivor lands verbatim inside an nft
+// `ip saddr {…}` set literal where a crafted value could splice
+// arbitrary rules (the old pass-through trusted config shape). A
+// refusal counts a cycle error and the entry drops out — fail
+// closed: the guard's allow set narrows, it never widens. Empty
+// entries refuse too: `strings.Join` would emit `a, , b` and the
+// whole ruleset would fail nft -c.
+func (c *cyc) nftAllowFilter(what string, addrs []string) []string {
+	return slices.DeleteFunc(addrs, func(a string) bool {
+		if a != "" && converge.SHIPCIDR(a) {
+			return false
+		}
+		c.err("hostconfig: invalid IP/CIDR refused for nft allow set",
+			"what", what, "value", a)
+		return true
+	})
 }
 
 // registryNodeIPs collects every node's registry addresses — the
@@ -167,6 +188,7 @@ func (c *cyc) registryNodeIPs() []string {
 func (c *cyc) portsGuardAllowSources() []string {
 	allow := append([]string{}, c.vs("host_internal_ports_guard_allow_extra")...)
 	allow = append(allow, c.registryNodeIPs()...)
+	allow = c.nftAllowFilter("host_internal_ports_guard_allow", allow)
 	slices.Sort(allow)
 	return allow
 }

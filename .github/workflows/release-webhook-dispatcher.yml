@@ -54,7 +54,7 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: webhook-dispatcher
-      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/** libs/hostkit/go.mod libs/hostkit/go.sum"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
     secrets: inherit

@@ -1,6 +1,7 @@
 package concoursejanitor
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -298,3 +299,6 @@ func TestATCClientReLoginFailureErrors(t *testing.T) {
 			s.tokenPOSTs, len(s.workerCalls))
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

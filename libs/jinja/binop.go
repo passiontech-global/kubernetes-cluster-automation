@@ -147,25 +147,36 @@ func binOp(op string, l, r any) (any, error) {
 			}
 		}
 		// An operand genuinely past int64 (uint64 > MaxInt64) has no
-		// int64 fast path — while the exact result fits uint64 it
-		// must not degrade to float64 rounding.
-		if op == "-" || op == "*" {
-			if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) &&
-				(!intFit(l) || !intFit(r)) {
-				if lneg, lm, lok := numMag(l); lok {
-					if rneg, rm, rok := numMag(r); rok {
-						switch op {
-						case "-":
-							if s, ok := exactUint64Sum(lneg, lm, !rneg, rm); ok {
+		// int64 fast path — while the exact result fits int64 or
+		// uint64 it must not degrade to float64 rounding (which
+		// collapses distinct uint64s to the same float and answers
+		// 0 for their difference/remainder).
+		if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) &&
+			(!intFit(l) || !intFit(r)) {
+			if lneg, lm, lok := numMag(l); lok {
+				if rneg, rm, rok := numMag(r); rok {
+					switch op {
+					case "-":
+						if s, ok := exactIntSub(lneg, lm, rneg, rm); ok {
+							return s, nil
+						}
+					case "*":
+						// The product of two magnitudes past
+						// int64 can still fit int64/uint64
+						// exactly (e.g. 2^63 * -1, 2^63 * 3).
+						hi, lo := bits.Mul64(lm, rm)
+						if hi == 0 {
+							if s, ok := magToInt(lneg != rneg, lo); ok {
 								return s, nil
 							}
-						case "*":
-							// The product of two magnitudes past
-							// int64 can still fit uint64 exactly
-							// (e.g. 2^63 * 3).
-							hi, lo := bits.Mul64(lm, rm)
-							if hi == 0 && lneg == rneg {
-								return lo, nil
+						}
+					case "//", "%":
+						// rm == 0 falls through to the float
+						// path, which raises the
+						// division-by-zero error.
+						if rm != 0 {
+							if s, ok := exactFloorDivMod(op, lneg, lm, rneg, rm); ok {
+								return s, nil
 							}
 						}
 					}

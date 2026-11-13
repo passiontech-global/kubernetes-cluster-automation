@@ -183,8 +183,8 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		for _, f := range n.egressFiles("dnsfb-") {
 			_ = os.Remove(f)
 		}
-		n.dnsfails = map[string]int{}
-		n.dnsok = map[string]int{}
+		n.dnsfails.Clear()
+		n.dnsok.Clear()
 		n.cycles.WithLabelValues(checkDNSFB, "ok").Inc()
 		return
 	}
@@ -224,13 +224,13 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 						"path", lg, "error", err)
 				}
 			}
-			delete(n.dnsfails, e.Name)
+			n.dnsfails.Reset(e.Name)
 			if curIP == "" {
 				// Nothing pinned — nothing to unpin. Drop any
 				// leftover streak too: a pin removed out-of-band
 				// must not let the NEXT pin unpin after a single
 				// success off the stale count.
-				delete(n.dnsok, e.Name)
+				n.dnsok.Reset(e.Name)
 				continue
 			}
 			// Symmetric hysteresis: the pin survives a successful
@@ -241,18 +241,16 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			// fired a conntrack flush. The pin drops only after
 			// ConsecNeeded CONSECUTIVE successes, mirroring the
 			// pin-on streak.
-			n.dnsok[e.Name]++
-			if n.dnsok[e.Name] < n.cfg.ConsecNeeded {
+			if n.dnsok.Hit(e.Name) < n.cfg.ConsecNeeded {
 				continue
 			}
-			delete(n.dnsok, e.Name)
+			n.dnsok.Reset(e.Name)
 			_ = os.Remove(pinf)
 			continue
 		}
 		// Failed probe: the success streak is broken.
-		delete(n.dnsok, e.Name)
-		n.dnsfails[e.Name]++
-		fails := n.dnsfails[e.Name]
+		n.dnsok.Reset(e.Name)
+		fails := n.dnsfails.Hit(e.Name)
 		if fails < n.cfg.ConsecNeeded && curIP == "" {
 			n.state.AppendLog("suspect: dns-resolve " + e.Name +
 				" fail via resolv.conf" +
@@ -307,16 +305,8 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			_ = os.Remove(filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-ctr-"+name))
 		}
 	}
-	for name := range n.dnsfails {
-		if !inMap[name] {
-			delete(n.dnsfails, name)
-		}
-	}
-	for name := range n.dnsok {
-		if !inMap[name] {
-			delete(n.dnsok, name)
-		}
-	}
+	n.dnsfails.Prune(func(name string) bool { return inMap[name] })
+	n.dnsok.Prune(func(name string) bool { return inMap[name] })
 	// Render the managed block from the pins.
 	var block strings.Builder
 	for _, f := range n.pinFiles() {

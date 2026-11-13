@@ -114,12 +114,13 @@ func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 		return
 	}
 	// -tA returns one 't' per terminated backend — and a trailing
-	// newline on every row. Counting "t\n" substrings PLUS a bare
-	// "t" fallback double-counted a single termination ("t\n" has
-	// both): count non-empty lines instead.
+	// newline on every row. pg_terminate_backend also answers 'f'
+	// for a backend it could NOT kill (insufficient privilege,
+	// already gone): counting every non-empty line reported those
+	// failures as reaped sessions. Count the 't' rows only.
 	n := 0
 	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		if strings.TrimSpace(line) != "" {
+		if strings.TrimSpace(line) == "t" {
 			n++
 		}
 	}

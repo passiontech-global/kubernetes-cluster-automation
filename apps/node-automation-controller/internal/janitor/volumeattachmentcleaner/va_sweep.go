@@ -32,20 +32,19 @@ import (
 // ledgers the two-cycle proofs read and write. All maps are
 // cycle-scoped — nothing in here outlives one run.
 type vaCycle struct {
-	// livePods caches the per-node non-terminal pod verdict for the
-	// cycle — several VAs typically share a node, and the List is
-	// the expensive part of the out-of-service gate. Errors are
-	// cached too (nil pods + err): without it every VA on one
-	// fenced node would re-issue the same failing List and each
-	// bump IncError.
+	// livePods caches the per-node pod LIST for the cycle — the
+	// fenced live-count gate, the stuck-Terminating gate's
+	// mounted-claim scan, and the Ready-node unused-volume sighting
+	// all issue the identical spec.nodeName= list, so they share
+	// ONE apiserver ListAll per node per sweep (a second map would
+	// double the pod API calls for zero extra information).
+	// Errors are cached too (nil pods + err): without it every VA
+	// on one fenced node would re-issue the same failing List and
+	// each bump IncError. pvcPVs/pvNames memoize the per-cycle PVC
+	// bound-volume and PV unique-name resolutions the gate's
+	// lookups make; every cache carries its error (fail closed)
+	// and meters it at most once.
 	livePods map[string]podListProbe
-	// nodePods caches the full per-node pod LIST for the Ready-node
-	// unused-volume gate (a pod's volumes — not just its count —
-	// must be inspected). pvcPVs/pvNames memoize the per-cycle PVC
-	// bound-volume and PV unique-name resolutions the gate's lookups
-	// make; every cache carries its error (fail closed) and meters
-	// it at most once.
-	nodePods map[string]podListProbe
 	pvcPVs   map[string]pvcProbe
 	pvNames  map[string]pvProbe
 
@@ -72,7 +71,6 @@ type vaCycle struct {
 func newVaCycle() *vaCycle {
 	return &vaCycle{
 		livePods:        map[string]podListProbe{},
-		nodePods:        map[string]podListProbe{},
 		pvcPVs:          map[string]pvcProbe{},
 		pvNames:         map[string]pvProbe{},
 		orphanNow:       map[string]bool{},
@@ -151,7 +149,7 @@ func (c *volumeAttachmentCleaner) buildTargets(ctx context.Context,
 				// every stuck VA (including capped ones) so the
 				// two-cycle window measures consecutive CYCLES, not
 				// consecutive confirmations.
-				c.sightStuckReadyUnused(ctx, va, nodeByName, cyc.nodePods,
+				c.sightStuckReadyUnused(ctx, va, nodeByName, cyc.livePods,
 					cyc.pvcPVs, cyc.pvNames, cyc.stuckReadyNow, cyc.stuckReadyPrior, now, log)
 			}
 			continue

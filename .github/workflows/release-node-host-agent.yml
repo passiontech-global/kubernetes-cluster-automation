@@ -19,6 +19,7 @@ on:
       - "libs/hostkit/envx/**"
       - "libs/hostkit/fsx/**"
       - "libs/hostkit/httpx/**"
+      - "libs/hostkit/ledger/**"
       - "libs/hostkit/logx/**"
       - "libs/hostkit/nodecond/**"
       - "libs/hostkit/timex/**"
@@ -65,5 +66,5 @@ jobs:
       # release (a follow-up job would download a non-executable 0644
       # asset and race a 404 window after `gh release create`).
       amd64_alias: true
-      lib_paths: "libs/hostkit/envx/** libs/hostkit/fsx/** libs/hostkit/httpx/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/** libs/jinja/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/fsx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/** libs/hostkit/go.mod libs/hostkit/go.sum libs/jinja/**"
     secrets: inherit

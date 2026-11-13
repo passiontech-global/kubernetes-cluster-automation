@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // TestApplyDefaults fills every empty field and nil seam, then
@@ -139,6 +141,7 @@ func TestFindEtcdProcessUnreadableProcRoot(t *testing.T) {
 	r := &rescuer{
 		cfg:     Config{ProcRoot: missing},
 		etcdBin: "/fake/k0s/bin/etcd",
+		proc:    procfs.New(missing),
 	}
 	_, _, err := r.findEtcdProcess()
 	if err == nil || !strings.Contains(err.Error(), "read ") {
@@ -172,6 +175,7 @@ func TestFindEtcdProcessSkipsNonNumericAndUnreadable(t *testing.T) {
 	r := &rescuer{
 		cfg:     Config{ProcRoot: root},
 		etcdBin: "/fake/k0s/bin/etcd",
+		proc:    procfs.New(root),
 	}
 	if _, _, err := r.findEtcdProcess(); err == nil ||
 		!strings.Contains(err.Error(), "no running etcd process") {
@@ -212,7 +216,7 @@ func TestWaitPidExitTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{ProcRoot: procRoot, SleepFn: func(time.Duration) {}}
-	r := &rescuer{cfg: cfg}
+	r := &rescuer{cfg: cfg, proc: procfs.New(procRoot)}
 
 	if err := r.waitPidExit(context.Background(), 4242); err == nil ||
 		!strings.Contains(err.Error(), "did not exit") {
@@ -233,7 +237,7 @@ func TestWaitPidExitZombieCountsAsExited(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{ProcRoot: procRoot, SleepFn: func(time.Duration) {}}
-	r := &rescuer{cfg: cfg}
+	r := &rescuer{cfg: cfg, proc: procfs.New(procRoot)}
 
 	if err := r.waitPidExit(context.Background(), 4242); err != nil {
 		t.Fatalf("waitPidExit on zombie: %v", err)

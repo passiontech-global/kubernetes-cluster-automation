@@ -31,6 +31,11 @@ var moduleFiles = []string{"libs/hostkit/go.mod", "libs/hostkit/go.sum"}
 
 var pathEntryRe = regexp.MustCompile(`-\s+"(libs/[^"]+)"`)
 
+// libPathsRe captures the caller's `with.lib_paths` string — the
+// space-separated globs release-app.yml turns into git-cliff
+// --include-path args.
+var libPathsRe = regexp.MustCompile(`lib_paths:\s*"([^"]*)"`)
+
 // TestReleaseWorkflowGlobsMatchCmdDeps asserts the release workflow's
 // libs/ path globs equal the hostkit/jinja subpackage roots imported
 // by ./cmd/... (non-test deps), plus libs/hostkit's module files.
@@ -118,6 +123,35 @@ func TestReleaseWorkflowGlobsMatchCmdDeps(t *testing.T) {
 	if len(missing) > 0 || len(stale) > 0 {
 		t.Fatalf("%s libs/ paths out of sync with go list -deps ./cmd/...\n  missing globs: %v\n  stale globs:   %v\n  imported roots: %v",
 			workflowGlob, missing, stale, sortedKeys(imported))
+	}
+
+	// with.lib_paths feeds git-cliff --include-path — the same roots
+	// must be declared there or release notes silently drop commits
+	// that touched shared-library code the app actually consumes.
+	lpMatch := libPathsRe.FindStringSubmatch(string(raw))
+	if lpMatch == nil {
+		t.Fatalf("no lib_paths input found in %s — parser out of date?", workflowRel)
+	}
+	declaredLibPaths := map[string]bool{}
+	for _, g := range strings.Fields(lpMatch[1]) {
+		declaredLibPaths[strings.TrimSuffix(g, "/**")] = true
+	}
+	var lpMissing, lpStale []string
+	for k := range expected {
+		if !declaredLibPaths[k] {
+			lpMissing = append(lpMissing, k)
+		}
+	}
+	for k := range declaredLibPaths {
+		if !expected[k] {
+			lpStale = append(lpStale, k)
+		}
+	}
+	slices.Sort(lpMissing)
+	slices.Sort(lpStale)
+	if len(lpMissing) > 0 || len(lpStale) > 0 {
+		t.Fatalf("%s with.lib_paths out of sync with go list -deps ./cmd/...\n  missing: %v\n  stale:   %v",
+			workflowGlob, lpMissing, lpStale)
 	}
 }
 

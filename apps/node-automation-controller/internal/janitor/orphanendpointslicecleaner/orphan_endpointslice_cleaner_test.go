@@ -1,6 +1,7 @@
 package orphanendpointslicecleaner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -477,3 +478,6 @@ func TestOrphanEndpointSliceConfirmErrorFailsClosed(t *testing.T) {
 			got, orphanEndpointSliceStreak)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

@@ -27,12 +27,11 @@ import (
 // of stalling the full wait budget.
 func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 	procDir := filepath.Join(r.cfg.ProcRoot, strconv.Itoa(pid))
-	statFile := filepath.Join(procDir, "stat")
 	if cycle.Poll(ctx, pidExitWaitTries, time.Second, func() bool {
 		if _, err := os.Stat(procDir); os.IsNotExist(err) {
 			return true
 		}
-		return procZombie(statFile)
+		return r.procZombie(pid)
 	}, r.cfg.SleepFn) {
 		return nil
 	}
@@ -40,20 +39,13 @@ func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 		pid, pidExitWaitTries)
 }
 
-// procZombie reports whether a /proc/<pid>/stat file shows process
-// state Z. comm is parenthesised and may itself contain spaces or
-// parens, so the state field is the first token after the LAST ')'.
-func procZombie(statFile string) bool {
-	data, err := os.ReadFile(statFile)
-	if err != nil {
-		return false
-	}
-	i := bytes.LastIndexByte(data, ')')
-	if i < 0 {
-		return false
-	}
-	f := strings.Fields(string(data[i+1:]))
-	return len(f) > 0 && f[0] == "Z"
+// procZombie reports whether /proc/<pid>/stat shows process state Z.
+// procfs.Stat reads fields after the LAST ')' — comm is parenthesised
+// and may itself contain spaces or parens, so the state field stays
+// Fields[0] regardless of what comm holds.
+func (r *rescuer) procZombie(pid int) bool {
+	st, ok := r.proc.Stat(pid)
+	return ok && st.Fields[0] == "Z"
 }
 
 // matchEtcdCmdline reports whether a /proc/<pid>/cmdline blob belongs
@@ -73,20 +65,16 @@ func matchEtcdCmdline(cmdline []byte, etcdBin string) bool {
 // standalone: --data-dir, --initial-cluster*, listen/advertise URLs,
 // cert paths all come along for free).
 func (r *rescuer) findEtcdProcess() (int, []string, error) {
-	entries, err := os.ReadDir(r.cfg.ProcRoot)
+	pids, err := r.proc.PIDs()
 	if err != nil {
 		return 0, nil, fmt.Errorf("read %s: %w", r.cfg.ProcRoot, err)
 	}
-	var pids []int
-	for _, e := range entries {
-		if pid, cerr := strconv.Atoi(e.Name()); cerr == nil && e.IsDir() {
-			pids = append(pids, pid)
-		}
-	}
 	slices.Sort(pids)
 	for _, pid := range pids {
-		cl, rerr := os.ReadFile(filepath.Join(r.cfg.ProcRoot,
-			strconv.Itoa(pid), "cmdline"))
+		// Raw cmdline bytes, not procfs.Cmdline: matchEtcdCmdline's
+		// argv[0] boundary check and the verbatim argv[1:] capture
+		// (interior empty args preserved) are byte-exact contracts.
+		cl, rerr := os.ReadFile(r.proc.File(pid, "cmdline"))
 		if rerr != nil || len(cl) == 0 {
 			continue
 		}

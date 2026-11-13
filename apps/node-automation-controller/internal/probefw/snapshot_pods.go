@@ -7,6 +7,7 @@ package probefw
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,21 +42,33 @@ func (d *Deps) AllPods(ctx context.Context) ([]corev1.Pod, error) {
 }
 
 // PodsIn filters the shared census to one namespace — the client-side
-// equivalent of Pods(ns).List for the namespace-scoped readers. The
-// returned slice is freshly allocated; elements still alias the
-// snapshot's pod structs, so treat them read-only like AllPods.
+// equivalent of Pods(ns).List for the namespace-scoped readers, backed
+// by the sweep's lazy ns index so repeat lookups don't rescan the
+// census. The returned slice is freshly allocated; elements still
+// alias the snapshot's pod structs, so treat them read-only like
+// AllPods.
 func (d *Deps) PodsIn(ctx context.Context, ns string) ([]*corev1.Pod, error) {
 	pods, err := d.AllPods(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []*corev1.Pod
-	for i := range pods {
-		if pods[i].Namespace == ns {
-			out = append(out, &pods[i])
-		}
+	byNS, _ := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
+	return slices.Clone(byNS[ns]), nil
+}
+
+// PodsOnNode filters the shared census to the pods bound to one node
+// (spec.nodeName) — the client-side equivalent of
+// Pods("").List{FieldSelector: "spec.nodeName="+node} for readers
+// that resolve a node's pod set inside a sweep. "" selects the
+// unscheduled pods (nodeName unset). Same fresh-slice/read-only
+// contract as PodsIn.
+func (d *Deps) PodsOnNode(ctx context.Context, node string) ([]*corev1.Pod, error) {
+	pods, err := d.AllPods(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	_, byNode := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
+	return slices.Clone(byNode[node]), nil
 }
 
 // PodsMatching filters the shared census to one namespace (""

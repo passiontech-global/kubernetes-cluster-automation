@@ -127,6 +127,16 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 					"pod", p.Namespace+"/"+p.Name)
 				continue
 			}
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				// The pod was deleted under us or recreated since
+				// the audit — either way there is nothing of ours
+				// left to evict; a raced outcome is not an error.
+				log.Info("SKIP: unmeshed pod eviction raced — pod gone or recreated",
+					"pod", p.Namespace+"/"+p.Name,
+					"notFound", apierrors.IsNotFound(err),
+					"conflict", apierrors.IsConflict(err))
+				continue
+			}
 			log.Error(err, "unmeshed pod eviction failed", "pod", p.Namespace+"/"+p.Name)
 			metrics.IncError(g.Queue)
 			errs++

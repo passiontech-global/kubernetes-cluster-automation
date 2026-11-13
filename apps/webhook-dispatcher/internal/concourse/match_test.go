@@ -68,12 +68,17 @@ func TestNormalizeRepo(t *testing.T) {
 		{"org/repo///", "org/repo"},
 		{"https://github.com/org/repo//", "org/repo"},
 		{"git@github.com:org/repo//", "org/repo"},
-		// The first "github.com" literal may be a lookalike host or a
-		// path segment while a LATER occurrence is the real host —
-		// the scan must keep going instead of giving up at #1.
-		{"github.com.evil.com/git@github.com:org/repo", "org/repo"},
+		// The first "github.com" literal may be a lookalike host while
+		// a LATER occurrence is the real host — the scan must keep
+		// going instead of giving up at #1. Here the second match
+		// sits in the URL userinfo ("…@github.com/…"), so it IS the
+		// host.
+		{"https://github.com.evil.com@github.com/org/repo", "org/repo"},
 		// But a github.com in a PATH (after a slash) is never a host,
-		// whatever it is followed by.
+		// whatever it is followed by — even when a lookalike host
+		// precedes it and a "git@" marker sits right before the match
+		// (that "@" is path text, not userinfo).
+		{"github.com.evil.com/git@github.com:org/repo", "github.com.evil.com/git@github.com:org/repo"},
 		{"https://git.example.com/github.com/org/repo", "https://git.example.com/github.com/org/repo"},
 		{"mirror/github.com/org/repo", "mirror/github.com/org/repo"},
 		{"github.com/org/repo", "org/repo"},

@@ -75,6 +75,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Same cache pair as ci.yml — the release job runs moon
+      # lint/vet/test plus a cold `go build`; without these every
+      # release re-downloads the module graph and rebuilds from
+      # scratch.
+      - name: Cache Go module + build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Cache moon workspace cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .moon/cache
+          key: moon-${{ runner.os }}-${{ github.run_id }}-${{ inputs.app }}
+          restore-keys: moon-${{ runner.os }}-
+
       - name: Compute version and changelog
         id: rel
         env:
@@ -141,9 +161,9 @@ jobs:
           # range, deriving this app's version from a foreign number.
           # Override per app (legacy_v_tags also admits bare "vX.Y.Z").
           if [ "$LEGACY_V_TAGS" = "true" ]; then
-            tag_pat="^($APP/)?v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$"
+            tag_pat="^($APP/)?v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$"
           else
-            tag_pat="^$APP/v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$"
+            tag_pat="^$APP/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$"
           fi
 
           if [ -n "$version_in" ]; then
@@ -181,8 +201,11 @@ jobs:
             rel_version="v$cliff_ver"
             # No new conventional commits since last tag -> git-cliff
             # echoes the same version; force a patch bump so the
-            # release tag never collides.
-            if [ "$rel_version" = "$last_ver" ]; then
+            # release tag never collides. Compare on the CORE semver —
+            # "+build" metadata is not part of version precedence, so
+            # "v1.2.3+build.5" and "v1.2.3" are the SAME version and a
+            # raw string compare would miss the collision.
+            if [ "${rel_version%%+*}" = "${last_ver%%+*}" ]; then
               # Strip "+build" metadata BEFORE the prerelease check:
               # a '-' inside build metadata ("v0.1.0+build-x") is not
               # a prerelease marker — matching *-* on the raw tag

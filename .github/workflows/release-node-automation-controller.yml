@@ -60,7 +60,7 @@ jobs:
       app: node-automation-controller
       # All seven hostkit subpackages the controller consumes, direct
       # or transitive (envx/nodecond/timex pull logx where they log).
-      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/** libs/hostkit/go.mod libs/hostkit/go.sum"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
       legacy_v_tags: true

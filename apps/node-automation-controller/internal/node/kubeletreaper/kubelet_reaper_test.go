@@ -678,3 +678,6 @@ func TestKubeletReaperMeshGuardNeverEngagesOnSingleWorker(t *testing.T) {
 		t.Fatal("single-worker fresh-lease failure suppressed — fake-ready can never fence")
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

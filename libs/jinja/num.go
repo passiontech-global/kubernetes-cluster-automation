@@ -11,6 +11,7 @@ package jinja
 import (
 	"fmt"
 	"math"
+	"math/bits"
 )
 
 // asInt64 normalizes every Go integer type to int64 — contexts feed
@@ -183,6 +184,96 @@ func mulInt64(a, b int64) (int64, bool) {
 func intFit(v any) bool {
 	_, ok := asInt64(v)
 	return ok
+}
+
+// magToInt renders a sign-magnitude result (neg, mag) in the
+// engine's numeric types: int64 whenever it fits — either sign —
+// uint64 for a non-negative value past MaxInt64, and ok=false when
+// no exact form exists (a negative magnitude past |MinInt64|). The
+// float64 fallback callers take on ok=false is the best
+// representable answer — the same posture every int64 overflow in
+// this file takes.
+func magToInt(neg bool, mag uint64) (any, bool) {
+	if mag == 0 {
+		return int64(0), true
+	}
+	if !neg {
+		if mag <= math.MaxInt64 {
+			return int64(mag), true
+		}
+		return mag, true
+	}
+	// |MinInt64| = 2^63 is the largest negative magnitude int64
+	// holds; one past it has no exact form.
+	if mag > uint64(math.MaxInt64)+1 {
+		return nil, false
+	}
+	if mag == uint64(math.MaxInt64)+1 {
+		return math.MinInt64, true
+	}
+	return -int64(mag), true
+}
+
+// exactIntSub computes l - r for integer-typed operands (per
+// numMag) whose int64 fast path overflowed or never applied — a
+// uint64 past MaxInt64 has no int64 form, and the DIFFERENCE of two
+// such operands can be negative even though both are unsigned
+// ((MaxInt64+3) - (MaxInt64+5) is -2). The old exactUint64Sum
+// rejected negative results outright, so float64 math answered 0.0
+// for operands that round to the same float. ok=false means the
+// true result fits neither int64 nor uint64 — the caller falls
+// back to float64.
+func exactIntSub(lneg bool, lm uint64, rneg bool, rm uint64) (any, bool) {
+	// l - r == l + (-r): flip r's sign, then combine magnitudes.
+	rneg = !rneg
+	var neg bool
+	var mag uint64
+	switch {
+	case lneg == rneg:
+		// Same sign: magnitudes add.
+		var carry uint64
+		mag, carry = bits.Add64(lm, rm, 0)
+		if carry != 0 {
+			return nil, false
+		}
+		neg = lneg
+	case lm >= rm:
+		mag, neg = lm-rm, lneg
+	default:
+		mag, neg = rm-lm, rneg
+	}
+	return magToInt(neg, mag)
+}
+
+// exactFloorDivMod computes python's // (floor toward -inf) and %
+// (remainder taking the DIVISOR's sign) for integer-typed operands
+// past int64 — float64 math rounds both operands to the same value
+// and answers 0 where the true result is nonzero
+// ((MaxInt64+2) % 2 is 1, not 0). rm == 0 never reaches here: the
+// caller's float path raises the division-by-zero error.
+func exactFloorDivMod(op string, lneg bool, lm uint64,
+	rneg bool, rm uint64) (any, bool) {
+	q, rem := lm/rm, lm%rm
+	if op == "%" {
+		if rem == 0 {
+			return int64(0), true
+		}
+		// python's % result carries the DIVISOR's sign; its
+		// magnitude is rem when the operands share a sign and
+		// rm-rem when they differ.
+		if lneg == rneg {
+			return magToInt(rneg, rem)
+		}
+		return magToInt(rneg, rm-rem)
+	}
+	// "//": floor toward -inf — a negative quotient with a
+	// nonzero remainder steps one magnitude further out
+	// (-7//2 = -4, not the truncating -3).
+	qneg := lneg != rneg
+	if rem != 0 && qneg {
+		q++
+	}
+	return magToInt(qneg, q)
 }
 
 // exactUint64Sum computes a + (bneg ? -b : b) exactly for

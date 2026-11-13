@@ -177,6 +177,12 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	// only observer of this flag.
 	directTypedCfg := rest.CopyConfig(directCfg)
 	directTypedCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	// ContentType only governs what the client SENDS — an empty
+	// AcceptContentTypes makes the accept header protobuf-only, so
+	// any resource without a registered protobuf scheme 406s. Offer
+	// JSON as the fallback, same posture as managerConfig.
+	directTypedCfg.AcceptContentTypes =
+		"application/vnd.kubernetes.protobuf,application/json"
 	cs, err := kubernetes.NewForConfig(directTypedCfg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create clientset: %w", err)
@@ -195,6 +201,8 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 		probeCfg.QPS, probeCfg.Burst)
 	probeTypedCfg := rest.CopyConfig(probeCfg)
 	probeTypedCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	probeTypedCfg.AcceptContentTypes =
+		"application/vnd.kubernetes.protobuf,application/json"
 	probeCS, err := kubernetes.NewForConfig(probeTypedCfg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create probe clientset: %w", err)

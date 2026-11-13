@@ -230,8 +230,8 @@ func TestDNSFallbackPrunesFailCounters(t *testing.T) {
 	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
 	// All lookups fail → both names accumulate fail counters.
 	e.n.Cycle(context.Background())
-	if len(e.n.dnsfails) != 2 {
-		t.Fatalf("dnsfails = %v, want 2 entries", e.n.dnsfails)
+	if e.n.dnsfails.Len() != 2 {
+		t.Fatalf("dnsfails.Len() = %d, want 2 entries", e.n.dnsfails.Len())
 	}
 
 	// Drop the second name from the map → its counter is pruned.
@@ -242,10 +242,10 @@ func TestDNSFallbackPrunesFailCounters(t *testing.T) {
 		},
 	}
 	e.n.Cycle(context.Background())
-	if _, ok := e.n.dnsfails["gone.test.internal"]; ok {
+	if e.n.dnsfails.Count("gone.test.internal") != 0 {
 		t.Fatal("dnsfails kept a name removed from DNS_FALLBACK_MAP")
 	}
-	if _, ok := e.n.dnsfails["api.test.internal"]; !ok {
+	if e.n.dnsfails.Count("api.test.internal") == 0 {
 		t.Fatal("dnsfails lost the still-mapped name")
 	}
 }

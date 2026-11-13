@@ -126,6 +126,19 @@ func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	}
 	if _, err := c.cs.StorageV1().VolumeAttachments().Patch(ctx, va.Name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		switch {
+		case apierrors.IsNotFound(err):
+			// The VA was deleted under us — nothing left to strip.
+			log.Info("SKIP: stuck volumeattachment already gone — raced with an external delete",
+				"va", va.Name, "node", va.Spec.NodeName)
+			return nil
+		case apierrors.IsConflict(err):
+			// The resourceVersion pin fired — a concurrent attacher
+			// write landed; the strip retries next sweep.
+			log.Info("SKIP: stuck volumeattachment changed since the list — retry next sweep",
+				"va", va.Name, "node", va.Spec.NodeName)
+			return nil
+		}
 		metrics.IncError(c.queue)
 		log.Error(err, "stuck volumeattachment finalizer strip failed",
 			"va", va.Name, "node", va.Spec.NodeName)

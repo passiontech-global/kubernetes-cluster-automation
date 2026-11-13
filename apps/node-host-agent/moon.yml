@@ -65,7 +65,10 @@ tasks:
       - '/.golangci.yml'
 
   build:
-    script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-host-agent ./cmd/agent'
+    # -tags timetzdata embeds the IANA tz database (cmd/agent/tzdata.go)
+    # — the standalone systemd binary runs on hosts that may lack
+    # /usr/share/zoneinfo; the pod image builds without the tag.
+    script: 'CGO_ENABLED=0 go build -tags timetzdata -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-host-agent ./cmd/agent'
     toolchains: 'system'
     options:
       # script contains an inline env assignment — must run via shell.

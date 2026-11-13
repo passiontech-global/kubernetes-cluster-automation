@@ -7,6 +7,7 @@ package probefw
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -29,6 +30,26 @@ func (d *Deps) AllEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSli
 			snapshotListOpts(),
 			kube.EndpointSlices(d.CS, metav1.NamespaceAll))
 	})
+}
+
+// EndpointSlicesForService resolves the EndpointSlices bound to one
+// Service — the kubernetes.io/service-name label join behind
+// Service(ns).Get → slices lookups, index-backed so repeat resolves
+// in one sweep don't rescan the census. Slices without the label
+// (and DeletionTimestamp-set ones stay INCLUDED — callers filter
+// lifecycle themselves, same as the raw census) never match. The
+// returned slice is freshly allocated; elements alias the snapshot's
+// slice structs — read-only like AllEndpointSlices.
+func (d *Deps) EndpointSlicesForService(ctx context.Context,
+	ns, name string) ([]*discoveryv1.EndpointSlice, error) {
+
+	eps, err := d.AllEndpointSlices(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byKey := sweepSnap(ctx).sliceSvc.lookup(eps)
+	return slices.Clone(byKey[types.NamespacedName{
+		Namespace: ns, Name: name}]), nil
 }
 
 // AllServices is the service twin.

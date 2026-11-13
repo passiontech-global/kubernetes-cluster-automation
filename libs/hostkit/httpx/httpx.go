@@ -18,6 +18,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,6 +38,11 @@ const (
 	// DefaultShutdownBudget is the drain window Shutdown applies when
 	// the caller's ctx carries no deadline.
 	DefaultShutdownBudget = 5 * time.Second
+	// DefaultMaxHeaderBytes caps request header size when Opts leaves
+	// MaxHeaderBytes zero — 64 KiB. Probe/metrics/webhook peers send
+	// a handful of modest headers; the tight cap keeps a hostile or
+	// buggy peer from parking large header buffers per connection.
+	DefaultMaxHeaderBytes = 64 << 10
 )
 
 // Opts tunes New; zero fields fall back to the package defaults.
@@ -57,8 +63,8 @@ type Opts struct {
 	// ShutdownBudget is the drain window Shutdown applies when the
 	// caller's ctx carries no deadline (zero → DefaultShutdownBudget).
 	ShutdownBudget time.Duration
-	// MaxHeaderBytes caps request header size (zero → the net/http
-	// default of 1 MiB).
+	// MaxHeaderBytes caps request header size (zero →
+	// DefaultMaxHeaderBytes).
 	MaxHeaderBytes int
 }
 
@@ -96,6 +102,9 @@ func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
 	if opts.ShutdownBudget <= 0 {
 		opts.ShutdownBudget = DefaultShutdownBudget
 	}
+	if opts.MaxHeaderBytes <= 0 {
+		opts.MaxHeaderBytes = DefaultMaxHeaderBytes
+	}
 	return &Server{
 		ln: ln,
 		srv: &http.Server{
@@ -109,6 +118,15 @@ func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
 		budget: opts.ShutdownBudget,
 		done:   make(chan error, 1),
 	}, nil
+}
+
+// ListenLoopback binds a TCP listener on 127.0.0.1:port — the
+// loopback-only posture debug/diagnostic endpoints (pprof) carry,
+// so they can never be reached off-node even if the configured bind
+// address is widened by mistake. Port 0 resolves to an ephemeral
+// port; the real address is available via ln.Addr().
+func ListenLoopback(port int) (net.Listener, error) {
+	return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 }
 
 // Addr returns the bound listener's address — usable before Serve, so
@@ -214,7 +232,11 @@ func (s *Server) Close() error {
 		first = err
 	}
 	if ln != nil {
-		if err := ln.Close(); first == nil {
+		// srv.Close already closed a listener it was Serving — the
+		// second close reports net.ErrClosed, the expected
+		// already-closed state, not a failure. Only a never-Served
+		// listener (unknown to srv) can return a real error here.
+		if err := ln.Close(); first == nil && !errors.Is(err, net.ErrClosed) {
 			first = err
 		}
 	}

@@ -272,9 +272,9 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		// API default), so the skip must test the pointed-to value,
 		// not nil-ness: `Suspend == nil || *Suspend` skipped EVERY
 		// CronJob that never declared suspend explicitly.
-		if cj.Annotations[kube.AnnoRelistStormSuspend] != "true" ||
+		if kube.EffectiveAnno(ctx, cj, kube.AnnoRelistStormSuspend) != "true" ||
 			(cj.Spec.Suspend != nil && *cj.Spec.Suspend) ||
-			cj.Annotations[kube.AnnoRelistStormSuspendedBy] != "" {
+			kube.EffectiveAnno(ctx, cj, kube.AnnoRelistStormSuspendedBy) != "" {
 			continue
 		}
 		targets = append(targets, cj)
@@ -309,6 +309,12 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 		}
 		log.Info("ACTION: suspended cronjob for relist-storm relief",
 			"cronjob", cj.Namespace+"/"+cj.Name)
+		// Record the landed annotation half on the sweep overlay —
+		// a later check reading AnnoRelistStormSuspendedBy through
+		// EffectiveAnno sees this stamp instead of the pre-patch
+		// snapshot (the spec.suspend half still needs the caller's
+		// own bookkeeping — the overlay only tracks annotations).
+		kube.RecordAnnoPatch(ctx, cj, patch)
 		p.suspended = true
 		patched++
 	}
@@ -340,7 +346,7 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 	ok := true
 	for i := range cjs {
 		cj := &cjs[i]
-		if cj.Annotations[kube.AnnoRelistStormSuspendedBy] == "" {
+		if kube.EffectiveAnno(ctx, cj, kube.AnnoRelistStormSuspendedBy) == "" {
 			continue
 		}
 		patch := []byte(fmt.Sprintf(
@@ -356,6 +362,10 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 		}
 		log.Info("ACTION: restored cronjob after relist-storm relief",
 			"cronjob", cj.Namespace+"/"+cj.Name)
+		// Record the stamp removal on the sweep overlay — a later
+		// check must not resurrect the cleared stamp off the
+		// pre-patch snapshot.
+		kube.RecordAnnoPatch(ctx, cj, patch)
 	}
 	return ok
 }

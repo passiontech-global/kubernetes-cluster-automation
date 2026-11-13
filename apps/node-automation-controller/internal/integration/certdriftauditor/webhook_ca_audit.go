@@ -46,6 +46,10 @@ const crdAuditPageSize = 25
 func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	a.seenWebhookExpiry.Begin() // drop any aborted sweep's leftover emissions
 	a.seenWebhooks.Begin()      // drop any aborted sweep's leftover emissions
+	// Fresh injection-source memos — a CA rotated since the last
+	// sweep must be re-read, not served from the previous pass.
+	a.certMemo = map[string]certSecretMemo{}
+	a.secretMemo = map[string]secretCAMemo{}
 	mutating, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.MutatingWebhookConfigurations(a.cs))
@@ -239,6 +243,21 @@ func (a *certDriftAuditor) injectionCA(ctx context.Context,
 // convention — a same-named unrelated Secret would fabricate drift
 // (or hide a real one).
 func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName string) (string, bool) {
+	key := ns + "/" + certName
+	if a.certMemo != nil {
+		if e, ok := a.certMemo[key]; ok {
+			return e.name, e.ok
+		}
+	}
+	name, ok := a.certSecretNameUncached(ctx, ns, certName)
+	if a.certMemo == nil {
+		a.certMemo = map[string]certSecretMemo{}
+	}
+	a.certMemo[key] = certSecretMemo{name: name, ok: ok}
+	return name, ok
+}
+
+func (a *certDriftAuditor) certSecretNameUncached(ctx context.Context, ns, certName string) (string, bool) {
 	cert, err := a.dyn.Resource(certificateGVR).Namespace(ns).
 		Get(ctx, certName, metav1.GetOptions{})
 	if err != nil {
@@ -263,6 +282,22 @@ func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName stri
 // ca.crt is where cainjector reads the bundle from, tls.crt is the
 // fallback for secrets that only carry the leaf pair.
 func (a *certDriftAuditor) secretCA(ctx context.Context,
+	ns, name, kind, cfgName string) ([]byte, bool) {
+	key := ns + "/" + name
+	if a.secretMemo != nil {
+		if e, ok := a.secretMemo[key]; ok {
+			return e.ca, e.ok
+		}
+	}
+	ca, ok := a.secretCAUncached(ctx, ns, name, kind, cfgName)
+	if a.secretMemo == nil {
+		a.secretMemo = map[string]secretCAMemo{}
+	}
+	a.secretMemo[key] = secretCAMemo{ca: ca, ok: ok}
+	return ca, ok
+}
+
+func (a *certDriftAuditor) secretCAUncached(ctx context.Context,
 	ns, name, kind, cfgName string) ([]byte, bool) {
 	log := logf.FromContext(ctx)
 	s, err := a.cs.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})

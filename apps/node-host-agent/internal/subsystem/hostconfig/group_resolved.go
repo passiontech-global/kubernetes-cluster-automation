@@ -13,13 +13,20 @@ func (c *cyc) groupResolved() {
 	if !c.resolvedRunning() {
 		return
 	}
+	// fallback_dns lands verbatim in the resolved.conf.d drop-in —
+	// gate it like every other rendered scalar (empty stays allowed:
+	// an unset var renders FallbackDNS= exactly as before).
+	dns := c.v("fallback_dns")
+	if dns != "" && !c.cfgScalar("fallback_dns", dns) {
+		return
+	}
 	_ = c.r.ensureDir("/etc/systemd/resolved.conf.d", 0o755)
 	if ch, _ := c.r.writeManaged("/etc/systemd/resolved.conf.d/99-fallback.conf",
 		[]byte(fmt.Sprintf(`# Managed by node-config-agent - diverse public fallback upstreams
 [Resolve]
 FallbackDNS=%s
 Cache=yes
-`, c.v("fallback_dns"))), 0o644); ch {
+`, dns)), 0o644); ch {
 		c.r.restartService(c.ctx, "systemd-resolved.service")
 	}
 	// psi-memory-thrash: timesyncd NTP fallback — when the primary NTP source dies

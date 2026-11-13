@@ -53,6 +53,9 @@ func TestSuperviseHealthyRun(t *testing.T) {
 type ladderSubsystem struct {
 	calls     atomic.Int32
 	firstDone chan struct{}
+	// runFor is how long the first Run stays up — must exceed the
+	// test's shrunk backoffInitial so the run "outlives the backoff".
+	runFor time.Duration
 	// restarted signals the SECOND Run's entry (cap 1, non-blocking
 	// send — later entries are irrelevant to the single waiter).
 	restarted chan struct{}
@@ -64,9 +67,10 @@ func (s *ladderSubsystem) Run(ctx context.Context) {
 	if s.calls.Add(1) == 1 {
 		// Load-bearing real-time scenario: the run must outlive the
 		// supervisor's initial backoff for superviseHealthyRun to
-		// keep the ladder where it is — there is no fake clock for
-		// the supervisor's production timers.
-		time.Sleep(superviseBackoffInitial + 300*time.Millisecond)
+		// keep the ladder where it is. The test shrinks
+		// a.backoffInitial so this costs milliseconds, not the
+		// production 5s+5s.
+		time.Sleep(s.runFor)
 		close(s.firstDone)
 		return
 	}
@@ -83,10 +87,17 @@ func (s *ladderSubsystem) Run(ctx context.Context) {
 // wait: the restart after such a run still waits the full jittered
 // backoff (≥ backoff − 15%).
 func TestSuperviseWaitsFullBackoffAfterRunOutlivingBackoff(t *testing.T) {
+	// Shrink the restart ladder via the Agent seam — the production
+	// 5s initial backoff would make this test cost ~10 real seconds.
+	// 50ms keeps every threshold (backoff, ±15% jitter, the 2x
+	// healthy bar) far above timer/scheduling noise.
+	backoff := 50 * time.Millisecond
 	a := New(Config{})
+	a.backoffInitial = backoff
 	sub := &ladderSubsystem{
 		firstDone: make(chan struct{}),
 		restarted: make(chan struct{}, 1),
+		runFor:    backoff*3 + 50*time.Millisecond,
 	}
 	ctx := t.Context()
 	go a.superviseSubsystem(ctx, sub)
@@ -107,8 +118,8 @@ func TestSuperviseWaitsFullBackoffAfterRunOutlivingBackoff(t *testing.T) {
 	if restartedAt.IsZero() {
 		t.Fatal("supervisor never restarted the subsystem")
 	}
-	if gap := restartedAt.Sub(ended); gap < superviseBackoffInitial*17/20 {
+	if gap := restartedAt.Sub(ended); gap < backoff*17/20 {
 		t.Fatalf("second Run started %v after the first ended — the stale "+
-			"timer tick skipped the %v backoff", gap, superviseBackoffInitial)
+			"timer tick skipped the %v backoff", gap, backoff)
 	}
 }

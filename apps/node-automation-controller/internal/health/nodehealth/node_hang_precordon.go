@@ -290,7 +290,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		}
 		// Auto-uncordon / stale-stamp sweep — only nodes THIS check
 		// cordoned carry the stamp; everything else is left alone.
-		if n.Annotations[nodeHangPreCordonAnno] == nodeHangPreCordonValue {
+		if kube.EffectiveAnno(ctx, n, nodeHangPreCordonAnno) == nodeHangPreCordonValue {
 			switch {
 			case n.Spec.Unschedulable && !nodeHangLatchActive(n):
 				uncordon = append(uncordon, n.Name)
@@ -317,8 +317,8 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	// Write passes (node_hang_writes.go) — lift our own cordons
 	// first so freed capacity counts toward the 35% ratio, clean
 	// stale stamps, then the ratio-capped cordon pass.
-	cordoned = p.uncordonCleared(ctx, log, uncordon, cordoned)
-	p.clearStaleStamps(ctx, log, staleStamp)
+	cordoned = p.uncordonCleared(ctx, log, uncordon, cordoned, nodes)
+	p.clearStaleStamps(ctx, log, staleStamp, nodes)
 	p.cordonLatched(ctx, log, &rep, nodes, workers, cordoned)
 	// Complete sweep — retire cordon/uncordon series whose node has
 	// now missed two consecutive censuses (the churn guard; see

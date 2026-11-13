@@ -60,7 +60,14 @@ func (c *cyc) removeFromHosts(mark string) {
 
 // pinHosts — blockinfile `# {mark} api-local-lb managed block`.
 func (c *cyc) pinHosts() {
-	block := "# BEGIN api-local-lb managed block\n127.0.0.1 " + c.v("cp_endpoint") +
+	// cp_endpoint lands verbatim on an /etc/hosts line — a newline
+	// would splice arbitrary host entries (empty stays allowed,
+	// same contract as before).
+	ep := c.v("cp_endpoint")
+	if ep != "" && !c.cfgScalar("cp_endpoint", ep) {
+		return
+	}
+	block := "# BEGIN api-local-lb managed block\n127.0.0.1 " + ep +
 		"\n# END api-local-lb managed block\n"
 	hosts, _ := os.ReadFile(c.r.hp("/etc/hosts"))
 	if len(hosts) > 0 && hosts[len(hosts)-1] != '\n' {

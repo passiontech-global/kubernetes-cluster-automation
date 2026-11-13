@@ -1198,3 +1198,6 @@ func TestSetupCoreDNSWatchdogDisabled(t *testing.T) {
 		t.Fatalf("disabled module registered %d runnables, want 0", got)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

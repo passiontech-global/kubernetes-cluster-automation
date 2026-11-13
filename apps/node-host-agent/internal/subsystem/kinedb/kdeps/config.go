@@ -8,10 +8,8 @@ package kdeps
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -345,10 +344,8 @@ func (c *Config) ApplyDefaults() error {
 // GUARD_MAX_STEP_REVISIONS becomes the cap; unset/0/garbage stays
 // disabled.
 func applyStepRevisionEnv(c *Config) {
-	if v := strings.TrimSpace(os.Getenv(envnames.EnvKinedbGuardMaxStepRevisions)); v != "" {
-		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil && n > 0 {
-			c.MaxStepRevisions = n
-		}
+	if n := envx.Int64(envnames.EnvKinedbGuardMaxStepRevisions, 0); n > 0 {
+		c.MaxStepRevisions = n
 	}
 }
 

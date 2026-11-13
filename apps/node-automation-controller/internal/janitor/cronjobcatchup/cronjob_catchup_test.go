@@ -1,6 +1,7 @@
 package cronjobcatchup
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -960,3 +961,6 @@ func TestUnfreezeDeadlinePatchErrorCounted(t *testing.T) {
 		t.Fatalf("queue errors delta = %v, want 1", got)
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

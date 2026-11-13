@@ -15,10 +15,13 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -35,6 +38,11 @@ var stripManagedFields = cache.TransformStripManagedFields()
 // large chunk of every cached object and .Status.Images alone is
 // 50-80% of a Node's size — no module reads either field.
 func defaultCacheTransform(obj interface{}) (interface{}, error) {
+	// A delete delta can arrive wrapped in the DeltaFIFO tombstone —
+	// unwrap before the type switch or the strip silently no-ops.
+	if tomb, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+		obj = tomb.Obj
+	}
 	if _, err := stripManagedFields(obj); err != nil {
 		return nil, err
 	}
@@ -107,6 +115,12 @@ func buildCacheOptions() cache.Options {
 //     .spec.conversion is deliberately KEPT — webhookguard's
 //     conversion-webhook census reads it off the cached objects.
 func crdCacheTransform(obj interface{}) (interface{}, error) {
+	// Same tombstone unwrap as defaultCacheTransform — a deleted
+	// CRD's final state must still record/strip, not pass through
+	// as an opaque DeletedFinalStateUnknown.
+	if tomb, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+		obj = tomb.Obj
+	}
 	crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
 	if !ok {
 		return obj, nil
@@ -158,6 +172,10 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		LeaderElectionReleaseOnCancel:       true,
 		LeaderElectionResourceLockInterface: leaderLock,
 		Cache:                               buildCacheOptions(),
+		// RecoverPanic: a panicking reconcile must not take the
+		// whole manager down — controller-runtime recovers per
+		// invocation and surfaces the panic as a reconcile error.
+		Controller: config.Controller{RecoverPanic: ptr.To(true)},
 	}
 	if leaseDuration > 0 {
 		mgrOptions.LeaseDuration = &leaseDuration

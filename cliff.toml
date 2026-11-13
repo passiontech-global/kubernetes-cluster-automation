@@ -24,7 +24,7 @@ filter_unconventional = false
 # tags prereleases "<app>/vX.Y.Z-rc.N" and treats them as release
 # boundaries, so a pattern ending in [0-9]+$ would make git-cliff skip
 # them when it selects tags itself.
-tag_pattern = '^((node-automation-controller|node-host-agent|webhook-dispatcher)/)?v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+tag_pattern = '^((node-automation-controller|node-host-agent|webhook-dispatcher)/)?v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 commit_parsers = [
   { message = "^feat", group = "Features" },
   { message = "^fix", group = "Bug Fixes" },

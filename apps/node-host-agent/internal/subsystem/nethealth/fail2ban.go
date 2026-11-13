@@ -50,12 +50,14 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		return
 	}
 	active, err := n.cfg.Systemd.Active(ctx, "fail2ban.service")
+	serviceDown := false
 	if err != nil {
 		logger().Warn("nethealth: fail2ban is-active probe failed — "+
 			"down-latch left unchanged this cycle (fail closed)",
 			"unit", "fail2ban.service",
 			"error", err)
 	} else if !active {
+		serviceDown = true
 		n.state.SuspectLog(latchdefs.LatchFail2banDown,
 			"suspect: fail2ban-down (unit exists but service inactive)",
 			suspectLogCadence)
@@ -75,6 +77,16 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		n.stateExit(latchdefs.LatchFail2banDown)
 	}
 	bannedFile := filepath.Join(n.cfg.WatchdogStateDir, "fail2ban-banned")
+	if serviceDown {
+		// Unit KNOWN-inactive: fail2ban-client can only fail — no
+		// jails running means nothing is banned, so skip the fork
+		// entirely and drop the series (absent, not stale). A failed
+		// is-active probe (err != nil) still falls through to the
+		// client call — the metrics path does not need systemd.
+		_ = os.Remove(bannedFile)
+		n.cycles.WithLabelValues(checkF2B, "ok").Inc()
+		return
+	}
 	out, err := n.cfg.runMountCmd(ctx, []string{"fail2ban-client", "status"})
 	if err != nil {
 		// Client missing/failed → remove the metric file (no stale

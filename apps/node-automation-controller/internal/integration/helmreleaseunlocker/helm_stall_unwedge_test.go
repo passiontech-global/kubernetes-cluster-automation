@@ -1,6 +1,7 @@
 package helmreleaseunlocker
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
@@ -690,3 +691,6 @@ func TestHRStalledRollout(t *testing.T) {
 		}
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

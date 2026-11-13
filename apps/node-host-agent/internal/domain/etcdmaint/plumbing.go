@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // Defaults mirror rescue-etcd.sh.
@@ -147,12 +148,14 @@ type rescuer struct {
 	etcdctlBin string
 	etcdBin    string
 	certArgs   []string
+	proc       procfs.FS
 }
 
 func newRescuer(cfg Config, out io.Writer) *rescuer {
 	return &rescuer{
 		cfg:        cfg,
 		out:        out,
+		proc:       procfs.New(cfg.ProcRoot),
 		etcdctlBin: filepath.Join(cfg.K0sDir, "bin", "etcdctl"),
 		etcdBin:    filepath.Join(cfg.K0sDir, "bin", "etcd"),
 		// The script's CERTS array — apiserver etcd client certs,

@@ -17,10 +17,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/ledger"
 )
 
 // hostWriteRetryInterval bounds how often ONE write target may be
@@ -29,27 +29,26 @@ import (
 const hostWriteRetryInterval = 5 * time.Minute
 
 // writeState carries the per-Collector write bookkeeping — the
-// mutex serializes reconcileHostWrites against itself (the latch
-// ticker is single-goroutine today, but Collect-side callers and
-// future writers share the same guard); writeTried is the
+// CooldownSet's own RWMutex serializes the check-and-stamp pair
+// (the latch ticker is single-goroutine today, but Collect-side
+// callers and future writers share the same guard); tried is the
 // per-target last-attempt stamp (success OR failure — the cooldown
 // covers both so a permanently unwritable sysctl isn't retried
 // every tick).
 type writeState struct {
-	mu    sync.Mutex
-	tried map[string]time.Time
+	tried ledger.CooldownSet
 }
 
 // attemptHostWrite writes content to path unless the cooldown for
 // that path is still hot. Returns true when a write was attempted.
 func (c *Collector) attemptHostWrite(path string, content string) bool {
-	c.wr.mu.Lock()
-	defer c.wr.mu.Unlock()
 	now := c.cfg.Clock.Now()
-	if last, ok := c.wr.tried[path]; ok && now.Sub(last) < hostWriteRetryInterval {
+	if c.wr.tried.CooledDown(path, hostWriteRetryInterval, now) {
 		return false
 	}
-	c.wr.tried[path] = now
+	// Stamp BEFORE the write — unlike heal's successful-action-only
+	// rule, this cooldown covers failures too (see writeState).
+	c.wr.tried.Stamp(path, now)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		logger().Warn("hostmetrics: host write failed",
 			"path", path, "error", err)

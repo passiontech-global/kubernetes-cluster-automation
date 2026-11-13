@@ -204,6 +204,30 @@ type certDriftAuditor struct {
 	// sweep, so the memo never serves a second call — kept for
 	// parity with the per-target heal loops, not for load.
 	verdict *maintenance.Verdict
+	// certMemo/secretMemo memoize the injectionCA resolution chain
+	// for the duration of one auditWebhookCABundles pass — dozens of
+	// webhook configs typically share one inject-ca-from
+	// Certificate / inject-ca-from-secret Secret, and without the
+	// memo each config re-GETs the same objects. auditWebhookCABundles
+	// resets both maps at entry so a rotated CA is never diffed
+	// against a previous sweep's read; the getters lazy-init for
+	// literal-constructed test fixtures.
+	certMemo   map[string]certSecretMemo
+	secretMemo map[string]secretCAMemo
+}
+
+// certSecretMemo caches one certSecretName resolution.
+type certSecretMemo struct {
+	name string
+	ok   bool
+}
+
+// secretCAMemo caches one secretCA resolution — ok=false covers
+// both NotFound and fetch failure (the caller treats them alike:
+// carry-forward, no drift verdict).
+type secretCAMemo struct {
+	ca []byte
+	ok bool
 }
 
 // Setup registers the 15m sweep — or nothing when the

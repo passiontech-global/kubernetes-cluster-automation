@@ -16,8 +16,8 @@ package nodelabeler
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
-	"reflect"
 	"strings"
 	"time"
 
@@ -79,7 +79,7 @@ var nodeLabelChanges = predicate.Funcs{
 		if !ok1 || !ok2 || oldN == nil || newN == nil {
 			return false // missing objects never fire
 		}
-		return !reflect.DeepEqual(oldN.GetLabels(), newN.GetLabels())
+		return !maps.Equal(oldN.GetLabels(), newN.GetLabels())
 	},
 }
 

@@ -8,9 +8,9 @@ package apiprober
 
 import (
 	"net/http"
-	"os"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
@@ -173,6 +173,5 @@ func dedupStatic(in []StaticBackend) []StaticBackend {
 // guardConfPath resolves the conf path the same way cmd/agent does —
 // NODE_HOST_AGENT_API_GUARD_CONF, default /etc/api-backend-guard.conf.
 func guardConfPath() string {
-	return firstNonEmpty(os.Getenv(envnames.EnvAPIGuardConf),
-		defaultGuardConfPath)
+	return envx.String(envnames.EnvAPIGuardConf, defaultGuardConfPath)
 }

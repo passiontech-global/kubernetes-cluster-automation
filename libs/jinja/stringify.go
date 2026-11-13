@@ -22,6 +22,30 @@ import (
 // maps sorted). Depth- and step-budgeted against cyclic values —
 // past either cap a "[...]" marks the elided tail.
 func Stringify(v any) string {
+	// Scalar fast path — the dominant render shapes (string, bool,
+	// int64, float64, nil/Undefined) stringify without touching the
+	// Builder at all; containers still take the budgeted writer.
+	switch t := v.(type) {
+	case nil:
+		return "None"
+	case Undefined:
+		return ""
+	case string:
+		return t
+	case bool:
+		if t {
+			return "True"
+		}
+		return "False"
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case float64:
+		// Mirrors writeStringifyAt's float64 arm exactly.
+		if i, ok := floatToInt64(t); ok && t == float64(i) {
+			return strconv.FormatInt(i, 10)
+		}
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	}
 	var b strings.Builder
 	writeStringify(v, &b)
 	return b.String()

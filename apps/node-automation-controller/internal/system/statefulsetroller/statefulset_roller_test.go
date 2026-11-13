@@ -1,6 +1,7 @@
 package statefulsetroller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -1121,3 +1122,6 @@ func TestStatefulSetRollerDragonflySyncedRollsAndOutageTolerated(t *testing.T) {
 		t.Fatal("roll pinned by a Prometheus outage — the gate must tolerate it")
 	}
 }
+
+// Package-wide test context shared by this package's _test files.
+var ctx = context.Background()

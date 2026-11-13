@@ -58,6 +58,15 @@ func (t *CRDSizeTable) Record(name, rv string, size int64) {
 	k := crdSizeKey{name, rv}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// A CRD's resourceVersion moves on every update — entries keyed
+	// by older RVs of the SAME name are unreachable (a lookup only
+	// ever asks for the version the informer currently holds) and
+	// would grow the map one dead entry per CRD update forever.
+	for kk := range t.m {
+		if kk.name == name && kk != k {
+			delete(t.m, kk)
+		}
+	}
 	// Only a NEW key can grow the map — an update overwrites in
 	// place. Past capacity, drop roughly half the entries (map
 	// iteration order — the survivors are repopulated by the next

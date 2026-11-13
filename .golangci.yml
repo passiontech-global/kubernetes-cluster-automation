@@ -264,6 +264,46 @@ linters:
         nac-domain-no-cross-system:
           files: ["**/node-automation-controller/internal/system/**"]
           deny: [*nac-deny-apiserver, *nac-deny-health, *nac-deny-integration, *nac-deny-janitor, *nac-deny-node]
+        # ===== health sub-branch isolation =====
+        # Each check family under internal/health/<branch> is
+        # self-contained: it may not import a SIBLING branch — shared
+        # logic belongs in platform/probefw. clusterhealthprobes is
+        # the one sanctioned aggregator (it wires every branch into
+        # the sweep) and probetest is shared test scaffolding, so
+        # neither is denied below.
+        nac-health-branch-no-cross-datastore:
+          files: ["**/node-automation-controller/internal/health/datastore/**"]
+          deny:
+            - &nac-hb-gitops {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - &nac-hb-nethealth {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - &nac-hb-nodehealth {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - &nac-hb-storage {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/storage", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - &nac-hb-watchdogs {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - &nac-hb-ported {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+        nac-health-branch-no-cross-gitops:
+          files: ["**/node-automation-controller/internal/health/gitops/**"]
+          deny:
+            - &nac-hb-datastore {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore", desc: "health sub-branches are self-contained; shared logic belongs in platform/probefw"}
+            - *nac-hb-nethealth
+            - *nac-hb-nodehealth
+            - *nac-hb-storage
+            - *nac-hb-watchdogs
+            - *nac-hb-ported
+        nac-health-branch-no-cross-nethealth:
+          files: ["**/node-automation-controller/internal/health/nethealth/**"]
+          deny: [*nac-hb-datastore, *nac-hb-gitops, *nac-hb-nodehealth, *nac-hb-storage, *nac-hb-watchdogs, *nac-hb-ported]
+        nac-health-branch-no-cross-nodehealth:
+          files: ["**/node-automation-controller/internal/health/nodehealth/**"]
+          deny: [*nac-hb-datastore, *nac-hb-gitops, *nac-hb-nethealth, *nac-hb-storage, *nac-hb-watchdogs, *nac-hb-ported]
+        nac-health-branch-no-cross-storage:
+          files: ["**/node-automation-controller/internal/health/storage/**"]
+          deny: [*nac-hb-datastore, *nac-hb-gitops, *nac-hb-nethealth, *nac-hb-nodehealth, *nac-hb-watchdogs, *nac-hb-ported]
+        nac-health-branch-no-cross-watchdogs:
+          files: ["**/node-automation-controller/internal/health/watchdogs/**"]
+          deny: [*nac-hb-datastore, *nac-hb-gitops, *nac-hb-nethealth, *nac-hb-nodehealth, *nac-hb-storage, *nac-hb-ported]
+        nac-health-branch-no-cross-ported:
+          files: ["**/node-automation-controller/internal/health/ported/**"]
+          deny: [*nac-hb-datastore, *nac-hb-gitops, *nac-hb-nethealth, *nac-hb-nodehealth, *nac-hb-storage, *nac-hb-watchdogs]
         # internal/platform is the leaf layer: nothing above it —
         # metrics/shared/promq/probefw, the registry, test fakes, or
         # a domain module — may be imported from it.

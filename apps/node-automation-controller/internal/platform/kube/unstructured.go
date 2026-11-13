@@ -172,8 +172,17 @@ func decodeCondition(m map[string]any) Condition {
 // ConditionOf, which wrap this with the same early stop).
 func ForEachCondition(obj map[string]any, fn func(Condition) bool,
 	fields ...string) {
-	raw, found := NestedSlice(obj, fields...)
-	if !found {
+	// NestedFieldNoCopy, NOT NestedSlice: the latter deep-copies the
+	// whole conditions list (every entry's maps) on EVERY call — the
+	// per-object scan this wrapper exists to cheapen would still pay
+	// a full slice+map copy per object per sweep. The walk only
+	// reads, so the shared backing slice is safe.
+	v, found, err := unstructured.NestedFieldNoCopy(obj, fields...)
+	if !found || err != nil {
+		return
+	}
+	raw, ok := v.([]any)
+	if !ok {
 		return
 	}
 	for _, c := range raw {

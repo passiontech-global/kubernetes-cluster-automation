@@ -98,14 +98,25 @@ func (m *Maint) urgentReindex(ctx context.Context, pg, user, pass string,
 		return
 	}
 	t0 := m.d.Cfg.Clock.Now()
-	if _, serr := m.d.PsqlScript(ctx, pg, user, pass,
-		m.buildHeavyScript(false)); serr != nil {
+	sout, serr := m.d.PsqlScript(ctx, pg, user, pass,
+		m.buildHeavyScript(false))
+	if serr != nil {
 		if m.d.LongBudgetExceeded(t0, serr) {
 			m.reapOrphanedMaint(ctx, pg, user, pass, note)
 		}
 		res.urgentState = "fail"
 		res.okUrgent = false
 		note(fmt.Sprintf("urgent-reindex-fail: %v", serr))
+		return
+	}
+	// The locked script exits 0 even when the try-lock lost — it
+	// echoes LockBusyMarker and skips the REINDEX. Stamping the
+	// cooldown on that path would park the bloat for 24h without
+	// ever reindexing (the heavy-block parity the lock probe
+	// exists for).
+	if strings.Contains(sout, kdeps.LockBusyMarker) {
+		res.urgentState = "skipped-lock-busy"
+		note("urgent reindex skipped: compact-guard advisory lock busy")
 		return
 	}
 	// Stamp the cooldown only on a completed reindex — a failed one

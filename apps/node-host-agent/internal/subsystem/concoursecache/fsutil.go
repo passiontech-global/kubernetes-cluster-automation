@@ -214,9 +214,34 @@ func makeWritableDirs(root string) {
 		if !d.IsDir() {
 			return nil
 		}
-		if info, ierr := d.Info(); ierr == nil {
-			_ = os.Chmod(path, info.Mode().Perm()|0o200)
-		}
+		chmodDirWritableFD(path)
 		return nil
 	})
+}
+
+// chmodDirWritableFD adds u+w to a directory WITHOUT re-resolving
+// the path — the path-based os.Chmod had a swap window: on a
+// CI-controlled 0777 tree an actor can replace a verified entry
+// with `<entry> -> /etc` between WalkDir's Lstat and the chmod,
+// turning the root perm pass into a host-file privilege gadget
+// (the same class enforceDirPermsFD closes for the perm pass). The
+// dir is opened O_NOFOLLOW (a swapped-in symlink fails the open),
+// fstat'd to confirm the fd still is a plain directory, then
+// Fchmod'd — only the held inode's mode ever changes.
+func chmodDirWritableFD(path string) {
+	fd, err := unix.Open(path,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return
+	}
+	_ = unix.Fchmod(fd, (st.Mode&0o7777)|0o200)
 }

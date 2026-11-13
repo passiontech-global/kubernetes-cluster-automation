@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
@@ -52,7 +53,7 @@ const promTouchInterval = 10 * time.Minute
 // derivation: callers pass their host root and never re-derive the
 // path shape.
 func TextfileDir(hostRoot string) string {
-	if v := os.Getenv(envnames.EnvTextfileDir); v != "" {
+	if v := envx.String(envnames.EnvTextfileDir, ""); v != "" {
 		return v
 	}
 	return filepath.Join(hostRoot, "var", "lib", "node-exporter", "textfile")

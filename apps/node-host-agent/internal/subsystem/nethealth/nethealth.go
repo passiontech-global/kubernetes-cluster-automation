@@ -59,6 +59,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/nebula"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/ledger"
 )
 
 // Check names — prometheus `check` label + log context. The two
@@ -84,14 +85,14 @@ type NetHealth struct {
 	// goes through it (the single lib.sh-parity implementation).
 	state *hoststate.Store
 
-	dnsfails map[string]int // per DNS_FALLBACK_MAP name
+	dnsfails ledger.StreakLedger // per DNS_FALLBACK_MAP name
 	// dnsok counts consecutive successful DNS probes per name — the
 	// unpin streak. The pin drops only after ConsecNeeded
 	// consecutive successes (symmetric with dnsfails' pin-on gate);
 	// a single lucky resolution must not tear the managed block out.
-	dnsok      map[string]int // per DNS_FALLBACK_MAP name
-	clockFails int            // consecutive unsynced adjtimex reads
-	egressCtr  map[string]int // per relay probe!=committed counter
+	dnsok      ledger.StreakLedger // per DNS_FALLBACK_MAP name
+	clockFails int                 // consecutive unsynced adjtimex reads
+	egressCtr  ledger.StreakLedger // per relay probe!=committed counter
 	// ctStatPrev is the last-cycle sum of the nf_conntrack
 	// insert_failed+drop+early_drop columns; ctStatSeen separates
 	// "first read" (baseline only) from a real delta — the spike
@@ -138,10 +139,7 @@ type NetHealth struct {
 func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 	cfg.applyDefaults()
 	n := &NetHealth{
-		cfg:       cfg,
-		dnsfails:  map[string]int{},
-		dnsok:     map[string]int{},
-		egressCtr: map[string]int{},
+		cfg: cfg,
 	}
 	// The store binds the shared timex.Cell — a post-New
 	// cfg.Clock.Set is observed by it (hoststate.Store.Now

@@ -221,7 +221,7 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 	// feature fall back to the plain List envelope, which
 	// probee.ListResourceVersion decodes identically.
 	req.Header.Set("Accept", "application/json;as=PartialObjectMetadataList;"+
-		"v=v1alpha1;g=meta.k8s.io,application/json")
+		"v=v1;g=meta.k8s.io,application/json")
 	resp, err := client.Do(req)
 	if err != nil {
 		logger().Warn("controllerhygiene: rv probe failed",

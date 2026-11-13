@@ -22,9 +22,6 @@ func TestFail2banDownAndBans(t *testing.T) {
 	e.sd.On("LoadState --value fail2ban.service", "loaded\n")
 	e.sd.On("is-active fail2ban.service", "inactive\n")
 	e.sd.On("restart fail2ban.service", "")
-	e.host.On("fail2ban-client status", "Status\n|- Number of jail:\t2\n`- Jail list:\tsshd, recidive\n")
-	e.host.On("fail2ban-client status sshd", "Currently banned:\t7\n")
-	e.host.On("fail2ban-client status recidive", "Currently banned:\t1\n")
 	e.n.Cycle(context.Background())
 	if !stateExists(e, "fail2ban-down") {
 		t.Fatal("fail2ban-down latch missing")
@@ -39,9 +36,13 @@ func TestFail2banDownAndBans(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.state, "last-fail2ban-restart")); err != nil {
 		t.Fatal("restart budget file missing")
 	}
-	got := fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
-	if !strings.Contains(got, "sshd=7") || !strings.Contains(got, "recidive=1") {
-		t.Fatalf("banned file=%q", got)
+	// Inactive unit → no fail2ban-client fork at all (it could only
+	// fail) and the banned series drops — no jails, nothing banned.
+	if e.host.Ran("fail2ban-client") {
+		t.Fatal("fail2ban-client forked while the unit is inactive")
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "fail2ban-banned")); !os.IsNotExist(err) {
+		t.Fatal("stale banned file kept while the unit is inactive")
 	}
 }
 
@@ -52,8 +53,6 @@ func TestFail2banRestartFailureLogged(t *testing.T) {
 	e.sd.On("LoadState --value fail2ban.service", "loaded\n")
 	e.sd.On("is-active fail2ban.service", "inactive\n")
 	e.sd.FailOn("restart fail2ban.service", errCmdFail)
-	e.host.On("fail2ban-client status", "Status\n`- Jail list:\tsshd\n")
-	e.host.On("fail2ban-client status sshd", "Currently banned:\t2\n")
 	e.n.Cycle(context.Background())
 	if !strings.Contains(logLines(t, e), "fail2ban.service restart failed") {
 		t.Fatalf("missing restart-failure log:\n%s", logLines(t, e))

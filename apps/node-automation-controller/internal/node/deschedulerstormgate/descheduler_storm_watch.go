@@ -6,7 +6,8 @@
 package deschedulerstormgate
 
 import (
-	"reflect"
+	"maps"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -37,8 +38,8 @@ var stormSignalChanges = predicate.Funcs{
 			return true
 		}
 		return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
-			!reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
-			!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
+			!maps.Equal(condStatusMap(oldN), condStatusMap(newN)) ||
+			!slices.Equal(taintKeys(oldN), taintKeys(newN))
 	},
 	// Node add/remove changes the storm verdict too.
 	CreateFunc:  func(event.CreateEvent) bool { return true },

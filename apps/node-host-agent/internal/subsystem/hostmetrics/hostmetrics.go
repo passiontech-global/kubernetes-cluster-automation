@@ -217,7 +217,6 @@ type Collector struct {
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg}
-	c.wr.tried = map[string]time.Time{}
 	c.seen.m = map[string]time.Time{}
 	c.fs.inflight = map[string]*fsFlight{}
 	c.fs.stalledLogged = map[string]bool{}

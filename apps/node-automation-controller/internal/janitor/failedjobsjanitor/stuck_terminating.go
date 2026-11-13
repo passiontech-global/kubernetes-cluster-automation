@@ -28,6 +28,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -280,6 +281,20 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	}
 	if _, err := j.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx,
 		pvc.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		switch {
+		case apierrors.IsNotFound(err):
+			// The claim is gone — nothing left to protect; treat as
+			// resolved so the stuck gauge does not count it.
+			log.Info("SKIP: pvc-protection target already gone — raced with an external delete",
+				"pvc", pvc.Namespace+"/"+pvc.Name)
+			return true
+		case apierrors.IsConflict(err):
+			// The resourceVersion pin fired — the claim changed
+			// since the census; retry next sweep.
+			log.Info("SKIP: pvc-protection target changed since the list — retry next sweep",
+				"pvc", pvc.Namespace+"/"+pvc.Name)
+			return false
+		}
 		metrics.IncError(j.queue)
 		log.Error(err, "pvc-protection finalizer strip failed",
 			"pvc", pvc.Namespace+"/"+pvc.Name)

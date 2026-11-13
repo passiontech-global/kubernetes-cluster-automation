@@ -57,6 +57,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -178,7 +179,12 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	}, kube.Pods(r.cs, metav1.NamespaceAll),
 		func(page []corev1.Pod) error {
 			for i := range page {
-				p := &page[i]
+				// Copy the pod out of the page buffer — targets
+				// outlive this callback, and a &page[i] pointer
+				// pins the whole ~500-element backing array for
+				// the rest of the sweep.
+				cp := page[i]
+				p := &cp
 				sidecar := r.zombiePod(p, now)
 				if sidecar == "" {
 					continue
@@ -263,9 +269,22 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 			return nil
 		},
 		OnError: func(log logr.Logger, t zombieTarget, err error) {
-			metrics.IncError(r.queue)
-			log.Error(err, "zombie pod delete failed",
-				"pod", t.pod.Namespace+"/"+t.pod.Name)
+			switch {
+			case apierrors.IsNotFound(err):
+				// The pod was deleted under us — raced with an
+				// external cleanup; nothing failed.
+				log.Info("SKIP: zombie pod already gone — raced with an external delete",
+					"pod", t.pod.Namespace+"/"+t.pod.Name)
+			case apierrors.IsConflict(err):
+				// The UID precondition fired — a same-named pod was
+				// recreated since the list; not ours to reap.
+				log.Info("SKIP: zombie pod recreated since the list — UID precondition fired",
+					"pod", t.pod.Namespace+"/"+t.pod.Name)
+			default:
+				metrics.IncError(r.queue)
+				log.Error(err, "zombie pod delete failed",
+					"pod", t.pod.Namespace+"/"+t.pod.Name)
+			}
 		},
 	})
 
