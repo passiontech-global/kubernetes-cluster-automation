@@ -1,8 +1,8 @@
 // konnectivity_tunnel_health_test.go — coverage for the
 // konnectivity-tunnel-health check (konnectivity-tunnel-health): the half-open deficit
 // persisting past the window heals the agent, an all-agents-down
-// shape never heals (server-side outage), and the no-CP /
-// no-Prometheus postures pass clean.
+// shape never heals (server-side outage), the CP-less hub-spoke
+// peer-max fallback, and the no-Prometheus inconclusive pass.
 package nethealth
 
 import (
@@ -157,15 +157,89 @@ func TestKonnectivityFullyConnectedPasses(t *testing.T) {
 	}
 }
 
-// Zero Ready control-plane nodes: the expected count is unprovable
-// (and the cluster has bigger problems) — pass without ever querying
-// Prometheus or listing pods.
+// Zero Ready control-plane nodes on a cluster WITH a Prometheus
+// endpoint no longer skips the check — the hub-spoke fallback
+// derives the expectation from live agents (covered below). Here
+// the evidence source itself is offline, so the check has nothing
+// to evaluate and passes inconclusively.
 func TestKonnectivityNoReadyControlPlanePasses(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset(
 		konnAgentPod("konnectivity-agent-a", "w1")))
 	if res := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p).
 		Run(ctx); !res.Pass {
 		t.Fatalf("no ready CP must pass: %+v", res)
+	}
+}
+
+// Hub-spoke (zero in-cluster CP nodes — the k0s nonprod shape): the
+// expected count derives from the healthiest LIVE agent, so a
+// half-open agent still heals once the deficit persists. This is
+// the regression pin for the 2026-11-13 vacuous-check incident.
+func TestKonnectivityHubSpokePeerMaxHeals(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 0, // peer max is 1 — half-open
+		"konnectivity-agent-b": 1,
+	})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
+		t.Fatalf("first sight is inside the window — must pass: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res := check.Run(probetest.SweepCtx(ctx))
+	if res.Pass {
+		t.Fatal("hub-spoke half-open tunnel past the window must FAIL")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "konnectivity-agent-a", metav1.GetOptions{}); err == nil {
+		t.Fatal("half-open agent must be deleted while a sibling is fully connected")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "konnectivity-agent-b", metav1.GetOptions{}); err != nil {
+		t.Fatalf("fully-connected sibling must survive: %v", err)
+	}
+}
+
+// Hub-spoke all-agents-at-zero: peerMax floors the expectation at
+// 1, so a TOTAL tunnel loss still fires the gauge — alerting is the
+// contract — but with no live agent at the expected count nothing
+// is deleted (the server-side outage posture).
+func TestKonnectivityHubSpokeAllZeroFiresGaugeNoHeal(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 0,
+		"konnectivity-agent-b": 0,
+	})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	_ = check.Run(probetest.SweepCtx(ctx))
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res := check.Run(probetest.SweepCtx(ctx))
+	if res.Pass {
+		t.Fatal("all-agents-at-zero tunnel loss must FAIL — the gauge is the alerting contract")
+	}
+	for _, name := range []string{"konnectivity-agent-a", "konnectivity-agent-b"} {
+		if _, err := cs.CoreV1().Pods("kube-system").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("no healthy peer — %s must not be deleted: %v", name, err)
+		}
 	}
 }
 

@@ -82,6 +82,13 @@ const (
 	// the old unconditional skip that suppressed the only scenario
 	// the reaper was built to catch.
 	kubeletReaperLeaseFreshGrace = 4 * time.Minute
+	// kubeletReaperLocalRemediationLease is the L1<->L3 protocol's
+	// trust window for the LocalRemediationInProgress heartbeat —
+	// the same 3m heal.localRemediationLease and
+	// nodecoord.LocalRemediationLease carry (duplicated per module
+	// boundary). The agent re-stamps only when it acts, so a frozen
+	// heartbeat means the episode ended or the reporter died.
+	kubeletReaperLocalRemediationLease = 3 * time.Minute
 )
 
 type kubeletReaper struct {
@@ -105,6 +112,15 @@ type kubeletReaper struct {
 	// taint it) from a transient proxy-path flap (skip it). run() is
 	// the only writer and sweeps sequentially, so no lock.
 	freshFail state.FirstSeenLedger
+	// meshDark is run()'s fleet guard for the sweep: true while
+	// >=half the probed workers show the apiserver-dark signature
+	// (probe fail + fresh kubelet Lease) — the shared proxy path,
+	// not the kubelets, is the suspect, so sweep() suppresses
+	// fresh-lease taints for the cycle (the
+	// apiserver-node-reachability >=half-dark posture). run() is
+	// the only writer and sweeps sequentially — no lock (the
+	// freshFail contract).
+	meshDark bool
 }
 
 func Setup(d shared.Deps) error {
@@ -197,6 +213,36 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 				"results", ok)
 			return nil
 		}
+	}
+
+	// Mesh-wide guard (the apiserver-node-reachability >=half-dark
+	// posture): count the apiserver-dark signature — probe failed
+	// AND the kubelet Lease still fresh — across the probed workers.
+	// At >=half the suspect is the shared apiserver->kubelet path
+	// (konnectivity/mesh), not N simultaneous fake-ready kubelets,
+	// so sweep() suppresses fresh-lease taints for the cycle. One
+	// Lease read per failed node — cheap next to the probe pool's
+	// apiserver fan-out — and an unreadable lease simply doesn't
+	// count (fail closed, the same posture sweep()'s own
+	// lease-read error path takes).
+	darkFresh := 0
+	for name, o := range ok {
+		if o {
+			continue
+		}
+		if alive, err := r.kubeletAlive(ctx, name); err == nil && alive {
+			darkFresh++
+		}
+	}
+	// len(ok) > 1: a single probed worker has no siblings to
+	// cross-check — its probe-fail+fresh-lease signature IS the
+	// fake-ready case this module exists to fence (the dedicated
+	// konnectivityDegraded guard above already covers the tunnel
+	// suspect), so the fleet guard must not engage there.
+	r.meshDark = len(ok) > 1 && darkFresh > 0 && darkFresh*2 >= len(ok)
+	if r.meshDark {
+		log.Info("mesh-dark guard: >=half of probed workers fail with fresh leases — fresh-lease taints suppressed",
+			"darkFresh", darkFresh, "probed", len(ok))
 	}
 
 	sweepErrs := 0

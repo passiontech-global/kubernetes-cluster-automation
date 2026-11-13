@@ -11,7 +11,11 @@
 // open_server_connections from Prometheus; once a deficit persists
 // 10m while a sibling agent demonstrably holds full connections
 // (proving the servers are reachable), the agent pod is deleted so
-// it re-dials every server.
+// it re-dials every server. The expected count is the Ready
+// control-plane node count on standard clusters; hub-spoke
+// topologies (k0s workers, apiserver + konnectivity-servers on a
+// remote hub — zero in-cluster CP nodes) derive it from the
+// healthiest live agent instead, so the check is not vacuous there.
 package nethealth
 
 import (
@@ -66,11 +70,12 @@ const (
 
 var (
 	// konnectivity-tunnel-health — a konnectivity-agent pod holding fewer open server
-	// connections than there are Ready control-plane nodes past the
-	// persistence window.
+	// connections than its expected count (Ready control-plane nodes,
+	// or the healthiest live agent on CP-less hub-spoke clusters)
+	// past the persistence window.
 	konnAgentHalfOpenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_konnectivity_agent_half_open",
-		Help: "1 while a konnectivity-agent pod holds fewer open server connections than Ready control-plane nodes for >=10m — konnectivity-tunnel-health.",
+		Help: "1 while a konnectivity-agent pod holds fewer open server connections than expected for >=10m — konnectivity-tunnel-health.",
 	}, []string{"pod", "node"})
 )
 
@@ -110,10 +115,13 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	now := p.Now()
 
 	// expectedCPCount — every agent should hold one open server
-	// connection per Ready control-plane node. A cluster reporting
-	// zero Ready CP has bigger problems than tunnel health, and 0
-	// would make the "sibling holds the full count" proof vacuous:
-	// skip rather than flag the whole DaemonSet.
+	// connection per Ready control-plane node. Zero Ready CP no
+	// longer skips the check: hub-spoke clusters (k0s workers, the
+	// apiserver and its konnectivity-servers on a remote hub) have
+	// no in-cluster CP nodes at all, and the old early-Pass made
+	// the watchdog vacuous exactly where tunnels break (nonprod
+	// 2026-11-13: dial failures for 6h, check silent). expectedConns
+	// below derives the expectation from live agents for that shape.
 	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
@@ -123,9 +131,6 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		if kube.IsControlPlane(&nodes[i]) && kube.NodeReady(&nodes[i]) {
 			expectedCP++
 		}
-	}
-	if expectedCP == 0 {
-		return probefw.Result{Pass: true}
 	}
 
 	// The connection counts only exist where a Prometheus endpoint
@@ -165,6 +170,40 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			conns[podName] = s.Value
 		}
 	}
+	// expectedConns — the per-agent open-server-connection count a
+	// healthy agent should hold. The Ready-CP count is the standard
+	// expectation; on CP-less (hub-spoke) clusters it derives from
+	// the healthiest LIVE agent — peerMax over Running members'
+	// series — floored at 1 so an all-agents-at-zero total tunnel
+	// loss still reads as deficit (alerting is the contract; the
+	// heal still requires a healthy peer and never fires on a
+	// server-side outage). The census this needs is the same one
+	// the eval loop below reuses — fetched once here, lazily on
+	// the CP-count path.
+	expectedConns := float64(expectedCP)
+	var pods []*corev1.Pod
+	podsListed := false
+	if expectedCP == 0 {
+		pods, err = p.PodsIn(ctx, konnAgentNS)
+		if err != nil {
+			return probefw.Result{Infra: fmt.Errorf("list %s pods: %w", konnAgentNS, err)}
+		}
+		podsListed = true
+		peerMax := 0.0
+		for _, pod := range pods {
+			if !isKonnectivityAgentPod(pod) || pod.DeletionTimestamp != nil ||
+				pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			if v, ok := conns[pod.Name]; ok && v > peerMax {
+				peerMax = v
+			}
+		}
+		expectedConns = peerMax
+		if expectedConns < 1 {
+			expectedConns = 1
+		}
+	}
 	// Cheap exit first: with no series below the expected count
 	// there is nothing to evaluate — the pods List (needed only to
 	// map a deficit onto live pods for the node label, the peer
@@ -175,7 +214,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	// this sweep's emits reuse it.)
 	deficit := false
 	for _, v := range conns {
-		if v < float64(expectedCP) {
+		if v < expectedConns {
 			deficit = true
 			break
 		}
@@ -193,9 +232,11 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
 			"konnectivity-agent pods with half-open tunnels: ", ", ")
 	}
-	pods, err := p.PodsIn(ctx, konnAgentNS)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list %s pods: %w", konnAgentNS, err)}
+	if !podsListed {
+		pods, err = p.PodsIn(ctx, konnAgentNS)
+		if err != nil {
+			return probefw.Result{Infra: fmt.Errorf("list %s pods: %w", konnAgentNS, err)}
+		}
 	}
 
 	halfOpen := map[string]bool{} // live-key set for the seen prune
@@ -223,7 +264,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			}
 			continue
 		}
-		if v >= float64(expectedCP) {
+		if v >= expectedConns {
 			// A LIVE agent holding the full count is the only
 			// admissible proof the konnectivity-servers are up —
 			// a stale series on a dead pod must not author it.
@@ -241,8 +282,8 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		}
 		rep.Emit(konnAgentHalfOpenGauge, key,
 			[]string{pod.Name, pod.Spec.NodeName},
-			fmt.Sprintf("%s(connections=%.0f/%d node=%s)",
-				key, conns[pod.Name], expectedCP, pod.Spec.NodeName))
+			fmt.Sprintf("%s(connections=%.0f/%.0f node=%s)",
+				key, conns[pod.Name], expectedConns, pod.Spec.NodeName))
 		if !healthyPeer {
 			log.Info("skip konnectivity heal: no live agent reports full "+
 				"connections — a server-side outage, not a half-open tunnel",

@@ -6,6 +6,14 @@
 // KubeletPLEGUnhealthy=True on every cicd/production worker long
 // after the host latch cleared; each stamped pre-cordon held until
 // the conditions were patched by hand — this check is that hand.
+//
+// A second group rides the same patch: agent-stamped ACTION
+// conditions (LocalRemediationInProgress) whose heartbeat is the
+// episode timer, not a reporter liveness stamp — a frozen heartbeat
+// there is the NORMAL episode end, and the cluster-side consumers
+// already stop trusting it at the 3m lease. Sweeping it only
+// garbage-collects the stale True so kubectl describe stops showing
+// a finished remediation as in-progress.
 package nodehealth
 
 import (
@@ -49,6 +57,15 @@ const CheckNameNodeCondSweeper = "node-condition-sweeper"
 // (Run skips NotReady nodes outright).
 const nodeCondSweepHeartbeatMaxAge = 25 * time.Minute
 
+// nodeCondRemediationSweepMaxAge is the zombie TTL for the
+// action-heartbeat group (nodeCondRemediationConds): the condition's
+// own trust lease is 3m (nodecoord.LocalRemediationLease /
+// heal.localRemediationLease), so a heartbeat frozen past 10m is
+// unambiguously an ended episode — long enough to never race a live
+// remediation's next stamp, short enough that a finished episode
+// stops reading as in-progress within one incident review.
+const nodeCondRemediationSweepMaxAge = 10 * time.Minute
+
 // nodeCondSweptConds is the sweeper's allowlist — every condition
 // nodereporter owns and re-stamps lastHeartbeatTime on while alive
 // (nodecond.HeartbeatSweptNames in libs/hostkit, the single source of
@@ -62,9 +79,19 @@ const nodeCondSweepHeartbeatMaxAge = 25 * time.Minute
 // node agent that re-stamps lastHeartbeatTime every ~2m while alive.
 var nodeCondSweptConds = kube.CondTypes(nodecond.HeartbeatSweptNames)
 
+// nodeCondRemediationConds is the sweeper's second group —
+// conditions node-host-agent stamps on ACTION (nodecoord
+// StampLocalRemediation/StampPodHealed), deliberately NOT in
+// HeartbeatSweptNames: nodereporter does not own or re-stamp them,
+// so their frozen heartbeat is episode expiry, not a dead writer.
+// The 3m consumer lease already ignores them; this sweep only
+// reconciles the stale True object itself.
+var nodeCondRemediationConds = kube.CondTypes(
+	[]string{nodecond.CondLocalRemediation})
+
 var nodeCondSweepsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_node_condition_sweeps_total",
-	Help: "Watchdog-managed node conditions cleared after their heartbeat froze (writer presumed dead).",
+	Help: "Agent-managed node conditions cleared after their heartbeat froze (dead writer or expired remediation episode).",
 }, []string{"node", "condition"})
 
 func init() {
@@ -72,21 +99,20 @@ func init() {
 }
 
 // condZombie reports a managed condition that is True but unverifiable:
-// its heartbeat is dead (zero or older than
-// nodeCondSweepHeartbeatMaxAge — the reporter re-stamps every ~2m
-// while alive) AND the True is old enough that a live writer would
-// have re-stamped by now. A fresh True with no heartbeat yet is
-// left alone — a foreign writer that just set it may legitimately
-// not stamp heartbeats.
-func condZombie(c *corev1.NodeCondition, now time.Time) bool {
+// its heartbeat is dead (zero or older than maxAge — the group's own
+// re-stamp cadence decides what "dead" means) AND the True is old
+// enough that a live writer would have re-stamped by now. A fresh
+// True with no heartbeat yet is left alone — a foreign writer that
+// just set it may legitimately not stamp heartbeats.
+func condZombie(c *corev1.NodeCondition, now time.Time, maxAge time.Duration) bool {
 	if c.Status != corev1.ConditionTrue {
 		return false
 	}
-	if kube.CondHeartbeatLive(c, nodeCondSweepHeartbeatMaxAge, now) {
+	if kube.CondHeartbeatLive(c, maxAge, now) {
 		return false
 	}
 	return !c.LastTransitionTime.IsZero() &&
-		now.Sub(c.LastTransitionTime.Time) >= nodeCondSweepHeartbeatMaxAge
+		now.Sub(c.LastTransitionTime.Time) >= maxAge
 }
 
 // Run patches every zombie managed condition back to False —
@@ -112,26 +138,32 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		var stale []corev1.NodeCondition
-		for _, t := range nodeCondSweptConds {
-			c := kube.NodeCondition(n, t)
-			if c == nil || !condZombie(c, now) {
-				continue
+		collect := func(conds []corev1.NodeConditionType, maxAge time.Duration, why string) {
+			for _, t := range conds {
+				c := kube.NodeCondition(n, t)
+				if c == nil || !condZombie(c, now, maxAge) {
+					continue
+				}
+				hbAge := "never stamped"
+				if !c.LastHeartbeatTime.IsZero() {
+					hbAge = fmt.Sprintf("frozen %s",
+						now.Sub(c.LastHeartbeatTime.Time).Round(time.Second))
+				}
+				stale = append(stale, corev1.NodeCondition{
+					Type:   c.Type,
+					Status: corev1.ConditionFalse,
+					Reason: "StaleConditionCleared",
+					Message: fmt.Sprintf("heartbeat %s — %s; cleared by %s",
+						hbAge, why, CheckNameNodeCondSweeper),
+					LastHeartbeatTime:  metav1.NewTime(now),
+					LastTransitionTime: metav1.NewTime(now),
+				})
 			}
-			hbAge := "never stamped"
-			if !c.LastHeartbeatTime.IsZero() {
-				hbAge = fmt.Sprintf("frozen %s",
-					now.Sub(c.LastHeartbeatTime.Time).Round(time.Second))
-			}
-			stale = append(stale, corev1.NodeCondition{
-				Type:   c.Type,
-				Status: corev1.ConditionFalse,
-				Reason: "StaleConditionCleared",
-				Message: fmt.Sprintf("heartbeat %s — owning reporter presumed dead; cleared by %s",
-					hbAge, CheckNameNodeCondSweeper),
-				LastHeartbeatTime:  metav1.NewTime(now),
-				LastTransitionTime: metav1.NewTime(now),
-			})
 		}
+		collect(nodeCondSweptConds, nodeCondSweepHeartbeatMaxAge,
+			"owning reporter presumed dead")
+		collect(nodeCondRemediationConds, nodeCondRemediationSweepMaxAge,
+			"remediation episode expired")
 		if len(stale) == 0 {
 			continue
 		}

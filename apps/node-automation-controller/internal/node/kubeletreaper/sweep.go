@@ -74,6 +74,23 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 			"node", listed.Name, "until", until.Format(time.RFC3339))
 		return nil
 	}
+	// The live L1 signal the annotation above was meant to be:
+	// node-host-agent marks NodeCondition LocalRemediationInProgress
+	// on nodes/status before restarting a node-local service —
+	// trusted while its heartbeat stays inside the protocol's 3m
+	// lease (a frozen heartbeat means the episode ended or the
+	// reporter died). The agent's ClusterRole grants nodes/status
+	// patch only, never nodes metadata patch, so nothing has
+	// stamped local-remediation-until since the shell operator
+	// retired — without this read the reaper races L1 self-heal.
+	if c := kube.NodeCondition(node, nodecond.CondLocalRemediation); c != nil &&
+		c.Status == corev1.ConditionTrue &&
+		kube.CondHeartbeatLive(c, kubeletReaperLocalRemediationLease, r.now.Now()) {
+		log.Info("YIELD: node-host-agent local remediation in flight — taint deferred",
+			"node", listed.Name,
+			"heartbeat", c.LastHeartbeatTime.Time.Format(time.RFC3339))
+		return nil
+	}
 	has := kube.HasTaint(node.Spec.Taints, kubeletReaperTaint)
 	name := listed.Name
 
@@ -116,8 +133,21 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 			}
 			return nil
 		}
-		// Grace expired with the lease still fresh — fake-ready
-		// confirmed; fall through to the taint path.
+		// Grace expired with the lease still fresh — before tainting,
+		// the fleet guard gets a vote: when >=half the probed workers
+		// show this same probe-fail+fresh-lease signature the suspect
+		// is the shared apiserver->kubelet path (konnectivity/mesh),
+		// not this kubelet — suppress the taint for the cycle (the
+		// apiserver-node-reachability >=half-dark posture). The
+		// freshFail entry is kept, not forgotten: observation
+		// continues and a node still failing the sweep the guard
+		// lifts fences immediately. Stale-lease fails below are
+		// dead-kubelet evidence and taint regardless.
+		if r.meshDark {
+			log.Info("SUPPRESS: mesh-wide probe dark — fresh-lease taint deferred",
+				"node", name)
+			return nil
+		}
 		r.freshFail.Forget(name)
 	} else {
 		r.freshFail.Forget(name)

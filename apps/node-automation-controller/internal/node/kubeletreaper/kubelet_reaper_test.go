@@ -24,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // krStaleNode builds a dead-kubelet worker: its Ready heartbeat is
@@ -522,5 +523,158 @@ func TestTruncateLog(t *testing.T) {
 	body := strings.TrimSuffix(got, "…")
 	if body != strings.Repeat("é", 100) || !utf8.ValidString(got) {
 		t.Fatalf("multibyte body truncated to %d bytes, want the first 200 bytes", len(body))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sweep() — the L1<->L3 yield: the live signal is the
+// LocalRemediationInProgress NodeCondition (the annotation has had no
+// writer since the agent's RBAC narrowed to nodes/status patch).
+// ---------------------------------------------------------------------------
+
+// krRemediationCond appends a LocalRemediationInProgress condition
+// with the given heartbeat age.
+func krRemediationCond(n *corev1.Node, hbAge time.Duration) {
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:              corev1.NodeConditionType(nodecond.CondLocalRemediation),
+		Status:            corev1.ConditionTrue,
+		LastHeartbeatTime: metav1.NewTime(time.Now().Add(-hbAge)),
+	})
+}
+
+// A node mid-L1-self-heal (fresh condition heartbeat) must not get
+// taint-raced while node-host-agent restarts k0sworker — the yield
+// the dead annotation was meant to provide.
+func TestKubeletReaperYieldsToLocalRemediationCondition(t *testing.T) {
+	n := krStaleNode("w1")
+	krRemediationCond(n, 30*time.Second)
+	cs := fake.NewSimpleClientset(n)
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	r := krReaper(cs, time.Now())
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("tainted while node-host-agent self-heal in flight")
+	}
+}
+
+// A FROZEN heartbeat means the episode ended (or the reporter died)
+// — the condition stops yielding and the dead-kubelet verdict
+// proceeds to the taint.
+func TestKubeletReaperStaleRemediationHeartbeatDoesNotYield(t *testing.T) {
+	n := krStaleNode("w1")
+	krRemediationCond(n, 10*time.Minute)
+	cs := fake.NewSimpleClientset(n)
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	r := krReaper(cs, time.Now())
+	if err := r.sweep(ctx, n, false); err != nil {
+		t.Fatal(err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("frozen remediation heartbeat still yielded — dead kubelet not tainted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// run() — the mesh-dark guard: >=half the probed workers showing
+// probe-fail + fresh lease means the shared proxy path is the suspect.
+// ---------------------------------------------------------------------------
+
+// With 3 of 5 workers apiserver-dark (fresh lease, probe failing past
+// the persistence grace) the fleet guard suppresses their fresh-lease
+// taints — while a stale-lease worker (dead kubelet) still taints:
+// the guard only covers the ambiguous signature.
+func TestKubeletReaperMeshDarkSuppressesFreshLeaseTaints(t *testing.T) {
+	now := time.Now()
+	w1 := krStaleNode("w1")
+	w2 := krStaleNode("w2")
+	w3 := krStaleNode("w3")
+	w4 := testutil.Node("w4", corev1.ConditionTrue, nil)
+	w5 := krStaleNode("w5") // no lease — dead kubelet
+	cs := fake.NewSimpleClientset(w1, w2, w3, w4, w5)
+	for _, w := range []string{"w1", "w2", "w3"} {
+		if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+			Create(ctx, krLease(w, 5*time.Second), metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return node == "w4" })
+	// Age the fresh-lease persistence ledger past the grace window —
+	// without it the sweep stops inside the window before the guard.
+	for _, w := range []string{"w1", "w2", "w3"} {
+		r.freshFail.Observe(w, now.Add(-kubeletReaperLeaseFreshGrace-time.Minute))
+	}
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, w := range []string{"w1", "w2", "w3"} {
+		if kube.HasTaint(testutil.GetNode(t, cs, w).Spec.Taints, kubeletReaperTaint) {
+			t.Fatalf("%s tainted under the mesh-dark guard — shared-path fault punished as dead kubelets", w)
+		}
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w5").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("stale-lease (dead kubelet) worker not tainted — guard over-suppressed")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w4").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("healthy worker tainted")
+	}
+}
+
+// The guard's complement: below the >=half threshold the same
+// persisted fresh-lease failure taints exactly as before — one node's
+// dead tunnel is its own incident, not a mesh fault.
+func TestKubeletReaperMeshGuardOffTaintsPersistedNode(t *testing.T) {
+	now := time.Now()
+	w1 := krStaleNode("w1")
+	w2 := testutil.Node("w2", corev1.ConditionTrue, nil)
+	w3 := testutil.Node("w3", corev1.ConditionTrue, nil)
+	w4 := testutil.Node("w4", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(w1, w2, w3, w4)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return node != "w1" })
+	r.freshFail.Observe("w1", now.Add(-kubeletReaperLeaseFreshGrace-time.Minute))
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("1-of-4 dark is below the mesh guard — persisted fake-ready must taint")
+	}
+}
+
+// The guard needs siblings to compare against: on a ONE-worker
+// cluster the same probe-fail+fresh-lease signature IS the
+// fake-ready case the reaper exists to fence (the dedicated
+// konnectivityDegraded check above already covers the tunnel
+// suspect) — meshDark must not engage and suppress it forever.
+func TestKubeletReaperMeshGuardNeverEngagesOnSingleWorker(t *testing.T) {
+	now := time.Now()
+	w1 := krStaleNode("w1")
+	cs := fake.NewSimpleClientset(w1)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return false })
+	r.freshFail.Observe("w1", now.Add(-kubeletReaperLeaseFreshGrace-time.Minute))
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("single-worker fresh-lease failure suppressed — fake-ready can never fence")
 	}
 }

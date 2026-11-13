@@ -123,7 +123,9 @@ const (
 // self-expires via LastHeartbeatTime: the cluster side only trusts
 // it while the heartbeat is fresh (< ~3m), so a crashed agent
 // cannot freeze remote remediation. NOT in HeartbeatSweptNames —
-// nodereporter does not own or re-stamp it.
+// nodereporter does not own or re-stamp it; the controller's
+// node-condition-sweeper garbage-collects the stale True once the
+// heartbeat has been frozen past its episode TTL.
 const CondLocalRemediation = "LocalRemediationInProgress"
 
 // Monitor- and kubelet-owned NodeConditions — not latch-backed.

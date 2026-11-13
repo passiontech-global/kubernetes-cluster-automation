@@ -367,3 +367,111 @@ func TestNodeCondSweeperTTLBoundary(t *testing.T) {
 		t.Fatalf("20m zombie = %+v, want Status=True untouched", c)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The action-heartbeat group: LocalRemediationInProgress is stamped
+// True by node-host-agent per remediation ACTION — its frozen
+// heartbeat is the NORMAL episode end (consumers already ignore it
+// past the 3m lease), so the sweeper garbage-collects the stale
+// True on its own shorter TTL instead of waiting for a reporter
+// that never re-stamps it.
+// ---------------------------------------------------------------------------
+
+// remediationNode builds a Ready worker carrying a
+// LocalRemediationInProgress condition with the given heartbeat and
+// transition ages.
+func remediationNode(name string, hbAge, transAge time.Duration) *corev1.Node {
+	n := probetest.ReadyWorkerNode("w-"+name, "",
+		0, false)
+	old := metav1.NewTime(time.Now().Add(-transAge))
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+		Status:             corev1.ConditionTrue,
+		Reason:             "L1SelfHeal",
+		LastHeartbeatTime:  metav1.NewTime(time.Now().Add(-hbAge)),
+		LastTransitionTime: old,
+	})
+	return n
+}
+
+// An episode whose heartbeat froze past the 10m remediation TTL is
+// garbage-collected to False — the stale True no longer reads as
+// in-progress on kubectl describe.
+func TestNodeCondSweeperClearsExpiredRemediation(t *testing.T) {
+	n := remediationNode("expired",
+		nodeCondRemediationSweepMaxAge+time.Minute,
+		nodeCondRemediationSweepMaxAge+time.Minute)
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+		t.Fatal("expired remediation condition did not fail the check")
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-expired", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := kube.NodeCondition(got, nodecond.CondLocalRemediation)
+	if c == nil || c.Status != corev1.ConditionFalse {
+		t.Fatalf("expired remediation = %+v, want Status=False", c)
+	}
+	if c.Reason != "StaleConditionCleared" {
+		t.Fatalf("cleared reason = %q, want StaleConditionCleared", c.Reason)
+	}
+}
+
+// A LIVE episode — heartbeat inside the 10m TTL — is never
+// second-guessed: the agent may stamp again at any moment.
+func TestNodeCondSweeperKeepsLiveRemediation(t *testing.T) {
+	n := remediationNode("live", time.Minute, time.Hour)
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+		t.Fatalf("live remediation failed the check: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-live", metav1.GetOptions{})
+	c := kube.NodeCondition(got, nodecond.CondLocalRemediation)
+	if c == nil || c.Status != corev1.ConditionTrue {
+		t.Fatalf("live remediation = %+v, want Status=True untouched", c)
+	}
+}
+
+// Between the 3m consumer lease and the 10m sweep TTL the sweeper
+// still holds its fire — consumers ignore the expired condition on
+// their own, but the object keeps its True until the episode TTL
+// proves no writer will ever stamp again.
+func TestNodeCondSweeperKeepsRecentRemediationExpiry(t *testing.T) {
+	n := remediationNode("recent",
+		5*time.Minute, 5*time.Minute)
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+		t.Fatalf("5m-expired remediation must survive inside the sweep TTL: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-recent", metav1.GetOptions{})
+	c := kube.NodeCondition(got, nodecond.CondLocalRemediation)
+	if c == nil || c.Status != corev1.ConditionTrue {
+		t.Fatalf("5m-expired remediation = %+v, want Status=True untouched", c)
+	}
+}
+
+// The remediation group is deliberately separate from
+// HeartbeatSweptNames — nodereporter does not own or re-stamp this
+// condition, so it must never appear in the reporter-owned allowlist
+// (whose 25m TTL and AgentHeartbeatManaged semantics assume a
+// per-cycle heartbeat writer).
+func TestNodeCondSweeperRemediationGroupIsSeparate(t *testing.T) {
+	for _, c := range nodeCondSweptConds {
+		if c == corev1.NodeConditionType(nodecond.CondLocalRemediation) {
+			t.Fatal("LocalRemediationInProgress must not join HeartbeatSweptNames — nodereporter does not own it")
+		}
+	}
+	found := false
+	for _, c := range nodeCondRemediationConds {
+		if c == corev1.NodeConditionType(nodecond.CondLocalRemediation) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("LocalRemediationInProgress missing from the remediation sweep group")
+	}
+}
